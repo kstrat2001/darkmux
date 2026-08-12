@@ -351,23 +351,57 @@ pub fn parse_import_bindings(text: &str) -> HashMap<String, String> {
     out
 }
 
+/// Extensions an ESM/NodeNext-style relative specifier keeps at the
+/// SOURCE level (`import './data-source.js'` naming a `data-source.ts`
+/// file on disk — TypeScript's own `moduleResolution: "nodenext"`
+/// convention: write the emitted `.js` extension, resolve against the
+/// `.ts` source). (#1753 MUST-FIX follow-up) Checked longest-first isn't
+/// actually necessary — none of these four is a suffix of another as a
+/// literal string (`.mjs`/`.cjs`/`.jsx` all fail `ends_with(".js")`,
+/// since that requires the dot itself to sit three bytes from the end) —
+/// but the order is written stable and explicit rather than relying on
+/// that fact staying true if this list ever grows.
+const ESM_SOURCE_EXTENSIONS: &[&str] = &[".js", ".jsx", ".mjs", ".cjs"];
+
 /// Given the importing file's own repo-relative path and a relative
 /// specifier (`./x`, `../y/z`), produce the candidate resolved paths in
 /// Node/TS resolution order: `<resolved>.ts`, `<resolved>.tsx`,
 /// `<resolved>/index.ts`, `<resolved>/index.tsx`. Pure — callers confirm
 /// existence via `FileSource::read_file`.
+///
+/// (#1753 MUST-FIX follow-up) When `spec` carries a trailing
+/// `.js`/`.jsx`/`.mjs`/`.cjs` (the ESM/NodeNext convention — pervasive in
+/// the repos this bundler reviews in production, including this branch's
+/// own `TOPLEVEL_TAIL_TS` fixture), the SAME FOUR candidates are ALSO
+/// produced against the specifier with that extension stripped, appended
+/// after the bare-spec candidates above — both styles occur, and a bare
+/// `.ts`-suffixed specifier (`./data-source.ts`) is untouched by this
+/// (nothing to strip). Without this, an ESM-style import never resolves
+/// to anything (`./data-source.js` only ever probes `data-source.js.ts`
+/// and friends, which never exist), silently defeating the caller's own
+/// import binding.
 pub fn resolve_relative_import_candidates(from_path: &str, spec: &str) -> Vec<String> {
     let from_dir = match from_path.rfind('/') {
         Some(idx) => &from_path[..idx],
         None => "",
     };
     let resolved = normalize_path(from_dir, spec);
-    vec![
+    let mut out = vec![
         format!("{resolved}.ts"),
         format!("{resolved}.tsx"),
         format!("{resolved}/index.ts"),
         format!("{resolved}/index.tsx"),
-    ]
+    ];
+    for ext in ESM_SOURCE_EXTENSIONS {
+        if let Some(stripped) = resolved.strip_suffix(ext) {
+            out.push(format!("{stripped}.ts"));
+            out.push(format!("{stripped}.tsx"));
+            out.push(format!("{stripped}/index.ts"));
+            out.push(format!("{stripped}/index.tsx"));
+            break;
+        }
+    }
+    out
 }
 
 /// Join `base_dir` + `spec` (a `./`/`../`-relative specifier) and
@@ -454,6 +488,55 @@ mod tests {
     fn resolve_relative_import_candidates_handles_parent_dir() {
         let cands = resolve_relative_import_candidates("src/services/order.ts", "../lib/bar");
         assert_eq!(cands[0], "src/lib/bar.ts");
+    }
+
+    #[test]
+    fn resolve_relative_import_candidates_also_strips_the_esm_js_extension() {
+        // (#1753 MUST-FIX follow-up) An ESM/NodeNext-style specifier
+        // (`./data-source.js`, naming a `data-source.ts` file on disk)
+        // must resolve — the bare-spec candidates (which would probe
+        // `data-source.js.ts` and never match anything) come first, then
+        // the four candidates against the `.js`-stripped specifier.
+        let cands = resolve_relative_import_candidates("src/services/order.ts", "./data-source.js");
+        assert_eq!(
+            cands,
+            vec![
+                "src/services/data-source.js.ts".to_string(),
+                "src/services/data-source.js.tsx".to_string(),
+                "src/services/data-source.js/index.ts".to_string(),
+                "src/services/data-source.js/index.tsx".to_string(),
+                "src/services/data-source.ts".to_string(),
+                "src/services/data-source.tsx".to_string(),
+                "src/services/data-source/index.ts".to_string(),
+                "src/services/data-source/index.tsx".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_relative_import_candidates_strips_jsx_mjs_cjs_too() {
+        assert!(resolve_relative_import_candidates("src/order.ts", "./widget.jsx")
+            .contains(&"src/widget.ts".to_string()));
+        assert!(resolve_relative_import_candidates("src/order.ts", "./legacy.mjs")
+            .contains(&"src/legacy.ts".to_string()));
+        assert!(resolve_relative_import_candidates("src/order.ts", "./old.cjs")
+            .contains(&"src/old.ts".to_string()));
+    }
+
+    #[test]
+    fn resolve_relative_import_candidates_leaves_a_bare_ts_specifier_unchanged() {
+        // A specifier with no recognized ESM source extension (or already
+        // ending in `.ts`) has nothing to strip — no duplicate candidates.
+        let cands = resolve_relative_import_candidates("src/order.ts", "./pricing.ts");
+        assert_eq!(
+            cands,
+            vec![
+                "src/pricing.ts.ts".to_string(),
+                "src/pricing.ts.tsx".to_string(),
+                "src/pricing.ts/index.ts".to_string(),
+                "src/pricing.ts/index.tsx".to_string(),
+            ]
+        );
     }
 
     #[test]

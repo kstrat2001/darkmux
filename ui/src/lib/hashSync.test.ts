@@ -49,9 +49,27 @@ describe("canonicalHash / parseRoute round-trip", () => {
     expect(roundTrip(route)).toEqual(route);
   });
 
-  it("machine round-trips", () => {
-    const route: Route = { kind: "machine" };
+  it("machine (local, uid: null) round-trips WITHOUT a uid param", () => {
+    const route: Route = { kind: "machine", uid: null };
     expect(canonicalHash(route)).toBe("lens=machine");
+    expect(roundTrip(route)).toEqual(route);
+  });
+
+  it("machine (a specific/remote uid) round-trips with an explicit uid param — the drill-in widening", () => {
+    const route: Route = { kind: "machine", uid: "studio-uid-123" };
+    expect(canonicalHash(route)).toBe("lens=machine&uid=studio-uid-123");
+    expect(roundTrip(route)).toEqual(route);
+  });
+
+  it("runs (kind=lab, a resolved run) round-trips with an explicit run param — the lab-run-detail deep link", () => {
+    const route: Route = { kind: "runs", runsKind: "lab", run: "live/gate-1" };
+    expect(canonicalHash(route)).toBe("lens=runs&kind=lab&run=live%2Fgate-1");
+    expect(roundTrip(route)).toEqual(route);
+  });
+
+  it("runs (kind=all, a resolved run) ALSO round-trips with run — a lab row is reachable from kind=all too, matching legacy's state.level==='lab-run' gate being independent of state.runsKind", () => {
+    const route: Route = { kind: "runs", runsKind: "all", run: "live/gate-1" };
+    expect(canonicalHash(route)).toBe("lens=runs&run=live%2Fgate-1");
     expect(roundTrip(route)).toEqual(route);
   });
 

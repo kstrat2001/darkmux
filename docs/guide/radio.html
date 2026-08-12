@@ -17,7 +17,7 @@
     <a href="../" class="brand">darkmux</a>
     <span class="crumbs"><a href="index.html">guide</a> <span>/</span> radio</span>
     <div class="links">
-      <a href="fleet.html">‹ Prev</a>
+      <a href="pr-flow.html">‹ Prev</a>
       <a href="index.html">Guide home</a>
     </div>
   </div>
@@ -25,7 +25,7 @@
 
 <header class="page-head">
   <div class="wrap">
-    <div class="label">07 <span class="dot">·</span> advanced</div>
+    <div class="label">09 <span class="dot">·</span> advanced</div>
     <h1><code>radio</code>: talk to the command registry</h1>
     <p class="lede">A conversational channel over darkmux's advertised commands. Instead of remembering that a review is <code>darkmux mission launch review</code>, you say what you want in plain text and a bounded routing dispatch picks one advertised command, or refuses rather than guess. A refusal isn't a dead end: the same text goes to a second, grounded seat that answers in prose instead.</p>
   </div>
@@ -138,8 +138,7 @@ No mission config in the merged registry (built-ins + ~/.darkmux/mission-configs
 <section>
   <div class="wrap">
     <h2>Fail closed: refuse, don't guess</h2>
-    <p>Before anything reaches a model, radio checks your text against the advertised command names for a likely typo, no model call involved. Typing <code>/pr-lst</code> prompts <code>did you mean /pr-list?</code> before either seat ever runs, catching the common fat-fingered case for free.</p>
-    <p>Past that, every failure mode the routing seat itself can hit (empty output, malformed JSON, a command name outside the catalog, more than one fenced block in the response) becomes a refusal, never a guess and never a crash. The routing seat's own instructions put it plainly: when in doubt, refuse; a wrong refusal costs you one extra step, a wrong route runs the wrong command.</p>
+    <p>Every failure mode the routing seat can hit (empty output, malformed JSON, a command name outside the catalog, more than one fenced block in the response) becomes a refusal, never a guess and never a crash. The routing seat's own instructions put it plainly: when in doubt, refuse; a wrong refusal costs you one extra step, a wrong route runs the wrong command.</p>
     <p>A refusal at the CLI doesn't just print the reason and stop. The same text is handed to the answering seat for a grounded, in-persona reply first:</p>
     <pre><code>darkmux radio "what's slow about my last review"
 <span class="comment"># radio: &lt;the answering seat's prose reply, possibly naming a /command to run&gt;</span></code></pre>
@@ -210,9 +209,9 @@ darkmux config get radio.humor</code></pre>
 </section>
 
 <nav class="page-nav wrap">
-  <a href="fleet.html" class="prev">
+  <a href="pr-flow.html" class="prev">
     <span class="dir">‹ Previous</span>
-    <span class="title">Join a worker peer</span>
+    <span class="title">PR-flow panel verbs</span>
   </a>
   <a href="index.html" class="next">
     <span class="dir">Guide home ›</span>

@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PR-flow panel verbs · darkmux user guide</title>
+<meta name="description" content="Author your own pr-list/pr-info/pr-approve/pr-merge slash commands in the darkmux agent panel: a per-verb gh allowlist, a permission dialog that shows CI/review/adjudication facts, and a flow-record audit trail.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> pr-flow</span>
+    <div class="links">
+      <a href="bundlers.html">‹ Prev</a>
+      <a href="index.html">Guide home</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">08 <span class="dot">·</span> advanced</div>
+    <h1>PR-flow panel verbs</h1>
+    <p class="lede">Four repetitive PR-lifecycle acts, running as slash commands in the SAME agent panel you already dispatch missions from: <code>/pr-list</code>, <code>/pr-info</code>, <code>/pr-approve</code>, <code>/pr-merge</code>. They are operator-authored <code>procedural.shell</code> mission configs, not a built-in feature: darkmux ships the machinery (the allowlist, the permission dialog, the audit trail), you author the verbs against your own repos and your own <code>gh</code>.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Why this exists</h2>
+    <p>The rest of a coding workflow is already automated through frontier sessions: a bot account authors PRs, a darkmux review posts CI-shaped findings, and the only thing left is the daily context switch to actually decide. <code>darkmux acp</code>'s agent panel is where the review lands, so the deciding step belongs there too, not in a browser tab.</p>
+    <p>The architecture keeps one line firm: <strong>GitHub never enters darkmux core.</strong> The binary has no GitHub credential, sends no GitHub API calls, and knows nothing about pull requests as a concept. Every verb below is a plain shell command that invokes the OPERATOR's own <code>gh</code> (the same posture as the existing <code>lms</code> shell-out), assembled into the standard <code>procedural.shell</code> step kind (see the <a href="missions.html">missions guide</a> for that graph model). What darkmux contributes is generic, reusable structure around that shell-out:</p>
+    <ul>
+      <li>a per-verb allowlist, so a config can't run at all until the operator names it explicitly;</li>
+      <li>a permission dialog on state-changing verbs, rendered from facts your own config gathers;</li>
+      <li>a flow-record audit entry per executed verb.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The three pieces</h2>
+    <h3>1. The allowlist (<code>gh.enabled</code> / <code>gh.allowed</code>)</h3>
+    <p>darkmux ships an <code>enabled</code>-gated config block, same shape as <code>redis</code>/<code>audit</code>/every other feature block: <code>darkmux init</code> writes it visible and off.</p>
+    <pre><code>{
+  "gh": {
+    "enabled": false,
+    "allowed": []
+  }
+}</code></pre>
+    <p>A config opts into the gate by declaring a <code>gh_verb</code> name at its top level (schema 2.3): <code>"gh_verb": "pr-merge"</code>. Before darkmux runs a SINGLE step of that config's graph, on EITHER entry point (a panel slash command, or a bare <code>darkmux mission launch pr-merge</code> from the terminal), it checks <code>gh.enabled == true</code> and that <code>"pr-merge"</code> is listed in <code>gh.allowed</code>. Fails closed on both: the block off refuses everything regardless of the list; a verb absent from the list refuses even with the block on.</p>
+    <pre><code>darkmux config set gh.enabled true
+darkmux config set gh.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
+    <p>The second command REPLACES the whole list (there is no incremental add today), so name every verb you want live. <code>darkmux doctor</code> shows the resolved state:</p>
+    <pre><code>✓ gh verb allowlist      enabled (config.json) — allowed: pr-list, pr-info, pr-approve, pr-merge</code></pre>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>2. The permission dialog</h2>
+    <p>The operator sign-off gate is already generic machinery in darkmux (any step can declare <code>"gate": "operator"</code>; see the <a href="missions.html">missions guide</a>). This feature doesn't add a new gate; it just puts REAL facts into the dialog body. A gated step's dialog shows the composed output of whatever step it depends on, one line per fact. So the pattern for a state-changing verb is two tasks: a read-only <code>gather</code> task that shells out to <code>gh</code> and prints the facts, then a <code>gate: "operator"</code> task that acts:</p>
+    <pre><code>{
+  "id": "gather",
+  "steps": [{ "id": "gather-step", "kind": "procedural.shell",
+    "config": { "command": "gh pr view ... -q '...ci/review/adjudication text...'" } }]
+},
+{
+  "id": "do-merge",
+  "depends_on": ["gather"],
+  "steps": [{ "id": "do-merge-step", "kind": "procedural.shell", "gate": "operator",
+    "config": { "command": "gh pr merge \"$PR\" --squash" } }]
+}</code></pre>
+    <p>In Zed this renders as a native <code>session/request_permission</code> dialog whose body is <code>gather</code>'s own output, verbatim. The example <code>pr-approve</code>/<code>pr-merge</code> verbs below gather exactly the facts the operator needs to decide without leaving the panel:</p>
+    <ul>
+      <li><strong>CI by conclusion, not completion.</strong> A check can be <code>status: COMPLETED</code> with <code>conclusion: FAILURE</code>; the gather step counts failed/pending checks separately and reports <code>FAILURE</code>/<code>PENDING</code>/<code>SUCCESS</code> accordingly, never conflating "finished" with "passed."</li>
+      <li><strong>The review verdict.</strong> The most recent posted comment matching darkmux's own review footer ("Automated review"), or "none" if the crew never reviewed this PR.</li>
+      <li><strong>The adjudication state.</strong> Whether that review carried the default advisory tagline ("Advisory, not a merge gate") or a custom attribution an operator might use to mark a higher-tier confirmation.</li>
+      <li><strong>PR/branch provenance.</strong> Number, head branch, base branch, URL.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>3. The audit record</h2>
+    <p>Every EXECUTED gh-verb command (a config that reached the allowlist gate and actually ran, whatever its outcome) emits one flow record: <code>category: audit</code>, <code>action: "gh.verb.executed"</code>, with the verb name, a best-effort PR number (the first token typed after the slash command), the worktree it ran from, whether the operator confirmed a gate, and success/failure, all in <code>payload</code>. This is the same audit-trail convention <code>darkmux flow note --source adjudication</code> already uses, not a parallel channel; it reads through the ordinary <code>/flow</code> viewer.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The cwd invariant</h2>
+    <p>Every verb below resolves its target SOLELY from the session's working directory, never from a global "current PR" or any state carried between sessions. In practice this falls out of <code>gh</code>'s own behavior for free: <code>gh pr list</code> and <code>gh pr view</code> (with no explicit <code>--repo</code>) both infer the repository from the cwd's git remote. A <code>procedural.shell</code> step's <code>cwd</code> is filled in from the session's own cwd when the step doesn't declare one itself, on both entry points (the panel route fills it explicitly; a direct CLI launch simply inherits the invoking terminal's cwd). Two concurrent darkmux sessions in two different worktrees never see each other's PRs by accident.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The four example verbs</h2>
+    <p>These are examples, not built-ins: copy what you want into <code>~/.darkmux/mission-configs/</code> (one file per verb, named after its id) and tune the <code>gh</code> flags to your own repo's conventions. Every command below was run live against a real PR on this repo before being written down here.</p>
+
+    <h3><code>pr-list.json</code>: no arguments, read-only</h3>
+    <pre><code>{
+  "id": "pr-list",
+  "name": "PR List",
+  "schema_version": "2.3",
+  "gh_verb": "pr-list",
+  "panel": {
+    "description": "List open pull requests in this repo",
+    "hint": "(no arguments)"
+  },
+  "phases": [
+    {
+      "id": "list",
+      "tasks": [{
+        "id": "list-open-prs",
+        "steps": [{
+          "id": "list-open-prs-step",
+          "kind": "procedural.shell",
+          "config": {
+            "command": "gh pr list --json number,title,author,isDraft,headRefName --limit 30 | jq -r 'if length == 0 then \"no open pull requests\" else .[] | \"#\\(.number)  \\(.title)  [\\(.headRefName)]\\(if .isDraft then \" (draft)\" else \"\" end)  @\\(.author.login)\" end'"
+          }
+        }]
+      }]
+    }
+  ]
+}</code></pre>
+    <p>No gate, no <code>reads</code>: listing is not a consequential act, so it only needs the allowlist. Live output looks like:</p>
+    <pre><code>#1777  feat(acp): cancellation, session pruning, and the chunk-noise filter  [acp/1684-remainder]  @kstrat2001
+#1757  docs(guide): radio — full v2.6 surface  [docs/radio-guide] (draft)  @kstrat2001</code></pre>
+
+    <h3><code>pr-info.json</code>: the shared gather logic, standalone</h3>
+    <p>Takes an optional PR number (<code>/pr-info 1776</code>); with none, resolves the CURRENT branch's PR via a bare <code>gh pr view</code>. This is the exact gather logic <code>pr-approve</code>/<code>pr-merge</code> reuse below, so reading it here first makes those two easier to follow.</p>
+    <pre><code>{
+  "id": "pr-info",
+  "name": "PR Info",
+  "schema_version": "2.3",
+  "gh_verb": "pr-info",
+  "inputs": [
+    { "name": "args", "required": false,
+      "description": "The PR number, for a direct CLI launch (--param args=&lt;n&gt;). Omit to use the current branch's PR." }
+  ],
+  "panel": {
+    "description": "Show CI status, review verdict, and adjudication state for a PR",
+    "hint": "[pr-number] (defaults to the current branch's PR)"
+  },
+  "phases": [
+    {
+      "id": "info",
+      "tasks": [{
+        "id": "show-pr",
+        "reads": ["__panel_args__"],
+        "steps": [{
+          "id": "show-pr-step",
+          "kind": "procedural.shell",
+          "config": {
+            "command": "PR=\"$DARKMUX_STEP_INPUT___PANEL_ARGS__\"\nif [ -z \"$PR\" ]; then PR=$(gh pr view --json number -q .number); fi\ngh pr view \"$PR\" --json number,title,headRefName,baseRefName,url,statusCheckRollup,comments -q '\n  . as $pr\n  | ($pr.statusCheckRollup // []) as $checks\n  | ($checks | map(select(.status==\"COMPLETED\" and (.conclusion==\"SUCCESS\" or .conclusion==\"SKIPPED\" or .conclusion==\"NEUTRAL\" | not))) | length) as $failed\n  | ($checks | map(select(.status!=\"COMPLETED\")) | length) as $pending\n  | (if ($checks|length)==0 then \"NO CHECKS REPORTED\"\n     elif $failed>0 then \"FAILURE (\\($failed) check(s) failed)\"\n     elif $pending>0 then \"PENDING (\\($pending) check(s) still running)\"\n     else \"SUCCESS (\\($checks|length) checks, all conclusion==SUCCESS/SKIPPED/NEUTRAL)\" end) as $ci\n  | ([$pr.comments[]? | select(.body|test(\"Automated review\"))] | last) as $review\n  | (if $review == null then \"no darkmux review posted on this PR\"\n     elif ($review.body|test(\"Advisory, not a merge gate\")) then \"advisory only, no higher-tier adjudication recorded\"\n     else \"custom attribution present, read the comment before treating this as a higher-tier sign-off\" end) as $adjudication\n  | \"ci: \\($ci)\\nreview: \\(if $review==null then \"none\" else ($review.body|split(\"\\n\")[0]) end)\\nadjudication: \\($adjudication)\\npr: #\\($pr.number) \\($pr.headRefName) -> \\($pr.baseRefName)\\nurl: \\($pr.url)\"\n'\n"
+          }
+        }]
+      }]
+    }
+  ]
+}</code></pre>
+    <p>The CI classification is an ALLOW-list, not a deny-list: a check only reads <code>SUCCESS</code> when its conclusion is one of <code>SUCCESS</code>/<code>SKIPPED</code>/<code>NEUTRAL</code>, and zero checks reads <code>NO CHECKS REPORTED</code> rather than a false <code>SUCCESS</code>. An unrecognized conclusion (GitHub's <code>ACTION_REQUIRED</code>, <code>STALE</code>, <code>STARTUP_FAILURE</code>, and anything added later) reads as a failure instead of silently passing. Known gap: <code>statusCheckRollup</code> mixes CheckRun objects (<code>status</code>/<code>conclusion</code>) with commit-status StatusContext objects (<code>state</code> only); a repo whose checks are commit statuses rather than GitHub Actions runs reads those entries as perpetually PENDING under this jq. Pending is the safe direction, but worth knowing.</p>
+    <p>Real output from this repo, run against the PR that shipped this page's fixes:</p>
+    <pre><code>ci: SUCCESS (10 checks, all conclusion==SUCCESS/SKIPPED/NEUTRAL)
+review: none
+adjudication: no darkmux review posted on this PR
+pr: #1778 acp/1685-pr-flow -> main
+url: https://github.com/kstrat2001/darkmux/pull/1778</code></pre>
+    <p>And against a real PR with no CI configured at all (<code>#1749</code>), the allow-list rewrite is what keeps this honest rather than a false green:</p>
+    <pre><code>ci: NO CHECKS REPORTED
+review: none
+adjudication: no darkmux review posted on this PR
+pr: #1749 formula-2.5.1 -> main
+url: https://github.com/kstrat2001/darkmux/pull/1749</code></pre>
+
+    <h3><code>pr-approve.json</code> and <code>pr-merge.json</code>: gather, then a gated act</h3>
+    <p><code>/approve</code>'s real use is a colleague's PR: GitHub itself forbids self-approval, so this verb is for reviewing OTHER sessions' work. Both configs share the exact <code>gather</code> task above; only the second task differs. <code>pr-approve.json</code>'s executor:</p>
+    <pre><code>{
+  "id": "post-approval",
+  "depends_on": ["gather"],
+  "steps": [{
+    "id": "post-approval-step",
+    "kind": "procedural.shell",
+    "gate": "operator",
+    "config": {
+      "command": "PR=$(echo \"$DARKMUX_STEP_INPUT_GATHER\" | grep '^pr:' | sed -E 's/^pr: #([0-9]+).*/\\1/')\n[ -n \"$PR\" ] || exit 1\ngh pr review \"$PR\" --approve --body \"Approved via darkmux panel.\""
+    }
+  }]
+}</code></pre>
+    <p><code>pr-merge.json</code>'s executor:</p>
+    <pre><code>{
+  "id": "do-merge",
+  "depends_on": ["gather"],
+  "steps": [{
+    "id": "do-merge-step",
+    "kind": "procedural.shell",
+    "gate": "operator",
+    "config": {
+      "command": "PR=$(echo \"$DARKMUX_STEP_INPUT_GATHER\" | grep '^pr:' | sed -E 's/^pr: #([0-9]+).*/\\1/')\n[ -n \"$PR\" ] || exit 1\ngh pr merge \"$PR\" --squash"
+    }
+  }]
+}</code></pre>
+    <p>Both extract the PR number back out of <code>gather</code>'s OWN already-fetched output (a single source of truth: no second <code>gh pr view</code> call, and the number the executor acts on is provably the same one the dialog just showed) rather than re-reading the raw panel args. The full configs (<code>id</code>, <code>schema_version</code>, <code>gh_verb</code>, <code>inputs</code>, <code>panel</code>) wrap around these two tasks the exact same way <code>pr-info.json</code> does above.</p>
+    <p>The <code>[ -n "$PR" ] || exit 1</code> line guards against an empty extraction: <code>gh pr view ""</code> and <code>gh pr merge "" --squash</code> both silently fall back to resolving the CURRENT branch's PR rather than erroring, so if you tune <code>gather</code>'s output format and the <code>grep</code>/<code>sed</code> pattern above stops matching, this line is what stands between "nothing happened" and "the session branch's own PR got merged instead of the one the dialog showed."</p>
+  </div>
+</section>
+
+<section id="honest-limits">
+  <div class="wrap">
+    <h2>Honest limits</h2>
+    <ul>
+      <li><strong>Arguments work fully from the agent panel; a direct CLI launch defaults to the current branch when no <code>--param args</code> is given.</strong> <code>darkmux mission launch pr-info --param args=1776</code> DOES deliver <code>1776</code> into the gather step (this repo's own test suite proves it, and it was dogfooded live against a real PR while writing this page) &mdash; the CLI and panel routes share one injection mechanism. What the CLI route does not have is the panel's own argument PARSING (<code>/pr-info 1776</code> splitting the command name from its argument): from a terminal, name the value explicitly with <code>--param args=&lt;n&gt;</code>.</li>
+      <li><strong>The demotion rule is fixed prose, not a config.</strong> "Advisory only" vs "custom attribution present" is a simple text match on the posted review's tagline. If your workflow adopts a different higher-tier-confirmation convention, edit the <code>gather</code> step's jq to match it &mdash; darkmux has no opinion here.</li>
+      <li><strong>One repo per session.</strong> Nothing aggregates PRs across repos or across concurrent darkmux sessions; that is deliberately the served viewer's job, not this surface's.</li>
+      <li><strong><code>gh</code> and <code>jq</code> must be on the operator's <code>PATH</code>.</strong> darkmux never installs, configures, or authenticates either; <code>gh auth status</code> is the pre-flight check.</li>
+      <li><strong>The allowlist gates configs that name themselves, never <code>gh</code> itself.</strong> Only a config that declares its own <code>gh_verb</code> field is checked against <code>gh.allowed</code> at all; a config that shells out to <code>gh</code> without declaring <code>gh_verb</code> runs wherever it would otherwise be allowed to run, ungated by any of this. And <code>gh_verb</code>'s value is a NAME the operator assigns, not a description darkmux verifies: an allowlisted <code>"gh_verb": "pr-list"</code> config is checked by that name only, never by reading what its <code>command</code> string actually does. Author and review your own gh-verb configs with both of those in mind; the gate is "this config may run," not "this config's commands are safe."</li>
+    </ul>
+  </div>
+</section>
+
+<nav class="page-nav wrap">
+  <a href="bundlers.html" class="prev">
+    <span class="dir">‹ Previous</span>
+    <span class="title">Bring your own bundler</span>
+  </a>
+  <a href="radio.html" class="next">
+    <span class="dir">Next ›</span>
+    <span class="title">radio: talk to the command registry</span>
+  </a>
+</nav>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+<script src="copy.js" defer></script>
+</body>
+</html>

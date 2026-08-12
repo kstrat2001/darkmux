@@ -556,6 +556,7 @@
             demoted_by_pass2: false,
             verify: None,
             demoted_by_verify: false,
+            absence_backstop: None,
         }
     }
 
@@ -1089,6 +1090,7 @@
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
+            source: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let mut cycler = RecordingCycler::new();
@@ -1118,6 +1120,7 @@
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
+            source: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` off by one")];
         let mut cycler = RecordingCycler::new();
@@ -1152,6 +1155,7 @@
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
+            source: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let mut cycler = RecordingCycler::new();
@@ -1189,6 +1193,506 @@
         assert!(kinds.iter().any(|k| k == "review.judge"), "judge step result present: {kinds:?}");
     }
 
+    // ── #1748: absence-claim backstop ─────────────────────────────────
+    //
+    // Production incident: a `confirmed` finding claimed a line of code
+    // was ABSENT ("does not assign process.exitCode", "there is no
+    // .catch") when both were present in the file — the AI seat had been
+    // shown a truncated bundle excerpt and reported honestly about its
+    // own window; the pipeline promoted that into a claim about the
+    // whole file. `apply_absence_backstop` is the cheap mechanical check
+    // that would have caught it for zero tokens.
+
+    /// A minimal `Tier::Confirmed` `JudgedFlag` whose decisive record's
+    /// text is `text` — the shape `apply_absence_backstop` reads.
+    fn confirmed_flag_with_text(bundle_id: &str, text: &str) -> JudgedFlag {
+        JudgedFlag {
+            flag: flag(bundle_id, "member-a", 0, "probe charge"),
+            pass1: JudgeRecord {
+                ruling: JudgeRuling::Confirmed,
+                decisive_evidence: text.to_string(),
+                note_for_author: String::new(),
+                pass: 1,
+                seconds: 0.0,
+            },
+            pass2: None,
+            tier: Tier::Confirmed,
+            demoted_by_pass2: false,
+            verify: None,
+            demoted_by_verify: false,
+            absence_backstop: None,
+        }
+    }
+
+    fn one_bundle(id: &str) -> Vec<BundleInput> {
+        vec![BundleInput {
+            id: id.to_string(),
+            fact_family: "unscoped".to_string(),
+            code: String::new(),
+            probe_code: String::new(),
+            facts: Vec::new(),
+            manifest: Vec::new(),
+        }]
+    }
+
+    // ── is_absence_claim / extract_claimed_absent_token / bundle_file_path ──
+
+    #[test]
+    fn is_absence_claim_matches_known_phrasing_case_insensitively() {
+        assert!(is_absence_claim("This function does not assign `process.exitCode` on the error path"));
+        assert!(is_absence_claim("THERE IS NO `.catch` handler attached here"));
+        assert!(is_absence_claim("the code never calls `cleanup()` before returning"));
+    }
+
+    #[test]
+    fn is_absence_claim_ignores_non_absence_wording() {
+        assert!(
+            !is_absence_claim("this loop is O(n^2) and could be slow on large inputs"),
+            "a performance claim is not an absence claim"
+        );
+        assert!(
+            !is_absence_claim("`total` is computed before `rate` is validated, which is a logic error"),
+            "an ordering claim is not an absence claim"
+        );
+    }
+
+    #[test]
+    fn extract_claimed_absent_token_requires_exactly_one_backtick_span() {
+        assert_eq!(
+            extract_claimed_absent_token("does not assign `process.exitCode` on the error path"),
+            Some("process.exitCode".to_string())
+        );
+        assert_eq!(extract_claimed_absent_token(".catch"), None, "no backtick span at all -> abstain");
+        assert_eq!(
+            extract_claimed_absent_token("does not call `foo` or `bar` anywhere"),
+            None,
+            "two spans is ambiguous -> abstain"
+        );
+    }
+
+    #[test]
+    fn bundle_file_path_splits_on_last_at_or_falls_back_to_the_bare_id() {
+        assert_eq!(bundle_file_path("handleError@src/foo.ts"), Some("src/foo.ts"));
+        assert_eq!(bundle_file_path("billing.ts"), Some("billing.ts"), "no `@` -> id IS the path");
+        assert_eq!(bundle_file_path(""), None);
+    }
+
+    // ── apply_absence_backstop ───────────────────────────────────────
+
+    /// The core failure mode: a `does not assign \`process.exitCode\``
+    /// claim, where `process.exitCode` IS present in the whole file (just
+    /// outside whatever excerpt the AI seat saw) -> demoted, with a note
+    /// naming the token/file/line.
+    #[test]
+    fn absence_backstop_demotes_when_token_is_present_in_the_whole_file() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("cli.ts"),
+            "function main() {\n  doWork();\n}\nprocess.exitCode = 1;\n",
+        )
+        .unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("cli.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("cli.ts", "does not assign `process.exitCode` on the error path")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(judged[0].tier, Tier::NeedsCheck, "a contradicted absence claim is demoted, not deleted");
+        let note = judged[0].absence_backstop.as_ref().expect("backstop note attached");
+        assert_eq!(note.token, "process.exitCode");
+        assert_eq!(note.file, "cli.ts");
+        assert_eq!(note.line, Some(4), "the token is on line 4 of the fixture file");
+        assert!(
+            judged[0].pass1.note_for_author.contains("process.exitCode"),
+            "the human-facing note also carries the mechanical explanation: {}",
+            judged[0].pass1.note_for_author
+        );
+    }
+
+    /// The MANDATORY inverted case: when the claimed-absent token is
+    /// genuinely absent from the whole file too, the claim holds and the
+    /// finding stays `Confirmed`, untouched. Without this case, a backstop
+    /// that demoted EVERY absence claim would pass the test above too.
+    #[test]
+    fn absence_backstop_leaves_a_genuine_absence_confirmed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("cli.ts"), "function main() {\n  doWork();\n}\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("cli.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("cli.ts", "does not assign `process.exitCode` on the error path")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(judged[0].tier, Tier::Confirmed, "a genuine absence claim is left standing");
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    /// A non-absence claim never even reaches token extraction / a file
+    /// read — it is left completely untouched.
+    #[test]
+    fn absence_backstop_ignores_non_absence_claims() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("cli.ts"), "function main() { doWork(); }\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("cli.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("cli.ts", "this loop is `O(n^2)` and could be slow on large inputs")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(judged[0].tier, Tier::Confirmed);
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    /// An absence claim with no confidently-extractable token (zero, or
+    /// ambiguous multiple, backtick spans) abstains rather than guessing.
+    #[test]
+    fn absence_backstop_abstains_without_a_confident_token() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("cli.ts"), "process.exitCode = 1;\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("cli.ts");
+
+        // Zero backtick spans.
+        let mut judged_none =
+            vec![confirmed_flag_with_text("cli.ts", "does not handle the error case at all")];
+        apply_absence_backstop(&mut judged_none, &bundles, Some(&source));
+        assert_eq!(judged_none[0].tier, Tier::Confirmed);
+        assert!(judged_none[0].absence_backstop.is_none());
+
+        // Two backtick spans — ambiguous which one is "the missing thing".
+        let mut judged_two =
+            vec![confirmed_flag_with_text("cli.ts", "does not call `setup` or `teardown` anywhere")];
+        apply_absence_backstop(&mut judged_two, &bundles, Some(&source));
+        assert_eq!(judged_two[0].tier, Tier::Confirmed);
+        assert!(judged_two[0].absence_backstop.is_none());
+    }
+
+    /// The file being unreadable via `FileSource` (never written, or a
+    /// bundle whose id names no real path) abstains — never fails the run.
+    #[test]
+    fn absence_backstop_abstains_when_the_file_is_unreadable() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // `cli.ts` is deliberately never written into `dir`.
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("cli.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("cli.ts", "does not assign `process.exitCode` on the error path")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(judged[0].tier, Tier::Confirmed, "an unreadable file must never fail or falsely demote");
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    /// No `FileSource` at all (most of this module's own tests) makes the
+    /// whole pass a no-op — never a panic, never a spurious demotion.
+    #[test]
+    fn absence_backstop_is_a_no_op_without_a_file_source() {
+        let bundles = one_bundle("cli.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("cli.ts", "does not assign `process.exitCode` on the error path")];
+
+        apply_absence_backstop(&mut judged, &bundles, None);
+
+        assert_eq!(judged[0].tier, Tier::Confirmed);
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    /// Only `Tier::Confirmed` flags are ever inspected — a `NeedsCheck` or
+    /// `Archived` flag naming a contradicted absence claim is left alone
+    /// (nothing to demote it FROM; the backstop only ever tightens
+    /// `Confirmed`, never re-litigates the judge's other tiers).
+    #[test]
+    fn absence_backstop_only_inspects_confirmed_flags() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("cli.ts"), "process.exitCode = 1;\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("cli.ts");
+        let mut flag = confirmed_flag_with_text("cli.ts", "does not assign `process.exitCode` on the error path");
+        flag.tier = Tier::NeedsCheck;
+        let mut judged = vec![flag];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(judged[0].tier, Tier::NeedsCheck, "unrelated to the backstop — never touched");
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    // ── MUST FIX 1 (PR #1765 merge-gate finding): operand-verb phrases ──
+    //
+    // "does not check `X`" / "does not handle `X`" name X as the SUBJECT
+    // of the missing operation when the sentence reads "does not check
+    // the return value of `X`" — X is guaranteed present (it's the thing
+    // being called), so a bare presence check demoted a TRUE finding
+    // every time. Fix: the claimed-absent token must IMMEDIATELY follow
+    // the matched phrase (only whitespace between) — "does not assign
+    // `process.exitCode`" keeps working; "does not check the return
+    // value of `spawn_worker`" does not.
+
+    /// This must STAY `Confirmed` — `spawn_worker` is the SUBJECT of the
+    /// missing check, not the absent thing, and it's present in the file
+    /// by construction of the finding (the file calls it). Before the
+    /// fix, `content.contains("spawn_worker")` mechanically demoted this
+    /// TRUE finding and attached a note asserting the absence claim
+    /// "does not hold", which was false.
+    #[test]
+    fn absence_backstop_leaves_operand_verb_finding_confirmed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("worker.ts"), "async function run() {\n  spawn_worker();\n}\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("worker.ts");
+        let mut judged = vec![confirmed_flag_with_text(
+            "worker.ts",
+            "does not check the return value of `spawn_worker` before using it",
+        )];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(
+            judged[0].tier,
+            Tier::Confirmed,
+            "the token is the SUBJECT of the missing check, not the absent thing — must not demote"
+        );
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    // ── MUST FIX 2 (PR #1765 merge-gate finding): word-boundary containment ──
+    //
+    // `content.contains(token)` was a bare substring check with no word
+    // boundary — it matched `id` inside `identifier`, `err` inside
+    // `error`. That both mis-demoted a TRUE finding AND cited a line that
+    // has nothing to do with the claim as fabricated evidence.
+
+    /// `id` must NOT be considered present just because `identifier` is —
+    /// a genuinely-absent `id` token must stay `Confirmed`.
+    #[test]
+    fn absence_backstop_word_boundary_rejects_substring_only_match() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("record.ts"),
+            "function createRecord() {\n  return { identifier: makeId() };\n}\n",
+        )
+        .unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("record.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("record.ts", "does not set `id` on the created record")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(
+            judged[0].tier,
+            Tier::Confirmed,
+            "`id` only occurs as a substring of `identifier` — that is not a real match"
+        );
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    /// THE REGRESSION GUARD: MUST FIX 1 and MUST FIX 2 must not blunt the
+    /// backstop's whole reason for existing — the production incident's
+    /// own shape (`does not assign process.exitCode`, token immediately
+    /// follows a SAFE verb, present as a genuine boundary match) must
+    /// still demote. If this test fails, the whole feature is inert.
+    #[test]
+    fn absence_backstop_still_demotes_the_production_incident_shape() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("cli.ts"),
+            "function main() {\n  doWork();\n}\nprocess.exitCode = 1;\n",
+        )
+        .unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("cli.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("cli.ts", "does not assign `process.exitCode` on the error path")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(
+            judged[0].tier,
+            Tier::NeedsCheck,
+            "the production incident's own shape must still demote, or the whole feature is inert"
+        );
+        assert!(judged[0].absence_backstop.is_some());
+    }
+
+    /// `.catch` (short, leading-dot token) must still work as a
+    /// claimed-absent token after the word-boundary fix — the PR
+    /// deliberately waives a minimum-length floor for exactly this shape.
+    #[test]
+    fn absence_backstop_dot_catch_token_still_demotes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("billing.ts"), "fetchThing().catch(handleError);\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("billing.ts");
+        let mut judged = vec![confirmed_flag_with_text("billing.ts", "there is no `.catch` around this call")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(judged[0].tier, Tier::NeedsCheck, "`.catch` is present and must still demote");
+        let note = judged[0].absence_backstop.as_ref().expect("backstop note attached");
+        assert_eq!(note.token, ".catch");
+    }
+
+    // ── cheap findings (same area) ──────────────────────────────────
+
+    /// "there is no longer" is a SUPERSESSION claim ("the old thing is
+    /// gone"), not an absence claim — the "there is no " phrase must not
+    /// prefix-match into "there is no longer" and pull an unrelated
+    /// finding into the backstop's scope.
+    #[test]
+    fn absence_backstop_ignores_there_is_no_longer() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("legacy.ts"), "setLegacyMode(true);\nlegacy_mode = true;\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("legacy.ts");
+        let mut judged = vec![confirmed_flag_with_text(
+            "legacy.ts",
+            "there is no longer any writer that sets `legacy_mode`",
+        )];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        assert_eq!(
+            judged[0].tier,
+            Tier::Confirmed,
+            "a supersession claim must never be treated as an absence claim"
+        );
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
+    #[test]
+    fn is_absence_claim_does_not_match_there_is_no_longer() {
+        assert!(
+            !is_absence_claim("there is no longer any writer that sets `legacy_mode`"),
+            "a supersession claim is not an absence claim"
+        );
+        // The un-prefixed phrasing must still be caught.
+        assert!(is_absence_claim("there is no writer that sets `legacy_mode`"));
+    }
+
+    /// The demotion note must say only what the mechanical check actually
+    /// knows (presence, not scope) — "this absence claim does not hold"
+    /// over-claims when the real situation could be e.g. "assigned on a
+    /// different path than the one claimed". The check cannot tell those
+    /// apart, so the wording must not pretend it can.
+    #[test]
+    fn absence_backstop_note_does_not_overclaim_the_finding_is_false() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("cli.ts"),
+            "function main() {\n  doWork();\n}\nprocess.exitCode = 1;\n",
+        )
+        .unwrap();
+        let source = FileSource::worktree(dir.path());
+        let bundles = one_bundle("cli.ts");
+        let mut judged =
+            vec![confirmed_flag_with_text("cli.ts", "does not assign `process.exitCode` on the error path")];
+
+        apply_absence_backstop(&mut judged, &bundles, Some(&source));
+
+        let note = &judged[0].pass1.note_for_author;
+        assert!(
+            !note.contains("does not hold"),
+            "the check knows presence, not scope — must not claim the finding is false: {note}"
+        );
+        assert!(note.contains("process.exitCode"), "still names the token: {note}");
+    }
+
+    // ── pipeline wiring: run_judge_only (sequential path) ─────────────
+
+    /// End-to-end: the sequential `--charges-file` path (`run_judge_only`
+    /// -> `finish_review`) applies the backstop BEFORE the tier counts are
+    /// computed, so a mechanically-contradicted `confirmed` judge ruling
+    /// lands in `env.needs_check`, not `env.confirmed`.
+    #[test]
+    fn run_judge_only_applies_the_absence_backstop_before_tier_counts() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("billing.ts"), "context line\nprocess.exitCode = 1;\nmore context\n")
+            .unwrap();
+        let source = FileSource::worktree(dir.path());
+        let crew = valid_crew();
+        let inputs = ReviewInputs {
+            case_id: "c1".to_string(),
+            roles: &crew,
+            intent_title: "add a feature",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 500_000,
+            bundles: None,
+            source: Some(&source),
+        };
+        let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` off by one")];
+        let judge_reply = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"e\", \
+             \"note_for_author\": \"does not assign `process.exitCode` on the error path\"}\n```";
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |_call: &ChatCall| Ok(reply(judge_reply));
+        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+
+        assert_eq!(env.judged.len(), 1);
+        assert_eq!(
+            env.judged[0].tier,
+            Tier::NeedsCheck,
+            "the mechanical backstop demoted the mechanically-contradicted claim"
+        );
+        assert!(env.judged[0].absence_backstop.is_some());
+        assert_eq!(env.confirmed, 0);
+        assert_eq!(env.needs_check, 1);
+    }
+
+    /// (#1442 sibling check for #1748) The absence backstop runs BEFORE the
+    /// optional AI verify stage — a mechanically-demoted flag is no longer
+    /// `Tier::Confirmed`, so `run_verify_stage`'s per-confirmed-flag filter
+    /// skips it entirely: zero verify dispatches for a flag the mechanical
+    /// check already caught, saving the AI spend.
+    #[test]
+    fn run_judge_only_absence_backstop_demotion_skips_the_verify_stage() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("billing.ts"), "fetchThing().catch(handleError);\n").unwrap();
+        let source = FileSource::worktree(dir.path());
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![staffing("fast", "judge-model", 1)]),
+            ("review-verify", vec![staffing("frontier", "verify-model", 1)]),
+        ]);
+        let inputs = ReviewInputs {
+            case_id: "c1".to_string(),
+            roles: &crew,
+            intent_title: "add a feature",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 500_000,
+            bundles: None,
+            source: Some(&source),
+        };
+        let flags = vec![flag("billing.ts", "member-a", 0, "off by one")];
+        let judge_reply = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"e\", \
+             \"note_for_author\": \"there is no `.catch` around this call\"}\n```";
+        let verify_calls = std::cell::RefCell::new(0u32);
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |call: &ChatCall| {
+            if call.system == "verify sys" {
+                *verify_calls.borrow_mut() += 1;
+            }
+            Ok(reply(judge_reply))
+        };
+        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+
+        assert_eq!(env.judged[0].tier, Tier::NeedsCheck);
+        assert_eq!(*verify_calls.borrow(), 0, "a mechanically-demoted flag never reaches the verify stage");
+    }
+
     /// (#1442) The sequential `--charges-file` verify path (`run_judge_only`
     /// -> `finish_review` -> `run_verify_stage`) shares the graph path's
     /// dispatch.map semantics: a non-empty UNPARSEABLE verify reply is
@@ -1216,6 +1720,7 @@
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
+            source: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let verify_calls = std::cell::RefCell::new(0u32);
@@ -1269,6 +1774,7 @@
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: None,
+            source: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let verified_json =
@@ -1344,6 +1850,7 @@
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 100, // one 600-token ruling exhausts a pass bucket
             bundles: None,
+            source: None,
         };
         // Three flags in three different bundles (no anchors + distinct
         // bundle_id ⇒ all survive dedup, in input order).
@@ -2080,6 +2587,7 @@
                 demoted_by_pass2: false,
                 verify: None,
                 demoted_by_verify: false,
+                absence_backstop: None,
             },
             JudgedFlag {
                 flag: flag_needs_check.clone(),
@@ -2101,6 +2609,7 @@
                 demoted_by_pass2: true,
                 verify: None,
                 demoted_by_verify: false,
+                absence_backstop: None,
             },
             JudgedFlag {
                 flag: flag_archived.clone(),
@@ -2116,6 +2625,7 @@
                 demoted_by_pass2: false,
                 verify: None,
                 demoted_by_verify: false,
+                absence_backstop: None,
             },
         ];
 
@@ -2250,6 +2760,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
             bundles: Some(bundles),
+            source: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let mut cycler = RecordingCycler::new();
@@ -2273,6 +2784,122 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             prompts.iter().all(|p| !p.to_lowercase().contains("manifest") && !p.contains("Symbols referenced")),
             "no manifest section header at all, matching judge-runner.py: {prompts:?}"
         );
+    }
+
+    // ── (branch: bundler/coverage-gap-audit) the PROBE seat's blind spots
+    //    ────────────────────────────────────────────────────────────────
+    //
+    // See `crates/darkmux-lab/src/lab/bundle/mod.rs`'s coverage-gap audit
+    // report (findings #4 and #5) for the full writeup. Both tests below
+    // are the review.rs half of that audit — they exercise the PROBE
+    // seat's prompt builder directly, the seat that actually ORIGINATES a
+    // finding (as opposed to `manifest_never_reaches_the_dispatched_judge_
+    // prompt` just above, which is an EXISTING, deliberate, #1256-cited
+    // exclusion on the JUDGE side).
+
+    /// Finding #4 (#1754 fix). `bundle_inputs_from_set` renders the SAME
+    /// code refs through two formatters: `slice_code` (-> `BundleInput.
+    /// code`, what the judge sees) embeds an explicit "excerpt truncated"
+    /// marker inline when a callee ref is a header-only stub of a longer
+    /// body; `slice_code_probe` (-> `BundleInput.probe_code`, what the
+    /// probe sees) now does too — a DELIBERATE DIVERGENCE from
+    /// `probe-runner.py`'s `read_code_excerpt` (which has no notion of a
+    /// truncated stub at all), not a port correction. The seat most
+    /// likely to raise a "this looks incomplete" finding now gets the
+    /// same textual signal the judge seat already had that its excerpt is
+    /// a stub, not the whole function.
+    #[test]
+    fn probe_seat_now_sees_the_truncation_marker_the_judge_seat_already_got_inline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut long_body = String::from("export function longHelper(x) {\n");
+        for i in 0..50 {
+            long_body.push_str(&format!("  console.log({i});\n"));
+        }
+        long_body.push_str("  return x;\n}\n");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/helpers.ts"), &long_body).unwrap();
+        std::fs::write(
+            dir.path().join("src/caller.ts"),
+            "import { longHelper } from './helpers';\nfunction useIt(x) {\n  return longHelper(x);\n}\n",
+        )
+        .unwrap();
+        let diff = "+++ b/src/caller.ts\n\
+@@ -0,0 +1,3 @@\n\
++import { longHelper } from './helpers';\n\
++function useIt(x) {\n\
++  return longHelper(x);\n\
++}\n";
+        let source = FileSource::worktree(dir.path());
+        let set = build_bundles(&source, diff).expect("build_bundles over the truncation fixture");
+        assert!(!set.bundles.is_empty(), "expected at least one bundle for useIt");
+        assert!(
+            set.bundles[0].truncated,
+            "fixture must actually exercise a truncated callee, or this test proves nothing: {:?}",
+            set.bundles[0]
+        );
+        let inputs =
+            bundle_inputs_from_set(&set, &source).expect("bundle_inputs_from_set over the truncation fixture");
+        let b = &inputs[0];
+        assert!(
+            b.code.contains("excerpt truncated"),
+            "the judge's rendering (`BundleInput.code`) must carry the truncation marker inline: {}",
+            b.code
+        );
+        assert!(
+            b.probe_code.to_lowercase().contains("truncat"),
+            "the probe's rendering (`BundleInput.probe_code`) must ALSO carry a truncation marker — \
+             the probe seat that raises the finding must learn the excerpt is a stub, same as the \
+             judge seat: {}",
+            b.probe_code
+        );
+    }
+
+    /// Finding #5 (#1755 — DECIDED). Unlike the judge side (tested and
+    /// cited above, #1256's "match Phase A exactly" operator decision),
+    /// nothing previously pinned `probe_user_message`'s exclusion of
+    /// `bundle.manifest` as deliberate — a future edit could have added
+    /// it in one seat and not the other with zero signal either way.
+    ///
+    /// DECISION: the probe seat does NOT get the manifest either. Phase
+    /// A's `probe-runner.py` never had a manifest field to drop in the
+    /// first place (`bundler.py`'s bundles carry no such field), so this
+    /// isn't quite "parity" the way the judge's exclusion is — but the
+    /// practical effect the operator cares about is the same: the
+    /// manifest is a Rust-only addition (#1222 packet 3) with no Phase A
+    /// precedent, and it stays out of every model-facing prompt, not just
+    /// the judge's, until a real consumer needs it. Kept conservative on
+    /// purpose: injecting new content into a probe prompt is a
+    /// model-facing-prompt change (see this repo's AI-convention/term-
+    /// provenance doctrine), not something to do as a side effect of an
+    /// audit finding with no operator request behind it.
+    ///
+    /// Pinned as a STRUCTURAL contract, not just a substring check:
+    /// `probe_user_message`'s output must be byte-identical whether
+    /// `bundle.manifest` is empty or populated — so this test fails if a
+    /// future edit reads the field for ANYTHING, not only if it happens
+    /// to leak the exact word "manifest" or a specific symbol name.
+    #[test]
+    fn manifest_never_reaches_the_probe_user_message() {
+        let mut bundle = BundleInput {
+            id: "billing.ts".to_string(),
+            fact_family: "unscoped".to_string(),
+            code: "const end = start.plus(30)".to_string(),
+            probe_code: "### `billing.ts` (lines 1-1)\n```typescript\nconst end = start.plus(30)\n```"
+                .to_string(),
+            facts: vec![],
+            manifest: vec![],
+        };
+        let without_manifest = probe_user_message("prior text", &bundle);
+        bundle.manifest = vec!["referenced but not defined in bundle: helperFn <- unknown".to_string()];
+        let with_manifest = probe_user_message("prior text", &bundle);
+        assert_eq!(
+            without_manifest, with_manifest,
+            "the probe prompt must be byte-identical regardless of `bundle.manifest` — this is a \
+             DECIDED contract (#1755), not an accident: a populated manifest must never leak into, \
+             or otherwise affect, the dispatched probe prompt"
+        );
+        assert!(!with_manifest.contains("helperFn"), "{with_manifest}");
+        assert!(!with_manifest.to_lowercase().contains("manifest"), "{with_manifest}");
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -2615,6 +3242,42 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 "the diff path must survive the stamp verbatim (the external bundler reads it)"
             );
         }
+    }
+
+    /// (#1748) `review-judge-step` carries the SAME `"source"` block
+    /// `review-bundle-step` does — the mechanical absence-claim backstop
+    /// (`ReviewJudgeStepKind::run_streaming`) needs its own `FileSource` to
+    /// check a confirmed finding against the whole file. Same
+    /// stamp-and-reader-agree discipline as the bundle-step test above,
+    /// applied to the judge step's copy of the block.
+    #[test]
+    fn judge_step_config_also_carries_source_for_the_absence_backstop() {
+        let spec = BundleBuildSpec {
+            source: BundleSourceSpec::Worktree { path: PathBuf::from("/tmp/some-worktree") },
+            bundler: None,
+            diff_file: PathBuf::from("/tmp/some-diff.patch"),
+        };
+        let graph = build_review_graph(
+            std::sync::Arc::new(ReviewStepContext::default()),
+            &spec,
+            graph_staffing("fast", "judge-model", 1),
+            None,
+            &[graph_staffing("fast", "probe-model", 1)],
+            "investigate",
+            "adjudicate",
+            "report",
+            1,
+        )
+        .expect("graph builds");
+        let config = &graph.steps.get("review-judge-step").expect("the judge step exists").config;
+
+        let source = file_source_from_step_config(config).unwrap_or_else(|e| {
+            panic!("the judge step's reader rejected the launcher's own stamp: {e:#}")
+        });
+        assert!(
+            matches!(&source, FileSource::Worktree(p) if p.as_path() == Path::new("/tmp/some-worktree")),
+            "the judge step's reconstructed FileSource must match the launcher's own bundle_spec"
+        );
     }
 
     /// (#1530 Packet 3a follow-on) `ReviewDedupStepKind`/
@@ -4358,6 +5021,188 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         );
     }
 
+    /// (#1748) The graph path's judge step (`ReviewJudgeStepKind::
+    /// run_streaming` — the ACTUAL production dispatch path for `mission
+    /// launch review`, unlike the sequential `--charges-file` re-judge
+    /// path) applies the SAME mechanical absence-claim backstop, once the
+    /// concurrent judge dispatches above have joined (single-threaded, so
+    /// no `FileSource` Send/Sync concern) and BEFORE `judged` is
+    /// serialized as this step's output.
+    #[test]
+    fn graph_judge_step_applies_the_absence_backstop_when_source_is_stamped() {
+        use std::sync::{Arc as StdArc, Mutex as TestMutex};
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("cli.ts"), "process.exitCode = 1;\n").unwrap();
+
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![{
+                let mut j = staffing("fast", "judge-model", 1);
+                j.passes = 1;
+                j
+            }]),
+        ]);
+        let flags = vec![flag("cli.ts", "member-a", 0, "probe charge")];
+        let judge_reply = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"e\", \
+             \"note_for_author\": \"does not assign `process.exitCode` on the error path\"}\n```";
+        let ctx = step_ctx_with_chat(&crew, vec![], move |_call: &ChatCall| Ok(reply(judge_reply)));
+        let kind = ReviewJudgeStepKind;
+        let judge = {
+            let mut j = staffing("fast", "judge-model", 1);
+            j.passes = 1;
+            j
+        };
+        let members: StdArc<TestMutex<Vec<MemberRecord>>> = StdArc::new(TestMutex::new(Vec::new()));
+        let env: StdArc<TestMutex<ReviewEnvelope>> = StdArc::new(TestMutex::new(ReviewEnvelope::default()));
+        let bundles: StdArc<TestMutex<Vec<BundleInput>>> = StdArc::new(TestMutex::new(one_bundle("cli.ts")));
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as StdArc<dyn Any + Send + Sync>);
+        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as StdArc<dyn Any + Send + Sync>);
+        bus.seed(REVIEW_MEMBERS_ARTIFACT, members.clone() as StdArc<dyn Any + Send + Sync>);
+        bus.seed(REVIEW_BUNDLES_ARTIFACT, bundles.clone() as StdArc<dyn Any + Send + Sync>);
+        let run_ctx = StepRunCtx::new(None, None, None, StdArc::new(bus));
+        let mut judge_config = serde_json::json!({
+            "concurrency": 1,
+            "model": seat_identifier(&judge.pm),
+            "passes": judge.passes,
+            "max_tokens": resolve_seat_max_tokens(&judge, DEFAULT_JUDGE_MAX_TOKENS),
+            // The stamp `build_review_graph_from_config` now writes onto
+            // this step's config too — see `bundle_source_spec_json`.
+            "source": { "kind": "worktree", "path": dir.path().display().to_string() },
+        });
+        judge_config["model_key"] = serde_json::json!(judge.pm.id);
+        judge_config["identifier"] = serde_json::json!(seat_identifier(&judge.pm));
+        if let Some(n_ctx) = judge.pm.n_ctx {
+            judge_config["n_ctx"] = serde_json::json!(n_ctx);
+        }
+        let step = darkmux_crew::types::Step {
+            id: "judge-step".to_string(),
+            task_id: "judge-task".to_string(),
+            gate: None,
+            kind: "review.judge".to_string(),
+            status: NodeStatus::default(),
+            config: judge_config,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = darkmux_crew::types::Task {
+            id: "judge-task".to_string(),
+            phase_id: "adjudicate".to_string(),
+            description: "judge".to_string(),
+            display_name: None,
+            step_ids: vec!["judge-step".to_string()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let mut input = BTreeMap::new();
+        input.insert("dedup".to_string(), serde_json::to_string(&flags).unwrap());
+
+        use darkmux_crew::step_kinds::StepKind as _;
+        let outcome = kind.run_streaming(&step, &task, &input, &run_ctx).expect("judge step completes");
+        let judged: Vec<JudgedFlag> = serde_json::from_str(&outcome.output).expect("judged parses");
+        assert_eq!(judged.len(), 1);
+        assert_eq!(
+            judged[0].tier,
+            Tier::NeedsCheck,
+            "the graph path's judge step must apply the mechanical backstop too, \
+             not just the sequential --charges-file path"
+        );
+        assert!(judged[0].absence_backstop.is_some());
+    }
+
+    /// (#1748) Backward compatibility: a hand-built `Step.config` with NO
+    /// `"source"` key at all (every OTHER graph-path test in this file,
+    /// plus any graph persisted before this packet) must never panic or
+    /// error — the backstop is a no-op, the judge step runs exactly as it
+    /// did before #1748.
+    #[test]
+    fn graph_judge_step_is_a_no_op_backstop_without_a_source_key() {
+        use std::sync::{Arc as StdArc, Mutex as TestMutex};
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![{
+                let mut j = staffing("fast", "judge-model", 1);
+                j.passes = 1;
+                j
+            }]),
+        ]);
+        let flags = vec![flag("cli.ts", "member-a", 0, "probe charge")];
+        let judge_reply = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"e\", \
+             \"note_for_author\": \"does not assign `process.exitCode` on the error path\"}\n```";
+        let ctx = step_ctx_with_chat(&crew, vec![], move |_call: &ChatCall| Ok(reply(judge_reply)));
+        let kind = ReviewJudgeStepKind;
+        let judge = {
+            let mut j = staffing("fast", "judge-model", 1);
+            j.passes = 1;
+            j
+        };
+        let members: StdArc<TestMutex<Vec<MemberRecord>>> = StdArc::new(TestMutex::new(Vec::new()));
+        let env: StdArc<TestMutex<ReviewEnvelope>> = StdArc::new(TestMutex::new(ReviewEnvelope::default()));
+        // No real bundle for "cli.ts" either — this is the exact pre-#1748
+        // fixture shape every other graph-judge test in this file uses.
+        let bundles: StdArc<TestMutex<Vec<BundleInput>>> = StdArc::new(TestMutex::new(Vec::new()));
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as StdArc<dyn Any + Send + Sync>);
+        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as StdArc<dyn Any + Send + Sync>);
+        bus.seed(REVIEW_MEMBERS_ARTIFACT, members.clone() as StdArc<dyn Any + Send + Sync>);
+        bus.seed(REVIEW_BUNDLES_ARTIFACT, bundles.clone() as StdArc<dyn Any + Send + Sync>);
+        let run_ctx = StepRunCtx::new(None, None, None, StdArc::new(bus));
+        let mut judge_config = serde_json::json!({
+            "concurrency": 1,
+            "model": seat_identifier(&judge.pm),
+            "passes": judge.passes,
+            "max_tokens": resolve_seat_max_tokens(&judge, DEFAULT_JUDGE_MAX_TOKENS),
+            // Deliberately NO "source" key.
+        });
+        judge_config["model_key"] = serde_json::json!(judge.pm.id);
+        judge_config["identifier"] = serde_json::json!(seat_identifier(&judge.pm));
+        if let Some(n_ctx) = judge.pm.n_ctx {
+            judge_config["n_ctx"] = serde_json::json!(n_ctx);
+        }
+        let step = darkmux_crew::types::Step {
+            id: "judge-step".to_string(),
+            task_id: "judge-task".to_string(),
+            gate: None,
+            kind: "review.judge".to_string(),
+            status: NodeStatus::default(),
+            config: judge_config,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = darkmux_crew::types::Task {
+            id: "judge-task".to_string(),
+            phase_id: "adjudicate".to_string(),
+            description: "judge".to_string(),
+            display_name: None,
+            step_ids: vec!["judge-step".to_string()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let mut input = BTreeMap::new();
+        input.insert("dedup".to_string(), serde_json::to_string(&flags).unwrap());
+
+        use darkmux_crew::step_kinds::StepKind as _;
+        let outcome = kind.run_streaming(&step, &task, &input, &run_ctx).expect("judge step completes");
+        let judged: Vec<JudgedFlag> = serde_json::from_str(&outcome.output).expect("judged parses");
+        assert_eq!(judged.len(), 1);
+        assert_eq!(
+            judged[0].tier,
+            Tier::Confirmed,
+            "no \"source\" key -> the backstop never fires -> the judge's own ruling stands"
+        );
+        assert!(judged[0].absence_backstop.is_none());
+    }
+
     /// Migrates `envelope_counts_and_steps_are_internally_consistent`'s
     /// INTENT (tier/count internal consistency) minus its `env.steps`
     /// assertions, which have no graph-path equivalent (see the retirement
@@ -5630,6 +6475,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             demoted_by_pass2: false,
             verify: None,
             demoted_by_verify: false,
+            absence_backstop: None,
         };
         let judged = vec![
             mk("a.ts", Tier::Confirmed, "charge one"),
@@ -6628,7 +7474,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             files_considered: entries.len(),
             files_skipped: entries
                 .into_iter()
-                .map(|(path, reason)| SkippedFile { path: path.to_string(), reason })
+                .map(|(path, reason)| SkippedFile { path: path.to_string(), reason, function: None })
                 .collect(),
         }
     }
@@ -6648,10 +7494,12 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 SkippedFile {
                     path: "src/foo.test.ts".to_string(),
                     reason: SkipReason::TestFileExcluded,
+                    function: None,
                 },
                 SkippedFile {
                     path: "tests/bar.ts".to_string(),
                     reason: SkipReason::TestFileExcluded,
+                    function: None,
                 },
             ],
         };
@@ -6704,6 +7552,69 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let (msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
         assert_eq!(kind, DegenerateKind::Error);
         assert!(msg.contains("over the bundler's size cap"), "{msg}");
+    }
+
+    // ── (#1757) classify_zero_bundle_degenerate: unsupported-language ──
+
+    #[test]
+    fn a_sql_only_diff_is_unsupported_language_not_benign_and_not_error() {
+        // The motivating case: a `.sql`-only PR is real source code, not
+        // "nothing to review" — but the built-in TypeScript-only bundler
+        // has no way to read it. This must NOT fail the check (it's not
+        // `Error`) and must NOT read as benign (it's not `BenignEmpty`).
+        let skip = skip_report(vec![("migrations/001_add_users.sql", SkipReason::SourceLanguageUnsupported)]);
+        let (msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(
+            kind,
+            DegenerateKind::UnsupportedLanguage,
+            "real source in an unsupported language must classify neutrally, not benign and not error"
+        );
+        assert!(msg.contains("real source in an unsupported language"), "{msg}");
+    }
+
+    #[test]
+    fn unsupported_language_mixed_with_benign_reasons_stays_unsupported_language() {
+        // A `.css`-only PR alongside a lockfile bump: the benign file
+        // doesn't change the classification once real unparseable source
+        // is present — the run is still "bring your own bundler," not
+        // "nothing here."
+        let skip = skip_report(vec![
+            ("package-lock.json", SkipReason::NonCodeExtension),
+            ("src/styles/app.css", SkipReason::SourceLanguageUnsupported),
+        ]);
+        let (_msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(kind, DegenerateKind::UnsupportedLanguage);
+    }
+
+    #[test]
+    fn unsupported_language_mixed_with_a_real_error_reason_stays_error() {
+        // A genuine bundler-limit decline (`OverSizeCap`) alongside an
+        // unsupported-language file must NOT be swallowed into the neutral
+        // outcome — a real error mixed in keeps the run loud.
+        let skip = skip_report(vec![
+            ("src/huge.ts", SkipReason::OverSizeCap),
+            ("migrations/001_add_users.sql", SkipReason::SourceLanguageUnsupported),
+        ]);
+        let (_msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(kind, DegenerateKind::Error, "a real error reason mixed in must stay Error, never neutral");
+    }
+
+    #[test]
+    fn a_genuinely_benign_diff_stays_benign_never_unsupported_language() {
+        // Inverted case: a diff whose ONLY skips are the deliberately
+        // benign reasons (no unsupported-language file at all) must keep
+        // reading as `BenignEmpty` — the new `UnsupportedLanguage` bucket
+        // must never widen to swallow the existing benign classification.
+        let skip = skip_report(vec![
+            ("package-lock.json", SkipReason::NonCodeExtension),
+            ("fixtures/sample.json", SkipReason::NonCodeExtension),
+        ]);
+        let (_msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(
+            kind,
+            DegenerateKind::BenignEmpty,
+            "a lockfile/json-only diff must stay benign, never reclassified as unsupported language"
+        );
     }
 
     #[test]

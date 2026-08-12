@@ -14,6 +14,7 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 ### Added
 
 - **`darkmux-bundler-edge`** — the second reference `--bundler` plugin: zero-dependency Python, Edge.js template spans + differential facts (interpolations, directives, class-attribute churn) + cross-template manifests, proving the frozen `--bundler` contract (#1319) at N=2 — a second language, for a template DSL rather than a systems language (#1686).
+- **PR-flow panel-verb machinery** (#1685): a per-verb `gh` allowlist (`config.gh.{enabled,allowed}`, `darkmux doctor` provenance, `MissionConfig.gh_verb`), a flow-record audit entry (`action: "gh.verb.executed"`) per executed verb, and `--param args=<value>` now delivers into a config's `reads: ["__panel_args__"]` task from a direct `darkmux mission launch <id>` the same way it already did from the ACP panel (previously CLI-only launch hard-failed `interpret` for any config using that convention). GitHub never enters darkmux core: `pr-list`/`pr-info`/`pr-approve`/`pr-merge` are operator-authored example `procedural.shell` configs documented in the new [PR-flow guide](docs/guide/pr-flow.html), not built-ins.
 
 ## [2.5.0] - 2026-08-06
 

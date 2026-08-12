@@ -4,22 +4,8 @@ import { LiveStatusBadge } from "./LiveStatusBadge";
 import { CatalogPanel } from "../lenses/catalog/CatalogPanel";
 import { isLiveRoute, type Route } from "../lib/route";
 import { todayUTC } from "../lib/flow";
+import { injectedMeta } from "../lib/injectedMeta";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
-
-/** `injectedMeta()` — viewer.html:3808-3811. Both `GET /` and `GET /next`
- * inject `darkmux-version`/`darkmux-flow-schema` metas via the SAME
- * `inject_mode_meta()` (`crates/darkmux-serve/src/lib.rs`), so reading them
- * here is the real, live mechanism — not a stand-in. Every automated
- * harness this repo has (`tests/parity/playwright.config.js`'s
- * `buildHarness()`, `tests/parity/next-*.playwright.config.js`'s "no
- * meta-injection here" — see that file's own comment) serves the page
- * WITHOUT these metas, so `injectedMeta` returns `null` in every test run
- * today and the chip renders empty, matching legacy's own `if(vb&&verMeta)`
- * gate. Only a REAL daemon (`darkmux serve`) populates it. */
-function injectedMeta(name: string): string | null {
-  const el = document.querySelector(`meta[name="${name}"]`);
-  return el ? el.getAttribute("content") : null;
-}
 
 /**
  * The masthead (`.top`, viewer.html:802-816) — brand, build-identifier chip,

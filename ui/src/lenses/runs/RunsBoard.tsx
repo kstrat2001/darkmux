@@ -3,7 +3,9 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
+import { missionGraphReachable } from "../../lib/injectedMeta";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
+import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse, LabRunsResponse, LabRun } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
 import {
@@ -48,12 +50,27 @@ import {
  * empty-is-never-silent contract is a later, separate arc (see the root
  * plan). Ledgered as a improvement candidate for that arc, not taken now.
  *
- * Row-click destinations (lab-run detail, the mission-graph page — both
- * genuinely out of scope this packet, see `RunRow`'s own doc) are NOT silent
- * no-ops: clicking a still-interactive row surfaces `NOT_PORTED_NOTICE`, a
- * visible one-line `.labnotice` naming the gap and pointing at the classic
- * viewer, per the operator-authored posture (a stuck feature gets a visible
- * placeholder, not just a code comment nobody but a future dev will read).
+ * Row-click destinations (drill-in packet — both now real, see `RunRow`'s
+ * own doc for the split):
+ * - a `kind==="lab"` row opens `LabRunDetail` (`data-act="labrun"` in
+ *   legacy, `drillLabRun(dir)`) — an in-component state swap (`labRunDir`),
+ *   NOT a route change, matching legacy's own mechanism exactly: `render()`
+ *   just swaps `$("stage").innerHTML` and syncs the address bar via
+ *   `history.replaceState` (`syncLabHash`), it never fires a real navigation
+ *   either. `initialRun` (from `route.run`, itself from the `run=` hash
+ *   param) seeds `labRunDir` on mount/deep-link, so pasting a `run=` URL
+ *   lands here directly — same `initialKind` echo-guard pattern below,
+ *   widened to cover both.
+ * - a tracked (mission/dispatch) row opens `/mission/<id>/graph`
+ *   (`data-act="gomission"`, `ACTIONS.gomission→goMissionGraph(id)`) — a
+ *   REAL cross-document navigation (`location.href=`), exactly matching
+ *   legacy, when `missionGraphReachable()` (`lib/injectedMeta.ts`) says a
+ *   daemon is actually behind this page. The daemon-less fallback
+ *   (`renderMissionStatic()`'s static summary) is genuinely out of scope —
+ *   see `MISSION_GRAPH_UNREACHABLE_NOTICE`'s own doc for why a named notice
+ *   stands in for it instead.
+ * - an untracked ghost row has nothing to open (unchanged: `interactive`
+ *   stays false, no click affordance at all).
  *
  * Hash write-back (Packet 1.5): a kind-chip click changes no `Route` (no
  * `hashchange` fires — this is purely local state), so `App`'s route-keyed
@@ -65,52 +82,126 @@ import {
  * screen, matching legacy's `setRunsKind`'s own `render()` (which calls
  * `syncLabHash` every time, chip clicks included).
  */
-const NOT_PORTED_NOTICE = "run detail isn't in /next yet — open it in the classic viewer at /";
+/** `goMissionGraph(id)`'s daemon-less fallback (viewer.html:2733-2736:
+ * `if(missionGraphReachable()){location.href=...;return;} state.level="mission";...`)
+ * renders `renderMissionStatic()` — a whole separate static-summary render
+ * surface that only exists to serve the daemon-less GitHub Pages demo (see
+ * `missionGraphReachable`'s own doc: real `/next` deployments, served by
+ * `darkmux serve`, always inject `darkmux-mode` and never hit this branch).
+ * Genuinely out of scope here — building a second summary page for a
+ * corner case this app's real deployment target never reaches is scope
+ * creep wearing this packet's clothes (the SAME judgment call
+ * `MissionReplay.tsx`/`PlaybackLens.tsx` already made for their own
+ * daemon-less edges). A named, honest notice stands in instead, per the
+ * operator-authored posture: a stuck feature gets a visible placeholder,
+ * not a silent no-op. */
+const MISSION_GRAPH_UNREACHABLE_NOTICE =
+  "mission graph needs a running daemon behind this page, which this one doesn't have — open it in the classic viewer at / instead";
 
-export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
+export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; initialRun: string | null }) {
   const [kind, setKind] = useState<RunsKind>(initialKind);
   const [series, setSeries] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [rowClickNotice, setRowClickNotice] = useState<string | null>(null);
-  const onRowActivate = () => setRowClickNotice(NOT_PORTED_NOTICE);
+  // `state.labRunDir` (viewer.html) — which lab run (if any) this board is
+  // showing the detail pane for. Seeded from `initialRun`, independent of
+  // `kind` — a lab row (and so this drill-in) is reachable from BOTH
+  // kind=all and kind=lab (every other kind filter excludes lab rows
+  // entirely, see `runsFiltered`), matching legacy's own
+  // `state.level==="lab-run"` gate, which is independent of
+  // `state.runsKind` too (see `route.ts`'s widened `run` doc).
+  const [labRunDir, setLabRunDir] = useState<string | null>(initialRun);
 
-  // A fresh deep-link into a DIFFERENT kind while this component is already
-  // mounted (route.runsKind changes without the runs lens itself
-  // unmounting) re-syncs local filter state — mirrors `window.goRuns`
-  // resetting `state.runsAll=false` on every fresh entry into the lens.
+  // `drillLabRun(dir)` (viewer.html:4101-4131), reduced to the address-bar
+  // half — `LabRunDetail` itself owns the two real fetches (detail +
+  // events poll). An in-component state swap, NOT a route change: legacy's
+  // own mechanism here is a `render()` stage-swap + `history.replaceState`
+  // sync, never a real navigation — see this file's own module doc.
+  // `runsKind: kind` (not hardcoded "lab") preserves whichever kind filter
+  // was actually active when the operator clicked in — matching legacy's
+  // own `syncLabHash`, which writes `kind=` from `state.runsKind` and `run=`
+  // from `state.labRunDir` as two independent fields on the same hash.
+  function openLabRun(dir: string) {
+    setLabRunDir(dir);
+    setRowClickNotice(null);
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: dir }));
+  }
+
+  // The lab-run detail's own "‹ runs" back link (viewer.html:4852/4862,
+  // `data-act="runs"` → `window.goRuns`... except `goRuns` ALSO re-fetches;
+  // this board's `/runs`+`/lab/runs` queries are still live/cached from
+  // before the drill-in, so a bare state-clear is the faithful equivalent
+  // here, not a redundant re-fetch).
+  function closeLabRun() {
+    setLabRunDir(null);
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null }));
+  }
+
+  // `ACTIONS.labrun`/`ACTIONS.gomission` (viewer.html:2991, folded per-row
+  // in `renderRunRow`'s own `data-act` choice) — the row-click dispatch
+  // every interactive `RunRow` funnels through. `LabRunRow` (the series
+  // view) skips this entirely and calls `openLabRun` directly — every row
+  // there is unconditionally a lab row, so there's no kind to dispatch on.
+  function activateRun(run: Run) {
+    if (run.kind === "lab") {
+      openLabRun(run.id);
+      return;
+    }
+    if (!run.tracked) return; // an untracked ghost has nothing to open
+    if (missionGraphReachable()) {
+      location.href = `/mission/${encodeURIComponent(run.id)}/graph`;
+      return;
+    }
+    setRowClickNotice(MISSION_GRAPH_UNREACHABLE_NOTICE);
+  }
+
+  // A fresh deep-link into a DIFFERENT kind or run while this component is
+  // already mounted (route.runsKind/route.run changes without the runs
+  // lens itself unmounting) re-syncs local filter state — mirrors
+  // `window.goRuns` resetting `state.runsAll=false` on every fresh entry
+  // into the lens.
   //
-  // QA must-fix (2026-08-09): `if (initialKind === kind) return;` guards
-  // against the WRITE-BACK ECHO Packet 1.5 armed. `selectKind`'s own
-  // `writeHash` call fires `history.replaceState`, which — same as legacy's
-  // `syncLabHash` — never dispatches `hashchange`. `useHashRoute`'s
-  // module-level `cachedHref` therefore goes stale; the NEXT App re-render
-  // for ANY unrelated reason (the presence poll, a query refetch — anything
-  // that touches `location.href` freshly) recomputes a `Route` whose
-  // `runsKind` now matches what the operator already clicked, and without
-  // this guard `initialKind` would look like a FRESH deep-link into a
-  // different kind, silently resetting `series`/`showAll`/the row-click
-  // notice out from under an operator who touched nothing. The guard is
-  // exactly "only a GENUINE kind change resets" — `initialKind !== kind`
-  // is true both for a real deep-link (arriving on a different `kind=`)
-  // and for the FIRST render after mount (`kind` seeded from `initialKind`,
-  // so they're already equal and this effect no-ops on mount too, matching
-  // its prior behavior there). Two alternatives that look right and
-  // aren't (ruled out during QA): pinning `useHashRoute`'s cache would
-  // leave THIS board stale after a later nav-tab click away and back;
-  // switching `selectKind`'s write to `location.hash = ...` would fire
+  // QA must-fix (2026-08-09): the guard below protects against the
+  // WRITE-BACK ECHO Packet 1.5 armed. `selectKind`/`openLabRun`/
+  // `closeLabRun`'s own `writeHash` calls fire `history.replaceState`,
+  // which — same as legacy's `syncLabHash` — never dispatches
+  // `hashchange`. `useHashRoute`'s module-level `cachedHref` therefore
+  // goes stale; the NEXT App re-render for ANY unrelated reason (the
+  // presence poll, a query refetch — anything that touches
+  // `location.href` freshly) recomputes a `Route` whose `runsKind`/`run`
+  // now match what the operator already clicked, and without this guard
+  // `initialKind`/`initialRun` would look like a FRESH deep-link, silently
+  // resetting `series`/`showAll`/the row-click notice out from under an
+  // operator who touched nothing. The guard is exactly "only a GENUINE
+  // change resets" — true both for a real deep-link (arriving on a
+  // different `kind=`/`run=`) and for the FIRST render after mount (`kind`/
+  // `labRunDir` seeded from the initial props, so they're already equal
+  // and this effect no-ops on mount too, matching its prior behavior
+  // there). Two alternatives that look right and aren't (ruled out during
+  // the original kind-only version of this guard): pinning `useHashRoute`'s
+  // cache would leave THIS board stale after a later nav-tab click away and
+  // back; switching the writes to `location.hash = ...` would fire
   // `hashchange` (fixing this symptom) but ALSO push a new history entry
-  // per chip click, breaking legacy's "lens hops must not spam history"
-  // contract (`syncLabHash`'s own comment) — `replaceState` is the whole
-  // reason legacy's mechanism exists.
+  // per click, breaking legacy's "lens hops must not spam history" contract
+  // (`syncLabHash`'s own comment) — `replaceState` is the whole reason
+  // legacy's mechanism exists.
   useEffect(() => {
-    if (initialKind === kind) return;
+    if (initialKind === kind && initialRun === labRunDir) return;
     setKind(initialKind);
     setSeries(false);
     setShowAll(false);
     setRowClickNotice(null);
+    setLabRunDir(initialRun);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialKind]);
+  }, [initialKind, initialRun]);
 
+  // These stay unconditional (React's rules-of-hooks — a hook can't sit
+  // after the early return below) even though the lab-run-detail branch
+  // doesn't need their data: `LabRunDetail` owns its own fetches
+  // (`/lab/run/detail` + the events poll), so this is cache warmth for
+  // when the operator backs out, not a blocking dependency (matching
+  // legacy: `drillLabRun` never blocks on `loadRuns()`/`loadLabRuns()`
+  // either — the two are genuinely independent fetches there too).
   const runsQuery = useQuery({
     queryKey: queryKeys.runs(),
     queryFn: () => fetchJson<RunsResponse>("/runs"),
@@ -119,6 +210,13 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
     queryKey: queryKeys.labRuns(),
     queryFn: () => fetchJson<LabRunsResponse>("/lab/runs"),
   });
+
+  // The lab-run detail pane is its own top-level render, reached without
+  // waiting on the two queries above and independent of `kind` (see
+  // `labRunDir`'s own doc above for why it isn't gated to kind==="lab").
+  if (labRunDir) {
+    return <LabRunDetail dir={labRunDir} onBack={closeLabRun} />;
+  }
 
   // Pending: neither query has resolved yet (matches `RUNS_LOADED===null`).
   if (!runsQuery.data || !labRunsQuery.data) {
@@ -177,7 +275,7 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
         {notice && <div className="labnotice">{notice}</div>}
         <div className="lablist">
           {groups.length ? (
-            groups.map((g) => <LabTaskCard key={g.key} group={g} onRowActivate={onRowActivate} />)
+            groups.map((g) => <LabTaskCard key={g.key} group={g} onRowActivate={openLabRun} />)
           ) : (
             <div className="none">
               no lab runs with a recorded corpus yet — run <code>darkmux lab eval --funnel …</code> to produce one.
@@ -210,10 +308,16 @@ export function RunsBoard({ initialKind }: { initialKind: RunsKind }) {
         {shown.length ? (
           <>
             {shown.map((r) => (
-              <RunRow key={r.id} run={r} showMachine={showMachine} onActivate={onRowActivate} />
+              <RunRow key={r.id} run={r} showMachine={showMachine} onActivate={() => activateRun(r)} />
             ))}
             {more > 0 && (
-              <div className="runmore" role="button" tabIndex={0} onClick={() => setShowAll(true)}>
+              <div
+                className="runmore"
+                role="button"
+                tabIndex={0}
+                onClick={() => setShowAll(true)}
+                onKeyDown={onActivateKeyDown(() => setShowAll(true))}
+              >
                 show all {rows.length} — {more} more
               </div>
             )}
@@ -258,13 +362,21 @@ function RunsBar({
           role="button"
           tabIndex={0}
           onClick={() => onKind(k)}
+          onKeyDown={onActivateKeyDown(() => onKind(k))}
         >
           {k}
           <span className="runchipn"> {counts[k] ?? 0}</span>
         </span>
       ))}
       {kind === "lab" && (
-        <span className={`runchip${series ? " on" : ""}`} data-arg="series" role="button" tabIndex={0} onClick={onSeries}>
+        <span
+          className={`runchip${series ? " on" : ""}`}
+          data-arg="series"
+          role="button"
+          tabIndex={0}
+          onClick={onSeries}
+          onKeyDown={onActivateKeyDown(onSeries)}
+        >
           ◧ series
         </span>
       )}
@@ -287,13 +399,11 @@ function onActivateKeyDown(onActivate: () => void) {
 
 /** viewer.html: `function runStatusBadge(r)` + `function renderRunRow(r,
  * showMachine)`. The `data-act="labrun"/"gomission"` click destinations
- * (lab-run detail, the mission-graph page) are BOTH out of scope for this
- * packet (see `tests/parity/README.md`'s KNOWN COVERAGE GAPS and lens
- * inventory) — the row keeps its `role="button"`/`tabIndex` affordance for
- * tracked rows (DOM-shape parity), and activating it (click or Enter/Space)
- * surfaces `NOT_PORTED_NOTICE` via `onActivate` rather than silently doing
- * nothing (operator-authored posture: a stuck feature gets a VISIBLE
- * placeholder, not a code comment). */
+ * (drill-in packet: both real now — lab-run detail opens in-page,
+ * mission/dispatch opens `/mission/<id>/graph` — see `RunsBoard`'s own
+ * `activateRun` for the dispatch) — the row keeps its `role="button"`/
+ * `tabIndex` affordance for tracked/lab rows (unchanged), and
+ * `onActivate` is now the REAL per-row action, not a placeholder notice. */
 function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
   const interactive = run.kind === "lab" || run.tracked;
   const ago = runsAgo(run);
@@ -326,7 +436,7 @@ function LabBadge({ finished }: { finished: boolean }) {
 /** viewer.html: `function renderLabRunRow(run)` (the series-view row, reading
  * `LabRun`'s own richer fields — NOT `renderRunRow`/`Run` above). Every
  * series row is interactive in legacy (it always opens the lab-run detail
- * pane) — same not-ported-yet notice on activation as `RunRow`. */
+ * pane) — `onActivate` now really does. */
 function LabRunRow({ run, onActivate }: { run: LabRun; onActivate: () => void }) {
   return (
     <div className="labrunrow" role="button" tabIndex={0} onClick={onActivate} onKeyDown={onActivateKeyDown(onActivate)}>
@@ -344,8 +454,9 @@ function LabRunRow({ run, onActivate }: { run: LabRun; onActivate: () => void })
   );
 }
 
-/** viewer.html: `function renderLabTaskCard(group)`. */
-function LabTaskCard({ group, onRowActivate }: { group: LabTaskGroup; onRowActivate: () => void }) {
+/** viewer.html: `function renderLabTaskCard(group)`. `onRowActivate` takes
+ * the DIR to open (curried per-row below) — `openLabRun` itself. */
+function LabTaskCard({ group, onRowActivate }: { group: LabTaskGroup; onRowActivate: (dir: string) => void }) {
   return (
     <div className="labtaskcard">
       <div className="labtaskhdr">
@@ -356,7 +467,7 @@ function LabTaskCard({ group, onRowActivate }: { group: LabTaskGroup; onRowActiv
         const diff = prev ? labKnobDiff(prev, r) : null;
         return (
           <Fragment key={r.dir}>
-            <LabRunRow run={r} onActivate={onRowActivate} />
+            <LabRunRow run={r} onActivate={() => onRowActivate(r.dir)} />
             {prev &&
               (diff && diff.length ? (
                 <div className={`labdiffline${diff.length > 1 ? " warn" : ""}`}>

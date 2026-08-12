@@ -182,7 +182,7 @@ impl FlowSink for LocalFileSink {
 
 // ─── AuditFileSink (#163) ────────────────────────────────────────────
 //
-// Compliance-strength sibling of LocalFileSink. Same per-day JSONL append
+// Detection-substrate sibling of LocalFileSink. Same per-day JSONL append
 // format, plus:
 //   - BLAKE3 hash chain — each record carries the prior record's hash,
 //     making any after-the-fact edit detectable via a linear walk.
@@ -192,7 +192,7 @@ impl FlowSink for LocalFileSink {
 //     might mistake for tampering).
 //   - Separate directory (default `~/.darkmux/audit/`, overridable via
 //     `DARKMUX_AUDIT_DIR`) — keeps casual flow records visually
-//     distinct from compliance-strength records and lets the operator
+//     distinct from audited records and lets the operator
 //     mount the audit dir on different storage (encrypted volume,
 //     read-only mirror, etc.).
 //
@@ -202,9 +202,9 @@ impl FlowSink for LocalFileSink {
 // "audit sink is unix-only on this platform". Cross-platform support
 // would need `LockFileEx` and a separate code path — out of scope here.
 //
-// Tamper-evident, NOT tamper-proof. OS-level append-only flags
+// Edit-detecting, NOT tamper-proof. OS-level append-only flags
 // (`chflags uappend` / `chattr +a`) are a follow-up; this PR ships the
-// chain layer. Operators in regulated environments compose this with
+// chain layer. Operators who need stronger guarantees compose this with
 // disk encryption + filesystem-level immutability for layered defense.
 
 /// Resolve the audit directory from env override (`DARKMUX_AUDIT_DIR`)
@@ -296,7 +296,7 @@ impl FlowSink for AuditFileSink {
 //
 // Live-coordination sink: XADD to a Redis Stream. Coexists with
 // LocalFileSink via TeeSink — Redis is the coordination substrate,
-// files are the audit substrate (see #163 for the compliance-strength
+// files are the audit substrate (see #163 for the detection-substrate
 // AuditFileSink and #162's refinement comment on the split).
 //
 // Opt-in via `DARKMUX_REDIS_URL` env var. When set, the default sink
@@ -1055,7 +1055,7 @@ impl RedisSink {
 // is degraded. Per the operator-sovereignty contract: surface failures
 // loudly via stderr; don't silently lose the audit record.
 
-/// `SinkInfo.kind` of the AuditFileSink — the compliance-strength child whose
+/// `SinkInfo.kind` of the AuditFileSink — the detection-substrate child whose
 /// write failures must be made DETECTABLE rather than vanish into stderr (#877).
 pub(crate) const AUDIT_SINK_KIND: &str = "AuditFile";
 /// `SinkInfo.kind` of the LocalFileSink — the durable casual sink the
@@ -1295,20 +1295,20 @@ pub fn record_via(sink: &dyn FlowSink, record: &FlowRecord) -> Result<()> {
 /// `FlowSink`. The default sink is `LocalFileSink`, which preserves
 /// the original behavior. No callers should see a behavior change.
 ///
-/// **Schema 1.4 refactor (#167):** `machine_id` + `orchestrator` are
-/// auto-populated here if the caller left them `None`. Callers that
-/// pre-set the fields (e.g., a remote ingest path forwarding records
-/// from another machine) win — auto-populate fills the absent ones only.
+/// **Schema 1.4 refactor (#167):** `machine_id` is auto-populated here if
+/// the caller left it `None`. Callers that pre-set the field (e.g., a
+/// remote ingest path forwarding records from another machine) win —
+/// auto-populate fills it only when absent.
 pub fn record(record: FlowRecord) -> Result<()> {
     record_to(default_sink().as_ref(), record)
 }
 
-/// Stamp provenance (machine_id / orchestrator when the
-/// caller left them `None`) and write to an explicit sink. `record()` is
-/// `record_to(default_sink(), …)`. Split out (#507) so callers — and
-/// tests — can target a sink built against an explicit dir instead of
-/// depending on the process-global default sink + live env. The
-/// provenance auto-populate is identical to the pre-split `record()`.
+/// Stamp provenance (machine_id when the caller left it `None`) and write
+/// to an explicit sink. `record()` is `record_to(default_sink(), …)`.
+/// Split out (#507) so callers — and tests — can target a sink built
+/// against an explicit dir instead of depending on the process-global
+/// default sink + live env. The provenance auto-populate is identical to
+/// the pre-split `record()`.
 pub(crate) fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
     let mut rec = record;
     if rec.machine_id.is_none() {
@@ -1318,9 +1318,6 @@ pub(crate) fn record_to(sink: &dyn FlowSink, record: FlowRecord) -> Result<()> {
         // (#640) Stamp the stable hardware identity at write time, like the
         // machine_id label above. Cached, so the ioreg shell-out runs once.
         rec.machine_uid = darkmux_hardware::machine_uid().map(str::to_string);
-    }
-    if rec.orchestrator.is_none() {
-        rec.orchestrator = resolve_orchestrator();
     }
     sink.write(&rec)
 }
@@ -1480,7 +1477,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1586,7 +1582,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1629,7 +1624,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1733,7 +1727,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1801,7 +1794,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: None,
@@ -1848,7 +1840,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1904,7 +1895,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2052,7 +2042,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2229,7 +2218,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2245,7 +2233,7 @@ mod tests {
     #[test]
     fn tee_sink_writes_to_all_children() {
         // #162 Phase 3: TeeSink composes N sinks. Each child receives
-        // the record. This is the canonical compliant deployment shape
+        // the record. This is the canonical full-composition deployment shape
         // ([LocalFileSink, RedisSink] in production); the test uses
         // two InMemorySink test doubles to verify the trait contract.
         let a = Arc::new(InMemorySink::new());
@@ -2271,7 +2259,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2327,7 +2314,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2371,7 +2357,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2479,7 +2464,11 @@ mod tests {
         //           dispatch.tool (authoritative running counts). Minor +
         //           additive — older readers ignore the new payload fields; see
         //           schema.rs's fuller changelog entry.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.18.0");
+        //   1.19.0 — REMOVED `orchestrator` (#1758) — write-only, machine-scoped
+        //           provenance describing an invocation-scoped fact; nothing ever
+        //           read it. Same shape of removal as 1.9.0's `machine_tier`; see
+        //           schema.rs's fuller changelog entry.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.19.0");
     }
 
     #[test]
@@ -2537,7 +2526,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2573,7 +2561,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: None,
@@ -2709,36 +2696,13 @@ mod tests {
         // the OnceLock-cached hostname makes the per-test outcome
         // depend on suite ordering. The trim assertion above is the
         // load-bearing behavior; the fall-through is covered indirectly
-        // by `resolve_orchestrator_resolves_from_env_only` and the
-        // doctor check's source labeling.
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn orchestrator_resolves_from_env_only() {
-        let prev = env::var("DARKMUX_ORCHESTRATOR").ok();
-        unsafe { env::remove_var("DARKMUX_ORCHESTRATOR"); }
-        // No env → None. Operator-explicit by design (#49).
-        assert_eq!(resolve_orchestrator(), None);
-
-        unsafe { env::set_var("DARKMUX_ORCHESTRATOR", "claude-code"); }
-        assert_eq!(resolve_orchestrator().as_deref(), Some("claude-code"));
-
-        unsafe { env::set_var("DARKMUX_ORCHESTRATOR", "   "); }
-        assert_eq!(resolve_orchestrator(), None);
-
-        unsafe {
-            match prev {
-                Some(v) => env::set_var("DARKMUX_ORCHESTRATOR", v),
-                None => env::remove_var("DARKMUX_ORCHESTRATOR"),
-            }
-        }
+        // by the doctor check's source labeling.
     }
 
     #[test]
     fn schema_1_4_fields_omit_when_none() {
-        // Both new optional fields must be skip-serialized when None so
-        // older viewers can keep parsing without seeing unexpected `null`s.
+        // machine_id must be skip-serialized when None so older viewers
+        // can keep parsing without seeing an unexpected `null`.
         let rec = FlowRecord {
             ts: "2026-05-17T00:00:00Z".to_string(),
             level: Level::Info,
@@ -2755,7 +2719,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2764,7 +2727,6 @@ mod tests {
         };
         let s = serde_json::to_string(&rec).unwrap();
         assert!(!s.contains("machine_id"), "machine_id should omit when None: {s}");
-        assert!(!s.contains("orchestrator"), "orchestrator should omit when None: {s}");
     }
 
     #[test]
@@ -2785,7 +2747,6 @@ mod tests {
             mission_id: None,
             machine_id: Some("studio".to_string()),
             machine_uid: None,
-            orchestrator: Some("claude-code".to_string()),
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2795,25 +2756,22 @@ mod tests {
         let s = serde_json::to_string(&rec).unwrap();
         let parsed: FlowRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.machine_id.as_deref(), Some("studio"));
-        assert_eq!(parsed.orchestrator.as_deref(), Some("claude-code"));
     }
 
     #[serial_test::serial]
     #[test]
-    fn record_auto_populates_machine_id_and_orchestrator() {
-        // record() should fill machine_id + orchestrator at write time
-        // when the caller leaves them None. The operator-set env values
-        // win over auto-detection so the test can assert deterministic
-        // values regardless of hostname.
+    fn record_auto_populates_machine_id() {
+        // record() should fill machine_id at write time when the caller
+        // leaves it None. The operator-set env value wins over
+        // auto-detection so the test can assert a deterministic value
+        // regardless of hostname.
         isolate_test_env_once();
         let tmp = TempDir::new().unwrap();
         let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
         let prev_machine = env::var("DARKMUX_MACHINE_ID").ok();
-        let prev_orch = env::var("DARKMUX_ORCHESTRATOR").ok();
         unsafe {
             env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
             env::set_var("DARKMUX_MACHINE_ID", "test-machine");
-            env::set_var("DARKMUX_ORCHESTRATOR", "test-orchestrator");
         }
 
         let rec = FlowRecord {
@@ -2832,7 +2790,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -2848,7 +2805,6 @@ mod tests {
         let record_line = content.lines().nth(1).expect("record line");
         let parsed: serde_json::Value = serde_json::from_str(record_line).unwrap();
         assert_eq!(parsed["machine_id"], "test-machine");
-        assert_eq!(parsed["orchestrator"], "test-orchestrator");
 
         unsafe {
             match prev_flows {
@@ -2858,10 +2814,6 @@ mod tests {
             match prev_machine {
                 Some(v) => env::set_var("DARKMUX_MACHINE_ID", v),
                 None => env::remove_var("DARKMUX_MACHINE_ID"),
-            }
-            match prev_orch {
-                Some(v) => env::set_var("DARKMUX_ORCHESTRATOR", v),
-                None => env::remove_var("DARKMUX_ORCHESTRATOR"),
             }
         }
     }
@@ -2889,7 +2841,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: Some("seed".to_string()),
             hash: None,
             payload: None,
@@ -2923,7 +2874,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: Some("seed".to_string()),
             hash: None,
             payload: None,
@@ -2997,7 +2947,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: None,
@@ -3063,7 +3012,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None, // sink stamps this
                 hash: None,      // sink stamps this
                 payload: None,
@@ -3113,7 +3061,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: None,
@@ -3144,25 +3091,25 @@ mod tests {
         }
     }
 
-    /// (#1611 / #1617 review) A record written by a NEWER darkmux must not read
-    /// as tampering.
+    /// (#1769) THE INVERTED CASE — mandatory alongside the FN-1 fix below. A
+    /// record from a genuinely NEWER peer, carrying an enum spelling this
+    /// binary does not recognize, must VALIDATE CLEANLY. Without this test, a
+    /// future "fix" for FN-1 could simply reject every record with an
+    /// unrecognized enum value — which would look like a fix (FN-1 passes)
+    /// while actually regressing #1611/#1617's forward-compat guarantee. The
+    /// correct behavior is neither "trust it blindly" (FN-1) nor "reject it
+    /// outright" (this test) — it's "hash it like everything else," because
+    /// under byte-hashing an unrecognized spelling is just more bytes.
     ///
-    /// This is the differential the frontier review built to disprove #1611's
-    /// original claim, kept as a permanent regression test. The catch-all enum
-    /// variants make such a record PARSE — but `audit_hash_of` recomputes the
-    /// BLAKE3 from the re-serialized struct, and an unknown `"catastrophe"`
-    /// re-serializes as `"unknown"`. So leniency alone converted the failure
-    /// from `unparseable JSON` into `hash mismatch — record content has been
-    /// edited`, which reads MORE like tampering, on the one substrate where a
-    /// false alarm is most expensive.
-    ///
-    /// The simulation is faithful rather than convenient: the record is given
-    /// the hash the NEWER writer would have stored — computed over ITS spelling
-    /// — because a test that stored this binary's hash would be testing
-    /// tampering, not skew.
+    /// Superseded here: `a_newer_peers_record_reads_as_unverifiable_not_as_
+    /// tampering` (#1611/#1617), which pinned the OLD struct-hash format's
+    /// `unverifiable_newer` bypass — the mechanism #1769 deletes because it
+    /// is the same mechanism FN-1 exploits. Under byte-hashing there is no
+    /// bypass to pin; there is only "does it hash correctly," which is what
+    /// this test asserts.
     #[serial_test::serial]
     #[test]
-    fn a_newer_peers_record_reads_as_unverifiable_not_as_tampering() {
+    fn a_newer_peers_record_with_an_unknown_enum_validates_cleanly() {
         let tmp = TempDir::new().unwrap();
         let prev_audit = env::var("DARKMUX_AUDIT_DIR").ok();
         unsafe { env::set_var("DARKMUX_AUDIT_DIR", tmp.path()); }
@@ -3185,7 +3132,6 @@ mod tests {
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: None,
@@ -3200,45 +3146,34 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         let mut lines: Vec<String> = contents.lines().map(String::from).collect();
 
-        // Rewrite the middle record the way a newer binary would have written
-        // it: an enum spelling this binary does not know, hashed over THAT
-        // spelling. Line 0 is the schema header, so record 1 is at index 2.
-        let target = lines[2].clone();
-        let old_hash = {
-            let v: serde_json::Value = serde_json::from_str(&target).unwrap();
-            v["hash"].as_str().unwrap().to_string()
-        };
-        // `audit_hash_of` serializes the struct with `hash: None`, and
-        // `skip_serializing_if` omits it entirely — so the canonical bytes are
-        // this line with that one member removed. Reconstructing through a
-        // `serde_json::Value` would NOT work: `Map` is a BTreeMap, so key order
-        // would diverge from the struct's declaration order.
-        let newer = target
-            .replace(&format!(",\"hash\":\"{old_hash}\""), "")
-            .replace("\"level\":\"info\"", "\"level\":\"catastrophe\"");
-        let newer_hash = blake3::hash(newer.as_bytes()).to_hex().to_string();
-        lines[2] = newer.replace(
-            "\"prev_hash\":",
-            &format!("\"hash\":\"{newer_hash}\",\"prev_hash\":"),
+        // Rewrite the middle record the way a NEWER binary genuinely would:
+        // an enum spelling this binary does not know, correctly hashed over
+        // THOSE literal bytes (a real writer always hashes what it actually
+        // wrote). Line 0 is the schema header, so record 1 is at index 2.
+        let (_old_hash, record_json) = lines[2].split_once(' ').expect(
+            "a byte-hash-format record line must have a `<hash> <json>` prefix",
         );
-        // Guard the simulation itself: if the splice didn't land, the test
-        // would "pass" while proving nothing.
-        assert!(lines[2].contains("catastrophe"), "the newer spelling must be in the line");
-        assert!(lines[2].contains(&newer_hash), "the newer writer's hash must be stored");
+        let newer_json = record_json.replace("\"level\":\"info\"", "\"level\":\"catastrophe\"");
+        assert_ne!(newer_json, record_json, "the newer spelling must actually land");
+        let newer_hash = crate::integrity::audit_hash_of_bytes(newer_json.as_bytes());
+        lines[2] = format!("{newer_hash} {newer_json}");
 
-        // Re-link the tail, because the newer writer would have. Rewriting one
-        // record in place leaves the NEXT record's `prev_hash` pointing at a
-        // hash that no longer exists — which is a genuine chain break, and
-        // would have made this test assert the wrong thing. The records after
-        // the skewed one use only known variants, so they re-hash normally.
+        // Re-link the tail, because a real newer writer would have. Rewriting
+        // one record's bytes changes its hash, so the NEXT record's
+        // `prev_hash` (baked into ITS bytes) would otherwise point at a hash
+        // that no longer exists — a genuine chain break, which would make
+        // this test assert the wrong thing. The records after the rewritten
+        // one carry no unknown values, so parsing them through `FlowRecord`
+        // to relink is lossless.
         let mut prev = newer_hash.clone();
         for line in lines.iter_mut().skip(3) {
-            let mut rec: FlowRecord = serde_json::from_str(line).unwrap();
+            let (_, json) = line.split_once(' ').expect("record line must have a hash prefix");
+            let mut rec: FlowRecord = serde_json::from_str(json).unwrap();
             rec.prev_hash = Some(prev.clone());
             rec.hash = None;
-            let h = crate::integrity::audit_hash_of(&rec).unwrap();
-            rec.hash = Some(h.clone());
-            *line = serde_json::to_string(&rec).unwrap();
+            let rebuilt = serde_json::to_string(&rec).unwrap();
+            let h = crate::integrity::audit_hash_of_bytes(rebuilt.as_bytes());
+            *line = format!("{h} {rebuilt}");
             prev = h;
         }
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
@@ -3247,7 +3182,8 @@ mod tests {
 
         assert!(
             report.chain_valid,
-            "a newer peer's record is a VERSION SKEW, never a compliance event; got {report:?}"
+            "an untouched newer-peer record — unrecognized enum spelling and all — must \
+             validate cleanly under byte-hashing; got {report:?}"
         );
         assert!(
             report.break_reason.is_none(),
@@ -3255,12 +3191,7 @@ mod tests {
              dismiss the real thing; got {:?}",
             report.break_reason
         );
-        assert_eq!(
-            report.unverifiable_newer, 1,
-            "...but it must be COUNTED — 'verified' and 'could not verify' are different claims"
-        );
-        // The records this binary CAN verify were still verified, and the chain
-        // still links across the skewed one.
+        assert!(!report.legacy_format);
         assert_eq!(report.records_checked, 3);
 
         unsafe {
@@ -3284,8 +3215,11 @@ mod tests {
 
         let day = day_utc_now();
         let path = tmp.path().join(format!("{day}.jsonl"));
-        // Simulate the crash state: header line only, no records.
-        let header = schema_header_line().unwrap();
+        // Simulate the crash state: header line only, no records. Must be
+        // the AUDIT header (carries the byte-hash format marker, #1769) —
+        // the plain `schema_header_line()` LocalFileSink uses would look
+        // like a legacy audit file and refuse to extend.
+        let header = crate::integrity::audit_schema_header_line().unwrap();
         std::fs::write(&path, format!("{header}\n")).unwrap();
 
         let sink = AuditFileSink::new();
@@ -3305,7 +3239,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -3371,7 +3304,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -3731,7 +3663,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -3813,10 +3744,14 @@ mod tests {
 
     #[test]
     fn audit_reseed_refuses_non_schema_single_line() {
-        // (#899) Truncating a multi-record audit log down to ONE fabricated
-        // non-header line must NOT re-seed a fresh clean-validating chain on
-        // the next write — the recovery requires the surviving line to be the
-        // schema header. Pre-fix this re-seeded silently, laundering tampering.
+        // (#899, folded into #1769's format gate) Truncating a multi-record
+        // audit log down to ONE fabricated non-header line must NOT re-seed a
+        // fresh clean-validating chain on the next write — the recovery
+        // requires the surviving line to be a genuine byte-hash-format
+        // schema header. Pre-#899-fix this re-seeded silently, laundering
+        // tampering; #1769 folds the same fail-closed posture into the
+        // format check (a fabricated line also lacks the `hash_format`
+        // marker, so it hits the same refusal either way).
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("audit.jsonl");
         // Legit first write → header + record.
@@ -3826,7 +3761,7 @@ mod tests {
         // Next write must bail rather than re-seed a clean chain.
         let err = audit_record_at(&minimal_record(), &path).unwrap_err();
         assert!(
-            err.to_string().contains("not the schema header"),
+            err.to_string().contains("refusing to re-seed"),
             "expected re-seed refusal, got: {err}"
         );
     }
@@ -3839,10 +3774,228 @@ mod tests {
         // this into a bail.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("audit.jsonl");
-        let header = crate::integrity::schema_header_line().unwrap();
+        let header = crate::integrity::audit_schema_header_line().unwrap();
         std::fs::write(&path, format!("{header}\n")).unwrap();
         audit_record_at(&minimal_record(), &path).unwrap();
         let report = crate::integrity::integrity_check_file(&path).unwrap();
         assert!(report.chain_valid, "header-only recovery must produce a valid chain");
     }
+
+    /// (#1768 threat model, FN-1) THE EXPLOIT, executed rather than argued.
+    ///
+    /// Before #1769, `integrity_check_file` SKIPPED content verification for
+    /// any record whose enum fields carried a spelling this binary did not
+    /// know (`has_unknown_enum`), and then advanced the chain using that
+    /// record's STORED hash verbatim — trusted without ever being tied to
+    /// the record's bytes. An attacker with write access needed only flip
+    /// ONE enum field to a garbage value, then rewrite every other field
+    /// freely, and the chain still reported valid.
+    ///
+    /// #1769's fix is the byte-hash format (see `integrity.rs`'s module
+    /// doc): the stored hash covers the line's LITERAL bytes, so this test
+    /// edits `reasoning` — the field carrying what the operator was told —
+    /// and the unknown `tier` spelling alongside it, and asserts the tool
+    /// notices regardless. There is no bypass left to exploit; this
+    /// exercises the ordinary content check.
+    ///
+    /// If this test FAILS, the audit chain does not detect content tampering,
+    /// which is the one thing it exists to do.
+    #[test]
+    #[serial_test::serial]
+    fn fn1_an_unknown_enum_must_not_buy_a_free_content_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+
+        // A legitimate two-record chain, written by the real sink path.
+        for i in 0..2 {
+            let mut rec = minimal_record();
+            rec.reasoning = Some(format!("original reasoning {i}"));
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+        let clean = integrity_check_file(&path).unwrap();
+        assert!(clean.chain_valid, "the untampered chain must validate first, else this test proves nothing: {clean:?}");
+
+        // The attack: rewrite the SECOND record's content in place, leaving
+        // the STORED HASH PREFIX untouched — exactly what an attacker with
+        // write access to the file would do. `tier` is set to an enum
+        // spelling this binary doesn't recognize; under byte-hashing that
+        // must not matter one way or the other (see the inverted-case test
+        // above) — the content check still fires because the BYTES changed.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+        let last = lines.len() - 1;
+        let (stored_hash, record_json) = lines[last]
+            .split_once(' ')
+            .expect("a byte-hash-format record line must have a `<hash> <json>` prefix");
+        let mut v: serde_json::Value = serde_json::from_str(record_json).unwrap();
+        v["reasoning"] = serde_json::json!("TAMPERED — this is not what the operator was told");
+        v["tier"] = serde_json::json!("x");
+        let tampered_json = serde_json::to_string(&v).unwrap();
+        lines[last] = format!("{stored_hash} {tampered_json}");
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let after = integrity_check_file(&path).unwrap();
+        assert!(
+            !after.chain_valid,
+            "FN-1 CONFIRMED: a record's content was rewritten and the chain still reports VALID. \
+             One unknown enum value bought a free edit of every other field. Report: {after:?}"
+        );
+    }
+
+    /// Byte-identical round trip: write a chain of ordinary records, read it
+    /// back, verify — clean, first pass, no surprises. The baseline every
+    /// tampering test below is a deviation from.
+    #[test]
+    #[serial_test::serial]
+    fn byte_hash_round_trip_is_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+
+        for i in 0..5 {
+            let mut rec = minimal_record();
+            rec.action = format!("action-{i}");
+            rec.reasoning = Some(format!("reasoning {i}"));
+            crate::integrity::audit_record_at(&rec, &path).unwrap();
+        }
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(report.chain_valid, "an untouched chain must validate cleanly: {report:?}");
+        assert!(!report.legacy_format);
+        assert_eq!(report.records_checked, 5);
+        assert!(report.break_reason.is_none());
+    }
+
+    /// Tampering at every position — first, middle, last record — via edit,
+    /// insert, delete, and reorder. Every one of these must break the chain.
+    /// (#1769 acceptance criteria.)
+    #[test]
+    #[serial_test::serial]
+    fn byte_hash_catches_tampering_at_every_position() {
+        fn fresh_chain(path: &std::path::Path, n: usize) {
+            for i in 0..n {
+                let mut rec = minimal_record();
+                rec.action = format!("action-{i}");
+                rec.handle = format!("rec-{i}");
+                crate::integrity::audit_record_at(&rec, path).unwrap();
+            }
+        }
+
+        // Edit: mutate one byte of content in the FIRST, MIDDLE, and LAST
+        // record, leaving the stored hash prefix untouched each time.
+        for target_idx in [0usize, 1, 2] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("chain.jsonl");
+            fresh_chain(&path, 3);
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+            let line_idx = target_idx + 1; // skip the header
+            let (stored_hash, record_json) = lines[line_idx].split_once(' ').unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(record_json).unwrap();
+            v["handle"] = serde_json::json!("EDITED");
+            let edited_json = serde_json::to_string(&v).unwrap();
+            lines[line_idx] = format!("{stored_hash} {edited_json}");
+            std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+            let report = integrity_check_file(&path).unwrap();
+            assert!(
+                !report.chain_valid,
+                "an edit at position {target_idx} must break the chain; got {report:?}"
+            );
+        }
+
+        // Insert: splice a fabricated record between two real ones, with a
+        // self-consistent hash (the attacker CAN compute a correct hash for
+        // content they made up — the chain must catch the insertion via
+        // linkage, not via a mismatched hash on the inserted line itself).
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("chain.jsonl");
+            fresh_chain(&path, 3);
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+            // Forge a record whose prev_hash points at record 0's stored
+            // hash, self-consistently hashed — but NOT re-linked into the
+            // record that follows it.
+            let (rec0_hash, _) = lines[1].split_once(' ').unwrap();
+            let mut forged = minimal_record();
+            forged.action = "forged".to_string();
+            forged.prev_hash = Some(rec0_hash.to_string());
+            forged.hash = None;
+            let forged_json = serde_json::to_string(&forged).unwrap();
+            let forged_hash = crate::integrity::audit_hash_of_bytes(forged_json.as_bytes());
+            lines.insert(2, format!("{forged_hash} {forged_json}"));
+            std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+            let report = integrity_check_file(&path).unwrap();
+            assert!(!report.chain_valid, "an inserted record must break the chain: {report:?}");
+        }
+
+        // Delete: drop the middle record entirely.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("chain.jsonl");
+            fresh_chain(&path, 3);
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+            lines.remove(2); // the middle record (index 0 = header, 1/2/3 = records)
+            std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+            let report = integrity_check_file(&path).unwrap();
+            assert!(!report.chain_valid, "a deleted record must break the chain: {report:?}");
+        }
+
+        // Reorder: swap two record lines.
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("chain.jsonl");
+            fresh_chain(&path, 3);
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+            lines.swap(2, 3);
+            std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+            let report = integrity_check_file(&path).unwrap();
+            assert!(!report.chain_valid, "reordered records must break the chain: {report:?}");
+        }
+    }
+
+    /// A legacy-format file (no `hash_format` marker on its header) must
+    /// report Warn-shaped honesty — readable, not re-verifiable — never
+    /// tampering, and never a silent pass. (#1769)
+    #[test]
+    #[serial_test::serial]
+    fn legacy_format_file_reports_honestly_not_as_tampering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("chain.jsonl");
+
+        // A pre-2.6.0 struct-hash-format file: bare JSON per line, `hash`
+        // embedded, header lacking the `hash_format` marker.
+        let legacy_header = crate::integrity::schema_header_line().unwrap();
+        let mut rec = minimal_record();
+        rec.hash = Some("deadbeef".repeat(8));
+        let legacy_line = serde_json::to_string(&rec).unwrap();
+        std::fs::write(&path, format!("{legacy_header}\n{legacy_line}\n")).unwrap();
+
+        let report = integrity_check_file(&path).unwrap();
+        assert!(
+            report.chain_valid,
+            "a legacy-format file is a format boundary, not tampering — chain_valid must stay \
+             true: {report:?}"
+        );
+        assert!(report.legacy_format, "must be flagged legacy: {report:?}");
+        let note = report.note.expect("a legacy file must carry an honest note");
+        assert!(
+            !note.to_lowercase().contains("tamper") && !note.to_lowercase().contains("edited"),
+            "wording must not assert editing or tampering; got {note:?}"
+        );
+        assert!(
+            note.contains("legacy") || note.contains("not re-verifiable"),
+            "wording must say why, honestly; got {note:?}"
+        );
+    }
+
 }

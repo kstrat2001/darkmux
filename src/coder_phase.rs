@@ -2556,7 +2556,6 @@ pub fn nudge_mission_debrief(mission_id: &str) {
         mission_id: Some(mission_id.to_string()),
         machine_id: None,
         machine_uid: None,
-        orchestrator: None,
         prev_hash: None,
         hash: None,
         payload: None,

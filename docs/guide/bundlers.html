@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bring your own bundler · darkmux user guide</title>
+<meta name="description" content="darkmux's built-in review bundler reads TypeScript only. The --bundler escape hatch lets any external command stand in for it, so any language can go through the review funnel.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> bundlers</span>
+    <div class="links">
+      <a href="fleet.html">‹ Prev</a>
+      <a href="index.html">Guide home</a>
+      <a href="pr-flow.html">Next ›</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">07 <span class="dot">·</span> advanced</div>
+    <h1>Bring your own bundler</h1>
+    <p class="lede">The review funnel's built-in bundler (<code>darkmux mission launch review</code>) parses TypeScript only. The <code>--bundler</code> flag is the escape hatch: point it at any external command that emits the same frozen JSON contract, and that command stands in for the built-in one. This page documents the contract field by field and walks through one of the two shipped reference plugins.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>Why this exists</h2>
+    <p>darkmux's built-in bundler splits a diff into per-changed-function code bundles by parsing TypeScript: <code>.ts</code>/<code>.tsx</code> files, walking function boundaries, resolving callees and siblings against a repo-wide index. It has no notion of any other language. A diff that touches <code>.rs</code>, <code>.py</code>, <code>.go</code>, <code>.sql</code>, <code>.css</code>, Edge.js templates, or anything else the built-in bundler can't parse used to read as a bare "no bundles produced" outcome, indistinguishable from a genuine bundler bug.</p>
+    <p><code>--bundler</code> fixes the ceiling, not the floor: instead of teaching the built-in bundler every language darkmux might ever review, any command that speaks the frozen contract can plug in. darkmux reviews its own (Rust) pull requests through exactly this mechanism; see <a href="missions.html">the missions guide</a> for how <code>mission launch review</code> fits into the wider agentic surface.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The contract</h2>
+    <p>Invoked exactly as:</p>
+    <pre><code>&lt;cmd&gt; --diff &lt;file&gt; [--worktree &lt;dir&gt;]</code></pre>
+    <ul>
+      <li><code>--diff &lt;file&gt;</code>: a unified diff (as produced by <code>git diff</code> / <code>gh pr diff</code>). Always supplied.</li>
+      <li><code>--worktree &lt;dir&gt;</code>: a local checkout to read full file contents from. Supplied when the review has one; omitted entirely when the source is a GitHub API fetch with no local checkout (darkmux's own self-review workflow runs this way). A bundler should still produce output from the diff's own hunk context alone when <code>--worktree</code> is absent, just without whole-file spans.</li>
+    </ul>
+    <p>On success: exit <code>0</code> and print a <code>BundleSet</code> JSON document on stdout, <code>{"bundles": [...]}</code>. Each entry in <code>bundles</code> is one <code>Bundle</code>:</p>
+    <table>
+      <tr><th>Field</th><th>Type</th><th>Required</th><th>Meaning</th></tr>
+      <tr><td><code>id</code></td><td>string</td><td>yes, non-empty</td><td>Groups a function's family-variant bundles. Convention: <code>"&lt;fn&gt;@&lt;path&gt;"</code>; a consumer should not assume that exact shape for a unit that isn't a named function (a template, say).</td></tr>
+      <tr><td><code>code</code></td><td>array of <code>{path, start, end}</code></td><td>yes, non-empty</td><td>1-indexed, inclusive line spans the review pipeline resolves against the worktree.</td></tr>
+      <tr><td><code>facts</code></td><td>array of string</td><td>yes (may be empty)</td><td>Mechanical, non-judgmental observations about the diff: counts, additions/removals, presence/absence checks. Never a ranked or interpreted finding.</td></tr>
+      <tr><td><code>fact_family</code></td><td>string</td><td>yes, non-empty</td><td>Names which family <code>facts</code> belongs to. Both shipped reference plugins use <code>"differential"</code>; see <a href="#honest-limits">honest limits</a> below for what the other built-in families require.</td></tr>
+      <tr><td><code>manifest</code></td><td>array of string</td><td>optional, default empty</td><td>External symbols the bundle's code references but doesn't define: other functions, included templates, whatever "external reference" means for the language.</td></tr>
+      <tr><td><code>truncated</code></td><td>bool</td><td>optional, default false</td><td>True when a <code>code</code> span shows less than the full extent of what it's pointing at (a windowed excerpt rather than the whole unit).</td></tr>
+    </table>
+    <p><strong>This JSON shape is frozen.</strong> <code>manifest</code> and <code>truncated</code> are additive: safe for an older consumer to ignore, never required for a minimal plugin to populate.</p>
+
+    <div class="callout warn">
+      <strong>Loud failure, not a silent pass.</strong>
+      <p style="margin: 8px 0 0;">A non-zero exit, non-JSON stdout, a missing <code>bundles</code> field, a bundle missing a required field, or an empty <code>bundles</code> array (<code>0</code> bundles) are all treated as errors the review surfaces, never a quiet no-op. If your plugin finds nothing reviewable in the diff, exit non-zero with a clear message on stderr rather than printing <code>{"bundles": []}</code>.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Worked example: <code>darkmux-bundler-edge</code></h2>
+    <p>Two reference plugins ship in the repo under <a href="https://github.com/kstrat2001/darkmux/tree/main/plugins" target="_blank" rel="noopener"><code>plugins/</code></a>: <code>darkmux-bundler-rust</code> (a standalone Cargo project that bundles <code>.rs</code> files, used by darkmux's own CI to review its own pull requests) and <code>darkmux-bundler-edge</code> (a single Python script for <a href="https://edgejs.dev/" target="_blank" rel="noopener">Edge.js</a> templates). This walkthrough picks <code>darkmux-bundler-edge</code>: it's a single ~200-line file with zero dependencies, so the whole contract fits on one screen. The Rust plugin does the same job with more machinery (its own <code>diff</code>/<code>scan</code>/<code>facts</code> modules) because Rust source needs more structure to parse than a template language does.</p>
+
+    <h3>Parse the diff into per-file hunks</h3>
+    <p>It reads the unified diff line by line, tracking which <code>.edge</code> file each hunk belongs to and collecting the added/removed lines per hunk:</p>
+    <pre><code>def parse_diff(diff_text):
+    <span class="comment"># Per-.edge-file hunks: {path: [(new_start, new_len, added_lines, removed_lines)]}</span>
+    files = {}
+    ...</code></pre>
+
+    <h3>Build the code spans</h3>
+    <p>Small templates (≤400 lines) get a whole-file span, since Edge templates are usually that small and the reviewing model benefits from full context. Larger templates get merged hunk windows (±30 lines of context around each changed region) with <code>truncated: true</code>, so the caller knows it isn't seeing the whole file:</p>
+    <pre><code>def code_refs(path, hunks, worktree):
+    <span class="comment">"""Whole-file span for small templates; merged hunk windows otherwise."""</span>
+    ...
+    if total is not None and total &lt;= WHOLE_FILE_MAX_LINES:
+        return [{"path": path, "start": 1, "end": max(total, 1)}], False, text</code></pre>
+
+    <h3>Emit mechanical facts</h3>
+    <p>All in the <code>"differential"</code> family: line/hunk counts; interpolation expressions (<code>{{ expr }}</code>) added or removed, with Edge comments (<code>{{-- ... --}}</code>) explicitly excluded since they're documentation, not template logic; directive line changes (<code>@if</code>/<code>@each</code>/<code>@component</code>/<code>@include</code>/...); <code>class="..."</code> attribute churn. Every fact is a mechanical count or presence check, never a judgment call.</p>
+
+    <h3>Build the manifest and assemble the bundle</h3>
+    <p><code>@include(...)</code> and <code>@!component(...)</code> targets become the bundle's <code>manifest</code> entries, a template naming itself (say, inside a usage-example comment) is excluded since that's not an external reference. The main loop assembles one bundle per touched file and prints the whole set as a single line of JSON:</p>
+    <pre><code>bundles = []
+for path, hunks in sorted(files.items()):
+    code, truncated, text = code_refs(path, hunks, args.worktree)
+    template = Path(path).stem
+    bundle = {
+        "id": f"{template}@{path}",
+        "code": code,
+        "facts": facts_for(hunks),
+        "fact_family": "differential",
+    }
+    manifest = manifest_for(text, hunks, template)
+    if manifest:
+        bundle["manifest"] = manifest
+    if truncated:
+        bundle["truncated"] = True
+    bundles.append(bundle)
+
+print(json.dumps({"bundles": bundles}))
+return 0</code></pre>
+    <p>And the loud-failure half: when the diff has no <code>.edge</code> hunks at all, it prints a clear message to stderr and exits <code>1</code> rather than emitting an empty bundle set:</p>
+    <pre><code>if not files:
+    print(
+        "darkmux-bundler-edge: no .edge files with reviewable hunks in this diff — nothing "
+        "to bundle. (If this diff touches TypeScript, the built-in bundler is the right "
+        "tool; this plugin only handles Edge templates.)",
+        file=sys.stderr,
+    )
+    return 1</code></pre>
+    <p>That's the whole contract satisfied: read <code>--diff</code> (and optionally <code>--worktree</code>), either print a non-empty <code>{"bundles": [...]}</code> and exit <code>0</code>, or fail loud on stderr and exit non-zero.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Wiring it in</h2>
+    <p>Name the command on the <code>bundler</code> input when launching a review:</p>
+    <pre><code>darkmux mission launch review --param bundler=darkmux-bundler-edge</code></pre>
+    <p>Any command on <code>PATH</code>, or a full path, works. This is the same public <code>bundler</code> input a third-party plugin author would use; there's no privileged internal seam darkmux's own tooling gets that a plugin author doesn't.</p>
+    <p>darkmux's own CI (<code>.github/workflows/darkmux-review.yml</code>) uses this exact seam to review darkmux's own Rust pull requests: it builds <code>darkmux-bundler-rust</code> from a trusted checkout of <code>main</code> as a standalone Cargo project, then passes its built path the same way:</p>
+    <pre><code>cd plugins/darkmux-bundler-rust
+cargo build --release --locked
+<span class="comment"># ... then, on the review launch:</span>
+darkmux mission launch review \
+  --param bundler=/path/to/darkmux-bundler-rust \
+  --param diff_file=pr.diff \
+  --param github=owner/repo \
+  --param head_sha=abc123</code></pre>
+    <p>Without this, every self-review of darkmux's own Rust source produced <code>0</code> bundles: the built-in bundler simply can't read <code>.rs</code>. Point <code>--bundler</code> at whatever plugin matches your repo's language, and the review funnel runs the same bundle → probe → dedup → judge → verify → synthesis pipeline on top of it.</p>
+  </div>
+</section>
+
+<section id="honest-limits">
+  <div class="wrap">
+    <h2>Honest limits</h2>
+    <p>A custom bundler doesn't get everything the built-in one does for free:</p>
+    <ul>
+      <li><strong>Fact families.</strong> The built-in bundler computes three: <code>param-flow</code>, <code>differential</code>, and <code>siblings</code>. Both shipped reference plugins emit only <code>differential</code>; <code>param-flow</code> (a callee's signature vs. what the caller actually passes) and <code>siblings</code> (same-named functions elsewhere in the repo) both depend on machinery a plugin has to build itself if it wants them.</li>
+      <li><strong>Callee/sibling resolution.</strong> The built-in bundler maintains a repo-wide function index and resolves each changed function's callees and siblings against it, so a bundle can carry a callee's real signature or point at a sibling implementation elsewhere in the codebase. That index is TypeScript-specific static analysis; an external bundler has no equivalent unless it builds one.</li>
+      <li><strong>Per-file decline accounting.</strong> The built-in bundler records exactly why each declined file produced no bundle (non-code data, an over-size function, an unreadable file, and so on), which is what lets a genuinely empty diff read as an honest "nothing here" rather than an unexplained failure. An external bundler carries none of that bookkeeping, so a zero-bundle run from a <code>--bundler</code> plugin always reads as the unexplained "can't tell you why" case, not the neutral one.</li>
+    </ul>
+    <p>None of this blocks a plugin from being useful. A bundler that only emits <code>differential</code> facts and good code spans still gives the review funnel real code to look at, which is the whole point: some signal in a language the built-in bundler can't touch beats no signal at all.</p>
+  </div>
+</section>
+
+<nav class="page-nav wrap">
+  <a href="fleet.html" class="prev">
+    <span class="dir">‹ Previous</span>
+    <span class="title">Join a worker peer</span>
+  </a>
+  <a href="pr-flow.html" class="next">
+    <span class="dir">Next ›</span>
+    <span class="title">PR-flow panel verbs</span>
+  </a>
+</nav>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+<script src="copy.js" defer></script>
+</body>
+</html>

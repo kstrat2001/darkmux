@@ -115,6 +115,13 @@ export function App() {
     [flowWindow.data, liveMachines, specs],
   );
   const localName = localUid != null ? nameOf(flowWindow.data, liveMachines, localUid) : null;
+  // (drill-in packet) The MACHINE route's own target — the local machine
+  // for `uid: null`, or the drilled uid's own name otherwise. `nameOf` is
+  // uid-generic (works for a remote uid too, via its presence beat or flow
+  // records — see `lib/flow.ts`), so this is the same lookup `MachineLens`
+  // itself does for its header, not a second implementation.
+  const targetMachineName =
+    route.kind === "machine" ? (route.uid != null ? nameOf(flowWindow.data, liveMachines, route.uid) : localName) : null;
 
   const ready = useMemo(() => readyParts(flowWindow.data, liveMachines, nowMs), [flowWindow.data, liveMachines, nowMs]);
   const metaLines = useMemo(() => computeMetaLines(flowWindow.data, liveMachines, nowMs), [flowWindow.data, liveMachines, nowMs]);
@@ -127,7 +134,7 @@ export function App() {
   // values are lowercase now for the same reason — CSS `text-transform`
   // never applies to text that is not rendered, so legacy's raw text is what
   // both sides must match. All of this dies with legacy at the flip.
-  const { crumb, logscope } = routeChrome(route, localName);
+  const { crumb, logscope } = routeChrome(route, targetMachineName);
 
   useSyncHash(route);
 
@@ -206,12 +213,17 @@ export function App() {
  * these are byte-parity targets for `#crumb` (see each component's own doc
  * for why), so inventing crumb text for them would be UX decoration, not a
  * port. */
-function routeChrome(route: Route, localMachineName: string | null): { crumb: string; logscope: string } {
+function routeChrome(route: Route, targetMachineName: string | null): { crumb: string; logscope: string } {
   if (route.kind === "machine") {
     // `$("crumb").innerHTML = state.machine!=null ? escN(state.machine) :
     // "this machine"` (viewer.html:2537); `$("logscope").textContent =
-    // m!=null?nameOf(m):"machine"` (viewer.html:1799).
-    return { crumb: localMachineName ?? "this machine", logscope: localMachineName ?? "machine" };
+    // m!=null?nameOf(m):"machine"` (viewer.html:1799). `targetMachineName`
+    // (computed below in `App()`) resolves the ROUTE's machine — the local
+    // one for `uid: null`, or the drilled uid's own name for a fleet-card
+    // drill — matching `escN(state.machine)`'s uid-generic lookup, not
+    // hardcoded to "this daemon's own name" the way the pre-drill-in
+    // single-route version of this function was.
+    return { crumb: targetMachineName ?? "this machine", logscope: targetMachineName ?? "machine" };
   }
   if (route.kind === "fleet") {
     // `$("logscope").textContent="fleet"` (viewer.html:1668) — legacy's
@@ -279,7 +291,12 @@ function routeChrome(route: Route, localMachineName: string | null): { crumb: st
   }
   if (route.kind === "runs") {
     // `$("logscope").textContent="runs"` (viewer.html:4676) — HIDDEN, raw.
-    return { crumb: "", logscope: "runs" };
+    // `$("crumb").innerHTML = state.level==="lab-run" ? esc(state.labRunDir||"—")
+    // : ""` (viewer.html:2575, `inRuns` branch) — drill-in packet: `route.run`
+    // is only ever populated once the operator is genuinely looking at a
+    // lab-run-detail pane (see `route.ts`'s widened `run` doc), matching
+    // legacy's own gate exactly.
+    return { crumb: route.run ?? "", logscope: "runs" };
   }
   return { crumb: "", logscope: "" };
 }
@@ -289,9 +306,9 @@ function renderRoute(route: Route) {
     case "fleet":
       return <FleetLens />;
     case "runs":
-      return <RunsBoard initialKind={route.runsKind} />;
+      return <RunsBoard initialKind={route.runsKind} initialRun={route.run} />;
     case "machine":
-      return <MachineLens />;
+      return <MachineLens uid={route.uid} />;
     case "console":
       return <ConsolePanel initialPanelId={route.panelId} />;
     case "session":

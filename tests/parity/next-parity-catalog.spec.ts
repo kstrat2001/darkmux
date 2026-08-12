@@ -2,10 +2,9 @@
 // Packet 4 acceptance: `/next`'s catalog panel + replay-by-query surfaces
 // vs the legacy goldens recorded this packet
 // (`goldens/catalog-open.txt`/`mission-replay.txt`/`playback-date.txt` —
-// `session-task-list.txt` already existed, see the session test below for
-// why it isn't byte-compared). Run via `bun run next-parity` (this file is
-// registered in `next-playwright.config.js`'s `testMatch`, ADDITIVELY
-// alongside `next-parity-runs.spec.ts`).
+// `session-task-list.txt` already existed). Run via `bun run next-parity`
+// (this file is registered in `next-playwright.config.js`'s `testMatch`,
+// ADDITIVELY alongside `next-parity-runs.spec.ts`).
 //
 // Byte-parity scope, and why it's narrower than a full four-region compare
 // for two of the three new goldens (documented here so nobody re-derives
@@ -16,6 +15,15 @@
 //     `lib/extract-next-lens.js`) — `CatalogPanel.tsx` is a genuine,
 //     faithful port of `toggleCatalog()`'s row-building logic, so this is
 //     the real spec-grade comparison this packet's brief asks for.
+//   - `session-task-list`: ALSO full byte parity now (drill-in packet) —
+//     `#stage` only (via `extractStageOnlyText`/`stageSectionOf`, the same
+//     scoping `next-parity-runs.spec.ts` uses), against
+//     `SessionReplay.tsx`'s real `runRegions()` render. This graduated from
+//     the loose "48 records loaded" placeholder check the pre-drill-in
+//     version of this test made — see the session test below and
+//     `lenses/session/sessionRun.ts`'s own module doc for how this port
+//     validated the derivation against this SAME golden at the pure-logic
+//     layer first.
 //   - `mission-replay` / `playback-date`: these goldens capture LEGACY's
 //     `#stage` (the fleet-hero render), which `/next` doesn't own yet —
 //     `FleetStrip` only covers `/fleet/machines/live` presence, not the
@@ -37,6 +45,9 @@ import { GOLDENS_DIR } from "./lib/paths.js";
 import {
   extractCatalogOnlyText,
   catalogSectionOf,
+  extractStageOnlyText,
+  stageSectionOf,
+  waitSettled,
   installFrozenClock,
   installCorpusRoutes,
   installBlankRoutes,
@@ -188,14 +199,17 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     await page.screenshot({ path: shot("playback-date-notice.png"), fullPage: true });
   });
 
-  test("#session=task-list: real fetch, populated not-ported notice naming the real record count", async ({ page }) => {
+  test("#session=task-list matches session-task-list.txt's #stage byte-for-byte (drill-in packet: real render, not a placeholder)", async ({
+    page,
+  }) => {
     // The one replay-by-query golden that already existed before this
-    // packet (`goldens/session-task-list.txt`, Packet 0a) — not byte-
-    // compared here either, same reasoning: it's legacy's `renderSubsystem()`
-    // full drill-in, a genuinely separate future lens (see
-    // `SessionReplay.tsx`'s own doc). This proves the FETCH wiring is real
-    // (the corpus's `flow-session-task-list.json` has 48 records) and the
-    // notice names that real count, not a placeholder guess.
+    // packet (`goldens/session-task-list.txt`, Packet 0a) — now a REAL
+    // byte-parity target: `SessionReplay.tsx` runs the corpus's 48 records
+    // (`flow-session-task-list.json`) through `flowToRenderModel` +
+    // `runRegions()` (`lenses/session/sessionRun.ts`) the same way legacy's
+    // `renderSubsystem()` does, and this asserts the REAL BROWSER's
+    // `#stage.innerText` matches the golden exactly — the same standard
+    // every other lens in this suite is held to.
     const meta = loadMeta();
     await installFrozenClock(page, meta.frozen_clock_ms);
     installCorpusRoutes(page, meta);
@@ -203,7 +217,11 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     page.on("pageerror", (e) => pageErrors.push(String(e)));
 
     await page.goto("/index.html#session=task-list");
-    await expect(page.getByText(/48 records loaded/i)).toBeVisible({ timeout: 15000 });
+    await waitSettled(page, expect, '.session-run[data-state="data"]');
+
+    const got = await extractStageOnlyText(page);
+    const golden = readFileSync(`${GOLDENS_DIR}/session-task-list.txt`, "utf8");
+    expect(got, "session drill-in must match legacy's #stage byte-for-byte").toBe(stageSectionOf(golden));
     expect(pageErrors, `pageerror events: ${pageErrors.join("; ")}`).toHaveLength(0);
 
     await page.screenshot({ path: shot("session-replay-notice.png"), fullPage: true });
@@ -281,5 +299,17 @@ test.describe("next-parity: catalog panel red-prove (harness self-test, Packet 4
 
     await page.goto("/index.html#mission=acp-ephemeral-pr-ship-1786152707367180000-5");
     await expect(page.getByText(/couldn't reach \/flow-mission\//i)).toBeVisible({ timeout: 15000 });
+  });
+
+  // (drill-in packet) The session drill-in's own red-prove, matching the
+  // mission-replay one above — `installBlankRoutes` 404s `/flow-session/`
+  // too, so this is a genuinely unreachable daemon, not the honest-empty
+  // branch (which `installCorpusRoutes`' real fixture would exercise).
+  test("blank routes: session replay renders a visible unreachable-daemon error, never a blank page", async ({ page }) => {
+    await installFrozenClock(page, Date.UTC(2026, 0, 1));
+    installBlankRoutes(page);
+
+    await page.goto("/index.html#session=task-list");
+    await expect(page.getByText(/couldn't reach \/flow-session\//i)).toBeVisible({ timeout: 15000 });
   });
 });

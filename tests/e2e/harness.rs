@@ -168,8 +168,7 @@ impl FleetNode {
             .env("DARKMUX_REDIS_URL", &self.redis_url)
             .env("DARKMUX_FLOWS_DIR", &self.flows_dir)
             .env("DARKMUX_FLEET_FILE", &self.fleet_file)
-            .env("DARKMUX_CREW_DIR", &self.crew_root)
-            .env("DARKMUX_ORCHESTRATOR", "darkmux-e2e-test");
+            .env("DARKMUX_CREW_DIR", &self.crew_root);
         cmd
     }
 
@@ -374,7 +373,6 @@ fn spawn_daemon(
         .env("DARKMUX_FLOWS_DIR", &flows_dir)
         .env("DARKMUX_FLEET_FILE", &fleet_file)
         .env("DARKMUX_CREW_DIR", &crew_root)
-        .env("DARKMUX_ORCHESTRATOR", "darkmux-e2e-test")
         // Point the internal runtime at our mock LMStudio.
         .env("OPENAI_BASE_URL", lmstudio_base_url)
         .env("DARKMUX_LMSTUDIO_BASE_URL", lmstudio_base_url)

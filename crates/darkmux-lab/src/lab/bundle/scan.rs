@@ -113,10 +113,24 @@ pub fn is_noise(name: &str) -> bool {
 /// keywords etc. that also happen to look like `ident(` at a line start).
 /// NOTE: this filter applies ONLY to method-style candidates in the
 /// reference — arrow/`function`-keyword candidates are never checked
-/// against it (ported faithfully, not "fixed").
+/// against it (ported faithfully, not "fixed"). This is `KEYWORD_NAMES`'
+/// ONLY use site (see `is_keyword_name` below and its single call in
+/// `find_all_functions_in_text`) — it does not double as a call-noise
+/// vocabulary (that's the separate `NOISE_WORDS`/`ORM_NOISE_WORDS`/
+/// `is_noise` above), so removing an entry here has exactly one effect:
+/// whether that name can be LOCATED as a function.
+///
+/// (#1756) `"constructor"` REMOVED: unlike every other entry here, it is
+/// not a language keyword at all — it's a valid, extremely common class
+/// method name. Filtering it out here meant `constructor(...) { ... }`
+/// was never located as its own function project-wide (it still reached
+/// a seat via the coarser toplevel fallback, but with zero per-function
+/// callee/sibling/param-flow enrichment). Every remaining entry is a
+/// genuine reserved word that can never legally be a method name, so
+/// this list still does exactly the job its doc describes.
 const KEYWORD_NAMES: &[&str] = &[
-    "if", "for", "while", "switch", "catch", "else", "constructor", "function", "return",
-    "typeof", "new", "await", "yield", "case",
+    "if", "for", "while", "switch", "catch", "else", "function", "return", "typeof", "new",
+    "await", "yield", "case",
 ];
 
 fn is_keyword_name(name: &str) -> bool {
@@ -529,7 +543,21 @@ pub fn find_all_functions_in_text(lines: &[String]) -> Vec<FnDef> {
         let start_line = line_of(start_off);
         let end_line = line_of(close_pos);
         let key = (start_line, end_line);
-        if seen.contains(&key) || end_line.saturating_sub(start_line) > 400 {
+        // (2026-08-11) The SECOND size cap, and the one that actually bit.
+        // A function longer than this is never recorded as a function at
+        // all, so `build_bundles`'s own `MAX_BUNDLE_LINES` cap never sees
+        // it — raising that one alone was a silent no-op for anything in
+        // between. The lines are not lost (they fall through to the
+        // top-level path), but they arrive without function context,
+        // facts, or resolved callees.
+        //
+        // Kept slightly above `MAX_BUNDLE_LINES` so the BUNDLER's cap is
+        // the one that decides, and the decline is reported through
+        // `SkipReason::OverSizeCap` rather than vanishing into a scanner
+        // heuristic nothing surfaces.
+        if seen.contains(&key)
+            || end_line.saturating_sub(start_line) > crate::lab::bundle::MAX_BUNDLE_LINES + 100
+        {
             continue;
         }
         seen.insert(key);

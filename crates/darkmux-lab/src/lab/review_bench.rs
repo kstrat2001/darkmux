@@ -831,6 +831,20 @@ fn resolve_funnel_ctx(opts: &ReviewBenchOpts) -> Result<FunnelCtx> {
         .context("resolving the --funnel roster profile")?;
     let review_config = darkmux_crew::mission_config::load("review")
         .context("loading mission config \"review\" for --funnel")?;
+    // (#1685 QA CONSIDER 3) `mission_config::load("review")` resolves the
+    // SAME user-tier-overridable lookup `darkmux mission launch`/`darkmux
+    // acp` use, and `build_review_graph_from_config` (downstream of this
+    // function) constructs its registry from `StepKindRegistry::
+    // with_builtins()`, which includes `procedural.shell` — so a user-tier
+    // `~/.darkmux/mission-configs/review.json` override that pairs a
+    // declared `gh_verb` with a shell step would run through `--funnel`
+    // completely unchecked without this. `check_gh_verb`'s own doc claims
+    // "Both entry points that can execute a config's graph call it"; this
+    // is the third, so the check belongs here too rather than leaving that
+    // doc comment quietly false.
+    if let Some(reason) = darkmux_crew::mission_config::check_gh_verb(&review_config.config) {
+        bail!("darkmux: --funnel: {reason}");
+    }
     // Every role, whichever `resolve_review_roles` discovers, resolves to
     // the SAME pinned roster — the override binding ignores the role_id it's
     // asked about entirely.

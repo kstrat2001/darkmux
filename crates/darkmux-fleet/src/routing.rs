@@ -402,7 +402,15 @@ fn dispatch_via_queue(opts: DispatchOpts, target_machine: Option<&str>) -> Resul
         opts.image.clone(),
         opts.timeout_seconds,
         darkmux_flow::resolve_machine_id(),
-        darkmux_flow::resolve_orchestrator(),
+        // (#1758) `resolve_orchestrator()` was removed — it was write-only,
+        // machine-scoped provenance for an invocation-scoped fact, and
+        // nothing read `WorkJob.published_by_orchestrator` either (grepped:
+        // producers + test fixtures only). Passing `None` here rather than
+        // removing the field/param keeps `WorkJob`'s `deny_unknown_fields`
+        // wire shape (`WORK_JOB_SCHEMA_VERSION`) unchanged — that field's
+        // own removal is a separate, harder (hard-break, not lenient-read)
+        // follow-up if it's ever worth doing.
+        None,
     );
 
     // Open the Redis client lazily here (not at darkmux startup) so the

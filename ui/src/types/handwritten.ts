@@ -265,13 +265,14 @@ export interface FlowMissionsResponse {
 
 /** `GET /flow-mission/:id` and `GET /flow-session/:id` — the "replay this
  * mission/dispatch" payload, both built by the same handler. `records` is
- * the raw flow-record shape (opaque here — the catalog/replay lenses this
- * packet ports only need `count`/`truncated` to decide what to render; a
- * future lens that actually renders the records widens this, per this
- * file's own convention). Source:
+ * the SAME raw flow-record shape `FlowRecord` already types (widened from
+ * the previously-opaque `Record<string, unknown>[]` this packet's own
+ * doc-comment named as the widen-when-consumed convention — the session
+ * drill-in, `SessionReplay.tsx`, is the "future lens that actually renders
+ * the records" that convention anticipated). Source:
  * `crates/darkmux-serve/src/lib.rs::catalog_records_response`. */
 export interface FlowRecordsResponse {
-  records: Record<string, unknown>[];
+  records: FlowRecord[];
   count: number;
   truncated: boolean;
   generated_at_ms: number;
@@ -325,7 +326,15 @@ export interface LiveSessionBeat {
  * typed here — a flow record carries more (see any `tests/parity/corpus/
  * flow-*.json` fixture for the full shape); widen as a future lens needs
  * more of it. `payload` is intentionally loose (`Record<string, unknown>`)
- * — its shape varies per `action`, same as the legacy JS's untyped access. */
+ * — its shape varies per `action`, same as the legacy JS's untyped access.
+ *
+ * `fields` widened for `lib/flow.ts::flowToRenderModel` (the session
+ * drill-in's data source, ported from viewer.html's own
+ * `flowToRenderModel`) — a real telemetry record carries its type-specific
+ * data under `fields` on the wire (schema 1.6+); `flowToRenderModel`
+ * ALIASES `payload` onto `fields` for the (rarer, pre-1.6 or synthesized)
+ * records that only carry the former, so a reader can always go through
+ * `fields` uniformly, matching legacy's own `o.fields=o.payload` line. */
 export interface FlowRecord {
   ts: string;
   level?: string;
@@ -343,6 +352,7 @@ export interface FlowRecord {
   machine_uid?: string;
   orchestrator?: string;
   payload?: Record<string, unknown>;
+  fields?: Record<string, unknown>;
   /** Present only on the schema-header line every flow file leads with —
    * `flowToRenderModel`'s `!r._type` filter drops it before it reaches the
    * render model (see `lib/flow.ts::buildFlowWindow`). */
@@ -353,7 +363,11 @@ export interface FlowRecord {
  * runs-list row (`recentRow()` in `viewer.html`) reads for its collapsed
  * summary line — the only state the `<details>` element's closed-by-default
  * `innerText` ever exposes (its `.rrdetail` expansion is hidden markup, out
- * of the parity harness's extraction target; see `tests/parity/README.md`). */
+ * of the parity harness's extraction target; see `tests/parity/README.md`).
+ * `endpoint` widened for the session drill-in's `runRegions()` port
+ * (`lenses/session/sessionRun.ts`) — the review path stamps the remote
+ * endpoint only on the terminal payload, not on start (see that module's
+ * own doc, ported from viewer.html:2131-2135). */
 export interface DispatchCompletePayload {
   total_turns?: number;
   total_tools?: number;
@@ -363,4 +377,79 @@ export interface DispatchCompletePayload {
   exit_code?: number;
   prompt_tokens?: number;
   completion_tokens?: number;
+  endpoint?: string;
+}
+
+/** The subset of `dispatch.start`'s `payload` the session drill-in's
+ * `runRegions()` port (`lenses/session/sessionRun.ts`) reads for the brief
+ * kv rows — viewer.html:2130 (`sp=(d&&d.payload)||{}`) onward. `prompt`
+ * (the #1127 full-text field) is real but rarely emitted (see that
+ * source's own comment: "the prompt TEXT is not emitted today (only
+ * prompt_chars)") — both are typed since the source code branches on
+ * `sp.prompt` truthy first. */
+export interface DispatchStartPayload {
+  runtime?: string;
+  image?: string;
+  workspace?: string;
+  endpoint?: string;
+  prompt?: string;
+  prompt_chars?: number;
+}
+
+/** One `funnel-events.jsonl` line — the lab-run detail's event feed +
+ * pipeline-stage source (`viewer.html`'s `computeLabPipeline`/
+ * `renderLabFeed`, ported in `lenses/runs/labRun.ts`). Loosely typed
+ * (`payload` is `Record<string, unknown>`, same posture as `FlowRecord`
+ * above) since its shape varies per `step_id`/`action` — the pure logic
+ * narrows what it needs per case, matching legacy's own untyped JS access.
+ * Source: `funnel-events.jsonl` lines, written by
+ * `crates/darkmux-lab/src/lab/review.rs`'s event emitters. */
+export interface LabRunEvent {
+  ts: string;
+  action?: string;
+  category?: string;
+  source?: string;
+  payload?: Record<string, unknown>;
+}
+
+/** `GET /lab/run/events?dir=&offset=` — the poll-based tail response.
+ * Source: `crates/darkmux-serve/src/lib.rs::LabRunEventsResponse`. */
+export interface LabRunEventsResponse {
+  lines: LabRunEvent[];
+  next_offset: number;
+  finished: boolean;
+}
+
+/** The fields of `ReviewEnvelope` (`crates/darkmux-lab/src/lab/review.rs`)
+ * `renderLabRun()`/`labCliHint()` actually read — the envelope carries far
+ * more (members/steps/flags/judged/…), unread by this port; widen as a
+ * future lab-run-detail feature needs more of it, per this file's own
+ * convention. */
+export interface LabFunnelEnvelope {
+  crew: string;
+  mode: string;
+  confirmed: number;
+  needs_check: number;
+  archived: number;
+}
+
+/** The fields of `ScoresDoc.provenance` (`RunProvenance`,
+ * `crates/darkmux-lab/src/lab/scores.rs`) `labCliHint()` reads
+ * (`scores.crew`/`scores.exec_mode` in the legacy source — read off a
+ * top-level `crew`/`exec_mode` the real `RunProvenance` doesn't actually
+ * carry; see `lenses/runs/labRun.ts`'s own doc for why the legacy source
+ * itself only ever hits the `env` half of this fallback in practice). Kept
+ * minimal on purpose — `ScoresDoc.rows` (the real scoring output) is unread
+ * by the lab-run-detail view this packet ports. */
+export interface LabScoresDoc {
+  crew?: string;
+  exec_mode?: string;
+}
+
+/** `GET /lab/run/detail?dir=` — the envelope(s) + scores content for one
+ * run. Source: `crates/darkmux-serve/src/lib.rs::LabRunDetailResponse`. */
+export interface LabRunDetailResponse {
+  dir: string;
+  funnels: LabFunnelEnvelope[];
+  scores: LabScoresDoc | null;
 }

@@ -68,8 +68,8 @@ pub(crate) fn env_str(key: &str) -> Option<String> {
 /// from the global) so precedence is unit-tested without the load-once
 /// `CONFIG`. An **empty/whitespace config string is treated as unset** (falls
 /// through), mirroring `env_str` — so a visible-but-blank field like
-/// `"orchestrator": ""` the operator hasn't filled in defers to the env/
-/// built-in tier rather than stamping an empty value.
+/// `"radio": { "router_profile": "" }` the operator hasn't filled in defers
+/// to the env/built-in tier rather than stamping an empty value.
 fn pick_string(env_key: &str, cfg: Option<&str>, default: Option<&str>) -> Option<String> {
     env_str(env_key)
         .or_else(|| cfg.filter(|s| !s.trim().is_empty()).map(str::to_string))
@@ -118,10 +118,6 @@ fn pick_dir(
 /// neither layer is set.
 pub fn machine_id() -> Option<String> {
     pick_string("DARKMUX_MACHINE_ID", config().machine_id.as_deref(), None)
-}
-/// `DARKMUX_ORCHESTRATOR > config.orchestrator`. `None` → field omitted.
-pub fn orchestrator() -> Option<String> {
-    pick_string("DARKMUX_ORCHESTRATOR", config().orchestrator.as_deref(), None)
 }
 
 // ── Fleet position (#933) ──
@@ -224,6 +220,34 @@ pub fn audit_dir_override() -> Option<std::path::PathBuf> {
 pub fn audit_enabled() -> bool {
     env_str("DARKMUX_AUDIT_DIR").is_some()
         || config().audit.as_ref().and_then(|a| a.enabled).unwrap_or(false)
+}
+
+// ── GitHub CLI verb allowlist (#1685) ──
+/// Whether the `gh`-verb allowlist gate is active at all. `env(DARKMUX_GH_ENABLED)`
+/// truthy (`1`/`true`/`yes`/`on`, case-insensitive) > `config.gh.enabled` >
+/// `false` — fail closed: darkmux never runs an operator-authored panel verb
+/// that shells out to the operator's own `gh` unless this is explicitly
+/// turned on. See `GhConfig`'s own doc for the feature this gates.
+pub fn gh_enabled() -> bool {
+    if let Some(s) = env_str("DARKMUX_GH_ENABLED") {
+        return matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config().gh.as_ref().and_then(|g| g.enabled).unwrap_or(false)
+}
+/// The allowlisted verb names. `env(DARKMUX_GH_ALLOWED)` (comma-separated,
+/// trimmed, empty entries dropped) > `config.gh.allowed` > empty — nothing
+/// is allowed by default even once `gh_enabled()` is true; the allowlist
+/// itself is opt-in per verb, not implied by the gate alone.
+pub fn gh_allowed_verbs() -> Vec<String> {
+    if let Some(s) = env_str("DARKMUX_GH_ALLOWED") {
+        return s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
+    }
+    config().gh.as_ref().and_then(|g| g.allowed.clone()).unwrap_or_default()
+}
+/// Whether `verb` may run right now — the gate is enabled AND `verb` is
+/// named in the allowlist. Fails closed on either count.
+pub fn gh_verb_allowed(verb: &str) -> bool {
+    gh_enabled() && gh_allowed_verbs().iter().any(|v| v == verb)
 }
 
 // ── Runtime behavior ──
@@ -823,8 +847,9 @@ mod tests {
         unsafe { std::env::set_var(k, "   "); }
         assert_eq!(pick_string(k, Some("c"), Some("d")), Some("c".to_string()));
         unsafe { std::env::remove_var(k); }
-        // empty/whitespace cfg is treated as unset (falls through) — the
-        // "visible but blank" field (`"orchestrator": ""`) defers to default.
+        // empty/whitespace cfg is treated as unset (falls through) — a
+        // "visible but blank" field (e.g. `"radio": { "router_profile": "" }`)
+        // defers to default.
         assert_eq!(pick_string(k, Some("   "), Some("d")), Some("d".to_string()));
         assert_eq!(pick_string(k, Some(""), None), None);
         // nothing set anywhere
@@ -1092,6 +1117,77 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_STRICT_SELECTION", v),
                 None => std::env::remove_var("DARKMUX_STRICT_SELECTION"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn gh_enabled_env_truthy_then_default_false() {
+        let prev = std::env::var("DARKMUX_GH_ENABLED").ok();
+        for truthy in ["1", "true", "YES", "On"] {
+            unsafe { std::env::set_var("DARKMUX_GH_ENABLED", truthy); }
+            assert!(gh_enabled(), "{truthy} → true (case-insensitive)");
+        }
+        unsafe { std::env::set_var("DARKMUX_GH_ENABLED", "nope"); }
+        assert!(!gh_enabled(), "non-truthy → false");
+        unsafe { std::env::remove_var("DARKMUX_GH_ENABLED"); }
+        assert!(!gh_enabled(), "unset → false default (fail closed)");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn gh_allowed_verbs_env_comma_separated_then_default_empty() {
+        let prev = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe { std::env::set_var("DARKMUX_GH_ALLOWED", " pr-list, pr-merge ,,pr-approve"); }
+        assert_eq!(
+            gh_allowed_verbs(),
+            vec!["pr-list".to_string(), "pr-merge".to_string(), "pr-approve".to_string()],
+            "trimmed, empty entries dropped"
+        );
+        unsafe { std::env::remove_var("DARKMUX_GH_ALLOWED"); }
+        assert!(gh_allowed_verbs().is_empty(), "unset → empty default");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn gh_verb_allowed_requires_both_enabled_and_named() {
+        let prev_enabled = std::env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        // Neither set — fails closed.
+        unsafe {
+            std::env::remove_var("DARKMUX_GH_ENABLED");
+            std::env::remove_var("DARKMUX_GH_ALLOWED");
+        }
+        assert!(!gh_verb_allowed("pr-merge"), "gate off entirely → refused");
+        // Allowlisted but the gate itself is off — still refused.
+        unsafe { std::env::set_var("DARKMUX_GH_ALLOWED", "pr-merge"); }
+        assert!(!gh_verb_allowed("pr-merge"), "enabled=false blocks regardless of allowed");
+        // Both set, but a DIFFERENT verb — refused.
+        unsafe { std::env::set_var("DARKMUX_GH_ENABLED", "true"); }
+        assert!(!gh_verb_allowed("pr-approve"), "named elsewhere in the allowlist, not this verb");
+        // Both set, matching verb — allowed.
+        assert!(gh_verb_allowed("pr-merge"), "enabled + named → allowed");
+        unsafe {
+            match prev_enabled {
+                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_allowed {
+                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
             }
         }
     }

@@ -11,7 +11,7 @@
 //! reviews the bundle downstream.
 
 use super::scan::{self, FnDef};
-use super::source::FileSource;
+use super::source::{self, FileSource};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
@@ -66,6 +66,25 @@ impl RepoIndex {
     }
 }
 
+/// (#1756 MUST-FIX follow-up) `"constructor"` is never indexed here, even
+/// though `scan::find_all_functions_in_text` locates it (that location fix
+/// is correct and stays — see `scan::KEYWORD_NAMES`'s doc). Unlike every
+/// other function name, `constructor` carries NO distinguishing signal: it
+/// is the one method name every class in a multi-class file/repo shares,
+/// so a repo-wide index keyed by name turns it into "one entry per class,
+/// all indistinguishable by name" — exactly the shape `resolve_callees`'s
+/// same-name heuristic and `find_siblings`'s same-name match assume can't
+/// happen for a real identifier. A constructor is also never CALLED by its
+/// bare name in real TS/JS (`new Foo()`, not `constructor()`), so it has
+/// no legitimate callee/sibling relationship for those two families to
+/// resolve in the first place — omitting it from the index is a correction
+/// to what should count as an indexable name, not a loss of real cross-
+/// reference data. A changed constructor is still located, still bundled,
+/// and still gets its own param-flow/differential facts (that path scans
+/// the file directly via `scan::find_all_functions_in_text`, independent
+/// of this index).
+const NON_INDEXABLE_NAMES: &[&str] = &["constructor"];
+
 /// Port of `build_repo_function_index`, generalized over `FileSource`:
 /// scans every file in `candidate_files` (the source's own fidelity
 /// boundary — full tree for `Worktree`, bounded diff+import-hop set for
@@ -82,6 +101,9 @@ pub fn build_repo_index(source: &FileSource, candidate_files: &[String]) -> Resu
             continue;
         }
         for f in scan::find_all_functions_in_text(&lines) {
+            if NON_INDEXABLE_NAMES.contains(&f.name.as_str()) {
+                continue;
+            }
             let params = scan::extract_params(&lines, f.start0);
             let body_text = lines[f.start0..=f.end0].join("\n");
             index.push(
@@ -100,18 +122,58 @@ pub fn build_repo_index(source: &FileSource, candidate_files: &[String]) -> Resu
     Ok(index)
 }
 
+/// (#1753) Given a call `name`'s import binding (if any) in the calling
+/// file, try to confirm WHICH of `defs` (all same-named repo-index
+/// entries) the caller actually imports — resolve the binding's module
+/// specifier to a repo-relative path and match it against each
+/// candidate's own `path`. `None` when there's no binding for this name,
+/// the binding is a bare-package specifier (not `./`/`../`-relative, so
+/// there's nothing in the repo tree to resolve against), or the resolved
+/// path doesn't match any candidate (e.g. the module wasn't scanned).
+fn resolve_via_import_binding<'a>(
+    name: &str,
+    own_path: &str,
+    import_bindings: &HashMap<String, String>,
+    defs: &'a [FnRecord],
+) -> Option<&'a FnRecord> {
+    let spec = import_bindings.get(name)?;
+    if !(spec.starts_with("./") || spec.starts_with("../")) {
+        return None;
+    }
+    let candidates = source::resolve_relative_import_candidates(own_path, spec);
+    defs.iter().find(|d| candidates.contains(&d.path))
+}
+
 /// Port of `resolve_callees`: for each distinct call name in
-/// `fn_body_lines`, the best-match repo def (prefer one NOT in
-/// `own_path`, else the same-path one). Returned in FIRST-CALL-APPEARANCE
-/// order — the Python reference builds its `out` dict in `names` order
-/// (first appearance in the body text) and iterates it in insertion
-/// order, so downstream callee code-ref emission matches the reference
-/// exactly. Callers needing name lookup build a `HashMap` view over the
-/// pairs (the `callee_index`); this Vec is the ordering-bearing surface.
+/// `fn_body_lines`, the best-match repo def. Returned in FIRST-CALL-
+/// APPEARANCE order — the Python reference builds its `out` dict in
+/// `names` order (first appearance in the body text) and iterates it in
+/// insertion order, so downstream callee code-ref emission matches the
+/// reference exactly. Callers needing name lookup build a `HashMap` view
+/// over the pairs (the `callee_index`); this Vec is the ordering-bearing
+/// surface.
+///
+/// (#1753) `import_bindings` (the CALLING file's own `name -> module
+/// specifier` map, from `source::parse_import_bindings` over the whole
+/// file's text — not just this function's body) is consulted FIRST: when
+/// the caller's binding resolves to one of the candidates, that one wins,
+/// no matter how the reference's name-only heuristic would have picked.
+/// Falls back to the OLD heuristic (prefer a def NOT in `own_path`, else
+/// the same-path one) only when there's no binding for this name at all —
+/// preserving the reference's behavior for calls the caller never
+/// explicitly imports (a same-file recursive call, an ambient global,
+/// etc.). When a binding EXISTS but can't be confirmed against any
+/// candidate AND more than one same-named candidate exists, the callee is
+/// OMITTED rather than guessed: the caller told us it imports this name
+/// from somewhere specific, so attaching an unrelated same-named function
+/// under that name would show a seat a confidently WRONG body — worse
+/// than showing it nothing at all. No ambiguity (a single candidate) is
+/// never omitted, since there's nothing to guess between.
 pub fn resolve_callees<'a>(
     fn_body_lines: &[String],
     repo_index: &'a RepoIndex,
     own_path: &str,
+    import_bindings: &HashMap<String, String>,
 ) -> Vec<(String, &'a FnRecord)> {
     let body_text = fn_body_lines.join("\n");
     let calls = scan::extract_calls(&body_text);
@@ -127,6 +189,17 @@ pub fn resolve_callees<'a>(
         let Some(defs) = repo_index.get(&name) else {
             continue;
         };
+        if let Some(bound) = resolve_via_import_binding(&name, own_path, import_bindings, defs) {
+            out.push((name, bound));
+            continue;
+        }
+        // No binding confirmed a specific candidate. If the caller's file
+        // DOES import this name from somewhere (just not somewhere we
+        // could confirm), and there's genuine ambiguity to guess among,
+        // omit rather than attach a possibly-wrong body (#1753).
+        if defs.len() > 1 && import_bindings.contains_key(&name) {
+            continue;
+        }
         let chosen = defs.iter().find(|d| d.path != own_path).or_else(|| defs.first());
         if let Some(c) = chosen {
             out.push((name, c));
@@ -582,7 +655,7 @@ mod tests {
         idx.push("helper".to_string(), rec("src/a.ts", 0, 2, &[], "function helper() {}"));
         idx.push("helper".to_string(), rec("src/b.ts", 0, 2, &[], "function helper() {}"));
         let body = vec!["  helper();".to_string()];
-        let callees = resolve_callees(&body, &idx, "src/a.ts");
+        let callees = resolve_callees(&body, &idx, "src/a.ts", &HashMap::new());
         let helper = callees.iter().find(|(n, _)| n == "helper").unwrap();
         assert_eq!(helper.1.path, "src/b.ts");
     }
@@ -610,7 +683,7 @@ mod tests {
         idx.push("zebra".to_string(), rec("src/z.ts", 0, 2, &[], "function zebra() {}"));
         idx.push("alpha".to_string(), rec("src/a.ts", 0, 2, &[], "function alpha() {}"));
         let body = vec!["  zebra(); alpha();".to_string()];
-        let callees = resolve_callees(&body, &idx, "src/own.ts");
+        let callees = resolve_callees(&body, &idx, "src/own.ts", &HashMap::new());
         let names: Vec<&str> = callees.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["zebra", "alpha"]);
     }

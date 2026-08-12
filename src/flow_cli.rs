@@ -73,8 +73,8 @@ pub enum FlowCmd {
     ///
     /// Tier-decision records form the audit substrate's *why* layer.
     /// Where dispatch records show *what* ran, tier-decision records
-    /// show *why this layer was chosen* — the missing provenance step
-    /// for compliance-bearing AI orchestration.
+    /// show *why this layer was chosen* — the routing rationale that
+    /// dispatch records alone don't capture.
     ///
     /// Typical use: the frontier orchestrator runs this verb before
     /// dispatching (or before deciding to hold work in frontier) and
@@ -122,9 +122,10 @@ pub enum FlowCmd {
     },
     /// Walk every audit file under `DARKMUX_AUDIT_DIR` (or the default
     /// `~/.darkmux/audit/`), recompute the hash chain, and report the
-    /// first divergence per file. Compliance verb (#163): proves the
-    /// AuditFileSink output hasn't been edited since write. Exits with
-    /// status 2 when any chain is broken so CI/cron can flag tampering.
+    /// first divergence per file (#163). A clean walk means no divergence
+    /// was found at this check — not that the file is unaltered; see
+    /// SECURITY.md for the chain's known gaps. Exits with status 2 when
+    /// any chain is broken so CI/cron can flag tampering.
     #[command(name = "integrity-check")]
     IntegrityCheck {
         /// Restrict the walk to a single file path. Useful when the
@@ -181,8 +182,12 @@ fn print_status(json: bool) -> Result<()> {
 
 /// Render `darkmux flow integrity-check` to stdout. Walks the audit dir
 /// (or a single `--path`), recomputes each file's hash chain, reports
-/// pass/break per file. Exits with status 2 when any chain is broken so
-/// CI / cron / monitoring can flag tampering.
+/// pass/break per file. Exits with status 2 when any chain is genuinely
+/// broken (`chain_valid == false`) so CI / cron / monitoring can flag
+/// tampering. (#1769) A legacy pre-2.6.0 file — struct-hash format, no
+/// `hash_format` marker on its header — is NOT a break: `chain_valid`
+/// stays `true`, the exit status stays 0, and the caveat prints as a
+/// warning (readable, never content-verified) rather than an error.
 fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result<()> {
     let reports = if let Some(p) = path {
         vec![flow::integrity_check_file(&p)?]
@@ -225,6 +230,24 @@ fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result
                 }
                 if let Some(reason) = r.break_reason.as_ref() {
                     println!("{}", style::error(&format!("       reason: {reason}")));
+                }
+            } else if r.legacy_format {
+                // (#1769) Chain-valid in the sense that nothing was broken,
+                // but this file predates byte-hash verification and its
+                // content was NOT checked at all. Loud, not silent — exit
+                // status stays 0 (this is not tampering), but an operator
+                // watching the output must still see the caveat, or
+                // "valid" quietly becomes a stronger claim than the walk
+                // actually supports.
+                println!(
+                    "{}",
+                    style::warn(&format!(
+                        "       {} record(s) NOT content-verified — legacy pre-2.6.0 format",
+                        r.records_checked
+                    ))
+                );
+                if let Some(note) = r.note.as_ref() {
+                    println!("{}", style::warn(&format!("       {note}")));
                 }
             }
         }
@@ -352,7 +375,6 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -375,7 +397,6 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -410,7 +431,6 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             mission_id,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -448,7 +468,6 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
             mission_id,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,

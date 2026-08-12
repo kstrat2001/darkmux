@@ -84,11 +84,9 @@ Tell the operator to add these to `~/.zshrc` (or `~/.bashrc`):
 # darkmux — fleet membership, added by /darkmux-add-machine
 export DARKMUX_MACHINE_ID=<picked-in-step-3>
 export DARKMUX_REDIS_URL=redis://default:<password>@<coord-addr>:6379
-# Optional: name this frontier session in flow records
-export DARKMUX_ORCHESTRATOR=<harness-name (e.g. claude-code / antigravity / cursor)>
 ```
 
-`DARKMUX_AUDIT_DIR` is intentionally NOT set here — audit substrate is the `/darkmux-enable-audit` skill's territory. Only run that if the operator wants the compliance posture.
+`DARKMUX_AUDIT_DIR` is intentionally NOT set here — audit substrate is the `/darkmux-enable-audit` skill's territory. Only run that if the operator wants the hash-chained audit log.
 
 After editing, the operator reloads the shell + verifies the vars are set (presence-only — do NOT print the values, which would expose the Redis password to shell history and screen-share workflows):
 
@@ -190,6 +188,6 @@ If re-configuring, continue from the step the operator names. If a different mac
 ## Composes with
 
 - `darkmux-bootstrap` — first-time setup; use that on the operator's FIRST machine; this skill on every subsequent one
-- `darkmux-enable-audit` — opt-in compliance posture (after this skill completes)
+- `darkmux-enable-audit` — opt-in hash-chained audit sink (after this skill completes)
 - [#280](https://github.com/kstrat2001/darkmux/issues/280) — cross-machine roster replication (will eliminate step 7's manual fanout)
 - [#590](https://github.com/kstrat2001/darkmux/issues/590) — single-stream fleet dispatch + the capability-routing successor (replaces the retired tier-aware routing)

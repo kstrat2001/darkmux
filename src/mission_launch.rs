@@ -76,7 +76,7 @@ use crate::flow;
 use crate::coder_phase;
 use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::{self, FindingSeverity, LaunchParams, MissionConfig, TaskOverride};
-use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus};
+use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus, Step};
 use darkmux_types::style;
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -228,6 +228,44 @@ fn cli_gate_handler() -> Box<crew::gate::GateHandler<'static>> {
     }
 }
 
+/// (#1685 QA MUST-FIX 2) Emit the SAME `gh.verb.executed` audit record
+/// `acp_panel::run_ephemeral` emits, on THIS entry point too. Before this,
+/// `check_gh_verb` (above, in `launch`) and the args-injection wiring
+/// covered this path, but no audit record ever followed — a bare `darkmux
+/// mission launch pr-merge` executed the merge, gated only by the tty
+/// prompt, with zero trace in `/flow`. Both the docs page ("Every EXECUTED
+/// gh-verb command ... emits one flow record") and the feature's own PR
+/// body promised the stronger claim; this closes the gap rather than
+/// scoping the docs down to match the (narrower) implementation.
+///
+/// A thin wrapper around `acp_panel::emit_gh_verb_audit` — same record
+/// shape, same `Category::Audit`/`gh.verb.executed` vocabulary, so the two
+/// entry points can never drift into two different audit shapes for the
+/// same fact. No-op when `config.gh_verb` is `None` (the ordinary case —
+/// every config that isn't an operator-authored GitHub-CLI verb), mirroring
+/// `run_ephemeral`'s own "no gh_verb declared, no audit record" rule.
+///
+/// `args` is this launcher's own view of the raw panel-argument text (the
+/// `--param args=<value>` the operator supplied, or empty if omitted) —
+/// the same `__panel_args__` value `inject_panel_args_task_if_referenced`
+/// seeds into the graph, so the audited `pr` extraction matches what the
+/// graph itself actually saw. `cwd` is the process's own current
+/// directory: a direct CLI launch has no separate "session cwd" the way
+/// the ACP ephemeral route does (see the docs page's "cwd invariant") — it
+/// simply inherits the invoking terminal's cwd, so that's what's audited.
+fn emit_launch_gh_verb_audit(
+    config: &MissionConfig,
+    collected: &BTreeMap<String, serde_json::Value>,
+    mission_id: &str,
+    gate_confirmed: Option<bool>,
+    success: bool,
+) {
+    let Some(verb) = config.gh_verb.as_deref() else { return };
+    let args = collected.get("args").and_then(|v| v.as_str()).unwrap_or("");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    crate::acp_panel::emit_gh_verb_audit(verb, args, &cwd, gate_confirmed, success, mission_id);
+}
+
 pub fn launch(
     config_id: &str,
     input_file: Option<&Path>,
@@ -250,6 +288,15 @@ pub fn launch(
         )
     })?;
     let config = &loaded.config;
+
+    // (#1685) The gh-verb allowlist gate — checked before ANY other work on
+    // this config, so a direct `darkmux mission launch <id>` gets the SAME
+    // refusal an ACP-panel invocation would (`acp_panel::run_ephemeral`
+    // checks the identical `mission_config::check_gh_verb` first thing).
+    // The gate holds regardless of which surface invoked the config.
+    if let Some(reason) = mission_config::check_gh_verb(config) {
+        bail!("mission launch: {reason}");
+    }
 
     // (contract 7) Semantic validation is a SEPARATE, explicit pass — this
     // IS the consumption point. `known_kinds` is everything this launcher
@@ -341,6 +388,28 @@ pub fn launch(
             );
         }
     }
+
+    // (#1685) If the config's graph references the reserved
+    // `__panel_args__` task id (the SAME convention the ACP ephemeral
+    // route uses for a panel command's raw argument text — see
+    // `mission_config::inject_panel_args_task_if_referenced`'s own doc),
+    // inject the synthetic task here too, seeded from `--param
+    // args=<value>` — BEFORE minting or interpreting — so a direct
+    // `darkmux mission launch <id> --param args=<value>` behaves
+    // identically to invoking the SAME config from the editor panel.
+    // Before this, a config declaring `reads: ["__panel_args__"]` (any
+    // panel verb that takes an argument, e.g. a PR number) resolved fine
+    // via `darkmux acp` but hard-failed `interpret` on this direct CLI
+    // path with "reads unknown task id `__panel_args__`" — nothing here
+    // ever injected the task the ACP route always does. A config that
+    // never references the reserved id is untouched (the function's own
+    // no-op early return), so this has zero effect on every other config.
+    let mut config_owned = config.clone();
+    mission_config::inject_panel_args_task_if_referenced(
+        &mut config_owned,
+        collected.get("args").and_then(|v| v.as_str()).unwrap_or(""),
+    );
+    let config: &MissionConfig = &config_owned;
 
     // (#1284 review round 1, consider 11) A config whose graph uses the
     // coder-phase step kinds needs workdir/branch/base to EXECUTE — check
@@ -601,7 +670,32 @@ pub fn launch(
     // for an ungated step), which today means an operator-authored
     // panel-verb config (e.g. the documented `pr-merge` example) launched
     // directly rather than through the ACP ephemeral route.
-    let mut gate_handler = cli_gate_handler();
+    //
+    // (#1685 QA MUST-FIX 2) Wrapped the same way `acp_panel::run_ephemeral`
+    // wraps its own gate handler: whether the operator actually CONFIRMED a
+    // gated step is one of the facts `emit_launch_gh_verb_audit` records, so
+    // it has to be observable AFTER `run_step_graph` returns (the closure
+    // below is the only place that decision is made). `Rc<Cell<..>>`, not a
+    // captured `&mut`, for the same reason `run_ephemeral` uses one: the
+    // closure's last use is the `run_step_graph` call itself, so the borrow
+    // checker would tolerate a `&mut` too, but a `Cell` keeps the intent
+    // (read this back once the graph is done) obvious at the read site.
+    // Stays `None` for the whole run when no gated step ever executes (a
+    // read-only verb, or a config with no `gate: "operator"` step at all)
+    // so the audit record honestly says "no gate" rather than fabricating a
+    // yes/no for a decision that never happened.
+    let gate_confirmed: std::rc::Rc<std::cell::Cell<Option<bool>>> =
+        std::rc::Rc::new(std::cell::Cell::new(None));
+    type BoxedGateHandler<'a> = Box<dyn FnMut(&Step, &BTreeMap<String, String>) -> crew::gate::GateDecision + 'a>;
+    let mut instrumented_gate: BoxedGateHandler<'static> = {
+        let mut handler = cli_gate_handler();
+        let flag = gate_confirmed.clone();
+        Box::new(move |step: &Step, facts: &BTreeMap<String, String>| {
+            let decision = handler(step, facts);
+            flag.set(Some(matches!(decision, crew::gate::GateDecision::Approved)));
+            decision
+        })
+    };
     let graph_result = crew::scheduler::run_step_graph(
         &mut steps,
         &tasks_by_id,
@@ -647,7 +741,7 @@ pub fn launch(
                 );
             }
         },
-        Some(gate_handler.as_mut()),
+        Some(instrumented_gate.as_mut()),
         None,
         &seed_artifacts,
     );
@@ -660,6 +754,11 @@ pub fn launch(
     // mission board just no longer lies about a dead run being active.
     if let Err(e) = graph_result {
         reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e);
+        // (#1685 QA MUST-FIX 2) A scheduler-level failure is still "the
+        // operator's session tried to act as them" — audit-worthy on its
+        // own (see `acp_panel::emit_gh_verb_audit`'s doc on why a failed
+        // attempt is never silently dropped from the trail).
+        emit_launch_gh_verb_audit(config, &collected, &mission_id, gate_confirmed.get(), false);
         return Err(e);
     }
 
@@ -687,6 +786,16 @@ pub fn launch(
             };
             reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e);
         }
+        // (#1685 QA MUST-FIX 2) `0` mirrors this function's own exit-code
+        // doc above ("`0` — ... coder ran and QA came back clean/flags-only
+        // ... gate banner printed"): the coder-phase path never actually
+        // pairs with a `gh_verb` config in practice (the built-in verbs are
+        // all `procedural.shell`-only), but the audit call is unconditional
+        // here for the same reason `check_gh_verb` runs before `launch`
+        // branches at all — the gate holds regardless of which graph shape
+        // a `gh_verb` config happens to declare.
+        let success = matches!(&outcome, Ok(code) if *code == 0);
+        emit_launch_gh_verb_audit(config, &collected, &mission_id, gate_confirmed.get(), success);
         return outcome;
     }
 
@@ -700,10 +809,17 @@ pub fn launch(
     print_run_summary(&mission_id, &steps);
 
     use crew::envelope::MissionOutcomeStatus;
-    Ok(match status {
+    let exit_code = match status {
         MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => 0,
         MissionOutcomeStatus::Degenerate | MissionOutcomeStatus::Error => 1,
-    })
+    };
+    // (#1685 QA MUST-FIX 2) This is the branch the documented `pr-list` /
+    // `pr-info` / `pr-approve` / `pr-merge` example verbs actually take —
+    // every one of them is a Tier-1-only `procedural.shell`/`procedural.noop`
+    // graph, so this is where a direct `darkmux mission launch pr-merge`
+    // gets its audit record in practice.
+    emit_launch_gh_verb_audit(config, &collected, &mission_id, gate_confirmed.get(), exit_code == 0);
+    Ok(exit_code)
 }
 
 /// Parse `--input <file.json>` (a flat object) and `--param key=value`
@@ -2110,6 +2226,250 @@ mod tests {
         ]
     }"#;
 
+    // ── (#1685) gh-verb allowlist gate on the DIRECT CLI launch path ────
+    // `acp_panel::run_ephemeral`'s own tests cover the ACP route; these
+    // cover the SAME `mission_config::check_gh_verb` gate on a bare
+    // `darkmux mission launch <id>` invocation, proving the allowlist holds
+    // on both entry points named in the #1685 spec.
+
+    const GH_VERB_CONFIG: &str = r#"{
+        "id": "gh-verb-test-mission",
+        "name": "GH Verb Test Mission",
+        "schema_version": "2.3",
+        "gh_verb": "pr-merge",
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.noop"}]}]}
+        ]
+    }"#;
+
+    #[test]
+    #[serial_test::serial]
+    fn launch_refuses_a_gh_verb_config_when_the_allowlist_gate_is_off() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("gh-verb-test-mission", GH_VERB_CONFIG);
+        let prev_enabled = env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_allowed = env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe {
+            env::remove_var("DARKMUX_GH_ENABLED");
+            env::remove_var("DARKMUX_GH_ALLOWED");
+        }
+
+        let err = launch("gh-verb-test-mission", None, &[], None)
+            .expect_err("a gh_verb config must be refused with the allowlist gate off");
+        assert!(err.to_string().contains("pr-merge"), "{err}");
+        assert!(all_mission_ids().is_empty(), "a refused gh-verb config must mint NOTHING, not a half-launched instance");
+
+        unsafe {
+            match prev_enabled {
+                Some(v) => env::set_var("DARKMUX_GH_ENABLED", v),
+                None => env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_allowed {
+                Some(v) => env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+        drop(guard);
+    }
+
+    const PANEL_ARGS_CONFIG: &str = r#"{
+        "id": "panel-args-test-mission",
+        "name": "Panel Args Test Mission",
+        "schema_version": "2.3",
+        "inputs": [{"name": "args", "required": false}],
+        "phases": [
+            {"id": "p1", "tasks": [{
+                "id": "echo-args",
+                "reads": ["__panel_args__"],
+                "steps": [{
+                    "id": "echo-args-step",
+                    "kind": "procedural.shell",
+                    "config": {"command": "echo got: $DARKMUX_STEP_INPUT___PANEL_ARGS__"}
+                }]
+            }]}
+        ]
+    }"#;
+
+    /// (#1685) Direct `darkmux mission launch <id> --param args=<value>`
+    /// must deliver the value into a config's `reads: ["__panel_args__"]`
+    /// task exactly like the ACP ephemeral route does (`acp_panel::
+    /// run_ephemeral`'s own `ephemeral_run_seeds_args_when_a_task_reads_
+    /// the_synthetic_args_task`). Before this fix, ANY config declaring
+    /// that read hard-failed `interpret` on this CLI path — this is the
+    /// regression test for the fix, not just new-feature coverage.
+    #[test]
+    #[serial_test::serial]
+    fn launch_delivers_param_args_into_a_task_reading_the_reserved_panel_args_id() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("panel-args-test-mission", PANEL_ARGS_CONFIG);
+
+        let exit = launch("panel-args-test-mission", None, &["args=hello-world".to_string()], None)
+            .expect("a config reading __panel_args__ must launch and run cleanly from the CLI too");
+        assert_eq!(exit, 0);
+
+        let mission_id = single_mission_id();
+        let steps_dir = crew::loader::missions_dir().join(&mission_id).join("steps");
+        let step_path = walk_for_file(&steps_dir, "echo-args-step.json").expect("step json must exist");
+        let step: crew::types::Step =
+            serde_json::from_str(&std::fs::read_to_string(&step_path).unwrap()).unwrap();
+        assert_eq!(step.output.as_deref().map(str::trim), Some("got: hello-world"));
+    }
+
+    /// The no-args case must still resolve cleanly (an empty string, not a
+    /// dangling-reference failure) — mirrors `ephemeral_run_with_empty_
+    /// args_still_resolves_a_task_that_reads_the_reserved_id` on the ACP side.
+    #[test]
+    #[serial_test::serial]
+    fn launch_with_no_args_param_still_resolves_a_task_reading_the_reserved_id() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("panel-args-test-mission", PANEL_ARGS_CONFIG);
+
+        let exit = launch("panel-args-test-mission", None, &[], None)
+            .expect("no --param args= at all must still resolve to an empty string, not fail");
+        assert_eq!(exit, 0);
+        drop(guard);
+    }
+
+    /// Find a file named `name` anywhere under `dir` (the step json lives
+    /// one phase-subdirectory deep — `steps/<phase-task-id>/<step-id>.json`
+    /// — and this test doesn't want to hardcode that shape).
+    fn walk_for_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk_for_file(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn launch_runs_a_gh_verb_config_once_allowlisted() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("gh-verb-test-mission", GH_VERB_CONFIG);
+        let prev_enabled = env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_allowed = env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe {
+            env::set_var("DARKMUX_GH_ENABLED", "true");
+            env::set_var("DARKMUX_GH_ALLOWED", "pr-merge");
+        }
+
+        let exit = launch("gh-verb-test-mission", None, &[], None)
+            .expect("an allowlisted gh_verb config must launch normally");
+        assert_eq!(exit, 0);
+        assert_eq!(all_mission_ids().len(), 1, "the allowlisted config must actually mint + run");
+
+        unsafe {
+            match prev_enabled {
+                Some(v) => env::set_var("DARKMUX_GH_ENABLED", v),
+                None => env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_allowed {
+                Some(v) => env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+        drop(guard);
+    }
+
+    const GH_VERB_GATED_CONFIG: &str = r#"{
+        "id": "gh-verb-gated-test-mission",
+        "name": "GH Verb Gated Test Mission",
+        "schema_version": "2.3",
+        "gh_verb": "pr-merge",
+        "inputs": [{"name": "args", "required": false}],
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [{
+                "id": "s1", "kind": "procedural.noop", "gate": "operator",
+                "config": {"output": "merged"}
+            }]}]}
+        ]
+    }"#;
+
+    /// (#1685 QA MUST-FIX 2) `darkmux mission launch pr-merge` must leave
+    /// the SAME `gh.verb.executed` audit record `acp_panel::run_ephemeral`
+    /// emits for the identical config launched from the panel — before this
+    /// fix, `check_gh_verb` and the args-injection wiring covered this
+    /// entry point, but NOTHING emitted the audit record after: a bare
+    /// `darkmux mission launch pr-merge` executed the merge, gated only by
+    /// the tty prompt, with zero trace in `/flow`. The gated step here is
+    /// DECLINED (cargo test's stdin/stdout are never real terminals, so
+    /// `cli_gate_handler` resolves to `refusal_handler`, which fails
+    /// closed) — proving `confirmed: false` and `success: false` land in
+    /// the payload for a real, non-approved attempt, not just a happy path
+    /// this launcher never actually exercises without Docker.
+    #[test]
+    #[serial_test::serial]
+    fn launch_emits_one_audit_flow_record_for_an_executed_gh_verb_command() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("gh-verb-gated-test-mission", GH_VERB_GATED_CONFIG);
+        let prev_enabled = env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_allowed = env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe {
+            env::set_var("DARKMUX_GH_ENABLED", "true");
+            env::set_var("DARKMUX_GH_ALLOWED", "pr-merge");
+        }
+
+        let exit = launch("gh-verb-gated-test-mission", None, &["args=123".to_string()], None)
+            .expect("an allowlisted gh_verb config must launch — a declined gate fails the STEP, not the scheduler");
+        assert_eq!(exit, 1, "the only step declined (non-interactive refusal_handler) so the mission ends Error");
+
+        let records = read_all_flow_records();
+        let audit = records
+            .iter()
+            .find(|r| r["action"] == "gh.verb.executed")
+            .expect("exactly one gh.verb.executed audit record must be emitted on the launch() path too");
+        assert_eq!(audit["category"], "audit");
+        let payload = &audit["payload"];
+        assert_eq!(payload["verb"], "pr-merge");
+        assert_eq!(payload["pr"], "123", "best-effort PR extraction from --param args");
+        assert_eq!(
+            payload["worktree"],
+            std::env::current_dir().unwrap().to_string_lossy().to_string(),
+            "a direct CLI launch audits the process's own cwd — it has no separate session cwd"
+        );
+        assert_eq!(payload["confirmed"], false, "non-interactive refusal_handler declines every gated step");
+        assert_eq!(payload["success"], false);
+
+        unsafe {
+            match prev_enabled {
+                Some(v) => env::set_var("DARKMUX_GH_ENABLED", v),
+                None => env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_allowed {
+                Some(v) => env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+        drop(guard);
+    }
+
+    /// The inverted case (red-prove): a config with NO `gh_verb` running
+    /// through the SAME generic tail path (`emit_launch_gh_verb_audit` is
+    /// called unconditionally there and must no-op) never emits this
+    /// record — mirrors `acp_panel::run_ephemeral_emits_no_audit_record_
+    /// for_a_non_gh_verb_config`.
+    #[test]
+    #[serial_test::serial]
+    fn launch_emits_no_audit_record_for_a_non_gh_verb_config() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("panel-args-test-mission", PANEL_ARGS_CONFIG);
+
+        let exit = launch("panel-args-test-mission", None, &[], None).expect("an ordinary launch must succeed");
+        assert_eq!(exit, 0);
+
+        assert!(
+            read_all_flow_records().iter().all(|r| r["action"] != "gh.verb.executed"),
+            "no gh_verb declared -> no audit record, ever, on the launch() path either"
+        );
+        drop(guard);
+    }
+
     // ── Generic launch path — freeform (no dispatch, no Docker) ────────
 
     /// All mission ids currently minted under the test's isolated crew root
@@ -3029,6 +3389,7 @@ mod tests {
             ],
             phases: Vec::new(),
             panel: None,
+            gh_verb: None,
             extras: BTreeMap::new(),
         };
         let missing = missing_required_inputs(&cfg, &BTreeMap::new());

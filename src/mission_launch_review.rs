@@ -619,13 +619,21 @@ fn review_result_to_mission_envelope(
             //
             // `Clean` rather than a new outcome variant: the review ran, the
             // bundler worked, nothing was wrong. The envelope still carries
-            // `degenerate` + `DegenerateKind::BenignEmpty` and the reason
-            // string below, so the "why zero findings" provenance is intact
-            // for anyone who looks — this narrows what gets FLAGGED, not
-            // what gets RECORDED.
-            let benign_empty =
-                env.degenerate_kind == Some(darkmux_lab::lab::review::DegenerateKind::BenignEmpty);
-            let status = if env.degenerate.is_some() && !benign_empty {
+            // `degenerate` + its `DegenerateKind` and the reason string
+            // below, so the "why zero findings" provenance is intact for
+            // anyone who looks — this narrows what gets FLAGGED, not what
+            // gets RECORDED. (#1757) `UnsupportedLanguage` gets the same
+            // carve-out as `BenignEmpty` for the identical reason: a diff
+            // that's real source in a language the built-in bundler can't
+            // parse produces the identical result on every repeat, so
+            // flagging it `Degenerate` would manufacture the same unbounded
+            // retry loop this carve-out exists to prevent.
+            let neutral_zero_bundle = matches!(
+                env.degenerate_kind,
+                Some(darkmux_lab::lab::review::DegenerateKind::BenignEmpty)
+                    | Some(darkmux_lab::lab::review::DegenerateKind::UnsupportedLanguage)
+            );
+            let status = if env.degenerate.is_some() && !neutral_zero_bundle {
                 MissionOutcomeStatus::Degenerate
             } else if !env.warnings.is_empty() {
                 MissionOutcomeStatus::Degraded
@@ -1024,6 +1032,11 @@ fn run_dispatch(
                 "charges_bundles is always Some when input `charges_file` is set (computed above)",
             )),
             remote_max_tokens_per_execution,
+            // (#1748) The same `FileSource` bundling used above — lets the
+            // mechanical absence-claim backstop check a confirmed finding
+            // against the whole file on the `--charges-file` re-judge path
+            // too, not just the graph path.
+            source: Some(&source),
         };
         let timeout = timeout_seconds;
         let mut chat = move |call: &ChatCall| -> Result<SingleShotReply> {
@@ -1522,7 +1535,6 @@ mod tests {
             mission_id: None,
             machine_id: None,
             machine_uid: None,
-            orchestrator: None,
             prev_hash: None,
             hash: None,
             payload: None,
@@ -1805,6 +1817,30 @@ mod tests {
         assert!(
             out.reason.as_deref().unwrap_or_default().contains("no bundles"),
             "the WHY is still recorded — this narrows what gets flagged, not what gets kept: {:?}",
+            out.reason
+        );
+    }
+
+    #[test]
+    fn an_unsupported_language_review_is_clean_not_degenerate() {
+        // (#1757) Same reasoning as the benign-empty carve-out above,
+        // applied to a diff that's real source in a language the built-in
+        // bundler can't parse: re-running produces the identical result, so
+        // `Degenerate` would manufacture the same unbounded retry loop.
+        let env = ReviewEnvelope {
+            degenerate: Some("no bundles produced from the diff — 1 skipped (1 real source in an unsupported language)".into()),
+            degenerate_kind: Some(darkmux_lab::lab::review::DegenerateKind::UnsupportedLanguage),
+            ..Default::default()
+        };
+        let out = review_result_to_mission_envelope("m-1", &["p-1"], &Ok(env));
+        assert_eq!(
+            out.status,
+            crew::envelope::MissionOutcomeStatus::Clean,
+            "an unsupported-language review must not read as a failure the session should retry"
+        );
+        assert!(
+            out.reason.as_deref().unwrap_or_default().contains("unsupported language"),
+            "the WHY is still recorded: {:?}",
             out.reason
         );
     }

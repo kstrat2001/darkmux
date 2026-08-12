@@ -1,7 +1,6 @@
 {
-  "schema_version": "1.7",
+  "schema_version": "1.9",
   "machine_id": "my-machine",
-  "orchestrator": "",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
   "redis": {
@@ -43,6 +42,10 @@
     "router_profile": "",
     "answerer_profile": "",
     "humor": 65
+  },
+  "gh": {
+    "enabled": false,
+    "allowed": []
   },
   "role_profiles": {}
 }

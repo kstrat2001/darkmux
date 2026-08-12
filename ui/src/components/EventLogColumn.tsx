@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type { FlowRecord } from "../types/handwritten";
 import { recKey } from "../lib/flow";
 import { LIVE_WINDOW_MS } from "../lib/flow";
@@ -43,6 +43,19 @@ const WINDOW_HOURS = Math.round(LIVE_WINDOW_MS / 3600000);
 const MIN_DETAIL_PCT = 15;
 const MAX_DETAIL_PCT = 70;
 const DEFAULT_DETAIL_PCT = 38;
+
+/** Enter/Space activates a `role="button"` `<div>` the same way a native
+ * `<button>` would (matching `RunsBoard.tsx`'s own `onActivateKeyDown`) —
+ * needed because `.eventlog__rec` is a click-only div with no other
+ * keyboard path to selecting a record from the log. */
+function onActivateKeyDown(onActivate: () => void) {
+  return (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onActivate();
+    }
+  };
+}
 
 /**
  * The event-log column (`.log`, viewer.html:829-849) — the per-record
@@ -309,7 +322,10 @@ export function EventLogColumn({
                   key={key}
                   className={`eventlog__rec${selected && recKey(selected) === key ? " sel" : ""}`}
                   data-act="rec"
+                  role="button"
+                  tabIndex={0}
                   onClick={() => selectRecord(r)}
+                  onKeyDown={onActivateKeyDown(() => selectRecord(r))}
                 >
                   <span className="eventlog__rectime">{clk(Date.parse(r.ts))}</span>{" "}
                   <span className="eventlog__ractivity">{activityOf(r)}</span>

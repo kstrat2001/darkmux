@@ -2,7 +2,7 @@
 //!
 //! The `FlowRecord` shape, its enum fields (`Level`, `Category`, `Tier`,
 //! `Stage`), the per-day file/timestamp helpers, and the env-driven
-//! provenance resolvers (`resolve_machine_id` / `resolve_orchestrator`).
+//! machine-provenance resolver (`resolve_machine_id`).
 //! Split out of the crate's sink/record core (#508).
 
 use clap::ValueEnum;
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.18.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.19.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -187,6 +187,27 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.18.0";
 //           actions, same `payload` blob — additive optional fields only;
 //           older readers ignore them; new records only, so prior AuditFileSink
 //           chains survive without rotation.
+//   1.19.0 — REMOVED `orchestrator` (#1758). It was stamped from
+//           `config.json` — MACHINE scope — to describe which frontier
+//           orchestrator drove the work — INVOCATION scope — so every
+//           record on a machine carried the same value regardless of
+//           whether it came from an orchestrator session, a hand-typed
+//           CLI command, a cron job, or the CI runner. Grepped every
+//           consumer: nothing ever READ it (no viewer lens, no CLI verb,
+//           no aggregation; `darkmux doctor` only checked "is it
+//           declared"). A field that lies is worse than an absent one.
+//           Same shape of removal as 1.9.0's `machine_tier`. Casual
+//           LocalFileSink readers are unaffected (unknown keys ignored
+//           on read; `#[serde(flatten)] extras` on `DarkmuxConfig`
+//           absorbs an old `config.json`'s `"orchestrator"` key the same
+//           way). Pre-1.19.0 AuditFileSink hash-chains cannot be
+//           re-verified after this canonical-form change — rotate to a
+//           fresh chain (no-compat-baggage; small known audience). If
+//           the want comes back, it comes back differently: a truthful
+//           version would stamp per-invocation from process environment
+//           (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, …), not from
+//           machine-scoped config — build that when a real consumer
+//           needs it.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -205,25 +226,19 @@ pub enum Level {
     /// ignore the unknown category", FLOW_SCHEMA 1.10.0) — true for the additive
     /// `Option` fields and the free-form `action` string, and never true for
     /// these enums until now. Contract 5: consumers are lenient-on-read, loud in
-    /// doctor. The typed production readers this makes whole are
-    /// `integrity_check_file` and `darkmux-crew`'s role index.
+    /// doctor. The typed production reader this makes whole is `darkmux-crew`'s
+    /// role index.
     ///
     /// Nothing ever WRITES `Unknown` — no code constructs it — so no record is
-    /// emitted carrying one. But reading is lossy where writing is not: a record
-    /// parsed to `Unknown` **re-serializes as `"unknown"`**, not as whatever the
-    /// writer wrote.
-    ///
-    /// That loss is why leniency ALONE does not make the audit chain honest, and
-    /// the first version of this change wrongly claimed it did.
-    /// `audit_hash_of` recomputes the BLAKE3 from the PARSED struct, so a
-    /// newer peer's record hashes differently and the checker called it
-    /// `hash mismatch — record content has been edited`. That is a false tamper
-    /// alert on the compliance substrate, and a worse-reading one than the
-    /// `unparseable JSON` it replaced. The real fix lives in
-    /// `integrity_check_file`, which now asks `has_unknown_enum` first and
-    /// reports such a record as unverifiable-pending-upgrade rather than
-    /// corrupt. Any FUTURE consumer that round-trips a record owes the same
-    /// question.
+    /// emitted carrying one. Reading IS lossy in the sense that a record parsed
+    /// to `Unknown` re-serializes as `"unknown"`, not as whatever the writer
+    /// wrote — but that no longer matters to the audit chain (#1769): the
+    /// hash-chain's content check hashes the RAW BYTES a writer put on disk, and
+    /// never round-trips a record through this struct to do it. A record
+    /// carrying an unknown spelling here reads fine and verifies fine; the two
+    /// concerns (can I read this field? can I trust the chain?) are now fully
+    /// decoupled. See `crates/darkmux-flow/src/integrity.rs`'s module doc for
+    /// the hash-format details.
     #[serde(other)]
     #[value(skip)]
     Unknown,
@@ -283,45 +298,6 @@ pub enum Stage {
     #[serde(other)]
     #[value(skip)]
     Unknown,
-}
-
-/// (#1611) Did this record carry an enum spelling THIS binary does not know?
-///
-/// The catch-all variants make such a record READABLE, which is contract 5 and
-/// the whole point. What they cannot do is make it re-serializable to its
-/// original bytes: an unknown `"catastrophe"` reads as `Unknown` and writes
-/// back as `"unknown"`. Any consumer that round-trips a record — most
-/// consequentially `integrity_check_file`, which recomputes the audit hash from
-/// the PARSED struct — must therefore be able to ask whether the value it holds
-/// is lossy, or it will report its own lossy re-serialization as evidence the
-/// record was edited.
-///
-/// A predicate rather than a stored flag so it cannot go stale, and so nothing
-/// has to be added to the wire format to support it.
-pub trait MaybeUnknown {
-    /// `true` when this value came from a spelling this binary does not know.
-    fn is_unknown(&self) -> bool;
-}
-
-impl MaybeUnknown for Level {
-    fn is_unknown(&self) -> bool {
-        matches!(self, Level::Unknown)
-    }
-}
-impl MaybeUnknown for Category {
-    fn is_unknown(&self) -> bool {
-        matches!(self, Category::Unknown)
-    }
-}
-impl MaybeUnknown for Tier {
-    fn is_unknown(&self) -> bool {
-        matches!(self, Tier::Unknown)
-    }
-}
-impl MaybeUnknown for Stage {
-    fn is_unknown(&self) -> bool {
-        matches!(self, Stage::Unknown)
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -385,28 +361,26 @@ pub struct FlowRecord {
     /// back to the (unprovable) name. Schema 1.11 addition.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_uid: Option<String>,
-    /// Frontier orchestrator driving this record's session — e.g.,
-    /// `"claude-code"`, `"antigravity"`, `"cursor"`. Auto-populated from
-    /// `DARKMUX_ORCHESTRATOR` env at write time. Operator-explicit by
-    /// design: there's no reliable way to auto-detect the frontier-tier
-    /// AI from inside darkmux. None when the operator hasn't declared.
-    /// Schema 1.4 addition (#167).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub orchestrator: Option<String>,
     /// BLAKE3 hash of the previous record in this audit file's chain.
     /// `None` on records written through LocalFileSink (the casual sink);
-    /// AuditFileSink (the compliance-strength sibling) populates this
-    /// with the prior record's `hash` value so tampering with any single
-    /// record is detectable via a linear walk. The first record in a
-    /// file points to the hash of the schema-header line. Schema 1.5
-    /// addition (#163).
+    /// AuditFileSink (the detection-substrate sibling) populates this
+    /// with the prior LINE's hash so tampering with any single record is
+    /// detectable via a linear walk. The first record in a file points to
+    /// the hash of the schema-header line. Schema 1.5 addition (#163).
+    /// This is the ONE hash-chain field that still lives inside the JSON
+    /// body under the byte-hash format (#1769) — it's covered by the
+    /// content hash the same way every other field is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_hash: Option<String>,
-    /// BLAKE3 hash of THIS record's content (excluding the `hash` field
-    /// itself — see `audit_hash_of()`). Populated only by AuditFileSink.
-    /// Together with `prev_hash` forms a hash chain. The
-    /// `darkmux flow integrity-check` verb recomputes the chain and
-    /// reports the first divergence. Schema 1.5 addition (#163).
+    /// Legacy field (pre-2.6.0): under the OLD struct-hash audit format
+    /// this carried THIS record's own content hash, embedded inside the
+    /// JSON body. #1769's byte-hash format moved that hash OUTSIDE the
+    /// JSON — it's now a `<hash-hex><SP>` prefix on the line itself (see
+    /// `crates/darkmux-flow/src/integrity.rs`'s module doc), so current
+    /// AuditFileSink writes never populate this field; it stays `None` on
+    /// every newly-written record and exists only so a pre-2.6.0 line
+    /// (which DID embed `hash` here) still deserializes. Schema 1.5
+    /// addition (#163).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     /// Event-specific structured fields that aren't promoted to first-class
@@ -441,25 +415,6 @@ pub struct FlowRecord {
     /// semantics outside the queue). Schema 1.8 addition (#246).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
-}
-
-impl FlowRecord {
-    /// (#1611) `true` when any of this record's enum fields fell back to its
-    /// catch-all — i.e. the record was written by a binary that knows a
-    /// spelling this one does not.
-    ///
-    /// Such a record is fully READABLE (that is the point of the catch-alls)
-    /// but NOT byte-reproducible: re-serializing it emits `"unknown"` in place
-    /// of whatever the writer wrote. Consumers that compare a re-serialization
-    /// against something the writer produced — the audit chain's content hash
-    /// is the one that matters — must consult this first, or they will report
-    /// their own lossy round-trip as evidence of tampering.
-    pub fn has_unknown_enum(&self) -> bool {
-        self.level.is_unknown()
-            || self.category.is_unknown()
-            || self.tier.is_unknown()
-            || self.stage.is_unknown()
-    }
 }
 
 /// Resolve the flows directory. Precedence (#661 Slice 3):
@@ -559,18 +514,6 @@ pub fn resolve_machine_id() -> Option<String> {
         .clone()
 }
 
-/// Resolve the orchestrator identifier for new flow records.
-///
-/// **Operator-explicit by design** — there's no reliable way to detect
-/// the frontier-tier AI driving the operator's session from inside
-/// darkmux. The operator declares it via `DARKMUX_ORCHESTRATOR`; absent
-/// declaration, records carry no orchestrator field and the doctor
-/// surfaces a warn so the operator knows the field exists.
-pub fn resolve_orchestrator() -> Option<String> {
-    // env(DARKMUX_ORCHESTRATOR) > config.orchestrator (#661 Slice 4), read live.
-    darkmux_types::config_access::orchestrator()
-}
-
 
 #[cfg(test)]
 mod forward_compat_tests {
@@ -580,10 +523,12 @@ mod forward_compat_tests {
     /// `#[serde(other)]` catch-alls, one unrecognized enum string failed the
     /// whole `FlowRecord`.
     ///
-    /// Parsing is the FLOOR, not the fix. The same record still does not
-    /// re-serialize to its original bytes — see `unknown_variants_are_lossy_on_
-    /// write_which_is_why_the_checker_asks` below, and the integrity checker's
-    /// `has_unknown_enum` branch that consumes this.
+    /// Parsing is the FLOOR. The same record still does not re-serialize to
+    /// its original bytes through THIS struct — see
+    /// `unknown_variants_are_lossy_on_write_at_the_struct_level` below — but
+    /// that lossiness stopped being a security concern once the audit chain
+    /// moved to byte-hashing (#1769): the chain never round-trips a record
+    /// through `FlowRecord` to verify it.
     #[test]
     fn a_record_from_a_newer_peer_parses_instead_of_failing_the_whole_record() {
         let wire = r#"{
@@ -637,17 +582,24 @@ mod forward_compat_tests {
         assert_eq!(out["stage"], "dispatch");
     }
 
-    /// The correction. Leniency makes a newer record READABLE; it does not make
-    /// it REPRODUCIBLE — and the audit chain hashes a re-serialization, so the
-    /// difference is the difference between "verified" and "tampered".
+    /// Leniency makes a newer record READABLE through this struct; it does
+    /// not make re-serializing it through this struct REPRODUCE the
+    /// original bytes. That WAS the audit chain's problem (#1768/#1769):
+    /// the pre-byte-hash chain hashed a re-serialization, so this
+    /// lossiness became a false tamper alert, and the bypass added to
+    /// paper over it became a real one.
     ///
-    /// This is the test that would have caught the original overclaim: the
-    /// first version of #1611 asserted the catch-alls fixed the false tamper
-    /// alert, and they did not. They changed its wording from `unparseable
-    /// JSON` to `hash mismatch — record content has been edited`, which reads
-    /// MORE like tampering.
+    /// It is no longer the chain's problem. #1769's byte-hash format
+    /// hashes the literal bytes a writer put on disk and never
+    /// round-trips a record through `FlowRecord` to compute or verify a
+    /// hash — see `crates/darkmux-flow/src/integrity.rs`'s module doc and
+    /// its own `a_newer_peers_record_with_an_unknown_enum_validates_cleanly`
+    /// test, which is the sibling of this one at the byte-hash layer. This
+    /// test still pins the STRUCT-level lossiness (useful for e.g. `darkmux
+    /// flow tail`'s human-readable rendering, which DOES round-trip through
+    /// this struct) — it is simply no longer a security-relevant fact.
     #[test]
-    fn unknown_variants_are_lossy_on_write_which_is_why_the_checker_asks() {
+    fn unknown_variants_are_lossy_on_write_at_the_struct_level() {
         let wire = r#"{
             "ts": "2026-08-03T12:00:00Z",
             "level": "catastrophe",
@@ -662,22 +614,37 @@ mod forward_compat_tests {
 
         assert_eq!(
             out["level"], "unknown",
-            "the writer's spelling is GONE on re-serialize — this is the lossiness \
-             that makes a recomputed content hash differ for an untouched record"
+            "the writer's spelling is GONE on re-serialize through this struct — true, and no \
+             longer load-bearing for the audit chain (#1769)"
         );
         assert_ne!(out["level"], "catastrophe");
+    }
 
-        // ...which is exactly the question any round-tripping consumer must
-        // ask, and the integrity checker now does.
-        assert!(rec.has_unknown_enum());
-
-        // A record this binary fully understands is NOT flagged, so the
-        // checker keeps verifying everything it legitimately can.
-        let known: FlowRecord = serde_json::from_str(
-            r#"{"ts":"2026-08-03T12:00:00Z","level":"info","category":"audit",
-                "tier":"local","stage":"dispatch","action":"a","handle":"h"}"#,
-        )
-        .unwrap();
-        assert!(!known.has_unknown_enum());
+    /// (#1758) A record written by a pre-1.19.0 binary carries an
+    /// `orchestrator` key this struct no longer has. It must still parse:
+    /// `FlowRecord` has no `deny_unknown_fields`, so serde drops the key.
+    ///
+    /// The PR removing the field claimed this compatibility; it was true
+    /// only BY CONSTRUCTION, with nothing pinning it. The existing
+    /// forward-compat tests cover unknown enum VALUES, not unknown KEYS, so
+    /// a future `deny_unknown_fields` would silently break every archived
+    /// record and no test would notice. This is that pin.
+    #[test]
+    fn a_pre_1_19_record_carrying_the_removed_orchestrator_key_still_parses() {
+        let old = r#"{
+            "ts": "2026-08-01T00:00:00Z",
+            "level": "info",
+            "category": "dispatch",
+            "tier": "local",
+            "stage": "run",
+            "action": "dispatch.start",
+            "handle": "h1",
+            "orchestrator": "claude-code",
+            "machine_id": "studio"
+        }"#;
+        let rec: FlowRecord = serde_json::from_str(old)
+            .expect("a record with the removed `orchestrator` key must still deserialize");
+        assert_eq!(rec.handle, "h1");
+        assert_eq!(rec.machine_id.as_deref(), Some("studio"));
     }
 }

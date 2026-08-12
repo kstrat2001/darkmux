@@ -6,6 +6,19 @@
   --accent: #4fd1c5;
   --error: #f56565;
   --border: #232838;
+  /* Semantic status colors, carried over from legacy's palette
+     (viewer.html `:root`). These were USED before they were DEFINED — a
+     `var(--warn)` with no fallback is invalid at computed-value time, so the
+     property silently unsets rather than erroring. `.fleetcov` (the
+     coverage-degraded banner, #1729) therefore rendered with inherited body
+     color and a colorless border: the one surface whose whole job is to look
+     alarming was the one rendering as ordinary text. Defining them here is
+     the fix; the fallbacks already present at other call sites stay as
+     belt-and-braces. */
+  --good: #4ade80;
+  --warn: #f0b429;
+  --bad: #f56565;
+  --accent-dim: #3aa89f;
 }
 
 * {
@@ -316,11 +329,17 @@ body {
     gap: 8px 10px;
     padding: 8px 12px;
   }
+  /* The site links (home/guide/articles/github) are desktop-browsing
+     affordances — on a monitoring screen this narrow, the operator wants
+     lens content, not a row spent on outbound links. CSS-hide only (never
+     removed from the DOM): the parity harness's `extractTopbarText`
+     (tests/parity/lib/extract-lens.js) reads `.top`'s `innerText`, which
+     already excludes anything `display:none` — but every recorded golden is
+     extracted at the Desktop Chrome default viewport (well above 768px, see
+     `next-parity.playwright.config.js`), so this rule never applies while a
+     golden is captured and no golden needed updating for it. */
   .masthead__nav {
-    order: 1;
-    flex: 1 1 100%;
-    margin-left: 0;
-    gap: 12px;
+    display: none;
   }
   /* Touch targets (mobile-only — desktop keeps its compact chrome). Every
      interactive masthead control grows to >=44x44 via padding/min-height,
@@ -350,15 +369,6 @@ body {
     height: 44px;
     transform: translateY(-50%);
   }
-
-  .masthead__nav a {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 44px;
-    min-height: 44px;
-    padding: 4px 8px;
-  }
 }
 
 /* (Mobile fix pass) Below ~560px the masthead's non-negotiable content
@@ -385,7 +395,15 @@ body {
      recorded golden) — hiding it here changes zero committed text. A build
      check on the phone is a real, if occasional, want; a tap-to-reveal (or
      folding it into an about surface) is the natural follow-up if the
-     operator wants it back, not reproduced here. */
+     operator wants it back, not reproduced here.
+
+   Update: the topnav itself is now hidden at the 768px breakpoint above
+   (not just wrapped onto its own row), so the "nav owns the other [row]"
+   line is historical — the row-count math that justified dropping
+   `.masthead__refresh`/`.masthead__ver` below 560px was measured with the
+   topnav still present and wrapping, and still holds on its own terms
+   (ver+today+live alone already exceeds the 354px budget), but there is no
+   longer a nav row competing for space at this width either. */
 @media (max-width: 560px) {
   .masthead__refresh {
     display: none;
@@ -746,6 +764,10 @@ body {
 .eventlog__rec:hover {
   background: #161b28;
 }
+.eventlog__rec:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
 .eventlog__rec.sel {
   background: #1a2030;
   border-left: 2px solid var(--accent);
@@ -756,6 +778,14 @@ body {
 }
 .eventlog__ractivity {
   color: var(--fg);
+}
+/* Machine/session are secondary — same "meta" weight as `.rv__dim`, kept
+   explicitly dim even inside `.eventlog__rec.sel` (which otherwise brightens
+   inherited text color to `--fg`) so the row keeps its time/activity ·
+   machine/session hierarchy while selected. */
+.eventlog__recmachine,
+.eventlog__recsession {
+  color: var(--dim);
 }
 .eventlog__empty {
   color: var(--dim);
@@ -804,6 +834,30 @@ body {
   border-radius: 8px;
   padding: 16px;
   color: var(--dim);
+}
+
+/* "We couldn't look" (unavailable/stale), not "we looked and it's empty" —
+   `--warn`, not `--error`: a degraded presence read is a caution, not a
+   failure, matching `.fleetcov`'s own warn treatment for the same
+   distinction on the mounted FleetLens variant of this marker. */
+.fleet-strip--degraded {
+  border: 1px solid var(--warn);
+  background: rgba(240, 180, 90, 0.08);
+  border-radius: 8px;
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--warn);
+}
+
+.fleet-strip__icon {
+  flex: none;
+}
+
+.fleet-strip__count {
+  color: var(--dim);
+  font-size: 12px;
 }
 
 .fleet-strip--data .fleet-card {
@@ -900,6 +954,10 @@ body {
   border-color: var(--accent);
   color: var(--fg);
 }
+.runchip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 .runchip.on {
   border-color: var(--accent);
   color: var(--accent);
@@ -947,6 +1005,10 @@ body {
 }
 .labrunrow.flat {
   cursor: default;
+}
+.labrunrow:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 .labrunmain {
   display: flex;
@@ -1033,6 +1095,14 @@ body {
   padding: 8px;
   border: 1px dashed var(--border);
   border-radius: 6px;
+}
+.runmore:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.runmore:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 .labtaskcard {
   background: #1c1c22;
@@ -1452,6 +1522,13 @@ body {
   color: var(--fg);
   font-weight: 700;
 }
+/* "(older notes exist)" — a plain marker, not a control (the notes-history
+   modal it would open isn't ported yet; see FleetLens.tsx's own comment on
+   `hybmore` for why this deliberately doesn't look clickable). Dimmed below
+   the note text it trails so it reads as a footnote, not a second sentence. */
+.hybmore {
+  color: var(--dim);
+}
 .hybts {
   color: var(--dim);
   font-size: 10px;
@@ -1790,4 +1867,415 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   #modebadge.pb.live .pbdot { animation: none; }
+}
+
+/* ── Machine lens (Tuesday-list item 1) ─────────────────────────────────────
+   All twelve of this lens's class names existed in the TSX and matched
+   nothing in the stylesheet, so the machine tab rendered as an undifferentiated
+   wall of default-serif text. The parity harness never caught it: goldens
+   compare `innerText`, and unstyled text has exactly the same innerText as
+   styled text.
+
+   Why this doesn't reuse legacy's `.memcard`/`.memrow`/`.k`/`.v` rules: the
+   port deliberately represents this lens's content as LINE ARRAYS (one `<div>`
+   per line, see `runLines.ts`'s module doc) so `innerText` line breaks don't
+   depend on flex behavior. Legacy's rules assume structured markup that no
+   longer exists here, so the visual language is reproduced rather than the
+   selectors.
+
+   Consequence worth naming: the health region flattened genuine key/value
+   pairs ("pressure" then "RED"; "swap used" then a byte count) into sibling
+   strings. CSS cannot re-pair them — proper k/v rows need the builders to emit
+   structure, which is a follow-up, not a stylesheet change. What's here makes
+   the region legible and hierarchical; it does not make it a table. */
+
+.machine-lens {
+  font: 12px/1.6 "JetBrains Mono", monospace;
+  max-width: min(1200px, 92vw);
+}
+
+.machine-lens__hdr {
+  font: 600 13px/1.4 "JetBrains Mono", monospace;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+  margin-bottom: 12px;
+}
+
+/* Shared card treatment. Matches `.rv__group`'s panel idiom so the machine
+   tab and the record panel read as the same product. */
+.machine-lens__util,
+.machine-lens__health,
+.machine-lens__loosenode {
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+
+/* `utilityLines` returns a FIXED four-element array — [name, state, caps,
+   pill] (memoryLedgerLines.ts) — so positional selectors are safe here in a
+   way they would not be for the health region's variable-length output. */
+.machine-lens__util > div:first-child {
+  font-weight: 600;
+  color: var(--accent);
+}
+.machine-lens__util > div:nth-child(2),
+.machine-lens__util > div:nth-child(3) {
+  color: var(--dim);
+  font-size: 11px;
+}
+.machine-lens__util > div:last-child {
+  display: block;
+  width: fit-content;
+  margin-top: 6px;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  /* NO text-transform. `innerText` is layout-aware and applies it, so
+     uppercasing here rewrote `resident` to `RESIDENT` and broke the parity
+     golden. Legacy renders this pill lowercase; only `.memstate`/`.memowner`
+     are uppercased there, and this port already uppercases those STRINGS
+     directly (see memoryLedgerLines.ts). */
+  color: var(--accent-dim);
+}
+
+/* The health region's length varies by machine state, so its lines are
+   classified by CONTENT PATTERN at render time (see `Lines` in
+   MachineLens.tsx) rather than by position. */
+.machine-lens__health .mline--state {
+  /* `block` + `fit-content`, NOT `inline-block`: adjacent inline-level
+     siblings merge onto ONE `innerText` line, which collapsed the owner tag
+     and the health state into `DARKMUXGREEN`. This keeps the chip's shrink-
+     to-fit box while preserving the line break the goldens pin. */
+  display: block;
+  width: fit-content;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  margin: 2px 0;
+}
+.machine-lens__health .mline--state.is-ok { color: var(--good); border-color: var(--good); }
+.machine-lens__health .mline--state.is-warn { color: var(--warn); border-color: var(--warn); }
+.machine-lens__health .mline--state.is-bad { color: var(--bad); border-color: var(--bad); }
+
+/* `model.owner` — legacy's `.memowner`. Deliberately muted: it says which
+   namespace loaded the model, not whether anything is wrong. */
+.machine-lens__health .mline--owner {
+  /* See `.mline--state` — block + fit-content, never inline-block. */
+  display: block;
+  width: fit-content;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  margin: 2px 6px 2px 0;
+}
+
+.machine-lens .mline--label {
+  color: var(--fg);
+  font-weight: 600;
+  margin-top: 8px;
+}
+.machine-lens .mline--meta {
+  color: var(--dim);
+  font-size: 11px;
+}
+.machine-lens .mline--hint {
+  color: var(--dim);
+  font-size: 11px;
+  border-left: 2px solid var(--border);
+  padding: 2px 0 2px 8px;
+  margin: 4px 0;
+}
+.machine-lens .mline--warn {
+  color: var(--warn);
+  font-size: 11px;
+  border-left: 2px solid var(--warn);
+  padding: 2px 0 2px 8px;
+  margin: 4px 0;
+}
+
+.machine-lens__runshdr,
+.machine-lens__loosehdr {
+  font: 600 10px/1.4 "JetBrains Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin: 18px 0 8px;
+}
+
+.machine-lens__run {
+  padding: 7px 10px;
+  border-left: 3px solid var(--border);
+  background: rgba(255, 255, 255, 0.015);
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+}
+/* Each run's first line is always its `handle · model` main line
+   (runLines.ts pushes it unconditionally, before the optional meta/time
+   lines), so first-child is deterministic here too. */
+.machine-lens__run > div:first-child {
+  color: var(--fg);
+}
+.machine-lens__run > div:not(:first-child) {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.machine-lens__runsmore {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+  /* 44px touch target without inflating the painted control — the same
+     `::after` technique the chrome controls use. */
+  position: relative;
+}
+.machine-lens__runsmore::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 44px;
+  transform: translateY(-50%);
+}
+.machine-lens__runsmore:hover,
+.machine-lens__runsmore:focus-visible {
+  border-color: var(--accent);
+}
+
+.machine-lens__loosenode > div:first-child {
+  font-weight: 600;
+  color: var(--fg);
+}
+.machine-lens__loosenode > div:not(:first-child) {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+/* `.hint` is used by this lens's empty state and was likewise undefined —
+   legacy defines it at viewer.html:455. */
+.hint {
+  display: block;
+  color: var(--dim);
+  font: 11px "JetBrains Mono", monospace;
+  margin-top: 10px;
+}
+
+/* ── Drill-in packet: back-links ─────────────────────────────────────────
+   `.machine-lens__back` (the "fleet" segment of the machine page's header)
+   and `.labrun-back` (the "‹ runs" segment of the lab-run-detail's header)
+   are real `<button>` elements now (see each component's own doc for why —
+   a real interactive control, not a styled span pretending to be one).
+   Reset to read as plain inline text/links, not a boxed native button —
+   the box-model difference from a bare span would be a visual regression
+   even though it changes no `innerText`. */
+.machine-lens__back,
+.labrun-back {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+}
+.machine-lens__back:hover,
+.labrun-back:hover,
+.machine-lens__back:focus-visible,
+.labrun-back:focus-visible {
+  text-decoration: underline;
+}
+
+/* ── Lab-run detail (drill-in packet) ────────────────────────────────────
+   `LabRunDetail.tsx` — reached from a `kind==="lab"` row in the runs
+   board. Legacy's own `.labpipe`/`.labstage`/`.labcli`/`.labfeed*` classes
+   (viewer.html) assume flex-row markup this port doesn't reproduce
+   verbatim (see the machine-lens block's own note on why "line arrays,
+   not legacy's structured markup" is this port's convention) — reused
+   HERE by NAME since this is a genuinely new render surface (no existing
+   golden pins its exact markup), but restyled for the line-array shape
+   `labRun.ts` actually emits. */
+.labpipe {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 14px 0;
+}
+.labstage {
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.025);
+  overflow-wrap: anywhere;
+}
+.labstagename {
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.04em;
+}
+.labstagemeta {
+  color: var(--dim);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.labcli {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+  margin-bottom: 14px;
+  overflow-wrap: anywhere;
+}
+.labclilbl {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+}
+.labcli code {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--fg);
+}
+
+.labfeedhdr {
+  font-size: 11px;
+  color: var(--dim);
+  margin-bottom: 6px;
+}
+.labfeed {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.labfeedrow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font: 11px/1.4 "JetBrains Mono", monospace;
+}
+.labfeedrow:nth-child(odd) {
+  background: rgba(255, 255, 255, 0.02);
+}
+.labfeedts {
+  color: var(--dim);
+  flex: 0 0 auto;
+}
+.labfeedtag {
+  color: var(--accent-dim, var(--accent));
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+.labfeedtext {
+  color: var(--fg);
+}
+
+/* ── Session run (drill-in packet) ───────────────────────────────────────
+   `SessionReplay.tsx`'s populated render — `runRegions()`'s port of
+   `renderSubsystem()`. `.pill`/`.track`/`.metrics`/`.met` are reused NAMES
+   from legacy for the same reason `.labpipe` etc. are above: a genuinely
+   new render surface, restyled for this port's own line-array shape
+   rather than legacy's flex markup. */
+.session-run {
+  font: 12px/1.6 "JetBrains Mono", monospace;
+  max-width: min(1200px, 92vw);
+}
+.session-run__header {
+  font: 600 13px/1.4 "JetBrains Mono", monospace;
+  color: var(--accent);
+  margin-bottom: 10px;
+  overflow-wrap: anywhere;
+  /* NO text-transform — `pillLabel`/`role` are already uppercased in
+     `sessionRun.ts` (the "uppercase the STRING directly" discipline this
+     port uses throughout, see `lib/format.ts`'s module doc), so a CSS
+     transform here would be redundant at best and a future drift risk at
+     worst if the JS ever stops pre-uppercasing. */
+}
+.session-run__meta {
+  color: var(--dim);
+  font-weight: 400;
+}
+.session-run .pill {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  vertical-align: middle;
+}
+.session-run .pill--run { color: var(--run, var(--accent)); border-color: var(--run, var(--accent)); }
+.session-run .pill--done { color: var(--good); border-color: var(--good); }
+.session-run .pill--err { color: var(--bad); border-color: var(--bad); }
+.session-run .pill--canceled { color: var(--warn); border-color: var(--warn); }
+
+.session-run .track {
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+/* `briefLines`' first element is always the "run" label (see
+   `sessionRun.ts`'s own doc) — positionally safe the same way
+   `.machine-lens__util`'s fixed-shape array is. */
+.session-run .track:first-of-type > div:first-child {
+  font-weight: 600;
+  color: var(--fg);
+  margin-bottom: 4px;
+}
+.session-run .track > div:not(:first-child) {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.session-run .metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.session-run .met {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.session-run .mv {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.session-run .ml {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  margin-top: 3px;
+  /* Labels are already uppercased directly in `sessionRun.ts` — no
+     text-transform here, same reasoning as `.session-run__header` above. */
 }

@@ -4,6 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>darkmux</title>
+    <!-- Standalone-app shell (#1403's convention, carried over from
+         viewer.html): the daemon already serves all three routes
+         (crates/darkmux-serve/src/lib.rs — web_manifest_handler,
+         apple_touch_icon_handler, icon_192_handler); this page just never
+         pointed at them, so /next had no tab favicon and could not be
+         installed to a phone home screen (no manifest link) or added with a
+         real icon on iOS (no apple-touch-icon). -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" href="/icon-192.png" />
   </head>
   <body>
     <div id="root"></div>

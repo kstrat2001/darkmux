@@ -865,6 +865,7 @@
             demoted_by_pass2: false,
             verify: None,
             demoted_by_verify: false,
+            absence_backstop: None,
         }
     }
 
@@ -1102,7 +1103,6 @@
                 mission_id: None,
                 machine_id: None,
                 machine_uid: None,
-                orchestrator: None,
                 prev_hash: None,
                 hash: None,
                 payload: Some(serde_json::json!({"status": "started"})),
@@ -1509,6 +1509,7 @@
     }
 
     #[test]
+    #[serial_test::serial]
     fn run_funnel_case_zero_bundles_from_non_ts_diff_yields_a_degenerate_envelope_with_no_dispatch() {
         let case = Case {
             id: "c-docs".into(),
@@ -1554,6 +1555,7 @@
     /// caught before a corpus run started spamming synthetic "running
     /// dispatch" entries into the fleet-liveness surfaces.
     #[test]
+    #[serial_test::serial]
     fn run_funnel_case_through_local_jsonl_emitter_emits_no_dispatch_bookends() {
         let case = Case {
             id: "c-docs-2".into(),
@@ -1606,6 +1608,7 @@
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn run_funnel_case_external_bundler_flows_through_bundle_external_bundles_and_names_the_case_on_failure() {
         // Mirrors `bundle::external::tests::write_stub_script` — an external
         // `--bundler` that produces an EMPTY bundle set is rejected loudly
@@ -1679,7 +1682,39 @@
         }
     }
 
+    /// Captures a set of env vars and restores them on Drop. Same idiom as
+    /// `CrewDirGuard` in `darkmux-crew`'s loader tests; used here so a
+    /// failing assert can't leak a tempdir path into the rest of the run.
+    struct FunnelEnvGuard(Vec<(String, Option<String>)>);
+
+    impl FunnelEnvGuard {
+        fn capture(keys: &[&str]) -> Self {
+            Self(keys.iter().map(|k| ((*k).to_string(), std::env::var(k).ok())).collect())
+        }
+    }
+
+    impl Drop for FunnelEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized via #[serial_test::serial] on every caller.
+            unsafe {
+                for (key, prev) in &self.0 {
+                    match prev {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    // Every test below resolves `mission_config::load("review")`, which reads
+    // the process-global DARKMUX_CREW_DIR. `#[serial_test::serial]` only
+    // serializes against OTHER serial tests, so the gate test above (which
+    // points that var at a tempdir holding a deliberately phase-less review
+    // override) would otherwise race these and fail them with a dangling
+    // `adjudicate` phase id. Config-resolving tests are all serial as a set.
     #[test]
+    #[serial_test::serial]
     fn resolve_funnel_ctx_missing_roster_profile_names_available() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = write_test_registry(tmp.path(), "fast");
@@ -1696,6 +1731,7 @@
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolve_funnel_ctx_k_override_greater_than_one_is_rejected() {
         // (#1512, #1513 review M1) Draw multiplication is retired — one
         // probe role is one dispatch, always — so a `--k > 1` request can no
@@ -1719,6 +1755,7 @@
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolve_funnel_ctx_k_override_of_one_is_accepted_as_a_no_op() {
         // `--k 1` (explicit) stays legal back-compat, same as omitting it.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1738,7 +1775,56 @@
         assert!(!ctx.judge_system.is_empty(), "review-judge.md resolves via the embedded role loader");
     }
 
+    /// (#1685 QA CONSIDER 3) `--funnel` resolves `mission_config::
+    /// load("review")` — the SAME user-tier-overridable lookup `darkmux
+    /// mission launch review`/`darkmux acp` use — and runs it through a
+    /// graph built off `StepKindRegistry::with_builtins()` (which includes
+    /// `procedural.shell`). Before this fix, a user-tier
+    /// `~/.darkmux/mission-configs/review.json` override pairing a
+    /// declared `gh_verb` with a shell step would run through `--funnel`
+    /// completely unchecked — the allowlist gate only ever covered the
+    /// other two entry points. This override is deliberately graph-invalid
+    /// (no phases at all): the allowlist check has to fire BEFORE any
+    /// graph-shape validation, exactly like the other two call sites, so a
+    /// config this minimal is enough to prove the gate runs first.
     #[test]
+    #[serial_test::serial]
+    fn resolve_funnel_ctx_refuses_a_gh_verb_review_override_when_the_allowlist_gate_is_off() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        // Restored on Drop, not at the end of the happy path: an assert
+        // below that fires would otherwise leave DARKMUX_CREW_DIR pointing
+        // at a deleted tempdir for every later test in the process, turning
+        // one real failure into a cascade of unrelated ones.
+        let _env = FunnelEnvGuard::capture(&["DARKMUX_CREW_DIR", "DARKMUX_GH_ENABLED", "DARKMUX_GH_ALLOWED"]);
+        // SAFETY: serialized via #[serial_test::serial]; restored by `_env`.
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", crew_tmp.path());
+            std::env::remove_var("DARKMUX_GH_ENABLED");
+            std::env::remove_var("DARKMUX_GH_ALLOWED");
+        }
+        let mission_configs_dir = darkmux_crew::loader::mission_configs_dir();
+        fs::create_dir_all(&mission_configs_dir).unwrap();
+        fs::write(
+            mission_configs_dir.join("review.json"),
+            r#"{"id": "review", "name": "Test Review Override", "schema_version": "2.3", "gh_verb": "pr-merge"}"#,
+        )
+        .unwrap();
+
+        let profiles_tmp = tempfile::TempDir::new().unwrap();
+        let path = write_test_registry(profiles_tmp.path(), "fast");
+        let opts = funnel_ctx_opts(path, "fast", None, None);
+
+        let err = match resolve_funnel_ctx(&opts) {
+            Ok(_) => panic!("a gh_verb-declaring review override must be refused with the allowlist gate off"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pr-merge"), "names the verb: {msg}");
+        assert!(msg.contains("gh.enabled"), "points at the fix: {msg}");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn resolve_funnel_ctx_no_k_override_uses_default_probe_k_and_exec_mode_defaults_to_auto() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = write_test_registry(tmp.path(), "fast");
