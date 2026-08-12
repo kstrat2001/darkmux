@@ -11,10 +11,111 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-08-12
+
+The release where you can **talk to darkmux**. Two new front doors — an agent
+panel inside your editor, and plain-English routing onto your own commands —
+plus a rebuilt viewer and a materially harder audit chain.
+
+### Added
+
+- **radio — say what you want instead of memorizing verbs.** `darkmux radio
+  "what PRs are open"` routes free text onto exactly ONE advertised command and
+  runs it, printing the route it chose before executing so the choice is never
+  silent. Two seats do the work: a small local model classifies, a larger one
+  answers when nothing matches. A message that doesn't clearly map onto one
+  command **refuses and lists what's available** rather than guessing — a wrong
+  refusal costs you a step, a wrong route runs the wrong command. `--dry-run`
+  shows the route without executing. (#1698)
+- **darkmux as an ACP agent — the Zed agent panel.** Your commands appear as
+  slash commands in the panel, run as real missions, and stream back into the
+  thread. Includes an operator sign-off gate on steps (fail-closed by default),
+  cancellation, session pruning, and an idle exit. (#1388, #1684)
+- **PR-flow panel verbs.** Author `/pr-list`, `/pr-view`, `/pr-comments-list`,
+  `/pr-comment-resolve`, `/pr-approve`, `/pr-merge`, `/pr-ship` as ordinary
+  mission configs: a per-verb `gh` allowlist (`gh.enabled` + `gh.allowed`, both
+  fail-closed), a sign-off dialog carrying real CI and review facts, and a flow
+  record for every executed verb. darkmux holds no GitHub credential — every
+  verb shells out to your own `gh`. (#1685)
+- **The viewer, rebuilt in React, behind `/next`.** Every lens ported with a
+  parity harness as its executable spec; the legacy viewer at `/` is untouched.
+  Adds a drill-in level: machine detail (local and remote), lab-run detail, and
+  a per-session run view. Plus a staleness marker, so an empty panel is never
+  silently empty. (#1665)
+- **`flow integrity-check --strict`** — exit 3 when a file could not be
+  content-verified at all, kept distinct from exit 2 (a real chain break).
+  "Verified" and "could not verify" are different claims, and a cron keyed on
+  the exit code can now tell them apart. (#1775)
+- **A second reference bundler plugin** (`darkmux-bundler-edge`) alongside the
+  `--bundler` escape hatch, for reviewing languages the built-in TypeScript
+  bundler doesn't read. (#1686, #1757)
+
+### Fixed
+
+- **The review bundler silently dropped code from its excerpts.** Changed lines
+  with no enclosing function were skipped entirely, so review seats reasoned
+  about a window that was missing the code under review — and reported honestly
+  about what they were shown while the pipeline promoted it into claims about
+  the file. Also fixes a second, hidden size cap that stopped large functions
+  from ever being located. (#1751–#1756)
+- **The audit chain now hashes the stored bytes** rather than a re-serialization
+  of a parsed record, closing a confirmed bypass where a record carrying an
+  unrecognized enum value skipped content verification entirely and its other
+  fields could be rewritten while the chain still validated. (#1768, #1769)
+- Mission board is recent-first by default. (#1713, #1717 for radio's grounding)
+- Viewer mission/run aggregations read the whole fleet stream, not only the
+  local machine. (#1705)
+- Accessibility and styling passes on `/next`, including keyboard-operable
+  controls and a real identity (favicon, touch icon, manifest).
+
+### Changed — read before upgrading
+
+Both of these degrade gracefully: nothing errors, and no action is required.
+
+- **The audit hash format changed** (`prefix-blake3-v1`). Files written by
+  2.5.x and earlier are still READ, and reported honestly as legacy — but their
+  content is not re-verified, because recomputing the old format would repeat
+  the lossy round trip that made the bypass possible. `--strict` (above) is how
+  you make that visible to automation. (#1772)
+- **The orchestrator provenance field is removed** — the `DARKMUX_ORCHESTRATOR`
+  env var, the `orchestrator` config field, and the flow-record field. It was
+  stamped from machine-scoped config to describe an invocation-scoped fact, so
+  every record on a machine carried the same value regardless of what actually
+  drove it, and nothing read it. A stale export is now a no-op; an old config
+  still loads. (#1758)
+
+### Documentation
+
+- README rewritten as a landing page (8,716 words → 978, nothing deleted).
+- A full guide page for radio, and one for the PR-flow verbs.
+- **Every audit and privacy claim a user actually meets was re-checked against
+  the code and corrected.** darkmux describes what its mechanisms do and names
+  their known gaps; it makes no claim about anyone's compliance with any
+  regulatory framework. See `SECURITY.md` for the audit chain's limits, stated
+  plainly.
+- The MIT disclaimer now names both copyright holders, so it covers the
+  distributor as well as the author.
+
+
 ### Added
 
 - **`darkmux-bundler-edge`** — the second reference `--bundler` plugin: zero-dependency Python, Edge.js template spans + differential facts (interpolations, directives, class-attribute churn) + cross-template manifests, proving the frozen `--bundler` contract (#1319) at N=2 — a second language, for a template DSL rather than a systems language (#1686).
 - **PR-flow panel-verb machinery** (#1685): a per-verb `gh` allowlist (`config.gh.{enabled,allowed}`, `darkmux doctor` provenance, `MissionConfig.gh_verb`), a flow-record audit entry (`action: "gh.verb.executed"`) per executed verb, and `--param args=<value>` now delivers into a config's `reads: ["__panel_args__"]` task from a direct `darkmux mission launch <id>` the same way it already did from the ACP panel (previously CLI-only launch hard-failed `interpret` for any config using that convention). GitHub never enters darkmux core: `pr-list`/`pr-info`/`pr-approve`/`pr-merge` are operator-authored example `procedural.shell` configs documented in the new [PR-flow guide](docs/guide/pr-flow.html), not built-ins.
+
+## [2.5.1] - 2026-08-11
+
+Hotfix off the v2.5.0 tag. The review bundler was silently dropping code from
+the excerpts it hands to review seats, so reviews were reasoning about a window
+that omitted the very lines under review.
+
+### Fixed
+
+- **Top-level changed lines reached a seat instead of vanishing.** A changed
+  line with no enclosing function was skipped entirely when building the
+  excerpt, so imports, constants, type aliases and module-level statements
+  never reached a reviewer. (#1751–#1756)
+- Unchanged context lines are no longer bundled as though they were top-level
+  code, which had the inverse effect of padding excerpts with untouched lines.
 
 ## [2.5.0] - 2026-08-06
 
@@ -299,6 +400,8 @@ schema changes (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`).
   "ready" with no time reference at all, indistinguishable from a fleet that
   had never dispatched.
 
+[2.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.6.0
+[2.5.1]: https://github.com/kstrat2001/darkmux/releases/tag/v2.5.1
 [2.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.5.0
 [2.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.4.0
 [2.3.1]: https://github.com/kstrat2001/darkmux/releases/tag/v2.3.1
