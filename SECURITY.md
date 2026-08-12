@@ -97,20 +97,52 @@ frame:
   with any regulatory framework. darkmux makes no compliance claim: producing
   evidence and being compliant are different things, and only the second one
   needs a lawyer.
-- **Known gaps in the audit chain, stated plainly.** As of 2026-08-11 the
-  chain does NOT detect every edit — tracked at
-  [darkmux#1769](https://github.com/kstrat2001/darkmux/issues/1769), a
-  confirmed bypass where a record carrying an unrecognized enum value skips
-  content verification entirely, so its other fields can be rewritten and
-  the chain still validates. Two further limits are structural rather than
-  bugs: whole-file deletion is undetectable, because each per-day file seeds
-  its own chain and
-  nothing records which files should exist; and the chain root is
-  **un-anchored**, computed and stored locally, so an attacker with write
-  access who rewrites a file wholesale produces one that validates. Treat this
-  as a supporting detective control composed with disk encryption and
-  filesystem permissions, not as a standalone guarantee against a local
-  attacker.
+- **Known gaps in the audit chain, stated plainly.** The
+  [#1769](https://github.com/kstrat2001/darkmux/issues/1769) bypass — where a
+  record carrying an unrecognized enum value skipped content verification
+  entirely, so its other fields could be rewritten while the chain still
+  validated — is **closed** as of 2026-08-11
+  ([#1772](https://github.com/kstrat2001/darkmux/pull/1772)): the chain now
+  hashes the stored bytes rather than a re-serialization of a parsed struct,
+  so there is no parse step left to skip.
+
+  What remains is structural rather than a bug.
+
+  **Truncating the tail of a file is undetectable, and it is the least
+  conspicuous of the three** — it leaves a present, plausible-looking file
+  rather than a missing day. Delete the last record line (or the last k of them)
+  and the walk sees a shorter but fully consistent chain: every `prev_hash`
+  links, every byte-hash matches, the file reports valid — including under
+  `--strict`. Nothing records how many records a file should contain or
+  hashes its tail. The next append then extends the chain from the truncated
+  end, so the deletion is permanent. Note this is *not* addressed by anchoring
+  the chain root: a root anchor proves where the chain started, not where it
+  should have ended. A tail anchor or an external high-water mark would be
+  needed.
+
+  **Whole-file deletion is undetectable**, because each per-day file seeds its
+  own chain and nothing records which files should exist.
+
+  And the chain root is **un-anchored** — computed and stored locally — so an
+  attacker with write access who rewrites a file wholesale (fresh header,
+  recomputed hashes, relinked `prev_hash`) produces one that validates.
+
+  All three ceilings are inherent to an anchorless local chain. What the walk
+  does catch: in-place edits, reordering, insertion, and **any deletion that is
+  not a pure suffix** — removing the first record, or a run from the middle,
+  breaks the following record's `prev_hash` linkage. Only records removed from
+  the very end leave nothing behind to disagree with.
+
+  A file that cannot be content-verified at all — a pre-2.6.0 struct-hash
+  file, or one whose `hash_format` header marker has been removed — is
+  reported honestly but exits 0 by default. Pass `--strict` to
+  `darkmux flow integrity-check` to make that exit 3
+  ([#1775](https://github.com/kstrat2001/darkmux/issues/1775)), so an
+  unattended consumer can distinguish "verified" from "never checked".
+
+  Treat all of this as a supporting detective control composed with disk
+  encryption and filesystem permissions, not as a standalone guarantee against
+  a local attacker.
 - **Model behavior is not policed.** darkmux faithfully executes what the model
   produces. Review agent output before it touches anything you care about.
 
