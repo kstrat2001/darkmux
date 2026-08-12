@@ -25,20 +25,93 @@
 //!   only signal available without teaching the review pipeline a
 //!   structured progress channel, which is out of scope for a spike whose
 //!   job is "does ACP+Zed work at all".
-//! - Session state (the cwd per ACP session) lives in an in-memory map that
-//!   is never pruned. A long-lived `darkmux acp` process leaks one entry
-//!   per `session/new` — fine for a spike where the process is one Zed tab.
-//! - No cancellation support. `session/cancel` is unhandled — a real
-//!   implementation would wire up `RequestCancellation` so the user's Zed
-//!   "stop" button actually stops the subprocess. (#1684 Packet 2 — QA
-//!   MUST-FIX: the `session/prompt` handler used to await the whole
-//!   command in place, blocking the connection's dispatch loop for the
-//!   duration; it now runs on a `cx.spawn`'d task instead, which this
-//!   packet needed anyway so a gated command's `session/request_permission`
-//!   round trip doesn't deadlock the very loop that would deliver its
-//!   reply. The loop no longer blocks, but `session/cancel` still isn't
-//!   wired to actually tear down the spawned task — that's the cancellation
-//!   gap this bullet still names.)
+//! - (#1684 remainder — RESOLVED) Session state (the cwd per ACP session)
+//!   used to live in an in-memory map that was never pruned. `session/close`
+//!   is now advertised (`SessionCapabilities.close`) and handled: it aborts
+//!   any in-flight command for the session (the SAME [`InFlight`]
+//!   abort-handle registry `session/cancel` drives, below) and removes the
+//!   session's `sessions` entry — that request is the only signal ACP gives
+//!   an agent that a Zed thread is genuinely gone (there is no
+//!   disconnect/drop notification at the protocol level). A client that
+//!   never sends it (or predates the capability) still gets the
+//!   process-level backstop already in place: `idle_self_exit_loop` (#1698
+//!   Packet B2 scope G2) exits the whole process — map included — once
+//!   nothing has been in flight for `acp_idle_exit_minutes`.
+//! - (#1684 remainder — RESOLVED) Cancellation is wired. `session/cancel`
+//!   (`CancelNotification`) looks up the session's in-flight command in the
+//!   [`InFlight`] registry and calls `AbortHandle::abort()` on it. The
+//!   command execution itself now runs as its OWN `tokio::spawn`'d task
+//!   (registered in that map for the duration of `session/prompt`'s
+//!   `cx.spawn`'d closure from Packet 2) rather than directly inline in that
+//!   closure — `cx.spawn` alone never hands back an abort handle, so
+//!   cancellation needed a genuinely abortable task underneath it. Because
+//!   [`run_review`]'s and [`run_launch_command`]'s subprocess `Command`s set
+//!   `kill_on_drop(true)`, aborting the task — which drops the `Child`
+//!   mid-`.wait()`/`.output()` — sends the OS process a real kill rather
+//!   than orphaning it (the exact defect this packet's own audit named: an
+//!   aborted ACP-side future used to leave the `darkmux mission launch`
+//!   child running with nothing left to stop it). On cancellation the
+//!   `session/prompt` response now carries `StopReason::Cancelled`, per
+//!   spec.
+//!
+//!   **"No OS subprocess to leak" is true ONLY for the no-slash channel's
+//!   router/answerer dispatch** — that path is a plain synchronous model
+//!   call (`crate::radio::dispatch_router_call` / the answering seat), run
+//!   on `tokio::task::spawn_blocking` because it's blocking, not because it
+//!   shells out; there is genuinely no `Child` anywhere on that path. It is
+//!   FALSE for [`run_ephemeral_command`]: `acp_panel::run_ephemeral`
+//!   executes `procedural.shell` steps via
+//!   `std::process::Command::output()` — a real OS subprocess, spawned on
+//!   that SAME `spawn_blocking` thread, with no `kill_on_drop` and nothing
+//!   holding a `Child` handle once that thread starts running (a prior
+//!   version of this note claimed the ephemeral path had no subprocess to
+//!   leak either — corrected, #1777 merge gate). Concretely: an operator
+//!   runs `/pr-merge`, approves the sign-off dialog, then hits Zed's stop
+//!   button while `gh pr merge` is running — aborting the outer task
+//!   resolves the ACP wire with `StopReason::Cancelled` right away, but
+//!   `spawn_blocking`'s closure cannot be preempted mid-call, so the merge
+//!   keeps running to completion on its own thread, unkillable from here,
+//!   with GitHub's own state as the only record it happened.
+//!
+//!   What IS fixed (#1777 merge gate, MUST FIX 1 tier 2): the closure's
+//!   eventual result is no longer silently thrown away just because the
+//!   task awaiting it got aborted. `run_ephemeral_command` wraps its
+//!   `spawn_blocking` `JoinHandle` in [`EphemeralJoinGuard`], which — the
+//!   instant the guard itself gets dropped WITHOUT `join` having completed
+//!   (exactly the abort case) — hands the still-live handle to a fresh,
+//!   UNTRACKED `tokio::spawn` that `session/cancel`/`session/close` can
+//!   never reach (it's never registered in [`InFlight`]), so it survives
+//!   the very abort that killed its parent. That detached task posts a
+//!   `"completed after cancellation: ..."` chunk once the blocking work
+//!   actually finishes, so a verb that DID execute (like the merge above)
+//!   still leaves evidence in the transcript even though the cancel could
+//!   not stop it. Genuinely making `procedural.shell` killable (running it
+//!   via `tokio::process` with `kill_on_drop` instead of
+//!   `std::process::Command::output()`) is the real fix, but it needs
+//!   `StepKind::run` — the trait every builtin step kind implements, not
+//!   just this one — to grow an async or cancellation-aware shape, which
+//!   ripples well past this file; tracked as follow-up rather than forced
+//!   into this packet.
+//!
+//!   Two more honestly-named gaps in the cancellation story, both INHERENT
+//!   to killing a process rather than bugs in how it's wired (#1777 merge
+//!   gate, CONSIDER items). (1) A `session/cancel` that races the outer
+//!   `cx.spawn`'d task's very first poll — arriving before
+//!   [`run_cancellable`] has inserted its own abort handle into
+//!   [`InFlight`] — used to be a silently-lost no-op that let the command
+//!   run to completion reporting `EndTurn` as if nothing happened;
+//!   `InFlight` now stores a `Cancelled` tombstone (`InFlightSlot`) in that
+//!   window, so the command aborts itself the instant it registers instead
+//!   of racing ahead uncancelled. (2) A `kill_on_drop`'d SIGKILL has no
+//!   finalize step — a cancelled `run_review`/`run_launch_command` mission
+//!   is left permanently `Active` (`darkmux mission status` will flag it;
+//!   a manual `mission abort` reconciles it), and the temp diff file
+//!   `run_review` writes is never cleaned up (`tokio::fs::remove_file`
+//!   sits AFTER `child.wait().await`, a line a cancel never reaches).
+//!   Neither is fixable by anything short of a completion-independent
+//!   cleanup path; named here so a stop-button user isn't surprised by
+//!   drift accumulating in `mission status` or stray files under the
+//!   workspace.
 //! - The `case_id` passed to the review mission is derived from the diff's
 //!   content hash + the cwd's directory name (see [`derive_case_id`]) —
 //!   deterministic (no `Date`/random per the task brief) but not
@@ -51,6 +124,31 @@
 //!   `~/.local/bin` because Zed's GUI env may not carry it on PATH). A
 //!   mixed ts+edge diff takes the TS path and skips the templates; real
 //!   bundler composition/config is follow-up work, not spike work.
+//! - (#1684 remainder — RESOLVED) `run_review`'s stderr-draining loop used
+//!   to forward every non-JSON, non-blank line straight into the chat as an
+//!   agent chunk — including darkmux-flow's own sink-init diagnostics
+//!   (`crates/darkmux-flow/src/lib.rs::build_default_sink`), which print
+//!   UNCONDITIONALLY on stderr the first time any process touches the flow
+//!   crate, i.e. every `mission launch` subprocess this file spawns.
+//!   Observed live leaking into the Zed panel ("flow: Redis sink enabled —
+//!   ... composed via TeeSink"). [`forwardable_chunk_text`] now drops any
+//!   line starting with the flow crate's own `"flow: "` prefix — narrowly,
+//!   not a broad heuristic — before it ever reaches the chat.
+//!
+//!   **Filter the chat, never the record (#1777 merge gate, MUST FIX 2).**
+//!   The same `"flow: "` prefix is also how the flow crate spells its own
+//!   DEGRADED-mode warnings — e.g. `"flow: Redis sink construction failed
+//!   (...); continuing without it."` when a Redis password has rotted
+//!   (`build_default_sink`, `crates/darkmux-flow/src/lib.rs`). A blanket
+//!   drop made that warning invisible everywhere: every `/review`
+//!   subprocess prints it, the filter ate it, and nothing on this
+//!   process's own stderr said so either — a dark fleet stream with no
+//!   diagnostic anywhere. `forwardable_chunk_text` now re-emits every line
+//!   it drops (chunk-suppressed or not) as `[darkmux-acp] subprocess:
+//!   <line>` on this process's OWN stderr (Zed surfaces that in its logs
+//!   panel, per this file's own "why stdout is off-limits" convention
+//!   above), so a degraded sink is never silently invisible — it's just
+//!   not narrated in the chat transcript.
 //!
 //! ## Why stdout is off-limits
 //!
@@ -69,13 +167,13 @@
 //! logs panel.
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, ContentBlock,
-    ContentChunk, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigOptionValue, SessionConfigSelectOption, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    AgentCapabilities, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, CancelNotification,
+    CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
+    PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptRequest, PromptResponse,
+    RequestPermissionOutcome, RequestPermissionRequest, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
     StopReason, ToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
     ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
 };
@@ -120,6 +218,35 @@ struct SessionState {
 }
 
 type Sessions = Arc<Mutex<HashMap<SessionId, SessionState>>>;
+
+/// (#1684 remainder) The abort-handle registry `session/cancel` and
+/// `session/close` both drive: keyed by session id, holding an
+/// [`InFlightSlot`] for whatever command that session currently has
+/// running (inserted by [`run_cancellable`] for the duration of one
+/// `session/prompt`, removed when that command finishes on its own). A
+/// session with nothing in flight simply has no entry — looking one up is
+/// always a `remove`-and-check, never a panic on absence.
+type InFlight = Arc<Mutex<HashMap<SessionId, InFlightSlot>>>;
+
+/// One session's entry in [`InFlight`] — either a genuinely running
+/// command's abort handle, or a `Cancelled` TOMBSTONE (#1777 merge gate,
+/// CONSIDER — the "lost-cancel race").
+///
+/// The race: `PromptRequest`'s handler returns as soon as `cx.spawn`
+/// SCHEDULES its task, not once that task actually starts running. On the
+/// multi-thread runtime, `session/cancel`'s notification can therefore be
+/// processed — and find `InFlight` empty for that session, since
+/// [`run_cancellable`] hasn't reached its own insert yet — before the
+/// command's first poll ever happens. Before this tombstone existed, that
+/// window turned a genuine cancel into a silently logged no-op, and the
+/// mission ran to completion reporting `EndTurn` as if nothing had been
+/// asked of it. Recording `Cancelled` in that same window means
+/// `run_cancellable`'s own insert attempt finds it and aborts immediately
+/// instead of registering a handle nobody will ever call `abort()` on.
+enum InFlightSlot {
+    Running(tokio::task::AbortHandle),
+    Cancelled,
+}
 
 /// `session/set_config_option`'s `config_id` for the "radio host" picker
 /// (#1698 Packet B2, scope F) — selects the answering seat's profile.
@@ -360,6 +487,12 @@ async fn serve(
     let in_flight = Arc::new(AtomicI64::new(0));
     tokio::spawn(idle_self_exit_loop(last_activity_unix.clone(), in_flight.clone()));
 
+    // (#1684 remainder) The abort-handle registry `session/cancel` and
+    // `session/close` both drive — see [`InFlight`]'s own doc. Distinct from
+    // `in_flight` above: that's a bare COUNT (for the idle self-exit loop);
+    // this is a per-session HANDLE (for actually tearing a command down).
+    let in_flight_tasks: InFlight = Arc::new(Mutex::new(HashMap::new()));
+
     let sessions_for_new = sessions.clone();
     let ordinal_for_new = next_session_ordinal.clone();
     let sessions_for_prompt = sessions.clone();
@@ -367,11 +500,15 @@ async fn serve(
     let seat_for_prompt = seat.clone();
     let sessions_for_load = sessions.clone();
     let sessions_for_config = sessions.clone();
+    let sessions_for_close = sessions.clone();
     let activity_for_new = last_activity_unix.clone();
     let activity_for_prompt = last_activity_unix.clone();
     let activity_for_load = last_activity_unix.clone();
     let activity_for_config = last_activity_unix.clone();
     let in_flight_for_prompt = in_flight.clone();
+    let in_flight_tasks_for_prompt = in_flight_tasks.clone();
+    let in_flight_tasks_for_cancel = in_flight_tasks.clone();
+    let in_flight_tasks_for_close = in_flight_tasks.clone();
 
     Agent
         .builder()
@@ -393,11 +530,20 @@ async fn serve(
                 responder.respond(
                     InitializeResponse::new(initialize.protocol_version)
                         .agent_capabilities(
-                            // (#1698 Packet B2, scope G1) Advertise minimal
-                            // `session/load` support — accept a resume,
-                            // restore cwd, replay nothing (see the
-                            // `LoadSessionRequest` handler below).
-                            AgentCapabilities::new().load_session(true),
+                            AgentCapabilities::new()
+                                // (#1698 Packet B2, scope G1) Advertise
+                                // minimal `session/load` support — accept a
+                                // resume, restore cwd, replay nothing (see
+                                // the `LoadSessionRequest` handler below).
+                                .load_session(true)
+                                // (#1684 remainder — session hygiene)
+                                // Advertise `session/close` — see the
+                                // `CloseSessionRequest` handler below and
+                                // the module doc's own note on why this is
+                                // the map-pruning mechanism.
+                                .session_capabilities(
+                                    SessionCapabilities::new().close(SessionCloseCapabilities::new()),
+                                ),
                         ),
                 )
             },
@@ -552,6 +698,7 @@ async fn serve(
                     let cx_task = cx.clone();
                     let sessions_for_task = sessions_for_prompt.clone();
                     let in_flight_for_task = in_flight_for_prompt.clone();
+                    let in_flight_tasks_for_task = in_flight_tasks_for_prompt.clone();
                     let activity_for_task = activity_for_prompt.clone();
                     return cx.spawn(async move {
                         // (#1698 Packet B2, scope G2) Incremented HERE, as
@@ -566,15 +713,35 @@ async fn serve(
                         // here down may panic or propagate a hard error across
                         // the protocol boundary. A crashed-looking agent in
                         // Zed has no explanation; a chunk of error text does.
-                        let run_result =
-                            execute_route_plan(&session_id, plan, &args, &cwd, &cx_task, &sessions_for_task).await;
-                        if let Err(err) = run_result {
-                            eprintln!("[darkmux-acp] session/prompt: command failed: {err:#}");
-                            let _ = cx_task.send_notification(agent_chunk(
-                                &session_id,
-                                format!("darkmux acp: command failed: {err:#}"),
-                            ));
-                        }
+                        //
+                        // (#1684 remainder — cancellation) `run_cancellable`
+                        // runs the actual command as its own `tokio::spawn`'d
+                        // task, registered in `in_flight_tasks` under this
+                        // session id for the duration — the seam
+                        // `session/cancel`/`session/close` abort into. See
+                        // `InFlight`'s and `run_cancellable`'s own docs.
+                        let work_session_id = session_id.clone();
+                        let work_cx = cx_task.clone();
+                        let work_sessions = sessions_for_task.clone();
+                        let work_cwd = cwd.clone();
+                        let work_args = args.clone();
+                        let stop_reason = run_cancellable(
+                            &in_flight_tasks_for_task,
+                            session_id.clone(),
+                            cx_task.clone(),
+                            async move {
+                                execute_route_plan(
+                                    &work_session_id,
+                                    plan,
+                                    &work_args,
+                                    &work_cwd,
+                                    &work_cx,
+                                    &work_sessions,
+                                )
+                                .await
+                            },
+                        )
+                        .await;
                         // Stamped on COMPLETION, not just on receipt (the
                         // top of the handler) — otherwise a long-running
                         // command (a multi-minute `/review`) drops
@@ -586,7 +753,7 @@ async fn serve(
                         activity_for_task.store(now_unix(), Ordering::SeqCst);
                         in_flight_for_task.fetch_sub(1, Ordering::SeqCst);
 
-                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        responder.respond(PromptResponse::new(stop_reason))
                     });
                 }
 
@@ -605,34 +772,43 @@ async fn serve(
                 let seat_for_task = seat_for_prompt.clone();
                 let sessions_for_task = sessions_for_prompt.clone();
                 let in_flight_for_task = in_flight_for_prompt.clone();
+                let in_flight_tasks_for_task = in_flight_tasks_for_prompt.clone();
                 let activity_for_task = activity_for_prompt.clone();
                 cx.spawn(async move {
                     // (#1698 Packet B2, scope G2) See the slash-path arm's
                     // own comment on why this increments HERE, inside the
                     // future, rather than before `cx.spawn`.
                     in_flight_for_task.fetch_add(1, Ordering::SeqCst);
-                    let run_result = run_no_slash_route(
-                        &session_id,
-                        &text,
-                        &cwd,
-                        &cx_task,
-                        router_for_task,
-                        seat_for_task,
-                        &sessions_for_task,
+                    // (#1684 remainder — cancellation) Same `run_cancellable`
+                    // wrapping as the slash path above — see its own doc.
+                    let work_session_id = session_id.clone();
+                    let work_cx = cx_task.clone();
+                    let work_sessions = sessions_for_task.clone();
+                    let work_cwd = cwd.clone();
+                    let work_text = text.clone();
+                    let stop_reason = run_cancellable(
+                        &in_flight_tasks_for_task,
+                        session_id.clone(),
+                        cx_task.clone(),
+                        async move {
+                            run_no_slash_route(
+                                &work_session_id,
+                                &work_text,
+                                &work_cwd,
+                                &work_cx,
+                                router_for_task,
+                                seat_for_task,
+                                &work_sessions,
+                            )
+                            .await
+                        },
                     )
                     .await;
-                    if let Err(err) = run_result {
-                        eprintln!("[darkmux-acp] session/prompt: no-slash route failed: {err:#}");
-                        let _ = cx_task.send_notification(agent_chunk(
-                            &session_id,
-                            format!("darkmux acp: command failed: {err:#}"),
-                        ));
-                    }
                     // Stamped on completion — see the slash-path arm's own
                     // comment on why receipt-only stamping is wrong.
                     activity_for_task.store(now_unix(), Ordering::SeqCst);
                     in_flight_for_task.fetch_sub(1, Ordering::SeqCst);
-                    responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    responder.respond(PromptResponse::new(stop_reason))
                 })
             },
             agent_client_protocol::on_receive_request!(),
@@ -754,10 +930,193 @@ async fn serve(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // (#1684 remainder — cancellation) Zed's stop button. Looks up the
+        // session's in-flight command in `InFlight` and aborts it — see
+        // `InFlight`'s own doc, `run_cancellable`, and the module doc's
+        // "Cancellation is wired" note for the full mechanism, including why
+        // aborting the task actually kills the OS subprocess rather than
+        // orphaning it. A cancel for a session with nothing in flight (the
+        // command already finished, or the id is unknown) records a
+        // `Cancelled` tombstone instead of a bare no-op (#1777 merge gate,
+        // CONSIDER — the lost-cancel race; see `InFlightSlot`'s own doc) —
+        // `session/cancel` stays fire-and-forget by protocol design either
+        // way, so there is still no response to fail even if it were an
+        // error.
+        .on_receive_notification(
+            async move |cancel: CancelNotification, _cx| {
+                let mut guard =
+                    in_flight_tasks_for_cancel.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
+                match guard.remove(&cancel.session_id) {
+                    Some(InFlightSlot::Running(handle)) => {
+                        eprintln!(
+                            "[darkmux-acp] session/cancel: {} — aborting the in-flight command",
+                            cancel.session_id
+                        );
+                        drop(guard);
+                        handle.abort();
+                    }
+                    Some(InFlightSlot::Cancelled) => {
+                        // Already tombstoned by an earlier cancel that
+                        // ALSO raced ahead of the command's own
+                        // registration — restore the tombstone rather
+                        // than losing it; still a no-op notification-wise.
+                        guard.insert(cancel.session_id.clone(), InFlightSlot::Cancelled);
+                        eprintln!(
+                            "[darkmux-acp] session/cancel: {} — already tombstoned by an earlier \
+                             cancel",
+                            cancel.session_id
+                        );
+                    }
+                    None => {
+                        // (#1777 merge gate — lost-cancel race) Nothing
+                        // registered YET, which is ambiguous on its own:
+                        // either the command already finished (a genuine
+                        // no-op) or it hasn't reached `run_cancellable`'s
+                        // own insert yet (the race). Recording a tombstone
+                        // costs nothing in the first case (nothing will
+                        // ever consume it) and closes the race in the
+                        // second.
+                        guard.insert(cancel.session_id.clone(), InFlightSlot::Cancelled);
+                        eprintln!(
+                            "[darkmux-acp] session/cancel: {} — nothing in flight yet; recording a \
+                             cancel tombstone in case the command hasn't registered itself yet",
+                            cancel.session_id
+                        );
+                    }
+                }
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        // (#1684 remainder — session hygiene) `session/close`: the map-
+        // pruning mechanism named in the module doc's own "never pruned"
+        // finding. Per spec, close implies cancel first — reuses the SAME
+        // `InFlight` registry `session/cancel` drives, above — then removes
+        // the session's `sessions` entry so a later prompt on the same id
+        // behaves exactly like an id this process never minted (proven at
+        // the wire level by this file's own tests).
+        .on_receive_request(
+            async move |request: CloseSessionRequest, responder, _cx| {
+                if let Some(InFlightSlot::Running(handle)) = in_flight_tasks_for_close
+                    .lock()
+                    .expect("darkmux acp: in-flight tasks mutex poisoned")
+                    .remove(&request.session_id)
+                {
+                    handle.abort();
+                }
+                let existed = sessions_for_close
+                    .lock()
+                    .expect("darkmux acp: sessions mutex poisoned")
+                    .remove(&request.session_id)
+                    .is_some();
+                eprintln!(
+                    "[darkmux-acp] session/close: {} ({})",
+                    request.session_id,
+                    if existed { "pruned" } else { "already unknown" }
+                );
+                responder.respond(CloseSessionResponse::new())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .connect_to(transport)
         .await?;
 
     Ok(())
+}
+
+/// (#1684 remainder — cancellation) Run `work` as a genuinely abortable
+/// `tokio::spawn`'d task, registered in `in_flight` under `session_id` for
+/// the duration — the seam `session/cancel`/`session/close` abort into (see
+/// [`InFlight`]'s own doc). `cx.spawn` (what `serve()`'s `PromptRequest`
+/// handler already runs the whole command inside, per Packet 2's own
+/// deadlock-avoidance doc) never hands back anything abortable, so
+/// cancellation needs a genuinely separate `tokio::spawn`'d task underneath
+/// it — this function is that task, plus the bookkeeping.
+///
+/// Translates the join outcome into the `StopReason` the caller's
+/// `PromptResponse` should carry: `StopReason::Cancelled` when
+/// `session/cancel` aborted the task before it finished (sending its own
+/// "cancelled" chunk, since the caller's `work` never got the chance to
+/// render anything of its own), `StopReason::EndTurn` for a normal
+/// completion (whether `work` returned `Ok` or `Err` — an `Err` still ends
+/// the turn, it just also renders a failure chunk first) or the rare case
+/// of `work` itself panicking (also rendered as a chunk, never silently
+/// swallowed — see the caller's own "nothing may panic across the protocol
+/// boundary" robustness rule).
+///
+/// Entry removal happens unconditionally once `work` settles (success,
+/// error, or abort) — `session/cancel`/`session/close` already remove the
+/// entry themselves on the abort path, so this is a harmless no-op remove
+/// in that case, not a double-abort risk (removing an absent key is inert).
+async fn run_cancellable(
+    in_flight: &InFlight,
+    session_id: SessionId,
+    cx: ConnectionTo<Client>,
+    work: impl std::future::Future<Output = Result<()>> + Send + 'static,
+) -> StopReason {
+    let handle = tokio::spawn(work);
+    // (#1777 merge gate — lost-cancel race) Check for a tombstone at the
+    // EXACT point this would otherwise insert its own handle — see
+    // `register_or_consume_cancel_tombstone`'s own doc.
+    if register_or_consume_cancel_tombstone(in_flight, &session_id, handle.abort_handle()) {
+        handle.abort();
+    }
+    let outcome = handle.await;
+    in_flight
+        .lock()
+        .expect("darkmux acp: in-flight tasks mutex poisoned")
+        .remove(&session_id);
+
+    match outcome {
+        Ok(Ok(())) => StopReason::EndTurn,
+        Ok(Err(err)) => {
+            eprintln!("[darkmux-acp] session/prompt: command failed: {err:#}");
+            let _ = cx.send_notification(agent_chunk(&session_id, format!("darkmux acp: command failed: {err:#}")));
+            StopReason::EndTurn
+        }
+        Err(join_err) if join_err.is_cancelled() => {
+            eprintln!("[darkmux-acp] session/prompt: {session_id} cancelled via session/cancel");
+            let _ = cx.send_notification(agent_chunk(&session_id, "darkmux: cancelled.".to_string()));
+            StopReason::Cancelled
+        }
+        Err(join_err) => {
+            eprintln!("[darkmux-acp] session/prompt: command task panicked: {join_err}");
+            let _ = cx.send_notification(agent_chunk(
+                &session_id,
+                format!("darkmux acp: internal error — the command task panicked: {join_err}"),
+            ));
+            StopReason::EndTurn
+        }
+    }
+}
+
+/// (#1777 merge gate — lost-cancel race) The tombstone check/insert
+/// [`run_cancellable`] performs at the exact point it would otherwise
+/// register `handle` as this session's live running command — factored out
+/// as a pure function of `in_flight` (no `cx`/`SessionId`-wire dependency)
+/// so the race fix is unit-testable without spinning up a full ACP
+/// connection. Returns `true` when a `Cancelled` tombstone was ALREADY
+/// there (meaning: `session/cancel` raced ahead of this registration —
+/// consume the tombstone and report "already cancelled, abort `handle`
+/// immediately"), `false` when this call successfully registered `handle`
+/// as the session's new [`InFlightSlot::Running`] entry (the ordinary
+/// case).
+fn register_or_consume_cancel_tombstone(
+    in_flight: &InFlight,
+    session_id: &SessionId,
+    handle: tokio::task::AbortHandle,
+) -> bool {
+    let mut guard = in_flight.lock().expect("darkmux acp: in-flight tasks mutex poisoned");
+    match guard.get(session_id) {
+        Some(InFlightSlot::Cancelled) => {
+            guard.remove(session_id);
+            true
+        }
+        _ => {
+            guard.insert(session_id.clone(), InFlightSlot::Running(handle));
+            false
+        }
+    }
 }
 
 /// The one message both cwd-lookup guards in `serve()`'s `PromptRequest`
@@ -1081,6 +1440,12 @@ async fn run_review(
         .stdin(ProcStdio::null())
         .stdout(ProcStdio::piped())
         .stderr(ProcStdio::piped())
+        // (#1684 remainder — cancellation) A `session/cancel` aborts the
+        // `tokio::spawn`'d task awaiting this child (see `run_cancellable`),
+        // which drops `child` mid-`.wait()`. `kill_on_drop` is what turns
+        // that drop into a real SIGKILL on the OS process instead of an
+        // orphan — see the module doc's "Cancellation is wired" note.
+        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawning `darkmux mission launch {config_id}` subprocess"))?;
 
@@ -1281,11 +1646,28 @@ async fn run_ephemeral_command(
     let mut gate = acp_gate_handler(cx.clone(), session_id.clone());
     let config_id = config.id.clone();
     let args_for_shelf = args.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let handle = tokio::task::spawn_blocking(move || {
         crate::acp_panel::run_ephemeral(&config, &args, &cwd, Some(&mut gate))
-    })
-    .await
-    .context("joining the ephemeral panel-command task")??;
+    });
+    // (#1777 merge gate — MUST FIX 1 tier 2) Wrapped in a guard, NOT
+    // awaited bare — see `EphemeralJoinGuard`'s own doc and the module
+    // doc's "no OS subprocess to leak" correction. `spawn_blocking`'s
+    // closure cannot itself be preempted by `session/cancel`/
+    // `session/close` aborting THIS future, so a bare `.await` here would
+    // silently discard whatever the closure eventually returns (a
+    // `procedural.shell` step that genuinely executed — e.g. a `gh pr
+    // merge` — with nothing left to report it happened). The guard
+    // detaches onto an untracked task instead of losing that result.
+    let outcome = EphemeralJoinGuard {
+        handle: Some(handle),
+        session_id: session_id.clone(),
+        cx: cx.clone(),
+        sessions: sessions.clone(),
+        config_id: config_id.clone(),
+        args: args_for_shelf.clone(),
+    }
+    .join()
+    .await?;
     // The ACP panel surface has no exit-code concept — it just displays
     // whichever text comes back, byte-identical to before `run_ephemeral`
     // gained a typed `success` field (#1698 Packet B carry-list item 5).
@@ -1294,6 +1676,100 @@ async fn run_ephemeral_command(
     session_shelf_push(sessions, session_id, crate::radio_answer::shelf_entry(&config_id, &args_for_shelf, &outcome.text));
     cx.send_notification(agent_chunk(session_id, outcome.text))?;
     Ok(())
+}
+
+/// (#1777 merge gate — MUST FIX 1 tier 2) Wraps the `spawn_blocking`
+/// `JoinHandle` [`run_ephemeral_command`] awaits, so a `procedural.shell`
+/// step that DID execute never has its result silently thrown away just
+/// because `session/cancel`/`session/close` aborted the future that was
+/// awaiting it — see the module doc's "no OS subprocess to leak"
+/// correction for the full story on why the underlying OS process itself
+/// still can't be STOPPED (`spawn_blocking`'s closure can't be preempted
+/// mid-call); this only stops the eventual RESULT from vanishing.
+///
+/// [`Self::join`] awaits the handle in place — via `&mut JoinHandle`,
+/// which is itself `Future` because `JoinHandle` is `Unpin`, so this never
+/// moves the handle OUT of `self` — exactly like the bare `.await` this
+/// replaces, for the normal (uncancelled) path; `self.handle` is set to
+/// `None` only once that completes, disarming the drop below. If `join`'s
+/// own future gets dropped before reaching that point (the abort case,
+/// since `self` is captured whole by `join`'s generated state machine),
+/// `Drop::drop` fires with `handle` still `Some(..)` and hands it to a
+/// BRAND NEW, untracked `tokio::spawn` — never registered in [`InFlight`],
+/// so no future `session/cancel`/`session/close` can reach it — which
+/// posts a `"completed after cancellation: ..."` chunk once the blocking
+/// work actually finishes.
+struct EphemeralJoinGuard {
+    handle: Option<tokio::task::JoinHandle<Result<crate::acp_panel::EphemeralOutcome>>>,
+    session_id: SessionId,
+    cx: ConnectionTo<Client>,
+    sessions: Sessions,
+    config_id: String,
+    args: String,
+}
+
+impl EphemeralJoinGuard {
+    /// Await the blocking task to completion. Called at most once — see
+    /// the struct's own doc on why `self` must stay intact (handle
+    /// `Some`) for the ENTIRE suspension, only clearing it once this
+    /// actually resolves.
+    async fn join(mut self) -> Result<crate::acp_panel::EphemeralOutcome> {
+        let joined = self
+            .handle
+            .as_mut()
+            .expect("EphemeralJoinGuard::join is only ever called once")
+            .await;
+        self.handle = None; // disarm: reached completion normally, not via abort.
+        joined.context("joining the ephemeral panel-command task")?
+    }
+}
+
+impl Drop for EphemeralJoinGuard {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return; // `join` completed normally — nothing to detach.
+        };
+        eprintln!(
+            "[darkmux-acp] ephemeral command `{}` was cancelled while its subprocess step kept \
+             running (a `spawn_blocking` closure cannot be preempted) — detaching to report the \
+             eventual result once it lands",
+            self.config_id
+        );
+        let session_id = self.session_id.clone();
+        let cx = self.cx.clone();
+        let sessions = self.sessions.clone();
+        let config_id = self.config_id.clone();
+        let args = self.args.clone();
+        tokio::spawn(async move {
+            match handle.await {
+                Ok(Ok(outcome)) => {
+                    let text = format!("completed after cancellation: {}", outcome.text);
+                    session_shelf_push(
+                        &sessions,
+                        &session_id,
+                        crate::radio_answer::shelf_entry(&config_id, &args, &text),
+                    );
+                    let _ = cx.send_notification(agent_chunk(&session_id, text));
+                }
+                Ok(Err(err)) => {
+                    eprintln!(
+                        "[darkmux-acp] ephemeral command `{config_id}` finished after cancellation \
+                         with an error: {err:#}"
+                    );
+                    let _ = cx.send_notification(agent_chunk(
+                        &session_id,
+                        format!("completed after cancellation: `{config_id}` failed: {err:#}"),
+                    ));
+                }
+                Err(join_err) => {
+                    eprintln!(
+                        "[darkmux-acp] ephemeral command `{config_id}`'s blocking task panicked \
+                         after cancellation: {join_err}"
+                    );
+                }
+            }
+        });
+    }
 }
 
 /// (#1684 Packet 2) Build the ACP surface's operator sign-off gate handler
@@ -1549,6 +2025,9 @@ async fn run_launch_command(
         .stdin(ProcStdio::null())
         .stdout(ProcStdio::piped())
         .stderr(ProcStdio::piped())
+        // (#1684 remainder — cancellation) See `run_review`'s own comment on
+        // this same flag — same subprocess-kill-on-abort mechanism.
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("spawning `darkmux mission launch {config_id}` subprocess"))?;
@@ -1616,9 +2095,48 @@ fn recognize_stage(line: &str) -> Option<usize> {
 /// buffered-only, not dumped into the chat as a giant blob — see
 /// `render_final_message`). Strips the `[darkmux-liveness] ` prefix when
 /// present so the chat reads as prose instead of a log-file dump.
+///
+/// (#1684 — chunk-noise filter) Also drops darkmux-flow's sink-init
+/// diagnostics (`crates/darkmux-flow/src/lib.rs::build_default_sink`),
+/// which print UNCONDITIONALLY on stderr the first time ANY process touches
+/// the flow crate — i.e. every `mission launch` subprocess this file spawns,
+/// review or otherwise, every time. Observed live leaking into the Zed
+/// panel as raw agent chunks (e.g. "flow: Redis sink enabled —
+/// url=redis://... stream=darkmux:flow max_len=None (composed via
+/// TeeSink)"). These lines are legitimate diagnostics for a terminal
+/// operator — never silenced at the source, matching the module's own "why
+/// stdout is off-limits" reasoning about not touching the emitter — but
+/// infrastructure chatter with nothing to say to someone reading a chat
+/// panel. Matched on the flow crate's own literal `"flow: "` prefix
+/// convention, the ONLY startup-noise prefix in the tree confirmed to fire
+/// unconditionally on a normal `mission launch` run (audited 2026-08-12:
+/// the `warning:`/`radio:`/`funnels:`/`scores:`/`debates:`/`machine:`
+/// prefixes elsewhere in the codebase are either error-path-only or belong
+/// to CLI verbs this file never subprocesses into) — a narrow, conservative
+/// match, never a broad heuristic that could eat real model output.
 fn forwardable_chunk_text(line: &str) -> Option<String> {
+    forwardable_chunk_text_with_record(line, |dropped| {
+        eprintln!("[darkmux-acp] subprocess: {dropped}");
+    })
+}
+
+/// [`forwardable_chunk_text`]'s actual logic, with the "what to do with a
+/// line we're dropping from the chat" side effect factored out as an
+/// injectable `record` callback (#1777 merge gate, MUST FIX 2) — the SAME
+/// `Arc<dyn Fn>`-injection shape this file already uses for
+/// `RouterCall`/`AnswererCall`/`ScopeCall` so the decision ("forward to
+/// chat" vs "suppress but still record") stays unit-testable without
+/// capturing this PROCESS'S real stderr (fd 2 is process-global; every
+/// `cargo test` thread shares it, so redirecting it mid-test would be
+/// flaky by construction). Production wraps this with a plain
+/// `eprintln!("[darkmux-acp] subprocess: {line}")` — see
+/// [`forwardable_chunk_text`] — so every filtered line still lands on
+/// this process's own stderr (Zed's logs panel) even when it's not
+/// narrated in the chat transcript: filter the CHAT, never the RECORD.
+fn forwardable_chunk_text_with_record(line: &str, mut record: impl FnMut(&str)) -> Option<String> {
     let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('{') {
+    if trimmed.is_empty() || trimmed.starts_with('{') || trimmed.starts_with("flow: ") {
+        record(line);
         return None;
     }
     let display = trimmed.strip_prefix("[darkmux-liveness] ").unwrap_or(trimmed);
@@ -1911,6 +2429,37 @@ mod tests {
                 "phases": [{
                     "id": "p1",
                     "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.noop", "config": {"output": output}}]}]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Write one panel-advertised, procedural-only fixture command whose
+    /// SINGLE step is a real `procedural.shell` — an actual OS subprocess,
+    /// unlike `write_echo_fixture`'s in-process `procedural.noop` — so a
+    /// test can prove things about REAL child-process lifecycle (started,
+    /// still running, killed) rather than in-process control flow. The
+    /// command touches `marker_path` the instant it starts (so a test can
+    /// poll for that file to know the subprocess is genuinely running
+    /// before acting on it), sleeps `sleep_secs`, then echoes `output`.
+    fn write_slow_shell_fixture(crew_dir: &Path, id: &str, marker_path: &Path, sleep_secs: u64, output: &str) {
+        let dir = crew_dir.join("mission-configs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let command = format!(
+            "touch '{}' && sleep {sleep_secs} && echo '{output}'",
+            marker_path.display()
+        );
+        std::fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_string(&serde_json::json!({
+                "id": id,
+                "name": id,
+                "panel": {"description": "Pipe-level test fixture — a real, observable OS subprocess."},
+                "phases": [{
+                    "id": "p1",
+                    "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.shell", "config": {"command": command}}]}]
                 }]
             }))
             .unwrap(),
@@ -2376,5 +2925,521 @@ mod tests {
 
         let final_response = recv_json(&mut reader).await;
         assert_end_turn(&final_response);
+    }
+
+    /// (#1684 remainder — chunk-noise filter) darkmux-flow's sink-init
+    /// diagnostics must never reach the ACP wire as agent chunks — the
+    /// defect observed live (issue #1684's own "flow: ... composed via
+    /// TeeSink" example). A real (non-noise) stderr line must still pass
+    /// through untouched, proving the filter is narrow, not a blanket drop.
+    #[test]
+    fn forwardable_chunk_text_filters_flow_sink_startup_noise() {
+        assert_eq!(
+            forwardable_chunk_text(
+                "flow: Redis sink enabled — url=redis://x stream=darkmux:flow max_len=None (composed via TeeSink)"
+            ),
+            None
+        );
+        assert_eq!(
+            forwardable_chunk_text(
+                "flow: AuditFileSink enabled — audit_dir=/tmp/x (hash-chained, flock-serialized)"
+            ),
+            None
+        );
+        assert_eq!(
+            forwardable_chunk_text("some real progress line"),
+            Some("`some real progress line`".to_string())
+        );
+    }
+
+    /// (#1777 merge gate — MUST FIX 2) A dropped line is filtered from the
+    /// CHAT, never from the RECORD. darkmux-flow's degraded-mode warnings
+    /// (a rotted Redis password, a POSIX-only audit sink on an unsupported
+    /// platform — `crates/darkmux-flow/src/lib.rs::build_default_sink`)
+    /// share the SAME `"flow: "` prefix as its benign startup-success
+    /// chatter, so the narrow chat filter above would otherwise make a
+    /// genuinely degraded fleet stream invisible everywhere: every
+    /// `/review` subprocess prints the warning, the chat filter eats it,
+    /// and nothing anywhere says so. This proves the drop branch still
+    /// hands every filtered line to its `record` callback — production
+    /// wires that to `eprintln!` on this process's own stderr (asserted by
+    /// inspection at the call site, not here — fd 2 is process-global and
+    /// shared by every concurrently-running `cargo test` thread, so
+    /// redirecting it mid-test would be flaky by construction; the
+    /// callback-injection seam is what makes the DECISION testable without
+    /// needing to capture real stderr).
+    #[test]
+    fn forwardable_chunk_text_still_records_a_filtered_degraded_mode_warning() {
+        let flow_warning = "flow: Redis sink construction failed (connection refused); \
+                             continuing without it. Other sinks intact.";
+        let mut recorded = Vec::new();
+        let result = forwardable_chunk_text_with_record(flow_warning, |line| recorded.push(line.to_string()));
+        assert_eq!(result, None, "a degraded-mode flow warning still must not reach the chat verbatim");
+        assert_eq!(
+            recorded,
+            vec![flow_warning.to_string()],
+            "but it MUST still reach the record — never silently eaten"
+        );
+
+        // A line that reaches the chat must NOT also be pushed onto the
+        // record path — the two are mutually exclusive per line, proving
+        // this isn't a blanket "record everything" change in disguise.
+        let mut recorded_real = Vec::new();
+        let real_line = "some real progress line";
+        let result = forwardable_chunk_text_with_record(real_line, |line| recorded_real.push(line.to_string()));
+        assert_eq!(result, Some("`some real progress line`".to_string()));
+        assert!(recorded_real.is_empty(), "a forwarded (non-filtered) line must not also be recorded");
+    }
+
+    /// (#1684 remainder — cancellation) `session/cancel` actually aborts an
+    /// in-flight no-slash-route command, and the `session/prompt` response
+    /// reports `StopReason::Cancelled` — the protocol-level contract this
+    /// packet's own audit found completely unhandled (`session/cancel` was
+    /// a documented no-op). The canned router blocks on a channel recv
+    /// rather than a fixed sleep, and signals `started_tx` the instant it
+    /// starts running — proving this test cancels REAL in-flight work
+    /// (never a command that raced ahead and finished first, which would
+    /// otherwise show up as a silently-green false pass).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_cancel_aborts_an_in_flight_command_and_reports_cancelled() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let started_tx = std::sync::Mutex::new(Some(started_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let router = move |_msg: &str| -> Result<String> {
+            if let Some(tx) = started_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            // Blocks until the test explicitly releases it (or the test
+            // itself ends and drops `release_tx`) — never actually reached
+            // by a correctly-cancelled task; only here so a REGRESSION
+            // (cancellation stops working) hangs this call instead of
+            // racing ahead and returning before the cancel could land.
+            let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10));
+            Ok("```json\n{\"command\": \"echo-fixture\", \"args\": \"\"}\n```".to_string())
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "please give me the fixture").await;
+
+        // Wait until the router closure has actually started running before
+        // cancelling — see this test's own doc. Off on its OWN
+        // `spawn_blocking` thread, never a bare synchronous `recv_timeout`
+        // on the test's own async task: this test runs under the default
+        // (single-threaded) `#[tokio::test]` flavor, so blocking that one
+        // worker thread directly would starve the very `serve()` tasks
+        // (including the router's own `spawn_blocking` closure) this wait
+        // depends on — a self-deadlock, confirmed live (this test hung on
+        // its first draft until switched to this shape).
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(std::time::Duration::from_secs(5)))
+            .await
+            .expect("joining the started-signal wait")
+            .expect("the router must start running before the test can cancel it");
+
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/cancel",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await;
+
+        let cancelled_chunk = recv_json(&mut reader).await;
+        assert!(
+            chunk_text(&cancelled_chunk).contains("cancelled"),
+            "{}",
+            chunk_text(&cancelled_chunk)
+        );
+
+        let final_response = recv_json(&mut reader).await;
+        assert_eq!(
+            final_response["result"]["stopReason"], "cancelled",
+            "a cancelled in-flight command must report StopReason::Cancelled: {final_response}"
+        );
+
+        drop(release_tx); // let the detached router closure unblock and exit cleanly
+    }
+
+    /// (#1684 remainder) `session/cancel` for a session with nothing in
+    /// flight (already finished, or an id this process never minted) is a
+    /// quiet no-op — the connection must stay healthy and keep serving
+    /// ordinary prompts afterward, proving this handler never poisons the
+    /// dispatch loop.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_cancel_for_unknown_session_is_a_quiet_no_op() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+
+        let router = |_msg: &str| -> Result<String> {
+            panic!("the slash-command path must never invoke the router");
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/cancel",
+                "params": {"sessionId": "darkmux-acp-does-not-exist"}
+            }),
+        )
+        .await;
+
+        // The connection must still be healthy: an ordinary slash command
+        // on the REAL session id executes normally afterward.
+        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        let output = recv_json(&mut reader).await;
+        assert_eq!(chunk_text(&output), "fixture output");
+        let final_response = recv_json(&mut reader).await;
+        assert_end_turn(&final_response);
+    }
+
+    /// (#1684 remainder — session hygiene) `session/close` is the map-
+    /// pruning mechanism the module doc's own "never pruned" finding named
+    /// — proven observably (no internal test hook needed): a prompt sent on
+    /// the SAME session id after closing it must see its `cwd` entry gone,
+    /// exactly as if that session id had never been minted by `session/new`
+    /// at all.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_close_prunes_the_session_and_a_later_prompt_finds_no_cwd() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+
+        let router = |_msg: &str| -> Result<String> {
+            panic!("the slash-command path must never invoke the router");
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        // Sanity: the session works before closing.
+        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        let output = recv_json(&mut reader).await;
+        assert_eq!(chunk_text(&output), "fixture output");
+        let before_close_response = recv_json(&mut reader).await;
+        assert_end_turn(&before_close_response);
+
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 99, "method": "session/close",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await;
+        let close_response = recv_json(&mut reader).await;
+        assert!(close_response.get("result").is_some(), "session/close must succeed: {close_response}");
+
+        // The session's entry is gone — the SAME session id now behaves
+        // exactly like one that was never minted.
+        send_prompt(&mut writer, &session_id, "/echo-fixture").await;
+        let no_cwd = recv_json(&mut reader).await;
+        assert!(
+            chunk_text(&no_cwd).contains("no working directory recorded"),
+            "a prompt on a CLOSED session must find its cwd entry pruned: {}",
+            chunk_text(&no_cwd)
+        );
+    }
+
+    /// (#1777 merge gate — test gap) Every EXISTING `session/close` test
+    /// closes an IDLE session; none of them exercise the "close implies
+    /// cancel first" branch the module doc itself claims
+    /// (`session/close`'s own comment: "Per spec, close implies cancel
+    /// first"). This proves it: closing a session with a REAL in-flight
+    /// no-slash-route command must (a) respond to the close request
+    /// PROMPTLY — before the still-blocked router closure ever releases,
+    /// proving close does not wait on the work it's aborting — and (b)
+    /// still let the aborted command's own deferred "cancelled" chunk +
+    /// `StopReason::Cancelled` response land afterward, exactly like
+    /// `session_cancel_aborts_an_in_flight_command_and_reports_cancelled`
+    /// proves for `session/cancel` — since both notifications drive the
+    /// SAME `InFlight` abort path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_close_aborts_an_in_flight_command_before_pruning_the_session() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let started_tx = std::sync::Mutex::new(Some(started_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let router = move |_msg: &str| -> Result<String> {
+            if let Some(tx) = started_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            // Blocks until the test releases it (or drops `release_tx`) —
+            // see `session_cancel_aborts_an_in_flight_command_and_reports_
+            // cancelled`'s own doc on why this shape proves REAL in-flight
+            // work gets cancelled, not a command that raced ahead.
+            let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10));
+            Ok("```json\n{\"command\": \"echo-fixture\", \"args\": \"\"}\n```".to_string())
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "please give me the fixture").await;
+
+        // Same "wait on its own spawn_blocking thread" shape as the
+        // session/cancel test — see that test's own doc on why a bare
+        // synchronous wait on this (single-threaded) test's own task would
+        // self-deadlock.
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(std::time::Duration::from_secs(5)))
+            .await
+            .expect("joining the started-signal wait")
+            .expect("the router must start running before the test can close its session");
+
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 99, "method": "session/close",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await;
+
+        // The close response must arrive WITHOUT waiting for the still-
+        // blocked router closure — proving `session/close` genuinely
+        // aborted the in-flight command rather than awaiting it.
+        let close_response = recv_json(&mut reader).await;
+        assert_eq!(close_response["id"], 99, "expected the session/close response first: {close_response}");
+        assert!(close_response.get("result").is_some(), "session/close must succeed: {close_response}");
+
+        // The aborted command's own deferred reporting still lands.
+        let cancelled_chunk = recv_json(&mut reader).await;
+        assert!(
+            chunk_text(&cancelled_chunk).contains("cancelled"),
+            "{}",
+            chunk_text(&cancelled_chunk)
+        );
+        let final_response = recv_json(&mut reader).await;
+        assert_eq!(
+            final_response["result"]["stopReason"], "cancelled",
+            "session/close must abort the in-flight command, reporting StopReason::Cancelled: {final_response}"
+        );
+
+        drop(release_tx); // let the detached router closure unblock and exit cleanly
+    }
+
+    /// (#1777 merge gate — MUST FIX 1 tier 2) The "no OS subprocess to
+    /// leak" claim was FALSE for the ephemeral `procedural.shell` runner —
+    /// see the module doc's own correction. This proves the mitigation:
+    /// cancelling a `procedural.shell` command still eventually reports
+    /// what the (unkillable, `spawn_blocking`-bound) subprocess actually
+    /// did, instead of throwing the result away. The shell step touches a
+    /// marker file the instant it starts (proving the test cancels REAL
+    /// in-flight work, the same discipline the router-based cancel tests
+    /// use), sleeps briefly, then echoes a distinctive string that must
+    /// show up in a LATE "completed after cancellation: ..." chunk sent
+    /// well after the `session/prompt` response has already resolved
+    /// `StopReason::Cancelled`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ephemeral_command_cancellation_still_reports_the_shells_eventual_result() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let flows_tmp = tempfile::TempDir::new().unwrap();
+        let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
+
+        let marker = crew_tmp.path().join("shell-started.marker");
+        write_slow_shell_fixture(crew_tmp.path(), "slow-echo", &marker, 1, "slow-output-marker");
+
+        let router = |_msg: &str| -> Result<String> {
+            panic!("the slash-command path must never invoke the router");
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, never_answer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "/slow-echo").await;
+
+        // Wait for the REAL shell subprocess to actually start (the
+        // marker file appears) before cancelling.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the shell step must start running before the test can cancel it");
+
+        send_json(
+            &mut writer,
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/cancel",
+                "params": {"sessionId": session_id}
+            }),
+        )
+        .await;
+
+        let cancelled_chunk = recv_json(&mut reader).await;
+        assert!(chunk_text(&cancelled_chunk).contains("cancelled"), "{}", chunk_text(&cancelled_chunk));
+
+        let final_response = recv_json(&mut reader).await;
+        assert_eq!(
+            final_response["result"]["stopReason"], "cancelled",
+            "a cancelled ephemeral command must still report StopReason::Cancelled promptly: {final_response}"
+        );
+
+        // The shell's `sleep` finishes on its OWN thread regardless of the
+        // cancel above (it cannot be preempted) — its eventual result must
+        // still land as a chunk, not vanish into a dropped JoinHandle.
+        let completed_after_cancel =
+            tokio::time::timeout(std::time::Duration::from_secs(5), recv_json(&mut reader))
+                .await
+                .expect(
+                    "the detached watcher must still post the shell step's eventual result — \
+                     MUST FIX 1 tier 2 regressed if this times out",
+                );
+        let text = chunk_text(&completed_after_cancel);
+        assert!(text.contains("completed after cancellation"), "{text}");
+        assert!(text.contains("slow-output-marker"), "{text}");
+    }
+
+    /// (#1777 merge gate — the headline mechanism, previously untested)
+    /// The existing cancel tests
+    /// (`session_cancel_aborts_an_in_flight_command_and_reports_cancelled`,
+    /// the `session/close` sibling above) only prove the WIRE contract —
+    /// `StopReason::Cancelled` comes back promptly — over the no-slash
+    /// ROUTER path, which is precisely the path where nothing is
+    /// killable (a plain synchronous call, no `Child` anywhere). The
+    /// actual promise `kill_on_drop(true)` makes for `run_review`'s and
+    /// `run_launch_command`'s real subprocess `Command`s — that the OS
+    /// PROCESS itself dies, not just that the Rust future resolves — has
+    /// rested on drop-topology reasoning alone until now.
+    ///
+    /// This proves that half directly: `tokio::spawn` a task that spawns
+    /// a real, observably long-lived child (`sleep 30`, with
+    /// `.kill_on_drop(true)` — the IDENTICAL flag `run_review`/
+    /// `run_launch_command` set on their own `Command`s) and holds it
+    /// across an in-place `.await` on `child.wait()` — the SAME "own the
+    /// `Child` across an await point, get a real abort handle from
+    /// `tokio::spawn`" shape those two functions use, and the exact shape
+    /// `run_cancellable` wraps every `session/prompt` branch in. Aborting
+    /// that task must leave the process GONE, polled via `kill -0 <pid>`
+    /// (fails once the process is reaped) rather than trusted from
+    /// reasoning about `Drop` order.
+    ///
+    /// RED-proved by hand: removing `.kill_on_drop(true)` from the
+    /// `Command` below makes this test fail (timeout waiting for the
+    /// process to disappear, since a plain `sleep 30` outlives the
+    /// aborted task) — confirming the assertion actually exercises the
+    /// flag, not just the task's own bookkeeping.
+    #[tokio::test]
+    async fn cancelling_a_task_holding_a_child_actually_kills_the_os_process() {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawning `sleep 30`");
+        let pid = child.id().expect("a freshly spawned child has a pid");
+
+        assert!(process_is_alive(pid), "the child must be running before cancellation");
+
+        let handle = tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        // Let the spawned task actually get polled at least once before
+        // aborting it — otherwise this could abort a task that was never
+        // even scheduled yet, proving nothing about `kill_on_drop`.
+        tokio::task::yield_now().await;
+
+        handle.abort();
+        let _ = handle.await;
+
+        // `kill_on_drop`'s SIGKILL isn't necessarily synchronous with the
+        // abort — poll with a bound rather than checking exactly once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !process_is_alive(pid) {
+                return; // PASS — the OS process is genuinely gone.
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "process {pid} (`sleep 30`) is still alive 5s after aborting the task holding \
+                     its Child — kill_on_drop did not terminate it"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// `kill -0 <pid>` — exits 0 iff a process with that pid exists and is
+    /// signalable by this user; used only to observe the REAL OS process
+    /// state in [`cancelling_a_task_holding_a_child_actually_kills_the_os_process`],
+    /// never to affect it.
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    /// (#1777 merge gate — CONSIDER, the lost-cancel race) A `session/
+    /// cancel` that arrives BEFORE `run_cancellable` has registered its
+    /// own handle used to be silently lost — see `InFlightSlot`'s own
+    /// doc. This proves the fix at the exact seam that matters:
+    /// `register_or_consume_cancel_tombstone` finds a pre-existing
+    /// `Cancelled` tombstone (simulating the race deterministically,
+    /// rather than trying to win a real timing race against the tokio
+    /// scheduler) and reports "already cancelled" instead of registering
+    /// a handle nobody will ever call `abort()` on.
+    #[tokio::test]
+    async fn a_cancel_tombstone_recorded_before_registration_is_consumed_and_reported() {
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new("darkmux-acp-test-session");
+
+        // Simulate `session/cancel` racing ahead of the command's own
+        // registration — exactly the window `InFlightSlot`'s doc names.
+        in_flight.lock().unwrap().insert(session_id.clone(), InFlightSlot::Cancelled);
+
+        let placeholder = tokio::spawn(async {});
+        let already_cancelled =
+            register_or_consume_cancel_tombstone(&in_flight, &session_id, placeholder.abort_handle());
+        placeholder.abort();
+
+        assert!(already_cancelled, "a pre-existing tombstone must be reported as already-cancelled");
+        assert!(
+            in_flight.lock().unwrap().get(&session_id).is_none(),
+            "the tombstone must be CONSUMED (removed), not left in place to fire twice"
+        );
+    }
+
+    /// (#1777 merge gate — CONSIDER, the lost-cancel race) The ordinary
+    /// case: no tombstone waiting, so `register_or_consume_cancel_
+    /// tombstone` registers the handle normally and reports "not yet
+    /// cancelled" — the SAME behavior `run_cancellable` relied on before
+    /// this fix, proving the race fix didn't change the common path.
+    #[tokio::test]
+    async fn no_tombstone_present_registers_the_handle_as_running() {
+        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = SessionId::new("darkmux-acp-test-session-2");
+
+        let placeholder = tokio::spawn(async {});
+        let already_cancelled =
+            register_or_consume_cancel_tombstone(&in_flight, &session_id, placeholder.abort_handle());
+        placeholder.abort();
+
+        assert!(!already_cancelled, "with nothing tombstoned, the handle must register as the running command");
+        assert!(
+            matches!(in_flight.lock().unwrap().get(&session_id), Some(InFlightSlot::Running(_))),
+            "the session's slot must now be Running"
+        );
     }
 }
