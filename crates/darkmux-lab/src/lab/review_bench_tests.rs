@@ -1738,6 +1738,69 @@
         assert!(!ctx.judge_system.is_empty(), "review-judge.md resolves via the embedded role loader");
     }
 
+    /// (#1685 QA CONSIDER 3) `--funnel` resolves `mission_config::
+    /// load("review")` — the SAME user-tier-overridable lookup `darkmux
+    /// mission launch review`/`darkmux acp` use — and runs it through a
+    /// graph built off `StepKindRegistry::with_builtins()` (which includes
+    /// `procedural.shell`). Before this fix, a user-tier
+    /// `~/.darkmux/mission-configs/review.json` override pairing a
+    /// declared `gh_verb` with a shell step would run through `--funnel`
+    /// completely unchecked — the allowlist gate only ever covered the
+    /// other two entry points. This override is deliberately graph-invalid
+    /// (no phases at all): the allowlist check has to fire BEFORE any
+    /// graph-shape validation, exactly like the other two call sites, so a
+    /// config this minimal is enough to prove the gate runs first.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_funnel_ctx_refuses_a_gh_verb_review_override_when_the_allowlist_gate_is_off() {
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew_tmp.path()) };
+        let mission_configs_dir = darkmux_crew::loader::mission_configs_dir();
+        fs::create_dir_all(&mission_configs_dir).unwrap();
+        fs::write(
+            mission_configs_dir.join("review.json"),
+            r#"{"id": "review", "name": "Test Review Override", "schema_version": "2.3", "gh_verb": "pr-merge"}"#,
+        )
+        .unwrap();
+        let prev_enabled = std::env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe {
+            std::env::remove_var("DARKMUX_GH_ENABLED");
+            std::env::remove_var("DARKMUX_GH_ALLOWED");
+        }
+
+        let profiles_tmp = tempfile::TempDir::new().unwrap();
+        let path = write_test_registry(profiles_tmp.path(), "fast");
+        let opts = funnel_ctx_opts(path, "fast", None, None);
+
+        let err = match resolve_funnel_ctx(&opts) {
+            Ok(_) => panic!("a gh_verb-declaring review override must be refused with the allowlist gate off"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pr-merge"), "names the verb: {msg}");
+        assert!(msg.contains("gh.enabled"), "points at the fix: {msg}");
+
+        // SAFETY: serialized via #[serial_test::serial].
+        unsafe {
+            match prev_enabled {
+                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_allowed {
+                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+            match prev_crew {
+                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
+                None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
     #[test]
     fn resolve_funnel_ctx_no_k_override_uses_default_probe_k_and_exec_mode_defaults_to_auto() {
         let tmp = tempfile::TempDir::new().unwrap();

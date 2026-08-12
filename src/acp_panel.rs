@@ -446,16 +446,26 @@ pub fn run_ephemeral(
 }
 
 /// (#1685) Emit the flow-record audit-trail entry for one executed gh-verb
-/// panel command — see `run_ephemeral`'s own doc for when this fires.
+/// command — see `run_ephemeral`'s own doc for when THIS module fires it.
 /// Follows the SAME audit-trail convention `darkmux flow note --source
 /// adjudication` uses (`Category::Audit`, a distinguishing `source` string,
 /// structured detail in `payload`), never a parallel record channel.
+///
+/// `pub(crate)` (#1685 QA MUST-FIX 2): `src/mission_launch.rs::launch`'s
+/// own `darkmux mission launch <id>` entry point calls this SAME function
+/// (via `emit_launch_gh_verb_audit`'s thin wrapper — see its doc) rather
+/// than growing a second, drifting copy of the record shape. Before this,
+/// only the ACP ephemeral route emitted `gh.verb.executed` at all: a bare
+/// `darkmux mission launch pr-merge` from a terminal executed the merge
+/// with ZERO audit trail, contradicting this feature's own docs page
+/// ("Every EXECUTED gh-verb command ... emits one flow record") and the
+/// PR body that shipped it.
 ///
 /// `pr` is a BEST-EFFORT extraction — the first whitespace-delimited token
 /// of the raw args string, verbatim. darkmux core has no notion of what a
 /// PR number IS or whether the operator typed one; it only records what
 /// was typed after the slash command, exactly as `gh` itself received it.
-fn emit_gh_verb_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed: Option<bool>, success: bool, correlation_id: &str) {
+pub(crate) fn emit_gh_verb_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed: Option<bool>, success: bool, correlation_id: &str) {
     let pr = args.split_whitespace().next().map(str::to_string);
     let handle = match &pr {
         Some(pr) => format!("{verb} {pr}"),
