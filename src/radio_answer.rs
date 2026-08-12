@@ -289,6 +289,23 @@ fn render_help_block() -> String {
 /// status` is the surface that shows the rest.
 const RECENT_MISSIONS_IN_BOARD_BLOCK: usize = 5;
 
+/// (#1717) The named-mission floor — the crowding half of the fix. On a
+/// board dominated by machine-minted runs, the top
+/// `RECENT_MISSIONS_IN_BOARD_BLOCK` most-recently-touched missions can be
+/// (and, on the board this issue measured — 61 runs vs 32 named — plausibly
+/// are) ALL run instances, so the operator's own named work never reaches
+/// the bundle. This many of the most-recently-touched NAMED missions
+/// (`Mission::is_minted_run() == false`) are always represented, on top of
+/// whatever named missions already made the "Most recent" cut — see the
+/// second list this backs in `render_board_block_from`.
+///
+/// Kept smaller than `RECENT_MISSIONS_IN_BOARD_BLOCK`: this is a FLOOR, not
+/// a second listing — enough to answer "what am I working on" with more
+/// than one name without doubling the block's token cost on a board that's
+/// already all named (where the extra list is empty and costs nothing) or
+/// already representative (where most of the floor is deduplicated away).
+const NAMED_MISSION_FLOOR_IN_BOARD_BLOCK: usize = 3;
+
 /// Per-id cap in the recent-missions rows (#1714 gate C-4). `truncate_chars`
 /// cuts the WHOLE block at a char count, which can slice an id in half and
 /// leave `review-17860` looking like a complete mission id a model can
@@ -323,6 +340,18 @@ fn status_word(s: crate::crew::types::MissionStatus) -> &'static str {
 /// questions an operator asks a console are disproportionately about what
 /// just happened, and before #1713 this block filtered exactly that out,
 /// leaving a machine with nothing open unable to name a single mission.
+///
+/// (#1717) That recency list mixes machine-minted run instances with the
+/// operator's own named missions and, before this, marked neither — a
+/// fresh-context model had no way to tell `review-1786081556-0eea32
+/// (finalized)` apart from a mission the operator actually planned, and on
+/// a board dominated by runs the top-N cap could crowd named missions out
+/// of the bundle entirely. Two independent fixes, both keyed on
+/// `Mission::is_minted_run`: every minted row in the recency list now
+/// carries an `auto` marker (defined inline, once, for a model with no
+/// darkmux history), and a small floor of the most-recently-touched named
+/// missions is always represented even when none of them made the
+/// recency-list cut.
 ///
 /// The loader half only; [`render_board_block_from`] is the pure core.
 fn render_board_block() -> Option<String> {
@@ -381,14 +410,60 @@ fn render_board_block_from(missions: &[crate::crew::types::Mission]) -> Option<S
     // and the board's top row cannot drift apart.
     let mut recent: Vec<&crate::crew::types::Mission> = missions.iter().collect();
     recent.sort_by_key(|m| std::cmp::Reverse(crate::mission_status::last_activity(m)));
-    out.push_str("Most recent (newest first): ");
-    let rows: Vec<String> = recent
+    let top: Vec<&crate::crew::types::Mission> =
+        recent.iter().take(RECENT_MISSIONS_IN_BOARD_BLOCK).copied().collect();
+
+    // (#1717) A fresh-context model has no way to tell a machine-minted run
+    // instance (`review-1786081556-0eea32`) from an id the operator typed —
+    // both are just strings on a line. `auto` is defined inline, once, right
+    // here (model-facing-prompt-construction provenance for a darkmux-
+    // specific distinction: option 2, "supplied conceptual definition
+    // before first use"), then used as a compact per-row marker so the seat
+    // can weigh a marked row as exhaust rather than intent. Uses the SAME
+    // predicate the CLI board's named-first default hides behind
+    // (`Mission::is_minted_run`, shared as of #1717 so this marker and that
+    // default cannot classify the same mission two different ways).
+    out.push_str(
+        "Most recent (newest first; \"auto\" marks a run the darkmux CLI launched by itself, \
+         not something the user typed): ",
+    );
+    let rows: Vec<String> = top
         .iter()
-        .take(RECENT_MISSIONS_IN_BOARD_BLOCK)
-        .map(|m| format!("{} ({})", elide(&m.id, BOARD_ID_CAP_CHARS), status_word(m.status)))
+        .map(|m| {
+            let marker = if m.is_minted_run() { ", auto" } else { "" };
+            format!("{} ({}{marker})", elide(&m.id, BOARD_ID_CAP_CHARS), status_word(m.status))
+        })
         .collect();
     out.push_str(&rows.join(", "));
     out.push('\n');
+
+    // (#1717) The named-mission floor — the crowding half of the fix. The
+    // list above is capped at `RECENT_MISSIONS_IN_BOARD_BLOCK` and NOT
+    // filtered by kind, so on a board dominated by runs it can legitimately
+    // be all `auto` rows (the issue's own measured case: 61 runs vs 32
+    // named). Top up to `NAMED_MISSION_FLOOR_IN_BOARD_BLOCK` of the most-
+    // recently-touched NAMED missions not already shown above, so the
+    // operator's own engagement work always has a floor in the bundle
+    // regardless of run volume. Emitted only when there's something to add
+    // — a board that's already named-heavy leaves this line out entirely,
+    // same as `hidden_run_summary`'s no-op convention on the CLI board.
+    //
+    // Cost: on a run-dominated board this doubles the mission-id surface
+    // the model has to parse (two disjoint lists instead of one) and adds
+    // a bounded number of extra characters — the floor is capped, so the
+    // cost never scales with how many runs exist, only with how many named
+    // missions do.
+    let extra_named: Vec<String> = recent
+        .iter()
+        .filter(|m| !m.is_minted_run() && !top.iter().any(|t| t.id == m.id))
+        .take(NAMED_MISSION_FLOOR_IN_BOARD_BLOCK)
+        .map(|m| format!("{} ({})", elide(&m.id, BOARD_ID_CAP_CHARS), status_word(m.status)))
+        .collect();
+    if !extra_named.is_empty() {
+        out.push_str("Also tracking (named work not in the list above): ");
+        out.push_str(&extra_named.join(", "));
+        out.push('\n');
+    }
 
     Some(truncate_chars(&out, BOARD_CAP_CHARS))
 }
@@ -925,6 +1000,90 @@ mod tests {
         // The cap keeps the NEWEST, which is the whole point.
         assert!(recent_line.contains("m-11"), "{recent_line}");
         assert!(!recent_line.contains("m-0 ("), "{recent_line}");
+    }
+
+    // ── (#1717) Minted-run marking + the named-mission crowding floor ────
+
+    /// A minted run's row carries the `auto` marker; a named mission's row
+    /// does not. Both ids are real observed shapes: the epoch-stamped one
+    /// is a pre-#1503 run-instance pattern (`spec: None`, id-shape
+    /// fallback), the other is exactly the `1616-compactor-fix` operator-
+    /// naming-convention counterexample `Mission::is_minted_run`'s own doc
+    /// names — proof the marker isn't just "contains digits."
+    #[test]
+    fn the_board_block_marks_minted_runs_and_leaves_named_missions_unmarked() {
+        use crate::crew::types::MissionStatus as M;
+        let missions = vec![
+            board_mission("review-1785400940-136e76", M::Finalized, 100, Some(9_000)),
+            board_mission("1616-compactor-fix", M::Active, 100, Some(8_000)),
+        ];
+        let block = render_board_block_from(&missions).expect("block renders");
+        let recent_line = block.lines().find(|l| l.starts_with("Most recent")).expect("line");
+        assert!(
+            recent_line.contains("review-1785400940-136e76 (finalized, auto)"),
+            "a machine-minted run must carry the auto marker: {recent_line}"
+        );
+        assert!(
+            recent_line.contains("1616-compactor-fix (active)")
+                && !recent_line.contains("1616-compactor-fix (active, auto)"),
+            "an operator-named mission must NOT carry the auto marker: {recent_line}"
+        );
+    }
+
+    /// THE #1717 regression. A board where every one of the top
+    /// `RECENT_MISSIONS_IN_BOARD_BLOCK` most-recently-touched missions is a
+    /// machine-minted run (the issue's own measured shape: runs vastly
+    /// outnumber named missions) must still surface the operator's named
+    /// work somewhere in the bundle — never silently crowded out entirely.
+    #[test]
+    fn the_board_block_surfaces_named_missions_even_when_runs_dominate_the_recent_list() {
+        use crate::crew::types::MissionStatus as M;
+        // More minted runs than the recent-list cap, all touched more
+        // recently than either named mission below.
+        let mut missions: Vec<_> = (0..(RECENT_MISSIONS_IN_BOARD_BLOCK + 3))
+            .map(|i| {
+                board_mission(
+                    &format!("review-178540{i:04}-136e76"),
+                    M::Finalized,
+                    100,
+                    Some(10_000 + i as u64),
+                )
+            })
+            .collect();
+        missions.push(board_mission("doom-loop-m4", M::Active, 1, None));
+        missions.push(board_mission("1616-compactor-fix", M::Finalized, 1, Some(50)));
+
+        let block = render_board_block_from(&missions).expect("block renders");
+        let recent_line = block.lines().find(|l| l.starts_with("Most recent")).expect("line");
+        assert!(
+            !recent_line.contains("doom-loop-m4") && !recent_line.contains("1616-compactor-fix"),
+            "precondition: the recent-list cap alone must NOT already include either named \
+             mission, or this test isn't exercising the floor: {recent_line}"
+        );
+        assert!(
+            block.contains("doom-loop-m4"),
+            "a named mission must reach the bundle even when runs dominate recency: {block}"
+        );
+        assert!(
+            block.contains("1616-compactor-fix"),
+            "a second named mission should also surface within the floor: {block}"
+        );
+    }
+
+    /// The floor line is a no-op cost on a board that's already
+    /// representative — every named mission worth floor-listing is already
+    /// in the "Most recent" rows, so nothing is left to add.
+    #[test]
+    fn the_named_floor_adds_nothing_when_the_recent_list_is_already_all_named() {
+        use crate::crew::types::MissionStatus as M;
+        let missions: Vec<_> = (0..RECENT_MISSIONS_IN_BOARD_BLOCK)
+            .map(|i| board_mission(&format!("m-{i}"), M::Finalized, 100, Some(1_000 + i as u64)))
+            .collect();
+        let block = render_board_block_from(&missions).expect("block renders");
+        assert!(
+            !block.contains("Also tracking"),
+            "no named missions were left to add — the floor line must not appear: {block}"
+        );
     }
 
     #[test]

@@ -179,44 +179,19 @@ const MIN_HANDLE_HEX: usize = 4;
 /// board they outnumber named missions (32 of 59) and drown the work the
 /// operator actually cares about.
 ///
-/// **The recorded discriminator is `spec.origin`, stamped at mint** from the
-/// launched config's tier ([`MissionSpecOrigin`]): a USER-tier config — a
-/// `mission propose` product persisted to the operator's own configs dir, or
-/// hand-authored there — is the operator's engagement work, and its launches
-/// stay on the board. A BUILTIN config's launches (`review`, `coder-phase`,
-/// `dispatch`) are run instances. This matters most on the golden path:
-/// `mission propose` → `--start` routes through `mission launch`, so its
-/// missions DO carry `spec: Some` — an earlier draft classified on bare
-/// `spec.is_some()` and would have hidden the operator's own
-/// freshly-proposed mission from the board that told them to propose it.
-///
-/// Two fallbacks, both for records that predate their signal:
-/// - `spec` present but `origin` absent (pre-origin mint): every such
-///   mission was a launched run — the propose→start flow is newer than the
-///   `origin` field — so it classifies as minted.
-/// - `spec` absent entirely (pre-#1503): fall back to the id shape — every
-///   mint pattern of that era embeds a 10-digit unix-seconds segment
-///   (`review-1785400940-136e76`, `dispatch-code-reviewer-1785589698-…`).
-///   A hand-authored name essentially never contains one. NOT reused from
-///   `short_handle`: that heuristic matches ANY ≥4-hex run, which
-///   misclassifies issue-number-prefixed operator names now that issue
-///   numbers are 4 digits (`1616-compactor-fix` → hidden from its owner's
-///   board). `short_handle`'s own doc says a wrong guess there "costs a
-///   column, never correctness" — here it would cost board visibility, a
-///   different contract, so it gets the tighter test.
+/// (#1717) The predicate itself now lives on [`Mission::is_minted_run`]
+/// (`darkmux_crew::types`), next to the `Mission`/`MissionSpecOrigin` types
+/// it operates on. It was module-private here (not even `pub(crate)`), so
+/// the radio answering seat's grounding block — a sibling command module in
+/// the same binary crate, not a submodule of this one — had no way to
+/// resolve it and re-derived a divergent copy instead. `darkmux-crew` is a
+/// library crate both modules already depend on, so this is the shared
+/// home the NEXT consumer resolves from too, rather than a fourth
+/// reinvention. See that method's doc for the full discriminator +
+/// fallback rules (spec.origin first, id-shape fallback for pre-#1503
+/// records).
 fn is_minted_run(m: &Mission) -> bool {
-    match &m.spec {
-        Some(spec) => spec.origin != Some(darkmux_crew::types::MissionSpecOrigin::UserConfig),
-        None => has_epoch_segment(&m.id),
-    }
-}
-
-/// (#1562) `true` iff a `-`-separated segment of `id` is exactly a 10-digit
-/// number — the unix-seconds stamp every pre-#1503 mint pattern embeds.
-/// Deliberately NOT "any 4+ hex chars" (see `is_minted_run`'s doc for the
-/// `1616-compactor-fix` counterexample).
-fn has_epoch_segment(id: &str) -> bool {
-    id.split('-').any(|seg| seg.len() == 10 && seg.bytes().all(|b| b.is_ascii_digit()))
+    m.is_minted_run()
 }
 
 /// (#1612) Compact "how long ago", in at most `AGE_COLS` columns.
@@ -2208,79 +2183,18 @@ mod tests {
     }
 
     // ── (#1562) Named-first default: minted-run classification + collapse ──
+    //
+    // (#1717) The semantic tests for the predicate itself (spec-over-id-shape
+    // trust, the `1616-compactor-fix` counterexample, the pre-#1503 id-shape
+    // fallback, hand-authored ids with no spec) moved with it to
+    // `darkmux-crew/src/types.rs`'s `is_minted_run_*` test group, next to
+    // `Mission::is_minted_run`. What stays here is this MODULE's own
+    // composition of that predicate — the board partition/collapse — which
+    // is what would actually break if a future edit here re-diverged from
+    // the shared method.
 
     fn minted_spec() -> MissionSpec {
         MissionSpec { config_id: "dispatch".to_string(), inputs_fingerprint: "x".to_string(), origin: None }
-    }
-
-    #[test]
-    fn is_minted_run_trusts_the_recorded_spec_over_id_shape() {
-        // A hand-authored id (no trailing hex discriminator) with spec:None
-        // must read as operator-named — the id-shape check must not
-        // override an absent spec into "minted" on its own.
-        let mut m = mission("doom-loop-m4", MissionStatus::Active);
-        assert!(!is_minted_run(&m), "operator-named id with spec:None must not read as minted");
-
-        // spec.origin is the RECORDED discriminator and must win regardless
-        // of what the id looks like. (#1562 QA finding: bare `spec.is_some()`
-        // was wrong — the propose→start golden path ALSO stamps spec, and
-        // classifying on presence hid the operator's own proposed mission
-        // from the board that told them to propose it.)
-        m.spec = Some(minted_spec());
-        assert!(
-            is_minted_run(&m),
-            "a builtin-origin (or legacy origin-less) spec must classify as minted"
-        );
-        m.spec.as_mut().unwrap().origin =
-            Some(darkmux_crew::types::MissionSpecOrigin::UserConfig);
-        assert!(
-            !is_minted_run(&m),
-            "a USER-tier config launch is the operator's named work and must stay on the board"
-        );
-    }
-
-    #[test]
-    fn is_minted_run_keeps_four_digit_numbered_operator_names_visible() {
-        // (#1562 QA finding) The first draft fell back to `short_handle`,
-        // which matches ANY ≥4-hex run — and darkmux issue numbers are now
-        // 4 digits, so the operator's own issue-prefixed naming convention
-        // (`756-live-diff` scaled up) would silently hide. Same for
-        // year-prefixed and pure-hex-word names.
-        for id in ["1616-compactor-fix", "2026-roadmap", "beef-cache-decade"] {
-            let m = mission(id, MissionStatus::Active);
-            assert!(m.spec.is_none());
-            assert!(
-                !is_minted_run(&m),
-                "`{id}` is an operator-named id and must stay on the default board"
-            );
-        }
-        // ...while the REAL pre-#1503 mint shapes (10-digit unix segment)
-        // still classify as minted — the fallback got tighter, not weaker.
-        let m = mission("review-1785400940-136e76", MissionStatus::Active);
-        assert!(is_minted_run(&m), "an epoch-stamped id must still read as minted");
-    }
-
-    #[test]
-    fn is_minted_run_falls_back_to_id_shape_for_pre_1503_records() {
-        // Real minted shapes written before `spec` existed (#1503) carry
-        // spec:None on disk today but are still run instances, not
-        // something an operator typed.
-        let review = mission("review-1785400940-136e76", MissionStatus::Active);
-        assert!(review.spec.is_none(), "precondition: no recorded spec");
-        assert!(is_minted_run(&review), "pre-#1503 review-shaped id must still classify as minted");
-
-        let dispatch = mission("dispatch-code-reviewer-1785589698-5d6a-0", MissionStatus::Finalized);
-        assert!(dispatch.spec.is_none(), "precondition: no recorded spec");
-        assert!(is_minted_run(&dispatch), "pre-#1503 dispatch-shaped id must still classify as minted");
-    }
-
-    #[test]
-    fn is_minted_run_is_false_for_hand_authored_ids_with_no_spec() {
-        for id in ["doom-loop-m4", "104-daemon-observability"] {
-            let m = mission(id, MissionStatus::Active);
-            assert!(m.spec.is_none());
-            assert!(!is_minted_run(&m), "`{id}` must read as operator-named");
-        }
     }
 
     #[test]
