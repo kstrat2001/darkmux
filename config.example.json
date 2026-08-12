@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.8",
+  "schema_version": "1.9",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -42,6 +42,10 @@
     "router_profile": "",
     "answerer_profile": "",
     "humor": 65
+  },
+  "gh": {
+    "enabled": false,
+    "allowed": []
   },
   "role_profiles": {}
 }
