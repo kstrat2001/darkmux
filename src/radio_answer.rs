@@ -405,14 +405,20 @@ fn render_board_block_from(missions: &[crate::crew::types::Mission]) -> Option<S
          typed.)\n",
     );
 
-    let live: Vec<String> = missions
+    // Kept as mission refs (not just formatted strings) so the floor below
+    // can exclude exactly what actually got emitted on this line — see its
+    // own comment for why (#1717 follow-up #2).
+    let live_missions: Vec<&crate::crew::types::Mission> = missions
         .iter()
         .filter(|m| matches!(m.status, MissionStatus::Active | MissionStatus::Paused))
+        .take(5)
+        .collect();
+    let live: Vec<String> = live_missions
+        .iter()
         .map(|m| {
             let marker = if m.is_minted_run() { " (auto)" } else { "" };
             format!("{}{marker}", elide(&m.id, BOARD_ID_CAP_CHARS))
         })
-        .take(5)
         .collect();
     if !live.is_empty() {
         out.push_str("Active/paused: ");
@@ -462,6 +468,19 @@ fn render_board_block_from(missions: &[crate::crew::types::Mission]) -> Option<S
     // — a board that's already named-heavy leaves this line out entirely,
     // same as `hidden_run_summary`'s no-op convention on the CLI board.
     //
+    // (#1717 follow-up #2) "not already shown above" means EVERY list
+    // above, not just the recent top-5 — this line's own header says "not
+    // in the list above," and a named mission that is Active/Paused is
+    // already on the `Active/paused:` line. Before this fix the filter only
+    // excluded `top`, so an open named mission crowded out of the top-5
+    // could be emitted a SECOND time here: a genuine duplicate that also
+    // makes the header's own claim false. Excluding `live_missions` too
+    // closes that gap. Because this is `filter().take(N)`, not `take(N)`
+    // THEN filter, an excluded active mission doesn't shrink the floor —
+    // the scan simply continues past it to the next-most-recent named
+    // mission not yet shown anywhere, so a slot the active mission didn't
+    // need still reaches someone who does.
+    //
     // Cost: on a run-dominated board this doubles the mission-id surface
     // the model has to parse (two disjoint lists instead of one) and adds
     // a bounded number of extra characters — the floor is capped, so the
@@ -469,7 +488,11 @@ fn render_board_block_from(missions: &[crate::crew::types::Mission]) -> Option<S
     // missions do.
     let extra_named: Vec<String> = recent
         .iter()
-        .filter(|m| !m.is_minted_run() && !top.iter().any(|t| t.id == m.id))
+        .filter(|m| {
+            !m.is_minted_run()
+                && !top.iter().any(|t| t.id == m.id)
+                && !live_missions.iter().any(|l| l.id == m.id)
+        })
         .take(NAMED_MISSION_FLOOR_IN_BOARD_BLOCK)
         .map(|m| format!("{} ({})", elide(&m.id, BOARD_ID_CAP_CHARS), status_word(m.status)))
         .collect();
@@ -1133,6 +1156,101 @@ mod tests {
             "a minted run that only surfaces via Active/paused must still carry the auto \
              marker — an unmarked id here reads as a positive claim the user typed it: \
              {live_line}"
+        );
+    }
+
+    /// (#1717 follow-up #2, coordinator finding) A named mission that is
+    /// itself Active/Paused — and therefore already visible on the
+    /// `Active/paused:` line — must not ALSO be re-emitted by the floor.
+    /// The floor's own header claims "named work not in the list above";
+    /// before this fix the floor only excluded ids already in the `Most
+    /// recent` top-5, not ids already on the `Active/paused` line, so an
+    /// active named mission crowded out of the top-5 (but still open) got
+    /// a genuine duplicate: once on `Active/paused`, again on the floor.
+    /// Two lines both asserting something true about the same mission
+    /// reads to a model as two DIFFERENT pieces of evidence about it, not
+    /// one restated — the same failure class the MUST FIX above closed on
+    /// the marking side, now on the dedup side.
+    #[test]
+    fn the_floor_excludes_ids_already_on_the_active_paused_line() {
+        use crate::crew::types::MissionStatus as M;
+        // Active named mission, touched a while ago — old enough to be
+        // crowded out of the RECENT_MISSIONS_IN_BOARD_BLOCK top-5 by the
+        // finalized runs below, but still Active (so it's on Active/paused).
+        let mut missions = vec![board_mission("1616-compactor-fix", M::Active, 100, None)];
+        missions.extend((0..RECENT_MISSIONS_IN_BOARD_BLOCK).map(|i| {
+            board_mission(
+                &format!("review-178540{i:04}-136e76"),
+                M::Finalized,
+                100,
+                Some(10_000 + i as u64),
+            )
+        }));
+
+        let block = render_board_block_from(&missions).expect("block renders");
+        let recent_line = block.lines().find(|l| l.starts_with("Most recent")).expect("line");
+        assert!(
+            !recent_line.contains("1616-compactor-fix"),
+            "precondition: the active mission must be crowded out of the recent list: \
+             {recent_line}"
+        );
+        let live_line = block.lines().find(|l| l.starts_with("Active/paused")).expect("line");
+        assert!(
+            live_line.contains("1616-compactor-fix"),
+            "precondition: it must be on Active/paused: {live_line}"
+        );
+
+        let occurrences = block.matches("1616-compactor-fix").count();
+        assert_eq!(
+            occurrences, 1,
+            "an active named mission must appear exactly ONCE across the whole block, not \
+             once on Active/paused AND again on the floor's Also-tracking line: {block}"
+        );
+    }
+
+    /// (#1717 follow-up #2) Excluding an already-visible active mission from
+    /// the floor must not simply shrink the floor by one slot — the floor's
+    /// whole point is that named work reaches the bundle, so a slot the
+    /// active mission didn't need goes to the next-most-recent named
+    /// mission that ISN'T visible anywhere else yet, not left unfilled.
+    #[test]
+    fn the_floor_reaches_deeper_when_an_active_mission_is_excluded_from_it() {
+        use crate::crew::types::MissionStatus as M;
+        // Crowds `1616-compactor-fix` out of the top-5, same as the test
+        // above.
+        let mut missions = vec![board_mission("1616-compactor-fix", M::Active, 100, None)];
+        missions.extend((0..RECENT_MISSIONS_IN_BOARD_BLOCK).map(|i| {
+            board_mission(
+                &format!("review-178540{i:04}-136e76"),
+                M::Finalized,
+                100,
+                Some(10_000 + i as u64),
+            )
+        }));
+        // Three more named missions, each OLDER than `1616-compactor-fix`
+        // (last_activity 100) — without the exclusion fix these are exactly
+        // the ones a naive "skip it, shrink by one" fix would leave out,
+        // since `1616-compactor-fix` itself would otherwise occupy one of
+        // the floor's `NAMED_MISSION_FLOOR_IN_BOARD_BLOCK` (3) slots ahead
+        // of them in recency order.
+        missions.push(board_mission("older-named-a", M::Finalized, 1, Some(3)));
+        missions.push(board_mission("older-named-b", M::Finalized, 1, Some(2)));
+        missions.push(board_mission("older-named-c", M::Finalized, 1, Some(1)));
+
+        let block = render_board_block_from(&missions).expect("block renders");
+        let floor_line =
+            block.lines().find(|l| l.starts_with("Also tracking")).expect("floor line present");
+        assert!(
+            !floor_line.contains("1616-compactor-fix"),
+            "the active mission must not consume a floor slot it doesn't need — it's \
+             already visible on Active/paused: {floor_line}"
+        );
+        assert!(floor_line.contains("older-named-a"), "{floor_line}");
+        assert!(floor_line.contains("older-named-b"), "{floor_line}");
+        assert!(
+            floor_line.contains("older-named-c"),
+            "the freed slot must go to the NEXT-most-recent named mission, not sit empty: \
+             {floor_line}"
         );
     }
 
