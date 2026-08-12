@@ -138,11 +138,19 @@ pub enum FlowCmd {
         /// summary.
         #[arg(long)]
         json: bool,
-        /// (#1775) Exit 3 when any file could NOT be content-verified —
-        /// a legacy pre-2.6.0 struct-hash file, or one whose `hash_format`
-        /// header marker is missing. Without this the walk reports those
-        /// files honestly but still exits 0, so a tripwire keyed on the
-        /// exit code cannot tell "verified" from "never checked".
+        /// (#1775) Exit 3 when a file PRESENT in the walk could not be
+        /// content-verified — a legacy pre-2.6.0 struct-hash file, one
+        /// whose `hash_format` header marker is missing, or one naming a
+        /// format this binary does not recognize. Without this the walk
+        /// reports those files honestly but still exits 0, so a tripwire
+        /// keyed on the exit code cannot tell "verified" from "never
+        /// checked".
+        ///
+        /// Scope: this is about files that ARE there. It says nothing
+        /// about records or files that are ABSENT — a truncated tail or a
+        /// deleted file still exits 0, because the chain records neither
+        /// how many records a file should hold nor which files should
+        /// exist (see SECURITY.md).
         ///
         /// Opt-in because a genuine read-only pre-2.6.0 archive is not a
         /// failure. On a fleet already writing byte-hashed files, no NEW
@@ -218,6 +226,14 @@ fn print_integrity_check(
         flow::integrity_check_all()?
     };
 
+    // (#1775) Computed BEFORE rendering, because one of the lines below
+    // makes a factual claim ABOUT this value. Gating that claim on an
+    // input predicate instead ("are any files legacy?") printed "exit
+    // status stays 0" on a run that exited 2 — a legacy file and a broken
+    // file in the same directory — which is the same class of defect this
+    // command exists to catch, in the output of the command itself.
+    let exit_code = flow::integrity_exit_code(&reports, strict);
+
     use darkmux_types::style;
     if json {
         // (#776) machine-readable: force color off (defense-in-depth).
@@ -283,8 +299,11 @@ fn print_integrity_check(
         // (#1775) Without --strict the walk still exits 0 on an
         // unverifiable file. Say so, so an operator reading the output
         // knows the exit code they'd get from cron does NOT reflect the
-        // warning they can see here.
-        if !strict && reports.iter().any(|r| r.legacy_format) {
+        // warning they can see here. Gated on the COMPUTED code, never on
+        // `!strict` alone: with a broken file also present the exit is 2,
+        // and claiming otherwise would be a false statement printed right
+        // beside a tamper signal.
+        if exit_code == 0 && reports.iter().any(|r| r.legacy_format) {
             println!(
                 "{}",
                 style::dim(
@@ -295,7 +314,7 @@ fn print_integrity_check(
         }
     }
 
-    match flow::integrity_exit_code(&reports, strict) {
+    match exit_code {
         0 => Ok(()),
         code => std::process::exit(code),
     }

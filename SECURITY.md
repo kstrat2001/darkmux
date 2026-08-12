@@ -106,13 +106,29 @@ frame:
   hashes the stored bytes rather than a re-serialization of a parsed struct,
   so there is no parse step left to skip.
 
-  What remains is structural rather than a bug. **Whole-file deletion is
-  undetectable**, because each per-day file seeds its own chain and nothing
-  records which files should exist. And the chain root is **un-anchored** —
-  computed and stored locally — so an attacker with write access who rewrites
-  a file wholesale (fresh header, recomputed hashes, relinked `prev_hash`)
-  produces one that validates. That ceiling is inherent to an anchorless local
-  chain; closing it would take an external anchor.
+  What remains is structural rather than a bug.
+
+  **Truncating the tail of a file is undetectable, and it is the cheapest
+  attack of the three.** Delete the last record line (or the last k of them)
+  and the walk sees a shorter but fully consistent chain: every `prev_hash`
+  links, every byte-hash matches, the file reports valid — including under
+  `--strict`. Nothing records how many records a file should contain or
+  hashes its tail. The next append then extends the chain from the truncated
+  end, so the deletion is permanent. Note this is *not* addressed by anchoring
+  the chain root: a root anchor proves where the chain started, not where it
+  should have ended. A tail anchor or an external high-water mark would be
+  needed.
+
+  **Whole-file deletion is undetectable**, because each per-day file seeds its
+  own chain and nothing records which files should exist.
+
+  And the chain root is **un-anchored** — computed and stored locally — so an
+  attacker with write access who rewrites a file wholesale (fresh header,
+  recomputed hashes, relinked `prev_hash`) produces one that validates.
+
+  All three ceilings are inherent to an anchorless local chain. What the walk
+  does catch: in-place edits, reordering, insertion, and deletion of records
+  from the **middle** of a file.
 
   A file that cannot be content-verified at all — a pre-2.6.0 struct-hash
   file, or one whose `hash_format` header marker has been removed — is

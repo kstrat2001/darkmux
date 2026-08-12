@@ -2549,3 +2549,80 @@ fn pr_review_run_bundler_should_warn_ignored_with_from_envelope() {
 // shape) is covered at the function level instead, with an injected
 // canned model call — see `src/radio.rs::tests` and
 // `src/radio_cli.rs::tests`.
+
+/// (#1775) The exit-status belt and the sentence that describes it must
+/// agree. The pure `integrity_exit_code` is unit tested in `darkmux-flow`;
+/// what is NOT reachable from there is the human output, which is where
+/// the first version of this feature printed "exit status stays 0" on a
+/// run that exited 2 — a legacy file and a broken file in the same
+/// directory. Spawning the binary is the only way to catch that, and the
+/// belt previously carried a comment conceding it was review-only.
+///
+/// Deliberately covers the MIXED case, not the happy one: with only a
+/// legacy file present the buggy and fixed versions behave identically,
+/// so a single-file test proves nothing.
+#[test]
+fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let audit = tmp.path().join("audit");
+    std::fs::create_dir_all(&audit).unwrap();
+
+    // Build one legacy file (header marker stripped -> unverifiable) and
+    // one genuinely broken file (marker intact, record bytes mutated), by
+    // emitting real records and then editing them the way an attacker
+    // would rather than hand-rolling the chain format.
+    for (day, text) in [("2026-01-01", "alpha"), ("2026-01-02", "bravo")] {
+        let staging = tmp.path().join(format!("stage-{day}"));
+        std::fs::create_dir_all(&staging).unwrap();
+        Command::cargo_bin("darkmux")
+            .unwrap()
+            .env("DARKMUX_AUDIT_DIR", &staging)
+            .args(["flow", "note", "--text", text, "--source", "orchestrator"])
+            .assert()
+            .success();
+        let produced = std::fs::read_dir(&staging)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+            .expect("flow note must write an audit file");
+        let body = std::fs::read_to_string(&produced).unwrap();
+        let mut lines: Vec<String> = body.lines().map(str::to_string).collect();
+        assert!(lines.len() >= 2, "need a header plus a record: {body}");
+
+        if day == "2026-01-01" {
+            // Strip the format marker -> the walk downgrades to legacy and
+            // content-verifies nothing.
+            lines[0] = lines[0].replace(",\"hash_format\":\"prefix-blake3-v1\"", "");
+            assert!(!lines[0].contains("hash_format"), "marker must be gone: {}", lines[0]);
+        } else {
+            // Mutate the record bytes AFTER the hash prefix -> a real break.
+            let sp = lines[1].find(' ').expect("record line is `<hash> <json>`");
+            let (hash, rec) = lines[1].split_at(sp);
+            lines[1] = format!("{hash}{}", rec.replace("bravo", "BRAVX"));
+        }
+        std::fs::write(audit.join(format!("{day}.jsonl")), lines.join("\n") + "\n").unwrap();
+    }
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_AUDIT_DIR", &audit)
+        .args(["flow", "integrity-check"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a genuine break must exit 2 even beside an unverifiable file; stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("exit status stays 0"),
+        "the run exited 2 — it must not print a claim that the status stays 0; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("BROKEN"),
+        "the break must still be reported; stdout:\n{stdout}"
+    );
+}
