@@ -1509,6 +1509,7 @@
     }
 
     #[test]
+    #[serial_test::serial]
     fn run_funnel_case_zero_bundles_from_non_ts_diff_yields_a_degenerate_envelope_with_no_dispatch() {
         let case = Case {
             id: "c-docs".into(),
@@ -1554,6 +1555,7 @@
     /// caught before a corpus run started spamming synthetic "running
     /// dispatch" entries into the fleet-liveness surfaces.
     #[test]
+    #[serial_test::serial]
     fn run_funnel_case_through_local_jsonl_emitter_emits_no_dispatch_bookends() {
         let case = Case {
             id: "c-docs-2".into(),
@@ -1606,6 +1608,7 @@
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn run_funnel_case_external_bundler_flows_through_bundle_external_bundles_and_names_the_case_on_failure() {
         // Mirrors `bundle::external::tests::write_stub_script` — an external
         // `--bundler` that produces an EMPTY bundle set is rejected loudly
@@ -1679,7 +1682,39 @@
         }
     }
 
+    /// Captures a set of env vars and restores them on Drop. Same idiom as
+    /// `CrewDirGuard` in `darkmux-crew`'s loader tests; used here so a
+    /// failing assert can't leak a tempdir path into the rest of the run.
+    struct FunnelEnvGuard(Vec<(String, Option<String>)>);
+
+    impl FunnelEnvGuard {
+        fn capture(keys: &[&str]) -> Self {
+            Self(keys.iter().map(|k| ((*k).to_string(), std::env::var(k).ok())).collect())
+        }
+    }
+
+    impl Drop for FunnelEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialized via #[serial_test::serial] on every caller.
+            unsafe {
+                for (key, prev) in &self.0 {
+                    match prev {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    // Every test below resolves `mission_config::load("review")`, which reads
+    // the process-global DARKMUX_CREW_DIR. `#[serial_test::serial]` only
+    // serializes against OTHER serial tests, so the gate test above (which
+    // points that var at a tempdir holding a deliberately phase-less review
+    // override) would otherwise race these and fail them with a dangling
+    // `adjudicate` phase id. Config-resolving tests are all serial as a set.
     #[test]
+    #[serial_test::serial]
     fn resolve_funnel_ctx_missing_roster_profile_names_available() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = write_test_registry(tmp.path(), "fast");
@@ -1696,6 +1731,7 @@
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolve_funnel_ctx_k_override_greater_than_one_is_rejected() {
         // (#1512, #1513 review M1) Draw multiplication is retired — one
         // probe role is one dispatch, always — so a `--k > 1` request can no
@@ -1719,6 +1755,7 @@
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolve_funnel_ctx_k_override_of_one_is_accepted_as_a_no_op() {
         // `--k 1` (explicit) stays legal back-compat, same as omitting it.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1754,9 +1791,17 @@
     #[serial_test::serial]
     fn resolve_funnel_ctx_refuses_a_gh_verb_review_override_when_the_allowlist_gate_is_off() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
-        let prev_crew = std::env::var("DARKMUX_CREW_DIR").ok();
-        // SAFETY: serialized via #[serial_test::serial].
-        unsafe { std::env::set_var("DARKMUX_CREW_DIR", crew_tmp.path()) };
+        // Restored on Drop, not at the end of the happy path: an assert
+        // below that fires would otherwise leave DARKMUX_CREW_DIR pointing
+        // at a deleted tempdir for every later test in the process, turning
+        // one real failure into a cascade of unrelated ones.
+        let _env = FunnelEnvGuard::capture(&["DARKMUX_CREW_DIR", "DARKMUX_GH_ENABLED", "DARKMUX_GH_ALLOWED"]);
+        // SAFETY: serialized via #[serial_test::serial]; restored by `_env`.
+        unsafe {
+            std::env::set_var("DARKMUX_CREW_DIR", crew_tmp.path());
+            std::env::remove_var("DARKMUX_GH_ENABLED");
+            std::env::remove_var("DARKMUX_GH_ALLOWED");
+        }
         let mission_configs_dir = darkmux_crew::loader::mission_configs_dir();
         fs::create_dir_all(&mission_configs_dir).unwrap();
         fs::write(
@@ -1764,13 +1809,6 @@
             r#"{"id": "review", "name": "Test Review Override", "schema_version": "2.3", "gh_verb": "pr-merge"}"#,
         )
         .unwrap();
-        let prev_enabled = std::env::var("DARKMUX_GH_ENABLED").ok();
-        let prev_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok();
-        // SAFETY: serialized via #[serial_test::serial].
-        unsafe {
-            std::env::remove_var("DARKMUX_GH_ENABLED");
-            std::env::remove_var("DARKMUX_GH_ALLOWED");
-        }
 
         let profiles_tmp = tempfile::TempDir::new().unwrap();
         let path = write_test_registry(profiles_tmp.path(), "fast");
@@ -1783,25 +1821,10 @@
         let msg = format!("{err:#}");
         assert!(msg.contains("pr-merge"), "names the verb: {msg}");
         assert!(msg.contains("gh.enabled"), "points at the fix: {msg}");
-
-        // SAFETY: serialized via #[serial_test::serial].
-        unsafe {
-            match prev_enabled {
-                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
-            }
-            match prev_allowed {
-                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
-                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
-            }
-            match prev_crew {
-                Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
-                None => std::env::remove_var("DARKMUX_CREW_DIR"),
-            }
-        }
     }
 
     #[test]
+    #[serial_test::serial]
     fn resolve_funnel_ctx_no_k_override_uses_default_probe_k_and_exec_mode_defaults_to_auto() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = write_test_registry(tmp.path(), "fast");
