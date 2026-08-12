@@ -154,6 +154,7 @@ pub fn run() -> DoctorReport {
         check_fleet_mode(),
         check_openai_base_url_conflict(),
         check_redis_config(),
+        check_gh_allowlist(),
         check_remote_endpoint_credentials(),
         check_env_masks_config(),
         check_binary_split_brain(),
@@ -1253,6 +1254,43 @@ fn check_redis_config() -> Check {
             message: format!("config Redis enabled → {host}, but no password (Keychain item `darkmux-redis` absent, no DARKMUX_REDIS_URL) — connecting password-less"),
             hint: Some("If your Redis requires auth, store the password: `security add-generic-password -a $USER -s darkmux-redis -w` (URL-safe). Password-less is fine for a local/Tailnet-trusted Redis.".into()),
         },
+    }
+}
+
+/// (#1685) Surface the `gh`-verb allowlist gate's resolved state —
+/// `enabled` + the allowed verb list, with provenance (env vs config vs
+/// default), so an operator wondering "why did `pr-merge` refuse to run"
+/// can see the answer from `darkmux doctor` without reading
+/// `~/.darkmux/config.json` by hand. Never touches GitHub or `gh` itself —
+/// this only reads darkmux's OWN config surface (`GhConfig`'s doc).
+fn check_gh_allowlist() -> Check {
+    let name = "gh verb allowlist";
+    let env_enabled = std::env::var("DARKMUX_GH_ENABLED").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let env_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let enabled = darkmux_types::config_access::gh_enabled();
+    let allowed = darkmux_types::config_access::gh_allowed_verbs();
+    let provenance = if env_enabled || env_allowed { "env" } else { "config.json" };
+    if !enabled {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("disabled ({provenance}) — every gh_verb-declaring panel command refuses to run"),
+            hint: None,
+        };
+    }
+    if allowed.is_empty() {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: "gh.enabled=true but gh.allowed is empty — every gh_verb-declaring panel command still refuses (a verb absent from the list is blocked even with the gate on)".into(),
+            hint: Some("`darkmux config set gh.allowed <comma-separated-verb-list>` — e.g. pr-list,pr-info,pr-approve,pr-merge — matching each config's own `gh_verb` field.".into()),
+        };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!("enabled ({provenance}) — allowed: {}", allowed.join(", ")),
+        hint: None,
     }
 }
 
@@ -3817,6 +3855,83 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    // ─── (#1685) check_gh_allowlist — resolved state + provenance ─────────
+
+    #[serial_test::serial]
+    #[test]
+    fn check_gh_allowlist_disabled_by_default_is_pass() {
+        let prev_e = std::env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_a = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_GH_ENABLED");
+            std::env::remove_var("DARKMUX_GH_ALLOWED");
+        }
+        let check = check_gh_allowlist();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("disabled"), "{}", check.message);
+        unsafe {
+            match prev_e {
+                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_a {
+                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_gh_allowlist_enabled_with_empty_list_warns() {
+        let prev_e = std::env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_a = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_GH_ENABLED", "true");
+            std::env::remove_var("DARKMUX_GH_ALLOWED");
+        }
+        let check = check_gh_allowlist();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("empty"), "{}", check.message);
+        assert!(check.hint.is_some());
+        unsafe {
+            match prev_e {
+                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_a {
+                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_gh_allowlist_enabled_with_verbs_is_pass_and_names_them() {
+        let prev_e = std::env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_a = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_GH_ENABLED", "true");
+            std::env::set_var("DARKMUX_GH_ALLOWED", "pr-list,pr-merge");
+        }
+        let check = check_gh_allowlist();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("pr-list"), "{}", check.message);
+        assert!(check.message.contains("pr-merge"), "{}", check.message);
+        assert!(check.message.contains("env"), "provenance named: {}", check.message);
+        unsafe {
+            match prev_e {
+                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_a {
+                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+    }
+
     // ─── (#1769) summarize_audit_reports — Fail / Warn / Pass split ────────
     //
     // Pure-function tests: no filesystem, no `DARKMUX_AUDIT_DIR`. Each test
@@ -4748,10 +4863,10 @@ mod tests {
         // [#934] + binary-split-brain [#934] + crew-validation [#1269] +
         // mission-config-registry [#1284] + daemon-freshness +
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
-        // [#1475]) + one per active eureka rule. Every check should appear
-        // regardless of environment — even if the underlying probe couldn't
-        // read state.
-        let expected = 35 + darkmux_eureka::all_rules().len();
+        // [#1475] + gh-verb-allowlist [#1685]) + one per active eureka rule.
+        // Every check should appear regardless of environment — even if the
+        // underlying probe couldn't read state.
+        let expected = 36 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

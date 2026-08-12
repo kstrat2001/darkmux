@@ -54,6 +54,11 @@ enum Ty {
     Float,
     /// A string constrained to the `FleetMode` token set (#933).
     FleetMode,
+    /// (#1685) Comma-separated list of non-empty, trimmed strings, coerced
+    /// to a JSON array — `darkmux config set gh.allowed pr-list,pr-merge`.
+    /// REPLACES the whole array (there is no incremental add); an empty
+    /// string clears it to `[]`.
+    StrList,
 }
 
 /// Every settable dotted key + its type — THE contract for `config set`. A key
@@ -123,6 +128,9 @@ const KEYS: &[(&str, Ty)] = &[
     // means adding it HERE by hand, or the tier exists in the resolver and is
     // unreachable from `config set`/`get`.
     ("dirs.lab", Ty::Str),
+    // (#1685) The `gh`-verb allowlist gate — see `GhConfig`'s own doc.
+    ("gh.enabled", Ty::Bool),
+    ("gh.allowed", Ty::StrList),
 ];
 
 /// Keys that are deliberately NOT config — a secret that lives in the macOS
@@ -291,6 +299,13 @@ fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
             // Store the canonical lowercase token regardless of the input casing.
             Value::String(mode.as_str().to_string())
         }
+        Ty::StrList => Value::Array(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| Value::String(s.to_string()))
+                .collect(),
+        ),
     })
 }
 
@@ -433,6 +448,32 @@ mod tests {
         assert!(set_at(f.path(), "role_profiles.a.b", "x").is_err(), "deeper path rejected");
     }
 
+    /// (#1685) `gh.allowed` round-trips as a JSON array, trims whitespace,
+    /// drops empty entries, and REPLACES (rather than appends to) whatever
+    /// was there before.
+    #[test]
+    fn gh_allowed_str_list_round_trips_and_replaces() {
+        let f = tmp();
+        let p = f.path();
+        set_at(p, "gh.enabled", "true").unwrap();
+        set_at(p, "gh.allowed", "pr-list, pr-info ,,pr-merge").unwrap();
+        let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        let gh = cfg.gh.unwrap();
+        assert_eq!(gh.enabled, Some(true));
+        assert_eq!(
+            gh.allowed,
+            Some(vec!["pr-list".to_string(), "pr-info".to_string(), "pr-merge".to_string()])
+        );
+        // A second set REPLACES the list, not appends.
+        set_at(p, "gh.allowed", "pr-approve").unwrap();
+        let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(cfg.gh.unwrap().allowed, Some(vec!["pr-approve".to_string()]));
+        // An empty value clears the list.
+        set_at(p, "gh.allowed", "").unwrap();
+        let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(cfg.gh.unwrap().allowed, Some(Vec::<String>::new()));
+    }
+
     #[test]
     fn unknown_key_is_rejected_with_suggestion() {
         let f = tmp();
@@ -523,6 +564,7 @@ mod tests {
                 Ty::Float => serde_json::json!(0.5),
                 // a valid FleetMode token doubles as the generic string sentinel
                 Ty::Str | Ty::FleetMode => Value::String("standalone".into()),
+                Ty::StrList => serde_json::json!(["sentinel"]),
             };
             let mut root = Value::Object(Default::default());
             set_path(&mut root, key, sentinel);
@@ -544,6 +586,7 @@ mod tests {
             + c.audit.as_ref().map_or(0, |x| x.extras.len())
             + c.runtime.as_ref().map_or(0, |x| x.extras.len())
             + c.fleet.as_ref().map_or(0, |x| x.extras.len())
+            + c.gh.as_ref().map_or(0, |x| x.extras.len())
     }
 
     #[test]

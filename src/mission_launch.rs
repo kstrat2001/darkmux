@@ -251,6 +251,15 @@ pub fn launch(
     })?;
     let config = &loaded.config;
 
+    // (#1685) The gh-verb allowlist gate — checked before ANY other work on
+    // this config, so a direct `darkmux mission launch <id>` gets the SAME
+    // refusal an ACP-panel invocation would (`acp_panel::run_ephemeral`
+    // checks the identical `mission_config::check_gh_verb` first thing).
+    // The gate holds regardless of which surface invoked the config.
+    if let Some(reason) = mission_config::check_gh_verb(config) {
+        bail!("mission launch: {reason}");
+    }
+
     // (contract 7) Semantic validation is a SEPARATE, explicit pass — this
     // IS the consumption point. `known_kinds` is everything this launcher
     // can actually construct today; anything else warns rather than errors
@@ -341,6 +350,28 @@ pub fn launch(
             );
         }
     }
+
+    // (#1685) If the config's graph references the reserved
+    // `__panel_args__` task id (the SAME convention the ACP ephemeral
+    // route uses for a panel command's raw argument text — see
+    // `mission_config::inject_panel_args_task_if_referenced`'s own doc),
+    // inject the synthetic task here too, seeded from `--param
+    // args=<value>` — BEFORE minting or interpreting — so a direct
+    // `darkmux mission launch <id> --param args=<value>` behaves
+    // identically to invoking the SAME config from the editor panel.
+    // Before this, a config declaring `reads: ["__panel_args__"]` (any
+    // panel verb that takes an argument, e.g. a PR number) resolved fine
+    // via `darkmux acp` but hard-failed `interpret` on this direct CLI
+    // path with "reads unknown task id `__panel_args__`" — nothing here
+    // ever injected the task the ACP route always does. A config that
+    // never references the reserved id is untouched (the function's own
+    // no-op early return), so this has zero effect on every other config.
+    let mut config_owned = config.clone();
+    mission_config::inject_panel_args_task_if_referenced(
+        &mut config_owned,
+        collected.get("args").and_then(|v| v.as_str()).unwrap_or(""),
+    );
+    let config: &MissionConfig = &config_owned;
 
     // (#1284 review round 1, consider 11) A config whose graph uses the
     // coder-phase step kinds needs workdir/branch/base to EXECUTE — check
@@ -2110,6 +2141,157 @@ mod tests {
         ]
     }"#;
 
+    // ── (#1685) gh-verb allowlist gate on the DIRECT CLI launch path ────
+    // `acp_panel::run_ephemeral`'s own tests cover the ACP route; these
+    // cover the SAME `mission_config::check_gh_verb` gate on a bare
+    // `darkmux mission launch <id>` invocation, proving the allowlist holds
+    // on both entry points named in the #1685 spec.
+
+    const GH_VERB_CONFIG: &str = r#"{
+        "id": "gh-verb-test-mission",
+        "name": "GH Verb Test Mission",
+        "schema_version": "2.3",
+        "gh_verb": "pr-merge",
+        "phases": [
+            {"id": "p1", "tasks": [{"id": "t1", "steps": [{"id": "s1", "kind": "procedural.noop"}]}]}
+        ]
+    }"#;
+
+    #[test]
+    #[serial_test::serial]
+    fn launch_refuses_a_gh_verb_config_when_the_allowlist_gate_is_off() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("gh-verb-test-mission", GH_VERB_CONFIG);
+        let prev_enabled = env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_allowed = env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe {
+            env::remove_var("DARKMUX_GH_ENABLED");
+            env::remove_var("DARKMUX_GH_ALLOWED");
+        }
+
+        let err = launch("gh-verb-test-mission", None, &[], None)
+            .expect_err("a gh_verb config must be refused with the allowlist gate off");
+        assert!(err.to_string().contains("pr-merge"), "{err}");
+        assert!(all_mission_ids().is_empty(), "a refused gh-verb config must mint NOTHING, not a half-launched instance");
+
+        unsafe {
+            match prev_enabled {
+                Some(v) => env::set_var("DARKMUX_GH_ENABLED", v),
+                None => env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_allowed {
+                Some(v) => env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+        drop(guard);
+    }
+
+    const PANEL_ARGS_CONFIG: &str = r#"{
+        "id": "panel-args-test-mission",
+        "name": "Panel Args Test Mission",
+        "schema_version": "2.3",
+        "inputs": [{"name": "args", "required": false}],
+        "phases": [
+            {"id": "p1", "tasks": [{
+                "id": "echo-args",
+                "reads": ["__panel_args__"],
+                "steps": [{
+                    "id": "echo-args-step",
+                    "kind": "procedural.shell",
+                    "config": {"command": "echo got: $DARKMUX_STEP_INPUT___PANEL_ARGS__"}
+                }]
+            }]}
+        ]
+    }"#;
+
+    /// (#1685) Direct `darkmux mission launch <id> --param args=<value>`
+    /// must deliver the value into a config's `reads: ["__panel_args__"]`
+    /// task exactly like the ACP ephemeral route does (`acp_panel::
+    /// run_ephemeral`'s own `ephemeral_run_seeds_args_when_a_task_reads_
+    /// the_synthetic_args_task`). Before this fix, ANY config declaring
+    /// that read hard-failed `interpret` on this CLI path — this is the
+    /// regression test for the fix, not just new-feature coverage.
+    #[test]
+    #[serial_test::serial]
+    fn launch_delivers_param_args_into_a_task_reading_the_reserved_panel_args_id() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("panel-args-test-mission", PANEL_ARGS_CONFIG);
+
+        let exit = launch("panel-args-test-mission", None, &["args=hello-world".to_string()], None)
+            .expect("a config reading __panel_args__ must launch and run cleanly from the CLI too");
+        assert_eq!(exit, 0);
+
+        let mission_id = single_mission_id();
+        let steps_dir = crew::loader::missions_dir().join(&mission_id).join("steps");
+        let step_path = walk_for_file(&steps_dir, "echo-args-step.json").expect("step json must exist");
+        let step: crew::types::Step =
+            serde_json::from_str(&std::fs::read_to_string(&step_path).unwrap()).unwrap();
+        assert_eq!(step.output.as_deref().map(str::trim), Some("got: hello-world"));
+    }
+
+    /// The no-args case must still resolve cleanly (an empty string, not a
+    /// dangling-reference failure) — mirrors `ephemeral_run_with_empty_
+    /// args_still_resolves_a_task_that_reads_the_reserved_id` on the ACP side.
+    #[test]
+    #[serial_test::serial]
+    fn launch_with_no_args_param_still_resolves_a_task_reading_the_reserved_id() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("panel-args-test-mission", PANEL_ARGS_CONFIG);
+
+        let exit = launch("panel-args-test-mission", None, &[], None)
+            .expect("no --param args= at all must still resolve to an empty string, not fail");
+        assert_eq!(exit, 0);
+        drop(guard);
+    }
+
+    /// Find a file named `name` anywhere under `dir` (the step json lives
+    /// one phase-subdirectory deep — `steps/<phase-task-id>/<step-id>.json`
+    /// — and this test doesn't want to hardcode that shape).
+    fn walk_for_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk_for_file(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn launch_runs_a_gh_verb_config_once_allowlisted() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("gh-verb-test-mission", GH_VERB_CONFIG);
+        let prev_enabled = env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_allowed = env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe {
+            env::set_var("DARKMUX_GH_ENABLED", "true");
+            env::set_var("DARKMUX_GH_ALLOWED", "pr-merge");
+        }
+
+        let exit = launch("gh-verb-test-mission", None, &[], None)
+            .expect("an allowlisted gh_verb config must launch normally");
+        assert_eq!(exit, 0);
+        assert_eq!(all_mission_ids().len(), 1, "the allowlisted config must actually mint + run");
+
+        unsafe {
+            match prev_enabled {
+                Some(v) => env::set_var("DARKMUX_GH_ENABLED", v),
+                None => env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_allowed {
+                Some(v) => env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+        drop(guard);
+    }
+
     // ── Generic launch path — freeform (no dispatch, no Docker) ────────
 
     /// All mission ids currently minted under the test's isolated crew root
@@ -3029,6 +3211,7 @@ mod tests {
             ],
             phases: Vec::new(),
             panel: None,
+            gh_verb: None,
             extras: BTreeMap::new(),
         };
         let missing = missing_required_inputs(&cfg, &BTreeMap::new());

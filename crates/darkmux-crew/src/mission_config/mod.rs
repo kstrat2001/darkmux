@@ -105,10 +105,19 @@ use std::collections::{BTreeMap, BTreeSet};
 /// silently treated as ungated (see `StepConfig::gate`'s own doc on the
 /// fail-closed contract).
 ///
+/// Bumped to **"2.3"** (#1685) — additive: [`MissionConfig`] gained the
+/// optional `gh_verb` field. Presence names the `gh`-verb allowlist entry
+/// (`darkmux_types::config::GhConfig`) this config requires before it may
+/// run at ALL, on either entry point (`darkmux acp`'s ephemeral panel route
+/// via `check_gh_verb`, or a direct `darkmux mission launch <id>`) — see
+/// [`MissionConfig::gh_verb`]'s own doc. Absence (every pre-2.3 document,
+/// and every config that isn't an operator-authored GitHub-CLI verb) is a
+/// pure no-op.
+///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "2.2";
+pub const MISSION_CONFIG_SCHEMA: &str = "2.3";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,10 +153,58 @@ pub struct MissionConfig {
     /// it carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel: Option<PanelConfig>,
+    /// (#1685, schema 2.3) The `gh`-verb allowlist entry this config
+    /// requires — `None` (the default; every config that isn't an
+    /// operator-authored GitHub-CLI verb) means no allowlist check applies
+    /// at all, the ordinary case. `Some(verb)` means darkmux refuses to run
+    /// ANY step in this config's graph unless
+    /// `darkmux_types::config_access::gh_verb_allowed(verb)` returns true
+    /// (`config.gh.enabled == true` AND `verb` is named in
+    /// `config.gh.allowed`) — checked ONCE, before `validate`/`interpret`
+    /// ever runs, by [`check_gh_verb`]. Both entry points that can execute
+    /// a config's graph call it: `darkmux acp`'s ephemeral panel route
+    /// (`run_ephemeral` in the `darkmux` binary crate) and a direct
+    /// `darkmux mission launch <id>` — so the gate holds regardless of
+    /// which surface invoked the config. Named independently of the
+    /// document's own `id` (conventionally the same string, e.g. a
+    /// `pr-merge.json` config declaring `"gh_verb": "pr-merge"`, but not
+    /// required to match) so the registry-key concern and the allowlist-name
+    /// concern don't silently couple.
+    ///
+    /// darkmux core holds no opinion about what a "verb" IS — this field
+    /// and `GhConfig.allowed` are both bare strings the OPERATOR chooses;
+    /// GitHub itself never enters this crate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh_verb: Option<String>,
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer document read by an older binary).
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
+}
+
+/// (#1685) Check `config`'s [`MissionConfig::gh_verb`] (if any) against the
+/// operator's `gh`-verb allowlist. `None` = no verb declared, always
+/// allowed (the ordinary case — most configs never touch this). `Some(reason)`
+/// = blocked; the caller MUST refuse to run any step in the graph rather
+/// than attempting it — never a partial run. Both entry points that can
+/// execute a config's graph call this ONCE, up front, before `validate`/
+/// `interpret` ever runs: `darkmux acp`'s ephemeral panel route and a
+/// direct `darkmux mission launch <id>`.
+pub fn check_gh_verb(config: &MissionConfig) -> Option<String> {
+    let verb = config.gh_verb.as_deref()?;
+    if darkmux_types::config_access::gh_verb_allowed(verb) {
+        None
+    } else {
+        Some(format!(
+            "config \"{}\" requires the gh-verb allowlist entry \"{verb}\" — darkmux holds no \
+             GitHub credential of its own and refuses to shell to the operator's own `gh` on \
+             this config's behalf until it is explicitly allowed. Run `darkmux config set \
+             gh.enabled true` and `darkmux config set gh.allowed <comma-separated-list-including-{verb}>` \
+             to allow it (the second command REPLACES the whole list — include every verb you \
+             want allowed).",
+            config.id
+        ))
+    }
 }
 
 /// (#1684, schema 2.1) The panel-advertising block on a [`MissionConfig`].
@@ -197,6 +254,83 @@ pub struct PanelConfig {
 /// dangling to a check that only knows about the STATIC document, never
 /// this runtime-injected convention.
 pub const PANEL_ARGS_TASK_ID: &str = "__panel_args__";
+
+/// If any task in `config` names [`PANEL_ARGS_TASK_ID`] (`"__panel_args__"`)
+/// in its own `reads` or `depends_on`, prepend a new phase carrying exactly
+/// one `procedural.noop` task under that id, whose step's `config.output`
+/// is `args` verbatim (empty string when no argument text was supplied — a
+/// graph that declares `reads: ["__panel_args__"]` must still resolve
+/// cleanly through `interpret`, so this seeds an empty value rather than
+/// skipping injection). A config that never references the reserved id is
+/// untouched.
+///
+/// **Two callers, one mechanism (#1685).** Originally `acp_panel.rs`'s own
+/// private helper (the ACP ephemeral route's `args` — the raw text typed
+/// after a panel slash command); moved here so
+/// `mission_launch::launch`'s DIRECT `darkmux mission launch <id> --param
+/// args=<value>` path can call the SAME injection before `interpret` runs.
+/// Before this move, a config declaring `reads: ["__panel_args__"]`
+/// (needed by any panel verb that takes an argument, e.g. a PR number)
+/// resolved fine through the ACP route but HARD-FAILED `interpret` on a
+/// direct CLI launch — "reads unknown task id `__panel_args__`" — because
+/// nothing on that path ever injected the synthetic task. Both callers now
+/// share this one function so the two entry points behave identically.
+///
+/// **Reservation collision (#1695 merge-gate finding 1).** If the
+/// operator's OWN document already declares a task literally named
+/// `__panel_args__`, injection is SKIPPED entirely rather than prepending
+/// a second task under the same id — `interpret`'s own duplicate-id check
+/// (`push_task`) would otherwise bail with a bare "duplicate task id"
+/// error that never explains WHY that particular id is special. Skipping
+/// is also the semantically correct choice, not just the safe one:
+/// `interpret` already resolves `reads`/`depends_on` entries against the
+/// document's OWN declared tasks first, so a task reading
+/// `__panel_args__` in a document that declares one under that name
+/// already receives THAT task's real output — operator sovereignty: an
+/// explicit declaration under a reserved name wins over the synthetic
+/// default for that name, silently and correctly, with nothing to inject.
+pub fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &str) {
+    let referenced = config
+        .phases
+        .iter()
+        .flat_map(|p| p.tasks.iter())
+        .any(|t| t.reads.iter().chain(t.depends_on.iter()).any(|r| r == PANEL_ARGS_TASK_ID));
+    if !referenced {
+        return;
+    }
+    let already_declared =
+        config.phases.iter().flat_map(|p| p.tasks.iter()).any(|t| t.id == PANEL_ARGS_TASK_ID);
+    if already_declared {
+        return;
+    }
+    let args_task = TaskConfig {
+        id: PANEL_ARGS_TASK_ID.to_string(),
+        description: Some("synthetic: the raw text typed after the panel command name (ACP) or the \
+                            `--param args=<value>` flag (direct CLI launch)".to_string()),
+        display_name: None,
+        depends_on: Vec::new(),
+        reads: Vec::new(),
+        role_id: None,
+        steps: vec![StepConfig {
+            id: format!("{PANEL_ARGS_TASK_ID}-step"),
+            kind: "procedural.noop".to_string(),
+            config: serde_json::json!({"output": args}),
+            gate: None,
+            extras: BTreeMap::new(),
+        }],
+        extras: BTreeMap::new(),
+    };
+    config.phases.insert(
+        0,
+        PhaseConfig {
+            id: "__panel_args_phase__".to_string(),
+            description: None,
+            display_name: None,
+            tasks: vec![args_task],
+            extras: BTreeMap::new(),
+        },
+    );
+}
 
 /// A declared runtime-only input a mission config's LAUNCHER must supply
 /// (Packet 3+) — a value that is genuinely per-launch (a diff, a worktree
@@ -810,7 +944,95 @@ mod tests {
             inputs: Vec::new(),
             phases,
             panel: None,
+            gh_verb: None,
             extras: BTreeMap::new(),
+        }
+    }
+
+    // ── (#1685) check_gh_verb ────────────────────────────────────────
+
+    #[test]
+    fn check_gh_verb_is_a_no_op_when_the_config_declares_none() {
+        let cfg = doc(vec![]);
+        assert!(cfg.gh_verb.is_none());
+        assert!(check_gh_verb(&cfg).is_none(), "a config with no gh_verb never gets blocked");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_gh_verb_blocks_when_the_gate_is_off() {
+        let mut cfg = doc(vec![]);
+        cfg.gh_verb = Some("pr-merge".to_string());
+        let prev_enabled = std::env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        // Neither env override set, and the test-support config tier is
+        // empty by construction — config_access falls to its built-in
+        // `false`/empty defaults.
+        unsafe {
+            std::env::remove_var("DARKMUX_GH_ENABLED");
+            std::env::remove_var("DARKMUX_GH_ALLOWED");
+        }
+        let reason = check_gh_verb(&cfg).expect("must be blocked with the gate off");
+        assert!(reason.contains("pr-merge"), "{reason}");
+        assert!(reason.contains("gh.enabled"), "{reason}");
+        unsafe {
+            match prev_enabled {
+                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_allowed {
+                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_gh_verb_allows_when_enabled_and_named() {
+        let mut cfg = doc(vec![]);
+        cfg.gh_verb = Some("pr-merge".to_string());
+        let prev_enabled = std::env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_GH_ENABLED", "true");
+            std::env::set_var("DARKMUX_GH_ALLOWED", "pr-list,pr-merge");
+        }
+        assert!(check_gh_verb(&cfg).is_none(), "enabled + named must pass");
+        unsafe {
+            match prev_enabled {
+                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_allowed {
+                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_gh_verb_blocks_a_verb_not_named_even_when_enabled() {
+        let mut cfg = doc(vec![]);
+        cfg.gh_verb = Some("pr-merge".to_string());
+        let prev_enabled = std::env::var("DARKMUX_GH_ENABLED").ok();
+        let prev_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_GH_ENABLED", "true");
+            std::env::set_var("DARKMUX_GH_ALLOWED", "pr-list,pr-info");
+        }
+        let reason = check_gh_verb(&cfg).expect("pr-merge is not in the allowlist");
+        assert!(reason.contains("pr-merge"), "{reason}");
+        unsafe {
+            match prev_enabled {
+                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+            }
+            match prev_allowed {
+                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+            }
         }
     }
 
@@ -1441,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_2_2() {
+    fn schema_version_constant_is_2_3() {
         // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
         // `LaunchParams::expansions` primitive — never fed by either
         // production launcher. A field REMOVAL is a MAJOR bump per this
@@ -1454,7 +1676,10 @@ mod tests {
         //
         // (#1684 Packet 2) Bumped again to "2.2" — additive (`StepConfig::
         // gate`), same minor-bump discipline.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "2.2");
+        //
+        // (#1685) Bumped again to "2.3" — additive (`MissionConfig::
+        // gh_verb`), same minor-bump discipline.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "2.3");
     }
 
     // ── (#1684) `panel` schema field ─────────────────────────────────────

@@ -409,6 +409,7 @@ mod tests {
             inputs: Vec::new(),
             phases,
             panel: None,
+            gh_verb: None,
             extras: Map::new(),
         }
     }

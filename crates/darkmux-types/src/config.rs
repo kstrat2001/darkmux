@@ -68,7 +68,13 @@ use std::path::Path;
 // invocation. Nothing ever read it. An older binary's `~/.darkmux/config.json`
 // still carrying the key loads fine — `extras` overflow absorbs the now-
 // unknown top-level key, same lenient-read guarantee as an additive bump.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.8";
+// 1.9 (#1685): additive `gh{}` block (`gh.enabled` / `gh.allowed` — the
+// per-verb allowlist gating an operator-authored panel command's shell-out
+// to their OWN `gh` CLI, e.g. the `pr-approve`/`pr-merge` example verbs in
+// the PR-flow guide). darkmux holds no GitHub credential of its own; this
+// block only says which verb NAMES the operator has opted into running.
+// Minor bump, same lenient-read reasoning as every other additive block.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.9";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -109,6 +115,9 @@ pub struct DarkmuxConfig {
     pub review: Option<ReviewConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radio: Option<RadioConfig>,
+    /// (#1685) The `gh`-verb allowlist — see [`GhConfig`]'s own doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh: Option<GhConfig>,
 
     /// (#1475 packet 1) The machine-local **role → profile** map — the binding
     /// that welds an abstract role id (e.g. `judge`, `probe-high`) to a
@@ -411,6 +420,42 @@ pub struct RadioConfig {
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (#1685) The operator's own `gh` CLI credential gate — a **feature block
+/// gated by `enabled`**, same pattern as `RedisConfig`/`AuditConfig`.
+/// darkmux never authenticates to GitHub itself; the PR-flow panel verbs
+/// (`pr-list`/`pr-info`/`pr-approve`/`pr-merge` — see the PR-flow guide)
+/// are operator-authored `procedural.shell` mission configs that shell out
+/// to whatever `gh` the OPERATOR already has signed in, exactly like the
+/// `lms`/`zed` shell-outs elsewhere in this binary. GitHub never enters
+/// darkmux core: this block holds no knowledge of PRs, issues, or the `gh`
+/// binary's own subcommands — just a list of operator-chosen VERB NAMES,
+/// checked against the `gh_verb` an operator's own mission config declares
+/// (`darkmux_crew::mission_config::MissionConfig::gh_verb` /
+/// `check_gh_verb`) before that config is allowed to run at all, on either
+/// entry point (`darkmux acp`'s ephemeral panel route or a direct `darkmux
+/// mission launch <id>`).
+///
+/// `darkmux init` writes this block visible with `enabled: false` and an
+/// EMPTY `allowed` list — darkmux ships no opinion about which verbs
+/// exist; the operator's own configs name their own verbs, and the
+/// operator opts each one in by listing it here. Fails closed on both
+/// counts: `enabled: false` blocks every verb regardless of `allowed`, and
+/// a verb absent from `allowed` is blocked even with `enabled: true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GhConfig {
+    /// The gate: `true` → the `allowed` list is consulted at all;
+    /// `false`/absent → every `gh_verb`-declaring config is refused,
+    /// regardless of `allowed`. Declared first so it reads at the top of
+    /// the block.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
+    /// The allowlisted verb names — e.g. `["pr-list", "pr-info", "pr-approve",
+    /// "pr-merge"]`, matching each config's own `gh_verb` field verbatim.
+    /// `darkmux config set gh.allowed <comma-separated-list>` replaces the
+    /// whole list (there is no incremental add today — see the PR-flow guide).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub allowed: Option<Vec<String>>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
 /// A machine's declared fleet position. `Standalone` (default) = a
 /// single-machine install with no fleet; `Hub` = the always-on coordinator
 /// (and, per #936, supervises its own Redis); `Peer` = points at a hub.
@@ -541,6 +586,15 @@ impl DarkmuxConfig {
             // `darkmux config set role_profiles.<role> <profile>`. Empty (not
             // absent) so it shows up in `config list` / the example file.
             role_profiles: Some(BTreeMap::new()),
+            // (#1685) Written visible with `enabled: false` and an empty
+            // `allowed` list — see `GhConfig`'s own doc. darkmux ships no
+            // opinion about which gh verbs exist; the operator opts each
+            // one in by naming it here once they've authored the config.
+            gh: Some(GhConfig {
+                enabled: Some(false),
+                allowed: Some(Vec::new()),
+                extras: Default::default(),
+            }),
             extras: Default::default(),
         }
     }

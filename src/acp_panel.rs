@@ -43,9 +43,7 @@
 //! for the `Launch`/`Review` routes) — split so each stays independently
 //! readable.
 
-use crate::crew::mission_config::{
-    self, LaunchParams, MissionConfig, PhaseConfig, StepConfig, TaskConfig, PANEL_ARGS_TASK_ID,
-};
+use crate::crew::mission_config::{self, LaunchParams, MissionConfig};
 use crate::crew::scheduler::SchedulerReport;
 use crate::crew::step_kinds::{Facts, FixedEstimator, StepKindRegistry};
 use crate::crew::types::{NodeStatus, Step, Task};
@@ -318,8 +316,19 @@ pub fn run_ephemeral(
     cwd: &Path,
     gate: Option<&mut crate::crew::gate::GateHandler<'_>>,
 ) -> Result<EphemeralOutcome> {
+    // (#1685) The gh-verb allowlist gate — checked FIRST, before
+    // validate()/interpret() ever run, so a blocked config never executes a
+    // single step (not even a read-only gather step). See
+    // `mission_config::check_gh_verb`'s own doc. Rendered the same way a
+    // declined operator sign-off gate renders (a command-failed message,
+    // never a hard `Err` across the ACP boundary), so the panel shows the
+    // operator exactly why nothing ran.
+    if let Some(reason) = mission_config::check_gh_verb(config) {
+        return Ok(EphemeralOutcome { text: format!("darkmux: command failed:\n\n{reason}"), success: false });
+    }
+
     let mut config = config.clone();
-    inject_panel_args_task_if_referenced(&mut config, args);
+    mission_config::inject_panel_args_task_if_referenced(&mut config, args);
 
     // (#1684 QA finding — CONSIDER 7) `mission launch` runs
     // `MissionConfig::validate` at its consumption point before ever
@@ -374,6 +383,29 @@ pub fn run_ephemeral(
     // `<mission_id>/` is ever written).
     let correlation_id = mint_ephemeral_correlation_id(&config.id);
 
+    // (#1685) Track whether an operator sign-off gate was actually
+    // CONFIRMED during this run, for the gh-verb audit record emitted
+    // below. `Rc<Cell<..>>` (not a plain captured `&mut`) so this closure
+    // can wrap the caller's own handler while still letting the outer
+    // function read the result AFTER `run_step_graph` returns — the
+    // closure's last use is the call below, so the borrow checker is happy,
+    // but a Cell keeps the intent obvious. `None` stays `None` for the
+    // whole run when no gated step ever runs (a read-only verb like
+    // `pr-list`/`pr-info`, or a config with no gate at all) — the audit
+    // record then records "no gate" rather than fabricating a yes/no for a
+    // decision that never happened.
+    let gate_confirmed: std::rc::Rc<std::cell::Cell<Option<bool>>> =
+        std::rc::Rc::new(std::cell::Cell::new(None));
+    type BoxedGateHandler<'a> = Box<dyn FnMut(&Step, &BTreeMap<String, String>) -> crate::crew::gate::GateDecision + 'a>;
+    let mut instrumented_gate: Option<BoxedGateHandler<'_>> = gate.map(|handler| {
+        let flag = gate_confirmed.clone();
+        Box::new(move |step: &Step, facts: &BTreeMap<String, String>| {
+            let decision = handler(step, facts);
+            flag.set(Some(matches!(decision, crate::crew::gate::GateDecision::Approved)));
+            decision
+        }) as BoxedGateHandler<'_>
+    });
+
     let report = crate::crew::scheduler::run_step_graph(
         &mut steps,
         &tasks,
@@ -391,13 +423,73 @@ pub fn run_ephemeral(
             // instance, so there is no `<mission>/<phase>/steps/<id>.json`
             // to persist a Step transition into (rule D).
         },
-        gate,
+        instrumented_gate.as_deref_mut(),
         None,
         &[],
     )
     .context("running panel command graph")?;
 
-    render_ephemeral_result(&ordered_tasks, &steps, &report, &interpret_warnings)
+    let outcome = render_ephemeral_result(&ordered_tasks, &steps, &report, &interpret_warnings)?;
+
+    // (#1685) Flow-record audit — ONE record per executed gh-verb command,
+    // regardless of outcome: a blocked-by-gate or otherwise-failed attempt
+    // is still "the operator's session tried to act as them," an
+    // audit-worthy fact on its own (trail 6: "the audit trail of 'when I
+    // allowed the tool to act as me' is a compliance artifact in its own
+    // right"). Configs with no `gh_verb` (the ordinary case) never emit
+    // this record at all.
+    if let Some(verb) = config.gh_verb.as_deref() {
+        emit_gh_verb_audit(verb, args, cwd, gate_confirmed.get(), outcome.success, &correlation_id);
+    }
+
+    Ok(outcome)
+}
+
+/// (#1685) Emit the flow-record audit-trail entry for one executed gh-verb
+/// panel command — see `run_ephemeral`'s own doc for when this fires.
+/// Follows the SAME audit-trail convention `darkmux flow note --source
+/// adjudication` uses (`Category::Audit`, a distinguishing `source` string,
+/// structured detail in `payload`), never a parallel record channel.
+///
+/// `pr` is a BEST-EFFORT extraction — the first whitespace-delimited token
+/// of the raw args string, verbatim. darkmux core has no notion of what a
+/// PR number IS or whether the operator typed one; it only records what
+/// was typed after the slash command, exactly as `gh` itself received it.
+fn emit_gh_verb_audit(verb: &str, args: &str, cwd: &Path, gate_confirmed: Option<bool>, success: bool, correlation_id: &str) {
+    let pr = args.split_whitespace().next().map(str::to_string);
+    let handle = match &pr {
+        Some(pr) => format!("{verb} {pr}"),
+        None => verb.to_string(),
+    };
+    let record = crate::flow::FlowRecord {
+        ts: crate::flow::ts_utc_now(),
+        level: if success { crate::flow::Level::Info } else { crate::flow::Level::Warn },
+        category: crate::flow::Category::Audit,
+        tier: crate::flow::Tier::Operator,
+        stage: crate::flow::Stage::Review,
+        action: "gh.verb.executed".to_string(),
+        handle,
+        phase_id: None,
+        session_id: None,
+        source: Some("gh-verb-audit".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: Some(correlation_id.to_string()),
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(serde_json::json!({
+            "verb": verb,
+            "pr": pr,
+            "worktree": cwd.to_string_lossy(),
+            "confirmed": gate_confirmed,
+            "success": success,
+        })),
+        work_id: None,
+        attempt: None,
+    };
+    let _ = crate::flow::record(record);
 }
 
 /// Mint a per-invocation flow-record correlation id for an ephemeral
@@ -415,71 +507,6 @@ fn mint_ephemeral_correlation_id(config_id: &str) -> String {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("acp-ephemeral-{config_id}-{nanos}-{n}")
-}
-
-/// If any task in `config` names [`PANEL_ARGS_TASK_ID`] (`"__panel_args__"`)
-/// in its own `reads` or `depends_on`, prepend a new phase carrying exactly
-/// one `procedural.noop` task under that id, whose step's `config.output`
-/// is `args` verbatim (empty string when the command was invoked with no
-/// arguments — the launch path's `--param` OMITS the flag entirely for
-/// that case, but an ephemeral graph that declares `reads:
-/// ["__panel_args__"]` must still resolve cleanly through `interpret`, so
-/// this seeds an empty value rather than skipping injection). A config
-/// that never references the reserved id is untouched.
-///
-/// **Reservation collision (#1695 merge-gate finding 1).** If the
-/// operator's OWN document already declares a task literally named
-/// `__panel_args__`, injection is SKIPPED entirely rather than prepending
-/// a second task under the same id — `interpret`'s own duplicate-id check
-/// (`push_task`) would otherwise bail with a bare "duplicate task id"
-/// error that never explains WHY that particular id is special. Skipping
-/// is also the semantically correct choice, not just the safe one:
-/// `interpret` already resolves `reads`/`depends_on` entries against the
-/// document's OWN declared tasks first, so a task reading
-/// `__panel_args__` in a document that declares one under that name
-/// already receives THAT task's real output — operator sovereignty: an
-/// explicit declaration under a reserved name wins over the synthetic
-/// default for that name, silently and correctly, with nothing to inject.
-fn inject_panel_args_task_if_referenced(config: &mut MissionConfig, args: &str) {
-    let referenced = config
-        .phases
-        .iter()
-        .flat_map(|p| p.tasks.iter())
-        .any(|t| t.reads.iter().chain(t.depends_on.iter()).any(|r| r == PANEL_ARGS_TASK_ID));
-    if !referenced {
-        return;
-    }
-    let already_declared =
-        config.phases.iter().flat_map(|p| p.tasks.iter()).any(|t| t.id == PANEL_ARGS_TASK_ID);
-    if already_declared {
-        return;
-    }
-    let args_task = TaskConfig {
-        id: PANEL_ARGS_TASK_ID.to_string(),
-        description: Some("synthetic: the raw text typed after the panel command name".to_string()),
-        display_name: None,
-        depends_on: Vec::new(),
-        reads: Vec::new(),
-        role_id: None,
-        steps: vec![StepConfig {
-            id: format!("{PANEL_ARGS_TASK_ID}-step"),
-            kind: "procedural.noop".to_string(),
-            config: serde_json::json!({"output": args}),
-            gate: None,
-            extras: BTreeMap::new(),
-        }],
-        extras: BTreeMap::new(),
-    };
-    config.phases.insert(
-        0,
-        PhaseConfig {
-            id: "__panel_args_phase__".to_string(),
-            description: None,
-            display_name: None,
-            tasks: vec![args_task],
-            extras: BTreeMap::new(),
-        },
-    );
 }
 
 /// Fill `cwd` into every `procedural.shell` step's config that doesn't
@@ -648,7 +675,7 @@ fn render_ephemeral_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crew::mission_config::{PanelConfig, PhaseConfig, StepConfig, TaskConfig};
+    use crate::crew::mission_config::{PanelConfig, PhaseConfig, StepConfig, TaskConfig, PANEL_ARGS_TASK_ID};
     use std::collections::BTreeMap as Map;
 
     fn step(id: &str, kind: &str, config: serde_json::Value) -> StepConfig {
@@ -685,6 +712,7 @@ mod tests {
             inputs: Vec::new(),
             phases,
             panel,
+            gh_verb: None,
             extras: Map::new(),
         }
     }
@@ -1329,5 +1357,274 @@ mod tests {
         assert!(!out.success, "a declined gate must report success: false");
         assert!(out.text.contains("darkmux: command failed"), "{}", out.text);
         assert!(out.text.contains("operator declined"), "{}", out.text);
+    }
+
+    // ── (#1685) gh-verb allowlist + audit record ────────────────────────
+
+    fn gather_then_gated_config_with_verb(verb: &str) -> MissionConfig {
+        let mut cfg = gather_then_gated_config();
+        cfg.gh_verb = Some(verb.to_string());
+        cfg
+    }
+
+    /// Env isolation for the `DARKMUX_GH_ENABLED`/`DARKMUX_GH_ALLOWED` pair
+    /// — restores both on drop, mirroring the restore blocks the rest of
+    /// this file's tests hand-roll inline (kept as a tiny guard here since
+    /// this cluster of tests uses it four times).
+    struct GhEnvGuard {
+        prev_enabled: Option<String>,
+        prev_allowed: Option<String>,
+    }
+    impl GhEnvGuard {
+        fn off() -> Self {
+            let g = Self {
+                prev_enabled: std::env::var("DARKMUX_GH_ENABLED").ok(),
+                prev_allowed: std::env::var("DARKMUX_GH_ALLOWED").ok(),
+            };
+            unsafe {
+                std::env::remove_var("DARKMUX_GH_ENABLED");
+                std::env::remove_var("DARKMUX_GH_ALLOWED");
+            }
+            g
+        }
+        fn on(allowed: &str) -> Self {
+            let g = Self {
+                prev_enabled: std::env::var("DARKMUX_GH_ENABLED").ok(),
+                prev_allowed: std::env::var("DARKMUX_GH_ALLOWED").ok(),
+            };
+            unsafe {
+                std::env::set_var("DARKMUX_GH_ENABLED", "true");
+                std::env::set_var("DARKMUX_GH_ALLOWED", allowed);
+            }
+            g
+        }
+    }
+    impl Drop for GhEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev_enabled {
+                    Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
+                    None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+                }
+                match &self.prev_allowed {
+                    Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
+                    None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+                }
+            }
+        }
+    }
+
+    /// Every flow record written to the isolated `DARKMUX_FLOWS_DIR` so far
+    /// — mirrors `mission_launch.rs`'s own `read_all_flow_records` test
+    /// helper (same on-disk shape, read raw off disk).
+    fn read_all_flow_records() -> Vec<serde_json::Value> {
+        let dir = std::env::var("DARKMUX_FLOWS_DIR").expect("DARKMUX_FLOWS_DIR must be set by an active guard");
+        let mut out = Vec::new();
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => return out,
+        };
+        for entry in rd.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            for line in contents.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    out.push(v);
+                }
+            }
+        }
+        out
+    }
+
+    /// The allowlist check happens BEFORE `validate()`/`interpret()` ever
+    /// run — with the gate off, NOT ONE step of the graph executes, gated
+    /// or not (proved two ways: the gate handler, which would only ever be
+    /// invoked for the GATED `executor` step, panics if called at all; and
+    /// zero flow records land on disk — the UNGATED `gather` step would
+    /// otherwise have emitted step-lifecycle records even though it needs
+    /// no sign-off).
+    #[test]
+    #[serial_test::serial]
+    fn run_ephemeral_blocks_a_gh_verb_config_when_the_allowlist_gate_is_off() {
+        let _gh = GhEnvGuard::off();
+        let tmp_flows = tempfile::TempDir::new().unwrap();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path()) };
+
+        let cfg = gather_then_gated_config_with_verb("pr-merge");
+        let tmp = std::env::temp_dir();
+        let mut never_called = |_s: &Step, _f: &Map<String, String>| {
+            panic!("the gate handler must never be invoked — the allowlist check refuses the whole config first")
+        };
+        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut never_called))
+            .expect("a blocked gh-verb config still renders a command-failed message, not an Err");
+        assert!(!out.success, "{}", out.text);
+        assert!(out.text.contains("pr-merge"), "names the verb: {}", out.text);
+        assert!(out.text.contains("gh.enabled"), "points at the fix: {}", out.text);
+        assert!(
+            read_all_flow_records().is_empty(),
+            "a blocked config must run zero steps, not even the ungated gather step"
+        );
+
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
+    /// The inverted case (required by the #1685 spec): a verb that IS
+    /// allowlisted, with its gate approved, actually runs — proving the
+    /// allowlist gate is not fail-closed by accident (it also opens).
+    #[test]
+    #[serial_test::serial]
+    fn run_ephemeral_runs_a_gh_verb_config_once_allowlisted_and_gate_approved() {
+        let _gh = GhEnvGuard::on("pr-list,pr-merge");
+        let cfg = gather_then_gated_config_with_verb("pr-merge");
+        let tmp = std::env::temp_dir();
+        let mut approve = |_s: &Step, _f: &Map<String, String>| crate::crew::gate::GateDecision::Approved;
+        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut approve)).expect("ephemeral run succeeds");
+        assert_eq!(out.text.trim(), "merged", "allowlisted + approved must actually run the executor");
+        assert!(out.success);
+    }
+
+    /// The permission-dialog facts contract this whole feature depends on:
+    /// the gathered CI/verdict/adjudication text the operator sees in the
+    /// `session/request_permission` dialog IS the gh-verb config's own
+    /// `gather` task output — exercised end to end through `run_ephemeral`
+    /// (the ACP wiring in `src/acp.rs::acp_gate_handler` renders this exact
+    /// map with `render_gate_facts`, one `key: value` line per fact).
+    #[test]
+    #[serial_test::serial]
+    fn run_ephemeral_gh_verb_gate_handler_sees_the_gathered_ci_and_verdict_facts() {
+        let _gh = GhEnvGuard::on("pr-merge");
+        let cfg = config(
+            "pr-merge",
+            None,
+            vec![phase(
+                "p1",
+                vec![
+                    task(
+                        "gather",
+                        &[],
+                        &[],
+                        vec![step(
+                            "gather-step",
+                            "procedural.shell",
+                            serde_json::json!({
+                                "command": "echo 'ci: SUCCESS\nreview: no confirmed findings\nadjudication: advisory only, no higher-tier review\npr: 123 -> main'"
+                            }),
+                        )],
+                    ),
+                    task(
+                        "executor",
+                        &["gather"],
+                        &[],
+                        vec![gated_step(
+                            "executor-step",
+                            "procedural.noop",
+                            serde_json::json!({"output": "merged"}),
+                            "operator",
+                        )],
+                    ),
+                ],
+            )],
+        );
+        let mut cfg = cfg;
+        cfg.gh_verb = Some("pr-merge".to_string());
+        let tmp = std::env::temp_dir();
+
+        let mut received: Option<Map<String, String>> = None;
+        let mut approve = |_s: &Step, f: &Map<String, String>| {
+            received = Some(f.clone());
+            crate::crew::gate::GateDecision::Approved
+        };
+        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut approve)).expect("ephemeral run succeeds");
+        assert_eq!(out.text.trim(), "merged");
+        let facts = received.expect("the gate handler must have been invoked");
+        let gathered = facts.get("gather").expect("the gather task's output must be a fact");
+        assert!(gathered.contains("ci: SUCCESS"), "CI status by conclusion, not just completed: {gathered}");
+        assert!(gathered.contains("no confirmed findings"), "the review verdict: {gathered}");
+        assert!(gathered.contains("advisory only"), "the adjudication state: {gathered}");
+        assert!(gathered.contains("123 -> main"), "PR/branch provenance: {gathered}");
+    }
+
+    /// One flow-record audit entry per EXECUTED gh-verb command — verb, PR
+    /// (best-effort from the raw args), worktree (the session cwd), and
+    /// whether the operator confirmed it.
+    #[test]
+    #[serial_test::serial]
+    fn run_ephemeral_emits_one_audit_flow_record_per_executed_gh_verb() {
+        let _gh = GhEnvGuard::on("pr-merge");
+        let tmp_flows = tempfile::TempDir::new().unwrap();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path()) };
+
+        let cfg = gather_then_gated_config_with_verb("pr-merge");
+        let worktree = std::env::temp_dir();
+        let mut approve = |_s: &Step, _f: &Map<String, String>| crate::crew::gate::GateDecision::Approved;
+        let out = run_ephemeral(&cfg, "123", &worktree, Some(&mut approve)).expect("ephemeral run succeeds");
+        assert!(out.success);
+
+        let records = read_all_flow_records();
+        let audit = records
+            .iter()
+            .find(|r| r["action"] == "gh.verb.executed")
+            .expect("exactly one gh.verb.executed audit record must be emitted");
+        assert_eq!(audit["category"], "audit");
+        let payload = &audit["payload"];
+        assert_eq!(payload["verb"], "pr-merge");
+        assert_eq!(payload["pr"], "123", "best-effort PR extraction from the raw args");
+        assert_eq!(payload["worktree"], worktree.to_string_lossy().to_string());
+        assert_eq!(payload["confirmed"], true, "the operator approved the gate");
+        assert_eq!(payload["success"], true);
+
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
+    /// A config with NO `gh_verb` (the ordinary case — every panel command
+    /// that isn't a GitHub-CLI verb) never emits this audit record at all.
+    #[test]
+    #[serial_test::serial]
+    fn run_ephemeral_emits_no_audit_record_for_a_non_gh_verb_config() {
+        let tmp_flows = tempfile::TempDir::new().unwrap();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path()) };
+
+        let cfg = config(
+            "echo-test",
+            None,
+            vec![phase(
+                "p1",
+                vec![task("t1", &[], &[], vec![step("s1", "procedural.shell", serde_json::json!({"command": "echo hi"}))])],
+            )],
+        );
+        assert!(cfg.gh_verb.is_none());
+        let tmp = std::env::temp_dir();
+        let out = run_ephemeral(&cfg, "", &tmp, None).expect("ephemeral run succeeds");
+        assert!(out.success);
+        assert!(
+            read_all_flow_records().iter().all(|r| r["action"] != "gh.verb.executed"),
+            "no gh_verb declared → no audit record, ever"
+        );
+
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
     }
 }
