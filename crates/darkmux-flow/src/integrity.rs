@@ -490,6 +490,46 @@ pub fn integrity_check_file(path: &Path) -> Result<IntegrityReport> {
     })
 }
 
+/// Exit status for `darkmux flow integrity-check`, given the walk's
+/// reports. (#1775)
+///
+/// | code | meaning |
+/// |---|---|
+/// | `0` | every chain walked clean, nothing unverifiable |
+/// | `2` | a chain BREAK was found — evidence of divergence |
+/// | `3` | `strict` only: a file could not be content-verified at all |
+///
+/// The distinction `2` vs `3` is the point. **"Verified" and "could not
+/// verify" are different claims**, and an unattended consumer needs to
+/// tell them apart: `2` says "look at this file, something diverged";
+/// `3` says "this file carries no evidence either way". Collapsing them
+/// would point a cron at the wrong thing.
+///
+/// A break OUTRANKS an unverifiable file — evidence beats absence of
+/// evidence, so a run with both exits `2`.
+///
+/// `strict` is opt-in because the only false positive is a genuine
+/// read-only pre-2.6.0 archive, which is not a failure and should not
+/// wake anyone. But on a fleet that has adopted byte-hashing, no NEW
+/// legacy file should ever legitimately appear — so an unexpected one is
+/// itself a signal, and `--strict` is what lets a tripwire say so.
+///
+/// This does NOT change the chain's inherent ceiling: an attacker with
+/// write access can still reach exit `0` by rewriting a whole file —
+/// fresh header, recomputed hashes, relinked `prev_hash` — which is true
+/// of any anchorless local hash chain and is documented in SECURITY.md.
+/// What it removes is the strictly *simpler* second route, where merely
+/// deleting the format marker skipped verification silently.
+pub fn integrity_exit_code(reports: &[IntegrityReport], strict: bool) -> i32 {
+    if reports.iter().any(|r| !r.chain_valid) {
+        return 2;
+    }
+    if strict && reports.iter().any(|r| r.legacy_format) {
+        return 3;
+    }
+    0
+}
+
 /// Walk every audit file under `audit_dir()`. Sorted by filename for
 /// stable output.
 pub fn integrity_check_all() -> Result<Vec<IntegrityReport>> {

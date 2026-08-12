@@ -125,7 +125,8 @@ pub enum FlowCmd {
     /// first divergence per file (#163). A clean walk means no divergence
     /// was found at this check — not that the file is unaltered; see
     /// SECURITY.md for the chain's known gaps. Exits with status 2 when
-    /// any chain is broken so CI/cron can flag tampering.
+    /// any chain is broken so CI/cron can flag tampering, and with 3 under
+    /// `--strict` when a file could not be content-verified at all.
     #[command(name = "integrity-check")]
     IntegrityCheck {
         /// Restrict the walk to a single file path. Useful when the
@@ -137,6 +138,17 @@ pub enum FlowCmd {
         /// summary.
         #[arg(long)]
         json: bool,
+        /// (#1775) Exit 3 when any file could NOT be content-verified —
+        /// a legacy pre-2.6.0 struct-hash file, or one whose `hash_format`
+        /// header marker is missing. Without this the walk reports those
+        /// files honestly but still exits 0, so a tripwire keyed on the
+        /// exit code cannot tell "verified" from "never checked".
+        ///
+        /// Opt-in because a genuine read-only pre-2.6.0 archive is not a
+        /// failure. On a fleet already writing byte-hashed files, no NEW
+        /// legacy file should appear — use this there.
+        #[arg(long)]
+        strict: bool,
     },
     /// Tail flow records, optionally filtered to one session, following new
     /// appends live (like `tail -f`). Ctrl-C to stop.
@@ -156,7 +168,9 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
     // only sees write verbs.
     match cmd {
         FlowCmd::Status { json } => return print_status(json),
-        FlowCmd::IntegrityCheck { path, json } => return print_integrity_check(path, json),
+        FlowCmd::IntegrityCheck { path, json, strict } => {
+            return print_integrity_check(path, json, strict)
+        }
         FlowCmd::Tail { session, json } => return run_tail(session.as_deref(), json),
         _ => {}
     }
@@ -188,7 +202,16 @@ fn print_status(json: bool) -> Result<()> {
 /// `hash_format` marker on its header — is NOT a break: `chain_valid`
 /// stays `true`, the exit status stays 0, and the caveat prints as a
 /// warning (readable, never content-verified) rather than an error.
-fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result<()> {
+///
+/// (#1775) `strict` promotes that caveat to exit 3, so a cron keyed on
+/// the exit code can tell "verified" from "could not verify". The status
+/// decision itself lives in `flow::integrity_exit_code`, which is unit
+/// tested — this belt used to be reachable only by review.
+fn print_integrity_check(
+    path: Option<std::path::PathBuf>,
+    json: bool,
+    strict: bool,
+) -> Result<()> {
     let reports = if let Some(p) = path {
         vec![flow::integrity_check_file(&p)?]
     } else {
@@ -249,14 +272,33 @@ fn print_integrity_check(path: Option<std::path::PathBuf>, json: bool) -> Result
                 if let Some(note) = r.note.as_ref() {
                     println!("{}", style::warn(&format!("       {note}")));
                 }
+                if strict {
+                    println!(
+                        "{}",
+                        style::error("       --strict: counted as a failure (exit 3)")
+                    );
+                }
             }
+        }
+        // (#1775) Without --strict the walk still exits 0 on an
+        // unverifiable file. Say so, so an operator reading the output
+        // knows the exit code they'd get from cron does NOT reflect the
+        // warning they can see here.
+        if !strict && reports.iter().any(|r| r.legacy_format) {
+            println!(
+                "{}",
+                style::dim(
+                    "       (exit status stays 0 — re-run with --strict to fail on files that \
+                     could not be content-verified)"
+                )
+            );
         }
     }
 
-    if reports.iter().any(|r| !r.chain_valid) {
-        std::process::exit(2);
+    match flow::integrity_exit_code(&reports, strict) {
+        0 => Ok(()),
+        code => std::process::exit(code),
     }
-    Ok(())
 }
 
 /// Filter a single JSONL line for tail output.

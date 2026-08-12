@@ -3963,6 +3963,76 @@ mod tests {
         }
     }
 
+    // (#1775) The exit-status belt. "Verified" and "could not verify" are
+    // DIFFERENT claims, and the automated consumer the docs name — a cron
+    // keyed on the exit code — could previously only see the first one.
+    // Stripping a file's `hash_format` marker downgraded it to legacy,
+    // skipped content verification entirely, and still exited 0.
+    //
+    // These exercise the decision directly rather than through a spawned
+    // binary, because the belt used to be reachable only by review.
+
+    fn report(legacy: bool, valid: bool) -> crate::integrity::IntegrityReport {
+        crate::integrity::IntegrityReport {
+            path: "x.jsonl".into(),
+            records_checked: 1,
+            chain_valid: valid,
+            break_at_line: None,
+            break_reason: None,
+            legacy_format: legacy,
+            note: None,
+            writer_schema_version: None,
+        }
+    }
+
+    #[test]
+    fn integrity_exit_code_is_zero_when_every_chain_verified() {
+        let r = vec![report(false, true), report(false, true)];
+        assert_eq!(crate::integrity::integrity_exit_code(&r, false), 0);
+        // Strict changes nothing when there is nothing unverifiable.
+        assert_eq!(crate::integrity::integrity_exit_code(&r, true), 0);
+    }
+
+    #[test]
+    fn integrity_exit_code_is_two_for_a_genuine_break_regardless_of_strict() {
+        let r = vec![report(false, false)];
+        assert_eq!(crate::integrity::integrity_exit_code(&r, false), 2);
+        assert_eq!(crate::integrity::integrity_exit_code(&r, true), 2);
+    }
+
+    /// The #1775 gap itself: a file whose content was never verified must
+    /// not report the same status as one that passed. Non-strict keeps 0
+    /// (a genuine read-only pre-2.6.0 archive is not a failure); strict
+    /// makes it loud for the unattended consumer.
+    #[test]
+    fn integrity_exit_code_flags_unverifiable_only_under_strict() {
+        let r = vec![report(true, true)];
+        assert_eq!(
+            crate::integrity::integrity_exit_code(&r, false),
+            0,
+            "default must stay 0 — a genuine legacy archive is not a failure"
+        );
+        assert_eq!(
+            crate::integrity::integrity_exit_code(&r, true),
+            3,
+            "strict must distinguish could-not-verify from verified"
+        );
+    }
+
+    /// A real break outranks an unverifiable file: 2 means "evidence of a
+    /// break", 3 means "no evidence either way". Collapsing them would tell
+    /// a cron the wrong thing about which file to look at.
+    #[test]
+    fn integrity_exit_code_prefers_a_break_over_unverifiable() {
+        let r = vec![report(true, true), report(false, false)];
+        assert_eq!(crate::integrity::integrity_exit_code(&r, true), 2);
+    }
+
+    #[test]
+    fn integrity_exit_code_is_zero_for_no_files() {
+        assert_eq!(crate::integrity::integrity_exit_code(&[], true), 0);
+    }
+
     /// A legacy-format file (no `hash_format` marker on its header) must
     /// report Warn-shaped honesty — readable, not re-verifiable — never
     /// tampering, and never a silent pass. (#1769)
