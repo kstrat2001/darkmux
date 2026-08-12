@@ -289,9 +289,21 @@ fn print_integrity_check(
                     println!("{}", style::warn(&format!("       {note}")));
                 }
                 if strict {
+                    // Same rule as the hint below: a line naming the exit
+                    // code is gated on the COMPUTED code, never on `strict`
+                    // alone. A chain break elsewhere in the walk outranks
+                    // this file, and saying "(exit 3)" on a run that exits
+                    // 2 is the defect this command exists to catch.
                     println!(
                         "{}",
-                        style::error("       --strict: counted as a failure (exit 3)")
+                        style::error(&format!(
+                            "       --strict: counted as a failure ({})",
+                            if exit_code == 3 {
+                                "exit 3".to_string()
+                            } else {
+                                format!("a chain break elsewhere takes precedence — exit {exit_code}")
+                            }
+                        ))
                     );
                 }
             }

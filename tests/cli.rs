@@ -2625,4 +2625,31 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
         stdout.contains("BROKEN"),
         "the break must still be reported; stdout:\n{stdout}"
     );
+
+    // The SAME run under --strict. The first fix for this defect missed
+    // this branch: a per-file line claiming "(exit 3)" was gated on the
+    // `strict` flag rather than on the computed code, so it printed the
+    // wrong status beside the tamper signal while the process exited 2.
+    // Non-strict coverage alone does not reach it.
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_AUDIT_DIR", &audit)
+        .args(["flow", "integrity-check", "--strict"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a break outranks an unverifiable file under --strict too; stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("exit 3"),
+        "the run exited 2 — no line may name exit 3; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("takes precedence"),
+        "the unverifiable file must still be called out, naming the real code; stdout:\n{stdout}"
+    );
 }

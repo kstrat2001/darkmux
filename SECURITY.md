@@ -108,8 +108,9 @@ frame:
 
   What remains is structural rather than a bug.
 
-  **Truncating the tail of a file is undetectable, and it is the cheapest
-  attack of the three.** Delete the last record line (or the last k of them)
+  **Truncating the tail of a file is undetectable, and it is the least
+  conspicuous of the three** — it leaves a present, plausible-looking file
+  rather than a missing day. Delete the last record line (or the last k of them)
   and the walk sees a shorter but fully consistent chain: every `prev_hash`
   links, every byte-hash matches, the file reports valid — including under
   `--strict`. Nothing records how many records a file should contain or
@@ -127,8 +128,10 @@ frame:
   recomputed hashes, relinked `prev_hash`) produces one that validates.
 
   All three ceilings are inherent to an anchorless local chain. What the walk
-  does catch: in-place edits, reordering, insertion, and deletion of records
-  from the **middle** of a file.
+  does catch: in-place edits, reordering, insertion, and **any deletion that is
+  not a pure suffix** — removing the first record, or a run from the middle,
+  breaks the following record's `prev_hash` linkage. Only records removed from
+  the very end leave nothing behind to disagree with.
 
   A file that cannot be content-verified at all — a pre-2.6.0 struct-hash
   file, or one whose `hash_format` header marker has been removed — is
