@@ -35,13 +35,43 @@ These claims compose with the existing **Anti-patterns** section below: anti-pat
 
 ```bash
 cargo build --release    # release binary at target/release/darkmux
-cargo test               # unit + integration suite
+cargo t-review           # test ONE area — see "Testing" below; NOT the whole suite
 cargo clippy             # lint
 cargo fmt                # format
 cargo install --path .   # install to ~/.cargo/bin/darkmux
 ```
 
 The release binary is self-contained (~11 MB as of 2.5.0). Built-in workloads, roles, mission configs, skills, the viewer, and the mission-graph lens's vendored React Flow bundle all ride inside it via `include_str!`/`include_bytes!`; `cargo install --path .` produces a binary that works from any directory without the source tree.
+
+
+## Testing — run the area, not the world
+
+**The full workspace suite is CI's job, not yours.** CI runs it on every PR for
+free. Locally, run the area you touched — committed cargo aliases name them,
+and each takes seconds:
+
+`cargo t-flow` · `t-review` · `t-serve` · `t-doctor` · `t-fleet` · `t-gestalt` ·
+`t-cli` · `t-fast` · `t-runtime` (the runtime crate is NOT a workspace member,
+so `t-all` does not reach it) · `t-all` (the merge gate — CI already runs it).
+
+These wrap `cargo nextest` (`cargo install cargo-nextest --locked`). The reason
+is NOT speed — on one area nextest and `cargo test` are equivalent — it is
+`.config/nextest.toml`'s per-test `terminate-after`, which turns a HANG into a
+loud failure instead of a wedged run.
+
+Reach for `t-all` only for a reason you can state: a change crossing crate
+boundaries no single area covers, or a release. "To be safe" is not a reason.
+
+Three habits to avoid, all of which feel diligent: running the world when one
+area covers it; re-running a green suite to feel sure (if you doubt a result,
+write a test that can FAIL for that reason); and full-suite-before-every-commit.
+
+Background lanes: `scripts/test-lane.sh review t-review` gives a run its own
+`CARGO_TARGET_DIR` so it doesn't contend with foreground builds. ~13 GB per
+lane; keep two or three, not one per area.
+
+Faster tests are not more trustworthy tests — a false-green gate (#1716) just
+returns its wrong answer sooner.
 
 ## Configuration (`config.json`)
 

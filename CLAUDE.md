@@ -35,7 +35,7 @@ These claims compose with the existing **Anti-patterns** section below: anti-pat
 
 ```bash
 cargo build --release    # release binary at target/release/darkmux
-cargo test               # unit + integration suite
+cargo t-review           # test ONE area — see "Testing" below; NOT the whole suite
 cargo clippy             # lint
 cargo fmt                # format
 cargo install --path .   # install to ~/.cargo/bin/darkmux
@@ -57,13 +57,14 @@ loop. Install it: `cargo install cargo-nextest --locked`.
 |---|---|---|
 | `cargo t-fast` | pure-logic crates, no I/O | **281 tests / 1.1s** |
 | `cargo t-flow` | flow records, sinks, audit chain, schema, config access | **252 / 1.3s** |
-| `cargo t-cli` | the CLI surface (spawns the real binary) | **80 / 2.4s** |
+| `cargo t-cli` | the whole root binary crate — every CLI verb module + all 11 integration targets | **632** |
 | `cargo t-review` | review funnel, bundler, lab harness, crew scheduler | **1324 / 5.3s** |
 | `cargo t-serve` | the HTTP daemon + bundled viewer | |
 | `cargo t-doctor` | preflight checks and their remedies | |
 | `cargo t-fleet` | roster + cross-machine routing | |
 | `cargo t-gestalt` | residency arbiter, hardware/heuristics providers | |
-| `cargo t-all` | **the merge gate — CI already runs this** | ~75s |
+| `cargo t-runtime` | the agent runtime — **not a workspace member, so `t-all` misses it** | ~418 |
+| `cargo t-all` | the same scope CI gates on (CI runs it as `cargo test --workspace`) | ~75s |
 
 Narrower still is better when you know the name: `cargo nextest run -p
 darkmux-flow integrity_exit_code` runs one function's tests in under a second.
@@ -116,6 +117,12 @@ per area; `rm -rf target/lanes/<name>` any time.
 Faster tests are not more trustworthy tests. A suite with a false-green gate
 (#1716) or a vacuous assertion (#1664) returns its wrong answer sooner in a
 lane. Speed is an ergonomics fix; trust is a separate, open problem.
+
+**And "CI is the gate" has one real hole**: `plugins/darkmux-bundler-rust` has
+37 tests that **no CI job runs** — it is workspace-excluded, and the only
+workflow touching it merely `cargo build`s it on manual dispatch. So `t-all`
+misses it and CI does not cover it either. Deferring to CI is right everywhere
+else; there, it is deferring to nothing.
 
 ## Releasing — dogfood the dispatch critical path first
 
@@ -442,7 +449,7 @@ If a user asks you to:
 | "list notebook entries" | `darkmux lab notebook list` (optionally `--machine <id>` to filter). Enumerates `.md` files, parses headers. (#1426 — the notebook family folded into `lab`.) |
 | "draft a notebook entry" | `darkmux lab notebook draft <run-id>` (optionally `--machine <id>` to override). |
 | "make the build self-contained" | Already is — `include_str!` for embedded workloads, no external assets needed at runtime. |
-| "review the diff before commit" | Run the suite (`cargo test`), eyeball `git diff`, propose a commit message — but **do not commit unless explicitly asked**. |
+| "review the diff before commit" | Run the AREA you touched (`cargo t-review`, `cargo t-flow`, … — see "Testing — run the area, not the world"; `t-all` only for a cross-cutting change or a release), eyeball `git diff`, propose a commit message — but **do not commit unless explicitly asked**. |
 | "check the mission board / housekeeping" | `darkmux mission status` (#829) — the global mission-control read: every mission grouped by status with phase progress + the drift that needs attention (an open mission whose phases are all done; a stalled Active mission; a phase permanently blocked by an earlier abandoned one) + copy-pasteable reconcile commands. READ-ONLY — surfaces + suggests, never mutates; the operator/you run the suggested `mission finalize`/`mission abort` (#1463 — those two whole-mission terminals reconcile phases now, so a "Finalized mission with a non-terminal phase" is no longer a reachable drift). `--json` for programmatic consumption. **Run it as session-start housekeeping** (and before opening PRs / wrapping a work arc) so mission↔phase drift gets caught structurally rather than by memory — and so gh/jira stay reconciled off the same cue. The CLI twin of the viewer's missions lens (#827). |
 | "leave an orchestrator note on the dashboard" | `darkmux flow note --text "<note>" --source orchestrator` (#807) — the savings hero renders the latest tagged note verbatim as its "Orchestrator note:" conclusion (procedural template is the fallback), and `history →` lists the window's notes. **Voice (operator-specified): 1–2 upbeat, plain-language lines — what the crew got done + keep-going energy. No jargon, no file paths, no verdict prose. This is encouragement infrastructure, not a changelog.** Emit one after a mission ships or a work arc wraps. TOKENS-ONLY discipline applies (no currency). Technical gate reasoning goes to the SEPARATE audit-trail channel instead: `darkmux flow note --session-id <sid> --text "<verdict · what you overrode · why>" --source adjudication` (#817) — session-scoped, never rendered on the hero card. |
 

@@ -49,15 +49,39 @@ t-doctor = "nextest run -p darkmux-doctor"
 t-fleet = "nextest run -p darkmux-fleet -p darkmux-flow"
 
 # Residency arbiter + the hardware/heuristics providers feeding it.
-t-gestalt = "nextest run -p darkmux-gestalt -p darkmux-hardware -p darkmux-heuristics"
+# NOTE darkmux-profiles is here on purpose: `gestalt_host/` (lms_host.rs —
+# the `lms load`/`unload` shell-out and its timeout, mac_probe, arch_facts)
+# lives THERE, not in darkmux-gestalt, which is the pure planning core.
+t-gestalt = "nextest run -p darkmux-gestalt -p darkmux-hardware -p darkmux-heuristics -p darkmux-profiles"
 
-# The CLI surface itself — spawns the real binary.
-t-cli = "nextest run --test cli"
+# The root binary crate: every CLI verb module (acp, radio, mission_launch,
+# pr_review, coder_phase, config_cmd, init, migrate, skills…) PLUS all 11
+# integration targets. Deliberately `-p darkmux`, not `--test cli`: that
+# selected ONE target and silently skipped ~550 tests, including the verb
+# layer where most recent work lands. The e2e_* targets self-skip without
+# redis unless DARKMUX_E2E_REQUIRED is set, so this is safe offline.
+t-cli = "nextest run -p darkmux"
 
-# --- the quick one: pure-logic crates, no I/O ---
+# --- the small foundation crates. FAST because they are small, NOT because
+#     they are pure: darkmux-types does fs/env/flock I/O and darkmux-profiles
+#     shells out to `lms`. Do not read this as "no side effects". ---
 t-fast = "nextest run -p darkmux-types -p darkmux-profiles -p darkmux-eureka"
 
-# --- the merge gate. CI already runs this on every PR. ---
+# --- the same SCOPE CI gates on. Note CI runs it as `cargo test --workspace`,
+#     not nextest — so CI has no terminate-after, and a flake that passes on
+#     retry reports FLAKY here but FAILS there. Local is the permissive one. ---
 # Reach for it when a change crosses crate boundaries in a way no single area
 # covers, or when tagging a release — not "to be safe".
 t-all = "nextest run --workspace"
+
+# --- NOT a workspace member; `t-all` does NOT reach it ---
+# The agent runtime (loop_runner, compaction, the cycle/reasoning/failure
+# detectors) is `exclude`d from the workspace, so `nextest run --workspace`
+# never touches its ~418 tests. CI gates it separately (ci.yml runtime-test-lint,
+# paths-filtered), but locally it needs naming or "run the area you touched"
+# has no area for the most behavior-dense code in the repo.
+#
+# Caveat: `.config/nextest.toml` is scoped to the root workspace, so this run
+# gets NO terminate-after — the hang protection that justifies nextest
+# elsewhere does not extend here.
+t-runtime = "nextest run --manifest-path runtime/Cargo.toml"

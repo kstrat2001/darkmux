@@ -24,7 +24,19 @@ if [ $# -lt 2 ]; then
 fi
 
 LANE="$1"; shift
+
+# A lane name containing `/` or `..` escapes target/ — verified: `../../x`
+# lands OUTSIDE the repo, where .gitignore does not cover it, so the lane
+# becomes committable. Reject rather than sanitize: there is no legitimate
+# nested lane name.
+case "$LANE" in
+  */*|*..*|"")
+    echo "[test-lane] refusing lane name '$LANE' — no '/' or '..' (it would escape target/)" >&2
+    exit 2 ;;
+esac
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"   # so cargo resolves this repo's aliases even when invoked by absolute path from elsewhere
 DIR="$ROOT/target/lanes/$LANE"
 
 mkdir -p "$DIR"
