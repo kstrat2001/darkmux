@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/kstrat2001/darkmux/actions/workflows/ci.yml/badge.svg)](https://github.com/kstrat2001/darkmux/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/kstrat2001/darkmux)](https://github.com/kstrat2001/darkmux/releases)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/kstrat2001/darkmux/badges/coverage.json)](https://github.com/kstrat2001/darkmux/actions/workflows/quality.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Own your AI workforce.** Run real engineering work on models you already have, on machines you already own. Off the meter.
