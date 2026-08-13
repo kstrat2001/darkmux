@@ -408,7 +408,7 @@ jobs:
           # benchmark corpus — adversarial PR diffs that intentionally quote
           # retired verbs (e.g. `darkmux mission run` in a test case). Corpus is
           # never reworded; its dir is excluded from every scan.
-          SCAN="README.md CONTRIBUTING.md DESIGN.md AGENTS.md CLAUDE.md ROADMAP.md DISCLAIMER.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/"
+          SCAN="README.md CONTRIBUTING.md DESIGN.md AGENTS.md CLAUDE.md ROADMAP.md DISCLAIMER.md docs/ENVIRONMENT.md docs/index.html docs/guide/ docs/architecture/ packaging/ skills/ templates/"
           EXCL="--exclude-dir=pr-review-bench"
           PAT='admin[- ]agent|admin</code>'
           if bad=$(grep -rniE $EXCL "$PAT" $SCAN 2>/dev/null); then

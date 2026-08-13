@@ -260,52 +260,27 @@ When proposing a config change to an operator, write the visible field; don't re
 
 ## Environment variables
 
-Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in default` — it wins live, and each maps to a `config.json` field (mapping after the table). Use env for per-shell/CI/test overrides; use `config.json` for durable operator config. Flow records carry per-record provenance fields auto-populated from these at write time. `darkmux doctor` surfaces what each resolves to.
+Every `DARKMUX_*` var is the top tier of **`env > config.json > built-in
+default`**, resolved in one place (`darkmux_types::config_access`), with the
+env tier read live per access.
 
-| Variable | Default | Effect |
-|---|---|---|
-| `DARKMUX_MACHINE_ID` | hostname | Logical fleet name **stamped at record-write time** on every new flow record. Operator-named (`studio`, `mini-1`) reads better in the topology view than DNS-style hostnames. Pre-1.4.0 records lack the field (which the viewer renders as `unknown`). |
-| `DARKMUX_FLEET_MODE` | `standalone` | The machine's declared fleet position — `standalone` (single machine), `hub` (the always-on coordinator; supervises its own Redis per #936), or `peer` (points at a hub). Operator-**declared** under `config.fleet.mode`; detection is only a doctor cross-check (declared ≠ observed), never the source of truth. `darkmux doctor` shows it with provenance and flags an unrecognized value (treated as `standalone`). Downstream fleet features key on it (#933). |
-| `DARKMUX_FLOWS_DIR` | `~/.darkmux/flows` | Where the per-day JSONL files live (LocalFileSink — casual write target). |
-| `DARKMUX_AUDIT_DIR` | unset → AuditFileSink off | When set, flow records ALSO write to a hash-chained per-day JSONL under this directory (AuditFileSink, #163). **POSIX-only** (Linux/macOS — Windows is unsupported; the env var is recognized but the sink is skipped). Cross-process safe via `flock(2)`. `darkmux flow integrity-check` walks the chain and **exits with status 2 on any chain break** so cron/CI can flag tampering; **`--strict` adds exit 3 for a file that could not be content-verified at all** (a pre-2.6.0 struct-hash file, or one whose `hash_format` header marker is missing — #1775). The two codes are deliberately distinct: `2` is evidence of divergence, `3` is absence of evidence, and an unattended consumer needs to tell them apart. Strict is opt-in because a genuine read-only pre-2.6.0 archive is not a failure — but on a fleet already writing byte-hashed files no NEW legacy file should appear, so an unexpected one is itself a signal. `darkmux doctor` rolls up the same result. A DETECTION substrate: `flow integrity-check` recomputes each chain and reports the first divergence, which catches in-place edits, reordering, insertion, and any deletion that is not a pure suffix (removing the first record or a middle run breaks the next record's `prev_hash` linkage). It does **not** catch every edit — notably **deleting records from the END of a file leaves a shorter but fully consistent chain that validates clean**, and whole-file deletion is invisible. See SECURITY.md for the full list. It does not prevent alteration, and running it does not make an operator compliant with any regulatory framework. |
-| `DARKMUX_REDIS_URL` | unset → Redis off | When set, flow records also XADD to the Redis stream (coordination substrate; not the audit substrate). Combined with `DARKMUX_AUDIT_DIR` produces the full composition: `TeeSink([LocalFile, Audit, Redis])`. See [#162](https://github.com/kstrat2001/darkmux/issues/162) Phase 3. |
-| `DARKMUX_REDIS_STREAM` | `darkmux:flow` | Override the Redis stream name. |
-| `DARKMUX_REDIS_MAXLEN` | `10000` | Approximate retention cap for the Redis stream (`XADD MAXLEN ~ N`); `0` for unbounded. |
-| `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | `600` | Per-dispatch inactivity budget. The host-side watchdog **hard-kills** the container at 100% if no proof-of-work signal lands. The runtime-side detector fires a **soft warning** at 75% (model-facing nudge to wrap up gracefully or escalate via `BLOCKED:`); both reset on the same proof-of-work signals (any tool.completed, any compaction). A productive dispatch never sees either; a stuck one gets the soft chance before the hard kill. Pathological tool patterns are caught by their dedicated detectors (cycle, cascade, edit-drift, reasoning loops) — the deadline trusts activity; the detectors catch struggle. (#457 + #464 + #466; renamed from `DARKMUX_RUNTIME_DEADLINE_SECONDS`) |
-| `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` | `600` | Bounded model-load/unload phase for gestalt host-port calls (#1276). The `LmsHost` adapter spawns `lms load`/`lms unload`, polls the child, and **hard-kills it at expiry**, returning a typed timeout naming the phase — a wrong model id (or a load waiting on anything interactive) can no longer hang a dispatch until the workflow's outer kill. Resolved into the mandatory `Deadline` every `ModelHost` mutation takes; distinct from the *inactivity* budget above (that one meters dispatch proof-of-work; this one meters a single host load/unload call). |
-| `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` | `500000` | (#1260/#1177) Per-EXECUTION remote token allowance for endpoint-staffed crew seats, where an execution = one pipeline stage. **Metered paths (1.18.0 scope):** the review funnel's remote seats (probe pass, each judge pass, the verify pass) AND the tool-less single-shot remote `dispatch` path. **NOT yet metered:** the AGENTIC-remote container path (#1187 — a tool-granting role on an endpoint profile, multi-call container loop); that follow-up is tracked separately. Only REMOTE (hosted-endpoint) calls draw from it — local seats are unmetered by it. **One execution = one pipeline stage even when the stage fans out into many sibling steps (#1442):** a group of `dispatch.map` steps that name the same `bucket_group` (the probe stage's `seats x k` sibling steps) meter ONE per-execution allowance BETWEEN them — the scheduler owns the group's shared bucket and hands the same one to every sibling, so the fan-out never multiplies the stage ceiling by the step count. A `dispatch.map` step naming no group gets its own step-scoped allowance. When a stage exhausts its bucket, that stage's remaining remote calls stop with the reason named in the envelope: a load-bearing JUDGE stage exhausting is an honest DEGRADED run; a VERIFY stage exhausting degrades only the STAGE (findings already verified still post; skipped confirms keep the manual-verification marker; a loud warning names it); probe exhaustion is a reduced-coverage warning and the run continues. A remote-JUDGE dispatch FAILURE (surviving bounded retries) is likewise a degraded run. Setting it to `0` refuses all remote calls with a typed error (a hard opt-out). Tokens only, never currency. |
-| `DARKMUX_SERVE_TOKEN` | unset → loopback-only | The serve daemon's bearer token (a **secret** — env override; else the macOS Keychain item `darkmux-serve-token`, gated by `runtime.daemon_auth_enabled`). When a token is set the daemon may bind non-loopback and **remote reads + `/diff` require** `Authorization: Bearer <token>` (loopback stays open so the local viewer keeps working). When **unset**, a non-loopback `--bind` is **refused** (a loopback daemon needs no token). `machine list --deep` sends this token to peers — use the **same shared token** on every machine in the fleet. (#881) |
-| `DARKMUX_GH_ENABLED` / `DARKMUX_GH_ALLOWED` | `false` / empty | (#1685) The `gh`-verb allowlist gate — governs whether a `MissionConfig.gh_verb`-declaring config (an operator-authored PR-flow panel verb, e.g. `pr-merge.json`) is allowed to run AT ALL, on either entry point (`darkmux acp`'s ephemeral panel route or a direct `darkmux mission launch <id>`). `DARKMUX_GH_ALLOWED` is comma-separated verb names. Fails closed on both: the gate off refuses every verb regardless of the list; a verb absent from the list refuses even with the gate on. darkmux holds no GitHub credential — every verb shells out to the operator's own `gh`. See the [PR-flow guide](docs/guide/pr-flow.html). |
+**The full table — every variable, its default, its effect, and the
+`config.json` field it maps to — is in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).**
+Read it when you need to know what a knob means. To find out what a setting
+resolves to *right now*, run `darkmux doctor`, which prints the resolved value
+with its provenance — that is the better answer to that question, and it cannot
+go stale.
 
-**env → `config.json` field** (the override-tier var → its durable config home):
+Two rules worth carrying without looking anything up:
 
-| Env var | `config.json` field |
-|---|---|
-| `DARKMUX_MACHINE_ID` | `machine_id` |
-| `DARKMUX_FLEET_MODE` | `fleet.mode` |
-| `DARKMUX_LMS_BIN` / `DARKMUX_LMSTUDIO_URL` | `lms_bin` / `lmstudio_url` (base URL; callers append `/v1/...`) |
-| `DARKMUX_FLOWS_DIR` / `DARKMUX_NOTEBOOK_DIR` / `DARKMUX_CREW_DIR` / … | `dirs.flows` / `dirs.notebook` / `dirs.crew` / … |
-| `DARKMUX_AUDIT_DIR` | `audit.dir` (gated by `audit.enabled`) |
-| `DARKMUX_REDIS_URL` (verbatim, password inline) | `redis.{enabled,host,port,db}` + Keychain password (assembled) |
-| `DARKMUX_REDIS_STREAM` / `DARKMUX_REDIS_MAXLEN` | `redis.stream` / `redis.maxlen` |
-| `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | `runtime.inactivity_timeout_seconds` |
-| `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` (#1276 — bounded host load/unload phase) | `runtime.model_load_timeout_seconds` |
-| `DARKMUX_RUNTIME_MAX_TURNS` / `DARKMUX_RUNTIME_MAX_TOKENS` | `runtime.max_turns` / `runtime.max_tokens` |
-| `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` (#1221 — per-CALL completion cap, reasoning + content of one turn; unset = the runtime's built-in 10000, which truncates productive reasoning on thinking-family models) | `runtime.max_tokens_per_call` |
-| `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` | `remote.max_tokens_per_execution` (#1260) |
-| `DARKMUX_RADIO_ROUTER_PROFILE` / `DARKMUX_RADIO_ANSWERER_PROFILE` / `DARKMUX_RADIO_HUMOR` (#1698 — the radio interpreter's two seats + the RADIO persona's humor dial) | `radio.router_profile` / `radio.answerer_profile` / `radio.humor` |
-| `DARKMUX_ACP_IDLE_EXIT_MINUTES` (#1684 — `darkmux acp` exits after this long with nothing in flight; `0` disables) | `runtime.acp_idle_exit_minutes` |
-| `DARKMUX_STRICT_SELECTION` / `DARKMUX_CHECK_UPDATES` | `runtime.strict_selection` / `runtime.check_updates` |
-| `DARKMUX_FEEDBACK_INJECTION` | `runtime.feedback_injection` (#1548 — wired: `darkmux_types::config_access::feedback_injection()` resolves the tier host-side and the docker-spawn site in `dispatch_internal.rs` forwards it into the container as `-e DARKMUX_FEEDBACK_INJECTION=<true\|false>`. The runtime crate still can't depend on `config_access` directly — it reads the forwarded env var, same as before #1548 — but the HOST now does the tier resolution and always forwards its result, closing the gap where neither `config.json` nor a host-side `export` ever reached the container). |
-| `DARKMUX_DEFAULT_ROLE` / `DARKMUX_DAEMON_CORS_ORIGINS` | `runtime.default_role` / `runtime.daemon_cors_origins` |
-| `DARKMUX_GH_ENABLED` / `DARKMUX_GH_ALLOWED` (#1685) | `gh.enabled` / `gh.allowed` |
-| `DARKMUX_SERVE_TOKEN` (verbatim, the secret) | — (a **secret**; macOS Keychain item `darkmux-serve-token`, whose read is gated by `runtime.daemon_auth_enabled`). Only the non-secret gate lives in `config.json`; the token never does — same carve-out as the Redis password. |
-| `DARKMUX_HOME` (bootstrap pointer) | — (locates the config root; can't live in config) |
-| `DARKMUX_PROFILES` (profiles registry, **renamed from `DARKMUX_CONFIG`**) | — (a separate file, not `config.json`) |
+- **Secrets are never `config.json`.** The Redis password and the serve token
+  live in the macOS Keychain, read at runtime, wrapped so `Debug`/`Display`
+  redact them. `darkmux config set` refuses those keys outright.
+- **When proposing a setting change to an operator, write the visible
+  `config.json` field** via `darkmux config set <key> <value>` — do not reach
+  for an env var as the primary mechanism. Env is for per-shell, CI, and test
+  overrides.
 
-The internal runtime is the only dispatch path and needs no external binary. (Historical: a `DARKMUX_RUNTIME_CMD` env var, then a per-dispatch `--runtime-cmd <path>` flag, once let operators point `dispatch` / `lab run` at an external openclaw/Aider/Cline shell-out. That whole path — the flag, the openclaw runtime, and the `crew sync` verb — was removed on the 2.0 track; see [#1405](https://github.com/kstrat2001/darkmux/issues/1405).)
-
-(Historical: a `DARKMUX_ORCHESTRATOR` env var + `config.orchestrator` field once stamped flow records with the name of the frontier harness driving the session. Removed in #1758 — it was stamped from MACHINE-scoped config to describe an INVOCATION-scoped fact, so every record on a machine carried the same value regardless of what actually drove that invocation, and nothing ever read it. The cultivation discipline tracked in [#130](https://github.com/kstrat2001/darkmux/issues/130) continues without it.)
 
 ## Where things live
 
