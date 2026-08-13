@@ -22,6 +22,11 @@ name: quality
 on:
   pull_request:
     branches: [main]
+  # (#1792) Coverage also runs on main so the README badge reflects MAIN,
+  # not whichever PR happened to publish last. The mutation jobs stay
+  # PR/schedule-only — they are gated on their own `if:` below.
+  push:
+    branches: [main]
   schedule:
     # Nightly full sweep. The PR job only mutates the diff (seconds); the whole
     # workspace is ~1410 mutants and does not belong in anyone's review loop.
@@ -104,6 +109,8 @@ jobs:
   coverage:
     name: coverage — which lines never execute
     runs-on: macos-latest
+    permissions:
+      contents: write   # pushes the badge branch (main only)
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +133,29 @@ jobs:
 
       - name: Report, and name the zero-coverage regions
         if: always()
-        run: python3 scripts/ci-coverage-summary.py cov.json >> "$GITHUB_STEP_SUMMARY"
+        run: python3 scripts/ci-coverage-summary.py cov.json --badge coverage-badge.json >> "$GITHUB_STEP_SUMMARY"
+
+      # (#1792) Publish the badge to an orphan `badges` branch that shields.io
+      # reads. Deliberately NOT a third-party service: no account, no data
+      # leaving the repo, no token beyond GITHUB_TOKEN. main-only, so a PR
+      # cannot move the published number.
+      - name: Publish coverage badge (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test -s coverage-badge.json || { echo "no badge JSON — skipping"; exit 0; }
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tmp=$(mktemp -d); cp coverage-badge.json "$tmp/coverage.json"
+          git fetch origin badges --depth=1 2>/dev/null && git checkout badges \
+            || git checkout --orphan badges
+          git rm -rqf . 2>/dev/null || true
+          cp "$tmp/coverage.json" coverage.json
+          git add coverage.json
+          git diff --cached --quiet && { echo "unchanged"; exit 0; }
+          git commit -qm "coverage badge: $(python3 -c "import json;print(json.load(open('coverage.json'))['message'])")"
+          git push -q origin badges
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -138,7 +167,10 @@ jobs:
   mutants-full:
     name: mutation — full workspace sweep (nightly)
     runs-on: macos-latest
-    if: github.event_name != 'pull_request'
+    # (#1792) Was `!= 'pull_request'`, which meant ANY non-PR event. Adding a
+    # push:main trigger for the coverage badge would have made this ~1410-mutant
+    # sweep run on EVERY MERGE. Pinned to the nightly it was written for.
+    if: github.event_name == 'schedule'
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
