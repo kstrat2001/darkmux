@@ -144,7 +144,18 @@ export function Masthead({ route, liveStatus }: { route: Route; liveStatus: Live
       ) : (
         <CatalogPanel label={srcbadgeText(route)} />
       )}
-      {live ? <LiveStatusBadge status={liveStatus} /> : route.kind === "playback" ? <PlaybackModeBadge /> : null}
+      {/* (#1801) A static build shows the PLAYBACK badge on every lens, not
+          just the playback route. `isLiveRoute()` now returns false for the
+          whole build (see its own doc), so keying the fallback on
+          `route.kind === "playback"` alone would leave `#lens=runs` on the
+          demo with NO mode badge at all — a page that is neither live nor
+          visibly playback. Legacy's `setBadges(mode, date)` shows the play
+          badge on every lens, mode being global there. */}
+      {live ? (
+        <LiveStatusBadge status={liveStatus} />
+      ) : isStaticBuild() || route.kind === "playback" ? (
+        <PlaybackModeBadge />
+      ) : null}
       {/* (operator: "a reload button next to 'live' is absurd") — and it is:
           a refresh control beside a badge reading `● LIVE` contradicts
           itself. If the view is live there is nothing to refresh; if you
@@ -209,7 +220,16 @@ function srcbadgeText(route: Route): string {
   // `FLOW · 2026-08-07`, and the prefix is the honest label rather than a
   // borrowed one. A same-day `#<date>` hash still reads "TODAY", matching
   // legacy's `dl` (its own boot treats today's date as live, not playback).
-  if (route.kind === "playback") return route.date === todayUTC() ? "TODAY" : `FLOW · ${route.date}`;
+  // `?? todayUTC()` is not defensive noise: `route.date` became `string | null`
+  // (#1801, a static build knows its date only after the flow file resolves)
+  // and a template literal accepts null SILENTLY — `FLOW · null` would render
+  // and typecheck. Unreachable today because `App.tsx` passes `displayRoute`,
+  // whose date is already resolved; this keeps the invariant in the code
+  // rather than in that one caller's habits.
+  if (route.kind === "playback") {
+    const date = route.date ?? todayUTC();
+    return date === todayUTC() ? "TODAY" : `FLOW · ${date}`;
+  }
   if (route.kind === "session" || route.kind === "mission-redirect") return "REPLAY";
   return "TODAY";
 }

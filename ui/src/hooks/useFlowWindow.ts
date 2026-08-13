@@ -3,6 +3,7 @@ import { skipToken, useQueries, useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { DATE_ROLLOVER_CHECK_MS, queryKeys } from "../lib/queryKeys";
 import { asRecordArray, buildFlowWindow, computeTMax, prevDateUTC, todayUTC } from "../lib/flow";
+import { isStaticBuild } from "../lib/staticSource";
 import type { FlowRecord } from "../types/handwritten";
 
 export interface FlowWindowResult {
@@ -61,15 +62,40 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
   }, []);
   const yesterday = prevDateUTC(today);
 
+  // (#1801) A daemon-less build has no `/flow/<date>` to fetch — legacy's
+  // flow-src branch never calls `loadLiveWindow` at all (viewer.html:3897).
+  // Without this gate the demo issues two guaranteed-404 requests on its
+  // landing page, before any lens is touched (measured:
+  // `/flow/2026-08-12`, `/flow/2026-08-13` in the page's resource timings).
+  //
+  // Gated on the BUILD, deliberately, not on `isLiveRoute(route)`. The window
+  // still legitimately feeds machine-name lookups on a daemon-served playback
+  // route (`App.tsx`'s `localMachineUid`/`nameOf`), and route-gating it would
+  // silently change what those render — the shared-cache trap this arc has
+  // already paid for twice. On a static build the fetch could only ever fail,
+  // so suppressing it changes nothing a consumer can observe. The broader
+  // question of route-gating this window is tracked separately as #1805.
+  const daemonBacked = !isStaticBuild();
+
   const results = useQueries({
     queries: [
-      { queryKey: queryKeys.flowDate(yesterday), queryFn: () => fetchJson<unknown>(`/flow/${yesterday}`) },
-      { queryKey: queryKeys.flowDate(today), queryFn: () => fetchJson<unknown>(`/flow/${today}`) },
+      {
+        queryKey: queryKeys.flowDate(yesterday),
+        queryFn: () => fetchJson<unknown>(`/flow/${yesterday}`),
+        enabled: daemonBacked,
+      },
+      {
+        queryKey: queryKeys.flowDate(today),
+        queryFn: () => fetchJson<unknown>(`/flow/${today}`),
+        enabled: daemonBacked,
+      },
     ],
   });
 
   const [yQuery, tQuery] = results;
-  const settled = yQuery.status !== "pending" && tQuery.status !== "pending";
+  // A disabled query sits at status `pending` forever, so the live-build
+  // definition of "settled" would leave a static build permanently loading.
+  const settled = !daemonBacked || (yQuery.status !== "pending" && tQuery.status !== "pending");
 
   // `queryFn: skipToken` — this hook never fetches these keys, only reads
   // whatever `useLiveTail` has (or hasn't yet) written there.

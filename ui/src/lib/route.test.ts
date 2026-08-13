@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { parseRoute, showsEventLog, type Route } from "./route";
+import { isLiveRoute, parseRoute, showsEventLog, type Route } from "./route";
 
 function setHash(hash: string) {
   window.location.hash = hash;
@@ -268,5 +268,63 @@ describe("parseRoute — the static-demo flow-src route (#1801)", () => {
   it("without the meta, a bare date hash still resolves to a REAL date, not null", () => {
     window.location.hash = "#2026-08-01";
     expect(parseRoute()).toEqual({ kind: "playback", date: "2026-08-01" });
+  });
+});
+
+/**
+ * (#1801, merge-gate finding) `isLiveRoute()` is the port's analog of legacy's
+ * GLOBAL `wantsPlayback` gate (viewer.html:3880). It was keyed on route KIND
+ * alone, and `parseRoute` resolves `lens=` BEFORE the static-build branch — so
+ * `#lens=runs` on the daemon-less demo parsed to `{kind:"runs"}` and opened
+ * every live consumer: an SSE stream, a 5s presence poll, and a mode badge
+ * reading `◌ RECONNECTING` on a page with no daemon anywhere near it.
+ *
+ * Both directions are asserted deliberately. A gate tested only where it FIRES
+ * can be vacuously true — the daemon-served cases below are what prove this
+ * one did not simply turn every route non-live.
+ */
+describe("isLiveRoute — a daemon-less build is never live, on any lens", () => {
+  function injectMeta(name: string, content: string) {
+    const el = document.createElement("meta");
+    el.setAttribute("name", name);
+    el.setAttribute("content", content);
+    document.head.appendChild(el);
+  }
+
+  afterEach(() => {
+    document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
+    window.location.hash = "";
+  });
+
+  const liveKinds: Route[] = [
+    { kind: "fleet" },
+    { kind: "runs", runsKind: "all", run: null },
+    { kind: "machine", uid: null },
+    { kind: "console", panelId: "" },
+    { kind: "unknown", hash: "nonsense" },
+  ];
+
+  it("every normally-live route goes non-live once darkmux-flow-src is present", () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    for (const route of liveKinds) {
+      expect(isLiveRoute(route), `${route.kind} should not be live on a static build`).toBe(false);
+    }
+  });
+
+  it("the SAME routes stay live with no flow-src meta (a real daemon)", () => {
+    for (const route of liveKinds) {
+      expect(isLiveRoute(route), `${route.kind} should stay live behind a daemon`).toBe(true);
+    }
+  });
+
+  it("historical routes are non-live either way — the kind test still stands on its own", () => {
+    expect(isLiveRoute({ kind: "playback", date: "2026-08-07" })).toBe(false);
+    expect(isLiveRoute({ kind: "session", sessionId: "s1" })).toBe(false);
+    expect(isLiveRoute({ kind: "mission-redirect", missionId: "m1" })).toBe(false);
+  });
+
+  it("an unrelated darkmux meta does not make a page static — flow-src is the signal", () => {
+    injectMeta("darkmux-mode", "play");
+    expect(isLiveRoute({ kind: "fleet" })).toBe(true);
   });
 });

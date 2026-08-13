@@ -123,6 +123,20 @@ export type Route =
  * no separate playback data pipeline for yet (see `PlaybackLens`'s own
  * module doc). */
 export function isLiveRoute(route: Route): boolean {
+  // (#1801) A daemon-less build is NEVER live, on any lens. Legacy's gate is
+  // GLOBAL — `wantsPlayback = injectedMode==="play" || !!flowSrc || !!cq`
+  // (viewer.html:3880) — and `startLiveTail(date); startLivePoll();` runs only
+  // under `if(mode==="live")` (viewer.html:3956), so a static build never
+  // opens an SSE stream or a presence poll no matter which lens is showing.
+  //
+  // This gate was keyed on route KIND alone, and `parseRoute` resolves `lens=`
+  // BEFORE the static-build branch — so `#lens=runs` on the demo parsed to
+  // `{kind:"runs"}` and every live consumer opened. Measured on the served
+  // demo: an EventSource to `/flow/<today>/stream`, `/fleet/machines/live`
+  // polled every 5s indefinitely, and the mode badge reading `◌ RECONNECTING`
+  // — a page asserting there is something to reconnect TO, on a marketing
+  // site with no daemon anywhere near it.
+  if (isStaticBuild()) return false;
   return route.kind !== "playback" && route.kind !== "session" && route.kind !== "mission-redirect";
 }
 
