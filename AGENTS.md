@@ -103,35 +103,27 @@ When proposing a config change to an operator, write the visible field; don't re
 
 ## Environment variables
 
-Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in default`: it wins live, and each maps to a `config.json` field (mapping after the table). Use env for per-shell/CI/test overrides; use `config.json` for durable operator config. Flow records carry per-record provenance fields auto-populated from these at write time. `darkmux doctor` surfaces what each resolves to.
+Every `DARKMUX_*` var is the top tier of **`env > config.json > built-in
+default`**, resolved in one place (`darkmux_types::config_access`), with the
+env tier read live per access.
 
-| Variable | Default | Effect |
-|---|---|---|
-| `DARKMUX_MACHINE_ID` | hostname | Logical fleet name **stamped at record-write time** on every new flow record. Operator-named (`studio`, `mini-1`) reads better in the topology view than DNS-style hostnames. Pre-1.4.0 records lack the field (which the viewer renders as `unknown`). |
-| `DARKMUX_FLOWS_DIR` | `~/.darkmux/flows` | Where the per-day JSONL files live (LocalFileSink, the casual write target). |
-| `DARKMUX_AUDIT_DIR` | unset → AuditFileSink off | When set, flow records ALSO write to a hash-chained per-day JSONL under this directory (AuditFileSink, #163). **POSIX-only** (Linux/macOS; Windows is unsupported: the env var is recognized but the sink is skipped). Cross-process safe via `flock(2)`. `darkmux flow integrity-check` walks the chain and **exits with status 2 on any chain break** so cron/CI can flag tampering. `darkmux doctor` rolls up the same result. A DETECTION substrate: `flow integrity-check` recomputes each chain and reports the first divergence, which catches in-place edits, reordering, insertion and deletion within a file. It does **not** catch every edit — see SECURITY.md for the known gaps. It does not prevent alteration, and running it does not make an operator compliant with any regulatory framework. |
-| `DARKMUX_REDIS_URL` | unset → Redis off | When set, flow records also XADD to the Redis stream (coordination substrate; not the audit substrate). Combined with `DARKMUX_AUDIT_DIR` produces the full composition: `TeeSink([LocalFile, Audit, Redis])`. See [#162](https://github.com/kstrat2001/darkmux/issues/162) Phase 3. |
-| `DARKMUX_REDIS_STREAM` | `darkmux:flow` | Override the Redis stream name. |
-| `DARKMUX_REDIS_MAXLEN` | `10000` | Approximate retention cap for the Redis stream (`XADD MAXLEN ~ N`); `0` for unbounded. |
-| `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | `600` | Per-dispatch inactivity budget. The host-side watchdog **hard-kills** the container at 100% if no proof-of-work signal lands. The runtime-side detector fires a **soft warning** at 75% (model-facing nudge to wrap up gracefully or escalate via `BLOCKED:`); both reset on the same proof-of-work signals (any tool.completed, any compaction). A productive dispatch never sees either; a stuck one gets the soft chance before the hard kill. Pathological tool patterns are caught by their dedicated detectors (cycle, cascade, edit-drift, reasoning loops): the deadline trusts activity; the detectors catch struggle. (#457 + #464 + #466; renamed from `DARKMUX_RUNTIME_DEADLINE_SECONDS`) |
+**The full table — every variable, its default, its effect, and the
+`config.json` field it maps to — is in [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md).**
+Read it when you need to know what a knob means. To find out what a setting
+resolves to *right now*, run `darkmux doctor`, which prints the resolved value
+with its provenance — that is the better answer to that question, and it cannot
+go stale.
 
-**env → `config.json` field** (the override-tier var → its durable config home):
+Two rules worth carrying without looking anything up:
 
-| Env var | `config.json` field |
-|---|---|
-| `DARKMUX_MACHINE_ID` | `machine_id` |
-| `DARKMUX_LMS_BIN` / `DARKMUX_LMSTUDIO_URL` | `lms_bin` / `lmstudio_url` (base URL; callers append `/v1/...`) |
-| `DARKMUX_FLOWS_DIR` / `DARKMUX_NOTEBOOK_DIR` / `DARKMUX_CREW_DIR` / … | `dirs.flows` / `dirs.notebook` / `dirs.crew` / … |
-| `DARKMUX_AUDIT_DIR` | `audit.dir` (gated by `audit.enabled`) |
-| `DARKMUX_REDIS_URL` (verbatim, password inline) | `redis.{enabled,host,port,db}` + Keychain password (assembled) |
-| `DARKMUX_REDIS_STREAM` / `DARKMUX_REDIS_MAXLEN` | `redis.stream` / `redis.maxlen` |
-| `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | `runtime.inactivity_timeout_seconds` |
-| `DARKMUX_RUNTIME_MAX_TURNS` / `DARKMUX_RUNTIME_MAX_TOKENS` | `runtime.max_turns` / `runtime.max_tokens` |
-| `DARKMUX_STRICT_SELECTION` / `DARKMUX_CHECK_UPDATES` | `runtime.strict_selection` / `runtime.check_updates` |
-| `DARKMUX_FEEDBACK_INJECTION` | `runtime.feedback_injection` exists, but is read **directly in the runtime container** (`runtime/src/feedback.rs`), NOT through `config_access`, so it does NOT yet honor the `config.json` tier (the runtime crate can't depend on `config_access`; wiring it needs a flag-plumb, deliberately deferred in #661). |
-| `DARKMUX_DEFAULT_ROLE` / `DARKMUX_DAEMON_CORS_ORIGINS` | `runtime.default_role` / `runtime.daemon_cors_origins` |
-| `DARKMUX_HOME` (bootstrap pointer) | — (locates the config root; can't live in config) |
-| `DARKMUX_PROFILES` (profiles registry, **renamed from `DARKMUX_CONFIG`**) | — (a separate file, not `config.json`) |
+- **Secrets are never `config.json`.** The Redis password and the serve token
+  live in the macOS Keychain, read at runtime, wrapped so `Debug`/`Display`
+  redact them. `darkmux config set` refuses those keys outright.
+- **When proposing a setting change to an operator, write the visible
+  `config.json` field** via `darkmux config set <key> <value>` — do not reach
+  for an env var as the primary mechanism. Env is for per-shell, CI, and test
+  overrides.
+
 
 ## Where things live
 
