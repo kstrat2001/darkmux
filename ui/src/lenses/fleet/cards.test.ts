@@ -83,6 +83,28 @@ describe("specOf", () => {
     expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
   });
 
+  it("still recognizes THIS machine when its records use a different alias than specs reports", () => {
+    // One uid, two names — `machine_id` defaults to the hostname, and macOS
+    // reports both the short and `.local` forms depending on how the daemon
+    // started. `nameOf` answers with the first alias it finds; specs reports
+    // the current one. Comparing those two directly made the machine fail to
+    // recognize its own hardware and render "hardware not reported".
+    const data: FlowRecord[] = [
+      rec({ machine_uid: "u1", machine_id: "MacBook-Pro.local" }),
+      rec({ machine_uid: "u1", machine_id: "MacBook-Pro" }),
+    ];
+    expect(specOf(data, new Map(), specs, "u1")).toBe("Apple M5 Max · 128 GB");
+  });
+
+  it("does NOT claim this daemon's hardware for a machine that merely shares no alias", () => {
+    // The inverted case: a genuinely remote machine must keep falling through
+    // to its own presence beat, or the fix would credit every card with the
+    // local host's CPU and RAM.
+    const data: FlowRecord[] = [rec({ machine_uid: "u2", machine_id: "studio" })];
+    const live = new Map([["u2", beat({ machine_uid: "u2", display_name: "studio", specs: "M1 Max · 32 GB" })]]);
+    expect(specOf(data, live, specs, "u2")).toBe("M1 Max · 32 GB");
+  });
+
   it("falls back to the presence beat's own spec string for a remote machine", () => {
     const data: FlowRecord[] = [rec({ machine_uid: "u2", machine_id: "studio" })];
     const live = new Map([["u2", beat({ machine_uid: "u2", display_name: "studio", specs: "M1 Max · 32 GB" })]]);

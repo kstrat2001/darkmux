@@ -302,15 +302,56 @@ export function machineUids(data: FlowRecord[], liveMachines: Map<string, Presen
   return [...new Set([...data.map(uidOf), ...liveMachines.keys()])];
 }
 
+/** EVERY name a uid has appeared under — across the window's records and its
+ * presence beat, not just the one `nameOf` happens to pick.
+ *
+ * One machine really does carry several names over time. `machine_id` defaults
+ * to the hostname, and macOS reports both the short form and the mDNS `.local`
+ * form depending on how the daemon was started, so a single stable
+ * `machine_uid` accumulates records under both. Renaming a machine, or setting
+ * `machine_id` explicitly after running without it, does the same thing.
+ *
+ * `nameOf` has to answer with ONE name, so it picks the first it finds. That is
+ * fine for a label and wrong for an identity test: asking "is the name I show
+ * for this uid equal to the name specs reports" fails whenever those two
+ * happen to be different aliases of the same machine. Identity questions ask
+ * this instead, and get a yes if ANY known alias matches. */
+export function machineNames(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  uid: string,
+): Set<string> {
+  const names = new Set<string>();
+  for (const r of data) {
+    if (uidOf(r) === uid && r.machine_id) names.add(r.machine_id as string);
+  }
+  const beat = liveMachines.get(uid);
+  if (beat?.display_name) names.add(beat.display_name);
+  return names;
+}
+
 /** `localMachineUid()` — viewer.html:2642-2644. Which uid IS this daemon,
- * for the nav-tab/deep-link entry into the machine page. */
+ * for the nav-tab/deep-link entry into the machine page.
+ *
+ * Matches against EVERY alias a uid has used (`machineNames`), not just the one
+ * `nameOf` returns. Legacy compared `nameOf(x) === machineId`, and so did this
+ * — which silently failed on a machine whose window carries records under two
+ * names: `nameOf` answered with the older alias, `/machine/specs` reported the
+ * current one, no uid matched, and the `?? machineId` fallback then handed back
+ * the NAME as if it were a uid. Every downstream comparison against a real uid
+ * was false from there on. Found on a laptop logging as both `MacBook-Pro` and
+ * `MacBook-Pro.local`.
+ *
+ * The `?? machineId` fallback stays for the case it was written for: a freshly
+ * booted daemon that has produced no records or beats of its own yet, where
+ * there is no uid to find and the raw name is the best available handle. */
 export function localMachineUid(
   data: FlowRecord[],
   liveMachines: Map<string, PresenceBeat>,
   machineId: string | null | undefined,
 ): string | null {
   if (!machineId) return null;
-  return machineUids(data, liveMachines).find((x) => nameOf(data, liveMachines, x) === machineId) ?? machineId;
+  return machineUids(data, liveMachines).find((x) => machineNames(data, liveMachines, x).has(machineId)) ?? machineId;
 }
 
 /** `sessionsOn()` — viewer.html:1124. */

@@ -17,7 +17,7 @@
 
 import { uidOf, sessionsOn, sessionRunning } from "../../lib/flow";
 import type { FlowRecord, MachineSpecs, PresenceBeat } from "../../types/handwritten";
-import { nameOf } from "../../lib/flow";
+import { nameOf, machineNames } from "../../lib/flow";
 
 /** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
  * of its started sessions is still running — routed through the shared
@@ -53,8 +53,15 @@ export function specOf(
   // (#1008) THIS machine: prefer the live `/machine/specs` probe (cpu + RAM)
   // over a static lookup. Remote machines fall through to their presence
   // beat's specs.
-  const name = nameOf(data, liveMachines, m);
-  if (specs && name === specs.machine_id && specs.cpu_brand) {
+  // "Is this uid the machine `/machine/specs` describes?" — asked against
+  // EVERY alias the uid has used, not just the one `nameOf` returns. A
+  // machine logging as both `MacBook-Pro` and `MacBook-Pro.local` under one
+  // uid would otherwise show "hardware not reported" for its own hardware,
+  // because `nameOf` answers with whichever alias it finds first while specs
+  // reports the current one. Same identity rule as
+  // `lib/flow.ts::localMachineUid`; see `machineNames` for why one machine
+  // accumulates several names.
+  if (specs && specs.machine_id && machineNames(data, liveMachines, m).has(specs.machine_id) && specs.cpu_brand) {
     const gb = specs.ram_total_bytes ? ` · ${Math.round(specs.ram_total_bytes / 1073741824)} GB` : "";
     return specs.cpu_brand + gb;
   }

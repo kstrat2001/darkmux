@@ -158,7 +158,21 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // fleet-card drill, local or remote) or, absent one, the local machine
   // (the nav-tab/deep-link entry — legacy's `goMachine`).
   const targetUid = routeUid ?? localUid;
-  const isLocalSpecs = !!(specs && targetUid != null && nameOf(flowWindow.data, liveMachines, targetUid) === specs.machine_id);
+  // Identity is the UID, never the display name. This compared
+  // `nameOf(targetUid) === specs.machine_id`, which asks whether the label we
+  // happen to show equals the name specs happens to report — and those are
+  // different aliases of one machine often enough to matter. A laptop whose
+  // window carried records as both `MacBook-Pro` and `MacBook-Pro.local`
+  // classified ITSELF as remote on a fleet-card drill: no residency ledger, no
+  // utility model, and a note advising the operator to "view the machine page
+  // on MacBook-Pro.local directly" — the machine they were already sitting on.
+  // The nav tab looked fine throughout, because `routeUid == null` short-
+  // circuits to local without ever asking.
+  //
+  // `localMachineUid` now resolves specs' name through every alias a uid has
+  // used (`lib/flow.ts::machineNames`), so both sides of this are uids and the
+  // comparison means what it says.
+  const isLocalSpecs = targetUid != null && localUid != null && targetUid === localUid;
   // `state.machineIsLocal` — the explicit nav-tab/deep-link intent
   // (`goMachine` always passes `local=true`; a fleet-card drill always
   // passes `local=false`, even when it happens to BE the local machine —
