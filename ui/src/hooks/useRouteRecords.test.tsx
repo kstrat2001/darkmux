@@ -31,11 +31,21 @@ function wrapper() {
   );
 }
 
+/** URL-AWARE on purpose. The two endpoints have DIFFERENT wire shapes, and a
+ *  mock that returns one shape for both is green while the decode is broken —
+ *  which is exactly what happened here, caught by a live probe at the merge
+ *  gate rather than by this file:
+ *
+ *    GET /flow/<date>        -> a BARE JSON ARRAY   (lib.rs flow_handler)
+ *    GET /flow-session/<id>  -> { records, count, ... }  (catalog_records_response)
+ */
 function mockFetch(records: unknown[]) {
-  return vi.fn().mockResolvedValue({
-    ok: true,
-    status: 200,
-    json: async () => ({ records, count: records.length, truncated: false, generated_at_ms: 0 }),
+  return vi.fn(async (url: string) => {
+    const u = String(url);
+    const body = u.startsWith("/flow/")
+      ? records // bare array
+      : { records, count: records.length, truncated: false, generated_at_ms: 0 };
+    return { ok: true, status: 200, json: async () => body };
   });
 }
 
@@ -76,6 +86,9 @@ describe("useRouteRecords", () => {
     expect(result.current.historical).toBe(true);
     expect(result.current.records).toEqual([{ action: "HISTORICAL-RECORD" }]);
     expect(result.current.records).not.toEqual(LIVE.data);
+    // Without this a hook fetching `/flow/undefined` and receiving the canned
+    // mock would pass identically — right records, wrong reason.
+    expect(globalThis.fetch).toHaveBeenCalledWith("/flow/2026-08-01", undefined);
   });
 
   it("shows EMPTY rather than live records when a historical fetch FAILS", async () => {

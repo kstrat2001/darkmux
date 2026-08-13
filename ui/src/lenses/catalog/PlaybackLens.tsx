@@ -1,9 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
-import { computeTMax } from "../../lib/flow";
+import { asRecordArray, computeTMax } from "../../lib/flow";
 import { FleetLens } from "../fleet/FleetLens";
-import type { FlowRecord, FlowRecordsResponse } from "../../types/handwritten";
+
 
 /**
  * The `playback` route — a bare `#<date>` hash.
@@ -27,7 +27,7 @@ import type { FlowRecord, FlowRecordsResponse } from "../../types/handwritten";
 export function PlaybackLens({ date }: { date: string }) {
   const query = useQuery({
     queryKey: queryKeys.flowDate(date),
-    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow/${encodeURIComponent(date)}`),
+    queryFn: () => fetchJson<unknown>(`/flow/${encodeURIComponent(date)}`),
   });
 
   if (!query.data) {
@@ -51,7 +51,10 @@ export function PlaybackLens({ date }: { date: string }) {
     );
   }
 
-  const records = query.data.data.records as unknown as FlowRecord[];
+  // `/flow/<date>` returns a BARE ARRAY, not `{records}` — decoded through the
+  // shared `asRecordArray` like `useFlowWindow` and legacy both do. An earlier
+  // draft read `.records` here and would have rendered every day as empty.
+  const records = asRecordArray(query.data.data);
 
   if (records.length === 0) {
     return (

@@ -67,16 +67,21 @@ function onActivateKeyDown(onActivate: () => void) {
  * that function's own doc for the verified visibility rule, which corrects
  * a wrong packet-brief claim about `console`).
  *
- * **`records` is the App-level `useFlowWindow` result — the rolling
- * live 2-day window — on EVERY route this column renders for, including
- * `session`/`playback`/`mission-redirect`.** Legacy loads genuinely
- * different data for a historical replay (a specific captured day/mission/
- * session, not the live window); `/next` has no real playback data
- * pipeline yet (`PlaybackLens`/`SessionReplay`'s own docs name this gap
- * directly — "not the full historical-playback view yet, a follow-up"), so
- * this column deliberately reuses the one flow-record source this app
- * already fetches rather than inventing a second one for routes that don't
- * have real content behind them yet. Named here, not hidden.
+ * **`records` is whatever `useRouteRecords` says this ROUTE means** — the
+ * rolling live 2-day window on live routes, and the FETCHED SLICE on
+ * `session` (`/flow-session/<id>`) and `playback` (`/flow/<date>`).
+ *
+ * (#1800 P1) It used to be the live window on every route — named here as a
+ * deliberate deferral, which is honest but meant a `#session=` route listed
+ * unrelated live traffic beside a stage headed "session replay". Legacy never
+ * had that: `boot()` re-scopes `RAW` to the fetched slice before rendering.
+ * The fix needed no second pipeline, because this column already took
+ * `records` as a prop — only the routing decision was missing.
+ *
+ * `loading` and `error` exist for the same reason: refusing to fall back to
+ * live records on a failed fetch is only honest if the column can say WHY it
+ * is empty. A dead daemon, a 500, a typo'd session id and a genuinely quiet
+ * day must not render identically.
  *
  * **`#logscope`** moves here from its previous App-level standalone
  * `<span>` (see `App.tsx`'s own doc) — legacy nests it INSIDE `.loglist`'s
@@ -136,9 +141,17 @@ export function EventLogColumn({
   records,
   visible,
   scopeLabel,
+  loading = false,
+  error = null,
 }: {
   records: FlowRecord[];
   visible: boolean;
+  /** (#1800 P1) A historical slice still in flight. Without this, "loading"
+   *  and "genuinely empty" both render "no events yet". */
+  loading?: boolean;
+  /** (#1800 P1) Why the slice is empty, when it failed. A dead daemon and a
+   *  quiet day must not render identically — see `useRouteRecords`. */
+  error?: { status: number | null; message: string } | null;
   /** Not shown — written into a hidden span purely so this port's parity
    *  extraction matches legacy's. See App's `routeChrome` note. */
   scopeLabel: string;
@@ -335,7 +348,15 @@ export function EventLogColumn({
               );
             })
           ) : (
-            <div className="eventlog__empty">{query ? "no events match your search" : "no events yet"}</div>
+            <div className="eventlog__empty" data-state={error ? "error" : loading ? "loading" : "empty"} role={error ? "alert" : undefined}>
+              {error
+                ? `couldn't load events${error.status !== null ? ` (HTTP ${error.status})` : ""}: ${error.message}`
+                : loading
+                  ? "loading…"
+                  : query
+                    ? "no events match your search"
+                    : "no events yet"}
+            </div>
           )}
         </div>
       </div>

@@ -2,7 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys } from "../lib/queryKeys";
 import type { Route } from "../lib/route";
-import type { FlowRecord, FlowRecordsResponse } from "../types/handwritten";
+import { asRecordArray } from "../lib/flow";
+import type { FlowRecord } from "../types/handwritten";
 import type { FlowWindowResult } from "./useFlowWindow";
 
 /**
@@ -37,12 +38,35 @@ export interface RouteRecords {
   loading: boolean;
   /** True when these records came from a historical fetch rather than the
    *  rolling live window — lets a caller label the scope honestly. */
-  historical: boolean;
+   historical: boolean;
+  /** Why the slice is empty, when it is empty BECAUSE the fetch failed.
+   *
+   * Without this, a dead daemon, a 500, a typo'd session id and a genuinely
+   * quiet day all render as "no events yet" — byte-identical. This repo has
+   * already litigated that exact class once (`queryKeys.ts`'s
+   * `LAB_POLL_FAILURE_THRESHOLD`: "a raw silent-catch made a dead daemon
+   * byte-identical to an idle run"). Refusing to fall back to live records is
+   * only honest if the UI can say WHY it has none. */
+  error: { status: number | null; message: string } | null;
 }
 
-function recordsOf(result: { ok: true; data: FlowRecordsResponse } | { ok: false } | undefined): FlowRecord[] | null {
+/** Decodes BOTH wire shapes via the shared `asRecordArray` (`lib/flow.ts:89`),
+ * the same helper `useFlowWindow` uses and legacy used at viewer.html:3920.
+ *
+ * The two endpoints DIFFER and an earlier version of this file assumed they
+ * did not — reading `.records` off both:
+ *
+ *   GET /flow/<date>        -> a BARE JSON ARRAY   (lib.rs `flow_handler`)
+ *   GET /flow-session/<id>  -> { records, ... }    (`catalog_records_response`)
+ *
+ * So every playback day decoded to `undefined` -> `[]` -> a permanently empty
+ * log, silently. Verified against the live daemon at the merge gate, not
+ * inferred. The old signature also LIED: it was annotated `FlowRecord[] | null`
+ * while returning `undefined` on the array payload, and the `?? []` at the call
+ * sites was load-bearing purely by accident. */
+function recordsOf(result: { ok: true; data: unknown } | { ok: false } | undefined): FlowRecord[] | null {
   if (!result || !result.ok) return null;
-  return result.data.records as unknown as FlowRecord[];
+  return asRecordArray(result.data);
 }
 
 export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): RouteRecords {
@@ -56,28 +80,40 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
   // can never disagree about what `/flow/<date>` returned.
   const dayQuery = useQuery({
     queryKey: queryKeys.flowDate(date ?? ""),
-    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow/${encodeURIComponent(date ?? "")}`),
+    queryFn: () => fetchJson<unknown>(`/flow/${encodeURIComponent(date ?? "")}`),
     enabled: date !== null,
   });
 
   const sessionQuery = useQuery({
     queryKey: queryKeys.flowSession(sessionId ?? ""),
-    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-session/${encodeURIComponent(sessionId ?? "")}`),
+    queryFn: () => fetchJson<unknown>(`/flow-session/${encodeURIComponent(sessionId ?? "")}`),
     enabled: sessionId !== null,
   });
 
   if (date !== null) {
     const recs = recordsOf(dayQuery.data);
+    const err = dayQuery.data && !dayQuery.data.ok ? dayQuery.data : null;
     // A FAILED fetch yields [] rather than the live window: showing live
     // traffic under a "playback for <date>" heading is the exact confusion
     // this hook exists to remove. Empty is honest; wrong is not.
-    return { records: recs ?? [], loading: dayQuery.data === undefined, historical: true };
+    return {
+      records: recs ?? [],
+      loading: dayQuery.data === undefined,
+      historical: true,
+      error: err ? { status: err.status, message: err.message } : null,
+    };
   }
 
   if (sessionId !== null) {
     const recs = recordsOf(sessionQuery.data);
-    return { records: recs ?? [], loading: sessionQuery.data === undefined, historical: true };
+    const err = sessionQuery.data && !sessionQuery.data.ok ? sessionQuery.data : null;
+    return {
+      records: recs ?? [],
+      loading: sessionQuery.data === undefined,
+      historical: true,
+      error: err ? { status: err.status, message: err.message } : null,
+    };
   }
 
-  return { records: flowWindow.data, loading: false, historical: false };
+  return { records: flowWindow.data, loading: false, historical: false, error: null };
 }

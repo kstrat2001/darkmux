@@ -193,7 +193,13 @@ export function App() {
         <main className="app-shell__stage" id="stage">
           {renderRoute(route)}
         </main>
-        <EventLogColumn scopeLabel={logscope} records={routeRecords.records} visible={showsEventLog(route)} />
+        <EventLogColumn
+          scopeLabel={logscope}
+          records={routeRecords.records}
+          visible={showsEventLog(route)}
+          loading={routeRecords.loading}
+          error={routeRecords.error}
+        />
       </div>
     </div>
   );

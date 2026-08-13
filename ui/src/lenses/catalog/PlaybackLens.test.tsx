@@ -34,11 +34,10 @@ function mockDay(records: unknown[]) {
       // Only the day fetch returns records; the LIVE presence endpoints must
       // never be consulted on a replay, so they 500 loudly if they are.
       if (String(url).startsWith("/flow/")) {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({ records, count: records.length, truncated: false, generated_at_ms: 0 }),
-        };
+        // A BARE ARRAY — what `lib.rs`'s `flow_handler` actually returns.
+        // An earlier version of this mock returned `{records}` here, which is
+        // `/flow-session/`'s shape, and was green while the decode was broken.
+        return { ok: true, status: 200, json: async () => records };
       }
       return { ok: false, status: 500, json: async () => ({}) };
     }),
