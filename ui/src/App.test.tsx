@@ -531,4 +531,64 @@ describe("App", () => {
     expect(document.querySelectorAll(".fleettl .lane")).toHaveLength(1);
     expect(document.querySelectorAll(".sbar")).toHaveLength(2);
   });
+
+  /**
+   * (#1800) The replay CHROME — topbar, crumb, meta. Legacy branches all three
+   * on live-vs-replay, and the port took the live arm on every route, so a
+   * `#<date>` page had three surfaces disagreeing about what day it showed:
+   * a stage rendering 2026-08-07 beside a status bar describing today.
+   *
+   * `goldens/playback-date.txt` is the byte-level spec and the parity suite
+   * enforces all four regions against a real browser; this is the fast guard
+   * beneath it, and the one that names WHICH surface broke when it breaks.
+   */
+  it("a replay's chrome describes the REPLAYED day, not today", async () => {
+    window.location.hash = "#2026-08-07";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (String(url) === "/flow/2026-08-07") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify([
+                { _type: "schema", darkmux_version: "2.6.0" },
+                { ts: "2026-08-07T02:09:42.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "review-1", session_id: "s1", action: "dispatch.start" },
+                { ts: "2026-08-07T18:28:15.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "review-2", session_id: "s1", action: "dispatch.complete" },
+              ]),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
+
+    // topbar: the source chip names the day, and the mode badge says what
+    // mode this is. Both were absent/wrong — the chip showed a bare date and
+    // no mode badge rendered at all on a replay.
+    expect(document.querySelector(".catalog-toggle")?.textContent).toContain("FLOW · 2026-08-07");
+    expect(document.getElementById("modebadge")?.textContent).toBe("▣ playback");
+
+    // crumb: `◆ <primaryMission()>`. Non-empty precisely BECAUSE a replay is
+    // not presence-scoped — the live arm filters to missions with a running
+    // session and finds none, which is why goldens/fleet.txt's crumb is empty.
+    expect(document.getElementById("crumb")?.textContent).toBe("◆ review-1");
+
+    // meta: the replay census, from the day's own records. Two lines, and the
+    // schema header counts as neither a record nor a machine.
+    const meta = document.getElementById("meta")?.textContent ?? "";
+    expect(meta).toContain("◆ review-1, review-2");
+    expect(meta).toContain("flow · 2026-08-07");
+    expect(meta).toContain("2 records · 1 machines");
+    // The live arm's headline must NOT appear — it is what used to render here.
+    expect(meta).not.toContain("last dispatch");
+  });
 });

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { LiveStatusBadge } from "./LiveStatusBadge";
+import { LiveStatusBadge, PlaybackModeBadge } from "./LiveStatusBadge";
 import { CatalogPanel } from "../lenses/catalog/CatalogPanel";
 import { isLiveRoute, type Route } from "../lib/route";
 import { todayUTC } from "../lib/flow";
@@ -123,7 +123,7 @@ export function Masthead({ route, liveStatus }: { route: Route; liveStatus: Live
         <span className="masthead__ver" id="verbadge" />
       )}
       <CatalogPanel label={srcbadgeText(route)} />
-      {live ? <LiveStatusBadge status={liveStatus} /> : null}
+      {live ? <LiveStatusBadge status={liveStatus} /> : route.kind === "playback" ? <PlaybackModeBadge /> : null}
       {/* (operator: "a reload button next to 'live' is absurd") — and it is:
           a refresh control beside a badge reading `● LIVE` contradicts
           itself. If the view is live there is nothing to refresh; if you
@@ -180,7 +180,15 @@ export function Masthead({ route, liveStatus }: { route: Route; liveStatus: Live
  * `App.tsx`'s `routeChrome` precedent for the fleet `#logscope` value)
  * except the literal ISO date, which has no case to begin with. */
 function srcbadgeText(route: Route): string {
-  if (route.kind === "playback") return route.date === todayUTC() ? "TODAY" : route.date;
+  // (#1800) `"Flow · "+date` verbatim from legacy's `play` arm, pre-uppercased
+  // per this component's own module doc. The previous version rendered a bare
+  // ISO date and said why: the "Flow · " prefix was "a borrowed live-mode
+  // phrase" for a route with no real playback pipeline behind it. That reason
+  // has EXPIRED — the pipeline exists now, `goldens/playback-date.txt` reads
+  // `FLOW · 2026-08-07`, and the prefix is the honest label rather than a
+  // borrowed one. A same-day `#<date>` hash still reads "TODAY", matching
+  // legacy's `dl` (its own boot treats today's date as live, not playback).
+  if (route.kind === "playback") return route.date === todayUTC() ? "TODAY" : `FLOW · ${route.date}`;
   if (route.kind === "session" || route.kind === "mission-redirect") return "REPLAY";
   return "TODAY";
 }

@@ -135,9 +135,58 @@ export function mergeTailRecords(existing: FlowRecord[], incoming: FlowRecord[],
  * `Invalid Date other` log row, and a third timeline lane. Both were live
  * before this split. */
 export function normalizeRecords(records: FlowRecord[]): FlowRecord[] {
-  return records
+  const shaped = records
     .filter((r): r is FlowRecord => !!r && !r._type)
     .map((r) => ({ ...r, action: normalizeAction(r.action) }));
+  return [...shaped, ...perSessionRuntimeRecords(records)].sort((a, b) => T(a.ts) - T(b.ts));
+}
+
+/** The APPEND half of `flowToRenderModel()` — viewer.html:3223-3234. One
+ * synthetic `source:"runtime"` telemetry record per session that emitted any
+ * `dispatch.turn`, carrying that session's max `turn_seq` as its TURNS
+ * metric. The subsystem view reads the metric from here rather than
+ * re-scanning, which is why the record exists at all.
+ *
+ * (#1800) Ported because it is not merely internal: these records are part of
+ * `DATA`, so they are COUNTED. `goldens/playback-date.txt`'s meta line reads
+ * "2008 records" against a fixture holding 1993 real records and 15 sessions
+ * with turns — the 15 are these. The live meta line does not state a count
+ * (legacy moved it to the event pane), which is why nothing noticed their
+ * absence until a replay had to say the number out loud.
+ *
+ * Legacy sorts the whole set by ts afterwards because these are appended out
+ * of order, and the event log plus follow-latest both assume `DATA` is
+ * temporal. `normalizeRecords` does the same, so the sort is not this
+ * function's own concern.
+ *
+ * Reads from the RAW records deliberately — `dispatch.turn` needs no action
+ * normalization (it has no space-separated legacy spelling), and taking the
+ * pre-filter set keeps this independent of the shaping step's ordering. */
+function perSessionRuntimeRecords(records: FlowRecord[]): FlowRecord[] {
+  const perSession = new Map<string, { turns: number; ts: string; machineId?: string; machineUid?: string }>();
+  for (const r of records) {
+    if (!r || r._type || r.action !== "dispatch.turn" || !r.session_id) continue;
+    const seq = (r.payload as { turn_seq?: number } | undefined)?.turn_seq ?? 0;
+    const prev = perSession.get(r.session_id);
+    const entry = prev ?? { turns: 0, ts: r.ts };
+    entry.turns = Math.max(entry.turns, seq);
+    // `e.ts=r.ts` unconditionally — the LAST turn's timestamp, not the max.
+    // Records arrive in ts order, so these agree; keeping legacy's form means
+    // they keep agreeing if that ever stops being true.
+    entry.ts = r.ts;
+    if (r.machine_id) entry.machineId = r.machine_id;
+    if (r.machine_uid) entry.machineUid = r.machine_uid;
+    perSession.set(r.session_id, entry);
+  }
+  return [...perSession.entries()].map(([sessionId, e]) => ({
+    ts: e.ts,
+    category: "telemetry",
+    source: "runtime",
+    machine_id: e.machineId,
+    machine_uid: e.machineUid,
+    session_id: sessionId,
+    fields: { turns: e.turns },
+  })) as FlowRecord[];
 }
 
 /** `loadLiveWindow()` + the dispatch-action slice of `flowToRenderModel()` —

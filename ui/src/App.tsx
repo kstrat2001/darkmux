@@ -17,13 +17,14 @@ import { useRouteRecords } from "./hooks/useRouteRecords";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
+import { primaryReplayMission, replayMetaLines } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
 import { localMachineUid, nameOf } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
 import { queryKeys } from "./lib/queryKeys";
-import type { MachineSpecs } from "./types/handwritten";
+import type { FlowRecord, MachineSpecs } from "./types/handwritten";
 import type { Route } from "./lib/route";
 
 /**
@@ -44,10 +45,13 @@ import type { Route } from "./lib/route";
  * function's own `$("logscope").textContent=...`) — the `{crumb, logscope}`
  * pair is computed here (`routeChrome`, below) per route rather than inside
  * each lens component, since `#crumb` is an App-level sibling of `#stage`,
- * not a descendant of it. `#meta` is GLOBAL (legacy's `renderMeta()` runs on
- * every render() regardless of `state.level` — confirmed: `goldens/fleet.txt`
- * and `goldens/machine.txt` carry byte-identical `=== meta ===` sections), so
- * it's computed here unconditionally rather than per-route. The underlying
+ * not a descendant of it. `#meta` is LENS-INDEPENDENT (legacy's `renderMeta()`
+ * runs on every render() regardless of `state.level` — confirmed:
+ * `goldens/fleet.txt` and `goldens/machine.txt` carry byte-identical
+ * `=== meta ===` sections), so it's computed here rather than per-lens — but
+ * it is NOT mode-independent: `renderMeta` branches live-vs-replay
+ * (viewer.html:1330-1340), and #1800 wired the replay arm (`lib/replayMeta.ts`)
+ * off `routeRecords`. Lens-independent, mode-dependent. The underlying
  * `useFlowWindow`/`useLiveMachines`/`machineSpecs` queries are ALSO used
  * inside `MachineLens` — TanStack Query dedupes by queryKey, so this is
  * cache reuse, not a second network round trip.
@@ -120,11 +124,12 @@ export function App() {
   // has no second observer. Gating the fetch is not enough; the consumer has
   // to be gated too, and this is the consumer.
   //
-  // KNOWN, UNCHANGED by this fix: `#meta` below still computes from
-  // `flowWindow` (the LIVE rolling window) on every route, so a replay's meta
-  // bar describes today. That is a separate, pre-existing divergence from
-  // legacy — which re-scopes its whole `DATA` on a playback boot — and it is
-  // named in #1800's plan rather than half-fixed here.
+  // The same rule caught a THIRD endpoint one commit later: `/machine/specs`
+  // (below) was ungated on both sides, so a replay rendered today's CPU and
+  // RAM on the machine card. Legacy's own statement of the rule is general —
+  // `pollLiveMachines`, `pollLiveSessions` and `pollMachineSpecs` are all
+  // live-mode-only polls, and a replay starts NONE of them. Anything added
+  // here that describes NOW belongs in that list.
   const liveMachines = useLiveMachines(isLiveRoute(route));
   // Gated for the SAME reason, and via the same two-sided rule: `/machine/specs`
   // is live-only (viewer.html:2696 — "playback mode never starts that poll"),
@@ -151,8 +156,27 @@ export function App() {
   const targetMachineName =
     route.kind === "machine" ? (route.uid != null ? nameOf(flowWindow.data, liveMachines, route.uid) : localName) : null;
 
-  const ready = useMemo(() => readyParts(flowWindow.data, liveMachines, nowMs), [flowWindow.data, liveMachines, nowMs]);
-  const metaLines = useMemo(() => computeMetaLines(flowWindow.data, liveMachines, nowMs), [flowWindow.data, liveMachines, nowMs]);
+  // (#1800) `#meta` takes legacy's REPLAY branch on a replay. Until now it
+  // computed from `flowWindow` (the live rolling window) on every route, so a
+  // `#<date>` page's status bar described TODAY while the stage beside it
+  // described the recorded day — the loudest of the three surfaces that
+  // disagreed about what day the page was showing.
+  //
+  // No new fetch: `routeRecords` is already that day's records (P1), so the
+  // replay line reads the same set the stage does. That is the property worth
+  // having — a second fetch could drift; one source cannot.
+  const replayMeta = route.kind === "playback" ? routeRecords.records : null;
+  const ready = useMemo(
+    () => (replayMeta ? null : readyParts(flowWindow.data, liveMachines, nowMs)),
+    [replayMeta, flowWindow.data, liveMachines, nowMs],
+  );
+  const metaLines = useMemo(
+    () =>
+      replayMeta
+        ? replayMetaLines(replayMeta, route.kind === "playback" ? route.date : "")
+        : computeMetaLines(flowWindow.data, liveMachines, nowMs),
+    [replayMeta, route, flowWindow.data, liveMachines, nowMs],
+  );
 
   // `logscope` is no longer SHOWN — the outer UI owns context (see
   // EventLogColumn's header). It is still computed and still rendered into a
@@ -162,7 +186,7 @@ export function App() {
   // values are lowercase now for the same reason — CSS `text-transform`
   // never applies to text that is not rendered, so legacy's raw text is what
   // both sides must match. All of this dies with legacy at the flip.
-  const { crumb, logscope } = routeChrome(route, targetMachineName);
+  const { crumb, logscope } = routeChrome(route, targetMachineName, replayMeta);
 
   useSyncHash(route);
 
@@ -248,7 +272,18 @@ export function App() {
  * these are byte-parity targets for `#crumb` (see each component's own doc
  * for why), so inventing crumb text for them would be UX decoration, not a
  * port. */
-function routeChrome(route: Route, targetMachineName: string | null): { crumb: string; logscope: string } {
+function routeChrome(
+  route: Route,
+  targetMachineName: string | null,
+  /** (#1800) A replay's own records, or null on a live route. The fleet-level
+   *  crumb is `◆ ${primaryMission()}` (viewer.html:2596-2605), and
+   *  `primaryMission` resolves through `liveScopedMissions`, whose two arms
+   *  are why `goldens/fleet.txt` has an EMPTY crumb and
+   *  `goldens/playback-date.txt` names a mission: live filters to missions
+   *  with a RUNNING session (none, on the recorded corpus), replay shows the
+   *  window's missions. */
+  replayRecords: FlowRecord[] | null,
+): { crumb: string; logscope: string } {
   if (route.kind === "machine") {
     // `$("crumb").innerHTML = state.machine!=null ? escN(state.machine) :
     // "this machine"` (viewer.html:2537); `$("logscope").textContent =
@@ -306,7 +341,13 @@ function routeChrome(route: Route, targetMachineName: string | null): { crumb: s
     // same read), so legacy's `renderFleet()` sets the same `"fleet"`
     // logscope (viewer.html:1668) it does on a live fleet view — VISIBLE,
     // already uppercase.
-    return { crumb: "", logscope: "fleet" };
+    //
+    // …and it therefore takes the same FLEET-LEVEL crumb branch, which is
+    // `◆ ${primaryMission()}` — non-empty here precisely because a replay is
+    // not presence-scoped. Empty when the day has no mission ids at all,
+    // matching legacy's `pm!=null ? ... : ""`.
+    const pm = replayRecords ? primaryReplayMission(replayRecords) : null;
+    return { crumb: pm != null ? `◆ ${pm}` : "", logscope: "fleet" };
   }
   if (route.kind === "mission-redirect") {
     // `$("logscope").textContent="mission"` (viewer.html:2730,

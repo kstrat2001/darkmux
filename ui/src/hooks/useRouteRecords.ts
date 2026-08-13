@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys } from "../lib/queryKeys";
 import type { Route } from "../lib/route";
-import { asRecordArray } from "../lib/flow";
+import { asRecordArray, normalizeRecords } from "../lib/flow";
 import type { FlowRecord } from "../types/handwritten";
 import type { FlowWindowResult } from "./useFlowWindow";
 
@@ -63,10 +63,26 @@ export interface RouteRecords {
  * log, silently. Verified against the live daemon at the merge gate, not
  * inferred. The old signature also LIED: it was annotated `FlowRecord[] | null`
  * while returning `undefined` on the array payload, and the `?? []` at the call
- * sites was load-bearing purely by accident. */
+ * sites was load-bearing purely by accident.
+ *
+ * (#1800) Then SHAPED through `normalizeRecords` — legacy's own playback boot
+ * is `DATA=flowToRenderModel(RAW)` (viewer.html:3894/3922), and this hook was
+ * handing out `RAW`. Two consequences, both real:
+ *
+ *   - The flow file's leading `{"_type":"schema"}` header stayed in the set.
+ *     It has no `machine_uid`, so the meta line counted a second, phantom
+ *     machine, and the event log listed it as an `Invalid Date other` row.
+ *   - This hook and `PlaybackLens` produced DIFFERENT record sets from the
+ *     same cache entry — the lens normalized, the log and meta line did not.
+ *     One source of truth was the stated property; two sets was the fact. The
+ *     meta line's census is what made the gap visible, because it is the only
+ *     surface that says the number out loud.
+ *
+ * Shared cache slot, shared decode, shared shaping: the stage, the event log
+ * and the status bar now cannot disagree about what the day contained. */
 function recordsOf(result: { ok: true; data: unknown } | { ok: false } | undefined): FlowRecord[] | null {
   if (!result || !result.ok) return null;
-  return asRecordArray(result.data);
+  return normalizeRecords(asRecordArray(result.data));
 }
 
 export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): RouteRecords {

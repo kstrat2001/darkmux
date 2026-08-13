@@ -44,6 +44,14 @@ import { test, expect } from "@playwright/test";
 import { readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { GOLDENS_DIR } from "./lib/paths.js";
+// The FULL four-region extractor, shared verbatim with the legacy extraction
+// (`extract.spec.ts`) exactly as `next-parity.spec.ts` uses it for the
+// machine/fleet full-file compares. Imported alongside the stage-only helpers
+// because this file now holds BOTH shapes: `session` compares `#stage` (its
+// chrome is the ordinary live chrome, already covered by `fleet.txt`), while
+// `playback` compares ALL FOUR regions — its topbar, crumb and meta are
+// mode-specific and were exactly where the port diverged.
+import { extractLensText } from "./lib/extract-lens.js";
 import {
   extractCatalogOnlyText,
   catalogSectionOf,
@@ -214,9 +222,8 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     await page.goto(`/index.html#${meta.captured_prev_date}`);
     await waitSettled(page, expect, '.fleet-lens[data-state="loaded"]');
 
-    const got = (await extractStageOnlyText(page)).replace(" (older notes exist)", " history →");
-    const golden = goldenText("playback-date");
-    expect(got, "playback must match legacy's #stage byte-for-byte").toBe(stageSectionOf(golden));
+    const got = (await extractLensText(page)).replace(" (older notes exist)", " history →");
+    expect(got, "playback must match legacy byte-for-byte, ALL regions").toBe(goldenText("playback-date"));
     expect(pageErrors, `pageerror events: ${pageErrors.join("; ")}`).toHaveLength(0);
 
     await page.screenshot({ path: shot("playback-date.png"), fullPage: true });

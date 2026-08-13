@@ -9,11 +9,9 @@ import type { LiveTailStatus } from "../hooks/useLiveTail";
  * `#meta`/`#crumb`, see `App.tsx`'s own module doc) — so this mounts once at
  * the App root, driven by `useLiveTail`'s returned status.
  *
- * Legacy's badge also renders `▣ playback` for the non-live (playback/
- * catalog-replay) case — out of scope here: this app has no real playback
- * render pipeline yet (`PlaybackLens`'s own doc), so there is nothing this
- * badge would be describing for that state. Only the two states
- * `useLiveTail` can actually report — `live`/`reconnecting` — are rendered.
+ * Legacy's badge has a SECOND arm (`▣ playback`) for the non-live case —
+ * `PlaybackModeBadge` below, rendered as a sibling rather than folded in
+ * here; see its own doc for why they are not one component.
  */
 export function LiveStatusBadge({ status }: { status: LiveTailStatus }) {
   const live = status === "live";
@@ -26,6 +24,34 @@ export function LiveStatusBadge({ status }: { status: LiveTailStatus }) {
           parity goldens do not move. */}
       <span className="pbdot">{live ? "●" : "◌"}</span>
       {live ? " live" : " reconnecting"}
+    </span>
+  );
+}
+
+/**
+ * `mb.textContent = live ? "● live" : "▣ playback"` — viewer.html:3473, the
+ * OTHER arm of the same badge. Rendered instead of `<LiveStatusBadge>` on a
+ * replay, which is why they are siblings here rather than one component with
+ * a mode flag: they are driven by different things entirely. The live badge
+ * tracks a CONNECTION (`useLiveTail`'s `live`/`reconnecting`, the #1480
+ * "a drop is visible" fix); this one states a MODE, and a replay has no
+ * connection whose health could change.
+ *
+ * (#1800) It was previously not rendered at all on a replay — a defensible
+ * cut while `PlaybackLens` was a placeholder, since a mode badge over a
+ * not-ported notice describes nothing. Now that the stage is a real
+ * historical render, its absence was the difference between a page that says
+ * what it is showing and one that leaves you to infer it —
+ * `goldens/playback-date.txt`'s topbar carries `▣ PLAYBACK`.
+ *
+ * `.pb` with neither `.live` nor `.stale`, matching legacy's own
+ * `classList.toggle("live", live)` leaving the class off in this arm.
+ */
+export function PlaybackModeBadge() {
+  return (
+    <span id="modebadge" className="pb" data-state="playback">
+      <span className="pbdot">▣</span>
+      {" playback"}
     </span>
   );
 }
