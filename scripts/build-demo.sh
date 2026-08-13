@@ -60,6 +60,15 @@ if [ ! -f "$SRC" ]; then
   exit 1
 fi
 
+# `--print-source` exists so the pre-commit hook can ask WHICH file the demo is
+# built from instead of hardcoding an answer that goes stale (which is exactly
+# what happened to this script itself). One owner of the derivation, two
+# consumers: this generator, and `.githooks/pre-commit`.
+if [ "${1:-}" = "--print-source" ]; then
+  printf '%s\n' "${SRC#"$ROOT/"}"
+  exit 0
+fi
+
 # Inject the demo metas right after the first <head> (exactly once), the same
 # spot the daemon's inject_mode_meta uses for the live/play routes. Pure-shell
 # sed split so it works on macOS BSD tools as well as GNU.
