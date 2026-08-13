@@ -568,60 +568,52 @@ Surfaced 2026-05-28 during PR #454/#455 iteration. Auditing the coder role promp
 
 ## Engagements (operator-defined dreamscapes)
 
-An engagement is operator-defined, never system-defined. The system doesn't enumerate engagements, doesn't impose a directory shape, doesn't have an `engagement` config file format. The operator decides what's an engagement and how much to describe it.
+**An engagement is operator-defined, never system-defined.** darkmux does not
+enumerate engagements, impose a directory shape, or have an engagement config
+format. The operator decides what counts as one and how much to describe it —
+a repo path, a trip, a book, a fitness goal, a URL, classified work they will
+not describe, or nothing written down at all.
 
-An engagement can be:
+**The orchestrator's bridging job**: read (or ask for) the engagement context in
+whatever form it takes; offer to capture it durably as an `.md` if wanted, in a
+location that is the operator's call; translate the soft context into the
+structured concepts darkmux models in code (Mission, Phase, role tilts,
+preferences) — proposing that translation is the job, not an overstep. **Do not
+pry for structure the operator did not volunteer**: offer once, let it land or
+get redirected, then drop it.
 
-- *"It's just a repo at `~/my-project`"* — one-line; the orchestrator uses the path
-- *"I'm planning a 10-day Japan trip with a food focus"* — fuller context; the orchestrator may capture it in a `dreamscape.md` with tilts and constraints
-- *"Our wedding site is at knot.com/our-wedding"* — engagement lives at a URL; not a local dir; the orchestrator notes the URL and maps planning sub-tasks to missions
-- *"It's a Lovable.dev app I'm prototyping"* — hosted SaaS; the orchestrator references the workspace URL
-- *"My personal training goal is sub-5-minute mile"* — life goal; the orchestrator captures the aspiration as missions
-- *"I'm running a substack about local AI"* — long-form writing engagement; the orchestrator helps with drafts, editorial calendar, cross-post threading
-- *"I'm authoring a book on systems engineering"* — multi-month writing project; the orchestrator scaffolds chapters and tracks research threads
-- *"It's classified work I can't describe"* — the orchestrator respects opacity; engagement is named but content is operator-private
-- Unwritten entirely — operator carries it in their head; the orchestrator works from conversation
+### The one hard rule: engagement never enters the CLI arg surface
 
-If the operator is unsure what their engagement *is*, the orchestrator can offer a few of the above as starting shapes — picking a medium is itself one of the bridging moves the orchestrator is here to help with.
+Engagement context lives in the frontier orchestrator layer — CLAUDE.md files,
+skills, conversation. It **never** becomes a `--engagement <hint>` flag on any
+darkmux verb. No `--context`, no `--vibe` either.
 
-**The orchestrator's bridging role.** When working on a mission within an engagement:
+Three reasons, and the third is the load-bearing one:
 
-- Read (or ask for) the engagement context — whatever form it takes
-- Capture it durably as an `.md` if the operator wants — location is operator's call (engagement repo root, `de-lab`, a private notes file, etc.)
-- Translate the soft free-form context into the structured concepts darkmux supports in code (Mission, Phase, role tilts, preferences) — proposing this translation when it'd help the operator move forward is the orchestrator's by-design job, not a thing to withhold
-- Don't pry for structure the operator didn't volunteer — offer a suggestion once, let it land or get redirected, then drop it
+- **CLI args quantize.** `--engagement "wife time"` forces a dreamscape into one
+  string-token. *"This is my marriage time, not a work trip — relaxation, no
+  aggressive sightseeing"* threaded through the intent text carries what the
+  flag cannot.
+- **Utility agents are the wrong layer to interpret it.** A 4B mission-compiler
+  asked to interpret the operator's relationship to an engagement is the exact
+  capability mismatch the utility/specialist split exists to prevent.
+- **Vision dies in translation, and a 4B agent cannot hold a contradiction — it
+  resolves it.** That resolution is where the operator's intent gets lost. The
+  pattern predates AI: when an admin layer translates vision into tasks, the
+  vision quietly disappears, and the cost scales with org size. The frontier's
+  role here is **vision guard** — protecting engagement-level intent from being
+  compressed before it has been translated into structure the utility layer can
+  handle.
 
-Engagements should not be well-defined. They are open-ended dreamscapes where ideas are meant to flourish. darkmux supports the engagements it can support (local dirs, local code work) and stays out of the way for the rest (SaaS, hosted, conceptual, classified). The Rust-level data model in the schema PR (#45) names Role, Crew, Mission, Phase — concepts the system CAN model uniformly. Engagement isn't in that schema by design; it's the layer above where operator judgment lives.
+For a verb that would benefit from "context-aware" output, the operator carries
+that context in the verb's primary input, where a utility agent reads it as part
+of its bounded structuring job.
 
-This is operator sovereignty (above) applied at the project-shape level: the operator decides what their projects look like; the system doesn't impose a schema.
+Surfaced 2026-05-14: `--engagement` was added to `mission propose` and caught
+pre-merge as a doctrine violation. The full reasoning — every engagement shape,
+the bridging role in detail, the complete lost-in-translation argument — is in
+[`docs/ENGAGEMENTS.md`](docs/ENGAGEMENTS.md). Tracked as #49.
 
-Tracked as #49.
-
-### Engagement never enters CLI arg surface
-
-Concrete doctrine that follows from the above: **engagement context lives in the frontier orchestrator layer (CLAUDE.md files, skills, conversation). It never becomes a `--engagement <hint>`-style CLI arg on any `darkmux` verb.**
-
-Three reasons the rule is load-bearing:
-
-- **CLI args quantize.** A `--engagement <hint>` field forces the operator to compress a dreamscape into a single string-token. *"wife time"* as a token is worse than *"this is my marriage time, not a work trip — focus on relaxation, no aggressive sightseeing"* threaded through the actual intent text. The frontier carries that nuance natively; the CLI surface cannot.
-- **Utility agents are the wrong layer for engagement interpretation.** A 4B mission-compiler asked to *"interpret the operator's relationship to this engagement"* is the capability mismatch the utility-vs-specialist split (role-families, defined below) exists to prevent. Engagement nuance interpretation is judgment-bearing work that belongs to the frontier — never to a utility agent and never to a CLI arg the utility agent will read.
-- **The frontier already handles it.** *"Plan our Japan trip — focus on relaxation, no aggressive sightseeing, this is for my marriage"* reads richer than `--engagement "wife time"` + `"plan Japan trip"` because the nuance threads through prose, not into a separate enum. A frontier-orchestrator-driven workflow gets engagement-shaping for free; a bare CLI invocation gets it by the operator putting context in the input text itself.
-
-For new CLI verbs that would benefit from "context-aware" output: the operator carries that context into the verb's primary input. No separate `--engagement`, no `--context`, no `--vibe`. If the operator has no frontier orchestrator and wants context-shaping, they write the context into the input prose where the utility agent reads it as part of its bounded structuring job.
-
-### Why the line matters at scale — the lost-in-translation problem
-
-The mechanical reasons above (quantization, capability mismatch, etc.) are downstream of a deeper principle. **The pattern is older than AI:** in any organization, when admin staff translate vision → tasks, the vision quietly dies in the translation. The admin role IS narrower — that's why an admin layer can absorb volume — but applying that layer to vision-bearing work is the antipattern. Same dynamic in the AI stack: darkmux's *utility* layer is the AI analog of the org-world admin layer; pushing engagement-bearing work into it produces the same lost-in-translation failure mode.
-
-What makes the line load-bearing:
-
-- **Engagement is where the *why* lives.** The frontier orchestrator can hold engagements because it can sit in operator context, hold contradictions, and carry nuance across turns. A 4B utility agent can't hold contradictions — it'll resolve them. That resolution is where vision gets lost. A `--engagement "wife time"` flag forces the utility agent to do that resolution before it has the context to do it well.
-- **The utility AI is the basic planning layer, not the strategic layer.** Capacity-matched to its actual job (bounded inputs, structured outputs, throughput). Asking it to ALSO carry *"what does this mean for the operator's broader life / org / book / engagement"* loads it past its capacity. Even when it produces something, that something is the small-picture compression of the big picture.
-- **The cost scales with org size.** A solo operator can correct utility output in the next turn — the loop is tight enough that drift gets caught. An organization where the admin layer is making decisions BEFORE the operator/frontier sees them is the scenario where *big dreams get eaten alive by small bugs written by admin staff who don't have capacity yet to hold the big picture vision.* darkmux's utility layer can have exactly that pathology if its scope leaks into engagement territory; the line drawn here is what prevents it.
-
-The frontier orchestrator's role in this layering is named **vision guard** — the layer that protects the operator's engagement-level intent from being compressed before it has been translated into structure the utility layer can handle. The cultivation discipline (how operators *shape* their frontier to actually hold their vision — CLAUDE.md files, skills, memory, conversation history) is the next-order concern; tracked separately as [#130](https://github.com/kstrat2001/darkmux/issues/130).
-
-Surfaced 2026-05-14: Sprint 3 of #113 originally added `--engagement` to `darkmux mission propose`; operator caught it pre-merge as a doctrine violation against #49. Removed in the same PR, and the rule made explicit here so future verbs don't re-introduce it. The lost-in-translation framing came from the same exchange — codified here because the *why* is harder to reconstruct from the rule alone, and future verbs that look context-shaped will tempt the same drift.
 
 ## Project posture
 
