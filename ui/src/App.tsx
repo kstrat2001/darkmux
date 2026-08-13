@@ -126,11 +126,17 @@ export function App() {
   // legacy — which re-scopes its whole `DATA` on a playback boot — and it is
   // named in #1800's plan rather than half-fixed here.
   const liveMachines = useLiveMachines(isLiveRoute(route));
+  // Gated for the SAME reason, and via the same two-sided rule: `/machine/specs`
+  // is live-only (viewer.html:2696 — "playback mode never starts that poll"),
+  // and an ungated observer here would keep the shared cache warm for
+  // `FleetLens`'s gated one exactly as `useLiveMachines` did. Gating one side
+  // and not the other is indistinguishable from gating neither.
   const specsQuery = useQuery({
+    enabled: isLiveRoute(route),
     queryKey: queryKeys.machineSpecs(),
     queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
   });
-  const specs = specsQuery.data?.ok ? specsQuery.data.data : null;
+  const specs = isLiveRoute(route) && specsQuery.data?.ok ? specsQuery.data.data : null;
 
   const localUid = useMemo(
     () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null),

@@ -208,11 +208,26 @@ export function FleetLens({
   // isolated test.
   const liveMachines = useLiveMachines(liveMode);
   const liveSessionIds = useLiveSessionIds(liveMode);
+  // `/machine/specs` is the THIRD live-only endpoint on this screen, and the
+  // one that got away in the first pass. It describes the hardware of the
+  // machine serving the page RIGHT NOW — `pollMachineSpecs` is the live-only
+  // 5s poll, and legacy states outright that "playback mode never starts that
+  // poll" (viewer.html:2696), leaving `MACHINE_SPECS` null so `specOf` returns
+  // "" and the card reads "hardware not reported". Rendering today's CPU and
+  // RAM against a replayed day is the same confidently-wrong claim as
+  // rendering today's presence.
+  //
+  // It also made the parity test genuinely FLAKY rather than merely wrong:
+  // whether the specs response landed before the assertion was a race, so a
+  // local run passed and CI failed on the identical commit. Gating it removes
+  // the race at its source — the request never happens — instead of waiting
+  // harder for a value that should not be read.
   const specsQuery = useQuery({
+    enabled: liveMode,
     queryKey: queryKeys.machineSpecs(),
     queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
   });
-  const specs = specsQuery.data?.ok ? specsQuery.data.data : null;
+  const specs = liveMode && specsQuery.data?.ok ? specsQuery.data.data : null;
 
   const tokens = useMemo(() => tokensOffMeter(flowWindow.data), [flowWindow.data]);
   const note = useMemo(() => hybridNote(flowWindow.data, tokens), [flowWindow.data, tokens]);

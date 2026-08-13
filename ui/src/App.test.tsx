@@ -456,8 +456,17 @@ describe("App", () => {
     await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
 
     const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
-    expect(urls.some((u) => u.includes("/fleet/machines/live"))).toBe(false);
-    expect(urls.some((u) => u.includes("/fleet/sessions/live"))).toBe(false);
+    // The list is EXHAUSTIVE on purpose. The first version of this assertion
+    // named only `/fleet/*`, and `/machine/specs` — a third live-only endpoint,
+    // ungated by the same oversight — sailed through it and was caught by CI
+    // instead, as a one-line golden diff ("Apple M5 Max · 128 GB" where legacy
+    // reads "hardware not reported"). An allowlist of the endpoints you
+    // remembered to name is not a gate. Legacy's own rule is the general one:
+    // `pollLiveMachines`, `pollLiveSessions` and `pollMachineSpecs` are all
+    // live-mode-only polls, and a replay starts none of them.
+    for (const live of ["/fleet/machines/live", "/fleet/sessions/live", "/machine/specs"]) {
+      expect(urls.some((u) => u.includes(live)), `a replay must not fetch ${live}`).toBe(false);
+    }
     // …and the day WAS actually fetched, so a hook quietly requesting nothing
     // at all cannot pass this by doing no work.
     expect(urls).toContain("/flow/2026-08-07");
