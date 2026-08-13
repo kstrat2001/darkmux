@@ -13,6 +13,7 @@ import { MissionReplay } from "./lenses/catalog/MissionReplay";
 import { SessionReplay } from "./lenses/catalog/SessionReplay";
 import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
+import { useRouteRecords } from "./hooks/useRouteRecords";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
@@ -103,6 +104,11 @@ export function App() {
   const liveStatus = useLiveTail(isLiveRoute(route));
 
   const flowWindow = useFlowWindow(nowMs);
+  // (#1800 P1) The event log follows the ROUTE, not the clock. On a
+  // `#session=`/`#<date>` route this is that slice; on a live route it is
+  // still the rolling window. Before this, every route got the live window,
+  // so a session's stage and its event log described different things.
+  const routeRecords = useRouteRecords(route, flowWindow);
   const liveMachines = useLiveMachines();
   const specsQuery = useQuery({
     queryKey: queryKeys.machineSpecs(),
@@ -187,7 +193,7 @@ export function App() {
         <main className="app-shell__stage" id="stage">
           {renderRoute(route)}
         </main>
-        <EventLogColumn scopeLabel={logscope} records={flowWindow.data} visible={showsEventLog(route)} />
+        <EventLogColumn scopeLabel={logscope} records={routeRecords.records} visible={showsEventLog(route)} />
       </div>
     </div>
   );
