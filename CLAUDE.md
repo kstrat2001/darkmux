@@ -124,24 +124,35 @@ workflow touching it merely `cargo build`s it on manual dispatch. So `t-all`
 misses it and CI does not cover it either. Deferring to CI is right everywhere
 else; there, it is deferring to nothing.
 
-## Releasing — dogfood the dispatch critical path first
+## Releasing — the gate, and where the steps live
 
-> **Release gate (operator mandate, 2026-06-29): NO release is cut until local darkmux runs against REAL AI dispatches that show the release's FEATURES are working — not just that the dispatch path runs.** A trivial smoke proves the *path* (container ran, loop executed, `result: "stop"`); it does NOT prove the *behaviors* this release ships actually work. For each feature-bearing change in the release, run a real local-AI dispatch that EXERCISES it and observe the expected behavior live — read `lms ps`, the flow records, the envelope, the served viewer, whatever the feature touches. `cargo test` + CI + a trivial path-smoke are necessary but not sufficient; the gate is **feature behavior verified live, locally, against real dispatches.**
->
-> **#1135 is exactly why.** `dispatch --profile` silently JIT-loaded the model at LMStudio's 4096 default instead of the profile's `n_ctx`, but **a trivial smoke message FITS 4096** — so `result: "stop"` looked perfectly healthy while the feature was broken and would have shipped garbage reviews. Only a dispatch that exercised the feature *and read `lms ps` to confirm the loaded context* caught it. A path-only smoke ships this class of bug.
+**Cutting a release? Invoke the `darkmux-point-release` skill and follow it.
+Do NOT improvise the sequence.** The steps, their ordering, and the traps that
+ordering exists to avoid live there — not here. This section is only the gate:
+the thing that decides whether a release should be cut at all.
 
-**Before cutting ANY release, run a real dogfood dispatch as a critical-path smoke test.** A trivial `darkmux dispatch <role> "<smoke>"` (or a `mission launch coder-phase`) on the build you're about to tag is the floor — it proves the end-to-end dispatch path (model selection → container spawn → `docker run` → runtime loop → envelope) runs. But the floor is not the gate (see the mandate above): also exercise the actual features. `cargo test` + `cargo clippy` are necessary but NOT sufficient: they exercise the *pieces*, not the live invocation, and never the feature behavior.
+> **Release gate (operator mandate, 2026-06-29): NO release is cut until local
+> darkmux runs against REAL AI dispatches showing the release's FEATURES work
+> — not merely that the dispatch path runs.** `cargo test`, CI, and a trivial
+> path-smoke are necessary and NOT sufficient: they exercise the pieces, never
+> the live invocation, and never the behavior.
 
-This is load-bearing, not ceremony. **v1.3.x–1.4.0 shipped a completely broken internal-runtime dispatch** (`docker docker run`, exit 125 — #975): every unit test asserted the docker *argv vector*, but nothing ever constructed and ran the real `Command`, so the break sailed through four releases of green CI. One dogfood dispatch before any of those cuts would have caught it on the first try; it was finally found only when a `dispatch` happened to run for an unrelated reason.
+Two failures are why, and both shipped:
 
-The discipline:
-- **Dogfood the version you're tagging** — `cargo install --path .` from the release commit first, then dispatch.
-- **Make a runtime image available first.** The versioned GHCR image (`darkmux-runtime:<version>`) only publishes *at* release, so a pre-release dogfood can't pull it. If `runtime/` changed in this release, `docker build -t darkmux-runtime:latest runtime/` from the release commit (darkmux prefers a local `:latest` over a pull). If `runtime/` is unchanged, the prior release's image is byte-identical — `docker tag <prev-runtime-image> darkmux-runtime:latest` and remove the tag after.
-- **A trivial message is the FLOOR, not the gate.** It tests the *path*: pass = the container ran and the loop executed (`result: "stop"`, or any non-125 / non-pull-miss outcome); fail = exit 125, an image-pull miss, or an immediate error before the loop. But a path-pass is necessary, not sufficient — see the next bullet.
-- **Verify the FEATURES live (the actual gate, per the mandate above).** For each feature-bearing change in the release, run a real dispatch that EXERCISES it and confirm the expected behavior against ground truth — `lms ps` (model/context loaded), the flow records (fields emitted), the envelope (output shape), the served viewer (rendered correctly), `darkmux doctor` (the check fires). The trivial smoke would have passed #1135 while the feature was broken; the feature check is what catches it. Viewer-only and failure-path features that a happy dispatch can't exercise (e.g. an error-path field) get verified by their own targeted reproduction, not skipped.
-- **Name the loaded model** (see Anti-patterns) — a runaway or garbage *response* is a model finding, not a dispatch-path failure; the path passed if the container ran and the loop executed.
-- **Standard coverage pair (operator, 2026-06-29): a coder long-agentic dispatch + a PR review.** These two real dispatches give broad real-AI coverage across the system in one cheap pass: (1) `darkmux lab run long-agentic` on the **default** coder profile (the pepper-grinder fixture) exercises dispatch → container spawn → tool-loop → compaction → verify; (2) a PR review (`gh workflow run darkmux-review.yml` / a `dispatch pr-reviewer`) exercises the reviewer → `mission launch review` render → post path. PR review is usually already covered by the session's own per-PR QA; the coder run is the piece to add. A coder run that doesn't *converge* is a model finding, not a path failure — the gate is that the dispatch+verify machinery ran end-to-end and produced an envelope, not that the model passed the tests.
-- Composes with the pre-PR dual-QA discipline: per-PR QA catches logic bugs; the pre-release dogfood catches integration / critical-path regressions only a real container run reveals. The `darkmux-point-release` skill's preconditions should include this smoke step.
+- **#1135** — `dispatch --profile` silently loaded the model at LMStudio's 4096
+  default instead of the profile's `n_ctx`. **A trivial smoke message FITS
+  4096**, so `result: "stop"` looked perfectly healthy while the feature was
+  broken and would have shipped garbage reviews. Only a dispatch that exercised
+  the feature *and read `lms ps`* caught it.
+- **#975** — v1.3.x–1.4.0 shipped a completely broken internal runtime (`docker
+  docker run`, exit 125). Every unit test asserted the docker argv vector;
+  nothing ever constructed and ran the real `Command`, so it sailed through four
+  releases of green CI.
+
+The generalization worth carrying: **a green test proves the pieces; only a
+live run proves the thing.** That applies past releases — see "No blind runs"
+and the lab/verify doctrine.
+
 
 ## Loop policy — recheck vs rethink (escalate, don't re-ask)
 
