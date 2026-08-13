@@ -17,8 +17,9 @@ executed lines cannot be caught by any amount of care in review.
 visible on the README. The operator's call (2026-08-13), over the objection
 recorded above: a number anyone can see is one the team is accountable for,
 where an invisible one is only accountable to whoever remembers to look. The
-badge carries the LINE percentage AND the zero-coverage file count, because the
-percentage alone is the part this script exists to argue is least interesting.
+badge carries the line percentage ONLY — it answers "is this tested?" for
+someone passing by. The zero-coverage list above stays here, in CI, where it is
+the dev team's work queue rather than front-page furniture.
 """
 import json
 import sys
@@ -74,9 +75,12 @@ def main(path: str = "cov.json", badge_path: str | None = None) -> int:
         # Two facts, not one: the percentage answers "how much runs", the
         # zero-file count answers "how much is unreachable by any test" — and
         # the second is the one that predicted real defects here.
+        # The percentage ONLY. The badge answers one question for a passing
+        # visitor — "is this tested?" — and a number is the whole answer. The
+        # zero-coverage list printed above is the DEV TEAM's work queue; it
+        # belongs in CI where it is actionable, not on the front page where it
+        # is a backlog item shown to strangers who did not ask.
         msg = f"{pct:.0f}%"
-        if zero:
-            msg += f" · {len(zero)} file(s) untouched"
         # Bands are deliberately wide. A badge that changes colour on a 1%
         # move invites chasing the colour instead of the gap.
         colour = "brightgreen" if pct >= 80 else "green" if pct >= 70 else "yellow" if pct >= 55 else "orange"
