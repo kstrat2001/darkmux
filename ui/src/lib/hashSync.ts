@@ -121,13 +121,39 @@ export function canonicalHash(route: Route): string | null {
 /** Imperative half — the actual `replaceState` write, with the same
  * no-change guard `useSyncHash`'s effect uses. Exported standalone for a
  * lens to call directly at the moment its own out-of-route state changes
- * (see the module doc — today's one caller is `RunsBoard`'s kind chips). */
+ * (see the module doc — today's one caller was `RunsBoard`'s kind chips;
+ * the lab-run drill-in (`openLabRun`/`closeLabRun`) is a second, added when
+ * the drill-in packet gave `run` a real destination).
+ *
+ * `history.replaceState` never fires `hashchange` (that's WHY it was
+ * chosen over `pushState`/a direct `location.hash=` assignment — see the
+ * module doc's "lens hops must not spam history" note). But `useHashRoute`
+ * (`lib/useHashRoute.ts`) is the ONLY thing that turns a URL change into a
+ * React re-render, and it subscribes to exactly that event — so a
+ * `writeHash`-only navigation (no other App-level state happens to change
+ * afterward) left `App.tsx`'s `route` — and everything derived from it,
+ * `#crumb` in particular — permanently stale. Caught live: drilling a lab
+ * run wrote `run=<dir>` to the address bar correctly, but `#crumb` (which
+ * reads `route.run`) stayed blank for the rest of the session, not just a
+ * render behind — probed directly against the running harness for 10s of
+ * wall-clock with no App-level re-render ever landing to pick the new
+ * `location.href` up. Firing a synthetic `hashchange` here closes that
+ * gap without reintroducing the history-spam problem `replaceState` exists
+ * to avoid: the event has no effect on `history.length` on its own, it
+ * only tells `useHashRoute`'s subscriber to re-check `location.href` (via
+ * `getSnapshot`'s own `cachedHref` guard) the same way a real hash edit
+ * would. Dispatched only when a write actually happened (after the
+ * no-change guards below), so this can't loop: `useSyncHash`'s effect
+ * re-runs on the resulting route change, calls `writeHash` again with the
+ * now-current canonical form, and the `next === current` guard makes that
+ * second call a no-op before it reaches this line. */
 export function writeHash(next: string | null): void {
   if (next === null) return;
   const current = (location.hash || "").replace(/^#/, "");
   if (next === current) return;
   const url = next ? "#" + next : location.pathname + location.search;
   history.replaceState(null, "", url);
+  window.dispatchEvent(new Event("hashchange"));
 }
 
 /** Effect half — call once, at the App root, with the CURRENT route. Fires

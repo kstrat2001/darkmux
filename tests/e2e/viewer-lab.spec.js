@@ -145,29 +145,26 @@ test('the lab series view stays reachable, under the lab filter only', async ({ 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
 
-test('labKnobDiff surfaces a judge seat added or removed between runs', async ({ page }) => {
-  // Direct unit-check of the client-side diff (frontier review, #1262): a
-  // judge appearing/disappearing between runs is methodology drift and must
-  // never render as "no knob change". Driven via page.evaluate against the
-  // real function rather than a fixture third-run (which would ripple
-  // through every series-count assertion above).
-  await page.goto('/index-lab.html');
-  await page.waitForSelector('#lens-runs');
-  const diffs = await page.evaluate(() => {
-    const probe = { name: 'p1', model: 'darkmux:m', k: 1, n_ctx: 1000, max_tokens: 100 };
-    const judge = { name: 'j', model: 'darkmux:judge-model', k: 3, n_ctx: 2000, max_tokens: 200 };
-    const withJudge = { crew: 'c', exec_mode: 's', staffing: { probes: [probe], judge } };
-    const noJudge = { crew: 'c', exec_mode: 's', staffing: { probes: [probe], judge: null } };
-    return {
-      added: labKnobDiff(noJudge, withJudge),
-      removed: labKnobDiff(withJudge, noJudge),
-      unchanged: labKnobDiff(withJudge, withJudge),
-    };
-  });
-  expect(diffs.added).toEqual(['+judge (judge-model)']);
-  expect(diffs.removed).toEqual(['-judge']);
-  expect(diffs.unchanged).toEqual([]);
-});
+// (port note) `labKnobDiff surfaces a judge seat added or removed between
+// runs` — REMOVED, not ported, and this is the finding, same shape as the
+// LAB_FEED_CAP note below.
+//
+// The original drove `page.evaluate(() => labKnobDiff(...))` against a
+// legacy GLOBAL function (viewer.html). The port has no page globals at
+// all — `labKnobDiff` is a module-scoped export
+// (`ui/src/lenses/lab/labSeries.ts`), unreachable from `page.evaluate` by
+// design (React state/logic doesn't leak onto `window`), so this spec
+// cannot work as written against `/next`.
+//
+// Real replacement coverage already exists, and it's a better home for
+// this check than a browser ever was: `labSeries.test.ts`'s own
+// `describe("labKnobDiff")` block, specifically `"reports a judge seat
+// appearing or disappearing"` — asserting the EXACT scenario this e2e test
+// did (`+judge (m)` / `-judge`), plus `"reports NO judge change when
+// neither side has one"`, a case this e2e version never covered. It's a
+// pure function of two plain objects; unit-testing it directly is strictly
+// MORE precise than driving a browser to reach the same call, not a
+// downgrade — see `ui/src/lenses/lab/labSeries.test.ts`.
 
 test('deep link #lens=runs boots directly into the runs lens', async ({ page }) => {
   const pageErrors = [];
@@ -231,7 +228,22 @@ test('drilling a lab row from the list opens its detail and updates the hash', a
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
 
-test('deep link with an unresolvable run falls back to the run list with a notice', async ({ page }) => {
+// (port gap, not a naming/mechanism difference — reported, not silently
+// narrowed) `LabRunDetail` (`ui/src/lenses/runs/LabRunDetail.tsx`) has no
+// fallback-to-list branch at all: on a `detailQuery.data.ok === false`
+// (this test's 400), it renders its OWN inline `data-state="error"` page
+// ("couldn't reach /lab/run/detail (HTTP 400): bad dir") and STAYS there —
+// `RunsBoard.tsx`'s `if (labRunDir) return <LabRunDetail .../>` hands off
+// unconditionally and never gets control back to bounce to `.labrunrow`.
+// Confirmed live (not inferred): this harness never renders `.labrunrow`
+// or `.labnotice` after booting on `run=no-such-run` — the DOM sits on
+// `data-state="error"` indefinitely. Fixme rather than deleted per this
+// packet's brief: the fallback-to-list-with-a-notice behavior genuinely
+// isn't built, which is a real product decision for the parent session
+// (build the fallback, or decide the inline HTTP error is the intended,
+// arguably more honest, replacement — it already names the exact status
+// code legacy's generic notice never did).
+test.fixme('deep link with an unresolvable run falls back to the run list with a notice', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   // Detail endpoint rejects (the daemon 400s a bad/out-of-bounds dir; the

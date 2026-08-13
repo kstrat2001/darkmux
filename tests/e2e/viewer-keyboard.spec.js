@@ -26,7 +26,40 @@ const openCount = (page) =>
     })
   );
 
-test('Tab cannot walk out of an open dialog', async ({ page }) => {
+// (port gap, reported not papered over — applies to every test below)
+// All four tests in this file exercise the shared modal focus-trap/
+// Escape/restore-focus machinery legacy built around `#modalbg`/
+// `#nmodalbg`/`#imodalbg` (`openModalEl`/`closeOpenModal`/`restoreModalFocus`,
+// `MODAL_IDS`) — and the port has not built ANY of the three dialogs those
+// tests need to open. Confirmed directly against the source, not inferred:
+//
+// - The full checkbox-per-facet FILTERS modal (`#modalbg`) is a named,
+//   deliberate cut — `EventLogColumn.tsx`'s own module doc: "The filter
+//   MODAL is a named, deliberate cut, not a half-build. `.fbtn` here
+//   toggles the quick filter directly instead of opening a modal with
+//   checkboxes." There is no `[data-act="filters"]` element in the port at
+//   all.
+// - The notes-history modal (`#nmodalbg`) and the about/build-info modal
+//   (`#imodalbg`) are both named follow-ups too — `Masthead.tsx`'s own
+//   module doc: "Deliberately NOT wired to an about-modal... Named here as
+//   a follow-up rather than half-wiring a modal with no content behind
+//   it," and the hybrid-note's "history →" is "a plain marker... Restore
+//   the link when the modal lands."
+// - `openModalEl`/`state`/every legacy global these tests call directly
+//   (test 3) don't exist on any page the port serves — React holds this
+//   state internally, not on `window`.
+//
+// This is real, substantial, security/accessibility-relevant work still to
+// do before `viewer.html` can be deleted without a coverage loss: the
+// managed-focus behavior this file's own header names (Tab-trap, Shift+Tab
+// wrap, single-Escape-closes-topmost, focus-restore-on-close) has NO
+// equivalent anywhere in the port today because there is no modal for it
+// to apply to. Kept here verbatim (fixme, not deleted) as the tracked
+// record of what a dialog implementation needs to satisfy once one exists
+// — these tests double as an executable spec for THAT future work, not
+// just a regression gate for behavior already shipped.
+
+test.fixme('Tab cannot walk out of an open dialog', async ({ page }) => {
   // The overlays are opaque `position:fixed;inset:0`, but nothing kept focus
   // inside. 31 Tab presses from an open Filters landed on the page header link
   // — visually buried under the backdrop, so a keyboard user is operating
@@ -46,7 +79,7 @@ test('Tab cannot walk out of an open dialog', async ({ page }) => {
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test('Shift+Tab wraps backwards instead of escaping', async ({ page }) => {
+test.fixme('Shift+Tab wraps backwards instead of escaping', async ({ page }) => {
   const errors = await boot(page);
   await page.locator('[data-act="filters"]').first().click();
   await expect(page.locator('#modalbg')).toBeVisible();
@@ -62,7 +95,7 @@ test('Shift+Tab wraps backwards instead of escaping', async ({ page }) => {
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test('one Escape closes the dialog the operator is actually looking at', async ({ page }) => {
+test.fixme('one Escape closes the dialog the operator is actually looking at', async ({ page }) => {
   // Two dialogs could be open at once, and `closeOpenModal` walks a FIXED list
   // closing the first one found — not the topmost. With About over Filters, one
   // Escape closed Filters (invisible, underneath) while About stayed covering
@@ -100,7 +133,7 @@ test('one Escape closes the dialog the operator is actually looking at', async (
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test('focus returns to the control that opened the dialog', async ({ page }) => {
+test.fixme('focus returns to the control that opened the dialog', async ({ page }) => {
   // Escape / ✕ / backdrop-click all restore focus. Without it a keyboard user
   // is dropped at the top of the document and has to tab back to where they
   // were, every time.

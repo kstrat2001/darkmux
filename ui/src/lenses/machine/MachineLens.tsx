@@ -185,14 +185,20 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
 
   return (
     <div className="machine-lens">
-      <div className="machine-lens__hdr">
+      <div className="machine-lens__hdr stagehdr">
         {/* `<a data-act="fleet">fleet</a> › machine · ${label}` — the
             `.stagehdr` back-link (viewer.html:2021), distinct from `#crumb`
             (which carries no such link for the machine page — see
             `App.tsx`'s `routeChrome` doc). A real `<button>` (not an
             anchor with no href) so it never offers a tooltip/status-bar
             URL; navigation is the same direct hash-write NavChrome's tabs
-            use for a cross-lens hop. */}
+            use for a cross-lens hop. `stagehdr` is a second class, purely
+            an e2e inspection hook — every other stage-header region
+            (`RunsBoard`, `LabRunDetail`, `SessionReplay`) already carries
+            it; this one dropped it when the header grew its own back-
+            BUTTON instead of legacy's plain anchor, and `viewer-xss.spec.js`/
+            `viewer-lab.spec.js` drill through the class uniformly across
+            all of them regardless of which lens they landed on. */}
         <button type="button" className="machine-lens__back" onClick={() => { location.hash = ""; }}>
           fleet
         </button>

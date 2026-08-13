@@ -53,10 +53,19 @@ test('at phone width the chrome reads broadest-scope-first', async ({ page }) =>
   await page.click('[data-act="console"]');
   await expect(page.locator('.panelout')).toBeVisible();
 
-  const meta = await page.locator('.meta').first().boundingBox();
-  const tabs = await page.locator('.lenstabs').first().boundingBox();
-  expect(meta, '.meta must be present to be ordered').not.toBeNull();
-  expect(tabs, '.lenstabs must be present to be ordered').not.toBeNull();
+  // (port note) `.meta`/`.lenstabs` were legacy's own class names for these
+  // two regions; the port kept the SAME two elements at the SAME `#meta` id
+  // (still selected by id — `App.tsx`'s own doc: the parity extractor reads
+  // `#crumb`/`#meta` by id regardless of parent) but restyled them under its
+  // BEM convention (`app-shell__meta`, `app-shell__navtabs` —
+  // `NavChrome.tsx`'s own doc calls out that `.lenstabs` is what this bar
+  // ports), so neither bare class selects anything on this page anymore.
+  // `#meta` is still unique; the tab bar has no id, so its `aria-label` (set
+  // for the same reason a `<nav>` landmark needs one) is the stable hook.
+  const meta = await page.locator('#meta').first().boundingBox();
+  const tabs = await page.locator('nav[aria-label="lens navigation"]').first().boundingBox();
+  expect(meta, '#meta must be present to be ordered').not.toBeNull();
+  expect(tabs, 'the lens-tab nav must be present to be ordered').not.toBeNull();
 
   // The regression: machine-scope status ("coder on MacBook-Pro") wrapped to
   // BELOW the tab strip and one line above the panel, where it read as the
@@ -150,8 +159,15 @@ test('no text input is small enough to trigger iOS auto-zoom on focus', async ({
   // this harness. Asserting the trigger condition is the most this suite can
   // honestly do.
   await page.goto('/index-lab.html');
+  // (port note) The one text-entry input this app ships (`#logq`, the event
+  // log's filter box — `EventLogColumn.tsx`) is a real `type="search"`, not
+  // `type="text"`/typeless like legacy's `#fsearch`/`#logq` were. The iOS
+  // auto-zoom heuristic this test proxies for fires on ANY text-entry input
+  // under 16px regardless of type (`search` included — same OS-level
+  // behavior as `text`), so the selector widens rather than narrows: this
+  // makes the check MORE accurate to what it claims to guard, not less.
   const sizes = await page.evaluate(() =>
-    Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).map((el) => ({
+    Array.from(document.querySelectorAll('input[type="text"], input[type="search"], input:not([type])')).map((el) => ({
       id: el.id || el.className,
       px: parseFloat(getComputedStyle(el).fontSize),
     }))

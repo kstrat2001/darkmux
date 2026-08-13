@@ -15,7 +15,7 @@ const PORT = 47823;
 // render path as the demo and a local `/play/<date>`; no viewer fork.
 (function buildHarness() {
   const repo = path.join(__dirname, '..', '..');
-  const viewer = fs.readFileSync(path.join(repo, 'crates', 'darkmux-serve', 'assets', 'viewer.html'), 'utf8');
+  const viewer = fs.readFileSync(path.join(repo, 'crates', 'darkmux-serve', 'assets', 'next.html'), 'utf8');
   const fixture = fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'xss-flow.jsonl'), 'utf8');
   const injected = viewer.replace(
     '<head>',

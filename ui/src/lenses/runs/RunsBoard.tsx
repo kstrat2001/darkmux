@@ -378,6 +378,7 @@ function RunsBar({
       {kind === "lab" && (
         <span
           className={`runchip${series ? " on" : ""}`}
+          data-act="runsseries"
           data-arg="series"
           role="button"
           tabIndex={0}

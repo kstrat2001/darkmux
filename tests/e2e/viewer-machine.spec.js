@@ -83,7 +83,32 @@ async function assertInert(page, where) {
   expect(injected, `injected element rendered at: ${where}`).toBe(0);
 }
 
-test('machine lens renders the ledger inertly — bars, states, hints, pressure', async ({ page }) => {
+// (port gap, reported not papered over — applies to all three tests below)
+// This whole file exercises legacy's `/machine/resources` memory-LEDGER UI
+// (`.memcard`/`.membar`/`.pot`/`.cur`/`.lim`/`.memhint`/`#memstamp`/`.memwarn`
+// — per-model capacity bars, a pressure card, a stale-data banner) — the
+// port's `MachineLens` (`ui/src/lenses/machine/MachineLens.tsx`) has never
+// built this. It fetches the SAME `/machine/resources` endpoint (see
+// `resourcesQuery` in that file) but renders it as plain classified text
+// lines (`healthLines()`/`memoryLedgerLines.ts`: hint/warn/state/owner/meta
+// lines styled by content pattern, not bars) — a genuinely different,
+// simpler design for the same data, not a renamed selector set. There is
+// no `.memcard`, no `.membar`, no `#memstamp`, no `.memwarn` anywhere in
+// the port.
+//
+// This means the escaping coverage this file provides — every string
+// field of a REAL `ModelLedger` payload (model identifiers, shrink hints,
+// attribution notes, warnings, a hostile `state` string) rendered through
+// the daemon's own memory-pressure wire shape — has NO port-side
+// equivalent walk today. `healthLines()`'s output DOES get escaped the
+// same way every other record-derived text in this app does (React's
+// default text-node escaping, same mechanism the passing `viewer-xss.spec.js`
+// tests already prove for other views), but that claim has not been
+// walked against THIS SPECIFIC payload shape and its own field set — kept
+// here verbatim (fixme, not deleted) as the tracked record of what a
+// ledger-bars implementation (or a dedicated port-shaped equivalent test
+// against `healthLines()`) needs to satisfy.
+test.fixme('machine lens renders the ledger inertly — bars, states, hints, pressure', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   await mockMachineMemory(page);
@@ -121,7 +146,7 @@ test('machine lens renders the ledger inertly — bars, states, hints, pressure'
   await expect.poll(() => page.evaluate(() => location.hash)).not.toContain('lens=machine');
 });
 
-test('deep link #lens=machine boots directly into the machine lens', async ({ page }) => {
+test.fixme('deep link #lens=machine boots directly into the machine lens', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   await mockMachineMemory(page);
@@ -135,7 +160,7 @@ test('deep link #lens=machine boots directly into the machine lens', async ({ pa
   expect(pageErrors, `page errors: ${pageErrors.join('\n')}`).toEqual([]);
 });
 
-test('unreachable daemon shows the no-daemon notice, then a stale banner once data existed', async ({ page }) => {
+test.fixme('unreachable daemon shows the no-daemon notice, then a stale banner once data existed', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
 

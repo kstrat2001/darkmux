@@ -293,10 +293,17 @@ export function FleetLens({
           // `syncLabHash` never even names the drilled uid in the address
           // bar at all — see `route.ts`'s widened-route doc for why this
           // port's `uid=` param is a deliberate improvement, not a replay
-          // of legacy's own mechanism).
+          // of legacy's own mechanism). `data-act`/`data-arg` themselves
+          // carry no behavior here (the click goes through the `onClick`
+          // below, not a delegated listener reading these attrs) — they're
+          // restored purely as the DOM inspection hook e2e specs drill
+          // through (`viewer-lifecycle.spec.js`, `viewer-xss.spec.js`),
+          // same contract legacy's markup gave them.
           <div
             key={card.uid}
             className={`mach${card.active && !card.absent ? " active" : ""}${card.absent ? " absent" : ""}`}
+            data-act="machine"
+            data-arg={card.uid}
             role="button"
             tabIndex={0}
             onClick={() => {
