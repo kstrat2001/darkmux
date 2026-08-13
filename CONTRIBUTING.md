@@ -35,11 +35,20 @@ having to remember. `git commit --no-verify` bypasses it.
 
 ```bash
 cargo build              # debug build (faster compile)
-cargo test               # run all tests
-cargo test <name>        # run a specific test by name
+cargo t-review           # test ONE area (see the alias table below)
+cargo nextest run <name> # run a specific test by name
 cargo clippy             # lint
 cargo fmt                # format
 ```
+
+**Test the area you touched, not the whole workspace.** Committed cargo aliases
+name the areas — `t-flow`, `t-review`, `t-serve`, `t-doctor`, `t-fleet`,
+`t-gestalt`, `t-cli`, `t-fast` — and each runs in seconds (`t-flow` is 252
+tests in 1.3s; `t-review` is 1324 in 5.3s). `cargo t-all` is the full
+workspace, which **CI already runs on every PR** — reach for it locally only
+when a change crosses crate boundaries in a way no single area covers, or when
+tagging a release. See `.cargo/config.toml` for what each alias covers, and
+CLAUDE.md's "Testing — run the area, not the world" for the reasoning.
 
 If you modify the embedded workload manifests under `templates/builtin/workloads/`, you must rebuild; `include_str!` resolves at compile time.
 
@@ -49,6 +58,18 @@ gate (2600+ tests in ~75s, against ~10 minutes for `cargo test --workspace`).
 `.config/nextest.toml` sets a per-test `terminate-after`, so a test that HANGS
 fails loudly instead of wedging the run. Install with
 `cargo install cargo-nextest --locked`.
+
+**Keep working while tests run.** Two cargo invocations share `target/`, so a
+background run fights a foreground build for it. `scripts/test-lane.sh` gives a
+run its own `CARGO_TARGET_DIR`:
+
+```bash
+scripts/test-lane.sh review t-review
+```
+
+Kick the lane off first, then keep working. A lane is a full target directory
+(~13 GB warm) — keep two or three, not one per area; `rm -rf target/lanes/<name>`
+any time.
 
 **Working on the viewer?** Verify it by reloading the page, not by running the
 suite: `viewer.html` is an `include_str!`'d asset, so the Rust tests never

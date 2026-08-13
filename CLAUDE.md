@@ -43,6 +43,80 @@ cargo install --path .   # install to ~/.cargo/bin/darkmux
 
 The release binary is self-contained (~11 MB as of 1.18.x — embedded workloads, roles, mission configs, the viewer, and the mission-graph lens's vendored React Flow bundle all ride inside it via `include_str!`/`include_bytes!`). `cargo install --path .` produces a binary that works from any directory without the source tree.
 
+## Testing — run the area, not the world (operator, 2026-08-13)
+
+**The full workspace suite is CI's job, not yours.** CI runs it on every PR, for
+free, on a public repo. Running it locally before every commit buys almost
+nothing — the area you actually touched tests in **seconds**, and the merge gate
+is CI's conclusion, not a local green.
+
+Everything below wraps **`cargo nextest`**, which is CONTRIBUTING.md's documented
+loop. Install it: `cargo install cargo-nextest --locked`.
+
+| alias | covers | measured |
+|---|---|---|
+| `cargo t-fast` | pure-logic crates, no I/O | **281 tests / 1.1s** |
+| `cargo t-flow` | flow records, sinks, audit chain, schema, config access | **252 / 1.3s** |
+| `cargo t-cli` | the CLI surface (spawns the real binary) | **80 / 2.4s** |
+| `cargo t-review` | review funnel, bundler, lab harness, crew scheduler | **1324 / 5.3s** |
+| `cargo t-serve` | the HTTP daemon + bundled viewer | |
+| `cargo t-doctor` | preflight checks and their remedies | |
+| `cargo t-fleet` | roster + cross-machine routing | |
+| `cargo t-gestalt` | residency arbiter, hardware/heuristics providers | |
+| `cargo t-all` | **the merge gate — CI already runs this** | ~75s |
+
+Narrower still is better when you know the name: `cargo nextest run -p
+darkmux-flow integrity_exit_code` runs one function's tests in under a second.
+A filter is almost always the right first move after an edit.
+
+**Why nextest rather than `cargo test`** — and it is NOT mainly speed. On a
+single area the two are equivalent (measured 4.6s vs 4.5s); the gap only opens
+on `--workspace` (~75s vs ~10min), which you rarely run. The real reason is
+`.config/nextest.toml`'s per-test `terminate-after`: a test that **hangs** fails
+loudly instead of wedging the run. That has happened twice here, turning a 6s
+suite into 10+ minutes of silence. A hang that reports nothing is the worst kind
+of green. (The repo has zero doctests, which nextest does not run — so routing
+everything through it loses nothing.)
+
+**Reach for `t-all` only when there is a reason you can state**: a change that
+crosses crate boundaries in a way no single area covers, or a release tag. "To
+be safe" is not a reason — it is the reflex this section exists to interrupt.
+
+### Over-testing is a real cost, not a virtue
+
+Three habits to avoid, all of which feel diligent:
+
+- **Running the world when one area covers it.** If you edited `darkmux-flow`,
+  `t-flow` tells you everything a `--workspace` run would about that change,
+  minutes sooner.
+- **Re-running a green suite to feel sure.** A second identical run adds no
+  information. If you doubt a result, the fix is a test that can FAIL for the
+  reason you doubt (red-prove it), not another pass of the same one.
+- **Running the full suite before every commit on a branch.** Push and let CI
+  do it. The merge gate is CI's conclusion, not a local green.
+
+### Background lanes — keep working while tests run
+
+Two cargo invocations share `target/`, so a background test run fights a
+foreground build for it. `scripts/test-lane.sh` gives a run its own
+`CARGO_TARGET_DIR` so they genuinely run in parallel:
+
+```bash
+scripts/test-lane.sh review t-review     # own lane, no contention
+scripts/test-lane.sh cli test --test cli integrity
+```
+
+Kick the lane off **first**, then do the next piece of work while it runs —
+the same priority-queue rule that applies to backgrounded crew dispatches. A
+lane is a full target directory (~13 GB warm), so keep two or three, not one
+per area; `rm -rf target/lanes/<name>` any time.
+
+### What this does NOT buy
+
+Faster tests are not more trustworthy tests. A suite with a false-green gate
+(#1716) or a vacuous assertion (#1664) returns its wrong answer sooner in a
+lane. Speed is an ergonomics fix; trust is a separate, open problem.
+
 ## Releasing — dogfood the dispatch critical path first
 
 > **Release gate (operator mandate, 2026-06-29): NO release is cut until local darkmux runs against REAL AI dispatches that show the release's FEATURES are working — not just that the dispatch path runs.** A trivial smoke proves the *path* (container ran, loop executed, `result: "stop"`); it does NOT prove the *behaviors* this release ships actually work. For each feature-bearing change in the release, run a real local-AI dispatch that EXERCISES it and observe the expected behavior live — read `lms ps`, the flow records, the envelope, the served viewer, whatever the feature touches. `cargo test` + CI + a trivial path-smoke are necessary but not sufficient; the gate is **feature behavior verified live, locally, against real dispatches.**
