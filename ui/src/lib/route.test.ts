@@ -135,3 +135,76 @@ describe("showsEventLog", () => {
     expect(showsEventLog({ kind } as Route)).toBe(true);
   });
 });
+
+/**
+ * (the flip, #1800) `/play/<date>` routing, which does NOT come from the URL.
+ *
+ * The server responds to that path with `inject_mode_meta(html, "play",
+ * Some(date))` — the date lands in a meta tag in the response BODY, while
+ * `location` reads `/play/2026-08-07` with no hash and no query. Legacy read
+ * those metas at boot; this port did not, and had no reason to while
+ * `/play/:date` served legacy and `/next` was live-only.
+ *
+ * Without this, the flip renders TODAY's live fleet view under yesterday's
+ * address — silently, and in precisely the confidently-wrong shape the whole
+ * #1800 gate existed to eliminate.
+ */
+describe("parseRoute — the injected playback date (/play/<date>)", () => {
+  function injectMeta(name: string, content: string) {
+    const el = document.createElement("meta");
+    el.setAttribute("name", name);
+    el.setAttribute("content", content);
+    document.head.appendChild(el);
+  }
+
+  afterEach(() => {
+    document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
+    window.location.hash = "";
+  });
+
+  it("routes to playback for that day when the server served a play page", () => {
+    injectMeta("darkmux-mode", "play");
+    injectMeta("darkmux-date", "2026-08-07");
+    expect(parseRoute()).toEqual({ kind: "playback", date: "2026-08-07" });
+  });
+
+  it("a LIVE page is unaffected — mode=live injects no date and stays fleet", () => {
+    injectMeta("darkmux-mode", "live");
+    expect(parseRoute()).toEqual({ kind: "fleet" });
+  });
+
+  it("ignores a date meta without the play mode — the mode is the evidence", () => {
+    // Reading the date alone would decide routing on weaker evidence than the
+    // server actually gave.
+    injectMeta("darkmux-mode", "live");
+    injectMeta("darkmux-date", "2026-08-07");
+    expect(parseRoute()).toEqual({ kind: "fleet" });
+  });
+
+  it("ignores a malformed injected date, falling back to live", () => {
+    injectMeta("darkmux-mode", "play");
+    injectMeta("darkmux-date", "not-a-date");
+    expect(parseRoute()).toEqual({ kind: "fleet" });
+  });
+
+  it("an explicit hash WINS over the injected date", () => {
+    // `/play/2026-08-07#lens=runs` must reach the runs lens rather than being
+    // preempted by the page's own mode. The injected date is the LAST
+    // fallback, not an override.
+    injectMeta("darkmux-mode", "play");
+    injectMeta("darkmux-date", "2026-08-07");
+    window.location.hash = "#lens=runs&kind=lab";
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null });
+  });
+
+  it("a bare date hash also wins, and may name a DIFFERENT day than the page", () => {
+    injectMeta("darkmux-mode", "play");
+    injectMeta("darkmux-date", "2026-08-07");
+    window.location.hash = "#2026-08-01";
+    expect(parseRoute()).toEqual({ kind: "playback", date: "2026-08-01" });
+  });
+
+  it("no metas at all (every test harness, and the static demo) stays fleet", () => {
+    expect(parseRoute()).toEqual({ kind: "fleet" });
+  });
+});

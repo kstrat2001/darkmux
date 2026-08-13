@@ -27,6 +27,8 @@
  * historical-playback view yet, a follow-up; see that file's doc).
  */
 
+import { injectedPlaybackDate } from "./injectedMeta";
+
 export const RUNS_KINDS = ["all", "mission", "dispatch", "lab"] as const;
 export type RunsKind = (typeof RUNS_KINDS)[number];
 
@@ -209,6 +211,25 @@ export function parseRoute(): Route {
     const qDate = search.get("date");
     if (qDate && DATE_RE.test(qDate)) {
       return { kind: "playback", date: qDate };
+    }
+    // (the flip) `GET /play/<date>` carries its date in an INJECTED META TAG,
+    // not in the URL the client can read as a route: the server responds to
+    // the path with `inject_mode_meta(html, "play", Some(date))`, and the
+    // browser's `location` shows `/play/2026-08-07` with no hash and no query.
+    // Legacy reads those metas at boot (`injectedMode`/`injectedDate`,
+    // viewer.html:3836+) — this port read only version/schema, so before the
+    // flip it had no way to know and no reason to: `/play/:date` served
+    // LEGACY, and `/next` was live-only by construction.
+    //
+    // That stops being true the moment `/play/:date` serves this app. Without
+    // this branch the flip would render the LIVE fleet view at a playback URL
+    // — today's numbers under yesterday's address, silently, which is the
+    // exact failure class the whole #1800 P2 gate was about. Checked LAST so
+    // an explicit hash or `?date=` still wins; a page served in live mode
+    // injects no date at all and falls through unchanged.
+    const injected = injectedPlaybackDate();
+    if (injected) {
+      return { kind: "playback", date: injected };
     }
     return { kind: "fleet" };
   }

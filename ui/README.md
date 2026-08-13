@@ -1,10 +1,20 @@
-# darkmux viewer — `/next` (UI port Packet 1: the scaffold)
+# darkmux viewer
 
 React + TanStack Query workspace that builds to ONE committed, self-contained
-`crates/darkmux-serve/assets/next.html`, served at `GET /next` alongside the
-legacy `viewer.html` (still at `GET /`). See the root plan
-(`UI_PORT_PLAN.md`, private scratch) for the full port arc; this package is
-Packet 1 only — the scaffold, not any lens.
+`crates/darkmux-serve/assets/next.html`. **This is the viewer** — it serves
+`GET /` and `GET /play/:date` as of the flip (#1800); `GET /next`, the route
+it grew up on, is now a permanent redirect to `/` so bookmarks and phone
+home-screen shortcuts keep working.
+
+The gate for the flip was a NUMBER, not a judgement: 21 of 22 goldens recorded
+from the legacy viewer asserting real byte parity in a real browser
+(`tests/parity/`), with the 22nd (`mission-replay`) blocked on a missing
+corpus fixture rather than on the port.
+
+The legacy `viewer.html` still exists but nothing serves it — it survives only
+as `scripts/build-demo.sh`'s input until the demo derives from this build
+instead (#1801), at which point the file, its XSS golden tests, and the
+`e2e` gate that points at it all retire together.
 
 ## The stack, and why
 

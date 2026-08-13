@@ -14,6 +14,20 @@
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <link rel="icon" type="image/png" href="/icon-192.png" />
+    <!-- (the flip, #1800) The four metas that make an iOS home-screen
+         shortcut open CHROMELESS. The links above are enough to install a
+         shortcut with a real icon; without these it opens inside Safari's
+         browser chrome instead of as an app, which is the whole point of the
+         operator's phone dashboard.
+         Missed when #1763 gave /next its identity — invisible while /next was
+         a dev surface nobody had pinned, and it would have become visible at
+         the flip as "my home-screen darkmux suddenly has a URL bar". Caught
+         by `html_shells_declare_standalone_app`, which asserts this exact set
+         and which the flip had to REPOINT at the served document. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="darkmux" />
   </head>
   <body>
     <div id="root"></div>
