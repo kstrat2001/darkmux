@@ -6,6 +6,7 @@ import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useFleetCoverage, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS } from "../../lib/flow";
+import type { FlowRecord } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { tokensOffMeter } from "./savings";
@@ -122,8 +123,9 @@ function SavingsHero({ tokens: t, note }: { tokens: ReturnType<typeof tokensOffM
  * when this lens replaced it — a regression no test caught, because
  * FleetStrip's own tests kept passing while it stopped being mounted.
  */
-function FleetCoverageNotice() {
-  const coverage = useFleetCoverage();
+function FleetCoverageNotice({ historical = false }: { historical?: boolean }) {
+  // A replay has no live coverage to report — see useFleetCoverage's note.
+  const coverage = useFleetCoverage(!historical);
   const fleet = coverage?.sources?.fleet;
   if (!fleet || fleet.state === "ok" || fleet.state === "off") return null;
   const stale = fleet.state === "stale";
@@ -139,13 +141,41 @@ function FleetCoverageNotice() {
   );
 }
 
-export function FleetLens() {
+/** (#1800 P2) `records`/`tMax` OPTIONAL so playback can render this same hero
+ * over a historical day. Omitted = the live rolling window, exactly as before,
+ * so every existing caller is unchanged.
+ *
+ * NOTE the honest limit: `liveMachines`/`liveSessionIds` below are LIVE
+ * presence endpoints and describe NOW, not the replayed day. On a historical
+ * route they are the wrong lens on the right records — which is precisely the
+ * failure this component's own doc warns about ("they render CONFIDENTLY
+ * WRONG: machines read idle"). Playback therefore passes `historical` so the
+ * hero can suppress presence-derived claims rather than assert today's
+ * presence over a past day's records. */
+export function FleetLens({
+  records,
+  tMax,
+  historical = false,
+}: {
+  records?: FlowRecord[];
+  tMax?: number;
+  historical?: boolean;
+} = {}) {
   const nowMs = Date.now();
   const [windowMinutes, setWindowMinutes] = useState(DEFAULT_ACTIVITY_WINDOW_MIN);
 
-  const flowWindow = useFlowWindow(nowMs);
-  const liveMachines = useLiveMachines();
-  const liveSessionIds = useLiveSessionIds();
+  const liveWindow = useFlowWindow(nowMs);
+  const flowWindow = records !== undefined
+    ? { data: records, tMax: tMax ?? 0, settled: true }
+    : liveWindow;
+  // On a replayed day, live presence describes NOW and would make every card
+  // claim a machine's current state over historical records — the exact
+  // "confidently wrong" failure this file's own doc names. `enabled: false`
+  // stops the REQUEST, not just the result: an earlier draft discarded the
+  // data while the hook kept polling `/fleet/machines/live` every few seconds
+  // behind a replay, which a test caught.
+  const liveMachines = useLiveMachines(!historical);
+  const liveSessionIds = useLiveSessionIds(!historical);
   const specsQuery = useQuery({
     queryKey: queryKeys.machineSpecs(),
     queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
@@ -177,7 +207,7 @@ export function FleetLens() {
   return (
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
       <SavingsHero tokens={tokens} note={note} />
-      <FleetCoverageNotice />
+      <FleetCoverageNotice historical={historical} />
       <div className="fleet">
         {cards.map((card) => (
           // `<div class="mach ..." data-act="machine" data-arg="${uid}">`

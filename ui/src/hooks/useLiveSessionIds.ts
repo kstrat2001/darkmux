@@ -8,8 +8,12 @@ import type { FleetSessionsLiveResponse } from "../types/handwritten";
  * as a `Set<session_id>`. Empty in the recorded corpus (no session was live
  * at record time); `lib/flow.ts::liveSessionSet` falls back to the
  * flow-derived heuristic when this is empty, same as legacy. */
-export function useLiveSessionIds(): Set<string> {
+/** `enabled` (#1800 P2): a REPLAY must not poll live presence. Passing the
+ * result away is not enough — the query still fires, still polls on
+ * `refetchInterval`, and still describes NOW. This stops the request. */
+export function useLiveSessionIds(enabled = true): Set<string> {
   const query = useQuery({
+    enabled,
     queryKey: queryKeys.fleetSessionsLive(),
     queryFn: () => fetchJson<FleetSessionsLiveResponse>("/fleet/sessions/live"),
     refetchInterval: PRESENCE_POLL_MS,

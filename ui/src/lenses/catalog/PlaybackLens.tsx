@@ -1,28 +1,74 @@
-import { LensPlaceholder } from "../../components/LensPlaceholder";
+import { useQuery } from "@tanstack/react-query";
+import { fetchJson } from "../../lib/fetcher";
+import { queryKeys } from "../../lib/queryKeys";
+import { computeTMax } from "../../lib/flow";
+import { FleetLens } from "../fleet/FleetLens";
+import type { FlowRecord, FlowRecordsResponse } from "../../types/handwritten";
 
 /**
- * The `playback` route — a bare `#<date>` hash (`targetDate()`'s convenience
- * form in `viewer.html`, distinct from the catalog panel's own day-row
- * click, which does a full navigation to `/play/<date>`, a server route
- * this app doesn't reproduce in-SPA). See `route.ts`'s own doc for how this
- * differs from `unknown` (Packet 1–3 treated it as unrecognized; this
- * packet is the one that owns the catalog, so it's named honestly now
- * instead of staying misclassified).
+ * The `playback` route — a bare `#<date>` hash.
  *
- * Rendering the FULL historical playback view (fetch `/flow/<date>`, derive
- * the fleet-hero render model, paint it) is deliberately NOT this packet's
- * job: `/next`'s fleet lens itself has no byte-parity port yet (`FleetStrip`
- * only covers `/fleet/machines/live` presence — the fleet-hero rendering
- * `fleet.txt`'s goldens actually capture is Packet 5's territory, since it's
- * tied to the same live-tail/SSE derivation pipeline). Building a SECOND,
- * parallel non-live rendering pipeline here — before the live one exists —
- * would be scope creep wearing this packet's clothes, so this stays an
- * honest not-ported notice; a follow-up packet (once the fleet-hero render
- * pipeline exists) can widen this into a real playback view, or simply
- * redirect to the still-fully-functional legacy `/play/<date>` the way the
- * catalog panel's OWN day-row click does — either is a reasonable choice
- * left to that packet, not decided here.
+ * (#1800 P2) `playback-date.txt` shows what this actually is: **the fleet hero
+ * rendered over one historical day**, not a separate view. Same stage
+ * (TOKENS / LOCAL / CLOUD, the machine cards, the activity timeline), different
+ * records. So this composes `FleetLens` rather than reimplementing it — the
+ * port's earlier note about needing "a SECOND, parallel fleet-rendering
+ * pipeline" was true when written, before Packet 5 built the first one.
+ *
+ * `historical` is passed so the hero drops `/fleet/machines/live` and
+ * `/fleet/sessions/live`. Those endpoints describe NOW; asserting today's
+ * presence over a replayed day is the "confidently wrong" failure `FleetLens`'s
+ * own doc warns about. A replay knows what its records know.
+ *
+ * The day fetch shares `queryKeys.flowDate` with `useFlowWindow` and
+ * `useRouteRecords` deliberately — one cache slot for one endpoint, so the
+ * stage and the event log beside it can never disagree about the day.
  */
 export function PlaybackLens({ date }: { date: string }) {
-  return <LensPlaceholder label={`playback for ${date}`} hash={date} />;
+  const query = useQuery({
+    queryKey: queryKeys.flowDate(date),
+    queryFn: () => fetchJson<FlowRecordsResponse>(`/flow/${encodeURIComponent(date)}`),
+  });
+
+  if (!query.data) {
+    return (
+      <div data-state="pending" role="status" aria-label={`Loading ${date}`}>
+        <div className="stagehdr">playback</div>
+        <div className="none">loading…</div>
+      </div>
+    );
+  }
+
+  if (!query.data.ok) {
+    return (
+      <div data-state="error" role="alert">
+        <div className="stagehdr">playback</div>
+        <div className="none">
+          couldn't reach /flow/{date}
+          {query.data.status !== null ? ` (HTTP ${query.data.status})` : ""}: {query.data.message}
+        </div>
+      </div>
+    );
+  }
+
+  const records = query.data.data.records as unknown as FlowRecord[];
+
+  if (records.length === 0) {
+    return (
+      <div data-state="empty">
+        <div className="stagehdr">playback</div>
+        <div className="none">no records for {date}.</div>
+      </div>
+    );
+  }
+
+  // tMax drives presence/staleness math inside the hero. For a replay it is the
+  // last record of the DAY, not `Date.now()` — otherwise every card would be
+  // measured against a clock the records never ran under. Uses the SHARED
+  // `computeTMax` (`lib/flow.ts:140`, the same one `useFlowWindow` uses) rather
+  // than a local reduce: an earlier draft here guessed the timestamp field as
+  // `ts_ms` when it is `ts`, which would have silently produced tMax = 0.
+  const tMax = computeTMax(records);
+
+  return <FleetLens records={records} tMax={tMax} historical />;
 }
