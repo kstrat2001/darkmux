@@ -932,6 +932,15 @@ body {
   gap: 14px;
   margin-top: 10px;
 }
+/* `.stagehdr` doubles as a TEST HOOK — `tests/e2e/` waits on it to know a
+   stage region actually mounted, which is why `MachineLens` carries it
+   alongside its own `.machine-lens__hdr`. Those two currently declare the
+   same three properties, and `.machine-lens__hdr` wins on source order, so
+   the machine header looks unchanged. Adding a property HERE that
+   `.machine-lens__hdr` does not also declare (`text-transform: uppercase`
+   is the realistic one for a header idiom) would silently restyle that
+   header AND change its `innerText`, which moves the parity goldens. Check
+   both rules together. */
 .stagehdr {
   font: 11px "JetBrains Mono", monospace;
   color: var(--dim);

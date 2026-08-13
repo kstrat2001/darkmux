@@ -9,6 +9,7 @@ import { buildMachineRuns, localMachineUid, looseRecords, nameOf, RECENT_CAP } f
 import { specOf } from "../fleet/cards";
 import { utilityLines, healthLines } from "./memoryLedgerLines";
 import { machineRunLines } from "./runLines";
+import { isStaticBuild } from "../../lib/staticSource";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
 /** The health region's state vocabulary, verbatim from `/machine/resources`
@@ -123,13 +124,28 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   const nowMs = Date.now();
   const [recentAll, setRecentAll] = useState(false);
 
+  // (#1801) A daemon-less build has nothing to poll. `App.tsx` gates its own
+  // copies of these three on `isLiveRoute(route)` and states the rule in
+  // place: "Gating one side and not the other is indistinguishable from
+  // gating neither." This lens holds BOTH sides — it calls the presence hooks
+  // itself rather than receiving them — and was ungated, so `#lens=machine`
+  // on the static demo hit `/fleet/machines/live`, `/fleet/sessions/live` and
+  // `/machine/resources` every 5s for as long as the tab stayed open, against
+  // an origin with no daemon behind it. Measured, then measured again after.
+  //
+  // Gated on the BUILD rather than the route, for the same reason
+  // `useFlowWindow` is: on a static build these fetches could only ever fail,
+  // so suppressing them changes nothing a consumer can observe.
+  const daemonBacked = !isStaticBuild();
+
   const flowWindow = useFlowWindow(nowMs);
-  const liveMachines = useLiveMachines();
-  const liveSessionIds = useLiveSessionIds();
+  const liveMachines = useLiveMachines(daemonBacked);
+  const liveSessionIds = useLiveSessionIds(daemonBacked);
 
   const specsQuery = useQuery({
     queryKey: queryKeys.machineSpecs(),
     queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
+    enabled: daemonBacked,
   });
 
   const specs = specsQuery.data?.ok ? specsQuery.data.data : null;
@@ -160,7 +176,7 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
     queryKey: queryKeys.machineResources(),
     queryFn: () => fetchJson<MachineResources>("/machine/resources"),
     refetchInterval: MACHINE_MEM_POLL_MS,
-    enabled: isLocalMach,
+    enabled: isLocalMach && daemonBacked,
   });
   const resourcesErrored = isLocalMach && resourcesQuery.data ? !resourcesQuery.data.ok : false;
   const resources = isLocalMach && resourcesQuery.data?.ok ? resourcesQuery.data.data : null;

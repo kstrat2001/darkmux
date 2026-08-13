@@ -50,9 +50,13 @@ esac
 # demo from the wrong asset and exiting 0. That is the same silent-wrong-source
 # failure this script was rewritten to end, so ambiguity has to be loud rather
 # than resolved by position.
+# `sort -u`: two branches serving the SAME constant is not ambiguous, it is
+# just two code paths agreeing. Only DISTINCT constants mean the script cannot
+# tell which asset the demo should ship.
 SERVED_MATCHES=$(
   sed -n '/async fn root_html/,/^}/p' "$LIB" |
-    sed -n 's/.*inject_mode_meta(\([A-Z_][A-Z0-9_]*\),.*/\1/p'
+    sed -n 's/.*inject_mode_meta(\([A-Z_][A-Z0-9_]*\),.*/\1/p' |
+    sort -u
 )
 SERVED_COUNT=$(printf '%s\n' "$SERVED_MATCHES" | grep -c . || true)
 if [ "$SERVED_COUNT" -eq 0 ]; then
@@ -105,6 +109,13 @@ fi
 # No `darkmux-date` meta, deliberately: the demo dataset carries its own dates,
 # and the viewer derives the playback day from the first record — so the demo
 # never needs updating when the fixture is re-recorded.
+#
+# `-lab-runs-src` names a fixture that is deliberately EMPTY (`configured:
+# false`). The runs board fetches `/runs` and `/lab/runs` together on mount, so
+# without this meta the demo one-shot a 404 against darkmux.com/lab/runs the
+# moment anyone opened the runs lens. An empty, well-formed body renders the
+# same "lab not configured" state a real daemon without a lab dir shows —
+# honest, and one request quieter.
 {
   sed '/<head>/q' "$SRC"
   cat <<EOF
@@ -114,6 +125,7 @@ fi
 <meta name="darkmux-missions-src" content="./demo-missions.json">
 <meta name="darkmux-phases-src" content="./demo-phases.json">
 <meta name="darkmux-runs-src" content="./demo-runs.json">
+<meta name="darkmux-lab-runs-src" content="./demo-lab-runs.json">
 EOF
   sed '1,/<head>/d' "$SRC"
 } > "$OUT"

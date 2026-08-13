@@ -6,8 +6,16 @@
 // HTML-injection payload (`<img src=x onerror=window.__xss=1>`), a JS-string
 // breakout (`'); window.__xss=1;//`), and a double-quoted-attribute breakout
 // (`" onmouseover=window.__xss=1 x="`). If any field reaches the DOM unescaped,
-// one of those fires `window.__xss` or injects a live element. We drill through
-// every render path and assert it never does.
+// one of those fires `window.__xss` or injects a live element.
+//
+// SCOPE, stated honestly (#1800): the full every-render-path walk is the
+// `test.fixme` below — it drills surfaces the React port does not have yet
+// (recent-run expand, session drill, mission drill, the filters modal), and it
+// is kept verbatim rather than narrowed, because quietly editing a security
+// walk's selectors until it passes is how a gate keeps its name while losing
+// its coverage. This file has been bitten by that once already; see the #1622
+// and #1631 notes further down. What runs today covers the fleet view and the
+// machine drill, and says so in its own name.
 const { test, expect } = require('@playwright/test');
 
 async function assertInert(page, where) {

@@ -13,15 +13,21 @@ const PORT = 47823;
 // injected after <head>, the same way scripts/build-demo.sh builds the public
 // demo — pointed at the XSS regression fixture instead of the demo data. Same
 // render path as the demo and a local `/play/<date>`; no viewer fork.
+// The asset this harness serves. Named once, so the failure message below
+// cannot drift from what was actually read — it said "viewer.html" for a
+// while after the repoint, which is the smallest possible version of the
+// same bug the repoint itself was fixing.
+const SERVED_VIEWER = path.join('crates', 'darkmux-serve', 'assets', 'next.html');
+
 (function buildHarness() {
   const repo = path.join(__dirname, '..', '..');
-  const viewer = fs.readFileSync(path.join(repo, 'crates', 'darkmux-serve', 'assets', 'next.html'), 'utf8');
+  const viewer = fs.readFileSync(path.join(repo, SERVED_VIEWER), 'utf8');
   const fixture = fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'xss-flow.jsonl'), 'utf8');
   const injected = viewer.replace(
     '<head>',
     '<head>\n<meta name="darkmux-mode" content="play">\n<meta name="darkmux-flow-src" content="./xss-flow.jsonl">'
   );
-  if (injected === viewer) throw new Error('playwright.config: <head> anchor not found in viewer.html');
+  if (injected === viewer) throw new Error(`playwright.config: <head> anchor not found in ${SERVED_VIEWER}`);
   fs.mkdirSync(SERVED, { recursive: true });
   fs.writeFileSync(path.join(SERVED, 'index.html'), injected);
   fs.writeFileSync(path.join(SERVED, 'xss-flow.jsonl'), fixture);
