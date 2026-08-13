@@ -1,0 +1,39 @@
+# Pin the toolchain so CI cannot break overnight without a code change.
+#
+# WHY: every workflow installed a FLOATING stable. A new clippy lint in any
+# stable release turns CI red on a PR that changed nothing relevant — and the
+# failure reads as "your PR broke it". Pinning makes a Rust upgrade its own
+# deliberate PR, reviewed on its own, instead of an ambush attached to
+# whoever pushed next.
+#
+# BUMPING: change `channel` here AND the `dtolnay/rust-toolchain@<version>`
+# refs in .github/workflows/. To find every site:
+#
+#     grep -rn '1\.97' rust-toolchain.toml .github/workflows/
+#
+# Push the bump ALONE and read what breaks. Never fold it into a feature PR —
+# the whole point is that the two kinds of failure stay distinguishable.
+# Renovate's `rust-toolchain` manager can open this PR for you (see #1789);
+# that is the other half of this mechanism, not a nice-to-have — a pin with
+# no updater is just deferred staleness.
+#
+# NOT the MSRV. `Cargo.toml`'s `rust-version` is the minimum darkmux claims
+# to compile on, and it is currently unverified (#1793).
+#
+#   ⚠ An MSRV job written the obvious way is VACUOUS because of this file.
+#     Installing 1.88 and setting it default does nothing — this toolchain
+#     file overrides it, and the job reports a green "MSRV verified" having
+#     tested 1.97.1. Use `cargo +1.88 …` or `RUSTUP_TOOLCHAIN=1.88`, which
+#     both outrank a toolchain file.
+#
+# NOT the shipped container. `runtime/Dockerfile` is `FROM rust:alpine` and
+# floats DELIBERATELY (pinning it broke on transitive-dep MSRV bumps — see
+# the comment there). This file sits outside that build context, so the
+# runtime image compiles at whatever stable it resolves to that day. So the
+# "cannot break overnight" guarantee covers every workflow EXCEPT
+# publish-runtime-image.yml, which is honest to know rather than assume.
+
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

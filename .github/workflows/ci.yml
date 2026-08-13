@@ -94,7 +94,7 @@ jobs:
 
       - name: Install Rust stable toolchain
         if: steps.filter.outputs.rust == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
 
@@ -176,8 +176,7 @@ jobs:
       - name: Install Rust stable toolchain
         if: steps.filter.outputs.rust == 'true'
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.97.1 --profile minimal
 
       - uses: Swatinem/rust-cache@v2
         if: steps.filter.outputs.rust == 'true'
@@ -250,7 +249,7 @@ jobs:
 
       - name: Install Rust stable toolchain
         if: steps.filter.outputs.runtime == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
 
