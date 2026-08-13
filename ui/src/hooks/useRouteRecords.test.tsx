@@ -111,3 +111,77 @@ describe("useRouteRecords", () => {
     expect(result.current.records).toEqual([]);
   });
 });
+
+/**
+ * (#1801) A static-build playback route (`route.date === null`, forced by
+ * `route.ts` under `isStaticBuild()`) reads the committed `.jsonl` named by
+ * `darkmux-flow-src` instead of `GET /flow/<date>` — there is no daemon
+ * behind the static demo to serve that endpoint at all.
+ */
+describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
+  function injectMeta(name: string, content: string) {
+    const el = document.createElement("meta");
+    el.setAttribute("name", name);
+    el.setAttribute("content", content);
+    document.head.appendChild(el);
+  }
+
+  afterEach(() => {
+    document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
+  });
+
+  function mockStaticSrc(text: string) {
+    return vi.fn(async (url: string) => {
+      if (String(url) === "./demo-flow.jsonl") {
+        return { ok: true, status: 200, text: async () => text };
+      }
+      throw new Error(`unexpected fetch in static test: ${url}`);
+    });
+  }
+
+  it("reads records from the flow-src file, never GET /flow/<date>", async () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    vi.stubGlobal("fetch", mockStaticSrc('{"ts":"2026-08-07T00:00:00Z","action":"dispatch.start"}\n'));
+    const route: Route = { kind: "playback", date: null };
+
+    const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.historical).toBe(true);
+    expect(result.current.records).toEqual([{ ts: "2026-08-07T00:00:00Z", action: "dispatch.start" }]);
+    // The regression this test guards: falling through to `/flow/<date>`
+    // (or `/flow/null`) instead of the static source.
+    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+    expect(calls.some((u) => u.startsWith("/flow/"))).toBe(false);
+  });
+
+  it("is EMPTY, not the live window, when the static source is unreachable", async () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 404, text: async () => "" })),
+    );
+    const route: Route = { kind: "playback", date: null };
+
+    const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.records).toEqual([]);
+    expect(result.current.historical).toBe(true);
+    expect(result.current.records).not.toEqual(LIVE.data);
+  });
+
+  // Inverted case: the SAME playback route shape, without the meta, must
+  // keep hitting /flow/<date> exactly as it always has — a gate that fires
+  // whenever `route.kind==="playback"` (rather than only under
+  // `isStaticBuild()`) would make this regress silently.
+  it("without the meta, a dated playback route still hits GET /flow/<date> as before", async () => {
+    const route: Route = { kind: "playback", date: "2026-08-01" };
+    const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.records).toEqual([{ action: "HISTORICAL-RECORD" }]);
+    expect(globalThis.fetch).toHaveBeenCalledWith("/flow/2026-08-01", undefined);
+  });
+});

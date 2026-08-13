@@ -259,6 +259,19 @@ body {
   letter-spacing: 0.02em;
   white-space: nowrap;
 }
+/* (#1801) The static build's inert stand-in for `.catalog-toggle` — same
+   box, no `cursor:pointer`/hover treatment, because it isn't a button
+   (`Masthead.tsx`'s own doc: a static demo has no `/flow-days`/
+   `/flow-missions` daemon endpoints for the real toggle to fetch). */
+.masthead__srcbadge {
+  font: 600 11px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--bg);
+  background: var(--accent);
+  padding: 5px 9px;
+  border-radius: 3px;
+}
 .masthead__refresh {
   background: none;
   border: 1px solid var(--border);

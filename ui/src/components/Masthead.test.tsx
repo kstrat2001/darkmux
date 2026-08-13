@@ -99,3 +99,51 @@ describe("Masthead", () => {
     expect(container.querySelector(".masthead__refresh")).toBeTruthy();
   });
 });
+
+/**
+ * (#1801) On a static build (`darkmux-flow-src` injected), the source/date
+ * badge must NOT become the catalog/history trigger — `CatalogPanel` fetches
+ * `/flow-days`/`/flow-missions`, endpoints the static demo doesn't ship
+ * fixtures for (out of scope per #1801's brief), so mounting the real
+ * button there would 404 on click. Mirrors legacy's own gate:
+ * `if(!flowSrc && mode!=="no-daemon"){ sb.dataset.act="catalog"; ... }`
+ * (viewer.html:3936).
+ */
+describe("Masthead — static-build badge suppression (#1801)", () => {
+  function injectMeta(name: string, content: string) {
+    const el = document.createElement("meta");
+    el.setAttribute("name", name);
+    el.setAttribute("content", content);
+    document.head.appendChild(el);
+  }
+
+  it("renders plain text, not the catalog-toggle button, when darkmux-flow-src is injected", () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    // `route` here is whatever `App.tsx`'s already-resolved `displayRoute`
+    // would be in production (see that component's own doc — the raw
+    // `date: null` never reaches `Masthead` directly); `{kind:"fleet"}`
+    // keeps this test focused on the badge-suppression gate itself, not on
+    // date resolution, which is a separate concern this file doesn't own.
+    const { container } = renderMasthead({ kind: "fleet" });
+    expect(screen.queryByRole("button", { name: /browse history/i })).not.toBeInTheDocument();
+    // The same VISIBLE text a live page would show for "today" still
+    // appears — this is a suppression of the AFFORDANCE, not the text.
+    const badge = container.querySelector(".masthead__srcbadge");
+    expect(badge).toBeTruthy();
+    expect(badge?.textContent).toBe("TODAY");
+    vi.unstubAllGlobals();
+  });
+
+  // Inverted case: the exact same route shape, without the meta, must keep
+  // rendering the real interactive toggle — matching the existing "renders
+  // the catalog toggle" test above, restated here so the gate is proven
+  // two-sided rather than inferred from that other test's unrelated route.
+  it("without the meta, still renders the real interactive catalog toggle", () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const { container } = renderMasthead({ kind: "fleet" });
+    expect(screen.getByRole("button", { name: /browse history/i })).toBeInTheDocument();
+    expect(container.querySelector(".masthead__srcbadge")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+});

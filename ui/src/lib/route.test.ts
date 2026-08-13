@@ -204,7 +204,69 @@ describe("parseRoute — the injected playback date (/play/<date>)", () => {
     expect(parseRoute()).toEqual({ kind: "playback", date: "2026-08-01" });
   });
 
-  it("no metas at all (every test harness, and the static demo) stays fleet", () => {
+  it("no metas at all (every test harness) stays fleet — the static demo now DOES inject darkmux-flow-src (#1801), see the describe block below", () => {
     expect(parseRoute()).toEqual({ kind: "fleet" });
+  });
+});
+
+/**
+ * (#1801) `darkmux-flow-src` — the static demo's committed `.jsonl` — forces
+ * a playback route with no server-assigned date, mirroring legacy's own
+ * `wantsPlayback = ... || !!flowSrc || ...` (viewer.html:3880), which forces
+ * the playback branch regardless of any date the hash/query names. See
+ * `route.ts`'s own doc on the widened `date: string | null` for why `null`
+ * is the honest value here rather than a guessed placeholder.
+ */
+describe("parseRoute — the static-demo flow-src route (#1801)", () => {
+  function injectMeta(name: string, content: string) {
+    const el = document.createElement("meta");
+    el.setAttribute("name", name);
+    el.setAttribute("content", content);
+    document.head.appendChild(el);
+  }
+
+  afterEach(() => {
+    document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
+    window.location.hash = "";
+  });
+
+  it("resolves to a playback route with date: null when no hash is present", () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    expect(parseRoute()).toEqual({ kind: "playback", date: null });
+  });
+
+  it("wins over an explicit bare-date hash — there is no daemon to serve that OTHER day", () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    window.location.hash = "#2026-08-01";
+    expect(parseRoute()).toEqual({ kind: "playback", date: null });
+  });
+
+  it("wins over ?date= too, for the same reason", () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    const url = new URL(window.location.href);
+    url.hash = "";
+    url.search = "?date=2026-08-07";
+    window.history.replaceState(null, "", url.toString());
+    expect(parseRoute()).toEqual({ kind: "playback", date: null });
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("still yields to an explicit #lens= deep link — flow-src is the LOWEST-precedence signal, not the highest", () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    window.location.hash = "#lens=runs&kind=lab";
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null });
+  });
+
+  // Inverted case: without the meta, the exact same hash states behave
+  // exactly as the rest of this file already asserts — a garbage/no-op
+  // gate would make EVERY test above pass by accident if it fired
+  // unconditionally instead of only under isStaticBuild().
+  it("without the meta, no hash still resolves to plain fleet, not playback", () => {
+    expect(parseRoute()).toEqual({ kind: "fleet" });
+  });
+
+  it("without the meta, a bare date hash still resolves to a REAL date, not null", () => {
+    window.location.hash = "#2026-08-01";
+    expect(parseRoute()).toEqual({ kind: "playback", date: "2026-08-01" });
   });
 });

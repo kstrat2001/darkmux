@@ -9,8 +9,9 @@
  *
  * Precedence when the hash carries multiple intents (same order `boot()`
  * checks them in): `lens=runs`/`lens=lab` > `lens=machine` > `lens=console` >
- * `mission=`/`session=` > a bare `#<date>` (or `?date=`) playback pin >
- * default fleet. A `lens` value this build doesn't recognize (not
+ * `mission=`/`session=` > a static-build's `darkmux-flow-src` meta (#1801 —
+ * see below) > a bare `#<date>` (or `?date=`) playback pin > default fleet.
+ * A `lens` value this build doesn't recognize (not
  * `runs`/`lab`/`machine`/`console`, and no bare `mission=`/`session=`/date
  * present either) falls through to `unknown` — a visible "lens not ported
  * yet" placeholder naming the raw hash, never a blank page (the overnight
@@ -28,6 +29,7 @@
  */
 
 import { injectedPlaybackDate } from "./injectedMeta";
+import { isStaticBuild } from "./staticSource";
 
 export const RUNS_KINDS = ["all", "mission", "dispatch", "lab"] as const;
 export type RunsKind = (typeof RUNS_KINDS)[number];
@@ -94,8 +96,20 @@ export type Route =
    * OTHER date, forcing the playback fetch branch instead of the live
    * window — a genuinely different render, not just a different label on
    * the same one. See `route.ts`'s own module doc for the precedence this
-   * sits at (lowest, below every `lens=`/`mission=`/`session=` form). */
-  | { kind: "playback"; date: string }
+   * sits at (lowest, below every `lens=`/`mission=`/`session=` form).
+   *
+   * (#1801) `date` is `string | null` — `null` ONLY when `isStaticBuild()`
+   * forced this route (see below): a static demo build has no server-
+   * assigned date the way `/play/<date>`'s injected meta does, and no daemon
+   * to ask `/flow/<date>` for one either. Legacy's own flowSrc branch has the
+   * identical gap — `let date=injectedDate||targetDate()` defaults to today,
+   * then gets overwritten by `RAW[0].ts` ONLY once the file has actually
+   * loaded (viewer.html:3902) — so the real date is knowable only after a
+   * fetch this synchronous parser can't perform. `null` names that honestly;
+   * a consumer that needs a display date derives one from the loaded records
+   * via `lib/flow.ts::firstRecordDate`, the same derivation legacy performs,
+   * once they exist (see `App.tsx`'s `displayRoute`). */
+  | { kind: "playback"; date: string | null }
   | { kind: "unknown"; hash: string };
 
 /** (Packet 5) Should the live tail (`hooks/useLiveTail.ts` — SSE + reconcile
@@ -202,6 +216,27 @@ export function parseRoute(): Route {
     // silently falling back to fleet, which would hide a broken bookmark.
     return { kind: "unknown", hash: raw };
   }
+
+  // (#1801) `darkmux-flow-src` (the static demo's committed .jsonl) forces
+  // playback UNCONDITIONALLY — checked here, above even an explicit bare
+  // `#<date>` hash, because it mirrors legacy's own precedence exactly:
+  // `wantsPlayback = injectedMode==="play" || !!flowSrc || !!cq`
+  // (viewer.html:3880) forces the playback branch regardless of what `date`
+  // holds, and the flowSrc RECORD-LOADING branch itself (3897-3906) reads
+  // the committed file unconditionally too — a hash like `#2026-08-01` on a
+  // static build has no daemon behind it to serve THAT day, so legacy
+  // renders the one file it has and lets the file's own first record
+  // relabel the date (`firstRecordDate`, `lib/flow.ts`), never treats the
+  // hash as a request for a day that doesn't exist. Only `lens=`/`mission=`/
+  // `session=` (already checked above) can still preempt this — matching
+  // this port's existing precedence order (see this file's own module doc);
+  // legacy's stricter `cq` suppression of mission/session under flowSrc
+  // (`(flowSrc||lq||mq||nq!=null) ? null : catalogQuery()`) is NOT ported —
+  // narrower scope, named here rather than silently dropped.
+  if (isStaticBuild()) {
+    return { kind: "playback", date: null };
+  }
+
   if (!raw) {
     // (Packet 4) `?date=<date>` — the query-string form of the same
     // `targetDate()` fallback the bare hash below reads, checked here only

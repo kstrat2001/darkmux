@@ -79,6 +79,72 @@ export function recKey(r: FlowRecord): string {
   ].join("\x1f");
 }
 
+/** Parses a flow file's raw JSONL TEXT the way the daemon parses the
+ * on-disk file the static demo commits a copy of — viewer.html:3899-3901
+ * (the `flowSrc` branch): split on newlines, trim, drop empty lines,
+ * `JSON.parse` each remaining line, drop any line that fails to parse.
+ * Lenient by design, matching legacy exactly: a truncated last line or a
+ * stray blank line must not fail the whole page, and the leading
+ * `{"_type":"schema"}` header line parses FINE here — it is dropped later,
+ * by `normalizeRecords`' `_type` filter, not by this function (#1801 — see
+ * that function's own doc for why the two stay separate steps). */
+export function parseFlowJsonl(text: string): FlowRecord[] {
+  return text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l): FlowRecord | null => {
+      try {
+        return JSON.parse(l) as FlowRecord;
+      } catch {
+        return null;
+      }
+    })
+    .filter((r): r is FlowRecord => r !== null);
+}
+
+/** GETs a static playback source (`staticSource.ts::staticFlowSrc()`) and
+ * parses it via `parseFlowJsonl` above — the static-build twin of
+ * `GET /flow/<date>`, read directly by both `useRouteRecords` (the event
+ * log's data) and `PlaybackLens` (the stage's data), each via the SAME
+ * query key so they share one fetch and can never disagree about the file's
+ * contents (#1801 — same "one source of truth" discipline this module's own
+ * doc already establishes for `normalizeRecords`).
+ *
+ * Returns `[]` rather than throwing on a network failure, a 404, or an
+ * empty file — matching legacy's own `catch(e){ RAW=[]; }` around the same
+ * fetch. A static build with no committed flow file (or one not yet built)
+ * is a valid, if empty, playback — never a crash and never a silent
+ * fallback to the live route (see `route.ts`'s own doc for why the ROUTE
+ * itself does not depend on this fetch succeeding). */
+export async function fetchStaticFlowRecords(src: string): Promise<FlowRecord[]> {
+  try {
+    const res = await fetch(src);
+    if (!res.ok) return [];
+    const text = await res.text();
+    return parseFlowJsonl(text);
+  } catch {
+    return [];
+  }
+}
+
+/** `if(!injectedDate&&RAW.length)date=String(RAW[0].ts||"").slice(0,10)||date;`
+ * — viewer.html:3902, the flowSrc branch's own date derivation. Takes the
+ * RAW parsed array (file order, BEFORE `normalizeRecords` drops the
+ * `{"_type":"schema"}` header line) — deliberately `records[0]`, not the
+ * earliest `ts`, matching legacy's own un-sorted read exactly, quirk
+ * included: a file whose first LINE is the schema header (no `ts` field)
+ * yields `null` here the same way legacy's derivation falls through to
+ * whatever `date` already defaulted to. Returns `null` on an empty array, an
+ * unreachable file, or a first record with no usable `ts` so a caller
+ * supplies its OWN placeholder rather than this function inventing one. */
+export function firstRecordDate(records: FlowRecord[]): string | null {
+  const ts = records[0]?.ts;
+  if (!ts) return null;
+  const date = String(ts).slice(0, 10);
+  return date || null;
+}
+
 /** A `/flow/<date>` response body is EITHER a bare array or one of two
  * wrapper shapes — `loadLiveWindow()`, viewer.html:3502:
  * `Array.isArray(body)?body:(body.records||body.flow||[])`. The recorded

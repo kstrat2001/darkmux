@@ -19,7 +19,7 @@ import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { primaryReplayMission, replayMetaLines } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
-import { localMachineUid, nameOf } from "./lib/flow";
+import { firstRecordDate, localMachineUid, nameOf, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
@@ -170,12 +170,46 @@ export function App() {
     () => (replayMeta ? null : readyParts(flowWindow.data, liveMachines, nowMs)),
     [replayMeta, flowWindow.data, liveMachines, nowMs],
   );
+
+  // (#1801) A static-build playback route carries `date: null` at parse time
+  // (`route.ts`'s own doc on the widened variant) — the real date is only
+  // knowable once the flow-src fetch resolves, exactly like legacy's own
+  // `RAW[0].ts` derivation (`lib/flow.ts::firstRecordDate`). `routeRecords`
+  // already IS that fetch's result (`useRouteRecords`' static branch reads
+  // the identical source), so this reads the one fetch already in flight
+  // rather than adding a second. Falls back to `todayUTC()` while the fetch
+  // is pending or the file is empty/unreachable — a placeholder, not a
+  // crash, matching legacy's own "date stays whatever it defaulted to" on
+  // that identical gap (`firstRecordDate`'s own doc).
+  //
+  // `displayRoute` is used ONLY for TEXT below (the meta line, the masthead
+  // badge) — `route` itself keeps driving every behavioral decision (which
+  // lens renders, whether the live tail runs, which fetch `PlaybackLens`
+  // issues), so a still-loading static date never flips any of those.
+  //
+  // Judgment call: `firstRecordDate` is documented against RAW file-order
+  // records (`records[0]`, matching legacy's un-sorted `RAW[0].ts` exactly,
+  // header-line quirk included), but `routeRecords.records` here has already
+  // been through `normalizeRecords` — sorted by ts, header line dropped. For
+  // a flow file that is itself roughly chronological (the only kind
+  // `build-demo.sh` ever commits), the two agree; a hand-edited or
+  // deliberately-reordered fixture could show a different label than
+  // legacy's literal quirk would. Reading `useRouteRecords`' RAW pre-shape
+  // array here instead would mean plumbing a second field through that
+  // hook's return type for this one display niche — not worth it for a
+  // label whose only failure mode is "names a different real date from the
+  // file", never a crash or an empty page.
+  const displayRoute: Route =
+    route.kind === "playback" && route.date === null
+      ? { ...route, date: firstRecordDate(routeRecords.records) ?? todayUTC() }
+      : route;
+
   const metaLines = useMemo(
     () =>
       replayMeta
-        ? replayMetaLines(replayMeta, route.kind === "playback" ? route.date : "")
+        ? replayMetaLines(replayMeta, displayRoute.kind === "playback" ? (displayRoute.date ?? "") : "")
         : computeMetaLines(flowWindow.data, liveMachines, nowMs),
-    [replayMeta, route, flowWindow.data, liveMachines, nowMs],
+    [replayMeta, displayRoute, flowWindow.data, liveMachines, nowMs],
   );
 
   // `logscope` is no longer SHOWN — the outer UI owns context (see
@@ -199,7 +233,7 @@ export function App() {
           to live on this line) now lives there instead. Precedes
           `.app-shell__crumbbar`, matching legacy's DOM order (`.top` before
           `.crumbbar`). */}
-      <Masthead route={route} liveStatus={liveStatus} />
+      <Masthead route={displayRoute} liveStatus={liveStatus} />
       <div className="app-shell__crumbbar">
         <NavChrome route={route} />
         <header className="app-shell__crumb" id="crumb">

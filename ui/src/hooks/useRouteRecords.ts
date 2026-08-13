@@ -2,7 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys } from "../lib/queryKeys";
 import type { Route } from "../lib/route";
-import { asRecordArray, normalizeRecords } from "../lib/flow";
+import { asRecordArray, fetchStaticFlowRecords, normalizeRecords } from "../lib/flow";
+import { staticFlowSrc } from "../lib/staticSource";
 import type { FlowRecord } from "../types/handwritten";
 import type { FlowWindowResult } from "./useFlowWindow";
 
@@ -88,6 +89,11 @@ function recordsOf(result: { ok: true; data: unknown } | { ok: false } | undefin
 export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): RouteRecords {
   const date = route.kind === "playback" ? route.date : null;
   const sessionId = route.kind === "session" ? route.sessionId : null;
+  // (#1801) `date` is `null` on a playback route ONLY when `isStaticBuild()`
+  // forced it (`route.ts`'s own doc) — so reading `staticFlowSrc()` directly
+  // here, rather than re-deriving it from `date === null`, is the "one
+  // resolver" this fix keeps to (`lib/staticSource.ts`'s module doc).
+  const flowSrc = route.kind === "playback" ? staticFlowSrc() : null;
 
   // Deliberately the SAME cache key `useFlowWindow` uses for its two day
   // fetches (`queryKeys.flowDate`). Same endpoint, same response — sharing the
@@ -100,11 +106,39 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
     enabled: date !== null,
   });
 
+  // (#1801) The static-demo twin of `dayQuery` above — same cache slot
+  // `PlaybackLens` reads for the stage, so the event log and the stage can
+  // never disagree about the committed file's contents (`queryKeys.ts`'s own
+  // doc on `staticFlowSrc`). `date` is always `null` whenever `flowSrc` is
+  // non-null (see the doc above), so this and `dayQuery` are mutually
+  // exclusive by construction, not by an extra guard.
+  const staticQuery = useQuery({
+    queryKey: queryKeys.staticFlowSrc(flowSrc ?? ""),
+    queryFn: () => fetchStaticFlowRecords(flowSrc ?? ""),
+    enabled: flowSrc !== null,
+  });
+
   const sessionQuery = useQuery({
     queryKey: queryKeys.flowSession(sessionId ?? ""),
     queryFn: () => fetchJson<unknown>(`/flow-session/${encodeURIComponent(sessionId ?? "")}`),
     enabled: sessionId !== null,
   });
+
+  if (flowSrc !== null) {
+    // `fetchStaticFlowRecords` already collapses a network failure, a 404,
+    // or an empty file to `[]` (matching legacy's own silent catch — see
+    // that function's own doc), so there is no distinct HTTP-status error to
+    // surface here the way `dayQuery`'s branch below does: a static build
+    // has no daemon to report a status FROM. Still shaped through the SAME
+    // `normalizeRecords` every other branch here uses (this hook's own
+    // module doc explains why that matters).
+    return {
+      records: staticQuery.data ? normalizeRecords(staticQuery.data) : [],
+      loading: staticQuery.data === undefined,
+      historical: true,
+      error: null,
+    };
+  }
 
   if (date !== null) {
     const recs = recordsOf(dayQuery.data);

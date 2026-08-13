@@ -5,6 +5,7 @@ import { CatalogPanel } from "../lenses/catalog/CatalogPanel";
 import { isLiveRoute, type Route } from "../lib/route";
 import { todayUTC } from "../lib/flow";
 import { injectedMeta } from "../lib/injectedMeta";
+import { isStaticBuild } from "../lib/staticSource";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
 
 /**
@@ -56,6 +57,19 @@ import type { LiveTailStatus } from "../hooks/useLiveTail";
  * masthead — see `extract-lens.js`'s `extractTopbarText`) AND
  * `CatalogPanel.test.tsx`'s own accessible-name-based queries, which never
  * render through this component and so never see the override.
+ *
+ * **On a static build (#1801, `isStaticBuild()`), the badge is TEXT, not a
+ * `<CatalogPanel>`.** Legacy's own gate is `if(!flowSrc && mode!=="no-daemon"){
+ * sb.dataset.act="catalog"; ... }` (viewer.html:3936) — `#srcbadge` becomes
+ * the history-browser trigger ONLY when a real daemon is behind the page;
+ * the static demo's badge stays inert. `CatalogPanel`'s toggle fetches
+ * `/flow-days` + `/flow-missions`, neither of which the static demo ships a
+ * fixture for (out of scope per #1801's brief — only `-flow-src`/`-runs-src`/
+ * `-lab-runs-src` have consumers), so mounting the real toggle there would
+ * render a working-looking button that 404s on click. The plain `<span>`
+ * below carries the same VISIBLE text (`srcbadgeText`) with no click
+ * handler and no fetch — the honest equivalent of legacy's un-upgraded
+ * `#srcbadge`.
  *
  * `#modebadge` (`<LiveStatusBadge>`) needs no equivalent split: its
  * lowercase JS-rendered text ("● live"/"◌ reconnecting") is matched to
@@ -122,7 +136,14 @@ export function Masthead({ route, liveStatus }: { route: Route; liveStatus: Live
       ) : (
         <span className="masthead__ver" id="verbadge" />
       )}
-      <CatalogPanel label={srcbadgeText(route)} />
+      {isStaticBuild() ? (
+        // (#1801) No `<CatalogPanel>` here — see this component's own doc
+        // for why a static build gets inert text instead of a button that
+        // would 404 on click.
+        <span className="masthead__srcbadge">{srcbadgeText(route)}</span>
+      ) : (
+        <CatalogPanel label={srcbadgeText(route)} />
+      )}
       {live ? <LiveStatusBadge status={liveStatus} /> : route.kind === "playback" ? <PlaybackModeBadge /> : null}
       {/* (operator: "a reload button next to 'live' is absurd") — and it is:
           a refresh control beside a badge reading `● LIVE` contradicts

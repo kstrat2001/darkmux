@@ -4,6 +4,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { missionGraphReachable } from "../../lib/injectedMeta";
+import { resolveLabRunsSrc, resolveRunsSrc } from "../../lib/staticSource";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse, LabRunsResponse, LabRun } from "../../types/handwritten";
@@ -31,7 +32,13 @@ import {
  *
  * Data: `GET /runs` (the flat cross-source view-model, every kind) and
  * `GET /lab/runs` (the lab-only staffing/bundle extras), fetched TOGETHER on
- * every mount — matching `window.goRuns`'s `Promise.all([loadRuns(),
+ * every mount — via `staticSource.ts`'s `resolveRunsSrc()`/
+ * `resolveLabRunsSrc()` rather than the two literal paths directly, so a
+ * static build (`darkmux-runs-src`/`darkmux-lab-runs-src` metas — #1801,
+ * viewer.html:4077/4027) reads its committed fixture files instead of
+ * hitting a daemon that isn't there. A daemon-served page is unaffected:
+ * both resolvers fall back to the exact literal paths this component always
+ * used — matching `window.goRuns`'s `Promise.all([loadRuns(),
  * loadLabRuns()])`, not gated by which kind chip is selected (the chip is a
  * client-side re-filter of already-loaded data, never a new fetch — see
  * `window.setRunsKind`). `/missions` and `/phases` are deliberately NOT
@@ -204,11 +211,11 @@ export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; 
   // either — the two are genuinely independent fetches there too).
   const runsQuery = useQuery({
     queryKey: queryKeys.runs(),
-    queryFn: () => fetchJson<RunsResponse>("/runs"),
+    queryFn: () => fetchJson<RunsResponse>(resolveRunsSrc()),
   });
   const labRunsQuery = useQuery({
     queryKey: queryKeys.labRuns(),
-    queryFn: () => fetchJson<LabRunsResponse>("/lab/runs"),
+    queryFn: () => fetchJson<LabRunsResponse>(resolveLabRunsSrc()),
   });
 
   // The lab-run detail pane is its own top-level render, reached without

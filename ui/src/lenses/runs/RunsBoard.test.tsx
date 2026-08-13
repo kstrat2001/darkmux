@@ -390,3 +390,66 @@ describe("RunsBoard", () => {
     });
   });
 });
+
+/**
+ * (#1801) `darkmux-runs-src`/`darkmux-lab-runs-src` — the static demo's
+ * committed fixture files, read instead of `GET /runs`/`GET /lab/runs`
+ * (there is no daemon behind the static demo to serve either). Via
+ * `staticSource.ts`'s `resolveRunsSrc()`/`resolveLabRunsSrc()`.
+ */
+describe("RunsBoard — the static-demo runs-src override (#1801)", () => {
+  function injectMeta(name: string, content: string) {
+    const el = document.createElement("meta");
+    el.setAttribute("name", name);
+    el.setAttribute("content", content);
+    document.head.appendChild(el);
+  }
+
+  afterEach(() => {
+    document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
+  });
+
+  function mockStaticSrc() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url === "./demo-runs.json") {
+          return Promise.resolve(new Response(JSON.stringify({ runs: RUNS, generated_at_ms: 1 }), { status: 200 }));
+        }
+        if (url === "./demo-lab-runs.json") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ configured: true, dir: "/lab", exists: true, runs: [] }), { status: 200 }),
+          );
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+  }
+
+  it("fetches the injected runs-src / lab-runs-src, never /runs or /lab/runs", async () => {
+    injectMeta("darkmux-runs-src", "./demo-runs.json");
+    injectMeta("darkmux-lab-runs-src", "./demo-lab-runs.json");
+    mockStaticSrc();
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+
+    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+    expect(calls).toContain("./demo-runs.json");
+    expect(calls).toContain("./demo-lab-runs.json");
+    expect(calls).not.toContain("/runs");
+    expect(calls).not.toContain("/lab/runs");
+  });
+
+  // Inverted case: without the metas, the board keeps hitting the literal
+  // daemon paths exactly as every other test in this file already proves —
+  // restated here as its own assertion so this describe block doesn't rely
+  // on file ordering to make the point.
+  it("without the metas, it still fetches the literal /runs and /lab/runs paths", async () => {
+    mockFetch();
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+    expect(calls).toContain("/runs");
+    expect(calls).toContain("/lab/runs");
+  });
+});
