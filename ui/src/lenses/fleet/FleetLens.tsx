@@ -45,15 +45,29 @@ function Chip({ value, label, cls }: { value: string | number; label: string; cl
  * `savings.ts`'s module doc for why that exclusion is load-bearing, not
  * incidental.
  */
-function SavingsHero({ tokens: t, note }: { tokens: ReturnType<typeof tokensOffMeter>; note: ReturnType<typeof hybridNote> }) {
+function SavingsHero({
+  tokens: t,
+  note,
+  liveMode,
+}: {
+  tokens: ReturnType<typeof tokensOffMeter>;
+  note: ReturnType<typeof hybridNote>;
+  liveMode: boolean;
+}) {
   const hours = Math.round(LIVE_WINDOW_MS / 3600000);
   return (
     <div className="savings">
       {/* (operator) "tokens · last 24h" rather than "by your fleet · last 24h",
           to match the event pane's "events last 24h". Two panels counting two
           things over the same window should say so the same way; "by your
-          fleet" named the SOURCE where its neighbour named the SUBJECT. */}
-      <div className="saveyebrow">tokens · last {hours}h</div>
+          fleet" named the SOURCE where its neighbour named the SUBJECT.
+
+          The window suffix is LIVE-ONLY — `const win=...live-mode...?` last
+          ${h}h`:''` (viewer.html:1660). A replay's numbers cover the recorded
+          day, not the last 24 hours, and the meta bar already states that
+          day's range. (#1800 P2: the suffix was unconditional, so a replayed
+          day claimed a window it had not been measured over.) */}
+      <div className="saveyebrow">tokens{liveMode ? ` · last ${hours}h` : ""}</div>
       <div className="savrow">
         <div className="savlead">
           <div className="savnum">{fmtN(t.local)}</div>
@@ -141,41 +155,59 @@ function FleetCoverageNotice({ historical = false }: { historical?: boolean }) {
   );
 }
 
-/** (#1800 P2) `records`/`tMax` OPTIONAL so playback can render this same hero
- * over a historical day. Omitted = the live rolling window, exactly as before,
- * so every existing caller is unchanged.
+/** (#1800 P2) `records`/`tMax`/`tMin` OPTIONAL so playback can render this
+ * same hero over a historical day. Omitted = the live rolling window, exactly
+ * as before, so every existing caller is unchanged.
  *
- * NOTE the honest limit: `liveMachines`/`liveSessionIds` below are LIVE
- * presence endpoints and describe NOW, not the replayed day. On a historical
- * route they are the wrong lens on the right records — which is precisely the
- * failure this component's own doc warns about ("they render CONFIDENTLY
- * WRONG: machines read idle"). Playback therefore passes `historical` so the
- * hero can suppress presence-derived claims rather than assert today's
- * presence over a past day's records. */
+ * `historical` is legacy's `liveMode`, inverted — and it is NOT merely a
+ * presence switch. Legacy branches on it in FOUR places inside `renderFleet()`
+ * + `savingsHero()`, and the port had collapsed all four to their live arm
+ * because `/next` had no route that reached the other one:
+ *
+ * | surface | live | replay |
+ * |---|---|---|
+ * | hero eyebrow | `tokens · last 24h` | `tokens` |
+ * | card count | running sessions, "N running" | the day's sessions, "N specialists" |
+ * | timeline span | `max(tMax, now) - window` | `tMin..tMax` |
+ * | window control | 10m/1h/4h/24h | absent |
+ *
+ * Presence is the fifth: `liveMachines`/`liveSessionIds` are LIVE endpoints
+ * describing NOW, so a replay must neither fetch nor consult them. Asserting
+ * today's presence over a past day is exactly the "confidently WRONG:
+ * machines read idle, running work reads zero" failure this file's own
+ * coverage notice exists to warn about. */
 export function FleetLens({
   records,
   tMax,
+  tMin,
   historical = false,
 }: {
   records?: FlowRecord[];
   tMax?: number;
+  tMin?: number;
   historical?: boolean;
 } = {}) {
   const nowMs = Date.now();
+  const liveMode = !historical;
   const [windowMinutes, setWindowMinutes] = useState(DEFAULT_ACTIVITY_WINDOW_MIN);
 
   const liveWindow = useFlowWindow(nowMs);
   const flowWindow = records !== undefined
     ? { data: records, tMax: tMax ?? 0, settled: true }
     : liveWindow;
-  // On a replayed day, live presence describes NOW and would make every card
-  // claim a machine's current state over historical records — the exact
-  // "confidently wrong" failure this file's own doc names. `enabled: false`
-  // stops the REQUEST, not just the result: an earlier draft discarded the
-  // data while the hook kept polling `/fleet/machines/live` every few seconds
-  // behind a replay, which a test caught.
-  const liveMachines = useLiveMachines(!historical);
-  const liveSessionIds = useLiveSessionIds(!historical);
+  // `enabled: false` stops the REQUEST, not just the result: an earlier draft
+  // discarded the data while the hook kept polling `/fleet/machines/live`
+  // every few seconds behind a replay.
+  //
+  // It is NOT sufficient on its own, and the QA gate proved it: a disabled
+  // TanStack observer still READS the shared cache slot, so as long as ANY
+  // enabled observer of the same key exists anywhere in the tree, this one
+  // keeps returning live beats and the poll never stops. `App.tsx` held
+  // exactly such an observer. Gating the fetch AND the consumer is what makes
+  // the property true in the composed app rather than only in this lens's own
+  // isolated test.
+  const liveMachines = useLiveMachines(liveMode);
+  const liveSessionIds = useLiveSessionIds(liveMode);
   const specsQuery = useQuery({
     queryKey: queryKeys.machineSpecs(),
     queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
@@ -186,27 +218,51 @@ export function FleetLens({
   const note = useMemo(() => hybridNote(flowWindow.data, tokens), [flowWindow.data, tokens]);
 
   const liveSet = useMemo(
-    () => liveSessionSet(flowWindow.data, liveSessionIds, nowMs),
-    [flowWindow.data, liveSessionIds, nowMs],
+    // The flow-derived liveness FALLBACK inside `liveSessionSet` is itself
+    // live-only in legacy (viewer.html:3378). Without `liveMode` a replay
+    // would route around the disabled presence hooks above and re-derive
+    // "running" from the day's own records — presence-agnostic in name only.
+    () => liveSessionSet(flowWindow.data, liveSessionIds, nowMs, liveMode),
+    [flowWindow.data, liveSessionIds, nowMs, liveMode],
   );
   const uids = useMemo(() => machineUids(flowWindow.data, liveMachines), [flowWindow.data, liveMachines]);
 
   const cards = useMemo(
     () =>
       uids.map((m) =>
-        buildFleetCard(flowWindow.data, liveMachines, specs, liveSet, machPresent(flowWindow.data, liveMachines, flowWindow.tMax, m) === false, m),
+        buildFleetCard(
+          flowWindow.data,
+          liveMachines,
+          specs,
+          liveSet,
+          machPresent(flowWindow.data, liveMachines, flowWindow.tMax, m) === false,
+          m,
+          liveMode,
+          flowWindow.tMax,
+        ),
       ),
-    [uids, flowWindow.data, flowWindow.tMax, liveMachines, specs, liveSet],
+    [uids, flowWindow.data, flowWindow.tMax, liveMachines, specs, liveSet, liveMode],
   );
 
   const timeline = useMemo(
-    () => buildActivityTimeline(flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, nowMs, windowMinutes),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, nowMs, windowMinutes],
+    () =>
+      buildActivityTimeline(
+        flowWindow.data,
+        liveMachines,
+        uids,
+        liveSet,
+        flowWindow.tMax,
+        nowMs,
+        windowMinutes,
+        liveMode,
+        tMin ?? 0,
+      ),
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, nowMs, windowMinutes, liveMode, tMin],
   );
 
   return (
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
-      <SavingsHero tokens={tokens} note={note} />
+      <SavingsHero tokens={tokens} note={note} liveMode={liveMode} />
       <FleetCoverageNotice historical={historical} />
       <div className="fleet">
         {cards.map((card) => (
@@ -249,7 +305,9 @@ export function FleetLens({
               <span className="dot" />
               {card.stat}
             </div>
-            <div className="runs">{card.runsCount} running</div>
+            <div className="runs">
+              {card.runsCount} {card.runsLabel}
+            </div>
           </div>
         ))}
       </div>
@@ -257,17 +315,22 @@ export function FleetLens({
         <div className="fleettl" style={{ "--lname-w": `${timeline.labelWidthPx}px` } as CSSProperties}>
           <div className="tlhdr">
             <span>{timeline.headerText}</span>
-            <span className="twin">
-              {ACTIVITY_WINDOW_PRESETS.map((p) => (
-                <button
-                  key={p.minutes}
-                  className={`twinb${windowMinutes === p.minutes ? " on" : ""}`}
-                  onClick={() => setWindowMinutes(p.minutes)}
-                >
-                  {p.label}
-                </button>
-              ))}
-            </span>
+            {/* `const winCtl=liveMode?...:''` (viewer.html:1764) — LIVE-ONLY.
+                A replay shows the full recorded day, so there is no window to
+                slide over and the control would be a dead knob. */}
+            {liveMode ? (
+              <span className="twin">
+                {ACTIVITY_WINDOW_PRESETS.map((p) => (
+                  <button
+                    key={p.minutes}
+                    className={`twinb${windowMinutes === p.minutes ? " on" : ""}`}
+                    onClick={() => setWindowMinutes(p.minutes)}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </span>
+            ) : null}
           </div>
           {timeline.lanes.map((lane) => (
             <div className="lane" key={lane.uid}>

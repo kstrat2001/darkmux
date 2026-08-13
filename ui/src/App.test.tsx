@@ -413,4 +413,113 @@ describe("App", () => {
     await waitFor(() => expect(window.location.hash).toBe("#lens=runs"));
     expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
   });
+
+  /**
+   * (#1800 P2, QA gate) The composed-app assertion the LENS-level test could
+   * not make. `FleetLens` gates its own presence hooks with `enabled: false`
+   * on a replay — and that was already true when the gate caught this. It was
+   * not enough: `App` held its OWN `useLiveMachines()` observer on the same
+   * query key, unconditionally, on every route. A disabled TanStack observer
+   * still reads the shared cache, so the enabled one kept the data warm and
+   * kept polling `/fleet/machines/live` behind the replay (measured: 2 polls
+   * in 9s, and a fleet card for a machine with zero records that day).
+   *
+   * The lens's own test rendered in ISOLATION, where no second observer
+   * exists, and passed throughout. So this assertion belongs HERE, at the
+   * level where the bug was reachable — not one component down.
+   */
+  it("a replay route never touches the live presence endpoints, even from App", async () => {
+    window.location.hash = "#2026-08-07";
+    const fetchSpy = vi.fn((url: string) => {
+      const path = String(url);
+      if (path === "/flow/2026-08-07") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify([
+              { ts: "2026-08-07T02:09:42.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start" },
+              { ts: "2026-08-07T18:28:15.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.complete" },
+            ]),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response("[]", { status: 200 }));
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
+
+    const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => u.includes("/fleet/machines/live"))).toBe(false);
+    expect(urls.some((u) => u.includes("/fleet/sessions/live"))).toBe(false);
+    // …and the day WAS actually fetched, so a hook quietly requesting nothing
+    // at all cannot pass this by doing no work.
+    expect(urls).toContain("/flow/2026-08-07");
+  });
+
+  /**
+   * The replay-mode RENDER, asserted at App level for the same reason: every
+   * one of these strings comes from a `liveMode ? ... : ...` branch that the
+   * port had collapsed to its live arm. `goldens/playback-date.txt` is the
+   * byte-level spec; this is the fast guard beneath it.
+   */
+  it("a replay renders the REPLAY arm of the fleet hero, not the live one", async () => {
+    window.location.hash = "#2026-08-07";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (String(url) === "/flow/2026-08-07") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify([
+                // The flow file's leading schema header. It has no
+                // `machine_uid`, so an unshaped read renders it as a phantom
+                // "unknown" machine card and a third timeline lane.
+                { _type: "schema", darkmux_version: "2.6.0", version: "1.18.0" },
+                { ts: "2026-08-07T02:09:42.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start" },
+                { ts: "2026-08-07T09:00:00.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.complete" },
+                { ts: "2026-08-07T10:00:00.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start" },
+                { ts: "2026-08-07T18:28:15.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.complete" },
+              ]),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
+
+    // The hero eyebrow drops the window suffix — these numbers cover the
+    // recorded day, not the last 24 hours.
+    expect(screen.getByText("tokens")).toBeInTheDocument();
+    expect(screen.queryByText(/tokens · last/i)).not.toBeInTheDocument();
+
+    // The card counts the DAY's sessions and calls them specialists.
+    expect(document.querySelector(".mach .runs")?.textContent).toBe("2 specialists");
+
+    // The `_type` header contributed no machine card.
+    expect(document.querySelectorAll(".mach")).toHaveLength(1);
+
+    // The timeline spans the day and carries no window control.
+    expect(document.querySelector(".tlhdr span")?.textContent).toMatch(/^activity · /);
+    expect(document.querySelector(".twin")).toBeNull();
+    // Both of the day's sessions drew a bar. The NOW-anchored live arm would
+    // have filtered every one of them out for ending before `now - 24h`.
+    expect(document.querySelectorAll(".fleettl .lane")).toHaveLength(1);
+    expect(document.querySelectorAll(".sbar")).toHaveLength(2);
+  });
 });

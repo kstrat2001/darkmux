@@ -109,7 +109,23 @@ export function App() {
   // still the rolling window. Before this, every route got the live window,
   // so a session's stage and its event log described different things.
   const routeRecords = useRouteRecords(route, flowWindow);
-  const liveMachines = useLiveMachines();
+  // (#1800 P2, QA gate) Route-gated for the same reason `useLiveTail` above
+  // is, and the gate is load-bearing in a way that is easy to get wrong:
+  // `FleetLens` already passed `enabled: false` on a replay, but a DISABLED
+  // TanStack observer still reads its key's shared cache — and this call,
+  // running on EVERY route with the same key, kept that cache warm and kept
+  // polling `/fleet/machines/live` behind a replay. Measured: 2 polls in 9s,
+  // plus a fleet card rendered for a machine with zero records that day. The
+  // lens's own test passed throughout, because a lens rendered in ISOLATION
+  // has no second observer. Gating the fetch is not enough; the consumer has
+  // to be gated too, and this is the consumer.
+  //
+  // KNOWN, UNCHANGED by this fix: `#meta` below still computes from
+  // `flowWindow` (the LIVE rolling window) on every route, so a replay's meta
+  // bar describes today. That is a separate, pre-existing divergence from
+  // legacy — which re-scopes its whole `DATA` on a playback boot — and it is
+  // named in #1800's plan rather than half-fixed here.
+  const liveMachines = useLiveMachines(isLiveRoute(route));
   const specsQuery = useQuery({
     queryKey: queryKeys.machineSpecs(),
     queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
@@ -199,6 +215,7 @@ export function App() {
           visible={showsEventLog(route)}
           loading={routeRecords.loading}
           error={routeRecords.error}
+          historical={routeRecords.historical}
         />
       </div>
     </div>
@@ -335,9 +352,9 @@ function renderRoute(route: Route) {
       // deferred placeholder rather than staying inert.
       return <MissionReplay missionId={route.missionId} />;
     case "playback":
-      // Packet 4: a bare #<date> hash — see PlaybackLens's own doc for why
-      // this is a named not-ported notice rather than a full historical
-      // render.
+      // (#1800 P2) A bare #<date> hash — a REAL historical render now: the
+      // fleet hero over that day's records, with every one of legacy's
+      // replay-mode branches taken. See PlaybackLens's own doc.
       return <PlaybackLens date={route.date} />;
     case "unknown":
       return <LensPlaceholder label="unrecognized" hash={route.hash} />;

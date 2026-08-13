@@ -4,12 +4,27 @@
  * machine; each dispatch session is a bar positioned across the recorded
  * window.
  *
- * (#1151) This port has no playback scrubber, so it's always the live-only
- * branch: `tlMax = Math.max(tMax, nowMs)` (anchored at NOW so the right-edge
- * axis label stays honest after the last record — see the legacy comment
- * this ports), `tlMin = tlMax - windowMinutes*60000`. `state.t` (the
- * playhead) is always `tMax` here — see `savings.ts`'s module doc for the
- * same reasoning applied to the token sums.
+ * (#1151) Two anchorings, and which one applies is the whole of this file's
+ * `liveMode` argument:
+ *
+ * - **Live**: `tlMax = Math.max(tMax, nowMs)`, `tlMin = tlMax - window`. NOW,
+ *   not the newest record — after a run ends `tMax` stops advancing while the
+ *   clock does not, so a `tMax` anchor would read 16:00 at 16:04. "24h" draws
+ *   a TRUE 24h axis ending at the current minute, and the operator picks the
+ *   window from the 10m/1h/4h/24h control.
+ * - **Replay**: `tlMin..tlMax = tMin..tMax`, the recorded day's own span, and
+ *   NO window control (there is nothing to slide over — the dataset is the
+ *   window). The header also drops "recent", because the day is not recent.
+ *
+ * (#1800 P2) The live arm used to be the only arm, since `/next` had no
+ * historical route to reach the other one. `Math.max(tMax, nowMs)` on a
+ * replayed day is `nowMs` by definition, which drew a 2026-08-07 page with an
+ * "AUG 12–AUG 13" axis and zero bars — every bar fell before `tlMin` and was
+ * dropped by the window filter below.
+ *
+ * `state.t` (the playhead) is `tMax` in both modes — this port has no
+ * scrubber; see `savings.ts`'s module doc for the same reasoning applied to
+ * the token sums.
  */
 
 import {
@@ -20,6 +35,7 @@ import {
   dispatchErrored,
   dispatchKilled,
   sessEnd,
+  sessionRunning,
   statusLabel,
   lastTs,
   nameOf,
@@ -80,10 +96,17 @@ export function buildActivityTimeline(
   tMax: number,
   nowMs: number,
   windowMinutes: number,
+  /** viewer.html:1727's `liveMode` — see this module's own doc for the two
+   * anchorings and why a replay must not use the live one. */
+  liveMode = true,
+  /** The dataset's earliest timestamp (`recompute()`'s `tMin`). Read only in
+   * replay, where it IS the left edge; ignored in live mode, whose left edge
+   * is `tlMax - window`. */
+  tMin = 0,
 ): ActivityTimeline {
   const winMs = windowMinutes * 60000;
-  const tlMax = Math.max(tMax, nowMs);
-  const tlMin = tlMax - winMs;
+  const tlMax = liveMode ? Math.max(tMax, nowMs) : tMax;
+  const tlMin = liveMode ? tlMax - winMs : tMin;
   const span = Math.max(1, tlMax - tlMin);
   const pct = (t: number) => ((t - tlMin) / span) * 100;
 
@@ -96,9 +119,11 @@ export function buildActivityTimeline(
       const e = sessEnd(data, sid);
       const closeCands = [term ? T(term.ts) : null, e ? T(e.ts) : null].filter((x): x is number => x != null);
       const closeTs = closeCands.length ? Math.min(...closeCands) : null;
-      // (#857) `done` is "not currently live" — this port's live-mode-only
-      // `sessionRunning()`.
-      const done = !liveSet.has(sid);
+      // (#857) `done` = not currently running, through the SHARED
+      // `sessionRunning` — live keys on presence, replay on the close-edge at
+      // the playhead. (#1800 P2: this was `!liveSet.has(sid)`, the live arm
+      // inlined, which read every session of a replayed day as running.)
+      const done = !sessionRunning(data, liveSet, sid, liveMode, tMax);
       const errored = done && dispatchErrored(term);
       const killed = dispatchKilled(term);
       const clean = done && !!term && !dispatchErrored(term);
@@ -116,7 +141,10 @@ export function buildActivityTimeline(
   });
 
   return {
-    headerText: `recent activity · ${clkrange(tlMin, tlMax)}`,
+    // `${liveMode?'recent activity':'activity'} · ${clkrange(tlMin,tlMax)}`
+    // — viewer.html:1766. Lowercase; `.tlhdr`'s `text-transform: uppercase`
+    // renders it, matching legacy.
+    headerText: `${liveMode ? "recent activity" : "activity"} · ${clkrange(tlMin, tlMax)}`,
     lanes,
     axis: [clkhm(tlMin), clkhm(tlMin + span / 2), clkhm(tlMax)],
     playheadPct: pct(tMax),

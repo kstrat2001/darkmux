@@ -119,13 +119,32 @@ export function mergeTailRecords(existing: FlowRecord[], incoming: FlowRecord[],
   return merged.filter((r) => T(r.ts) >= cutMs);
 }
 
+/** The RECORD-SHAPING half of `flowToRenderModel()` — viewer.html:3195-3204.
+ * Drops non-record meta lines and normalizes the space-separated legacy
+ * action spellings to their dotted forms. Deliberately does NOT window or
+ * dedup: those belong to the LIVE two-day merge (`buildFlowWindow`, below),
+ * not to reading a record set.
+ *
+ * (#1800 P2) Split out because a historical day must be shaped the same way
+ * and windowed NOT AT ALL — legacy's playback boot is literally
+ * `DATA=flowToRenderModel(RAW)` with no window step (viewer.html:3922).
+ * Feeding a replayed day through `buildFlowWindow` instead would have
+ * dropped every record older than 24h — i.e. the entire day — and running it
+ * unshaped leaves the flow file's leading `{"_type":"schema"}` header in the
+ * set, where it renders as a phantom "unknown" machine card, an
+ * `Invalid Date other` log row, and a third timeline lane. Both were live
+ * before this split. */
+export function normalizeRecords(records: FlowRecord[]): FlowRecord[] {
+  return records
+    .filter((r): r is FlowRecord => !!r && !r._type)
+    .map((r) => ({ ...r, action: normalizeAction(r.action) }));
+}
+
 /** `loadLiveWindow()` + the dispatch-action slice of `flowToRenderModel()` —
  * viewer.html:3497-3512 / 3161-3187. `yesterday`/`today` MUST be passed in
  * that fetch order (see the module doc above for why). */
 export function buildFlowWindow(yesterday: FlowRecord[], today: FlowRecord[], nowMs: number): FlowRecord[] {
-  const merged = [...yesterday, ...today]
-    .filter((r): r is FlowRecord => !!r && !r._type)
-    .map((r) => ({ ...r, action: normalizeAction(r.action) }));
+  const merged = normalizeRecords([...yesterday, ...today]);
   const windowed = merged.filter((r) => T(r.ts) >= nowMs - LIVE_WINDOW_MS);
   const seen = new Set<string>();
   return windowed.filter((r) => {
@@ -140,6 +159,15 @@ export function buildFlowWindow(yesterday: FlowRecord[], today: FlowRecord[], no
 export function computeTMax(data: FlowRecord[]): number {
   const ts = data.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
   return ts.length ? Math.max(...ts) : Date.now();
+}
+
+/** `recompute()`'s tMin — viewer.html:1051. Unused while `/next` was
+ * live-only (the live timeline anchors on NOW and a fixed window); a REPLAY
+ * spans `tMin..tMax`, which is what makes the axis describe the recorded day
+ * rather than the last 24 hours of wall-clock. */
+export function computeTMin(data: FlowRecord[]): number {
+  const ts = data.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
+  return ts.length ? Math.min(...ts) : Date.now();
 }
 
 /** `uidOf()` — viewer.html:1107. */
@@ -197,6 +225,42 @@ export function sessEnd(data: FlowRecord[], sid: string): FlowRecord | undefined
   return data.find((r) => r.session_id === sid && r.action === "session.end");
 }
 
+/** `sessionCloseEdge()` — viewer.html:1171-1175. The EARLIEST of the dispatch
+ * terminal and the reconciler's `session.end`. Every "is this session done /
+ * where does its bar end" decision goes through here rather than bare
+ * `dispatchEnd`: a session whose ONLY terminal is `session.end` (abandoned,
+ * hard-killed, shipped without a clean complete) must read as ENDED, not
+ * in-flight to the playhead. */
+export function sessionCloseEdge(data: FlowRecord[], sid: string): FlowRecord | undefined {
+  const c = dispatchEnd(data, sid);
+  const e = sessEnd(data, sid);
+  if (c && e) return T(c.ts) <= T(e.ts) ? c : e;
+  return c ?? e;
+}
+
+/** `sessionRunning()` — viewer.html:1183-1187. THE single source of truth for
+ * "is this session in flight?", and the reason it takes `liveMode`:
+ *
+ * - **live** keys on PRESENCE (`liveSet`), which is TTL-self-healing — an
+ *   orphaned session with no close-edge ages out of the live set on its own.
+ * - **replay** keys on the durable CLOSE-EDGE relative to the playhead: the
+ *   session was running iff nothing had closed it yet at time `t`.
+ *
+ * (#1800 P2) Before this, the port had only the live arm, because `/next` had
+ * no historical route that reached it. A replay asking presence about a past
+ * day is the "confidently wrong" failure `FleetLens`'s own doc names. */
+export function sessionRunning(
+  data: FlowRecord[],
+  liveSet: Set<string>,
+  sid: string,
+  liveMode: boolean,
+  t: number,
+): boolean {
+  if (liveMode) return liveSet.has(sid);
+  const close = sessionCloseEdge(data, sid);
+  return !(close && T(close.ts) <= t);
+}
+
 /** `statusVisual()` — viewer.html:1140-1145. Only `lbl` is consumed here —
  * `cls`/`pill` are CSS class names in legacy, invisible to `innerText`. */
 export function statusLabel(args: { open: boolean; errored: boolean; killed: boolean; clean: boolean }): string {
@@ -226,7 +290,15 @@ export function machPresent(
  * fallback for when Redis session-presence (`/fleet/sessions/live`) is
  * empty. `nowMs` is REAL wall-clock now (frozen via Playwright's clock in
  * the parity spec), not `tMax` — see the legacy comment this ports. */
-export function flowLiveSessions(data: FlowRecord[], nowMs: number): Set<string> {
+export function flowLiveSessions(data: FlowRecord[], nowMs: number, liveMode = true): Set<string> {
+  // `if(!document.body.classList.contains('live-mode')) return new Set();`
+  // (viewer.html:3378) — the gate this port dropped, because until #1800 P2
+  // nothing here ever ran outside live mode. Without it a REPLAY derives
+  // liveness from flow records and reads a past day's sessions as running
+  // right now: cards go "dispatch in flight", the machine card counts
+  // "N running" instead of the day's specialists, and timeline bars draw
+  // yellow. Replay is presence-agnostic by construction.
+  if (!liveMode) return new Set();
   const lastBySid = new Map<string, number>();
   const started = new Set<string>();
   for (const r of data) {
@@ -246,9 +318,14 @@ export function flowLiveSessions(data: FlowRecord[], nowMs: number): Set<string>
 
 /** `liveSessionSet()` — viewer.html:1373-1379. Redis presence when it has
  * ANY beat (authoritative), else the flow-derived fallback. */
-export function liveSessionSet(data: FlowRecord[], liveSessionIds: Set<string>, nowMs: number): Set<string> {
+export function liveSessionSet(
+  data: FlowRecord[],
+  liveSessionIds: Set<string>,
+  nowMs: number,
+  liveMode = true,
+): Set<string> {
   if (liveSessionIds.size) return liveSessionIds;
-  return flowLiveSessions(data, nowMs);
+  return flowLiveSessions(data, nowMs, liveMode);
 }
 
 /** One row of the machine lens's runs list — the fields `recentRow()`

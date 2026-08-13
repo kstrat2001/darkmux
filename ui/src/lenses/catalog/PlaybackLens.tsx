@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
-import { asRecordArray, computeTMax } from "../../lib/flow";
+import { asRecordArray, computeTMax, computeTMin, normalizeRecords } from "../../lib/flow";
 import { FleetLens } from "../fleet/FleetLens";
 
 
@@ -54,7 +54,17 @@ export function PlaybackLens({ date }: { date: string }) {
   // `/flow/<date>` returns a BARE ARRAY, not `{records}` — decoded through the
   // shared `asRecordArray` like `useFlowWindow` and legacy both do. An earlier
   // draft read `.records` here and would have rendered every day as empty.
-  const records = asRecordArray(query.data.data);
+  //
+  // Then SHAPED through `normalizeRecords`, which is legacy's own playback
+  // boot verbatim: `DATA=flowToRenderModel(RAW)` (viewer.html:3922) — drop the
+  // `_type` meta lines, normalize the space-separated action spellings.
+  // Reading the raw array left the flow file's leading `{"_type":"schema"}`
+  // header in the set, where (having no `machine_uid`) it rendered a phantom
+  // "unknown" machine card, an `Invalid Date other` log row, and a third
+  // timeline lane. Deliberately NOT `buildFlowWindow`: that one also windows
+  // to the last 24h of WALL-CLOCK, which for any day but today drops every
+  // record in the file.
+  const records = normalizeRecords(asRecordArray(query.data.data));
 
   if (records.length === 0) {
     return (
@@ -72,6 +82,10 @@ export function PlaybackLens({ date }: { date: string }) {
   // than a local reduce: an earlier draft here guessed the timestamp field as
   // `ts_ms` when it is `ts`, which would have silently produced tMax = 0.
   const tMax = computeTMax(records);
+  // `tMin` is the replay timeline's LEFT edge (`recompute()`, viewer.html:1051
+  // → `tlMin=liveMode?(tlMax-winMs):tMin`, :1727). Live mode derives its left
+  // edge from the clock and never needs this.
+  const tMin = computeTMin(records);
 
-  return <FleetLens records={records} tMax={tMax} historical />;
+  return <FleetLens records={records} tMax={tMax} tMin={tMin} historical />;
 }

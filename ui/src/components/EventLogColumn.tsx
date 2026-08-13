@@ -143,9 +143,13 @@ export function EventLogColumn({
   scopeLabel,
   loading = false,
   error = null,
+  historical = false,
 }: {
   records: FlowRecord[];
   visible: boolean;
+  /** (#1800 P2) True when `records` is a fetched historical slice rather than
+   *  the live rolling window — see the header's own note. */
+  historical?: boolean;
   /** (#1800 P1) A historical slice still in flight. Without this, "loading"
    *  and "genuinely empty" both render "no events yet". */
   loading?: boolean;
@@ -266,8 +270,17 @@ export function EventLogColumn({
                 against `◆ <mission id>"). Kept in the DOM, empty and hidden,
                 so legacy's extraction and this port's agree; the element
                 itself is legacy's and dies with it at the flip. */}
+            {/* The window suffix is LIVE-ONLY. On a `session`/`playback`
+                route `records` is a fetched historical slice, so "last 24h"
+                named a window these records were never selected by — the
+                same overclaim the savings hero's eyebrow carried until
+                #1800 P2. No replacement string is invented here: the route's
+                own chrome already says which day or session this is. */}
             <span>
-              events last {WINDOW_HOURS}h<span id="logscope" hidden>{scopeLabel}</span>
+              events{historical ? "" : ` last ${WINDOW_HOURS}h`}
+              <span id="logscope" hidden>
+                {scopeLabel}
+              </span>
             </span>
             <span className="eventlog__headbtns">
               <button
