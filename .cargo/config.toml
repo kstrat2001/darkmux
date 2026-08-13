@@ -1,0 +1,87 @@
+# Repo-level cargo config. Deliberately ONLY `[alias]`.
+#
+# Cargo MERGES this with `~/.cargo/config.toml` per-key, so a user-level
+# `rustc-wrapper = "sccache"` still applies (verified). Do not add build
+# settings here without re-checking that — a repo config that shadows the
+# wrapper turns every build cold, and the symptom (slow builds) does not
+# name the cause.
+#
+# These wrap `cargo nextest`, matching CONTRIBUTING.md's documented loop —
+# NOT `cargo test`. Two reasons, and the second is the important one:
+#
+#   1. On the full workspace nextest is far faster (~75s vs ~10min), because
+#      it parallelizes ACROSS test binaries rather than only within each.
+#      On a single area the two are equivalent — measured 4.6s vs 4.5s — so
+#      speed is not why you'd pick it for day-to-day work.
+#   2. `.config/nextest.toml` sets a per-test `terminate-after`, so a test
+#      that HANGS fails loudly instead of wedging the run. That happened
+#      twice (a process-global DARKMUX_REDIS_URL pointed at a listener that
+#      accepted and never answered), turning a 6s suite into 10+ minutes of
+#      silence. A hang that reports nothing is the worst kind of green.
+#
+# The repo has ZERO doctests (verified), which nextest does not run — so
+# nothing is lost by routing everything through it.
+#
+# Needs: cargo install cargo-nextest --locked
+#
+# WHY AREAS EXIST: the full suite is a MERGE gate and CI runs it on every PR
+# for free. Locally you almost always want one area. See CLAUDE.md
+# "Testing — run the area, not the world".
+
+[alias]
+# --- area suites: pick the one covering what you touched ---
+
+# Flow records, sinks, the audit hash chain, schema, config access.
+t-flow = "nextest run -p darkmux-flow -p darkmux-types"
+
+# Review funnel, bundler, lab harness, crew scheduler + step kinds.
+t-review = "nextest run -p darkmux-lab -p darkmux-crew"
+
+# The HTTP daemon and the bundled viewer.
+# (Viewer CHANGES are verified by reloading the page — viewer.html is an
+# include_str!'d asset the Rust tests never render. See CONTRIBUTING.md.)
+t-serve = "nextest run -p darkmux-serve"
+
+# Preflight checks and their remedies.
+t-doctor = "nextest run -p darkmux-doctor"
+
+# Cross-machine roster and routing (flow rides along — fleet reads its records).
+t-fleet = "nextest run -p darkmux-fleet -p darkmux-flow"
+
+# Residency arbiter + the hardware/heuristics providers feeding it.
+# NOTE darkmux-profiles is here on purpose: `gestalt_host/` (lms_host.rs —
+# the `lms load`/`unload` shell-out and its timeout, mac_probe, arch_facts)
+# lives THERE, not in darkmux-gestalt, which is the pure planning core.
+t-gestalt = "nextest run -p darkmux-gestalt -p darkmux-hardware -p darkmux-heuristics -p darkmux-profiles"
+
+# The root binary crate: every CLI verb module (acp, radio, mission_launch,
+# pr_review, coder_phase, config_cmd, init, migrate, skills…) PLUS all 11
+# integration targets. Deliberately `-p darkmux`, not `--test cli`: that
+# selected ONE target and silently skipped ~550 tests, including the verb
+# layer where most recent work lands. The e2e_* targets self-skip without
+# redis unless DARKMUX_E2E_REQUIRED is set, so this is safe offline.
+t-cli = "nextest run -p darkmux"
+
+# --- the small foundation crates. FAST because they are small, NOT because
+#     they are pure: darkmux-types does fs/env/flock I/O and darkmux-profiles
+#     shells out to `lms`. Do not read this as "no side effects". ---
+t-fast = "nextest run -p darkmux-types -p darkmux-profiles -p darkmux-eureka"
+
+# --- the same SCOPE CI gates on. Note CI runs it as `cargo test --workspace`,
+#     not nextest — so CI has no terminate-after, and a flake that passes on
+#     retry reports FLAKY here but FAILS there. Local is the permissive one. ---
+# Reach for it when a change crosses crate boundaries in a way no single area
+# covers, or when tagging a release — not "to be safe".
+t-all = "nextest run --workspace"
+
+# --- NOT a workspace member; `t-all` does NOT reach it ---
+# The agent runtime (loop_runner, compaction, the cycle/reasoning/failure
+# detectors) is `exclude`d from the workspace, so `nextest run --workspace`
+# never touches its ~418 tests. CI gates it separately (ci.yml runtime-test-lint,
+# paths-filtered), but locally it needs naming or "run the area you touched"
+# has no area for the most behavior-dense code in the repo.
+#
+# Caveat: `.config/nextest.toml` is scoped to the root workspace, so this run
+# gets NO terminate-after — the hang protection that justifies nextest
+# elsewhere does not extend here.
+t-runtime = "nextest run --manifest-path runtime/Cargo.toml"
