@@ -1,28 +1,76 @@
 #!/usr/bin/env bash
 #
-# Generate docs/demo/index.html from the canonical serve viewer.
+# Generate docs/demo/index.html from whatever the daemon serves at `/`.
 #
-# darkmux.com/demo IS the live observability viewer in playback mode, loading a
+# darkmux.com/demo IS the observability viewer in playback mode, loading a
 # committed flow-schema dataset (docs/demo/demo-flow.jsonl) — behaving exactly
 # like opening `/play/<date>` locally on that file. There is no demo fork: this
-# copies the ONE viewer (crates/darkmux-serve/assets/viewer.html) and injects
-# the static-playback metas the viewer's boot() honors.
+# copies the ONE served viewer and injects the static-playback metas its boot
+# path honors.
 #
-# Run after editing the viewer. CI re-runs this and fails on drift
+# The SOURCE IS DERIVED, not named here (#1801). This script used to hardcode
+# `assets/viewer.html`, which meant two files independently encoded "which
+# viewer is the real one" with nothing keeping them agreeing — so when the
+# route flip (#1800) changed what `/` serves, the demo silently stayed on the
+# legacy UI and no drift guard could notice, because the file still generated
+# cleanly. Now `crates/darkmux-serve/src/lib.rs` is the single owner: this
+# reads the constant `root_html` actually serves, then that constant's own
+# `include_str!` path. Flip the route or rename the asset and the demo follows
+# by construction, with nothing to remember.
+#
+# Deliberately pure shell rather than a `darkmux --emit-demo` verb (the other
+# option #1801 weighed): CI's docs-drift job runs this script WITHOUT a Rust
+# toolchain build, and making the demo guard depend on compiling the binary
+# would trade a fast docs check for a multi-minute one.
+#
+# Run after editing the UI. CI re-runs this and fails on drift
 # (.github/workflows/ci.yml) so the demo can never re-fork from the viewer.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="$ROOT/crates/darkmux-serve/assets/viewer.html"
+LIB="$ROOT/crates/darkmux-serve/src/lib.rs"
 OUT="$ROOT/docs/demo/index.html"
+
+# Step 1: which embedded constant does `GET /` serve? Read it out of the
+# handler body rather than trusting a name, so a future flip is picked up.
+SERVED_CONST=$(
+  sed -n '/async fn root_html/,/^}/p' "$LIB" |
+    sed -n 's/.*inject_mode_meta(\([A-Z_][A-Z0-9_]*\),.*/\1/p' |
+    head -1
+)
+if [ -z "$SERVED_CONST" ]; then
+  echo "build-demo: could not determine which constant root_html serves in $LIB" >&2
+  echo "build-demo: (expected an inject_mode_meta(<CONST>, \"live\", ...) call)" >&2
+  exit 1
+fi
+
+# Step 2: which file does that constant embed?
+ASSET=$(
+  sed -n "s|^const ${SERVED_CONST}: &str = include_str!(\"\.\./assets/\([^\"]*\)\");|\1|p" "$LIB" |
+    head -1
+)
+if [ -z "$ASSET" ]; then
+  echo "build-demo: found served constant '$SERVED_CONST' but no include_str! for it in $LIB" >&2
+  exit 1
+fi
+
+SRC="$ROOT/crates/darkmux-serve/assets/$ASSET"
+if [ ! -f "$SRC" ]; then
+  echo "build-demo: derived source $SRC does not exist" >&2
+  exit 1
+fi
 
 # Inject the demo metas right after the first <head> (exactly once), the same
 # spot the daemon's inject_mode_meta uses for the live/play routes. Pure-shell
 # sed split so it works on macOS BSD tools as well as GNU.
+#
+# No `darkmux-date` meta, deliberately: the demo dataset carries its own dates,
+# and the viewer derives the playback day from the first record — so the demo
+# never needs updating when the fixture is re-recorded.
 {
   sed '/<head>/q' "$SRC"
-  cat <<'EOF'
-<!-- GENERATED from crates/darkmux-serve/assets/viewer.html by scripts/build-demo.sh — edit the viewer, not this file. -->
+  cat <<EOF
+<!-- GENERATED from crates/darkmux-serve/assets/$ASSET by scripts/build-demo.sh — edit the UI source, not this file. -->
 <meta name="darkmux-mode" content="play">
 <meta name="darkmux-flow-src" content="./demo-flow.jsonl">
 <meta name="darkmux-missions-src" content="./demo-missions.json">
