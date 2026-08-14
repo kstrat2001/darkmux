@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
@@ -7,7 +7,8 @@ import { useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, looseRecords, nameOf } from "../../lib/flow";
 import { specOf } from "../fleet/cards";
 import { utilityLines } from "./memoryLedgerLines";
-import { MachineHealthRegion } from "./MemLedgerCards";
+import { MachineHealthRegion } from "./MachineHealthRegion";
+import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
 import { isStaticBuild } from "../../lib/staticSource";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
@@ -30,8 +31,10 @@ const OWNER_WORDS = new Set(["DARKMUX", "USER"]);
 
 /** Classify a health line by CONTENT PATTERN — the technique the health
  * region used to style itself BEFORE #1806 Stage 1 gave it real structure
- * (`MemLedgerCards.tsx`'s `.memcard`/`.memhdr`/`.memname`/`.memstate`
- * elements now carry their own classes at render time, so nothing in that
+ * (Stage 1's `.memcard`/`.memhdr`/`.memname`/`.memstate` elements carried
+ * their own classes at render time; Stage 2/3's `MachineHealthRegion.tsx`
+ * — the redesigned gauge/lamp/odometer/row region, `machineGauge.ts` for
+ * the math behind it — carries this further still, so nothing in that
  * region calls this anymore). Kept — not deleted — for two reasons: it is
  * still a correct, independently useful pure function (`lineClass.test.ts`
  * exercises it directly, including the hostile-string inverted case), and
@@ -70,8 +73,9 @@ export function lineClass(line: string): string | undefined {
  * easy to render and carries the same guarantee by construction. Still used
  * for the `darkmux/utility` node (`utilityLines()` — a fixed four-element
  * array, styled positionally in CSS, per that block's own stylesheet
- * comment); the health region moved to `MemLedgerCards.tsx`'s explicit
- * structure in #1806 Stage 1 and no longer renders through here.
+ * comment); the health region moved to real structure in #1806 Stage 1
+ * (then further, in Stage 2/3, to `MachineHealthRegion.tsx`'s gauge/lamp/
+ * odometer/row markup) and no longer renders through here.
  *
  * `classify` stays as real, tested API (`lineClass.test.ts`) even though
  * nothing in this file passes `classify` anymore post-Stage-1 — see
@@ -201,7 +205,48 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
     enabled: isLocalMach && daemonBacked,
   });
   const resourcesErrored = isLocalMach && resourcesQuery.data ? !resourcesQuery.data.ok : false;
-  const resources = isLocalMach && resourcesQuery.data?.ok ? resourcesQuery.data.data : null;
+
+  // (#1812) `resources` used to be derived FRESH from `resourcesQuery.data`
+  // every render — `fetchJson` returns a discriminated result rather than
+  // throwing, so a failed poll is a SUCCESSFUL query whose data says
+  // `ok:false`, and TanStack Query happily replaces the previous good
+  // payload with that error object. The stale banner existed to keep
+  // showing the last snapshot through exactly that moment
+  // (`STALE_BANNER_TEXT`), but the derivation threw the snapshot away
+  // before the banner ever got a reading to sit over. Holding the last GOOD
+  // payload in state, updated ONLY on `ok:true`, restores legacy's
+  // two-variable shape (`MACHINE_MEM` + `MACHINE_MEM_ERR`, `viewer.html`) in
+  // React terms — `resourcesErrored` above still reflects the LATEST poll
+  // (drives the banner + lamp), independent of what `resources` shows.
+  const [lastGoodResources, setLastGoodResources] = useState<MachineResources | null>(null);
+  const resources = lastGoodResources;
+
+  // The residency state machine (PROPOSAL.md §8 — ghost/NEW rows) advances
+  // on the SAME successful-poll cadence as the payload above: a failed poll
+  // carries no model list to diff against, so it must neither advance a
+  // ghost's retirement clock nor manufacture a spurious departure. Held in
+  // a ref (not state) because `advanceResidency` is a state MACHINE, not a
+  // value to re-render on its own — the derived `residencyRows`/
+  // `residencyChanged` below are the render-facing outputs.
+  const residencyRef = useRef<ResidencyState | null>(null);
+  const [residencyRows, setResidencyRows] = useState<ResidencyRowView[]>([]);
+  const [residencyChanged, setResidencyChanged] = useState(false);
+
+  useEffect(() => {
+    if (!(isLocalMach && resourcesQuery.data?.ok)) return;
+    const data = resourcesQuery.data.data;
+    setLastGoodResources(data);
+    const models = Array.isArray(data.models) ? data.models : [];
+    const { state, rows } = advanceResidency(residencyRef.current, models, Date.now());
+    residencyRef.current = state;
+    setResidencyRows(rows);
+    setResidencyChanged(residencyChangedThisPoll(rows));
+    // Depends on the query's own settle timestamp, not `resourcesQuery.data`
+    // itself — the object is a fresh reference every render regardless of
+    // whether new data actually arrived, which would re-run this on every
+    // paint rather than once per poll.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLocalMach, resourcesQuery.dataUpdatedAt]);
 
   const label = targetUid != null ? nameOf(flowWindow.data, liveMachines, targetUid) : "this machine";
   // `specOf()` (viewer.html:1124-1129, ported in `lenses/fleet/cards.ts` —
@@ -274,7 +319,15 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
           distinct from "loaded"/"error" so a future remote parity test
           waiting on this marker doesn't hang (#1770 merge-gate finding). */}
       <div className="machine-lens__health" data-state={!isLocalMach ? "remote" : resources ? "loaded" : resourcesErrored ? "error" : "loading"}>
-        <MachineHealthRegion isLocalMach={isLocalMach} machineName={label} resources={resources} resourcesErrored={resourcesErrored} />
+        <MachineHealthRegion
+          isLocalMach={isLocalMach}
+          machineName={label}
+          resources={resources}
+          resourcesErrored={resourcesErrored}
+          residencyRows={residencyRows}
+          residencyChanged={residencyChanged}
+          nowMs={nowMs}
+        />
       </div>
 
       {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —

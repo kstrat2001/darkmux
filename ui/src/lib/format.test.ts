@@ -2,8 +2,8 @@ import { describe, it, expect } from "vitest";
 import { memPct, memStateCls } from "./format";
 
 // `memStateCls` was ported (format.ts) ahead of its first consumer; #1806
-// Stage 1 (`MemLedgerCards.tsx`) is that consumer — it decides BOTH the
-// `.memcard`/`.memstate` chip class AND the `.membar .cur` fill class, so a
+// Stage 1, then Stage 2/3's `MachineHealthRegion.tsx`, is that consumer —
+// it decides BOTH a chip's severity class AND a bar layer's fill class, so a
 // wrong mapping here is a security-adjacent bug (a hostile state string
 // landing raw in a class attribute), not just a cosmetic one. Covered here
 // directly since it now sits on that path.
@@ -34,8 +34,9 @@ describe("memStateCls", () => {
   });
 });
 
-// `memPct()` sizes every `.membar` layer (`.pot`/`.cur`/`.lim`/`.poolline`) —
-// #1806 Stage 1's new consumer (`MemLedgerCards.tsx`'s `MemBar`).
+// `memPct()` sizes every bar layer — #1806 Stage 1's new consumer, carried
+// into Stage 2/3's `MachineHealthRegion.tsx` (the gauge's commit tick and
+// each model row's `.mm-row-pot`/`.mm-row-cur`).
 describe("memPct", () => {
   it("computes a plain percentage of part against scale", () => {
     expect(memPct(25, 100)).toBe(25);

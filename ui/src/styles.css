@@ -1986,23 +1986,15 @@ body {
   color: var(--accent-dim);
 }
 
-/* ── `.memcard` — the health region's real structure (#1806 Stage 1) ───────
-   Legacy's own class names/geometry (`crates/darkmux-serve/assets/viewer.html`
-   CSS 274-303, `memBar()` at :4946-4954), so #1806's `.memcard`/`.membar`/
-   `.memhint`/`#memstamp`/`.memwarn` e2e specs pass against this port
-   unmodified. `MemLedgerCards.tsx`'s own module doc is the source of truth
-   for WHY every element below is safe for `innerText` byte-parity; read it
-   before touching this block's markup shape (adding/removing an element,
-   not just restyling one).
-
-   `.memname`/`.memowner`/`.memstate` are `display:block;width:fit-content`
-   — NOT `inline-block` — for the exact reason `.mline--state`/`.mline--owner`
-   already are, below: adjacent inline-level siblings merge onto ONE
-   `innerText` line. Legacy gets its own header line breaks for free because
-   `.memhdr` there is `display:flex` (flex-blockifies its children); this
-   port does not lean on that — forcing block on the LEAF elements makes the
-   line break unconditional regardless of what `.memhdr` here ends up being,
-   the same brittleness `MachineLens.tsx`'s `Lines` doc already flags. */
+/* ── `.memcard` — the health region's SURVIVING plain-card treatment ───────
+   #1806 Stage 1 gave the health region real structure; Stage 2/3 (the
+   gauge/lamp/odometer/row redesign below) replaced the LEDGER portion of
+   that structure entirely (`.membar`/`.memowner`/`.memstate`/`.memmeta`/
+   `.memhint` are gone with it — nothing renders them anymore). `.memcard`
+   itself survives for the handful of surfaces Stage 2/3 didn't touch: the
+   not-local placeholder, the warnings card, and (via `.memfoot`/`.none`)
+   the footer and loading/error placeholders — see `MachineHealthRegion.tsx`
+   for exactly where each is still used. */
 .machine-lens__health .memcard {
   background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--border);
@@ -2010,16 +2002,6 @@ body {
   padding: 12px 14px;
   overflow-wrap: anywhere;
 }
-.machine-lens__health .memcard.green { border-color: var(--good); }
-.machine-lens__health .memcard.amber { border-color: var(--warn); }
-.machine-lens__health .memcard.red { border-color: var(--bad); }
-/* No `.memcard.unknown` rule, deliberately — matches legacy (no such rule
-   there either): `unknown` is a REAL, common state on this page (PROVENANCE
-   finding 1 — any unpriced resident forces the whole machine to `unknown`),
-   and its honest rendering is the unstyled base look: a plain border, no
-   color claim the server didn't make (the "honesty rule" governing color,
-   PROPOSAL §2 — the client never invents a judgment). */
-
 .machine-lens__health .memhdr {
   margin-bottom: 2px;
 }
@@ -2027,103 +2009,6 @@ body {
   display: block;
   font-weight: 600;
   color: var(--fg);
-}
-.machine-lens__health .memowner,
-.machine-lens__health .memstate {
-  display: block;
-  width: fit-content;
-  font: 600 10px/1.4 "JetBrains Mono", monospace;
-  letter-spacing: 0.06em;
-  padding: 1px 7px;
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  color: var(--dim);
-  margin: 2px 0;
-}
-.machine-lens__health .memstate.green { color: var(--good); border-color: var(--good); }
-.machine-lens__health .memstate.amber { color: var(--warn); border-color: var(--warn); }
-.machine-lens__health .memstate.red { color: var(--bad); border-color: var(--bad); }
-
-/* The four-layer meter — legacy's own instrument (viewer.html:286-303,
-   `memBar()` :4946-4954): `.pot` (committed extent, dashed edge), `.cur`
-   (measured fill, state-colored AND state-PATTERNED — color is never the
-   only channel, PROVENANCE.md), `.lim` (the limit tick), `.poolline` (the
-   physical-pool tick, only drawn when it differs from the limit). All four
-   are `position:absolute` and carry no text node — see `MemLedgerCards.tsx`'s
-   module doc for why that keeps them `innerText`-invisible regardless of
-   where they sit in the DOM. `#131826` (not a token) matches this port's
-   own existing recessed-track color (`.tltrack`, this file) rather than
-   inventing a second one. */
-.machine-lens__health .membar {
-  position: relative;
-  height: 26px;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  background: #131826;
-  overflow: hidden;
-  margin: 6px 0 4px;
-}
-.machine-lens__health .membar .pot {
-  position: absolute;
-  inset: 0 auto 0 0;
-  background: rgba(255, 255, 255, 0.05);
-  border-right: 2px dashed var(--dim);
-}
-.machine-lens__health .membar .cur {
-  position: absolute;
-  inset: 0 auto 0 0;
-  opacity: 0.55;
-}
-.machine-lens__health .membar .cur.green {
-  background: var(--good);
-}
-/* watch = 45° hatch, red = 135° dense hatch, unknown = dots — the
-   level-3 mockup's own severity recipe (`level1.html`'s `.m-cur` rules),
-   carried into Stage 1 because it's CSS-only (no text, no DOM change) and
-   PROVENANCE.md names it explicitly: color cannot be the only channel. */
-.machine-lens__health .membar .cur.amber {
-  background:
-    repeating-linear-gradient(45deg, transparent 0 5px, rgba(0, 0, 0, 0.45) 5px 8px),
-    var(--warn);
-}
-.machine-lens__health .membar .cur.red {
-  background:
-    repeating-linear-gradient(135deg, transparent 0 3px, rgba(0, 0, 0, 0.5) 3px 6px),
-    var(--bad);
-  opacity: 0.65;
-}
-.machine-lens__health .membar .cur.unknown {
-  background: radial-gradient(circle at 2px 2px, var(--dim) 1.2px, transparent 1.2px);
-  background-size: 7px 7px;
-  background-color: rgba(139, 147, 167, 0.22);
-  opacity: 0.9;
-}
-.machine-lens__health .membar .lim {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: var(--accent);
-}
-.machine-lens__health .membar .poolline {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: var(--dim);
-  opacity: 0.7;
-}
-
-.machine-lens__health .memmeta {
-  color: var(--dim);
-  font-size: 11px;
-}
-.machine-lens__health .memhint {
-  color: var(--dim);
-  font-size: 11px;
-  border-left: 2px solid var(--border);
-  padding: 2px 0 2px 8px;
-  margin: 4px 0 0;
 }
 .machine-lens__health .memwarn {
   color: var(--warn);
@@ -2143,9 +2028,428 @@ body {
   padding: 4px 0;
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   Stage 2/3 — the redesigned ledger: a bezel-less semicircle hero (the
+   machine gauge), a tell-tale lamp row, odometer digit cells for the
+   pressure instruments, and model rows grouped darkmux-first with
+   ghost/NEW residency states. `MachineHealthRegion.tsx` is the markup;
+   `machineGauge.ts` is every number behind it. Geometry constants (radius,
+   center, tick positions) match that component's own `CX`/`CY`/`R`
+   constants and `level3.html`'s canonical hand-placed coordinates — change
+   one, change the other.
+
+   Zero animation anywhere in this block, by design (root `CLAUDE.md`'s
+   "the observer must not join the observed" — a continuously-animated
+   glow would burn GPU precisely when the machine is under the memory
+   pressure it's reporting). Every color flip here is a ONE-TIME repaint on
+   state entry: React re-renders the SVG's class/attribute strings on the
+   next poll: no `transition`, no `animation`, no `@keyframes`. */
+
+.mm-stalebanner {
+  color: var(--warn);
+  border: 1px dashed var(--warn);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 11px;
+  margin-bottom: 12px;
+  background: color-mix(in srgb, var(--warn) 7%, transparent);
+  overflow-wrap: anywhere;
+}
+
+.mm-hero {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.012));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 4px 14px rgba(0, 0, 0, 0.45);
+  padding: 16px 14px 14px;
+  margin-bottom: 12px;
+}
+/* Stale — desaturate the WHOLE instrument cluster rather than blank it; the
+   reading stays legible, just visibly marked as not-current. Static filter,
+   no transition. */
+.mm-hero.is-stale {
+  filter: saturate(0.3) opacity(0.75);
+}
+
+.mm-heroline {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 10px 40px;
+}
+.mm-semi {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.mm-gauge svg {
+  display: block;
+}
+.mm-gauge text {
+  font-family: "JetBrains Mono", monospace;
+}
+.mm-gauge-scale-label {
+  fill: var(--dim);
+  font-size: 10px;
+}
+.mm-gauge-scale-word {
+  fill: var(--dim);
+  font-size: 6.5px;
+  letter-spacing: 0.14em;
+}
+.mm-gauge-center-val {
+  fill: var(--fg);
+  font-size: 24px;
+  font-weight: 600;
+}
+.mm-gauge-center-unit {
+  font-size: 11px;
+  fill: var(--dim);
+}
+.mm-gauge-center-caption {
+  fill: var(--dim);
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+}
+.mm-gauge-tick {
+  stroke: var(--dim);
+  stroke-width: 2;
+  opacity: 0.8;
+}
+.mm-gauge-track {
+  stroke: #222a3c;
+}
+.mm-gauge-val.is-unknown {
+  stroke: var(--dim);
+  opacity: 0.5;
+}
+.mm-gauge-val.is-green {
+  stroke: var(--good);
+}
+.mm-gauge-val.is-amber {
+  stroke: var(--warn);
+}
+.mm-gauge-val.is-red {
+  stroke: var(--bad);
+}
+.mm-gauge-commit {
+  stroke: var(--fg);
+  stroke-width: 2;
+  stroke-dasharray: 3 2;
+}
+/* Overcommit (machine-Amber: Σ potential > scale) — the tick CLAMPS to the
+   line and turns amber: the overrun that hasn't materialized yet, marked at
+   the boundary it would cross (`machineGauge.ts::resolveGaugeScale`'s doc —
+   the scale never auto-expands to hide this). */
+.mm-gauge-commit.over {
+  stroke: var(--warn);
+}
+/* The redline: a fixed end-cap segment at the scale's own end (the
+   server's red condition begins exactly there — `current_bytes >
+   limit_bytes` is the redline's own position). Neutral by default; `.lit`
+   turns it red in the SAME repaint that turns the center value red (one
+   condition, `machine.state === "red"`, two elements, no independent
+   thresholds — `machineGauge.ts::redlineLit`). The glow is a STATIC
+   `drop-shadow` — one repaint on state entry, zero cost at idle, never
+   pulsed. */
+.mm-gauge-redline {
+  stroke: var(--dim);
+}
+.mm-gauge-redline.lit {
+  stroke: var(--bad);
+  filter:
+    drop-shadow(0 0 4px var(--bad))
+    drop-shadow(0 0 9px var(--bad));
+}
+.mm-gauge-center-val.lit {
+  fill: var(--bad);
+  filter:
+    drop-shadow(0 0 3px var(--bad))
+    drop-shadow(0 0 8px var(--bad));
+}
+.mm-gauge-needle {
+  stroke: var(--fg);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+}
+.mm-gauge-needle.is-unknown {
+  stroke: var(--dim);
+}
+.mm-gauge-hub {
+  fill: #454d5c;
+  stroke: #1a1f2b;
+}
+.mm-gcap {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  text-align: center;
+}
+.mm-gcap b {
+  color: var(--fg);
+}
+
+/* Reused, tightly-scoped chip — the gauge caption's own state word
+   (`.mm-chip`) and a model row's owner/state/unpriced/new/departed markers
+   (`.mm-row-chip`) share one visual language: a bordered pill, colored ONLY
+   from a server-verified severity class, the word always present alongside
+   the color (never color-alone). */
+.mm-chip,
+.mm-row-chip {
+  display: inline-block;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  vertical-align: middle;
+}
+.mm-chip.is-green,
+.mm-row-chip.is-state.is-green {
+  color: var(--good);
+  border-color: var(--good);
+}
+.mm-chip.is-amber,
+.mm-row-chip.is-state.is-amber {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.mm-chip.is-red,
+.mm-row-chip.is-state.is-red {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+/* No `.is-unknown` color rule, deliberately — matches the honesty rule
+   `.memcard.unknown` used to encode: `unknown` is a REAL, common state
+   (PROVENANCE finding 1), and its honest rendering is the neutral base
+   look, never an invented color. */
+.mm-row-chip.is-warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.mm-row-chip.is-new {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.mm-lamps {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin: 4px 0 2px;
+}
+.mm-lamp {
+  display: inline-block;
+  font: 600 9.5px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.08em;
+  padding: 5px 9px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: #4a5162;
+  background: rgba(0, 0, 0, 0.25);
+}
+.mm-lamp.is-lit-dim {
+  color: var(--dim);
+  border-color: var(--dim);
+}
+.mm-lamp.is-lit-warn {
+  color: var(--warn);
+  border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--warn) 35%, transparent);
+}
+.mm-lamp.is-lit-bad {
+  color: var(--bad);
+  border-color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--bad) 35%, transparent);
+}
+
+.mm-odorow {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px 34px;
+  margin-top: 13px;
+}
+.mm-odo {
+  text-align: center;
+}
+.mm-odo-cells {
+  display: inline-flex;
+  gap: 2px;
+}
+.mm-odo-c {
+  display: inline-block;
+  font: 600 16px/1 "JetBrains Mono", monospace;
+  color: var(--fg);
+  background: #0d1120;
+  border: 1px solid #2c3446;
+  border-radius: 3px;
+  padding: 5px 4px;
+  min-width: 20px;
+  box-shadow: inset 0 3px 5px rgba(0, 0, 0, 0.6);
+}
+.mm-odo-unit {
+  font: 600 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  margin-left: 5px;
+}
+.mm-odo-k {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-top: 4px;
+}
+.mm-odo-n {
+  font-size: 8.5px;
+  color: #4a5162;
+}
+
+.mm-kv {
+  color: var(--dim);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  margin-bottom: 12px;
+}
+.mm-kv b {
+  color: var(--fg);
+  font-weight: 600;
+}
+.mm-kv--machine {
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.mm-grouphdr {
+  font: 600 10px/1.4 "JetBrains Mono", monospace;
+  letter-spacing: 0.1em;
+  color: var(--dim);
+  margin: 14px 0 6px;
+}
+
+/* Model rows — the scaling rule's repeating element (PROPOSAL.md §8):
+   constant height at any N, grouped darkmux-first, alphabetical within
+   group. Ghost/NEW are the ONLY two state modifiers — a live row carries
+   neither. */
+.mm-row {
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 9px 12px;
+  margin-bottom: 8px;
+  overflow-wrap: anywhere;
+}
+.mm-row.is-new {
+  border-left: 2px solid var(--accent);
+}
+.mm-row.is-ghost {
+  opacity: 0.5;
+}
+.mm-row.is-ghost .mm-row-track {
+  border-style: dashed;
+}
+.mm-row-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.mm-row-name {
+  font-weight: 600;
+}
+.mm-row-track-wrap {
+  margin: 4px 0 2px;
+}
+.mm-row-track {
+  position: relative;
+  height: 20px;
+  border: 1px solid #1a2030;
+  border-radius: 5px;
+  overflow: hidden;
+  background:
+    repeating-linear-gradient(90deg, transparent 0 calc(25% - 1px), #222a3c calc(25% - 1px) 25%),
+    linear-gradient(180deg, #0c111b, #10151f 40%, #141a28);
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.6);
+}
+.mm-row-pot {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(255, 255, 255, 0.05);
+  border-right: 2px dashed var(--dim);
+}
+.mm-row-cur {
+  position: absolute;
+  inset: 0 auto 0 0;
+  opacity: 0.8;
+  border-right: 2px solid rgba(255, 255, 255, 0.5);
+}
+.mm-row-cur.is-green {
+  background: var(--good);
+}
+.mm-row-cur.is-amber {
+  background:
+    repeating-linear-gradient(45deg, transparent 0 5px, rgba(0, 0, 0, 0.45) 5px 8px),
+    var(--warn);
+}
+.mm-row-cur.is-red {
+  background:
+    repeating-linear-gradient(135deg, transparent 0 3px, rgba(0, 0, 0, 0.5) 3px 6px),
+    var(--bad);
+}
+.mm-row-cur.is-unknown {
+  background: radial-gradient(circle at 2px 2px, var(--dim) 1.2px, transparent 1.2px);
+  background-size: 7px 7px;
+  background-color: rgba(139, 147, 167, 0.2);
+  border-right-color: var(--dim);
+}
+.mm-row-val {
+  position: absolute;
+  top: 50%;
+  transform: translate(6px, -50%);
+  font: 600 10px "JetBrains Mono", monospace;
+  color: var(--fg);
+  white-space: nowrap;
+  text-shadow:
+    0 0 4px var(--bg),
+    0 0 4px var(--bg);
+}
+.mm-row-kv {
+  font-size: 10.5px;
+  color: var(--dim);
+}
+.mm-row-kv b {
+  color: var(--fg);
+  font-weight: 600;
+}
+.mm-hint {
+  color: var(--dim);
+  font-size: 11px;
+  border-left: 2px solid var(--border);
+  padding: 2px 0 2px 8px;
+  margin: 6px 0 0;
+}
+
 @media (max-width: 768px) {
-  .machine-lens__health .membar {
-    height: 34px;
+  .mm-heroline {
+    gap: 6px 16px;
+  }
+  .mm-row-track {
+    height: 28px;
+  }
+  .mm-odorow {
+    gap: 8px 18px;
   }
 }
 
