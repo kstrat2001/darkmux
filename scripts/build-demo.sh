@@ -130,4 +130,44 @@ EOF
   sed '1,/<head>/d' "$SRC"
 } > "$OUT"
 
+# (#1811 sibling, found pre-release) The served page links its manifest and
+# icons ABSOLUTELY (`/manifest.webmanifest`, `/icon-192.png`,
+# `/apple-touch-icon.png`) and must: the daemon answers those paths, and the
+# page is served at BOTH `/` and `/play/<date>`, so a relative href would
+# resolve to `/play/manifest.webmanifest` on the playback route and 404.
+#
+# The demo is a different deployment. It lives at darkmux.com/demo — a
+# SUBPATH — where those absolute paths resolve to the site root, which does
+# not carry them (checked: `docs/` has no icon-192.png, manifest.webmanifest
+# or apple-touch-icon.png). Legacy had the same three dangling refs, so this
+# is not a regression; it is a pre-existing 404 that the demo's own generator
+# is the right place to fix, because only here is the deployment context
+# known. Rewrite to relative and ship local copies alongside.
+DEMO_DIR="$(dirname "$OUT")"
+ASSET_DIR="$ROOT/crates/darkmux-serve/assets"
+for a in manifest.webmanifest icon-192.png apple-touch-icon.png; do
+  if [ -f "$ASSET_DIR/$a" ]; then
+    cp "$ASSET_DIR/$a" "$DEMO_DIR/$a"
+  else
+    echo "build-demo: expected asset $ASSET_DIR/$a is missing" >&2
+    exit 1
+  fi
+done
+# Same pure-shell sed discipline as the meta injection above (BSD + GNU).
+sed -i.bak \
+  -e 's|href="/manifest.webmanifest"|href="./manifest.webmanifest"|' \
+  -e 's|href="/icon-192.png"|href="./icon-192.png"|' \
+  -e 's|href="/apple-touch-icon.png"|href="./apple-touch-icon.png"|' \
+  "$OUT"
+rm -f "$OUT.bak"
+
+# Fail loudly rather than shipping a silently-dangling link: if the served
+# page ever grows another absolute asset ref, this catches it here instead of
+# on the public site.
+if grep -qE '(href|src)="/[^"]' "$OUT"; then
+  echo "build-demo: $OUT still contains absolute asset refs, which 404 under the /demo subpath:" >&2
+  grep -oE '(href|src)="/[^"]*"' "$OUT" | sort -u | sed 's/^/build-demo:   /' >&2
+  exit 1
+fi
+
 echo "generated $OUT from $SRC ($(wc -l < "$OUT" | tr -d ' ') lines)"

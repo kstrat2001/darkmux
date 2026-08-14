@@ -12,7 +12,7 @@ import {
   redlineLit,
   type ResidencyRowView,
 } from "./machineGauge";
-import { memBytes } from "../../lib/format";
+import { memBytes, poolGiBNote } from "../../lib/format";
 import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
@@ -382,9 +382,29 @@ export function MachineHealthRegion({
         </div>
       </div>
 
+      {/* (#1811) The pool figure carries its BINARY equivalent in parentheses,
+          and that parenthetical is the whole fix. `hw.memsize` is rendered
+          twice on this page in two conventions: the stage header says
+          `128 GB` (binary GiB, `specOf`) and this row says `137.44 GB`
+          (decimal, `memBytes`). They are the same number, and a reader doing
+          the obvious arithmetic on the one screen whose job is telling them
+          how much room they have gets an answer in units that do not match
+          the machine they think they own.
+          Naming both at the point of comparison resolves it where the
+          confusion actually arises. The more correct fix — relabelling the
+          header `128 GiB`, since that is what its arithmetic computes — is
+          deliberately NOT taken here: that string is inside the one region
+          `next-parity.spec.ts` still asserts byte-exact against legacy, and
+          it is the machine lens's last such tie. Spending it to relabel a
+          unit is an operator call, not a drive-by. */}
       <div className="mm-kv mm-kv--machine">
-        limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b> · pool free{" "}
-        <b>{memBytes(b.pool?.available_bytes)}</b> · unpriced <b>{Number(b.machine.unpriced_models) || 0} model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}</b>
+        limit source <b>{limitDescription(b.limit_source)}</b> · pool{" "}
+        <b>
+          {memBytes(b.pool?.capacity_bytes)}
+          {poolGiBNote(b.pool?.capacity_bytes)}
+        </b>{" "}
+        · pool free <b>{memBytes(b.pool?.available_bytes)}</b> · unpriced{" "}
+        <b>{Number(b.machine.unpriced_models) || 0} model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}</b>
       </div>
 
       {/* The machine's OWN shrink hint (distinct from a per-model one — an

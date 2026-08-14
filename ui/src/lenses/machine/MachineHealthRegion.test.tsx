@@ -277,6 +277,15 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     expect(kv.textContent).not.toContain("physical pool");
   });
 
+  it("reconciles the page's two byte conventions on the pool figure (#1811)", () => {
+    const { container } = renderRegion(BASE);
+    const kv = container.querySelector(".mm-kv--machine")!;
+    // The header says "128 GB" (binary) and this row says "137.44 GB"
+    // (decimal) for the SAME `hw.memsize`. The parenthetical is what tells a
+    // reader those are one number.
+    expect(kv.textContent).toContain("137.44 GB (128 GiB)");
+  });
+
   it("distinguishes pool CAPACITY from pool FREE — they are different fields", () => {
     const { container } = renderRegion(BASE);
     const kv = container.querySelector(".mm-kv--machine")!;

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { memPct, memStateCls } from "./format";
+import { memPct, memStateCls, poolGiBNote } from "./format";
 
 // `memStateCls` was ported (format.ts) ahead of its first consumer; #1806
 // Stage 1, then Stage 2/3's `MachineHealthRegion.tsx`, is that consumer —
@@ -63,5 +63,38 @@ describe("memPct", () => {
 
   it("returns 0, not Infinity/NaN, when scale is 0", () => {
     expect(memPct(50, 0)).toBe(0);
+  });
+});
+
+/**
+ * (#1811) `hw.memsize` is rendered twice on the machine page in two byte
+ * conventions — the stage header's binary `128 GB` and the ledger's decimal
+ * `137.44 GB` — and a reader comparing them sees two quantities rather than
+ * one number. `poolGiBNote` is the parenthetical that reconciles them at the
+ * point of comparison.
+ *
+ * The suppression cases are the interesting half: a parenthetical that
+ * restates the number beside it is noise, and noise on this page costs more
+ * than it looks like, because every figure here is load-bearing.
+ */
+describe("poolGiBNote", () => {
+  it("names the binary equivalent when the two conventions genuinely differ", () => {
+    // 137438953472 = exactly 128 GiB = 137.44 GB. The operator's own machine.
+    expect(poolGiBNote(137438953472)).toBe(" (128 GiB)");
+  });
+
+  it("stays silent when both conventions round to the same integer — the note would only restate", () => {
+    // 2e9 bytes: 2 GB decimal, 2 GiB rounded. Nothing to reconcile.
+    expect(poolGiBNote(2_000_000_000)).toBe("");
+  });
+
+  it("stays silent below a gigabyte, where a rounded GiB figure would be misleading", () => {
+    expect(poolGiBNote(500_000_000)).toBe("");
+  });
+
+  it("stays silent rather than guessing on an unreadable byte count", () => {
+    expect(poolGiBNote(null)).toBe("");
+    expect(poolGiBNote(undefined)).toBe("");
+    expect(poolGiBNote(Number.NaN)).toBe("");
   });
 });
