@@ -424,7 +424,10 @@
     #[tokio::test]
     async fn root_serves_viewer_html() {
         // #554: GET / serves the observability viewer (same-origin host
-        // for the viewer's /flow/:date fetches).
+        // for the viewer's /flow/:date fetches). Since the flip (#1800) that
+        // viewer is the React port; the mode-meta contract asserted here is
+        // unchanged by which document it is injected into, and BOTH apps read
+        // it — legacy in `boot()`, the port in `injectedPlaybackDate()`.
         let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -462,54 +465,49 @@
         );
     }
 
-    /// (UI port Packet 1, #1717) `GET /next` serves the committed React
-    /// build artifact, same live-mode-meta injection posture as `GET /`
-    /// (`root_serves_viewer_html` above) — additive-only: this must not
-    /// disturb `/`'s own behavior, which the OTHER tests in this module
-    /// already cover unchanged.
+    /// (the flip, #1800) `GET /next` is a PERMANENT REDIRECT to `/` — it
+    /// served the in-progress React port (#1717) until that port became `/`
+    /// itself.
+    ///
+    /// The route is kept, not deleted, and this test is why it has to stay
+    /// correct rather than merely present: the operator's phone reaches the
+    /// daemon over the tailnet at this path, and every bookmark and
+    /// home-screen shortcut minted during the port points here. A 404 for the
+    /// page that is now the default would be the most visible possible way to
+    /// get the flip wrong.
     #[tokio::test]
-    async fn next_route_serves_the_react_build_artifact() {
+    async fn next_route_permanently_redirects_to_root() {
         let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(Request::builder().uri("/next").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
-        assert_eq!(response.status(), 200);
-        let ct = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        assert!(ct.starts_with("text/html"), "content-type was `{ct}`");
-
-        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap();
-        let body = String::from_utf8(bytes.to_vec()).unwrap();
-        let lower = body.to_lowercase();
-        assert!(
-            lower.contains("<!doctype") || lower.contains("<html"),
-            "GET /next body is not HTML"
+        assert_eq!(
+            response.status(),
+            StatusCode::PERMANENT_REDIRECT,
+            "308, not 302: permanent so it caches, method-preserving so the \
+             semantics cannot quietly change"
         );
-        assert!(
-            body.contains(r#"<meta name="darkmux-mode" content="live">"#),
-            "live meta absent from GET /next body"
-        );
-        // The singlefile build inlines its JS as a <script type="module">
-        // with no external src — this is the artifact's own self-contained
-        // contract (no CDN, no separate chunk file to 404 on).
-        assert!(
-            !lower.contains("src=\"/assets/") && !lower.contains("src='./assets/"),
-            "GET /next body references an external asset — the singlefile build should have inlined it"
+        assert_eq!(
+            response.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("/"),
+            "a bare `/` target is what lets the FRAGMENT survive — RFC 7231 \
+             §7.1.2 reattaches the original request's fragment when the \
+             target carries none, so `/next#lens=runs` lands correctly \
+             without this handler ever seeing a hash (it is never sent one)"
         );
     }
 
+    /// The flip itself: `GET /` serves the React port, not the legacy viewer.
+    ///
+    /// This test previously asserted the OPPOSITE — `next_route_does_not_
+    /// disturb_the_legacy_root_route`, which guarded `/`'s legacy body while
+    /// `/next` was additive. Inverting it is the point of this change, so it
+    /// is inverted here rather than deleted: the assertion that `/` changed
+    /// hands is exactly what a future reader needs to find.
     #[tokio::test]
-    async fn next_route_does_not_disturb_the_legacy_root_route() {
-        // (#1717) Additive-only per the packet brief: adding /next must not
-        // change what / serves.
+    async fn root_serves_the_react_port_not_the_legacy_viewer() {
         let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -520,17 +518,47 @@
             .await
             .unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let lower = body.to_lowercase();
+
+        // The singlefile build inlines its JS — no external chunk to 404 on.
         assert!(
-            body.contains("id=\"stage\"") || body.contains("id='stage'"),
-            "GET / no longer looks like the legacy viewer"
+            !lower.contains("src=\"/assets/") && !lower.contains("src='./assets/"),
+            "GET / references an external asset — the singlefile build should have inlined it"
+        );
+        // A POSITIVE identification of the port, so this cannot pass merely
+        // because some unrelated body also lacks external assets. The legacy
+        // viewer is a hand-written document with no bundler banner; the port
+        // is a Vite singlefile build and carries its own root node.
+        assert!(
+            body.contains(r#"id="root""#),
+            "GET / does not look like the React port's document"
+        );
+        // And the legacy viewer's own top-level JS, which the port has no
+        // reason to contain. `id="stage"` is NOT usable for this: the port
+        // reproduces that element deliberately (the parity extractor selects
+        // it in BOTH apps), which is exactly the trap an inverted test invites.
+        assert!(
+            !body.contains("function renderFleet()"),
+            "GET / still contains the legacy viewer's renderFleet — the flip did not take"
         );
     }
 
     #[tokio::test]
     async fn play_serves_viewer_html_with_playback_meta() {
         // #624 follow-up: GET /play/<date> serves the same viewer HTML with
-        // darkmux-mode=play + darkmux-date=<date> so boot() skips the SSE
-        // tail and stays in scrubber-replay mode for the captured day.
+        // darkmux-mode=play + darkmux-date=<date> so the client skips the SSE
+        // tail and stays in replay mode for the captured day.
+        //
+        // (the flip, #1800) These two metas became LOAD-BEARING FOR ROUTING,
+        // not just for mode. `/play/<date>` puts the date in the response
+        // body and nowhere in the URL the client can route on — no hash, no
+        // query. Legacy read them at boot; the port did not, because until
+        // the flip `/play/:date` served legacy and the port was live-only. So
+        // the flip had to teach the port to read them
+        // (`lib/injectedMeta.ts`'s `injectedPlaybackDate`), or `/play/<date>`
+        // would have rendered TODAY's live fleet view under yesterday's
+        // address — silently, and in exactly the confidently-wrong way the
+        // #1800 gate spent its whole scope eliminating.
         let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
@@ -4067,13 +4095,26 @@
         }
     }
 
-    /// (#1403) Both HTML shells (the viewer and the mission-graph page) declare
-    /// the standalone-app shell — manifest link + apple-touch-icon — so a
-    /// future edit that drops the shell fails a test rather than silently
-    /// breaking the home-screen-shortcut experience.
+    /// (#1403) Every HTML shell the daemon SERVES declares the standalone-app
+    /// shell — manifest link + apple-touch-icon + the apple-mobile metas — so
+    /// a future edit that drops it fails a test rather than silently breaking
+    /// the home-screen-shortcut experience.
+    ///
+    /// (the flip, #1800) Repointed from `VIEWER_HTML` to `NEXT_HTML`, because
+    /// the served document changed hands. That repoint immediately went RED:
+    /// the port carried the manifest and the icon (#1763) but not
+    /// `apple-mobile-web-app-capable`, so an iOS home-screen shortcut would
+    /// have opened inside Safari's chrome instead of as an app. Invisible
+    /// while `/next` was a dev surface nobody had pinned; it would have
+    /// surfaced at the flip as "my home-screen darkmux suddenly has a URL
+    /// bar". Fixed in `ui/index.html`.
+    ///
+    /// The legacy file is no longer checked here because nothing serves it —
+    /// `viewer.html` survives only as `scripts/build-demo.sh`'s input until
+    /// #1801, and a static demo page has no home screen to be added to.
     #[test]
     fn html_shells_declare_standalone_app() {
-        for (name, html) in [("viewer", VIEWER_HTML), ("mission-graph", MISSION_GRAPH_HTML)] {
+        for (name, html) in [("next", NEXT_HTML), ("mission-graph", MISSION_GRAPH_HTML)] {
             assert!(
                 html.contains("rel=\"manifest\"") && html.contains("/manifest.webmanifest"),
                 "{name}.html lost its web-manifest link (#1403 standalone shell)"

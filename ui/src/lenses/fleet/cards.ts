@@ -4,23 +4,36 @@
  * `machActive()` (viewer.html:1315-1322) and `specOf()`
  * (viewer.html:1120-1125).
  *
- * This port is always "live mode" (`/next` has no playback scrubber — see
- * `savings.ts`'s module doc for the same reasoning applied to the token
- * sums), so every `liveMode?...:...` branch in the legacy source collapses
- * to its live-mode arm here: `runs` counts only sessions ∈ the live set
- * (never the whole day's history), and the label is always "running" (never
- * "specialist(s)").
+ * (#1800 P2) `liveMode` is REAL here now. It used to be assumed true, because
+ * `/next` had no historical route — so both of legacy's `liveMode?...:...`
+ * branches collapsed to their live arm. `PlaybackLens` reaches this code with
+ * a recorded day, where the live arm is wrong twice over: `runs` counted
+ * sessions against a live set that describes NOW (a replayed day reads "0
+ * running"), and the label said "running" for work that finished hours ago.
+ * Legacy's replay arm counts ALL of the day's sessions and labels them
+ * "specialist(s)" — `goldens/playback-date.txt` reads "48 specialists" where
+ * `goldens/fleet.txt` reads "0 running", from this one branch.
  */
 
-import { uidOf, sessionsOn } from "../../lib/flow";
+import { uidOf, sessionsOn, sessionRunning } from "../../lib/flow";
 import type { FlowRecord, MachineSpecs, PresenceBeat } from "../../types/handwritten";
-import { nameOf } from "../../lib/flow";
+import { nameOf, machineNames } from "../../lib/flow";
 
-/** `machActive()` — viewer.html:1315-1322. A machine is "in flight" iff one
- * of its started sessions is still running (∈ the live session set — this
- * port's live-mode-only `sessionRunning()`). */
-export function machActive(data: FlowRecord[], liveSet: Set<string>, m: string): boolean {
-  return data.some((r) => uidOf(r) === m && r.action === "dispatch.start" && liveSet.has(r.session_id ?? ""));
+/** `machActive()` — viewer.html:1342-1349. A machine is "in flight" iff one
+ * of its started sessions is still running — routed through the shared
+ * `sessionRunning()` (live = presence, replay = close-edge at the playhead)
+ * so the running-forever bug class can't be fixed at one site and linger at
+ * another. */
+export function machActive(
+  data: FlowRecord[],
+  liveSet: Set<string>,
+  m: string,
+  liveMode: boolean,
+  t: number,
+): boolean {
+  return data.some(
+    (r) => uidOf(r) === m && r.action === "dispatch.start" && sessionRunning(data, liveSet, r.session_id ?? "", liveMode, t),
+  );
 }
 
 /** `specOf()` — viewer.html:1120-1125. Returns a RAW string (JSX escapes at
@@ -40,8 +53,15 @@ export function specOf(
   // (#1008) THIS machine: prefer the live `/machine/specs` probe (cpu + RAM)
   // over a static lookup. Remote machines fall through to their presence
   // beat's specs.
-  const name = nameOf(data, liveMachines, m);
-  if (specs && name === specs.machine_id && specs.cpu_brand) {
+  // "Is this uid the machine `/machine/specs` describes?" — asked against
+  // EVERY alias the uid has used, not just the one `nameOf` returns. A
+  // machine logging as both `MacBook-Pro` and `MacBook-Pro.local` under one
+  // uid would otherwise show "hardware not reported" for its own hardware,
+  // because `nameOf` answers with whichever alias it finds first while specs
+  // reports the current one. Same identity rule as
+  // `lib/flow.ts::localMachineUid`; see `machineNames` for why one machine
+  // accumulates several names.
+  if (specs && specs.machine_id && machineNames(data, liveMachines, m).has(specs.machine_id) && specs.cpu_brand) {
     const gb = specs.ram_total_bytes ? ` · ${Math.round(specs.ram_total_bytes / 1073741824)} GB` : "";
     return specs.cpu_brand + gb;
   }
@@ -58,6 +78,10 @@ export interface FleetCard {
   absent: boolean;
   stat: string;
   runsCount: number;
+  /** `${runs} ${liveMode?'running':'specialist'+(runs===1?'':'s')}` —
+   * viewer.html:1713. The whole label, not just the noun, so the pluralization
+   * rule lives beside the count it describes. */
+  runsLabel: string;
 }
 
 /** `machPresent()`'s boolean-or-null result, narrowed to "definitely
@@ -71,10 +95,19 @@ export function buildFleetCard(
   liveSet: Set<string>,
   machAbsent: boolean,
   m: string,
+  liveMode: boolean,
+  /** The playhead. `tMax` in both modes today (`/next` has no scrubber), but
+   * named rather than assumed — `sessionRunning`'s replay arm is defined
+   * against it, and a scrubber would change only this argument. */
+  t: number,
 ): FleetCard {
-  const active = machActive(data, liveSet, m);
+  const active = machActive(data, liveSet, m, liveMode, t);
   const stat = machAbsent ? "offline" : active ? "dispatch in flight" : "idle";
-  const runsCount = sessionsOn(data, m).filter((sid) => liveSet.has(sid)).length;
+  const all = sessionsOn(data, m);
+  // (#691 Slice 2 / viewer.html:1704) Live counts only RUNNING sessions —
+  // completed dispatches from earlier today must not read as current crew.
+  // A replay counts the whole window: that IS the day's work.
+  const runsCount = liveMode ? all.filter((sid) => liveSet.has(sid)).length : all.length;
   return {
     uid: m,
     name: nameOf(data, liveMachines, m),
@@ -83,5 +116,6 @@ export function buildFleetCard(
     absent: machAbsent,
     stat,
     runsCount,
+    runsLabel: liveMode ? "running" : `specialist${runsCount === 1 ? "" : "s"}`,
   };
 }

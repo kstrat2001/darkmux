@@ -25,6 +25,13 @@ function mockFleetFetch(opts: {
   flowToday?: unknown[];
   flowYesterday?: unknown[];
   machines?: unknown[];
+  /** (#1809) This daemon's OWN `/machine/specs` — the confirmed-local
+   * signal `localMachineUid` resolves against. Omitted (the default) keeps
+   * the pre-existing 404 (no daemon has confirmed ANY card as local), so
+   * every pre-#1809 test in this file is unaffected by this field's
+   * addition. Set it to make ONE uid resolve as local — see the two
+   * locality-split tests below for why that distinction now matters. */
+  specs?: unknown;
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -50,7 +57,10 @@ function mockFleetFetch(opts: {
           new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }),
         );
       }
-      if (path === "/machine/specs") return Promise.resolve(new Response("{}", { status: 404 }));
+      if (path === "/machine/specs") {
+        if (opts.specs === undefined) return Promise.resolve(new Response("{}", { status: 404 }));
+        return Promise.resolve(new Response(JSON.stringify(opts.specs), { status: 200 }));
+      }
       return Promise.resolve(new Response("not recorded\n", { status: 404 }));
     }),
   );
@@ -128,17 +138,30 @@ describe("FleetLens", () => {
     expect(localBlock?.textContent).toBe("0");
   });
 
-  // (drill-in packet) The fleet-card click — `data-act="machine" data-arg`
-  // in legacy (`ACTIONS.machine`, `drillMachine(uid)`) — was previously a
-  // plain, non-interactive `<div>`. This is the fleet-lens half of the
-  // drill-in; `MachineLens.test.tsx` covers what the destination page does
-  // with a REMOTE uid.
-  it("clicking a machine card navigates to that machine's page via a real hash write", async () => {
+  // (drill-in packet, split by locality in #1809) The fleet-card click —
+  // `data-act="machine" data-arg` in legacy (`ACTIONS.machine`,
+  // `drillMachine(uid)`) — was previously a plain, non-interactive `<div>`,
+  // and every card drilled to the SAME destination. #1809 splits that
+  // destination by locality (see `FleetLens.tsx`'s own `machineDrillHash`
+  // doc): the LOCAL card (confirmed against this daemon's OWN
+  // `/machine/specs`) still reaches the residency room; anything this
+  // daemon can't confirm as itself — including, but not limited to, a
+  // genuinely remote machine — goes to the runs lens instead, pinned to
+  // that machine. `MachineLens.test.tsx` covers what the residency-room
+  // destination does with a REMOTE uid reached by a DIRECT deep-link
+  // (still a real, supported route — see that file's own doc); these two
+  // tests below are the LOCAL half. The REMOTE half — what a click on a
+  // card this daemon can't confirm as itself actually does — is its own
+  // test further down, the inverted case.
+  it("clicking the LOCAL machine card navigates to the residency room via a real hash write", async () => {
     const today = todayUTC();
     mockFleetFetch({
       flowToday: [
         { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
       ],
+      // This daemon's own /machine/specs identifies it AS the u1 machine —
+      // the confirmed-local signal `localMachineUid` resolves against.
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
     });
     renderFleetLens();
     // "MacBook-Pro" renders TWICE — the machine card AND the activity-
@@ -152,12 +175,13 @@ describe("FleetLens", () => {
     expect(window.location.hash).toBe("#lens=machine&uid=u1");
   });
 
-  it("Enter/Space also activates the fleet-card drill-in (keyboard parity with the click)", async () => {
+  it("Enter/Space also activates the LOCAL fleet-card drill-in (keyboard parity with the click)", async () => {
     const today = todayUTC();
     mockFleetFetch({
       flowToday: [
         { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
       ],
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
     });
     renderFleetLens();
     // "MacBook-Pro" renders TWICE — the machine card AND the activity-
@@ -168,5 +192,48 @@ describe("FleetLens", () => {
     expect(card.textContent).toContain("MacBook-Pro");
     fireEvent.keyDown(card, { key: "Enter" });
     expect(window.location.hash).toBe("#lens=machine&uid=u1");
+  });
+
+  // (#1809, merge-gate fix) The runs lens is for a machine POSITIVELY known
+  // to be remote — nothing else. An earlier cut sent every unconfirmed card
+  // there, which measured wrong on the first paint: `localUid` is null until
+  // `/machine/specs` resolves, so the LOCAL card was clickable-and-wrong for
+  // one frame (+0ms → runs, +100ms → machine). These two tests pin both
+  // sides of the corrected rule, and the second is what stops the first from
+  // being vacuous — without a confirmed-remote case, `machineDrillHash`
+  // could always return the machine hash and every other test here would
+  // still pass.
+  it("an UNCONFIRMED card goes to the residency room — the destination that admits it is guessing", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      ],
+      // No `specs` — locality unresolved, exactly the first-paint state.
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    fireEvent.click(document.querySelector(".mach")!);
+    // The room names its own limitation for a remote machine and
+    // self-corrects once specs land; the runs lens would have answered a
+    // question the operator did not ask, confidently and unlabeled.
+    expect(window.location.hash).toBe("#lens=machine&uid=u1");
+  });
+
+  it("a CONFIRMED-REMOTE card goes to the runs lens, pinned to that machine", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        { ts: `${today}T10:00:01.000Z`, machine_uid: "u2", machine_id: "studio", session_id: "s2", action: "dispatch.start", handle: "coder" },
+      ],
+      // specs names THIS daemon as MacBook-Pro, so u2 is positively remote.
+      specs: { machine_id: "MacBook-Pro" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach").length).toBe(2));
+    const studio = [...document.querySelectorAll(".mach")].find((c) => c.textContent?.includes("studio"))!;
+    fireEvent.click(studio);
+    expect(window.location.hash).toBe("#lens=runs&machine=u2");
   });
 });

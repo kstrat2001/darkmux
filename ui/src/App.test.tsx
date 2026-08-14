@@ -413,4 +413,182 @@ describe("App", () => {
     await waitFor(() => expect(window.location.hash).toBe("#lens=runs"));
     expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
   });
+
+  /**
+   * (#1800 P2, QA gate) The composed-app assertion the LENS-level test could
+   * not make. `FleetLens` gates its own presence hooks with `enabled: false`
+   * on a replay — and that was already true when the gate caught this. It was
+   * not enough: `App` held its OWN `useLiveMachines()` observer on the same
+   * query key, unconditionally, on every route. A disabled TanStack observer
+   * still reads the shared cache, so the enabled one kept the data warm and
+   * kept polling `/fleet/machines/live` behind the replay (measured: 2 polls
+   * in 9s, and a fleet card for a machine with zero records that day).
+   *
+   * The lens's own test rendered in ISOLATION, where no second observer
+   * exists, and passed throughout. So this assertion belongs HERE, at the
+   * level where the bug was reachable — not one component down.
+   */
+  it("a replay route never touches the live presence endpoints, even from App", async () => {
+    window.location.hash = "#2026-08-07";
+    const fetchSpy = vi.fn((url: string) => {
+      const path = String(url);
+      if (path === "/flow/2026-08-07") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify([
+              { ts: "2026-08-07T02:09:42.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start" },
+              { ts: "2026-08-07T18:28:15.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.complete" },
+            ]),
+            { status: 200 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response("[]", { status: 200 }));
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
+
+    const urls = fetchSpy.mock.calls.map((c) => String(c[0]));
+    // The list is EXHAUSTIVE on purpose. The first version of this assertion
+    // named only `/fleet/*`, and `/machine/specs` — a third live-only endpoint,
+    // ungated by the same oversight — sailed through it and was caught by CI
+    // instead, as a one-line golden diff ("Apple M5 Max · 128 GB" where legacy
+    // reads "hardware not reported"). An allowlist of the endpoints you
+    // remembered to name is not a gate. Legacy's own rule is the general one:
+    // `pollLiveMachines`, `pollLiveSessions` and `pollMachineSpecs` are all
+    // live-mode-only polls, and a replay starts none of them.
+    for (const live of ["/fleet/machines/live", "/fleet/sessions/live", "/machine/specs"]) {
+      expect(urls.some((u) => u.includes(live)), `a replay must not fetch ${live}`).toBe(false);
+    }
+    // …and the day WAS actually fetched, so a hook quietly requesting nothing
+    // at all cannot pass this by doing no work.
+    expect(urls).toContain("/flow/2026-08-07");
+  });
+
+  /**
+   * The replay-mode RENDER, asserted at App level for the same reason: every
+   * one of these strings comes from a `liveMode ? ... : ...` branch that the
+   * port had collapsed to its live arm. `goldens/playback-date.txt` is the
+   * byte-level spec; this is the fast guard beneath it.
+   */
+  it("a replay renders the REPLAY arm of the fleet hero, not the live one", async () => {
+    window.location.hash = "#2026-08-07";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (String(url) === "/flow/2026-08-07") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify([
+                // The flow file's leading schema header. It has no
+                // `machine_uid`, so an unshaped read renders it as a phantom
+                // "unknown" machine card and a third timeline lane.
+                { _type: "schema", darkmux_version: "2.6.0", version: "1.18.0" },
+                { ts: "2026-08-07T02:09:42.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start" },
+                { ts: "2026-08-07T09:00:00.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.complete" },
+                { ts: "2026-08-07T10:00:00.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start" },
+                { ts: "2026-08-07T18:28:15.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.complete" },
+              ]),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
+
+    // The hero eyebrow drops the window suffix — these numbers cover the
+    // recorded day, not the last 24 hours.
+    expect(screen.getByText("tokens")).toBeInTheDocument();
+    expect(screen.queryByText(/tokens · last/i)).not.toBeInTheDocument();
+
+    // The card counts the DAY's sessions and calls them specialists.
+    expect(document.querySelector(".mach .runs")?.textContent).toBe("2 specialists");
+
+    // The `_type` header contributed no machine card.
+    expect(document.querySelectorAll(".mach")).toHaveLength(1);
+
+    // The timeline spans the day and carries no window control.
+    expect(document.querySelector(".tlhdr span")?.textContent).toMatch(/^activity · /);
+    expect(document.querySelector(".twin")).toBeNull();
+    // Both of the day's sessions drew a bar. The NOW-anchored live arm would
+    // have filtered every one of them out for ending before `now - 24h`.
+    expect(document.querySelectorAll(".fleettl .lane")).toHaveLength(1);
+    expect(document.querySelectorAll(".sbar")).toHaveLength(2);
+  });
+
+  /**
+   * (#1800) The replay CHROME — topbar, crumb, meta. Legacy branches all three
+   * on live-vs-replay, and the port took the live arm on every route, so a
+   * `#<date>` page had three surfaces disagreeing about what day it showed:
+   * a stage rendering 2026-08-07 beside a status bar describing today.
+   *
+   * `goldens/playback-date.txt` is the byte-level spec and the parity suite
+   * enforces all four regions against a real browser; this is the fast guard
+   * beneath it, and the one that names WHICH surface broke when it breaks.
+   */
+  it("a replay's chrome describes the REPLAYED day, not today", async () => {
+    window.location.hash = "#2026-08-07";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (String(url) === "/flow/2026-08-07") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify([
+                { _type: "schema", darkmux_version: "2.6.0" },
+                { ts: "2026-08-07T02:09:42.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "review-1", session_id: "s1", action: "dispatch.start" },
+                { ts: "2026-08-07T18:28:15.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "review-2", session_id: "s1", action: "dispatch.complete" },
+              ]),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
+
+    // topbar: the source chip names the day, and the mode badge says what
+    // mode this is. Both were absent/wrong — the chip showed a bare date and
+    // no mode badge rendered at all on a replay.
+    expect(document.querySelector(".catalog-toggle")?.textContent).toContain("FLOW · 2026-08-07");
+    expect(document.getElementById("modebadge")?.textContent).toBe("▣ playback");
+
+    // crumb: `◆ <primaryMission()>`. Non-empty precisely BECAUSE a replay is
+    // not presence-scoped — the live arm filters to missions with a running
+    // session and finds none, which is why goldens/fleet.txt's crumb is empty.
+    expect(document.getElementById("crumb")?.textContent).toBe("◆ review-1");
+
+    // meta: the replay census, from the day's own records. Two lines, and the
+    // schema header counts as neither a record nor a machine.
+    const meta = document.getElementById("meta")?.textContent ?? "";
+    expect(meta).toContain("◆ review-1, review-2");
+    expect(meta).toContain("flow · 2026-08-07");
+    expect(meta).toContain("2 records · 1 machines");
+    // The live arm's headline must NOT appear — it is what used to render here.
+    expect(meta).not.toContain("last dispatch");
+  });
 });

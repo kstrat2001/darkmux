@@ -120,26 +120,44 @@ fn is_valid_date(date: &str) -> Option<&str> {
     }
 }
 
-/// Embedded HTML for the observability viewer. Shared between the live
-/// route (`GET /`) and the playback route (`GET /play/:date`); each handler
-/// injects a `<meta name="darkmux-mode">` tag the viewer's boot() reads to
-/// decide whether to start the SSE tail (live) or skip it (playback).
-///
-/// Lives at `crates/darkmux-serve/assets/viewer.html` (not under `docs/`)
-/// specifically so GitHub Pages doesn't also serve it at `darkmux.com/viewer/`.
-/// `darkmux.com` is reserved for the demo (`/demo`) + marketing surface; the
-/// live and playback viewers only exist where there's a daemon to talk to
-/// (operator's localhost or tailnet). See #624.
-const VIEWER_HTML: &str = include_str!("../assets/viewer.html");
+// Embedded HTML for the observability viewer. Shared between the live
+// route (`GET /`) and the playback route (`GET /play/:date`); each handler
+// injects a `<meta name="darkmux-mode">` tag the viewer's boot() reads to
+// decide whether to start the SSE tail (live) or skip it (playback).
+//
+// Lives at `crates/darkmux-serve/assets/viewer.html` (not under `docs/`)
+// specifically so GitHub Pages doesn't also serve it at `darkmux.com/viewer/`.
+// `darkmux.com` is reserved for the demo (`/demo`) + marketing surface; the
+// live and playback viewers only exist where there's a daemon to talk to
+// (operator's localhost or tailnet). See #624.
+//
+// **(the flip, #1800) NOTHING SERVES THIS ANYMORE.** `/` and `/play/:date`
+// both serve `NEXT_HTML` below; the constant that used to hold this file is
+// gone, because the compiler correctly called it dead the moment the last
+// handler stopped reading it.
+//
+// The FILE stays, for two live consumers that read it directly rather than
+// through a constant:
+//
+//  - `scripts/build-demo.sh` generates `docs/demo/index.html` from it, and
+//    CI's docs-drift guard checks the result. Deleting the file before the
+//    demo derives from the port instead (#1801) would break darkmux.com/demo.
+//  - `lib_tests.rs`'s XSS/escaping gates `include_str!` it themselves, so
+//    they keep guarding it for as long as the demo ships it.
+//
+// Delete the file, those tests, and this comment together once #1801 lands.
 
 /// (UI port Packet 1, #1717) The committed React + TanStack Query build
 /// artifact — a SINGLE self-contained HTML file (inlined JS/CSS, no separate
 /// chunks; see `ui/vite.config.ts`'s `vite-plugin-singlefile` config) built
 /// from `ui/` by `bun run build` and committed here so the release binary
 /// stays self-contained and node-free, same posture as `VIEWER_HTML` above.
-/// Served at `GET /next` — a SEPARATE route from `GET /`, additive-only: the
-/// legacy viewer keeps serving `/` until the last lens moves (see
-/// `ui/README.md`'s port-status note and the plan's Rule 2). Regenerate:
+/// **Serves `GET /` and `GET /play/:date`** as of the flip (#1800) — this IS
+/// the viewer now. `/next` remains as a permanent redirect to `/` so the
+/// bookmarks minted during the port keep working (see `next_html`). The gate
+/// for the flip was a number, not a judgement: 21 of 22 recorded legacy
+/// goldens asserting real byte parity, with the 22nd (`mission-replay`)
+/// blocked on a missing corpus fixture rather than on the port. Regenerate:
 /// `cd ui && bun run build` (writes `assets/next.html` directly; see that
 /// package's `copy-artifact` script).
 const NEXT_HTML: &str = include_str!("../assets/next.html");
@@ -224,18 +242,29 @@ fn inject_mode_meta(html: &str, mode: &str, date: Option<&str>) -> String {
 /// file (`docs/demo/demo-flow.jsonl`) — identical to a local `/play`, not a
 /// separate fork.
 async fn root_html(headers: axum::http::HeaderMap) -> impl IntoResponse {
-    html_response(&headers, inject_mode_meta(VIEWER_HTML, "live", None))
+    html_response(&headers, inject_mode_meta(NEXT_HTML, "live", None))
 }
 
-/// Serve the NEXT (in-progress React port) viewer at `GET /next` (UI port
-/// Packet 1, #1717). Same mode-meta injection + ETag/cache posture as
-/// `root_html` — `inject_mode_meta` is generic over the HTML body, so reusing
-/// it here cost nothing (the brief's "IF cheap to reuse" — it was). Live-mode
-/// only for now: the React shell doesn't have a playback route yet (that's a
-/// lens-packet concern once `/play/:date` grows a `/next` counterpart), so
-/// this always injects `mode="live"`, matching `/`'s own default arm.
-async fn next_html(headers: axum::http::HeaderMap) -> impl IntoResponse {
-    html_response(&headers, inject_mode_meta(NEXT_HTML, "live", None))
+/// `GET /next` — a permanent REDIRECT to `/` since the flip (#1800).
+///
+/// It served the in-progress React port from Packet 1 (#1717) until that port
+/// became `/` itself. Kept rather than removed, and kept deliberately: the
+/// operator's phone dashboard reaches the daemon through
+/// `tailscale serve --bg --http=80 8765`, and every bookmark, home-screen
+/// shortcut and shared link minted during the port's development points here.
+/// Deleting the route would 404 all of them for a page that not only still
+/// exists but is now the default.
+///
+/// **308, not 302** — permanent, so a browser can cache it, and
+/// method-preserving (302 is defined to allow a method rewrite; this route is
+/// GET-only today, but a redirect that quietly changes semantics is the kind
+/// of thing nobody re-reads later). The FRAGMENT survives on its own: a
+/// redirect target carrying no fragment inherits the original request's, per
+/// RFC 7231 §7.1.2, so `/next#lens=runs&kind=lab` lands on `/#lens=runs&kind=lab`
+/// without this route needing to see a hash it is never sent in the first
+/// place.
+async fn next_html() -> impl IntoResponse {
+    axum::response::Redirect::permanent("/")
 }
 
 /// Strong validator for an HTML document, so a browser can revalidate
@@ -306,7 +335,7 @@ fn html_response(headers: &axum::http::HeaderMap, body: String) -> Response {
 /// Returns 404 for malformed dates. The viewer expects UTC `YYYY-MM-DD`.
 async fn play_html(Path(date): Path<String>, headers: axum::http::HeaderMap) -> impl IntoResponse {
     match is_valid_date(&date) {
-        Some(valid) => html_response(&headers, inject_mode_meta(VIEWER_HTML, "play", Some(valid))),
+        Some(valid) => html_response(&headers, inject_mode_meta(NEXT_HTML, "play", Some(valid))),
         None => (
             StatusCode::NOT_FOUND,
             [("content-type", "text/plain; charset=utf-8")],

@@ -9,8 +9,9 @@
  *
  * Precedence when the hash carries multiple intents (same order `boot()`
  * checks them in): `lens=runs`/`lens=lab` > `lens=machine` > `lens=console` >
- * `mission=`/`session=` > a bare `#<date>` (or `?date=`) playback pin >
- * default fleet. A `lens` value this build doesn't recognize (not
+ * `mission=`/`session=` > a static-build's `darkmux-flow-src` meta (#1801 —
+ * see below) > a bare `#<date>` (or `?date=`) playback pin > default fleet.
+ * A `lens` value this build doesn't recognize (not
  * `runs`/`lab`/`machine`/`console`, and no bare `mission=`/`session=`/date
  * present either) falls through to `unknown` — a visible "lens not ported
  * yet" placeholder naming the raw hash, never a blank page (the overnight
@@ -26,6 +27,9 @@
  * `lenses/catalog/PlaybackLens.tsx` for what it renders (not the full
  * historical-playback view yet, a follow-up; see that file's doc).
  */
+
+import { injectedPlaybackDate } from "./injectedMeta";
+import { isStaticBuild } from "./staticSource";
 
 export const RUNS_KINDS = ["all", "mission", "dispatch", "lab"] as const;
 export type RunsKind = (typeof RUNS_KINDS)[number];
@@ -51,7 +55,25 @@ export type PanelId = (typeof PANEL_IDS)[number];
 
 export type Route =
   | { kind: "fleet" }
-  | { kind: "runs"; runsKind: RunsKind; run: string | null }
+  /** `machine` — added for #1809 (finishing #1508 step 4): pins the runs
+   * lens to ONE machine, composable with `runsKind`/`run` (independent
+   * params on the same hash — a pinned kind filter, or a pinned lab-run
+   * drill-in, are both real reachable states). `null` is "every machine",
+   * the pre-existing behavior — every hash this port already emits
+   * (`#lens=runs`, `#lens=runs&kind=lab`, …) still parses to `machine:
+   * null` and renders identically to before this field existed.
+   *
+   * An open string, same precedent as `machine.uid` below and
+   * `session.sessionId` further down — machine uids are arbitrary
+   * hardware-derived identifiers with no closed set to validate against
+   * here (an unresolvable pin degrades gracefully: `RunsBoard` just shows
+   * zero rows for a uid nothing is filed under, same posture `MachineLens`
+   * already takes for a stale `machine.uid`). This is the runs-lens half of
+   * `MachineLens`'s `RUNS ON <MACHINE>` list moving out into a real lens —
+   * see `MachineLens.tsx`'s own doc and #1508 step 2's commit message
+   * (`d2041ae3`), which named this the deliberately-interim piece step 4
+   * was always going to replace. */
+  | { kind: "runs"; runsKind: RunsKind; run: string | null; machine: string | null }
   /** `uid` — widened this packet (the drill-in packet) to carry a SPECIFIC
    * machine uid: `null` for the nav-tab/deep-link entry (`goMachine` in
    * legacy — always "the local machine"), a real uid for a fleet-card
@@ -92,8 +114,20 @@ export type Route =
    * OTHER date, forcing the playback fetch branch instead of the live
    * window — a genuinely different render, not just a different label on
    * the same one. See `route.ts`'s own module doc for the precedence this
-   * sits at (lowest, below every `lens=`/`mission=`/`session=` form). */
-  | { kind: "playback"; date: string }
+   * sits at (lowest, below every `lens=`/`mission=`/`session=` form).
+   *
+   * (#1801) `date` is `string | null` — `null` ONLY when `isStaticBuild()`
+   * forced this route (see below): a static demo build has no server-
+   * assigned date the way `/play/<date>`'s injected meta does, and no daemon
+   * to ask `/flow/<date>` for one either. Legacy's own flowSrc branch has the
+   * identical gap — `let date=injectedDate||targetDate()` defaults to today,
+   * then gets overwritten by `RAW[0].ts` ONLY once the file has actually
+   * loaded (viewer.html:3902) — so the real date is knowable only after a
+   * fetch this synchronous parser can't perform. `null` names that honestly;
+   * a consumer that needs a display date derives one from the loaded records
+   * via `lib/flow.ts::firstRecordDate`, the same derivation legacy performs,
+   * once they exist (see `App.tsx`'s `displayRoute`). */
+  | { kind: "playback"; date: string | null }
   | { kind: "unknown"; hash: string };
 
 /** (Packet 5) Should the live tail (`hooks/useLiveTail.ts` — SSE + reconcile
@@ -107,6 +141,20 @@ export type Route =
  * no separate playback data pipeline for yet (see `PlaybackLens`'s own
  * module doc). */
 export function isLiveRoute(route: Route): boolean {
+  // (#1801) A daemon-less build is NEVER live, on any lens. Legacy's gate is
+  // GLOBAL — `wantsPlayback = injectedMode==="play" || !!flowSrc || !!cq`
+  // (viewer.html:3880) — and `startLiveTail(date); startLivePoll();` runs only
+  // under `if(mode==="live")` (viewer.html:3956), so a static build never
+  // opens an SSE stream or a presence poll no matter which lens is showing.
+  //
+  // This gate was keyed on route KIND alone, and `parseRoute` resolves `lens=`
+  // BEFORE the static-build branch — so `#lens=runs` on the demo parsed to
+  // `{kind:"runs"}` and every live consumer opened. Measured on the served
+  // demo: an EventSource to `/flow/<today>/stream`, `/fleet/machines/live`
+  // polled every 5s indefinitely, and the mode badge reading `◌ RECONNECTING`
+  // — a page asserting there is something to reconnect TO, on a marketing
+  // site with no daemon anywhere near it.
+  if (isStaticBuild()) return false;
   return route.kind !== "playback" && route.kind !== "session" && route.kind !== "mission-redirect";
 }
 
@@ -169,7 +217,8 @@ export function parseRoute(): Route {
       ? (rawKind as RunsKind)
       : "all";
     const run = search.has("run") ? search.get("run") : hash.has("run") ? hash.get("run") : null;
-    return { kind: "runs", runsKind, run: run === null ? null : run.trim() };
+    const machine = get("machine");
+    return { kind: "runs", runsKind, run: run === null ? null : run.trim(), machine: machine ? machine : null };
   }
 
   if (lens === "machine") {
@@ -200,6 +249,27 @@ export function parseRoute(): Route {
     // silently falling back to fleet, which would hide a broken bookmark.
     return { kind: "unknown", hash: raw };
   }
+
+  // (#1801) `darkmux-flow-src` (the static demo's committed .jsonl) forces
+  // playback UNCONDITIONALLY — checked here, above even an explicit bare
+  // `#<date>` hash, because it mirrors legacy's own precedence exactly:
+  // `wantsPlayback = injectedMode==="play" || !!flowSrc || !!cq`
+  // (viewer.html:3880) forces the playback branch regardless of what `date`
+  // holds, and the flowSrc RECORD-LOADING branch itself (3897-3906) reads
+  // the committed file unconditionally too — a hash like `#2026-08-01` on a
+  // static build has no daemon behind it to serve THAT day, so legacy
+  // renders the one file it has and lets the file's own first record
+  // relabel the date (`firstRecordDate`, `lib/flow.ts`), never treats the
+  // hash as a request for a day that doesn't exist. Only `lens=`/`mission=`/
+  // `session=` (already checked above) can still preempt this — matching
+  // this port's existing precedence order (see this file's own module doc);
+  // legacy's stricter `cq` suppression of mission/session under flowSrc
+  // (`(flowSrc||lq||mq||nq!=null) ? null : catalogQuery()`) is NOT ported —
+  // narrower scope, named here rather than silently dropped.
+  if (isStaticBuild()) {
+    return { kind: "playback", date: null };
+  }
+
   if (!raw) {
     // (Packet 4) `?date=<date>` — the query-string form of the same
     // `targetDate()` fallback the bare hash below reads, checked here only
@@ -209,6 +279,25 @@ export function parseRoute(): Route {
     const qDate = search.get("date");
     if (qDate && DATE_RE.test(qDate)) {
       return { kind: "playback", date: qDate };
+    }
+    // (the flip) `GET /play/<date>` carries its date in an INJECTED META TAG,
+    // not in the URL the client can read as a route: the server responds to
+    // the path with `inject_mode_meta(html, "play", Some(date))`, and the
+    // browser's `location` shows `/play/2026-08-07` with no hash and no query.
+    // Legacy reads those metas at boot (`injectedMode`/`injectedDate`,
+    // viewer.html:3836+) — this port read only version/schema, so before the
+    // flip it had no way to know and no reason to: `/play/:date` served
+    // LEGACY, and `/next` was live-only by construction.
+    //
+    // That stops being true the moment `/play/:date` serves this app. Without
+    // this branch the flip would render the LIVE fleet view at a playback URL
+    // — today's numbers under yesterday's address, silently, which is the
+    // exact failure class the whole #1800 P2 gate was about. Checked LAST so
+    // an explicit hash or `?date=` still wins; a page served in live mode
+    // injects no date at all and falls through unchanged.
+    const injected = injectedPlaybackDate();
+    if (injected) {
+      return { kind: "playback", date: injected };
     }
     return { kind: "fleet" };
   }

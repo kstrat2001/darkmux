@@ -213,7 +213,13 @@ function CatalogContent({
   return (
     <>
       <div className="cathdr">playback catalog</div>
-      <button type="button" className="catrow live" onClick={onLive}>
+      {/* `data-act`/`data-arg` on every row below — viewer.html:3122/3130/3142
+          (`data-act="golive"`/`"goday"`/`"gomission"`) — carry no behavior
+          here (each row's own `onClick` above does the navigating, not a
+          delegated listener reading these attrs off the click target), same
+          restored-inspection-hook contract as the fleet card's `data-act`
+          (see that component's own doc). */}
+      <button type="button" className="catrow live" data-act="golive" onClick={onLive}>
         <div className="cd">● live · today</div>
         <div className="cs">now-ish on present machines</div>
       </button>
@@ -221,7 +227,14 @@ function CatalogContent({
         <>
           <div className="cathdr">{missionsHeader(missions.length, CATALOG_MISSION_CAP)}</div>
           {missions.slice(0, CATALOG_MISSION_CAP).map((m) => (
-            <button type="button" className="catrow" key={m.mission_id} onClick={() => onMission(m.mission_id)}>
+            <button
+              type="button"
+              className="catrow"
+              data-act="gomission"
+              data-arg={m.mission_id}
+              key={m.mission_id}
+              onClick={() => onMission(m.mission_id)}
+            >
               <div className="cd">▣ {m.mission_id}</div>
               <div className="cs">{missionSummary(m)}</div>
             </button>
@@ -232,7 +245,14 @@ function CatalogContent({
         <>
           <div className="cathdr">days</div>
           {days.map((d) => (
-            <button type="button" className="catrow" key={d.date} onClick={() => onDay(d.date)}>
+            <button
+              type="button"
+              className="catrow"
+              data-act="goday"
+              data-arg={d.date}
+              key={d.date}
+              onClick={() => onDay(d.date)}
+            >
               <div className="cd">
                 {d.date}
                 {d.date === today ? " · today" : ""}

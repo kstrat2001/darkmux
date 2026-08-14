@@ -32,6 +32,15 @@ export function clkhm(t: number): string {
   return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
+/** `lday()` — viewer.html:992. Local DATE, no time. Ported with #1800's
+ * replay meta line, the only surface that names a calendar day: a live view
+ * says "today" in the badge, a replay states the actual date its records
+ * came from. Same locale-dependence as `clk` above — the harness pins the
+ * timezone for both sides. */
+export function lday(t: number): string {
+  return new Date(t).toLocaleDateString();
+}
+
 /** `sameDay()` — viewer.html:982. */
 function sameDay(a: number, b: number): boolean {
   return new Date(a).toDateString() === new Date(b).toDateString();
@@ -99,7 +108,26 @@ export function ramGiB(bytes: number | null | undefined): number | null {
 }
 
 /** `memStateCls()` — viewer.html:4866. Only green/amber/red pass through;
- * anything else (missing, unrecognized) normalizes to "unknown". */
+ * anything else (missing, unrecognized) normalizes to "unknown". Ported
+ * ahead of its first consumer; #1806 Stage 1 (then Stage 2/3's
+ * `MachineHealthRegion.tsx`, `machineGauge.ts`) is that consumer — see this
+ * module's own doc for why the mapping normalizes a hostile/unrecognized
+ * state string rather than passing it through into a class attribute. */
 export function memStateCls(s: string | null | undefined): "green" | "amber" | "red" | "unknown" {
   return s === "green" || s === "amber" || s === "red" ? s : "unknown";
+}
+
+/** `memPct()` — viewer.html:4939-4940. Clamped 0-100 percent of `part`
+ * against `scale`. Its one caller is `machineGauge.ts`'s
+ * `computeGaugeGeometry` — the model ROWS inline their own clamp rather
+ * than routing through here, so do not read this as their shared helper.
+ * `part == null`
+ * (the unpriced-model case — no committed extent to draw at all, see that
+ * component's own doc) returns 0 rather than NaN; callers
+ * still gate on `part != null` before rendering the layer at all, so this
+ * value is never actually used for that case — it exists so the function is
+ * total and never hands a caller `NaN%`. */
+export function memPct(part: number | null | undefined, scale: number): number {
+  if (part == null || !scale) return 0;
+  return Math.max(0, Math.min(100, (Number(part) / scale) * 100));
 }

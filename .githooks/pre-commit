@@ -23,20 +23,32 @@
 #     git commit --no-verify
 set -euo pipefail
 
-VIEWER="crates/darkmux-serve/assets/viewer.html"
 DEMO="docs/demo/index.html"
 GEN="scripts/build-demo.sh"
 
-# Nothing to do unless the viewer is part of THIS commit. Keeps the hook free
-# for the overwhelming majority of commits (Rust changes, docs, configs).
-if ! git diff --cached --name-only | grep -qx "$VIEWER"; then
+if [ ! -x "$GEN" ] && [ ! -f "$GEN" ]; then
+  # Can't ask which viewer is the source, so can't know whether this commit
+  # needed a regeneration. Stay out of the way; CI's drift guard still catches it.
   exit 0
 fi
 
-if [ ! -x "$GEN" ] && [ ! -f "$GEN" ]; then
-  echo "pre-commit: $VIEWER is staged but $GEN is missing — cannot regenerate the demo." >&2
-  echo "            Commit with --no-verify only if you are certain the demo is correct." >&2
-  exit 1
+# ASK the generator which file the demo is built from rather than naming one
+# here. This hook used to hardcode `assets/viewer.html`, and the route flip
+# (#1800) moved the demo's source to the React bundle — after which the hook
+# would have sat silently inert on every UI commit, which is the same
+# "two places encode which viewer is real" drift the generator itself was
+# fixed for (#1801). A name that must be kept in sync is a name that won't be.
+VIEWER=$(bash "$GEN" --print-source 2>/dev/null || true)
+if [ -z "$VIEWER" ]; then
+  echo "pre-commit: $GEN could not name the demo's source viewer — skipping the demo check." >&2
+  echo "            CI's docs-drift guard still enforces it." >&2
+  exit 0
+fi
+
+# Nothing to do unless that viewer is part of THIS commit. Keeps the hook free
+# for the overwhelming majority of commits (Rust changes, docs, configs).
+if ! git diff --cached --name-only | grep -qx "$VIEWER"; then
+  exit 0
 fi
 
 # CORRECTNESS EDGE CASE, worth the extra check: the generator reads the

@@ -97,3 +97,54 @@ export function runsFiltered(runs: Run[], kind: string): Run[] {
 export function labCounts(run: LabRun): string {
   return `bundles ${run.bundles} · flags ${run.raw_flags}→${run.deduped_flags} · confirmed ${run.confirmed} · needs_check ${run.needs_check} · archived ${run.archived}`;
 }
+
+/**
+ * (#1809, #1508 step 4) Filter a runs list down to ONE pinned machine — the
+ * runs-lens half of the machine dimension legacy never had. Unlike every
+ * other export in this file (see the module doc's opening paragraph), this
+ * one has no `viewer.html` namesake; it is new.
+ *
+ * `Run.machine` (`crates/darkmux-serve/src/runs.rs::build_runs`) is a
+ * `machine_id` NAME, not a uid — and one machine can carry SEVERAL names
+ * over its lifetime (a laptop logging as both `MacBook-Pro` and
+ * `MacBook-Pro.local` — see `lib/flow.ts::machineNames`'s own doc for why).
+ * Matching the route's pinned uid against `Run.machine` by resolving ONE
+ * label (`nameOf`) and comparing strings would silently drop every row
+ * filed under an older alias: measured against the live daemon's real
+ * `/runs` (380 rows), that approach returned ZERO rows for the very machine
+ * the page was pinned to, because every row said `MacBook-Pro` while
+ * `nameOf` resolved the uid to `MacBook-Pro.local`. `names` must be the
+ * FULL alias set (`machineNames(...)`), never a single resolved label.
+ *
+ * A run with NO `machine` at all is excluded from every pin. That set is
+ * missions and dispatches only — every lab run carries a machine, because
+ * `lab_summary_to_run` takes the daemon's own `machine_id` directly instead
+ * of deriving it — and every one of them is `tracked: true`, so this is not
+ * ghost noise. The mechanism, rather than a count that rots: `/runs`
+ * resolves a mission's machine from the WINDOWED flow session index
+ * (`RUNS_FLOW_SCAN_WINDOW_DAYS`, 14 days), and the durable `mission.json`
+ * has no machine field to fall back on, so any tracked run older than that
+ * window loses its attribution even though the flow records are still on
+ * disk. Filed as #1810.
+ *
+ * Excluding them is the honest call — claiming an unattributed row as "this
+ * machine" would be the worse lie — but it is worth naming so nobody
+ * re-derives "where did the missing rows go" from scratch. It is a
+ * meaningful fraction: at the time of writing, 82 of 380.
+ *
+ * KNOWN LIMIT, not a defect of this function: `Run` carries no
+ * `machine_uid`, only the name, so two uids that have EVER logged the same
+ * `machine_id` are indistinguishable here — two Macs on Apple's default
+ * hostname, or a rename that hands a name from one host to another. Both
+ * alias sets would contain the shared name and both pins would return the
+ * union, under a chip naming one of them. Disjoint on any fleet where
+ * machine names are distinct (verified on the operator's: `{MacBook-Pro,
+ * MacBook-Pro.local}` vs `{m1-max-32gb-studio}`). The real fix is a
+ * `machine_uid` on `Run`, an #1810 sibling — this is the first surface that
+ * claims per-machine scoping over name-keyed data, so the collision is
+ * named here rather than discovered later.
+ */
+export function runsForMachine(runs: Run[], names: Set<string>): Run[] {
+  if (names.size === 0) return [];
+  return runs.filter((r) => r.machine != null && names.has(r.machine));
+}

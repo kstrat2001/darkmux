@@ -5,7 +5,8 @@ import { queryKeys } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useFleetCoverage, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS } from "../../lib/flow";
+import { localMachineUid, machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS } from "../../lib/flow";
+import type { FlowRecord } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { tokensOffMeter } from "./savings";
@@ -20,6 +21,35 @@ import type { MachineSpecs } from "../../types/handwritten";
  * machines render with no icon until /machine/specs/<id> wiring lands"). No
  * text content — contributes nothing to the parity extractor's `innerText`,
  * same as legacy's inline SVG. */
+/** (#1809) A fleet-card click's destination. The runs lens is taken ONLY for
+ * a machine positively known to be remote; local and not-yet-known both go
+ * to the residency room.
+ *
+ * The obvious rule — "local goes to the room, everything else goes to runs"
+ * — is wrong in a way that only shows up in the first paint, and it was
+ * measured doing exactly that: `localUid` is null until `/machine/specs`
+ * resolves, so the LOCAL card was clickable-and-wrong for one frame
+ * (`+0ms → lens=runs`, `+100ms → lens=machine`). On loopback that is a
+ * blink; over the tailnet phone path it scales with round-trip time, and
+ * the wrong destination is SILENT — you land on a populated, plausible runs
+ * list rather than anything that says it guessed. `specs` is also gated on
+ * `liveMode`, so on a playback route locality never resolves at all and the
+ * old rule sent every card, local included, to the runs lens permanently.
+ *
+ * Inverting the unknown case fixes both, because the two failure modes are
+ * not symmetric. A remote machine that lands in the residency room gets an
+ * honest dead end — "residency / RAM not reported from here, local-probe
+ * only" — which names its own limitation and self-corrects the moment specs
+ * confirm locality. A local machine that lands in the runs lens gets a
+ * confident, wrong, and unlabeled answer to a question it did not ask. When
+ * a guess is unavoidable, guess toward the destination that admits it is
+ * guessing. */
+function machineDrillHash(uid: string, localUid: string | null): string {
+  const knownRemote = localUid != null && uid !== localUid;
+  if (knownRemote) return `lens=runs&machine=${encodeURIComponent(uid)}`;
+  return `lens=machine&uid=${encodeURIComponent(uid)}`;
+}
+
 /** `sc()` — viewer.html:1633. One token-class chip (value over label). */
 function Chip({ value, label, cls }: { value: string | number; label: string; cls?: string }) {
   return (
@@ -44,15 +74,29 @@ function Chip({ value, label, cls }: { value: string | number; label: string; cl
  * `savings.ts`'s module doc for why that exclusion is load-bearing, not
  * incidental.
  */
-function SavingsHero({ tokens: t, note }: { tokens: ReturnType<typeof tokensOffMeter>; note: ReturnType<typeof hybridNote> }) {
+function SavingsHero({
+  tokens: t,
+  note,
+  liveMode,
+}: {
+  tokens: ReturnType<typeof tokensOffMeter>;
+  note: ReturnType<typeof hybridNote>;
+  liveMode: boolean;
+}) {
   const hours = Math.round(LIVE_WINDOW_MS / 3600000);
   return (
     <div className="savings">
       {/* (operator) "tokens · last 24h" rather than "by your fleet · last 24h",
           to match the event pane's "events last 24h". Two panels counting two
           things over the same window should say so the same way; "by your
-          fleet" named the SOURCE where its neighbour named the SUBJECT. */}
-      <div className="saveyebrow">tokens · last {hours}h</div>
+          fleet" named the SOURCE where its neighbour named the SUBJECT.
+
+          The window suffix is LIVE-ONLY — `const win=...live-mode...?` last
+          ${h}h`:''` (viewer.html:1660). A replay's numbers cover the recorded
+          day, not the last 24 hours, and the meta bar already states that
+          day's range. (#1800 P2: the suffix was unconditional, so a replayed
+          day claimed a window it had not been measured over.) */}
+      <div className="saveyebrow">tokens{liveMode ? ` · last ${hours}h` : ""}</div>
       <div className="savrow">
         <div className="savlead">
           <div className="savnum">{fmtN(t.local)}</div>
@@ -122,8 +166,9 @@ function SavingsHero({ tokens: t, note }: { tokens: ReturnType<typeof tokensOffM
  * when this lens replaced it — a regression no test caught, because
  * FleetStrip's own tests kept passing while it stopped being mounted.
  */
-function FleetCoverageNotice() {
-  const coverage = useFleetCoverage();
+function FleetCoverageNotice({ historical = false }: { historical?: boolean }) {
+  // A replay has no live coverage to report — see useFleetCoverage's note.
+  const coverage = useFleetCoverage(!historical);
   const fleet = coverage?.sources?.fleet;
   if (!fleet || fleet.state === "ok" || fleet.state === "off") return null;
   const stale = fleet.state === "stale";
@@ -139,72 +184,185 @@ function FleetCoverageNotice() {
   );
 }
 
-export function FleetLens() {
+/** (#1800 P2) `records`/`tMax`/`tMin` OPTIONAL so playback can render this
+ * same hero over a historical day. Omitted = the live rolling window, exactly
+ * as before, so every existing caller is unchanged.
+ *
+ * `historical` is legacy's `liveMode`, inverted — and it is NOT merely a
+ * presence switch. Legacy branches on it in FOUR places inside `renderFleet()`
+ * + `savingsHero()`, and the port had collapsed all four to their live arm
+ * because `/next` had no route that reached the other one:
+ *
+ * | surface | live | replay |
+ * |---|---|---|
+ * | hero eyebrow | `tokens · last 24h` | `tokens` |
+ * | card count | running sessions, "N running" | the day's sessions, "N specialists" |
+ * | timeline span | `max(tMax, now) - window` | `tMin..tMax` |
+ * | window control | 10m/1h/4h/24h | absent |
+ *
+ * Presence is the fifth: `liveMachines`/`liveSessionIds` are LIVE endpoints
+ * describing NOW, so a replay must neither fetch nor consult them. Asserting
+ * today's presence over a past day is exactly the "confidently WRONG:
+ * machines read idle, running work reads zero" failure this file's own
+ * coverage notice exists to warn about. */
+export function FleetLens({
+  records,
+  tMax,
+  tMin,
+  historical = false,
+}: {
+  records?: FlowRecord[];
+  tMax?: number;
+  tMin?: number;
+  historical?: boolean;
+} = {}) {
   const nowMs = Date.now();
+  const liveMode = !historical;
   const [windowMinutes, setWindowMinutes] = useState(DEFAULT_ACTIVITY_WINDOW_MIN);
 
-  const flowWindow = useFlowWindow(nowMs);
-  const liveMachines = useLiveMachines();
-  const liveSessionIds = useLiveSessionIds();
+  const liveWindow = useFlowWindow(nowMs);
+  const flowWindow = records !== undefined
+    ? { data: records, tMax: tMax ?? 0, settled: true }
+    : liveWindow;
+  // `enabled: false` stops the REQUEST, not just the result: an earlier draft
+  // discarded the data while the hook kept polling `/fleet/machines/live`
+  // every few seconds behind a replay.
+  //
+  // It is NOT sufficient on its own, and the QA gate proved it: a disabled
+  // TanStack observer still READS the shared cache slot, so as long as ANY
+  // enabled observer of the same key exists anywhere in the tree, this one
+  // keeps returning live beats and the poll never stops. `App.tsx` held
+  // exactly such an observer. Gating the fetch AND the consumer is what makes
+  // the property true in the composed app rather than only in this lens's own
+  // isolated test.
+  const liveMachines = useLiveMachines(liveMode);
+  const liveSessionIds = useLiveSessionIds(liveMode);
+  // `/machine/specs` is the THIRD live-only endpoint on this screen, and the
+  // one that got away in the first pass. It describes the hardware of the
+  // machine serving the page RIGHT NOW — `pollMachineSpecs` is the live-only
+  // 5s poll, and legacy states outright that "playback mode never starts that
+  // poll" (viewer.html:2696), leaving `MACHINE_SPECS` null so `specOf` returns
+  // "" and the card reads "hardware not reported". Rendering today's CPU and
+  // RAM against a replayed day is the same confidently-wrong claim as
+  // rendering today's presence.
+  //
+  // It also made the parity test genuinely FLAKY rather than merely wrong:
+  // whether the specs response landed before the assertion was a race, so a
+  // local run passed and CI failed on the identical commit. Gating it removes
+  // the race at its source — the request never happens — instead of waiting
+  // harder for a value that should not be read.
   const specsQuery = useQuery({
+    enabled: liveMode,
     queryKey: queryKeys.machineSpecs(),
     queryFn: () => fetchJson<MachineSpecs>("/machine/specs"),
   });
-  const specs = specsQuery.data?.ok ? specsQuery.data.data : null;
+  const specs = liveMode && specsQuery.data?.ok ? specsQuery.data.data : null;
+
+  // (#1809) Which uid IS this daemon — the SAME derivation `App.tsx`/
+  // `MachineLens.tsx` already do off their own copies of `flowWindow`/
+  // `liveMachines`/`specs`, used here for exactly one decision: where a
+  // fleet-card CLICK routes to (see the card below). `null` on a replay
+  // (`specs` is gated off — `localMachineUid(..., null)` returns `null`
+  // unconditionally) and on any daemon-less static build (no
+  // `/machine/specs` to confirm against) — every card reads as "not
+  // confirmed local" in both cases, which is the honest answer: neither has
+  // a live residency probe to claim local identity against.
+  const localUid = useMemo(
+    () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null),
+    [flowWindow.data, liveMachines, specs],
+  );
 
   const tokens = useMemo(() => tokensOffMeter(flowWindow.data), [flowWindow.data]);
   const note = useMemo(() => hybridNote(flowWindow.data, tokens), [flowWindow.data, tokens]);
 
   const liveSet = useMemo(
-    () => liveSessionSet(flowWindow.data, liveSessionIds, nowMs),
-    [flowWindow.data, liveSessionIds, nowMs],
+    // The flow-derived liveness FALLBACK inside `liveSessionSet` is itself
+    // live-only in legacy (viewer.html:3378). Without `liveMode` a replay
+    // would route around the disabled presence hooks above and re-derive
+    // "running" from the day's own records — presence-agnostic in name only.
+    () => liveSessionSet(flowWindow.data, liveSessionIds, nowMs, liveMode),
+    [flowWindow.data, liveSessionIds, nowMs, liveMode],
   );
   const uids = useMemo(() => machineUids(flowWindow.data, liveMachines), [flowWindow.data, liveMachines]);
 
   const cards = useMemo(
     () =>
       uids.map((m) =>
-        buildFleetCard(flowWindow.data, liveMachines, specs, liveSet, machPresent(flowWindow.data, liveMachines, flowWindow.tMax, m) === false, m),
+        buildFleetCard(
+          flowWindow.data,
+          liveMachines,
+          specs,
+          liveSet,
+          machPresent(flowWindow.data, liveMachines, flowWindow.tMax, m) === false,
+          m,
+          liveMode,
+          flowWindow.tMax,
+        ),
       ),
-    [uids, flowWindow.data, flowWindow.tMax, liveMachines, specs, liveSet],
+    [uids, flowWindow.data, flowWindow.tMax, liveMachines, specs, liveSet, liveMode],
   );
 
   const timeline = useMemo(
-    () => buildActivityTimeline(flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, nowMs, windowMinutes),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, nowMs, windowMinutes],
+    () =>
+      buildActivityTimeline(
+        flowWindow.data,
+        liveMachines,
+        uids,
+        liveSet,
+        flowWindow.tMax,
+        nowMs,
+        windowMinutes,
+        liveMode,
+        tMin ?? 0,
+      ),
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, nowMs, windowMinutes, liveMode, tMin],
   );
 
   return (
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
-      <SavingsHero tokens={tokens} note={note} />
-      <FleetCoverageNotice />
+      <SavingsHero tokens={tokens} note={note} liveMode={liveMode} />
+      <FleetCoverageNotice historical={historical} />
       <div className="fleet">
         {cards.map((card) => (
           // `<div class="mach ..." data-act="machine" data-arg="${uid}">`
-          // (viewer.html:1711) — the fleet-card drill-in this packet wires:
-          // `ACTIONS.machine` (viewer.html:2991) calls `drillMachine(uid)`
-          // for an explicit arg, local OR remote. Ported as a real
-          // cross-lens navigation (a literal `location.hash` write, firing
-          // `hashchange` so `useHashRoute` actually swaps the rendered
-          // component — the SAME mechanism `NavChrome`'s tab clicks use,
-          // see that component's own doc for why replaceState alone can't
-          // do this), not a `history.replaceState` (legacy's OWN
-          // `syncLabHash` never even names the drilled uid in the address
-          // bar at all — see `route.ts`'s widened-route doc for why this
-          // port's `uid=` param is a deliberate improvement, not a replay
-          // of legacy's own mechanism).
+          // (viewer.html:1711) — the fleet-card drill-in: `ACTIONS.machine`
+          // (viewer.html:2991) calls `drillMachine(uid)` for an explicit
+          // arg. Ported as a real cross-lens navigation (a literal
+          // `location.hash` write, firing `hashchange` so `useHashRoute`
+          // actually swaps the rendered component — the SAME mechanism
+          // `NavChrome`'s tab clicks use, see that component's own doc for
+          // why replaceState alone can't do this), not a
+          // `history.replaceState`. `data-act`/`data-arg` themselves carry
+          // no behavior here (the click goes through the `onClick` below,
+          // not a delegated listener reading these attrs) — they're
+          // restored purely as the DOM inspection hook e2e specs drill
+          // through (`viewer-lifecycle.spec.js`, `viewer-xss.spec.js`),
+          // same contract legacy's markup gave them.
+          //
+          // (#1809) The DESTINATION now splits by locality, which legacy
+          // never did (every drill went to the same page). Residency is
+          // local-probe-only by construction (#1286's "observer must not
+          // join the observed" — `/machine/resources` always describes
+          // THIS daemon's own host, never a remote one's), so a remote
+          // machine's page would otherwise be a header plus two
+          // "not reported" notices — the runs lens, pinned to that machine,
+          // is the honest destination instead. The LOCAL card (confirmed
+          // against `localUid`, above) keeps going to the residency room,
+          // same as before this packet.
           <div
             key={card.uid}
             className={`mach${card.active && !card.absent ? " active" : ""}${card.absent ? " absent" : ""}`}
+            data-act="machine"
+            data-arg={card.uid}
             role="button"
             tabIndex={0}
             onClick={() => {
-              location.hash = `lens=machine&uid=${encodeURIComponent(card.uid)}`;
+              location.hash = machineDrillHash(card.uid, localUid);
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                location.hash = `lens=machine&uid=${encodeURIComponent(card.uid)}`;
+                location.hash = machineDrillHash(card.uid, localUid);
               }
             }}
           >
@@ -219,7 +377,9 @@ export function FleetLens() {
               <span className="dot" />
               {card.stat}
             </div>
-            <div className="runs">{card.runsCount} running</div>
+            <div className="runs">
+              {card.runsCount} {card.runsLabel}
+            </div>
           </div>
         ))}
       </div>
@@ -227,17 +387,22 @@ export function FleetLens() {
         <div className="fleettl" style={{ "--lname-w": `${timeline.labelWidthPx}px` } as CSSProperties}>
           <div className="tlhdr">
             <span>{timeline.headerText}</span>
-            <span className="twin">
-              {ACTIVITY_WINDOW_PRESETS.map((p) => (
-                <button
-                  key={p.minutes}
-                  className={`twinb${windowMinutes === p.minutes ? " on" : ""}`}
-                  onClick={() => setWindowMinutes(p.minutes)}
-                >
-                  {p.label}
-                </button>
-              ))}
-            </span>
+            {/* `const winCtl=liveMode?...:''` (viewer.html:1764) — LIVE-ONLY.
+                A replay shows the full recorded day, so there is no window to
+                slide over and the control would be a dead knob. */}
+            {liveMode ? (
+              <span className="twin">
+                {ACTIVITY_WINDOW_PRESETS.map((p) => (
+                  <button
+                    key={p.minutes}
+                    className={`twinb${windowMinutes === p.minutes ? " on" : ""}`}
+                    onClick={() => setWindowMinutes(p.minutes)}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </span>
+            ) : null}
           </div>
           {timeline.lanes.map((lane) => (
             <div className="lane" key={lane.uid}>

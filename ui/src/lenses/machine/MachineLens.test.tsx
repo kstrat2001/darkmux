@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MachineLens } from "./MachineLens";
-import { todayUTC, prevDateUTC, RECENT_CAP } from "../../lib/flow";
+import { todayUTC, prevDateUTC } from "../../lib/flow";
 
 function renderMachine(uid: string | null) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -118,11 +118,15 @@ describe("MachineLens", () => {
     expect(screen.queryByText(/not reported from here/i)).not.toBeInTheDocument();
   });
 
-  it("an unrecognized/stale uid degrades gracefully — names the raw uid, shows no runs, never crashes", async () => {
+  it("an unrecognized/stale uid degrades gracefully — names the raw uid, links to its (empty) runs lens, never crashes", async () => {
     mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" } });
     renderMachine("totally-unknown-uid-nobody-has-ever-seen");
     await waitFor(() => expect(screen.getByText(/machine · totally-unknown-uid-nobody-has-ever-seen/)).toBeInTheDocument());
-    expect(screen.getByText(/no runs recorded for this machine/i)).toBeInTheDocument();
+    // (#1809) The old "no runs recorded for this machine" hint text is gone
+    // with the runs list itself — a stale uid still gets a real, honestly
+    // zero-count link out (never a crash, never a stale-looking count).
+    const link = screen.getByRole("link", { name: /runs on/i });
+    expect(link).toHaveAttribute("href", "#lens=runs&machine=totally-unknown-uid-nobody-has-ever-seen");
     expect(screen.getByText(/not reported from here/i)).toBeInTheDocument();
   });
 
@@ -163,16 +167,6 @@ describe("MachineLens", () => {
   });
 });
 
-/* ── Merged from two branches that independently created this file ──────────
-   The drill-in packet added the route/uid cases above; the styling+a11y
-   packet (#1767) added the "show all" keyboard-operability cases below.
-   They are disjoint and both are kept.
-
-   One adjustment was required: #1767's helper rendered `<MachineLens />`
-   with no props, which no longer typechecks now that the component takes a
-   `uid`. It passes `uid={null}` — the nav-tab/local-machine case its tests
-   were always exercising. */
-
 function renderMachineLens() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -182,10 +176,7 @@ function renderMachineLens() {
   );
 }
 
-/** One flow record is enough for `sessionsOn`/`buildMachineRuns` to surface
- *  a run row — `buildMachineRuns` falls back to "no start" when there's no
- *  `dispatch.start`, reading handle/model off the first record on the
- *  session (see `lib/flow.ts`'s own doc). */
+/** One flow record per session. */
 function machineFlowRecord(sessionId: string) {
   return {
     ts: `${todayUTC()}T10:00:00.000Z`,
@@ -210,11 +201,6 @@ function mockMachineRunsFetch(runCount: number) {
       if (path === "/fleet/machines/live") {
         return Promise.resolve(
           new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }),
-        );
-      }
-      if (path === "/fleet/sessions/live") {
-        return Promise.resolve(
-          new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }),
         );
       }
       if (path === "/machine/specs") {
@@ -243,48 +229,65 @@ function mockMachineRunsFetch(runCount: number) {
   );
 }
 
-describe("MachineLens — keyboard operability of '.machine-lens__runsmore'", () => {
-  it("does not render the 'show all' control when the run count is at or under the cap", async () => {
-    mockMachineRunsFetch(RECENT_CAP);
-    const { container } = renderMachineLens();
-    await waitFor(() => expect(screen.getByText(/RUNS ON/)).toBeInTheDocument());
-    expect(container.querySelector(".machine-lens__runsmore")).toBeNull();
+// (#1809, finishing #1508 step 4) The old "RUNS ON <MACHINE>" list — and
+// the "show all"/"show fewer" expand-collapse control the a11y packet
+// (#1767) hardened keyboard access for — is gone; this section replaces
+// those tests with coverage of what replaced it: a link out to the runs
+// lens, pinned to this machine.
+//
+// The link carries NO COUNT, and these tests pin that absence deliberately.
+// An earlier cut labeled it with `sessionsOn(...).length` and this suite
+// asserted the number — which passed while the live page LIED: that counts
+// distinct session ids in the 24h flow window, the destination lists /runs
+// rows over a 14-day window unioning missions, lab runs and ghosts. Measured
+// on a real daemon: the link read "0 runs" while the destination listed 282.
+// The tests were green the whole time, because they seeded the flow window
+// and asserted against the same window — never against what the destination
+// would actually show. A test that pins a number to its own fixture cannot
+// catch a number that means the wrong thing.
+describe("MachineLens — the runs-lens link (#1809)", () => {
+  it("names the machine and points at the pinned runs lens", async () => {
+    mockMachineRunsFetch(3);
+    renderMachineLens();
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    expect(link).toHaveAttribute("href", "#lens=runs&machine=u1");
   });
 
-  it("is a real role=button with tabIndex once the run count exceeds the cap", async () => {
-    mockMachineRunsFetch(RECENT_CAP + 5);
-    const { container } = renderMachineLens();
-    await waitFor(() => expect(container.querySelector(".machine-lens__runsmore")).toBeInTheDocument());
-    const more = container.querySelector(".machine-lens__runsmore")!;
-    expect(more).toHaveAttribute("role", "button");
-    expect(more).toHaveAttribute("tabIndex", "0");
-    expect(more.textContent).toMatch(new RegExp(`show all ${RECENT_CAP + 5}`));
+  // The regression guard for the lie described above: whatever the flow
+  // window happens to hold, the label must not claim a quantity. Seeded with
+  // three sessions precisely because the old implementation would have
+  // rendered "3" here.
+  it("claims no count, whatever this window's session total happens to be", async () => {
+    mockMachineRunsFetch(3);
+    renderMachineLens();
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    expect(link.textContent).toBe("runs on MacBook-Pro →");
+    expect(link.textContent).not.toMatch(/\d/);
   });
 
-  it("expands to the full list on a click", async () => {
-    mockMachineRunsFetch(RECENT_CAP + 5);
-    const { container } = renderMachineLens();
-    await waitFor(() => expect(container.querySelector(".machine-lens__runsmore")).toBeInTheDocument());
-    fireEvent.click(container.querySelector(".machine-lens__runsmore")!);
-    await waitFor(() => expect(container.querySelectorAll(".machine-lens__run").length).toBe(RECENT_CAP + 5));
-    expect(screen.getByText("show fewer")).toBeInTheDocument();
+  it("renders the same label with an EMPTY window — no count to be wrong, nothing hidden", async () => {
+    mockMachineRunsFetch(0);
+    renderMachineLens();
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    expect(link.textContent).toBe("runs on MacBook-Pro →");
   });
 
-  it("expands to the full list on a keyboard Enter — the fix under test", async () => {
-    mockMachineRunsFetch(RECENT_CAP + 5);
-    const { container } = renderMachineLens();
-    await waitFor(() => expect(container.querySelector(".machine-lens__runsmore")).toBeInTheDocument());
-    fireEvent.keyDown(container.querySelector(".machine-lens__runsmore")!, { key: "Enter" });
-    await waitFor(() => expect(container.querySelectorAll(".machine-lens__run").length).toBe(RECENT_CAP + 5));
+  it("clicking the link navigates via a real hash write, not a page reload", async () => {
+    mockMachineRunsFetch(3);
+    renderMachineLens();
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    fireEvent.click(link);
+    expect(window.location.hash).toBe("#lens=runs&machine=u1");
   });
 
-  it("toggles back on a keyboard Space", async () => {
-    mockMachineRunsFetch(RECENT_CAP + 5);
+  // Red-provable regression guard: if the old list ever comes back, this
+  // fails — proving the removal actually happened, not just that the link
+  // exists alongside it.
+  it("the old per-run list markup is gone — no '.machine-lens__run' rows, no 'RUNS ON' header", async () => {
+    mockMachineRunsFetch(3);
     const { container } = renderMachineLens();
-    await waitFor(() => expect(container.querySelector(".machine-lens__runsmore")).toBeInTheDocument());
-    fireEvent.keyDown(container.querySelector(".machine-lens__runsmore")!, { key: " " });
-    await waitFor(() => expect(screen.getByText("show fewer")).toBeInTheDocument());
-    fireEvent.keyDown(container.querySelector(".machine-lens__runsmore")!, { key: " " });
-    await waitFor(() => expect(container.querySelectorAll(".machine-lens__run").length).toBe(RECENT_CAP));
+    await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    expect(container.querySelector(".machine-lens__run")).toBeNull();
+    expect(screen.queryByText(/RUNS ON/)).not.toBeInTheDocument();
   });
 });

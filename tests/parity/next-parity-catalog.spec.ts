@@ -24,24 +24,34 @@
 //     `lenses/session/sessionRun.ts`'s own module doc for how this port
 //     validated the derivation against this SAME golden at the pure-logic
 //     layer first.
-//   - `mission-replay` / `playback-date`: these goldens capture LEGACY's
-//     `#stage` (the fleet-hero render), which `/next` doesn't own yet —
-//     `FleetStrip` only covers `/fleet/machines/live` presence, not the
-//     dispatch-lifecycle-derived hero rendering `fleet.txt`-family goldens
-//     actually show (that's Packet 5's territory, tied to the live-tail/SSE
-//     pipeline). Forcing byte parity here would mean building a SECOND
-//     fleet-rendering pipeline inside this packet before the first one
-//     exists — scope creep wearing this packet's clothes. So these two
-//     tests assert `/next`'s own HONEST, narrower behavior instead
-//     (`MissionReplay`/`PlaybackLens`'s own doc comments name the same
-//     reasoning) — the goldens still earn their keep as the "collector"
-//     record of what legacy does, for whichever future packet ports the
-//     fleet-hero pipeline and can then extend this file to real parity.
+//   - `playback-date`: full byte parity as of #1800 P2, with ONE named
+//     normalization (the unported notes-modal link — see the test itself).
+//     It was NOT parity before, for a reason worth keeping: this golden
+//     captures legacy's fleet-hero render, and at the time `/next` had no
+//     fleet-hero pipeline at all, so forcing parity would have meant
+//     building one inside a catalog packet — scope creep wearing that
+//     packet's clothes. Packet 5 built the real one; `PlaybackLens` now
+//     COMPOSES it rather than growing a second, which is what made this a
+//     small change instead of a large one. The narrower honest assertion
+//     was the right call while it stood, and the golden earned its keep as
+//     the record of what legacy does until the port could meet it.
+//   - `mission-replay`: still NOT byte parity, and for a data reason rather
+//     than a rendering one — this corpus has no `/flow-mission` fixture, so
+//     the route legitimately has zero records to render. The test asserts
+//     the real fetch happened and the empty state is named.
 
 import { test, expect } from "@playwright/test";
 import { readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { GOLDENS_DIR } from "./lib/paths.js";
+// The FULL four-region extractor, shared verbatim with the legacy extraction
+// (`extract.spec.ts`) exactly as `next-parity.spec.ts` uses it for the
+// machine/fleet full-file compares. Imported alongside the stage-only helpers
+// because this file now holds BOTH shapes: `session` compares `#stage` (its
+// chrome is the ordinary live chrome, already covered by `fleet.txt`), while
+// `playback` compares ALL FOUR regions — its topbar, crumb and meta are
+// mode-specific and were exactly where the port diverged.
+import { extractLensText } from "./lib/extract-lens.js";
 import {
   extractCatalogOnlyText,
   catalogSectionOf,
@@ -181,11 +191,28 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     await page.screenshot({ path: shot("mission-replay-empty.png"), fullPage: true });
   });
 
-  test("bare #<date> hash: recognized as a named playback route, not silently rendered as fleet", async ({ page }) => {
-    // Same scoping note as the mission test above — no #stage byte compare
-    // against `playback-date.txt` (Packet 5's territory); this asserts the
-    // route is recognized and named honestly (never blank, never
-    // misclassified as `unknown` the way Packet 1–3 left it).
+  test("bare #<date> hash matches playback-date.txt's #stage byte-for-byte (#1800 P2: a real historical render)", async ({
+    page,
+  }) => {
+    // GRADUATED from the placeholder check this test used to make ("playback
+    // for <date>" — honest at the time, since the lens rendered a named
+    // not-ported notice). `PlaybackLens` now composes `FleetLens` over the
+    // day's records with legacy's replay-mode branches taken, so this is held
+    // to the same standard as every other lens here: the REAL browser's
+    // `#stage.innerText` against the golden recorded from legacy.
+    //
+    // ONE named normalization, per this file's "never a silent fuzzy match"
+    // rule. Legacy's hybrid note ends with `history →`, an anchor that opens
+    // a notes modal. That modal is NOT ported, and `FleetLens` deliberately
+    // renders "(older notes exist)" instead — rendering a link that looks
+    // clickable and does nothing would be a trap control (see `FleetLens.tsx`'s
+    // own note). The INFORMATION is identical ("there are older notes"); only
+    // the affordance differs. Normalizing the port's text to legacy's keeps
+    // that one deliberate UX divergence from masking any OTHER difference in
+    // the same string — which is the whole reason to normalize narrowly and
+    // name it rather than relaxing the compare.
+    //
+    // Delete this normalization when the notes modal lands.
     const meta = loadMeta();
     await installFrozenClock(page, meta.frozen_clock_ms);
     installCorpusRoutes(page, meta);
@@ -193,10 +220,13 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     page.on("pageerror", (e) => pageErrors.push(String(e)));
 
     await page.goto(`/index.html#${meta.captured_prev_date}`);
-    await expect(page.getByText(new RegExp(`playback for ${meta.captured_prev_date}`, "i"))).toBeVisible({ timeout: 15000 });
+    await waitSettled(page, expect, '.fleet-lens[data-state="loaded"]');
+
+    const got = (await extractLensText(page)).replace(" (older notes exist)", " history →");
+    expect(got, "playback must match legacy byte-for-byte, ALL regions").toBe(goldenText("playback-date"));
     expect(pageErrors, `pageerror events: ${pageErrors.join("; ")}`).toHaveLength(0);
 
-    await page.screenshot({ path: shot("playback-date-notice.png"), fullPage: true });
+    await page.screenshot({ path: shot("playback-date.png"), fullPage: true });
   });
 
   test("#session=task-list matches session-task-list.txt's #stage byte-for-byte (drill-in packet: real render, not a placeholder)", async ({

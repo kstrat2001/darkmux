@@ -30,7 +30,7 @@ import { readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { GOLDENS_DIR } from "./lib/paths.js";
 import { loadMeta, installCorpusRoutes, installBlankRoutes } from "./lib/mock-routes.js";
-import { extractLensText, waitSettled, installFrozenClock, regionText } from "./lib/extract-lens.js";
+import { extractLensText, waitSettled, installFrozenClock, regionText, normalize } from "./lib/extract-lens.js";
 
 // Overnight-runbook render-sanity contract (every UI packet's standing
 // requirement): zero pageerror, `#stage` visible with real height, no
@@ -63,6 +63,146 @@ function readGolden(label) {
   return readFileSync(`${GOLDENS_DIR}/${label}.txt`, "utf8");
 }
 
+/**
+ * (#1809, finishing #1508 step 4) `MachineLens` deliberately stopped
+ * matching `goldens/machine.txt`/`goldens/machine-deeplink.txt` byte-for-
+ * byte the moment its `RUNS ON <MACHINE>` list moved out to the runs lens
+ * (`#lens=runs&machine=<uid>`) — 80 of the golden's 131 lines ARE that list
+ * (`RUNS ON MACBOOK-PRO` through `show all 30 →`), and this port no longer
+ * renders it at all, replaced by a "N runs on <machine> →" link with no
+ * golden counterpart. This is NOT legacy behaving wrongly, and it is NOT a
+ * regression to chase back to byte parity: #1508 step 2's own commit
+ * (`d2041ae3`) named the list "deliberately interim", and #1809 is the
+ * step-4 follow-up that finishes moving it out — see `MachineLens.tsx`'s
+ * own module doc for the full history.
+ *
+ * The golden itself is NOT edited (goldens are the frozen record of what
+ * LEGACY did; legacy was never wrong here, the port just moved on) and the
+ * assertion is NOT deleted (see `MachineLens.tsx`'s doc + this repo's own
+ * `tests/parity/README.md` for why an un-asserted lens is worse than a
+ * narrowed one). It is NARROWED, the same way this file's sibling
+ * (`next-parity-catalog.spec.ts`) narrows its own `mission-replay` case —
+ * name exactly which region still corresponds and why, keep everything
+ * else at full byte equality.
+ *
+ * (#1806 Stage 2/3 — the machine-lens redesign, docs/design/machine-lens/proposal.md in the design
+ * packet) #1809 narrowed the comparison to `topbar`/`crumb`/`meta`/
+ * `logscope` (`machineChromePrefixOf`, still full byte equality below)
+ * PLUS the stage's header + `darkmux/utility` block + the health/pressure
+ * LEDGER text. Stage 2/3 is the second, deeper narrowing: it retires the
+ * ledger half of that comparison entirely.
+ *
+ * **What diverged.** The ledger used to be one flat, classified string per
+ * fact (`Σ potential 29.83 GB · Σ current 22.21 GB · limit …`, `darkmux:
+ * qwen3.6-35b … GREEN … ctx 262144 · weights 18.45 GB …`) — an `innerText`
+ * walk of that region was a meaningful byte-exact spec because the PORT'S
+ * OWN structure was still "one line per fact", the same shape legacy's
+ * flattened extraction produced. Stage 2/3 (docs/design/machine-lens/proposal.md, operator-approved)
+ * replaced that shape on purpose: a bezel-less semicircle gauge whose
+ * reading is a NEEDLE POSITION plus a handful of on-arc tick labels
+ * (`0 · 34 · 69 · 103 · 137 · LIMIT`), a tell-tale lamp row that renders
+ * SEVEN lamps every time regardless of payload (`STATE GREEN`, `Δ
+ * RESIDENCY`, `UNPRICED`, …), odometer DIGIT CELLS for the pressure
+ * instruments (`8`/`8` rather than `88%`), and model ROWS with ghost/NEW
+ * residency chips that don't exist in the flat ledger's vocabulary at all.
+ * None of that is a bug — it is the redesign's entire point (docs/design/machine-lens/proposal.md
+ * §1's whole argument is that the flat ledger was the defect) — but it
+ * means an `innerText` diff against a golden recorded from the FLAT shape
+ * is comparing two genuinely different information architectures, not
+ * catching drift within one. The failing diff is representative: every
+ * line differs, because every line's SHAPE differs, not because any single
+ * fact stopped being reported.
+ *
+ * **Why this is deliberate, not a silently-lost regression.** #1806 Stage 1
+ * already established the precedent this follows (this file's own #1809
+ * narrowing) — a redesign that changes RENDERING while explicitly PRESERVING
+ * the underlying facts (every figure the flat ledger reported still renders
+ * somewhere in the gauge/lamp/odometer/row cluster — see docs/design/machine-lens/provenance.md's
+ * value-by-value trace, written and verified against a live daemon for
+ * exactly this packet) is a text-shape change, not an information loss.
+ * The operator reviewed and approved the redesign (docs/design/machine-lens/proposal.md, "the
+ * chosen shape") BEFORE this narrowing was written, so this is not a
+ * unilateral test-weakening — it is the golden format catching up to a
+ * decision already made above the test file.
+ *
+ * **Where the ledger's coverage lives now**, since a byte-diff can no
+ * longer be it:
+ * - `ui/src/lenses/machine/machineGauge.test.ts` — 46 unit tests on the
+ *   pure gauge/lamp/odometer/residency math (no DOM): scale resolution,
+ *   needle-angle formula, commit-tick clamping vs overcommit, the redline's
+ *   one-field provenance (`machine.state === "red"`, nothing else), every
+ *   lamp's single-field key, the ghost/NEW residency state machine
+ *   (arrival, departure, one-more-poll-then-retire, reappearance-as-NEW),
+ *   and stable darkmux-first/alphabetical sort. RED-PROVED live in this
+ *   packet: temporarily changing `redlineLit()` to key on `"amber"` instead
+ *   of `"red"` failed 3 tests for the exact right reason (the redline lit
+ *   on the wrong state, and the face caption flipped when it shouldn't
+ *   have) before the change was reverted — the coverage is not decorative.
+ * - `ui/src/lenses/machine/MachineHealthRegion.test.tsx` — 20 component
+ *   tests on the assembled region: absence-vs-zero (no `.mm-row-pot`/no
+ *   `.mm-gauge-commit` when unpriced/zero, the inverted priced case DOES
+ *   draw it), a hostile state string degrading to the neutral class (never
+ *   landing raw in a `className`), the redline's state-gate (lit on red,
+ *   NOT on amber even at high current, NEVER on a stale/cached read), and
+ *   — the #1812 fix this same packet ships — the last-good payload staying
+ *   on screen under a visible stale banner rather than being discarded.
+ * - `tests/e2e/viewer-machine.spec.js` — 3 real-browser tests: every
+ *   hostile string in a realistic `/machine/resources` payload (model
+ *   identifiers, shrink hints, attribution note, warnings, a hostile
+ *   `state` value) still renders INERTLY through the new markup, the
+ *   observer-cost stamp (`#memstamp`) is visible, and (the #1812 regression
+ *   test, un-fixme'd in this same packet) an unreachable daemon shows the
+ *   no-daemon notice, then a stale banner with the LAST GOOD reading still
+ *   on screen once data has existed.
+ *
+ * 69 tests total replace what this narrowing removes, none of them a byte
+ * comparison against a frozen string — each asserts a STRUCTURAL or
+ * NUMERIC claim about the new shape instead, which is the right unit for a
+ * redesign whose whole point was to change the shape.
+ *
+ * What survives THIS byte comparison, narrower still than #1809 left it:
+ * only the header line + the `darkmux/utility` block (5 lines,
+ * `utilityLines()` in `memoryLedgerLines.ts` — untouched by Stage 2/3, a
+ * fixed four-element array plus the page header) — see
+ * `goldenMachineHdrUtilText`/`machineHdrUtilText` below. If EITHER
+ * assertion in either test starts failing, that IS real coverage: the
+ * header/utility-tier chrome broke, not a rubber stamp.
+ */
+function machineChromePrefixOf(fullText: string): string {
+  const stageMarker = "=== stage ===\n";
+  const idx = fullText.indexOf(stageMarker);
+  if (idx === -1) throw new Error(`machineChromePrefixOf: no "${stageMarker.trim()}" marker found`);
+  return fullText.slice(0, idx);
+}
+
+/** The golden's own stage text, sliced down to JUST the header + the fixed
+ * four-line `darkmux/utility` block (`utilityLines()` — untouched by Stage
+ * 2/3) — the one region of the OLD golden that still corresponds to
+ * something real in the new markup. See this section's own doc for why the
+ * rest of the golden's stage (the flat ledger, from "machine total" through
+ * "RUNS ON …") no longer has a byte-exact counterpart. */
+function goldenMachineHdrUtilText(goldenText: string): string {
+  const stageMarker = "=== stage ===\n";
+  const stageIdx = goldenText.indexOf(stageMarker);
+  if (stageIdx === -1) throw new Error(`goldenMachineHdrUtilText: no "${stageMarker.trim()}" marker found`);
+  const stage = goldenText.slice(stageIdx + stageMarker.length);
+  // header (1 line) + utilityLines()'s fixed 4-element array = 5 lines,
+  // then "machine total" begins the retired ledger portion.
+  const lines = stage.split("\n").slice(0, 5);
+  return normalize(lines.join("\n"));
+}
+
+async function machineHdrUtilText(page): Promise<string> {
+  const parts: string[] = await page.evaluate(() => {
+    const selectors = [".machine-lens__hdr", ".machine-lens__util"];
+    return selectors.map((sel) => {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      return el ? el.innerText : "";
+    });
+  });
+  return normalize(parts.join("\n"));
+}
+
 // NOTE: deliberately NOT `test.describe.configure({ mode: "serial" })` (QA
 // take, mutation-proved 2026-08-09) — serial mode meant one lens's failure
 // suppressed every OTHER lens's result in this shared file (observed:
@@ -92,8 +232,20 @@ test("next: click-navigation into #lens=machine matches goldens/machine.txt", as
   await waitSettled(page, expect, '.machine-lens__health[data-state="loaded"]');
   await expect(page.locator("body")).not.toHaveClass(/booting/);
 
+  // (#1809, then narrowed further by #1806 Stage 2/3) See this file's own
+  // `machineChromePrefixOf`/`goldenMachineHdrUtilText` doc for exactly
+  // which regions no longer correspond (the runs list, then the whole flat
+  // ledger) and why each is a deliberate divergence, not a regression.
   const got = await extractLensText(page);
-  expect(got).toBe(readGolden("machine"));
+  const golden = readGolden("machine");
+  expect(machineChromePrefixOf(got), "topbar/crumb/meta/logscope must still match byte-for-byte").toBe(
+    machineChromePrefixOf(golden),
+  );
+  const gotHdrUtil = await machineHdrUtilText(page);
+  expect(
+    gotHdrUtil,
+    "the stage's header + darkmux/utility block must still match byte-for-byte — the ledger below it was deliberately redesigned (Stage 2/3), see this file's own doc for the replacement coverage",
+  ).toBe(goldenMachineHdrUtilText(golden));
 });
 
 test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", async ({ page }) => {
@@ -111,8 +263,18 @@ test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", 
   await waitSettled(page, expect, '.machine-lens__health[data-state="loaded"]');
   await expect(page.locator("body")).not.toHaveClass(/booting/);
 
+  // (#1809, then narrowed further by #1806 Stage 2/3) — same split as the
+  // click-navigation test above.
   const got = await extractLensText(page);
-  expect(got).toBe(readGolden("machine-deeplink"));
+  const golden = readGolden("machine-deeplink");
+  expect(machineChromePrefixOf(got), "topbar/crumb/meta/logscope must still match byte-for-byte").toBe(
+    machineChromePrefixOf(golden),
+  );
+  const gotHdrUtil = await machineHdrUtilText(page);
+  expect(
+    gotHdrUtil,
+    "the stage's header + darkmux/utility block must still match byte-for-byte — the ledger below it was deliberately redesigned (Stage 2/3), see this file's own doc for the replacement coverage",
+  ).toBe(goldenMachineHdrUtilText(golden));
 });
 
 // Red-prove — the SAME self-test discipline the legacy harness's

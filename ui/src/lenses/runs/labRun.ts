@@ -9,8 +9,8 @@
  * hit byte-for-byte; these functions still track legacy's real derivation
  * logic line-for-line (not a redesign) per the drill-in packet's brief.
  *
- * Output shape follows the same convention `lenses/machine/runLines.ts`/
- * `memoryLedgerLines.ts` established: flat line arrays, one visible text
+ * Output shape follows the same convention `lenses/machine/memoryLedgerLines.ts`
+ * established: flat line arrays, one visible text
  * unit per array element, because legacy's own `.labstage`/`.labfeedrow`/
  * `.labcli` are all `display:flex` — each flex child becomes its own
  * `innerText` line, so a literal array element per child reproduces that

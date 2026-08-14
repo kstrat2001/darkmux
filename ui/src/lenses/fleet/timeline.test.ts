@@ -126,3 +126,68 @@ describe("buildActivityTimeline — lanes and bars", () => {
     expect(bar.leftPct).toBe(0);
   });
 });
+
+/**
+ * (#1800 P2) The REPLAY arm. Until this packet `buildActivityTimeline` had
+ * only the live one, because `/next` had no historical route that reached it
+ * — and `Math.max(tMax, nowMs)` on a recorded day is `nowMs` by definition,
+ * so a 2026-08-07 page drew today's axis with every bar filtered out for
+ * falling before `tlMin`.
+ */
+describe("buildActivityTimeline — replay (liveMode = false)", () => {
+  const TMIN = Date.parse("2026-08-08T02:09:42.000Z");
+  // NOW is days after the recorded day — the whole point: the live arm would
+  // anchor here and leave the day off the left edge of the axis entirely.
+  const NOW = Date.parse("2026-08-12T09:00:00.000Z");
+  const uids = ["m1"];
+  const day: FlowRecord[] = [
+    rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: new Date(TMIN).toISOString(), handle: "coder" }),
+    rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.complete", ts: new Date(TMAX).toISOString() }),
+  ];
+
+  it("spans tMin..tMax — the recorded day, NOT a window ending at now", () => {
+    const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
+    expect(tl.headerText).toBe(`activity · ${clkrange(TMIN, TMAX)}`);
+    expect(tl.axis).toEqual([clkhm(TMIN), clkhm(TMIN + (TMAX - TMIN) / 2), clkhm(TMAX)]);
+    // The playhead sits at the right edge (state.t = tMax on boot).
+    expect(tl.playheadPct).toBe(100);
+  });
+
+  it("drops 'recent' from the header — the day is not recent", () => {
+    const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
+    expect(tl.headerText.startsWith("activity · ")).toBe(true);
+    expect(tl.headerText).not.toContain("recent");
+  });
+
+  it("the day's bars SURVIVE — the live arm drops every one of them", () => {
+    const replay = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
+    expect(replay.lanes[0].bars.map((b) => b.sid)).toEqual(["s1"]);
+
+    // The inverted case, on the SAME inputs: this is the render the QA gate
+    // caught — an "AUG 12–AUG 13" header over a 2026-08-08 day, with zero
+    // bars because all of them ended before `nowMs - 24h`.
+    const live = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, true, TMIN);
+    expect(live.lanes[0].bars).toHaveLength(0);
+    expect(live.headerText).toBe(`recent activity · ${clkrange(NOW - 1440 * 60000, NOW)}`);
+  });
+
+  it("a closed session reads 'done', not 'run', on an EMPTY live set", () => {
+    // The live arm would read `!liveSet.has(sid)` -> done here too, so this
+    // alone proves nothing. The next test is the one that separates them.
+    const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
+    expect(tl.lanes[0].bars[0].cls).toBe("done");
+  });
+
+  it("an UNCLOSED session reads 'run' on that same empty live set — close-edge, not presence", () => {
+    const open: FlowRecord[] = [
+      rec({ machine_uid: "m1", session_id: "s9", action: "dispatch.start", ts: new Date(TMIN).toISOString() }),
+      rec({ machine_uid: "m1", session_id: "s9", action: "dispatch.turn", ts: new Date(TMAX).toISOString() }),
+    ];
+    const tl = buildActivityTimeline(open, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
+    expect(tl.lanes[0].bars[0].cls).toBe("run");
+    // …and the live arm, given the same empty set, calls it done. Same data,
+    // opposite verdicts: the mode argument is genuinely load-bearing.
+    const live = buildActivityTimeline(open, new Map(), uids, new Set(), TMAX, TMAX, 1440, true, TMIN);
+    expect(live.lanes[0].bars[0].cls).not.toBe("run");
+  });
+});

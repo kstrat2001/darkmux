@@ -79,6 +79,72 @@ export function recKey(r: FlowRecord): string {
   ].join("\x1f");
 }
 
+/** Parses a flow file's raw JSONL TEXT the way the daemon parses the
+ * on-disk file the static demo commits a copy of — viewer.html:3899-3901
+ * (the `flowSrc` branch): split on newlines, trim, drop empty lines,
+ * `JSON.parse` each remaining line, drop any line that fails to parse.
+ * Lenient by design, matching legacy exactly: a truncated last line or a
+ * stray blank line must not fail the whole page, and the leading
+ * `{"_type":"schema"}` header line parses FINE here — it is dropped later,
+ * by `normalizeRecords`' `_type` filter, not by this function (#1801 — see
+ * that function's own doc for why the two stay separate steps). */
+export function parseFlowJsonl(text: string): FlowRecord[] {
+  return text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l): FlowRecord | null => {
+      try {
+        return JSON.parse(l) as FlowRecord;
+      } catch {
+        return null;
+      }
+    })
+    .filter((r): r is FlowRecord => r !== null);
+}
+
+/** GETs a static playback source (`staticSource.ts::staticFlowSrc()`) and
+ * parses it via `parseFlowJsonl` above — the static-build twin of
+ * `GET /flow/<date>`, read directly by both `useRouteRecords` (the event
+ * log's data) and `PlaybackLens` (the stage's data), each via the SAME
+ * query key so they share one fetch and can never disagree about the file's
+ * contents (#1801 — same "one source of truth" discipline this module's own
+ * doc already establishes for `normalizeRecords`).
+ *
+ * Returns `[]` rather than throwing on a network failure, a 404, or an
+ * empty file — matching legacy's own `catch(e){ RAW=[]; }` around the same
+ * fetch. A static build with no committed flow file (or one not yet built)
+ * is a valid, if empty, playback — never a crash and never a silent
+ * fallback to the live route (see `route.ts`'s own doc for why the ROUTE
+ * itself does not depend on this fetch succeeding). */
+export async function fetchStaticFlowRecords(src: string): Promise<FlowRecord[]> {
+  try {
+    const res = await fetch(src);
+    if (!res.ok) return [];
+    const text = await res.text();
+    return parseFlowJsonl(text);
+  } catch {
+    return [];
+  }
+}
+
+/** `if(!injectedDate&&RAW.length)date=String(RAW[0].ts||"").slice(0,10)||date;`
+ * — viewer.html:3902, the flowSrc branch's own date derivation. Takes the
+ * RAW parsed array (file order, BEFORE `normalizeRecords` drops the
+ * `{"_type":"schema"}` header line) — deliberately `records[0]`, not the
+ * earliest `ts`, matching legacy's own un-sorted read exactly, quirk
+ * included: a file whose first LINE is the schema header (no `ts` field)
+ * yields `null` here the same way legacy's derivation falls through to
+ * whatever `date` already defaulted to. Returns `null` on an empty array, an
+ * unreachable file, or a first record with no usable `ts` so a caller
+ * supplies its OWN placeholder rather than this function inventing one. */
+export function firstRecordDate(records: FlowRecord[]): string | null {
+  const ts = records[0]?.ts;
+  if (!ts) return null;
+  const date = String(ts).slice(0, 10);
+  return date || null;
+}
+
 /** A `/flow/<date>` response body is EITHER a bare array or one of two
  * wrapper shapes — `loadLiveWindow()`, viewer.html:3502:
  * `Array.isArray(body)?body:(body.records||body.flow||[])`. The recorded
@@ -119,13 +185,81 @@ export function mergeTailRecords(existing: FlowRecord[], incoming: FlowRecord[],
   return merged.filter((r) => T(r.ts) >= cutMs);
 }
 
+/** The RECORD-SHAPING half of `flowToRenderModel()` — viewer.html:3195-3204.
+ * Drops non-record meta lines and normalizes the space-separated legacy
+ * action spellings to their dotted forms. Deliberately does NOT window or
+ * dedup: those belong to the LIVE two-day merge (`buildFlowWindow`, below),
+ * not to reading a record set.
+ *
+ * (#1800 P2) Split out because a historical day must be shaped the same way
+ * and windowed NOT AT ALL — legacy's playback boot is literally
+ * `DATA=flowToRenderModel(RAW)` with no window step (viewer.html:3922).
+ * Feeding a replayed day through `buildFlowWindow` instead would have
+ * dropped every record older than 24h — i.e. the entire day — and running it
+ * unshaped leaves the flow file's leading `{"_type":"schema"}` header in the
+ * set, where it renders as a phantom "unknown" machine card, an
+ * `Invalid Date other` log row, and a third timeline lane. Both were live
+ * before this split. */
+export function normalizeRecords(records: FlowRecord[]): FlowRecord[] {
+  const shaped = records
+    .filter((r): r is FlowRecord => !!r && !r._type)
+    .map((r) => ({ ...r, action: normalizeAction(r.action) }));
+  return [...shaped, ...perSessionRuntimeRecords(records)].sort((a, b) => T(a.ts) - T(b.ts));
+}
+
+/** The APPEND half of `flowToRenderModel()` — viewer.html:3223-3234. One
+ * synthetic `source:"runtime"` telemetry record per session that emitted any
+ * `dispatch.turn`, carrying that session's max `turn_seq` as its TURNS
+ * metric. The subsystem view reads the metric from here rather than
+ * re-scanning, which is why the record exists at all.
+ *
+ * (#1800) Ported because it is not merely internal: these records are part of
+ * `DATA`, so they are COUNTED. `goldens/playback-date.txt`'s meta line reads
+ * "2008 records" against a fixture holding 1993 real records and 15 sessions
+ * with turns — the 15 are these. The live meta line does not state a count
+ * (legacy moved it to the event pane), which is why nothing noticed their
+ * absence until a replay had to say the number out loud.
+ *
+ * Legacy sorts the whole set by ts afterwards because these are appended out
+ * of order, and the event log plus follow-latest both assume `DATA` is
+ * temporal. `normalizeRecords` does the same, so the sort is not this
+ * function's own concern.
+ *
+ * Reads from the RAW records deliberately — `dispatch.turn` needs no action
+ * normalization (it has no space-separated legacy spelling), and taking the
+ * pre-filter set keeps this independent of the shaping step's ordering. */
+function perSessionRuntimeRecords(records: FlowRecord[]): FlowRecord[] {
+  const perSession = new Map<string, { turns: number; ts: string; machineId?: string; machineUid?: string }>();
+  for (const r of records) {
+    if (!r || r._type || r.action !== "dispatch.turn" || !r.session_id) continue;
+    const seq = (r.payload as { turn_seq?: number } | undefined)?.turn_seq ?? 0;
+    const prev = perSession.get(r.session_id);
+    const entry = prev ?? { turns: 0, ts: r.ts };
+    entry.turns = Math.max(entry.turns, seq);
+    // `e.ts=r.ts` unconditionally — the LAST turn's timestamp, not the max.
+    // Records arrive in ts order, so these agree; keeping legacy's form means
+    // they keep agreeing if that ever stops being true.
+    entry.ts = r.ts;
+    if (r.machine_id) entry.machineId = r.machine_id;
+    if (r.machine_uid) entry.machineUid = r.machine_uid;
+    perSession.set(r.session_id, entry);
+  }
+  return [...perSession.entries()].map(([sessionId, e]) => ({
+    ts: e.ts,
+    category: "telemetry",
+    source: "runtime",
+    machine_id: e.machineId,
+    machine_uid: e.machineUid,
+    session_id: sessionId,
+    fields: { turns: e.turns },
+  })) as FlowRecord[];
+}
+
 /** `loadLiveWindow()` + the dispatch-action slice of `flowToRenderModel()` —
  * viewer.html:3497-3512 / 3161-3187. `yesterday`/`today` MUST be passed in
  * that fetch order (see the module doc above for why). */
 export function buildFlowWindow(yesterday: FlowRecord[], today: FlowRecord[], nowMs: number): FlowRecord[] {
-  const merged = [...yesterday, ...today]
-    .filter((r): r is FlowRecord => !!r && !r._type)
-    .map((r) => ({ ...r, action: normalizeAction(r.action) }));
+  const merged = normalizeRecords([...yesterday, ...today]);
   const windowed = merged.filter((r) => T(r.ts) >= nowMs - LIVE_WINDOW_MS);
   const seen = new Set<string>();
   return windowed.filter((r) => {
@@ -140,6 +274,15 @@ export function buildFlowWindow(yesterday: FlowRecord[], today: FlowRecord[], no
 export function computeTMax(data: FlowRecord[]): number {
   const ts = data.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
   return ts.length ? Math.max(...ts) : Date.now();
+}
+
+/** `recompute()`'s tMin — viewer.html:1051. Unused while `/next` was
+ * live-only (the live timeline anchors on NOW and a fixed window); a REPLAY
+ * spans `tMin..tMax`, which is what makes the axis describe the recorded day
+ * rather than the last 24 hours of wall-clock. */
+export function computeTMin(data: FlowRecord[]): number {
+  const ts = data.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
+  return ts.length ? Math.min(...ts) : Date.now();
 }
 
 /** `uidOf()` — viewer.html:1107. */
@@ -159,15 +302,56 @@ export function machineUids(data: FlowRecord[], liveMachines: Map<string, Presen
   return [...new Set([...data.map(uidOf), ...liveMachines.keys()])];
 }
 
+/** EVERY name a uid has appeared under — across the window's records and its
+ * presence beat, not just the one `nameOf` happens to pick.
+ *
+ * One machine really does carry several names over time. `machine_id` defaults
+ * to the hostname, and macOS reports both the short form and the mDNS `.local`
+ * form depending on how the daemon was started, so a single stable
+ * `machine_uid` accumulates records under both. Renaming a machine, or setting
+ * `machine_id` explicitly after running without it, does the same thing.
+ *
+ * `nameOf` has to answer with ONE name, so it picks the first it finds. That is
+ * fine for a label and wrong for an identity test: asking "is the name I show
+ * for this uid equal to the name specs reports" fails whenever those two
+ * happen to be different aliases of the same machine. Identity questions ask
+ * this instead, and get a yes if ANY known alias matches. */
+export function machineNames(
+  data: FlowRecord[],
+  liveMachines: Map<string, PresenceBeat>,
+  uid: string,
+): Set<string> {
+  const names = new Set<string>();
+  for (const r of data) {
+    if (uidOf(r) === uid && r.machine_id) names.add(r.machine_id as string);
+  }
+  const beat = liveMachines.get(uid);
+  if (beat?.display_name) names.add(beat.display_name);
+  return names;
+}
+
 /** `localMachineUid()` — viewer.html:2642-2644. Which uid IS this daemon,
- * for the nav-tab/deep-link entry into the machine page. */
+ * for the nav-tab/deep-link entry into the machine page.
+ *
+ * Matches against EVERY alias a uid has used (`machineNames`), not just the one
+ * `nameOf` returns. Legacy compared `nameOf(x) === machineId`, and so did this
+ * — which silently failed on a machine whose window carries records under two
+ * names: `nameOf` answered with the older alias, `/machine/specs` reported the
+ * current one, no uid matched, and the `?? machineId` fallback then handed back
+ * the NAME as if it were a uid. Every downstream comparison against a real uid
+ * was false from there on. Found on a laptop logging as both `MacBook-Pro` and
+ * `MacBook-Pro.local`.
+ *
+ * The `?? machineId` fallback stays for the case it was written for: a freshly
+ * booted daemon that has produced no records or beats of its own yet, where
+ * there is no uid to find and the raw name is the best available handle. */
 export function localMachineUid(
   data: FlowRecord[],
   liveMachines: Map<string, PresenceBeat>,
   machineId: string | null | undefined,
 ): string | null {
   if (!machineId) return null;
-  return machineUids(data, liveMachines).find((x) => nameOf(data, liveMachines, x) === machineId) ?? machineId;
+  return machineUids(data, liveMachines).find((x) => machineNames(data, liveMachines, x).has(machineId)) ?? machineId;
 }
 
 /** `sessionsOn()` — viewer.html:1124. */
@@ -195,6 +379,42 @@ export const dispatchKilled = (rec: FlowRecord | undefined): boolean =>
 /** `sessEnd()` — viewer.html:1149. */
 export function sessEnd(data: FlowRecord[], sid: string): FlowRecord | undefined {
   return data.find((r) => r.session_id === sid && r.action === "session.end");
+}
+
+/** `sessionCloseEdge()` — viewer.html:1171-1175. The EARLIEST of the dispatch
+ * terminal and the reconciler's `session.end`. Every "is this session done /
+ * where does its bar end" decision goes through here rather than bare
+ * `dispatchEnd`: a session whose ONLY terminal is `session.end` (abandoned,
+ * hard-killed, shipped without a clean complete) must read as ENDED, not
+ * in-flight to the playhead. */
+export function sessionCloseEdge(data: FlowRecord[], sid: string): FlowRecord | undefined {
+  const c = dispatchEnd(data, sid);
+  const e = sessEnd(data, sid);
+  if (c && e) return T(c.ts) <= T(e.ts) ? c : e;
+  return c ?? e;
+}
+
+/** `sessionRunning()` — viewer.html:1183-1187. THE single source of truth for
+ * "is this session in flight?", and the reason it takes `liveMode`:
+ *
+ * - **live** keys on PRESENCE (`liveSet`), which is TTL-self-healing — an
+ *   orphaned session with no close-edge ages out of the live set on its own.
+ * - **replay** keys on the durable CLOSE-EDGE relative to the playhead: the
+ *   session was running iff nothing had closed it yet at time `t`.
+ *
+ * (#1800 P2) Before this, the port had only the live arm, because `/next` had
+ * no historical route that reached it. A replay asking presence about a past
+ * day is the "confidently wrong" failure `FleetLens`'s own doc names. */
+export function sessionRunning(
+  data: FlowRecord[],
+  liveSet: Set<string>,
+  sid: string,
+  liveMode: boolean,
+  t: number,
+): boolean {
+  if (liveMode) return liveSet.has(sid);
+  const close = sessionCloseEdge(data, sid);
+  return !(close && T(close.ts) <= t);
 }
 
 /** `statusVisual()` — viewer.html:1140-1145. Only `lbl` is consumed here —
@@ -226,7 +446,15 @@ export function machPresent(
  * fallback for when Redis session-presence (`/fleet/sessions/live`) is
  * empty. `nowMs` is REAL wall-clock now (frozen via Playwright's clock in
  * the parity spec), not `tMax` — see the legacy comment this ports. */
-export function flowLiveSessions(data: FlowRecord[], nowMs: number): Set<string> {
+export function flowLiveSessions(data: FlowRecord[], nowMs: number, liveMode = true): Set<string> {
+  // `if(!document.body.classList.contains('live-mode')) return new Set();`
+  // (viewer.html:3378) — the gate this port dropped, because until #1800 P2
+  // nothing here ever ran outside live mode. Without it a REPLAY derives
+  // liveness from flow records and reads a past day's sessions as running
+  // right now: cards go "dispatch in flight", the machine card counts
+  // "N running" instead of the day's specialists, and timeline bars draw
+  // yellow. Replay is presence-agnostic by construction.
+  if (!liveMode) return new Set();
   const lastBySid = new Map<string, number>();
   const started = new Set<string>();
   for (const r of data) {
@@ -246,9 +474,14 @@ export function flowLiveSessions(data: FlowRecord[], nowMs: number): Set<string>
 
 /** `liveSessionSet()` — viewer.html:1373-1379. Redis presence when it has
  * ANY beat (authoritative), else the flow-derived fallback. */
-export function liveSessionSet(data: FlowRecord[], liveSessionIds: Set<string>, nowMs: number): Set<string> {
+export function liveSessionSet(
+  data: FlowRecord[],
+  liveSessionIds: Set<string>,
+  nowMs: number,
+  liveMode = true,
+): Set<string> {
   if (liveSessionIds.size) return liveSessionIds;
-  return flowLiveSessions(data, nowMs);
+  return flowLiveSessions(data, nowMs, liveMode);
 }
 
 /** One row of the machine lens's runs list — the fields `recentRow()`

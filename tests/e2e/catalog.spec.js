@@ -15,6 +15,24 @@ test('catalog picker renders days + missions inertly and wires navigation', asyn
   await page.route('**/flow/2026-01-01', (r) =>
     r.fulfill({ contentType: 'application/json', body: '[]' })
   );
+  // The day this spec drills into via the catalog — PlaybackLens's own
+  // `/flow/<date>` fetch (the port's day-row destination; see the
+  // navigation comment below). One real record, not an empty array: an
+  // empty day renders PlaybackLens's OWN "no records for <date>" state,
+  // not `.fleet-lens` — this spec needs the historical fleet hero to
+  // actually paint to prove the drill-in landed somewhere real.
+  await page.route('**/flow/2026-01-02', (r) =>
+    r.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify([
+        {
+          ts: '2026-01-02T00:00:00Z', level: 'info', category: 'machinery',
+          tier: 'local', stage: 'dispatch', action: 'machine.online',
+          source: 'presence-reconciler', machine_id: 'demo-machine', machine_uid: 'demo-machine-uid',
+        },
+      ]),
+    })
+  );
   // The catalog: a real-shaped day plus an attacker-controlled mission name.
   await page.route('**/flow-days', (r) =>
     r.fulfill({
@@ -31,12 +49,18 @@ test('catalog picker renders days + missions inertly and wires navigation', asyn
 
   await page.goto('/index-daemon.html');
 
-  // (#1098) The source/date badge becomes the history trigger (.srcbtn) once
-  // boot() resolves the daemon mode — the separate ▤ button was removed.
-  await page.waitForSelector('#srcbadge.srcbtn', { timeout: 15_000 });
+  // (port note) Legacy upgrades a plain `#srcbadge` span into the catalog
+  // trigger at boot time (`sb.dataset.act="catalog"; sb.classList.add
+  // ("srcbtn")`, viewer.html:3937) — a JS-bolted-on affordance. The port's
+  // `<Masthead>` mounts the REAL toggle unconditionally instead
+  // (`CatalogPanel`'s own `.catalog-toggle` button, `aria-label="browse
+  // history"` — see that component's module doc): no `#srcbadge` id exists
+  // at all, and there's no boot-time upgrade step to wait on because the
+  // button is interactive from first paint.
+  await page.waitForSelector('.catalog-toggle', { timeout: 15_000 });
 
-  await page.click('#srcbadge');
-  await page.waitForSelector('#catpanel:not([hidden]) .catrow');
+  await page.click('.catalog-toggle');
+  await page.waitForSelector('#catpanel .catrow');
 
   // Live row + two day rows.
   const rows = page.locator('#catpanel .catrow');
@@ -53,10 +77,19 @@ test('catalog picker renders days + missions inertly and wires navigation', asyn
   const dayRow = page.locator('.catrow[data-arg="2026-01-02"]');
   await expect(dayRow).toHaveAttribute('data-act', 'goday');
 
-  // Clicking it navigates to the day's playback URL.
+  // Clicking it navigates to the day's playback view. Legacy does a real
+  // `location.href="/play/"+date` (a server route, `.catalog-toggle`'s own
+  // predecessor was a full-page bounce); the port's day row instead writes
+  // `location.hash=date` (`CatalogPanel.tsx`'s own doc: "the NEW `playback`
+  // route this packet adds") and renders the same in-SPA `FleetLens` over
+  // that historical day (`PlaybackLens.tsx`'s own doc: "the fleet hero
+  // rendered over one historical day, not a separate view") — no page
+  // navigation at all. `/play/<date>` still exists as a real SERVER route
+  // (a fresh boot straight onto that day, per this repo's daemon), it's
+  // just not what a day-ROW CLICK does inside an already-booted SPA.
   await dayRow.click();
-  await page.waitForURL('**/play/2026-01-02');
-  expect(page.url()).toContain('/play/2026-01-02');
+  await expect.poll(() => page.evaluate(() => location.hash)).toBe('#2026-01-02');
+  await expect(page.locator('.fleet-lens')).toBeVisible();
 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });

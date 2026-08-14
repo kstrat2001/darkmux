@@ -72,6 +72,15 @@ export const queryKeys = {
    * (viewer.html:3497) — see `lib/flow.ts`'s module doc for the fetch-order
    * subtlety that makes the two-day merge order load-bearing. */
   flowDate: (date: string) => ["flow", date] as const,
+  /** `staticSource.ts::staticFlowSrc()`'s committed `.jsonl` (#1801) — the
+   * static-demo twin of `flowDate` above, keyed on the SRC PATH rather than
+   * a date (a static build has no daemon-assigned date until the file's own
+   * first record supplies one — see `lib/flow.ts::firstRecordDate`'s own
+   * doc). `useRouteRecords` and `PlaybackLens` both use this exact key for
+   * the exact same reason `flowDate` is shared between `useFlowWindow` and
+   * `useRouteRecords`: one cache slot, one fetch, no possibility of the
+   * stage and the event log disagreeing about the file's contents. */
+  staticFlowSrc: (src: string) => ["flow", "static-src", src] as const,
   // (Packet 4) The playback catalog (`#691`) — day/mission history browser.
   flowDays: () => ["flow", "days"] as const,
   flowMissions: () => ["flow", "missions"] as const,

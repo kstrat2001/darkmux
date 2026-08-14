@@ -27,24 +27,24 @@ describe("canonicalHash / parseRoute round-trip", () => {
   });
 
   it("runs (kind=all) round-trips WITHOUT a kind param — all is the implicit default", () => {
-    const route: Route = { kind: "runs", runsKind: "all", run: null };
+    const route: Route = { kind: "runs", runsKind: "all", run: null, machine: null };
     expect(canonicalHash(route)).toBe("lens=runs");
     expect(roundTrip(route)).toEqual(route);
   });
 
   it("runs (kind=mission) round-trips with an explicit kind param", () => {
-    const route: Route = { kind: "runs", runsKind: "mission", run: null };
+    const route: Route = { kind: "runs", runsKind: "mission", run: null, machine: null };
     expect(canonicalHash(route)).toBe("lens=runs&kind=mission");
     expect(roundTrip(route)).toEqual(route);
   });
 
   it("runs (kind=dispatch) round-trips", () => {
-    const route: Route = { kind: "runs", runsKind: "dispatch", run: null };
+    const route: Route = { kind: "runs", runsKind: "dispatch", run: null, machine: null };
     expect(roundTrip(route)).toEqual(route);
   });
 
   it("runs (kind=lab) round-trips — the legacy #lens=lab upgrade target", () => {
-    const route: Route = { kind: "runs", runsKind: "lab", run: null };
+    const route: Route = { kind: "runs", runsKind: "lab", run: null, machine: null };
     expect(canonicalHash(route)).toBe("lens=runs&kind=lab");
     expect(roundTrip(route)).toEqual(route);
   });
@@ -62,14 +62,29 @@ describe("canonicalHash / parseRoute round-trip", () => {
   });
 
   it("runs (kind=lab, a resolved run) round-trips with an explicit run param — the lab-run-detail deep link", () => {
-    const route: Route = { kind: "runs", runsKind: "lab", run: "live/gate-1" };
+    const route: Route = { kind: "runs", runsKind: "lab", run: "live/gate-1", machine: null };
     expect(canonicalHash(route)).toBe("lens=runs&kind=lab&run=live%2Fgate-1");
     expect(roundTrip(route)).toEqual(route);
   });
 
   it("runs (kind=all, a resolved run) ALSO round-trips with run — a lab row is reachable from kind=all too, matching legacy's state.level==='lab-run' gate being independent of state.runsKind", () => {
-    const route: Route = { kind: "runs", runsKind: "all", run: "live/gate-1" };
+    const route: Route = { kind: "runs", runsKind: "all", run: "live/gate-1", machine: null };
     expect(canonicalHash(route)).toBe("lens=runs&run=live%2Fgate-1");
+    expect(roundTrip(route)).toEqual(route);
+  });
+
+  // (#1809) The machine pin round-trips the same way `uid`/`run` do —
+  // written only when set, and composable with the OTHER independent runs
+  // params rather than replacing them.
+  it("runs with a machine pin round-trips with an explicit machine param", () => {
+    const route: Route = { kind: "runs", runsKind: "all", run: null, machine: "some-uid" };
+    expect(canonicalHash(route)).toBe("lens=runs&machine=some-uid");
+    expect(roundTrip(route)).toEqual(route);
+  });
+
+  it("a machine pin composes with a kind filter AND a resolved run on the same hash", () => {
+    const route: Route = { kind: "runs", runsKind: "lab", run: "live/gate-1", machine: "some-uid" };
+    expect(canonicalHash(route)).toBe("lens=runs&kind=lab&run=live%2Fgate-1&machine=some-uid");
     expect(roundTrip(route)).toEqual(route);
   });
 

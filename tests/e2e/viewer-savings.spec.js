@@ -32,23 +32,38 @@ test('the hero splits local / cloud / unknown and never credits the unattributab
   await page.goto('/index-savings.html');
   await page.waitForSelector('.savings', { timeout: 15_000 });
 
-  const t = await page.evaluate(() => {
-    const o = tokensOffMeter();
-    return { local: o.local, cloud: o.cloud, unknown: o.unknown, total: o.total, uncls: o.uncls };
-  });
+  // (port note) `tokensOffMeter()` is a pure function taking flow records as
+  // an argument (`ui/src/lenses/fleet/savings.ts`) — the port holds no
+  // global mirroring legacy's `state`/`DATA` for `page.evaluate` to call
+  // into, and its exact scenarios (endpoint-without-tokens, the review
+  // path's `remote_tokens`-only completion, an unknown/no-bookend session)
+  // are already unit-tested directly against that function in
+  // `savings.test.ts` — see the `describe("tokensOffMeter")` block there,
+  // one `it` per defect this spec's own header names. What's NOT covered
+  // there is whether the computed split actually REACHES the rendered
+  // hero, which is what this e2e spec exists to prove — so it reads the
+  // numbers off the DOM `SavingsHero` paints instead of recomputing them.
+  async function savNum(selector) {
+    const text = await page.locator(selector).innerText();
+    return Number(text.replace(/,/g, ''));
+  }
 
   // Fixture: local 1000 · cloud 5000 (telemetry) + 700 (a telemetry-LESS
   // session whose only spend figure is `remote_tokens`) · unknown 300 (a
-  // `task:` seat with no bookend of its own).
-  expect(t.cloud).toBe(5700);   // (1): endpoint registered without token fields present
-  // 300 from the bookend-less `task:` seat + 900 from a hosted review that
-  // ERRORED: its start named no endpoint (the review classifies itself only on
-  // a clean close) and its terminal is `dispatch error`, so nothing ever says
-  // where it ran. A rule that accepted any endpoint-less bookend would call
-  // that local — the flattering error surviving on the error path.
-  expect(t.unknown).toBe(1200); // (2): not silently local
-  expect(t.local).toBe(1000);   // and the genuinely-local session is untouched
-  expect(t.local + t.cloud + t.unknown).toBe(t.total); // the three partition the whole
+  // `task:` seat with no bookend of its own) + 900 from a hosted review
+  // that ERRORED (its start named no endpoint — the review classifies
+  // itself only on a clean close — and its terminal is `dispatch error`,
+  // so nothing ever says where it ran; a rule that accepted any
+  // endpoint-less bookend would call that local — the flattering error
+  // surviving on the error path).
+  const cloud = await savNum('.savlead.cloud .savnum');
+  expect(cloud).toBe(5700); // (1): endpoint registered without token fields present
+
+  const unknown = await savNum('.savlead.unknown .savnum');
+  expect(unknown).toBe(1200); // (2): not silently local
+
+  const local = await savNum('.savlead:not(.cloud):not(.unknown) .savnum');
+  expect(local).toBe(1000); // the genuinely-local session is untouched
 
   // The unattributed figure is SHOWN, not just computed — a number excluded
   // from the savings claim without appearing anywhere would be a quieter
@@ -58,6 +73,6 @@ test('the hero splits local / cloud / unknown and never credits the unattributab
   // The telemetry-less session's spend has no prompt/completion split, so it
   // must land in `unclassified` rather than vanishing from the class row —
   // otherwise the headline silently exceeds the chips beneath it.
-  expect(t.uncls).toBe(700);
+  await expect(page.locator('.savc.uncls .scv')).toHaveText('700');
   expect(pageErrors).toEqual([]);
 });

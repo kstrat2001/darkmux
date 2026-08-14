@@ -2,12 +2,17 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RunsBoard } from "./RunsBoard";
+import { todayUTC } from "../../lib/flow";
 
-function renderBoard(initialKind: "all" | "mission" | "dispatch" | "lab" = "all", initialRun: string | null = null) {
+function renderBoard(
+  initialKind: "all" | "mission" | "dispatch" | "lab" = "all",
+  initialRun: string | null = null,
+  initialMachineUid: string | null = null,
+) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <RunsBoard initialKind={initialKind} initialRun={initialRun} />
+      <RunsBoard initialKind={initialKind} initialRun={initialRun} initialMachineUid={initialMachineUid} />
     </QueryClientProvider>,
   );
 }
@@ -388,5 +393,230 @@ describe("RunsBoard", () => {
       await waitFor(() => expect(container.querySelector(".runmore")).not.toBeInTheDocument());
       expect(screen.getByText("r29")).toBeInTheDocument();
     });
+  });
+});
+
+/**
+ * (#1801) `darkmux-runs-src`/`darkmux-lab-runs-src` — the static demo's
+ * committed fixture files, read instead of `GET /runs`/`GET /lab/runs`
+ * (there is no daemon behind the static demo to serve either). Via
+ * `staticSource.ts`'s `resolveRunsSrc()`/`resolveLabRunsSrc()`.
+ */
+describe("RunsBoard — the static-demo runs-src override (#1801)", () => {
+  function injectMeta(name: string, content: string) {
+    const el = document.createElement("meta");
+    el.setAttribute("name", name);
+    el.setAttribute("content", content);
+    document.head.appendChild(el);
+  }
+
+  afterEach(() => {
+    document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
+  });
+
+  function mockStaticSrc() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url === "./demo-runs.json") {
+          return Promise.resolve(new Response(JSON.stringify({ runs: RUNS, generated_at_ms: 1 }), { status: 200 }));
+        }
+        if (url === "./demo-lab-runs.json") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ configured: true, dir: "/lab", exists: true, runs: [] }), { status: 200 }),
+          );
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+  }
+
+  it("fetches the injected runs-src / lab-runs-src, never /runs or /lab/runs", async () => {
+    injectMeta("darkmux-runs-src", "./demo-runs.json");
+    injectMeta("darkmux-lab-runs-src", "./demo-lab-runs.json");
+    mockStaticSrc();
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+
+    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+    expect(calls).toContain("./demo-runs.json");
+    expect(calls).toContain("./demo-lab-runs.json");
+    expect(calls).not.toContain("/runs");
+    expect(calls).not.toContain("/lab/runs");
+  });
+
+  // Inverted case: without the metas, the board keeps hitting the literal
+  // daemon paths exactly as every other test in this file already proves —
+  // restated here as its own assertion so this describe block doesn't rely
+  // on file ordering to make the point.
+  it("without the metas, it still fetches the literal /runs and /lab/runs paths", async () => {
+    mockFetch();
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+    expect(calls).toContain("/runs");
+    expect(calls).toContain("/lab/runs");
+  });
+});
+
+/**
+ * (#1809, finishing #1508 step 4) The machine pin — `#lens=runs&machine=<uid>`.
+ *
+ * `Run.machine` is a NAME (`machine_id`), not a uid (see `format.ts`'s
+ * `runsForMachine` doc) — so pinning by uid needs a live `/flow/<date>` +
+ * `/fleet/machines/live` window to resolve which name(s) that uid has
+ * appeared under (`lib/flow.ts::machineNames`). `mockPinnedFetch` below
+ * serves both, unlike this file's plain `mockFetch` (which 404s them,
+ * fine for every OTHER test here — an unpinned board never resolves a
+ * uid at all).
+ */
+describe("RunsBoard — the machine pin (#1809)", () => {
+  afterEach(() => {
+    window.location.hash = "";
+  });
+
+  const PINNED_RUNS = [
+    { id: "m1", kind: "mission", status: "complete", tracked: true, updated_ts: 300, machine: "MacBook-Pro" },
+    { id: "d1", kind: "dispatch", status: "running", tracked: true, role: "coder", updated_ts: 200, machine: "MacBook-Pro" },
+    { id: "l1", kind: "lab", status: "abandoned", tracked: true, updated_ts: 150, machine: "MacBook-Pro" },
+    // A different machine — must never appear under the u1 pin.
+    { id: "m2", kind: "mission", status: "complete", tracked: true, updated_ts: 250, machine: "studio" },
+    // Real tracked work with no recorded machine attribution at all — must
+    // never appear under ANY pin (see `runsForMachine`'s own doc for why
+    // this is the honest call, not a bug).
+    { id: "g1", kind: "dispatch", status: "complete", tracked: true, updated_ts: 50 },
+  ];
+
+  const LAB_RUNS_FIXTURE = [{ dir: "l1", mtime_ms: 1, case_ids: [], bundles: 1, raw_flags: 0, deduped_flags: 0, confirmed: 0, needs_check: 0, archived: 0, degenerate: false, finished: true }];
+
+  function mockPinnedFetch(opts: {
+    runs?: unknown[];
+    /** Extra flow records beyond the default single `u1 -> MacBook-Pro`
+     * mapping — used by the multi-alias test to add a SECOND name for the
+     * same uid. */
+    extraFlowToday?: unknown[];
+  } = {}) {
+    const today = todayUTC();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "/runs") {
+          return Promise.resolve(new Response(JSON.stringify({ runs: opts.runs ?? PINNED_RUNS, generated_at_ms: 1 }), { status: 200 }));
+        }
+        if (path === "/lab/runs") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ configured: true, dir: "/lab", exists: true, runs: LAB_RUNS_FIXTURE }), { status: 200 }),
+          );
+        }
+        if (path === `/flow/${today}`) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify([{ ts: `${today}T00:00:00Z`, machine_uid: "u1", machine_id: "MacBook-Pro" }, ...(opts.extraFlowToday ?? [])]),
+              { status: 200 },
+            ),
+          );
+        }
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
+        if (path === "/fleet/machines/live") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }),
+          );
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+  }
+
+  it("filters the flat row list to the pinned machine's alias set", async () => {
+    mockPinnedFetch();
+    renderBoard("all", null, "u1");
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    expect(screen.getByText("d1")).toBeInTheDocument();
+    // The other machine and the unattributed row are both absent.
+    expect(screen.queryByText("m2")).not.toBeInTheDocument();
+    expect(screen.queryByText("g1")).not.toBeInTheDocument();
+  });
+
+  it("scopes the kind-chip counts to the pinned machine, not the whole fleet", async () => {
+    mockPinnedFetch();
+    const { container } = renderBoard("all", null, "u1");
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    // 3 rows carry machine "MacBook-Pro" (m1, d1, l1) — m2 (studio) and g1
+    // (unattributed) are excluded from the "all" count under the pin.
+    expect(container.querySelector('[data-arg="all"]')?.textContent).toContain("3");
+    expect(container.querySelector('[data-arg="mission"]')?.textContent).toContain("1");
+  });
+
+  it("names the pinned machine in a visible, clickable chip", async () => {
+    mockPinnedFetch();
+    renderBoard("all", null, "u1");
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    expect(screen.getByText(/machine: MacBook-Pro/)).toBeInTheDocument();
+  });
+
+  it("clicking the chip clears the pin — back to every machine, via a real hash write", async () => {
+    mockPinnedFetch();
+    const { container } = renderBoard("all", null, "u1");
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    expect(screen.queryByText("m2")).not.toBeInTheDocument();
+
+    fireEvent.click(container.querySelector('[data-act="clearmachine"]')!);
+
+    await waitFor(() => expect(screen.getByText("m2")).toBeInTheDocument());
+    expect(screen.queryByText(/machine: MacBook-Pro/)).not.toBeInTheDocument();
+    expect(window.location.hash).toBe("#lens=runs");
+  });
+
+  // Inverted case: the UNPINNED board is untouched by any of the above —
+  // every machine's rows show, and no chip renders at all. Guards against
+  // the machine-pin feature accidentally narrowing the default view.
+  it("an unpinned board still shows every machine, with no machine chip", async () => {
+    mockPinnedFetch();
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    expect(screen.getByText("m2")).toBeInTheDocument();
+    expect(screen.getByText("g1")).toBeInTheDocument();
+    expect(screen.queryByText(/^machine:/)).not.toBeInTheDocument();
+  });
+
+  it("switching kind chips while pinned preserves the pin in the address bar", async () => {
+    mockPinnedFetch();
+    renderBoard("all", null, "u1");
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    fireEvent.click(document.querySelector('[data-arg="dispatch"]')!);
+    await waitFor(() => expect(screen.queryByText("m1")).not.toBeInTheDocument());
+    expect(screen.getByText("d1")).toBeInTheDocument();
+    expect(window.location.hash).toBe("#lens=runs&kind=dispatch&machine=u1");
+  });
+
+  // The regression this whole feature exists to avoid shipping: matching
+  // by a single resolved label instead of the full alias set. u1 here has
+  // appeared under TWO names in the window (`MacBook-Pro` and
+  // `MacBook-Pro.local`), and rows are split across both — a pin that only
+  // matched `nameOf(uid)`'s first-found alias would silently drop half of
+  // these.
+  it("matches rows filed under EITHER of a uid's known aliases", async () => {
+    mockPinnedFetch({
+      runs: [
+        { id: "old-alias", kind: "mission", status: "complete", tracked: true, updated_ts: 300, machine: "MacBook-Pro" },
+        { id: "new-alias", kind: "mission", status: "complete", tracked: true, updated_ts: 200, machine: "MacBook-Pro.local" },
+      ],
+      extraFlowToday: [{ ts: `${todayUTC()}T01:00:00Z`, machine_uid: "u1", machine_id: "MacBook-Pro.local" }],
+    });
+    renderBoard("all", null, "u1");
+    await waitFor(() => expect(screen.getByText("old-alias")).toBeInTheDocument());
+    expect(screen.getByText("new-alias")).toBeInTheDocument();
+  });
+
+  it("the lab series view (kind=lab, ◧ series) is ALSO scoped to the pin, bridged via the shared dir/id", async () => {
+    mockPinnedFetch();
+    const { container } = renderBoard("lab", null, "u1");
+    await waitFor(() => expect(screen.getByText("l1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("◧ series"));
+    await waitFor(() => expect(screen.getByText(/lab series/)).toBeInTheDocument());
+    // l1 is the pinned machine's only lab run and has a recorded corpus
+    // (`LAB_RUNS_FIXTURE`) — the series card renders for it.
+    expect(container.querySelector(".labtaskcard")).toBeInTheDocument();
   });
 });

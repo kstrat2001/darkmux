@@ -4,13 +4,18 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { missionGraphReachable } from "../../lib/injectedMeta";
+import { isStaticBuild, resolveLabRunsSrc, resolveRunsSrc } from "../../lib/staticSource";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
+import { useFlowWindow } from "../../hooks/useFlowWindow";
+import { useLiveMachines } from "../../hooks/useLiveMachines";
+import { machineNames, nameOf } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse, LabRunsResponse, LabRun } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
 import {
   RUNS_CAP,
   runsFiltered,
+  runsForMachine,
   runsMultiMachine,
   runsAgo,
   runSubtitle,
@@ -31,7 +36,13 @@ import {
  *
  * Data: `GET /runs` (the flat cross-source view-model, every kind) and
  * `GET /lab/runs` (the lab-only staffing/bundle extras), fetched TOGETHER on
- * every mount — matching `window.goRuns`'s `Promise.all([loadRuns(),
+ * every mount — via `staticSource.ts`'s `resolveRunsSrc()`/
+ * `resolveLabRunsSrc()` rather than the two literal paths directly, so a
+ * static build (`darkmux-runs-src`/`darkmux-lab-runs-src` metas — #1801,
+ * viewer.html:4077/4027) reads its committed fixture files instead of
+ * hitting a daemon that isn't there. A daemon-served page is unaffected:
+ * both resolvers fall back to the exact literal paths this component always
+ * used — matching `window.goRuns`'s `Promise.all([loadRuns(),
  * loadLabRuns()])`, not gated by which kind chip is selected (the chip is a
  * client-side re-filter of already-loaded data, never a new fetch — see
  * `window.setRunsKind`). `/missions` and `/phases` are deliberately NOT
@@ -98,11 +109,27 @@ import {
 const MISSION_GRAPH_UNREACHABLE_NOTICE =
   "mission graph needs a running daemon behind this page, which this one doesn't have — open it in the classic viewer at / instead";
 
-export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; initialRun: string | null }) {
+export function RunsBoard({
+  initialKind,
+  initialRun,
+  initialMachineUid,
+}: {
+  initialKind: RunsKind;
+  initialRun: string | null;
+  /** (#1809) The route's `machine=` pin — `null` means every machine, the
+   * pre-existing behavior. Seeded the same way `initialKind`/`initialRun`
+   * are (local state, re-synced on a genuine deep-link change below) rather
+   * than read live off the route on every render, for the same reason: the
+   * kind chips already own a piece of state outside `Route` (see this
+   * file's own module doc), and the machine pin composes with it the same
+   * way. */
+  initialMachineUid: string | null;
+}) {
   const [kind, setKind] = useState<RunsKind>(initialKind);
   const [series, setSeries] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [rowClickNotice, setRowClickNotice] = useState<string | null>(null);
+  const [machineUid, setMachineUid] = useState<string | null>(initialMachineUid);
   // `state.labRunDir` (viewer.html) — which lab run (if any) this board is
   // showing the detail pane for. Seeded from `initialRun`, independent of
   // `kind` — a lab row (and so this drill-in) is reachable from BOTH
@@ -124,7 +151,7 @@ export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; 
   function openLabRun(dir: string) {
     setLabRunDir(dir);
     setRowClickNotice(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: dir }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: dir, machine: machineUid }));
   }
 
   // The lab-run detail's own "‹ runs" back link (viewer.html:4852/4862,
@@ -134,7 +161,17 @@ export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; 
   // here, not a redundant re-fetch).
   function closeLabRun() {
     setLabRunDir(null);
-    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null, machine: machineUid }));
+  }
+
+  // (#1809) Clears the machine pin — the "back to all machines" half of
+  // "visible AND clearable" the packet brief requires. Preserves whichever
+  // kind filter/lab-run drill-in was active, matching `selectKind`'s own
+  // "only the ONE thing that changed" discipline below.
+  function clearMachinePin() {
+    setMachineUid(null);
+    setShowAll(false);
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: labRunDir, machine: null }));
   }
 
   // `ACTIONS.labrun`/`ACTIONS.gomission` (viewer.html:2991, folded per-row
@@ -185,15 +222,22 @@ export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; 
   // per click, breaking legacy's "lens hops must not spam history" contract
   // (`syncLabHash`'s own comment) — `replaceState` is the whole reason
   // legacy's mechanism exists.
+  // (#1809) `initialMachineUid` joins the same guard, same reasoning: a
+  // genuine deep-link onto a DIFFERENT machine pin re-syncs local state;
+  // this component's OWN `clearMachinePin`/machine-chip writes echo back
+  // through `writeHash` without a `hashchange`, so without the guard they'd
+  // look like a fresh deep-link and reset `series`/`showAll` right after
+  // the operator clicked.
   useEffect(() => {
-    if (initialKind === kind && initialRun === labRunDir) return;
+    if (initialKind === kind && initialRun === labRunDir && initialMachineUid === machineUid) return;
     setKind(initialKind);
     setSeries(false);
     setShowAll(false);
     setRowClickNotice(null);
     setLabRunDir(initialRun);
+    setMachineUid(initialMachineUid);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialKind, initialRun]);
+  }, [initialKind, initialRun, initialMachineUid]);
 
   // These stay unconditional (React's rules-of-hooks — a hook can't sit
   // after the early return below) even though the lab-run-detail branch
@@ -204,12 +248,28 @@ export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; 
   // either — the two are genuinely independent fetches there too).
   const runsQuery = useQuery({
     queryKey: queryKeys.runs(),
-    queryFn: () => fetchJson<RunsResponse>("/runs"),
+    queryFn: () => fetchJson<RunsResponse>(resolveRunsSrc()),
   });
   const labRunsQuery = useQuery({
     queryKey: queryKeys.labRuns(),
-    queryFn: () => fetchJson<LabRunsResponse>("/lab/runs"),
+    queryFn: () => fetchJson<LabRunsResponse>(resolveLabRunsSrc()),
   });
+
+  // (#1809) Also unconditional, same rules-of-hooks reason as the two
+  // queries above — needed only to resolve a machine PIN's full alias set
+  // (`machineNames`, see `format.ts::runsForMachine`'s own doc for why a
+  // single resolved label isn't enough), but App.tsx ALREADY runs both of
+  // these on every route (its own `flowWindow`/`liveMachines`, used for
+  // `#meta` and the machine-lens crumb) — same "cache reuse, not a second
+  // network round trip" TanStack dedup App.tsx's own module doc names for
+  // `MachineLens`. `useLiveMachines` is gated the same way every OTHER
+  // live-only poll in this app is (`isStaticBuild()` — see that hook's own
+  // doc and `MachineLens.tsx`'s identical gate): a daemon-less static build
+  // has no `/fleet/machines/live` to poll.
+  const nowMs = Date.now();
+  const daemonBacked = !isStaticBuild();
+  const flowWindow = useFlowWindow(nowMs);
+  const liveMachines = useLiveMachines(daemonBacked);
 
   // The lab-run detail pane is its own top-level render, reached without
   // waiting on the two queries above and independent of `kind` (see
@@ -234,17 +294,36 @@ export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; 
   const labDirExists = labRunsQuery.data.ok ? labRunsQuery.data.data.exists : null;
   const labRuns: LabRun[] = labRunsQuery.data.ok ? labRunsQuery.data.data.runs : [];
 
+  // (#1809) The machine pin, applied ONCE here so every derivation below
+  // (kind counts, the lab-source notice, `showMachine`, the series grouping,
+  // the flat row list) sees the already-scoped set rather than each
+  // re-deriving its own filter — see `format.ts::runsForMachine`'s own doc
+  // for the alias-matching rationale and the "50 missions + 15 dispatches
+  // carry no machine at all" exclusion it names.
+  const pinnedMachineName = machineUid != null ? nameOf(flowWindow.data, liveMachines, machineUid) : null;
+  const scopedRuns = machineUid != null ? runsForMachine(runs, machineNames(flowWindow.data, liveMachines, machineUid)) : runs;
+  // `LabRun` (the `/lab/runs` series-view source) carries no machine field
+  // at all (`crates/darkmux-serve/src/lib.rs::LabRunSummary` — verified,
+  // not assumed) — bridged via the ONE field the two sources share: a lab
+  // run's `dir` IS its `Run.id` (`runs.rs::lab_summary_to_run`: `id:
+  // summary.dir.clone()`). So the lab-kind subset of `scopedRuns` (already
+  // machine-filtered) names exactly which dirs belong to the pin.
+  const scopedLabRuns =
+    machineUid != null
+      ? labRuns.filter((r) => scopedRuns.some((run) => run.kind === "lab" && run.id === r.dir))
+      : labRuns;
+
   function selectKind(k: RunsKind) {
     setKind(k);
     setShowAll(false);
     setRowClickNotice(null);
     if (k !== "lab") setSeries(false);
-    writeHash(canonicalHash({ kind: "runs", runsKind: k, run: null }));
+    writeHash(canonicalHash({ kind: "runs", runsKind: k, run: null, machine: machineUid }));
   }
 
   // viewer.html: `labSourceNotice()`.
   let notice: string | null = null;
-  if (kind === "lab" && !runs.some((r) => r.kind === "lab")) {
+  if (kind === "lab" && !scopedRuns.some((r) => r.kind === "lab")) {
     if (!labConfigured) {
       notice = "this daemon has no lab-run source wired — darkmux doctor shows the resolved dirs.lab and where it came from.";
     } else if (labDirExists === false) {
@@ -254,17 +333,26 @@ export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; 
     }
   }
 
-  const showMachine = runsMultiMachine(runs);
+  const showMachine = runsMultiMachine(scopedRuns);
   const bar = (
-    <RunsBar counts={countsByKind(runs)} kind={kind} series={series} onKind={selectKind} onSeries={() => setSeries((s) => !s)} />
+    <RunsBar
+      counts={countsByKind(scopedRuns)}
+      kind={kind}
+      series={series}
+      onKind={selectKind}
+      onSeries={() => setSeries((s) => !s)}
+      pinnedMachineName={pinnedMachineName}
+      onClearMachine={clearMachinePin}
+    />
   );
 
   if (kind === "lab" && series) {
-    const groups = groupLabRunsByTask(labRuns);
+    const groups = groupLabRunsByTask(scopedLabRuns);
     return (
       <div data-state="data">
         <div className="stagehdr">
-          runs · lab series · {labRuns.length} run{labRuns.length === 1 ? "" : "s"} · {groups.length} task{groups.length === 1 ? "" : "s"}
+          runs · lab series · {scopedLabRuns.length} run{scopedLabRuns.length === 1 ? "" : "s"} · {groups.length} task
+          {groups.length === 1 ? "" : "s"}
         </div>
         {bar}
         {rowClickNotice && (
@@ -286,7 +374,7 @@ export function RunsBoard({ initialKind, initialRun }: { initialKind: RunsKind; 
     );
   }
 
-  const rows = runsFiltered(runs, kind);
+  const rows = runsFiltered(scopedRuns, kind);
   const shown = showAll ? rows : rows.slice(0, RUNS_CAP);
   const more = rows.length - shown.length;
   const scope = kind === "all" ? "" : ` · ${kind}`;
@@ -338,19 +426,34 @@ function countsByKind(runs: Run[]): Record<string, number> {
   return counts;
 }
 
-/** viewer.html: `function renderRunsBar()`. */
+/** viewer.html: `function renderRunsBar()` — PLUS the machine-pin chip
+ * (#1809), which has no legacy namesake (the runs lens gained a machine
+ * dimension only in this port). Deliberately reuses the `.runchip` idiom
+ * the kind/series chips already establish rather than inventing a second
+ * visual language for "a filter is active, click to change it" — see
+ * `RunsBoard.tsx`'s own module doc / #1809 for why this is the pinned
+ * state's ONE required property: visible (the chip names the machine) and
+ * clearable (clicking it is `clearMachinePin`, the "back to all machines"
+ * path). Rendered only when a pin is actually set — an unpinned board's
+ * `.runsbar` is byte-identical to before this packet, which is what keeps
+ * `goldens/runs.txt`'s existing byte-parity assertion untouched. */
 function RunsBar({
   counts,
   kind,
   series,
   onKind,
   onSeries,
+  pinnedMachineName,
+  onClearMachine,
 }: {
   counts: Record<string, number>;
   kind: RunsKind;
   series: boolean;
   onKind: (k: RunsKind) => void;
   onSeries: () => void;
+  /** `null` = no machine pin — the pre-existing "every machine" board. */
+  pinnedMachineName: string | null;
+  onClearMachine: () => void;
 }) {
   return (
     <div className="runsbar">
@@ -371,6 +474,7 @@ function RunsBar({
       {kind === "lab" && (
         <span
           className={`runchip${series ? " on" : ""}`}
+          data-act="runsseries"
           data-arg="series"
           role="button"
           tabIndex={0}
@@ -378,6 +482,19 @@ function RunsBar({
           onKeyDown={onActivateKeyDown(onSeries)}
         >
           ◧ series
+        </span>
+      )}
+      {pinnedMachineName != null && (
+        <span
+          className="runchip on"
+          data-act="clearmachine"
+          role="button"
+          tabIndex={0}
+          onClick={onClearMachine}
+          onKeyDown={onActivateKeyDown(onClearMachine)}
+          title="clear the machine filter — show runs from every machine"
+        >
+          machine: {pinnedMachineName} ✕
         </span>
       )}
     </div>
