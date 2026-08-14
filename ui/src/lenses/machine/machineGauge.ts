@@ -1,9 +1,9 @@
 /**
- * Pure builders for the Stage 2/3 machine-lens redesign (PROPOSAL.md in the
+ * Pure builders for the Stage 2/3 machine-lens redesign (docs/design/machine-lens/proposal.md in the
  * design packet; §3 "level 3 — the works" is the chosen treatment). Nothing
  * here touches the DOM — every function is a straight number-in/shape-out
  * transform, tested without rendering (`machineGauge.test.ts`), which is
- * also where PROVENANCE.md's honesty rules get pinned at the unit level:
+ * also where docs/design/machine-lens/provenance.md's honesty rules get pinned at the unit level:
  * absence vs zero, unknown-is-real, color-never-alone, redline keys on
  * exactly one server field.
  *
@@ -15,7 +15,7 @@
  * - **Detail layer** (per-model kv lines, the machine k/v row, the odometer
  *   tiles, the footer) keeps `memBytes()`'s existing two-decimal form — nothing
  *   about Stage 2/3 asked for that to change, and it stays the one place
- *   every figure on the page still matches PROVENANCE.md's traced values.
+ *   every figure on the page still matches docs/design/machine-lens/provenance.md's traced values.
  */
 
 import { memBytes, memPct, memStateCls } from "../../lib/format";
@@ -78,7 +78,7 @@ export function gaugeTickLabel(bytes: number): string {
 
 /** The scale's own end-label word — `LIMIT`, or `BUDGET` once a #1243
  * budget is configured (`limit_source === "budget"`). Never a bare number;
- * PROPOSAL.md §3's whole argument for moving the denominator off the face
+ * docs/design/machine-lens/proposal.md §3's whole argument for moving the denominator off the face
  * was that the max tick had to carry its OWN meaning. */
 export function gaugeScaleWord(limitSource: string | null | undefined): "LIMIT" | "BUDGET" {
   return limitSource === "budget" ? "BUDGET" : "LIMIT";
@@ -87,7 +87,7 @@ export function gaugeScaleWord(limitSource: string | null | undefined): "LIMIT" 
 /** The gauge's scale — deliberately NOT the old flat-meter's `machineScale()`
  * (limit ∨ pool ∨ potential ∨ current, whichever is largest). That auto-
  * expanding scale was right for a linear track that had to fit everything
- * without clipping; the semicircle's whole argument (PROPOSAL.md §"The
+ * without clipping; the semicircle's whole argument (docs/design/machine-lens/proposal.md §"The
  * denominator, argued") is the opposite — the scale end IS the allowance
  * (`limit_bytes`, or the #1243 budget), full stop, so an overcommitted
  * potential CLAMPS to the line and turns amber rather than silently
@@ -141,14 +141,14 @@ export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry
 }
 
 /** The redline's lit state keys on exactly ONE server field —
- * `machine.state === "red"` — zero client arithmetic (PROPOSAL.md §"The
+ * `machine.state === "red"` — zero client arithmetic (docs/design/machine-lens/proposal.md §"The
  * redline"). Whatever put the machine in Red (pressure, or the over-limit
  * disjunct) is a `stateWordSuffix()` question, never this one's. */
 export function redlineLit(state: string | null | undefined): boolean {
   return state === "red";
 }
 
-/** The one piece of client arithmetic PROPOSAL.md explicitly sanctions: `cur
+/** The one piece of client arithmetic docs/design/machine-lens/proposal.md explicitly sanctions: `cur
  * >= limit` is the server's OWN published over-limit rule
  * (`model_ledger.rs`'s cascade arm 2) applied to two server-supplied
  * numbers — the exact comparison that already clamps the needle at 100%,
@@ -195,7 +195,7 @@ export interface LampInputs {
   residencyChanged: boolean;
 }
 
-/** Every lamp keys on exactly ONE named field (PROVENANCE.md row ⑨) —
+/** Every lamp keys on exactly ONE named field (docs/design/machine-lens/provenance.md row ⑨) —
  * listed here in the mockup's own order. Always all seven render (an unlit
  * lamp still carries a visible outline — accessibility rule: presence is
  * never color-alone), so the row's SHAPE never changes with the payload,
@@ -283,7 +283,7 @@ export function digitCells(s: string): string[] {
  * order. Memory free is NOT a high-water mark (it can rise as well as
  * fall — it is the sole pressure TRIGGER); swap/compressor are, and their
  * note says so (`reports, never alarms` — the row-colored-by-its-own-
- * condition lesson carried into copy, PROPOSAL.md §2). Reuses `memBytes()`
+ * condition lesson carried into copy, docs/design/machine-lens/proposal.md §2). Reuses `memBytes()`
  * (the detail-layer's two-decimal convention) rather than the gauge's own
  * one-decimal `gaugeValueParts` — these are k/v figures, not the glance
  * layer. */
@@ -304,7 +304,7 @@ export function odometerTiles(pressure: MachineResources["pressure"]): OdometerV
 // ── Model rows: the scaling rule + residency diffing ────────────────────
 
 export type RowStatus = "live" | "new" | "ghost";
-// `"expected"` is a RESERVED, not-yet-buildable fourth status — PROPOSAL.md
+// `"expected"` is a RESERVED, not-yet-buildable fourth status — docs/design/machine-lens/proposal.md
 // §8 names the `EXPECTED · not yet resident` row explicitly as blocked on a
 // server-side `expected[]` set (staffing-derived) that does not exist today.
 // The slot is named here so a future packet extends this union instead of
@@ -342,7 +342,7 @@ function rowIdentifier(m: MachineResourcesModel): string {
 }
 
 /**
- * Advances the residency state machine by one poll (PROPOSAL.md §8,
+ * Advances the residency state machine by one poll (docs/design/machine-lens/proposal.md §8,
  * Scenario 2 — "a swap mid-glance"). Pure and total: same inputs, same
  * outputs, no timers, no DOM — `MachineLens.tsx` holds the returned `state`
  * in a ref and calls this again on the NEXT successful poll (never on an
@@ -414,10 +414,10 @@ export function residencyChangedThisPoll(rows: ResidencyRowView[]): boolean {
   return rows.some((r) => r.status !== "live");
 }
 
-/** The scaling rule (PROPOSAL.md §8): darkmux-owned rows first, then
+/** The scaling rule (docs/design/machine-lens/proposal.md §8): darkmux-owned rows first, then
  * alphabetical by identifier WITHIN each group — never by a live figure.
  * `owner` here is the same namespace test the server already computed
- * (PROVENANCE.md row ⑭ — `owner==="darkmux"` IS the `darkmux:` prefix
+ * (docs/design/machine-lens/provenance.md row ⑭ — `owner==="darkmux"` IS the `darkmux:` prefix
  * test), so this never re-derives ownership from the identifier string. */
 export function sortResidencyRows(rows: ResidencyRowView[]): ResidencyRowView[] {
   return [...rows].sort((a, b) => {
@@ -440,7 +440,7 @@ export interface RowGroup {
  * `1 RESIDENT (+1 EXPECTED)` / `2 RESIDENT (+1 DEPARTED)` phrasing, minus
  * the EXPECTED half this packet doesn't build). A group with zero rows is
  * omitted entirely — headers render only when there's something under
- * them, matching PROPOSAL.md §8's "today's common case adds no chrome". */
+ * them, matching docs/design/machine-lens/proposal.md §8's "today's common case adds no chrome". */
 export function groupResidencyRows(rows: ResidencyRowView[]): RowGroup[] {
   const sorted = sortResidencyRows(rows);
   const darkmux = sorted.filter((r) => r.owner === "darkmux");
@@ -469,7 +469,7 @@ export { memStateCls };
 /** The per-model detail line — `ctx · weights · kv@ctx · potential ·
  * current`, the same shape the retired `modelLines()` produced as its
  * fourth element, kept verbatim because it is a well-tested, genuinely good
- * string (PROVENANCE.md row ⑮'s traced identities all read off this exact
+ * string (docs/design/machine-lens/provenance.md row ⑮'s traced identities all read off this exact
  * text). Detail-layer precision (`memBytes()`, two decimals) — this is a
  * k/v row, not the glance layer. */
 export function modelKvLine(m: MachineResourcesModel): string {

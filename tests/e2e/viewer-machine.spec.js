@@ -8,7 +8,7 @@
 // attribution notes, warnings), so it rides the same output-encoding gate
 // as every other view.
 //
-// (#1806 Stage 2/3 — the machine-lens redesign, PROPOSAL.md in the design
+// (#1806 Stage 2/3 — the machine-lens redesign, docs/design/machine-lens/proposal.md in the design
 // packet) This file was rewritten for the new markup: a bezel-less
 // semicircle gauge (`.mm-gauge`), a tell-tale lamp row (`.mm-lamps`), the
 // odometer tiles (`.mm-odo`), and model rows (`.mm-row`) replace Stage 1's

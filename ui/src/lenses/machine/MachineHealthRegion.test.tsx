@@ -10,7 +10,7 @@ import type { MachineResources } from "../../types/handwritten";
 // `tests/parity/next-parity.spec.ts` (the narrowed byte-exact comparison —
 // see that file's own doc for what still corresponds and what was
 // deliberately retired). These tests pin the two honesty rules
-// PROVENANCE.md names as load-bearing, with BOTH sides of each inverted
+// docs/design/machine-lens/provenance.md names as load-bearing, with BOTH sides of each inverted
 // case in one file so a future edit can't quietly satisfy one and break
 // the other.
 
@@ -72,7 +72,7 @@ function renderRegion(resources: MachineResources | null, extra: Partial<Paramet
   );
 }
 
-describe("MachineHealthRegion — absence vs zero (PROVENANCE.md's central honesty rule)", () => {
+describe("MachineHealthRegion — absence vs zero (docs/design/machine-lens/provenance.md's central honesty rule)", () => {
   it("draws NO .mm-row-pot layer at all for an unpriced model — absence, not a zero-width bar", () => {
     const { container } = renderRegion(BASE);
     const unpricedRow = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("unpriced-model"))!;
@@ -214,7 +214,7 @@ describe("MachineHealthRegion — structure the e2e/parity suites also check", (
   });
 });
 
-describe("MachineHealthRegion — ghost/NEW residency rows (PROPOSAL.md §8)", () => {
+describe("MachineHealthRegion — ghost/NEW residency rows (docs/design/machine-lens/proposal.md §8)", () => {
   it("a departed model renders a dimmed DEPARTED row with its last observed figure", () => {
     const first = advanceResidency(null, BASE.models, 1000);
     const second = advanceResidency(first.state, [BASE.models[0]], 2000); // the unpriced model departs
@@ -242,5 +242,54 @@ describe("MachineHealthRegion — ghost/NEW residency rows (PROPOSAL.md §8)", (
     const { container } = renderRegion(BASE, { residencyRows: second.rows });
     expect(container.querySelectorAll(".mm-row.is-new").length).toBe(0);
     expect(container.querySelectorAll(".mm-row.is-ghost").length).toBe(0);
+  });
+});
+
+/**
+ * (final merge gate) The three surfaces the parity retirement left at ZERO
+ * coverage, found by mutation rather than by reading: deleting the machine
+ * k/v row, deleting the attribution footer, and — the one that matters —
+ * swapping `limitDescription(b.limit_source)` for a literal all passed the
+ * entire suite. The retired golden region had been covering them by byte
+ * equality, and the retirement's own justification claimed a replacement
+ * that did not exist for these three.
+ *
+ * The limit-source case is not cosmetic. Rendering a fixed string there
+ * makes the page state that a #1243 budget is configured on a machine whose
+ * limit is the physical pool — a fabricated claim about where a limit came
+ * from, on the surface whose entire job is provenance (#44: "the operator
+ * never has to wonder where a decision came from").
+ */
+describe("MachineHealthRegion — the k/v row and footer the retired golden used to cover", () => {
+  it("names the ACTUAL limit source, not a fixed string", () => {
+    const { container } = renderRegion(BASE);
+    const kv = container.querySelector(".mm-kv--machine");
+    expect(kv).toBeTruthy();
+    expect(kv!.textContent).toContain("physical pool (no budget configured)");
+    expect(kv!.textContent).not.toContain("budget configured (");
+  });
+
+  // The inverted case — without it, a hardcoded "physical pool" literal would
+  // satisfy the assertion above and the mutation would go undetected again.
+  it("follows limit_source when it changes, rather than hardcoding one answer", () => {
+    const { container } = renderRegion({ ...BASE, limit_source: "budget" });
+    const kv = container.querySelector(".mm-kv--machine")!;
+    expect(kv.textContent).not.toContain("physical pool");
+  });
+
+  it("distinguishes pool CAPACITY from pool FREE — they are different fields", () => {
+    const { container } = renderRegion(BASE);
+    const kv = container.querySelector(".mm-kv--machine")!;
+    // 137438953472 vs 3738599424 — rendering `available` where `capacity`
+    // belongs was the third undetected mutation.
+    expect(kv.textContent).toContain("137.44 GB");
+    expect(kv.textContent).toContain("3.74 GB");
+  });
+
+  it("renders the attribution footer — the observer's own cost disclosure", () => {
+    const { container } = renderRegion(BASE);
+    const feet = [...container.querySelectorAll(".memfoot")];
+    expect(feet.length).toBeGreaterThanOrEqual(2);
+    expect(feet.some((f) => /attribution:/i.test(f.textContent ?? ""))).toBe(true);
   });
 });

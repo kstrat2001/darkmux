@@ -17,7 +17,7 @@ import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDesc
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
 /**
- * (#1806 Stage 2/3 — the machine-lens redesign, `PROPOSAL.md` in the design
+ * (#1806 Stage 2/3 — the machine-lens redesign, `docs/design/machine-lens/proposal.md` in the design
  * packet at the top of this repo's scratch workspace) The health region's
  * hierarchy + level-3 treatment: a bezel-less semicircle hero (the machine
  * gauge, `<Gauge>`), a tell-tale lamp row (`<LampRow>`), odometer digit
@@ -34,7 +34,7 @@ import type { MachineResources, MachineResourcesModel } from "../../types/handwr
  * - **Absence, never zero.** `<Gauge>` draws NO commit tick when
  *   `commitPct` is `null` (no models, or Σ priced potential is 0); a model
  *   row draws NO `.mm-row-pot` layer when its OWN `potential_bytes` is
- *   `null` (unpriced) — the same rule `MemLedgerCards.tsx` pinned at Stage 1,
+ *   `null` (unpriced) — the same rule Stage 1 pinned (in the component this one replaced),
  *   carried forward rather than re-derived.
  * - **Color is never the only channel.** Every severity-colored element
  *   (the gauge fill, a row's current bar, a lamp) also carries the state
@@ -43,7 +43,7 @@ import type { MachineResources, MachineResourcesModel } from "../../types/handwr
  *   it ever reaches a `className` — never landed raw.
  * - **The redline keys on one server field.** `redlineLit()` /
  *   `gaugeFaceCaption()` read `machine.state` only; `isOverLimit()` is the
- *   one piece of client arithmetic PROPOSAL.md sanctions (the server's own
+ *   one piece of client arithmetic docs/design/machine-lens/proposal.md sanctions (the server's own
  *   over-limit rule applied to two server numbers) and never substitutes
  *   for the server's verdict.
  * - **Stale keeps the last good reading, visibly marked.** `resourcesErrored`
@@ -277,7 +277,7 @@ function ModelRow({ row, scale, nowMs }: { row: ResidencyRowView; scale: number;
       </div>
       {isGhost ? (
         <div className="mm-row-kv">
-          no longer resident — last observed current <b>{memBytes(cur)}</b> · row retires after the next poll
+          no longer resident — last observed current <b>{memBytes(cur)}</b> · row retires after the next successful poll
         </div>
       ) : (
         <div className="mm-row-kv">{modelKvLine(m)}</div>

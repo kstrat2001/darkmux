@@ -118,8 +118,10 @@ export function memStateCls(s: string | null | undefined): "green" | "amber" | "
 }
 
 /** `memPct()` — viewer.html:4939-4940. Clamped 0-100 percent of `part`
- * against `scale`, used to size a bar layer's `width`/`left` (Stage 2/3:
- * `MachineHealthRegion.tsx`'s `.mm-row-pot`/`.mm-row-cur`). `part == null`
+ * against `scale`. Its one caller is `machineGauge.ts`'s
+ * `computeGaugeGeometry` — the model ROWS inline their own clamp rather
+ * than routing through here, so do not read this as their shared helper.
+ * `part == null`
  * (the unpriced-model case — no committed extent to draw at all, see that
  * component's own doc) returns 0 rather than NaN; callers
  * still gate on `part != null` before rendering the layer at all, so this

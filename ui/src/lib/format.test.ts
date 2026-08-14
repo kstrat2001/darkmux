@@ -52,7 +52,7 @@ describe("memPct", () => {
   });
 
   // The inverted case this function exists to serve: `part == null` (the
-  // unpriced-model case, PROVENANCE.md) returns 0 rather than NaN — but
+  // unpriced-model case, docs/design/machine-lens/provenance.md) returns 0 rather than NaN — but
   // callers gate on `pot != null`/`cur != null` before rendering the layer
   // at all, so this value is a safety net, not something a real unpriced
   // bar ever paints.

@@ -1903,17 +1903,19 @@ body {
    worth knowing the shape of): content rendered as one flat classified LINE
    ARRAY (`Lines` + `lineClass()` in `MachineLens.tsx`), so genuine key/value
    pairs ("pressure" then "RED") stayed flattened sibling strings CSS alone
-   could never re-pair. Stage 1 replaced that with REAL structure
-   (`MemLedgerCards.tsx`) — `.memcard`/`.membar`/`.memhdr`/`.memname`/
-   `.memstate`/`.memowner`/`.memmeta`/`.memhint`/`.memwarn`/`.memfoot`/`.none`,
-   legacy's OWN class names (`crates/darkmux-serve/assets/viewer.html` CSS
-   274-303) — reused on purpose so #1806's `.memcard`/`.membar`/`#memstamp`/
-   `.memwarn` e2e specs (`tests/e2e/viewer-machine.spec.js`) pass unmodified.
-   Pressure's four k/v fragments are the one deliberate holdout: still flat
-   siblings (`.mline--label`/`.mline--meta`, reused below), because pairing
-   them WOULD re-pair "swap used" and its value onto one line, changing
-   `innerText` — Stage 1's one hard constraint (`MemLedgerCards.tsx`'s own
-   doc). That pairing is Stage 2's job, not this stylesheet's. */
+   could never re-pair.
+
+   Stage 1 replaced that with legacy's own card/bar structure under legacy's
+   own class names, chosen so #1806's e2e specs would pass unmodified. Stage
+   2/3 then replaced the SHAPE as well (`MachineHealthRegion.tsx`): the
+   `.mm-*` block further down is the live one, and those e2e specs were
+   rewritten to match it. What survives from Stage 1 is only what Stage 2/3
+   still renders — `.memcard` for placeholder/remote states, `.memwarn` for
+   warnings, `.memfoot` for the footer, `.none` for empties. `.membar`,
+   `.memstate`, `.memowner`, `.memmeta` and `.memhint` were deleted with the
+   flat ledger; `.mline--*` further down survives only because `lineClass()`
+   is still a tested export, and renders nowhere (see `MachineLens.tsx`'s
+   note on why it is kept). */
 
 .machine-lens {
   font: 12px/1.6 "JetBrains Mono", monospace;
@@ -1946,7 +1948,7 @@ body {
    OWN card stack, and it is verified layout-safe for this exact purpose:
    `tests/parity/goldens/machine.txt` was captured off legacy's real
    `.memwrap`-nested `.memcard`s and shows clean one-line-per-string text
-   with zero blank-line drift (see `MemLedgerCards.tsx`'s module doc), so
+   with zero blank-line drift (see `MachineHealthRegion.tsx`'s module doc), so
    reusing the identical technique here — rather than inventing a
    margin-based alternative — carries that same verified guarantee forward
    instead of re-deriving it. */
@@ -2338,7 +2340,7 @@ body {
   margin: 14px 0 6px;
 }
 
-/* Model rows — the scaling rule's repeating element (PROPOSAL.md §8):
+/* Model rows — the scaling rule's repeating element (docs/design/machine-lens/proposal.md §8):
    constant height at any N, grouped darkmux-first, alphabetical within
    group. Ghost/NEW are the ONLY two state modifiers — a live row carries
    neither. */

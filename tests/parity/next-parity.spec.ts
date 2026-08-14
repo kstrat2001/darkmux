@@ -85,7 +85,7 @@ function readGolden(label) {
  * name exactly which region still corresponds and why, keep everything
  * else at full byte equality.
  *
- * (#1806 Stage 2/3 — the machine-lens redesign, PROPOSAL.md in the design
+ * (#1806 Stage 2/3 — the machine-lens redesign, docs/design/machine-lens/proposal.md in the design
  * packet) #1809 narrowed the comparison to `topbar`/`crumb`/`meta`/
  * `logscope` (`machineChromePrefixOf`, still full byte equality below)
  * PLUS the stage's header + `darkmux/utility` block + the health/pressure
@@ -97,7 +97,7 @@ function readGolden(label) {
  * qwen3.6-35b … GREEN … ctx 262144 · weights 18.45 GB …`) — an `innerText`
  * walk of that region was a meaningful byte-exact spec because the PORT'S
  * OWN structure was still "one line per fact", the same shape legacy's
- * flattened extraction produced. Stage 2/3 (PROPOSAL.md, operator-approved)
+ * flattened extraction produced. Stage 2/3 (docs/design/machine-lens/proposal.md, operator-approved)
  * replaced that shape on purpose: a bezel-less semicircle gauge whose
  * reading is a NEEDLE POSITION plus a handful of on-arc tick labels
  * (`0 · 34 · 69 · 103 · 137 · LIMIT`), a tell-tale lamp row that renders
@@ -105,7 +105,7 @@ function readGolden(label) {
  * RESIDENCY`, `UNPRICED`, …), odometer DIGIT CELLS for the pressure
  * instruments (`8`/`8` rather than `88%`), and model ROWS with ghost/NEW
  * residency chips that don't exist in the flat ledger's vocabulary at all.
- * None of that is a bug — it is the redesign's entire point (PROPOSAL.md
+ * None of that is a bug — it is the redesign's entire point (docs/design/machine-lens/proposal.md
  * §1's whole argument is that the flat ledger was the defect) — but it
  * means an `innerText` diff against a golden recorded from the FLAT shape
  * is comparing two genuinely different information architectures, not
@@ -117,10 +117,10 @@ function readGolden(label) {
  * already established the precedent this follows (this file's own #1809
  * narrowing) — a redesign that changes RENDERING while explicitly PRESERVING
  * the underlying facts (every figure the flat ledger reported still renders
- * somewhere in the gauge/lamp/odometer/row cluster — see PROVENANCE.md's
+ * somewhere in the gauge/lamp/odometer/row cluster — see docs/design/machine-lens/provenance.md's
  * value-by-value trace, written and verified against a live daemon for
  * exactly this packet) is a text-shape change, not an information loss.
- * The operator reviewed and approved the redesign (PROPOSAL.md, "the
+ * The operator reviewed and approved the redesign (docs/design/machine-lens/proposal.md, "the
  * chosen shape") BEFORE this narrowing was written, so this is not a
  * unilateral test-weakening — it is the golden format catching up to a
  * decision already made above the test file.

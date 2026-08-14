@@ -5,10 +5,10 @@
  * footer, the not-local/loading/daemon-unreachable placeholder sentences.
  *
  * (#1806 Stage 1 → Stage 2/3 history) Stage 1 replaced one flat `healthLines()`
- * string array with granular per-fragment exports so `MemLedgerCards.tsx`
+ * string array with granular per-fragment exports so `MachineHealthRegion.tsx`
  * could slot legacy's own `.memcard`/`.membar` structure around unchanged
  * text. Stage 2/3 (the gauge/lamp/odometer/row redesign, `MachineHealthRegion.tsx`,
- * PROPOSAL.md in the design packet) replaced that flat-ledger RENDERING
+ * docs/design/machine-lens/proposal.md in the design packet) replaced that flat-ledger RENDERING
  * entirely, and with it the fragments that existed only to feed it:
  * `machineTotalText()` and `modelLines()` (the old card's meta-line/header
  * text) and `pressureText()` (superseded by `machineGauge.ts`'s
@@ -87,7 +87,7 @@ export function perModelScale(models: MachineResourcesModel[]): number {
 }
 
 /** The not-local placeholder sentence — viewer.html:1871. Named export
- * (rather than an inline literal in `MemLedgerCards.tsx`) so the wording has
+ * (rather than an inline literal in the component) so the wording has
  * exactly one source. */
 export function notLocalMessage(machineName: string): string {
   return `residency / RAM not reported from here — local-probe only. View the machine page on ${machineName || "that machine"} directly for live figures.`;
@@ -100,7 +100,9 @@ export const DAEMON_UNREACHABLE_MESSAGE =
 /** The first-fetch-in-flight placeholder — viewer.html:1875. */
 export const LOADING_MESSAGE = "loading…";
 
-/** The stale-cached-snapshot banner — viewer.html:1880. Rendered as a
- * `.memwarn` line (matching legacy), the same class the warnings card's own
- * lines use — both are "read this, something is off" text. */
+/** The stale-cached-snapshot banner — viewer.html:1880. Stage 2/3 renders
+ * it as `.mm-stalebanner` above the desaturated hero, not as a `.memwarn`
+ * line: legacy showed it inside the ledger card because the ledger WAS the
+ * page, whereas the banner now has to caption an entire instrument cluster
+ * whose figures are all equally stale. */
 export const STALE_BANNER_TEXT = "⚠ daemon unreachable — showing the last snapshot; the figures below are stale";

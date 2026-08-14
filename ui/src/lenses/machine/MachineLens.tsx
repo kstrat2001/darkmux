@@ -221,7 +221,7 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   const [lastGoodResources, setLastGoodResources] = useState<MachineResources | null>(null);
   const resources = lastGoodResources;
 
-  // The residency state machine (PROPOSAL.md §8 — ghost/NEW rows) advances
+  // The residency state machine (docs/design/machine-lens/proposal.md §8 — ghost/NEW rows) advances
   // on the SAME successful-poll cadence as the payload above: a failed poll
   // carries no model list to diff against, so it must neither advance a
   // ghost's retirement clock nor manufacture a spurious departure. Held in
@@ -333,8 +333,10 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
       {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —
           #1508 step 2's own commit named it "deliberately interim". This is
           the replacement: a link into the Runs lens, pinned to this
-          machine, carrying the run count so the page still answers "how
-          much is there" without owning the list itself anymore. Rendered
+          machine. It carries NO count, deliberately — see the block above
+          `loose` for the measured reason (the two sides counted different
+          things over different windows and the link read "0 runs" against a
+          destination listing 282). Rendered
           only once a machine is actually resolved (`targetUid != null` —
           mirrors every other `targetUid`-gated region on this page); a page
           that hasn't resolved a target yet has nothing to link to. A real
