@@ -11,6 +11,75 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-08-14
+
+The release where **the new viewer becomes the viewer**. `/next` graduated: the
+React port now serves `/` and `/play/<date>`, it runs with no daemon behind it
+at all, and the machine page stopped being a wall of numbers.
+
+### Added
+
+- **The React viewer is now what darkmux serves.** `GET /` and
+  `GET /play/<date>` render the port; `/next` becomes a permanent redirect to
+  `/` rather than disappearing, so every bookmark, phone shortcut and tailnet
+  link minted during the port keeps working. The gate was a number, not a
+  judgement: 21 of 22 goldens recorded from the legacy viewer asserting real
+  byte parity in a real browser. (#1800)
+- **The viewer runs with no daemon.** It reads the static-source metas a
+  daemon-less build injects (`darkmux-flow-src`, `-runs-src`, `-lab-runs-src`),
+  parses the committed flow file directly, and suppresses every live poll —
+  which is what makes darkmux.com/demo the real viewer rather than a fork of
+  it. The demo now also DERIVES which viewer it ships from the daemon's own
+  source instead of naming a file, so it can never again silently lag the flip.
+  (#1801)
+- **The machine page is an instrument.** It became the residency room it was
+  always described as — its runs list moved to the runs lens — and gained a
+  real gauge: a semicircle reading current against the limit, a tell-tale lamp
+  row, odometer cells for the monotonic pressure counters, and a redline keyed
+  on the server's own state rather than a threshold invented in the browser.
+  Unpriceable models render with **no** committed extent rather than a
+  zero-width one, and `unknown` is a designed state instead of a blank.
+  (#1806, #1809)
+- **The runs lens takes a machine pin** — `#lens=runs&machine=<uid>`,
+  composable with the kind filter, with a clearable chip naming the machine.
+  A fleet card for a remote machine now drills straight there. (#1508, #1809)
+
+### Fixed
+
+- **A machine's identity is its uid, not whichever name it logged under.** One
+  machine carries several `machine_id`s over its life — the hostname's short
+  and `.local` forms, or a rename — so every check that asked "is this machine
+  me?" by matching names failed on a machine with two aliases. It classified
+  itself as remote, hid its own residency ledger, advised viewing the machine
+  page on the machine you were already using, and reported "hardware not
+  reported" for its own CPU. Four sites, one rule. (#1809)
+- **A daemon-less build no longer polls a daemon.** The static demo opened an
+  SSE stream and hit `/fleet/machines/live` every five seconds indefinitely,
+  showing "reconnecting" on a page with nothing to reconnect to. (#1801)
+- **The machine page's runs link no longer claims a count it cannot know** — it
+  read "0 runs" while its destination listed 282, because the two counted
+  different things over different windows. (#1809)
+- **A stale reading survives an unreachable daemon.** An errored poll discarded
+  the last good snapshot, so the stale banner was unreachable code and the
+  figures vanished exactly when the daemon blinked. (#1812)
+- **A navigation that changed destination as data loaded.** The local fleet
+  card briefly routed to the runs lens before specs resolved — a blink on
+  loopback, longer over a tailnet, and silent either way. (#1809)
+- **The demo's icons and manifest 404'd under its subpath**, and the machine
+  page printed `hw.memsize` twice in two byte conventions (`128 GB` and
+  `137.44 GB` are the same number). (#1811)
+
+### Notes
+
+- The end-to-end viewer suite now grades the **shipped** viewer rather than the
+  legacy one it was written against — 71 passing, with 8 kept as `test.fixme`
+  naming behaviours the port does not have yet rather than deleted (#1806).
+  The legacy `viewer.html` deliberately stays on disk as the reference
+  implementation for exactly those, and is unreachable at runtime.
+- `FLOW_SCHEMA_VERSION` is unchanged at 1.19.0 — no cross-machine schema lock
+  needed for this upgrade.
+
+
 ## [2.6.0] - 2026-08-12
 
 The release where you can **talk to darkmux**. Two new front doors — an agent
@@ -400,6 +469,7 @@ schema changes (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`).
   "ready" with no time reference at all, indistinguishable from a fleet that
   had never dispatched.
 
+[2.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.7.0
 [2.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.6.0
 [2.5.1]: https://github.com/kstrat2001/darkmux/releases/tag/v2.5.1
 [2.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.5.0
