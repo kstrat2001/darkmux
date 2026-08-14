@@ -164,9 +164,30 @@ test('fleet + machine-drill render attacker-controlled records inertly', async (
   // "inert" for a reason unrelated to escaping (nothing rendered at all).
   await expect(page.locator('[data-act="machine"][data-arg]')).toHaveCount(2);
 
+  const uid = await page.locator('[data-act="machine"][data-arg]').first().getAttribute('data-arg');
+
   await page.locator('[data-act="machine"][data-arg]').first().click();
   await page.waitForSelector('.stagehdr');
-  await assertInert(page, 'machine');
+  // (#1809) A fleet-card click now routes by LOCALITY (`FleetLens.tsx`'s
+  // `machineDrillHash`): local goes to the residency room, anything this
+  // daemon can't confirm as itself — which, on THIS daemon-less static
+  // harness, is every card, since there is no live `/machine/specs` probe
+  // to confirm against — goes to the runs lens instead, pinned to that
+  // machine. That's real, current product behavior for a daemon-less
+  // build, and the runs lens renders the SAME attacker-controlled machine
+  // name, so it earns its own inertness check here rather than being
+  // skipped.
+  await assertInert(page, 'runs lens (remote-machine drill destination)');
+
+  // Deep-link straight into the machine lens too, so THAT render path
+  // keeps its own real coverage regardless of which lens a click happens
+  // to land on in this harness — see the comment above for why the click
+  // no longer reliably reaches it here.
+  await page.evaluate((u) => {
+    location.hash = `lens=machine&uid=${encodeURIComponent(u)}`;
+  }, uid);
+  await page.waitForSelector('.stagehdr');
+  await assertInert(page, 'machine (direct deep-link)');
 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });

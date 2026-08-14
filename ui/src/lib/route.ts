@@ -55,7 +55,25 @@ export type PanelId = (typeof PANEL_IDS)[number];
 
 export type Route =
   | { kind: "fleet" }
-  | { kind: "runs"; runsKind: RunsKind; run: string | null }
+  /** `machine` — added for #1809 (finishing #1508 step 4): pins the runs
+   * lens to ONE machine, composable with `runsKind`/`run` (independent
+   * params on the same hash — a pinned kind filter, or a pinned lab-run
+   * drill-in, are both real reachable states). `null` is "every machine",
+   * the pre-existing behavior — every hash this port already emits
+   * (`#lens=runs`, `#lens=runs&kind=lab`, …) still parses to `machine:
+   * null` and renders identically to before this field existed.
+   *
+   * An open string, same precedent as `machine.uid` below and
+   * `session.sessionId` further down — machine uids are arbitrary
+   * hardware-derived identifiers with no closed set to validate against
+   * here (an unresolvable pin degrades gracefully: `RunsBoard` just shows
+   * zero rows for a uid nothing is filed under, same posture `MachineLens`
+   * already takes for a stale `machine.uid`). This is the runs-lens half of
+   * `MachineLens`'s `RUNS ON <MACHINE>` list moving out into a real lens —
+   * see `MachineLens.tsx`'s own doc and #1508 step 2's commit message
+   * (`d2041ae3`), which named this the deliberately-interim piece step 4
+   * was always going to replace. */
+  | { kind: "runs"; runsKind: RunsKind; run: string | null; machine: string | null }
   /** `uid` — widened this packet (the drill-in packet) to carry a SPECIFIC
    * machine uid: `null` for the nav-tab/deep-link entry (`goMachine` in
    * legacy — always "the local machine"), a real uid for a fleet-card
@@ -199,7 +217,8 @@ export function parseRoute(): Route {
       ? (rawKind as RunsKind)
       : "all";
     const run = search.has("run") ? search.get("run") : hash.has("run") ? hash.get("run") : null;
-    return { kind: "runs", runsKind, run: run === null ? null : run.trim() };
+    const machine = get("machine");
+    return { kind: "runs", runsKind, run: run === null ? null : run.trim(), machine: machine ? machine : null };
   }
 
   if (lens === "machine") {

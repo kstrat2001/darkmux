@@ -17,7 +17,7 @@ describe("NavChrome", () => {
 
   it.each<[Route, string]>([
     [{ kind: "fleet" }, "lens-fleet"],
-    [{ kind: "runs", runsKind: "all", run: null }, "lens-runs"],
+    [{ kind: "runs", runsKind: "all", run: null, machine: null }, "lens-runs"],
     [{ kind: "machine", uid: null }, "lens-machine"],
     [{ kind: "console", panelId: "" }, "lens-console"],
     // Legacy: `state.level==="subsystem"` (a session drill-in) leaves the
@@ -29,6 +29,11 @@ describe("NavChrome", () => {
     // `#mission=` redirect this app actually exercises. See
     // `NavChrome.tsx`'s own `isActive` doc for the full measurement.
     [{ kind: "mission-redirect", missionId: "m1" }, "lens-fleet"],
+    // (#1809) A fleet-card drill (uid set) is the SAME shape as the session
+    // drill above — arriving IN from fleet, not from a lens tab — so it
+    // keeps FLEET lit, not MACHINE. The inverted case (uid: null) is
+    // already covered two rows up.
+    [{ kind: "machine", uid: "remote-uid" }, "lens-fleet"],
   ])("highlights exactly the tab matching %o -> %s", (route, expectedOnId) => {
     render(<NavChrome route={route} />);
     const tabs = screen.getAllByRole("link");

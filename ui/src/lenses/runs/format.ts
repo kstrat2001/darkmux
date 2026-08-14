@@ -97,3 +97,36 @@ export function runsFiltered(runs: Run[], kind: string): Run[] {
 export function labCounts(run: LabRun): string {
   return `bundles ${run.bundles} · flags ${run.raw_flags}→${run.deduped_flags} · confirmed ${run.confirmed} · needs_check ${run.needs_check} · archived ${run.archived}`;
 }
+
+/**
+ * (#1809, #1508 step 4) Filter a runs list down to ONE pinned machine — the
+ * runs-lens half of the machine dimension legacy never had. Unlike every
+ * other export in this file (see the module doc's opening paragraph), this
+ * one has no `viewer.html` namesake; it is new.
+ *
+ * `Run.machine` (`crates/darkmux-serve/src/runs.rs::build_runs`) is a
+ * `machine_id` NAME, not a uid — and one machine can carry SEVERAL names
+ * over its lifetime (a laptop logging as both `MacBook-Pro` and
+ * `MacBook-Pro.local` — see `lib/flow.ts::machineNames`'s own doc for why).
+ * Matching the route's pinned uid against `Run.machine` by resolving ONE
+ * label (`nameOf`) and comparing strings would silently drop every row
+ * filed under an older alias: measured against the live daemon's real
+ * `/runs` (380 rows), that approach returned ZERO rows for the very machine
+ * the page was pinned to, because every row said `MacBook-Pro` while
+ * `nameOf` resolved the uid to `MacBook-Pro.local`. `names` must be the
+ * FULL alias set (`machineNames(...)`), never a single resolved label.
+ *
+ * A run with NO `machine` at all is excluded from every pin — measured on
+ * the live daemon, that is 50 missions + 15 dispatches (every one
+ * `tracked: true`; every lab run DOES carry a machine, so this is not
+ * lab-run noise). That is a real attribution gap upstream (the mission/
+ * dispatch machine field was never recorded for those rows), not phantom
+ * work — a reader who notices fewer rows under a pin should read that as
+ * "unattributed", not "destroyed". Claiming an unattributed row as "this
+ * machine" would be the worse lie; excluding it is the honest call, but it
+ * is worth naming so nobody re-derives "where did 65 rows go" from scratch.
+ */
+export function runsForMachine(runs: Run[], names: Set<string>): Run[] {
+  if (names.size === 0) return [];
+  return runs.filter((r) => r.machine != null && names.has(r.machine));
+}

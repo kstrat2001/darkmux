@@ -19,9 +19,9 @@ import type { FlowRecordsResponse } from "../../types/handwritten";
  *
  * DOM shape follows the same "one `<div>`/text-run per visible line"
  * convention `MachineLens`/`LabRunDetail` already establish — see
- * `runLines.ts`'s module doc for why this port represents content as line
- * arrays rather than leaning on legacy's CSS-flex-dependent `innerText`
- * line-break behavior.
+ * `MachineLens.tsx`'s `Lines` component doc for why this port represents
+ * content as line arrays rather than leaning on legacy's CSS-flex-dependent
+ * `innerText` line-break behavior.
  *
  * An EMPTY response is a genuine no-data state (this corpus's own
  * `flow-session-task-list.json` fixture is non-empty, so the parity spec

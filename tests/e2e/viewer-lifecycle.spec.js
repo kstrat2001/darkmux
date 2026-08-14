@@ -66,24 +66,31 @@ test('activity lane brackets a session.end-only session as ended, not in-flight'
 // test — machine card → expand a collapsible recent-run row → click
 // through to the session's own detail view, to prove the fix doesn't
 // TypeError on a session.end-only session's undefined close-edge fields.
-// Two real gaps block it, confirmed against the source (not inferred):
 //
-// - `MachineLens`'s run rows are plain, non-collapsible `<div>`s
-//   (`ui/src/lenses/machine/MachineLens.tsx`'s `.machine-lens__run`) — no
-//   `<details>`, no expand step, unlike legacy's `recentRow()`.
-// - There is no session-drill link on them either — `runLines.ts`'s own
-//   module doc names legacy's "open →" `data-act="session"` link as a
-//   real, not-yet-ported follow-up (the same gap `viewer-session-url.spec.js`
-//   names for the OTHER session-entry path).
+// #1809 (finishing #1508 step 4) changed the SHAPE of this gap, not its
+// existence. Pre-#1809 the blocker was that `MachineLens`'s run rows were
+// plain non-collapsible `<div>`s with no session-drill affordance at all
+// (`runLines.ts`'s own module doc named the missing "open →" link). #1809
+// removed that whole per-run list — the machine page now links out to the
+// Runs lens (`#lens=runs&machine=<uid>`) instead of rendering rows itself.
+// `RunsBoard`'s own rows carry their OWN drill-ins now (`/mission/<id>/graph`
+// for a tracked mission/dispatch, an in-page lab-run detail for a lab run —
+// see `RunsBoard.tsx`'s `activateRun`), but NEITHER of those is a
+// `#session=` drill either. So the gap this test names is unchanged in
+// substance: no path from a machine-scoped list reaches a bare session-
+// subsystem view, only relocated from one lens to another.
 //
 // The underlying claim this half exists to protect (a session.end-only
 // session's detail view renders without throwing) is still worth
-// verifying once either gap closes — `SessionReplay.tsx` already renders
+// verifying once that gap closes — `SessionReplay.tsx` already renders
 // real content off `runRegions()` for any resolvable session id (see
 // `viewer-session-url.spec.js`'s own coverage of that component via a
 // direct hash boot), so the remaining risk is specifically whether a
 // session.end-only close edge reaches it cleanly. Kept here verbatim
-// (fixme, not deleted) as the tracked record.
+// (fixme, not deleted) as the tracked record — the body below is left
+// UNUPDATED to the pre-#1809 selectors deliberately: rewriting it to
+// "work" against the new DOM would misrepresent a gap that is still open
+// as one that is merely stale, and this fixme was never runnable anyway.
 test.fixme('activity lane: drilling a session.end-only session does not throw', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));

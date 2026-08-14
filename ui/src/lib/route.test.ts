@@ -16,17 +16,28 @@ describe("parseRoute", () => {
 
   it("parses #lens=runs with a kind filter", () => {
     setHash("#lens=runs&kind=lab");
-    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null });
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null, machine: null });
   });
 
   it("parses the legacy #lens=lab alias, defaulting kind to lab", () => {
     setHash("#lens=lab");
-    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null });
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null, machine: null });
   });
 
   it("falls back to kind=all for an unrecognized kind value", () => {
     setHash("#lens=runs&kind=bogus");
-    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "all", run: null });
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "all", run: null, machine: null });
+  });
+
+  // (#1809) The machine pin — finishing #1508 step 4.
+  it("parses #lens=runs&machine=<uid>, composable with a kind filter", () => {
+    setHash("#lens=runs&kind=lab&machine=some-uid");
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null, machine: "some-uid" });
+  });
+
+  it("machine defaults to null (every machine) when the param is absent", () => {
+    setHash("#lens=runs");
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "all", run: null, machine: null });
   });
 
   it("parses #lens=machine with no uid as the local machine (uid: null)", () => {
@@ -66,7 +77,7 @@ describe("parseRoute", () => {
 
   it("mission precedence: lens=runs wins over a co-present mission= param", () => {
     setHash("#lens=runs&mission=my-mission");
-    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "all", run: null });
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "all", run: null, machine: null });
   });
 
   it("an unrecognized lens value reports unknown, naming the raw hash", () => {
@@ -194,7 +205,7 @@ describe("parseRoute — the injected playback date (/play/<date>)", () => {
     injectMeta("darkmux-mode", "play");
     injectMeta("darkmux-date", "2026-08-07");
     window.location.hash = "#lens=runs&kind=lab";
-    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null });
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null, machine: null });
   });
 
   it("a bare date hash also wins, and may name a DIFFERENT day than the page", () => {
@@ -254,7 +265,7 @@ describe("parseRoute — the static-demo flow-src route (#1801)", () => {
   it("still yields to an explicit #lens= deep link — flow-src is the LOWEST-precedence signal, not the highest", () => {
     injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
     window.location.hash = "#lens=runs&kind=lab";
-    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null });
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null, machine: null });
   });
 
   // Inverted case: without the meta, the exact same hash states behave
@@ -298,7 +309,7 @@ describe("isLiveRoute — a daemon-less build is never live, on any lens", () =>
 
   const liveKinds: Route[] = [
     { kind: "fleet" },
-    { kind: "runs", runsKind: "all", run: null },
+    { kind: "runs", runsKind: "all", run: null, machine: null },
     { kind: "machine", uid: null },
     { kind: "console", panelId: "" },
     { kind: "unknown", hash: "nonsense" },

@@ -416,7 +416,7 @@ function renderRoute(route: Route) {
     case "fleet":
       return <FleetLens />;
     case "runs":
-      return <RunsBoard initialKind={route.runsKind} initialRun={route.run} />;
+      return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineUid={route.machine} />;
     case "machine":
       return <MachineLens uid={route.uid} />;
     case "console":

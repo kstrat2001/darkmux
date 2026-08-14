@@ -30,7 +30,7 @@ import { readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { GOLDENS_DIR } from "./lib/paths.js";
 import { loadMeta, installCorpusRoutes, installBlankRoutes } from "./lib/mock-routes.js";
-import { extractLensText, waitSettled, installFrozenClock, regionText } from "./lib/extract-lens.js";
+import { extractLensText, waitSettled, installFrozenClock, regionText, normalize } from "./lib/extract-lens.js";
 
 // Overnight-runbook render-sanity contract (every UI packet's standing
 // requirement): zero pageerror, `#stage` visible with real height, no
@@ -63,6 +63,90 @@ function readGolden(label) {
   return readFileSync(`${GOLDENS_DIR}/${label}.txt`, "utf8");
 }
 
+/**
+ * (#1809, finishing #1508 step 4) `MachineLens` deliberately stopped
+ * matching `goldens/machine.txt`/`goldens/machine-deeplink.txt` byte-for-
+ * byte the moment its `RUNS ON <MACHINE>` list moved out to the runs lens
+ * (`#lens=runs&machine=<uid>`) — 80 of the golden's 131 lines ARE that list
+ * (`RUNS ON MACBOOK-PRO` through `show all 30 →`), and this port no longer
+ * renders it at all, replaced by a "N runs on <machine> →" link with no
+ * golden counterpart. This is NOT legacy behaving wrongly, and it is NOT a
+ * regression to chase back to byte parity: #1508 step 2's own commit
+ * (`d2041ae3`) named the list "deliberately interim", and #1809 is the
+ * step-4 follow-up that finishes moving it out — see `MachineLens.tsx`'s
+ * own module doc for the full history.
+ *
+ * The golden itself is NOT edited (goldens are the frozen record of what
+ * LEGACY did; legacy was never wrong here, the port just moved on) and the
+ * assertion is NOT deleted (see `MachineLens.tsx`'s doc + this repo's own
+ * `tests/parity/README.md` for why an un-asserted lens is worse than a
+ * narrowed one). It is NARROWED instead, the same way this file's sibling
+ * (`next-parity-catalog.spec.ts`) narrows its own `mission-replay` case:
+ * name exactly which region still corresponds and why, keep everything
+ * else at full byte equality.
+ *
+ * The two tests below therefore assert TWO separate byte-exact regions
+ * rather than one whole-text compare:
+ *
+ * 1. `topbar`/`crumb`/`meta`/`logscope` — untouched by #1809, so the full
+ *    `extractLensText()` output up to (not including) `=== stage ===` still
+ *    has to match the golden's own prefix exactly.
+ * 2. The STAGE's header + `darkmux/utility` block + health/pressure ledger
+ *    — everything ABOVE the golden's `RUNS ON <MACHINE>` marker. Sliced
+ *    directly off the live DOM (`.machine-lens__hdr`/`__util`/`__health`,
+ *    the same three regions `MachineLens.tsx`'s own doc names as the
+ *    "residency room") rather than off `extractLensText()`'s stage string,
+ *    because — unlike the golden — the LIVE stage has nothing to slice ON:
+ *    `RUNS ON ` never appears in the port's rendered text anymore, so a
+ *    marker-based slice would silently include the new link and the
+ *    UNSCOPED RECORDS block below it.
+ *
+ * What is deliberately OUT of scope for this narrowed assertion: the runs
+ * list itself (gone), the new runs-lens link (no golden to compare against
+ * — it is new content), and the UNSCOPED RECORDS block (unchanged content,
+ * but at a different position relative to the now-missing list; not worth
+ * a three-way splice for one region this narrowing already excludes by
+ * construction). A future reader can tell a deliberate divergence from an
+ * accidental regression by running `bun run next-parity`: if EITHER
+ * assertion below starts failing, something in the actual residency-room
+ * chrome broke — that IS real coverage, not a rubber stamp.
+ */
+function machineChromePrefixOf(fullText: string): string {
+  const stageMarker = "=== stage ===\n";
+  const idx = fullText.indexOf(stageMarker);
+  if (idx === -1) throw new Error(`machineChromePrefixOf: no "${stageMarker.trim()}" marker found`);
+  return fullText.slice(0, idx);
+}
+
+/** The golden's own stage text, sliced down to the header+util+health
+ * portion — the counterpart `machineHealthChromeText` below compares
+ * against, extracted from the LIVE DOM rather than sliced off
+ * `extractLensText()`'s stage string (see this section's own doc for why
+ * the two sides need different extraction mechanisms here). */
+function goldenMachineHealthChromeText(goldenText: string): string {
+  const stageMarker = "=== stage ===\n";
+  const stageIdx = goldenText.indexOf(stageMarker);
+  if (stageIdx === -1) throw new Error(`goldenMachineHealthChromeText: no "${stageMarker.trim()}" marker found`);
+  const stage = goldenText.slice(stageIdx + stageMarker.length);
+  const runsMarker = "RUNS ON ";
+  const runsIdx = stage.indexOf(runsMarker);
+  if (runsIdx === -1) {
+    throw new Error(`goldenMachineHealthChromeText: no "${runsMarker.trim()}" marker found — has the golden format changed?`);
+  }
+  return normalize(stage.slice(0, runsIdx));
+}
+
+async function machineHealthChromeText(page): Promise<string> {
+  const parts: string[] = await page.evaluate(() => {
+    const selectors = [".machine-lens__hdr", ".machine-lens__util", ".machine-lens__health"];
+    return selectors.map((sel) => {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      return el ? el.innerText : "";
+    });
+  });
+  return normalize(parts.join("\n"));
+}
+
 // NOTE: deliberately NOT `test.describe.configure({ mode: "serial" })` (QA
 // take, mutation-proved 2026-08-09) — serial mode meant one lens's failure
 // suppressed every OTHER lens's result in this shared file (observed:
@@ -92,8 +176,20 @@ test("next: click-navigation into #lens=machine matches goldens/machine.txt", as
   await waitSettled(page, expect, '.machine-lens__health[data-state="loaded"]');
   await expect(page.locator("body")).not.toHaveClass(/booting/);
 
+  // (#1809) NARROWED — see this file's own `machineChromePrefixOf`/
+  // `machineHealthChromeText` doc for exactly which region no longer
+  // corresponds (the runs list) and why this is a deliberate divergence,
+  // not a regression.
   const got = await extractLensText(page);
-  expect(got).toBe(readGolden("machine"));
+  const golden = readGolden("machine");
+  expect(machineChromePrefixOf(got), "topbar/crumb/meta/logscope must still match byte-for-byte").toBe(
+    machineChromePrefixOf(golden),
+  );
+  const gotHealth = await machineHealthChromeText(page);
+  expect(
+    gotHealth,
+    "the stage's header + darkmux/utility + health/pressure ledger must still match byte-for-byte — the runs list intentionally diverges, see this file's own doc",
+  ).toBe(goldenMachineHealthChromeText(golden));
 });
 
 test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", async ({ page }) => {
@@ -111,8 +207,17 @@ test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", 
   await waitSettled(page, expect, '.machine-lens__health[data-state="loaded"]');
   await expect(page.locator("body")).not.toHaveClass(/booting/);
 
+  // (#1809) NARROWED — same split as the click-navigation test above.
   const got = await extractLensText(page);
-  expect(got).toBe(readGolden("machine-deeplink"));
+  const golden = readGolden("machine-deeplink");
+  expect(machineChromePrefixOf(got), "topbar/crumb/meta/logscope must still match byte-for-byte").toBe(
+    machineChromePrefixOf(golden),
+  );
+  const gotHealth = await machineHealthChromeText(page);
+  expect(
+    gotHealth,
+    "the stage's header + darkmux/utility + health/pressure ledger must still match byte-for-byte — the runs list intentionally diverges, see this file's own doc",
+  ).toBe(goldenMachineHealthChromeText(golden));
 });
 
 // Red-prove — the SAME self-test discipline the legacy harness's

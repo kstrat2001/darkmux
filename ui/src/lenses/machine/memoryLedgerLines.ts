@@ -4,9 +4,10 @@
  * `util`/`health` assembly, viewer.html:1796-1901, and the
  * `renderMachineMemModel`/`memBar`/`memStampText` helpers at
  * viewer.html:4853-4897). Each function returns the VISIBLE lines in
- * top-to-bottom order — see `runLines.ts`'s module doc for why this port
- * represents content as literal line arrays (one `<div>` per line) rather
- * than reproducing legacy's CSS-flex-dependent `innerText` line breaks.
+ * top-to-bottom order — see `MachineLens.tsx`'s `Lines` component doc for
+ * why this port represents content as literal line arrays (one `<div>` per
+ * line) rather than reproducing legacy's CSS-flex-dependent `innerText`
+ * line breaks.
  *
  * `.memowner`/`.memstate` are `text-transform: uppercase` in legacy CSS
  * (`crates/darkmux-serve/assets/viewer.html`, `.memowner`/`.memstate`

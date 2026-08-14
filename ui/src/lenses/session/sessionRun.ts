@@ -85,16 +85,22 @@ export interface SessionHeader {
    * path, but not evidence the field is dead everywhere.
    *
    * This port's own output is still correct empty, for an unrelated
-   * reason: this port's machine-run-row rendering (`runLines.ts`) never
-   * emits an "open →" link at all — the row stays a collapsed
-   * `<summary>` with no click-through — so nothing in this port can reach
-   * a session drill-in carrying machine context in the first place. The
-   * real residual gap this leaves: an operator viewing a machine's page
-   * cannot open any of that machine's runs from there. Not built here —
-   * ledgered as a follow-up, not a silent narrowing. Deriving a machine
-   * name from the session's OWN records instead (rather than building the
-   * "open →" link) would be adding information legacy itself doesn't show
-   * on this path, not a port. */
+   * reason: this port never had a machine-scoped run row with a session
+   * drill-in link at all. Pre-#1809 that was `runLines.ts`'s
+   * `machineRunLines` — a collapsed `<summary>` with no click-through.
+   * #1809 (finishing #1508 step 4) removed that list entirely; the machine
+   * page now links out to the Runs lens (`#lens=runs&machine=<uid>`)
+   * instead of rendering its own rows. `RunsBoard`'s rows carry their OWN
+   * drill-ins now (`/mission/<id>/graph` for a tracked mission/dispatch, the
+   * in-page lab-run detail for a lab run — see `RunsBoard.tsx`'s
+   * `activateRun`), but neither is a `#session=` drill either. So the real
+   * residual gap is unchanged in shape, just relocated: an operator still
+   * cannot reach a bare session-subsystem view (this file's own render
+   * target) FROM a machine-scoped list, by any path this port builds today.
+   * Not built here — ledgered as a follow-up, not a silent narrowing.
+   * Deriving a machine name from the session's OWN records instead (rather
+   * than building an "open →" link) would be adding information legacy
+   * itself doesn't show on this path, not a port. */
   machineName: string;
 }
 

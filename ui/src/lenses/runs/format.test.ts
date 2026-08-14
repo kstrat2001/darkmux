@@ -7,6 +7,7 @@ import {
   runSubtitle,
   runsMultiMachine,
   runsFiltered,
+  runsForMachine,
   labTaskKey,
   groupLabRunsByTask,
   labKnobSummary,
@@ -215,5 +216,46 @@ describe("labCounts", () => {
   it("formats bundle/flag/confirm counts", () => {
     const r = labRun({ dir: "a", mtime_ms: 1, bundles: 5, raw_flags: 10, deduped_flags: 7, confirmed: 3, needs_check: 2, archived: 1 });
     expect(labCounts(r)).toBe("bundles 5 · flags 10→7 · confirmed 3 · needs_check 2 · archived 1");
+  });
+});
+
+// (#1809, #1508 step 4) `runsForMachine` — the runs lens's machine pin.
+describe("runsForMachine", () => {
+  it("keeps only rows whose machine name is in the alias set", () => {
+    const a = run({ id: "a", kind: "dispatch", status: "complete", tracked: true, machine: "MacBook-Pro" });
+    const b = run({ id: "b", kind: "dispatch", status: "complete", tracked: true, machine: "studio" });
+    expect(runsForMachine([a, b], new Set(["MacBook-Pro"]))).toEqual([a]);
+  });
+
+  // The regression this function exists to prevent: matching against a
+  // SINGLE resolved label (e.g. `nameOf(uid)`) instead of the full alias
+  // set returns ZERO rows for a machine whose window carries records under
+  // more than one name — measured on the live daemon (see this function's
+  // own doc). The alias set is the fix; assert it actually behaves like
+  // one, not just like a singleton set that happens to work in the easy
+  // case above.
+  it("matches a row filed under ANY alias in the set — the multi-alias regression this function exists to fix", () => {
+    const legacyAlias = run({ id: "a", kind: "mission", status: "complete", tracked: true, machine: "MacBook-Pro" });
+    const currentAlias = run({ id: "b", kind: "mission", status: "complete", tracked: true, machine: "MacBook-Pro.local" });
+    const names = new Set(["MacBook-Pro", "MacBook-Pro.local"]);
+    expect(runsForMachine([legacyAlias, currentAlias], names)).toEqual([legacyAlias, currentAlias]);
+  });
+
+  // Inverted case: a single-alias set must NOT accidentally match the
+  // other alias — proves the match is a real Set.has, not a substring/
+  // prefix check that would silently widen the filter.
+  it("does NOT match a different alias not in the set", () => {
+    const other = run({ id: "a", kind: "mission", status: "complete", tracked: true, machine: "MacBook-Pro.local" });
+    expect(runsForMachine([other], new Set(["MacBook-Pro"]))).toEqual([]);
+  });
+
+  it("excludes a run with no machine at all — real tracked work with an unrecorded attribution, not this machine's", () => {
+    const unattributed = run({ id: "a", kind: "mission", status: "complete", tracked: true });
+    expect(runsForMachine([unattributed], new Set(["MacBook-Pro"]))).toEqual([]);
+  });
+
+  it("returns nothing for an empty alias set (an unresolvable/stale pin) rather than throwing", () => {
+    const a = run({ id: "a", kind: "dispatch", status: "complete", tracked: true, machine: "MacBook-Pro" });
+    expect(runsForMachine([a], new Set())).toEqual([]);
   });
 });

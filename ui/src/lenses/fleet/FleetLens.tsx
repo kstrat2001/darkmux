@@ -5,7 +5,7 @@ import { queryKeys } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useFleetCoverage, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS } from "../../lib/flow";
+import { localMachineUid, machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS } from "../../lib/flow";
 import type { FlowRecord } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
@@ -21,6 +21,22 @@ import type { MachineSpecs } from "../../types/handwritten";
  * machines render with no icon until /machine/specs/<id> wiring lands"). No
  * text content — contributes nothing to the parity extractor's `innerText`,
  * same as legacy's inline SVG. */
+/** (#1809) A fleet-card click's destination — LOCAL (confirmed against
+ * `localUid`) keeps going to the residency room (`#lens=machine`); anything
+ * else (a genuinely remote machine, OR a card whose locality this daemon
+ * simply cannot confirm — a replay, a static build, a specs fetch that
+ * hasn't resolved yet) goes to the runs lens pinned to that machine
+ * instead. Read "not confirmed local" as the honest default, not "assumed
+ * remote": the residency room requires a live probe to back it, and a card
+ * this daemon can't vouch for gets the destination that degrades
+ * gracefully either way (the runs lens works from `/runs`, no locality
+ * question involved) rather than the one that would otherwise render two
+ * "not reported" notices for nothing. */
+function machineDrillHash(uid: string, localUid: string | null): string {
+  if (uid === localUid) return `lens=machine&uid=${encodeURIComponent(uid)}`;
+  return `lens=runs&machine=${encodeURIComponent(uid)}`;
+}
+
 /** `sc()` — viewer.html:1633. One token-class chip (value over label). */
 function Chip({ value, label, cls }: { value: string | number; label: string; cls?: string }) {
   return (
@@ -229,6 +245,20 @@ export function FleetLens({
   });
   const specs = liveMode && specsQuery.data?.ok ? specsQuery.data.data : null;
 
+  // (#1809) Which uid IS this daemon — the SAME derivation `App.tsx`/
+  // `MachineLens.tsx` already do off their own copies of `flowWindow`/
+  // `liveMachines`/`specs`, used here for exactly one decision: where a
+  // fleet-card CLICK routes to (see the card below). `null` on a replay
+  // (`specs` is gated off — `localMachineUid(..., null)` returns `null`
+  // unconditionally) and on any daemon-less static build (no
+  // `/machine/specs` to confirm against) — every card reads as "not
+  // confirmed local" in both cases, which is the honest answer: neither has
+  // a live residency probe to claim local identity against.
+  const localUid = useMemo(
+    () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null),
+    [flowWindow.data, liveMachines, specs],
+  );
+
   const tokens = useMemo(() => tokensOffMeter(flowWindow.data), [flowWindow.data]);
   const note = useMemo(() => hybridNote(flowWindow.data, tokens), [flowWindow.data, tokens]);
 
@@ -282,23 +312,30 @@ export function FleetLens({
       <div className="fleet">
         {cards.map((card) => (
           // `<div class="mach ..." data-act="machine" data-arg="${uid}">`
-          // (viewer.html:1711) — the fleet-card drill-in this packet wires:
-          // `ACTIONS.machine` (viewer.html:2991) calls `drillMachine(uid)`
-          // for an explicit arg, local OR remote. Ported as a real
-          // cross-lens navigation (a literal `location.hash` write, firing
-          // `hashchange` so `useHashRoute` actually swaps the rendered
-          // component — the SAME mechanism `NavChrome`'s tab clicks use,
-          // see that component's own doc for why replaceState alone can't
-          // do this), not a `history.replaceState` (legacy's OWN
-          // `syncLabHash` never even names the drilled uid in the address
-          // bar at all — see `route.ts`'s widened-route doc for why this
-          // port's `uid=` param is a deliberate improvement, not a replay
-          // of legacy's own mechanism). `data-act`/`data-arg` themselves
-          // carry no behavior here (the click goes through the `onClick`
-          // below, not a delegated listener reading these attrs) — they're
+          // (viewer.html:1711) — the fleet-card drill-in: `ACTIONS.machine`
+          // (viewer.html:2991) calls `drillMachine(uid)` for an explicit
+          // arg. Ported as a real cross-lens navigation (a literal
+          // `location.hash` write, firing `hashchange` so `useHashRoute`
+          // actually swaps the rendered component — the SAME mechanism
+          // `NavChrome`'s tab clicks use, see that component's own doc for
+          // why replaceState alone can't do this), not a
+          // `history.replaceState`. `data-act`/`data-arg` themselves carry
+          // no behavior here (the click goes through the `onClick` below,
+          // not a delegated listener reading these attrs) — they're
           // restored purely as the DOM inspection hook e2e specs drill
           // through (`viewer-lifecycle.spec.js`, `viewer-xss.spec.js`),
           // same contract legacy's markup gave them.
+          //
+          // (#1809) The DESTINATION now splits by locality, which legacy
+          // never did (every drill went to the same page). Residency is
+          // local-probe-only by construction (#1286's "observer must not
+          // join the observed" — `/machine/resources` always describes
+          // THIS daemon's own host, never a remote one's), so a remote
+          // machine's page would otherwise be a header plus two
+          // "not reported" notices — the runs lens, pinned to that machine,
+          // is the honest destination instead. The LOCAL card (confirmed
+          // against `localUid`, above) keeps going to the residency room,
+          // same as before this packet.
           <div
             key={card.uid}
             className={`mach${card.active && !card.absent ? " active" : ""}${card.absent ? " absent" : ""}`}
@@ -307,12 +344,12 @@ export function FleetLens({
             role="button"
             tabIndex={0}
             onClick={() => {
-              location.hash = `lens=machine&uid=${encodeURIComponent(card.uid)}`;
+              location.hash = machineDrillHash(card.uid, localUid);
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                location.hash = `lens=machine&uid=${encodeURIComponent(card.uid)}`;
+                location.hash = machineDrillHash(card.uid, localUid);
               }
             }}
           >

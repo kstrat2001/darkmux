@@ -35,7 +35,7 @@ import type { Route } from "./route";
  *   effect just names it in the address bar.
  *
  * Scope: the params every ported lens drives (`lens`/`kind`/`panel`/
- * `session`/`uid`) are written. `mission` (the mission-graph
+ * `session`/`uid`/`machine`) are written. `mission` (the mission-graph
  * full-navigation) stays out of scope for this write-back path: legacy does
  * a full navigation away when it fires, so there's nothing left to write
  * back to.
@@ -81,6 +81,11 @@ export function canonicalHash(route: Route): string | null {
       // REVERSES the prior QA correction, now that the drill-in exists to
       // preserve `run` for.
       if (route.run) p.set("run", route.run);
+      // (#1809) The machine pin, written whenever set — composable with
+      // `kind`/`run` above, independent params on the same hash (matching
+      // `route.ts`'s own doc: a pinned kind filter and a pinned lab-run
+      // drill-in are both real, simultaneously reachable states).
+      if (route.machine) p.set("machine", route.machine);
       return p.toString();
     }
     case "machine": {

@@ -1,14 +1,12 @@
-import { useMemo, useState, type KeyboardEvent } from "react";
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
-import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { buildMachineRuns, localMachineUid, looseRecords, nameOf, RECENT_CAP } from "../../lib/flow";
+import { localMachineUid, looseRecords, nameOf, sessionsOn } from "../../lib/flow";
 import { specOf } from "../fleet/cards";
 import { utilityLines, healthLines } from "./memoryLedgerLines";
-import { machineRunLines } from "./runLines";
 import { isStaticBuild } from "../../lib/staticSource";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
@@ -62,23 +60,13 @@ export function lineClass(line: string): string | undefined {
   return undefined;
 }
 
-/** Enter/Space activates a `role="button"` `<div>` the same way a native
- * `<button>` would — this element has a click handler and no other keyboard
- * path to it (matching `RunsBoard.tsx`'s own `onActivateKeyDown`, ported
- * here rather than shared since the two modules have no other coupling). */
-function onActivateKeyDown(onActivate: () => void) {
-  return (e: KeyboardEvent<HTMLDivElement>) => {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      onActivate();
-    }
-  };
-}
-
 /** One `<div>` per line. `innerText` puts each block-level sibling on its
- * own line regardless of stylesheet — see `runLines.ts`'s module doc for
- * why this port represents content as line arrays rather than leaning on
- * legacy's CSS-flex-dependent `innerText` line-break behavior.
+ * own line regardless of stylesheet — this port represents content as line
+ * arrays (rendered one `<div>` per element) rather than leaning on legacy's
+ * CSS-flex-dependent `innerText` line-break behavior, which depends on
+ * every relevant ancestor being `display:flex` (or another block-level
+ * layout) — brittle to depend on implicitly when a plain array is just as
+ * easy to render and carries the same guarantee by construction.
  *
  * `classify` is opt-in per region: the util/run/loose blocks have
  * deterministic array shapes and are styled positionally in CSS, so only the
@@ -97,41 +85,57 @@ function Lines({ lines, classify = false }: { lines: string[]; classify?: boolea
 }
 
 /**
- * The unified machine page — `renderMachine()` (viewer.html:1796-1991).
- * Reached by THREE entry points, same as legacy (viewer.html:1827-1829):
- * the nav tab / `#lens=machine` deep-link (`uid: null` — always "the local
- * machine"), and a fleet-card drill (`uid: <uid>` — local OR remote,
- * `drillMachine(uid, false)`). `isLocalMach` restores legacy's
- * `state.machineIsLocal || isLocalMachine(state.machine)` OR-gate now that
- * `lib/route.ts`'s widened `{kind:"machine",uid}` gives a fleet-card drill
- * somewhere to carry its uid (this OR was narrowed to an unconditional
- * `true` before that widening existed — see the drill-in packet's report
- * for the restore).
+ * The machine page — `renderMachine()` (viewer.html:1796-1991), now purely
+ * the RESIDENCY ROOM its #1286 doctrine names it as (probe-fed RAM/model
+ * health that only THIS daemon's own host can honestly report — see the
+ * module-level `CLAUDE.md`'s "observer must not join the observed"
+ * section). #1508 step 2 (`d2041ae3`) merged this page with the flow-scoped
+ * fleet-card drill and left its runs list as an explicitly interim stand-in
+ * ("step 4 of #1508 replaces it with the full Runs lens, machine-pinned").
+ * #1809 is that step 4: the `RUNS ON <MACHINE>` list is gone, replaced by a
+ * link into `#lens=runs&machine=<uid>` (`RunsBoard.tsx`'s machine pin) —
+ * see the render below for the link itself.
  *
- * Data sources (read the code, not the plan's assumption): `/machine/specs`
- * + `/machine/resources` (the plan's named pair — resources is fetched ONLY
- * for the local machine, matching legacy's `pollMachineMem` guard: a
- * remote machine's page never reads THIS daemon's own probe under the
- * wrong name) PLUS `/flow/<today>` + `/flow/<yesterday>` (the
- * runs-on-this-machine list is derived from RAW flow records, not `/runs`
- * — see `lib/flow.ts`'s module doc) PLUS `/fleet/machines/live` +
- * `/fleet/sessions/live` (machine presence + session liveness fallback,
- * ALSO the source of a remote machine's own `specs` string — `specOf()`,
- * viewer.html:1124-1129 — since a remote machine's hardware line comes
- * from its presence beat, not this daemon's local `/machine/specs` probe).
+ * Reached by TWO entry points now, not three: the nav tab / bare
+ * `#lens=machine` deep-link (`uid: null` — always "the local machine"), and
+ * a LOCAL fleet-card drill (`uid: <uid>`, `FleetLens.tsx`'s locality split —
+ * a REMOTE card now routes to the runs lens instead, since a remote
+ * machine's residency is unreadable from here by construction: no
+ * `/machine/resources` probe exists for a host that isn't this one). The
+ * component itself still resolves an explicit REMOTE uid gracefully
+ * (`isLocalMach` below stays real, `resourcesQuery` stays gated off) — a
+ * `#lens=machine&uid=<remote>` bookmark minted before this packet, or typed
+ * by hand, still degrades honestly rather than crashing; `FleetLens` simply
+ * no longer MINTS that link itself. `isLocalMach` restores legacy's
+ * `state.machineIsLocal || isLocalMachine(state.machine)` OR-gate now that
+ * `lib/route.ts`'s widened `{kind:"machine",uid}` gives a drill somewhere
+ * to carry its uid (this OR was narrowed to an unconditional `true` before
+ * that widening existed — see the drill-in packet's report for the
+ * restore).
+ *
+ * Data sources: `/machine/specs` + `/machine/resources` (resources is
+ * fetched ONLY for the local machine, matching legacy's `pollMachineMem`
+ * guard: a remote machine's page never reads THIS daemon's own probe under
+ * the wrong name) PLUS `/flow/<today>` + `/flow/<yesterday>` +
+ * `/fleet/machines/live` (machine presence — the source of the header's
+ * `label`/`spec`, the run-count link below, AND a remote machine's own
+ * `specs` string — `specOf()`, viewer.html:1124-1129, since a remote
+ * machine's hardware line comes from its presence beat, not this daemon's
+ * local `/machine/specs` probe). `/fleet/sessions/live` — fetched by the
+ * OLD runs list for its live-vs-ended status labels — is gone along with
+ * that list; nothing on this page needs session liveness anymore.
  */
 export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   const nowMs = Date.now();
-  const [recentAll, setRecentAll] = useState(false);
 
   // (#1801) A daemon-less build has nothing to poll. `App.tsx` gates its own
-  // copies of these three on `isLiveRoute(route)` and states the rule in
-  // place: "Gating one side and not the other is indistinguishable from
-  // gating neither." This lens holds BOTH sides — it calls the presence hooks
+  // copies of these on `isLiveRoute(route)` and states the rule in place:
+  // "Gating one side and not the other is indistinguishable from gating
+  // neither." This lens holds BOTH sides — it calls the presence hooks
   // itself rather than receiving them — and was ungated, so `#lens=machine`
-  // on the static demo hit `/fleet/machines/live`, `/fleet/sessions/live` and
-  // `/machine/resources` every 5s for as long as the tab stayed open, against
-  // an origin with no daemon behind it. Measured, then measured again after.
+  // on the static demo hit `/fleet/machines/live` and `/machine/resources`
+  // every 5s for as long as the tab stayed open, against an origin with no
+  // daemon behind it. Measured, then measured again after.
   //
   // Gated on the BUILD rather than the route, for the same reason
   // `useFlowWindow` is: on a static build these fetches could only ever fail,
@@ -140,7 +144,6 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
 
   const flowWindow = useFlowWindow(nowMs);
   const liveMachines = useLiveMachines(daemonBacked);
-  const liveSessionIds = useLiveSessionIds(daemonBacked);
 
   const specsQuery = useQuery({
     queryKey: queryKeys.machineSpecs(),
@@ -203,15 +206,17 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // machine's hardware line, as broadcast by ITS heartbeat).
   const spec = targetUid != null ? specOf(flowWindow.data, liveMachines, specs, targetUid) : "";
 
-  const runs = useMemo(() => {
-    if (targetUid == null) return [];
-    return buildMachineRuns(flowWindow.data, liveMachines, liveSessionIds, flowWindow.tMax, nowMs, targetUid);
-  }, [flowWindow.data, flowWindow.tMax, liveMachines, liveSessionIds, targetUid, nowMs]);
+  // (#1809) Just the COUNT now — the full per-run detail this used to build
+  // (`buildMachineRuns`, closed/live status labels, handle/model/mission per
+  // row) moved to the Runs lens, which reads its own richer `/runs` source
+  // (missions/lab/ghosts, not just this window's raw flow records — see
+  // `RunsBoard.tsx`'s own doc). `sessionsOn(m).length` is the same total
+  // `buildMachineRuns` always returned (one node per distinct session id on
+  // this machine, see that function's own doc) without building the nodes
+  // this page no longer renders.
+  const total = useMemo(() => (targetUid != null ? sessionsOn(flowWindow.data, targetUid).length : 0), [flowWindow.data, targetUid]);
 
   const loose = useMemo(() => (targetUid != null ? looseRecords(flowWindow.data, targetUid) : []), [flowWindow.data, targetUid]);
-
-  const total = runs.length;
-  const shown = recentAll ? runs : runs.slice(0, RECENT_CAP);
 
   return (
     <div className="machine-lens">
@@ -266,26 +271,31 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
         />
       </div>
 
-      <div className="machine-lens__runshdr">RUNS ON {label.toUpperCase()}</div>
-      <div className="machine-lens__runs">
-        {shown.map((n, i) => (
-          <div className="machine-lens__run" key={n.sid}>
-            <Lines lines={machineRunLines(n, total - i, flowWindow.tMax)} />
-          </div>
-        ))}
-        {total > RECENT_CAP && (
-          <div
-            className="machine-lens__runsmore"
-            role="button"
-            tabIndex={0}
-            onClick={() => setRecentAll((v) => !v)}
-            onKeyDown={onActivateKeyDown(() => setRecentAll((v) => !v))}
-          >
-            {recentAll ? "show fewer" : `show all ${total} →`}
-          </div>
-        )}
-        {total === 0 && <div className="hint">no runs recorded for this machine at this point in the timeline</div>}
-      </div>
+      {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —
+          #1508 step 2's own commit named it "deliberately interim". This is
+          the replacement: a link into the Runs lens, pinned to this
+          machine, carrying the run count so the page still answers "how
+          much is there" without owning the list itself anymore. Rendered
+          only once a machine is actually resolved (`targetUid != null` —
+          mirrors every other `targetUid`-gated region on this page); a page
+          that hasn't resolved a target yet has nothing to link to. A real
+          `<a>` (not a `role="button"` div, unlike the old expand control it
+          replaces) — this is honest cross-lens NAVIGATION, keyboard-
+          activatable for free, and consistent with every other cross-lens
+          hop in this file (`NavChrome`'s own tabs use the same direct
+          hash-write pattern). */}
+      {targetUid != null && (
+        <a
+          className="machine-lens__runslink"
+          href={`#lens=runs&machine=${encodeURIComponent(targetUid)}`}
+          onClick={(e) => {
+            e.preventDefault();
+            location.hash = `lens=runs&machine=${encodeURIComponent(targetUid)}`;
+          }}
+        >
+          {total} run{total === 1 ? "" : "s"} on {label} →
+        </a>
+      )}
 
       {loose.length > 0 && (
         <div className="machine-lens__loose">
