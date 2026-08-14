@@ -21,20 +21,33 @@ import type { MachineSpecs } from "../../types/handwritten";
  * machines render with no icon until /machine/specs/<id> wiring lands"). No
  * text content — contributes nothing to the parity extractor's `innerText`,
  * same as legacy's inline SVG. */
-/** (#1809) A fleet-card click's destination — LOCAL (confirmed against
- * `localUid`) keeps going to the residency room (`#lens=machine`); anything
- * else (a genuinely remote machine, OR a card whose locality this daemon
- * simply cannot confirm — a replay, a static build, a specs fetch that
- * hasn't resolved yet) goes to the runs lens pinned to that machine
- * instead. Read "not confirmed local" as the honest default, not "assumed
- * remote": the residency room requires a live probe to back it, and a card
- * this daemon can't vouch for gets the destination that degrades
- * gracefully either way (the runs lens works from `/runs`, no locality
- * question involved) rather than the one that would otherwise render two
- * "not reported" notices for nothing. */
+/** (#1809) A fleet-card click's destination. The runs lens is taken ONLY for
+ * a machine positively known to be remote; local and not-yet-known both go
+ * to the residency room.
+ *
+ * The obvious rule — "local goes to the room, everything else goes to runs"
+ * — is wrong in a way that only shows up in the first paint, and it was
+ * measured doing exactly that: `localUid` is null until `/machine/specs`
+ * resolves, so the LOCAL card was clickable-and-wrong for one frame
+ * (`+0ms → lens=runs`, `+100ms → lens=machine`). On loopback that is a
+ * blink; over the tailnet phone path it scales with round-trip time, and
+ * the wrong destination is SILENT — you land on a populated, plausible runs
+ * list rather than anything that says it guessed. `specs` is also gated on
+ * `liveMode`, so on a playback route locality never resolves at all and the
+ * old rule sent every card, local included, to the runs lens permanently.
+ *
+ * Inverting the unknown case fixes both, because the two failure modes are
+ * not symmetric. A remote machine that lands in the residency room gets an
+ * honest dead end — "residency / RAM not reported from here, local-probe
+ * only" — which names its own limitation and self-corrects the moment specs
+ * confirm locality. A local machine that lands in the runs lens gets a
+ * confident, wrong, and unlabeled answer to a question it did not ask. When
+ * a guess is unavoidable, guess toward the destination that admits it is
+ * guessing. */
 function machineDrillHash(uid: string, localUid: string | null): string {
-  if (uid === localUid) return `lens=machine&uid=${encodeURIComponent(uid)}`;
-  return `lens=runs&machine=${encodeURIComponent(uid)}`;
+  const knownRemote = localUid != null && uid !== localUid;
+  if (knownRemote) return `lens=runs&machine=${encodeURIComponent(uid)}`;
+  return `lens=machine&uid=${encodeURIComponent(uid)}`;
 }
 
 /** `sc()` — viewer.html:1633. One token-class chip (value over label). */

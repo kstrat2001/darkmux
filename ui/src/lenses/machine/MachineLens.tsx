@@ -4,7 +4,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
-import { localMachineUid, looseRecords, nameOf, sessionsOn } from "../../lib/flow";
+import { localMachineUid, looseRecords, nameOf } from "../../lib/flow";
 import { specOf } from "../fleet/cards";
 import { utilityLines, healthLines } from "./memoryLedgerLines";
 import { isStaticBuild } from "../../lib/staticSource";
@@ -206,16 +206,25 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // machine's hardware line, as broadcast by ITS heartbeat).
   const spec = targetUid != null ? specOf(flowWindow.data, liveMachines, specs, targetUid) : "";
 
-  // (#1809) Just the COUNT now — the full per-run detail this used to build
-  // (`buildMachineRuns`, closed/live status labels, handle/model/mission per
-  // row) moved to the Runs lens, which reads its own richer `/runs` source
-  // (missions/lab/ghosts, not just this window's raw flow records — see
-  // `RunsBoard.tsx`'s own doc). `sessionsOn(m).length` is the same total
-  // `buildMachineRuns` always returned (one node per distinct session id on
-  // this machine, see that function's own doc) without building the nodes
-  // this page no longer renders.
-  const total = useMemo(() => (targetUid != null ? sessionsOn(flowWindow.data, targetUid).length : 0), [flowWindow.data, targetUid]);
-
+  // (#1809) The link below carries NO COUNT, deliberately.
+  //
+  // It used to read `${sessionsOn(data, uid).length} runs on <machine> →`,
+  // which was the same total the removed runs list always showed — correct
+  // while it labeled a list rendered from that same data, and a lie the
+  // moment it labeled a link to somewhere else. The two count different
+  // things over different windows: `sessionsOn` counts distinct session ids
+  // in the 24h flow window (`LIVE_WINDOW_MS`), while the destination lists
+  // `/runs` rows over the daemon's 14-day scan window, unioning missions,
+  // lab runs and ghosts this page never sees. Measured live on both
+  // machines: the link said "0 runs" while the destination listed 282 and
+  // 16. Agreement would have been coincidence.
+  //
+  // Fetching `/runs` here to make the number honest was the alternative and
+  // is the wrong trade: this page is the RESIDENCY ROOM (see the module doc)
+  // and the whole point of #1809 is that run accounting belongs to the runs
+  // lens. Adding a second live-only query, and a second thing to gate on
+  // `isStaticBuild`, to label a hyperlink would walk that back. A count that
+  // cannot drift because it is not there beats a count that is right today.
   const loose = useMemo(() => (targetUid != null ? looseRecords(flowWindow.data, targetUid) : []), [flowWindow.data, targetUid]);
 
   return (
@@ -293,7 +302,7 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
             location.hash = `lens=runs&machine=${encodeURIComponent(targetUid)}`;
           }}
         >
-          {total} run{total === 1 ? "" : "s"} on {label} →
+          runs on {label} →
         </a>
       )}
 

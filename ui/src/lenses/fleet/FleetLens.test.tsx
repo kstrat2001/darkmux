@@ -194,28 +194,46 @@ describe("FleetLens", () => {
     expect(window.location.hash).toBe("#lens=machine&uid=u1");
   });
 
-  // (#1809) The inverted case: a card this daemon CANNOT confirm as itself
-  // (no `specs` supplied here — the default 404, same as every pre-#1809
-  // test in this file) goes to the runs lens, pinned to that machine, not
-  // the residency room. This is the branch that protects the two tests
-  // above from being vacuously true — without it, `machineDrillHash` could
-  // always return the local-machine hash and both LOCAL tests would still
-  // pass for the wrong reason.
-  it("clicking a NON-LOCAL machine card navigates to the runs lens, pinned to that machine", async () => {
+  // (#1809, merge-gate fix) The runs lens is for a machine POSITIVELY known
+  // to be remote — nothing else. An earlier cut sent every unconfirmed card
+  // there, which measured wrong on the first paint: `localUid` is null until
+  // `/machine/specs` resolves, so the LOCAL card was clickable-and-wrong for
+  // one frame (+0ms → runs, +100ms → machine). These two tests pin both
+  // sides of the corrected rule, and the second is what stops the first from
+  // being vacuous — without a confirmed-remote case, `machineDrillHash`
+  // could always return the machine hash and every other test here would
+  // still pass.
+  it("an UNCONFIRMED card goes to the residency room — the destination that admits it is guessing", async () => {
     const today = todayUTC();
     mockFleetFetch({
       flowToday: [
         { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
       ],
-      // No `specs` — this daemon has not confirmed u1 as itself, the same
-      // "unconfirmed, not assumed remote" default `machineDrillHash`'s own
-      // doc names.
+      // No `specs` — locality unresolved, exactly the first-paint state.
     });
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
-    const card = document.querySelector(".mach")!;
-    expect(card.textContent).toContain("MacBook-Pro");
-    fireEvent.click(card);
-    expect(window.location.hash).toBe("#lens=runs&machine=u1");
+    fireEvent.click(document.querySelector(".mach")!);
+    // The room names its own limitation for a remote machine and
+    // self-corrects once specs land; the runs lens would have answered a
+    // question the operator did not ask, confidently and unlabeled.
+    expect(window.location.hash).toBe("#lens=machine&uid=u1");
+  });
+
+  it("a CONFIRMED-REMOTE card goes to the runs lens, pinned to that machine", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        { ts: `${today}T10:00:01.000Z`, machine_uid: "u2", machine_id: "studio", session_id: "s2", action: "dispatch.start", handle: "coder" },
+      ],
+      // specs names THIS daemon as MacBook-Pro, so u2 is positively remote.
+      specs: { machine_id: "MacBook-Pro" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelectorAll(".mach").length).toBe(2));
+    const studio = [...document.querySelectorAll(".mach")].find((c) => c.textContent?.includes("studio"))!;
+    fireEvent.click(studio);
+    expect(window.location.hash).toBe("#lens=runs&machine=u2");
   });
 });

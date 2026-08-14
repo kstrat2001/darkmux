@@ -116,15 +116,33 @@ export function labCounts(run: LabRun): string {
  * `nameOf` resolved the uid to `MacBook-Pro.local`. `names` must be the
  * FULL alias set (`machineNames(...)`), never a single resolved label.
  *
- * A run with NO `machine` at all is excluded from every pin — measured on
- * the live daemon, that is 50 missions + 15 dispatches (every one
- * `tracked: true`; every lab run DOES carry a machine, so this is not
- * lab-run noise). That is a real attribution gap upstream (the mission/
- * dispatch machine field was never recorded for those rows), not phantom
- * work — a reader who notices fewer rows under a pin should read that as
- * "unattributed", not "destroyed". Claiming an unattributed row as "this
- * machine" would be the worse lie; excluding it is the honest call, but it
- * is worth naming so nobody re-derives "where did 65 rows go" from scratch.
+ * A run with NO `machine` at all is excluded from every pin. That set is
+ * missions and dispatches only — every lab run carries a machine, because
+ * `lab_summary_to_run` takes the daemon's own `machine_id` directly instead
+ * of deriving it — and every one of them is `tracked: true`, so this is not
+ * ghost noise. The mechanism, rather than a count that rots: `/runs`
+ * resolves a mission's machine from the WINDOWED flow session index
+ * (`RUNS_FLOW_SCAN_WINDOW_DAYS`, 14 days), and the durable `mission.json`
+ * has no machine field to fall back on, so any tracked run older than that
+ * window loses its attribution even though the flow records are still on
+ * disk. Filed as #1810.
+ *
+ * Excluding them is the honest call — claiming an unattributed row as "this
+ * machine" would be the worse lie — but it is worth naming so nobody
+ * re-derives "where did the missing rows go" from scratch. It is a
+ * meaningful fraction: at the time of writing, 82 of 380.
+ *
+ * KNOWN LIMIT, not a defect of this function: `Run` carries no
+ * `machine_uid`, only the name, so two uids that have EVER logged the same
+ * `machine_id` are indistinguishable here — two Macs on Apple's default
+ * hostname, or a rename that hands a name from one host to another. Both
+ * alias sets would contain the shared name and both pins would return the
+ * union, under a chip naming one of them. Disjoint on any fleet where
+ * machine names are distinct (verified on the operator's: `{MacBook-Pro,
+ * MacBook-Pro.local}` vs `{m1-max-32gb-studio}`). The real fix is a
+ * `machine_uid` on `Run`, an #1810 sibling — this is the first surface that
+ * claims per-machine scoping over name-keyed data, so the collision is
+ * named here rather than discovered later.
  */
 export function runsForMachine(runs: Run[], names: Set<string>): Run[] {
   if (names.size === 0) return [];

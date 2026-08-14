@@ -26,7 +26,7 @@
 // (`FleetLens`'s machine cards, `NavChrome`'s tabs). What's genuinely
 // UNBUILT is a CLICKABLE entry point into a session from anywhere in the
 // UI — `MachineLens`'s run rows are plain `<div>`s with no session-drill
-// link (`runLines.ts`'s own module doc: the "open →" link legacy's
+// link (removed with the machine page's runs list in #1809; the "open →" link legacy's
 // `recentRow()` details panel carried is a named, deliberate cut, not
 // ported yet). So three of the four tests below are rewritten to drive the
 // SAME `location.hash` mechanism a future click affordance would use

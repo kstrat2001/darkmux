@@ -125,7 +125,7 @@ describe("MachineLens", () => {
     // (#1809) The old "no runs recorded for this machine" hint text is gone
     // with the runs list itself — a stale uid still gets a real, honestly
     // zero-count link out (never a crash, never a stale-looking count).
-    const link = screen.getByRole("link", { name: /0 runs on/i });
+    const link = screen.getByRole("link", { name: /runs on/i });
     expect(link).toHaveAttribute("href", "#lens=runs&machine=totally-unknown-uid-nobody-has-ever-seen");
     expect(screen.getByText(/not reported from here/i)).toBeInTheDocument();
   });
@@ -233,31 +233,49 @@ function mockMachineRunsFetch(runCount: number) {
 // the "show all"/"show fewer" expand-collapse control the a11y packet
 // (#1767) hardened keyboard access for — is gone; this section replaces
 // those tests with coverage of what replaced it: a link out to the runs
-// lens, pinned to this machine, naming the run count.
+// lens, pinned to this machine.
+//
+// The link carries NO COUNT, and these tests pin that absence deliberately.
+// An earlier cut labeled it with `sessionsOn(...).length` and this suite
+// asserted the number — which passed while the live page LIED: that counts
+// distinct session ids in the 24h flow window, the destination lists /runs
+// rows over a 14-day window unioning missions, lab runs and ghosts. Measured
+// on a real daemon: the link read "0 runs" while the destination listed 282.
+// The tests were green the whole time, because they seeded the flow window
+// and asserted against the same window — never against what the destination
+// would actually show. A test that pins a number to its own fixture cannot
+// catch a number that means the wrong thing.
 describe("MachineLens — the runs-lens link (#1809)", () => {
-  it("names the run count and machine, and points at the pinned runs lens", async () => {
+  it("names the machine and points at the pinned runs lens", async () => {
     mockMachineRunsFetch(3);
     renderMachineLens();
-    const link = await screen.findByRole("link", { name: /3 runs on MacBook-Pro/i });
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
     expect(link).toHaveAttribute("href", "#lens=runs&machine=u1");
   });
 
-  it("singular count reads '1 run', not '1 runs'", async () => {
-    mockMachineRunsFetch(1);
+  // The regression guard for the lie described above: whatever the flow
+  // window happens to hold, the label must not claim a quantity. Seeded with
+  // three sessions precisely because the old implementation would have
+  // rendered "3" here.
+  it("claims no count, whatever this window's session total happens to be", async () => {
+    mockMachineRunsFetch(3);
     renderMachineLens();
-    expect(await screen.findByRole("link", { name: /^1 run on MacBook-Pro/i })).toBeInTheDocument();
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    expect(link.textContent).toBe("runs on MacBook-Pro →");
+    expect(link.textContent).not.toMatch(/\d/);
   });
 
-  it("zero runs still renders a real, honest link — never hidden, never a stale count", async () => {
+  it("renders the same label with an EMPTY window — no count to be wrong, nothing hidden", async () => {
     mockMachineRunsFetch(0);
     renderMachineLens();
-    expect(await screen.findByRole("link", { name: /0 runs on MacBook-Pro/i })).toBeInTheDocument();
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    expect(link.textContent).toBe("runs on MacBook-Pro →");
   });
 
   it("clicking the link navigates via a real hash write, not a page reload", async () => {
     mockMachineRunsFetch(3);
     renderMachineLens();
-    const link = await screen.findByRole("link", { name: /3 runs on MacBook-Pro/i });
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
     fireEvent.click(link);
     expect(window.location.hash).toBe("#lens=runs&machine=u1");
   });
@@ -268,7 +286,7 @@ describe("MachineLens — the runs-lens link (#1809)", () => {
   it("the old per-run list markup is gone — no '.machine-lens__run' rows, no 'RUNS ON' header", async () => {
     mockMachineRunsFetch(3);
     const { container } = renderMachineLens();
-    await screen.findByRole("link", { name: /3 runs on MacBook-Pro/i });
+    await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
     expect(container.querySelector(".machine-lens__run")).toBeNull();
     expect(screen.queryByText(/RUNS ON/)).not.toBeInTheDocument();
   });

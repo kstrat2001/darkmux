@@ -1900,7 +1900,7 @@ body {
 
    Why this doesn't reuse legacy's `.memcard`/`.memrow`/`.k`/`.v` rules: the
    port deliberately represents this lens's content as LINE ARRAYS (one `<div>`
-   per line, see `runLines.ts`'s module doc) so `innerText` line breaks don't
+   per line, see `MachineLens.tsx`'s `Lines` doc) so `innerText` line breaks don't
    depend on flex behavior. Legacy's rules assume structured markup that no
    longer exists here, so the visual language is reproduced rather than the
    selectors.
@@ -2028,7 +2028,6 @@ body {
   margin: 4px 0;
 }
 
-.machine-lens__runshdr,
 .machine-lens__loosehdr {
   font: 600 10px/1.4 "JetBrains Mono", monospace;
   letter-spacing: 0.12em;
@@ -2037,39 +2036,27 @@ body {
   margin: 18px 0 8px;
 }
 
-.machine-lens__run {
-  padding: 7px 10px;
-  border-left: 3px solid var(--border);
-  background: rgba(255, 255, 255, 0.015);
-  margin-bottom: 4px;
-  overflow-wrap: anywhere;
-}
-/* Each run's first line is always its `handle · model` main line
-   (runLines.ts pushes it unconditionally, before the optional meta/time
-   lines), so first-child is deterministic here too. */
-.machine-lens__run > div:first-child {
-  color: var(--fg);
-}
-.machine-lens__run > div:not(:first-child) {
-  color: var(--dim);
-  font-size: 11px;
-}
-
-.machine-lens__runsmore {
+/* (#1809) The link out to this machine's pinned runs lens, replacing the
+   per-run list that used to live here. Styled as a control rather than a
+   document link: a bare `<a>` renders as the browser's default blue
+   underline, which is the only such thing on a page built entirely from
+   bordered cards and chips. Carries the same box the expand-control that
+   used to sit here had (bordered, accent, 44px touch target), so the
+   affordance reads as the one operators already learned. */
+.machine-lens__runslink {
   display: inline-block;
-  margin-top: 8px;
+  margin-top: 14px;
   padding: 5px 10px;
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--accent);
-  font-size: 11px;
-  cursor: pointer;
-  user-select: none;
-  /* 44px touch target without inflating the painted control — the same
-     `::after` technique the chrome controls use. */
+  font: 11px/1.4 "JetBrains Mono", monospace;
+  text-decoration: none;
   position: relative;
 }
-.machine-lens__runsmore::after {
+/* 44px touch target without inflating the painted control — the same
+   `::after` technique the chrome controls use. */
+.machine-lens__runslink::after {
   content: "";
   position: absolute;
   left: 0;
@@ -2078,8 +2065,8 @@ body {
   height: 44px;
   transform: translateY(-50%);
 }
-.machine-lens__runsmore:hover,
-.machine-lens__runsmore:focus-visible {
+.machine-lens__runslink:hover,
+.machine-lens__runslink:focus-visible {
   border-color: var(--accent);
 }
 

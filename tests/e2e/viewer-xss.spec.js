@@ -52,7 +52,9 @@ async function assertInert(page, where) {
 // drill-downs (lines 50-83) are ALSO all unreachable in the port today —
 // confirmed live, not inferred (`walked.recentRun + walked.session +
 // walked.mission` is 0 against this exact fixture) — because `MachineLens`'s
-// run rows carry no session-drill affordance yet (`runLines.ts`'s own
+// run rows are gone entirely as of #1809 — the machine page is the
+// residency room now and links out to the pinned runs lens (whose rows
+// carry no session-drill affordance either) (`MachineLens.tsx`'s own
 // module doc names this cut) and there is no mission-drill affordance in
 // this static harness either. So even past the filters-modal blocker, the
 // ORIGINAL test's audit assertion (line 80-83) would still fail honestly.
