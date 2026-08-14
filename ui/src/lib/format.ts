@@ -107,6 +107,21 @@ export function ramGiB(bytes: number | null | undefined): number | null {
   return Math.round(bytes / 1073741824);
 }
 
+/** (#1811) The parenthetical that reconciles this page's two byte
+ * conventions: ` (128 GiB)` beside a decimal `137.44 GB`, so a reader can see
+ * the two figures are one number rather than two quantities. Returns `""`
+ * whenever the binary form would NOT actually clarify anything — an
+ * unreadable byte count, or a value that rounds to the same integer in both
+ * conventions (under ~1 GB), where the parenthetical would be noise
+ * restating the number beside it. */
+export function poolGiBNote(bytes: number | null | undefined): string {
+  const gib = ramGiB(bytes);
+  if (gib == null || !Number.isFinite(gib) || gib < 1) return "";
+  const decimalGb = Number(bytes) / 1e9;
+  if (Math.round(decimalGb) === gib) return "";
+  return ` (${gib} GiB)`;
+}
+
 /** `memStateCls()` — viewer.html:4866. Only green/amber/red pass through;
  * anything else (missing, unrecognized) normalizes to "unknown". Ported
  * ahead of its first consumer; #1806 Stage 1 (then Stage 2/3's
