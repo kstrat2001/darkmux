@@ -18,7 +18,7 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
   `137.44 GB`, and the gauge inherited it — labeling its arc `0 · 34 · 69 · 103
   · 137` on the one screen whose whole job is telling you how much room you
   have. Every figure in the memory ledger and on the gauge face now divides by
-  2³⁰ and is labeled `GiB`: the arc reads `0 · 32 · 64 · 96 · 128`, the pool
+  a power of two and is labeled `GiB`/`MiB`: the arc reads `0 · 32 · 64 · 96 · 128`, the pool
   reads `128.00 GiB`, and the ` (128 GiB)` parenthetical that used to patch the
   mismatch is gone along with it. The stage header's own RAM figure keeps its
   `GB` label for now — it was always computed in binary, so it now agrees

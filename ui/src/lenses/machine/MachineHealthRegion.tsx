@@ -116,7 +116,16 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   const odo = odoLayout(digitCells(centerVal.num));
 
   const committed = gaugeValueParts(resources.machine.potential_bytes);
-  const ariaLabel = `Machine memory: ${centerVal.num} ${centerVal.unit} in use of the ${gaugeValueParts(geo.scale).num} ${gaugeValueParts(geo.scale).unit} ${geo.scaleWord.toLowerCase()} (${Math.round(geo.pct)}% full). ${
+  // The "% full" clause is gated on a READABLE current, not rendered
+  // unconditionally: `memPct(null, scale)` is 0 by design (it exists to never
+  // hand a caller NaN), so an unreadable `current_bytes` would otherwise have
+  // the screen reader announce "0% full" for the same payload the odometer
+  // honestly renders as a single "—" cell. Absence is never zero — including
+  // in the channel a sighted reader can't check.
+  const scaleVal = gaugeValueParts(geo.scale);
+  const fullness = geo.cur != null ? ` (${Math.round(geo.pct)}% full)` : "";
+  const inUse = geo.cur != null ? `${centerVal.num} ${centerVal.unit}` : "an unreadable amount";
+  const ariaLabel = `Machine memory: ${inUse} in use of the ${scaleVal.num} ${scaleVal.unit} ${geo.scaleWord.toLowerCase()}${fullness}. ${
     geo.commitPct != null ? `Committed ${committed.num} ${committed.unit}${resources.machine.unpriced_models ? ` plus ${resources.machine.unpriced_models} unpriced model(s)` : ""}, marked by the dashed tick. ` : ""
   }State ${resources.machine.state || "unknown"}.`;
 

@@ -18,7 +18,7 @@
  *   every figure on the page still matches docs/design/machine-lens/provenance.md's traced values.
  */
 
-import { GIB, memBytes, memPct, memStateCls } from "../../lib/format";
+import { GIB, KIB, MIB, memBytes, memPct, memStateCls } from "../../lib/format";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
 export type Severity = "green" | "amber" | "red" | "unknown";
@@ -62,8 +62,8 @@ export function gaugeValueParts(bytes: number | null | undefined): { num: string
   const n = Number(bytes);
   if (!Number.isFinite(n)) return { num: "—", unit: "" };
   if (n >= GIB) return { num: (n / GIB).toFixed(1), unit: "GiB" };
-  if (n >= 1048576) return { num: String(Math.round(n / 1048576)), unit: "MiB" };
-  if (n >= 1024) return { num: String(Math.round(n / 1024)), unit: "KiB" };
+  if (n >= MIB) return { num: String(Math.round(n / MIB)), unit: "MiB" };
+  if (n >= KIB) return { num: String(Math.round(n / KIB)), unit: "KiB" };
   return { num: String(Math.round(n)), unit: "B" };
 }
 

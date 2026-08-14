@@ -87,8 +87,8 @@ export function fmtC(n: number): string {
 }
 
 export const GIB = 1073741824; // 2³⁰
-const MIB = 1048576; // 2²⁰
-const KIB = 1024; // 2¹⁰
+export const MIB = 1048576; // 2²⁰
+export const KIB = 1024; // 2¹⁰
 
 /** `memBytes()` — **binary** GiB/MiB/KiB (`bytes / 2³⁰`, two decimals for the
  * GiB arm).
@@ -107,7 +107,7 @@ const KIB = 1024; // 2¹⁰
  * no longer two conventions on the page to reconcile.
  *
  * Residual, deliberately NOT taken here: the stage header's own RAM figure
- * (`specOf`, `lenses/fleet/cards.ts:65`) has always been binary and has always
+ * (`specOf`, in `lenses/fleet/cards.ts`) has always been binary and has always
  * been labeled `GB`. It now agrees with this function NUMERICALLY (both say
  * 128), which is the confusion #1811 was actually about; only the unit suffix
  * still differs. Relabelling it is a one-token change gated on retiring the

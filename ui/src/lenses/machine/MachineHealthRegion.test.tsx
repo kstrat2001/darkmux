@@ -185,6 +185,25 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
     expect(Number(container.querySelector(".mm-gauge-center-unit")!.getAttribute("x"))).toBeGreaterThan(right);
   });
 
+  it("never announces a fabricated 0% to a screen reader when the reading is unavailable", () => {
+    // `memPct(null, scale)` is 0 by design (it exists so no caller is handed
+    // NaN), so an unguarded "% full" clause would tell a screen-reader user
+    // the machine is 0% full for the very payload the odometer renders as a
+    // single "—". Absence is never zero — including in the channel a sighted
+    // reader cannot check against the dial.
+    const none: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: null as unknown as number } };
+    const { container } = renderRegion(none, { residencyRows: residencyRowsFor(none) });
+    const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
+    expect(aria).not.toContain("% full");
+    expect(aria).not.toContain("0%");
+    expect(aria).toContain("unreadable");
+
+    // The inverted case: a readable reading DOES get its fullness announced.
+    const ok = renderRegion(BASE);
+    const okAria = ok.container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
+    expect(okAria).toContain("% full");
+  });
+
   it("stays centered when the figure's width changes — including the no-data case", () => {
     const wide: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: 130000000000 } }; // "121.1", 5 cells
     const { container } = renderRegion(wide, { residencyRows: residencyRowsFor(wide) });
