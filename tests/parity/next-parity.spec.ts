@@ -160,13 +160,42 @@ function readGolden(label) {
  * NUMERIC claim about the new shape instead, which is the right unit for a
  * redesign whose whole point was to change the shape.
  *
- * What survives THIS byte comparison, narrower still than #1809 left it:
- * only the header line + the `darkmux/utility` block (5 lines,
- * `utilityLines()` in `memoryLedgerLines.ts` — untouched by Stage 2/3, a
- * fixed four-element array plus the page header) — see
- * `goldenMachineHdrUtilText`/`machineHdrUtilText` below. If EITHER
- * assertion in either test starts failing, that IS real coverage: the
- * header/utility-tier chrome broke, not a rubber stamp.
+ * **Narrowed a THIRD time** (operator-approved `darkmux/utility` block
+ * redesign, then that redesign's own follow-up moving the block below the
+ * health region): the previous narrowing above still asserted the header
+ * line PLUS the `darkmux/utility` block's old fixed four-line shape
+ * (`utilityLines()`) byte-for-byte, on the theory that block was untouched
+ * by Stage 2/3. It is not untouched anymore — the same redesign this
+ * comment describes for the ledger now applies to that block too: a typed
+ * `utilityView()` replaces the flat `string[]`, the rendering is a
+ * header/chip/kv structure instead of four plain lines, the copy itself
+ * changed (a gloss line, restructured chip text, a hint line in one state),
+ * and the block's POSITION in the DOM moved (it now renders AFTER
+ * `.machine-lens__health`, not before it — identity → instrument → evidence
+ * → context, per the operator's own ordering). None of that has a byte-exact
+ * counterpart in a golden recorded from the OLD four-line block, for the
+ * same reason the ledger's redesign didn't: comparing two genuinely
+ * different information architectures byte-for-byte doesn't catch drift,
+ * it just always fails.
+ *
+ * What survives THIS byte comparison, narrower still than the prior cut:
+ * ONLY the stage's header line (`.machine-lens__hdr` — "fleet › machine ·
+ * <label> — <spec>") — see `goldenMachineHdrText`/`machineHdrText` below.
+ * That line is real chrome untouched by either redesign (it renders before
+ * `.machine-lens__health` and always has), so it stays a meaningful
+ * byte-exact tie. If it starts failing, that IS real coverage: the page
+ * header broke, not a rubber stamp.
+ *
+ * **Where the utility block's OWN coverage lives now**, since a byte-diff
+ * can no longer be it: `memoryLedgerLines.test.ts`'s `utilityView` describe
+ * block (all four states: chip text + severity, the model row's live-vs-copy
+ * flag, the hint line's presence in exactly one state, `not reported` vs
+ * `not configured` staying distinct) and the row-chip identity marker this
+ * same follow-up added — `machineGauge.test.ts`'s `isUtilityTierRow`
+ * describe block (the pure match/no-match logic, both inverted cases) plus
+ * `MachineHealthRegion.test.tsx`'s "the utility row-chip" describe block
+ * (the rendered chip, its neutral/unclassed severity, and the inverted case
+ * of no chip anywhere when nothing is resident or nothing matches).
  */
 function machineChromePrefixOf(fullText: string): string {
   const stageMarker = "=== stage ===\n";
@@ -175,32 +204,28 @@ function machineChromePrefixOf(fullText: string): string {
   return fullText.slice(0, idx);
 }
 
-/** The golden's own stage text, sliced down to JUST the header + the fixed
- * four-line `darkmux/utility` block (`utilityLines()` — untouched by Stage
- * 2/3) — the one region of the OLD golden that still corresponds to
- * something real in the new markup. See this section's own doc for why the
- * rest of the golden's stage (the flat ledger, from "machine total" through
- * "RUNS ON …") no longer has a byte-exact counterpart. */
-function goldenMachineHdrUtilText(goldenText: string): string {
+/** The golden's own stage text, sliced down to JUST the header line — the
+ * one region of the OLD golden that still corresponds to something real in
+ * the new markup (see this section's own doc for the full history of what
+ * else used to be covered here and why each piece was retired). */
+function goldenMachineHdrText(goldenText: string): string {
   const stageMarker = "=== stage ===\n";
   const stageIdx = goldenText.indexOf(stageMarker);
-  if (stageIdx === -1) throw new Error(`goldenMachineHdrUtilText: no "${stageMarker.trim()}" marker found`);
+  if (stageIdx === -1) throw new Error(`goldenMachineHdrText: no "${stageMarker.trim()}" marker found`);
   const stage = goldenText.slice(stageIdx + stageMarker.length);
-  // header (1 line) + utilityLines()'s fixed 4-element array = 5 lines,
-  // then "machine total" begins the retired ledger portion.
-  const lines = stage.split("\n").slice(0, 5);
+  // Just the header — "machine total" (Stage 2/3's ledger) and
+  // "darkmux/utility" (the utility-block redesign) both begin retired
+  // portions now.
+  const lines = stage.split("\n").slice(0, 1);
   return normalize(lines.join("\n"));
 }
 
-async function machineHdrUtilText(page): Promise<string> {
-  const parts: string[] = await page.evaluate(() => {
-    const selectors = [".machine-lens__hdr", ".machine-lens__util"];
-    return selectors.map((sel) => {
-      const el = document.querySelector(sel) as HTMLElement | null;
-      return el ? el.innerText : "";
-    });
+async function machineHdrText(page): Promise<string> {
+  const got: string = await page.evaluate(() => {
+    const el = document.querySelector(".machine-lens__hdr") as HTMLElement | null;
+    return el ? el.innerText : "";
   });
-  return normalize(parts.join("\n"));
+  return normalize(got);
 }
 
 // NOTE: deliberately NOT `test.describe.configure({ mode: "serial" })` (QA
@@ -232,20 +257,22 @@ test("next: click-navigation into #lens=machine matches goldens/machine.txt", as
   await waitSettled(page, expect, '.machine-lens__health[data-state="loaded"]');
   await expect(page.locator("body")).not.toHaveClass(/booting/);
 
-  // (#1809, then narrowed further by #1806 Stage 2/3) See this file's own
-  // `machineChromePrefixOf`/`goldenMachineHdrUtilText` doc for exactly
-  // which regions no longer correspond (the runs list, then the whole flat
-  // ledger) and why each is a deliberate divergence, not a regression.
+  // (#1809, then narrowed further by #1806 Stage 2/3, then narrowed a THIRD
+  // time by the utility-block redesign + its reorder follow-up) See this
+  // file's own `machineChromePrefixOf`/`goldenMachineHdrText` doc for
+  // exactly which regions no longer correspond (the runs list, then the
+  // whole flat ledger, then the utility block itself) and why each is a
+  // deliberate divergence, not a regression.
   const got = await extractLensText(page);
   const golden = readGolden("machine");
   expect(machineChromePrefixOf(got), "topbar/crumb/meta/logscope must still match byte-for-byte").toBe(
     machineChromePrefixOf(golden),
   );
-  const gotHdrUtil = await machineHdrUtilText(page);
+  const gotHdr = await machineHdrText(page);
   expect(
-    gotHdrUtil,
-    "the stage's header + darkmux/utility block must still match byte-for-byte — the ledger below it was deliberately redesigned (Stage 2/3), see this file's own doc for the replacement coverage",
-  ).toBe(goldenMachineHdrUtilText(golden));
+    gotHdr,
+    "the stage's header line must still match byte-for-byte — everything below it (the ledger, then the utility block) was deliberately redesigned, see this file's own doc for the replacement coverage",
+  ).toBe(goldenMachineHdrText(golden));
 });
 
 test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", async ({ page }) => {
@@ -263,18 +290,19 @@ test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", 
   await waitSettled(page, expect, '.machine-lens__health[data-state="loaded"]');
   await expect(page.locator("body")).not.toHaveClass(/booting/);
 
-  // (#1809, then narrowed further by #1806 Stage 2/3) — same split as the
-  // click-navigation test above.
+  // (#1809, then narrowed further by #1806 Stage 2/3, then narrowed a THIRD
+  // time by the utility-block redesign + its reorder follow-up) — same
+  // split as the click-navigation test above.
   const got = await extractLensText(page);
   const golden = readGolden("machine-deeplink");
   expect(machineChromePrefixOf(got), "topbar/crumb/meta/logscope must still match byte-for-byte").toBe(
     machineChromePrefixOf(golden),
   );
-  const gotHdrUtil = await machineHdrUtilText(page);
+  const gotHdr = await machineHdrText(page);
   expect(
-    gotHdrUtil,
-    "the stage's header + darkmux/utility block must still match byte-for-byte — the ledger below it was deliberately redesigned (Stage 2/3), see this file's own doc for the replacement coverage",
-  ).toBe(goldenMachineHdrUtilText(golden));
+    gotHdr,
+    "the stage's header line must still match byte-for-byte — everything below it (the ledger, then the utility block) was deliberately redesigned, see this file's own doc for the replacement coverage",
+  ).toBe(goldenMachineHdrText(golden));
 });
 
 // Red-prove — the SAME self-test discipline the legacy harness's

@@ -26,33 +26,123 @@
  * `/machine/resources`); only the rendering was uppercased there. This port
  * uppercases the STRING directly (see `format.ts`'s module doc) rather than
  * depending on a stylesheet rule the port is free to change.
+ *
+ * (operator-approved utility-block redesign) `utilityLines()` — the
+ * `darkmux/utility` node's own flat four-element `string[]` builder,
+ * unchanged since this file's introduction — is retired in favor of
+ * `utilityView()`, a typed structure (see its own doc below). The old
+ * function's positional-array shape forced `MachineLens.tsx`'s rendering CSS
+ * into `nth-child` selectors and flattened a live probe reading and a
+ * hardcoded capability list into one indistinguishable style; the new shape
+ * carries a `model.isLiveData` flag specifically so the renderer can keep
+ * those two visually distinct (`docs/design/machine-lens/provenance.md`'s
+ * rule against hardcoded copy rendering as if it were read data). The four
+ * branch conditions (`um` undefined/null/loaded/not-loaded) are unchanged —
+ * only what each branch produces changed.
  */
 
 import { MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
 
-/** The `darkmux/utility` node — viewer.html:1810-1822. `isLocalSpecs` is
+/** Chip severities the utility block's state chip can carry. Deliberately
+ * narrower than `.mm-chip`'s full green/amber/red vocabulary — nothing about
+ * utility-tier residency is ever a RED (failure) condition, only a spectrum
+ * from "healthy" to "can't see it" — and `"unknown"` renders with NO color
+ * class (see `.mm-chip`'s own CSS comment: `unknown` is a real, common state
+ * and its honest rendering is the neutral base look, never an invented
+ * color). */
+export type UtilityChipSeverity = "green" | "amber" | "unknown";
+
+/** The structured shape of the `darkmux/utility` node. Replaces the old
+ * `utilityLines()` fixed four-element `string[]` (see this file's git
+ * history / #1806 packet doc for that shape) — a positional array forced
+ * the rendering CSS to key on `nth-child`, which is exactly the kind of
+ * "guesswork from shape" this project's own `lineClass()` doc (in
+ * `MachineLens.tsx`) warns against for variable content, and it also
+ * flattened two semantically different rows (a live probe reading and a
+ * hardcoded capability list) into one identical style with no label at all.
+ * `model.isLiveData` is the field that lets the renderer apply
+ * `docs/design/machine-lens/provenance.md`'s rule that hardcoded UI copy
+ * must never render indistinguishably from a value that came off a probe —
+ * `handles` has no such flag because it is ALWAYS static copy. */
+export interface UtilityView {
+  /** Constant: `"darkmux/utility"`. */
+  name: string;
+  /** Constant gloss naming what this node IS, so a first-time reader isn't
+   * left inferring it from the model id alone. */
+  gloss: string;
+  model: {
+    /** The model id (live probe data) when one is registered/reported;
+     * otherwise an explanatory sentence — never a bare dash or blank. */
+    value: string;
+    /** `true` only when `value` came off `/machine/specs` verbatim. Drives
+     * the bright-vs-dim treatment (provenance.md's rule, above). */
+    isLiveData: boolean;
+  };
+  /** Constant: `"compaction · mission-compile · estimate · scribe"` — the
+   * fixed capability list, always hardcoded UI copy, never live data. */
+  handles: string;
+  chip: { text: string; severity: UtilityChipSeverity };
+  /** The utility model's id when it is ACTUALLY RESIDENT, else `null` — the
+   * single field the ledger's `utility` row-chip keys on
+   * (`isUtilityTierRow`). A real discriminant rather than a re-derivation:
+   * the alternative was for the caller to recover this state by
+   * string-matching the DISPLAY text (`chip.text === "resident"`), which
+   * couples a rendering decision to a copy string that exists to be
+   * rewritten. Non-null in exactly the `um.loaded === true` branch, so a
+   * registered-but-not-loaded tier can never mark a row. */
+  residentModelId: string | null;
+  /** A `↳`-prefixed-at-render hint line, present only for the
+   * present-but-not-loaded state (the one state where there is something
+   * actionable to tell the reader: the model isn't resident yet, but
+   * dispatching still works — the FIRST dispatch just pays the load cost). */
+  hint?: string;
+}
+
+const UTILITY_HANDLES = "compaction · mission-compile · estimate · scribe";
+
+/** The `darkmux/utility` node — viewer.html:1810-1822 (legacy shape;
+ * superseded on the React port by the operator-approved kv/chip redesign,
+ * `MachineLens.tsx`'s render of this view). `isLocalSpecs` is
  * `isLocalMachine(m)` (viewer.html:2628): only a specs-confirmed local
  * machine gets real utility-tier state; everything else reads "not
- * reported" (never fabricated residency for a remote/unresolved machine). */
-export function utilityLines(specs: MachineSpecs | null, isLocalSpecs: boolean): string[] {
+ * reported" (never fabricated residency for a remote/unresolved machine).
+ * The four branch conditions below are unchanged from the retired
+ * `utilityLines()` — only the presentation each branch produces changed. */
+export function utilityView(specs: MachineSpecs | null, isLocalSpecs: boolean): UtilityView {
   const um = isLocalSpecs ? specs?.utility_model : undefined;
-  let utilState: string;
-  let pillText: string;
+  const base = { name: "darkmux/utility", gloss: "the internal small-model tier", handles: UTILITY_HANDLES };
   if (um === undefined) {
-    utilState = "utility tier";
-    pillText = "not reported";
-  } else if (um === null) {
-    utilState = "utility tier · not configured";
-    pillText = "not configured";
-  } else if (um.loaded) {
-    utilState = `utility tier · ${um.id}`;
-    pillText = "resident";
-  } else {
-    utilState = `utility tier · ${um.id}`;
-    pillText = "registered · not loaded";
+    return {
+      ...base,
+      model: { value: "not visible from here — local-probe only", isLiveData: false },
+      chip: { text: "not reported", severity: "unknown" },
+      residentModelId: null,
+    };
   }
-  return ["darkmux/utility", utilState, "compaction · mission-compile · estimate · scribe", pillText];
+  if (um === null) {
+    return {
+      ...base,
+      model: { value: "— none on this machine", isLiveData: false },
+      chip: { text: "not configured", severity: "unknown" },
+      residentModelId: null,
+    };
+  }
+  if (um.loaded) {
+    return {
+      ...base,
+      model: { value: um.id, isLiveData: true },
+      chip: { text: "resident", severity: "green" },
+      residentModelId: um.id,
+    };
+  }
+  return {
+    ...base,
+    model: { value: um.id, isLiveData: true },
+    chip: { text: "not loaded", severity: "amber" },
+    residentModelId: null,
+    hint: "loads on first use — the first dispatch pays the model load",
+  };
 }
 
 /** `limitDescription()` — viewer.html:4896's inline ternary, factored out so

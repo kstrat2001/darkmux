@@ -476,3 +476,35 @@ export function modelKvLine(m: MachineResourcesModel): string {
   const kv = m.kv_bytes_at_ctx != null ? `kv@ctx ${memBytes(m.kv_bytes_at_ctx)}` : "kv unknown (no arch facts)";
   return `ctx ${m.loaded_ctx} · weights ${memBytes(m.weights_bytes)} · ${kv} · potential ${memBytes(m.potential_bytes)} · current ${memBytes(m.current_bytes)}`;
 }
+
+/** Whether a residency row is the currently RESIDENT utility-tier model —
+ * the identity marker that stitches a row in this ledger back to the
+ * `darkmux/utility` explainer block elsewhere on the page (operator-approved
+ * follow-up to the utility-block redesign). Deliberately takes
+ * `utilityResidentId` rather than the raw `utility_model` field + a `loaded`
+ * check: the caller (`MachineLens.tsx`) derives that string from
+ * `utilityView()`'s OWN "resident" branch, so it is non-null in exactly the
+ * one state (`um.loaded === true`) where marking a row is honest — a
+ * registered-but-not-loaded utility model has no resident row to mark, and
+ * this function never has to re-derive that condition or risk drifting from
+ * it. Never fabricates a match against a `null`/`undefined` identifier on
+ * either side.
+ *
+ * Matches the namespaced `identifier` OR the bare `model_key`, and that is
+ * not belt-and-braces — it MIRRORS THE SERVER. `machine_specs_handler`
+ * decides `utility_model.loaded` with `m.identifier == id || m.model == id`,
+ * because the profiles registry may store the utility model id in either
+ * form. Matching a single field here would let the two surfaces disagree in
+ * a configuration the server explicitly supports: the block would honestly
+ * report `resident` while no ledger row carried the chip, and the stitch the
+ * chip exists to make would fail silently. Widening it cannot produce a
+ * FABRICATED marker either — any row this tags matched the same id, on the
+ * same two fields, that the server matched to decide residency at all. */
+export function isUtilityTierRow(
+  identifier: string | null | undefined,
+  modelKey: string | null | undefined,
+  utilityResidentId: string | null,
+): boolean {
+  if (utilityResidentId == null) return false;
+  return identifier === utilityResidentId || modelKey === utilityResidentId;
+}

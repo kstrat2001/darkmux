@@ -1959,33 +1959,51 @@ body {
   margin-bottom: 12px;
 }
 
-/* `utilityLines` returns a FIXED four-element array — [name, state, caps,
-   pill] (memoryLedgerLines.ts) — so positional selectors are safe here in a
-   way they would not be for the health region's variable-length output. */
-.machine-lens__util > div:first-child {
+/* (operator-approved redesign) `utilityView()` (memoryLedgerLines.ts)
+   replaced the old fixed four-element `string[]` — [name, state, caps, pill]
+   — with a typed structure, so the positional `nth-child` selectors this
+   block used to carry are gone: real structure gets real classes instead.
+   `.mm-util-hdr`/`.mm-util-row`/`.mm-util-key` below are scoped to THIS
+   block only (not general `.mm-*` idioms other regions share) because the
+   two-row key-alignment shape is specific to this node; the chip and kv
+   COLOR treatment still ride the page's shared `.mm-chip`/`.mm-kv` idioms
+   (further down this file) rather than reinventing them. */
+.mm-util-hdr {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+.mm-util-name {
   font-weight: 600;
   color: var(--accent);
 }
-.machine-lens__util > div:nth-child(2),
-.machine-lens__util > div:nth-child(3) {
+.mm-util-gloss {
   color: var(--dim);
-  font-size: 11px;
 }
-.machine-lens__util > div:last-child {
-  display: block;
-  width: fit-content;
-  margin-top: 6px;
-  padding: 2px 7px;
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  /* NO text-transform. `innerText` is layout-aware and applies it, so
-     uppercasing here rewrote `resident` to `RESIDENT` and broke the parity
-     golden. Legacy renders this pill lowercase; only `.memstate`/`.memowner`
-     are uppercased there, and this port already uppercases those STRINGS
-     directly (see memoryLedgerLines.ts). */
-  color: var(--accent-dim);
+.mm-util-hdr .mm-chip {
+  flex-shrink: 0;
+}
+/* `.mm-kv`'s default `margin-bottom: 12px` is sized for a single detail row
+   sitting between two OTHER blocks (its usual context,
+   `MachineHealthRegion.tsx`); inside this compact node it would nearly
+   double the block's height. So the rows' own bottom margin is zeroed and
+   every vertical gap in this block — header→row and row→row alike — comes
+   from the column `gap` below. One number, in one place, rather than a
+   margin on the header plus a sibling-combinator margin between rows. */
+.machine-lens__util {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.machine-lens__util .mm-util-row {
+  margin-bottom: 0;
+}
+.mm-util-key {
+  display: inline-block;
+  min-width: 54px;
+  color: var(--dim);
 }
 
 /* ── `.memcard` — the health region's SURVIVING plain-card treatment ───────

@@ -167,6 +167,131 @@ describe("MachineLens", () => {
   });
 });
 
+/**
+ * (operator-approved redesign, then its own reorder follow-up) End-to-end
+ * coverage for the `darkmux/utility` block AS RENDERED by this component —
+ * `memoryLedgerLines.test.ts`'s `utilityView` suite already pins the pure
+ * data shape per state; these tests pin the two things only the rendered
+ * DOM can prove: which values land inside a `<b>` (the live-vs-copy
+ * brightness split `docs/design/machine-lens/provenance.md` requires) and
+ * where the block sits relative to `.machine-lens__health` now that it
+ * moved below the ledger.
+ */
+describe("MachineLens — the darkmux/utility block (operator-approved redesign)", () => {
+  it("renders AFTER the health region — identity → instrument → evidence → context", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472, utility_model: { id: "darkmux:qwen3-4b", loaded: true } },
+    });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    const util = container.querySelector(".machine-lens__util")!;
+    const health = container.querySelector(".machine-lens__health")!;
+    expect(util).toBeTruthy();
+    expect(health).toBeTruthy();
+    // eslint-disable-next-line no-bitwise
+    expect(util.compareDocumentPosition(health) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+  });
+
+  it("'resident': the model row's value renders inside a <b> (live data) with a green chip", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472, utility_model: { id: "darkmux:qwen3-4b", loaded: true } },
+    });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    const util = container.querySelector(".machine-lens__util")!;
+    const bright = [...util.querySelectorAll("b")].find((el) => el.textContent === "darkmux:qwen3-4b");
+    expect(bright).toBeTruthy();
+    expect(util.querySelector(".mm-chip.is-green")?.textContent).toBe("resident");
+  });
+
+  it("the 'handles' row NEVER renders inside a <b> — it is always static copy, never live data (the inverted case of the model row above)", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472, utility_model: { id: "darkmux:qwen3-4b", loaded: true } },
+    });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    const util = container.querySelector(".machine-lens__util")!;
+    const handlesRow = [...util.querySelectorAll(".mm-util-row")].find((r) => r.textContent?.includes("compaction"))!;
+    expect(handlesRow).toBeTruthy();
+    expect(handlesRow.querySelector("b")).toBeNull();
+  });
+
+  it("'not loaded': amber chip plus the hint line naming the first-dispatch load cost", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472, utility_model: { id: "darkmux:qwen3-4b", loaded: false } },
+    });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    const util = container.querySelector(".machine-lens__util")!;
+    expect(util.querySelector(".mm-chip.is-amber")?.textContent).toBe("not loaded");
+    expect(util.querySelector(".mm-hint")?.textContent).toContain("loads on first use");
+  });
+
+  it("'not configured': neutral (unclassed) chip, no hint — the inverted case of the amber+hint state above", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472, utility_model: null },
+    });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    const util = container.querySelector(".machine-lens__util")!;
+    const chip = util.querySelector(".mm-util-hdr .mm-chip")!;
+    expect(chip.textContent).toBe("not configured");
+    expect(chip.className).toBe("mm-chip");
+    expect(util.querySelector(".mm-hint")).toBeNull();
+  });
+
+  it("threads utilityResidentId end-to-end: the matching ledger row carries the 'utility' chip, a non-matching row never does", async () => {
+    const today = todayUTC();
+    const yesterday = prevDateUTC(today);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "/machine/specs") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                machine_id: "MacBook-Pro",
+                cpu_brand: "M5 Max",
+                ram_total_bytes: 137438953472,
+                utility_model: { id: "darkmux:qwen3-4b", loaded: true },
+              }),
+              { status: 200 },
+            ),
+          );
+        }
+        if (path === "/machine/resources") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                ...RESOURCES,
+                models: [
+                  { identifier: "darkmux:qwen3-4b", model_key: "qwen3-4b", owner: "darkmux", loaded_ctx: 16000, weights_bytes: 1, kv_per_token_bytes: 1, kv_bytes_at_ctx: 1, potential_bytes: 1, current_bytes: 1, state: "green" },
+                  { identifier: "darkmux:qwen3.6-35b-a3b", model_key: "qwen3.6-35b-a3b", owner: "darkmux", loaded_ctx: 262144, weights_bytes: 1, kv_per_token_bytes: 1, kv_bytes_at_ctx: 1, potential_bytes: 1, current_bytes: 1, state: "green" },
+                ],
+              }),
+              { status: 200 },
+            ),
+          );
+        }
+        if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
+        if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
+        if (path === "/fleet/machines/live") {
+          return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        }
+        return Promise.resolve(new Response("not recorded\n", { status: 404 }));
+      }),
+    );
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    const rows = [...container.querySelectorAll(".mm-row")];
+    const matchRow = rows.find((r) => r.textContent?.includes("darkmux:qwen3-4b") && !r.textContent?.includes("35b"))!;
+    const otherRow = rows.find((r) => r.textContent?.includes("35b"))!;
+    expect([...matchRow.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(true);
+    expect([...otherRow.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
+  });
+});
+
 function renderMachineLens() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(

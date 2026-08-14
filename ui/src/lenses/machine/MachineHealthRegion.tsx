@@ -5,6 +5,7 @@ import {
   gaugeValueParts,
   groupResidencyRows,
   isOverLimit,
+  isUtilityTierRow,
   memStateCls,
   modelKvLine,
   odometerTiles,
@@ -231,10 +232,21 @@ function relSecondsAgo(nowMs: number, thenMs: number): string {
   return `${s}s ago`;
 }
 
-function ModelRow({ row, scale, nowMs }: { row: ResidencyRowView; scale: number; nowMs: number }) {
+function ModelRow({
+  row,
+  scale,
+  nowMs,
+  utilityResidentId,
+}: {
+  row: ResidencyRowView;
+  scale: number;
+  nowMs: number;
+  utilityResidentId: string | null;
+}) {
   const m: MachineResourcesModel = row.model;
   const isGhost = row.status === "ghost";
   const isNew = row.status === "new";
+  const isUtility = isUtilityTierRow(m.identifier, m.model_key, utilityResidentId);
   const stateCls = memStateCls(m.state);
   const pot = m.potential_bytes != null ? Number(m.potential_bytes) : null;
   const cur = m.current_bytes != null ? Number(m.current_bytes) : null;
@@ -247,6 +259,12 @@ function ModelRow({ row, scale, nowMs }: { row: ResidencyRowView; scale: number;
     <div className={rowCls}>
       <div className="mm-row-top">
         <span className="mm-row-name">{m.identifier || m.model_key}</span>
+        {/* Identity marker, not a health verdict — deliberately NO severity
+            class (green/amber/red). Stitches this row back to the
+            `darkmux/utility` explainer block below the ledger; see
+            `isUtilityTierRow`'s own doc for why it can only ever be true
+            for a currently-RESIDENT row. */}
+        {!isGhost && isUtility && <span className="mm-row-chip">utility</span>}
         {isGhost && <span className="mm-row-chip is-warn">DEPARTED · last seen {new Date(row.lastSeenMs).toLocaleTimeString([], { hour12: false })}</span>}
         {isNew && <span className="mm-row-chip is-new">NEW · first seen {relSecondsAgo(nowMs, row.firstSeenMs ?? row.lastSeenMs)}</span>}
         {!isGhost && pot == null && <span className="mm-row-chip is-warn">UNPRICED · potential unknown</span>}
@@ -292,7 +310,15 @@ function ModelRow({ row, scale, nowMs }: { row: ResidencyRowView; scale: number;
   );
 }
 
-function ModelRows({ rows, nowMs }: { rows: ResidencyRowView[]; nowMs: number }) {
+function ModelRows({
+  rows,
+  nowMs,
+  utilityResidentId,
+}: {
+  rows: ResidencyRowView[];
+  nowMs: number;
+  utilityResidentId: string | null;
+}) {
   const groups = groupResidencyRows(rows);
   // Shared scale (`perModelScale`'s own doc) — the largest figure across
   // every rendered row, GHOSTS INCLUDED (a departed model's last-observed
@@ -311,7 +337,7 @@ function ModelRows({ rows, nowMs }: { rows: ResidencyRowView[]; nowMs: number })
             {g.rows.some((r) => r.status === "ghost") ? ` (+${g.rows.filter((r) => r.status === "ghost").length} DEPARTED)` : ""}
           </div>
           {g.rows.map((r) => (
-            <ModelRow key={r.identifier} row={r} scale={scale} nowMs={nowMs} />
+            <ModelRow key={r.identifier} row={r} scale={scale} nowMs={nowMs} utilityResidentId={utilityResidentId} />
           ))}
         </div>
       ))}
@@ -329,6 +355,14 @@ export interface HealthRegionProps {
   residencyRows?: ResidencyRowView[];
   residencyChanged?: boolean;
   nowMs?: number;
+  /** The RESIDENT utility-tier model's id, or `null` — threaded explicitly
+   * from `MachineLens.tsx`'s own `utilityView()` call rather than this
+   * component reaching for `specs` itself (this region never otherwise
+   * touches `/machine/specs`). `null` covers every non-resident state
+   * (not configured, not reported, registered-but-not-loaded) uniformly —
+   * see `isUtilityTierRow`'s doc for why the caller pre-filters to just
+   * the resident case. */
+  utilityResidentId?: string | null;
 }
 
 export function MachineHealthRegion({
@@ -339,6 +373,7 @@ export function MachineHealthRegion({
   residencyRows = [],
   residencyChanged = false,
   nowMs = Date.now(),
+  utilityResidentId = null,
 }: HealthRegionProps) {
   if (!isLocalMach) {
     return (
@@ -418,7 +453,7 @@ export function MachineHealthRegion({
       )}
 
       <div className={stale ? "is-stale" : ""}>
-        <ModelRows rows={residencyRows} nowMs={nowMs} />
+        <ModelRows rows={residencyRows} nowMs={nowMs} utilityResidentId={utilityResidentId} />
       </div>
 
       {warnings.length > 0 && (

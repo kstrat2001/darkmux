@@ -302,3 +302,49 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     expect(feet.some((f) => /attribution:/i.test(f.textContent ?? ""))).toBe(true);
   });
 });
+
+/**
+ * (follow-up to the utility-block redesign) The `utility` row-chip stitches
+ * a residency row back to the `darkmux/utility` explainer block below the
+ * ledger. `renderRegion`'s BASE fixture already carries a darkmux-owned row
+ * (`darkmux:priced-model`) and a user-owned one (`user/unpriced-model`),
+ * which is exactly the pair needed to prove the marker is keyed on IDENTITY
+ * (a matching id) and not merely on OWNERSHIP (`owner === "darkmux"`) or
+ * on any state coloring — a chip with no severity class is the deliberate
+ * choice (`isUtilityTierRow`'s own doc): this is an identity label, not a
+ * health verdict, and the page's color-means-verified-severity doctrine
+ * would be violated by spending green/amber on it.
+ */
+describe("MachineHealthRegion — the utility row-chip (identity marker, never a severity color)", () => {
+  it("marks the matching row with a neutral, unclassed chip when the utility model is resident", () => {
+    const { container } = renderRegion(BASE, { utilityResidentId: "darkmux:priced-model" });
+    const row = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("priced-model") && !c.textContent?.includes("unpriced"))!;
+    const chip = [...row.querySelectorAll(".mm-row-chip")].find((c) => c.textContent === "utility");
+    expect(chip).toBeTruthy();
+    // Identity marker, not a verdict — no severity class riding along.
+    expect(chip!.className).toBe("mm-row-chip");
+    const otherRow = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("unpriced-model"))!;
+    expect([...otherRow.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
+  });
+
+  it("the inverted case: no row anywhere carries the chip when utilityResidentId doesn't match any row", () => {
+    const { container } = renderRegion(BASE, { utilityResidentId: "darkmux:some-other-model" });
+    const chips = [...container.querySelectorAll(".mm-row-chip")].filter((c) => c.textContent === "utility");
+    expect(chips).toHaveLength(0);
+  });
+
+  it("the inverted case: no chip anywhere when the utility tier isn't resident at all (null, the default)", () => {
+    const { container } = renderRegion(BASE);
+    const chips = [...container.querySelectorAll(".mm-row-chip")].filter((c) => c.textContent === "utility");
+    expect(chips).toHaveLength(0);
+  });
+
+  it("never marks a departed (ghost) row even if its identifier matches — a ghost isn't resident", () => {
+    const first = advanceResidency(null, BASE.models, 1000);
+    const second = advanceResidency(first.state, [BASE.models[1]], 2000); // the darkmux priced model departs
+    const { container } = renderRegion(BASE, { residencyRows: second.rows, utilityResidentId: "darkmux:priced-model" });
+    const ghostRow = [...container.querySelectorAll(".mm-row.is-ghost")].find((r) => r.textContent?.includes("priced-model"))!;
+    expect(ghostRow).toBeTruthy();
+    expect([...ghostRow.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
+  });
+});

@@ -6,7 +6,7 @@ import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, looseRecords, nameOf } from "../../lib/flow";
 import { specOf } from "../fleet/cards";
-import { utilityLines } from "./memoryLedgerLines";
+import { utilityView } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
 import { isStaticBuild } from "../../lib/staticSource";
@@ -64,34 +64,23 @@ export function lineClass(line: string): string | undefined {
   return undefined;
 }
 
-/** One `<div>` per line. `innerText` puts each block-level sibling on its
- * own line regardless of stylesheet — this port represents content as line
- * arrays (rendered one `<div>` per element) rather than leaning on legacy's
- * CSS-flex-dependent `innerText` line-break behavior, which depends on
- * every relevant ancestor being `display:flex` (or another block-level
- * layout) — brittle to depend on implicitly when a plain array is just as
- * easy to render and carries the same guarantee by construction. Still used
- * for the `darkmux/utility` node (`utilityLines()` — a fixed four-element
- * array, styled positionally in CSS, per that block's own stylesheet
- * comment); the health region moved to real structure in #1806 Stage 1
- * (then further, in Stage 2/3, to `MachineHealthRegion.tsx`'s gauge/lamp/
- * odometer/row markup) and no longer renders through here.
+/* A `Lines` component (one `<div>` per string, optionally classified through
+ * `lineClass` above) lived here until the utility-block redesign. The
+ * `darkmux/utility` node was its last caller; that node now renders real
+ * structure, for the same reason the health region left the flat shape
+ * behind in #1806 Stage 1 — a line array cannot distinguish a live probe
+ * reading from hardcoded UI copy, and the positional CSS it forces is
+ * guesswork the moment the shape is not truly fixed.
  *
- * `classify` stays as real, tested API (`lineClass.test.ts`) even though
- * nothing in this file passes `classify` anymore post-Stage-1 — see
- * `lineClass`'s own doc for why it wasn't deleted. Adding a class changes no
- * `innerText`, so the parity goldens are unaffected either way. */
-function Lines({ lines, classify = false }: { lines: string[]; classify?: boolean }) {
-  return (
-    <>
-      {lines.map((line, i) => (
-        <div key={i} className={classify ? lineClass(line) : undefined}>
-          {line}
-        </div>
-      ))}
-    </>
-  );
-}
+ * Deleted rather than kept: at zero callers it would have had to be
+ * `export`ed purely to stop `noUnusedLocals` removing it, and an export that
+ * exists only to satisfy a lint is dead code wearing a justification. It was
+ * nine lines and `git log` still has them if a future flat-line-shaped
+ * region wants the wrapper back.
+ *
+ * `lineClass` itself STAYS: it is independently exported, directly tested
+ * (`lineClass.test.ts`, including the hostile-string inverted case), and any
+ * such future region can call it without this wrapper existing. */
 
 /**
  * The machine page — `renderMachine()` (viewer.html:1796-1991), now purely
@@ -277,6 +266,8 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // cannot drift because it is not there beats a count that is right today.
   const loose = useMemo(() => (targetUid != null ? looseRecords(flowWindow.data, targetUid) : []), [flowWindow.data, targetUid]);
 
+  const utility = utilityView(specs, isLocalSpecs);
+
   return (
     <div className="machine-lens">
       <div className="machine-lens__hdr stagehdr">
@@ -301,10 +292,6 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
         {spec ? ` — ${spec}` : ""}
       </div>
 
-      <div className="machine-lens__util">
-        <Lines lines={utilityLines(specs, isLocalSpecs)} />
-      </div>
-
       {/* `data-state` is the parity harness's post-fetch content marker —
           the React-port twin of legacy's `.memcard` selector (see
           `tests/parity/extract.spec.ts`'s machine-lens comment): "loaded"
@@ -327,7 +314,44 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
           residencyRows={residencyRows}
           residencyChanged={residencyChanged}
           nowMs={nowMs}
+          utilityResidentId={utility.residentModelId}
         />
+      </div>
+
+      {/* (operator-approved redesign, then its own follow-up moving this
+          block BELOW the health region) Identity → instrument → evidence →
+          context → provenance: the ledger above is the evidence (it already
+          lists the utility model as one of its own resident rows, tagged
+          with the small `utility` row-chip — see `ModelRow` in
+          `MachineHealthRegion.tsx`), and this block is what explains that
+          row's PURPOSE now that the reader has already seen it, rather than
+          announcing it as the page's first content ahead of the memory
+          instrument the page actually exists to show. Header row carries
+          the node's name + a gloss naming what it IS, with the state chip
+          right-aligned in the SAME row so its referent is unambiguous.
+          Body rows are a dim key + value pair; `model`'s value goes BRIGHT
+          (`<b>`) only when it is live probe data (`utility.model.isLiveData`)
+          — `handles` never does, because it is always static UI copy
+          (`docs/design/machine-lens/provenance.md`'s rule against hardcoded
+          copy rendering as if it were read data). */}
+      <div className="machine-lens__util">
+        <div className="mm-util-hdr">
+          <span>
+            <span className="mm-util-name">{utility.name}</span>
+            <span className="mm-util-gloss"> · {utility.gloss}</span>
+          </span>
+          <span className={`mm-chip${utility.chip.severity !== "unknown" ? ` is-${utility.chip.severity}` : ""}`}>
+            {utility.chip.text}
+          </span>
+        </div>
+        <div className="mm-kv mm-util-row">
+          <span className="mm-util-key">model</span>{" "}
+          {utility.model.isLiveData ? <b>{utility.model.value}</b> : utility.model.value}
+        </div>
+        <div className="mm-kv mm-util-row">
+          <span className="mm-util-key">handles</span> {utility.handles}
+        </div>
+        {utility.hint && <div className="mm-hint">↳ {utility.hint}</div>}
       </div>
 
       {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —
