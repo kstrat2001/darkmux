@@ -317,7 +317,7 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
  */
 describe("MachineHealthRegion — the utility row-chip (identity marker, never a severity color)", () => {
   it("marks the matching row with a neutral, unclassed chip when the utility model is resident", () => {
-    const { container } = renderRegion(BASE, { utilityResidentId: "darkmux:priced-model" });
+    const { container } = renderRegion(BASE, { utilityModelId: "darkmux:priced-model" });
     const row = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("priced-model") && !c.textContent?.includes("unpriced"))!;
     const chip = [...row.querySelectorAll(".mm-row-chip")].find((c) => c.textContent === "utility");
     expect(chip).toBeTruthy();
@@ -327,8 +327,8 @@ describe("MachineHealthRegion — the utility row-chip (identity marker, never a
     expect([...otherRow.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
   });
 
-  it("the inverted case: no row anywhere carries the chip when utilityResidentId doesn't match any row", () => {
-    const { container } = renderRegion(BASE, { utilityResidentId: "darkmux:some-other-model" });
+  it("the inverted case: no row anywhere carries the chip when utilityModelId doesn't match any row", () => {
+    const { container } = renderRegion(BASE, { utilityModelId: "darkmux:some-other-model" });
     const chips = [...container.querySelectorAll(".mm-row-chip")].filter((c) => c.textContent === "utility");
     expect(chips).toHaveLength(0);
   });
@@ -342,7 +342,7 @@ describe("MachineHealthRegion — the utility row-chip (identity marker, never a
   it("never marks a departed (ghost) row even if its identifier matches — a ghost isn't resident", () => {
     const first = advanceResidency(null, BASE.models, 1000);
     const second = advanceResidency(first.state, [BASE.models[1]], 2000); // the darkmux priced model departs
-    const { container } = renderRegion(BASE, { residencyRows: second.rows, utilityResidentId: "darkmux:priced-model" });
+    const { container } = renderRegion(BASE, { residencyRows: second.rows, utilityModelId: "darkmux:priced-model" });
     const ghostRow = [...container.querySelectorAll(".mm-row.is-ghost")].find((r) => r.textContent?.includes("priced-model"))!;
     expect(ghostRow).toBeTruthy();
     expect([...ghostRow.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);

@@ -88,7 +88,7 @@ function readGolden(label) {
  * (#1806 Stage 2/3 — the machine-lens redesign, docs/design/machine-lens/proposal.md in the design
  * packet) #1809 narrowed the comparison to `topbar`/`crumb`/`meta`/
  * `logscope` (`machineChromePrefixOf`, still full byte equality below)
- * PLUS the stage's header + `darkmux/utility` block + the health/pressure
+ * PLUS the stage's header + (at the time) the `darkmux/utility` block + the health/pressure
  * LEDGER text. Stage 2/3 is the second, deeper narrowing: it retires the
  * ledger half of that comparison entirely.
  *
@@ -161,41 +161,40 @@ function readGolden(label) {
  * redesign whose whole point was to change the shape.
  *
  * **Narrowed a THIRD time** (operator-approved `darkmux/utility` block
- * redesign, then that redesign's own follow-up moving the block below the
- * health region): the previous narrowing above still asserted the header
- * line PLUS the `darkmux/utility` block's old fixed four-line shape
- * (`utilityLines()`) byte-for-byte, on the theory that block was untouched
- * by Stage 2/3. It is not untouched anymore — the same redesign this
- * comment describes for the ledger now applies to that block too: a typed
- * `utilityView()` replaces the flat `string[]`, the rendering is a
- * header/chip/kv structure instead of four plain lines, the copy itself
- * changed (a gloss line, restructured chip text, a hint line in one state),
- * and the block's POSITION in the DOM moved (it now renders AFTER
- * `.machine-lens__health`, not before it — identity → instrument → evidence
- * → context, per the operator's own ordering). None of that has a byte-exact
- * counterpart in a golden recorded from the OLD four-line block, for the
- * same reason the ledger's redesign didn't: comparing two genuinely
- * different information architectures byte-for-byte doesn't catch drift,
- * it just always fails.
+ * redesign, then its reorder, then its DELETION): the previous narrowing
+ * still asserted the header line PLUS that block's fixed four-line shape
+ * (`utilityLines()`) byte-for-byte, on the theory the block was untouched by
+ * Stage 2/3. It is not untouched anymore — it is GONE. The operator's call
+ * after reading it live: the block was CONFIG, not machine state. It named
+ * what the utility tier is responsible for, not how it relates to this
+ * machine, and this page shows what is resident.
+ *
+ * Its four states did not need re-homing, which is the test that the cut was
+ * right rather than merely tidy: `resident` was already proven by the ledger
+ * row's own existence (a row exists iff `lms ps` lists the model), `not
+ * loaded` and `not configured` are config questions `darkmux doctor`'s
+ * `check_utility_model_binding` already answers WITH a fix hint, and `not
+ * reported` duplicated the page-level not-local placeholder. What survives
+ * is one neutral `utility` badge on the residency row that renders anyway.
  *
  * What survives THIS byte comparison, narrower still than the prior cut:
  * ONLY the stage's header line (`.machine-lens__hdr` — "fleet › machine ·
  * <label> — <spec>") — see `goldenMachineHdrText`/`machineHdrText` below.
- * That line is real chrome untouched by either redesign (it renders before
+ * That line is real chrome untouched by any of it (it renders before
  * `.machine-lens__health` and always has), so it stays a meaningful
  * byte-exact tie. If it starts failing, that IS real coverage: the page
  * header broke, not a rubber stamp.
  *
- * **Where the utility block's OWN coverage lives now**, since a byte-diff
- * can no longer be it: `memoryLedgerLines.test.ts`'s `utilityView` describe
- * block (all four states: chip text + severity, the model row's live-vs-copy
- * flag, the hint line's presence in exactly one state, `not reported` vs
- * `not configured` staying distinct) and the row-chip identity marker this
- * same follow-up added — `machineGauge.test.ts`'s `isUtilityTierRow`
- * describe block (the pure match/no-match logic, both inverted cases) plus
- * `MachineHealthRegion.test.tsx`'s "the utility row-chip" describe block
- * (the rendered chip, its neutral/unclassed severity, and the inverted case
- * of no chip anywhere when nothing is resident or nothing matches).
+ * **Where the coverage lives now**, since a byte-diff can no longer be it:
+ * `memoryLedgerLines.test.ts`'s `utilityModelId` describe block (the id
+ * lookup and its locality guard), `machineGauge.test.ts`'s
+ * `isUtilityTierRow` block (the two-field match mirroring the server, both
+ * inverted cases), `MachineHealthRegion.test.tsx`'s "the utility row-chip"
+ * block (the rendered badge, its neutral/unclassed severity, and no badge
+ * when nothing matches), and `MachineLens.test.tsx`'s "the utility tier is a
+ * row badge, not a card" block — which asserts the CARD'S ABSENCE, so it
+ * cannot quietly come back, and proves the specs-id → health-region → badge
+ * seam end-to-end. Every one of those was red-proved by mutation.
  */
 function machineChromePrefixOf(fullText: string): string {
   const stageMarker = "=== stage ===\n";
@@ -271,7 +270,7 @@ test("next: click-navigation into #lens=machine matches goldens/machine.txt", as
   const gotHdr = await machineHdrText(page);
   expect(
     gotHdr,
-    "the stage's header line must still match byte-for-byte — everything below it (the ledger, then the utility block) was deliberately redesigned, see this file's own doc for the replacement coverage",
+    "the stage's header line must still match byte-for-byte — everything below it (the ledger, then the utility block, which is now deleted outright) was deliberately redesigned, see this file's own doc for the replacement coverage",
   ).toBe(goldenMachineHdrText(golden));
 });
 
@@ -301,7 +300,7 @@ test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", 
   const gotHdr = await machineHdrText(page);
   expect(
     gotHdr,
-    "the stage's header line must still match byte-for-byte — everything below it (the ledger, then the utility block) was deliberately redesigned, see this file's own doc for the replacement coverage",
+    "the stage's header line must still match byte-for-byte — everything below it (the ledger, then the utility block, which is now deleted outright) was deliberately redesigned, see this file's own doc for the replacement coverage",
   ).toBe(goldenMachineHdrText(golden));
 });
 

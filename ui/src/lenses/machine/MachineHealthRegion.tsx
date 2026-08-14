@@ -236,17 +236,17 @@ function ModelRow({
   row,
   scale,
   nowMs,
-  utilityResidentId,
+  utilityModelId,
 }: {
   row: ResidencyRowView;
   scale: number;
   nowMs: number;
-  utilityResidentId: string | null;
+  utilityModelId: string | null;
 }) {
   const m: MachineResourcesModel = row.model;
   const isGhost = row.status === "ghost";
   const isNew = row.status === "new";
-  const isUtility = isUtilityTierRow(m.identifier, m.model_key, utilityResidentId);
+  const isUtility = isUtilityTierRow(m.identifier, m.model_key, utilityModelId);
   const stateCls = memStateCls(m.state);
   const pot = m.potential_bytes != null ? Number(m.potential_bytes) : null;
   const cur = m.current_bytes != null ? Number(m.current_bytes) : null;
@@ -260,11 +260,18 @@ function ModelRow({
       <div className="mm-row-top">
         <span className="mm-row-name">{m.identifier || m.model_key}</span>
         {/* Identity marker, not a health verdict — deliberately NO severity
-            class (green/amber/red). Stitches this row back to the
-            `darkmux/utility` explainer block below the ledger; see
-            `isUtilityTierRow`'s own doc for why it can only ever be true
-            for a currently-RESIDENT row. */}
-        {!isGhost && isUtility && <span className="mm-row-chip">utility</span>}
+            class (green/amber/red): "which resident is the internal tier" is
+            identity, and this page spends color only on verified health.
+            This badge is ALL that remains of the `darkmux/utility` card that
+            used to sit on this page; see `isUtilityTierRow`'s doc for why
+            the card was config rather than machine state, and why matching
+            on the id alone is correct by construction. The title carries the
+            gloss the card used to spend three lines on. */}
+        {!isGhost && isUtility && (
+          <span className="mm-row-chip" title="darkmux's internal small-model tier — handles compaction · mission-compile · estimate · scribe">
+            utility
+          </span>
+        )}
         {isGhost && <span className="mm-row-chip is-warn">DEPARTED · last seen {new Date(row.lastSeenMs).toLocaleTimeString([], { hour12: false })}</span>}
         {isNew && <span className="mm-row-chip is-new">NEW · first seen {relSecondsAgo(nowMs, row.firstSeenMs ?? row.lastSeenMs)}</span>}
         {!isGhost && pot == null && <span className="mm-row-chip is-warn">UNPRICED · potential unknown</span>}
@@ -313,11 +320,11 @@ function ModelRow({
 function ModelRows({
   rows,
   nowMs,
-  utilityResidentId,
+  utilityModelId,
 }: {
   rows: ResidencyRowView[];
   nowMs: number;
-  utilityResidentId: string | null;
+  utilityModelId: string | null;
 }) {
   const groups = groupResidencyRows(rows);
   // Shared scale (`perModelScale`'s own doc) — the largest figure across
@@ -337,7 +344,7 @@ function ModelRows({
             {g.rows.some((r) => r.status === "ghost") ? ` (+${g.rows.filter((r) => r.status === "ghost").length} DEPARTED)` : ""}
           </div>
           {g.rows.map((r) => (
-            <ModelRow key={r.identifier} row={r} scale={scale} nowMs={nowMs} utilityResidentId={utilityResidentId} />
+            <ModelRow key={r.identifier} row={r} scale={scale} nowMs={nowMs} utilityModelId={utilityModelId} />
           ))}
         </div>
       ))}
@@ -362,7 +369,7 @@ export interface HealthRegionProps {
    * (not configured, not reported, registered-but-not-loaded) uniformly —
    * see `isUtilityTierRow`'s doc for why the caller pre-filters to just
    * the resident case. */
-  utilityResidentId?: string | null;
+  utilityModelId?: string | null;
 }
 
 export function MachineHealthRegion({
@@ -373,7 +380,7 @@ export function MachineHealthRegion({
   residencyRows = [],
   residencyChanged = false,
   nowMs = Date.now(),
-  utilityResidentId = null,
+  utilityModelId = null,
 }: HealthRegionProps) {
   if (!isLocalMach) {
     return (
@@ -453,7 +460,7 @@ export function MachineHealthRegion({
       )}
 
       <div className={stale ? "is-stale" : ""}>
-        <ModelRows rows={residencyRows} nowMs={nowMs} utilityResidentId={utilityResidentId} />
+        <ModelRows rows={residencyRows} nowMs={nowMs} utilityModelId={utilityModelId} />
       </div>
 
       {warnings.length > 0 && (

@@ -1934,7 +1934,6 @@ body {
    any more — that region now holds its OWN cards (`.memcard`, below), and a
    bordered/padded wrapper around a stack of bordered/padded cards is a
    double border, not a nested one. */
-.machine-lens__util,
 .machine-lens__loosenode {
   background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--border);
@@ -1957,53 +1956,6 @@ body {
   flex-direction: column;
   gap: 12px;
   margin-bottom: 12px;
-}
-
-/* (operator-approved redesign) `utilityView()` (memoryLedgerLines.ts)
-   replaced the old fixed four-element `string[]` — [name, state, caps, pill]
-   — with a typed structure, so the positional `nth-child` selectors this
-   block used to carry are gone: real structure gets real classes instead.
-   `.mm-util-hdr`/`.mm-util-row`/`.mm-util-key` below are scoped to THIS
-   block only (not general `.mm-*` idioms other regions share) because the
-   two-row key-alignment shape is specific to this node; the chip and kv
-   COLOR treatment still ride the page's shared `.mm-chip`/`.mm-kv` idioms
-   (further down this file) rather than reinventing them. */
-.mm-util-hdr {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 4px 8px;
-}
-.mm-util-name {
-  font-weight: 600;
-  color: var(--accent);
-}
-.mm-util-gloss {
-  color: var(--dim);
-}
-.mm-util-hdr .mm-chip {
-  flex-shrink: 0;
-}
-/* `.mm-kv`'s default `margin-bottom: 12px` is sized for a single detail row
-   sitting between two OTHER blocks (its usual context,
-   `MachineHealthRegion.tsx`); inside this compact node it would nearly
-   double the block's height. So the rows' own bottom margin is zeroed and
-   every vertical gap in this block — header→row and row→row alike — comes
-   from the column `gap` below. One number, in one place, rather than a
-   margin on the header plus a sibling-combinator margin between rows. */
-.machine-lens__util {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.machine-lens__util .mm-util-row {
-  margin-bottom: 0;
-}
-.mm-util-key {
-  display: inline-block;
-  min-width: 54px;
-  color: var(--dim);
 }
 
 /* ── `.memcard` — the health region's SURVIVING plain-card treatment ───────
@@ -2760,8 +2712,10 @@ body {
   overflow-wrap: anywhere;
 }
 /* `briefLines`' first element is always the "run" label (see
-   `sessionRun.ts`'s own doc) — positionally safe the same way
-   `.machine-lens__util`'s fixed-shape array is. */
+   `sessionRun.ts`'s own doc) — positionally safe because that array's shape
+   is genuinely fixed. (The machine lens's utility node used to be cited here
+   as the sibling precedent; it is gone — its "fixed" shape was exactly what
+   stopped a live reading and hardcoded copy from being told apart.) */
 .session-run .track:first-of-type > div:first-child {
   font-weight: 600;
   color: var(--fg);

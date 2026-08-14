@@ -477,34 +477,35 @@ export function modelKvLine(m: MachineResourcesModel): string {
   return `ctx ${m.loaded_ctx} · weights ${memBytes(m.weights_bytes)} · ${kv} · potential ${memBytes(m.potential_bytes)} · current ${memBytes(m.current_bytes)}`;
 }
 
-/** Whether a residency row is the currently RESIDENT utility-tier model —
- * the identity marker that stitches a row in this ledger back to the
- * `darkmux/utility` explainer block elsewhere on the page (operator-approved
- * follow-up to the utility-block redesign). Deliberately takes
- * `utilityResidentId` rather than the raw `utility_model` field + a `loaded`
- * check: the caller (`MachineLens.tsx`) derives that string from
- * `utilityView()`'s OWN "resident" branch, so it is non-null in exactly the
- * one state (`um.loaded === true`) where marking a row is honest — a
- * registered-but-not-loaded utility model has no resident row to mark, and
- * this function never has to re-derive that condition or risk drifting from
- * it. Never fabricates a match against a `null`/`undefined` identifier on
- * either side.
+/** Whether this residency row IS the machine's configured utility-tier
+ * model — the badge that says "this resident is darkmux's own small-model
+ * tier" (compaction, mission-compile, estimate, scribe).
+ *
+ * It takes only the configured ID and needs no `loaded` flag, which is the
+ * whole point: a row exists in this ledger if and only if `lms ps` lists the
+ * model (`gather_with_bin` builds `residents` from `ps` rows alone), so the
+ * ROW is the residency claim and this function only has to answer identity.
+ * A configured-but-unloaded tier simply has no row to match, and badges
+ * nothing, without any state machine to get wrong. That collapse is what
+ * replaced a four-state explainer card on this page: the card was config,
+ * not machine state, and `darkmux doctor`'s `check_utility_model_binding`
+ * already answers the config question — with a fix hint.
  *
  * Matches the namespaced `identifier` OR the bare `model_key`, and that is
  * not belt-and-braces — it MIRRORS THE SERVER. `machine_specs_handler`
- * decides `utility_model.loaded` with `m.identifier == id || m.model == id`,
+ * resolves the same binding with `m.identifier == id || m.model == id`,
  * because the profiles registry may store the utility model id in either
- * form. Matching a single field here would let the two surfaces disagree in
- * a configuration the server explicitly supports: the block would honestly
- * report `resident` while no ledger row carried the chip, and the stitch the
- * chip exists to make would fail silently. Widening it cannot produce a
- * FABRICATED marker either — any row this tags matched the same id, on the
- * same two fields, that the server matched to decide residency at all. */
+ * form. Matching a single field would leave the badge missing on a machine
+ * whose registry happens to hold the other one — a configuration the server
+ * explicitly supports. Widening it cannot produce a FABRICATED badge: any
+ * row this tags matched the operator's own configured id exactly, on one of
+ * the two fields the server itself compares. Never matches on a
+ * `null`/`undefined` on either side. */
 export function isUtilityTierRow(
   identifier: string | null | undefined,
   modelKey: string | null | undefined,
-  utilityResidentId: string | null,
+  utilityModelId: string | null,
 ): boolean {
-  if (utilityResidentId == null) return false;
-  return identifier === utilityResidentId || modelKey === utilityResidentId;
+  if (utilityModelId == null) return false;
+  return identifier === utilityModelId || modelKey === utilityModelId;
 }

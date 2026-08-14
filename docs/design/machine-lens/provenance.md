@@ -25,11 +25,11 @@ recorded knob, never silent.
 
 ![Provenance key — circled numbers map to the table](provenance-key.jpg)
 
-> **The key image predates the utility-block redesign.** ② and ③ are now one
-> block rendered BELOW the health region rather than above it, in a different
-> shape (see those rows). Every circled number still maps to the right row,
-> which is all the image is load-bearing for; retake it when the annotated
-> overlay is next regenerated.
+> **The key image predates the utility-card deletion.** What it circles as ②
+> and ③ — the `darkmux/utility` card — no longer renders at all; ② is now the
+> small `utility` badge on a residency row. Every other circled number still
+> maps to its row, which is what the image is load-bearing for; retake it
+> when the annotated overlay is next regenerated.
 
 ## The trace, value by value
 
@@ -37,27 +37,29 @@ Byte figures render through `memBytes()` (`ui/src/lib/format.ts:92`):
 **decimal** GB/MB (`bytes / 1e9`, two decimals) — with one deliberate
 exception at ①, noted below.
 
-**The copy-vs-data rule.** Not every string on this page came off a probe —
-some is UI copy written by hand (the utility node's `handles` list is the
-clearest case: there is no capability list on `/machine/specs` at all, only
-`{id, loaded}`). Where the two sit next to each other, **hardcoded copy must
-not render indistinguishably from a value that was read.** The page's
-mechanism is brightness: a live value is `--fg`, hand-written copy stays
-`--dim`. This matters because the whole promise above — every figure traces
-to a probe — is falsifiable only if a reader can tell which strings are
-making that claim. A page where an invented string looks exactly like a
-measured one has quietly widened its promise past what it can keep.
+**The copy-vs-data rule.** Not every string on a page like this came off a
+probe — some is UI copy written by hand. Where the two sit next to each
+other, **hardcoded copy must not render indistinguishably from a value that
+was read**, because the promise above (every figure traces to a probe) is
+falsifiable only if a reader can tell which strings are making it.
 
-The rule is stated here rather than assumed because the code cites it
-(`memoryLedgerLines.ts`, `MachineLens.tsx`, and their tests all point at this
-section by name).
+This page's current answer is stronger than a styling convention: it stopped
+rendering the hand-written strings at all. The `darkmux/utility` card — whose
+`handles  compaction · mission-compile · estimate · scribe` line was
+hardcoded in the TypeScript, with no capability list on `/machine/specs` to
+read (`utility_model` carries only `{id, loaded}`) — was deleted outright as
+config rather than machine state. Its gloss survives as a `title` on the
+badge at ②. Where live and static values do sit together in future, the
+mechanism is brightness: a live value is `--fg`, hand-written copy stays
+`--dim`.
+
+The rule is stated here rather than assumed because the code cites it by
+name (`memoryLedgerLines.ts` and its tests).
 
 | # | The pixel says | Source | Transformation | Tested |
 |---|---|---|---|---|
 | ① | `Apple M5 Max · 128 GB` | `/machine/specs` → `cpu_brand` (sysctl `machdep.cpu.brand_string`), `ram_total_bytes` (sysctl `hw.memsize`) | `specOf()` → `ramGiB()` (`format.ts:105`): **binary** GiB, `round(bytes/2³⁰)` | 137438953472 / 2³⁰ = 128 ✓ — same physical quantity as ⑬'s "137.44 GB"; see finding 3 |
-| ② | `model  darkmux:qwen3-4b-instruct-2507` | `/machine/specs` → `utility_model.id` | `utilityView()` (`memoryLedgerLines.ts`): verbatim, and rendered **bright** — the block's only live-data value (`model.isLiveData`). Its sibling row, `handles  compaction · mission-compile · estimate · scribe`, is a hardcoded constant and stays dim; see *the copy-vs-data rule* below | field present, id matches ✓; the `handles` string is a literal in the source, not a field ✓ |
-| ③ | the `darkmux/utility` state chip — `resident` / `not loaded` / `not configured` / `not reported` | `/machine/specs` → `utility_model` (absent / `null` / `.loaded`) | `utilityView()`: four branches on that one field. `loaded:false` → chip `not loaded` (amber) **plus** the hint `↳ loads on first use — the first dispatch pays the model load`; specs not confirmed-local → `not reported`, never a fabricated residency | all four branches unit-tested; `loaded: true` → `resident` live ✓ |
-| ③b | the small `utility` chip on one residency row | ② and ③ together | `isUtilityTierRow()`: marks the row whose `identifier` **or** `model_key` is the utility model's id, and ONLY while ③ is `resident`. Neutral, never a severity color — it is an identity marker, not a verdict. Mirrors the server's own two-field residency test (`m.identifier == id \|\| m.model == id`) so the two surfaces cannot disagree | chip present on exactly the 4b row live ✓; inverted cases unit-tested ✓ |
+| ② | the small `utility` badge on one residency row | `/machine/specs` → `utility_model.id` + the row itself | `utilityModelId()` + `isUtilityTierRow()`: badges the row whose `identifier` **or** `model_key` is the configured id — mirroring the server's own two-field test (`m.identifier == id \|\| m.model == id`). Needs no `loaded` flag: a row exists iff `lms ps` lists the model, so the ROW is the residency claim and the badge only answers identity. Neutral, never a severity color — identity is not a verdict | badge present on exactly the 4b row live ✓; ledger rows == `lms ps` verified 3-for-3 ✓; inverted cases unit-tested ✓ |
 | ④ | `32.4 GB — IN USE` (dial center + needle) | `/machine/resources` → `machine.current_bytes` | Σ of per-model attributed RSS (see *machine total* below); needle angle = `current / limit_bytes`, clamped at 100% | Σ model currents = 32378306560 = field ✓; 23.6% of scale ✓ |
 | ⑤ | arc ticks `0 · 34 · 69 · 103` | `limit_bytes` | quarter marks of the scale, `limit × k/4` in decimal GB | 137.44 × ¾ ≈ 103 ✓ |
 | ⑥ | `137 / LIMIT` at the max position (+ the redline end-cap) | `limit_bytes` + `limit_source` | limit resolution: `budget > physical pool > none` (`compute_ledger`, `model_ledger.rs:383`); word is LIMIT, or BUDGET when `limit_source:"budget"` | `limit == pool.capacity`, source `physical_pool` ✓; **budget arm currently unreachable — finding 4** |

@@ -6,7 +6,7 @@ import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, looseRecords, nameOf } from "../../lib/flow";
 import { specOf } from "../fleet/cards";
-import { utilityView } from "./memoryLedgerLines";
+import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
 import { isStaticBuild } from "../../lib/staticSource";
@@ -266,7 +266,6 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // cannot drift because it is not there beats a count that is right today.
   const loose = useMemo(() => (targetUid != null ? looseRecords(flowWindow.data, targetUid) : []), [flowWindow.data, targetUid]);
 
-  const utility = utilityView(specs, isLocalSpecs);
 
   return (
     <div className="machine-lens">
@@ -314,44 +313,8 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
           residencyRows={residencyRows}
           residencyChanged={residencyChanged}
           nowMs={nowMs}
-          utilityResidentId={utility.residentModelId}
+          utilityModelId={utilityModelId(specs, isLocalSpecs)}
         />
-      </div>
-
-      {/* (operator-approved redesign, then its own follow-up moving this
-          block BELOW the health region) Identity → instrument → evidence →
-          context → provenance: the ledger above is the evidence (it already
-          lists the utility model as one of its own resident rows, tagged
-          with the small `utility` row-chip — see `ModelRow` in
-          `MachineHealthRegion.tsx`), and this block is what explains that
-          row's PURPOSE now that the reader has already seen it, rather than
-          announcing it as the page's first content ahead of the memory
-          instrument the page actually exists to show. Header row carries
-          the node's name + a gloss naming what it IS, with the state chip
-          right-aligned in the SAME row so its referent is unambiguous.
-          Body rows are a dim key + value pair; `model`'s value goes BRIGHT
-          (`<b>`) only when it is live probe data (`utility.model.isLiveData`)
-          — `handles` never does, because it is always static UI copy
-          (`docs/design/machine-lens/provenance.md`'s rule against hardcoded
-          copy rendering as if it were read data). */}
-      <div className="machine-lens__util">
-        <div className="mm-util-hdr">
-          <span>
-            <span className="mm-util-name">{utility.name}</span>
-            <span className="mm-util-gloss"> · {utility.gloss}</span>
-          </span>
-          <span className={`mm-chip${utility.chip.severity !== "unknown" ? ` is-${utility.chip.severity}` : ""}`}>
-            {utility.chip.text}
-          </span>
-        </div>
-        <div className="mm-kv mm-util-row">
-          <span className="mm-util-key">model</span>{" "}
-          {utility.model.isLiveData ? <b>{utility.model.value}</b> : utility.model.value}
-        </div>
-        <div className="mm-kv mm-util-row">
-          <span className="mm-util-key">handles</span> {utility.handles}
-        </div>
-        {utility.hint && <div className="mm-hint">↳ {utility.hint}</div>}
       </div>
 
       {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —

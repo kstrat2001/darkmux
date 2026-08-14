@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { attributionLine, limitDescription, perModelScale, stampLine, utilityView } from "./memoryLedgerLines";
+import { attributionLine, limitDescription, perModelScale, stampLine, utilityModelId } from "./memoryLedgerLines";
 import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
 
 // #1806 Stage 1 refactored the health region's text builders from one flat
@@ -49,108 +49,41 @@ function model(overrides: Partial<MachineResourcesModel> = {}): MachineResources
 // Replacement coverage for the operator-approved utility-block redesign
 // (`tests/parity/next-parity.spec.ts`'s narrowing doc names this file as
 // where the retired byte-exact utility-block assertion's coverage lives).
-// Every one of the four `utilityView()` branches gets its own test, each
-// pinning: the chip's TEXT and its SEVERITY class (both, not just one — a
-// mutation swapping severity alone would slip past a text-only assertion),
-// the model row's value AND its live-vs-copy flag, and — since `handles` is
-// ALWAYS static copy, never live data — that it never varies across states.
-describe("utilityView", () => {
-  it("constants: name and gloss never change, handles is always the same static copy", () => {
-    const states: MachineSpecs["utility_model"][] = [
-      null,
-      { id: "darkmux:qwen3-4b", loaded: true },
-      { id: "darkmux:qwen3-4b", loaded: false },
-    ];
-    for (const um of states) {
-      const v = utilityView({ utility_model: um } as unknown as MachineSpecs, true);
-      expect(v.name).toBe("darkmux/utility");
-      expect(v.gloss).toBe("the internal small-model tier");
-      expect(v.handles).toBe("compaction · mission-compile · estimate · scribe");
-    }
-    // ...and the fourth branch (not confirmed local) too.
-    const notLocal = utilityView(null, false);
-    expect(notLocal.name).toBe("darkmux/utility");
-    expect(notLocal.gloss).toBe("the internal small-model tier");
-    expect(notLocal.handles).toBe("compaction · mission-compile · estimate · scribe");
+/**
+ * `utilityModelId` is what remains of a whole `utilityView()` four-state
+ * structure (and, before that, `utilityLines()`'s four-element array) that
+ * rendered as its own card on the machine page. The operator's cut: that
+ * card was CONFIG, not machine state — it described what the tier is
+ * responsible for, not how it relates to this machine.
+ *
+ * So the tests shrink with it. The states did not need re-homing: `resident`
+ * was already proven by the ledger row's existence, `not loaded` and `not
+ * configured` are answered by `darkmux doctor` (with a fix hint), and `not
+ * reported` duplicated the page-level not-local placeholder. What is left to
+ * pin is the locality guard — the one honesty rule that survived — and that
+ * a missing binding yields `null` rather than a fabricated id.
+ */
+describe("utilityModelId", () => {
+  const specs = (utility_model: unknown) => ({ utility_model }) as unknown as MachineSpecs;
+
+  it("returns the configured id for a specs-confirmed local machine", () => {
+    expect(utilityModelId(specs({ id: "darkmux:qwen3-4b", loaded: true }), true)).toBe("darkmux:qwen3-4b");
   });
 
-  it("'not reported': specs aren't confirmed local — chip neutral, model row explains why with no live data", () => {
-    const v = utilityView(null, false);
-    expect(v.chip).toEqual({ text: "not reported", severity: "unknown" });
-    expect(v.model).toEqual({ value: "not visible from here — local-probe only", isLiveData: false });
-    expect(v.hint).toBeUndefined();
+  it("ignores `loaded` entirely — a row exists iff the model is resident, so identity is the only question", () => {
+    // Same id either way. A configured-but-unloaded tier simply has no row
+    // to match downstream, so it badges nothing without a state machine.
+    expect(utilityModelId(specs({ id: "darkmux:qwen3-4b", loaded: false }), true)).toBe("darkmux:qwen3-4b");
   });
 
-  it("'not configured': explicit null utility model — chip neutral, model row says none configured, no live data", () => {
-    const specs = { utility_model: null } as unknown as MachineSpecs;
-    const v = utilityView(specs, true);
-    expect(v.chip).toEqual({ text: "not configured", severity: "unknown" });
-    expect(v.model).toEqual({ value: "— none on this machine", isLiveData: false });
-    expect(v.hint).toBeUndefined();
+  it("never reports a utility tier for a machine it cannot see — the locality guard", () => {
+    // The inverted case that matters: the SAME payload, not confirmed local.
+    expect(utilityModelId(specs({ id: "darkmux:qwen3-4b", loaded: true }), false)).toBeNull();
   });
 
-  it("'resident': loaded true — chip green, model id is live data, no hint", () => {
-    const specs = { utility_model: { id: "darkmux:qwen3-4b", loaded: true } } as unknown as MachineSpecs;
-    const v = utilityView(specs, true);
-    expect(v.chip).toEqual({ text: "resident", severity: "green" });
-    expect(v.model).toEqual({ value: "darkmux:qwen3-4b", isLiveData: true });
-    expect(v.hint).toBeUndefined();
-  });
-
-  it("'not loaded': registered but not resident — chip amber, model id is STILL live data, hint present", () => {
-    const specs = { utility_model: { id: "darkmux:qwen3-4b", loaded: false } } as unknown as MachineSpecs;
-    const v = utilityView(specs, true);
-    expect(v.chip).toEqual({ text: "not loaded", severity: "amber" });
-    expect(v.model).toEqual({ value: "darkmux:qwen3-4b", isLiveData: true });
-    expect(v.hint).toBe("loads on first use — the first dispatch pays the model load");
-  });
-
-  it("'not reported' and 'not configured' are textually and semantically distinct (can't see it vs it doesn't exist)", () => {
-    const notReported = utilityView(null, false);
-    const notConfigured = utilityView({ utility_model: null } as unknown as MachineSpecs, true);
-    expect(notReported.chip.text).not.toBe(notConfigured.chip.text);
-    expect(notReported.model.value).not.toBe(notConfigured.model.value);
-  });
-
-  it("the hint line is present in exactly one of the four states", () => {
-    const views = [
-      utilityView(null, false),
-      utilityView({ utility_model: null } as unknown as MachineSpecs, true),
-      utilityView({ utility_model: { id: "darkmux:qwen3-4b", loaded: true } } as unknown as MachineSpecs, true),
-      utilityView({ utility_model: { id: "darkmux:qwen3-4b", loaded: false } } as unknown as MachineSpecs, true),
-    ];
-    const withHint = views.filter((v) => v.hint !== undefined);
-    expect(withHint).toHaveLength(1);
-    expect(withHint[0].chip.text).toBe("not loaded");
-  });
-
-  /**
-   * `residentModelId` is what the ledger's `utility` row-chip keys on, so a
-   * non-null value in any branch OTHER than `loaded === true` would tag a
-   * residency row for a model that is not resident — the page asserting
-   * something it has not been told. The field's own doc promises exactly
-   * this; nothing tested it until a mutation (setting it to `um.id` in the
-   * not-loaded branch) passed all 643 tests. That mutation now fails here.
-   */
-  it("carries residentModelId in EXACTLY the resident state, never the other three", () => {
-    const resident = utilityView({ utility_model: { id: "darkmux:qwen3-4b", loaded: true } } as unknown as MachineSpecs, true);
-    expect(resident.residentModelId).toBe("darkmux:qwen3-4b");
-
-    // The three inverted cases, each named — a registered-but-unloaded tier
-    // is the interesting one: it HAS an id, and the id is still not a
-    // licence to mark a row.
-    expect(utilityView({ utility_model: { id: "darkmux:qwen3-4b", loaded: false } } as unknown as MachineSpecs, true).residentModelId).toBeNull();
-    expect(utilityView({ utility_model: null } as unknown as MachineSpecs, true).residentModelId).toBeNull();
-    expect(utilityView(null, false).residentModelId).toBeNull();
-  });
-
-  it("residentModelId is the id itself, not the chip's display text — the seam it replaced", () => {
-    // It used to be recovered by the caller as `chip.text === "resident"`,
-    // which coupled a rendering decision to a copy string that exists to be
-    // rewritten. Renaming the chip copy must not disturb the marker.
-    const v = utilityView({ utility_model: { id: "darkmux:qwen3-4b", loaded: true } } as unknown as MachineSpecs, true);
-    expect(v.residentModelId).toBe(v.model.value);
-    expect(v.residentModelId).not.toBe(v.chip.text);
+  it("yields null rather than a fabricated id when nothing is configured", () => {
+    expect(utilityModelId(specs(null), true)).toBeNull();
+    expect(utilityModelId(null, true)).toBeNull();
   });
 });
 
