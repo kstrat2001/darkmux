@@ -2,11 +2,16 @@
 
 Every figure on the machine page traces to a probe on your own machine, through
 a named transformation, to the pixel you see. This document is that trace,
-**tested against a live daemon** rather than asserted: each row below was
-verified on 2026-08-14 against `http://127.0.0.1:8765` (snapshots preserved
-beside this file as `live-resources.json` / `live-specs.json`; verification
-method noted per row). This is operator sovereignty (#44) applied to the page
+**tested against a live daemon** rather than asserted: every row below was
+re-verified on 2026-08-14 against a live `/machine/resources` +
+`/machine/specs` pair on the operator's own machine, with the verification
+method noted per row. This is operator sovereignty (#44) applied to the page
 itself — the operator never has to wonder where a number came from.
+
+The figures are one real snapshot and will not match your machine, or this
+machine tomorrow — what is being asserted is the **identity** in each
+"Tested" cell (Σ of these fields equals that field; this sysctl equals that
+pixel), which is what re-verification actually checks.
 
 **The two feeds:**
 
@@ -25,27 +30,33 @@ recorded knob, never silent.
 
 ![Provenance key — circled numbers map to the table](provenance-key.jpg)
 
+> **The key image predates the #1811 units change** and still shows the
+> decimal figures (`137`, `32.4 GB`) described in finding 3. The circled
+> numbers — the only thing it is load-bearing for — still map to the rows
+> below. Retake when the annotated overlay is next regenerated.
+
 ## The trace, value by value
 
-Byte figures render through `memBytes()` (`ui/src/lib/format.ts:92`):
-**decimal** GB/MB (`bytes / 1e9`, two decimals) — with one deliberate
-exception at ①, noted below.
+Byte figures render through `memBytes()` (`ui/src/lib/format.ts`): **binary**
+GiB/MiB (`bytes / 2³⁰`, two decimals), and the gauge's glance layer through
+`gaugeValueParts()` (same divisor, one decimal). Since #1811 that is the ONLY
+convention on the page — see finding 3 for what it replaced and what is left.
 
 | # | The pixel says | Source | Transformation | Tested |
 |---|---|---|---|---|
-| ① | `Apple M5 Max · 128 GB` | `/machine/specs` → `cpu_brand` (sysctl `machdep.cpu.brand_string`), `ram_total_bytes` (sysctl `hw.memsize`) | `specOf()` → `ramGiB()` (`format.ts:105`): **binary** GiB, `round(bytes/2³⁰)` | 137438953472 / 2³⁰ = 128 ✓ — same physical quantity as ⑬'s "137.44 GB"; see finding 3 |
+| ① | `Apple M5 Max · 128 GB` | `/machine/specs` → `cpu_brand` (sysctl `machdep.cpu.brand_string`), `ram_total_bytes` (sysctl `hw.memsize`) | `specOf()` (`lenses/fleet/cards.ts:65`): **binary**, `round(bytes/2³⁰)` — labeled `GB`, see finding 3 | 137438953472 / 2³⁰ = 128 ✓ — and ⑬ now reads `128.00 GiB` for the same field |
 | ② | `darkmux:qwen3-4b-instruct-2507 · compaction · …` | `/machine/specs` → `utility_model.id` | verbatim; capability list is static UI copy | field present, id matches ✓ |
 | ③ | `registered · not loaded` | `/machine/specs` → `utility_model.loaded` | `utilityLines()` (`memoryLedgerLines.ts:27`): `loaded:false` → this wording | `loaded: false` live ✓ |
-| ④ | `32.4 GB — IN USE` (dial center + needle) | `/machine/resources` → `machine.current_bytes` | Σ of per-model attributed RSS (see *machine total* below); needle angle = `current / limit_bytes`, clamped at 100% | Σ model currents = 32378306560 = field ✓; 23.6% of scale ✓ |
-| ⑤ | arc ticks `0 · 34 · 69 · 103` | `limit_bytes` | quarter marks of the scale, `limit × k/4` in decimal GB | 137.44 × ¾ ≈ 103 ✓ |
-| ⑥ | `137 / LIMIT` at the max position (+ the redline end-cap) | `limit_bytes` + `limit_source` | limit resolution: `budget > physical pool > none` (`compute_ledger`, `model_ledger.rs:383`); word is LIMIT, or BUDGET when `limit_source:"budget"` | `limit == pool.capacity`, source `physical_pool` ✓; **budget arm currently unreachable — finding 4** |
-| ⑦ | `╌ committed 24.6 GB (+1 unpriced)` | `machine.potential_bytes`, `machine.unpriced_models` | Σ of **priced** models' potential only; unpriced count appended — the undercount is stated, never hidden | Σ priced = 24565385183 = field ✓; count 1 ✓ |
+| ④ | `32.9 GiB — IN USE` (odometer center + needle) | `/machine/resources` → `machine.current_bytes` | Σ of per-model attributed RSS (see *machine total* below); needle angle = `current / limit_bytes`, clamped at 100%. The odometer cells are centered on the hub with the unit hung outside that centering (`odoLayout`) | Σ model currents = 35357818880 = field ✓; 25.7% of scale ✓ |
+| ⑤ | arc ticks `0 · 32 · 64 · 96` | `limit_bytes` | quarter marks of the scale, `limit × k/4` in whole **binary** GiB (`gaugeTickLabel`) | 128 × ¾ = 96 ✓ — decimal labeled this same arc `0 · 34 · 69 · 103`, finding 3 |
+| ⑥ | `128 / LIMIT` at the max position (+ the redline end-cap) | `limit_bytes` + `limit_source` | limit resolution: `budget > physical pool > none` (`compute_ledger`, `model_ledger.rs:383`); word is LIMIT, or BUDGET when `limit_source:"budget"` | `limit == pool.capacity`, source `physical_pool` ✓; **budget arm currently unreachable — finding 4** |
+| ⑦ | `╌ committed 42.06 GiB (+1 unpriced)` | `machine.potential_bytes`, `machine.unpriced_models` | Σ of **priced** models' potential only; unpriced count appended — the undercount is stated, never hidden | Σ priced = 45163330707 = field ✓; count 1 ✓ |
 | ⑧ | `UNKNOWN` state chip | `machine.state` | uppercased verbatim (`modelLines`/port uppercases the string, not CSS) | cascade verified — see *the state cascade* below |
 | ⑨ | tell-tale lamps | `machine.state` (STATE), `unpriced_models` (UNPRICED), `pressure.red` (PRESSURE), fetch-failure + `generated_at_ms` age (STALE), `warnings.length` (WARN), `current ≥ limit` (OVER LIMIT — see PROPOSAL §redline) | each lamp keys on exactly one named field; lit = word + border + glow, never color alone | field values reproduce the lit set shown ✓ |
 | ⑩ | `87 % free — memory free` | `pressure.memory_free_percent` | sysctl **`kern.memorystatus_level`** — the kernel's pressure headroom, 0–100. Sole red trigger: `pressure.red = level < 15` (`MEMORY_FREE_PERCENT_RED`, `model_ledger.rs:122`) | live sysctl read = 87 = field ✓; 87 ≥ 15 → `red: false` ✓ |
-| ⑪ | `5.46 GB — swap used` | `pressure.swap_used_bytes` | sysctl `vm.swapusage` (used), parsed by `parse_swapusage_used_bytes` | rendered = memBytes(field) ✓ — a monotonic high-water mark: reports, never alarms (by design, `model_ledger.rs:462`) |
-| ⑫ | `728 MB — compressor` | `pressure.compressor_bytes` | `vm_stat` "Pages occupied by compressor" × page size | rendered = memBytes(field) ✓; same reports-never-alarms rule |
-| ⑬ | `limit source · pool · pool free · unpriced` detail row | `limit_source`, `pool.capacity_bytes`, `pool.available_bytes`, `machine.unpriced_models` | capacity = sysctl `hw.memsize`; **available = `vm_stat` "Pages free" × page size** — deliberately conservative (finding 2) | Pages free 373121 × 16384 ≈ live field ✓ |
+| ⑪ | `5.03 GiB — swap used` | `pressure.swap_used_bytes` | sysctl `vm.swapusage` (used), parsed by `parse_swapusage_used_bytes` | rendered = memBytes(field) ✓ — a monotonic high-water mark: reports, never alarms (by design, `model_ledger.rs:462`) |
+| ⑫ | `1220 MiB — compressor` | `pressure.compressor_bytes` | `vm_stat` "Pages occupied by compressor" × page size | rendered = memBytes(field) ✓; same reports-never-alarms rule |
+| ⑬ | `limit source · pool 128.00 GiB · pool free · unpriced` detail row | `limit_source`, `pool.capacity_bytes`, `pool.available_bytes`, `machine.unpriced_models` | capacity = sysctl `hw.memsize`; **available = `vm_stat` "Pages free" × page size** — deliberately conservative (finding 2) | capacity/2³⁰ = 128.00 ✓, agreeing with ①; pool free 1.84 GiB = live field ✓ |
 | ⑭ | model name + `DARKMUX`/`USER` chip | `models[].identifier`, `.owner` | owner = namespace test `swap::is_darkmux_owned(identifier)` — the `darkmux:` prefix IS the ownership record | prefix ⇔ owner on both residents ✓ |
 | ⑮ | `ctx · weights · kv@ctx · potential · current` | `models[].loaded_ctx`, `.weights_bytes`, `.kv_bytes_at_ctx`, `.potential_bytes`, `.current_bytes` | ctx from `lms ps`; weights from `lms ls` `sizeBytes`; the rest derived — see *per-model math* below | all identities verified ✓ |
 | ⑯ | `UNPRICED · potential unknown` chip | `models[].kv_per_token_bytes == null` | no readable arch facts → kv, potential stay `null`; the bar/dial draws **no committed extent** (absence, never zero) | phi-4: all three null ✓ |
@@ -53,6 +64,7 @@ exception at ①, noted below.
 | ⑱ | warning text | `warnings[]` | composed server-side in `compute_ledger` (`model_ledger.rs:368`) — verbatim on the page, never summarized | text matches byte-for-byte ✓ |
 | ⑲ | attribution line | `attribution`, `attribution_note` | `attribute_current()`'s self-documenting degradation ladder (per-process RSS → rank-matched → estimated split → unavailable) | note matches live payload ✓ |
 | ⑳ | `snapshot Ns ago · gather 438 ms (zero model dispatches) · server cache 2000 ms · polled every 5s` | `generated_at_ms`, `gather_ms`, `cache_ttl_ms` + client constant | the observer stamps its own cost into the payload — "the gather was negligible" is a verifiable claim, not an assumption | fields present; `gather_ms` 438–494 across polls ✓ |
+| ㉑ | **the arc fill's color** (not circled in the key image — added 2026-08-14) | `machine.current_bytes` ÷ the scale — i.e. the needle's own position, and NOTHING else | `gaugeFillSeverity(pct)`: green < 50 ≤ amber < 85 ≤ red. **The one client-derived color on the page**, and deliberately so — see finding 1 | live fill `is-green` at 25.7% ✓; component tests pin an UNKNOWN-state payload rendering `is-red` at 94% and `is-green` at 3% ✓ |
 
 ## The derived values, expanded
 
@@ -97,22 +109,38 @@ unpriceable models stay Unknown.
 
 ## Findings
 
-1. **`unknown` is the normal state on this machine, and that is correct.**
-   The live snapshot takes arm 5 above: the priced sum (24.6 GB) fits the
-   137.4 GB limit, but `microsoft/phi-4` is unpriceable, so the ledger
-   honestly declines to promise a fit. Consequence: with any user-loaded
-   model lacking readable arch facts, **the entire green/amber/red
-   vocabulary is inert** — every state chip on the operator's real setup
-   reads UNKNOWN. The page renders this truthfully (dim fills, dot patterns,
-   the word); if colored states should be common rather than exceptional,
-   the improvement is server-side (pricing more models, or a
-   partial-fit verdict), never a client guess.
+1. **`unknown` is the normal state on this machine, and that is correct —
+   which is why the fill stopped keying on it.** The live snapshot takes arm
+   5 above: the priced sum (42.06 GiB) fits the 128 GiB limit, but
+   `microsoft/phi-4` is unpriceable, so the ledger honestly declines to
+   promise a fit. Consequence: with any user-loaded model lacking readable
+   arch facts, **the entire green/amber/red vocabulary is inert** — every
+   state chip on the operator's real setup reads UNKNOWN.
+
+   The page always rendered that truthfully, and *originally rendered it into
+   the gauge too*: the arc fill carried `is-${machine.state}`, so the hero
+   instrument swept from empty to full in permanent dim grey. Truthful, and
+   useless — a gauge exists to show you the tank filling without reading a
+   number, and this one had traded that away to re-encode a verdict three
+   other elements already carried. The operator reported it from the live
+   page on 2026-08-14 ("seems very grey... I was hoping it would have more of
+   a color coded value as it fills up").
+
+   The fix splits the two questions rather than guessing at either (row ㉑):
+   **how full** is client arithmetic on two server numbers and says nothing
+   about health; **what state** stays server-only, in the chip, the seven
+   lamps, the face caption and the redline. An amber fill never means the
+   arbiter said amber, and a component test pins exactly that — an
+   UNKNOWN-state payload rendering a red fill while the chip still reads
+   UNKNOWN and the redline stays dark. Making the *verdict* colored more
+   often is still server-side work (pricing more models, or a partial-fit
+   arm), never a client guess.
 
 2. **`pool free` and `memory free %` disagree by design, and the labels hide
    it.** `pool.available` is `vm_stat` "Pages free" × page size —
    deliberately conservative, and macOS keeps free pages near zero by
-   reclaiming everything into cache, so 4–6 GB on an idle 128 GB machine is
-   normal. `memory_free_percent` is `kern.memorystatus_level` — the
+   reclaiming everything into cache, so a couple of GiB on an idle 128 GiB
+   machine is normal (1.84 GiB in this snapshot). `memory_free_percent` is `kern.memorystatus_level` — the
    kernel's own pressure headroom (0–100), not a byte count at all. Both are
    true; neither is "how much RAM is left" in the colloquial sense. The page
    keeps them in separate instruments (detail row vs pressure tile) with the
@@ -120,15 +148,29 @@ unpriceable models stay Unknown.
    the display labels (e.g. "free pages" / "pressure headroom") so the
    similarity of names stops implying comparability.
 
-3. **The same physical quantity renders as both `128 GB` and `137.44 GB`.**
-   The header's RAM figure is binary GiB (`ramGiB`, matching Apple's
-   marketing number); every ledger figure is decimal GB (`memBytes`). Both
-   derive from the identical `hw.memsize` = 137,438,953,472 bytes. This is
-   inherited legacy behavior, verified rather than invented here — worth a
-   one-line footnote on the page or a doc note, since it is the first
-   question a careful reader asks. (A third figure, specs'
-   `ram_free_for_ai_bytes` = 87.5 GB — doctor's reclaimable estimate minus
-   residents — is **not rendered on this page at all**.)
+3. **The same physical quantity used to render as both `128 GB` and
+   `137.44 GB` — fixed by moving the page to binary (#1811).** The header's
+   RAM figure was binary (matching Apple's marketing number); every ledger
+   figure was decimal (`memBytes`). Both derive from the identical
+   `hw.memsize` = 137,438,953,472 bytes, so the page showed one quantity as
+   two numbers — and the gauge inherited it, labeling its arc `0 · 34 · 69 ·
+   103 · 137` on a machine everyone calls a 128 GB machine. The operator
+   raised it against the live page on 2026-08-14: *"137 isn't going to make
+   sense for a lot of users. we're all used to 128 powers of 2."*
+
+   `memBytes`/`gaugeValueParts`/`gaugeTickLabel` are now binary and labeled
+   `GiB`. The arc reads `0 · 32 · 64 · 96 · 128`, the ledger reads
+   `128.00 GiB`, and the reconciling ` (128 GiB)` parenthetical that used to
+   sit beside the pool figure is gone with the confusion it patched.
+
+   **What remains:** `specOf` still labels its (always-binary) figure `GB`,
+   so the header says `128 GB` where the ledger says `128.00 GiB`. Same
+   number now — which is what the finding was actually about — but a
+   mismatched suffix. Relabelling that one token is gated on retiring the
+   machine stage's last byte-exact parity tie to legacy, so it stays an
+   operator call. (A third figure, specs' `ram_free_for_ai_bytes` — doctor's
+   reclaimable estimate minus residents — is **not rendered on this page at
+   all**.)
 
 4. **The BUDGET limit arm is currently unreachable in production.**
    `compute_ledger` fully supports `limit_source:"budget"`, but `gather()`

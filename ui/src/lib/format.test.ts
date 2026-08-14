@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { memPct, memStateCls, poolGiBNote } from "./format";
+import { memBytes, memPct, memStateCls } from "./format";
 
 // `memStateCls` was ported (format.ts) ahead of its first consumer; #1806
 // Stage 1, then Stage 2/3's `MachineHealthRegion.tsx`, is that consumer —
@@ -67,34 +67,46 @@ describe("memPct", () => {
 });
 
 /**
- * (#1811) `hw.memsize` is rendered twice on the machine page in two byte
- * conventions — the stage header's binary `128 GB` and the ledger's decimal
- * `137.44 GB` — and a reader comparing them sees two quantities rather than
- * one number. `poolGiBNote` is the parenthetical that reconciles them at the
- * point of comparison.
+ * (#1811) `memBytes` is **binary**, and these are the tests that pin it there.
  *
- * The suppression cases are the interesting half: a parenthetical that
- * restates the number beside it is noise, and noise on this page costs more
- * than it looks like, because every figure here is load-bearing.
+ * The bug this closes: `hw.memsize` used to render as the header's `128 GB`
+ * and the ledger's `137.44 GB`, and a reader comparing the two saw two
+ * quantities rather than one number — on the single screen whose job is
+ * telling them how much room they have. The predecessor of this block tested a
+ * reconciling parenthetical (` (128 GiB)`) bolted beside the decimal figure;
+ * the operator's call was to fix the units instead, so the parenthetical and
+ * its tests are gone and the conversion itself is asserted here.
+ *
+ * The exact-boundary cases matter more than they look: an off-by-one in the
+ * threshold (`>` for `>=`, or a decimal 1e9 left behind in one arm) silently
+ * relabels a whole magnitude, and every figure on that page is load-bearing.
  */
-describe("poolGiBNote", () => {
-  it("names the binary equivalent when the two conventions genuinely differ", () => {
-    // 137438953472 = exactly 128 GiB = 137.44 GB. The operator's own machine.
-    expect(poolGiBNote(137438953472)).toBe(" (128 GiB)");
+describe("memBytes", () => {
+  it("renders hw.memsize as the power of two the machine is actually sold as", () => {
+    // 137438953472 = exactly 128 GiB — the operator's own machine, and the
+    // figure that used to read "137.44 GB".
+    expect(memBytes(137438953472)).toBe("128.00 GiB");
   });
 
-  it("stays silent when both conventions round to the same integer — the note would only restate", () => {
-    // 2e9 bytes: 2 GB decimal, 2 GiB rounded. Nothing to reconcile.
-    expect(poolGiBNote(2_000_000_000)).toBe("");
+  it("uses binary divisors, not decimal, at every magnitude", () => {
+    expect(memBytes(32378306560)).toBe("30.15 GiB"); // decimal would say 32.38 GB
+    expect(memBytes(5 * 1073741824)).toBe("5.00 GiB");
+    expect(memBytes(700 * 1048576)).toBe("700 MiB"); // decimal would say 734 MB
+    expect(memBytes(4 * 1024)).toBe("4 KiB");
   });
 
-  it("stays silent below a gigabyte, where a rounded GiB figure would be misleading", () => {
-    expect(poolGiBNote(500_000_000)).toBe("");
+  it("switches magnitude exactly AT each binary boundary, never one byte off", () => {
+    expect(memBytes(1073741824)).toBe("1.00 GiB");
+    expect(memBytes(1073741823)).toBe("1024 MiB");
+    expect(memBytes(1048576)).toBe("1 MiB");
+    expect(memBytes(1048575)).toBe("1024 KiB");
+    expect(memBytes(1024)).toBe("1 KiB");
+    expect(memBytes(1023)).toBe("1023 B");
   });
 
-  it("stays silent rather than guessing on an unreadable byte count", () => {
-    expect(poolGiBNote(null)).toBe("");
-    expect(poolGiBNote(undefined)).toBe("");
-    expect(poolGiBNote(Number.NaN)).toBe("");
+  it("says so rather than guessing on an unreadable byte count", () => {
+    expect(memBytes(null)).toBe("—");
+    expect(memBytes(undefined)).toBe("—");
+    expect(memBytes(Number.NaN)).toBe("—");
   });
 });

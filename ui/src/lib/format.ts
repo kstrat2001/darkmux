@@ -86,40 +86,41 @@ export function fmtC(n: number): string {
   return fmtN(n);
 }
 
-/** `memBytes()` — viewer.html:4853. Decimal (1e9/1e6/1e3) byte formatting —
- * NOT binary GiB (see `ramGiB` below for the one place legacy uses GiB
- * instead: the machine spec line's "128 GB" from `ram_total_bytes`). */
+export const GIB = 1073741824; // 2³⁰
+const MIB = 1048576; // 2²⁰
+const KIB = 1024; // 2¹⁰
+
+/** `memBytes()` — **binary** GiB/MiB/KiB (`bytes / 2³⁰`, two decimals for the
+ * GiB arm).
+ *
+ * Legacy (`viewer.html:4853`) was decimal — `bytes / 1e9`, labeled "GB" — and
+ * the port matched it byte-for-byte until #1811. The operator called it on the
+ * live gauge: a machine that Apple, the box, and every operator on earth calls
+ * "128 GB" was rendering its own ceiling as `137.44 GB`, and the one screen
+ * whose entire job is telling you how much room you have was answering in units
+ * nobody's machine is sold in. Powers of two are what a reader can check against
+ * the hardware they bought.
+ *
+ * Binary throughout, labeled `GiB` so the unit is not itself the lie, is the
+ * whole fix — and it retires the reconciling parenthetical this replaced
+ * (`poolGiBNote`, ` (128 GiB)` beside a decimal `137.44 GB`), because there are
+ * no longer two conventions on the page to reconcile.
+ *
+ * Residual, deliberately NOT taken here: the stage header's own RAM figure
+ * (`specOf`, `lenses/fleet/cards.ts:65`) has always been binary and has always
+ * been labeled `GB`. It now agrees with this function NUMERICALLY (both say
+ * 128), which is the confusion #1811 was actually about; only the unit suffix
+ * still differs. Relabelling it is a one-token change gated on retiring the
+ * machine stage's last byte-exact parity tie to legacy — an operator call, and
+ * a separate one from the units decision made here. */
 export function memBytes(b: number | null | undefined): string {
   if (b == null) return "—";
   const n = Number(b);
   if (!Number.isFinite(n)) return "—";
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + " GB";
-  if (n >= 1e6) return Math.round(n / 1e6) + " MB";
-  if (n >= 1e3) return Math.round(n / 1e3) + " KB";
+  if (n >= GIB) return (n / GIB).toFixed(2) + " GiB";
+  if (n >= MIB) return Math.round(n / MIB) + " MiB";
+  if (n >= KIB) return Math.round(n / KIB) + " KiB";
   return n + " B";
-}
-
-/** The machine spec line's RAM figure — `specOf()`, viewer.html:1117:
- * `Math.round(ram_total_bytes/1073741824)` (GiB, binary), distinct from
- * `memBytes()`'s decimal GB used everywhere else in the health region. */
-export function ramGiB(bytes: number | null | undefined): number | null {
-  if (bytes == null) return null;
-  return Math.round(bytes / 1073741824);
-}
-
-/** (#1811) The parenthetical that reconciles this page's two byte
- * conventions: ` (128 GiB)` beside a decimal `137.44 GB`, so a reader can see
- * the two figures are one number rather than two quantities. Returns `""`
- * whenever the binary form would NOT actually clarify anything — an
- * unreadable byte count, or a value that rounds to the same integer in both
- * conventions (under ~1 GB), where the parenthetical would be noise
- * restating the number beside it. */
-export function poolGiBNote(bytes: number | null | undefined): string {
-  const gib = ramGiB(bytes);
-  if (gib == null || !Number.isFinite(gib) || gib < 1) return "";
-  const decimalGb = Number(bytes) / 1e9;
-  if (Math.round(decimalGb) === gib) return "";
-  return ` (${gib} GiB)`;
 }
 
 /** `memStateCls()` — viewer.html:4866. Only green/amber/red pass through;

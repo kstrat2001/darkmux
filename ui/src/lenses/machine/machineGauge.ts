@@ -18,7 +18,7 @@
  *   every figure on the page still matches docs/design/machine-lens/provenance.md's traced values.
  */
 
-import { memBytes, memPct, memStateCls } from "../../lib/format";
+import { GIB, memBytes, memPct, memStateCls } from "../../lib/format";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
 export type Severity = "green" | "amber" | "red" | "unknown";
@@ -53,27 +53,63 @@ export interface GaugeGeometry {
   scaleWord: "LIMIT" | "BUDGET";
 }
 
-/** `gaugeValueParts()` — the glance-layer figure, one decimal for GB, whole
+/** `gaugeValueParts()` — the glance-layer figure, one decimal for GiB, whole
  * numbers below that. `memBytes()` (two decimals) stays the detail-layer
- * convention; see this module's own doc for why the two coexist. */
+ * convention; see this module's own doc for why the two coexist. Both are
+ * **binary** since #1811 — see `format.ts::memBytes` for the units argument. */
 export function gaugeValueParts(bytes: number | null | undefined): { num: string; unit: string } {
   if (bytes == null) return { num: "—", unit: "" };
   const n = Number(bytes);
   if (!Number.isFinite(n)) return { num: "—", unit: "" };
-  if (n >= 1e9) return { num: (n / 1e9).toFixed(1), unit: "GB" };
-  if (n >= 1e6) return { num: String(Math.round(n / 1e6)), unit: "MB" };
-  if (n >= 1e3) return { num: String(Math.round(n / 1e3)), unit: "KB" };
+  if (n >= GIB) return { num: (n / GIB).toFixed(1), unit: "GiB" };
+  if (n >= 1048576) return { num: String(Math.round(n / 1048576)), unit: "MiB" };
+  if (n >= 1024) return { num: String(Math.round(n / 1024)), unit: "KiB" };
   return { num: String(Math.round(n)), unit: "B" };
 }
 
 /** `gaugeTickLabel()` — the bare, unit-less number painted directly on the
- * arc (`0 · 34 · 69 · 103 · 137`, `level3.html`) — five of these share one
- * tight radius, so even the one decimal `gaugeValueParts` keeps is too much.
- * Whole GB only; a machine with a sub-GB scale isn't a real target here. */
+ * arc — five of these share one tight radius, so even the one decimal
+ * `gaugeValueParts` keeps is too much. Whole GiB only; a machine with a
+ * sub-GiB scale isn't a real target here.
+ *
+ * Binary is what makes this row legible: the same 128 GiB machine used to
+ * label its arc `0 · 34 · 69 · 103 · 137` (decimal quarter-marks of
+ * `hw.memsize`) and now labels it `0 · 32 · 64 · 96 · 128` — the powers of two
+ * an operator can recognize as their own hardware without doing arithmetic. */
 export function gaugeTickLabel(bytes: number): string {
   const n = Number(bytes);
   if (!Number.isFinite(n) || n <= 0) return "0";
-  return String(Math.round(n / 1e9));
+  return String(Math.round(n / GIB));
+}
+
+/** The arc fill's hue — the ONE color on this face derived from client
+ * arithmetic rather than a server verdict, and the deliberate exception to
+ * this module's otherwise strict "the server decides, we render" rule.
+ *
+ * Why it has to be an exception (docs/design/machine-lens/provenance.md
+ * finding 1): the fill used to key on `machine.state`, and on a real machine
+ * `machine.state` is almost always `unknown` — the ledger honestly refuses to
+ * promise a fit whenever ANY resident model is unpriceable, which is the
+ * normal case. A fill keyed to that verdict is therefore a permanently grey
+ * fill, and a gauge whose needle sweeps a grey arc from empty to full has
+ * thrown away the one thing a gauge is for: showing you, without reading a
+ * number, that the tank is filling.
+ *
+ * So the two questions are separated, and each is answered by the channel that
+ * can actually answer it:
+ * - **"how full is it?"** — this ramp, off the needle's own position. Pure
+ *   arithmetic on two server numbers (`current / scale`), no verdict implied.
+ * - **"is the machine in trouble?"** — unchanged and still server-only: the
+ *   state chip, the seven lamps, the redline (`redlineLit`, one field), and
+ *   the face caption. An amber fill NEVER means the arbiter said amber.
+ *
+ * Thresholds are the operator's own (2026-08-14): green to half, amber past
+ * half, red approaching the line. They are fill-level marks, not the server's
+ * cascade, and nothing else on the page reads them. */
+export function gaugeFillSeverity(pct: number): "green" | "amber" | "red" {
+  if (!Number.isFinite(pct) || pct < 50) return "green";
+  if (pct < 85) return "amber";
+  return "red";
 }
 
 /** The scale's own end-label word — `LIMIT`, or `BUDGET` once a #1243
