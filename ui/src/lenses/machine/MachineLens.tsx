@@ -6,7 +6,8 @@ import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, looseRecords, nameOf } from "../../lib/flow";
 import { specOf } from "../fleet/cards";
-import { utilityLines, healthLines } from "./memoryLedgerLines";
+import { utilityLines } from "./memoryLedgerLines";
+import { MachineHealthRegion } from "./MemLedgerCards";
 import { isStaticBuild } from "../../lib/staticSource";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
@@ -27,20 +28,20 @@ const STATE_SEVERITY: Record<string, string> = {
  * `.memowner`: muted, not colored. */
 const OWNER_WORDS = new Set(["DARKMUX", "USER"]);
 
-/** Classify a health line by CONTENT PATTERN so the region can be styled
- * without the builders having to emit structure.
- *
- * Rules over per-case templates, the same call `RecordView` makes: the
- * health region's length and composition vary by machine state, so
- * positional selectors would be guesswork that happens to fit whatever data
- * was on screen when they were written. These four markers are all authored
- * deliberately in `memoryLedgerLines.ts` — `↳` for hints, `⚠` for warnings,
- * an uppercased state string, and ` · ` joining meta fields — so they are
- * load-bearing content, not incidental formatting.
- *
- * This does NOT re-pair the flattened key/value lines ("pressure" then
- * "RED"). CSS can't, and neither can a per-line classifier; that needs the
- * builders to emit pairs. See the stylesheet's machine-lens header. */
+/** Classify a health line by CONTENT PATTERN — the technique the health
+ * region used to style itself BEFORE #1806 Stage 1 gave it real structure
+ * (`MemLedgerCards.tsx`'s `.memcard`/`.memhdr`/`.memname`/`.memstate`
+ * elements now carry their own classes at render time, so nothing in that
+ * region calls this anymore). Kept — not deleted — for two reasons: it is
+ * still a correct, independently useful pure function (`lineClass.test.ts`
+ * exercises it directly, including the hostile-string inverted case), and
+ * `Lines`'s `classify` prop below is still real API that a future
+ * flat-line-shaped region could opt into. Rules over per-case templates,
+ * the same call `RecordView` makes: content varies by machine state, so
+ * positional selectors would be guesswork. These four markers were all
+ * authored deliberately in `memoryLedgerLines.ts` — `↳` for hints, `⚠` for
+ * warnings, an uppercased state string, and ` · ` joining meta fields — so
+ * they are load-bearing content, not incidental formatting. */
 export function lineClass(line: string): string | undefined {
   if (line.startsWith("↳")) return "mline--hint";
   if (line.startsWith("⚠")) return "mline--warn";
@@ -66,12 +67,16 @@ export function lineClass(line: string): string | undefined {
  * CSS-flex-dependent `innerText` line-break behavior, which depends on
  * every relevant ancestor being `display:flex` (or another block-level
  * layout) — brittle to depend on implicitly when a plain array is just as
- * easy to render and carries the same guarantee by construction.
+ * easy to render and carries the same guarantee by construction. Still used
+ * for the `darkmux/utility` node (`utilityLines()` — a fixed four-element
+ * array, styled positionally in CSS, per that block's own stylesheet
+ * comment); the health region moved to `MemLedgerCards.tsx`'s explicit
+ * structure in #1806 Stage 1 and no longer renders through here.
  *
- * `classify` is opt-in per region: the util/run/loose blocks have
- * deterministic array shapes and are styled positionally in CSS, so only the
- * variable-length health region pays for pattern matching. Adding a class
- * changes no `innerText`, so the parity goldens are unaffected either way. */
+ * `classify` stays as real, tested API (`lineClass.test.ts`) even though
+ * nothing in this file passes `classify` anymore post-Stage-1 — see
+ * `lineClass`'s own doc for why it wasn't deleted. Adding a class changes no
+ * `innerText`, so the parity goldens are unaffected either way. */
 function Lines({ lines, classify = false }: { lines: string[]; classify?: boolean }) {
   return (
     <>
@@ -269,15 +274,7 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
           distinct from "loaded"/"error" so a future remote parity test
           waiting on this marker doesn't hang (#1770 merge-gate finding). */}
       <div className="machine-lens__health" data-state={!isLocalMach ? "remote" : resources ? "loaded" : resourcesErrored ? "error" : "loading"}>
-        <Lines
-          classify
-          lines={healthLines({
-            isLocalMach,
-            machineName: label,
-            resources,
-            resourcesErrored,
-          })}
-        />
+        <MachineHealthRegion isLocalMach={isLocalMach} machineName={label} resources={resources} resourcesErrored={resourcesErrored} />
       </div>
 
       {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —

@@ -1898,18 +1898,22 @@ body {
    compare `innerText`, and unstyled text has exactly the same innerText as
    styled text.
 
-   Why this doesn't reuse legacy's `.memcard`/`.memrow`/`.k`/`.v` rules: the
-   port deliberately represents this lens's content as LINE ARRAYS (one `<div>`
-   per line, see `MachineLens.tsx`'s `Lines` doc) so `innerText` line breaks don't
-   depend on flex behavior. Legacy's rules assume structured markup that no
-   longer exists here, so the visual language is reproduced rather than the
-   selectors.
-
-   Consequence worth naming: the health region flattened genuine key/value
-   pairs ("pressure" then "RED"; "swap used" then a byte count) into sibling
-   strings. CSS cannot re-pair them — proper k/v rows need the builders to emit
-   structure, which is a follow-up, not a stylesheet change. What's here makes
-   the region legible and hierarchical; it does not make it a table. */
+   (#1806 Stage 1) The health region ORIGINALLY reproduced legacy's visual
+   language without its markup (see this block's own former comment, still
+   worth knowing the shape of): content rendered as one flat classified LINE
+   ARRAY (`Lines` + `lineClass()` in `MachineLens.tsx`), so genuine key/value
+   pairs ("pressure" then "RED") stayed flattened sibling strings CSS alone
+   could never re-pair. Stage 1 replaced that with REAL structure
+   (`MemLedgerCards.tsx`) — `.memcard`/`.membar`/`.memhdr`/`.memname`/
+   `.memstate`/`.memowner`/`.memmeta`/`.memhint`/`.memwarn`/`.memfoot`/`.none`,
+   legacy's OWN class names (`crates/darkmux-serve/assets/viewer.html` CSS
+   274-303) — reused on purpose so #1806's `.memcard`/`.membar`/`#memstamp`/
+   `.memwarn` e2e specs (`tests/e2e/viewer-machine.spec.js`) pass unmodified.
+   Pressure's four k/v fragments are the one deliberate holdout: still flat
+   siblings (`.mline--label`/`.mline--meta`, reused below), because pairing
+   them WOULD re-pair "swap used" and its value onto one line, changing
+   `innerText` — Stage 1's one hard constraint (`MemLedgerCards.tsx`'s own
+   doc). That pairing is Stage 2's job, not this stylesheet's. */
 
 .machine-lens {
   font: 12px/1.6 "JetBrains Mono", monospace;
@@ -1924,9 +1928,11 @@ body {
 }
 
 /* Shared card treatment. Matches `.rv__group`'s panel idiom so the machine
-   tab and the record panel read as the same product. */
+   tab and the record panel read as the same product. NOT `.machine-lens__health`
+   any more — that region now holds its OWN cards (`.memcard`, below), and a
+   bordered/padded wrapper around a stack of bordered/padded cards is a
+   double border, not a nested one. */
 .machine-lens__util,
-.machine-lens__health,
 .machine-lens__loosenode {
   background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--border);
@@ -1934,6 +1940,21 @@ body {
   padding: 10px 12px;
   margin-bottom: 12px;
   overflow-wrap: anywhere;
+}
+
+/* `.memwrap`, viewer.html:273 — flex-column + gap is how legacy spaces its
+   OWN card stack, and it is verified layout-safe for this exact purpose:
+   `tests/parity/goldens/machine.txt` was captured off legacy's real
+   `.memwrap`-nested `.memcard`s and shows clean one-line-per-string text
+   with zero blank-line drift (see `MemLedgerCards.tsx`'s module doc), so
+   reusing the identical technique here — rather than inventing a
+   margin-based alternative — carries that same verified guarantee forward
+   instead of re-deriving it. */
+.machine-lens__health {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 12px;
 }
 
 /* `utilityLines` returns a FIXED four-element array — [name, state, caps,
@@ -1965,9 +1986,173 @@ body {
   color: var(--accent-dim);
 }
 
-/* The health region's length varies by machine state, so its lines are
-   classified by CONTENT PATTERN at render time (see `Lines` in
-   MachineLens.tsx) rather than by position. */
+/* ── `.memcard` — the health region's real structure (#1806 Stage 1) ───────
+   Legacy's own class names/geometry (`crates/darkmux-serve/assets/viewer.html`
+   CSS 274-303, `memBar()` at :4946-4954), so #1806's `.memcard`/`.membar`/
+   `.memhint`/`#memstamp`/`.memwarn` e2e specs pass against this port
+   unmodified. `MemLedgerCards.tsx`'s own module doc is the source of truth
+   for WHY every element below is safe for `innerText` byte-parity; read it
+   before touching this block's markup shape (adding/removing an element,
+   not just restyling one).
+
+   `.memname`/`.memowner`/`.memstate` are `display:block;width:fit-content`
+   — NOT `inline-block` — for the exact reason `.mline--state`/`.mline--owner`
+   already are, below: adjacent inline-level siblings merge onto ONE
+   `innerText` line. Legacy gets its own header line breaks for free because
+   `.memhdr` there is `display:flex` (flex-blockifies its children); this
+   port does not lean on that — forcing block on the LEAF elements makes the
+   line break unconditional regardless of what `.memhdr` here ends up being,
+   the same brittleness `MachineLens.tsx`'s `Lines` doc already flags. */
+.machine-lens__health .memcard {
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  overflow-wrap: anywhere;
+}
+.machine-lens__health .memcard.green { border-color: var(--good); }
+.machine-lens__health .memcard.amber { border-color: var(--warn); }
+.machine-lens__health .memcard.red { border-color: var(--bad); }
+/* No `.memcard.unknown` rule, deliberately — matches legacy (no such rule
+   there either): `unknown` is a REAL, common state on this page (PROVENANCE
+   finding 1 — any unpriced resident forces the whole machine to `unknown`),
+   and its honest rendering is the unstyled base look: a plain border, no
+   color claim the server didn't make (the "honesty rule" governing color,
+   PROPOSAL §2 — the client never invents a judgment). */
+
+.machine-lens__health .memhdr {
+  margin-bottom: 2px;
+}
+.machine-lens__health .memname {
+  display: block;
+  font-weight: 600;
+  color: var(--fg);
+}
+.machine-lens__health .memowner,
+.machine-lens__health .memstate {
+  display: block;
+  width: fit-content;
+  font: 600 10px/1.4 "JetBrains Mono", monospace;
+  letter-spacing: 0.06em;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--dim);
+  margin: 2px 0;
+}
+.machine-lens__health .memstate.green { color: var(--good); border-color: var(--good); }
+.machine-lens__health .memstate.amber { color: var(--warn); border-color: var(--warn); }
+.machine-lens__health .memstate.red { color: var(--bad); border-color: var(--bad); }
+
+/* The four-layer meter — legacy's own instrument (viewer.html:286-303,
+   `memBar()` :4946-4954): `.pot` (committed extent, dashed edge), `.cur`
+   (measured fill, state-colored AND state-PATTERNED — color is never the
+   only channel, PROVENANCE.md), `.lim` (the limit tick), `.poolline` (the
+   physical-pool tick, only drawn when it differs from the limit). All four
+   are `position:absolute` and carry no text node — see `MemLedgerCards.tsx`'s
+   module doc for why that keeps them `innerText`-invisible regardless of
+   where they sit in the DOM. `#131826` (not a token) matches this port's
+   own existing recessed-track color (`.tltrack`, this file) rather than
+   inventing a second one. */
+.machine-lens__health .membar {
+  position: relative;
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #131826;
+  overflow: hidden;
+  margin: 6px 0 4px;
+}
+.machine-lens__health .membar .pot {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: rgba(255, 255, 255, 0.05);
+  border-right: 2px dashed var(--dim);
+}
+.machine-lens__health .membar .cur {
+  position: absolute;
+  inset: 0 auto 0 0;
+  opacity: 0.55;
+}
+.machine-lens__health .membar .cur.green {
+  background: var(--good);
+}
+/* watch = 45° hatch, red = 135° dense hatch, unknown = dots — the
+   level-3 mockup's own severity recipe (`level1.html`'s `.m-cur` rules),
+   carried into Stage 1 because it's CSS-only (no text, no DOM change) and
+   PROVENANCE.md names it explicitly: color cannot be the only channel. */
+.machine-lens__health .membar .cur.amber {
+  background:
+    repeating-linear-gradient(45deg, transparent 0 5px, rgba(0, 0, 0, 0.45) 5px 8px),
+    var(--warn);
+}
+.machine-lens__health .membar .cur.red {
+  background:
+    repeating-linear-gradient(135deg, transparent 0 3px, rgba(0, 0, 0, 0.5) 3px 6px),
+    var(--bad);
+  opacity: 0.65;
+}
+.machine-lens__health .membar .cur.unknown {
+  background: radial-gradient(circle at 2px 2px, var(--dim) 1.2px, transparent 1.2px);
+  background-size: 7px 7px;
+  background-color: rgba(139, 147, 167, 0.22);
+  opacity: 0.9;
+}
+.machine-lens__health .membar .lim {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+}
+.machine-lens__health .membar .poolline {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--dim);
+  opacity: 0.7;
+}
+
+.machine-lens__health .memmeta {
+  color: var(--dim);
+  font-size: 11px;
+}
+.machine-lens__health .memhint {
+  color: var(--dim);
+  font-size: 11px;
+  border-left: 2px solid var(--border);
+  padding: 2px 0 2px 8px;
+  margin: 4px 0 0;
+}
+.machine-lens__health .memwarn {
+  color: var(--warn);
+  font-size: 11px;
+  border-left: 2px solid var(--warn);
+  padding: 2px 0 2px 8px;
+  margin: 4px 0 0;
+}
+.machine-lens__health .memfoot {
+  color: var(--dim);
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+.machine-lens__health .none {
+  color: var(--dim);
+  font-size: 11px;
+  padding: 4px 0;
+}
+
+@media (max-width: 768px) {
+  .machine-lens__health .membar {
+    height: 34px;
+  }
+}
+
+/* The health region's remaining flat lines (pressure's k/v fragments, and
+   anything a future caller renders through `lineClass()` — see that
+   function's own doc for why it's still live code) are classified by
+   CONTENT PATTERN at render time rather than by position. */
 .machine-lens__health .mline--state {
   /* `block` + `fit-content`, NOT `inline-block`: adjacent inline-level
      siblings merge onto ONE `innerText` line, which collapsed the owner tag
