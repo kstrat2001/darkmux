@@ -1989,6 +1989,32 @@ body {
   padding: 2px 0 2px 8px;
   margin: 4px 0 0;
 }
+/* #1821 — the `messages[]` severity treatment, replacing the old uniformly
+   -amber `.memwarn` above (kept — harmless, unreferenced by this port's own
+   markup) for the machine lens's message card. An `info` disclosure (the
+   #1819 estimate note) must NOT look like a `warn`/`error`: `.is-estimated`
+   already spent the dashed-outline treatment on provenance, so severity
+   here is carried by color instead — `--dim` for a disclosure,
+   `--warn`/`--bad` for a real degradation — the same outline/hue-is-status
+   convention this file uses elsewhere, applied to a left-border accent. */
+.machine-lens__health .memmsg {
+  font-size: 11px;
+  border-left: 2px solid var(--dim);
+  padding: 2px 0 2px 8px;
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+.machine-lens__health .memmsg-info {
+  color: var(--dim);
+}
+.machine-lens__health .memmsg-warn {
+  color: var(--warn);
+  border-left-color: var(--warn);
+}
+.machine-lens__health .memmsg-error {
+  color: var(--bad);
+  border-left-color: var(--bad);
+}
 .machine-lens__health .memfoot {
   color: var(--dim);
   font-size: 10px;

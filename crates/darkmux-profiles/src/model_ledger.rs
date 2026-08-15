@@ -78,7 +78,20 @@ use std::time::Duration;
 /// 1.0 → 1.1 (#1819): additive fields only (`ModelRow::potential_source`,
 /// `MachineTotals::estimated_models`) — a 1.0 reader tolerates the payload
 /// unchanged (contract 5's "minor = additive, safe to ignore").
-pub const LEDGER_SCHEMA_VERSION: &str = "1.1";
+///
+/// 1.1 → 2.0 (#1821): BREAKING — `warnings: Vec<String>` renamed AND
+/// retyped to `messages: Vec<LedgerMessage>` (a rename plus a shape change,
+/// not additive — the schema rules name exactly this a major bump).
+/// Renders uniformly amber with no severity channel, so the #1819 estimate
+/// DISCLOSURE and a real degradation both lit the same WARN lamp; `info` /
+/// `warn` / `error` gives the disclosure somewhere honest to live.
+/// `PoolSnapshot.available_bytes` is ALSO renamed to `free_bytes` (it was
+/// always truly-free pages, not the colloquial "available"), with a NEW
+/// `used_bytes` and a NEW `available_bytes` meaning the colloquial figure —
+/// see that struct's doc. Tolerable as a major: every consumer (CLI,
+/// `/machine/resources`, the viewer) ships in this same binary; no external
+/// reader is stranded.
+pub const LEDGER_SCHEMA_VERSION: &str = "2.0";
 
 /// v1 KV-cache dtype width: 2 bytes/element (fp16 cache, the MLX default).
 /// Deliberately a named constant, not a guess from weight quantization —
@@ -197,7 +210,7 @@ const SYS_PROBE_BOUND: Duration = Duration::from_secs(3);
 // retains swap long after the pressure that created it (live-observed: 1.7 GB
 // used at 94% memorystatus free on a healthy 128 GB box), so a small used-swap
 // figure is stale evidence, not an active signal — the crisp 'pressure NOW'
-// tell is MEMORY_FREE_PERCENT_RED." All true. The error was concluding that
+// tell is MARGIN_PERCENT_RED." All true. The error was concluding that
 // residue is BOUNDED, so a bigger number must mean something. It is not
 // bounded: swap-in-use is a monotonic high-water mark that macOS never
 // reclaims, so it grows with UPTIME, not with distress.
@@ -217,10 +230,18 @@ const SYS_PROBE_BOUND: Duration = Duration::from_secs(3);
 // samples, not a number compared to a constant.
 
 /// `kern.memorystatus_level` red threshold (#1286 pressure signal) — the
-/// kernel counter behind `memory_pressure`'s "system-wide memory free
-/// percentage". Healthy systems idle in the 40–70 band; below ~15 the
-/// kernel is in its warn/critical pressure band.
-pub const MEMORY_FREE_PERCENT_RED: u64 = 15;
+/// kernel's own 0–100 pressure-headroom counter, `(capacity - wired -
+/// compressor) / capacity`. Healthy systems idle in the 40–70 band; below
+/// ~15 the kernel is in its warn/critical pressure band.
+///
+/// Named `margin`, not `free` (#1821, operator-approved rename): live,
+/// same instant, this read 82% while truly-free pages were 30.8% — a
+/// 51-point gap under names that both implied "how much RAM is left".
+/// `margin` borrows this project's own NASA register (mass margin, power
+/// margin, propellant margin) — the redline is where margin runs out, and
+/// this is that margin. It does not claim to be a byte count, which both
+/// "free" and "available" would.
+pub const MARGIN_PERCENT_RED: u64 = 15;
 
 /// Floor for the amber shrink hint's suggested context — suggesting less
 /// than 4 K ctx stops being a usable dispatch config.
@@ -275,6 +296,54 @@ pub enum Attribution {
     Unavailable,
 }
 
+/// Logger-style severity for a [`LedgerMessage`] (#1821) — the channel the
+/// old `warnings: Vec<String>` never had. Every entry rendered amber
+/// regardless of what it said, so a DISCLOSURE (the #1819 estimate note —
+/// working as designed, permanently true on a machine with a GGUF resident)
+/// lit the same WARN lamp as a real degradation.
+///
+/// Named `info`, not `note`: `darkmux flow note` is an existing verb for
+/// the orchestrator dashboard, and reusing the word here would give one
+/// term two meanings inside the same product (the same collision class as
+/// compactor/compressor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// A disclosure — nothing degraded, working as documented. The #1819
+    /// estimate note lives here: an ESTIMATED model is priced by its own
+    /// stated convention, not a fault.
+    Info,
+    /// A real degradation — the answer is worse than it would be without
+    /// this condition (e.g. an unpriceable resident undercounts the sum).
+    Warn,
+    /// The reading itself is untrustworthy — a probe or enumeration
+    /// failure (gather failed, LMStudio unreachable, worker enumeration
+    /// came back empty for reasons other than "no workers").
+    Error,
+}
+
+/// One entry in [`ModelLedger::messages`] (#1821) — replaces the old
+/// `warnings: Vec<String>`. See [`Severity`] for the three levels and
+/// [`LEDGER_SCHEMA_VERSION`]'s 2.0 changelog entry for why this was a
+/// breaking rename rather than an additive field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerMessage {
+    pub severity: Severity,
+    pub text: String,
+}
+
+impl LedgerMessage {
+    pub fn info(text: impl Into<String>) -> Self {
+        LedgerMessage { severity: Severity::Info, text: text.into() }
+    }
+    pub fn warn(text: impl Into<String>) -> Self {
+        LedgerMessage { severity: Severity::Warn, text: text.into() }
+    }
+    pub fn error(text: impl Into<String>) -> Self {
+        LedgerMessage { severity: Severity::Error, text: text.into() }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LimitSource {
@@ -307,14 +376,43 @@ pub enum PotentialSource {
     Estimated,
 }
 
+/// A single machine-wide memory decomposition, all three figures read from
+/// the SAME `vm_stat` call the gather already runs (zero added probe cost,
+/// #1286 observer constraint). #1821: the prior shape had only
+/// `available_bytes` (truly-free pages) and no `used_bytes` at all, so the
+/// page could say how much DARKMUX was using but never how full the
+/// MACHINE was — the operator misread darkmux's own figure as the
+/// machine's for hours because there was nothing to compare it against.
+///
+/// **Honest naming, not just new fields.** `available_bytes` used to MEAN
+/// truly-free pages; it now means the colloquial figure, and the old
+/// meaning moved to `free_bytes`. Leaving both names pointed at
+/// truly-free-vs-something-else is exactly the defect this rename fixes
+/// (issue finding 7: `pool free` and the `% free` tile disagreed by 51
+/// points while sharing the word "free").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolSnapshot {
     pub capacity_bytes: u64,
-    /// Conservative `Pages free × page size` — the same tilt as the gestalt
-    /// `MacProbe` (inactive/speculative/purgeable deliberately excluded);
-    /// gathered here through the ledger's own bounded runner so one
-    /// `vm_stat` read feeds both the pool row and the compressor row.
+    /// Activity-Monitor-style: `wired + compressor_occupied + (active +
+    /// inactive - purgeable)`. Cross-checked live against `top` (issue
+    /// #1821): 69.3 GiB vs `top`'s ~66 GiB used, sampled seconds apart on a
+    /// loaded machine — materially closer than the implied
+    /// `capacity - free`, which came in at 73.4 GiB the same instant and
+    /// had swung between 1.8 and 61 GiB within one earlier session.
+    pub used_bytes: Option<u64>,
+    /// The colloquial "how much is left": `free + inactive + speculative`.
+    /// Neither `free_bytes` alone (too strict — charges ~26 GiB of
+    /// reclaimable inactive pages as not-free) nor `kern.memorystatus_level`
+    /// (too generous — the `% free` pressure tile; see its own doc) answers
+    /// this; this field is the figure that was missing from the page
+    /// entirely (issue finding 7).
     pub available_bytes: Option<u64>,
+    /// Truly-free pages only (`vm_stat` "Pages free" × page size) — the
+    /// SAME conservative figure this field answered to the name
+    /// `available_bytes` before #1821's honest rename. Still the same tilt
+    /// as the gestalt `MacProbe` (inactive/speculative/purgeable
+    /// deliberately excluded).
+    pub free_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -325,8 +423,12 @@ pub struct PressureSnapshot {
     /// row; NOT a red trigger in v1 (growth detection needs history a
     /// single snapshot doesn't have — #1247 telemetry series will).
     pub compressor_bytes: Option<u64>,
-    /// `sysctl kern.memorystatus_level` — the `memory_pressure` free%.
-    pub memory_free_percent: Option<u64>,
+    /// `sysctl kern.memorystatus_level` — `(capacity - wired - compressor) /
+    /// capacity`, the kernel's own 0–100 pressure headroom. Named `margin`,
+    /// not `free` (#1821): it is neither free nor available memory in the
+    /// byte-count sense — see [`MARGIN_PERCENT_RED`]'s doc for the live
+    /// 82%-vs-30.8% gap that motivated the rename.
+    pub margin_percent: Option<u64>,
     /// Whether any red-zone pressure signal is active (see the thresholds).
     pub red: bool,
 }
@@ -396,6 +498,25 @@ pub struct MachineTotals {
     /// Total inference-worker footprint; `None` under
     /// [`Attribution::Unavailable`].
     pub current_bytes: Option<u64>,
+    /// #1821: what everything else on the machine is holding right now —
+    /// `pool.used_bytes - current_bytes`, floored at 0. `None` when
+    /// `pool.used_bytes` is unreadable (vm_stat failed). A missing
+    /// `current_bytes` (attribution unavailable) is treated as 0 here —
+    /// the direction that makes this an OVERESTIMATE of other tenants,
+    /// never an underestimate that could hide risk behind a falsely-small
+    /// commitment. Emitted so the cascade's arithmetic is checkable from
+    /// the JSON, not just trusted (this page's covenant).
+    #[serde(default)]
+    pub other_used_bytes: Option<u64>,
+    /// #1821: `other_used_bytes + potential_bytes` — "if darkmux's own
+    /// commitment fully materializes while everything else holds what it
+    /// holds now, what is the machine's total?" This is what the
+    /// green/amber cascade actually compares against `limit_bytes` now,
+    /// replacing the old `potential_bytes <= limit` comparison that
+    /// silently assumed darkmux was the machine's only tenant. `None`
+    /// exactly when `other_used_bytes` is `None`.
+    #[serde(default)]
+    pub projected_total_bytes: Option<u64>,
     pub state: LedgerState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shrink_hint: Option<String>,
@@ -419,7 +540,11 @@ pub struct ModelLedger {
     /// attribution did (rank pairing / proportional split / why
     /// unavailable), so a degraded number can never read as precise.
     pub attribution_note: String,
-    pub warnings: Vec<String>,
+    /// #1821: replaces the old `warnings: Vec<String>` — see
+    /// [`Severity`]/[`LedgerMessage`] and [`LEDGER_SCHEMA_VERSION`]'s 2.0
+    /// changelog entry. A disclosure (`info`) no longer lights the same
+    /// lamp as a real degradation (`warn`/`error`).
+    pub messages: Vec<LedgerMessage>,
 }
 
 // ── pure inputs (the test seam: canned/fixture data, never real probes) ──
@@ -540,10 +665,13 @@ pub struct LedgerInputs {
     pub budget_bytes: Option<u64>,
     pub swap_used_bytes: Option<u64>,
     pub compressor_bytes: Option<u64>,
-    pub memory_free_percent: Option<u64>,
+    pub margin_percent: Option<u64>,
     /// `None` = enumeration failed; `Some(vec![])` = ran, found none.
     pub workers: Option<Vec<WorkerProc>>,
-    pub warnings: Vec<String>,
+    /// Pre-populated `error`-severity messages from the gather stage (probe
+    /// failures) — `compute_ledger` appends its own `warn`/`info` entries
+    /// on top (#1821).
+    pub messages: Vec<LedgerMessage>,
 }
 
 // ── the estimator composition (#1819) ───────────────────────────────────
@@ -647,9 +775,9 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         budget_bytes,
         swap_used_bytes,
         compressor_bytes,
-        memory_free_percent,
+        margin_percent,
         workers,
-        mut warnings,
+        mut messages,
     } = inputs;
 
     let estimator = ArchWithSizeFallback::new(arch.clone());
@@ -703,11 +831,13 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         .map(|r| r.model_key.as_str())
         .collect();
     if !unpriced.is_empty() {
-        warnings.push(format!(
+        // A real degradation — the sum undercounts by an uncounted amount —
+        // so `warn`, not `info` (#1821).
+        messages.push(LedgerMessage::warn(format!(
             "{} resident model(s) unpriceable (no readable arch facts or catalog size): {} — machine potential UNDERCOUNTS by their commitment",
             unpriced.len(),
             unpriced.join(", ")
-        ));
+        )));
     }
     let unpriced_models = unpriced.len() as u32;
 
@@ -722,7 +852,11 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         .map(|r| r.model_key.as_str())
         .collect();
     if !estimated.is_empty() {
-        warnings.push(format!(
+        // A disclosure, not a degradation — an ESTIMATED model is priced
+        // exactly as designed, permanently true on any machine with a GGUF
+        // resident. `info`, so it stops lighting the WARN lamp (#1821 —
+        // the whole point of this change).
+        messages.push(LedgerMessage::info(format!(
             "{} resident model(s) priced by ESTIMATE, not measurement (no readable config.json — commonly a GGUF download): {} — potential assumes dense attention at a size-tiered {:.1} KB/token. Set at or above every modern GQA architecture in its size class; it OVERSTATES hybrid-attention models (safe), and UNDER-reserves pre-GQA multi-head models such as Llama-2-13B (~819 KB/token), whose real cost no size-derived rate can predict",
             estimated.len(),
             estimated.join(", "),
@@ -749,7 +883,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
                     _ => "—".to_string(),
                 }
             },
-        ));
+        )));
     }
     let estimated_models = estimated.len() as u32;
 
@@ -768,22 +902,60 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     let pressure = PressureSnapshot {
         swap_used_bytes,
         compressor_bytes,
-        memory_free_percent,
-        red: pressure_red(memory_free_percent),
+        margin_percent,
+        red: pressure_red(margin_percent),
     };
 
-    // Machine-total color per the #1286 semantics.
+    // #1821: darkmux is not the machine's only tenant. `other_used` is
+    // everything ELSE on the machine, right now — `pool.used_bytes` minus
+    // darkmux's own attributed current. A missing `current_total`
+    // (attribution unavailable) is treated as 0, which makes `other_used`
+    // an OVERESTIMATE of the other tenants rather than an underestimate —
+    // the safe direction when the real darkmux share is unknown.
+    //
+    // `projected_total` answers the question this cascade has always been
+    // TRYING to answer: if darkmux's own committed potential fully
+    // materializes while everything else holds what it holds now, does the
+    // total exceed the limit? The prior rule compared `sum_potential`
+    // (darkmux alone) against `limit` (the WHOLE machine), which is only
+    // correct on a machine where darkmux is the sole tenant — never true in
+    // practice. `None` when `pool.used_bytes` itself is unreadable
+    // (vm_stat failed): there is then no fit guarantee to give, so the
+    // cascade below falls through to `Unknown` rather than silently
+    // reusing the old darkmux-only comparison.
+    let other_used_bytes: Option<u64> =
+        pool.and_then(|p| p.used_bytes).map(|used| used.saturating_sub(current_total.unwrap_or(0)));
+    let projected_total_bytes: Option<u64> = other_used_bytes.map(|o| o + sum_potential);
+
+    // Machine-total color per the #1286 semantics, updated by #1821: arms 3
+    // and 4 now key on `projected_total`, not `sum_potential` alone.
     let mut machine_shrink: Option<String> = None;
     let machine_state = match limit_bytes {
         _ if pressure.red => LedgerState::Red,
         Some(limit) if current_total.is_some_and(|c| c > limit) => LedgerState::Red,
-        Some(limit) if sum_potential <= limit && unpriced_models == 0 => LedgerState::Green,
-        Some(limit) if sum_potential > limit => {
-            machine_shrink = Some(shrink_hint(&rows, sum_potential, limit, unpriced_models));
+        Some(limit) if projected_total_bytes.is_some_and(|p| p <= limit) && unpriced_models == 0 => {
+            LedgerState::Green
+        }
+        Some(limit) if projected_total_bytes.is_some_and(|p| p > limit) => {
+            // The shrink hint's own overshoot has to be measured against
+            // the SAME total the verdict was — `projected_total`, not
+            // `sum_potential` — or a suggested cut could land exactly on
+            // the old (wrong) target and still leave the machine over the
+            // real limit once other tenants are counted.
+            machine_shrink = Some(shrink_hint(
+                &rows,
+                projected_total_bytes.unwrap_or(sum_potential),
+                limit,
+                unpriced_models,
+            ));
             LedgerState::Amber
         }
-        // Under the limit on the KNOWN sum but with unpriceable residents:
-        // no fit guarantee exists, and no shrink target is computable.
+        // Either under the limit on the known projection but with
+        // unpriceable residents (no fit guarantee, no shrink target), OR
+        // `other_used`/`projected_total` themselves are unreadable
+        // (`pool.used_bytes` missing) — neither case can honestly answer
+        // "does this fit", so both land here rather than silently falling
+        // back to the darkmux-only comparison this cascade used to make.
         Some(_) => LedgerState::Unknown,
         None => LedgerState::Unknown,
     };
@@ -809,7 +981,11 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     }
     // Attach the machine shrink hint to the row it names (single-row hint).
     if let (Some(hint), LedgerState::Amber) = (&machine_shrink, machine_state) {
-        if let Some(key) = hint_target_key(&rows, sum_potential, limit_bytes.unwrap_or(0)) {
+        if let Some(key) = hint_target_key(
+            &rows,
+            projected_total_bytes.unwrap_or(sum_potential),
+            limit_bytes.unwrap_or(0),
+        ) {
             if let Some(row) = rows.iter_mut().find(|r| r.model_key == key) {
                 row.shrink_hint = Some(hint.clone());
             }
@@ -829,13 +1005,15 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
             unpriced_models,
             estimated_models,
             current_bytes: current_total,
+            other_used_bytes,
+            projected_total_bytes,
             state: machine_state,
             shrink_hint: machine_shrink,
         },
         models: rows,
         attribution,
         attribution_note,
-        warnings,
+        messages,
     }
 }
 
@@ -843,8 +1021,8 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
 /// kernel's own memorystatus level is the one tell that describes NOW. Swap
 /// and compressor are reported as rows — see the note where the swap
 /// threshold used to be for why neither is a trigger.
-fn pressure_red(memory_free_percent: Option<u64>) -> bool {
-    memory_free_percent.is_some_and(|p| p < MEMORY_FREE_PERCENT_RED)
+fn pressure_red(margin_percent: Option<u64>) -> bool {
+    margin_percent.is_some_and(|p| p < MARGIN_PERCENT_RED)
 }
 
 /// Attribute worker footprints to model rows, filling `current_bytes`.
@@ -989,8 +1167,13 @@ fn effective_kv_rate(row: &ModelRow) -> u64 {
 /// ctx reduction saves the most per token (highest effective kv rate — see
 /// [`effective_kv_rate`] — with shrinkable ctx), preferring one whose full
 /// reduction covers the overshoot alone.
-fn hint_target_key(rows: &[ModelRow], sum_potential: u64, limit: u64) -> Option<String> {
-    let overshoot = sum_potential.saturating_sub(limit);
+///
+/// `total_bytes` is the figure the amber verdict was actually computed
+/// against — since #1821, `projected_total` (darkmux's Σ potential plus
+/// everything else the machine is holding), not the raw darkmux-only sum —
+/// so the overshoot this targets a cut for is the real one.
+fn hint_target_key(rows: &[ModelRow], total_bytes: u64, limit: u64) -> Option<String> {
+    let overshoot = total_bytes.saturating_sub(limit);
     let candidates: Vec<&ModelRow> = rows
         .iter()
         .filter(|r| effective_kv_rate(r) > 0 && r.loaded_ctx > SHRINK_CTX_FLOOR)
@@ -1008,16 +1191,20 @@ fn hint_target_key(rows: &[ModelRow], sum_potential: u64, limit: u64) -> Option<
 }
 
 /// The amber "config shrink to green" hint (#1286): names the model + the
-/// reloaded ctx that brings Σ potential under the limit at load time, or
+/// reloaded ctx that brings the total under the limit at load time, or
 /// says honestly that no single-model ctx cut reaches green.
+///
+/// `total_bytes` — see [`hint_target_key`]'s doc: since #1821 this is
+/// `projected_total`, not darkmux's Σ potential alone, so a saving computed
+/// here actually closes the gap the verdict is amber about.
 ///
 /// When `unpriced_models > 0` the promised fit is NOT green — green requires
 /// zero unpriceable residents (their commitment is uncounted), so applying
 /// the shrink lands the machine total at Unknown, not Green. The hint carries
 /// that caveat rather than over-promising green (#1286 honesty).
-fn shrink_hint(rows: &[ModelRow], sum_potential: u64, limit: u64, unpriced_models: u32) -> String {
-    let overshoot = sum_potential.saturating_sub(limit);
-    let base = match hint_target_key(rows, sum_potential, limit) {
+fn shrink_hint(rows: &[ModelRow], total_bytes: u64, limit: u64, unpriced_models: u32) -> String {
+    let overshoot = total_bytes.saturating_sub(limit);
+    let base = match hint_target_key(rows, total_bytes, limit) {
         None => format!(
             "over the limit by {} with no shrinkable context — unload a resident or load a smaller quant to reach green at load time",
             fmt_bytes(overshoot)
@@ -1085,10 +1272,10 @@ pub fn gather() -> ModelLedger {
 /// LMStudio; with no ls entries the arch reader touches no files either).
 pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
     let started = std::time::Instant::now();
-    let mut warnings = Vec::new();
+    let mut messages = Vec::new();
 
-    let ps_rows = bounded_json_rows(lms_bin, &["ps", "--json"], "ps", &mut warnings);
-    let ls_rows = bounded_json_rows(lms_bin, &["ls", "--json"], "ls", &mut warnings);
+    let ps_rows = bounded_json_rows(lms_bin, &["ps", "--json"], "ps", &mut messages);
+    let ls_rows = bounded_json_rows(lms_bin, &["ls", "--json"], "ls", &mut messages);
 
     let residents: Vec<ResidentInput> = ps_rows.iter().map(resident_from_ps_json).collect();
     let catalog: Vec<CatalogFact> = ls_rows
@@ -1119,37 +1306,33 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
         }
     }
 
-    // Kernel counters — ONE vm_stat read feeds both the conservative pool
-    // availability (MacProbe's tilt) and the compressor row.
-    let vm_stat = bounded_stdout("vm_stat", &[], "vm_stat", SYS_PROBE_BOUND, &mut warnings);
-    let (available_bytes, compressor_bytes) = match vm_stat.as_deref() {
-        Some(out) => {
-            let page = parse_vm_stat_page_size(out);
-            (
-                parse_vm_stat_pages(out, "Pages free").map(|p| p * page),
-                parse_vm_stat_pages(out, "Pages occupied by compressor").map(|p| p * page),
-            )
-        }
-        None => (None, None),
+    // Kernel counters — ONE vm_stat read feeds the pool decomposition
+    // (#1821), the compressor row, AND (unchanged) the memorystatus
+    // pressure tile below.
+    let vm_stat = bounded_stdout("vm_stat", &[], "vm_stat", SYS_PROBE_BOUND, &mut messages);
+    let (used_bytes, available_bytes, free_bytes, compressor_bytes) = match vm_stat.as_deref() {
+        Some(out) => parse_pool_from_vm_stat(out),
+        None => (None, None, None, None),
     };
     let capacity_bytes =
-        bounded_stdout("sysctl", &["-n", "hw.memsize"], "hw.memsize", SYS_PROBE_BOUND, &mut warnings)
+        bounded_stdout("sysctl", &["-n", "hw.memsize"], "hw.memsize", SYS_PROBE_BOUND, &mut messages)
             .and_then(|s| s.trim().parse::<u64>().ok());
-    let pool = capacity_bytes.map(|capacity_bytes| PoolSnapshot { capacity_bytes, available_bytes });
+    let pool = capacity_bytes
+        .map(|capacity_bytes| PoolSnapshot { capacity_bytes, used_bytes, available_bytes, free_bytes });
     let swap_used_bytes = bounded_stdout(
         "sysctl",
         &["-n", "vm.swapusage"],
         "vm.swapusage",
         SYS_PROBE_BOUND,
-        &mut warnings,
+        &mut messages,
     )
     .and_then(|s| parse_swapusage_used_bytes(&s));
-    let memory_free_percent = bounded_stdout(
+    let margin_percent = bounded_stdout(
         "sysctl",
         &["-n", "kern.memorystatus_level"],
         "memorystatus",
         SYS_PROBE_BOUND,
-        &mut warnings,
+        &mut messages,
     )
     .and_then(|s| s.trim().parse::<u64>().ok());
 
@@ -1159,7 +1342,7 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
         &["-axo", "pid=,rss=,command="],
         "ps-workers",
         SYS_PROBE_BOUND,
-        &mut warnings,
+        &mut messages,
     )
     .map(|out| enrich_with_footprint(parse_worker_rss(&out), phys_footprint));
 
@@ -1175,9 +1358,9 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
             budget_bytes: None,
             swap_used_bytes,
             compressor_bytes,
-            memory_free_percent,
+            margin_percent,
             workers,
-            warnings,
+            messages,
         },
         now_ms(),
     );
@@ -1238,11 +1421,11 @@ fn bounded_stdout(
     args: &[&str],
     phase: &'static str,
     bound: Duration,
-    warnings: &mut Vec<String>,
+    messages: &mut Vec<LedgerMessage>,
 ) -> Option<String> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
-    // Warnings ride /machine/resources to remote viewers, so they carry the
+    // Messages ride /machine/resources to remote viewers, so they carry the
     // binary's BASENAME, never a full configured path — a `DARKMUX_LMS_BIN`
     // under a home dir must not leak off-machine (#1286 observer/privacy).
     // The runner's own error text (which repeats the full path) is likewise
@@ -1252,12 +1435,14 @@ fn bounded_stdout(
         Ok(run) if run.status.success() => Some(run.stdout),
         Ok(run) => {
             let detail = run.exit_detail().replace(bin, label);
-            warnings.push(format!("`{label} {}` {detail}", args.join(" ")));
+            // #1821: a probe failure means THIS reading is untrustworthy —
+            // `error`, not `warn`.
+            messages.push(LedgerMessage::error(format!("`{label} {}` {detail}", args.join(" "))));
             None
         }
         Err(e) => {
             let detail = e.to_string().replace(bin, label);
-            warnings.push(format!("`{label} {}` failed: {detail}", args.join(" ")));
+            messages.push(LedgerMessage::error(format!("`{label} {}` failed: {detail}", args.join(" "))));
             None
         }
     }
@@ -1276,15 +1461,18 @@ fn bounded_json_rows(
     bin: &str,
     args: &[&str],
     phase: &'static str,
-    warnings: &mut Vec<String>,
+    messages: &mut Vec<LedgerMessage>,
 ) -> Vec<serde_json::Value> {
-    let Some(out) = bounded_stdout(bin, args, phase, LMS_PROBE_BOUND, warnings) else {
+    let Some(out) = bounded_stdout(bin, args, phase, LMS_PROBE_BOUND, messages) else {
         return Vec::new();
     };
     match serde_json::from_str::<serde_json::Value>(&out) {
         Ok(serde_json::Value::Array(rows)) => rows,
         _ => {
-            warnings.push(format!("`{bin} {}` output is not a JSON array", args.join(" ")));
+            messages.push(LedgerMessage::error(format!(
+                "`{bin} {}` output is not a JSON array",
+                args.join(" ")
+            )));
             Vec::new()
         }
     }
@@ -1311,6 +1499,51 @@ fn parse_vm_stat_pages(vm_stat: &str, label: &str) -> Option<u64> {
         .find(|l| l.trim_start().starts_with(label))
         .and_then(|l| l.rsplit(':').next())
         .and_then(|v| v.trim().trim_end_matches('.').parse::<u64>().ok())
+}
+
+/// The full pool decomposition (#1821) off ONE `vm_stat` read — every term
+/// is a page-count already present in that single call, so this costs
+/// nothing beyond the read the gather already does. Returns
+/// `(used_bytes, available_bytes, free_bytes, compressor_bytes)`.
+///
+/// Each figure degrades INDEPENDENTLY: a single missing label (an
+/// unfamiliar `vm_stat` build, a truncated read) takes down only the
+/// figures that need it, never panics, and never silently substitutes a
+/// wrong number for a missing one (#1286 leniency).
+///
+/// - `used_bytes` — Activity-Monitor-style: `wired + compressor +
+///   (active + inactive - purgeable)`.
+/// - `available_bytes` — the colloquial "how much is left":
+///   `free + inactive + speculative`.
+/// - `free_bytes` — truly-free pages only (`Pages free × page size`).
+/// - `compressor_bytes` — `Pages occupied by compressor × page size`,
+///   unchanged from before #1821 (the pressure-row figure), folded in here
+///   so the whole read happens through one page-size lookup.
+fn parse_pool_from_vm_stat(vm_stat: &str) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+    let page = parse_vm_stat_page_size(vm_stat);
+    let pages = |label: &str| parse_vm_stat_pages(vm_stat, label);
+    let free = pages("Pages free");
+    let active = pages("Pages active");
+    let inactive = pages("Pages inactive");
+    let speculative = pages("Pages speculative");
+    let purgeable = pages("Pages purgeable");
+    let wired = pages("Pages wired down");
+    let compressor = pages("Pages occupied by compressor");
+
+    let used_bytes = match (wired, compressor, active, inactive, purgeable) {
+        (Some(w), Some(c), Some(a), Some(i), Some(p)) => {
+            Some((w + c + (a + i).saturating_sub(p)) * page)
+        }
+        _ => None,
+    };
+    let available_bytes = match (free, inactive, speculative) {
+        (Some(f), Some(i), Some(s)) => Some((f + i + s) * page),
+        _ => None,
+    };
+    let free_bytes = free.map(|f| f * page);
+    let compressor_bytes = compressor.map(|c| c * page);
+
+    (used_bytes, available_bytes, free_bytes, compressor_bytes)
 }
 
 /// Used bytes out of `sysctl -n vm.swapusage`:
@@ -1488,16 +1721,24 @@ pub fn render_human(ledger: &ModelLedger) -> String {
         limit_desc,
         ledger.machine.state.as_str(),
     ));
+    // #1821: the cascade's own arithmetic, checkable from this line —
+    // "other tenants" plus darkmux's Σ potential is what the verdict above
+    // was actually compared against the limit with.
+    out.push_str(&format!(
+        "  other tenants {} · projected total {}\n",
+        fmt_opt(ledger.machine.other_used_bytes),
+        fmt_opt(ledger.machine.projected_total_bytes),
+    ));
     if let Some(h) = &ledger.machine.shrink_hint {
         out.push_str(&format!("  ↳ {h}\n"));
     }
     out.push_str(&format!(
-        "pressure: swap used {} · compressor {} · memory free {}{}\n",
+        "pressure: swap used {} · compressor {} · margin {}{}\n",
         fmt_opt(ledger.pressure.swap_used_bytes),
         fmt_opt(ledger.pressure.compressor_bytes),
         ledger
             .pressure
-            .memory_free_percent
+            .margin_percent
             .map(|p| format!("{p}%"))
             .unwrap_or_else(|| "—".to_string()),
         if ledger.pressure.red { "  [PRESSURE RED]" } else { "" },
@@ -1507,8 +1748,13 @@ pub fn render_human(ledger: &ModelLedger) -> String {
         "gather: {} ms (kernel counters + lms metadata only — zero model dispatches, #1286)\n",
         ledger.gather_ms
     ));
-    for w in &ledger.warnings {
-        out.push_str(&format!("warning: {w}\n"));
+    for m in &ledger.messages {
+        let tag = match m.severity {
+            Severity::Info => "info",
+            Severity::Warn => "warning",
+            Severity::Error => "error",
+        };
+        out.push_str(&format!("{tag}: {}\n", m.text));
     }
     out
 }
@@ -1560,17 +1806,24 @@ mod tests {
             ]),
             pool: Some(PoolSnapshot {
                 capacity_bytes: 137_438_953_472,
-                available_bytes: Some(3_738_599_424),
+                // #1821: 40 GB machine-wide used, against 33 GB darkmux
+                // current (the two workers below) — 7 GB of OTHER tenants,
+                // which keeps every test built on this fixture's existing
+                // Green/Amber expectations unchanged (7 GB is negligible
+                // against a 137.4 GB limit).
+                used_bytes: Some(40_000_000_000),
+                available_bytes: Some(90_000_000_000),
+                free_bytes: Some(3_738_599_424),
             }),
             budget_bytes: None,
             swap_used_bytes: Some(0),
             compressor_bytes: Some(2_000_000_000),
-            memory_free_percent: Some(43),
+            margin_percent: Some(43),
             workers: Some(vec![
                 WorkerProc { pid: 1, rss_bytes: 18_000_000_000, footprint_bytes: None },
                 WorkerProc { pid: 2, rss_bytes: 15_000_000_000, footprint_bytes: None },
             ]),
-            warnings: Vec::new(),
+            messages: Vec::new(),
         }
     }
 
@@ -1616,6 +1869,51 @@ mod tests {
         assert!(ledger.machine.shrink_hint.is_none());
     }
 
+    /// #1821 — the cascade must key on `projected_total` (darkmux's Σ
+    /// potential PLUS what everything else on the machine is holding), not
+    /// on darkmux's Σ potential alone. Same residents/potential as
+    /// `green_when_sum_potential_fits_the_limit` above (Σ potential ≈ 38.39
+    /// GB, well under the 137.44 GB limit) — the ONLY thing this test
+    /// changes is `pool.used_bytes`, driven high enough that OTHER tenants
+    /// push the projected total over the limit. Under the pre-#1821 rule
+    /// (`sum_potential <= limit`) this machine would have reported GREEN;
+    /// it must not.
+    #[test]
+    fn amber_verdict_and_shrink_hint_key_on_projected_total_not_darkmux_alone() {
+        let mut inputs = base_inputs();
+        // Σ current (the two workers) is 33 GB; pinning `used_bytes` to 135
+        // GB makes `other_used` = 135 - 33 = 102 GB — on its own already
+        // most of the 137.44 GB limit, before darkmux's own ~38.39 GB is
+        // even added.
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(135_000_000_000), ..p });
+        let ledger = compute_ledger(inputs, 1);
+
+        let sum_potential = JUDGE_POTENTIAL + DEVSTRAL_POTENTIAL;
+        assert!(
+            sum_potential <= 137_438_953_472,
+            "the darkmux-alone sum must still fit — that's the whole point of this test"
+        );
+        assert_eq!(
+            ledger.machine.other_used_bytes,
+            Some(102_000_000_000),
+            "other_used = pool.used_bytes - darkmux current, emitted so the arithmetic is checkable"
+        );
+        assert_eq!(
+            ledger.machine.projected_total_bytes,
+            Some(102_000_000_000 + sum_potential),
+            "projected_total = other_used + Σ potential"
+        );
+        assert_eq!(
+            ledger.machine.state,
+            LedgerState::Amber,
+            "other tenants push the PROJECTED total over the limit even though darkmux's own sum fits — \
+             a cascade that ignores other_used would report Green here"
+        );
+        // The shrink hint's own arithmetic must be honest about which total
+        // it is targeting — see `hint_target_key`/`shrink_hint`'s doc.
+        assert!(ledger.machine.shrink_hint.is_some());
+    }
+
     #[test]
     fn budget_wins_over_physical_pool_as_the_limit() {
         let mut inputs = base_inputs();
@@ -1629,8 +1927,13 @@ mod tests {
     fn amber_made_it_by_luck_names_a_shrink_hint() {
         // Budget between Σ current (33 GB) and Σ potential (~37.6 GB):
         // running under the limit only because lazy allocation hasn't
-        // materialized — amber, with the config shrink named.
+        // materialized — amber, with the config shrink named. `used_bytes`
+        // pinned to Σ current so `other_used` is exactly 0 (#1821) — this
+        // test is about the shrink-hint TARGET, not the other-tenants
+        // arithmetic, which `amber_verdict_and_shrink_hint_key_on_
+        // projected_total_not_darkmux_alone` below covers directly.
         let mut inputs = base_inputs();
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
         inputs.budget_bytes = Some(35_000_000_000);
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.state, LedgerState::Amber);
@@ -1690,7 +1993,7 @@ mod tests {
     #[test]
     fn red_on_memory_pressure_free_percent_signal() {
         let mut inputs = base_inputs();
-        inputs.memory_free_percent = Some(MEMORY_FREE_PERCENT_RED - 1);
+        inputs.margin_percent = Some(MARGIN_PERCENT_RED - 1);
         let ledger = compute_ledger(inputs, 1);
         assert!(ledger.pressure.red);
         assert_eq!(ledger.machine.state, LedgerState::Red);
@@ -1770,7 +2073,7 @@ mod tests {
         inputs.residents.push(resident("mystery", "mystery-model", 8_192));
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.unpriced_models, 1);
-        assert!(ledger.warnings.iter().any(|w| w.contains("mystery-model")));
+        assert!(ledger.messages.iter().any(|m| m.severity == Severity::Warn && m.text.contains("mystery-model")));
         assert_eq!(ledger.machine.state, LedgerState::Unknown);
         let mystery = ledger.models.iter().find(|m| m.model_key == "mystery-model").unwrap();
         assert_eq!(mystery.state, LedgerState::Unknown);
@@ -1791,7 +2094,7 @@ mod tests {
     fn pressure_red_wins_even_without_a_limit() {
         let mut inputs = base_inputs();
         inputs.pool = None;
-        inputs.memory_free_percent = Some(MEMORY_FREE_PERCENT_RED - 1);
+        inputs.margin_percent = Some(MARGIN_PERCENT_RED - 1);
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.state, LedgerState::Red);
     }
@@ -1827,6 +2130,74 @@ mod tests {
             Some(131_072)
         );
         assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages purgeable"), None);
+    }
+
+    // A FULL vm_stat sample (#1821) — every label the pool decomposition
+    // reads, chosen as round page counts so the expected byte math is
+    // hand-checkable rather than trusted. Deliberately a SEPARATE const
+    // from `VM_STAT` above: that one's own test pins the "label absent"
+    // case (`Pages purgeable` → `None`), which adding a line here would
+    // quietly break.
+    const VM_STAT_FULL: &str = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+        Pages free:                              1000.\n\
+        Pages active:                            2000.\n\
+        Pages inactive:                          1500.\n\
+        Pages speculative:                        300.\n\
+        Pages purgeable:                          200.\n\
+        Pages wired down:                         900.\n\
+        Pages occupied by compressor:             700.\n";
+
+    /// `used_bytes` is Activity-Monitor-style — `wired + compressor +
+    /// (active + inactive - purgeable)` — NOT the cruder implied
+    /// `capacity - free` this page used to lean on (#1821 finding: that
+    /// implied figure swung 1.8→61 GiB in one session). Page math:
+    /// `(900 + 700 + (2000 + 1500 - 200)) * 16384 = 4900 * 16384 =
+    /// 80,281,600`. `capacity - free`, by contrast, depends on a capacity
+    /// this function never receives — the two are structurally different
+    /// computations, and this test pins the ONE this function actually
+    /// performs.
+    #[test]
+    fn pool_used_bytes_is_activity_monitor_style() {
+        let (used, _available, _free, _compressor) = parse_pool_from_vm_stat(VM_STAT_FULL);
+        assert_eq!(used, Some(80_281_600));
+    }
+
+    /// `available_bytes` is the COLLOQUIAL figure — `free + inactive +
+    /// speculative` — not truly-free pages alone. Page math:
+    /// `(1000 + 1500 + 300) * 16384 = 2800 * 16384 = 45,875,200`, which is
+    /// larger than `free_bytes` alone (`1000 * 16384 = 16,384,000`) by
+    /// exactly the reclaimable inactive+speculative pages neither the old
+    /// `available_bytes` nor `kern.memorystatus_level` counted (issue
+    /// finding 7).
+    #[test]
+    fn pool_available_bytes_is_the_colloquial_figure_not_truly_free() {
+        let (_used, available, free, _compressor) = parse_pool_from_vm_stat(VM_STAT_FULL);
+        assert_eq!(available, Some(45_875_200));
+        assert_eq!(free, Some(16_384_000));
+        assert_ne!(available, free, "available and free must be DIFFERENT figures, not the same one twice");
+    }
+
+    /// The compressor figure folds into the same one-`vm_stat`-read helper
+    /// (#1821) without changing what it reports.
+    #[test]
+    fn pool_compressor_bytes_is_unchanged_by_the_fold_into_one_helper() {
+        let (_used, _available, _free, compressor) = parse_pool_from_vm_stat(VM_STAT_FULL);
+        assert_eq!(compressor, Some(11_468_800));
+    }
+
+    /// Each of the four figures degrades INDEPENDENTLY on a missing label —
+    /// never panics, never silently substitutes a wrong figure for a
+    /// missing one, and a gap in ONE figure's inputs does not take the
+    /// others down with it (#1286 leniency, applied to the new decomposition).
+    #[test]
+    fn pool_decomposition_degrades_each_figure_independently_on_a_missing_label() {
+        // No "Pages purgeable" line: `used` (which needs it) goes `None`;
+        // `available`/`free`/`compressor` (which don't) stay populated.
+        let (used, available, free, compressor) = parse_pool_from_vm_stat(VM_STAT);
+        assert_eq!(used, None, "used needs purgeable, which VM_STAT lacks");
+        assert_eq!(available, None, "available needs speculative, which VM_STAT also lacks");
+        assert_eq!(free, Some(228_186 * 16_384));
+        assert_eq!(compressor, Some(131_072 * 16_384));
     }
 
     #[test]
@@ -2048,18 +2419,19 @@ mod tests {
     }
 
     /// The one gather test: a nonexistent lms binary — every probe degrades
-    /// to warnings, the operator's real LMStudio is never touched (no ls
-    /// entries ⇒ the arch reader opens no files), and the observer-cost
-    /// stamp is populated. Kernel-counter probes run for real (read-only),
-    /// same as the MacProbe tests.
+    /// to an `error`-severity message (#1821: a probe failure means the
+    /// reading itself is untrustworthy), the operator's real LMStudio is
+    /// never touched (no ls entries ⇒ the arch reader opens no files), and
+    /// the observer-cost stamp is populated. Kernel-counter probes run for
+    /// real (read-only), same as the MacProbe tests.
     #[test]
     fn gather_with_missing_lms_degrades_loud_and_stamps_cost() {
         let ledger = gather_with_bin("/nonexistent/darkmux-test-lms-bin");
         assert!(ledger.models.is_empty());
         assert!(
-            ledger.warnings.iter().any(|w| w.contains("ps")),
-            "lms ps failure surfaces as a warning: {:?}",
-            ledger.warnings
+            ledger.messages.iter().any(|m| m.severity == Severity::Error && m.text.contains("ps")),
+            "lms ps failure surfaces as an error-severity message: {:?}",
+            ledger.messages
         );
         assert_eq!(ledger.schema_version, LEDGER_SCHEMA_VERSION);
         assert!(ledger.generated_at_ms > 1_700_000_000_000);
@@ -2092,30 +2464,36 @@ mod tests {
     }
 
     #[test]
-    fn probe_warnings_use_basename_not_home_path() {
+    fn probe_messages_use_basename_not_home_path() {
         // A configured absolute lms path must not leak off-machine through the
-        // served warnings (#1286): only the basename is embedded.
-        let mut warnings = Vec::new();
+        // served message (#1286): only the basename is embedded.
+        let mut messages = Vec::new();
         let got = bounded_stdout(
             "/Users/someone/private/bin/lms-does-not-exist",
             &["ps", "--json"],
             "ps",
             SYS_PROBE_BOUND,
-            &mut warnings,
+            &mut messages,
         );
         assert!(got.is_none());
-        assert_eq!(warnings.len(), 1);
-        let w = &warnings[0];
-        assert!(!w.contains("/Users/"), "no home path in the served warning: {w}");
-        assert!(w.contains("lms-does-not-exist"), "basename still names the binary: {w}");
+        assert_eq!(messages.len(), 1);
+        let m = &messages[0];
+        assert_eq!(m.severity, Severity::Error, "a probe failure is error severity (#1821)");
+        assert!(!m.text.contains("/Users/"), "no home path in the served message: {}", m.text);
+        assert!(m.text.contains("lms-does-not-exist"), "basename still names the binary: {}", m.text);
         assert_eq!(bin_label("/Users/x/lms"), "lms");
         assert_eq!(bin_label("vm_stat"), "vm_stat");
     }
 
     #[test]
     fn sum_potential_equal_to_limit_is_green_inclusive() {
-        // Σ potential == limit: the green arm's `≤` is inclusive at equality.
+        // projected_total == limit: the green arm's `≤` is inclusive at
+        // equality. `used_bytes` pinned to Σ current so `other_used` is
+        // exactly 0 (#1821) — projected_total then equals Σ potential
+        // exactly, isolating the equality-boundary claim this test makes
+        // from the separate other-tenants arithmetic.
         let mut inputs = base_inputs();
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
         inputs.budget_bytes = Some(JUDGE_POTENTIAL + DEVSTRAL_POTENTIAL);
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.state, LedgerState::Green);
@@ -2124,10 +2502,10 @@ mod tests {
 
     #[test]
     fn memory_free_exactly_at_threshold_is_not_red() {
-        // memory_free_percent == 15: the test is strict `<`, so equality is
+        // margin_percent == 15: the test is strict `<`, so equality is
         // NOT red.
         let mut inputs = base_inputs();
-        inputs.memory_free_percent = Some(MEMORY_FREE_PERCENT_RED);
+        inputs.margin_percent = Some(MARGIN_PERCENT_RED);
         let ledger = compute_ledger(inputs, 1);
         assert!(!ledger.pressure.red);
         assert_eq!(ledger.machine.state, LedgerState::Green);
@@ -2189,8 +2567,11 @@ mod tests {
         // Property: derive the hinted ctx, reload the target at it, and the
         // recomputed ledger must be Green. Pins the floor-rounding DIRECTION —
         // a future ceil-flip that shipped a hint landing just shy of green
-        // would fail here.
+        // would fail here. `used_bytes` pinned to Σ current so `other_used`
+        // is exactly 0 (#1821) — this property is about the ROUNDING
+        // direction, not the other-tenants arithmetic.
         let mut inputs = base_inputs();
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
         inputs.budget_bytes = Some(35_000_000_000);
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.state, LedgerState::Amber);
@@ -2198,6 +2579,7 @@ mod tests {
         let new_ctx = parse_hint_ctx(hint).expect("covering hint names a ctx");
 
         let mut applied = base_inputs();
+        applied.pool = applied.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
         applied.budget_bytes = Some(35_000_000_000);
         for r in &mut applied.residents {
             if r.model_key == "devstral" {
@@ -2467,9 +2849,10 @@ mod tests {
     /// #1819 decision 2: `estimated_models` counts separately from
     /// `unpriced_models` — an estimated row IS priced (it contributes to
     /// `sum_potential`), so it must never inflate the undercount counter.
-    /// A dedicated warning names the estimated resident(s) too.
+    /// A dedicated message names the estimated resident(s) too — `info`
+    /// severity (#1821): the estimate is a disclosure, not a degradation.
     #[test]
-    fn estimated_models_counted_separately_from_unpriced_with_its_own_warning() {
+    fn estimated_models_counted_separately_from_unpriced_with_its_own_message() {
         let mut inputs = base_inputs();
         inputs
             .catalog
@@ -2480,16 +2863,20 @@ mod tests {
         assert_eq!(ledger.machine.estimated_models, 1);
         assert_eq!(ledger.machine.unpriced_models, 0);
         assert!(
-            ledger.warnings.iter().any(|w| w.contains("ESTIMATE") && w.contains("phi-4-gguf")),
-            "a dedicated estimate warning names the resident: {:?}",
-            ledger.warnings
+            ledger
+                .messages
+                .iter()
+                .any(|m| m.severity == Severity::Info && m.text.contains("ESTIMATE") && m.text.contains("phi-4-gguf")),
+            "a dedicated info-severity estimate message names the resident: {:?}",
+            ledger.messages
         );
-        // The undercount warning (a DIFFERENT fact) must not fire for an
-        // estimated resident — it has a potential, just not a measured one.
+        // The undercount message (a DIFFERENT fact, `warn` severity) must
+        // not fire for an estimated resident — it has a potential, just not
+        // a measured one.
         assert!(
-            !ledger.warnings.iter().any(|w| w.contains("undercount") && w.contains("phi-4-gguf")),
+            !ledger.messages.iter().any(|m| m.text.contains("undercount") && m.text.contains("phi-4-gguf")),
             "an estimated resident is not an undercounted one: {:?}",
-            ledger.warnings
+            ledger.messages
         );
     }
 
@@ -2526,8 +2913,18 @@ mod tests {
         let inputs = LedgerInputs {
             residents: vec![resident("microsoft/phi-4", "phi-4-gguf", 131_072)],
             catalog: vec![CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) }],
-            // No arch entry ⇒ estimated.
-            pool: Some(PoolSnapshot { capacity_bytes: 137_438_953_472, available_bytes: Some(1) }),
+            // No arch entry ⇒ estimated. `used_bytes: Some(0)` keeps
+            // `other_used` (and so `projected_total`) at exactly
+            // `sum_potential` — this test is about the shrink-hint TARGET,
+            // not the #1821 other-tenants arithmetic, and a `None` here
+            // would land the machine at Unknown instead of the Amber this
+            // test needs.
+            pool: Some(PoolSnapshot {
+                capacity_bytes: 137_438_953_472,
+                used_bytes: Some(0),
+                available_bytes: Some(1),
+                free_bytes: Some(1),
+            }),
             budget_bytes: Some(34_646_682_097), // potential − 2 GB ⇒ amber
             workers: Some(Vec::new()),
             ..Default::default()
@@ -2625,7 +3022,7 @@ mod tests {
             mystery.get("potential_source").is_none(),
             "no potential at all ⇒ the field is OMITTED, not null: {mystery}"
         );
-        assert_eq!(v["schema_version"], "1.1");
+        assert_eq!(v["schema_version"], "2.0");
         assert_eq!(v["machine"]["estimated_models"], 1);
     }
 

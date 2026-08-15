@@ -20,8 +20,8 @@ const BASE: MachineResources = {
   gather_ms: 42,
   limit_bytes: 137438953472,
   limit_source: "physical_pool",
-  pool: { capacity_bytes: 137438953472, available_bytes: 3738599424 },
-  pressure: { swap_used_bytes: 0, compressor_bytes: 0, memory_free_percent: 88, red: false },
+  pool: { capacity_bytes: 137438953472, used_bytes: 69300000000, available_bytes: 72000000000, free_bytes: 3738599424 },
+  pressure: { swap_used_bytes: 0, compressor_bytes: 0, margin_percent: 88, red: false },
   models: [
     {
       identifier: "darkmux:priced-model",
@@ -50,7 +50,7 @@ const BASE: MachineResources = {
   ],
   machine: { potential_bytes: 19272177280, unpriced_models: 1, estimated_models: 0, current_bytes: 20841952256, state: "unknown" },
   attribution: "per_process",
-  warnings: [],
+  messages: [],
   cache_ttl_ms: 2000,
 };
 
@@ -396,13 +396,20 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     expect(kv.textContent).not.toContain("137.44");
   });
 
-  it("distinguishes pool CAPACITY from pool FREE — they are different fields", () => {
+  it("distinguishes pool CAPACITY, USED, and AVAILABLE — three different fields (#1821)", () => {
     const { container } = renderRegion(BASE);
     const kv = container.querySelector(".mm-kv--machine")!;
-    // 137438953472 vs 3738599424 — rendering `available` where `capacity`
-    // belongs was the third undetected mutation.
-    expect(kv.textContent).toContain("128.00 GiB");
-    expect(kv.textContent).toContain("3.48 GiB");
+    // capacity 137438953472, used 69300000000, available 72000000000 — all
+    // three must render as DIFFERENT numbers, not one figure repeated.
+    expect(kv.textContent).toContain("128.00 GiB"); // capacity
+    expect(kv.textContent).toContain("64.54 GiB"); // used
+    expect(kv.textContent).toContain("67.06 GiB"); // available (colloquial)
+    // free_bytes (3738599424 -> "3.48 GiB") stays in the PAYLOAD but is
+    // deliberately not given prime space in this row (operator-approved
+    // #1821 addendum) — two figures both reading "how much is left" was
+    // the defect the rename fixed, not something to preserve under a new
+    // label.
+    expect(kv.textContent).not.toContain("3.48 GiB");
   });
 
   it("renders the attribution footer — the observer's own cost disclosure", () => {
@@ -511,7 +518,10 @@ describe("MachineHealthRegion — the pressure tiles explain themselves on deman
     const btn = container.querySelector(".mm-odo-i")!;
     expect(btn.tagName).toBe("BUTTON");
     expect(btn.getAttribute("type")).toBe("button");
-    expect(btn.getAttribute("aria-label")).toMatch(/memory free/i);
+    // #1821 (operator-approved rename): this tile's label is "margin", not
+    // "memory free" — kern.memorystatus_level is neither free nor available
+    // memory (see the tile's own note test in machineGauge.test.ts).
+    expect(btn.getAttribute("aria-label")).toMatch(/margin/i);
   });
 });
 
@@ -702,5 +712,54 @@ describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its prove
     // of whether the whole-machine cascade could reach a verdict.
     const estimatedRow = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("phi-4"))!;
     expect(estimatedRow.querySelector(".mm-row-chip.is-estimated")).not.toBeNull();
+  });
+});
+
+describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure must not look like a warning)", () => {
+  function findWarnLamp(container: HTMLElement) {
+    return [...container.querySelectorAll(".mm-lamp")].find((l) => l.textContent?.includes("WARN"))!;
+  }
+
+  it("an info-only message does NOT light the WARN lamp", () => {
+    const infoOnly: MachineResources = {
+      ...BASE,
+      messages: [{ severity: "info", text: "N models priced by ESTIMATE" }],
+    };
+    const { container } = renderRegion(infoOnly);
+    expect(findWarnLamp(container).className).not.toMatch(/is-lit-/);
+  });
+
+  it("the inverted case: a warn-severity message DOES light the WARN lamp", () => {
+    const withWarn: MachineResources = {
+      ...BASE,
+      messages: [{ severity: "warn", text: "resident model(s) unpriceable — undercounts" }],
+    };
+    const { container } = renderRegion(withWarn);
+    expect(findWarnLamp(container).className).toMatch(/is-lit-warn/);
+  });
+
+  it("an error-severity message also lights the WARN lamp", () => {
+    const withError: MachineResources = {
+      ...BASE,
+      messages: [{ severity: "error", text: "`lms ps` probe failed" }],
+    };
+    const { container } = renderRegion(withError);
+    expect(findWarnLamp(container).className).toMatch(/is-lit-warn/);
+  });
+
+  it("the message card renders each entry with a severity-keyed class, not a uniform amber treatment", () => {
+    const mixed: MachineResources = {
+      ...BASE,
+      messages: [
+        { severity: "info", text: "estimate disclosure" },
+        { severity: "warn", text: "undercount warning" },
+      ],
+    };
+    const { container } = renderRegion(mixed);
+    expect(container.querySelector(".memmsg-info")).not.toBeNull();
+    expect(container.querySelector(".memmsg-warn")).not.toBeNull();
+    // The inverted case: an info message must not ALSO carry the warn class.
+    const infoMsg = [...container.querySelectorAll(".memmsg")].find((m) => m.textContent?.includes("estimate disclosure"))!;
+    expect(infoMsg.className).not.toMatch(/memmsg-warn/);
   });
 });

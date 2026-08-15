@@ -306,7 +306,11 @@ export interface LampInputs {
   pressureRed: boolean;
   overLimit: boolean;
   unprivedCount: number;
-  warningsCount: number;
+  /** #1821 — count of `warn` + `error` severity messages ONLY. An `info`
+   * disclosure (the #1819 estimate note) must NOT light this lamp — that
+   * was the whole defect: a working-as-designed disclosure lit the same
+   * amber WARN lamp as a real degradation. */
+  alarmMessagesCount: number;
   resourcesErrored: boolean;
   residencyChanged: boolean;
 }
@@ -352,7 +356,7 @@ export function deriveLamps(inputs: LampInputs): LampView[] {
       word: "PRESSURE",
       lit: inputs.pressureRed,
       severity: "bad",
-      title: "memory_free_percent trigger",
+      title: "margin_percent trigger",
     },
     {
       key: "overLimit",
@@ -370,10 +374,10 @@ export function deriveLamps(inputs: LampInputs): LampView[] {
     },
     {
       key: "warn",
-      word: inputs.warningsCount > 0 ? `⚠ WARN ×${inputs.warningsCount}` : "WARN",
-      lit: inputs.warningsCount > 0,
+      word: inputs.alarmMessagesCount > 0 ? `⚠ WARN ×${inputs.alarmMessagesCount}` : "WARN",
+      lit: inputs.alarmMessagesCount > 0,
       severity: "warn",
-      title: "full warning text below",
+      title: "full message text below (warn/error severity only — a disclosure does not light this)",
     },
   ];
 }
@@ -410,20 +414,25 @@ export function digitCells(s: string): string[] {
  * one-decimal `gaugeValueParts` — these are k/v figures, not the glance
  * layer. */
 export function odometerTiles(pressure: MachineResources["pressure"]): OdometerView[] {
-  const freeText =
-    pressure.memory_free_percent != null && Number.isFinite(Number(pressure.memory_free_percent))
-      ? String(Math.round(Number(pressure.memory_free_percent)))
+  const marginText =
+    pressure.margin_percent != null && Number.isFinite(Number(pressure.margin_percent))
+      ? String(Math.round(Number(pressure.margin_percent)))
       : "—";
   const swap = splitFormatted(memBytes(pressure.swap_used_bytes));
   const comp = splitFormatted(memBytes(pressure.compressor_bytes));
   return [
     {
-      digits: digitCells(freeText),
-      unit: "% free",
-      label: "memory free",
-      // The one figure here that can put the machine in Red, and the one
-      // most easily misread: it sits beside two BYTE COUNTS but is not one.
-      note: "the only figure that can trigger RED — kern.memorystatus_level, the kernel's own 0–100 pressure headroom, not a byte count",
+      digits: digitCells(marginText),
+      unit: "% margin",
+      label: "margin",
+      // #1821 (operator-approved rename): this tile used to read "% free"
+      // — measured live, the SAME instant, this figure read 82% while
+      // truly-free pages read 30.8%. Neither "free" nor "available"
+      // belongs on it; `margin` (this project's own NASA register — mass
+      // margin, power margin, propellant margin) is honest: it is
+      // headroom before the kernel sheds load, not a byte count, and it
+      // is still the only figure that can trigger RED.
+      note: "the only figure that can trigger RED — kern.memorystatus_level = (capacity − wired − compressor) / capacity, the kernel's own 0–100 pressure headroom. Not free memory and not a byte count — it read 82% margin here while truly-free pages read 30.8%",
     },
     {
       digits: digitCells(swap.num),

@@ -35,11 +35,11 @@ const LEDGER = {
   cache_ttl_ms: 2000,
   limit_bytes: 137438953472,
   limit_source: 'physical_pool',
-  pool: { capacity_bytes: 137438953472, available_bytes: 3738599424 },
+  pool: { capacity_bytes: 137438953472, used_bytes: 69300000000, available_bytes: 63000000000, free_bytes: 3738599424 },
   pressure: {
     swap_used_bytes: 0,
     compressor_bytes: 2000000000,
-    memory_free_percent: 43,
+    margin_percent: 43,
     red: false,
   },
   models: [
@@ -80,7 +80,10 @@ const LEDGER = {
   },
   attribution: 'per_process',
   attribution_note: `2 worker(s) rank-matched ${XSS}`,
-  warnings: [`probe degraded ${XSS}`],
+  // #1821: `warnings: string[]` -> `messages: [{severity, text}]`. This
+  // fixture's hostile string carries `warn` severity so the existing
+  // `.memmsg-warn` assertion below still exercises the XSS-inertness path.
+  messages: [{ severity: 'warn', text: `probe degraded ${XSS}` }],
 };
 
 function mockMachineMemory(page, body) {
@@ -152,8 +155,9 @@ test('machine lens renders the ledger inertly — gauge, lamps, odometer, rows, 
   await expect(page.locator('#memstamp')).toContainText('gather 42 ms');
   // The hostile per-model state string degraded to the unknown class.
   expect(await page.locator('.mm-row-cur.is-unknown').count()).toBe(1);
-  // The warning card still renders full text.
-  await expect(page.locator('.memwarn').first()).toContainText('probe degraded');
+  // The message card still renders full text, with severity-keyed styling
+  // (#1821 — `.memmsg-warn`, not the old uniformly-amber `.memwarn`).
+  await expect(page.locator('.memmsg-warn').first()).toContainText('probe degraded');
 
   await assertInert(page, 'machine lens');
   expect(pageErrors, `page errors: ${pageErrors.join('\n')}`).toEqual([]);

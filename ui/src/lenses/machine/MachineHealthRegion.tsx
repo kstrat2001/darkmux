@@ -252,12 +252,17 @@ function LampRow({
   resourcesErrored: boolean;
   residencyChanged: boolean;
 }) {
+  // #1821: the WARN lamp counts `warn` + `error` severity messages ONLY —
+  // an `info` disclosure (the #1819 estimate note) must not light it.
+  const alarmMessagesCount = Array.isArray(resources.messages)
+    ? resources.messages.filter((m) => m.severity === "warn" || m.severity === "error").length
+    : 0;
   const lamps = deriveLamps({
     state: resources.machine.state,
     pressureRed: !!resources.pressure?.red,
     overLimit: isOverLimit(resources.machine.current_bytes, resources.limit_bytes),
     unprivedCount: Number(resources.machine.unpriced_models) || 0,
-    warningsCount: Array.isArray(resources.warnings) ? resources.warnings.length : 0,
+    alarmMessagesCount,
     resourcesErrored,
     residencyChanged,
   });
@@ -571,7 +576,10 @@ export function MachineHealthRegion({
 
   const b = resources;
   const stale = resourcesErrored; // a poll failed, but we still have a last-good payload (#1812)
-  const warnings = Array.isArray(b.warnings) ? b.warnings : [];
+  // #1821: replaces `warnings: string[]` — each entry now carries a
+  // severity, rendered below (an `info` disclosure must not look like a
+  // `warn`/`error`).
+  const messages = Array.isArray(b.messages) ? b.messages : [];
 
   return (
     <>
@@ -603,8 +611,20 @@ export function MachineHealthRegion({
           retiring the machine stage's last byte-exact parity tie to legacy.
           Operator call, still not a drive-by. */}
       <div className="mm-kv mm-kv--machine">
+        {/* #1821 (operator-approved naming): this row used to read
+            `pool free <memBytes(pool.available_bytes)>` — truly-free pages,
+            sitting a few inches from a "% free" pressure tile that measured
+            something else entirely (82% margin vs 30.8% truly-free, same
+            instant). `used` and `available` now name what they actually
+            are; `available` (the colloquial "how much is left" —
+            free + inactive + speculative) is the headline figure in the
+            slot `pool free` used to occupy. Truly-free pages (`free_bytes`)
+            stay in the payload but are deliberately NOT given prime space
+            here — two figures both reading as "how much is left" was the
+            defect being fixed, not something to preserve under a new name. */}
         limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b>{" "}
-        · pool free <b>{memBytes(b.pool?.available_bytes)}</b> · unpriced{" "}
+        · used <b>{memBytes(b.pool?.used_bytes)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>{" "}
+        · unpriced{" "}
         <b>{Number(b.machine.unpriced_models) || 0} model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}</b>
         {/* #1819: the same row that already discloses the genuinely-unpriced
             count discloses the ESTIMATED count too — a different fact
@@ -639,14 +659,20 @@ export function MachineHealthRegion({
         <ModelRows rows={residencyRows} nowMs={nowMs} utilityModelId={utilityModelId} machineState={b.machine.state} />
       </div>
 
-      {warnings.length > 0 && (
+      {/* #1821: `messages` replaces `warnings` — each entry carries a
+          severity, and an `info` disclosure (the #1819 estimate note) must
+          NOT render with the same alarm treatment as a `warn`/`error`.
+          `.memmsg-*` in styles.css keys color+icon off the severity; a
+          plain `.memwarn` uniformly-amber treatment is exactly the defect
+          this replaces. */}
+      {messages.length > 0 && (
         <div className="memcard">
           <div className="memhdr">
-            <div className="memname">warnings</div>
+            <div className="memname">messages</div>
           </div>
-          {warnings.map((w, i) => (
-            <div className="memwarn" key={i}>
-              ⚠ {w}
+          {messages.map((m, i) => (
+            <div className={`memmsg memmsg-${m.severity}`} key={i}>
+              {m.severity === "error" ? "✕" : m.severity === "warn" ? "⚠" : "ℹ"} {m.text}
             </div>
           ))}
         </div>

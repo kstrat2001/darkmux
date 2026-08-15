@@ -31,12 +31,12 @@ function resources(overrides: Partial<MachineResources> = {}): MachineResources 
     gather_ms: 42,
     limit_bytes: 137438953472, // 128 GiB, decimal ~137.44 GB
     limit_source: "physical_pool",
-    pool: { capacity_bytes: 137438953472, available_bytes: 3738599424 },
-    pressure: { swap_used_bytes: 5453843005, compressor_bytes: 890290176, memory_free_percent: 88, red: false },
+    pool: { capacity_bytes: 137438953472, used_bytes: 69300000000, available_bytes: 72000000000, free_bytes: 3738599424 },
+    pressure: { swap_used_bytes: 5453843005, compressor_bytes: 890290176, margin_percent: 88, red: false },
     models: [],
     machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, current_bytes: 19506757632, state: "green" },
     attribution: "per_process",
-    warnings: [],
+    messages: [],
     cache_ttl_ms: 2000,
     ...overrides,
   };
@@ -178,7 +178,11 @@ describe("computeGaugeGeometry", () => {
 
   it("clamps an overcommitted tick to the line and flags it — Σ potential > scale (machine-Amber's own condition)", () => {
     const g = computeGaugeGeometry(
-      resources({ limit_bytes: 10000000000, pool: { capacity_bytes: 10000000000, available_bytes: 1 }, machine: { potential_bytes: 15000000000, unpriced_models: 0, estimated_models: 0, current_bytes: 8000000000, state: "amber" } }),
+      resources({
+        limit_bytes: 10000000000,
+        pool: { capacity_bytes: 10000000000, used_bytes: 8000000000, available_bytes: 1, free_bytes: 1 },
+        machine: { potential_bytes: 15000000000, unpriced_models: 0, estimated_models: 0, current_bytes: 8000000000, state: "amber" },
+      }),
     );
     expect(g.overcommitted).toBe(true);
     expect(g.commitPct).toBe(100); // clamped to the line, not 150
@@ -235,7 +239,7 @@ describe("redlineLit / isOverLimit / gaugeFaceCaption — the redline's provenan
 });
 
 describe("deriveLamps — every lamp keys on exactly one field", () => {
-  const base = { state: "green", pressureRed: false, overLimit: false, unprivedCount: 0, warningsCount: 0, resourcesErrored: false, residencyChanged: false };
+  const base = { state: "green", pressureRed: false, overLimit: false, unprivedCount: 0, alarmMessagesCount: 0, resourcesErrored: false, residencyChanged: false };
 
   it("all six lamps render, unlit, on a clean green payload", () => {
     const lamps = deriveLamps(base);
@@ -289,8 +293,8 @@ describe("deriveLamps — every lamp keys on exactly one field", () => {
     expect(deriveLamps({ ...base, resourcesErrored: true }).find((l) => l.key === "stale")!.lit).toBe(true);
   });
 
-  it("WARN keys only on warningsCount, names the count", () => {
-    const on = deriveLamps({ ...base, warningsCount: 3 }).find((l) => l.key === "warn")!;
+  it("WARN keys only on alarmMessagesCount (warn + error severities), names the count", () => {
+    const on = deriveLamps({ ...base, alarmMessagesCount: 3 }).find((l) => l.key === "warn")!;
     expect(on.lit).toBe(true);
     expect(on.word).toBe("⚠ WARN ×3");
   });
@@ -301,11 +305,11 @@ describe("deriveLamps — every lamp keys on exactly one field", () => {
 });
 
 describe("odometerTiles", () => {
-  it("splits memory free / swap / compressor into digit cells with detail-layer (two-decimal) precision", () => {
-    const tiles = odometerTiles({ swap_used_bytes: 5453843005, compressor_bytes: 727711744, memory_free_percent: 87, red: false });
+  it("splits margin / swap / compressor into digit cells with detail-layer (two-decimal) precision", () => {
+    const tiles = odometerTiles({ swap_used_bytes: 5453843005, compressor_bytes: 727711744, margin_percent: 87, red: false });
     expect(tiles[0].digits).toEqual(["8", "7"]);
-    expect(tiles[0].unit).toBe("% free");
-    expect(tiles[0].label).toBe("memory free");
+    expect(tiles[0].unit).toBe("% margin");
+    expect(tiles[0].label).toBe("margin");
     expect(tiles[1].digits.join("")).toBe("5.08");
     expect(tiles[1].unit).toBe("GiB");
     expect(tiles[2].digits.join("")).toBe("694");
@@ -317,8 +321,8 @@ describe("odometerTiles", () => {
    * SAY something — the permanent 8.5px line they replaced could not. These
    * assert the two facts a reader most needs and most easily gets wrong.
    */
-  it("the memory-free note says it is the sole red trigger AND that it is not a byte count", () => {
-    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, memory_free_percent: 87, red: false });
+  it("the margin note says it is the sole red trigger AND that it is not a byte count", () => {
+    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, margin_percent: 87, red: false });
     expect(tiles[0].note).toMatch(/only figure that can trigger RED/i);
     expect(tiles[0].note).toMatch(/not a byte count/i);
     // The inverted case: the two byte-count tiles must NOT claim to be triggers.
@@ -330,13 +334,13 @@ describe("odometerTiles", () => {
     // The operator hit this exactly: "Is compressor the 'utility' model?"
     // One letter apart, three rows apart on the page. The label stays (the
     // CLI and JSON use it); the note is where they get told apart.
-    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, memory_free_percent: 50, red: false });
+    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, margin_percent: 50, red: false });
     expect(tiles[2].note).toMatch(/macOS/);
     expect(tiles[2].note).toMatch(/compactor/);
   });
 
   it("renders a single — cell rather than a fabricated 0% when the percent is missing", () => {
-    const tiles = odometerTiles({ swap_used_bytes: 0, compressor_bytes: 0, memory_free_percent: null as unknown as number, red: false });
+    const tiles = odometerTiles({ swap_used_bytes: 0, compressor_bytes: 0, margin_percent: null as unknown as number, red: false });
     expect(tiles[0].digits).toEqual(["—"]);
   });
 });

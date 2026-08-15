@@ -6,12 +6,14 @@
   "limit_source": "physical_pool",
   "pool": {
     "capacity_bytes": 137438953472,
-    "available_bytes": 14452359168
+    "used_bytes": 69300000000,
+    "available_bytes": 63000000000,
+    "free_bytes": 14452359168
   },
   "pressure": {
     "swap_used_bytes": 8308129792,
     "compressor_bytes": 1121665024,
-    "memory_free_percent": 94,
+    "margin_percent": 94,
     "red": false
   },
   "models": [
@@ -48,6 +50,6 @@
   },
   "attribution": "per_process",
   "attribution_note": "nostrud anim pariatur do nostrud cillum cupidatat duis fugiat nostrud ullamco anim pariatur amet amet quis voluptate proid",
-  "warnings": [],
+  "messages": [],
   "cache_ttl_ms": 2000
 }

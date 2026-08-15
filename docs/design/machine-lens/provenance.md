@@ -17,7 +17,7 @@ pixel), which is what re-verification actually checks.
 
 | Endpoint | Producer | What it carries |
 |---|---|---|
-| `GET /machine/resources` | `darkmux_profiles::model_ledger::gather()` — served by `machine_resources_handler` (`crates/darkmux-serve/src/lib.rs`), identical to `darkmux machine resources --json` | The memory ledger: residents, potential vs current, pool/limit, pressure, warnings |
+| `GET /machine/resources` | `darkmux_profiles::model_ledger::gather()` — served by `machine_resources_handler` (`crates/darkmux-serve/src/lib.rs`), identical to `darkmux machine resources --json` | The memory ledger: residents, potential vs current, pool/limit, pressure, severity-tagged messages |
 | `GET /machine/specs` | `machine_specs_handler` (same file) | Hardware line, machine identity, utility-tier model |
 
 The gather runs **zero model dispatches** — it reads `lms ps --json` /
@@ -72,16 +72,16 @@ name (`memoryLedgerLines.ts` and its tests).
 | ⑥ | `128 / LIMIT` at the max position (+ the redline end-cap) | `limit_bytes` + `limit_source` | limit resolution: `budget > physical pool > none` (`compute_ledger`, `model_ledger.rs:383`); word is LIMIT, or BUDGET when `limit_source:"budget"` | `limit == pool.capacity`, source `physical_pool` ✓; **budget arm currently unreachable — finding 4** |
 | ⑦ | `╌ committed 42.06 GiB (+1 unpriced)`, or `╌ committed … (1 estimated)` since #1819 | `machine.potential_bytes`, `machine.unpriced_models`, `machine.estimated_models` | Σ of **priced** models' potential — this now includes ESTIMATED rows, not just measured ones (#1819); `unpriced_models` (genuinely unpriceable, uncounted) and `estimated_models` (counted, but via a labeled guess) are DIFFERENT facts and never collapse into one word — see "The #1819 estimate" below | Σ priced = 45163330707 = field ✓; count 1 ✓ |
 | ⑧ | `UNKNOWN` state chip | `machine.state` | uppercased verbatim (`modelLines`/port uppercases the string, not CSS) | cascade verified — see *the state cascade* below |
-| ⑨ | tell-tale lamps | `machine.state` (STATE), `unpriced_models` (UNPRICED), `pressure.red` (PRESSURE), fetch-failure + `generated_at_ms` age (STALE), `warnings.length` (WARN), `current ≥ limit` (OVER LIMIT — see PROPOSAL §redline) | each lamp keys on exactly one named field; lit = word + border + glow, never color alone | field values reproduce the lit set shown ✓ |
-| ⑩ | `87 % free — memory free` | `pressure.memory_free_percent` | sysctl **`kern.memorystatus_level`** — the kernel's pressure headroom, 0–100. Sole red trigger: `pressure.red = level < 15` (`MEMORY_FREE_PERCENT_RED`, `model_ledger.rs:122`) | live sysctl read = 87 = field ✓; 87 ≥ 15 → `red: false` ✓ |
+| ⑨ | tell-tale lamps | `machine.state` (STATE), `unpriced_models` (UNPRICED), `pressure.red` (PRESSURE), fetch-failure + `generated_at_ms` age (STALE), `messages[]` filtered to `warn`/`error` severity (WARN — **#1821, was `warnings.length`**), `current ≥ limit` (OVER LIMIT — see PROPOSAL §redline) | each lamp keys on exactly one named field; lit = word + border + glow, never color alone. The WARN lamp's condition changed shape in #1821: an `info`-severity message (the #1819 estimate disclosure) no longer counts — only `warn`/`error` do, which is the actual fix to a working-as-designed disclosure lighting an alarm lamp | field values reproduce the lit set shown ✓; `alarmMessagesCount` unit-tested against a mixed-severity payload ✓ |
+| ⑩ | `82 % margin — margin` (was `% free — memory free`) | `pressure.margin_percent` (renamed from `memory_free_percent`, #1821) | sysctl **`kern.memorystatus_level`** = `(capacity − wired − compressor) / capacity` — the kernel's own pressure headroom, 0–100. Sole red trigger: `pressure.red = level < 15` (`MARGIN_PERCENT_RED`, `model_ledger.rs`). **Renamed from "free" (operator-approved, #1821):** live, the same instant, this read 82% while truly-free pages read 30.8% — a 51-point gap under a label that implied "how much RAM is left". `margin` borrows this project's own NASA register (mass margin, power margin, propellant margin); the redline is where margin runs out | live sysctl read = 82 = field ✓; 82 ≥ 15 → `red: false` ✓; cross-checked against truly-free (30.8%) the same instant — finding 8 |
 | ⑪ | `5.03 GiB — swap used` | `pressure.swap_used_bytes` | sysctl `vm.swapusage` (used), parsed by `parse_swapusage_used_bytes` | rendered = memBytes(field) ✓ — a monotonic high-water mark: reports, never alarms (by design, `model_ledger.rs:462`) |
 | ⑫ | `1220 MiB — compressor` | `pressure.compressor_bytes` | `vm_stat` "Pages occupied by compressor" × page size | rendered = memBytes(field) ✓; same reports-never-alarms rule |
-| ⑬ | `limit source · pool 128.00 GiB · pool free · unpriced` detail row | `limit_source`, `pool.capacity_bytes`, `pool.available_bytes`, `machine.unpriced_models` | capacity = sysctl `hw.memsize`; **available = `vm_stat` "Pages free" × page size** — deliberately conservative (finding 2) | capacity/2³⁰ = 128.00 ✓, agreeing with ①; pool free 1.84 GiB = live field ✓ |
+| ⑬ | `limit source · pool 128.00 GiB · used 64.54 GiB · available 67.06 GiB · unpriced` detail row (was `· pool free ·`) | `limit_source`, `pool.capacity_bytes`, `pool.used_bytes`, `pool.available_bytes`, `machine.unpriced_models` | **#1821 — a real machine-memory decomposition, one `vm_stat` read, zero added probe cost:** `used = wired + compressor_occupied + (active + inactive − purgeable)` (Activity-Monitor-style); `available = free + inactive + speculative` (the colloquial "how much is left" — the figure this row now leads with, in the slot `pool free` used to occupy); `free = "Pages free" × page size` (truly-free pages — kept in the payload as `pool.free_bytes`, deliberately NOT rendered in this row: two figures both reading "how much is left" was the defect finding 7 fixed, not something to preserve under a new label) | capacity/2³⁰ = 128.00 ✓, agreeing with ①; live `used` 69.3 GiB cross-checked against `top`'s ~66 GiB used, seconds apart ✓; `used + free` ≈ capacity (69.3 + 58.7 ≈ 128) ✓ |
 | ⑭ | model name + `DARKMUX`/`USER` chip | `models[].identifier`, `.owner` | owner = namespace test `swap::is_darkmux_owned(identifier)` — the `darkmux:` prefix IS the ownership record | prefix ⇔ owner on both residents ✓ |
 | ⑮ | `ctx · weights · kv@ctx · potential · current` | `models[].loaded_ctx`, `.weights_bytes`, `.kv_bytes_at_ctx`, `.potential_bytes`, `.current_bytes` | ctx from `lms ps`; weights from `lms ls` `sizeBytes`; the rest derived — see *per-model math* below | all identities verified ✓ |
 | ⑯ | `UNPRICED · potential unknown` chip | `models[].potential_bytes == null` (the UI keys on this ONE field, `MachineHealthRegion.tsx`'s `pot == null` — `kv_per_token_bytes` staying `null` is a consequence of the same unreadable-arch-facts cause, not a second condition the component itself tests) | no readable arch facts AND no catalog size either → kv, potential stay `null`; the bar/dial draws **no committed extent** (absence, never zero). **Since #1819 this is the NARROWER case** — see "The #1819 estimate" below for the sibling `ESTIMATED` chip, which DOES draw a committed extent | a resident with no catalog entry either (the genuinely unpriceable case): all three null ✓ |
 | ⑰ | `kv@ctx — no arch facts` | same null | `modelLines()` renders the reason, not a dash alone | ✓ |
-| ⑱ | warning text | `warnings[]` | composed server-side in `compute_ledger` (`model_ledger.rs:368`) — verbatim on the page, never summarized | text matches byte-for-byte ✓ |
+| ⑱ | message text, severity-keyed | `messages[]` (renamed AND retyped from `warnings[]`, #1821 — `LEDGER_SCHEMA_VERSION` 1.1 → 2.0) | composed server-side in `compute_ledger`, each entry `{severity, text}` — `info` (a disclosure, e.g. the #1819 estimate note), `warn` (a real degradation, e.g. the unpriceable undercount), `error` (the reading itself is untrustworthy — a probe/enumeration failure). Rendered verbatim, never summarized, with the severity carried as a CSS class (`.memmsg-info`/`.memmsg-warn`/`.memmsg-error`) rather than one uniform amber treatment | text matches byte-for-byte ✓; severity round-trips through JSON ✓; an `info` message renders visually distinct from `warn`/`error` (component-tested) ✓ |
 | ⑲ | attribution line | `attribution`, `attribution_note` | `attribute_current()`'s self-documenting degradation ladder (per-process RSS → rank-matched → estimated split → unavailable) | note matches live payload ✓ |
 | ⑳ | `snapshot Ns ago · gather 438 ms (zero model dispatches) · server cache 2000 ms · polled every 5s` | `generated_at_ms`, `gather_ms`, `cache_ttl_ms` + client constant | the observer stamps its own cost into the payload — "the gather was negligible" is a verifiable claim, not an assumption | fields present; `gather_ms` 438–494 across polls ✓ |
 | ㉑ | **the arc fill's color** (not circled in the key image — added 2026-08-14) | `machine.current_bytes` ÷ the scale — i.e. the needle's own position, and NOTHING else | `gaugeFillSeverity(pct)`: green < 50 ≤ amber < 85 ≤ red. **The one client-derived color on the page**, and deliberately so — see finding 1 | live fill `is-green` at 25.7% ✓; component tests pin an UNKNOWN-state payload rendering `is-red` at 94% and `is-green` at 3% ✓ |
@@ -112,26 +112,55 @@ gap (counted, but by a labeled guess rather than a measurement) that must
 not be silently folded into the "priced" bucket the way a reader would
 otherwise assume it is.
 
+**#1821 — darkmux is not the machine's only tenant.** Two new fields, both
+emitted so the cascade's own arithmetic is checkable from the JSON, never
+just trusted:
+
+```
+other_used_bytes      = pool.used_bytes − machine.current_bytes   (floored at 0)
+projected_total_bytes = other_used_bytes + machine.potential_bytes
+```
+
+`other_used_bytes` is everything ELSE on the machine, right now. A missing
+`current_bytes` (attribution unavailable) is treated as 0, which makes
+`other_used_bytes` an OVERESTIMATE of other tenants rather than an
+underestimate — the safe direction when darkmux's own share is unknown.
+`projected_total_bytes` answers the question this cascade has always been
+trying to answer: *if darkmux's own commitment fully materializes while
+everything else holds what it holds now, what is the machine's total?*
+
 **The state cascade** (`compute_ledger`, `model_ledger.rs`, in order — line
-numbers drift with #1819's additions, so given by name rather than pinned):
+numbers drift with #1819/#1821's additions, so given by name rather than
+pinned):
 
 1. `pressure.red` → **Red**
 2. `current_total > limit` → **Red** (this boundary is the redline's
-   position — the display re-derives nothing)
-3. `Σ potential ≤ limit` **and** no unpriced residents → **Green**
-4. `Σ potential > limit` → **Amber** (+ a shrink hint)
-5. under the limit on the *known* sum but with unpriceable residents →
-   **Unknown** — no fit guarantee exists, and no shrink target is computable
+   position — the display re-derives nothing; unchanged by #1821 — this arm
+   is still darkmux's own current against the limit, not the projection)
+3. `projected_total ≤ limit` **and** no unpriced residents → **Green**
+   (**#1821 — was `Σ potential ≤ limit`**, which silently assumed darkmux
+   was the machine's only tenant)
+4. `projected_total > limit` → **Amber** (+ a shrink hint, itself now
+   computed against `projected_total`, not `Σ potential` alone — a
+   suggested cut has to close the REAL gap, including other tenants, or it
+   would land exactly on the old target and still leave the machine over
+   the limit)
+5. under the limit on the *known* projection but with unpriceable
+   residents → **Unknown** — no fit guarantee exists, and no shrink target
+   is computable. Also reached when `other_used_bytes`/`projected_total`
+   themselves are unreadable (`pool.used_bytes` missing, e.g. `vm_stat`
+   failed) — the cascade never silently falls back to the pre-#1821
+   darkmux-only comparison
 6. no limit readable → **Unknown**
 
 **Unchanged by #1819, and that is the load-bearing fact.** Arm 3's gate is
 `unpriced_models == 0` — never `estimated_models == 0`. An estimated
-resident's potential IS counted in `Σ potential`, so it can carry the
-machine straight to Green (arm 3) or Amber (arm 4) exactly like a
-measured one; it never forces arm 5. Only a GENUINELY unpriceable resident
-(no arch facts and no catalog size — nothing left to estimate FROM) still
-forces Unknown. See "The #1819 estimate" below for what changed and what
-deliberately did not.
+resident's potential IS counted in `Σ potential` (and so in
+`projected_total`), so it can carry the machine straight to Green (arm 3)
+or Amber (arm 4) exactly like a measured one; it never forces arm 5. Only a
+GENUINELY unpriceable resident (no arch facts and no catalog size —
+nothing left to estimate FROM) still forces Unknown. See "The #1819
+estimate" below for what changed and what deliberately did not.
 
 Per-model tint then follows the machine state (shared-fate unified memory),
 with one nuance: under machine-Amber, a model whose current has fully
@@ -214,7 +243,7 @@ named:**
 | Row hint | A `↳ estimated: …` line beside the row, mirroring the existing `↳ unpriceable: …` hint's shape and position. |
 | Machine chip | `GREEN · 1 estimated` (decision 1 — an estimated resident MAY produce a decided verdict; the count travels with the word, `machineStateWord()`). Never prefixed `fit ` — that's a separate, still-open decision named explicitly in the code so a future edit doesn't confuse the two. |
 | Machine detail row | `unpriced 0 models · estimated 1 model` — the SAME row that already named the unpriced count, extended rather than replaced. |
-| `warnings[]` | A dedicated warning naming the estimated resident(s) and the assumption, SEPARATE from the existing unpriceable-resident warning — the two are different facts (counted-via-guess vs. genuinely-uncounted) and must never share one sentence. |
+| `messages[]` | A dedicated `info`-severity message naming the estimated resident(s) and the assumption, SEPARATE from the existing `warn`-severity unpriceable-resident message — the two are different facts (counted-via-guess vs. genuinely-uncounted) AND different severities (a disclosure vs. a real degradation) and must never share one sentence or one lamp (#1821 — this is the fix to the WARN-lamp-lights-on-a-disclosure defect the estimate feature itself surfaced). |
 | CLI (`darkmux machine resources`) | The row's STATE column carries `(estimated)`; the POTENTIAL column itself carries the same `~` prefix the kv line uses; the machine line's parenthetical names both counts when both are nonzero: `(+1 unpriced, 2 estimated)`. |
 | Amber shrink hint | An estimated resident CAN be the shrink target — `hint_target_key`/`shrink_hint` read a row's kv rate through `effective_kv_rate()`, which uses `V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN` for an estimated row rather than treating it as un-shrinkable (an earlier draft could render the FALSE "no shrinkable context" line when the estimated resident was the only one with room — caught in review). When the target itself is estimated, the hint's own saving figure carries a parenthetical noting it's computed from the same conservative assumption. |
 | `darkmux doctor` | A dedicated check (`resident pricing`) names residents that are STILL genuinely unpriceable after the fallback — i.e. no catalog size either — and hints the concrete remedy (load an MLX build of the same model, when one exists). It does NOT warn on an estimated resident; estimation is the intended, working path, not a defect to flag. |
@@ -281,6 +310,22 @@ meantime, GGUF or otherwise, and never silently claims to be more than that.
    tile labeled *sole pressure trigger*; a worthwhile follow-up is renaming
    the display labels (e.g. "free pages" / "pressure headroom") so the
    similarity of names stops implying comparability.
+
+   **Addendum (#1821, 2026-08-15) — addressed.** This finding predicted
+   exactly this outcome, and the operator declined the rename at the time
+   because the argument then was GB-vs-GiB pedantry. A later live
+   measurement made it a different case: the SAME instant, `pressure`'s
+   tile read 82% while `pool free` read 30.8% — a 51-point gap under names
+   that both implied "how much RAM is left". Three honest names now exist
+   where two ambiguous ones did: `margin` (the renamed pressure tile —
+   `kern.memorystatus_level`, not a byte count), `available` (NEW — the
+   colloquial `free + inactive + speculative`, now the headline figure in
+   the machine detail row), and `free` (the renamed byte-count field —
+   truly-free pages, kept in the payload but deliberately not given prime
+   space in the row: two figures both reading "how much is left" was the
+   defect, not something a rename alone fixes if the row still shows both).
+   See rows ⑩ and ⑬ above, and "The pool decomposition" below for the full
+   derivation.
 
 3. **The same physical quantity used to render as both `128 GB` and
    `137.44 GB` — fixed by moving the page to binary (#1811).** The header's
@@ -364,6 +409,83 @@ meantime, GGUF or otherwise, and never silently claims to be more than that.
    potentially rendering a false "no shrinkable context" line; and the CLI
    table's POTENTIAL column now carries the same `~` prefix the UI's kv
    line does, so the caveat travels with the CLI figure too.
+
+8. **#1821 — the machine-total cascade measured darkmux's commitment against
+   the WHOLE machine's capacity, as though darkmux were the only tenant.**
+   `Σ potential ≤ limit` (arm 3, pre-#1821) compares darkmux's own models
+   against `hw.memsize`. Live: darkmux's committed ~42 GiB fit inside 128
+   GiB — GREEN — while ~44 GiB was already held by other processes, so real
+   headroom for darkmux was ~58 GiB, not 128. The verdict never looked at
+   that.
+
+   This is finding 2 one layer down: the pressure tile mislabeled darkmux's
+   usage as the machine's; the cascade measured darkmux's commitment
+   against the machine's whole capacity. The cascade is the one that
+   matters more — it drives the chip, the lamps, the redline, and the
+   whole green/amber/red vocabulary a reader actually trusts.
+
+   Fixed by introducing `other_used_bytes` (everything else the machine is
+   holding, right now) and `projected_total_bytes` (`other_used_bytes +
+   Σ potential`), and rewriting cascade arms 3–4 to key on
+   `projected_total`, not `Σ potential` alone — see "The state cascade"
+   above. Verified NOT to flip the verdict on the operator's own machine at
+   the figures the issue traced (used 69.3 GiB, darkmux current 36.78 GiB,
+   darkmux potential 54.32 GiB → projected 86.8 GiB ≤ 128 GiB limit →
+   still Green) — the fix corrects the ARITHMETIC the cascade performs, it
+   does not by itself change today's verdict on a lightly-loaded machine;
+   it changes the verdict on a machine where other tenants are large
+   enough to matter, which is exactly the case arm 3 used to get wrong
+   silently.
+
+9. **`messages[]` replaces `warnings[]` — a rename AND a retype
+   (`LEDGER_SCHEMA_VERSION` 1.1 → 2.0), because a disclosure and a
+   degradation were rendering identically.** `warnings: Vec<String>` had no
+   severity channel, so the #1819 estimate note — a disclosure, working
+   exactly as designed, permanently true on any machine with a GGUF
+   resident — lit the same amber WARN lamp as a genuine degradation (the
+   unpriceable-resident undercount). `messages: Vec<{severity, text}>`
+   with `info`/`warn`/`error` fixes the chip-color inconsistency the
+   operator spotted, one layer below the color: the WARN lamp now keys on
+   `warn`+`error` only. Named `info`, not `note` — `darkmux flow note` is
+   an existing verb, and reusing the word would give one term two meanings
+   in the same product (the same collision class as compactor/compressor,
+   finding 2's sibling). Tolerable as a MAJOR bump: every consumer (CLI,
+   `/machine/resources`, the viewer) ships in this same binary; no
+   external reader is stranded.
+
+## The pool decomposition (#1821)
+
+All three pool figures come from ONE `vm_stat` read the gather already
+performs — zero added probe cost, per this page's own observer-effect
+constraint (constraint 1: zero model dispatches; this extends the same
+discipline to zero added kernel probes).
+
+```
+used_bytes      = wired + compressor_occupied + (active + inactive - purgeable)
+available_bytes = free + inactive + speculative
+free_bytes      = free
+```
+
+`used_bytes` is Activity-Monitor-style. Cross-checked live against `top`
+the same instant: 69.3 GiB from this formula vs `top`'s ~66 GiB used — far
+closer than the implied `capacity - free` this page leaned on before
+(73.4 GiB the same instant, and the reason `pool free` alone swung between
+1.8 and 61 GiB across one earlier session: `free` is the most volatile of
+the three page classes, since macOS reclaims aggressively into cache).
+
+`available_bytes` is the colloquial "how much is left" — reclaimable
+inactive and speculative pages counted as available, matching what a
+person actually means by the phrase (the Linux `MemAvailable` / Activity
+Monitor model). Neither `free_bytes` alone (too strict — charges ~26 GiB
+of reclaimable pages as not-free) nor `margin_percent`
+(`kern.memorystatus_level`, too generous — counts only wired+compressor as
+"not available") answers this question; before #1821 it was not on the
+page at all.
+
+Every figure is parsed independently and degrades independently: a single
+missing `vm_stat` label (an unfamiliar build, a truncated read) takes down
+only the figures that need it, never panics, and never substitutes a
+plausible-looking wrong number for a genuinely missing one.
 
 ## What in the mockups is synthetic
 
