@@ -191,16 +191,13 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
           pathLength={100}
           strokeDasharray={`${rings.inner.solidPct} 100`}
         />
-        {geo.commitAngleDeg != null && (
-          <line
-            className={`mm-gauge-commit${geo.overcommitted ? " over" : ""}`}
-            x1={26}
-            y1={CY}
-            x2={44}
-            y2={CY}
-            transform={`rotate(${geo.commitAngleDeg} ${CX} ${CY})`}
-          />
-        )}
+        {/* The dashed commit tick is GONE. It marked Σ darkmux potential back when
+            this dial was darkmux-only and a tick was the only way to show a
+            commitment. Now darkmux has its own inner ring and its growth has
+            its own hatched band — so the tick was a THIRD rendering of the
+            same fact, on a face the operator already could not read
+            ("a new user will not know what this means"). The legend below
+            names the bands instead. */}
         {geo.ticks.map((t) => (
           <line
             key={t.pct}
@@ -274,6 +271,38 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   );
 }
 
+/**
+ * The dial's legend. Three bands share one face — the machine's used memory,
+ * darkmux's share inside it, and darkmux's committed growth beyond it — and
+ * until this existed nothing named any of them. The operator, looking at the
+ * finished rings: "a new user will not know what this means."
+ *
+ * Each entry pairs a SWATCH DRAWN IN THE BAND'S OWN TREATMENT with its figure,
+ * so the mapping is visual rather than positional — a reader matches the
+ * hatching, not a sentence describing where to look. "Everything else" is
+ * deliberately absent: it is the gap between the rings, a derived quantity
+ * (`used - darkmux`), and giving it a swatch would present arithmetic as a
+ * measured band.
+ */
+function GaugeLegend({ resources, rings, fillCls }: { resources: MachineResources; rings: ReturnType<typeof computeRingGeometry>; fillCls: string }) {
+  const growth = rings.outer.hatchedPct > 0;
+  return (
+    <div className="mm-legend">
+      <span className="mm-legend-item">
+        <span className={`mm-legend-sw is-${fillCls}`} /> machine <b>{memBytes(resources.pool?.used_bytes)}</b>
+      </span>
+      <span className="mm-legend-item">
+        <span className="mm-legend-sw is-darkmux" /> darkmux <b>{memBytes(resources.machine.current_bytes)}</b>
+      </span>
+      {growth && (
+        <span className="mm-legend-item">
+          <span className="mm-legend-sw is-growth" /> committed <b>{memBytes(resources.machine.potential_bytes)}</b>
+        </span>
+      )}
+    </div>
+  );
+}
+
 function GaugeCaption({ resources }: { resources: MachineResources }) {
   const stateCls = memStateCls(resources.machine.state);
   const stateText = machineStateWord(
@@ -283,11 +312,9 @@ function GaugeCaption({ resources }: { resources: MachineResources }) {
     Number(resources.machine.estimated_models) || 0,
   );
   const unpriced = Number(resources.machine.unpriced_models) || 0;
-  const committed = memBytes(resources.machine.potential_bytes);
   return (
     <div className="mm-gcap">
-      <b>machine total</b> <span className={`mm-chip is-${stateCls}`}>{stateText}</span> · darkmux{" "}
-      <b>{memBytes(resources.machine.current_bytes)}</b> · ╌ committed {committed}
+      <b>machine total</b> <span className={`mm-chip is-${stateCls}`}>{stateText}</span>
       {unpriced ? ` (+${unpriced} unpriced)` : ""}
     </div>
   );
@@ -645,6 +672,7 @@ export function MachineHealthRegion({
         <div className="mm-heroline">
           <div className="mm-semi">
             <Gauge resources={b} stale={stale} />
+            <GaugeLegend resources={b} rings={computeRingGeometry(b)} fillCls={gaugeFillSeverity(computeRingGeometry(b).outer.solidPct)} />
             <GaugeCaption resources={b} />
           </div>
           <div>

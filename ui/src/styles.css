@@ -2230,6 +2230,51 @@ body {
   fill: #454d5c;
   stroke: #1a1f2b;
 }
+/* The dial's legend — a swatch per band, each drawn in its band's OWN
+   treatment so the mapping is visual rather than positional. "Everything
+   else" gets no swatch on purpose: it is the gap between the rings, derived
+   rather than measured, and a swatch would claim otherwise. */
+.mm-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 3px 12px;
+  margin-top: 5px;
+  font-size: 9.5px;
+  color: var(--dim);
+}
+.mm-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.mm-legend b {
+  color: var(--fg);
+  font-weight: 600;
+}
+.mm-legend-sw {
+  display: inline-block;
+  width: 13px;
+  height: 5px;
+  border-radius: 2px;
+  background: var(--dim);
+}
+.mm-legend-sw.is-green { background: var(--good); }
+.mm-legend-sw.is-amber { background: var(--warn); }
+.mm-legend-sw.is-red { background: var(--bad); }
+/* darkmux's inner ring: achromatic and thinner on the dial, so the swatch
+   matches — the machine's band carries the how-full hue, this one does not. */
+.mm-legend-sw.is-darkmux {
+  background: var(--fg);
+  opacity: 0.85;
+  height: 4px;
+}
+/* Committed-but-not-yet: the same hatching the dial's growth band uses. */
+.mm-legend-sw.is-growth {
+  background: repeating-linear-gradient(90deg, var(--dim) 0 3px, transparent 3px 6px);
+  opacity: 0.75;
+}
+
 .mm-gcap {
   font-size: 10px;
   letter-spacing: 0.06em;

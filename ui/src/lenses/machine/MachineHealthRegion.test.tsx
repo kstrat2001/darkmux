@@ -91,15 +91,47 @@ describe("MachineHealthRegion — absence vs zero (docs/design/machine-lens/prov
     expect(pricedRow.querySelector(".mm-row-pot")).not.toBeNull();
   });
 
-  it("the gauge draws NO commit tick when Σ priced potential is 0 — no models at all", () => {
-    const empty: MachineResources = { ...BASE, models: [], machine: { ...BASE.machine, potential_bytes: 0, unpriced_models: 0 } };
-    const { container } = renderRegion(empty, { residencyRows: [] });
+  /**
+   * The commit TICK is gone — with darkmux on its own inner ring and its
+   * growth as a hatched band, the tick was a third rendering of one fact on a
+   * face already too crowded to read. The honesty rule it carried moves with
+   * it: nothing committed beyond what is held now means NO growth band and no
+   * legend entry for one, rather than a zero-width band.
+   */
+  it("draws NO growth band and no committed legend entry when there is nothing beyond current", () => {
+    const nothingPending: MachineResources = {
+      ...BASE,
+      models: [],
+      machine: { ...BASE.machine, potential_bytes: 0, unpriced_models: 0 },
+    };
+    const { container } = renderRegion(nothingPending, { residencyRows: [] });
+    expect(container.querySelector(".mm-gauge-growth")).toBeNull();
+    expect(container.querySelector(".mm-legend-sw.is-growth")).toBeNull();
+    // ...and the tick itself never returns.
     expect(container.querySelector(".mm-gauge-commit")).toBeNull();
   });
 
-  it("the inverted case: a nonzero Σ priced potential DOES draw the commit tick", () => {
+  it("the inverted case: a commitment beyond current DOES draw the band and name it", () => {
+    // BASE is a fully-materialised fixture (committed 17.95 < current 19.41),
+    // so it correctly has NO growth. Give it something still to claim.
+    const pending: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, potential_bytes: 60_000_000_000 },
+    };
+    const { container } = renderRegion(pending, { residencyRows: residencyRowsFor(pending) });
+    expect(container.querySelector(".mm-gauge-growth")).not.toBeNull();
+    expect(container.querySelector(".mm-legend-sw.is-growth")).not.toBeNull();
+    expect(container.querySelector(".mm-legend")!.textContent).toMatch(/committed/);
+  });
+
+  it("names every band it draws — the legend is what makes the face readable", () => {
     const { container } = renderRegion(BASE);
-    expect(container.querySelector(".mm-gauge-commit")).not.toBeNull();
+    const legend = container.querySelector(".mm-legend")!;
+    expect(legend.textContent).toMatch(/machine/);
+    expect(legend.textContent).toMatch(/darkmux/);
+    // "everything else" is the GAP between the rings — derived, never drawn,
+    // so it must NOT appear as a swatch claiming to be measured.
+    expect(legend.textContent).not.toMatch(/everything else|other/i);
   });
 });
 
