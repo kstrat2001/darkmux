@@ -388,6 +388,26 @@ file. That is a named follow-up issue, not built here: the size-based
 fallback is the honest floor for every unreadable architecture in the
 meantime, GGUF or otherwise, and never silently claims to be more than that.
 
+**Addendum (#1820, 2026-08-15) — the GGUF-header follow-up landed.** This
+section's own text above is left UNCHANGED — it is a dated record of the
+#1819 decision, not a claim about today. What changed: `GgufFactsReader`
+(`crates/darkmux-profiles/src/gestalt_host/gguf_facts.rs`) now parses a
+GGUF download's own binary metadata header directly — `<arch>.block_count`,
+`<arch>.attention.head_count_kv`, `<arch>.embedding_length` /
+`<arch>.attention.key_length` — and feeds the result into the SAME
+`ArchEstimator` a `config.json` reading does. `gather_with_bin`'s resolution
+order is now `config.json` → GGUF header → the #1819 size-tiered estimate
+above → genuinely unpriceable. Verified against the real
+`lmstudio-community/phi-4-GGUF/phi-4-Q4_K_M.gguf` — this section's own
+motivating trace: the header reader reproduces the exact `204_800`
+B/token figure `V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN` above was DERIVED from,
+except now as a genuine per-model measurement (`potential_source: "arch"`)
+rather than a tier estimate applied to that model. The `ESTIMATED` chip, the
+`info`-severity message, and every other consumer in the table below are
+UNCHANGED — they still fire, just now only for a GGUF this reader itself
+can't parse (corrupt/truncated download, an ambiguous multi-file directory,
+or a format neither reader understands), not for "GGUF" as a category.
+
 ## Findings
 
 Each finding below now opens with an explicit **Status** line — open,

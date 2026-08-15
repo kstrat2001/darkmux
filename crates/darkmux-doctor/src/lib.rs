@@ -907,23 +907,27 @@ fn utility_binding_status(
     }
 }
 
-/// (#1819) Names resident models the memory ledger genuinely CANNOT price —
-/// no readable `config.json` arch facts AND no catalog size either, so even
-/// the #1819 size-based fallback estimate has nothing to work from. This is
-/// the narrower, worse case than "estimated": an estimated resident still
-/// gets a labeled potential; this check is about the residents that get
-/// none at all, and are the reason `machine.state` stays UNKNOWN forever
-/// while they're loaded (`model_ledger.rs`'s cascade — `unpriced_models >
-/// 0` blocks Green even when the priced sum fits).
+/// (#1819, narrowed by #1820) Names resident models the memory ledger
+/// genuinely CANNOT price — no readable `config.json` arch facts, no
+/// readable GGUF header either, AND no catalog size for the #1819
+/// size-based fallback to work from. This is the narrower, worse case than
+/// "estimated": an estimated resident still gets a labeled potential; this
+/// check is about the residents that get none at all, and are the reason
+/// `machine.state` stays UNKNOWN forever while they're loaded
+/// (`model_ledger.rs`'s cascade — `unpriced_models > 0` blocks Green even
+/// when the priced sum fits).
 ///
-/// The live trace this check exists for (#1819's issue body):
-/// `microsoft/phi-4` resolves to a GGUF download
+/// The live trace this check originally existed for (#1819's issue body):
+/// `microsoft/phi-4` resolving to a GGUF download
 /// (`lmstudio-community/phi-4-GGUF/phi-4-Q4_K_M.gguf`) with no sidecar
-/// `config.json` — the architecture lives inside the GGUF binary itself,
-/// which darkmux does not parse (tracked as a follow-up, not built here).
-/// The concrete remedy in that trace: `mlx-community/phi-4-8bit` IS the
-/// same model as an MLX build, and MLX builds ship a `config.json` — load
-/// that instead and the resident prices normally.
+/// `config.json`. #1820 closed that specific gap — `GgufFactsReader` now
+/// reads the architecture directly out of the GGUF binary's own metadata
+/// header, so a phi-4-shaped GGUF prices as a MEASUREMENT today, not an
+/// estimate and not unpriceable. What still lands here: a corrupt or
+/// truncated GGUF download, an ambiguous multi-file directory the GGUF
+/// reader declines to guess a shard from (see `gguf_facts`'s module docs),
+/// or a weights format neither reader understands. The MLX-build remedy
+/// below still applies whenever one exists.
 ///
 /// Calls the SAME `model_ledger::gather()` the machine page's `/machine/
 /// resources` endpoint uses, rather than re-deriving "unpriceable" from
@@ -957,12 +961,12 @@ fn unpriceable_residents_status(models: &[darkmux_profiles::model_ledger::ModelR
         name,
         status: Status::Warn,
         message: format!(
-            "{} resident model(s) genuinely unpriceable — no readable config.json arch facts AND no catalog size either, so even the size-based estimate has nothing to work from: {} — the machine's fit verdict stays UNKNOWN while any of these are loaded",
+            "{} resident model(s) genuinely unpriceable — no readable config.json, no readable GGUF header, AND no catalog size, so even the size-based estimate has nothing to work from: {} — the machine's fit verdict stays UNKNOWN while any of these are loaded",
             unpriceable.len(),
             unpriceable.join(", ")
         ),
         hint: Some(
-            "Commonly a GGUF download whose weights file darkmux can locate but whose architecture it cannot read (no sidecar config.json — darkmux does not parse GGUF headers yet). If an MLX build of the same model exists (check the LMStudio catalog for a `-mlx`/`-bit` variant), load that instead — MLX builds ship a config.json and price normally. Otherwise this resident's commitment is invisible to the machine page's totals and its fit verdict for the whole machine stays UNKNOWN for as long as it's loaded.".into(),
+            "darkmux tried a config.json, then the GGUF header, then a catalog-size estimate — none of the three had anything to work from. A corrupt/truncated download, an ambiguous multi-file GGUF directory (no unambiguous -00001-of- shard to read), or an unusual weights format neither reader understands are the likely causes. If an MLX build of the same model exists (check the LMStudio catalog for a `-mlx`/`-bit` variant), load that instead — MLX builds ship a config.json and price normally. Otherwise this resident's commitment is invisible to the machine page's totals and its fit verdict for the whole machine stays UNKNOWN for as long as it's loaded.".into(),
         ),
     }
 }

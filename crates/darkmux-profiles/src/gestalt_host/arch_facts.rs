@@ -222,7 +222,12 @@ fn content_scan_match(root: &Path, model_key: &str, max_scan_dirs: usize) -> Opt
 
 /// Lowercase `s`, split on every non-alphanumeric run, drop empties → the
 /// token SET used for the #1309 name match.
-fn tokenize(s: &str) -> BTreeSet<String> {
+///
+/// `pub(super)`: reused by [`super::gguf_facts`] (#1820), whose own
+/// content-scan fallback matches directory names against a GGUF resident's
+/// model_key using the exact same tokenization rule — one definition of
+/// "what counts as a name token" for both readers, not two that could drift.
+pub(super) fn tokenize(s: &str) -> BTreeSet<String> {
     s.to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| !t.is_empty())
@@ -234,7 +239,9 @@ fn tokenize(s: &str) -> BTreeSet<String> {
 /// last `/` (the HF/publisher prefix is dropped — the on-disk dir has its own
 /// publisher segment). e.g. `mistralai/devstral-small-2-2512` →
 /// `{devstral, small, 2, 2512}`.
-fn model_name_tokens(model_key: &str) -> BTreeSet<String> {
+///
+/// `pub(super)`: reused by [`super::gguf_facts`] (#1820) — see [`tokenize`].
+pub(super) fn model_name_tokens(model_key: &str) -> BTreeSet<String> {
     let name = model_key.rsplit('/').next().unwrap_or(model_key);
     tokenize(name)
 }
@@ -244,7 +251,12 @@ fn model_name_tokens(model_key: &str) -> BTreeSet<String> {
 /// the models root; `indexedModelIdentifier` mirrors it and serves as the
 /// fallback. Rows missing both (or missing `modelKey`) are skipped — those
 /// models simply stay on the modelKey-as-dir fallback.
-fn key_paths_from_entries(entries: &[serde_json::Value]) -> BTreeMap<String, String> {
+///
+/// `pub(super)`: reused verbatim by [`super::gguf_facts::GgufFactsReader`]
+/// (#1820) — the ls-entry → on-disk-path resolution is identical for both
+/// readers; only what they look FOR once there (`config.json` vs `*.gguf`)
+/// differs.
+pub(super) fn key_paths_from_entries(entries: &[serde_json::Value]) -> BTreeMap<String, String> {
     entries
         .iter()
         .filter_map(|e| {

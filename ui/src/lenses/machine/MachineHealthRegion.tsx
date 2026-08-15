@@ -519,7 +519,7 @@ function ModelRow({
         {!isGhost && isEstimatedRow(m) && (
           <span
             className="mm-row-chip is-estimated"
-            title="priced by size-based estimate, not measurement — no readable config.json (commonly a GGUF download with no sidecar config file). Assumes DENSE attention at a size-tiered rate, set at or above every modern GQA architecture in its size class. Over-reserves hybrid-attention models; under-reserves pre-GQA multi-head models such as Llama-2-13B (#1819)."
+            title="priced by size-based estimate, not measurement — neither a readable config.json nor a readable GGUF header (a corrupt or truncated download, an ambiguous multi-file directory, or a weights format neither reader understands). Assumes DENSE attention at a size-tiered rate, set at or above every modern GQA architecture in its size class. Over-reserves hybrid-attention models; under-reserves pre-GQA multi-head models such as Llama-2-13B (#1819, #1820)."
           >
             ESTIMATED
           </span>
@@ -571,7 +571,7 @@ function ModelRow({
       )}
       {!isGhost && isEstimatedRow(m) && (
         <div className="mm-hint">
-          ↳ estimated: no readable config.json — priced from catalog size + a size-tiered dense-attention KV rate (every layer assumed to hold a KV cache). Set at or above every modern GQA architecture in its size class; it over-reserves hybrid-attention models, and under-reserves pre-GQA multi-head models like Llama-2-13B
+          ↳ estimated: no readable config.json and no readable GGUF header — priced from catalog size + a size-tiered dense-attention KV rate (every layer assumed to hold a KV cache). Set at or above every modern GQA architecture in its size class; it over-reserves hybrid-attention models, and under-reserves pre-GQA multi-head models like Llama-2-13B
         </div>
       )}
       {!isGhost && (m as { shrink_hint?: string }).shrink_hint && <div className="mm-hint">↳ {(m as { shrink_hint?: string }).shrink_hint}</div>}
