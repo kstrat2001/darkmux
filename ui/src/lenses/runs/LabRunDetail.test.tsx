@@ -4,11 +4,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LabRunDetail } from "./LabRunDetail";
 import { LAB_POLL_STEADY_MS } from "../../lib/queryKeys";
 
-function renderDetail(dir: string, onBack: () => void = () => {}) {
+function renderDetail(dir: string, onBack: () => void = () => {}, onUnresolvable: () => void = () => {}) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <LabRunDetail dir={dir} onBack={onBack} />
+      <LabRunDetail dir={dir} onBack={onBack} onUnresolvable={onUnresolvable} />
     </QueryClientProvider>,
   );
 }
@@ -72,6 +72,27 @@ describe("LabRunDetail", () => {
     expect(screen.getByRole("alert").textContent).toMatch(/500/);
   });
 
+  /**
+   * (drill-in packet) `onUnresolvable` — legacy's `drillLabRun` fallback,
+   * ported. The CALLER (`RunsBoard`) owns falling back to the run list with
+   * a notice (see `viewer-lab.spec.js`'s e2e coverage of that half); this
+   * component's own job is narrower and is what this test pins: report the
+   * failure exactly ONCE, even though `detailQuery.data` (and so
+   * `detailErrored`) stays `true` across every subsequent re-render this
+   * component sees before its parent unmounts it.
+   */
+  it("calls onUnresolvable exactly once when the detail fetch fails", async () => {
+    mockFetch({ detailStatus: 400 });
+    const onUnresolvable = vi.fn();
+    renderDetail("d1", () => {}, onUnresolvable);
+    await waitFor(() => expect(onUnresolvable).toHaveBeenCalledTimes(1));
+    // A later re-render (the events poll ticking, e.g.) must not re-fire it.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 10));
+    });
+    expect(onUnresolvable).toHaveBeenCalledTimes(1);
+  });
+
   it("shows a 'not started' pipeline stage and the live badge for a freshly-opened run", async () => {
     mockFetch({});
     renderDetail("d1");
@@ -126,7 +147,7 @@ describe("LabRunDetail", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     rerender(
       <QueryClientProvider client={queryClient}>
-        <LabRunDetail dir="d2" onBack={() => {}} />
+        <LabRunDetail dir="d2" onBack={() => {}} onUnresolvable={() => {}} />
       </QueryClientProvider>,
     );
     // Wait for the SETTLED render, not just "· d2" (which is ALSO present
