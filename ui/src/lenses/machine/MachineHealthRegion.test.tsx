@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency } from "./machineGauge";
@@ -473,6 +473,37 @@ describe("MachineHealthRegion — the pressure tiles explain themselves on deman
     expect(notes.length).toBe(1);
     expect(notes[0].textContent).toMatch(/macOS/);
     expect(free.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("dismisses on Escape — a popover must close by the gestures every popover supports", () => {
+    const { container } = renderRegion(BASE);
+    fireEvent.click(container.querySelector(".mm-odo-i")!);
+    expect(container.querySelectorAll(".mm-odo-n").length).toBe(1);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(container.querySelectorAll(".mm-odo-n").length).toBe(0);
+  });
+
+  it("dismisses on a click outside, but NOT on a click within the tile row", () => {
+    const { container } = renderRegion(BASE);
+    fireEvent.click(container.querySelector(".mm-odo-i")!);
+    // Inside the row: stays open (otherwise the popover would close before
+    // its own text could be selected).
+    fireEvent.mouseDown(container.querySelector(".mm-odo-n")!);
+    expect(container.querySelectorAll(".mm-odo-n").length).toBe(1);
+    // Outside: closes.
+    fireEvent.mouseDown(document.body);
+    expect(container.querySelectorAll(".mm-odo-n").length).toBe(0);
+  });
+
+  it("registers no global listeners while closed — an idle page costs nothing", () => {
+    const add = vi.spyOn(document, "addEventListener");
+    const { container } = renderRegion(BASE);
+    const before = add.mock.calls.filter(([e]) => e === "keydown" || e === "mousedown").length;
+    expect(before).toBe(0);
+    fireEvent.click(container.querySelector(".mm-odo-i")!);
+    const after = add.mock.calls.filter(([e]) => e === "keydown" || e === "mousedown").length;
+    expect(after).toBe(2);
+    add.mockRestore();
   });
 
   it("is a real button — reachable without a pointer at all", () => {

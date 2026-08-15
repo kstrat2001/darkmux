@@ -2355,14 +2355,34 @@ body {
   border-color: var(--dim);
 }
 /* Revealed on demand — so it can afford to be READABLE, which the permanent
-   8.5px `#4a5162` line it replaced could not. It is asked for, not endured. */
+   8.5px `#4a5162` line it replaced could not. It is asked for, not endured.
+
+   A POPOVER, not an inline reveal: it is absolutely positioned so opening one
+   does not reflow the page. The first cut expanded the tile in place, which
+   pushed every row below it down — the operator's read, and correct: a
+   disclosure that moves the thing you were looking at costs more than the
+   sentence it shows you. `z-index` clears the sibling tiles; the tile itself
+   is the positioning context. */
+.mm-odo {
+  position: relative;
+}
 .mm-odo-n {
-  max-width: 24ch;
-  margin: 4px auto 0;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  width: max-content;
+  max-width: 30ch;
+  padding: 7px 9px;
   font-size: 9.5px;
-  line-height: 1.45;
-  color: var(--dim);
+  line-height: 1.5;
+  color: var(--fg);
   text-align: left;
+  background: #11151f;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
 }
 
 .mm-kv {

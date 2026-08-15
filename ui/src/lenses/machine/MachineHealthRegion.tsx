@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   computeGaugeGeometry,
   deriveLamps,
@@ -289,8 +289,32 @@ function LampRow({
 function Odometer({ resources }: { resources: MachineResources }) {
   const tiles = odometerTiles(resources.pressure);
   const [openLabel, setOpenLabel] = useState<string | null>(null);
+  const rowRef = useRef<HTMLDivElement>(null);
+
+  // A popover has to be dismissible by the two gestures every popover
+  // supports, or it is just a div that will not go away: Escape, and a click
+  // anywhere outside it. Both listeners exist ONLY while one is open — an
+  // idle machine page registers nothing (the observer-must-not-perturb rule
+  // applies to the client too, and this component re-renders on every 5s
+  // poll).
+  useEffect(() => {
+    if (openLabel == null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpenLabel(null);
+    };
+    const onDown = (e: MouseEvent) => {
+      if (!rowRef.current?.contains(e.target as Node)) setOpenLabel(null);
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [openLabel]);
+
   return (
-    <div className="mm-odorow">
+    <div className="mm-odorow" ref={rowRef}>
       {tiles.map((t) => {
         const open = openLabel === t.label;
         return (
@@ -315,7 +339,11 @@ function Odometer({ resources }: { resources: MachineResources }) {
                 i
               </button>
             </div>
-            {open && <div className="mm-odo-n">{t.note}</div>}
+            {open && (
+              <div className="mm-odo-n" role="note">
+                {t.note}
+              </div>
+            )}
           </div>
         );
       })}

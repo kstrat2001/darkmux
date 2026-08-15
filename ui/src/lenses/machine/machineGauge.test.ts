@@ -236,16 +236,35 @@ describe("redlineLit / isOverLimit / gaugeFaceCaption — the redline's provenan
 describe("deriveLamps — every lamp keys on exactly one field", () => {
   const base = { state: "green", pressureRed: false, overLimit: false, unprivedCount: 0, warningsCount: 0, resourcesErrored: false, residencyChanged: false };
 
-  it("all seven lamps render, unlit, on a clean green payload", () => {
+  it("all six lamps render, unlit, on a clean green payload", () => {
     const lamps = deriveLamps(base);
-    expect(lamps.map((l) => l.key)).toEqual(["state", "residency", "unpriced", "pressure", "overLimit", "stale", "warn"]);
+    expect(lamps.map((l) => l.key)).toEqual(["residency", "unpriced", "pressure", "overLimit", "stale", "warn"]);
     expect(lamps.every((l) => !l.lit)).toBe(true);
   });
 
-  it("the STATE lamp lights for any non-green state — the inverted case is green staying unlit", () => {
-    expect(deriveLamps({ ...base, state: "unknown" }).find((l) => l.key === "state")!.lit).toBe(true);
-    expect(deriveLamps({ ...base, state: "amber" }).find((l) => l.key === "state")!.lit).toBe(true);
-    expect(deriveLamps({ ...base, state: "green" }).find((l) => l.key === "state")!.lit).toBe(false);
+  /**
+   * There is no STATE lamp, and its absence is the assertion. One rendered
+   * here until the operator caught what it did: it relabelled ITSELF with the
+   * state (`STATE GREEN`) *and* changed its lit-ness, so a healthy machine
+   * showed the word "GREEN" in grey, beside the same word in actual green on
+   * the machine chip. A tell-tale never renames itself — its lit-ness IS the
+   * message — and the verdict already has a home that carries its cause and
+   * its estimated-count qualifier too.
+   */
+  it("has NO state lamp — a verdict is not a condition, and it is already rendered as a chip", () => {
+    for (const st of ["green", "amber", "red", "unknown", null]) {
+      const lamps = deriveLamps({ ...base, state: st });
+      expect(lamps.some((l) => l.key === ("state" as unknown as typeof l.key))).toBe(false);
+      // ...and no lamp anywhere restates the bare verdict word.
+      expect(lamps.some((l) => /^STATE\b/.test(l.word))).toBe(false);
+    }
+  });
+
+  it("every remaining lamp keys on a CONDITION, so a state change alone lights nothing", () => {
+    // The inverted case for the deletion: an amber/unknown machine with no
+    // actual condition present leaves the whole row dark.
+    expect(deriveLamps({ ...base, state: "amber" }).every((l) => !l.lit)).toBe(true);
+    expect(deriveLamps({ ...base, state: "unknown" }).every((l) => !l.lit)).toBe(true);
   });
 
   it("UNPRICED lights only when the count is > 0 and names the count", () => {

@@ -273,7 +273,7 @@ export function gaugeFaceCaption(state: string | null | undefined, pressureRed: 
 
 // ── The tell-tale lamp row ───────────────────────────────────────────────
 
-export type LampKey = "state" | "residency" | "unpriced" | "pressure" | "overLimit" | "stale" | "warn";
+export type LampKey = "residency" | "unpriced" | "pressure" | "overLimit" | "stale" | "warn";
 export type LampSeverity = "dim" | "warn" | "bad";
 
 export interface LampView {
@@ -294,22 +294,28 @@ export interface LampInputs {
   residencyChanged: boolean;
 }
 
-/** Every lamp keys on exactly ONE named field (docs/design/machine-lens/provenance.md row ⑨) —
- * listed here in the mockup's own order. Always all seven render (an unlit
+/** Every lamp keys on exactly ONE named CONDITION (docs/design/machine-lens/provenance.md row ⑨) —
+ listed here in the mockup's own
+ * order.
+ *
+ * There is deliberately NO `STATE` lamp. One rendered here until the operator
+ * caught what it was doing (2026-08-15): it relabelled ITSELF with the state
+ * (`STATE GREEN` / `STATE AMBER`) *and* changed its lit-ness, so on a healthy
+ * machine it sat UNLIT rendering the word "GREEN" in grey — a few inches from
+ * the same word rendered in actual green on the machine chip. A tell-tale
+ * never renames itself; the oil light says "oil pressure" whether it is lit
+ * or not, and its lit-ness is the entire message.
+ *
+ * It was also a duplicate: the machine chip beside it already carries the
+ * verdict WITH its cause and its estimated-count qualifier, so the lamp
+ * offered a second, greyer, less-informed copy. The other lamps each key on a
+ * CONDITION (pressure, over-limit, stale, an unpriced resident); a verdict is
+ * not a condition, and it already has a home. Always all seven render (an unlit
  * lamp still carries a visible outline — accessibility rule: presence is
  * never color-alone), so the row's SHAPE never changes with the payload,
  * only which ones glow. */
 export function deriveLamps(inputs: LampInputs): LampView[] {
-  const state = (inputs.state || "unknown").toLowerCase();
-  const stateSeverity: LampSeverity = state === "amber" ? "warn" : state === "red" ? "bad" : "dim";
   return [
-    {
-      key: "state",
-      word: `STATE ${state.toUpperCase()}`,
-      lit: state !== "green",
-      severity: stateSeverity,
-      title: "the residency arbiter's own verdict — machine.state, verbatim",
-    },
     {
       key: "residency",
       word: "Δ RESIDENCY",
