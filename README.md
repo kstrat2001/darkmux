@@ -76,7 +76,7 @@ darkmux exists because the [Genesis series](https://darklyenergized.substack.com
 
 ## Status
 
-**v2.7.0** on the [Homebrew tap](https://github.com/kstrat2001/homebrew-darkmux), moving fast: breaking changes ship clean with migration notes, and every release is dogfooded on real work before it tags. Full history: [CHANGELOG.md](CHANGELOG.md).
+**v2.8.0** on the [Homebrew tap](https://github.com/kstrat2001/homebrew-darkmux), moving fast: breaking changes ship clean with migration notes, and every release is dogfooded on real work before it tags. Full history: [CHANGELOG.md](CHANGELOG.md).
 
 ## Security
 
