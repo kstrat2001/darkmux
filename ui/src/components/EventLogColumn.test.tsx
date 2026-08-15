@@ -1,7 +1,8 @@
-import { describe, it, expect } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, it, expect, afterEach } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { EventLogColumn } from "./EventLogColumn";
 import type { FlowRecord } from "../types/handwritten";
+import { closeOpenModal } from "../lib/dialogManager";
 
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
   return {
@@ -12,6 +13,15 @@ function rec(overrides: Partial<FlowRecord>): FlowRecord {
     ...overrides,
   };
 }
+
+// `dialogManager`'s "which dialog is open" state is a module-level
+// singleton, not React state — it survives across `render()` calls within
+// this file (unmounting a component does not reset it). Without this, a
+// test that opens the Filters modal and doesn't explicitly close it would
+// leave it open for the NEXT test's freshly-rendered instance too.
+afterEach(() => {
+  closeOpenModal({ restore: false });
+});
 
 describe("EventLogColumn", () => {
   it("names the WINDOW in the header, and keeps #logscope present but empty", () => {
@@ -107,16 +117,74 @@ describe("EventLogColumn", () => {
     expect(screen.getByText("select an event from the log to inspect it")).toBeInTheDocument();
   });
 
-  it("the 'model only' quick filter keeps reasoning/tool-call/turn rows and drops others", () => {
+  it("#fbtn opens the filters modal (#1640) — matching legacy's data-act=\"filters\" trigger", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    expect(document.getElementById("modalbg")!.style.display).toBe("none");
+    fireEvent.click(document.getElementById("fbtn")!);
+    expect(document.getElementById("modalbg")!.style.display).toBe("flex");
+    expect(document.querySelector('[aria-labelledby="filters-title"]')).toBeInTheDocument();
+  });
+
+  it("the modal's 'model only' quick action keeps reasoning/tool-call/turn rows and drops others", () => {
     const records = [
       rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-reasoning" }),
       rec({ ts: "2026-08-08T12:05:00.000Z", action: "machine.online", session_id: "s-machine" }),
     ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
     fireEvent.click(document.getElementById("fbtn")!);
+    fireEvent.click(screen.getByText("model only"));
     const rows = document.querySelectorAll('[data-act="rec"]');
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain("s-reasoning");
+  });
+
+  it("the modal's checkbox grid filters by category/tier/source, not just activity", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-local", tier: "local" }),
+      rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.reasoning", session_id: "s-cloud", tier: "cloud" }),
+    ];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.click(document.getElementById("fbtn")!);
+    // Uncheck the "cloud" tier checkbox — its own accessible label is the
+    // literal facet value text (see FiltersDialog.tsx).
+    fireEvent.click(screen.getByLabelText("cloud"));
+    const rows = document.querySelectorAll('[data-act="rec"]');
+    expect(rows.length).toBe(1);
+    expect(rows[0].textContent).toContain("s-local");
+  });
+
+  it("'clear all' restores every facet and empties the search text", () => {
+    const records = [rec({ ts: "2026-08-08T12:00:00.000Z", action: "dispatch.reasoning", session_id: "s-1", tier: "local" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.click(document.getElementById("fbtn")!);
+    fireEvent.click(screen.getByLabelText("local"));
+    expect(document.querySelectorAll('[data-act="rec"]').length).toBe(0);
+    fireEvent.click(screen.getByText("clear all"));
+    expect(document.querySelectorAll('[data-act="rec"]').length).toBe(1);
+  });
+
+  // RED-PROVED (real regression, caught by
+  // tests/parity/next-parity-live.spec.ts, not invented for this test): a
+  // first draft seeded `filters` via a plain `useState(() =>
+  // defaultFilterState(facets))` lazy initializer, which only ever runs
+  // ONCE — at mount, when `records` is still `[]` (the shape every real
+  // caller passes before its fetch resolves; `App.tsx` always mounts this
+  // component before `useRouteRecords`/`useFlowWindow` have data). That
+  // locked every facet Set to EMPTY forever, so `matchesFilters` rejected
+  // every record once real data arrived — the log stayed permanently
+  // empty. Confirmed by temporarily reverting the `useEffect` reseed in
+  // `EventLogColumn.tsx` back to the bare lazy initializer and re-running
+  // this test, which then failed with 0 rows instead of 1; restored
+  // afterward.
+  it("records that arrive AFTER the initial (empty) mount still render — filters must not lock onto an empty facet snapshot", async () => {
+    const { rerender } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    expect(document.querySelectorAll('[data-act="rec"]').length).toBe(0);
+
+    const records = [rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-late" })];
+    rerender(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+
+    await waitFor(() => expect(document.querySelectorAll('[data-act="rec"]').length).toBe(1));
+    expect(document.querySelector('[data-act="rec"]')!.textContent).toContain("s-late");
   });
 
   // `.eventlog__rec` was a click-only div — no `role`, no `tabIndex`, no

@@ -233,7 +233,7 @@ export function App() {
           to live on this line) now lives there instead. Precedes
           `.app-shell__crumbbar`, matching legacy's DOM order (`.top` before
           `.crumbbar`). */}
-      <Masthead route={displayRoute} liveStatus={liveStatus} />
+      <Masthead route={displayRoute} liveStatus={liveStatus} specs={specs} />
       <div className="app-shell__crumbbar">
         <NavChrome route={route} />
         <header className="app-shell__crumb" id="crumb">
