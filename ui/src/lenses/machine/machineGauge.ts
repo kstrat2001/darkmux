@@ -430,7 +430,7 @@ export interface LampInputs {
  * verdict WITH its cause and its estimated-count qualifier, so the lamp
  * offered a second, greyer, less-informed copy. The other lamps each key on a
  * CONDITION (pressure, over-limit, stale, an unpriced resident); a verdict is
- * not a condition, and it already has a home. Always all seven render (an unlit
+ * not a condition, and it already has a home. Always all six render (an unlit
  * lamp still carries a visible outline — accessibility rule: presence is
  * never color-alone), so the row's SHAPE never changes with the payload,
  * only which ones glow. */
