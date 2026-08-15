@@ -129,6 +129,98 @@ describe("MachineHealthRegion — hostile state strings degrade to 'unknown', ne
   });
 });
 
+/**
+ * The gauge face's two 2026-08-14 fixes, both raised by the operator against
+ * the live page and both structural rather than cosmetic.
+ *
+ * The `state` on every payload here is BASE's own `"unknown"` — deliberately.
+ * That is the state a real machine reports (any unpriceable resident makes the
+ * ledger decline to promise a fit — provenance finding 1), and under the old
+ * code it painted the fill dim grey at every fill level, which is what the
+ * operator actually saw and reported. A test that only exercised green/red
+ * payloads would have passed against the broken version.
+ */
+describe("MachineHealthRegion — the fill answers 'how full', not 'what state'", () => {
+  it("goes red on a nearly-full machine whose state is UNKNOWN", () => {
+    const full: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "unknown", current_bytes: 130000000000 } };
+    const { container } = renderRegion(full, { residencyRows: residencyRowsFor(full) });
+    expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-red");
+  });
+
+  it("the inverted case: the SAME unknown state on a near-empty machine is green", () => {
+    const empty: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "unknown", current_bytes: 4000000000 } };
+    const { container } = renderRegion(empty, { residencyRows: residencyRowsFor(empty) });
+    expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-green");
+  });
+
+  it("never lands the arbiter's verdict on the fill — an is-unknown fill is what the fix removed", () => {
+    const { container } = renderRegion(BASE);
+    expect(container.querySelector(".mm-gauge-val.is-unknown")).toBeNull();
+    // ...and the needle stops carrying it too: position is its whole job.
+    expect(container.querySelector(".mm-gauge-needle")!.getAttribute("class")).toBe("mm-gauge-needle");
+  });
+
+  it("keeps the VERDICT channels server-driven — the unknown state still reaches the chip and the lamp", () => {
+    const full: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "unknown", current_bytes: 130000000000 } };
+    const { container } = renderRegion(full, { residencyRows: residencyRowsFor(full) });
+    // A red FILL must not be mistakable for a red machine anywhere it counts.
+    expect(container.querySelector(".mm-gcap .mm-chip")!.textContent).toBe("UNKNOWN");
+    expect(container.querySelector(".mm-gauge-redline.lit")).toBeNull();
+    expect(container.querySelector(".mm-gauge-center-caption")!.textContent).toBe("IN USE");
+  });
+});
+
+describe("MachineHealthRegion — the center readout is centered on the hub", () => {
+  it("centers the digit cells on the gauge's own axis, independently of the unit beside them", () => {
+    const { container } = renderRegion(BASE);
+    const cells = [...container.querySelectorAll(".mm-gauge-odo-cell")] as SVGRectElement[];
+    expect(cells.length).toBe(4); // "19.4"
+    const left = Math.min(...cells.map((c) => Number(c.getAttribute("x"))));
+    const right = Math.max(...cells.map((c) => Number(c.getAttribute("x")) + Number(c.getAttribute("width"))));
+    // CX is 120. The old single <text x=120 textAnchor="middle"> centered the
+    // number AND the unit as one run, so the figure itself always sat left of
+    // the hub by half of " GB" — the nit this fixes.
+    expect((left + right) / 2).toBeCloseTo(120, 6);
+    // The unit hangs off the right edge and takes no part in that centering.
+    expect(Number(container.querySelector(".mm-gauge-center-unit")!.getAttribute("x"))).toBeGreaterThan(right);
+  });
+
+  it("never announces a fabricated 0% to a screen reader when the reading is unavailable", () => {
+    // `memPct(null, scale)` is 0 by design (it exists so no caller is handed
+    // NaN), so an unguarded "% full" clause would tell a screen-reader user
+    // the machine is 0% full for the very payload the odometer renders as a
+    // single "—". Absence is never zero — including in the channel a sighted
+    // reader cannot check against the dial.
+    const none: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: null as unknown as number } };
+    const { container } = renderRegion(none, { residencyRows: residencyRowsFor(none) });
+    const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
+    expect(aria).not.toContain("% full");
+    expect(aria).not.toContain("0%");
+    expect(aria).toContain("unreadable");
+
+    // The inverted case: a readable reading DOES get its fullness announced.
+    const ok = renderRegion(BASE);
+    const okAria = ok.container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
+    expect(okAria).toContain("% full");
+  });
+
+  it("stays centered when the figure's width changes — including the no-data case", () => {
+    const wide: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: 130000000000 } }; // "121.1", 5 cells
+    const { container } = renderRegion(wide, { residencyRows: residencyRowsFor(wide) });
+    const cells = [...container.querySelectorAll(".mm-gauge-odo-cell")] as SVGRectElement[];
+    expect(cells.length).toBe(5);
+    const left = Math.min(...cells.map((c) => Number(c.getAttribute("x"))));
+    const right = Math.max(...cells.map((c) => Number(c.getAttribute("x")) + Number(c.getAttribute("width"))));
+    expect((left + right) / 2).toBeCloseTo(120, 6);
+
+    const none: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: null as unknown as number } };
+    const r2 = renderRegion(none, { residencyRows: residencyRowsFor(none) });
+    const oneCell = [...r2.container.querySelectorAll(".mm-gauge-odo-cell")] as SVGRectElement[];
+    expect(oneCell.length).toBe(1); // the "—" cell, not a fabricated 0
+    expect(Number(oneCell[0].getAttribute("x")) + Number(oneCell[0].getAttribute("width")) / 2).toBeCloseTo(120, 6);
+  });
+});
+
 describe("MachineHealthRegion — the redline keys on exactly machine.state === 'red'", () => {
   it("lights the redline and the center value when state is red", () => {
     const red: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "red", current_bytes: 140000000000 }, pressure: { ...BASE.pressure, red: true } };
@@ -156,8 +248,10 @@ describe("MachineHealthRegion — #1812: stale keeps the last-good reading, visi
     const { container, getByText } = renderRegion(BASE, { resourcesErrored: true });
     expect(getByText(/showing the last snapshot/i)).toBeInTheDocument();
     expect(container.querySelector(".mm-hero.is-stale")).not.toBeNull();
-    // The reading itself is still there — never blanked.
-    expect(container.querySelector(".mm-gauge-center-val")?.textContent).toContain("20.8");
+    // The reading itself is still there — never blanked. (The odometer splits
+    // the figure into per-character cells, so this reads the group's
+    // concatenated text: "19.4" + the unit.)
+    expect(container.querySelector(".mm-gauge-center-val")?.textContent).toContain("19.4");
   });
 
   it("the inverted case: no stale banner and no desaturation when the latest poll succeeded", () => {
@@ -277,13 +371,16 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     expect(kv.textContent).not.toContain("physical pool");
   });
 
-  it("reconciles the page's two byte conventions on the pool figure (#1811)", () => {
+  it("renders the pool in binary GiB, agreeing with the header's own figure (#1811)", () => {
     const { container } = renderRegion(BASE);
     const kv = container.querySelector(".mm-kv--machine")!;
-    // The header says "128 GB" (binary) and this row says "137.44 GB"
-    // (decimal) for the SAME `hw.memsize`. The parenthetical is what tells a
-    // reader those are one number.
-    expect(kv.textContent).toContain("137.44 GB (128 GiB)");
+    // Same `hw.memsize` the stage header renders as "128 GB". It used to read
+    // "137.44 GB" here — one number, two figures, on the one screen whose job
+    // is telling the operator how much room they have. The units are the fix;
+    // the reconciling " (128 GiB)" parenthetical that used to be asserted here
+    // is gone with them.
+    expect(kv.textContent).toContain("128.00 GiB");
+    expect(kv.textContent).not.toContain("137.44");
   });
 
   it("distinguishes pool CAPACITY from pool FREE — they are different fields", () => {
@@ -291,8 +388,8 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     const kv = container.querySelector(".mm-kv--machine")!;
     // 137438953472 vs 3738599424 — rendering `available` where `capacity`
     // belongs was the third undetected mutation.
-    expect(kv.textContent).toContain("137.44 GB");
-    expect(kv.textContent).toContain("3.74 GB");
+    expect(kv.textContent).toContain("128.00 GiB");
+    expect(kv.textContent).toContain("3.48 GiB");
   });
 
   it("renders the attribution footer — the observer's own cost disclosure", () => {

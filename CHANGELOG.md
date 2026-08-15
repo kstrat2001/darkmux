@@ -11,6 +11,33 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+### Changed
+
+- **The machine page reads in binary GiB, so its numbers match the machine you
+  bought** (#1811). A 128 GB MacBook Pro was rendering its own memory ceiling as
+  `137.44 GB`, and the gauge inherited it — labeling its arc `0 · 34 · 69 · 103
+  · 137` on the one screen whose whole job is telling you how much room you
+  have. Every figure in the memory ledger and on the gauge face now divides by
+  a power of two and is labeled `GiB`/`MiB`: the arc reads `0 · 32 · 64 · 96 · 128`, the pool
+  reads `128.00 GiB`, and the ` (128 GiB)` parenthetical that used to patch the
+  mismatch is gone along with it. The stage header's own RAM figure keeps its
+  `GB` label for now — it was always computed in binary, so it now agrees
+  numerically; only the suffix still differs.
+- **The gauge's fill shows how full the machine is, instead of a verdict that is
+  almost never colored.** The arc was tinted by `machine.state`, which reads
+  `unknown` whenever any resident model is unpriceable — the normal case — so
+  the hero instrument swept from empty to full in permanent dim grey. The fill
+  now ramps green → amber → red off the needle's own position, and the needle
+  stopped being dimmed by that same verdict. **The verdict is unchanged and
+  still server-only**: the state chip, the seven tell-tale lamps, the face
+  caption and the redline each still key on their own single field, so an amber
+  fill never means the arbiter said amber.
+- **The gauge's center readout is an odometer, centered on the hub.** It was one
+  centered text run, which centered the number *and* its unit together and so
+  left the figure itself sitting off-axis. The digits now render as recessed
+  odometer cells matching the pressure tiles, centered on the dial's own axis,
+  with the unit hung outside that centering.
+
 ## [2.7.0] - 2026-08-14
 
 The release where **the new viewer becomes the viewer**. `/next` graduated: the

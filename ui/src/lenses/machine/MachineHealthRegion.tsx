@@ -1,7 +1,9 @@
 import {
   computeGaugeGeometry,
   deriveLamps,
+  digitCells,
   gaugeFaceCaption,
+  gaugeFillSeverity,
   gaugeValueParts,
   groupResidencyRows,
   isOverLimit,
@@ -12,7 +14,7 @@ import {
   redlineLit,
   type ResidencyRowView,
 } from "./machineGauge";
-import { memBytes, poolGiBNote } from "../../lib/format";
+import { memBytes } from "../../lib/format";
 import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
@@ -73,17 +75,58 @@ const TICK_LABEL_XY: [number, number][] = [
   [220, 136],
 ];
 
+/** The center readout's odometer geometry, in the SVG's own units. The digit
+ * cells are laid out by hand rather than by `textAnchor` because the operator's
+ * nit was precisely that the old single centered `<text>` was NOT centered: it
+ * centered the whole run — number AND unit — so the number itself always sat
+ * left of the hub by half the width of " GB". Here the CELLS are centered on
+ * `CX` and the unit hangs off the right edge, the way a real odometer's unit
+ * plate does, so the figure the eye actually reads is the thing that is
+ * centered. `.` gets a narrow cell — a decimal point in a full-width digit cell
+ * reads as a blank slot. */
+const ODO_CELL_W = 17;
+const ODO_DOT_W = 8;
+const ODO_GAP = 2.5;
+const ODO_TOP = 133;
+const ODO_H = 23;
+const ODO_BASELINE = ODO_TOP + 16.5;
+
+function odoLayout(chars: string[]): { cells: { ch: string; x: number; w: number }[]; width: number } {
+  const widths = chars.map((c) => (c === "." ? ODO_DOT_W : ODO_CELL_W));
+  const width = widths.reduce((a, b) => a + b, 0) + ODO_GAP * Math.max(0, widths.length - 1);
+  let x = CX - width / 2;
+  const cells = chars.map((ch, i) => {
+    const cell = { ch, x, w: widths[i] };
+    x += widths[i] + ODO_GAP;
+    return cell;
+  });
+  return { cells, width };
+}
+
 function Gauge({ resources, stale }: { resources: MachineResources; stale: boolean }) {
   const geo = computeGaugeGeometry(resources);
   const pressureRed = !!resources.pressure?.red;
   const overLimit = isOverLimit(resources.machine.current_bytes, resources.limit_bytes);
   const lit = redlineLit(resources.machine.state) && !stale;
-  const stateCls = memStateCls(resources.machine.state);
   const centerVal = gaugeValueParts(resources.machine.current_bytes);
   const faceCaption = gaugeFaceCaption(resources.machine.state, pressureRed, overLimit);
+  // The fill's hue answers "how full", NOT "what did the arbiter decide" —
+  // see `gaugeFillSeverity`'s own doc for why that separation is load-bearing.
+  const fillCls = gaugeFillSeverity(geo.pct);
+  const odo = odoLayout(digitCells(centerVal.num));
 
-  const ariaLabel = `Machine memory: ${centerVal.num} ${centerVal.unit} in use of the ${gaugeValueParts(geo.scale).num} ${gaugeValueParts(geo.scale).unit} ${geo.scaleWord.toLowerCase()}. ${
-    geo.commitPct != null ? `Committed ${gaugeValueParts(resources.machine.potential_bytes).num} GB${resources.machine.unpriced_models ? ` plus ${resources.machine.unpriced_models} unpriced model(s)` : ""}, marked by the dashed tick. ` : ""
+  const committed = gaugeValueParts(resources.machine.potential_bytes);
+  // The "% full" clause is gated on a READABLE current, not rendered
+  // unconditionally: `memPct(null, scale)` is 0 by design (it exists to never
+  // hand a caller NaN), so an unreadable `current_bytes` would otherwise have
+  // the screen reader announce "0% full" for the same payload the odometer
+  // honestly renders as a single "—" cell. Absence is never zero — including
+  // in the channel a sighted reader can't check.
+  const scaleVal = gaugeValueParts(geo.scale);
+  const fullness = geo.cur != null ? ` (${Math.round(geo.pct)}% full)` : "";
+  const inUse = geo.cur != null ? `${centerVal.num} ${centerVal.unit}` : "an unreadable amount";
+  const ariaLabel = `Machine memory: ${inUse} in use of the ${scaleVal.num} ${scaleVal.unit} ${geo.scaleWord.toLowerCase()}${fullness}. ${
+    geo.commitPct != null ? `Committed ${committed.num} ${committed.unit}${resources.machine.unpriced_models ? ` plus ${resources.machine.unpriced_models} unpriced model(s)` : ""}, marked by the dashed tick. ` : ""
   }State ${resources.machine.state || "unknown"}.`;
 
   return (
@@ -91,7 +134,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
       <svg width="300" height="212" viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
         <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={11} pathLength={100} />
         <path
-          className={`mm-gauge-val is-${stateCls}`}
+          className={`mm-gauge-val is-${fillCls}`}
           d={HALF_ARC_D}
           fill="none"
           strokeWidth={11}
@@ -136,18 +179,28 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
           strokeDasharray="2.5 100"
           strokeDashoffset="-97.5"
         />
-        <line
-          className={`mm-gauge-needle is-${stateCls}`}
-          x1={CX}
-          y1={CY}
-          x2={52}
-          y2={CY}
-          transform={`rotate(${geo.needleAngleDeg} ${CX} ${CY})`}
-        />
+        {/* The needle is deliberately UNCOLORED by state. It used to carry
+            `is-${stateCls}`, which on a real machine means `is-unknown` — a dim
+            grey needle over a dim grey fill, permanently (provenance finding
+            1). Position is the needle's whole job; the fill beside it now
+            carries the how-full channel and the lamps carry the verdict, so a
+            third, permanently-grey encoding of the same question is subtraction
+            rather than information. */}
+        <line className="mm-gauge-needle" x1={CX} y1={CY} x2={52} y2={CY} transform={`rotate(${geo.needleAngleDeg} ${CX} ${CY})`} />
         <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
-        <text className={`mm-gauge-center-val${lit ? " lit" : ""}`} x={CX} y={150} textAnchor="middle">
-          {centerVal.num} <tspan className="mm-gauge-center-unit">{centerVal.unit}</tspan>
-        </text>
+        <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
+          {odo.cells.map((c, i) => (
+            <g key={i}>
+              <rect className="mm-gauge-odo-cell" x={c.x} y={ODO_TOP} width={c.w} height={ODO_H} rx={2.5} />
+              <text className="mm-gauge-odo-digit" x={c.x + c.w / 2} y={ODO_BASELINE} textAnchor="middle">
+                {c.ch}
+              </text>
+            </g>
+          ))}
+          <text className="mm-gauge-center-unit" x={CX + odo.width / 2 + 5} y={ODO_BASELINE} textAnchor="start">
+            {centerVal.unit}
+          </text>
+        </g>
         <text className="mm-gauge-center-caption" x={CX} y={164} textAnchor="middle">
           {faceCaption}
         </text>
@@ -382,27 +435,16 @@ export function MachineHealthRegion({
         </div>
       </div>
 
-      {/* (#1811) The pool figure carries its BINARY equivalent in parentheses,
-          and that parenthetical is the whole fix. `hw.memsize` is rendered
-          twice on this page in two conventions: the stage header says
-          `128 GB` (binary GiB, `specOf`) and this row says `137.44 GB`
-          (decimal, `memBytes`). They are the same number, and a reader doing
-          the obvious arithmetic on the one screen whose job is telling them
-          how much room they have gets an answer in units that do not match
-          the machine they think they own.
-          Naming both at the point of comparison resolves it where the
-          confusion actually arises. The more correct fix — relabelling the
-          header `128 GiB`, since that is what its arithmetic computes — is
-          deliberately NOT taken here: that string is inside the one region
-          `next-parity.spec.ts` still asserts byte-exact against legacy, and
-          it is the machine lens's last such tie. Spending it to relabel a
-          unit is an operator call, not a drive-by. */}
+      {/* (#1811) The pool figure no longer needs the reconciling ` (128 GiB)`
+          parenthetical that used to sit here: `memBytes` is binary now, so
+          `hw.memsize` reads `128.00 GiB` on this row and `128 GB` in the stage
+          header — the SAME NUMBER, which is what the finding was about. What
+          survives is a unit-suffix mismatch (`GB` on a figure `specOf` has
+          always computed in binary), and relabelling that one token is gated on
+          retiring the machine stage's last byte-exact parity tie to legacy.
+          Operator call, still not a drive-by. */}
       <div className="mm-kv mm-kv--machine">
-        limit source <b>{limitDescription(b.limit_source)}</b> · pool{" "}
-        <b>
-          {memBytes(b.pool?.capacity_bytes)}
-          {poolGiBNote(b.pool?.capacity_bytes)}
-        </b>{" "}
+        limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b>{" "}
         · pool free <b>{memBytes(b.pool?.available_bytes)}</b> · unpriced{" "}
         <b>{Number(b.machine.unpriced_models) || 0} model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}</b>
       </div>
