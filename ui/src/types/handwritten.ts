@@ -129,13 +129,18 @@ export interface MachineResourcesModel {
   kv_per_token_bytes: number;
   kv_bytes_at_ctx: number;
   potential_bytes: number;
-  /** #1819 — where `potential_bytes` came from. `"arch"` = measured from the
-   * model's own `config.json`; `"estimated"` = the size-based fallback
-   * (catalog size + a conservative dense-attention KV constant, #1819's
-   * `ArchWithSizeFallback`), used when arch facts are unreadable (commonly
-   * a GGUF download with no sidecar `config.json`). OMITTED (not `null`)
-   * when `potential_bytes` itself is `null` — nothing priced the row at
-   * all. Source: `crates/darkmux-profiles/src/model_ledger.rs::ModelRow`. */
+  /** #1819/#1820 — where `potential_bytes` came from. `"arch"` = MEASURED
+   * from the model's own architecture facts, read either from a sibling
+   * `config.json` or (#1820) straight out of the GGUF binary header; the
+   * two share one value deliberately, because what matters downstream is
+   * that the number was measured, not which byte layout carried it.
+   * `"estimated"` = the size-based fallback (catalog size + a conservative
+   * dense-attention KV constant, #1819's `ArchWithSizeFallback`), used when
+   * NEITHER reader could answer — a corrupt or truncated download, an
+   * ambiguous multi-file directory, or a weights format neither understands.
+   * OMITTED (not `null`) when `potential_bytes` itself is `null` — nothing
+   * priced the row at all.
+   * Source: `crates/darkmux-profiles/src/model_ledger.rs::ModelRow`. */
   potential_source?: "arch" | "estimated";
   current_bytes: number;
   state: "green" | "yellow" | "red" | string;

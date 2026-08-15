@@ -75,7 +75,7 @@
 use super::arch_facts::{key_paths_from_entries, model_name_tokens, tokenize, ArchFactsRaw};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
 /// Same walk-budget the #1309 content-scan fallback in `arch_facts` uses —
@@ -208,13 +208,30 @@ fn read_gguf_dir(dir: &Path) -> Option<ArchFactsRaw> {
 
 /// Picks the single `.gguf` file a directory's header should be read from.
 /// See the module docs' "Multi-file (sharded) GGUF downloads" section.
+///
+/// `mmproj-*` siblings are excluded before the ambiguity check. A vision
+/// model's directory holds the language model beside its multimodal
+/// projector (`mmproj-<model>-BF16.gguf`) — two `.gguf` files, neither
+/// carrying a shard marker, which without this filter reads as ambiguous and
+/// declines. `mmproj-` is llama.cpp's own fixed prefix for that file, so this
+/// is a named convention rather than a guess. The cost of getting it wrong
+/// was measurable: a resident gemma-4-E4B prices at 344,064 B/token measured
+/// against the ≤15 GiB tier's 204,800 estimate — the fallback under-reserves
+/// it, so declining to measure errs in the UNSAFE direction for exactly the
+/// class of model this filter recovers.
 fn pick_gguf_file(dir: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut candidates: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
-            candidates.push(path);
+            let is_projector = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.to_ascii_lowercase().starts_with("mmproj-"));
+            if !is_projector {
+                candidates.push(path);
+            }
         }
     }
     match candidates.len() {
@@ -461,9 +478,21 @@ fn read_gguf_string_bounded<R: Read>(r: &mut R, max_len: u64) -> Option<String> 
 /// EOF is harmless on a real file (the next `read_exact` simply fails), so
 /// this needs no upper bound on `len` beyond the caller's own ceilings on
 /// how many times it gets called (`MAX_KV_COUNT` / `MAX_ARRAY_LEN`).
+///
+/// `seek_relative`, deliberately, NOT `seek(SeekFrom::Current(..))`:
+/// `BufReader`'s `Seek` impl DISCARDS its whole 8KB buffer on every seek,
+/// even a 3-byte one, so skipping a tokenizer array's ~100k strings costs
+/// ~100k lseek syscalls and ~100k full buffer refills. Measured against a
+/// real 9GB phi-4 GGUF: **127–150ms and ~1.6GB of page-cache traffic with
+/// `seek`, 0.9ms with `seek_relative`.** That cost lands on every cold
+/// `/machine/resources` poll while an operator watches the machine lens —
+/// on the inference host, contending with the memory-bandwidth-bound work
+/// being observed, which the #1286 observer contract forbids. It also bounds
+/// the hostile-file worst case to roughly one pass over the file instead of
+/// ~1000x that in page-cache reads.
 fn skip_gguf_string<R: Read + Seek>(r: &mut R) -> Option<()> {
     let len = read_u64(r)?;
-    r.seek(SeekFrom::Current(i64::try_from(len).ok()?)).ok()?;
+    r.seek_relative(i64::try_from(len).ok()?).ok()?;
     Some(())
 }
 
@@ -494,7 +523,9 @@ fn skip_gguf_array<R: Read + Seek>(r: &mut R) -> Option<()> {
     }
     let elem_size = scalar_byte_width(elem_type)?;
     let total = elem_size.checked_mul(len)?;
-    r.seek(SeekFrom::Current(i64::try_from(total).ok()?)).ok()?;
+    // `seek_relative` for the same reason as `skip_gguf_string` above — it
+    // keeps `BufReader`'s buffer alive across the skip.
+    r.seek_relative(i64::try_from(total).ok()?).ok()?;
     Some(())
 }
 
@@ -953,6 +984,36 @@ mod tests {
         root.write_gguf(dir, "variant-b.gguf", &valid_bytes());
         let reader = GgufFactsReader::with_root(root.path());
         assert_eq!(reader.read(dir), None, "no shard marker to disambiguate — must not guess");
+    }
+
+    /// A vision model ships its multimodal projector beside the language
+    /// model — two `.gguf` files, no shard marker — which read as ambiguous
+    /// before the `mmproj-` filter and cost the whole class its measurement.
+    /// The projector here is deliberately UNPARSEABLE, so a reader that
+    /// picked it (rather than filtering it) fails loudly instead of passing
+    /// on a coincidence.
+    #[test]
+    fn read_ignores_the_mmproj_sibling_and_measures_the_language_model() {
+        let root = TempRoot::new("vision");
+        let dir = "gemma-vision-GGUF";
+        root.write_gguf(dir, "gemma-vision-Q4_K_M.gguf", &valid_bytes());
+        root.write_gguf(dir, "mmproj-gemma-vision-BF16.gguf", b"not a gguf header at all");
+        let reader = GgufFactsReader::with_root(root.path());
+        let facts = reader.read(dir).expect("the projector must not make this ambiguous");
+        assert_eq!(facts.num_hidden_layers, 40);
+    }
+
+    /// The filter is a carve-out for the projector, NOT a general "pick the
+    /// biggest / first" relaxation: two real variants stay ambiguous.
+    #[test]
+    fn read_still_declines_when_two_non_projector_variants_remain() {
+        let root = TempRoot::new("vision-ambiguous");
+        let dir = "two-variants-plus-projector";
+        root.write_gguf(dir, "variant-a.gguf", &valid_bytes());
+        root.write_gguf(dir, "variant-b.gguf", &valid_bytes());
+        root.write_gguf(dir, "mmproj-variant-BF16.gguf", &valid_bytes());
+        let reader = GgufFactsReader::with_root(root.path());
+        assert_eq!(reader.read(dir), None, "filtering the projector must not resolve a real ambiguity");
     }
 
     #[test]

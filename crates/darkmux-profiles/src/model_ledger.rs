@@ -378,8 +378,13 @@ pub enum LimitSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PotentialSource {
-    /// Priced from the model's own `config.json` architecture facts
-    /// ([`ArchEstimator`]) — a measurement, not a guess.
+    /// Priced from the model's own architecture facts ([`ArchEstimator`]) —
+    /// a measurement, not a guess. Read from a sibling `config.json`, or
+    /// (#1820) from the GGUF binary header when the download carries its
+    /// architecture inside the file instead of in a sidecar. Both are the
+    /// same class of fact and deliberately share this variant: a consumer
+    /// cares that the number was MEASURED, not which byte layout it came
+    /// from.
     Arch,
     /// Arch facts were unreadable; priced from catalog size + the
     /// conservative dense-attention KV constant instead ([`V1Estimator`]

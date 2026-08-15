@@ -961,7 +961,7 @@ fn unpriceable_residents_status(models: &[darkmux_profiles::model_ledger::ModelR
         name,
         status: Status::Warn,
         message: format!(
-            "{} resident model(s) genuinely unpriceable — no readable config.json arch facts AND no catalog size either, so even the size-based estimate has nothing to work from: {} — the machine's fit verdict stays UNKNOWN while any of these are loaded",
+            "{} resident model(s) genuinely unpriceable — no readable config.json, no readable GGUF header, AND no catalog size, so even the size-based estimate has nothing to work from: {} — the machine's fit verdict stays UNKNOWN while any of these are loaded",
             unpriceable.len(),
             unpriceable.join(", ")
         ),
