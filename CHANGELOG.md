@@ -7,9 +7,14 @@ darkmux follows semver, stable since **1.0.0**; breaking changes are called out
 explicitly in each entry (pre-1.0, the no-compat-baggage policy shipped breaks
 without deprecation shims). Roadmap **milestones** (`M1`/`M2`/`M3`…) are
 intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
-`FLOW_SCHEMA` data-shape contracts version on their own cadence (see `CLAUDE.md`).
+`FLOW_SCHEMA` / `LEDGER_SCHEMA` data-shape contracts version on their own
+cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
+to that payload, called out in the entry, and does not by itself force a major
+darkmux release.
 
 ## [Unreleased]
+
+## [2.8.0] - 2026-08-15
 
 The machine page's numbers were wrong, and now they are not. Per-model memory
 was read from a counter (`ps rss`) that does not count MLX weights at all, so
@@ -655,6 +660,7 @@ schema changes (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`).
   "ready" with no time reference at all, indistinguishable from a fleet that
   had never dispatched.
 
+[2.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.8.0
 [2.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.7.0
 [2.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.6.0
 [2.5.1]: https://github.com/kstrat2001/darkmux/releases/tag/v2.5.1
