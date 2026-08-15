@@ -30,15 +30,15 @@ for the case that established this).
 
 ## Supported versions
 
-As of v1.0.0, darkmux follows semver. The current `1.x` line receives security
-fixes and maintenance. Older major versions (`0.x`) get no backports; upgrade to
-the `1.x` line to receive fixes. Pin a version for reproducibility, but track the
-`1.x` line for security updates.
+As of v1.0.0, darkmux follows semver. The current `2.x` line receives security
+fixes and maintenance. Older major versions (`0.x`, `1.x`) get no backports;
+upgrade to the `2.x` line to receive fixes. Pin a version for reproducibility,
+but track the `2.x` line for security updates.
 
 | Version | Supported |
 | ------- | --------- |
-| `1.x` (current) + `main` | ✅ |
-| `0.x` and older | ❌ (upgrade to `1.x`) |
+| `2.x` (current) + `main` | ✅ |
+| `1.x` and older | ❌ (upgrade to `2.x`) |
 
 ## Threat model
 

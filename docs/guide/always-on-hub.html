@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Set up a secure hub · darkmux user guide</title>
+<title>Set up an always-on hub · darkmux user guide</title>
 <meta name="description" content="Turn one always-on machine into a secure 24/7 darkmux hub on your tailnet: password-less Redis bound to loopback + the tailnet interface (never the public internet), the daemon under launchd, audit substrate, log rotation, daily integrity checks.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -15,7 +15,7 @@
 <nav class="topnav">
   <div class="wrap">
     <a href="../" class="brand">darkmux</a>
-    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> secure hub</span>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> always-on hub</span>
     <div class="links">
       <a href="index.html">Guide</a>
       <a href="fleet.html">Peer setup</a>
@@ -27,7 +27,7 @@
 <header class="page-head">
   <div class="wrap">
     <div class="label">user guide <span class="dot">·</span> 05 · machine setup</div>
-    <h1>Set up a secure hub</h1>
+    <h1>Set up an always-on hub</h1>
     <p class="lede">A copy/paste walkthrough for turning one always-on machine into the secure 24/7 hub the rest of your fleet relies on. The hub runs Redis (the coordination substrate) and the darkmux daemon (the live viewer + flow endpoints). This page assumes a clean machine and a tailnet: <strong>every command after <code>brew install</code> should work as written.</strong> Setting up a worker peer? Do this page first, then the <a href="fleet.html">peer setup guide</a>.</p>
   </div>
 </header>
@@ -43,14 +43,14 @@
 <section>
   <div class="wrap">
     <h2>The security model: the tailnet is the perimeter</h2>
-    <p>This guide sets up <strong>password-less Redis</strong>, and that is a deliberate, safe choice <em>because of how the listener is bound</em>. The logic:</p>
+    <p>This guide sets up <strong>password-less Redis</strong>. That works <em>only</em> because of how the listener is bound — read the points below before running it, and decide whether it fits your threat model. The logic:</p>
     <ul>
       <li><strong>Redis listens only on loopback + your tailnet interface</strong> (<code>127.0.0.1</code> and the hub's <code>100.x.y.z</code> Tailscale address). It does NOT listen on your physical LAN, your WiFi, or any public interface. The only machines that can open a socket to it are devices already on your tailnet.</li>
       <li><strong>The tailnet is the authentication boundary.</strong> Tailscale (or WireGuard / your mesh VPN) already gates who joins with WireGuard encryption + your ACLs. A device that isn't on your tailnet cannot route a packet to the hub's Redis port, password or not.</li>
       <li><strong>A Redis password would be a second lock on a door only your own devices can reach.</strong> It's useful defense-in-depth if you don't fully trust every device on your tailnet (this guide shows the optional <code>requirepass</code> path at the end), but the <em>bind</em> is the primary control, and on a single-operator tailnet it's sufficient.</li>
     </ul>
     <div class="callout warn">
-      <strong>Never <code>bind 0.0.0.0</code>.</strong> That makes Redis listen on <em>every</em> interface, including whatever LAN or coffee-shop WiFi the machine is on. The old advice of "<code>0.0.0.0</code> + a password" trades a structural guarantee for a credential you have to manage and protect. Binding the specific loopback + tailnet addresses makes the port structurally unreachable from anywhere but the tailnet: no password to leak, rotate, or fat-finger.
+      <strong>Never <code>bind 0.0.0.0</code>.</strong> That makes Redis listen on <em>every</em> interface, including whatever LAN or coffee-shop WiFi the machine is on. The old advice of "<code>0.0.0.0</code> + a password" trades an interface restriction for a credential you have to manage and protect. Binding the specific loopback + tailnet addresses means the listener accepts connections only on those interfaces — nothing else on the machine’s LAN or WiFi can open a socket to it, and there is no password to leak, rotate, or fat-finger. That property depends entirely on the bind line staying correct: re-verify it after any Tailscale device re-add, since the tailnet address can change.
     </div>
     <p class="muted">One caveat to know: Tailscale assigns each device a stable <code>100.x.y.z</code> address that persists across reboots. It only changes if you remove and re-add the device in the admin console. If you ever do that, update the <code>bind</code> line (and peers' <code>redis.host</code>) and restart. In normal operation the address is stable.</p>
   </div>
@@ -113,17 +113,20 @@ darkmux doctor</code></pre>
 
 <section>
   <div class="wrap">
-    <h2 id="harden">Before you start: harden the hub's OS</h2>
+    <h2 id="harden">Before you start: keep the hub awake and reachable</h2>
     <p>The most common multi-machine failure mode is the operator-default-macOS one: the hub sleeps overnight, drops Tailscale, your other machines' dispatches start timing out, and you don't notice until you try to use it. Walk through this once on the hub:</p>
     <pre><code><span class="comment"># Stop sleeping. Mac defaults assume "lid closed = sleep"; wrong for a 24/7 hub.</span>
 sudo pmset -a sleep 0 disksleep 0 autorestart 1
 pmset -g                                          <span class="comment"># verify the settings landed</span>
 
 <span class="comment"># Tailscale:  System Settings → Tailscale → "Run at login" + "Always on"</span>
-<span class="comment"># Auto-login: System Settings → Users &amp; Groups → Login Options → Automatic login</span>
+<span class="comment"># Auto-login: System Settings → Users &amp; Groups → Login Options → Automatic login
+#             ^ availability tradeoff, NOT hardening: a reboot lands in an unlocked session
+#               and FileVault stops protecting the volume once it is up. Skip if the machine
+#               is not physically secure.</span>
 <span class="comment"># Updates:    set major-version auto-install OFF; schedule them manually.</span></code></pre>
     <p><code>autorestart 1</code> recovers from a brief power blip. Tailscale "Run at login" + an auto-login user means: after any reboot the machine boots straight into a session where Tailscale + your services start automatically, instead of sitting at the login screen with Tailscale down and no remote way in.</p>
-    <p>You also need <a href="https://brew.sh">Homebrew</a> (to install darkmux and Redis) and a private mesh network reaching the hub. This guide assumes <a href="https://tailscale.com">Tailscale</a>; WireGuard / ZeroTier / plain LAN work the same. And run darkmux on a version that ships <code>darkmux machine</code> + <code>darkmux config</code> (check with <code>darkmux config --help</code>; if it errors, <code>brew upgrade darkmux</code>).</p>
+    <p>You also need <a href="https://brew.sh">Homebrew</a> (to install darkmux and Redis) and a private mesh network reaching the hub. This guide assumes <a href="https://tailscale.com">Tailscale</a>; WireGuard and ZeroTier substitute cleanly, because they too are authenticated mesh networks. <strong>A plain LAN does not</strong> — the password-less posture below depends on the network itself gating who can reach the machine. On a LAN, set <code>requirepass</code> and keep <code>protected-mode yes</code>. And run darkmux on a version that ships <code>darkmux machine</code> + <code>darkmux config</code> (check with <code>darkmux config --help</code>; if it errors, <code>brew upgrade darkmux</code>).</p>
     <div class="callout">
       <strong>macOS vs Linux:</strong> the deep phases below use launchd + newsyslog (macOS-native). Linux operators substitute systemd units for launchd plists, logrotate for newsyslog, and your distro's <code>redis.conf</code> path (<code>/etc/redis/redis.conf</code>). The decisions and verification steps are the same; only the file formats change.
     </div>
@@ -141,7 +144,7 @@ redis-cli CONFIG SET bind "127.0.0.1 $TS_IP"
 redis-cli CONFIG SET protected-mode no
 redis-cli CONFIG REWRITE
 brew services restart redis</code></pre>
-    <p>Two interfaces, deliberately: <code>127.0.0.1</code> so the hub's own daemon connects over loopback, and the tailnet IP so peers can reach it across the tailnet. Nothing else. <code>protected-mode no</code> is required for the password-less posture: with <code>protected-mode yes</code> (the default) and no <code>requirepass</code>, Redis refuses every non-loopback connection, so peers couldn't connect. Turning it off is safe <em>here</em> precisely because the bind already restricts the listener to the tailnet interface.</p>
+    <p>Two interfaces, deliberately: <code>127.0.0.1</code> so the hub's own daemon connects over loopback, and the tailnet IP so peers can reach it across the tailnet. Nothing else. <code>protected-mode no</code> is required for the password-less posture: with <code>protected-mode yes</code> (the default) and no <code>requirepass</code>, Redis refuses every non-loopback connection, so peers couldn't connect. Turning it off removes Redis’s own refusal of non-loopback connections, which makes the <code>bind</code> line the only remaining control. If that line is ever wrong, the port is open and unauthenticated.</p>
     <p>Confirm:</p>
     <pre><code>redis-cli CONFIG GET bind                           <span class="comment"># "127.0.0.1 100.x.y.z"</span>
 redis-cli CONFIG GET protected-mode                 <span class="comment"># "no"</span></code></pre>
@@ -376,7 +379,7 @@ tailscale serve status                              <span class="comment"># show
 <section id="requirepass">
   <div class="wrap">
     <h2>Optional: add a Redis password (defense-in-depth)</h2>
-    <p>Password-less + tailnet-bound is sufficient on a single-operator tailnet. Add <code>requirepass</code> if you want a second layer: say you run untrusted tagged devices on the tailnet, or your compliance posture asks for authentication independent of the network boundary. The password lives in the macOS Keychain, never in a file:</p>
+    <p>Password-less + tailnet-bound is sufficient on a single-operator tailnet. Add <code>requirepass</code> if you want a second layer: say you run untrusted tagged devices on the tailnet, or you run untrusted tagged devices and want authentication that does not depend on the network boundary. The password lives in the macOS Keychain, never in a file:</p>
     <pre><code><span class="comment"># Generate a URL-safe password and store it in the Keychain.</span>
 PASS=$(openssl rand -base64 36 | tr -d '/+=' | head -c 48)
 security add-generic-password -a "$USER" -s darkmux-redis -w "$PASS"
@@ -434,7 +437,7 @@ redis-cli XLEN darkmux:flow                         <span class="comment"># high
   <div class="wrap">
     <h2>Good to know</h2>
     <ul>
-      <li><strong>Retention is your policy.</strong> Flow and audit JSONL files grow per-day. A quarterly find-and-delete is plenty for casual use; audit retention is part of your compliance posture if you keep one.</li>
+      <li><strong>Retention is your policy.</strong> Flow and audit JSONL files grow per-day. A quarterly find-and-delete is plenty for casual use; audit retention is yours to set against whatever obligations you have.</li>
       <li><strong>The hub is one machine.</strong> If its disk dies, the AOF goes with it, but each peer's local <code>~/.darkmux/flows/</code> sink survives independently, so per-machine history is preserved everywhere. The hub is the coordination point, not the sole source of truth: back it up like any machine you rely on.</li>
       <li><strong>Rosters are per-machine.</strong> Each machine's <code>~/.darkmux/fleet.json</code> is its own, so adding a machine means registering it on the machines that need to see it (the <code>machine add</code> commands above).</li>
     </ul>

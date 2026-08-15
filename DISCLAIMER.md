@@ -59,7 +59,7 @@ darkmux helps you load models through LMStudio. It does not download, redistribu
 
 ## Hardware compatibility
 
-darkmux is developed and tested on Apple Silicon Macs, specifically on the author's M5 Max system. It should work on other M-series chips, but that is not validated. Intel Macs are not supported. Linux and Windows are not supported.
+darkmux is developed and tested on Apple Silicon Macs, specifically on the author's M5 Max system. It should work on other M-series chips, but that is not validated. Linux compiles and passes CI's fleet tests, but nobody dogfoods it — treat it as unsupported in practice. Intel Macs and Windows are untested and unsupported.
 
 ## Two layers of liability
 
