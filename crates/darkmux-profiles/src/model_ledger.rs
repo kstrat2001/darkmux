@@ -434,7 +434,98 @@ pub struct ResidentInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerProc {
     pub pid: i64,
+    /// `ps` RSS — every resident page mapped into the process, INCLUDING
+    /// clean file-backed ones.
     pub rss_bytes: u64,
+    /// `proc_pid_rusage`'s `ri_phys_footprint` — the figure Activity Monitor
+    /// shows and jetsam judges by. `None` when the syscall is unavailable
+    /// (non-macOS, or a process that vanished between enumeration and probe).
+    pub footprint_bytes: Option<u64>,
+}
+
+impl WorkerProc {
+    /// The worker's memory, as `max(rss, footprint)`.
+    ///
+    /// **This is a documented HEURISTIC, not a precise quantity**, and the
+    /// reason is that neither counter is correct alone — which one is right
+    /// depends on the inference backend, and darkmux runs both:
+    ///
+    /// | backend | weights live in | `ps rss` | `phys_footprint` |
+    /// |---|---|---|---|
+    /// | MLX | Metal / IOAccelerator buffers | ~0 | the real figure |
+    /// | llama.cpp (GGUF) | `mmap`ed clean file-backed pages | the real figure | excludes them |
+    ///
+    /// Measured live on the operator's machine (2026-08-15), same instant:
+    /// a 2.15 GB MLX model read `rss 0.25 GiB / footprint 2.77 GiB`, an
+    /// 18.45 GB MLX model read `0.14 / 22.27`, and a 9.05 GB GGUF model read
+    /// `11.74 / 3.25`. Footprint deliberately excludes clean file-backed
+    /// pages because they are evictable without swapping — true, and exactly
+    /// wrong for "is this model occupying RAM right now".
+    ///
+    /// So the two counters cover largely DISJOINT territory across the two
+    /// backends, and the union is what this page wants. `max` approximates
+    /// that union: `rss + footprint` would double-count dirty anonymous
+    /// pages, which appear in both. `max` slightly UNDER-counts the
+    /// non-overlapping remainder of whichever is smaller — the safe
+    /// direction, and far closer than either counter alone (RSS alone
+    /// understated the machine total ~97x, #1821).
+    ///
+    /// Both raw figures are kept on this struct and serialised, so the
+    /// derivation is checkable rather than trusted.
+    pub fn memory_bytes(&self) -> u64 {
+        self.rss_bytes.max(self.footprint_bytes.unwrap_or(0))
+    }
+}
+
+/// `proc_pid_rusage(pid, RUSAGE_INFO_V0, &buf).ri_phys_footprint` — the
+/// per-process memory figure Activity Monitor displays and jetsam kills on.
+///
+/// Called directly rather than shelling out to `/usr/bin/footprint`, which
+/// returns the same number: measured at **0.05 s per process** versus a
+/// gather that currently completes in ~490 ms and repeats every 5 s. This
+/// page's own doctrine (#1286: the observer must not join the observed)
+/// makes a ~30% gather-cost increase for three subprocess spawns the wrong
+/// trade when a frozen libSystem call costs nothing. `vmmap --summary`
+/// yields the same figure at 1.3 s/process and was never a candidate.
+///
+/// `rusage_info_v0` is a stable, frozen ABI — later flavors append fields
+/// and never reorder these. `ri_phys_footprint` is its 8th `u64`.
+/// Cross-checked against `/usr/bin/footprint -p` on a live worker: 3.25 GiB
+/// both ways, to the byte-rounding shown.
+#[cfg(target_os = "macos")]
+fn phys_footprint(pid: i64) -> Option<u64> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct RUsageInfoV0 {
+        uuid: [u8; 16],
+        user_time: u64,
+        system_time: u64,
+        pkg_idle_wkups: u64,
+        interrupt_wkups: u64,
+        pageins: u64,
+        wired_size: u64,
+        resident_size: u64,
+        phys_footprint: u64,
+        proc_start_abstime: u64,
+        proc_exit_abstime: u64,
+    }
+    unsafe extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+    }
+    let mut buf = RUsageInfoV0::default();
+    // SAFETY: `buf` is a correctly-sized, correctly-aligned `#[repr(C)]`
+    // mirror of `rusage_info_v0`, and the callee writes only within it. A
+    // dead or unreadable pid returns non-zero and we report `None` rather
+    // than reading the buffer.
+    let rc = unsafe { proc_pid_rusage(pid as i32, 0, (&raw mut buf).cast()) };
+    (rc == 0).then_some(buf.phys_footprint)
+}
+
+/// Non-macOS: no footprint concept to read. Callers fall back to RSS alone,
+/// which is what this page did everywhere before #1821.
+#[cfg(not(target_os = "macos"))]
+fn phys_footprint(_pid: i64) -> Option<u64> {
+    None
 }
 
 #[derive(Debug, Clone, Default)]
@@ -779,7 +870,7 @@ fn attribute_current(
             None,
         );
     };
-    let total: u64 = workers.iter().map(|w| w.rss_bytes).sum();
+    let total: u64 = workers.iter().map(WorkerProc::memory_bytes).sum();
     if rows.is_empty() {
         // Nothing to attribute to; the worker total (usually 0) is still
         // the honest machine current.
@@ -804,11 +895,24 @@ fn attribute_current(
     if workers.len() == rows.len() {
         // Rank pairing: sort worker RSS desc; sort row indices by potential
         // (falling back to weights) desc; pair positionally.
-        let mut rss: Vec<u64> = workers.iter().map(|w| w.rss_bytes).collect();
+        let mut rss: Vec<u64> = workers.iter().map(WorkerProc::memory_bytes).collect();
         rss.sort_unstable_by(|a, b| b.cmp(a));
         let mut order: Vec<usize> = (0..rows.len()).collect();
+        // Rank by WEIGHTS, falling back to potential. Weights are the
+        // materialised floor — the bytes a loaded model is holding no matter
+        // what — whereas potential includes KV that may not exist yet, so
+        // ranking by it mis-pairs whenever a small model is loaded at a huge
+        // context.
+        //
+        // Live case that exposed this once #1821 made the worker figures
+        // real: a 2.01 GiB-weights model at 120k ctx has potential 19.18 GiB
+        // and an actual footprint of 2.77, while an 8.43 GiB-weights model at
+        // 16k ctx has potential 12.25 and a footprint of 11.74. Ranked by
+        // potential the two swap; ranked by weights every pair lands on the
+        // right model. It stays a HEURISTIC either way — `lms ps` exposes no
+        // pid, so nothing here is an identity, only an ordering.
         order.sort_by_key(|&i| {
-            std::cmp::Reverse(rows[i].potential_bytes.or(rows[i].weights_bytes).unwrap_or(0))
+            std::cmp::Reverse(rows[i].weights_bytes.or(rows[i].potential_bytes).unwrap_or(0))
         });
         for (rank, &i) in order.iter().enumerate() {
             rows[i].current_bytes = Some(rss[rank]);
@@ -816,7 +920,7 @@ fn attribute_current(
         return (
             Attribution::PerProcess,
             format!(
-                "{} worker(s) for {} resident(s) — per-model RSS, workers rank-matched to models by size (largest worker ↔ largest potential)",
+                "{} worker(s) for {} resident(s) — per-model footprint (max of rss and phys_footprint), workers rank-matched to models by weights (largest worker ↔ largest weights)",
                 workers.len(),
                 rows.len()
             ),
@@ -1057,7 +1161,7 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
         SYS_PROBE_BOUND,
         &mut warnings,
     )
-    .map(|out| parse_worker_rss(&out));
+    .map(|out| enrich_with_footprint(parse_worker_rss(&out), phys_footprint));
 
     let mut ledger = compute_ledger(
         LedgerInputs {
@@ -1242,9 +1346,24 @@ fn parse_worker_rss(ps_out: &str) -> Vec<WorkerProc> {
             let mut it = l.split_whitespace();
             let pid: i64 = it.next()?.parse().ok()?;
             let rss_kib: u64 = it.next()?.parse().ok()?;
-            Some(WorkerProc { pid, rss_bytes: rss_kib * 1024 })
+            Some(WorkerProc { pid, rss_bytes: rss_kib * 1024, footprint_bytes: None })
         })
         .collect()
+}
+
+/// Fills each worker's `footprint_bytes` from `probe`.
+///
+/// Split out with the probe INJECTED rather than inlined at the gather so the
+/// wiring is testable: a mutation that stopped filling footprint entirely
+/// passed the whole suite when this lived inline, because every test built
+/// `WorkerProc`s by hand and nothing exercised the path that populates them.
+/// The parser above stays pure (`ps` text in, structs out); this is where the
+/// syscall-per-worker happens.
+fn enrich_with_footprint(mut workers: Vec<WorkerProc>, probe: impl Fn(i64) -> Option<u64>) -> Vec<WorkerProc> {
+    for w in &mut workers {
+        w.footprint_bytes = probe(w.pid);
+    }
+    workers
 }
 
 /// True when a `ps` command line is an LMStudio inference worker: it runs the
@@ -1448,8 +1567,8 @@ mod tests {
             compressor_bytes: Some(2_000_000_000),
             memory_free_percent: Some(43),
             workers: Some(vec![
-                WorkerProc { pid: 1, rss_bytes: 18_000_000_000 },
-                WorkerProc { pid: 2, rss_bytes: 15_000_000_000 },
+                WorkerProc { pid: 1, rss_bytes: 18_000_000_000, footprint_bytes: None },
+                WorkerProc { pid: 2, rss_bytes: 15_000_000_000, footprint_bytes: None },
             ]),
             warnings: Vec::new(),
         }
@@ -1533,8 +1652,8 @@ mod tests {
         let mut inputs = base_inputs();
         inputs.budget_bytes = Some(35_000_000_000);
         inputs.workers = Some(vec![
-            WorkerProc { pid: 1, rss_bytes: JUDGE_POTENTIAL + 1_000_000 },
-            WorkerProc { pid: 2, rss_bytes: 10_000_000_000 },
+            WorkerProc { pid: 1, rss_bytes: JUDGE_POTENTIAL + 1_000_000, footprint_bytes: None },
+            WorkerProc { pid: 2, rss_bytes: 10_000_000_000, footprint_bytes: None },
         ]);
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.state, LedgerState::Amber);
@@ -1607,7 +1726,7 @@ mod tests {
         // the total splits proportional to potential, the attribution field
         // says "estimated", and the note says exactly what happened.
         let mut inputs = base_inputs();
-        inputs.workers = Some(vec![WorkerProc { pid: 1, rss_bytes: 30_000_000_000 }]);
+        inputs.workers = Some(vec![WorkerProc { pid: 1, rss_bytes: 30_000_000_000, footprint_bytes: None }]);
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.attribution, Attribution::Estimated);
         assert!(ledger.attribution_note.contains("split proportional to potential"));
@@ -1724,6 +1843,144 @@ mod tests {
         assert_eq!(parse_swapusage_used_bytes("nonsense"), None);
     }
 
+    /// Rank-pairing must use WEIGHTS, not potential. The live case from
+    /// #1821: a small model at a huge context outranks a bigger model on
+    /// potential while holding a fraction of its memory, so ranking by
+    /// potential hands each the other's figure.
+    #[test]
+    fn workers_pair_by_weights_so_a_huge_ctx_does_not_outrank_real_weights() {
+        let g = |x: f64| (x * (1u64 << 30) as f64) as u64;
+        let mut inputs = base_inputs();
+        inputs.residents.clear();
+        inputs.catalog.clear();
+
+        // 2.01 GiB of weights at a huge ctx -> potential 19.18, footprint 2.77
+        inputs.catalog.push(CatalogFact { model_key: "small-huge-ctx".into(), size_bytes: Some(g(2.01)) });
+        inputs.residents.push(resident("darkmux:small", "small-huge-ctx", 120_000));
+        // 8.43 GiB of weights at a small ctx -> potential 12.25, footprint 11.74
+        inputs.catalog.push(CatalogFact { model_key: "big-small-ctx".into(), size_bytes: Some(g(8.43)) });
+        inputs.residents.push(resident("user/big", "big-small-ctx", 16_384));
+
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: g(11.74), footprint_bytes: Some(g(3.25)) },
+            WorkerProc { pid: 2, rss_bytes: g(0.25), footprint_bytes: Some(g(2.77)) },
+        ]);
+
+        let ledger = compute_ledger(inputs, 1);
+        let small = ledger.models.iter().find(|m| m.model_key == "small-huge-ctx").unwrap();
+        let big = ledger.models.iter().find(|m| m.model_key == "big-small-ctx").unwrap();
+
+        // The big-weights model gets the big footprint, despite the small one
+        // having the larger POTENTIAL.
+        assert_eq!(big.current_bytes, Some(g(11.74)));
+        assert_eq!(small.current_bytes, Some(g(2.77)));
+        assert!(small.potential_bytes.unwrap() > big.potential_bytes.unwrap(), "the trap this guards");
+    }
+
+    /// The gather WIRING, with the probe injected. Without this, a mutation
+    /// that stopped filling footprint passed all 157 tests.
+    #[test]
+    fn enrichment_fills_every_worker_from_the_probe() {
+        let ws = vec![
+            WorkerProc { pid: 7, rss_bytes: 100, footprint_bytes: None },
+            WorkerProc { pid: 9, rss_bytes: 200, footprint_bytes: None },
+        ];
+        let out = enrich_with_footprint(ws, |pid| Some((pid as u64) * 1_000));
+        assert_eq!(out[0].footprint_bytes, Some(7_000));
+        assert_eq!(out[1].footprint_bytes, Some(9_000));
+        // ...and the resolved figure follows it, not the RSS it replaced.
+        assert_eq!(out[0].memory_bytes(), 7_000);
+    }
+
+    /// A probe that cannot answer leaves `None`, and the worker falls back to
+    /// RSS rather than to zero.
+    #[test]
+    fn enrichment_leaves_none_when_the_probe_declines() {
+        let ws = vec![WorkerProc { pid: 7, rss_bytes: 4_242, footprint_bytes: None }];
+        let out = enrich_with_footprint(ws, |_| None);
+        assert_eq!(out[0].footprint_bytes, None);
+        assert_eq!(out[0].memory_bytes(), 4_242);
+    }
+
+    /// The real FFI, against THIS process: `rusage_info_v0`'s layout is a
+    /// frozen ABI, and a wrong field offset would return garbage rather than
+    /// fail loudly. Asserting a plausible range is what catches a shifted
+    /// struct — a mis-parsed field reads as either 0 or an absurd value.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn phys_footprint_reads_a_plausible_figure_for_the_test_process_itself() {
+        let me = std::process::id() as i64;
+        let fp = phys_footprint(me).expect("own footprint is readable");
+        assert!(fp > 1_000_000, "implausibly small: {fp} bytes — struct offset likely wrong");
+        assert!(fp < 100 * (1u64 << 30), "implausibly large: {fp} bytes — struct offset likely wrong");
+    }
+
+    /// A pid that cannot exist reports `None`, never a fabricated figure.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn phys_footprint_declines_for_a_dead_pid() {
+        assert_eq!(phys_footprint(i64::from(i32::MAX)), None);
+    }
+
+    /// `memory_bytes` is `max(rss, footprint)`, and these are the two REAL
+    /// backend shapes measured live on 2026-08-15 — the reason neither
+    /// counter can be used alone.
+    #[test]
+    fn worker_memory_takes_whichever_counter_the_backend_actually_populates() {
+        let g = |x: f64| (x * (1u64 << 30) as f64) as u64;
+
+        // MLX: weights live in Metal/IOAccelerator buffers. RSS sees ~nothing.
+        let mlx_35b = WorkerProc { pid: 1, rss_bytes: g(0.14), footprint_bytes: Some(g(22.27)) };
+        assert_eq!(mlx_35b.memory_bytes(), g(22.27));
+
+        // GGUF: weights are mmapped CLEAN file-backed pages. Footprint
+        // deliberately excludes them (evictable without swapping) — true,
+        // and exactly wrong for "is this occupying RAM right now".
+        let gguf_phi4 = WorkerProc { pid: 2, rss_bytes: g(11.74), footprint_bytes: Some(g(3.25)) };
+        assert_eq!(gguf_phi4.memory_bytes(), g(11.74));
+
+        // Reading footprint alone — the naive "fix" — would have reported the
+        // GGUF model at 3.25 instead of 11.7: a different wrong number.
+        assert!(gguf_phi4.footprint_bytes.unwrap() < gguf_phi4.rss_bytes);
+    }
+
+    /// Degrades to RSS when no footprint is readable (non-macOS, or a worker
+    /// that exited between enumeration and probe) — never to zero, which
+    /// would silently erase a live model from the machine total.
+    #[test]
+    fn worker_memory_falls_back_to_rss_when_footprint_is_unavailable() {
+        let w = WorkerProc { pid: 3, rss_bytes: 5_000_000_000, footprint_bytes: None };
+        assert_eq!(w.memory_bytes(), 5_000_000_000);
+    }
+
+    /// The union is APPROXIMATED, never summed: dirty anonymous pages appear
+    /// in both counters, so adding them double-counts.
+    #[test]
+    fn worker_memory_never_sums_the_two_counters() {
+        let w = WorkerProc { pid: 4, rss_bytes: 3_000_000_000, footprint_bytes: Some(2_000_000_000) };
+        assert_eq!(w.memory_bytes(), 3_000_000_000);
+        assert_ne!(w.memory_bytes(), 5_000_000_000);
+    }
+
+    /// The end-to-end consequence, and the whole point of #1821: a machine
+    /// whose workers report near-zero RSS but real footprints must total the
+    /// footprints, not the RSS. Understating this is what put 271 MiB on a
+    /// dial next to 25 GiB of actually-resident models.
+    #[test]
+    fn machine_current_totals_the_larger_counter_not_rss() {
+        let g = |x: f64| (x * (1u64 << 30) as f64) as u64;
+        let mut inputs = base_inputs();
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: g(0.14), footprint_bytes: Some(g(22.27)) },
+            WorkerProc { pid: 2, rss_bytes: g(0.25), footprint_bytes: Some(g(2.77)) },
+        ]);
+        let ledger = compute_ledger(inputs, 1);
+        let total = ledger.machine.current_bytes.expect("attributed");
+        assert_eq!(total, g(22.27) + g(2.77));
+        // ...and emphatically not the RSS sum, which is what shipped.
+        assert!(total > g(20.0));
+    }
+
     #[test]
     fn worker_rss_filters_llmworker_rows_and_scales_kib() {
         let ps = "  735  18432000 /Applications/LM Studio.app/Contents/Resources/app/.webpack/main/llmworker.js --stdio\n\
@@ -1731,8 +1988,8 @@ mod tests {
              990    512000 node /opt/lmstudio/llmworker.js\n";
         let workers = parse_worker_rss(ps);
         assert_eq!(workers.len(), 2);
-        assert_eq!(workers[0], WorkerProc { pid: 735, rss_bytes: 18_432_000 * 1024 });
-        assert_eq!(workers[1], WorkerProc { pid: 990, rss_bytes: 512_000 * 1024 });
+        assert_eq!(workers[0], WorkerProc { pid: 735, rss_bytes: 18_432_000 * 1024, footprint_bytes: None });
+        assert_eq!(workers[1], WorkerProc { pid: 990, rss_bytes: 512_000 * 1024, footprint_bytes: None });
     }
 
     #[test]
@@ -1883,8 +2140,8 @@ mod tests {
         let mut inputs = base_inputs();
         inputs.budget_bytes = Some(35_000_000_000); // machine amber
         inputs.workers = Some(vec![
-            WorkerProc { pid: 1, rss_bytes: JUDGE_POTENTIAL }, // cur == pot
-            WorkerProc { pid: 2, rss_bytes: 10_000_000_000 },
+            WorkerProc { pid: 1, rss_bytes: JUDGE_POTENTIAL, footprint_bytes: None }, // cur == pot
+            WorkerProc { pid: 2, rss_bytes: 10_000_000_000, footprint_bytes: None },
         ]);
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.state, LedgerState::Amber);
@@ -1910,8 +2167,8 @@ mod tests {
             arch: BTreeMap::from([("twin".to_string(), judge_arch())]),
             pool: base_inputs().pool,
             workers: Some(vec![
-                WorkerProc { pid: 1, rss_bytes: 12_000_000_000 },
-                WorkerProc { pid: 2, rss_bytes: 8_000_000_000 },
+                WorkerProc { pid: 1, rss_bytes: 12_000_000_000, footprint_bytes: None },
+                WorkerProc { pid: 2, rss_bytes: 8_000_000_000, footprint_bytes: None },
             ]),
             ..Default::default()
         };
