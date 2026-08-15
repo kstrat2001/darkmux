@@ -214,11 +214,28 @@ fn set_at(path: &Path, key: &str, value: &str) -> Result<String> {
 /// Print a key's stored value, or note it's unset (falls through to env/default).
 fn get_at(path: &Path, key: &str) -> Result<String> {
     if let Some((_, item)) = SECRET_KEYS.iter().find(|(k, _)| *k == key) {
-        // Consistent with `set`: a secret is never in config.json — point at the
-        // Keychain rather than reporting "(unset)".
-        return Ok(format!(
-            "`{key}` is a Keychain secret (item `{item}`), not a config value — darkmux never stores it in config.json"
-        ));
+        // This used to return here WITHOUT reading the file, asserting
+        // "darkmux never stores it in config.json". Two problems: the claim
+        // was made without looking, and it is false in a reachable state —
+        // `#[serde(flatten)] extras` plus `set_at`'s whole-root writeback
+        // preserves a hand-added secret across every subsequent `config set`.
+        // So the one command an operator runs to check whether a secret leaked
+        // into their config reassured them it hadn't. Describe the mechanism
+        // (`config set` refuses to write it) and then actually look.
+        let present = load_object(path).ok().is_some_and(|root| get_path(&root, key).is_some());
+        return Ok(if present {
+            format!(
+                "`{key}` is read from the macOS Keychain (item `{item}`), and `darkmux config set` refuses to write it here — \
+                 but it IS PRESENT in {}. Something added it by hand; remove it, and treat the value as exposed.",
+                path.display()
+            )
+        } else {
+            format!(
+                "`{key}` is read from the macOS Keychain (item `{item}`); `darkmux config set` refuses to write it to config.json. \
+                 Not present in {}.",
+                path.display()
+            )
+        });
     }
     if key_type(key).is_none() {
         bail!("unknown config key `{key}`{}", suggestion(key));
@@ -244,8 +261,48 @@ pub(crate) fn list_at(path: &Path) -> Result<String> {
             path.display()
         ));
     }
-    let root = load_object(path)?;
+    let mut root = load_object(path)?;
+    redact_secret_keys(&mut root);
     serde_json::to_string_pretty(&root).context("serializing config.json")
+}
+
+/// Replace the value at every [`SECRET_KEYS`] path with a marker, in place.
+///
+/// `config set` refuses to write these, but nothing stops a hand edit, and
+/// `#[serde(flatten)] extras` preserves whatever it finds. Printing the file
+/// verbatim then defeats the entire Keychain carve-out, whose stated purpose
+/// is that these values never reach a terminal — and on this project, never
+/// reach an agent-session transcript.
+///
+/// Applied in [`list_at`] rather than at the call sites, because it has two
+/// consumers: the `darkmux config list` verb and
+/// `radio_answer::config_block`, which uses the same function as the live
+/// config-surface grounding for the answering seat. One layer covers both.
+/// (That grounding is already gated to machine-local seats, so this is not a
+/// cloud-egress fix — it is a terminal, transcript, and local-model-context
+/// one.)
+///
+/// The KEY is deliberately still shown. Its presence is exactly what the
+/// operator needs to know; only the value is withheld.
+fn redact_secret_keys(root: &mut Value) {
+    for (key, _) in SECRET_KEYS {
+        let mut cur: &mut Value = root;
+        let mut parts = key.split('.').peekable();
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                if let Some(obj) = cur.as_object_mut() {
+                    if let Some(slot) = obj.get_mut(part) {
+                        *slot = Value::String("(redacted — secrets belong in the Keychain, not here)".into());
+                    }
+                }
+                break;
+            }
+            match cur.get_mut(part) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+    }
 }
 
 /// Load config.json as a JSON object; a missing file is an empty object (so
@@ -593,8 +650,67 @@ mod tests {
     fn get_on_a_secret_key_points_at_the_keychain() {
         let f = tmp();
         let out = get_at(f.path(), "redis.password").unwrap();
-        assert!(out.contains("Keychain secret"), "{out}");
+        assert!(out.contains("Keychain"), "{out}");
         assert!(out.contains("darkmux-redis"), "names the item: {out}");
+    }
+
+    /// Canary for the secret-in-file tests. Not a credential — it exists so an
+    /// assertion can prove the real value never reaches an output surface.
+    const CANARY: &str = "NOT-A-REAL-SECRET-canary";
+
+    fn write_cfg_with_secret(p: &Path) {
+        std::fs::write(
+            p,
+            format!(
+                r#"{{"schema_version":"1.2","machine_id":"testbox","redis":{{"enabled":true,"host":"127.0.0.1","password":"{CANARY}"}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// `config get <secret>` answered "darkmux never stores it in config.json"
+    /// WITHOUT opening the file — it short-circuited on `SECRET_KEYS` before
+    /// `load_object`. The claim is also false in a reachable state:
+    /// `#[serde(flatten)] extras` plus a whole-root writeback preserves a
+    /// hand-added key across every `config set`. So the one command an
+    /// operator runs to check whether a secret leaked into their config
+    /// actively reassured them it hadn't.
+    #[test]
+    fn get_on_a_secret_key_reports_it_when_the_file_actually_has_one() {
+        let f = tmp();
+        write_cfg_with_secret(f.path());
+        let out = get_at(f.path(), "redis.password").unwrap();
+        assert!(
+            !out.contains("never stores it in config.json"),
+            "must not claim absence without having looked: {out}"
+        );
+        assert!(out.to_lowercase().contains("present"), "must say it IS in the file: {out}");
+        assert!(!out.contains(CANARY), "must not echo the value while reporting it: {out}");
+    }
+
+    /// The other half: with no such key in the file, say so without
+    /// over-claiming about what darkmux "never" does.
+    #[test]
+    fn get_on_a_secret_key_absent_from_the_file_says_so_without_overclaiming() {
+        let f = tmp();
+        std::fs::write(f.path(), r#"{"schema_version":"1.2"}"#).unwrap();
+        let out = get_at(f.path(), "redis.password").unwrap();
+        assert!(out.contains("darkmux-redis"), "still names the Keychain item: {out}");
+        assert!(!out.contains("never stores"), "no universal claim: {out}");
+    }
+
+    /// `config list` printed the file verbatim, so a hand-added secret reached
+    /// the terminal — and any agent-session transcript. It also feeds
+    /// `radio_answer::config_block` as the live config-surface grounding, so
+    /// redacting here covers both consumers at one layer.
+    #[test]
+    fn list_redacts_a_secret_that_was_hand_added_to_the_file() {
+        let f = tmp();
+        write_cfg_with_secret(f.path());
+        let out = list_at(f.path()).unwrap();
+        assert!(!out.contains(CANARY), "the value must never reach stdout: {out}");
+        assert!(out.contains("redacted"), "the key is still shown, marked: {out}");
+        assert!(out.contains("machine_id"), "the rest of the config still renders: {out}");
     }
 
     #[test]

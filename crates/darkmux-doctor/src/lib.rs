@@ -767,8 +767,7 @@ fn check_audit_write_drops() -> Check {
             hint: Some(
                 "An AuditFileSink write failed (audit dir unwritable / ENOSPC / flock contention). \
                  Confirm DARKMUX_AUDIT_DIR (or ~/.darkmux/audit) is writable; the dropped records are \
-                 in today's flow file as `action=audit.write_failed`. For compliance, treat a dropped \
-                 audit write as a record-keeping incident, not a silent event."
+                 in today's flow file as `action=audit.write_failed`."
                     .into(),
             ),
         }
@@ -792,7 +791,7 @@ fn daemon_auth_status(token_present: bool) -> (Status, String, Option<String>) {
             Status::Pass,
             "no serve token — the daemon is loopback-only (a non-loopback `--bind` is refused)".into(),
             Some(
-                "Safe as-is for a single machine. To expose the daemon across your fleet \
+                "To expose the daemon across your fleet \
                  (e.g. `fleet status --deep`), set ONE shared bearer token on every machine: \
                  `security add-generic-password -U -a \"$USER\" -s darkmux-serve-token -w` (macOS) + \
                  `daemon_auth_enabled: true` in ~/.darkmux/config.json, or export DARKMUX_SERVE_TOKEN."
@@ -802,12 +801,20 @@ fn daemon_auth_status(token_present: bool) -> (Status, String, Option<String>) {
     }
 }
 
-/// `serve daemon auth`: surfaces the bearer-auth posture (#881). Informational
-/// — the bind gate enforces safety at runtime; this just reports whether a
-/// shared fleet token is set.
+/// `serve daemon token`: reports whether a shared fleet token is configured
+/// (#881). Both arms return `Pass` by design — a loopback-only daemon with no
+/// token is the ordinary single-machine state, and the bind gate refuses the
+/// unsafe combination at runtime, so there is nothing here to cry wolf about.
+///
+/// Named for the STATE it reports, not for a posture (#1839). It was
+/// `serve daemon auth`, and a check that (a) names a security concern and
+/// (b) is structurally incapable of any status but ✓ reads, inside doctor's
+/// `● ok — every check passed` headline, as a security check that cleared.
+/// It never checked anything of the sort. `token` says what it actually
+/// looks at: whether one is set.
 fn check_daemon_auth() -> Check {
     let (status, message, hint) = daemon_auth_status(darkmux_flow::serve_token_present());
-    Check { name: "serve daemon auth".into(), status, message, hint }
+    Check { name: "serve daemon token".into(), status, message, hint }
 }
 
 /// `utility model`: surfaces the machine-level `internal.utility` binding
@@ -1317,7 +1324,7 @@ fn check_redis_config() -> Check {
             name: name.into(),
             status: Status::Warn,
             message: format!("config Redis enabled → {host}, but no password (Keychain item `darkmux-redis` absent, no DARKMUX_REDIS_URL) — connecting password-less"),
-            hint: Some("If your Redis requires auth, store the password: `security add-generic-password -a $USER -s darkmux-redis -w` (URL-safe). Password-less is fine for a local/Tailnet-trusted Redis.".into()),
+            hint: Some("If your Redis requires auth, store the password: `security add-generic-password -a $USER -s darkmux-redis -w` (URL-safe).".into()),
         },
     }
 }
@@ -5020,6 +5027,33 @@ mod tests {
             h.contains("darkmux-serve-token") || h.contains("DARKMUX_SERVE_TOKEN"),
             "hint should name how to set the token: {h}"
         );
+    }
+
+    /// (#1839) darkmux describes its own state; it does not adjudicate the
+    /// operator's posture. Every string here is printed by `doctor`, and
+    /// `doctor` output is republished verbatim by the viewer's console lens —
+    /// two surfaces, one source, so the rule is enforced at the source.
+    ///
+    /// The specific regression this pins: the no-token hint opened with
+    /// "Safe as-is for a single machine." Conditionally true, and false for
+    /// the setup the project actually recommends — a loopback daemon behind a
+    /// Tailscale reverse proxy, where the same daemon is reachable by the
+    /// whole tailnet and this check never looked at the proxy.
+    #[test]
+    fn daemon_auth_and_redis_hints_state_facts_without_rendering_a_verdict() {
+        let verdicts = ["safe as-is", "is fine", "secure", "protected", "no risk", "for compliance"];
+        let (_, msg_t, hint_t) = daemon_auth_status(true);
+        let (_, msg_f, hint_f) = daemon_auth_status(false);
+        for text in [msg_t, msg_f, hint_t.unwrap_or_default(), hint_f.unwrap_or_default()] {
+            let low = text.to_lowercase();
+            for v in verdicts {
+                assert!(!low.contains(v), "doctor must not adjudicate the operator's posture ({v:?}): {text}");
+            }
+        }
+        // Still says the useful part: what is configured, and how to change it.
+        let (_, msg, hint) = daemon_auth_status(false);
+        assert!(msg.contains("loopback-only"), "still reports the actual state: {msg}");
+        assert!(hint.unwrap().contains("darkmux-serve-token"), "still actionable");
     }
 
     // ─── check_utility_model_binding (#590) ───────────────────────────
