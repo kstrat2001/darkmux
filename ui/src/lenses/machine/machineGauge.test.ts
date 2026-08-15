@@ -635,10 +635,18 @@ describe("computeRingGeometry — the machine outside, darkmux inside", () => {
     expect(r.inner.hatchedPct).toBe(0);
   });
 
-  it("lands the needle at the PROJECTED total, not at what is used today", () => {
+  /**
+   * The needle reads NOW, and must agree with the centre readout, which shows
+   * the same figure. An earlier cut pointed it at the projected total while
+   * the readout still showed darkmux's share — a needle at ~82% beside a
+   * readout of 36.8 GiB, two subjects on one instrument. The projection is a
+   * REGION (the hatched band), never a pointer.
+   */
+  it("lands the needle at what the machine uses NOW, not at the projection", () => {
     const r = computeRingGeometry(res({}));
-    // (50 + 12.5)% of 180deg
-    expect(r.needleAngleDeg).toBeCloseTo(62.5 * 1.8, 4);
+    expect(r.needleAngleDeg).toBeCloseTo(50 * 1.8, 4); // used 64 of 128
+    // ...and strictly short of the ring's hatched end.
+    expect(r.needleAngleDeg).toBeLessThan((r.outer.solidPct + r.outer.hatchedPct) * 1.8);
   });
 
   it("reports everything-else as the gap, which is never a band of its own", () => {

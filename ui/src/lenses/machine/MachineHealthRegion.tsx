@@ -121,7 +121,12 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   const pressureRed = !!resources.pressure?.red;
   const overLimit = isOverLimit(resources.machine.current_bytes, resources.limit_bytes);
   const lit = redlineLit(resources.machine.state) && !stale;
-  const centerVal = gaugeValueParts(resources.machine.current_bytes);
+  // The readout shows what the NEEDLE points at — the machine's used memory —
+  // not darkmux's share. Those were different subjects on one instrument
+  // until the operator caught it: a needle at ~82% beside a readout of
+  // 36.8 GiB. darkmux's own figure is named in the caption below, beside the
+  // inner ring it belongs to.
+  const centerVal = gaugeValueParts(resources.pool?.used_bytes ?? resources.machine.current_bytes);
   const faceCaption = gaugeFaceCaption(resources.machine.state, pressureRed, overLimit);
   // The fill's hue answers "how full", NOT "what did the arbiter decide" —
   // see `gaugeFillSeverity`'s own doc for why that separation is load-bearing.
@@ -251,8 +256,16 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
             beneath the reading where the eye already is; in every other
             state it used to say `IN USE`, restating the one thing a needle
             over a 0→LIMIT scale cannot fail to communicate. */}
+        {/* The readout's own subject label. `IN USE` was deleted as noise when
+            the dial had ONE subject and the caption restated the obvious.
+            With a machine ring and a darkmux ring on one face, naming which
+            one the big number belongs to is no longer restatement — it is the
+            difference between two readings. */}
+        <text className="mm-gauge-readout-label" x={CX} y={164} textAnchor="middle">
+          MACHINE USED
+        </text>
         {faceCaption && (
-          <text className="mm-gauge-center-caption" x={CX} y={164} textAnchor="middle">
+          <text className="mm-gauge-center-caption" x={CX} y={176} textAnchor="middle">
             {faceCaption}
           </text>
         )}
@@ -273,7 +286,8 @@ function GaugeCaption({ resources }: { resources: MachineResources }) {
   const committed = memBytes(resources.machine.potential_bytes);
   return (
     <div className="mm-gcap">
-      <b>machine total</b> <span className={`mm-chip is-${stateCls}`}>{stateText}</span> · ╌ committed {committed}
+      <b>machine total</b> <span className={`mm-chip is-${stateCls}`}>{stateText}</span> · darkmux{" "}
+      <b>{memBytes(resources.machine.current_bytes)}</b> · ╌ committed {committed}
       {unpriced ? ` (+${unpriced} unpriced)` : ""}
     </div>
   );

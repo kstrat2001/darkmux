@@ -223,7 +223,11 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
     // the machine is 0% full for the very payload the odometer renders as a
     // single "—". Absence is never zero — including in the channel a sighted
     // reader cannot check against the dial.
-    const none: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: null as unknown as number } };
+    const none: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, current_bytes: null as unknown as number },
+      pool: { ...BASE.pool!, used_bytes: null as unknown as number },
+    };
     const { container } = renderRegion(none, { residencyRows: residencyRowsFor(none) });
     const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
     expect(aria).not.toContain("% full");
@@ -237,7 +241,9 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
   });
 
   it("stays centered when the figure's width changes — including the no-data case", () => {
-    const wide: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: 130000000000 } }; // "121.1", 5 cells
+    // The readout's source is the MACHINE's used memory: 130e9 = 121.1 GiB,
+    // five cells.
+    const wide: MachineResources = { ...BASE, pool: { ...BASE.pool!, used_bytes: 130000000000 } };
     const { container } = renderRegion(wide, { residencyRows: residencyRowsFor(wide) });
     const cells = [...container.querySelectorAll(".mm-gauge-odo-cell")] as SVGRectElement[];
     expect(cells.length).toBe(5);
@@ -245,7 +251,13 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
     const right = Math.max(...cells.map((c) => Number(c.getAttribute("x")) + Number(c.getAttribute("width"))));
     expect((left + right) / 2).toBeCloseTo(120, 6);
 
-    const none: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: null as unknown as number } };
+    // Both sources unreadable — the readout falls back through pool.used to
+    // machine.current, and with neither present renders "—", never a 0.
+    const none: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, current_bytes: null as unknown as number },
+      pool: { ...BASE.pool!, used_bytes: null as unknown as number },
+    };
     const r2 = renderRegion(none, { residencyRows: residencyRowsFor(none) });
     const oneCell = [...r2.container.querySelectorAll(".mm-gauge-odo-cell")] as SVGRectElement[];
     expect(oneCell.length).toBe(1); // the "—" cell, not a fabricated 0
@@ -286,10 +298,10 @@ describe("MachineHealthRegion — #1812: stale keeps the last-good reading, visi
     const { container, getByText } = renderRegion(BASE, { resourcesErrored: true });
     expect(getByText(/showing the last snapshot/i)).toBeInTheDocument();
     expect(container.querySelector(".mm-hero.is-stale")).not.toBeNull();
-    // The reading itself is still there — never blanked. (The odometer splits
-    // the figure into per-character cells, so this reads the group's
-    // concatenated text: "19.4" + the unit.)
-    expect(container.querySelector(".mm-gauge-center-val")?.textContent).toContain("19.4");
+    // The reading itself is still there — never blanked. The readout shows
+    // the MACHINE's used memory (what the needle points at), not darkmux's
+    // share: pool.used_bytes 69.3e9 = 64.5 GiB.
+    expect(container.querySelector(".mm-gauge-center-val")?.textContent).toContain("64.5");
   });
 
   it("the inverted case: no stale banner and no desaturation when the latest poll succeeded", () => {

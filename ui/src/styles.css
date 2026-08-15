@@ -2120,6 +2120,11 @@ body {
   font-weight: 600;
   fill: var(--dim);
 }
+.mm-gauge-readout-label {
+  fill: var(--dim);
+  font-size: 7px;
+  letter-spacing: 0.14em;
+}
 .mm-gauge-center-caption {
   fill: var(--dim);
   font-size: 8.5px;

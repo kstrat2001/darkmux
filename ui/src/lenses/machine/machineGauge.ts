@@ -159,7 +159,12 @@ export interface RingGeometry {
    * visible GAP between the two rings. Carried for the caption and for
    * tests, so the relationship is checkable. */
   otherPct: number;
-  /** The needle sits at the outer ring's end — the projected machine total. */
+  /** The needle sits at what the machine is using NOW — the outer ring's
+   * SOLID end, not its hatched projection. A needle reads the present; a
+   * projection is a region, not a pointer. It must also agree with the centre
+   * readout, which shows the same figure: the operator saw a needle at ~82%
+   * beside a readout of 36.8 GiB and correctly called it off, because they
+   * were pointing at two different subjects. */
   needleAngleDeg: number;
 }
 
@@ -210,7 +215,7 @@ export function computeRingGeometry(resources: MachineResources): RingGeometry {
     outer: { solidPct: outerSolid, hatchedPct: outerHatched },
     inner: { solidPct: darkmux, hatchedPct: 0 },
     otherPct: Math.max(0, used - darkmux),
-    needleAngleDeg: (outerSolid + outerHatched) * 1.8,
+    needleAngleDeg: outerSolid * 1.8,
   };
 }
 

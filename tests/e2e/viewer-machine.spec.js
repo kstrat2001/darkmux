@@ -208,15 +208,16 @@ test('unreachable daemon shows the no-daemon notice, then a stale banner once da
 
   // Daemon goes away again: the cached snapshot stays BUT is labeled
   // stale — a silently frozen gauge is the failure mode this banner
-  // prevents. The reading itself (30.7 GiB — LEDGER's
-  // machine.current_bytes of 33e9, binary since #1811) must still be on
-  // screen, not blanked. The readout is an odometer of per-character cells,
-  // so this reads the group's concatenated text.
+  // prevents. The reading itself must still be on screen, not blanked — and
+  // it is the MACHINE's used memory (pool.used_bytes 69.3e9 = 64.5 GiB), the
+  // figure the needle points at, NOT darkmux's own share. Those were two
+  // different subjects on one instrument until #1821 made the readout follow
+  // the needle.
   await page.unroute('**/machine/resources*');
   await expect(page.locator('.mm-stalebanner').first()).toContainText('stale', { timeout: 10_000 });
   await expect(page.locator('.mm-hero')).toHaveClass(/is-stale/);
   await expect(page.locator('.mm-gcap')).toContainText('machine total');
-  await expect(page.locator('.mm-gauge-center-val')).toContainText('30.7');
+  await expect(page.locator('.mm-gauge-center-val')).toContainText('64.5');
 
   expect(pageErrors, `page errors: ${pageErrors.join('\n')}`).toEqual([]);
 });
