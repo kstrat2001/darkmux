@@ -7,6 +7,7 @@ import {
   gaugeFillSeverity,
   gaugeValueParts,
   groupResidencyRows,
+  isEstimatedRow,
   isOverLimit,
   machineStateWord,
   rowStateDiffers,
@@ -130,7 +131,9 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   const fullness = geo.cur != null ? ` (${Math.round(geo.pct)}% full)` : "";
   const inUse = geo.cur != null ? `${centerVal.num} ${centerVal.unit}` : "an unreadable amount";
   const ariaLabel = `Machine memory: ${inUse} in use of the ${scaleVal.num} ${scaleVal.unit} ${geo.scaleWord.toLowerCase()}${fullness}. ${
-    geo.commitPct != null ? `Committed ${committed.num} ${committed.unit}${resources.machine.unpriced_models ? ` plus ${resources.machine.unpriced_models} unpriced model(s)` : ""}, marked by the dashed tick. ` : ""
+    geo.commitPct != null
+      ? `Committed ${committed.num} ${committed.unit}${resources.machine.unpriced_models ? ` plus ${resources.machine.unpriced_models} unpriced model(s)` : ""}${resources.machine.estimated_models ? ` (${resources.machine.estimated_models} estimated)` : ""}, marked by the dashed tick. `
+      : ""
   }State ${resources.machine.state || "unknown"}.`;
 
   return (
@@ -222,7 +225,12 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
 
 function GaugeCaption({ resources }: { resources: MachineResources }) {
   const stateCls = memStateCls(resources.machine.state);
-  const stateText = machineStateWord(resources.machine.state, resources.limit_bytes, Number(resources.machine.unpriced_models) || 0);
+  const stateText = machineStateWord(
+    resources.machine.state,
+    resources.limit_bytes,
+    Number(resources.machine.unpriced_models) || 0,
+    Number(resources.machine.estimated_models) || 0,
+  );
   const unpriced = Number(resources.machine.unpriced_models) || 0;
   const committed = memBytes(resources.machine.potential_bytes);
   return (
@@ -403,6 +411,25 @@ function ModelRow({
         {isGhost && <span className="mm-row-chip is-warn">DEPARTED · last seen {new Date(row.lastSeenMs).toLocaleTimeString([], { hour12: false })}</span>}
         {isNew && <span className="mm-row-chip is-new">NEW · first seen {relSecondsAgo(nowMs, row.firstSeenMs ?? row.lastSeenMs)}</span>}
         {!isGhost && pot == null && <span className="mm-row-chip is-warn">UNPRICED · potential unknown</span>}
+        {/* #1819: a row IS priced (pot != null) but by the size-based
+            fallback, not a measurement — neither a severity verdict (it
+            doesn't say whether the machine is healthy) nor an identity
+            marker (it doesn't say WHAT this resident is), so it gets
+            neither `.is-state` nor `.is-identity`'s visual language; see
+            `.mm-row-chip.is-estimated` in styles.css for the third axis
+            this establishes. The title states the assumption the figure
+            rests on (dense attention — every layer holds a KV cache —
+            which over-reserves hybrid-attention models but UNDER-reserves
+            pre-GQA multi-head ones — stated rather than implied, per the
+            #1819 merge gate). */}
+        {!isGhost && isEstimatedRow(m) && (
+          <span
+            className="mm-row-chip is-estimated"
+            title="priced by size-based estimate, not measurement — no readable config.json (commonly a GGUF download with no sidecar config file). Assumes DENSE attention at a size-tiered rate, set at or above every modern GQA architecture in its size class. Over-reserves hybrid-attention models; under-reserves pre-GQA multi-head models such as Llama-2-13B (#1819)."
+          >
+            ESTIMATED
+          </span>
+        )}
         {/* Renders ONLY when this row disagrees with the machine's verdict —
             see `rowStateDiffers`. A row that agrees is one machine-level
             fact stamped once per row; a row that disagrees (a materialized
@@ -421,7 +448,7 @@ function ModelRow({
             ? `${m.identifier || m.model_key}: no longer resident; last observed ${memBytes(cur)} current`
             : pot == null
               ? `${m.identifier || m.model_key}: ${memBytes(cur)} current; unpriced — no committed extent can be computed`
-              : `${m.identifier || m.model_key}: ${memBytes(cur)} current of ${memBytes(pot)} committed; state ${m.state || "unknown"}`
+              : `${m.identifier || m.model_key}: ${memBytes(cur)} current of ${memBytes(pot)}${isEstimatedRow(m) ? " estimated" : ""} committed; state ${m.state || "unknown"}`
         }
       >
         <div className={`mm-row-track${isGhost ? " is-empty" : ""}`}>
@@ -446,6 +473,11 @@ function ModelRow({
       {!isGhost && pot == null && (
         <div className="mm-hint">
           ↳ unpriceable: no readable arch facts or catalog size — machine committed total undercounts by this model's commitment
+        </div>
+      )}
+      {!isGhost && isEstimatedRow(m) && (
+        <div className="mm-hint">
+          ↳ estimated: no readable config.json — priced from catalog size + a size-tiered dense-attention KV rate (every layer assumed to hold a KV cache). Set at or above every modern GQA architecture in its size class; it over-reserves hybrid-attention models, and under-reserves pre-GQA multi-head models like Llama-2-13B
         </div>
       )}
       {!isGhost && (m as { shrink_hint?: string }).shrink_hint && <div className="mm-hint">↳ {(m as { shrink_hint?: string }).shrink_hint}</div>}
@@ -574,6 +606,23 @@ export function MachineHealthRegion({
         limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b>{" "}
         · pool free <b>{memBytes(b.pool?.available_bytes)}</b> · unpriced{" "}
         <b>{Number(b.machine.unpriced_models) || 0} model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}</b>
+        {/* #1819: the same row that already discloses the genuinely-unpriced
+            count discloses the ESTIMATED count too — a different fact
+            (counted, but via a labeled guess, not a measurement), stated
+            beside it rather than folded into the same number. Omitted
+            entirely when zero, matching the unpriced clause's own
+            always-present-but-usually-zero shape being the one exception
+            worth keeping (unpriced is a structural row; estimated only
+            earns its place on the page when it's actually true). */}
+        {Number(b.machine.estimated_models) > 0 && (
+          <>
+            {" "}
+            · estimated{" "}
+            <b>
+              {b.machine.estimated_models} model{b.machine.estimated_models === 1 ? "" : "s"}
+            </b>
+          </>
+        )}
       </div>
 
       {/* The machine's OWN shrink hint (distinct from a per-model one — an

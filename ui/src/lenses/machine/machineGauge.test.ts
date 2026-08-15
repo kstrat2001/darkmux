@@ -10,6 +10,7 @@ import {
   gaugeTickLabel,
   gaugeValueParts,
   groupResidencyRows,
+  isEstimatedRow,
   isOverLimit,
   machineStateWord,
   rowStateDiffers,
@@ -33,7 +34,7 @@ function resources(overrides: Partial<MachineResources> = {}): MachineResources 
     pool: { capacity_bytes: 137438953472, available_bytes: 3738599424 },
     pressure: { swap_used_bytes: 5453843005, compressor_bytes: 890290176, memory_free_percent: 88, red: false },
     models: [],
-    machine: { potential_bytes: 24565385183, unpriced_models: 0, current_bytes: 19506757632, state: "green" },
+    machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, current_bytes: 19506757632, state: "green" },
     attribution: "per_process",
     warnings: [],
     cache_ttl_ms: 2000,
@@ -149,7 +150,7 @@ describe("resolveGaugeScale — the scale is the allowance, never auto-expanded 
 describe("computeGaugeGeometry", () => {
   it("scales to the limit and positions the needle at cur/scale, clamped 0-180deg", () => {
     const g = computeGaugeGeometry(
-      resources({ machine: { potential_bytes: 24565385183, unpriced_models: 0, current_bytes: 32378306560, state: "unknown" } }),
+      resources({ machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, current_bytes: 32378306560, state: "unknown" } }),
     );
     expect(g.scale).toBe(137438953472);
     expect(g.pct).toBeCloseTo(23.56, 1);
@@ -157,7 +158,7 @@ describe("computeGaugeGeometry", () => {
   });
 
   it("clamps the needle at 100% (180deg) when current meets or exceeds the scale — never past it", () => {
-    const g = computeGaugeGeometry(resources({ machine: { potential_bytes: 1, unpriced_models: 0, current_bytes: 999999999999, state: "red" } }));
+    const g = computeGaugeGeometry(resources({ machine: { potential_bytes: 1, unpriced_models: 0, estimated_models: 0, current_bytes: 999999999999, state: "red" } }));
     expect(g.pct).toBe(100);
     expect(g.needleAngleDeg).toBe(180);
   });
@@ -170,14 +171,14 @@ describe("computeGaugeGeometry", () => {
   });
 
   it("the inverted case: commit tick is null when Σ potential is 0 — no models, nothing to draw", () => {
-    const g = computeGaugeGeometry(resources({ machine: { potential_bytes: 0, unpriced_models: 0, current_bytes: 0, state: "unknown" } }));
+    const g = computeGaugeGeometry(resources({ machine: { potential_bytes: 0, unpriced_models: 0, estimated_models: 0, current_bytes: 0, state: "unknown" } }));
     expect(g.commitPct).toBeNull();
     expect(g.commitAngleDeg).toBeNull();
   });
 
   it("clamps an overcommitted tick to the line and flags it — Σ potential > scale (machine-Amber's own condition)", () => {
     const g = computeGaugeGeometry(
-      resources({ limit_bytes: 10000000000, pool: { capacity_bytes: 10000000000, available_bytes: 1 }, machine: { potential_bytes: 15000000000, unpriced_models: 0, current_bytes: 8000000000, state: "amber" } }),
+      resources({ limit_bytes: 10000000000, pool: { capacity_bytes: 10000000000, available_bytes: 1 }, machine: { potential_bytes: 15000000000, unpriced_models: 0, estimated_models: 0, current_bytes: 8000000000, state: "amber" } }),
     );
     expect(g.overcommitted).toBe(true);
     expect(g.commitPct).toBe(100); // clamped to the line, not 150
@@ -449,6 +450,32 @@ describe("modelKvLine — unchanged from the retired modelLines()'s fourth eleme
     expect(line).toContain("kv unknown (no arch facts)");
     expect(line).toContain("potential —");
   });
+
+  // #1819: an estimated row's potential is a labeled guess, not a
+  // measurement — the figure itself carries `~` and `(estimated)`, distinct
+  // from BOTH the priced case above (a bare number) and the unpriced case
+  // (no number at all).
+  it("marks an ESTIMATED potential with `~` and `(estimated)` — distinct from both the priced and unpriced cases", () => {
+    const line = modelKvLine(
+      model({
+        kv_per_token_bytes: null as unknown as number,
+        kv_bytes_at_ctx: null as unknown as number,
+        potential_bytes: 11480858097,
+        potential_source: "estimated",
+      }),
+    );
+    expect(line).toContain("kv unknown (no arch facts)");
+    expect(line).toContain("potential ~10.69 GiB (estimated)");
+    expect(line).not.toContain("potential 10.69 GiB ·"); // never the bare, unqualified form
+  });
+});
+
+describe("isEstimatedRow — the #1819 provenance predicate", () => {
+  it("true only when potential_source is exactly 'estimated'", () => {
+    expect(isEstimatedRow(model({ potential_source: "estimated" }))).toBe(true);
+    expect(isEstimatedRow(model({ potential_source: "arch" }))).toBe(false);
+    expect(isEstimatedRow(model({ potential_source: undefined }))).toBe(false);
+  });
 });
 
 describe("isUtilityTierRow — the row-chip identity marker (follow-up to the utility-block redesign)", () => {
@@ -519,6 +546,24 @@ describe("machineStateWord — UNKNOWN carries its reason", () => {
     // unpriced. Degrades to the bare word rather than guessing.
     expect(machineStateWord("unknown", 100, 0)).toBe("UNKNOWN");
     expect(machineStateWord(null, 100, 0)).toBe("UNKNOWN");
+  });
+
+  // #1819 decision 1: a DECIDED verdict (green/amber/red) may rest partly on
+  // an estimate — the count travels with the word.
+  it("appends the estimate disclosure to a decided verdict", () => {
+    expect(machineStateWord("green", 100, 0, 1)).toBe("GREEN · 1 estimated");
+    expect(machineStateWord("amber", 100, 0, 2)).toBe("AMBER · 2 estimated");
+    expect(machineStateWord("red", 100, 0, 1)).toBe("RED · 1 estimated");
+  });
+
+  it("does NOT prepend a 'fit ' word — that prefix is a separate, not-yet-built decision", () => {
+    expect(machineStateWord("green", 100, 0, 1)).not.toContain("fit");
+    expect(machineStateWord("green", 100, 0, 1).toLowerCase()).not.toContain("fit ");
+  });
+
+  it("omits the disclosure entirely when nothing was estimated (the default, and every pre-#1819 call site)", () => {
+    expect(machineStateWord("green", 100, 0, 0)).toBe("GREEN");
+    expect(machineStateWord("green", 100, 0)).toBe("GREEN"); // no 4th arg at all
   });
 });
 

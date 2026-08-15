@@ -22,7 +22,7 @@ function machineResources(overrides: Partial<MachineResources> = {}): MachineRes
     pool: { capacity_bytes: 137438953472, available_bytes: 3738599424 },
     pressure: { swap_used_bytes: 5453843005, compressor_bytes: 890290176, memory_free_percent: 88, red: false },
     models: [],
-    machine: { potential_bytes: 24565385183, unpriced_models: 0, current_bytes: 19506757632, state: "green" },
+    machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, current_bytes: 19506757632, state: "green" },
     attribution: "per_process",
     warnings: [],
     cache_ttl_ms: 2000,

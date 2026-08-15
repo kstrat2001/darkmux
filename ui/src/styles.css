@@ -2252,6 +2252,26 @@ body {
   font-weight: 600;
 }
 
+/* PROVENANCE, not status and not identity — the `ESTIMATED` marker (#1819).
+   It sits between the two families above and belongs to neither: it does
+   not say whether the machine is healthy (that's `.is-state`'s job — an
+   estimated row's severity chip, when it renders at all, is separate and
+   still keys on `machine.state`), and it does not say WHAT this resident IS
+   (that's `.is-identity`'s job). It says something about the FIGURE itself
+   — this potential is a labeled conservative guess, not a measurement.
+
+   Both existing axes are taken (outline+hue = status; fill+grey =
+   identity), so this spends the one that is genuinely unclaimed: BORDER
+   STYLE. A dashed outline reads as "this line is provisional" without
+   borrowing a color that already means something else, and keeps the
+   neutral `--dim` hue so it never gets mistaken for a health verdict the
+   way a `--warn` amber would. */
+.mm-row-chip.is-estimated {
+  color: var(--dim);
+  border-style: dashed;
+  border-color: var(--dim);
+}
+
 .mm-lamps {
   display: flex;
   flex-wrap: wrap;
