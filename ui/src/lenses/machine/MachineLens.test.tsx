@@ -38,6 +38,7 @@ const RESOURCES = {
  * assertion for the local-only-probe gate (`enabled: isLocalMach`). */
 function mockMachineFetch(opts: {
   specs?: unknown;
+  resources?: unknown;
   flowToday?: unknown[];
   flowYesterday?: unknown[];
   liveMachines?: unknown[];
@@ -54,7 +55,7 @@ function mockMachineFetch(opts: {
       }
       if (path === "/machine/resources") {
         resourcesCalled.value = true;
-        return Promise.resolve(new Response(JSON.stringify(RESOURCES), { status: 200 }));
+        return Promise.resolve(new Response(JSON.stringify(opts.resources ?? RESOURCES), { status: 200 }));
       }
       if (path === `/flow/${today}`) return Promise.resolve(new Response(JSON.stringify(opts.flowToday ?? []), { status: 200 }));
       if (path === `/flow/${yesterday}`) return Promise.resolve(new Response(JSON.stringify(opts.flowYesterday ?? []), { status: 200 }));
@@ -164,6 +165,90 @@ describe("MachineLens", () => {
     window.location.hash = "#lens=machine";
     screen.getByRole("button", { name: "fleet" }).click();
     expect(window.location.hash).toBe("");
+  });
+});
+
+/**
+ * The `darkmux/utility` CARD is gone from this page, and its absence is the
+ * assertion. The operator's cut, after seeing it live: **it was config, not
+ * machine state** — it described what the tier is responsible for, not how
+ * it relates to this machine, and this page shows what is resident.
+ *
+ * Nothing needed re-homing. `resident` was already proven by the ledger
+ * row's own existence; `not loaded` and `not configured` are config
+ * questions `darkmux doctor` answers with a fix hint; `not reported`
+ * duplicated the page-level not-local placeholder. What survives is one
+ * badge on the row that was going to render anyway — covered in
+ * `MachineHealthRegion.test.tsx`, with the id derivation in
+ * `memoryLedgerLines.test.ts`.
+ *
+ * These tests exist so the card cannot quietly come back, and so the one
+ * seam that replaced it — specs id → health region → row badge — is proven
+ * end-to-end through the real component rather than only in unit isolation.
+ */
+describe("MachineLens — the utility tier is a row badge, not a card", () => {
+  // A ledger carrying the configured tier as a real resident row — the only
+  // arrangement in which a badge can legitimately appear.
+  const RESIDENT_UTILITY = {
+    ...RESOURCES,
+    models: [
+      {
+        identifier: "darkmux:qwen3-4b",
+        model_key: "qwen3-4b",
+        owner: "darkmux",
+        loaded_ctx: 120000,
+        weights_bytes: 100,
+        kv_per_token_bytes: 1,
+        kv_bytes_at_ctx: 50,
+        potential_bytes: 200,
+        current_bytes: 150,
+        state: "green",
+      },
+    ],
+  };
+  const withUtility = {
+    specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472, utility_model: { id: "darkmux:qwen3-4b", loaded: true } },
+    resources: RESIDENT_UTILITY,
+  };
+
+  it("renders NO utility card, in the state that used to render the fullest one", async () => {
+    mockMachineFetch(withUtility);
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    expect(container.querySelector(".machine-lens__util")).toBeNull();
+    expect(container.querySelector(".mm-util-hdr")).toBeNull();
+    // The card's own copy, gone with it — `handles` was the clearest case of
+    // documentation pretending to be instrumentation.
+    expect(container.textContent).not.toContain("internal small-model tier");
+    expect(container.textContent).not.toContain("mission-compile");
+  });
+
+  it("badges the configured tier's row instead — the seam that replaced the card", async () => {
+    mockMachineFetch(withUtility);
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    const row = [...container.querySelectorAll(".mm-row")].find((r) => r.textContent?.includes("darkmux:qwen3-4b"))!;
+    expect(row).toBeTruthy();
+    const chip = [...row.querySelectorAll(".mm-row-chip")].find((c) => c.textContent === "utility")!;
+    expect(chip).toBeTruthy();
+    // Identity, never a health verdict — no severity class.
+    // Identity, never a health verdict: it carries the identity treatment
+    // (filled + achromatic) and NONE of the severity classes.
+    expect(chip.className).toBe("mm-row-chip is-identity");
+    expect(chip.className).not.toMatch(/is-(green|amber|red|state|warn|new)\b/);
+    // The gloss the card used to spend a line on survives as the title.
+    expect(chip.getAttribute("title")).toContain("small-model tier");
+  });
+
+  it("the inverted case: a machine with no utility tier configured badges nothing", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472, utility_model: null },
+      resources: RESIDENT_UTILITY, // the row is THERE; only the binding is absent
+    });
+    const { container } = renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    expect([...container.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
+    expect(container.querySelector(".machine-lens__util")).toBeNull();
   });
 });
 

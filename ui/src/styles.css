@@ -1934,7 +1934,6 @@ body {
    any more — that region now holds its OWN cards (`.memcard`, below), and a
    bordered/padded wrapper around a stack of bordered/padded cards is a
    double border, not a nested one. */
-.machine-lens__util,
 .machine-lens__loosenode {
   background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--border);
@@ -1957,35 +1956,6 @@ body {
   flex-direction: column;
   gap: 12px;
   margin-bottom: 12px;
-}
-
-/* `utilityLines` returns a FIXED four-element array — [name, state, caps,
-   pill] (memoryLedgerLines.ts) — so positional selectors are safe here in a
-   way they would not be for the health region's variable-length output. */
-.machine-lens__util > div:first-child {
-  font-weight: 600;
-  color: var(--accent);
-}
-.machine-lens__util > div:nth-child(2),
-.machine-lens__util > div:nth-child(3) {
-  color: var(--dim);
-  font-size: 11px;
-}
-.machine-lens__util > div:last-child {
-  display: block;
-  width: fit-content;
-  margin-top: 6px;
-  padding: 2px 7px;
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  /* NO text-transform. `innerText` is layout-aware and applies it, so
-     uppercasing here rewrote `resident` to `RESIDENT` and broke the parity
-     golden. Legacy renders this pill lowercase; only `.memstate`/`.memowner`
-     are uppercased there, and this port already uppercases those STRINGS
-     directly (see memoryLedgerLines.ts). */
-  color: var(--accent-dim);
 }
 
 /* ── `.memcard` — the health region's SURVIVING plain-card treatment ───────
@@ -2257,6 +2227,29 @@ body {
 .mm-row-chip.is-new {
   color: var(--accent);
   border-color: var(--accent);
+}
+/* IDENTITY, not status — the `utility` marker. Every status chip on this
+   page encodes severity as HUE ON AN OUTLINE (green/amber/red text + border,
+   neutral base for unknown). This one differs on both axes at once: it has a
+   FILL, which no status chip has, and it is ACHROMATIC, and hue is the
+   property severity is actually carried by. So it is salient by value
+   contrast against a dark page rather than by color, and cannot be read as a
+   health verdict.
+
+   The rule this establishes, and the one to follow for any future marker:
+   **outline + hue = status; fill + grey = identity.** The lowercase word is
+   a deliberate second signal on top (every status chip is UPPERCASE) —
+   double-coding keeps the two families apart at 10px.
+
+   `--accent` was the obvious alternative and is NOT available: `.is-new`
+   above already spends it, so a teal `utility` beside a teal `NEW` would be
+   two meanings in one costume. (It is also uncomfortably close to `--good`
+   at this size, which would have been the worse failure.) */
+.mm-row-chip.is-identity {
+  color: var(--bg);
+  background: var(--dim);
+  border-color: var(--dim);
+  font-weight: 600;
 }
 
 .mm-lamps {
@@ -2761,8 +2754,10 @@ body {
   overflow-wrap: anywhere;
 }
 /* `briefLines`' first element is always the "run" label (see
-   `sessionRun.ts`'s own doc) — positionally safe the same way
-   `.machine-lens__util`'s fixed-shape array is. */
+   `sessionRun.ts`'s own doc) — positionally safe because that array's shape
+   is genuinely fixed. (The machine lens's utility node used to be cited here
+   as the sibling precedent; it is gone — its "fixed" shape was exactly what
+   stopped a live reading and hardcoded copy from being told apart.) */
 .session-run .track:first-of-type > div:first-child {
   font-weight: 600;
   color: var(--fg);

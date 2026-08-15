@@ -11,6 +11,9 @@ import {
   gaugeValueParts,
   groupResidencyRows,
   isOverLimit,
+  machineStateWord,
+  rowStateDiffers,
+  isUtilityTierRow,
   modelKvLine,
   odometerTiles,
   redlineLit,
@@ -394,5 +397,107 @@ describe("modelKvLine — unchanged from the retired modelLines()'s fourth eleme
     const line = modelKvLine(model({ kv_bytes_at_ctx: null as unknown as number, potential_bytes: null as unknown as number }));
     expect(line).toContain("kv unknown (no arch facts)");
     expect(line).toContain("potential —");
+  });
+});
+
+describe("isUtilityTierRow — the row-chip identity marker (follow-up to the utility-block redesign)", () => {
+  const ID = "darkmux:qwen3-4b-instruct-2507";
+  const KEY = "qwen3-4b-instruct-2507";
+
+  it("matches when the row's identifier equals the resident utility model's id", () => {
+    expect(isUtilityTierRow(ID, KEY, ID)).toBe(true);
+  });
+
+  /**
+   * The server decides `utility_model.loaded` with
+   * `m.identifier == id || m.model == id` (`machine_specs_handler`) — the
+   * profiles registry may store the utility model id EITHER namespaced or
+   * bare. A client that matched only `identifier` would leave a registry
+   * holding the bare key with a block honestly reading `resident` and no
+   * ledger row carrying the chip: the stitch failing silently in a config
+   * the server explicitly supports. This is the mirror of that rule.
+   */
+  it("also matches on the BARE model_key, mirroring the server's own two-field residency test", () => {
+    expect(isUtilityTierRow(ID, KEY, KEY)).toBe(true);
+  });
+
+  it("the inverted case: does NOT match a different resident row on either field", () => {
+    expect(isUtilityTierRow("darkmux:qwen3.6-35b-a3b", "qwen3.6-35b-a3b", ID)).toBe(false);
+  });
+
+  it("never matches when there is no resident utility model (null — not configured/not reported/not loaded, all collapse to null upstream)", () => {
+    expect(isUtilityTierRow(ID, KEY, null)).toBe(false);
+  });
+
+  it("never fabricates a match when the row itself has no identifier or key", () => {
+    expect(isUtilityTierRow(null, null, ID)).toBe(false);
+    expect(isUtilityTierRow(undefined, undefined, ID)).toBe(false);
+    // ...and a null on ONE side must not match a null resident id either —
+    // the null-resident guard runs first, so this can never be `true`.
+    expect(isUtilityTierRow(null, null, null)).toBe(false);
+  });
+});
+
+/**
+ * `UNKNOWN` was the one word on this page a first-time reader could not
+ * resolve from anything else on it — and, per provenance finding 1, the one
+ * they see permanently, because the ledger declines to promise a fit
+ * whenever any resident is unpriceable. Naming which of the cascade's two
+ * unknown arms fired turns jargon into a sentence, using the same fields the
+ * server branched on.
+ */
+describe("machineStateWord — UNKNOWN carries its reason", () => {
+  it("names the unpriced-resident arm — the permanent-normal case on a real machine", () => {
+    expect(machineStateWord("unknown", 137438953472, 1)).toBe("UNKNOWN · unpriced resident");
+  });
+
+  it("names the no-limit arm, and checks it FIRST — the server's own arm order", () => {
+    // With no limit, none of the server's `Some(limit)` arms can fire, so a
+    // missing limit dominates even when unpriced residents also exist.
+    expect(machineStateWord("unknown", null, 3)).toBe("UNKNOWN · no limit readable");
+  });
+
+  it("leaves green/amber/red bare — a reason on a self-evident word is noise", () => {
+    expect(machineStateWord("green", 100, 0)).toBe("GREEN");
+    expect(machineStateWord("amber", 100, 0)).toBe("AMBER");
+    expect(machineStateWord("red", 100, 2)).toBe("RED");
+  });
+
+  it("never invents a reason it cannot name", () => {
+    // Unknown for neither named cause: a limit exists and nothing is
+    // unpriced. Degrades to the bare word rather than guessing.
+    expect(machineStateWord("unknown", 100, 0)).toBe("UNKNOWN");
+    expect(machineStateWord(null, 100, 0)).toBe("UNKNOWN");
+  });
+});
+
+/**
+ * The per-row state chip renders only where it disagrees with the machine.
+ *
+ * Deleting it outright was tempting and would have been WRONG: unified
+ * memory means the machine state dominates, but `compute_ledger`'s per-model
+ * tint has two real divergence branches — a model whose `current >=
+ * potential` shows GREEN under a machine-AMBER (its commitment is already
+ * paid), and an unpriceable model stays UNKNOWN whatever the machine says.
+ * Those rows are the only place that fact exists.
+ */
+describe("rowStateDiffers — the per-row chip's whole condition", () => {
+  it("is false when the row agrees with the machine — the quiet common case", () => {
+    expect(rowStateDiffers("unknown", "unknown")).toBe(false);
+    expect(rowStateDiffers("green", "green")).toBe(false);
+  });
+
+  it("is true for a materialized model under machine-amber — the divergence that made deletion wrong", () => {
+    expect(rowStateDiffers("green", "amber")).toBe(true);
+  });
+
+  it("is true for an unpriceable row under a decided machine", () => {
+    expect(rowStateDiffers("unknown", "red")).toBe(true);
+  });
+
+  it("normalizes both sides before comparing, so a hostile string never reads as a difference", () => {
+    // Both degrade to "unknown" through memStateCls — not two distinct values.
+    expect(rowStateDiffers("bogus", null)).toBe(false);
+    expect(rowStateDiffers(undefined, "not-a-state")).toBe(false);
   });
 });

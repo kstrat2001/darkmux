@@ -26,33 +26,46 @@
  * `/machine/resources`); only the rendering was uppercased there. This port
  * uppercases the STRING directly (see `format.ts`'s module doc) rather than
  * depending on a stylesheet rule the port is free to change.
+ *
+ * (operator-approved) The `darkmux/utility` node this file used to build —
+ * first as `utilityLines()`'s flat four-element `string[]`, then briefly as
+ * `utilityView()`'s typed structure — is GONE from the machine page. It was
+ * config wearing machine-state clothing; see `utilityModelId` below, which
+ * is all that survives of it, and why.
  */
 
 import { MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
 
-/** The `darkmux/utility` node — viewer.html:1810-1822. `isLocalSpecs` is
- * `isLocalMachine(m)` (viewer.html:2628): only a specs-confirmed local
- * machine gets real utility-tier state; everything else reads "not
- * reported" (never fabricated residency for a remote/unresolved machine). */
-export function utilityLines(specs: MachineSpecs | null, isLocalSpecs: boolean): string[] {
-  const um = isLocalSpecs ? specs?.utility_model : undefined;
-  let utilState: string;
-  let pillText: string;
-  if (um === undefined) {
-    utilState = "utility tier";
-    pillText = "not reported";
-  } else if (um === null) {
-    utilState = "utility tier · not configured";
-    pillText = "not configured";
-  } else if (um.loaded) {
-    utilState = `utility tier · ${um.id}`;
-    pillText = "resident";
-  } else {
-    utilState = `utility tier · ${um.id}`;
-    pillText = "registered · not loaded";
-  }
-  return ["darkmux/utility", utilState, "compaction · mission-compile · estimate · scribe", pillText];
+/** The configured utility-tier model's id, or `null` — the ONE thing the
+ * machine page still needs to know about the utility tier, used to badge
+ * whichever residency row is that model (`isUtilityTierRow`).
+ *
+ * This replaced a whole `utilityView()` four-state structure (id + gloss +
+ * capability list + a `resident`/`not loaded`/`not configured`/`not
+ * reported` chip + a hint line) that rendered as its own card on this page.
+ * The operator's call, and it is the right cut: **that card was config, not
+ * machine state.** It described what the tier is responsible for, not how it
+ * relates to this machine — and the machine page shows what is resident.
+ *
+ * The states dissolve rather than needing a new home:
+ * - `resident` was redundant the moment the ledger row itself existed — a
+ *   row exists if and only if `lms ps` lists the model (`gather_with_bin`
+ *   builds `residents` from `ps` rows alone), so the row IS the residency
+ *   claim, and this function needs no `loaded` field to make it.
+ * - `not loaded` / `not configured` are config questions, and
+ *   `darkmux doctor`'s `check_utility_model_binding` already answers both —
+ *   with a fix hint, which the card never had.
+ * - `not reported` duplicated the page-level not-local placeholder the
+ *   health region already renders for a remote machine.
+ *
+ * `isLocalSpecs` is unchanged from the retired builder: only a
+ * specs-confirmed local machine reports a utility tier, so a remote or
+ * unresolved machine yields `null` and badges nothing — never a fabricated
+ * marker for a machine this daemon cannot see. */
+export function utilityModelId(specs: MachineSpecs | null, isLocalSpecs: boolean): string | null {
+  if (!isLocalSpecs) return null;
+  return specs?.utility_model?.id ?? null;
 }
 
 /** `limitDescription()` — viewer.html:4896's inline ternary, factored out so

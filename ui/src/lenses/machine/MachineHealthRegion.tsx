@@ -7,6 +7,9 @@ import {
   gaugeValueParts,
   groupResidencyRows,
   isOverLimit,
+  machineStateWord,
+  rowStateDiffers,
+  isUtilityTierRow,
   memStateCls,
   modelKvLine,
   odometerTiles,
@@ -211,7 +214,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
 
 function GaugeCaption({ resources }: { resources: MachineResources }) {
   const stateCls = memStateCls(resources.machine.state);
-  const stateText = (resources.machine.state || "unknown").toUpperCase();
+  const stateText = machineStateWord(resources.machine.state, resources.limit_bytes, Number(resources.machine.unpriced_models) || 0);
   const unpriced = Number(resources.machine.unpriced_models) || 0;
   const committed = memBytes(resources.machine.potential_bytes);
   return (
@@ -284,10 +287,23 @@ function relSecondsAgo(nowMs: number, thenMs: number): string {
   return `${s}s ago`;
 }
 
-function ModelRow({ row, scale, nowMs }: { row: ResidencyRowView; scale: number; nowMs: number }) {
+function ModelRow({
+  row,
+  scale,
+  nowMs,
+  utilityModelId,
+  machineState,
+}: {
+  row: ResidencyRowView;
+  scale: number;
+  nowMs: number;
+  utilityModelId: string | null;
+  machineState: string | null | undefined;
+}) {
   const m: MachineResourcesModel = row.model;
   const isGhost = row.status === "ghost";
   const isNew = row.status === "new";
+  const isUtility = isUtilityTierRow(m.identifier, m.model_key, utilityModelId);
   const stateCls = memStateCls(m.state);
   const pot = m.potential_bytes != null ? Number(m.potential_bytes) : null;
   const cur = m.current_bytes != null ? Number(m.current_bytes) : null;
@@ -300,10 +316,31 @@ function ModelRow({ row, scale, nowMs }: { row: ResidencyRowView; scale: number;
     <div className={rowCls}>
       <div className="mm-row-top">
         <span className="mm-row-name">{m.identifier || m.model_key}</span>
+        {/* Identity marker, not a health verdict — deliberately NO severity
+            class (green/amber/red): "which resident is the internal tier" is
+            identity, and this page spends color only on verified health.
+            This badge is ALL that remains of the `darkmux/utility` card that
+            used to sit on this page; see `isUtilityTierRow`'s doc for why
+            the card was config rather than machine state, and why matching
+            on the id alone is correct by construction. The title carries the
+            gloss the card used to spend three lines on. */}
+        {!isGhost && isUtility && (
+          <span className="mm-row-chip is-identity" title="darkmux's internal small-model tier — handles compaction · mission-compile · estimate · scribe">
+            utility
+          </span>
+        )}
         {isGhost && <span className="mm-row-chip is-warn">DEPARTED · last seen {new Date(row.lastSeenMs).toLocaleTimeString([], { hour12: false })}</span>}
         {isNew && <span className="mm-row-chip is-new">NEW · first seen {relSecondsAgo(nowMs, row.firstSeenMs ?? row.lastSeenMs)}</span>}
         {!isGhost && pot == null && <span className="mm-row-chip is-warn">UNPRICED · potential unknown</span>}
-        {!isGhost && <span className={`mm-row-chip is-state is-${stateCls}`}>{(m.state || "unknown").toUpperCase()}</span>}
+        {/* Renders ONLY when this row disagrees with the machine's verdict —
+            see `rowStateDiffers`. A row that agrees is one machine-level
+            fact stamped once per row; a row that disagrees (a materialized
+            model under machine-amber, or an unpriceable one) is the only
+            place that fact exists. On a healthy or uniformly-unknown
+            machine, no row renders this at all. */}
+        {!isGhost && rowStateDiffers(m.state, machineState) && (
+          <span className={`mm-row-chip is-state is-${stateCls}`}>{(m.state || "unknown").toUpperCase()}</span>
+        )}
       </div>
       <div
         className="mm-row-track-wrap"
@@ -345,7 +382,17 @@ function ModelRow({ row, scale, nowMs }: { row: ResidencyRowView; scale: number;
   );
 }
 
-function ModelRows({ rows, nowMs }: { rows: ResidencyRowView[]; nowMs: number }) {
+function ModelRows({
+  rows,
+  nowMs,
+  utilityModelId,
+  machineState,
+}: {
+  rows: ResidencyRowView[];
+  nowMs: number;
+  utilityModelId: string | null;
+  machineState: string | null | undefined;
+}) {
   const groups = groupResidencyRows(rows);
   // Shared scale (`perModelScale`'s own doc) — the largest figure across
   // every rendered row, GHOSTS INCLUDED (a departed model's last-observed
@@ -364,7 +411,7 @@ function ModelRows({ rows, nowMs }: { rows: ResidencyRowView[]; nowMs: number })
             {g.rows.some((r) => r.status === "ghost") ? ` (+${g.rows.filter((r) => r.status === "ghost").length} DEPARTED)` : ""}
           </div>
           {g.rows.map((r) => (
-            <ModelRow key={r.identifier} row={r} scale={scale} nowMs={nowMs} />
+            <ModelRow key={r.identifier} row={r} scale={scale} nowMs={nowMs} utilityModelId={utilityModelId} machineState={machineState} />
           ))}
         </div>
       ))}
@@ -382,6 +429,14 @@ export interface HealthRegionProps {
   residencyRows?: ResidencyRowView[];
   residencyChanged?: boolean;
   nowMs?: number;
+  /** The RESIDENT utility-tier model's id, or `null` — threaded explicitly
+   * from `MachineLens.tsx`'s own `utilityView()` call rather than this
+   * component reaching for `specs` itself (this region never otherwise
+   * touches `/machine/specs`). `null` covers every non-resident state
+   * (not configured, not reported, registered-but-not-loaded) uniformly —
+   * see `isUtilityTierRow`'s doc for why the caller pre-filters to just
+   * the resident case. */
+  utilityModelId?: string | null;
 }
 
 export function MachineHealthRegion({
@@ -392,6 +447,7 @@ export function MachineHealthRegion({
   residencyRows = [],
   residencyChanged = false,
   nowMs = Date.now(),
+  utilityModelId = null,
 }: HealthRegionProps) {
   if (!isLocalMach) {
     return (
@@ -460,7 +516,7 @@ export function MachineHealthRegion({
       )}
 
       <div className={stale ? "is-stale" : ""}>
-        <ModelRows rows={residencyRows} nowMs={nowMs} />
+        <ModelRows rows={residencyRows} nowMs={nowMs} utilityModelId={utilityModelId} machineState={b.machine.state} />
       </div>
 
       {warnings.length > 0 && (

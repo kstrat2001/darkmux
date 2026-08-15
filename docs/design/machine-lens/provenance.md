@@ -30,10 +30,12 @@ recorded knob, never silent.
 
 ![Provenance key — circled numbers map to the table](provenance-key.jpg)
 
-> **The key image predates the #1811 units change** and still shows the
-> decimal figures (`137`, `32.4 GB`) described in finding 3. The circled
-> numbers — the only thing it is load-bearing for — still map to the rows
-> below. Retake when the annotated overlay is next regenerated.
+> **The key image predates both of this day's changes.** It still shows the
+> decimal figures (`137`, `32.4 GB`) that finding 3 describes, and it circles
+> as ② and ③ a `darkmux/utility` card that no longer renders at all — ② is
+> now the small `utility` badge on a residency row. Every other circled
+> number still maps to its row, which is what the image is load-bearing for;
+> retake it when the annotated overlay is next regenerated.
 
 ## The trace, value by value
 
@@ -42,11 +44,29 @@ GiB/MiB (`bytes / 2³⁰`, two decimals), and the gauge's glance layer through
 `gaugeValueParts()` (same divisor, one decimal). Since #1811 that is the ONLY
 convention on the page — see finding 3 for what it replaced and what is left.
 
+**The copy-vs-data rule.** Not every string on a page like this came off a
+probe — some is UI copy written by hand. Where the two sit next to each
+other, **hardcoded copy must not render indistinguishably from a value that
+was read**, because the promise above (every figure traces to a probe) is
+falsifiable only if a reader can tell which strings are making it.
+
+This page's current answer is stronger than a styling convention: it stopped
+rendering the hand-written strings at all. The `darkmux/utility` card — whose
+`handles  compaction · mission-compile · estimate · scribe` line was
+hardcoded in the TypeScript, with no capability list on `/machine/specs` to
+read (`utility_model` carries only `{id, loaded}`) — was deleted outright as
+config rather than machine state. Its gloss survives as a `title` on the
+badge at ②. Where live and static values do sit together in future, the
+mechanism is brightness: a live value is `--fg`, hand-written copy stays
+`--dim`.
+
+The rule is stated here rather than assumed because the code cites it by
+name (`memoryLedgerLines.ts` and its tests).
+
 | # | The pixel says | Source | Transformation | Tested |
 |---|---|---|---|---|
 | ① | `Apple M5 Max · 128 GB` | `/machine/specs` → `cpu_brand` (sysctl `machdep.cpu.brand_string`), `ram_total_bytes` (sysctl `hw.memsize`) | `specOf()` (`lenses/fleet/cards.ts:65`): **binary**, `round(bytes/2³⁰)` — labeled `GB`, see finding 3 | 137438953472 / 2³⁰ = 128 ✓ — and ⑬ now reads `128.00 GiB` for the same field |
-| ② | `darkmux:qwen3-4b-instruct-2507 · compaction · …` | `/machine/specs` → `utility_model.id` | verbatim; capability list is static UI copy | field present, id matches ✓ |
-| ③ | `registered · not loaded` | `/machine/specs` → `utility_model.loaded` | `utilityLines()` (`memoryLedgerLines.ts:27`): `loaded:false` → this wording | `loaded: false` live ✓ |
+| ② | the small `utility` badge on one residency row | `/machine/specs` → `utility_model.id` + the row itself | `utilityModelId()` + `isUtilityTierRow()`: badges the row whose `identifier` **or** `model_key` is the configured id — mirroring the server's own two-field test (`m.identifier == id \|\| m.model == id`). Needs no `loaded` flag: a row exists iff `lms ps` lists the model, so the ROW is the residency claim and the badge only answers identity. Neutral, never a severity color — identity is not a verdict | badge present on exactly the 4b row live ✓; ledger rows == `lms ps` verified 3-for-3 ✓; inverted cases unit-tested ✓ |
 | ④ | `32.9 GiB — IN USE` (odometer center + needle) | `/machine/resources` → `machine.current_bytes` | Σ of per-model attributed RSS (see *machine total* below); needle angle = `current / limit_bytes`, clamped at 100%. The odometer cells are centered on the hub with the unit hung outside that centering (`odoLayout`) | Σ model currents = 35357818880 = field ✓; 25.7% of scale ✓ |
 | ⑤ | arc ticks `0 · 32 · 64 · 96` | `limit_bytes` | quarter marks of the scale, `limit × k/4` in whole **binary** GiB (`gaugeTickLabel`) | 128 × ¾ = 96 ✓ — decimal labeled this same arc `0 · 34 · 69 · 103`, finding 3 |
 | ⑥ | `128 / LIMIT` at the max position (+ the redline end-cap) | `limit_bytes` + `limit_source` | limit resolution: `budget > physical pool > none` (`compute_ledger`, `model_ledger.rs:383`); word is LIMIT, or BUDGET when `limit_source:"budget"` | `limit == pool.capacity`, source `physical_pool` ✓; **budget arm currently unreachable — finding 4** |

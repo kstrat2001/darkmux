@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { attributionLine, limitDescription, perModelScale, stampLine, utilityLines } from "./memoryLedgerLines";
+import { attributionLine, limitDescription, perModelScale, stampLine, utilityModelId } from "./memoryLedgerLines";
 import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
 
 // #1806 Stage 1 refactored the health region's text builders from one flat
@@ -46,21 +46,44 @@ function model(overrides: Partial<MachineResourcesModel> = {}): MachineResources
   };
 }
 
-describe("utilityLines", () => {
-  it("reads 'not reported' when specs aren't confirmed local", () => {
-    expect(utilityLines(null, false)).toEqual(["darkmux/utility", "utility tier", "compaction · mission-compile · estimate · scribe", "not reported"]);
+// Replacement coverage for the operator-approved utility-block redesign
+// (`tests/parity/next-parity.spec.ts`'s narrowing doc names this file as
+// where the retired byte-exact utility-block assertion's coverage lives).
+/**
+ * `utilityModelId` is what remains of a whole `utilityView()` four-state
+ * structure (and, before that, `utilityLines()`'s four-element array) that
+ * rendered as its own card on the machine page. The operator's cut: that
+ * card was CONFIG, not machine state — it described what the tier is
+ * responsible for, not how it relates to this machine.
+ *
+ * So the tests shrink with it. The states did not need re-homing: `resident`
+ * was already proven by the ledger row's existence, `not loaded` and `not
+ * configured` are answered by `darkmux doctor` (with a fix hint), and `not
+ * reported` duplicated the page-level not-local placeholder. What is left to
+ * pin is the locality guard — the one honesty rule that survived — and that
+ * a missing binding yields `null` rather than a fabricated id.
+ */
+describe("utilityModelId", () => {
+  const specs = (utility_model: unknown) => ({ utility_model }) as unknown as MachineSpecs;
+
+  it("returns the configured id for a specs-confirmed local machine", () => {
+    expect(utilityModelId(specs({ id: "darkmux:qwen3-4b", loaded: true }), true)).toBe("darkmux:qwen3-4b");
   });
 
-  it("reads 'not configured' for an explicit null utility model", () => {
-    const specs = { utility_model: null } as unknown as MachineSpecs;
-    expect(utilityLines(specs, true)[1]).toBe("utility tier · not configured");
+  it("ignores `loaded` entirely — a row exists iff the model is resident, so identity is the only question", () => {
+    // Same id either way. A configured-but-unloaded tier simply has no row
+    // to match downstream, so it badges nothing without a state machine.
+    expect(utilityModelId(specs({ id: "darkmux:qwen3-4b", loaded: false }), true)).toBe("darkmux:qwen3-4b");
   });
 
-  it("distinguishes resident from registered-not-loaded", () => {
-    const loaded = { utility_model: { id: "darkmux:qwen3-4b", loaded: true } } as unknown as MachineSpecs;
-    const notLoaded = { utility_model: { id: "darkmux:qwen3-4b", loaded: false } } as unknown as MachineSpecs;
-    expect(utilityLines(loaded, true)[3]).toBe("resident");
-    expect(utilityLines(notLoaded, true)[3]).toBe("registered · not loaded");
+  it("never reports a utility tier for a machine it cannot see — the locality guard", () => {
+    // The inverted case that matters: the SAME payload, not confirmed local.
+    expect(utilityModelId(specs({ id: "darkmux:qwen3-4b", loaded: true }), false)).toBeNull();
+  });
+
+  it("yields null rather than a fabricated id when nothing is configured", () => {
+    expect(utilityModelId(specs(null), true)).toBeNull();
+    expect(utilityModelId(null, true)).toBeNull();
   });
 });
 
