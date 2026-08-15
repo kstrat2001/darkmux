@@ -232,7 +232,10 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
     const chip = [...row.querySelectorAll(".mm-row-chip")].find((c) => c.textContent === "utility")!;
     expect(chip).toBeTruthy();
     // Identity, never a health verdict — no severity class.
-    expect(chip.className).toBe("mm-row-chip");
+    // Identity, never a health verdict: it carries the identity treatment
+    // (filled + achromatic) and NONE of the severity classes.
+    expect(chip.className).toBe("mm-row-chip is-identity");
+    expect(chip.className).not.toMatch(/is-(green|amber|red|state|warn|new)\b/);
     // The gloss the card used to spend a line on survives as the title.
     expect(chip.getAttribute("title")).toContain("small-model tier");
   });

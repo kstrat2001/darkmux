@@ -2209,6 +2209,29 @@ body {
   color: var(--accent);
   border-color: var(--accent);
 }
+/* IDENTITY, not status — the `utility` marker. Every status chip on this
+   page encodes severity as HUE ON AN OUTLINE (green/amber/red text + border,
+   neutral base for unknown). This one differs on both axes at once: it has a
+   FILL, which no status chip has, and it is ACHROMATIC, and hue is the
+   property severity is actually carried by. So it is salient by value
+   contrast against a dark page rather than by color, and cannot be read as a
+   health verdict.
+
+   The rule this establishes, and the one to follow for any future marker:
+   **outline + hue = status; fill + grey = identity.** The lowercase word is
+   a deliberate second signal on top (every status chip is UPPERCASE) —
+   double-coding keeps the two families apart at 10px.
+
+   `--accent` was the obvious alternative and is NOT available: `.is-new`
+   above already spends it, so a teal `utility` beside a teal `NEW` would be
+   two meanings in one costume. (It is also uncomfortably close to `--good`
+   at this size, which would have been the worse failure.) */
+.mm-row-chip.is-identity {
+  color: var(--bg);
+  background: var(--dim);
+  border-color: var(--dim);
+  font-weight: 600;
+}
 
 .mm-lamps {
   display: flex;

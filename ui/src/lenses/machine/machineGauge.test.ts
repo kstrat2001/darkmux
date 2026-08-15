@@ -10,6 +10,8 @@ import {
   gaugeValueParts,
   groupResidencyRows,
   isOverLimit,
+  machineStateWord,
+  rowStateDiffers,
   isUtilityTierRow,
   modelKvLine,
   odometerTiles,
@@ -397,5 +399,69 @@ describe("isUtilityTierRow — the row-chip identity marker (follow-up to the ut
     // ...and a null on ONE side must not match a null resident id either —
     // the null-resident guard runs first, so this can never be `true`.
     expect(isUtilityTierRow(null, null, null)).toBe(false);
+  });
+});
+
+/**
+ * `UNKNOWN` was the one word on this page a first-time reader could not
+ * resolve from anything else on it — and, per provenance finding 1, the one
+ * they see permanently, because the ledger declines to promise a fit
+ * whenever any resident is unpriceable. Naming which of the cascade's two
+ * unknown arms fired turns jargon into a sentence, using the same fields the
+ * server branched on.
+ */
+describe("machineStateWord — UNKNOWN carries its reason", () => {
+  it("names the unpriced-resident arm — the permanent-normal case on a real machine", () => {
+    expect(machineStateWord("unknown", 137438953472, 1)).toBe("UNKNOWN · unpriced resident");
+  });
+
+  it("names the no-limit arm, and checks it FIRST — the server's own arm order", () => {
+    // With no limit, none of the server's `Some(limit)` arms can fire, so a
+    // missing limit dominates even when unpriced residents also exist.
+    expect(machineStateWord("unknown", null, 3)).toBe("UNKNOWN · no limit readable");
+  });
+
+  it("leaves green/amber/red bare — a reason on a self-evident word is noise", () => {
+    expect(machineStateWord("green", 100, 0)).toBe("GREEN");
+    expect(machineStateWord("amber", 100, 0)).toBe("AMBER");
+    expect(machineStateWord("red", 100, 2)).toBe("RED");
+  });
+
+  it("never invents a reason it cannot name", () => {
+    // Unknown for neither named cause: a limit exists and nothing is
+    // unpriced. Degrades to the bare word rather than guessing.
+    expect(machineStateWord("unknown", 100, 0)).toBe("UNKNOWN");
+    expect(machineStateWord(null, 100, 0)).toBe("UNKNOWN");
+  });
+});
+
+/**
+ * The per-row state chip renders only where it disagrees with the machine.
+ *
+ * Deleting it outright was tempting and would have been WRONG: unified
+ * memory means the machine state dominates, but `compute_ledger`'s per-model
+ * tint has two real divergence branches — a model whose `current >=
+ * potential` shows GREEN under a machine-AMBER (its commitment is already
+ * paid), and an unpriceable model stays UNKNOWN whatever the machine says.
+ * Those rows are the only place that fact exists.
+ */
+describe("rowStateDiffers — the per-row chip's whole condition", () => {
+  it("is false when the row agrees with the machine — the quiet common case", () => {
+    expect(rowStateDiffers("unknown", "unknown")).toBe(false);
+    expect(rowStateDiffers("green", "green")).toBe(false);
+  });
+
+  it("is true for a materialized model under machine-amber — the divergence that made deletion wrong", () => {
+    expect(rowStateDiffers("green", "amber")).toBe(true);
+  });
+
+  it("is true for an unpriceable row under a decided machine", () => {
+    expect(rowStateDiffers("unknown", "red")).toBe(true);
+  });
+
+  it("normalizes both sides before comparing, so a hostile string never reads as a difference", () => {
+    // Both degrade to "unknown" through memStateCls — not two distinct values.
+    expect(rowStateDiffers("bogus", null)).toBe(false);
+    expect(rowStateDiffers(undefined, "not-a-state")).toBe(false);
   });
 });

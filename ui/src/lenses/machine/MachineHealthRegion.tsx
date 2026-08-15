@@ -5,6 +5,8 @@ import {
   gaugeValueParts,
   groupResidencyRows,
   isOverLimit,
+  machineStateWord,
+  rowStateDiffers,
   isUtilityTierRow,
   memStateCls,
   modelKvLine,
@@ -159,7 +161,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
 
 function GaugeCaption({ resources }: { resources: MachineResources }) {
   const stateCls = memStateCls(resources.machine.state);
-  const stateText = (resources.machine.state || "unknown").toUpperCase();
+  const stateText = machineStateWord(resources.machine.state, resources.limit_bytes, Number(resources.machine.unpriced_models) || 0);
   const unpriced = Number(resources.machine.unpriced_models) || 0;
   const committed = memBytes(resources.machine.potential_bytes);
   return (
@@ -237,11 +239,13 @@ function ModelRow({
   scale,
   nowMs,
   utilityModelId,
+  machineState,
 }: {
   row: ResidencyRowView;
   scale: number;
   nowMs: number;
   utilityModelId: string | null;
+  machineState: string | null | undefined;
 }) {
   const m: MachineResourcesModel = row.model;
   const isGhost = row.status === "ghost";
@@ -268,14 +272,22 @@ function ModelRow({
             on the id alone is correct by construction. The title carries the
             gloss the card used to spend three lines on. */}
         {!isGhost && isUtility && (
-          <span className="mm-row-chip" title="darkmux's internal small-model tier — handles compaction · mission-compile · estimate · scribe">
+          <span className="mm-row-chip is-identity" title="darkmux's internal small-model tier — handles compaction · mission-compile · estimate · scribe">
             utility
           </span>
         )}
         {isGhost && <span className="mm-row-chip is-warn">DEPARTED · last seen {new Date(row.lastSeenMs).toLocaleTimeString([], { hour12: false })}</span>}
         {isNew && <span className="mm-row-chip is-new">NEW · first seen {relSecondsAgo(nowMs, row.firstSeenMs ?? row.lastSeenMs)}</span>}
         {!isGhost && pot == null && <span className="mm-row-chip is-warn">UNPRICED · potential unknown</span>}
-        {!isGhost && <span className={`mm-row-chip is-state is-${stateCls}`}>{(m.state || "unknown").toUpperCase()}</span>}
+        {/* Renders ONLY when this row disagrees with the machine's verdict —
+            see `rowStateDiffers`. A row that agrees is one machine-level
+            fact stamped once per row; a row that disagrees (a materialized
+            model under machine-amber, or an unpriceable one) is the only
+            place that fact exists. On a healthy or uniformly-unknown
+            machine, no row renders this at all. */}
+        {!isGhost && rowStateDiffers(m.state, machineState) && (
+          <span className={`mm-row-chip is-state is-${stateCls}`}>{(m.state || "unknown").toUpperCase()}</span>
+        )}
       </div>
       <div
         className="mm-row-track-wrap"
@@ -321,10 +333,12 @@ function ModelRows({
   rows,
   nowMs,
   utilityModelId,
+  machineState,
 }: {
   rows: ResidencyRowView[];
   nowMs: number;
   utilityModelId: string | null;
+  machineState: string | null | undefined;
 }) {
   const groups = groupResidencyRows(rows);
   // Shared scale (`perModelScale`'s own doc) — the largest figure across
@@ -344,7 +358,7 @@ function ModelRows({
             {g.rows.some((r) => r.status === "ghost") ? ` (+${g.rows.filter((r) => r.status === "ghost").length} DEPARTED)` : ""}
           </div>
           {g.rows.map((r) => (
-            <ModelRow key={r.identifier} row={r} scale={scale} nowMs={nowMs} utilityModelId={utilityModelId} />
+            <ModelRow key={r.identifier} row={r} scale={scale} nowMs={nowMs} utilityModelId={utilityModelId} machineState={machineState} />
           ))}
         </div>
       ))}
@@ -460,7 +474,7 @@ export function MachineHealthRegion({
       )}
 
       <div className={stale ? "is-stale" : ""}>
-        <ModelRows rows={residencyRows} nowMs={nowMs} utilityModelId={utilityModelId} />
+        <ModelRows rows={residencyRows} nowMs={nowMs} utilityModelId={utilityModelId} machineState={b.machine.state} />
       </div>
 
       {warnings.length > 0 && (

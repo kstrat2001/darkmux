@@ -140,6 +140,55 @@ export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry
   };
 }
 
+/** The machine chip's word, with its REASON attached when the verdict is
+ * `unknown`.
+ *
+ * A bare `UNKNOWN` is jargon that comes out of nowhere: nothing else on the
+ * page defines it, and — per docs/design/machine-lens/provenance.md finding
+ * 1 — it is the PERMANENT state on any machine with an unpriceable resident,
+ * i.e. most real ones. So the one word a first-time reader most needs
+ * explained is also the one they will see every single time.
+ *
+ * The cascade has exactly two `Unknown` arms and they are distinguishable
+ * from the SAME fields the server branched on, so this names which one fired
+ * rather than guessing:
+ *   - `limit_bytes == null` → the server's `None` arm, "no limit readable".
+ *   - otherwise (a limit exists, the priced sum fits, but residents are
+ *     unpriceable) → the `Some(_)` arm, "unpriced resident".
+ * Order matters and mirrors the server's: the `Some(limit)` arms cannot fire
+ * at all when the limit is absent, so a missing limit is checked FIRST.
+ *
+ * Green/amber/red stay bare — they are self-evident, and a reason appended
+ * to a self-evident word is noise. This never invents a verdict; it only
+ * annotates one the server already reached. */
+export function machineStateWord(state: string | null | undefined, limitBytes: number | null | undefined, unpricedModels: number): string {
+  const word = (state || "unknown").toUpperCase();
+  if (word !== "UNKNOWN") return word;
+  if (limitBytes == null) return "UNKNOWN · no limit readable";
+  if (unpricedModels > 0) return "UNKNOWN · unpriced resident";
+  return word; // defensive: unknown for neither named reason — never invent one
+}
+
+/** Whether a row's own state chip carries information the MACHINE chip does
+ * not — i.e. whether this row disagrees with the machine's verdict.
+ *
+ * The tempting simplification was to delete the per-row chip outright, on the
+ * grounds that unified memory is one pool with shared fate so the machine
+ * state dominates. That is ALMOST true, and the exceptions are exactly the
+ * interesting rows (`compute_ledger`'s per-model tint):
+ *   - machine AMBER + a model whose `current >= potential` → the row is
+ *     GREEN: its commitment is already materialized, so it is not part of
+ *     the risk the machine is amber about.
+ *   - a model with no `potential_bytes` (unpriceable) → the row stays
+ *     UNKNOWN whatever the machine says.
+ * A row that agrees with the machine is one fact stamped twice; a row that
+ * disagrees is the only place that fact exists. So the chip renders exactly
+ * when it disagrees — which on a healthy or uniformly-unknown machine means
+ * it does not render at all, and the rows get quiet. */
+export function rowStateDiffers(rowState: string | null | undefined, machineState: string | null | undefined): boolean {
+  return memStateCls(rowState) !== memStateCls(machineState);
+}
+
 /** The redline's lit state keys on exactly ONE server field —
  * `machine.state === "red"` — zero client arithmetic (docs/design/machine-lens/proposal.md §"The
  * redline"). Whatever put the machine in Red (pressure, or the over-limit
