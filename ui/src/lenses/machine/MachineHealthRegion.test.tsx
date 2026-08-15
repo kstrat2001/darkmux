@@ -20,8 +20,8 @@ const BASE: MachineResources = {
   gather_ms: 42,
   limit_bytes: 137438953472,
   limit_source: "physical_pool",
-  pool: { capacity_bytes: 137438953472, available_bytes: 3738599424 },
-  pressure: { swap_used_bytes: 0, compressor_bytes: 0, memory_free_percent: 88, red: false },
+  pool: { capacity_bytes: 137438953472, used_bytes: 69300000000, available_bytes: 72000000000, free_bytes: 3738599424 },
+  pressure: { swap_used_bytes: 0, compressor_bytes: 0, margin_percent: 88, red: false },
   models: [
     {
       identifier: "darkmux:priced-model",
@@ -50,7 +50,7 @@ const BASE: MachineResources = {
   ],
   machine: { potential_bytes: 19272177280, unpriced_models: 1, estimated_models: 0, current_bytes: 20841952256, state: "unknown" },
   attribution: "per_process",
-  warnings: [],
+  messages: [],
   cache_ttl_ms: 2000,
 };
 
@@ -91,15 +91,50 @@ describe("MachineHealthRegion — absence vs zero (docs/design/machine-lens/prov
     expect(pricedRow.querySelector(".mm-row-pot")).not.toBeNull();
   });
 
-  it("the gauge draws NO commit tick when Σ priced potential is 0 — no models at all", () => {
-    const empty: MachineResources = { ...BASE, models: [], machine: { ...BASE.machine, potential_bytes: 0, unpriced_models: 0 } };
-    const { container } = renderRegion(empty, { residencyRows: [] });
+  /**
+   * The commit TICK is gone — with darkmux on its own inner ring and its
+   * growth as a hatched band, the tick was a third rendering of one fact on a
+   * face already too crowded to read. The honesty rule it carried moves with
+   * it: nothing committed beyond what is held now means NO growth band and no
+   * legend entry for one, rather than a zero-width band.
+   */
+  it("draws NO growth band and no committed legend entry when there is nothing beyond current", () => {
+    const nothingPending: MachineResources = {
+      ...BASE,
+      models: [],
+      machine: { ...BASE.machine, potential_bytes: 0, unpriced_models: 0 },
+    };
+    const { container } = renderRegion(nothingPending, { residencyRows: [] });
+    expect(container.querySelector(".mm-gauge-growth")).toBeNull();
+    expect(container.querySelector(".mm-legend-sw.is-growth")).toBeNull();
+    // ...and the tick itself never returns.
     expect(container.querySelector(".mm-gauge-commit")).toBeNull();
   });
 
-  it("the inverted case: a nonzero Σ priced potential DOES draw the commit tick", () => {
+  it("the inverted case: a commitment beyond current DOES draw the band and name it", () => {
+    // BASE is a fully-materialised fixture (committed 17.95 < current 19.41),
+    // so it correctly has NO growth. Give it something still to claim.
+    const pending: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, potential_bytes: 60_000_000_000 },
+    };
+    const { container } = renderRegion(pending, { residencyRows: residencyRowsFor(pending) });
+    expect(container.querySelector(".mm-gauge-growth")).not.toBeNull();
+    expect(container.querySelector(".mm-legend-sw.is-growth")).not.toBeNull();
+    expect(container.querySelector(".mm-legend")!.textContent).toMatch(/committed/);
+  });
+
+  it("names every band it draws — including 'other', now that it IS drawn", () => {
     const { container } = renderRegion(BASE);
-    expect(container.querySelector(".mm-gauge-commit")).not.toBeNull();
+    const legend = container.querySelector(".mm-legend")!;
+    expect(legend.textContent).toMatch(/darkmux/);
+    // The inverse of what this asserted under the rings: this segment was
+    // undrawn there on the theory the gap showed it, and was effectively
+    // invisible. Stacked, it is a real segment and must be named.
+    expect(legend.textContent).toMatch(/\bother\b/i);
+    // The readout owns the machine's own figure — the legend covers only the
+    // segments the readout does not explain, so `used` is not restated here.
+    expect(legend.textContent).not.toMatch(/\bmachine\b/i);
   });
 });
 
@@ -147,10 +182,35 @@ describe("MachineHealthRegion — the fill answers 'how full', not 'what state'"
     expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-red");
   });
 
-  it("the inverted case: the SAME unknown state on a near-empty machine is green", () => {
-    const empty: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "unknown", current_bytes: 4000000000 } };
+  it("the inverted case: the SAME unknown state on a near-empty MACHINE is green", () => {
+    // The whole machine near-empty, not merely darkmux's share of it — the
+    // outer ring is the machine, so its hue must follow the machine.
+    const empty: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, state: "unknown", current_bytes: 4000000000 },
+      pool: { ...BASE.pool!, used_bytes: 6000000000 },
+    };
     const { container } = renderRegion(empty, { residencyRows: residencyRowsFor(empty) });
     expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-green");
+  });
+
+  /**
+   * The hue follows the MACHINE, not darkmux's slice of it. This is the
+   * labelling error #1821 exists to fix, expressed as colour: a dial that
+   * ends at the machine's `128 LIMIT` must not be tinted by a quantity that
+   * is only ever a fraction of it.
+   */
+  it("tints by the machine's fill, not by darkmux's share of it", () => {
+    // darkmux barely present; the MACHINE two-thirds full.
+    const busyElsewhere: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, current_bytes: 2_000_000_000 },
+      pool: { ...BASE.pool!, used_bytes: 120_000_000_000 },
+    };
+    const { container } = renderRegion(busyElsewhere, { residencyRows: residencyRowsFor(busyElsewhere) });
+    // 120e9 bytes = 111.8 GiB = 87.3% of the 128 GiB scale -> red.
+    // Tinting by darkmux's 1.6% share would have said green.
+    expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-red");
   });
 
   it("never lands the arbiter's verdict on the fill — an is-unknown fill is what the fix removed", () => {
@@ -192,13 +252,48 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
     expect(Number(container.querySelector(".mm-gauge-center-unit")!.getAttribute("x"))).toBeGreaterThan(right);
   });
 
+  /**
+   * The aria narrative must describe the same band a sighted reader sees. Two
+   * bugs lived here until the #1821 review: the percentage came from
+   * darkmux's share while the figure beside it was the machine's ("87.7 GiB
+   * in use … 29% full"), and it cited a dashed tick deleted long before. The
+   * needle-vs-readout defect had survived in the one channel nobody looks at.
+   */
+  it("narrates the machine's figure and the machine's percentage — the same subject", () => {
+    const { container } = renderRegion(BASE);
+    const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
+    // pool.used 69.3e9 = 64.5 GiB = 50% of the 128 GiB scale.
+    expect(aria).toContain("64.5 GiB used");
+    expect(aria).toMatch(/50% full/);
+    // ...and NOT darkmux's 19.4 GiB / 15%, which is what it used to mix in.
+    expect(aria).not.toMatch(/15% full/);
+  });
+
+  it("names darkmux's share as a part OF that total, not as the total", () => {
+    const { container } = renderRegion(BASE);
+    const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
+    expect(aria).toMatch(/Of that, darkmux holds 19\.4 GiB/);
+  });
+
+  it("never cites the dashed tick — it was deleted", () => {
+    const pending: MachineResources = { ...BASE, machine: { ...BASE.machine, potential_bytes: 60_000_000_000 } };
+    const { container } = renderRegion(pending, { residencyRows: residencyRowsFor(pending) });
+    const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
+    expect(aria).not.toMatch(/dashed tick/);
+    expect(aria).toMatch(/hatched extension beyond the needle/);
+  });
+
   it("never announces a fabricated 0% to a screen reader when the reading is unavailable", () => {
     // `memPct(null, scale)` is 0 by design (it exists so no caller is handed
     // NaN), so an unguarded "% full" clause would tell a screen-reader user
     // the machine is 0% full for the very payload the odometer renders as a
     // single "—". Absence is never zero — including in the channel a sighted
     // reader cannot check against the dial.
-    const none: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: null as unknown as number } };
+    const none: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, current_bytes: null as unknown as number },
+      pool: { ...BASE.pool!, used_bytes: null as unknown as number },
+    };
     const { container } = renderRegion(none, { residencyRows: residencyRowsFor(none) });
     const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
     expect(aria).not.toContain("% full");
@@ -212,7 +307,9 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
   });
 
   it("stays centered when the figure's width changes — including the no-data case", () => {
-    const wide: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: 130000000000 } }; // "121.1", 5 cells
+    // The readout's source is the MACHINE's used memory: 130e9 = 121.1 GiB,
+    // five cells.
+    const wide: MachineResources = { ...BASE, pool: { ...BASE.pool!, used_bytes: 130000000000 } };
     const { container } = renderRegion(wide, { residencyRows: residencyRowsFor(wide) });
     const cells = [...container.querySelectorAll(".mm-gauge-odo-cell")] as SVGRectElement[];
     expect(cells.length).toBe(5);
@@ -220,7 +317,13 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
     const right = Math.max(...cells.map((c) => Number(c.getAttribute("x")) + Number(c.getAttribute("width"))));
     expect((left + right) / 2).toBeCloseTo(120, 6);
 
-    const none: MachineResources = { ...BASE, machine: { ...BASE.machine, current_bytes: null as unknown as number } };
+    // Both sources unreadable — the readout falls back through pool.used to
+    // machine.current, and with neither present renders "—", never a 0.
+    const none: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, current_bytes: null as unknown as number },
+      pool: { ...BASE.pool!, used_bytes: null as unknown as number },
+    };
     const r2 = renderRegion(none, { residencyRows: residencyRowsFor(none) });
     const oneCell = [...r2.container.querySelectorAll(".mm-gauge-odo-cell")] as SVGRectElement[];
     expect(oneCell.length).toBe(1); // the "—" cell, not a fabricated 0
@@ -261,10 +364,10 @@ describe("MachineHealthRegion — #1812: stale keeps the last-good reading, visi
     const { container, getByText } = renderRegion(BASE, { resourcesErrored: true });
     expect(getByText(/showing the last snapshot/i)).toBeInTheDocument();
     expect(container.querySelector(".mm-hero.is-stale")).not.toBeNull();
-    // The reading itself is still there — never blanked. (The odometer splits
-    // the figure into per-character cells, so this reads the group's
-    // concatenated text: "19.4" + the unit.)
-    expect(container.querySelector(".mm-gauge-center-val")?.textContent).toContain("19.4");
+    // The reading itself is still there — never blanked. The readout shows
+    // the MACHINE's used memory (what the needle points at), not darkmux's
+    // share: pool.used_bytes 69.3e9 = 64.5 GiB.
+    expect(container.querySelector(".mm-gauge-center-val")?.textContent).toContain("64.5");
   });
 
   it("the inverted case: no stale banner and no desaturation when the latest poll succeeded", () => {
@@ -384,6 +487,31 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     expect(kv.textContent).not.toContain("physical pool");
   });
 
+  /**
+   * `used` and `available` overlap by design, so adjacent in one row they
+   * read as an addition that exceeds the machine — 152.78 GiB on a 128 GiB
+   * box when first shown (#1821). The parenthetical is what refuses that
+   * reading, and it must be RENDERED, not merely available: a mutation that
+   * dropped it from this row passed all 688 tests while the helper stayed
+   * green.
+   */
+  it("names the reclaimable overlap in the row, so used + available cannot read as a sum", () => {
+    const { container } = renderRegion(BASE);
+    const kv = container.querySelector(".mm-kv--machine")!;
+    expect(kv.textContent).toMatch(/reclaimable/);
+    // available 67.06 GiB - free 3.48 GiB = 63.57 GiB counted by both.
+    expect(kv.textContent).toContain("63.57 GiB reclaimable");
+  });
+
+  it("omits the parenthetical when there is no overlap to explain", () => {
+    const flush: MachineResources = {
+      ...BASE,
+      pool: { ...BASE.pool!, available_bytes: BASE.pool!.free_bytes },
+    };
+    const { container } = renderRegion(flush);
+    expect(container.querySelector(".mm-kv--machine")!.textContent).not.toMatch(/reclaimable/);
+  });
+
   it("renders the pool in binary GiB, agreeing with the header's own figure (#1811)", () => {
     const { container } = renderRegion(BASE);
     const kv = container.querySelector(".mm-kv--machine")!;
@@ -396,13 +524,20 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     expect(kv.textContent).not.toContain("137.44");
   });
 
-  it("distinguishes pool CAPACITY from pool FREE — they are different fields", () => {
+  it("distinguishes pool CAPACITY, USED, and AVAILABLE — three different fields (#1821)", () => {
     const { container } = renderRegion(BASE);
     const kv = container.querySelector(".mm-kv--machine")!;
-    // 137438953472 vs 3738599424 — rendering `available` where `capacity`
-    // belongs was the third undetected mutation.
-    expect(kv.textContent).toContain("128.00 GiB");
-    expect(kv.textContent).toContain("3.48 GiB");
+    // capacity 137438953472, used 69300000000, available 72000000000 — all
+    // three must render as DIFFERENT numbers, not one figure repeated.
+    expect(kv.textContent).toContain("128.00 GiB"); // capacity
+    expect(kv.textContent).toContain("64.54 GiB"); // used
+    expect(kv.textContent).toContain("67.06 GiB"); // available (colloquial)
+    // free_bytes (3738599424 -> "3.48 GiB") stays in the PAYLOAD but is
+    // deliberately not given prime space in this row (operator-approved
+    // #1821 addendum) — two figures both reading "how much is left" was
+    // the defect the rename fixed, not something to preserve under a new
+    // label.
+    expect(kv.textContent).not.toContain("3.48 GiB");
   });
 
   it("renders the attribution footer — the observer's own cost disclosure", () => {
@@ -511,7 +646,10 @@ describe("MachineHealthRegion — the pressure tiles explain themselves on deman
     const btn = container.querySelector(".mm-odo-i")!;
     expect(btn.tagName).toBe("BUTTON");
     expect(btn.getAttribute("type")).toBe("button");
-    expect(btn.getAttribute("aria-label")).toMatch(/memory free/i);
+    // #1821 (operator-approved rename): this tile's label is "margin", not
+    // "memory free" — kern.memorystatus_level is neither free nor available
+    // memory (see the tile's own note test in machineGauge.test.ts).
+    expect(btn.getAttribute("aria-label")).toMatch(/margin/i);
   });
 });
 
@@ -702,5 +840,54 @@ describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its prove
     // of whether the whole-machine cascade could reach a verdict.
     const estimatedRow = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("phi-4"))!;
     expect(estimatedRow.querySelector(".mm-row-chip.is-estimated")).not.toBeNull();
+  });
+});
+
+describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure must not look like a warning)", () => {
+  function findWarnLamp(container: HTMLElement) {
+    return [...container.querySelectorAll(".mm-lamp")].find((l) => l.textContent?.includes("WARN"))!;
+  }
+
+  it("an info-only message does NOT light the WARN lamp", () => {
+    const infoOnly: MachineResources = {
+      ...BASE,
+      messages: [{ severity: "info", text: "N models priced by ESTIMATE" }],
+    };
+    const { container } = renderRegion(infoOnly);
+    expect(findWarnLamp(container).className).not.toMatch(/is-lit-/);
+  });
+
+  it("the inverted case: a warn-severity message DOES light the WARN lamp", () => {
+    const withWarn: MachineResources = {
+      ...BASE,
+      messages: [{ severity: "warn", text: "resident model(s) unpriceable — undercounts" }],
+    };
+    const { container } = renderRegion(withWarn);
+    expect(findWarnLamp(container).className).toMatch(/is-lit-warn/);
+  });
+
+  it("an error-severity message also lights the WARN lamp", () => {
+    const withError: MachineResources = {
+      ...BASE,
+      messages: [{ severity: "error", text: "`lms ps` probe failed" }],
+    };
+    const { container } = renderRegion(withError);
+    expect(findWarnLamp(container).className).toMatch(/is-lit-warn/);
+  });
+
+  it("the message card renders each entry with a severity-keyed class, not a uniform amber treatment", () => {
+    const mixed: MachineResources = {
+      ...BASE,
+      messages: [
+        { severity: "info", text: "estimate disclosure" },
+        { severity: "warn", text: "undercount warning" },
+      ],
+    };
+    const { container } = renderRegion(mixed);
+    expect(container.querySelector(".memmsg-info")).not.toBeNull();
+    expect(container.querySelector(".memmsg-warn")).not.toBeNull();
+    // The inverted case: an info message must not ALSO carry the warn class.
+    const infoMsg = [...container.querySelectorAll(".memmsg")].find((m) => m.textContent?.includes("estimate disclosure"))!;
+    expect(infoMsg.className).not.toMatch(/memmsg-warn/);
   });
 });

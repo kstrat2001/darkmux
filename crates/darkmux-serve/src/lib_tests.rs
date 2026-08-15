@@ -834,7 +834,8 @@
     /// constraints made visible in the payload. `lms` is pointed at a
     /// nonexistent binary so the test NEVER calls the operator's real
     /// LMStudio (and with no ls entries the arch reader opens no files);
-    /// probe failures must degrade to `warnings`, never a 500.
+    /// probe failures must degrade to `messages` (#1821 — renamed from
+    /// `warnings`; a probe failure is `error` severity), never a 500.
     #[tokio::test]
     #[serial_test::serial]
     async fn machine_memory_endpoint_returns_ledger_with_observer_stamps() {
@@ -873,7 +874,7 @@
             "machine",
             "attribution",
             "attribution_note",
-            "warnings",
+            "messages",
             "cache_ttl_ms",
         ] {
             assert!(
@@ -885,8 +886,8 @@
         assert!(json["machine"]["state"].is_string());
         // The nonexistent lms degrades loud — the payload documents it.
         assert!(
-            json["warnings"].as_array().is_some_and(|w| !w.is_empty()),
-            "missing-lms probes must surface as warnings: {json}"
+            json["messages"].as_array().is_some_and(|w| !w.is_empty()),
+            "missing-lms probes must surface as messages: {json}"
         );
         assert_eq!(json["cache_ttl_ms"].as_u64(), Some(2_000));
     }

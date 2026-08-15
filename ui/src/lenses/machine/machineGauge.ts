@@ -142,6 +142,105 @@ export function resolveGaugeScale(limit: number | null, poolCap: number | null, 
  * the single source every element on the face (needle, ticks, commit
  * marker, redline) reads from, so none of them can disagree about what the
  * scale means. */
+/** One segment of the stacked band, as percentages of the dial's scale. */
+export interface BandSegment {
+  startPct: number;
+  lengthPct: number;
+}
+
+export interface BandGeometry {
+  /** darkmux's own memory, from 0. */
+  darkmux: BandSegment;
+  /** Everything else on the machine, stacked on top of darkmux and ending at
+   * the needle. Its derivedness is SELF-EVIDENT here in a way it never was as
+   * an undrawn gap: it is visibly the span between darkmux's end and the
+   * needle. */
+  other: BandSegment;
+  /** darkmux's committed-but-unmaterialised growth, beyond the needle. */
+  growth: BandSegment;
+  /** Where the machine is NOW — the end of `other`, and the needle. */
+  usedPct: number;
+  /** Where it lands if darkmux's models fully materialise. */
+  projectedPct: number;
+  needleAngleDeg: number;
+}
+
+/**
+ * The dial's stacked band (#1821).
+ *
+ * This replaced two concentric rings. The rings were honest but not
+ * glanceable: "everything else" was left undrawn on the theory that the GAP
+ * between the rings showed it — but that gap is the angular difference
+ * between two arc endpoints at DIFFERENT RADII, so the machine's single
+ * largest consumer (~50 GiB here) required cross-radius mental subtraction
+ * and was effectively unrendered. The inner ring also under-read: at r=66 vs
+ * r=86 the same percentage draws a visibly shorter arc, so darkmux's share
+ * looked smaller than it was. And a gauge that needs a three-item legend to
+ * be read is telling you something about its own geometry.
+ *
+ * Stacking restores the property the rings gave up — ADDITIVITY. This page's
+ * whole question is "will it fit", which is a sum, and the one thing two
+ * rings could not show was the sum.
+ *
+ * On the "other is derived, so do not draw it" rule that kept it off the
+ * rings: that was over-applied. The needle position, every percentage, and
+ * the growth band are all client arithmetic on server numbers. Stacked, the
+ * geometry declares `other` a remainder by construction — it is the span
+ * between darkmux's end and the needle — which is more honest than absence,
+ * not less.
+ */
+export function computeBandGeometry(resources: MachineResources): BandGeometry {
+  const geo = computeGaugeGeometry(resources);
+  const scale = geo.scale;
+  const pctOf = (b: number | null | undefined): number => (b == null || !scale ? 0 : Math.max(0, Math.min(100, (Number(b) / scale) * 100)));
+
+  const darkmuxPct = pctOf(resources.machine.current_bytes);
+  // The machine's used can never read below darkmux's own share — darkmux's
+  // memory IS part of the machine's — so a degraded pool reading clamps up
+  // rather than producing a negative `other`.
+  const usedPct = Math.max(pctOf(resources.pool?.used_bytes), darkmuxPct);
+  const committedPct = pctOf(resources.machine.potential_bytes);
+  const growthPct = Math.max(0, Math.min(100 - usedPct, committedPct - darkmuxPct));
+
+  return {
+    darkmux: { startPct: 0, lengthPct: darkmuxPct },
+    other: { startPct: darkmuxPct, lengthPct: Math.max(0, usedPct - darkmuxPct) },
+    growth: { startPct: usedPct, lengthPct: growthPct },
+    usedPct,
+    projectedPct: usedPct + growthPct,
+    needleAngleDeg: usedPct * 1.8,
+  };
+}
+
+/**
+ * A `stroke-dasharray` that draws ONE sub-arc of a `pathLength=100` path,
+ * hatched, without CSS having to supply the dash pattern.
+ *
+ * This exists because of a real shipped bug: the growth band set its extent
+ * via the `stroke-dasharray` ATTRIBUTE while `styles.css` set
+ * `stroke-dasharray: 3 3` for the hatching — and a CSS declaration overrides
+ * an SVG presentation attribute, so the inline extent was silently clobbered
+ * and the band ran hatched to the END OF THE SCALE. The dial spent its whole
+ * life claiming "projected to the limit". One dasharray cannot carry both
+ * dashing and extent, so the extent and the hatch are composed here, in one
+ * value, and the CSS rule is gone.
+ *
+ * Shape: a leading `0 <start>` gap, then `dash gap` pairs covering the
+ * segment, then a long final gap swallowing the remainder.
+ */
+export function hatchedSegmentDash(startPct: number, lengthPct: number, dash = 2.2, gap = 2.2): string {
+  if (lengthPct <= 0) return "0 100";
+  const parts: number[] = [0, startPct];
+  let drawn = 0;
+  while (drawn < lengthPct) {
+    const d = Math.min(dash, lengthPct - drawn);
+    parts.push(d, gap);
+    drawn += d + gap;
+  }
+  parts.push(0, 200); // swallow whatever is left of the path
+  return parts.map((n) => Number(n.toFixed(3))).join(" ");
+}
+
 export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry {
   const limit = resources.limit_bytes != null ? Number(resources.limit_bytes) : null;
   const poolCap = resources.pool?.capacity_bytes != null ? Number(resources.pool.capacity_bytes) : null;
@@ -306,7 +405,11 @@ export interface LampInputs {
   pressureRed: boolean;
   overLimit: boolean;
   unprivedCount: number;
-  warningsCount: number;
+  /** #1821 — count of `warn` + `error` severity messages ONLY. An `info`
+   * disclosure (the #1819 estimate note) must NOT light this lamp — that
+   * was the whole defect: a working-as-designed disclosure lit the same
+   * amber WARN lamp as a real degradation. */
+  alarmMessagesCount: number;
   resourcesErrored: boolean;
   residencyChanged: boolean;
 }
@@ -352,7 +455,7 @@ export function deriveLamps(inputs: LampInputs): LampView[] {
       word: "PRESSURE",
       lit: inputs.pressureRed,
       severity: "bad",
-      title: "memory_free_percent trigger",
+      title: "margin_percent trigger",
     },
     {
       key: "overLimit",
@@ -370,10 +473,10 @@ export function deriveLamps(inputs: LampInputs): LampView[] {
     },
     {
       key: "warn",
-      word: inputs.warningsCount > 0 ? `⚠ WARN ×${inputs.warningsCount}` : "WARN",
-      lit: inputs.warningsCount > 0,
+      word: inputs.alarmMessagesCount > 0 ? `⚠ WARN ×${inputs.alarmMessagesCount}` : "WARN",
+      lit: inputs.alarmMessagesCount > 0,
       severity: "warn",
-      title: "full warning text below",
+      title: "full message text below (warn/error severity only — a disclosure does not light this)",
     },
   ];
 }
@@ -410,20 +513,25 @@ export function digitCells(s: string): string[] {
  * one-decimal `gaugeValueParts` — these are k/v figures, not the glance
  * layer. */
 export function odometerTiles(pressure: MachineResources["pressure"]): OdometerView[] {
-  const freeText =
-    pressure.memory_free_percent != null && Number.isFinite(Number(pressure.memory_free_percent))
-      ? String(Math.round(Number(pressure.memory_free_percent)))
+  const marginText =
+    pressure.margin_percent != null && Number.isFinite(Number(pressure.margin_percent))
+      ? String(Math.round(Number(pressure.margin_percent)))
       : "—";
   const swap = splitFormatted(memBytes(pressure.swap_used_bytes));
   const comp = splitFormatted(memBytes(pressure.compressor_bytes));
   return [
     {
-      digits: digitCells(freeText),
-      unit: "% free",
-      label: "memory free",
-      // The one figure here that can put the machine in Red, and the one
-      // most easily misread: it sits beside two BYTE COUNTS but is not one.
-      note: "the only figure that can trigger RED — kern.memorystatus_level, the kernel's own 0–100 pressure headroom, not a byte count",
+      digits: digitCells(marginText),
+      unit: "% margin",
+      label: "margin",
+      // #1821 (operator-approved rename): this tile used to read "% free"
+      // — measured live, the SAME instant, this figure read 82% while
+      // truly-free pages read 30.8%. Neither "free" nor "available"
+      // belongs on it; `margin` (this project's own NASA register — mass
+      // margin, power margin, propellant margin) is honest: it is
+      // headroom before the kernel sheds load, not a byte count, and it
+      // is still the only figure that can trigger RED.
+      note: "the only figure that can trigger RED — kern.memorystatus_level = (capacity − wired − compressor) / capacity, the kernel's own 0–100 pressure headroom. Not free memory and not a byte count — it read 82% margin here while truly-free pages read 30.8%",
     },
     {
       digits: digitCells(swap.num),

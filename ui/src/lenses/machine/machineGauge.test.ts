@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   advanceResidency,
   computeGaugeGeometry,
+  computeBandGeometry,
+  hatchedSegmentDash,
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
@@ -31,12 +33,12 @@ function resources(overrides: Partial<MachineResources> = {}): MachineResources 
     gather_ms: 42,
     limit_bytes: 137438953472, // 128 GiB, decimal ~137.44 GB
     limit_source: "physical_pool",
-    pool: { capacity_bytes: 137438953472, available_bytes: 3738599424 },
-    pressure: { swap_used_bytes: 5453843005, compressor_bytes: 890290176, memory_free_percent: 88, red: false },
+    pool: { capacity_bytes: 137438953472, used_bytes: 69300000000, available_bytes: 72000000000, free_bytes: 3738599424 },
+    pressure: { swap_used_bytes: 5453843005, compressor_bytes: 890290176, margin_percent: 88, red: false },
     models: [],
     machine: { potential_bytes: 24565385183, unpriced_models: 0, estimated_models: 0, current_bytes: 19506757632, state: "green" },
     attribution: "per_process",
-    warnings: [],
+    messages: [],
     cache_ttl_ms: 2000,
     ...overrides,
   };
@@ -178,7 +180,11 @@ describe("computeGaugeGeometry", () => {
 
   it("clamps an overcommitted tick to the line and flags it — Σ potential > scale (machine-Amber's own condition)", () => {
     const g = computeGaugeGeometry(
-      resources({ limit_bytes: 10000000000, pool: { capacity_bytes: 10000000000, available_bytes: 1 }, machine: { potential_bytes: 15000000000, unpriced_models: 0, estimated_models: 0, current_bytes: 8000000000, state: "amber" } }),
+      resources({
+        limit_bytes: 10000000000,
+        pool: { capacity_bytes: 10000000000, used_bytes: 8000000000, available_bytes: 1, free_bytes: 1 },
+        machine: { potential_bytes: 15000000000, unpriced_models: 0, estimated_models: 0, current_bytes: 8000000000, state: "amber" },
+      }),
     );
     expect(g.overcommitted).toBe(true);
     expect(g.commitPct).toBe(100); // clamped to the line, not 150
@@ -235,7 +241,7 @@ describe("redlineLit / isOverLimit / gaugeFaceCaption — the redline's provenan
 });
 
 describe("deriveLamps — every lamp keys on exactly one field", () => {
-  const base = { state: "green", pressureRed: false, overLimit: false, unprivedCount: 0, warningsCount: 0, resourcesErrored: false, residencyChanged: false };
+  const base = { state: "green", pressureRed: false, overLimit: false, unprivedCount: 0, alarmMessagesCount: 0, resourcesErrored: false, residencyChanged: false };
 
   it("all six lamps render, unlit, on a clean green payload", () => {
     const lamps = deriveLamps(base);
@@ -289,8 +295,8 @@ describe("deriveLamps — every lamp keys on exactly one field", () => {
     expect(deriveLamps({ ...base, resourcesErrored: true }).find((l) => l.key === "stale")!.lit).toBe(true);
   });
 
-  it("WARN keys only on warningsCount, names the count", () => {
-    const on = deriveLamps({ ...base, warningsCount: 3 }).find((l) => l.key === "warn")!;
+  it("WARN keys only on alarmMessagesCount (warn + error severities), names the count", () => {
+    const on = deriveLamps({ ...base, alarmMessagesCount: 3 }).find((l) => l.key === "warn")!;
     expect(on.lit).toBe(true);
     expect(on.word).toBe("⚠ WARN ×3");
   });
@@ -301,11 +307,11 @@ describe("deriveLamps — every lamp keys on exactly one field", () => {
 });
 
 describe("odometerTiles", () => {
-  it("splits memory free / swap / compressor into digit cells with detail-layer (two-decimal) precision", () => {
-    const tiles = odometerTiles({ swap_used_bytes: 5453843005, compressor_bytes: 727711744, memory_free_percent: 87, red: false });
+  it("splits margin / swap / compressor into digit cells with detail-layer (two-decimal) precision", () => {
+    const tiles = odometerTiles({ swap_used_bytes: 5453843005, compressor_bytes: 727711744, margin_percent: 87, red: false });
     expect(tiles[0].digits).toEqual(["8", "7"]);
-    expect(tiles[0].unit).toBe("% free");
-    expect(tiles[0].label).toBe("memory free");
+    expect(tiles[0].unit).toBe("% margin");
+    expect(tiles[0].label).toBe("margin");
     expect(tiles[1].digits.join("")).toBe("5.08");
     expect(tiles[1].unit).toBe("GiB");
     expect(tiles[2].digits.join("")).toBe("694");
@@ -317,8 +323,8 @@ describe("odometerTiles", () => {
    * SAY something — the permanent 8.5px line they replaced could not. These
    * assert the two facts a reader most needs and most easily gets wrong.
    */
-  it("the memory-free note says it is the sole red trigger AND that it is not a byte count", () => {
-    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, memory_free_percent: 87, red: false });
+  it("the margin note says it is the sole red trigger AND that it is not a byte count", () => {
+    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, margin_percent: 87, red: false });
     expect(tiles[0].note).toMatch(/only figure that can trigger RED/i);
     expect(tiles[0].note).toMatch(/not a byte count/i);
     // The inverted case: the two byte-count tiles must NOT claim to be triggers.
@@ -330,13 +336,13 @@ describe("odometerTiles", () => {
     // The operator hit this exactly: "Is compressor the 'utility' model?"
     // One letter apart, three rows apart on the page. The label stays (the
     // CLI and JSON use it); the note is where they get told apart.
-    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, memory_free_percent: 50, red: false });
+    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, margin_percent: 50, red: false });
     expect(tiles[2].note).toMatch(/macOS/);
     expect(tiles[2].note).toMatch(/compactor/);
   });
 
   it("renders a single — cell rather than a fabricated 0% when the percent is missing", () => {
-    const tiles = odometerTiles({ swap_used_bytes: 0, compressor_bytes: 0, memory_free_percent: null as unknown as number, red: false });
+    const tiles = odometerTiles({ swap_used_bytes: 0, compressor_bytes: 0, margin_percent: null as unknown as number, red: false });
     expect(tiles[0].digits).toEqual(["—"]);
   });
 });
@@ -595,5 +601,105 @@ describe("rowStateDiffers — the per-row chip's whole condition", () => {
     // Both degrade to "unknown" through memStateCls — not two distinct values.
     expect(rowStateDiffers("bogus", null)).toBe(false);
     expect(rowStateDiffers(undefined, "not-a-state")).toBe(false);
+  });
+});
+
+/**
+ * The two concentric rings (#1821). The dial used to fill from darkmux's
+ * `current` alone against a scale ending at the MACHINE's whole RAM — so it
+ * read as "how full is this machine" while measuring a fraction of it. The
+ * operator misread it for hours and was right to.
+ */
+/**
+ * The stacked band (#1821). This replaced two concentric rings: honest, but
+ * not glanceable — "everything else" was left undrawn on the theory that the
+ * gap between the rings showed it, when that gap was the angular difference
+ * between two arc endpoints at different RADII. The machine's largest
+ * consumer was effectively unrendered.
+ */
+describe("computeBandGeometry — one band, stacked in scale order", () => {
+  const G = 1073741824;
+  const res = (over: Record<string, unknown>): MachineResources =>
+    resources({
+      limit_bytes: 128 * G,
+      pool: { capacity_bytes: 128 * G, used_bytes: 64 * G, available_bytes: 40 * G, free_bytes: 20 * G },
+      machine: { potential_bytes: 48 * G, unpriced_models: 0, current_bytes: 32 * G, state: "green" },
+      ...over,
+    } as Partial<MachineResources>);
+
+  it("stacks darkmux, then everything else, then growth — in that order, without gaps", () => {
+    const b = computeBandGeometry(res({}));
+    expect(b.darkmux).toEqual({ startPct: 0, lengthPct: 25 });          // 32 of 128
+    expect(b.other).toEqual({ startPct: 25, lengthPct: 25 });           // used 64 - darkmux 32
+    expect(b.growth.startPct).toBeCloseTo(50, 5);                       // begins at the needle
+    expect(b.growth.lengthPct).toBeCloseTo(12.5, 5);                    // committed 48 - current 32
+  });
+
+  /** The property the rings gave up, and the reason for this shape: the parts
+   * compose the whole, so "will it fit" is answered by looking rather than by
+   * subtracting across radii. */
+  it("is additive — the segments compose the total, with no arithmetic left to the reader", () => {
+    const b = computeBandGeometry(res({}));
+    expect(b.darkmux.lengthPct + b.other.lengthPct).toBeCloseTo(b.usedPct, 5);
+    expect(b.usedPct + b.growth.lengthPct).toBeCloseTo(b.projectedPct, 5);
+  });
+
+  it("puts the needle at what the machine uses NOW, where `other` ends", () => {
+    const b = computeBandGeometry(res({}));
+    expect(b.needleAngleDeg).toBeCloseTo(50 * 1.8, 4);
+    expect(b.growth.startPct).toBeCloseTo(b.usedPct, 5);
+  });
+
+  it("draws no growth segment when nothing is committed beyond what is held", () => {
+    const b = computeBandGeometry(res({ machine: { potential_bytes: 10 * G, unpriced_models: 0, current_bytes: 30 * G, state: "green" } }));
+    expect(b.growth.lengthPct).toBe(0);
+    expect(b.projectedPct).toBeCloseTo(b.usedPct, 5);
+  });
+
+  it("never lets `other` go negative when the pool reading degrades below darkmux's own share", () => {
+    const b = computeBandGeometry(res({ pool: { capacity_bytes: 128 * G, used_bytes: 1 * G, available_bytes: 1, free_bytes: 1 } }));
+    expect(b.other.lengthPct).toBe(0);
+    expect(b.usedPct).toBeGreaterThanOrEqual(b.darkmux.lengthPct);
+  });
+
+  it("clamps at the scale rather than sweeping past it when over-committed", () => {
+    const b = computeBandGeometry(res({ machine: { potential_bytes: 400 * G, unpriced_models: 0, current_bytes: 100 * G, state: "amber" } }));
+    expect(b.projectedPct).toBeLessThanOrEqual(100);
+    expect(b.needleAngleDeg).toBeLessThanOrEqual(180);
+  });
+});
+
+/**
+ * The dash generator exists because of a SHIPPED bug: the growth band set its
+ * extent via the `stroke-dasharray` attribute while CSS set
+ * `stroke-dasharray: 3 3` for hatching — and CSS overrides SVG presentation
+ * attributes, so the extent was silently clobbered and the band ran hatched to
+ * the END OF THE SCALE. The dial spent its life claiming "projected to the
+ * limit".
+ */
+describe("hatchedSegmentDash — extent and hatching in ONE value", () => {
+  it("opens with a gap to the segment's start, so the hatch begins where the segment does", () => {
+    const d = hatchedSegmentDash(60, 10).split(" ").map(Number);
+    expect(d[0]).toBe(0);
+    expect(d[1]).toBe(60);
+  });
+
+  it("covers the segment's length and no more", () => {
+    const d = hatchedSegmentDash(0, 10).split(" ").map(Number);
+    // Sum of the drawn runs (every other entry from index 2) must not exceed
+    // the requested length — a hatch that overruns is the shipped bug again.
+    const drawn = d.slice(2).filter((_, i) => i % 2 === 0).reduce((a, b) => a + b, 0);
+    expect(drawn).toBeLessThanOrEqual(10 + 0.001);
+    expect(drawn).toBeGreaterThan(0);
+  });
+
+  it("ends with a long gap so the remainder of the path stays blank", () => {
+    const d = hatchedSegmentDash(10, 5).split(" ").map(Number);
+    expect(d[d.length - 1]).toBeGreaterThanOrEqual(100);
+  });
+
+  it("draws nothing at all for an empty segment", () => {
+    expect(hatchedSegmentDash(50, 0)).toBe("0 100");
+    expect(hatchedSegmentDash(50, -3)).toBe("0 100");
   });
 });

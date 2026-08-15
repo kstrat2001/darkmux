@@ -1898,13 +1898,13 @@ function renderMachine(){
     const machineCard=`<div class="memcard ${mState}">
       <div class="memhdr"><span class="memname">machine total</span><span class="memstate ${mState}">${esc(machine.state||"unknown")}</span></div>
       ${memBar(mCur, mPot, mScale, mState, limit, poolCap)}
-      <div class="memmeta">Σ potential ${memBytes(mPot)}${unpriced?` (+${unpriced} unpriced)`:""} · Σ current ${memBytes(mCur)} · limit ${memBytes(limit)} (${esc(limitDesc)})${pool?` · pool ${memBytes(pool.capacity_bytes)} / free ${memBytes(pool.available_bytes)}`:""}</div>
+      <div class="memmeta">Σ potential ${memBytes(mPot)}${unpriced?` (+${unpriced} unpriced)`:""} · Σ current ${memBytes(mCur)} · limit ${memBytes(limit)} (${esc(limitDesc)})${pool?` · pool ${memBytes(pool.capacity_bytes)} / free ${memBytes(pool.free_bytes ?? pool.available_bytes)}`:""}</div>
       ${machine.shrink_hint?`<div class="memhint">↳ ${esc(machine.shrink_hint)}</div>`:""}
     </div>`;
     const modelCards=models.length
       ? models.map(mm=>renderMachineMemModel(mm, perScale, null)).join("")
       : `<div class="none">no models loaded.</div>`;
-    const freePct=pressure.memory_free_percent!=null?`${Number(pressure.memory_free_percent)}%`:"—";
+    const _mp=pressure.margin_percent??pressure.memory_free_percent;const freePct=_mp!=null?`${Number(_mp)}%`:"—";
     // Each row is colored by ITS OWN condition, never by the card's. Both the
     // swap and memory-free rows used to key on `pressure.red`, so whichever
     // signal tripped painted the OTHER row red too — that is how a healthy

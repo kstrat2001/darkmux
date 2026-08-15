@@ -1989,6 +1989,32 @@ body {
   padding: 2px 0 2px 8px;
   margin: 4px 0 0;
 }
+/* #1821 — the `messages[]` severity treatment, replacing the old uniformly
+   -amber `.memwarn` above (kept — harmless, unreferenced by this port's own
+   markup) for the machine lens's message card. An `info` disclosure (the
+   #1819 estimate note) must NOT look like a `warn`/`error`: `.is-estimated`
+   already spent the dashed-outline treatment on provenance, so severity
+   here is carried by color instead — `--dim` for a disclosure,
+   `--warn`/`--bad` for a real degradation — the same outline/hue-is-status
+   convention this file uses elsewhere, applied to a left-border accent. */
+.machine-lens__health .memmsg {
+  font-size: 11px;
+  border-left: 2px solid var(--dim);
+  padding: 2px 0 2px 8px;
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+.machine-lens__health .memmsg-info {
+  color: var(--dim);
+}
+.machine-lens__health .memmsg-warn {
+  color: var(--warn);
+  border-left-color: var(--warn);
+}
+.machine-lens__health .memmsg-error {
+  color: var(--bad);
+  border-left-color: var(--bad);
+}
 .machine-lens__health .memfoot {
   color: var(--dim);
   font-size: 10px;
@@ -2094,6 +2120,11 @@ body {
   font-weight: 600;
   fill: var(--dim);
 }
+.mm-gauge-readout-label {
+  fill: var(--dim);
+  font-size: 7px;
+  letter-spacing: 0.14em;
+}
 .mm-gauge-center-caption {
   fill: var(--dim);
   font-size: 8.5px;
@@ -2107,6 +2138,52 @@ body {
 .mm-gauge-track {
   stroke: #222a3c;
 }
+/* The OUTER ring's hatched extension: darkmux's committed-but-unmaterialised
+   growth, drawn beyond the solid used band so the ring ends at the PROJECTED
+   total. Hatched rather than tinted because it is not memory anyone holds yet
+   — the same "not yet, but committed" idiom the ESTIMATED chip uses (dashed),
+   kept visually distinct from every solid band on the dial. */
+/* NO `stroke-dasharray` here, deliberately. It used to set `3 3` for the
+   hatching while the component set the band's EXTENT via the
+   `stroke-dasharray` attribute — and a CSS declaration overrides an SVG
+   presentation attribute, so the extent was silently clobbered and the band
+   ran hatched to the end of the scale. The dial claimed "projected to the
+   limit" for its whole life. Extent and hatch are now composed into one value
+   by `hatchedSegmentDash`; CSS must not supply a second. */
+.mm-gauge-growth {
+  stroke: var(--dim);
+  opacity: 0.55;
+}
+
+/* "Everything else" — the machine's memory that is not darkmux's. Same hue as
+   darkmux's segment because it is the same subject (the machine filling up),
+   dimmed because it is not darkmux's to manage. It stacks directly on
+   darkmux's segment and ends at the needle, so the two visibly compose the
+   used total. */
+.mm-gauge-other {
+  opacity: 0.32;
+}
+.mm-gauge-other.is-green { stroke: var(--good); }
+.mm-gauge-other.is-amber { stroke: var(--warn); }
+.mm-gauge-other.is-red { stroke: var(--bad); }
+
+/* Legend swatch for that segment — same dimming, so the mapping holds. */
+.mm-legend-sw.is-other { opacity: 0.32; }
+
+/* The INNER ring: darkmux's own share, on the same scale, read from 0.
+   Thinner than the machine's band so the two never read as one thick arc, and
+   deliberately achromatic — the machine's ring carries the how-full hue, and a
+   second hue here would imply a second verdict. The GAP between the two rings
+   is "everything else" (#1821): derived, never drawn as a band, visible as the
+   difference. */
+.mm-gauge-inner-track {
+  stroke: #1a2030;
+}
+.mm-gauge-inner-val {
+  stroke: var(--fg);
+  opacity: 0.85;
+}
+
 /* The fill's three zones. There is deliberately no `.is-unknown` arm: the fill
    is driven by `gaugeFillSeverity(pct)` (how full), which is total over
    green/amber/red, and no longer by `machine.state` (the arbiter's verdict),
@@ -2174,6 +2251,51 @@ body {
   fill: #454d5c;
   stroke: #1a1f2b;
 }
+/* The dial's legend — a swatch per band, each drawn in its band's OWN
+   treatment so the mapping is visual rather than positional. "Everything
+   else" gets no swatch on purpose: it is the gap between the rings, derived
+   rather than measured, and a swatch would claim otherwise. */
+.mm-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 3px 12px;
+  margin-top: 5px;
+  font-size: 9.5px;
+  color: var(--dim);
+}
+.mm-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.mm-legend b {
+  color: var(--fg);
+  font-weight: 600;
+}
+.mm-legend-sw {
+  display: inline-block;
+  width: 13px;
+  height: 5px;
+  border-radius: 2px;
+  background: var(--dim);
+}
+.mm-legend-sw.is-green { background: var(--good); }
+.mm-legend-sw.is-amber { background: var(--warn); }
+.mm-legend-sw.is-red { background: var(--bad); }
+/* darkmux's inner ring: achromatic and thinner on the dial, so the swatch
+   matches — the machine's band carries the how-full hue, this one does not. */
+.mm-legend-sw.is-darkmux {
+  background: var(--fg);
+  opacity: 0.85;
+  height: 4px;
+}
+/* Committed-but-not-yet: the same hatching the dial's growth band uses. */
+.mm-legend-sw.is-growth {
+  background: repeating-linear-gradient(90deg, var(--dim) 0 3px, transparent 3px 6px);
+  opacity: 0.75;
+}
+
 .mm-gcap {
   font-size: 10px;
   letter-spacing: 0.06em;

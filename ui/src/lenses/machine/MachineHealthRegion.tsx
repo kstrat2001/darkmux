@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
   computeGaugeGeometry,
+  computeBandGeometry,
+  hatchedSegmentDash,
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
@@ -19,7 +21,7 @@ import {
   redlineLit,
   type ResidencyRowView,
 } from "./machineGauge";
-import { memBytes } from "../../lib/format";
+import { memBytes, reclaimableNote } from "../../lib/format";
 import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
@@ -67,6 +69,7 @@ const CY = 120;
 const R = 86;
 const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
 
+
 /** Where a tick label sits, in the arc's own local geometry — one fixed
  * layout per quarter-tick index (0/25/50/75/100%), matching `level3.html`'s
  * hand-placed label coordinates (a computed trig placement would drift off
@@ -113,11 +116,19 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   const pressureRed = !!resources.pressure?.red;
   const overLimit = isOverLimit(resources.machine.current_bytes, resources.limit_bytes);
   const lit = redlineLit(resources.machine.state) && !stale;
-  const centerVal = gaugeValueParts(resources.machine.current_bytes);
+  // The readout shows what the NEEDLE points at — the machine's used memory —
+  // not darkmux's share. Those were different subjects on one instrument
+  // until the operator caught it: a needle at ~82% beside a readout of
+  // 36.8 GiB. darkmux's own figure is named in the caption below, beside the
+  // inner ring it belongs to.
+  const centerVal = gaugeValueParts(resources.pool?.used_bytes ?? resources.machine.current_bytes);
   const faceCaption = gaugeFaceCaption(resources.machine.state, pressureRed, overLimit);
   // The fill's hue answers "how full", NOT "what did the arbiter decide" —
   // see `gaugeFillSeverity`'s own doc for why that separation is load-bearing.
-  const fillCls = gaugeFillSeverity(geo.pct);
+  const band = computeBandGeometry(resources);
+  // Hue follows the MACHINE's fill now, not darkmux's share — the ring it
+  // colours is the machine's.
+  const fillCls = gaugeFillSeverity(band.usedPct);
   const odo = odoLayout(digitCells(centerVal.num));
 
   const committed = gaugeValueParts(resources.machine.potential_bytes);
@@ -128,46 +139,72 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   // honestly renders as a single "—" cell. Absence is never zero — including
   // in the channel a sighted reader can't check.
   const scaleVal = gaugeValueParts(geo.scale);
-  const fullness = geo.cur != null ? ` (${Math.round(geo.pct)}% full)` : "";
-  const inUse = geo.cur != null ? `${centerVal.num} ${centerVal.unit}` : "an unreadable amount";
-  const ariaLabel = `Machine memory: ${inUse} in use of the ${scaleVal.num} ${scaleVal.unit} ${geo.scaleWord.toLowerCase()}${fullness}. ${
-    geo.commitPct != null
-      ? `Committed ${committed.num} ${committed.unit}${resources.machine.unpriced_models ? ` plus ${resources.machine.unpriced_models} unpriced model(s)` : ""}${resources.machine.estimated_models ? ` (${resources.machine.estimated_models} estimated)` : ""}, marked by the dashed tick. `
-      : ""
-  }State ${resources.machine.state || "unknown"}.`;
+  // The aria narrative describes the SAME band a sighted reader sees, in the
+  // same stacked order. Two bugs lived here until #1821's review: the
+  // percentage was computed from `geo.pct` — darkmux's share — while the
+  // figure beside it was the machine's, so a screen reader heard "87.7 GiB in
+  // use (29% full)"; and it still cited "the dashed tick" months after that
+  // tick was deleted. The needle-vs-readout defect had survived in the one
+  // channel nobody looks at.
+  const usedVal = gaugeValueParts(resources.pool?.used_bytes);
+  const darkmuxVal = gaugeValueParts(resources.machine.current_bytes);
+  const hasUsed = resources.pool?.used_bytes != null;
+  const ariaLabel = [
+    hasUsed
+      ? `Machine memory: ${usedVal.num} ${usedVal.unit} used of the ${scaleVal.num} ${scaleVal.unit} ${geo.scaleWord.toLowerCase()} (${Math.round(band.usedPct)}% full).`
+      : `Machine memory: usage unreadable, of the ${scaleVal.num} ${scaleVal.unit} ${geo.scaleWord.toLowerCase()}.`,
+    resources.machine.current_bytes != null ? `Of that, darkmux holds ${darkmuxVal.num} ${darkmuxVal.unit}.` : "",
+    band.growth.lengthPct > 0
+      ? `Committed ${committed.num} ${committed.unit}${resources.machine.unpriced_models ? ` plus ${resources.machine.unpriced_models} unpriced model(s)` : ""}${resources.machine.estimated_models ? ` (${resources.machine.estimated_models} estimated)` : ""}, shown as the hatched extension beyond the needle.`
+      : "",
+    `State ${resources.machine.state || "unknown"}.`,
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <div className="mm-gauge">
       <svg width="300" height="212" viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
         <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={11} pathLength={100} />
+        {/* ONE STACKED BAND, in scale order: darkmux from 0, everything
+            else on top of it ending at the needle, then darkmux's committed
+            growth beyond. Stacking is what restores ADDITIVITY — this page's
+            question is "will it fit", which is a sum, and two concentric
+            rings could show every part but never the total. It also makes
+            `other` visible at last: as a span between darkmux's end and the
+            needle, its derivedness is self-evident, where as an undrawn gap
+            between two radii it was simply missing. */}
         <path
           className={`mm-gauge-val is-${fillCls}`}
           d={HALF_ARC_D}
           fill="none"
           strokeWidth={11}
           pathLength={100}
-          strokeDasharray={`${geo.pct} 100`}
+          strokeDasharray={`${band.darkmux.lengthPct} 100`}
         />
-        {geo.commitAngleDeg != null && (
-          <line
-            className={`mm-gauge-commit${geo.overcommitted ? " over" : ""}`}
-            x1={26}
-            y1={CY}
-            x2={44}
-            y2={CY}
-            transform={`rotate(${geo.commitAngleDeg} ${CX} ${CY})`}
+        {band.other.lengthPct > 0 && (
+          <path
+            className={`mm-gauge-other is-${fillCls}`}
+            d={HALF_ARC_D}
+            fill="none"
+            strokeWidth={11}
+            pathLength={100}
+            strokeDasharray={`${band.other.lengthPct} 100`}
+            strokeDashoffset={-band.other.startPct}
+          />
+        )}
+        {band.growth.lengthPct > 0 && (
+          <path
+            className="mm-gauge-growth"
+            d={HALF_ARC_D}
+            fill="none"
+            strokeWidth={11}
+            pathLength={100}
+            strokeDasharray={hatchedSegmentDash(band.growth.startPct, band.growth.lengthPct)}
           />
         )}
         {geo.ticks.map((t) => (
-          <line
-            key={t.pct}
-            className="mm-gauge-tick"
-            x1={30}
-            y1={CY}
-            x2={38}
-            y2={CY}
-            transform={`rotate(${t.pct * 1.8} ${CX} ${CY})`}
-          />
+          <line key={t.pct} className="mm-gauge-tick" x1={30} y1={CY} x2={38} y2={CY} transform={`rotate(${t.pct * 1.8} ${CX} ${CY})`} />
         ))}
         {geo.ticks.map((t, i) => (
           <text key={t.pct} className="mm-gauge-scale-label" x={TICK_LABEL_XY[i][0]} y={TICK_LABEL_XY[i][1]} textAnchor="middle">
@@ -193,7 +230,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
             carries the how-full channel and the lamps carry the verdict, so a
             third, permanently-grey encoding of the same question is subtraction
             rather than information. */}
-        <line className="mm-gauge-needle" x1={CX} y1={CY} x2={52} y2={CY} transform={`rotate(${geo.needleAngleDeg} ${CX} ${CY})`} />
+        <line className="mm-gauge-needle" x1={CX} y1={CY} x2={42} y2={CY} transform={`rotate(${band.needleAngleDeg} ${CX} ${CY})`} />
         <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
         <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
           {odo.cells.map((c, i) => (
@@ -213,12 +250,65 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
             beneath the reading where the eye already is; in every other
             state it used to say `IN USE`, restating the one thing a needle
             over a 0→LIMIT scale cannot fail to communicate. */}
+        {/* The readout's own subject label. `IN USE` was deleted as noise when
+            the dial had ONE subject and the caption restated the obvious.
+            With a machine ring and a darkmux ring on one face, naming which
+            one the big number belongs to is no longer restatement — it is the
+            difference between two readings. */}
+        <text className="mm-gauge-readout-label" x={CX} y={164} textAnchor="middle">
+          MACHINE USED
+        </text>
         {faceCaption && (
-          <text className="mm-gauge-center-caption" x={CX} y={164} textAnchor="middle">
+          <text className="mm-gauge-center-caption" x={CX} y={176} textAnchor="middle">
             {faceCaption}
           </text>
         )}
       </svg>
+    </div>
+  );
+}
+
+/**
+ * The dial's legend. Three bands share one face — the machine's used memory,
+ * darkmux's share inside it, and darkmux's committed growth beyond it — and
+ * until this existed nothing named any of them. The operator, looking at the
+ * finished rings: "a new user will not know what this means."
+ *
+ * Each entry pairs a SWATCH DRAWN IN THE BAND'S OWN TREATMENT with its figure,
+ * so the mapping is visual rather than positional — a reader matches the
+ * hatching, not a sentence describing where to look. "Everything else" is
+ * deliberately absent: it is the gap between the rings, a derived quantity
+ * (`used - darkmux`), and giving it a swatch would present arithmetic as a
+ * measured band.
+ */
+function GaugeLegend({ resources, band, fillCls }: { resources: MachineResources; band: ReturnType<typeof computeBandGeometry>; fillCls: string }) {
+  const growth = band.growth.lengthPct > 0;
+  const other = resources.pool?.used_bytes != null && resources.machine.current_bytes != null
+    ? Math.max(0, Number(resources.pool.used_bytes) - Number(resources.machine.current_bytes))
+    : null;
+  const projected = resources.pool?.used_bytes != null && growth
+    ? Number(resources.pool.used_bytes) + Math.max(0, Number(resources.machine.potential_bytes ?? 0) - Number(resources.machine.current_bytes ?? 0))
+    : null;
+  return (
+    <div className="mm-legend">
+      <span className="mm-legend-item">
+        <span className={`mm-legend-sw is-${fillCls}`} /> darkmux <b>{memBytes(resources.machine.current_bytes)}</b>
+      </span>
+      {other != null && (
+        <span className="mm-legend-item">
+          <span className={`mm-legend-sw is-other is-${fillCls}`} /> other <b>{memBytes(other)}</b>
+        </span>
+      )}
+      {growth && (
+        <span className="mm-legend-item">
+          {/* Label first, exactly like `darkmux` and `other` above — the
+              figure trailing its label is the row's grammar, and this entry
+              had it inverted. */}
+          <span className="mm-legend-sw is-growth" /> committed +
+          <b>{memBytes(Math.max(0, Number(resources.machine.potential_bytes ?? 0) - Number(resources.machine.current_bytes ?? 0)))}</b>
+          {projected != null ? <> → <b>{memBytes(projected)}</b></> : null}
+        </span>
+      )}
     </div>
   );
 }
@@ -232,10 +322,9 @@ function GaugeCaption({ resources }: { resources: MachineResources }) {
     Number(resources.machine.estimated_models) || 0,
   );
   const unpriced = Number(resources.machine.unpriced_models) || 0;
-  const committed = memBytes(resources.machine.potential_bytes);
   return (
     <div className="mm-gcap">
-      <b>machine total</b> <span className={`mm-chip is-${stateCls}`}>{stateText}</span> · ╌ committed {committed}
+      <b>machine total</b> <span className={`mm-chip is-${stateCls}`}>{stateText}</span>
       {unpriced ? ` (+${unpriced} unpriced)` : ""}
     </div>
   );
@@ -252,12 +341,17 @@ function LampRow({
   resourcesErrored: boolean;
   residencyChanged: boolean;
 }) {
+  // #1821: the WARN lamp counts `warn` + `error` severity messages ONLY —
+  // an `info` disclosure (the #1819 estimate note) must not light it.
+  const alarmMessagesCount = Array.isArray(resources.messages)
+    ? resources.messages.filter((m) => m.severity === "warn" || m.severity === "error").length
+    : 0;
   const lamps = deriveLamps({
     state: resources.machine.state,
     pressureRed: !!resources.pressure?.red,
     overLimit: isOverLimit(resources.machine.current_bytes, resources.limit_bytes),
     unprivedCount: Number(resources.machine.unpriced_models) || 0,
-    warningsCount: Array.isArray(resources.warnings) ? resources.warnings.length : 0,
+    alarmMessagesCount,
     resourcesErrored,
     residencyChanged,
   });
@@ -570,8 +664,14 @@ export function MachineHealthRegion({
   }
 
   const b = resources;
+  // Computed ONCE for the hero — an earlier cut called this three times per
+  // render, on a component that re-renders every 5s poll.
+  const bandGeo = computeBandGeometry(resources);
   const stale = resourcesErrored; // a poll failed, but we still have a last-good payload (#1812)
-  const warnings = Array.isArray(b.warnings) ? b.warnings : [];
+  // #1821: replaces `warnings: string[]` — each entry now carries a
+  // severity, rendered below (an `info` disclosure must not look like a
+  // `warn`/`error`).
+  const messages = Array.isArray(b.messages) ? b.messages : [];
 
   return (
     <>
@@ -585,6 +685,7 @@ export function MachineHealthRegion({
         <div className="mm-heroline">
           <div className="mm-semi">
             <Gauge resources={b} stale={stale} />
+            <GaugeLegend resources={b} band={bandGeo} fillCls={gaugeFillSeverity(bandGeo.usedPct)} />
             <GaugeCaption resources={b} />
           </div>
           <div>
@@ -603,8 +704,21 @@ export function MachineHealthRegion({
           retiring the machine stage's last byte-exact parity tie to legacy.
           Operator call, still not a drive-by. */}
       <div className="mm-kv mm-kv--machine">
+        {/* #1821 (operator-approved naming): this row used to read
+            `pool free <memBytes(pool.available_bytes)>` — truly-free pages,
+            sitting a few inches from a "% free" pressure tile that measured
+            something else entirely (82% margin vs 30.8% truly-free, same
+            instant). `used` and `available` now name what they actually
+            are; `available` (the colloquial "how much is left" —
+            free + inactive + speculative) is the headline figure in the
+            slot `pool free` used to occupy. Truly-free pages (`free_bytes`)
+            stay in the payload but are deliberately NOT given prime space
+            here — two figures both reading as "how much is left" was the
+            defect being fixed, not something to preserve under a new name. */}
         limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b>{" "}
-        · pool free <b>{memBytes(b.pool?.available_bytes)}</b> · unpriced{" "}
+        · used <b>{memBytes(b.pool?.used_bytes)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>
+        {reclaimableNote(b.pool?.available_bytes, b.pool?.free_bytes)}{" "}
+        · unpriced{" "}
         <b>{Number(b.machine.unpriced_models) || 0} model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}</b>
         {/* #1819: the same row that already discloses the genuinely-unpriced
             count discloses the ESTIMATED count too — a different fact
@@ -639,14 +753,20 @@ export function MachineHealthRegion({
         <ModelRows rows={residencyRows} nowMs={nowMs} utilityModelId={utilityModelId} machineState={b.machine.state} />
       </div>
 
-      {warnings.length > 0 && (
+      {/* #1821: `messages` replaces `warnings` — each entry carries a
+          severity, and an `info` disclosure (the #1819 estimate note) must
+          NOT render with the same alarm treatment as a `warn`/`error`.
+          `.memmsg-*` in styles.css keys color+icon off the severity; a
+          plain `.memwarn` uniformly-amber treatment is exactly the defect
+          this replaces. */}
+      {messages.length > 0 && (
         <div className="memcard">
           <div className="memhdr">
-            <div className="memname">warnings</div>
+            <div className="memname">messages</div>
           </div>
-          {warnings.map((w, i) => (
-            <div className="memwarn" key={i}>
-              ⚠ {w}
+          {messages.map((m, i) => (
+            <div className={`memmsg memmsg-${m.severity}`} key={i}>
+              {m.severity === "error" ? "✕" : m.severity === "warn" ? "⚠" : "ℹ"} {m.text}
             </div>
           ))}
         </div>

@@ -286,17 +286,45 @@ export interface FlowRecordsResponse {
   generated_at_ms: number;
 }
 
+/** #1821 — one entry in `MachineResources.messages`, replacing the old
+ * uniformly-amber `warnings: string[]`. `info` is a disclosure (the #1819
+ * estimate note); `warn` is a real degradation; `error` means the reading
+ * itself is untrustworthy (a probe/enumeration failure). Source:
+ * `crates/darkmux-profiles/src/model_ledger.rs::{Severity,LedgerMessage}`. */
+export interface LedgerMessage {
+  severity: "info" | "warn" | "error";
+  text: string;
+}
+
 export interface MachineResources {
   schema_version: string;
   generated_at_ms: number;
   gather_ms: number;
   limit_bytes: number;
   limit_source: string;
-  pool: { capacity_bytes: number; available_bytes: number };
+  /** #1821 — a real machine-memory decomposition, all three read from the
+   * SAME `vm_stat` call the gather already runs.
+   * - `used_bytes` — Activity-Monitor-style: `wired + compressor +
+   *   (active + inactive - purgeable)`.
+   * - `available_bytes` — the colloquial "how much is left":
+   *   `free + inactive + speculative`. This is the headline figure — put
+   *   it where the old `pool free` sat.
+   * - `free_bytes` — truly-free pages only (`Pages free × page size`). The
+   *   figure `available_bytes` used to (wrongly) mean before #1821's
+   *   rename. Kept in the payload but deliberately NOT given prime space
+   *   next to `available_bytes` in the k/v row — two figures both reading
+   *   as "how much is left" was the defect being fixed. */
+  pool: { capacity_bytes: number; used_bytes: number; available_bytes: number; free_bytes: number };
   pressure: {
     swap_used_bytes: number;
     compressor_bytes: number;
-    memory_free_percent: number;
+    /** `sysctl kern.memorystatus_level` — `(capacity - wired - compressor)
+     * / capacity`, the kernel's own 0–100 pressure headroom. Named
+     * `margin`, NOT `free` (#1821, operator-approved): live, same
+     * instant, this read 82% while truly-free pages read 30.8% — neither
+     * "free" nor "available" describes it. Renders on the odometer tile
+     * as `MARGIN`. Still the sole red trigger (`< 15`). */
+    margin_percent: number;
     red: boolean;
   };
   models: MachineResourcesModel[];
@@ -310,11 +338,22 @@ export interface MachineResources {
      * unpriceable, no potential at all) does that. */
     estimated_models: number;
     current_bytes: number;
+    /** #1821 — everything ELSE on the machine, right now:
+     * `pool.used_bytes - current_bytes`, floored at 0. */
+    other_used_bytes?: number;
+    /** #1821 — `other_used_bytes + potential_bytes`. This is what the
+     * green/amber cascade actually compares against `limit_bytes` now —
+     * "if darkmux's own commitment fully materializes while everything
+     * else holds what it holds now, what is the total?" Replaces the old
+     * `potential_bytes <= limit_bytes` comparison, which silently assumed
+     * darkmux was the machine's only tenant. */
+    projected_total_bytes?: number;
     state: "green" | "yellow" | "red" | string;
   };
   attribution: string;
   attribution_note?: string;
-  warnings: string[];
+  /** #1821 — replaces `warnings: string[]`. See [`LedgerMessage`]. */
+  messages: LedgerMessage[];
   cache_ttl_ms: number;
 }
 
