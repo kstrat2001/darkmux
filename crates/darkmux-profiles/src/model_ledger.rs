@@ -132,6 +132,56 @@ pub const KV_BYTES_PER_ELEMENT_V1: u32 = 2;
 /// dense GGUF model would be the unsafe one.
 pub const V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN: u64 = 204_800;
 
+/// The tier boundaries, on catalog `size_bytes`, and the KV rate each one
+/// assumes. **Size-tiered because a single constant could not be honest**
+/// (#1819 merge-gate finding, 2026-08-15).
+///
+/// The first cut used `V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN` alone — phi-4's
+/// own exact rate — for EVERY unpriceable model. Review found that this
+/// UNDER-reserves for the population most likely to trigger the fallback in
+/// the first place: large dense GGUF downloads. Working the crate's own
+/// formula (`ArchFacts::kv_per_token`) over published configs:
+///
+/// | model | layers × kv_heads × head_dim | true B/token | vs 204_800 |
+/// |---|---|---|---|
+/// | phi-4 | 40 × 10 × 128 | 204_800 | exact |
+/// | Qwen3-32B | 64 × 8 × 128 | 262_144 | 1.28× short |
+/// | Llama-3.3-70B, Qwen2.5-72B | 80 × 8 × 128 | 327_680 | 1.60× short |
+/// | Mistral-Large-2 123B | 88 × 8 × 128 | 360_448 | 1.76× short |
+///
+/// A 70B at 32K ctx was short by ~4 GB, at 128K by ~16 GB — and none of it
+/// absorbed elsewhere, since weights and margin are identical in both arms.
+/// That is the one failure direction this feature exists to refuse: the sum
+/// comes in low, the cascade promises GREEN, and the machine overruns at
+/// materialization.
+///
+/// The fallback's one available fact is `size_bytes`, and KV rate tracks it
+/// through layer count, so the rate is selected from it. Each tier is set at
+/// or above the true rate of every modern GQA architecture that lands in it.
+///
+/// **Where this still under-reserves, stated plainly:** pre-GQA
+/// multi-head-attention models (Llama-2-13B: 40 layers × 40 kv_heads × 128 =
+/// 819_200 B/token) exceed every tier here, because MHA's kv_heads equals its
+/// attention heads instead of a small fraction of them. No size-derived rate
+/// can catch that — the size looks small while the KV rate is enormous.
+/// Reading arch facts out of the GGUF header (#1820) is the real fix; this
+/// table is the honest approximation until then.
+const FALLBACK_KV_TIERS: [(u64, u64); 3] = [
+    (15 * 1024 * 1024 * 1024, V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN), // ≤15 GiB: phi-4 class
+    (45 * 1024 * 1024 * 1024, 327_680),                            // ≤45 GiB: 70B/72B class
+    (u64::MAX, 409_600),                                           // above: 123B class and up
+];
+
+/// The KV rate this fallback assumes for a model of `size_bytes`. Total and
+/// monotonic: a larger model never assumes a smaller rate.
+pub fn fallback_kv_rate_for_size(size_bytes: u64) -> u64 {
+    FALLBACK_KV_TIERS
+        .iter()
+        .find(|(ceiling, _)| size_bytes <= *ceiling)
+        .map(|(_, rate)| *rate)
+        .unwrap_or(409_600)
+}
+
 /// Bound on each `lms` metadata call (`ps --json` / `ls --json`). Generous
 /// for a healthy CLI; a wedged one is killed rather than hanging the ledger
 /// (#1276 mechanics), and two of these still fit the serve daemon's 30 s
@@ -444,15 +494,16 @@ pub struct LedgerInputs {
 /// `effective_kv_rate` closes that gap.
 struct ArchWithSizeFallback {
     arch: ArchEstimator,
-    fallback: V1Estimator,
+    // No `fallback: V1Estimator` field: since the tiers landed, the fallback's
+    // KV rate is chosen PER MODEL from its catalog size, so the estimator is
+    // constructed per call in `estimate_with_source` rather than held here at
+    // one fixed rate. A held instance would have to carry a single rate — the
+    // exact shape that under-reserved large models and the merge gate caught.
 }
 
 impl ArchWithSizeFallback {
     fn new(arch: BTreeMap<String, ArchFacts>) -> Self {
-        ArchWithSizeFallback {
-            arch: ArchEstimator::new(arch),
-            fallback: V1Estimator { kv_bytes_per_ctx_token: V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN },
-        }
+        ArchWithSizeFallback { arch: ArchEstimator::new(arch) }
     }
 
     /// Arch first (a measurement); V1 fallback second (a labeled estimate);
@@ -479,7 +530,12 @@ impl ArchWithSizeFallback {
         if let Some(bytes) = self.arch.estimate_bytes(model_key, min_ctx, catalog) {
             return Some((bytes, PotentialSource::Arch));
         }
-        self.fallback
+        // The fallback's rate is chosen per model from its catalog size (see
+        // `FALLBACK_KV_TIERS`) rather than fixed at construction, so a large
+        // dense GGUF is not priced at a small model's KV rate.
+        let size = catalog?.iter().find(|c| c.model_key == model_key)?.size_bytes?;
+        let tiered = V1Estimator { kv_bytes_per_ctx_token: fallback_kv_rate_for_size(size) };
+        tiered
             .estimate_bytes(model_key, min_ctx, catalog)
             .map(|bytes| {
                 (bytes + darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES, PotentialSource::Estimated)
@@ -576,14 +632,32 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         .collect();
     if !estimated.is_empty() {
         warnings.push(format!(
-            "{} resident model(s) priced by ESTIMATE, not measurement (no readable config.json — commonly a GGUF download): {} — potential assumes dense attention (every layer holds a KV cache) at {:.1} KB/token, which OVERSTATES hybrid-attention models",
+            "{} resident model(s) priced by ESTIMATE, not measurement (no readable config.json — commonly a GGUF download): {} — potential assumes dense attention at a size-tiered {:.1} KB/token. Set at or above every modern GQA architecture in its size class; it OVERSTATES hybrid-attention models (safe), and UNDER-reserves pre-GQA multi-head models such as Llama-2-13B (~819 KB/token), whose real cost no size-derived rate can predict",
             estimated.len(),
             estimated.join(", "),
-            // Decimal KB (÷1000, this crate's own `fmt_bytes` convention),
-            // ONE decimal — integer-dividing this away from the doc
-            // comment's own "204.8 KB/token" figure was a real
-            // Rust-vs-prose mismatch the #1819 review caught.
-            V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN as f64 / 1000.0,
+            // The rate(s) ACTUALLY applied, re-derived per row from the same
+            // size that selected them — never the bare tier-1 constant. The
+            // tiers made a single hardcoded figure wrong here the moment a
+            // large model was estimated, which is the same class of drift
+            // (stating one rate while pricing at another) that `effective_kv_
+            // rate` exists to prevent on the shrink path. Decimal KB (÷1000,
+            // this crate's own `fmt_bytes` convention), ONE decimal.
+            {
+                let mut rates: Vec<u64> = rows
+                    .iter()
+                    .filter(|r| r.potential_source == Some(PotentialSource::Estimated))
+                    .map(effective_kv_rate)
+                    .collect();
+                rates.sort_unstable();
+                rates.dedup();
+                match (rates.first(), rates.last()) {
+                    (Some(lo), Some(hi)) if lo != hi => {
+                        format!("{:.1}–{:.1}", *lo as f64 / 1000.0, *hi as f64 / 1000.0)
+                    }
+                    (Some(one), _) => format!("{:.1}", *one as f64 / 1000.0),
+                    _ => "—".to_string(),
+                }
+            },
         ));
     }
     let estimated_models = estimated.len() as u32;
@@ -794,7 +868,13 @@ fn attribute_current(
 fn effective_kv_rate(row: &ModelRow) -> u64 {
     row.kv_per_token_bytes.unwrap_or_else(|| {
         if row.potential_source == Some(PotentialSource::Estimated) {
-            V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN
+            // The SAME tier the row was priced at, re-derived from the same
+            // input (its catalog weights). Reading the flat constant here
+            // instead would reintroduce, one level down, exactly the defect
+            // this function exists to fix: a shrink saving computed at a
+            // different rate than the commitment it is shrinking. The tiers
+            // are size-keyed, so the size must be the one thing consulted.
+            row.weights_bytes.map(fallback_kv_rate_for_size).unwrap_or(0)
         } else {
             0
         }
@@ -1917,6 +1997,69 @@ mod tests {
         assert_eq!(V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN, 204_800);
     }
 
+    /// Each tier must sit at or ABOVE the true KV rate of every modern GQA
+    /// architecture that lands in it. These are the published configs the
+    /// #1819 merge gate worked through — the same table in
+    /// `FALLBACK_KV_TIERS`'s doc — asserted against the crate's own formula
+    /// so a tier can never drift below the models it is supposed to cover.
+    #[test]
+    fn every_tier_covers_the_real_architectures_that_land_in_it() {
+        // (name, size_bytes, layers, kv_heads, head_dim)
+        let published: [(&str, u64, u32, u32, u32); 4] = [
+            ("microsoft/phi-4", 9_053_136_497, 40, 10, 128),
+            ("Qwen3-32B", 20 * 1024 * 1024 * 1024, 64, 8, 128),
+            ("Llama-3.3-70B", 40 * 1024 * 1024 * 1024, 80, 8, 128),
+            ("Mistral-Large-2-123B", 70 * 1024 * 1024 * 1024, 88, 8, 128),
+        ];
+        for (name, size, layers, kv_heads, head_dim) in published {
+            let truth = ArchFacts {
+                total_layers: layers,
+                full_attention_layers: layers,
+                kv_heads,
+                head_dim,
+                kv_bytes_per_element: 2,
+            }
+            .kv_per_token();
+            let assumed = fallback_kv_rate_for_size(size);
+            assert!(
+                assumed >= truth,
+                "{name}: fallback assumes {assumed} B/token but the real architecture needs {truth} — \
+                 under-reserving is the one direction this estimate must never take",
+            );
+        }
+    }
+
+    /// The regression the #1819 merge gate caught: a 70B-class GGUF must NOT
+    /// be priced at phi-4's rate. Before the tiers, this returned 204_800 —
+    /// short by 122_880 B/token, which at 32K ctx is ~4 GB of reserve the
+    /// machine silently did not have, while the cascade promised GREEN.
+    #[test]
+    fn a_large_dense_gguf_is_not_priced_at_a_small_models_kv_rate() {
+        let seventy_b = 40 * 1024 * 1024 * 1024;
+        assert_eq!(fallback_kv_rate_for_size(seventy_b), 327_680);
+        assert!(fallback_kv_rate_for_size(seventy_b) > V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN);
+    }
+
+    /// Total and monotonic: every size maps to a rate, and a bigger model
+    /// never assumes a smaller one. The boundaries are inclusive-below.
+    #[test]
+    fn the_tier_table_is_total_and_monotonic() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(fallback_kv_rate_for_size(0), 204_800);
+        assert_eq!(fallback_kv_rate_for_size(15 * gib), 204_800); // inclusive
+        assert_eq!(fallback_kv_rate_for_size(15 * gib + 1), 327_680);
+        assert_eq!(fallback_kv_rate_for_size(45 * gib), 327_680); // inclusive
+        assert_eq!(fallback_kv_rate_for_size(45 * gib + 1), 409_600);
+        assert_eq!(fallback_kv_rate_for_size(u64::MAX), 409_600);
+
+        let mut prev = 0;
+        for step in 0..200u64 {
+            let rate = fallback_kv_rate_for_size(step * gib);
+            assert!(rate >= prev, "rate fell from {prev} to {rate} at {step} GiB");
+            prev = rate;
+        }
+    }
+
     /// A resident with a catalog size but NO arch facts (the live #1819
     /// trace: a GGUF download, no sidecar `config.json`) is priced by the
     /// fallback, not left `None` — and the row says so via
@@ -1946,6 +2089,57 @@ mod tests {
         // breakdown.
         assert!(phi4.kv_per_token_bytes.is_none());
         assert!(phi4.kv_bytes_at_ctx.is_none());
+    }
+
+    /// The end-to-end half of the tier fix: `compute_ledger` must PRICE a
+    /// large unpriceable resident at its tier's rate, not merely be able to
+    /// look that rate up. Mutating `estimate_with_source` back to the flat
+    /// constant passed every tier test until this existed — the selector was
+    /// covered, its USE was not.
+    #[test]
+    fn a_large_estimated_resident_is_priced_at_its_tier_rate_end_to_end() {
+        let seventy_b: u64 = 40 * 1024 * 1024 * 1024; // lands in the ≤45 GiB tier
+        let ctx: u64 = 32_768;
+        let mut inputs = base_inputs();
+        inputs
+            .catalog
+            .push(CatalogFact { model_key: "llama-70b-gguf".into(), size_bytes: Some(seventy_b) });
+        inputs.residents.push(resident("meta/llama-70b", "llama-70b-gguf", ctx));
+
+        let ledger = compute_ledger(inputs, 1);
+        let row = ledger.models.iter().find(|m| m.model_key == "llama-70b-gguf").unwrap();
+        let expected = seventy_b + 327_680 * ctx + darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES;
+        assert_eq!(row.potential_bytes, Some(expected));
+        // ...and materially MORE than the tier-1 rate would have reserved:
+        // this difference is the ~4 GB the merge gate found missing.
+        let flat = seventy_b + V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN * ctx + darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES;
+        assert!(row.potential_bytes.unwrap() > flat);
+        assert_eq!(row.potential_bytes.unwrap() - flat, (327_680 - 204_800) * ctx);
+    }
+
+    /// The shrink path must charge an estimated row the rate it was PRICED
+    /// at, including its tier. Reverting `effective_kv_rate` to the flat
+    /// constant also passed everything until this existed — the earlier
+    /// shrink test used a small model, where flat and tier-1 coincide.
+    #[test]
+    fn the_shrink_path_charges_a_large_estimated_row_its_own_tier_rate() {
+        let seventy_b: u64 = 40 * 1024 * 1024 * 1024;
+        let row = ModelRow {
+            identifier: "meta/llama-70b".into(),
+            model_key: "llama-70b-gguf".into(),
+            owner: Owner::User,
+            loaded_ctx: 32_768,
+            weights_bytes: Some(seventy_b),
+            kv_per_token_bytes: None, // estimated rows carry no per-token fact
+            kv_bytes_at_ctx: None,
+            potential_bytes: Some(1),
+            current_bytes: None,
+            state: LedgerState::Unknown,
+            potential_source: Some(PotentialSource::Estimated),
+            shrink_hint: None,
+        };
+        assert_eq!(effective_kv_rate(&row), 327_680);
+        assert_ne!(effective_kv_rate(&row), V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN);
     }
 
     /// #1819 review finding 1's own invariant, pinned directly: an

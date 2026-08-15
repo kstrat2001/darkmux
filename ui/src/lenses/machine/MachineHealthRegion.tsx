@@ -348,11 +348,13 @@ function ModelRow({
             `.mm-row-chip.is-estimated` in styles.css for the third axis
             this establishes. The title states the assumption the figure
             rests on (dense attention — every layer holds a KV cache —
-            which OVERSTATES hybrid-attention models), per #1819 decision 3. */}
+            which over-reserves hybrid-attention models but UNDER-reserves
+            pre-GQA multi-head ones — stated rather than implied, per the
+            #1819 merge gate). */}
         {!isGhost && isEstimatedRow(m) && (
           <span
             className="mm-row-chip is-estimated"
-            title="priced by size-based estimate, not measurement — no readable config.json (commonly a GGUF download with no sidecar config file). Assumes DENSE attention (every layer holds a KV cache), which OVERSTATES hybrid-attention models (#1819)."
+            title="priced by size-based estimate, not measurement — no readable config.json (commonly a GGUF download with no sidecar config file). Assumes DENSE attention at a size-tiered rate, set at or above every modern GQA architecture in its size class. Over-reserves hybrid-attention models; under-reserves pre-GQA multi-head models such as Llama-2-13B (#1819)."
           >
             ESTIMATED
           </span>
@@ -404,7 +406,7 @@ function ModelRow({
       )}
       {!isGhost && isEstimatedRow(m) && (
         <div className="mm-hint">
-          ↳ estimated: no readable config.json — priced from catalog size + a conservative dense-attention KV assumption (~204.8 KB/token, every layer holds a KV cache), which overstates hybrid-attention models
+          ↳ estimated: no readable config.json — priced from catalog size + a size-tiered dense-attention KV rate (every layer assumed to hold a KV cache). Set at or above every modern GQA architecture in its size class; it over-reserves hybrid-attention models, and under-reserves pre-GQA multi-head models like Llama-2-13B
         </div>
       )}
       {!isGhost && (m as { shrink_hint?: string }).shrink_hint && <div className="mm-hint">↳ {(m as { shrink_hint?: string }).shrink_hint}</div>}
