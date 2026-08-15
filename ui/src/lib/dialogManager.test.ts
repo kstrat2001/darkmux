@@ -217,4 +217,31 @@ describe("dialogManager — Escape closes the topmost dialog only (viewer-keyboa
     expect(e).toBeTruthy();
     expect(getOpenId()).toBeNull();
   });
+
+  /** The `ModalId` type is not enforced at the `window.openModalEl` boundary,
+   * which is the entire reason that global exists. Unguarded, an unknown id
+   * set `openId` to an element that does not exist: nothing rendered, and the
+   * next Escape anywhere on the page was silently swallowed closing it.
+   * Legacy no-ops on a missing element (viewer.html:2928). */
+  it("an unknown modal id is a no-op, and does not arm Escape against a dialog that isn't there", () => {
+    // The untyped call IS the case under test — this is how the global is reached.
+    (openModalEl as unknown as (id: string) => void)("bogus");
+    expect(getOpenId()).toBeNull();
+
+    // The real proof: a subsequent Escape must still be a genuine no-op
+    // rather than being consumed by the phantom.
+    press("Escape");
+    expect(getOpenId()).toBeNull();
+  });
+
+  /** Pins that the guard rejects only what is genuinely unknown — a guard
+   * that rejected everything would pass the test above and break the app. */
+  it("every id in MODAL_IDS still opens", () => {
+    for (const id of MODAL_IDS) {
+      openModalEl(id);
+      expect(getOpenId()).toBe(id);
+      closeOpenModal();
+      expect(isModalOpen(id)).toBe(false);
+    }
+  });
 });

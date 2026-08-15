@@ -80,7 +80,17 @@ export interface Facets {
   src: string[];
 }
 
-/** `recompute()`'s facet derivation — viewer.html:1054-1058. */
+/** `recompute()`'s facet derivation — viewer.html:1054-1058.
+ *
+ * One DELIBERATE divergence from legacy, named here because the file it
+ * diverges from is about to be deleted and would otherwise stop being
+ * checkable: legacy's `FCATS` has no `.filter(Boolean)` on category, so a
+ * record with no `category` produced an EMPTY-LABEL checkbox that could be
+ * unchecked to filter such records out. Here nulls are dropped, and
+ * `matchesFilters` null-guards to match — a record with no category is never
+ * excluded on that facet. Every current producer emits a category, so this
+ * changes nothing observable today; it is a blank checkbox nobody could name
+ * being dropped rather than faithfully reproduced. */
 export function computeFacets(records: FlowRecord[]): Facets {
   const cat = [...new Set(records.map((r) => r.category).filter((v): v is string => v != null))];
   const tier = [...new Set(records.map((r) => r.tier).filter((v): v is string => v != null))];

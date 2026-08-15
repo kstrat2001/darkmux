@@ -157,9 +157,19 @@ export function EventLogColumn({
   const facets = useMemo(() => computeFacets(records), [records]);
   const [filters, setFilters] = useState<FilterState>(() => defaultFilterState(facets));
   const seenRef = useRef<FacetSeen>(createFacetSeen());
+  // The absorb runs in the EFFECT BODY, not inside the `setFilters` updater.
+  // `absorbNewFacetValues` mutates the `seen` ledger, and React requires
+  // updaters to be pure — `<StrictMode>` (on, `main.tsx`) double-invokes them
+  // precisely to punish impurity. On React 18.3 the impure version happened
+  // to behave, but the failure it risks is the exact bug the ledger exists to
+  // prevent: the second invocation sees every value already marked seen and
+  // returns the stale filters, silently dropping a live-streamed record whose
+  // facet value is brand new. Reading `filters` here costs a dependency on it,
+  // and the identity guard below keeps that from looping.
   useEffect(() => {
-    setFilters((f) => absorbNewFacetValues(f, facets, seenRef.current));
-  }, [facets]);
+    const next = absorbNewFacetValues(filters, facets, seenRef.current);
+    if (next !== filters) setFilters(next);
+  }, [facets, filters]);
   const [follow, setFollow] = useState(true);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [detailPct, setDetailPct] = useState(DEFAULT_DETAIL_PCT);

@@ -21,6 +21,17 @@ const GROUPS: { title: string; key: keyof Facets }[] = [
  * This was the named, deliberate cut in `EventLogColumn.tsx`'s own module
  * doc ("The filter MODAL is a named, deliberate cut, not a half-build") —
  * the real thing, now that the shared dialog machinery exists to hold it.
+ *
+ * **Legacy's per-checkbox `data-act="filter" data-k data-arg` attributes
+ * (viewer.html:2864) are deliberately NOT carried over.** The repo's rule is
+ * to preserve legacy's `data-act` hooks so e2e coverage transfers rather
+ * than being re-authored — but those three were legacy's DELEGATED-EVENT
+ * plumbing (one body-level listener reading `data-k`/`data-arg` off the
+ * clicked node), not test hooks. React binds each checkbox's handler
+ * directly, so they would be dead attributes. Checked before dropping them:
+ * no spec in `tests/e2e` or `tests/parity` targets them. The hook that IS a
+ * test hook — `data-act="filters"`, the trigger that opens this dialog —
+ * is preserved, and is what the specs actually use.
  */
 export function FiltersDialog({
   facets,

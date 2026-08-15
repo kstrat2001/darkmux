@@ -75,6 +75,14 @@ export function isModalOpen(id: ModalId): boolean {
  * swap between dialogs rather than being overwritten by the second one.
  */
 export function openModalEl(id: ModalId): void {
+  // Guard an unknown id. The TypeScript signature says `ModalId`, but the
+  // whole point of this function is that it is reachable from `window` by
+  // untyped callers, where the type is not enforced. Without this,
+  // `window.openModalEl('bogus')` sets `openId` to an element that does not
+  // exist: nothing renders, and the next Escape is silently swallowed
+  // closing the dialog that isn't there. Legacy no-ops on a missing element
+  // (`const m=$(id); if(!m)return;` — viewer.html:2928); this is that.
+  if (!MODAL_IDS.includes(id)) return;
   if (openId !== null) {
     // Swap: close the currently-open one silently, keep `returnFocus` as-is.
     openId = null;
