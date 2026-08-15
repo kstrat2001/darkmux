@@ -78,9 +78,37 @@ as each fix changed what there was to look at.
   same model when one exists). **Known limit, stated rather than hidden:** the
   size-tiered rate under-reserves pre-GQA multi-head models such as
   Llama-2-13B, where KV-head count equals attention-head count instead of a
-  small fraction of it — no size-derived rate can catch that shape. Reading
-  the GGUF header directly (#1820) is the real fix and is not in this release.
-  (#1819, #1823)
+  small fraction of it — no size-derived rate can catch that shape. The
+  estimator is now the *second* fallback rather than the first: see the GGUF
+  header reader below. (#1819, #1823)
+- **A GGUF resident is priced from its own architecture, read out of the
+  binary.** The estimate above is a floor, not an answer — so darkmux now
+  parses the GGUF metadata header directly for the same three facts a
+  `config.json` would carry. Resolution order is `config.json` → GGUF header
+  → size-tiered estimate → genuinely unpriceable, and a GGUF-derived row
+  reports `potential_source: "arch"` because it is a measurement like any
+  other. Verified against a real 9 GB `phi-4-Q4_K_M.gguf`: 40 layers, 10 KV
+  heads, head dim 128, matching the published config exactly. Only the header
+  is read, never the tensor data — parsing that file costs ~7 ms. It also
+  prefers the header's own `key_length` over deriving head dim from embedding
+  size, which is what keeps models like gemma-4-E4B correct (its derived
+  value would be 320 where the true one is 512). Every file-supplied length
+  and count is bounds-checked before it can allocate or loop, and any
+  malformed, truncated or ambiguous file declines to a labeled estimate
+  rather than failing. **Known limits:** GGUF v1's differing wire format is
+  unsupported (v2/v3 only); GGUF carries no per-layer attention-pattern
+  field, so hybrid-attention models are assumed dense — an overprice, the
+  same safe direction the estimator chose. (#1820, #1831)
+- **The viewer's dialogs are back: filters, notes, and about.** The React
+  viewer shipped without them — the event log offered a one-shot "model only"
+  quick filter in place of the real checkbox-per-facet modal, a named cut
+  rather than a half-build. All three dialogs now exist on a shared shell with
+  managed focus: Tab cannot walk out of an open dialog, Shift+Tab wraps,
+  Escape closes it, and focus returns to whatever opened it. The old viewer
+  failed the first of those — 31 Tab presses from an open filter panel landed
+  on the page header, underneath an opaque backdrop, so a keyboard user was
+  operating controls they could not see. Session and mission drill-in routes
+  land alongside them. (#1640, #1829)
 
 ### Changed
 
