@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
   computeGaugeGeometry,
-  computeRingGeometry,
+  computeBandGeometry,
+  hatchedSegmentDash,
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
@@ -68,12 +69,6 @@ const CY = 120;
 const R = 86;
 const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
 
-/** The inner ring's radius — darkmux's own share, concentric inside the
- * machine's. Set so the two bands read as separate instruments with the GAP
- * between them legible, since that gap IS "everything else" (#1821) and is
- * deliberately never drawn as a band of its own. */
-const R_INNER = 66;
-const INNER_ARC_D = `M 54 120 A ${R_INNER} ${R_INNER} 0 0 1 186 120`;
 
 /** Where a tick label sits, in the arc's own local geometry — one fixed
  * layout per quarter-tick index (0/25/50/75/100%), matching `level3.html`'s
@@ -130,10 +125,10 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   const faceCaption = gaugeFaceCaption(resources.machine.state, pressureRed, overLimit);
   // The fill's hue answers "how full", NOT "what did the arbiter decide" —
   // see `gaugeFillSeverity`'s own doc for why that separation is load-bearing.
-  const rings = computeRingGeometry(resources);
+  const band = computeBandGeometry(resources);
   // Hue follows the MACHINE's fill now, not darkmux's share — the ring it
   // colours is the machine's.
-  const fillCls = gaugeFillSeverity(rings.outer.solidPct);
+  const fillCls = gaugeFillSeverity(band.usedPct);
   const odo = odoLayout(digitCells(centerVal.num));
 
   const committed = gaugeValueParts(resources.machine.potential_bytes);
@@ -144,70 +139,72 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   // honestly renders as a single "—" cell. Absence is never zero — including
   // in the channel a sighted reader can't check.
   const scaleVal = gaugeValueParts(geo.scale);
-  const fullness = geo.cur != null ? ` (${Math.round(geo.pct)}% full)` : "";
-  const inUse = geo.cur != null ? `${centerVal.num} ${centerVal.unit}` : "an unreadable amount";
-  const ariaLabel = `Machine memory: ${inUse} in use of the ${scaleVal.num} ${scaleVal.unit} ${geo.scaleWord.toLowerCase()}${fullness}. ${
-    geo.commitPct != null
-      ? `Committed ${committed.num} ${committed.unit}${resources.machine.unpriced_models ? ` plus ${resources.machine.unpriced_models} unpriced model(s)` : ""}${resources.machine.estimated_models ? ` (${resources.machine.estimated_models} estimated)` : ""}, marked by the dashed tick. `
-      : ""
-  }State ${resources.machine.state || "unknown"}.`;
+  // The aria narrative describes the SAME band a sighted reader sees, in the
+  // same stacked order. Two bugs lived here until #1821's review: the
+  // percentage was computed from `geo.pct` — darkmux's share — while the
+  // figure beside it was the machine's, so a screen reader heard "87.7 GiB in
+  // use (29% full)"; and it still cited "the dashed tick" months after that
+  // tick was deleted. The needle-vs-readout defect had survived in the one
+  // channel nobody looks at.
+  const usedVal = gaugeValueParts(resources.pool?.used_bytes);
+  const darkmuxVal = gaugeValueParts(resources.machine.current_bytes);
+  const hasUsed = resources.pool?.used_bytes != null;
+  const ariaLabel = [
+    hasUsed
+      ? `Machine memory: ${usedVal.num} ${usedVal.unit} used of the ${scaleVal.num} ${scaleVal.unit} ${geo.scaleWord.toLowerCase()} (${Math.round(band.usedPct)}% full).`
+      : `Machine memory: usage unreadable, of the ${scaleVal.num} ${scaleVal.unit} ${geo.scaleWord.toLowerCase()}.`,
+    resources.machine.current_bytes != null ? `Of that, darkmux holds ${darkmuxVal.num} ${darkmuxVal.unit}.` : "",
+    band.growth.lengthPct > 0
+      ? `Committed ${committed.num} ${committed.unit}${resources.machine.unpriced_models ? ` plus ${resources.machine.unpriced_models} unpriced model(s)` : ""}${resources.machine.estimated_models ? ` (${resources.machine.estimated_models} estimated)` : ""}, shown as the hatched extension beyond the needle.`
+      : "",
+    `State ${resources.machine.state || "unknown"}.`,
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <div className="mm-gauge">
       <svg width="300" height="212" viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
         <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={11} pathLength={100} />
-        {/* OUTER ring — the machine. Solid = used now; the hatched extension
-            beyond it = darkmux's committed-but-unmaterialised growth, so the
-            ring's end is the PROJECTED total and the needle lands there.
-            Drawn hatched-first so the solid band paints over its start and
-            the two meet without a seam. */}
-        {rings.outer.hatchedPct > 0 && (
-          <path
-            className="mm-gauge-growth"
-            d={HALF_ARC_D}
-            fill="none"
-            strokeWidth={11}
-            pathLength={100}
-            strokeDasharray={`${rings.outer.solidPct + rings.outer.hatchedPct} 100`}
-          />
-        )}
+        {/* ONE STACKED BAND, in scale order: darkmux from 0, everything
+            else on top of it ending at the needle, then darkmux's committed
+            growth beyond. Stacking is what restores ADDITIVITY — this page's
+            question is "will it fit", which is a sum, and two concentric
+            rings could show every part but never the total. It also makes
+            `other` visible at last: as a span between darkmux's end and the
+            needle, its derivedness is self-evident, where as an undrawn gap
+            between two radii it was simply missing. */}
         <path
           className={`mm-gauge-val is-${fillCls}`}
           d={HALF_ARC_D}
           fill="none"
           strokeWidth={11}
           pathLength={100}
-          strokeDasharray={`${rings.outer.solidPct} 100`}
+          strokeDasharray={`${band.darkmux.lengthPct} 100`}
         />
-        {/* INNER ring — darkmux's share alone, read from 0 on the same scale.
-            "Everything else" is the visible gap between this and the outer
-            band; it is derived (`used - darkmux`) and is never drawn. */}
-        <path className="mm-gauge-inner-track" d={INNER_ARC_D} fill="none" strokeWidth={7} pathLength={100} />
-        <path
-          className="mm-gauge-inner-val"
-          d={INNER_ARC_D}
-          fill="none"
-          strokeWidth={7}
-          pathLength={100}
-          strokeDasharray={`${rings.inner.solidPct} 100`}
-        />
-        {/* The dashed commit tick is GONE. It marked Σ darkmux potential back when
-            this dial was darkmux-only and a tick was the only way to show a
-            commitment. Now darkmux has its own inner ring and its growth has
-            its own hatched band — so the tick was a THIRD rendering of the
-            same fact, on a face the operator already could not read
-            ("a new user will not know what this means"). The legend below
-            names the bands instead. */}
-        {geo.ticks.map((t) => (
-          <line
-            key={t.pct}
-            className="mm-gauge-tick"
-            x1={30}
-            y1={CY}
-            x2={38}
-            y2={CY}
-            transform={`rotate(${t.pct * 1.8} ${CX} ${CY})`}
+        {band.other.lengthPct > 0 && (
+          <path
+            className={`mm-gauge-other is-${fillCls}`}
+            d={HALF_ARC_D}
+            fill="none"
+            strokeWidth={11}
+            pathLength={100}
+            strokeDasharray={`${band.other.lengthPct} 100`}
+            strokeDashoffset={-band.other.startPct}
           />
+        )}
+        {band.growth.lengthPct > 0 && (
+          <path
+            className="mm-gauge-growth"
+            d={HALF_ARC_D}
+            fill="none"
+            strokeWidth={11}
+            pathLength={100}
+            strokeDasharray={hatchedSegmentDash(band.growth.startPct, band.growth.lengthPct)}
+          />
+        )}
+        {geo.ticks.map((t) => (
+          <line key={t.pct} className="mm-gauge-tick" x1={30} y1={CY} x2={38} y2={CY} transform={`rotate(${t.pct * 1.8} ${CX} ${CY})`} />
         ))}
         {geo.ticks.map((t, i) => (
           <text key={t.pct} className="mm-gauge-scale-label" x={TICK_LABEL_XY[i][0]} y={TICK_LABEL_XY[i][1]} textAnchor="middle">
@@ -233,7 +230,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
             carries the how-full channel and the lamps carry the verdict, so a
             third, permanently-grey encoding of the same question is subtraction
             rather than information. */}
-        <line className="mm-gauge-needle" x1={CX} y1={CY} x2={52} y2={CY} transform={`rotate(${rings.needleAngleDeg} ${CX} ${CY})`} />
+        <line className="mm-gauge-needle" x1={CX} y1={CY} x2={42} y2={CY} transform={`rotate(${band.needleAngleDeg} ${CX} ${CY})`} />
         <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
         <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
           {odo.cells.map((c, i) => (
@@ -284,19 +281,32 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
  * (`used - darkmux`), and giving it a swatch would present arithmetic as a
  * measured band.
  */
-function GaugeLegend({ resources, rings, fillCls }: { resources: MachineResources; rings: ReturnType<typeof computeRingGeometry>; fillCls: string }) {
-  const growth = rings.outer.hatchedPct > 0;
+function GaugeLegend({ resources, band, fillCls }: { resources: MachineResources; band: ReturnType<typeof computeBandGeometry>; fillCls: string }) {
+  const growth = band.growth.lengthPct > 0;
+  const other = resources.pool?.used_bytes != null && resources.machine.current_bytes != null
+    ? Math.max(0, Number(resources.pool.used_bytes) - Number(resources.machine.current_bytes))
+    : null;
+  const projected = resources.pool?.used_bytes != null && growth
+    ? Number(resources.pool.used_bytes) + Math.max(0, Number(resources.machine.potential_bytes ?? 0) - Number(resources.machine.current_bytes ?? 0))
+    : null;
   return (
     <div className="mm-legend">
       <span className="mm-legend-item">
-        <span className={`mm-legend-sw is-${fillCls}`} /> machine <b>{memBytes(resources.pool?.used_bytes)}</b>
+        <span className={`mm-legend-sw is-${fillCls}`} /> darkmux <b>{memBytes(resources.machine.current_bytes)}</b>
       </span>
-      <span className="mm-legend-item">
-        <span className="mm-legend-sw is-darkmux" /> darkmux <b>{memBytes(resources.machine.current_bytes)}</b>
-      </span>
+      {other != null && (
+        <span className="mm-legend-item">
+          <span className={`mm-legend-sw is-other is-${fillCls}`} /> other <b>{memBytes(other)}</b>
+        </span>
+      )}
       {growth && (
         <span className="mm-legend-item">
-          <span className="mm-legend-sw is-growth" /> committed <b>{memBytes(resources.machine.potential_bytes)}</b>
+          {/* Label first, exactly like `darkmux` and `other` above — the
+              figure trailing its label is the row's grammar, and this entry
+              had it inverted. */}
+          <span className="mm-legend-sw is-growth" /> committed +
+          <b>{memBytes(Math.max(0, Number(resources.machine.potential_bytes ?? 0) - Number(resources.machine.current_bytes ?? 0)))}</b>
+          {projected != null ? <> → <b>{memBytes(projected)}</b></> : null}
         </span>
       )}
     </div>
@@ -654,6 +664,9 @@ export function MachineHealthRegion({
   }
 
   const b = resources;
+  // Computed ONCE for the hero — an earlier cut called this three times per
+  // render, on a component that re-renders every 5s poll.
+  const bandGeo = computeBandGeometry(resources);
   const stale = resourcesErrored; // a poll failed, but we still have a last-good payload (#1812)
   // #1821: replaces `warnings: string[]` — each entry now carries a
   // severity, rendered below (an `info` disclosure must not look like a
@@ -672,7 +685,7 @@ export function MachineHealthRegion({
         <div className="mm-heroline">
           <div className="mm-semi">
             <Gauge resources={b} stale={stale} />
-            <GaugeLegend resources={b} rings={computeRingGeometry(b)} fillCls={gaugeFillSeverity(computeRingGeometry(b).outer.solidPct)} />
+            <GaugeLegend resources={b} band={bandGeo} fillCls={gaugeFillSeverity(bandGeo.usedPct)} />
             <GaugeCaption resources={b} />
           </div>
           <div>

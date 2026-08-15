@@ -2143,11 +2143,32 @@ body {
    total. Hatched rather than tinted because it is not memory anyone holds yet
    — the same "not yet, but committed" idiom the ESTIMATED chip uses (dashed),
    kept visually distinct from every solid band on the dial. */
+/* NO `stroke-dasharray` here, deliberately. It used to set `3 3` for the
+   hatching while the component set the band's EXTENT via the
+   `stroke-dasharray` attribute — and a CSS declaration overrides an SVG
+   presentation attribute, so the extent was silently clobbered and the band
+   ran hatched to the end of the scale. The dial claimed "projected to the
+   limit" for its whole life. Extent and hatch are now composed into one value
+   by `hatchedSegmentDash`; CSS must not supply a second. */
 .mm-gauge-growth {
   stroke: var(--dim);
   opacity: 0.55;
-  stroke-dasharray: 3 3;
 }
+
+/* "Everything else" — the machine's memory that is not darkmux's. Same hue as
+   darkmux's segment because it is the same subject (the machine filling up),
+   dimmed because it is not darkmux's to manage. It stacks directly on
+   darkmux's segment and ends at the needle, so the two visibly compose the
+   used total. */
+.mm-gauge-other {
+  opacity: 0.32;
+}
+.mm-gauge-other.is-green { stroke: var(--good); }
+.mm-gauge-other.is-amber { stroke: var(--warn); }
+.mm-gauge-other.is-red { stroke: var(--bad); }
+
+/* Legend swatch for that segment — same dimming, so the mapping holds. */
+.mm-legend-sw.is-other { opacity: 0.32; }
 
 /* The INNER ring: darkmux's own share, on the same scale, read from 0.
    Thinner than the machine's band so the two never read as one thick arc, and

@@ -2,7 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   advanceResidency,
   computeGaugeGeometry,
-  computeRingGeometry,
+  computeBandGeometry,
+  hatchedSegmentDash,
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
@@ -609,7 +610,14 @@ describe("rowStateDiffers — the per-row chip's whole condition", () => {
  * read as "how full is this machine" while measuring a fraction of it. The
  * operator misread it for hours and was right to.
  */
-describe("computeRingGeometry — the machine outside, darkmux inside", () => {
+/**
+ * The stacked band (#1821). This replaced two concentric rings: honest, but
+ * not glanceable — "everything else" was left undrawn on the theory that the
+ * gap between the rings showed it, when that gap was the angular difference
+ * between two arc endpoints at different RADII. The machine's largest
+ * consumer was effectively unrendered.
+ */
+describe("computeBandGeometry — one band, stacked in scale order", () => {
   const G = 1073741824;
   const res = (over: Record<string, unknown>): MachineResources =>
     resources({
@@ -619,81 +627,79 @@ describe("computeRingGeometry — the machine outside, darkmux inside", () => {
       ...over,
     } as Partial<MachineResources>);
 
-  it("puts the machine on the outer ring and darkmux on the inner, on one scale", () => {
-    const r = computeRingGeometry(res({}));
-    expect(r.outer.solidPct).toBeCloseTo(50, 5); // 64 of 128
-    expect(r.inner.solidPct).toBeCloseTo(25, 5); // 32 of 128
+  it("stacks darkmux, then everything else, then growth — in that order, without gaps", () => {
+    const b = computeBandGeometry(res({}));
+    expect(b.darkmux).toEqual({ startPct: 0, lengthPct: 25 });          // 32 of 128
+    expect(b.other).toEqual({ startPct: 25, lengthPct: 25 });           // used 64 - darkmux 32
+    expect(b.growth.startPct).toBeCloseTo(50, 5);                       // begins at the needle
+    expect(b.growth.lengthPct).toBeCloseTo(12.5, 5);                    // committed 48 - current 32
   });
 
-  it("draws darkmux's growth as an extension of the OUTER ring only, never twice", () => {
-    const r = computeRingGeometry(res({}));
-    // committed 48 - current 32 = 16 GiB of growth = 12.5% of the scale.
-    expect(r.outer.hatchedPct).toBeCloseTo(12.5, 5);
-    // The inner ring carries no hatched band: drawing the same quantity on
-    // both rings is duplication, so it appears once, where "will it fit" is
-    // answered.
-    expect(r.inner.hatchedPct).toBe(0);
+  /** The property the rings gave up, and the reason for this shape: the parts
+   * compose the whole, so "will it fit" is answered by looking rather than by
+   * subtracting across radii. */
+  it("is additive — the segments compose the total, with no arithmetic left to the reader", () => {
+    const b = computeBandGeometry(res({}));
+    expect(b.darkmux.lengthPct + b.other.lengthPct).toBeCloseTo(b.usedPct, 5);
+    expect(b.usedPct + b.growth.lengthPct).toBeCloseTo(b.projectedPct, 5);
   });
 
-  /**
-   * The needle reads NOW, and must agree with the centre readout, which shows
-   * the same figure. An earlier cut pointed it at the projected total while
-   * the readout still showed darkmux's share — a needle at ~82% beside a
-   * readout of 36.8 GiB, two subjects on one instrument. The projection is a
-   * REGION (the hatched band), never a pointer.
-   */
-  it("lands the needle at what the machine uses NOW, not at the projection", () => {
-    const r = computeRingGeometry(res({}));
-    expect(r.needleAngleDeg).toBeCloseTo(50 * 1.8, 4); // used 64 of 128
-    // ...and strictly short of the ring's hatched end.
-    expect(r.needleAngleDeg).toBeLessThan((r.outer.solidPct + r.outer.hatchedPct) * 1.8);
+  it("puts the needle at what the machine uses NOW, where `other` ends", () => {
+    const b = computeBandGeometry(res({}));
+    expect(b.needleAngleDeg).toBeCloseTo(50 * 1.8, 4);
+    expect(b.growth.startPct).toBeCloseTo(b.usedPct, 5);
   });
 
-  it("reports everything-else as the gap, which is never a band of its own", () => {
-    const r = computeRingGeometry(res({}));
-    expect(r.otherPct).toBeCloseTo(25, 5); // used 64 - darkmux 32
-    // The three quantities compose the outer ring exactly.
-    expect(r.inner.solidPct + r.otherPct).toBeCloseTo(r.outer.solidPct, 5);
+  it("draws no growth segment when nothing is committed beyond what is held", () => {
+    const b = computeBandGeometry(res({ machine: { potential_bytes: 10 * G, unpriced_models: 0, current_bytes: 30 * G, state: "green" } }));
+    expect(b.growth.lengthPct).toBe(0);
+    expect(b.projectedPct).toBeCloseTo(b.usedPct, 5);
   });
 
-  /**
-   * The degenerate case that DEFINED the outer ring. Small residents, huge
-   * commitment, quiet machine: if the outer ring were "used" alone, darkmux's
-   * inner ring could exceed it and the dial would look broken. Defining outer
-   * as the PROJECTED total keeps outer >= inner in every case.
-   */
-  it("never lets the inner ring overshoot the outer, however large the commitment", () => {
-    const r = computeRingGeometry(
-      res({
-        pool: { capacity_bytes: 128 * G, used_bytes: 20 * G, available_bytes: 100 * G, free_bytes: 100 * G },
-        machine: { potential_bytes: 100 * G, unpriced_models: 0, current_bytes: 5 * G, state: "green" },
-      }),
-    );
-    const outerEnd = r.outer.solidPct + r.outer.hatchedPct;
-    expect(outerEnd).toBeGreaterThanOrEqual(r.inner.solidPct);
-    expect(outerEnd).toBeCloseTo(20 / 128 * 100 + 95 / 128 * 100, 4);
+  it("never lets `other` go negative when the pool reading degrades below darkmux's own share", () => {
+    const b = computeBandGeometry(res({ pool: { capacity_bytes: 128 * G, used_bytes: 1 * G, available_bytes: 1, free_bytes: 1 } }));
+    expect(b.other.lengthPct).toBe(0);
+    expect(b.usedPct).toBeGreaterThanOrEqual(b.darkmux.lengthPct);
   });
 
   it("clamps at the scale rather than sweeping past it when over-committed", () => {
-    const r = computeRingGeometry(
-      res({ machine: { potential_bytes: 400 * G, unpriced_models: 0, current_bytes: 100 * G, state: "amber" } }),
-    );
-    expect(r.outer.solidPct + r.outer.hatchedPct).toBeLessThanOrEqual(100);
-    expect(r.needleAngleDeg).toBeLessThanOrEqual(180);
+    const b = computeBandGeometry(res({ machine: { potential_bytes: 400 * G, unpriced_models: 0, current_bytes: 100 * G, state: "amber" } }));
+    expect(b.projectedPct).toBeLessThanOrEqual(100);
+    expect(b.needleAngleDeg).toBeLessThanOrEqual(180);
+  });
+});
+
+/**
+ * The dash generator exists because of a SHIPPED bug: the growth band set its
+ * extent via the `stroke-dasharray` attribute while CSS set
+ * `stroke-dasharray: 3 3` for hatching — and CSS overrides SVG presentation
+ * attributes, so the extent was silently clobbered and the band ran hatched to
+ * the END OF THE SCALE. The dial spent its life claiming "projected to the
+ * limit".
+ */
+describe("hatchedSegmentDash — extent and hatching in ONE value", () => {
+  it("opens with a gap to the segment's start, so the hatch begins where the segment does", () => {
+    const d = hatchedSegmentDash(60, 10).split(" ").map(Number);
+    expect(d[0]).toBe(0);
+    expect(d[1]).toBe(60);
   });
 
-  it("never reports negative growth for a fully materialised model", () => {
-    const r = computeRingGeometry(
-      res({ machine: { potential_bytes: 10 * G, unpriced_models: 0, current_bytes: 30 * G, state: "green" } }),
-    );
-    expect(r.outer.hatchedPct).toBe(0);
+  it("covers the segment's length and no more", () => {
+    const d = hatchedSegmentDash(0, 10).split(" ").map(Number);
+    // Sum of the drawn runs (every other entry from index 2) must not exceed
+    // the requested length — a hatch that overruns is the shipped bug again.
+    const drawn = d.slice(2).filter((_, i) => i % 2 === 0).reduce((a, b) => a + b, 0);
+    expect(drawn).toBeLessThanOrEqual(10 + 0.001);
+    expect(drawn).toBeGreaterThan(0);
   });
 
-  it("never lets the machine read as less full than darkmux's own share", () => {
-    // A degraded/absent pool reading must not produce an outer ring shorter
-    // than the inner one — darkmux's memory IS part of the machine's.
-    const r = computeRingGeometry(res({ pool: { capacity_bytes: 128 * G, used_bytes: 1 * G, available_bytes: 1, free_bytes: 1 } }));
-    expect(r.outer.solidPct).toBeGreaterThanOrEqual(r.inner.solidPct);
-    expect(r.otherPct).toBe(0);
+  it("ends with a long gap so the remainder of the path stays blank", () => {
+    const d = hatchedSegmentDash(10, 5).split(" ").map(Number);
+    expect(d[d.length - 1]).toBeGreaterThanOrEqual(100);
+  });
+
+  it("draws nothing at all for an empty segment", () => {
+    expect(hatchedSegmentDash(50, 0)).toBe("0 100");
+    expect(hatchedSegmentDash(50, -3)).toBe("0 100");
   });
 });

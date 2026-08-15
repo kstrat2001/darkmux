@@ -142,81 +142,103 @@ export function resolveGaugeScale(limit: number | null, poolCap: number | null, 
  * the single source every element on the face (needle, ticks, commit
  * marker, redline) reads from, so none of them can disagree about what the
  * scale means. */
-/** One concentric ring's drawable extent, in percent of the dial's scale.
- * `solid` is measured now; `hatched` is committed-but-not-yet-materialised
- * and is drawn as an EXTENSION beyond the solid, never from zero. */
-export interface RingExtent {
-  solidPct: number;
-  hatchedPct: number;
+/** One segment of the stacked band, as percentages of the dial's scale. */
+export interface BandSegment {
+  startPct: number;
+  lengthPct: number;
 }
 
-export interface RingGeometry {
-  /** The MACHINE: everything in use, plus darkmux's unmaterialised growth. */
-  outer: RingExtent;
-  /** DARKMUX only, solid — its share of the same scale, read from 0. */
-  inner: RingExtent;
-  /** Memory held by everything that is not darkmux. NEVER drawn: it is the
-   * visible GAP between the two rings. Carried for the caption and for
-   * tests, so the relationship is checkable. */
-  otherPct: number;
-  /** The needle sits at what the machine is using NOW — the outer ring's
-   * SOLID end, not its hatched projection. A needle reads the present; a
-   * projection is a region, not a pointer. It must also agree with the centre
-   * readout, which shows the same figure: the operator saw a needle at ~82%
-   * beside a readout of 36.8 GiB and correctly called it off, because they
-   * were pointing at two different subjects. */
+export interface BandGeometry {
+  /** darkmux's own memory, from 0. */
+  darkmux: BandSegment;
+  /** Everything else on the machine, stacked on top of darkmux and ending at
+   * the needle. Its derivedness is SELF-EVIDENT here in a way it never was as
+   * an undrawn gap: it is visibly the span between darkmux's end and the
+   * needle. */
+  other: BandSegment;
+  /** darkmux's committed-but-unmaterialised growth, beyond the needle. */
+  growth: BandSegment;
+  /** Where the machine is NOW — the end of `other`, and the needle. */
+  usedPct: number;
+  /** Where it lands if darkmux's models fully materialise. */
+  projectedPct: number;
   needleAngleDeg: number;
 }
 
 /**
- * The two concentric rings (#1821).
+ * The dial's stacked band (#1821).
  *
- * The dial used to fill from `machine.current` alone against a scale ending
- * at the machine's whole RAM — so it read as "how full is this machine" while
- * measuring only darkmux's share. The operator misread it for hours, and was
- * right to: it is the MACHINE tab, the scale says `128 LIMIT`, and the caption
- * said `IN USE`.
+ * This replaced two concentric rings. The rings were honest but not
+ * glanceable: "everything else" was left undrawn on the theory that the GAP
+ * between the rings showed it — but that gap is the angular difference
+ * between two arc endpoints at DIFFERENT RADII, so the machine's single
+ * largest consumer (~50 GiB here) required cross-radius mental subtraction
+ * and was effectively unrendered. The inner ring also under-read: at r=66 vs
+ * r=86 the same percentage draws a visibly shorter arc, so darkmux's share
+ * looked smaller than it was. And a gauge that needs a three-item legend to
+ * be read is telling you something about its own geometry.
  *
- * Now:
- * - **outer** = the machine's used memory (solid) + darkmux's unmaterialised
- *   growth (hatched). The needle lands at its end. Defining the outer ring as
- *   the PROJECTED total is what keeps `outer >= inner` in every case,
- *   including the degenerate one — small residents, huge commitment, quiet
- *   machine — where an outer ring of used-only would let the inner overshoot
- *   it and look broken.
- * - **inner** = darkmux's current share, solid only. The hatched band is drawn
- *   ONCE, on the outer ring: its length is identical on both (darkmux's growth
- *   is the only projected quantity), so drawing it twice would be the same
- *   duplication this page spent a session deleting. darkmux's committed TOTAL
- *   remains available as caption text.
- * - **everything else** is never drawn. It is the difference between the
- *   rings. That is deliberate: it is a DERIVED quantity (`used - darkmux`),
- *   and drawing it would render it as though it had been measured.
+ * Stacking restores the property the rings gave up — ADDITIVITY. This page's
+ * whole question is "will it fit", which is a sum, and the one thing two
+ * rings could not show was the sum.
  *
- * All four extents clamp to the scale, so an over-committed machine pins at
- * the line rather than sweeping past it.
+ * On the "other is derived, so do not draw it" rule that kept it off the
+ * rings: that was over-applied. The needle position, every percentage, and
+ * the growth band are all client arithmetic on server numbers. Stacked, the
+ * geometry declares `other` a remainder by construction — it is the span
+ * between darkmux's end and the needle — which is more honest than absence,
+ * not less.
  */
-export function computeRingGeometry(resources: MachineResources): RingGeometry {
+export function computeBandGeometry(resources: MachineResources): BandGeometry {
   const geo = computeGaugeGeometry(resources);
   const scale = geo.scale;
   const pctOf = (b: number | null | undefined): number => (b == null || !scale ? 0 : Math.max(0, Math.min(100, (Number(b) / scale) * 100)));
 
-  const darkmux = pctOf(resources.machine.current_bytes);
-  const used = Math.max(pctOf(resources.pool?.used_bytes), darkmux);
-  const committed = pctOf(resources.machine.potential_bytes);
-
-  // darkmux's growth: what its models will take beyond what they hold now.
-  // Never negative — a fully materialised model has no growth left.
-  const growth = Math.max(0, committed - darkmux);
-  const outerSolid = used;
-  const outerHatched = Math.max(0, Math.min(100 - outerSolid, growth));
+  const darkmuxPct = pctOf(resources.machine.current_bytes);
+  // The machine's used can never read below darkmux's own share — darkmux's
+  // memory IS part of the machine's — so a degraded pool reading clamps up
+  // rather than producing a negative `other`.
+  const usedPct = Math.max(pctOf(resources.pool?.used_bytes), darkmuxPct);
+  const committedPct = pctOf(resources.machine.potential_bytes);
+  const growthPct = Math.max(0, Math.min(100 - usedPct, committedPct - darkmuxPct));
 
   return {
-    outer: { solidPct: outerSolid, hatchedPct: outerHatched },
-    inner: { solidPct: darkmux, hatchedPct: 0 },
-    otherPct: Math.max(0, used - darkmux),
-    needleAngleDeg: outerSolid * 1.8,
+    darkmux: { startPct: 0, lengthPct: darkmuxPct },
+    other: { startPct: darkmuxPct, lengthPct: Math.max(0, usedPct - darkmuxPct) },
+    growth: { startPct: usedPct, lengthPct: growthPct },
+    usedPct,
+    projectedPct: usedPct + growthPct,
+    needleAngleDeg: usedPct * 1.8,
   };
+}
+
+/**
+ * A `stroke-dasharray` that draws ONE sub-arc of a `pathLength=100` path,
+ * hatched, without CSS having to supply the dash pattern.
+ *
+ * This exists because of a real shipped bug: the growth band set its extent
+ * via the `stroke-dasharray` ATTRIBUTE while `styles.css` set
+ * `stroke-dasharray: 3 3` for the hatching — and a CSS declaration overrides
+ * an SVG presentation attribute, so the inline extent was silently clobbered
+ * and the band ran hatched to the END OF THE SCALE. The dial spent its whole
+ * life claiming "projected to the limit". One dasharray cannot carry both
+ * dashing and extent, so the extent and the hatch are composed here, in one
+ * value, and the CSS rule is gone.
+ *
+ * Shape: a leading `0 <start>` gap, then `dash gap` pairs covering the
+ * segment, then a long final gap swallowing the remainder.
+ */
+export function hatchedSegmentDash(startPct: number, lengthPct: number, dash = 2.2, gap = 2.2): string {
+  if (lengthPct <= 0) return "0 100";
+  const parts: number[] = [0, startPct];
+  let drawn = 0;
+  while (drawn < lengthPct) {
+    const d = Math.min(dash, lengthPct - drawn);
+    parts.push(d, gap);
+    drawn += d + gap;
+  }
+  parts.push(0, 200); // swallow whatever is left of the path
+  return parts.map((n) => Number(n.toFixed(3))).join(" ");
 }
 
 export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry {

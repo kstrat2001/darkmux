@@ -124,14 +124,17 @@ describe("MachineHealthRegion — absence vs zero (docs/design/machine-lens/prov
     expect(container.querySelector(".mm-legend")!.textContent).toMatch(/committed/);
   });
 
-  it("names every band it draws — the legend is what makes the face readable", () => {
+  it("names every band it draws — including 'other', now that it IS drawn", () => {
     const { container } = renderRegion(BASE);
     const legend = container.querySelector(".mm-legend")!;
-    expect(legend.textContent).toMatch(/machine/);
     expect(legend.textContent).toMatch(/darkmux/);
-    // "everything else" is the GAP between the rings — derived, never drawn,
-    // so it must NOT appear as a swatch claiming to be measured.
-    expect(legend.textContent).not.toMatch(/everything else|other/i);
+    // The inverse of what this asserted under the rings: this segment was
+    // undrawn there on the theory the gap showed it, and was effectively
+    // invisible. Stacked, it is a real segment and must be named.
+    expect(legend.textContent).toMatch(/\bother\b/i);
+    // The readout owns the machine's own figure — the legend covers only the
+    // segments the readout does not explain, so `used` is not restated here.
+    expect(legend.textContent).not.toMatch(/\bmachine\b/i);
   });
 });
 
@@ -247,6 +250,37 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
     expect((left + right) / 2).toBeCloseTo(120, 6);
     // The unit hangs off the right edge and takes no part in that centering.
     expect(Number(container.querySelector(".mm-gauge-center-unit")!.getAttribute("x"))).toBeGreaterThan(right);
+  });
+
+  /**
+   * The aria narrative must describe the same band a sighted reader sees. Two
+   * bugs lived here until the #1821 review: the percentage came from
+   * darkmux's share while the figure beside it was the machine's ("87.7 GiB
+   * in use … 29% full"), and it cited a dashed tick deleted long before. The
+   * needle-vs-readout defect had survived in the one channel nobody looks at.
+   */
+  it("narrates the machine's figure and the machine's percentage — the same subject", () => {
+    const { container } = renderRegion(BASE);
+    const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
+    // pool.used 69.3e9 = 64.5 GiB = 50% of the 128 GiB scale.
+    expect(aria).toContain("64.5 GiB used");
+    expect(aria).toMatch(/50% full/);
+    // ...and NOT darkmux's 19.4 GiB / 15%, which is what it used to mix in.
+    expect(aria).not.toMatch(/15% full/);
+  });
+
+  it("names darkmux's share as a part OF that total, not as the total", () => {
+    const { container } = renderRegion(BASE);
+    const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
+    expect(aria).toMatch(/Of that, darkmux holds 19\.4 GiB/);
+  });
+
+  it("never cites the dashed tick — it was deleted", () => {
+    const pending: MachineResources = { ...BASE, machine: { ...BASE.machine, potential_bytes: 60_000_000_000 } };
+    const { container } = renderRegion(pending, { residencyRows: residencyRowsFor(pending) });
+    const aria = container.querySelector(".mm-gauge svg")!.getAttribute("aria-label")!;
+    expect(aria).not.toMatch(/dashed tick/);
+    expect(aria).toMatch(/hatched extension beyond the needle/);
   });
 
   it("never announces a fabricated 0% to a screen reader when the reading is unavailable", () => {
