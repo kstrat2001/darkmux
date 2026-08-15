@@ -1,0 +1,4 @@
+
+# `bun install` byproduct — this directory ships package-lock.json (npm).
+# Two lockfiles from two package managers can resolve differently; keep one.
+bun.lock
