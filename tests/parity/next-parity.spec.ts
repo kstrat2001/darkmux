@@ -100,7 +100,9 @@ function readGolden(label) {
  * flattened extraction produced. Stage 2/3 (docs/design/machine-lens/proposal.md, operator-approved)
  * replaced that shape on purpose: a bezel-less semicircle gauge whose
  * reading is a NEEDLE POSITION plus a handful of on-arc tick labels
- * (`0 · 34 · 69 · 103 · 137 · LIMIT`), a tell-tale lamp row that renders
+ * (`0 · 34 · 69 · 103 · 137 · LIMIT` as of this writing — #1811 has since
+ * moved the arc to binary, `0 · 32 · 64 · 96 · 128`, which changes nothing
+ * about the argument here), a tell-tale lamp row that renders
  * SEVEN lamps every time regardless of payload (`STATE GREEN`, `Δ
  * RESIDENCY`, `UNPRICED`, …), odometer DIGIT CELLS for the pressure
  * instruments (`8`/`8` rather than `88%`), and model ROWS with ghost/NEW

@@ -5,6 +5,7 @@ import {
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
+  gaugeFillSeverity,
   gaugeScaleWord,
   gaugeTickLabel,
   gaugeValueParts,
@@ -57,12 +58,14 @@ function model(overrides: Partial<MachineResourcesModel> = {}): MachineResources
 }
 
 describe("gaugeValueParts — the glance-layer figure (one decimal)", () => {
-  it("formats GB at one decimal", () => {
-    expect(gaugeValueParts(32378306560)).toEqual({ num: "32.4", unit: "GB" });
+  it("formats GiB at one decimal", () => {
+    // Binary since #1811. The same byte count used to read "32.4 GB", on an
+    // arc whose max tick read 137 — see `gaugeTickLabel` below.
+    expect(gaugeValueParts(32378306560)).toEqual({ num: "30.2", unit: "GiB" });
   });
-  it("formats MB/KB/B without a decimal", () => {
-    expect(gaugeValueParts(728000000)).toEqual({ num: "728", unit: "MB" });
-    expect(gaugeValueParts(5000)).toEqual({ num: "5", unit: "KB" });
+  it("formats MiB/KiB/B without a decimal", () => {
+    expect(gaugeValueParts(728000000)).toEqual({ num: "694", unit: "MiB" });
+    expect(gaugeValueParts(5000)).toEqual({ num: "5", unit: "KiB" });
     expect(gaugeValueParts(5)).toEqual({ num: "5", unit: "B" });
   });
   it("renders — for null/undefined/non-finite, never a fabricated 0", () => {
@@ -73,14 +76,47 @@ describe("gaugeValueParts — the glance-layer figure (one decimal)", () => {
 });
 
 describe("gaugeTickLabel — bare on-arc numbers", () => {
-  it("rounds to whole GB with no unit", () => {
-    expect(gaugeTickLabel(137438953472)).toBe("137");
-    expect(gaugeTickLabel(137438953472 * 0.75)).toBe("103");
+  it("rounds to whole GiB with no unit — the power of two the machine is sold as", () => {
+    // #1811's headline case: `hw.memsize` on a 128 GB MacBook Pro. The decimal
+    // convention labeled this arc's end 137, a number matching nothing the
+    // operator can look up about their own hardware.
+    expect(gaugeTickLabel(137438953472)).toBe("128");
+    expect(gaugeTickLabel(137438953472 * 0.75)).toBe("96");
   });
   it("floors to 0 for non-positive/non-finite input, never negative", () => {
     expect(gaugeTickLabel(0)).toBe("0");
     expect(gaugeTickLabel(-5)).toBe("0");
     expect(gaugeTickLabel(NaN)).toBe("0");
+  });
+});
+
+/**
+ * The fill ramp. Two things are being pinned, and the second is the one that
+ * actually matters:
+ *
+ * 1. The thresholds are the operator's (green to half, amber past half, red
+ *    approaching the line), and they are inclusive-lower at each boundary —
+ *    an off-by-one here shifts a whole zone.
+ * 2. It is a function of the NEEDLE POSITION and nothing else. The bug this
+ *    replaced keyed the fill to `machine.state`, which on a machine with any
+ *    unpriceable resident is permanently `unknown`, so a gauge on a real
+ *    desk swept from empty to full without ever changing color. Nothing in
+ *    this function can see a state string, which is what makes that
+ *    unrepeatable — asserted at the component level too, where the payload
+ *    carrying `state:"unknown"` is actually available to get it wrong.
+ */
+describe("gaugeFillSeverity — how full, NOT what the arbiter decided", () => {
+  it("ramps green → amber → red across the operator's own thresholds", () => {
+    expect(gaugeFillSeverity(0)).toBe("green");
+    expect(gaugeFillSeverity(49.9)).toBe("green");
+    expect(gaugeFillSeverity(50)).toBe("amber"); // inclusive at the boundary
+    expect(gaugeFillSeverity(84.9)).toBe("amber");
+    expect(gaugeFillSeverity(85)).toBe("red"); // inclusive at the boundary
+    expect(gaugeFillSeverity(100)).toBe("red");
+  });
+
+  it("is total — a non-finite percentage degrades to green, never to a missing class", () => {
+    expect(gaugeFillSeverity(Number.NaN)).toBe("green");
   });
 });
 
@@ -147,9 +183,9 @@ describe("computeGaugeGeometry", () => {
     expect(g.commitPct).toBe(100); // clamped to the line, not 150
   });
 
-  it("produces five quarter ticks with whole-GB labels", () => {
+  it("produces five quarter ticks with whole-GiB labels", () => {
     const g = computeGaugeGeometry(resources());
-    expect(g.ticks.map((t) => t.label)).toEqual(["0", "34", "69", "103", "137"]);
+    expect(g.ticks.map((t) => t.label)).toEqual(["0", "32", "64", "96", "128"]);
     expect(g.ticks.map((t) => t.pct)).toEqual([0, 25, 50, 75, 100]);
   });
 
@@ -241,10 +277,10 @@ describe("odometerTiles", () => {
   it("splits memory free / swap / compressor into digit cells with detail-layer (two-decimal) precision", () => {
     const tiles = odometerTiles({ swap_used_bytes: 5453843005, compressor_bytes: 727711744, memory_free_percent: 87, red: false });
     expect(tiles[0]).toEqual({ digits: ["8", "7"], unit: "% free", label: "memory free", note: "sole pressure trigger" });
-    expect(tiles[1].digits.join("")).toBe("5.45");
-    expect(tiles[1].unit).toBe("GB");
-    expect(tiles[2].digits.join("")).toBe("728");
-    expect(tiles[2].unit).toBe("MB");
+    expect(tiles[1].digits.join("")).toBe("5.08");
+    expect(tiles[1].unit).toBe("GiB");
+    expect(tiles[2].digits.join("")).toBe("694");
+    expect(tiles[2].unit).toBe("MiB");
   });
 
   it("renders a single — cell rather than a fabricated 0% when the percent is missing", () => {
@@ -353,7 +389,7 @@ describe("sortResidencyRows / groupResidencyRows — stable, never keyed on a li
 describe("modelKvLine — unchanged from the retired modelLines()'s fourth element", () => {
   it("formats the priced case", () => {
     expect(modelKvLine(model({ loaded_ctx: 262144, weights_bytes: 18446676063, kv_bytes_at_ctx: 5368709120, potential_bytes: 24565385183, current_bytes: 19351355392 }))).toBe(
-      "ctx 262144 · weights 18.45 GB · kv@ctx 5.37 GB · potential 24.57 GB · current 19.35 GB",
+      "ctx 262144 · weights 17.18 GiB · kv@ctx 5.00 GiB · potential 22.88 GiB · current 18.02 GiB",
     );
   });
 

@@ -2073,13 +2073,25 @@ body {
   font-size: 6.5px;
   letter-spacing: 0.14em;
 }
-.mm-gauge-center-val {
+/* The center readout is an odometer: recessed cells matching the pressure
+   tiles (`.mm-odo-c`), so the face carries one numeric idiom rather than two.
+   Geometry — cell widths, the narrow `.` cell, the centering on the hub — is
+   laid out in `MachineHealthRegion.tsx::odoLayout`, because an SVG has no
+   flexbox and the whole point of the nit was that the FIGURE has to center on
+   the hub independently of the unit sitting beside it. */
+.mm-gauge-odo-cell {
+  fill: #0d1120;
+  stroke: #2c3446;
+  stroke-width: 1;
+}
+.mm-gauge-odo-digit {
   fill: var(--fg);
-  font-size: 24px;
+  font-size: 15px;
   font-weight: 600;
 }
 .mm-gauge-center-unit {
-  font-size: 11px;
+  font-size: 10px;
+  font-weight: 600;
   fill: var(--dim);
 }
 .mm-gauge-center-caption {
@@ -2095,10 +2107,11 @@ body {
 .mm-gauge-track {
   stroke: #222a3c;
 }
-.mm-gauge-val.is-unknown {
-  stroke: var(--dim);
-  opacity: 0.5;
-}
+/* The fill's three zones. There is deliberately no `.is-unknown` arm: the fill
+   is driven by `gaugeFillSeverity(pct)` (how full), which is total over
+   green/amber/red, and no longer by `machine.state` (the arbiter's verdict),
+   which is `unknown` on a real machine and painted the whole sweep dim grey.
+   See that function's doc for why the two questions were split. */
 .mm-gauge-val.is-green {
   stroke: var(--good);
 }
@@ -2137,19 +2150,25 @@ body {
     drop-shadow(0 0 4px var(--bad))
     drop-shadow(0 0 9px var(--bad));
 }
+/* Redline glow on the readout. The digits carry their own `fill`, so the
+   group's `fill` alone would not reach them — the descendant rule is what
+   actually turns the number red; the cells stay recessed and dark. */
 .mm-gauge-center-val.lit {
-  fill: var(--bad);
   filter:
     drop-shadow(0 0 3px var(--bad))
     drop-shadow(0 0 8px var(--bad));
+}
+.mm-gauge-center-val.lit .mm-gauge-odo-digit {
+  fill: var(--bad);
+}
+.mm-gauge-center-val.lit .mm-gauge-center-unit {
+  fill: var(--bad);
+  opacity: 0.75;
 }
 .mm-gauge-needle {
   stroke: var(--fg);
   stroke-width: 2.5;
   stroke-linecap: round;
-}
-.mm-gauge-needle.is-unknown {
-  stroke: var(--dim);
 }
 .mm-gauge-hub {
   fill: #454d5c;
