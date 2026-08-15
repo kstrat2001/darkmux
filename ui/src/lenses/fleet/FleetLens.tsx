@@ -425,8 +425,49 @@ export function FleetLens({
                 {lane.name}
               </div>
               <div className="tltrack">
+                {/* (#1639, drill-in packet) Session drill — click a bar, land
+                    on `#session=<sid>`. Legacy's OWN `.sbar` bars are inert
+                    (no `data-act`, no click handler anywhere in
+                    `viewer.html`'s timeline code); legacy's only session-drill
+                    click was `recentRow()`'s "open →" link on the machine
+                    page's per-run list, which #1809 removed outright when it
+                    replaced that list with a link into the runs lens (see
+                    `MachineLens.tsx`'s own doc, and `viewer-session-url.spec.js`'s
+                    module doc for the full gap history). Since #1809 nothing
+                    ANYWHERE in this port reaches `SessionReplay` by clicking,
+                    even though the fetch + render it needs (`/flow-session/<id>`
+                    → `runRegions`) has worked since Packet 4.
+                    This is a deliberate WIDENING beyond legacy's own address-bar
+                    behavior, same precedent as `machineDrillHash`'s `uid=` and
+                    the `machine=` runs-lens pin above: the activity lane already
+                    names every session on screen (`bar.sid`, carried into
+                    `bar.title`), so it is the least-surprising place to attach
+                    the click legacy never wired. A real `location.hash` write
+                    (not `writeHash`/`replaceState`) — the same mechanism every
+                    other cross-lens hop in this file uses — so `hashchange`
+                    fires, back/forward/copy-paste all behave, and `useSyncHash`
+                    never has to reconcile a route no navigation actually
+                    happened for. */}
                 {lane.bars.map((bar) => (
-                  <div key={bar.sid} className={`sbar ${bar.cls}`} style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }} title={bar.title} />
+                  <div
+                    key={bar.sid}
+                    className={`sbar ${bar.cls}`}
+                    style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }}
+                    title={bar.title}
+                    data-act="session"
+                    data-arg={bar.sid}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => {
+                      location.hash = `session=${encodeURIComponent(bar.sid)}`;
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        location.hash = `session=${encodeURIComponent(bar.sid)}`;
+                      }
+                    }}
+                  />
                 ))}
                 <div className="ph" style={{ left: `${timeline.playheadPct}%` }} />
               </div>

@@ -1790,6 +1790,15 @@ body {
   background: var(--dim);
   border-radius: 3px;
   min-width: 2px;
+  /* (drill-in packet) Clickable — see `FleetLens.tsx`'s own doc on the bar's
+     `onClick`: a genuine widening beyond legacy (whose `.sbar` never had a
+     click handler), so a real pointer affordance is honest here rather than
+     a trap control. */
+  cursor: pointer;
+}
+.sbar:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 .sbar.run {
   background-color: #ffd166;
