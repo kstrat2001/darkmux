@@ -1,14 +1,16 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Masthead } from "./Masthead";
 import type { Route } from "../lib/route";
+import { closeOpenModal } from "../lib/dialogManager";
+import type { MachineSpecs } from "../types/handwritten";
 
-function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live") {
+function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live", specs: MachineSpecs | null = null) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <Masthead route={route} liveStatus={liveStatus} />
+      <Masthead route={route} liveStatus={liveStatus} specs={specs} />
     </QueryClientProvider>,
   );
 }
@@ -19,6 +21,9 @@ function clearInjectedMetas() {
 
 afterEach(() => {
   clearInjectedMetas();
+  // See EventLogColumn.test.tsx's own comment on why this is required:
+  // dialogManager's open/close state outlives `render()`/unmount.
+  closeOpenModal({ restore: false });
 });
 
 describe("Masthead", () => {
@@ -97,6 +102,76 @@ describe("Masthead", () => {
   it("shows it again when the stream drops, where a manual retry actually helps", () => {
     const { container } = renderMasthead({ kind: "fleet" } as Route, "reconnecting");
     expect(container.querySelector(".masthead__refresh")).toBeTruthy();
+  });
+});
+
+describe("Masthead — about modal (#1640)", () => {
+  function injectVersionMetas() {
+    const meta1 = document.createElement("meta");
+    meta1.name = "darkmux-version";
+    meta1.content = "2.7.0 (abc1234)";
+    document.head.appendChild(meta1);
+    const meta2 = document.createElement("meta");
+    meta2.name = "darkmux-flow-schema";
+    meta2.content = "1.16";
+    document.head.appendChild(meta2);
+  }
+
+  it("#verbadge is a real data-act=\"about\" button when it has content, and opens #imodalbg", () => {
+    injectVersionMetas();
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    renderMasthead({ kind: "fleet" });
+    const verbadge = document.getElementById("verbadge")!;
+    expect(verbadge.tagName).toBe("BUTTON");
+    expect(verbadge.getAttribute("data-act")).toBe("about");
+
+    expect(document.getElementById("imodalbg")!.style.display).toBe("none");
+    fireEvent.click(verbadge);
+    expect(document.getElementById("imodalbg")!.style.display).toBe("flex");
+    expect(screen.getByText("about · darkmux")).toBeInTheDocument();
+    expect(screen.getByText("2.7.0 (abc1234)")).toBeInTheDocument();
+    expect(screen.getByText("1.16")).toBeInTheDocument();
+    // The four external links legacy's modal footer carries — scoped to the
+    // dialog body since the masthead's OWN topnav also has links with these
+    // same accessible names.
+    const dialogLinks = within(document.getElementById("infobody")!);
+    for (const label of ["github", "guide", "articles", "home"]) {
+      expect(dialogLinks.getByRole("link", { name: label })).toBeInTheDocument();
+    }
+    vi.unstubAllGlobals();
+  });
+
+  it("#verbadge stays a non-interactive span (no about trigger) when empty — matching legacy's if(vb&&verMeta) gate", () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    renderMasthead({ kind: "fleet" });
+    const verbadge = document.getElementById("verbadge")!;
+    expect(verbadge.tagName).toBe("SPAN");
+    expect(verbadge.getAttribute("data-act")).toBeNull();
+    vi.unstubAllGlobals();
+  });
+
+  it("shows the machine/hardware rows on a live route when specs are available, and omits them on a replay", () => {
+    injectVersionMetas();
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const specs = {
+      darkmux_version: "2.7.0",
+      flow_schema_version: "1.16",
+      machine_id: "MacBook-Pro",
+      os: "macOS",
+      ram_total_bytes: 137438953472, // 128 GiB
+      ram_free_for_ai_bytes: null,
+      cpu_brand: "Apple M5 Max",
+      loaded_models: [],
+      lms_unreachable: false,
+      utility_model: null,
+      redis_url_redacted: null,
+      generated_at_ms: 0,
+    };
+    renderMasthead({ kind: "fleet" }, "live", specs);
+    fireEvent.click(document.getElementById("verbadge")!);
+    expect(screen.getByText("MacBook-Pro")).toBeInTheDocument();
+    expect(screen.getByText(/Apple M5 Max/)).toBeInTheDocument();
+    vi.unstubAllGlobals();
   });
 });
 

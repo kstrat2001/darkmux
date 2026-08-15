@@ -1,36 +1,22 @@
-import { useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type { FlowRecord } from "../types/handwritten";
 import { recKey } from "../lib/flow";
 import { LIVE_WINDOW_MS } from "../lib/flow";
 import { clk } from "../lib/format";
 import { RecordView } from "./RecordView";
-
-/** `activityOf()` — viewer.html:1014-1038, the subset this column's "model
- * only" quick filter and row tags need (reasoning/tool-call/turn/dispatch
- * lifecycle/telemetry). Not the full mapping (session end, machine
- * online/offline aren't reachable from a live-window record set this
- * column ever renders) — extend if a future consumer needs those labels. */
-function activityOf(r: FlowRecord): string {
-  const a = r.action || "";
-  if (a === "dispatch.reasoning") return "reasoning";
-  if (a === "dispatch.tool") return "tool call";
-  if (a === "dispatch.turn") return "turn";
-  if (a === "dispatch.turn.heartbeat") return "heartbeat";
-  if (a === "dispatch.start" || a === "dispatch start") return "dispatch start";
-  if (a === "dispatch.complete" || a === "dispatch complete") return "dispatch end";
-  if (a === "dispatch.error" || a === "dispatch error") return "dispatch error";
-  if (a === "tier-decision") return "routing";
-  if (a === "dispatch.compaction" || r.source === "compaction") return "compaction";
-  if (r.category === "telemetry") return r.source || "telemetry";
-  return a || "other";
-}
-
-/** `ACT_ICON`'s "model only" subset — viewer.html:861's `onlymodel` quick
- * filter (`onlyModelActivity()`), reproduced as a fixed set rather than the
- * full checkbox-per-facet filter modal (`#modalbg`/`#filterbody`,
- * viewer.html:857-863) — see this file's module doc for why the modal
- * itself is a named follow-up, not reproduced here. */
-const MODEL_ACTIVITIES = new Set(["reasoning", "tool call", "turn"]);
+import {
+  absorbNewFacetValues,
+  activityOf,
+  computeFacets,
+  createFacetSeen,
+  defaultFilterState,
+  matchesFilters,
+  type Facets,
+  type FacetSeen,
+  type FilterState,
+} from "../lib/eventFilters";
+import { FiltersDialog, onlyModelFacet } from "./FiltersDialog";
+import { openModalEl } from "../lib/dialogManager";
 
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
  * newest 50, newest-first. */
@@ -59,9 +45,9 @@ function onActivateKeyDown(onActivate: () => void) {
 
 /**
  * The event-log column (`.log`, viewer.html:829-849) — the per-record
- * stream, its search box + "model only" quick filter, the follow-latest
- * toggle, the drag-to-resize `.split` handle, and the `#detail`
- * selected-event panel. Rendered by `App.tsx` only when
+ * stream, its search box + the full checkbox-per-facet filters modal, the
+ * follow-latest toggle, the drag-to-resize `.split` handle, and the
+ * `#detail` selected-event panel. Rendered by `App.tsx` only when
  * `lib/route.ts`'s `showsEventLog(route)` is true (fleet / a session
  * drill-in / a bare-date playback / the mission-redirect fallback — see
  * that function's own doc for the verified visibility rule, which corrects
@@ -111,31 +97,16 @@ function onActivateKeyDown(onActivate: () => void) {
  * flex item doesn't participate in flex layout, so `.app-shell__stage`'s
  * `flex:1` expands on its own — no separate CSS class needed on the row).
  *
- * **The filter MODAL is a named, deliberate cut, not a half-build.**
- * `MODEL_ACTIVITIES` above reproduces exactly the modal footer's one
- * always-available quick action ("model only"); the full category/tier/
- * source/activity checkbox grid is a real follow-up (`.fbtn` here toggles
- * the quick filter directly instead of opening a modal with checkboxes).
- *
- * **(Mobile fix pass) `#fbtn` no longer renders legacy's funnel glyph.**
- * Legacy's `ICON.filter` is a real funnel SVG, and its own `title`/
- * `aria-label` literally say "filters" — an honest name for a control that
- * opens the full modal. This button does something narrower (a one-shot
- * "model activity only" toggle), and the `title`/`aria-label` text already
- * said so — but `title` is a HOVER affordance, invisible on a phone with no
- * mouse. The operator tapped it expecting the modal anyway: the glyph was
- * the only thing a touch user actually sees before tapping, and an
- * ambiguous icon in the funnel's old visual slot still reads as "open
- * filters" regardless of what the hidden title says. Fixed by replacing the
- * glyph with a real VISIBLE label ("MODEL") — no hover required to know
- * what tapping it does — rather than reproducing the funnel shape (which
- * would keep implying the modal) or any other icon that still needs a
- * tooltip to explain itself. `title`/`aria-label` are unchanged and still
- * carry the fuller sentence for pointer/screen-reader users. Untested by
- * every parity golden (`extractLensText` only reads `#topbar`/`#crumb`/
- * `#meta`/`#logscope`/`#stage` — `.eventlog__head`'s buttons are outside
- * all five regions), so this is a zero-golden-risk change; verified no
- * golden references either the old glyph or "MODEL".
+ * **The filter MODAL (#1640) — no longer a cut.** `#fbtn`/`data-act="filters"`
+ * now opens the real checkbox-per-facet modal (`FiltersDialog.tsx`,
+ * `#modalbg`) — matching legacy's own trigger exactly (viewer.html:840,
+ * `data-act="filters"`) — rather than the narrower "model activity only"
+ * boolean toggle this button stood in for previously (see git history for
+ * that interim shape; superseded now that the shared dialog/focus machinery
+ * exists to hold the real thing). The former glyph-vs-label mobile-UX note
+ * that lived here no longer applies: the button's own visible label is now
+ * literally "filters", matching its `title`/`aria-label`, so there is no
+ * hover-only sentence left to disagree with a touch user's expectation.
  */
 export function EventLogColumn({
   records,
@@ -160,8 +131,35 @@ export function EventLogColumn({
    *  extraction matches legacy's. See App's `routeChrome` note. */
   scopeLabel: string;
 }) {
-  const [query, setQuery] = useState("");
-  const [modelOnly, setModelOnly] = useState(false);
+  // The full facet-filter model (activity/category/tier/telemetry-source +
+  // free-text search) — `FiltersDialog` renders the checkbox grid for it,
+  // this column applies it to `records`. Facets are DERIVED from `records`
+  // every render (`computeFacets`, matching legacy's own `recompute()`).
+  //
+  // `filters` starts as `defaultFilterState` over WHATEVER facets exist at
+  // mount — usually none, since `records` is TanStack Query data and this
+  // component mounts before the fetch resolves. That is fine PROVIDED every
+  // facet value that shows up afterward gets absorbed into the active
+  // filter Sets, which is exactly `absorbNewFacetValues`'s job (viewer.html's
+  // `absorbNewFilterValues()` + its `SEEN` ledger — see `eventFilters.ts`'s
+  // own doc for the full mechanism and why a ONE-TIME reseed-at-first-
+  // population isn't enough on its own: a live-streamed record can
+  // introduce a brand-new activity/category/tier/source value at ANY point
+  // after the first population too, and that value needs absorbing just as
+  // much as the initial batch does). Caught two ways in
+  // `tests/parity/next-parity-live.spec.ts`'s SSE record-count assertion: a
+  // first draft (seed-once-at-mount) got stuck at a permanent 0 because
+  // `records` starts empty; a second draft (reseed once, the first time
+  // `facets` has any content) fixed the baseline count but then silently
+  // dropped the live-streamed test record itself, because ITS activity
+  // (`"note"`) was a facet value that had never been seen before and the
+  // one-shot reseed had already run.
+  const facets = useMemo(() => computeFacets(records), [records]);
+  const [filters, setFilters] = useState<FilterState>(() => defaultFilterState(facets));
+  const seenRef = useRef<FacetSeen>(createFacetSeen());
+  useEffect(() => {
+    setFilters((f) => absorbNewFacetValues(f, facets, seenRef.current));
+  }, [facets]);
   const [follow, setFollow] = useState(true);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [detailPct, setDetailPct] = useState(DEFAULT_DETAIL_PCT);
@@ -169,14 +167,25 @@ export function EventLogColumn({
   const columnRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ startY: number; startPct: number } | null>(null);
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return records.filter((r) => {
-      if (modelOnly && !MODEL_ACTIVITIES.has(activityOf(r))) return false;
-      if (q && !JSON.stringify(r).toLowerCase().includes(q)) return false;
-      return true;
+  const filtered = useMemo(() => records.filter((r) => matchesFilters(r, filters)), [records, filters]);
+
+  function setQuery(q: string) {
+    setFilters((f) => ({ ...f, q }));
+  }
+  function toggleFacet(key: keyof Facets, value: string) {
+    setFilters((f) => {
+      const next = new Set(f[key]);
+      if (next.has(value)) next.delete(value);
+      else next.add(value);
+      return { ...f, [key]: next };
     });
-  }, [records, query, modelOnly]);
+  }
+  function onlyModel() {
+    setFilters((f) => ({ ...f, act: onlyModelFacet(facets) }));
+  }
+  function clearAllFilters() {
+    setFilters(defaultFilterState(facets));
+  }
 
   const capped = filtered.length > LOG_CAP;
   const visibleRecs = useMemo(() => filtered.slice(-LOG_CAP).reverse(), [filtered]);
@@ -221,7 +230,7 @@ export function EventLogColumn({
     e.currentTarget.releasePointerCapture(e.pointerId);
   }
 
-  const q = query.length > 0;
+  const q = filters.q.length > 0;
   const qcountText = q
     ? filtered.length
       ? `${filtered.length} match${filtered.length === 1 ? "" : "es"}${capped ? ` · ${LOG_CAP} shown` : ""}`
@@ -295,14 +304,14 @@ export function EventLogColumn({
               </button>
               <button
                 type="button"
-                className={`eventlog__fbtn${modelOnly ? " on" : ""}`}
+                className="eventlog__fbtn"
                 id="fbtn"
-                title={modelOnly ? "showing model activity only" : "show only reasoning, tool calls, and turns"}
-                aria-label={modelOnly ? "showing model activity only" : "show only reasoning, tool calls, and turns"}
-                aria-pressed={modelOnly}
-                onClick={() => setModelOnly((v) => !v)}
+                data-act="filters"
+                title="filters"
+                aria-label="filters"
+                onClick={() => openModalEl("modalbg")}
               >
-                MODEL
+                filters
               </button>
             </span>
           </h3>
@@ -318,10 +327,10 @@ export function EventLogColumn({
                 autoComplete="off"
                 spellCheck={false}
                 aria-label="search events"
-                value={query}
+                value={filters.q}
                 onChange={(e) => setQuery(e.target.value)}
               />
-              {query ? (
+              {filters.q ? (
                 <button
                   className="eventlog__sclear"
                   id="sclear"
@@ -366,13 +375,26 @@ export function EventLogColumn({
                 ? `couldn't load events${error.status !== null ? ` (HTTP ${error.status})` : ""}: ${error.message}`
                 : loading
                   ? "loading…"
-                  : query
-                    ? "no events match your search"
+                  : // (broadened from "no events match your search") A
+                    // filtered-to-empty result can now come from an
+                    // unchecked facet, not just the text search — the two
+                    // are indistinguishable from here, so the message
+                    // covers both honestly rather than naming only search.
+                    records.length > 0
+                    ? "no events match your filters"
                     : "no events yet"}
             </div>
           )}
         </div>
       </div>
+      <FiltersDialog
+        facets={facets}
+        filters={filters}
+        onToggle={toggleFacet}
+        onSetQuery={setQuery}
+        onOnlyModel={onlyModel}
+        onClearAll={clearAllFilters}
+      />
     </div>
   );
 }

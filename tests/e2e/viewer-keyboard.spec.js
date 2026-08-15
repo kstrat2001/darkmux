@@ -26,7 +26,21 @@ const openCount = (page) =>
     })
   );
 
-// (port gap, reported not papered over — applies to every test below)
+// (#1640, resolution) The port gap this comment block originally documented
+// is closed — `ui/src/lib/dialogManager.ts` + `ui/src/components/Dialog.tsx`
+// (+ `FiltersDialog.tsx`/`NotesDialog.tsx`/`AboutDialog.tsx`) now implement
+// exactly the machinery described below (`openModalEl`/`closeOpenModal`/
+// `restoreModalFocus`/`MODAL_IDS`, Tab-trap, single-Escape-closes-topmost,
+// focus-restore), and all four tests below are un-fixme'd and passing
+// against the real dialogs. The paragraph is kept verbatim below as the
+// historical record of what the fixme'd state looked like and why these
+// tests are shaped the way they are — including one deliberate, documented
+// deviation: `openModalEl` is exposed as `window.openModalEl` (see
+// `dialogManager.ts`'s own module doc) specifically so the third test's
+// approach — described two paragraphs down — still works, even though this
+// port otherwise avoids page globals by design.
+//
+// (port gap, as originally reported — kept verbatim below)
 // All four tests in this file exercise the shared modal focus-trap/
 // Escape/restore-focus machinery legacy built around `#modalbg`/
 // `#nmodalbg`/`#imodalbg` (`openModalEl`/`closeOpenModal`/`restoreModalFocus`,
@@ -59,7 +73,7 @@ const openCount = (page) =>
 // — these tests double as an executable spec for THAT future work, not
 // just a regression gate for behavior already shipped.
 
-test.fixme('Tab cannot walk out of an open dialog', async ({ page }) => {
+test('Tab cannot walk out of an open dialog', async ({ page }) => {
   // The overlays are opaque `position:fixed;inset:0`, but nothing kept focus
   // inside. 31 Tab presses from an open Filters landed on the page header link
   // — visually buried under the backdrop, so a keyboard user is operating
@@ -79,7 +93,7 @@ test.fixme('Tab cannot walk out of an open dialog', async ({ page }) => {
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test.fixme('Shift+Tab wraps backwards instead of escaping', async ({ page }) => {
+test('Shift+Tab wraps backwards instead of escaping', async ({ page }) => {
   const errors = await boot(page);
   await page.locator('[data-act="filters"]').first().click();
   await expect(page.locator('#modalbg')).toBeVisible();
@@ -95,7 +109,7 @@ test.fixme('Shift+Tab wraps backwards instead of escaping', async ({ page }) => 
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test.fixme('one Escape closes the dialog the operator is actually looking at', async ({ page }) => {
+test('one Escape closes the dialog the operator is actually looking at', async ({ page }) => {
   // Two dialogs could be open at once, and `closeOpenModal` walks a FIXED list
   // closing the first one found — not the topmost. With About over Filters, one
   // Escape closed Filters (invisible, underneath) while About stayed covering
@@ -133,7 +147,7 @@ test.fixme('one Escape closes the dialog the operator is actually looking at', a
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test.fixme('focus returns to the control that opened the dialog', async ({ page }) => {
+test('focus returns to the control that opened the dialog', async ({ page }) => {
   // Escape / ✕ / backdrop-click all restore focus. Without it a keyboard user
   // is dropped at the top of the document and has to tab back to where they
   // were, every time.

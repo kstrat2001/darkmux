@@ -254,10 +254,18 @@ body {
    reaches a golden (`tests/parity/lib/extract-lens.js`'s
    `extractTopbarText`). */
 .masthead__ver {
+  /* (#1640) Reset the UA `<button>` defaults — this renders as a `<button>`
+     now (the about-modal trigger) whenever it has content, and as a bare
+     `<span>` when empty (see this rule's own doc above); both must look
+     identical to the pre-#1640 always-`<span>` chip. */
+  background: none;
+  border: 0;
+  padding: 0;
   font: 11px/1 ui-monospace, SFMono-Regular, monospace;
   color: var(--dim);
   letter-spacing: 0.02em;
   white-space: nowrap;
+  cursor: pointer;
 }
 /* (#1801) The static build's inert stand-in for `.catalog-toggle` — same
    box, no `cursor:pointer`/hover treatment, because it isn't a button
@@ -1543,13 +1551,6 @@ body {
 .hybnote .hybpre {
   color: var(--fg);
   font-weight: 700;
-}
-/* "(older notes exist)" — a plain marker, not a control (the notes-history
-   modal it would open isn't ported yet; see FleetLens.tsx's own comment on
-   `hybmore` for why this deliberately doesn't look clickable). Dimmed below
-   the note text it trails so it reads as a footnote, not a second sentence. */
-.hybmore {
-  color: var(--dim);
 }
 .hybts {
   color: var(--dim);
@@ -2991,4 +2992,151 @@ body {
   margin-top: 3px;
   /* Labels are already uppercased directly in `sessionRun.ts` — no
      text-transform here, same reasoning as `.session-run__header` above. */
+}
+
+/* ── Modal dialogs (#1640) — Filters/Notes/About ─────────────────────────
+   viewer.html's `.modalbg`/`.modal`/`.mhd`/`.mx`/`.fgroup`/`.mft`/`.nmodal`/
+   `.rrdetail`/`.kv` block (viewer.html:649-663, 574, 510-513), ported under
+   fresh `.dialog*` BEM names — the port is free to restyle (per the packet
+   brief: "visual styling may differ, text content must match"); only the
+   element `id`s (`#modalbg`/`#nmodalbg`/`#imodalbg`) and `data-act` hooks
+   are required to match legacy/the e2e specs, not the class names. See
+   `Dialog.tsx` for the shared shell these classes style. */
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  z-index: 200;
+  align-items: center;
+  justify-content: center;
+}
+.dialog {
+  width: 380px;
+  max-width: 92vw;
+  max-height: 84vh;
+  overflow: auto;
+  background: #131826;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+}
+.dialog--wide {
+  width: 540px;
+}
+.dialog__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  font: 600 13px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.dialog__close {
+  background: none;
+  border: 0;
+  color: var(--dim);
+  font-size: 16px;
+  cursor: pointer;
+}
+.dialog__fgroup {
+  margin-bottom: 14px;
+}
+.dialog__fgroup h4 {
+  margin: 0 0 8px;
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.dialog__fgroup label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 14px 7px 0;
+  font: 12px "JetBrains Mono", monospace;
+  color: var(--fg);
+  cursor: pointer;
+}
+.dialog__fgroup input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.dialog__filterfoot {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.dialog__filterfoot input {
+  flex: 1;
+  min-width: 120px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font: 14px "JetBrains Mono", monospace;
+}
+.dialog__clr {
+  background: var(--bg);
+  border: 1px solid var(--accent-dim);
+  color: var(--fg);
+  border-radius: 4px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font: 600 12px "JetBrains Mono", monospace;
+  white-space: nowrap;
+}
+.dialog__none {
+  color: var(--dim);
+  font: 12px "JetBrains Mono", monospace;
+}
+.dialog__nrow {
+  border-bottom: 1px solid var(--border);
+  padding: 9px 0;
+}
+.dialog__nrow:last-child {
+  border-bottom: none;
+}
+.dialog__nts {
+  font: 10px "JetBrains Mono", monospace;
+  color: var(--accent-dim);
+}
+.dialog__ntext {
+  font: 12px/1.5 "JetBrains Mono", monospace;
+  color: var(--fg);
+  margin-top: 3px;
+  white-space: pre-wrap;
+}
+.dialog__rrdetail {
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+.dialog__kv {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+}
+.dialog__kv b {
+  color: var(--fg);
+  font-weight: 600;
+  min-width: 92px;
+  flex-shrink: 0;
+}
+.dialog__kv span {
+  min-width: 0;
+  word-break: break-word;
+}
+.dialog__kv a {
+  color: var(--accent);
+  cursor: pointer;
+}
+.dialog__kv a:hover {
+  text-decoration: underline;
+}
+.dialog__rule {
+  border-top: 1px solid var(--border);
+  margin: 10px 0;
 }

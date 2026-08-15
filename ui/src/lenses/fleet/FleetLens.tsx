@@ -11,6 +11,8 @@ import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
+import { NotesDialog } from "../../components/NotesDialog";
+import { openModalEl } from "../../lib/dialogManager";
 import { buildFleetCard } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
@@ -78,10 +80,17 @@ function SavingsHero({
   tokens: t,
   note,
   liveMode,
+  data,
+  nowMs,
 }: {
   tokens: ReturnType<typeof tokensOffMeter>;
   note: ReturnType<typeof hybridNote>;
   liveMode: boolean;
+  /** The window this hero's numbers derive from — passed through to
+   *  `NotesDialog` so "history →" opens the SAME notes those numbers came
+   *  from, not a second, differently-scoped fetch. */
+  data: FlowRecord[];
+  nowMs: number;
 }) {
   const hours = Math.round(LIVE_WINDOW_MS / 3600000);
   return (
@@ -125,15 +134,21 @@ function SavingsHero({
       </div>
       <div className="hybnote">
         <b className="hybpre">Orchestrator note:</b> {note.text}
-        {/* (QA) Legacy's `history →` opens a notes modal that is NOT ported.
-            Rendering it as a pointer-cursor accent link on the default view
-            would be a trap control: it looks clickable, it is the README
-            screenshot, and nothing happens. Kept as a plain marker so the
-            information ("there are older notes") survives without promising
-            an interaction that does not exist. Restore the link when the
-            modal lands. */}
-        {note.hasHistory ? <span className="hybmore"> (older notes exist)</span> : null}
+        {/* (#1640) Legacy's real `<a class="hyblink" data-act="notes">history
+            →</a>` (viewer.html:1584) — restored now that `NotesDialog`
+            exists to open. Previously a plain, deliberately non-interactive
+            `<span>` (a trap control would have looked clickable and done
+            nothing, before the modal existed to back it). */}
+        {note.hasHistory ? (
+          <a className="hyblink" data-act="notes" href="#" onClick={(e) => {
+            e.preventDefault();
+            openModalEl("nmodalbg");
+          }}>
+            {" "}history →
+          </a>
+        ) : null}
       </div>
+      <NotesDialog data={data} nowMs={nowMs} />
     </div>
   );
 }
@@ -320,7 +335,7 @@ export function FleetLens({
 
   return (
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
-      <SavingsHero tokens={tokens} note={note} liveMode={liveMode} />
+      <SavingsHero tokens={tokens} note={note} liveMode={liveMode} data={flowWindow.data} nowMs={nowMs} />
       <FleetCoverageNotice historical={historical} />
       <div className="fleet">
         {cards.map((card) => (

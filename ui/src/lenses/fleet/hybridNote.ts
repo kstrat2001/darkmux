@@ -24,8 +24,13 @@ import type { TokensOffMeter } from "./savings";
 
 /** `orchNotes()` — viewer.html:1553-1554. Dashboard notes are MISSION-level
  * by definition (`!r.session_id`) — session-scoped notes are adjudication
- * trail, not hero material. */
-function orchNotes(data: FlowRecord[]): FlowRecord[] {
+ * trail, not hero material.
+ *
+ * Exported (not just used internally by `hybridNote` below) so
+ * `NotesDialog.tsx` — the notes-HISTORY modal `openNotes()` builds
+ * (viewer.html:1606-1610) — reads the SAME set rather than re-deriving it;
+ * `hybridNote`'s own `hasHistory` flag is `orchNotes(data).length > 0`. */
+export function orchNotes(data: FlowRecord[]): FlowRecord[] {
   return data
     .filter((r) => r.action === "note" && r.source === "orchestrator" && !r.session_id)
     .sort((a, b) => T(a.ts) - T(b.ts));
