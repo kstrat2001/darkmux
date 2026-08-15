@@ -65,7 +65,7 @@
 use crate::gestalt_host::lms_host::{run_bounded, StdoutMode};
 use crate::gestalt_host::ArchFactsReader;
 use darkmux_gestalt::{
-    ArchEstimator, ArchFacts, CatalogFact, Deadline, FootprintEstimator,
+    ArchEstimator, ArchFacts, CatalogFact, Deadline, FootprintEstimator, V1Estimator,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -74,12 +74,63 @@ use std::time::Duration;
 
 /// Ledger payload schema (plain semver on the DATA shape, minor-bump +
 /// lenient-on-read like the other darkmux data shapes — contract 5).
-pub const LEDGER_SCHEMA_VERSION: &str = "1.0";
+///
+/// 1.0 → 1.1 (#1819): additive fields only (`ModelRow::potential_source`,
+/// `MachineTotals::estimated_models`) — a 1.0 reader tolerates the payload
+/// unchanged (contract 5's "minor = additive, safe to ignore").
+pub const LEDGER_SCHEMA_VERSION: &str = "1.1";
 
 /// v1 KV-cache dtype width: 2 bytes/element (fp16 cache, the MLX default).
 /// Deliberately a named constant, not a guess from weight quantization —
 /// see the module docs (#1286 wiring note; refined later by #1257).
 pub const KV_BYTES_PER_ELEMENT_V1: u32 = 2;
+
+/// #1819 fallback KV-cache byte rate per context token — used ONLY when a
+/// resident's `config.json` arch facts are unreadable (today, this is
+/// always a GGUF download: the architecture lives inside the binary, not a
+/// sidecar `config.json` — reading it directly is a follow-up, not built
+/// here) but the model DOES have a catalog `size_bytes`. Feeds
+/// [`V1Estimator`] as the [`ArchWithSizeFallback`]'s second stage.
+///
+/// **Derivation — traceable, not invented, and traced to the exact model
+/// this issue is ABOUT.** `microsoft/phi-4` (the GGUF resident #1819's own
+/// issue body names) has an MLX sibling, `mlx-community/phi-4-8bit`, which
+/// DOES ship a `config.json` — and the same architecture is published
+/// verbatim by Microsoft (`huggingface.co/microsoft/phi-4/raw/main/
+/// config.json`, fetched 2026-08-15): `num_hidden_layers: 40,
+/// num_attention_heads: 40, num_key_value_heads: 10, hidden_size: 5120`
+/// (`model_type: "phi3"` — Phi-4 reuses the Phi-3 architecture class; no
+/// `sliding_window`, no `rope_scaling` — a homogeneous DENSE decoder, every
+/// layer full-attention, GQA 40→10). `head_dim = hidden_size /
+/// num_attention_heads = 5120 / 40 = 128`. So:
+/// `2 (K and V) × 40 layers × 10 kv_heads × 128 head_dim × 2 bytes fp16 =
+/// 204_800 bytes/token` (204.8 KB/token, decimal). See
+/// `fallback_kv_constant_matches_phi_4s_own_published_architecture` below,
+/// which ties this literal to that same arithmetic so the two can never
+/// drift apart silently.
+///
+/// **This is deliberately NOT the crate's #1286 devstral-24B referent**
+/// (163_840 B/token) that an earlier draft of this constant used: devstral
+/// undershoots phi-4 itself by ~20%, which would have meant the fallback
+/// underprices the exact resident this issue traces, on the very first
+/// machine it runs on — the opposite of "conservative." Deriving from
+/// phi-4's own real numbers instead removes that gap for the model that
+/// motivated the feature, though it remains a REFERENT, not a proven
+/// universal ceiling — a denser architecture than phi-4's could still
+/// exceed it (see the dense-attention caveat below, which is about a
+/// different axis: hybrid-attention UNDER-counting, not dense-model
+/// variance).
+///
+/// **The dense-attention assumption is deliberate and named (#1819 decision
+/// 3).** A hybrid linear-attention model (the Qwen 3.5/3.6 generation,
+/// #1286) holds a KV cache on only a small fraction of its layers — as few
+/// as 1 in 4 — so pricing it at a dense-attention rate OVERSTATES its true
+/// KV cost, sometimes by 4× or more. That overstatement is the intended
+/// failure direction: this constant only fires when the real architecture
+/// is unreadable, and reserving MORE memory than a hybrid model actually
+/// needs is the safe mistake. Assuming hybrid and underpricing a genuinely
+/// dense GGUF model would be the unsafe one.
+pub const V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN: u64 = 204_800;
 
 /// Bound on each `lms` metadata call (`ps --json` / `ls --json`). Generous
 /// for a healthy CLI; a wedged one is killed rather than hanging the ledger
@@ -187,6 +238,25 @@ pub enum LimitSource {
     Unknown,
 }
 
+/// Where a row's `potential_bytes` came from (#1819) — the provenance field
+/// that makes a labeled estimate distinguishable from a measurement
+/// everywhere the potential figure appears (row chip, kv line, warnings).
+/// Absent (not serialized) on a [`ModelRow`] with no potential at all —
+/// see [`ModelRow::potential_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PotentialSource {
+    /// Priced from the model's own `config.json` architecture facts
+    /// ([`ArchEstimator`]) — a measurement, not a guess.
+    Arch,
+    /// Arch facts were unreadable; priced from catalog size + the
+    /// conservative dense-attention KV constant instead ([`V1Estimator`]
+    /// fallback, #1819). A labeled conservative estimate, never a silent
+    /// one — see [`V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN`] for the assumption
+    /// this carries.
+    Estimated,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolSnapshot {
     pub capacity_bytes: u64,
@@ -223,10 +293,18 @@ pub struct ModelRow {
     pub kv_per_token_bytes: Option<u64>,
     /// `kv_per_token × loaded_ctx`.
     pub kv_bytes_at_ctx: Option<u64>,
-    /// weights + KV@ctx + transient margin ([`ArchEstimator`]); `None` =
-    /// unpriceable (missing arch facts or catalog size — the documented
+    /// weights + KV@ctx + transient margin ([`ArchEstimator`]), OR weights +
+    /// the #1819 size-based fallback estimate ([`V1Estimator`] via
+    /// [`ArchWithSizeFallback`]); `None` = genuinely unpriceable (no
+    /// readable arch facts AND no catalog size either — the documented
     /// unknowable path, never guessed).
     pub potential_bytes: Option<u64>,
+    /// Which estimator answered — `None` only when `potential_bytes` is
+    /// also `None` (nothing priced it at all). Not serialized when absent
+    /// (`skip_serializing_if`), matching this file's other optional-field
+    /// convention (see `shrink_hint`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub potential_source: Option<PotentialSource>,
     /// Attributed current footprint — `None` under
     /// [`Attribution::Unavailable`].
     pub current_bytes: Option<u64>,
@@ -238,11 +316,33 @@ pub struct ModelRow {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineTotals {
-    /// Σ potential over PRICEABLE residents. When `unpriced_models > 0`
-    /// this UNDERCOUNTS — a warning names the gap.
+    /// Σ potential over PRICEABLE residents (arch-priced AND estimated —
+    /// see [`Self::estimated_models`]). When `unpriced_models > 0` this
+    /// UNDERCOUNTS — a warning names the gap.
     pub potential_bytes: u64,
-    /// Residents whose potential is unknowable (counted as 0 above).
+    /// Residents whose potential is genuinely unknowable — no readable arch
+    /// facts AND no catalog size either (counted as 0 above). Distinct from
+    /// [`Self::estimated_models`]: an estimated resident IS counted in
+    /// `potential_bytes`, just via the #1819 fallback rather than a
+    /// measurement.
     pub unpriced_models: u32,
+    /// Residents priced by the #1819 size-based fallback rather than
+    /// measured arch facts (#1819 decision 2 — provenance is disclosed
+    /// wherever the verdict appears). These ARE counted in
+    /// `potential_bytes` and do NOT block Green (decision 1) — only
+    /// `unpriced_models` does that.
+    ///
+    /// `#[serde(default)]` (unlike its sibling fields above, which predate
+    /// #1819 and were always present): contract 5 requires this schema stay
+    /// lenient-on-read, and a NEW non-`Option` field breaks that in the
+    /// READ direction without it — a 1.1 binary parsing a 1.0 peer's ledger
+    /// (a real path on a heterogeneous fleet, `main.rs::cmd_machine_resources`)
+    /// would otherwise hard-fail on the missing key and silently fall back to
+    /// raw-JSON dumping instead of the table. Confirmed absent-key
+    /// deserialization below (`estimated_models_defaults_to_zero_on_a_pre_
+    /// 1819_payload_missing_the_field`).
+    #[serde(default)]
+    pub estimated_models: u32,
     /// Total inference-worker footprint; `None` under
     /// [`Attribution::Unavailable`].
     pub current_bytes: Option<u64>,
@@ -305,6 +405,88 @@ pub struct LedgerInputs {
     pub warnings: Vec<String>,
 }
 
+// ── the estimator composition (#1819) ───────────────────────────────────
+
+/// Composes [`ArchEstimator`] (measured, from `config.json`) with
+/// [`V1Estimator`] (catalog size + the conservative dense-attention KV
+/// constant) as an HONEST fallback, never a silent one (#1819). Neither
+/// [`ArchEstimator`] nor [`V1Estimator`] is modified — this type composes
+/// the two existing `FootprintEstimator` implementations rather than
+/// growing a third estimation algorithm, per `darkmux-gestalt`'s own
+/// `ArchEstimator` doc, which names exactly this composition as the
+/// legitimate way to add a fallback ("a chain estimator trying Arch then
+/// V1 is a legitimate composition — if built, it gets its own tests — the
+/// fallback is then visible in the wiring, never implicit in the math").
+///
+/// Arch first because it is a MEASUREMENT — real per-model layer/head/dtype
+/// facts read off the model's own `config.json`. The V1 fallback only fires
+/// when those facts are unreadable — today, entirely the GGUF case (a
+/// download that carries its architecture inside the binary rather than a
+/// sidecar `config.json`; reading it directly is a named follow-up, not
+/// built here).
+///
+/// [`Self::estimate_with_source`] is the ONLY port this type exposes —
+/// there is no bare `FootprintEstimator::estimate_bytes` impl, because
+/// nothing in this module calls one and a private type gains no drop-in
+/// value from implementing a trait it has no consumer for; add it back if
+/// a real caller needs it.
+///
+/// An ESTIMATED row's `kv_per_token_bytes` field stays `None` (the flat V1
+/// rate is never decomposed into a per-token figure written back onto the
+/// row) — but the amber shrink-hint search (`hint_target_key`) does NOT
+/// therefore skip estimated rows: it reads the row's kv rate through
+/// [`effective_kv_rate`], which falls back to
+/// [`V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN`] for an estimated row — the SAME
+/// rate it was priced with — rather than treating it as un-shrinkable. An
+/// earlier draft left estimated rows out of shrink-hint targeting entirely,
+/// which could render the FALSE claim "no shrinkable context" when the
+/// estimated resident was in fact the only one with room to shrink;
+/// `effective_kv_rate` closes that gap.
+struct ArchWithSizeFallback {
+    arch: ArchEstimator,
+    fallback: V1Estimator,
+}
+
+impl ArchWithSizeFallback {
+    fn new(arch: BTreeMap<String, ArchFacts>) -> Self {
+        ArchWithSizeFallback {
+            arch: ArchEstimator::new(arch),
+            fallback: V1Estimator { kv_bytes_per_ctx_token: V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN },
+        }
+    }
+
+    /// Arch first (a measurement); V1 fallback second (a labeled estimate);
+    /// `None` when NEITHER can answer (no arch facts AND no catalog size —
+    /// genuinely unpriceable).
+    ///
+    /// The fallback arm adds [`darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES`]
+    /// on top of `V1Estimator`'s own `size + kv_rate×ctx` — the SAME
+    /// post-load-overhead margin [`ArchEstimator`] already includes. Without
+    /// it, an estimated row would be priced on a DIFFERENT accounting basis
+    /// than an arch-priced one (750 MB cheaper for identical weights/ctx),
+    /// which would make Green systematically easier to reach for an
+    /// estimated resident than a measured one — exactly the silent-optimism
+    /// this whole feature exists to refuse. Both arms now price on the same
+    /// basis; see `an_estimated_row_and_an_arch_priced_row_price_the_same_
+    /// weights_and_ctx_identically_up_to_the_kv_rate` below, which pins that
+    /// invariant directly.
+    fn estimate_with_source(
+        &self,
+        model_key: &str,
+        min_ctx: u32,
+        catalog: Option<&[CatalogFact]>,
+    ) -> Option<(u64, PotentialSource)> {
+        if let Some(bytes) = self.arch.estimate_bytes(model_key, min_ctx, catalog) {
+            return Some((bytes, PotentialSource::Arch));
+        }
+        self.fallback
+            .estimate_bytes(model_key, min_ctx, catalog)
+            .map(|bytes| {
+                (bytes + darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES, PotentialSource::Estimated)
+            })
+    }
+}
+
 // ── the pure core ────────────────────────────────────────────────────────
 
 /// Fold gathered inputs into the ledger. Pure — all I/O lives in
@@ -323,7 +505,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         mut warnings,
     } = inputs;
 
-    let estimator = ArchEstimator::new(arch.clone());
+    let estimator = ArchWithSizeFallback::new(arch.clone());
 
     // Per-model potential math.
     let mut rows: Vec<ModelRow> = residents
@@ -338,7 +520,11 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
             // ctx is u32 at the estimator port; clamp (a >4B-token ctx does
             // not exist in practice, but never wrap silently).
             let ctx32 = u32::try_from(r.loaded_ctx).unwrap_or(u32::MAX);
-            let potential_bytes = estimator.estimate_bytes(&r.model_key, ctx32, Some(&catalog));
+            let (potential_bytes, potential_source) =
+                match estimator.estimate_with_source(&r.model_key, ctx32, Some(&catalog)) {
+                    Some((bytes, source)) => (Some(bytes), Some(source)),
+                    None => (None, None),
+                };
             ModelRow {
                 identifier: r.identifier.clone(),
                 owner: if crate::swap::is_darkmux_owned(&r.identifier) {
@@ -352,6 +538,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
                 kv_per_token_bytes,
                 kv_bytes_at_ctx,
                 potential_bytes,
+                potential_source,
                 current_bytes: None, // attribution below
                 state: LedgerState::Unknown,
                 shrink_hint: None,
@@ -360,6 +547,9 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         .collect();
 
     let sum_potential: u64 = rows.iter().filter_map(|r| r.potential_bytes).sum();
+    // Genuinely unpriceable: neither arch facts NOR a catalog size could
+    // answer — `potential_bytes` itself is `None`. Distinct from an
+    // ESTIMATED row (below), which DOES have a `potential_bytes`.
     let unpriced: Vec<&str> = rows
         .iter()
         .filter(|r| r.potential_bytes.is_none())
@@ -373,6 +563,30 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         ));
     }
     let unpriced_models = unpriced.len() as u32;
+
+    // #1819: residents priced by the size-based FALLBACK rather than
+    // measured arch facts. Counted separately from `unpriced` (they DO
+    // contribute to `sum_potential`) and warned about separately, so the
+    // two failure modes ("we have no idea" vs "we have a labeled
+    // conservative guess") never read as the same thing.
+    let estimated: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.potential_source == Some(PotentialSource::Estimated))
+        .map(|r| r.model_key.as_str())
+        .collect();
+    if !estimated.is_empty() {
+        warnings.push(format!(
+            "{} resident model(s) priced by ESTIMATE, not measurement (no readable config.json — commonly a GGUF download): {} — potential assumes dense attention (every layer holds a KV cache) at {:.1} KB/token, which OVERSTATES hybrid-attention models",
+            estimated.len(),
+            estimated.join(", "),
+            // Decimal KB (÷1000, this crate's own `fmt_bytes` convention),
+            // ONE decimal — integer-dividing this away from the doc
+            // comment's own "204.8 KB/token" figure was a real
+            // Rust-vs-prose mismatch the #1819 review caught.
+            V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN as f64 / 1000.0,
+        ));
+    }
+    let estimated_models = estimated.len() as u32;
 
     // Current-footprint attribution (#1286: the degradation ladder is
     // documented in the output itself, never silently precise).
@@ -448,6 +662,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         machine: MachineTotals {
             potential_bytes: sum_potential,
             unpriced_models,
+            estimated_models,
             current_bytes: current_total,
             state: machine_state,
             shrink_hint: machine_shrink,
@@ -565,31 +780,46 @@ fn attribute_current(
     )
 }
 
+/// The kv-per-token rate a shrink-hint computation should charge a row —
+/// `kv_per_token_bytes` when it's a real measurement, or, for an ESTIMATED
+/// row (which never gets a `kv_per_token_bytes` written back — see
+/// [`ArchWithSizeFallback`]'s doc), the SAME
+/// [`V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN`] rate it was priced with. `0` for a
+/// genuinely unpriceable row (no rate exists to charge). Without this, an
+/// estimated resident could never be picked as a shrink target and — worse
+/// — a machine over the limit ONLY because of an estimated resident's ctx
+/// would render the false "no shrinkable context" line (#1819 review
+/// finding): the context is shrinkable, the code was just declining to
+/// price the saving with the rate it already used to price the commitment.
+fn effective_kv_rate(row: &ModelRow) -> u64 {
+    row.kv_per_token_bytes.unwrap_or_else(|| {
+        if row.potential_source == Some(PotentialSource::Estimated) {
+            V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN
+        } else {
+            0
+        }
+    })
+}
+
 /// Which model the amber shrink hint targets: the priceable resident whose
-/// ctx reduction saves the most per token (highest `kv_per_token` with
-/// shrinkable ctx), preferring one whose full reduction covers the
-/// overshoot alone.
+/// ctx reduction saves the most per token (highest effective kv rate — see
+/// [`effective_kv_rate`] — with shrinkable ctx), preferring one whose full
+/// reduction covers the overshoot alone.
 fn hint_target_key(rows: &[ModelRow], sum_potential: u64, limit: u64) -> Option<String> {
     let overshoot = sum_potential.saturating_sub(limit);
     let candidates: Vec<&ModelRow> = rows
         .iter()
-        .filter(|r| {
-            r.kv_per_token_bytes.unwrap_or(0) > 0 && r.loaded_ctx > SHRINK_CTX_FLOOR
-        })
+        .filter(|r| effective_kv_rate(r) > 0 && r.loaded_ctx > SHRINK_CTX_FLOOR)
         .collect();
     let covering = candidates
         .iter()
         .filter(|r| {
-            let kv = r.kv_per_token_bytes.unwrap_or(0);
+            let kv = effective_kv_rate(r);
             kv * (r.loaded_ctx - SHRINK_CTX_FLOOR) >= overshoot
         })
-        .max_by_key(|r| r.kv_per_token_bytes.unwrap_or(0));
+        .max_by_key(|r| effective_kv_rate(r));
     covering
-        .or_else(|| {
-            candidates.iter().max_by_key(|r| {
-                r.kv_per_token_bytes.unwrap_or(0) * (r.loaded_ctx - SHRINK_CTX_FLOOR)
-            })
-        })
+        .or_else(|| candidates.iter().max_by_key(|r| effective_kv_rate(r) * (r.loaded_ctx - SHRINK_CTX_FLOOR)))
         .map(|r| r.model_key.clone())
 }
 
@@ -610,8 +840,18 @@ fn shrink_hint(rows: &[ModelRow], sum_potential: u64, limit: u64, unpriced_model
         ),
         Some(key) => {
             let row = rows.iter().find(|r| r.model_key == key).expect("target from rows");
-            let kv = row.kv_per_token_bytes.unwrap_or(0).max(1);
+            let kv = effective_kv_rate(row).max(1);
             let max_saving = kv * (row.loaded_ctx - SHRINK_CTX_FLOOR);
+            let target_is_estimated = row.potential_source == Some(PotentialSource::Estimated);
+            let saving_note = if target_is_estimated {
+                // #1819: the saving itself was computed from the same
+                // conservative estimate that priced the row's commitment,
+                // not a measurement — say so right where the number is
+                // named, not just in a machine-level footnote.
+                " (estimated — computed from the same conservative KV assumption as the row's own potential)"
+            } else {
+                ""
+            };
             if max_saving >= overshoot {
                 let cut_tokens = overshoot.div_ceil(kv);
                 // Round the suggested ctx DOWN to a 4 K multiple (still ≥ the
@@ -620,7 +860,7 @@ fn shrink_hint(rows: &[ModelRow], sum_potential: u64, limit: u64, unpriced_model
                     .max(SHRINK_CTX_FLOOR);
                 let saved = kv * (row.loaded_ctx - new_ctx);
                 format!(
-                    "reload {} at ctx {} (now {}) — cuts {} of KV commitment; Σ potential then fits the limit at load time",
+                    "reload {} at ctx {} (now {}) — cuts {} of KV commitment{saving_note}; Σ potential then fits the limit at load time",
                     row.model_key,
                     new_ctx,
                     row.loaded_ctx,
@@ -628,7 +868,7 @@ fn shrink_hint(rows: &[ModelRow], sum_potential: u64, limit: u64, unpriced_model
                 )
             } else {
                 format!(
-                    "no single ctx reduction reaches green — largest single saving is {} at ctx {} ({}); shrink several contexts, unload a resident, or load a smaller quant",
+                    "no single ctx reduction reaches green — largest single saving is {} at ctx {} ({}){saving_note}; shrink several contexts, unload a resident, or load a smaller quant",
                     row.model_key,
                     SHRINK_CTX_FLOOR,
                     fmt_bytes(max_saving)
@@ -680,8 +920,11 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
 
     // Arch facts for each distinct resident model — located via the ls
     // entries' path fields (the #1290 reader), priced with the v1 fp16 KV
-    // width. An unreadable model simply stays out of the map (the
-    // estimator's unknowable path, warned about in compute_ledger).
+    // width. An unreadable model simply stays out of the map — NOT the
+    // unpriceable path since #1819: `compute_ledger`'s `ArchWithSizeFallback`
+    // then tries the size-based estimate before giving up, so an absence
+    // here means "estimated" for any model with a catalog size, and only
+    // "genuinely unpriceable" for one without.
     let reader = ArchFactsReader::from_ls_entries(&ls_rows);
     let mut arch: BTreeMap<String, ArchFacts> = BTreeMap::new();
     for r in &residents {
@@ -990,6 +1233,18 @@ pub fn render_human(ledger: &ModelLedger) -> String {
     }
     for m in &ledger.models {
         let ident = truncate_ident(&m.identifier, 46);
+        // #1819: an ESTIMATED row's state carries the disclosure right next
+        // to the figure it qualifies — provenance visible everywhere the
+        // verdict appears, not just in the warnings list at the foot. The
+        // POTENTIAL figure itself gets the same `~` prefix the UI's kv line
+        // uses (`modelKvLine`, `machineGauge.ts`) — the CAVEAT travels WITH
+        // the number so it survives a copy-paste out of this table, not
+        // just a separate column a reader could crop away.
+        let is_estimated = m.potential_source == Some(PotentialSource::Estimated);
+        let state_word =
+            if is_estimated { format!("{} (estimated)", m.state.as_str()) } else { m.state.as_str().to_string() };
+        let potential_word =
+            if is_estimated { format!("~{}", fmt_opt(m.potential_bytes)) } else { fmt_opt(m.potential_bytes) };
         out.push_str(&format!(
             "{:<46} {:<8} {:>8} {:>10} {:>10} {:>10} {:>10}  {}\n",
             ident,
@@ -1000,9 +1255,9 @@ pub fn render_human(ledger: &ModelLedger) -> String {
             m.loaded_ctx,
             fmt_opt(m.weights_bytes),
             fmt_opt(m.kv_bytes_at_ctx),
-            fmt_opt(m.potential_bytes),
+            potential_word,
             fmt_opt(m.current_bytes),
-            m.state.as_str(),
+            state_word,
         ));
         if let Some(h) = &m.shrink_hint {
             out.push_str(&format!("  ↳ {h}\n"));
@@ -1015,14 +1270,20 @@ pub fn render_human(ledger: &ModelLedger) -> String {
         }
         LimitSource::Unknown => "no budget and no readable pool".to_string(),
     };
+    // #1819: the machine-total parenthetical names BOTH gaps when both are
+    // present — "unpriced" (uncounted, undercounts the sum) and "estimated"
+    // (counted, but via a labeled guess) are different facts and must not
+    // collapse into one word.
+    let counts_paren = match (ledger.machine.unpriced_models, ledger.machine.estimated_models) {
+        (0, 0) => String::new(),
+        (u, 0) => format!(" (+{u} unpriced)"),
+        (0, e) => format!(" ({e} estimated)"),
+        (u, e) => format!(" (+{u} unpriced, {e} estimated)"),
+    };
     out.push_str(&format!(
         "\nmachine: potential {}{} · current {} · limit {} ({}) → {}\n",
         fmt_bytes(ledger.machine.potential_bytes),
-        if ledger.machine.unpriced_models > 0 {
-            format!(" (+{} unpriced)", ledger.machine.unpriced_models)
-        } else {
-            String::new()
-        },
+        counts_paren,
         fmt_opt(ledger.machine.current_bytes),
         fmt_opt(ledger.limit_bytes),
         limit_desc,
@@ -1631,5 +1892,313 @@ mod tests {
             lower.contains("unpriceable") && lower.contains("unknown"),
             "hint carries the undercount caveat: {hint}"
         );
+    }
+
+    // ── #1819 estimate-fallback tests ───────────────────────────────────
+
+    /// Ties the fallback constant to the arithmetic it claims to derive
+    /// from: `microsoft/phi-4`'s OWN published architecture (fetched from
+    /// `huggingface.co/microsoft/phi-4/raw/main/config.json`, 2026-08-15 —
+    /// `num_hidden_layers: 40, num_attention_heads: 40,
+    /// num_key_value_heads: 10, hidden_size: 5120` → `head_dim = 5120/40 =
+    /// 128`, a homogeneous dense decoder, no hybrid/sliding-window layers).
+    /// If either drifts, this fails — the derivation can never go silently
+    /// stale.
+    #[test]
+    fn fallback_kv_constant_matches_phi_4s_own_published_architecture() {
+        let phi4_arch = ArchFacts {
+            total_layers: 40,
+            full_attention_layers: 40, // dense: every layer is full-attention
+            kv_heads: 10,
+            head_dim: 128,
+            kv_bytes_per_element: 2, // fp16, the v1 default
+        };
+        assert_eq!(V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN, phi4_arch.kv_per_token());
+        assert_eq!(V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN, 204_800);
+    }
+
+    /// A resident with a catalog size but NO arch facts (the live #1819
+    /// trace: a GGUF download, no sidecar `config.json`) is priced by the
+    /// fallback, not left `None` — and the row says so via
+    /// `potential_source`. The fallback estimate carries the SAME
+    /// `DEFAULT_TRANSIENT_MARGIN_BYTES` post-load margin an arch-priced row
+    /// gets (#1819 review finding 1) — without it, an estimated row would
+    /// be priced on a cheaper basis than a measured one, letting Green come
+    /// easier for a guess than for a measurement.
+    #[test]
+    fn gguf_style_resident_falls_back_to_the_size_based_estimate() {
+        let mut inputs = base_inputs();
+        inputs
+            .catalog
+            .push(CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) });
+        inputs.residents.push(resident("microsoft/phi-4", "phi-4-gguf", 8_192));
+        // Deliberately NOT added to `inputs.arch` — this is the whole point.
+
+        let ledger = compute_ledger(inputs, 1);
+        let phi4 = ledger.models.iter().find(|m| m.model_key == "phi-4-gguf").unwrap();
+        let expected = 9_053_136_497
+            + V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN * 8_192
+            + darkmux_gestalt::DEFAULT_TRANSIENT_MARGIN_BYTES;
+        assert_eq!(phi4.potential_bytes, Some(expected));
+        assert_eq!(phi4.potential_source, Some(PotentialSource::Estimated));
+        // The row's own arch-derived fields stay honestly `None` — only the
+        // AGGREGATE potential was estimated, never a fabricated per-token
+        // breakdown.
+        assert!(phi4.kv_per_token_bytes.is_none());
+        assert!(phi4.kv_bytes_at_ctx.is_none());
+    }
+
+    /// #1819 review finding 1's own invariant, pinned directly: an
+    /// ESTIMATED row and an ARCH-priced row with IDENTICAL weights/ctx and
+    /// an identical kv rate must price identically up to that rate — i.e.
+    /// the two estimators sit on the same accounting basis (weights + kv +
+    /// the SAME transient margin), never a cheaper one for the guess.
+    #[test]
+    fn an_estimated_row_and_an_arch_priced_row_price_the_same_weights_and_ctx_identically_up_to_the_kv_rate(
+    ) {
+        let ctx = 8_192u64;
+        let size = 9_053_136_497u64;
+        // An arch-priced row whose kv_per_token happens to equal the
+        // fallback's own rate — so if the two estimators share a basis,
+        // their `potential_bytes` must be byte-for-byte identical.
+        let matching_arch = ArchFacts {
+            total_layers: 1,
+            full_attention_layers: 1,
+            kv_heads: 1,
+            head_dim: (V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN / (2 * 2)) as u32, // 2×heads×dim×elem = rate
+            kv_bytes_per_element: 2,
+        };
+        assert_eq!(matching_arch.kv_per_token(), V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN, "fixture sanity");
+
+        let mut arch_inputs = base_inputs();
+        arch_inputs.residents = vec![resident("a", "same-key", ctx)];
+        arch_inputs.catalog = vec![CatalogFact { model_key: "same-key".into(), size_bytes: Some(size) }];
+        arch_inputs.arch = BTreeMap::from([("same-key".to_string(), matching_arch)]);
+        let arch_ledger = compute_ledger(arch_inputs, 1);
+        let arch_row = &arch_ledger.models[0];
+        assert_eq!(arch_row.potential_source, Some(PotentialSource::Arch));
+
+        let mut estimated_inputs = base_inputs();
+        estimated_inputs.residents = vec![resident("b", "same-key", ctx)];
+        estimated_inputs.catalog = vec![CatalogFact { model_key: "same-key".into(), size_bytes: Some(size) }];
+        // No arch entry ⇒ falls to the estimate.
+        let estimated_ledger = compute_ledger(estimated_inputs, 1);
+        let estimated_row = &estimated_ledger.models[0];
+        assert_eq!(estimated_row.potential_source, Some(PotentialSource::Estimated));
+
+        assert_eq!(
+            arch_row.potential_bytes, estimated_row.potential_bytes,
+            "same weights/ctx/kv-rate must price identically regardless of which estimator answered"
+        );
+    }
+
+    /// The two normally-priced rows in `base_inputs()` both came from real
+    /// arch facts — `potential_source` says `Arch`, not `Estimated`.
+    #[test]
+    fn arch_priced_rows_report_the_arch_source() {
+        let ledger = compute_ledger(base_inputs(), 1);
+        for m in &ledger.models {
+            assert_eq!(
+                m.potential_source,
+                Some(PotentialSource::Arch),
+                "{} should be arch-priced, not estimated",
+                m.model_key
+            );
+        }
+        // Pin the WIRE string too (not just the Rust enum) — the UI's
+        // `MachineResourcesModel.potential_source` union names `"arch"`
+        // literally, and a variant rename here would slip past an
+        // enum-only assertion.
+        let v = serde_json::to_value(&ledger).expect("serializes");
+        assert_eq!(v["models"][0]["potential_source"], "arch");
+    }
+
+    /// #1819 decision 2: `estimated_models` counts separately from
+    /// `unpriced_models` — an estimated row IS priced (it contributes to
+    /// `sum_potential`), so it must never inflate the undercount counter.
+    /// A dedicated warning names the estimated resident(s) too.
+    #[test]
+    fn estimated_models_counted_separately_from_unpriced_with_its_own_warning() {
+        let mut inputs = base_inputs();
+        inputs
+            .catalog
+            .push(CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) });
+        inputs.residents.push(resident("microsoft/phi-4", "phi-4-gguf", 8_192));
+
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.estimated_models, 1);
+        assert_eq!(ledger.machine.unpriced_models, 0);
+        assert!(
+            ledger.warnings.iter().any(|w| w.contains("ESTIMATE") && w.contains("phi-4-gguf")),
+            "a dedicated estimate warning names the resident: {:?}",
+            ledger.warnings
+        );
+        // The undercount warning (a DIFFERENT fact) must not fire for an
+        // estimated resident — it has a potential, just not a measured one.
+        assert!(
+            !ledger.warnings.iter().any(|w| w.contains("undercount") && w.contains("phi-4-gguf")),
+            "an estimated resident is not an undercounted one: {:?}",
+            ledger.warnings
+        );
+    }
+
+    /// #1819 decision 1: an estimated resident MAY produce a decided GREEN
+    /// verdict — the whole point of the fallback. Per-model tint for the
+    /// estimated row follows the ordinary machine-state rule (it is NOT
+    /// forced to `Unknown` the way a genuinely unpriceable row is).
+    #[test]
+    fn green_is_reachable_with_an_estimated_resident_present() {
+        let mut inputs = base_inputs();
+        inputs
+            .catalog
+            .push(CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) });
+        inputs.residents.push(resident("microsoft/phi-4", "phi-4-gguf", 8_192));
+        // No budget_bytes set: falls back to the 128 GiB physical pool,
+        // comfortably fitting judge + devstral + the phi-4 estimate (~48 GB
+        // total).
+
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Green);
+        assert_eq!(ledger.machine.estimated_models, 1);
+        assert_eq!(ledger.machine.unpriced_models, 0);
+        let phi4 = ledger.models.iter().find(|m| m.model_key == "phi-4-gguf").unwrap();
+        assert_eq!(phi4.state, LedgerState::Green, "an estimated row follows the machine verdict like any priced row");
+    }
+
+    /// #1819 review finding 5: an amber machine whose ONLY resident is an
+    /// ESTIMATED one, with real shrinkable ctx, must NOT render the false
+    /// "no shrinkable context" line — `effective_kv_rate()` has to let the
+    /// shrink-hint search charge the estimated row its own fallback rate
+    /// rather than treating it as `kv_per_token_bytes == 0` (un-shrinkable).
+    #[test]
+    fn amber_shrink_hint_can_target_an_estimated_row_not_just_arch_priced_ones() {
+        let inputs = LedgerInputs {
+            residents: vec![resident("microsoft/phi-4", "phi-4-gguf", 131_072)],
+            catalog: vec![CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) }],
+            // No arch entry ⇒ estimated.
+            pool: Some(PoolSnapshot { capacity_bytes: 137_438_953_472, available_bytes: Some(1) }),
+            budget_bytes: Some(34_646_682_097), // potential − 2 GB ⇒ amber
+            workers: Some(Vec::new()),
+            ..Default::default()
+        };
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Amber);
+        assert_eq!(ledger.machine.estimated_models, 1);
+        let hint = ledger.machine.shrink_hint.as_deref().expect("amber names a shrink");
+        assert!(
+            !hint.to_lowercase().contains("no shrinkable context"),
+            "an estimated row's ctx IS shrinkable — the false claim the review caught: {hint}"
+        );
+        assert!(hint.contains("phi-4-gguf") && hint.contains("reload"), "names the estimated row as the target: {hint}");
+        // The saving figure is itself flagged as computed from the estimate.
+        assert!(
+            hint.to_lowercase().contains("estimated"),
+            "the shrink hint discloses that ITS OWN saving figure rests on the same estimate: {hint}"
+        );
+    }
+
+    /// The inverted case of the test above: a GENUINELY unpriceable
+    /// resident (no catalog size either) must still force `Unknown`, even
+    /// when an estimated resident is ALSO present and would otherwise have
+    /// let the machine land Green. `unpriced_models == 0` is the only gate
+    /// on Green — an estimate never substitutes for it.
+    #[test]
+    fn unpriceable_resident_still_blocks_green_even_alongside_an_estimated_one() {
+        let mut inputs = base_inputs();
+        inputs
+            .catalog
+            .push(CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) });
+        inputs.residents.push(resident("microsoft/phi-4", "phi-4-gguf", 8_192));
+        // Genuinely unpriceable: no catalog entry AND no arch entry.
+        inputs.residents.push(resident("mystery", "mystery-model", 8_192));
+
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.estimated_models, 1);
+        assert_eq!(ledger.machine.unpriced_models, 1);
+        assert_eq!(
+            ledger.machine.state,
+            LedgerState::Unknown,
+            "a genuinely unpriceable resident blocks Green regardless of any estimated one"
+        );
+        let mystery = ledger.models.iter().find(|m| m.model_key == "mystery-model").unwrap();
+        assert_eq!(mystery.state, LedgerState::Unknown);
+        assert!(mystery.potential_source.is_none());
+    }
+
+    /// Provenance travels through both surfaces `render_human` composes:
+    /// the row's STATE column and the machine-total parenthetical.
+    #[test]
+    fn render_human_discloses_the_estimated_count_on_the_row_and_the_machine_line() {
+        let mut inputs = base_inputs();
+        inputs
+            .catalog
+            .push(CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) });
+        inputs.residents.push(resident("microsoft/phi-4", "phi-4-gguf", 8_192));
+        let ledger = compute_ledger(inputs, 1);
+        let text = render_human(&ledger);
+        assert!(text.contains("(estimated)"), "row STATE column discloses the estimate: {text}");
+        assert!(
+            text.contains("1 estimated"),
+            "machine-total line names the estimated count: {text}"
+        );
+        // #1819 review nitpick: the CAVEAT travels WITH the potential figure
+        // itself (a `~` prefix), not only in a separate column — a reader
+        // copy-pasting just that cell still carries the qualifier.
+        let phi4 = ledger.models.iter().find(|m| m.model_key == "phi-4-gguf").unwrap();
+        let expected_potential = fmt_bytes(phi4.potential_bytes.unwrap());
+        assert!(
+            text.contains(&format!("~{expected_potential}")),
+            "the estimated row's POTENTIAL cell carries a `~` prefix: {text}"
+        );
+    }
+
+    /// `potential_source` is OMITTED from the JSON entirely for a row with
+    /// no potential at all (never a spurious `null`), and present verbatim
+    /// as `"estimated"` for the fallback-priced row — the wire contract
+    /// `MachineResourcesModel` (the UI's TypeScript type) depends on.
+    #[test]
+    fn json_potential_source_is_present_for_estimated_and_absent_for_unpriceable() {
+        let mut inputs = base_inputs();
+        inputs
+            .catalog
+            .push(CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) });
+        inputs.residents.push(resident("microsoft/phi-4", "phi-4-gguf", 8_192));
+        inputs.residents.push(resident("mystery", "mystery-model", 8_192));
+        let ledger = compute_ledger(inputs, 1);
+        let v = serde_json::to_value(&ledger).expect("serializes");
+        let models = v["models"].as_array().unwrap();
+        let phi4 = models.iter().find(|m| m["model_key"] == "phi-4-gguf").unwrap();
+        assert_eq!(phi4["potential_source"], "estimated");
+        let mystery = models.iter().find(|m| m["model_key"] == "mystery-model").unwrap();
+        assert!(
+            mystery.get("potential_source").is_none(),
+            "no potential at all ⇒ the field is OMITTED, not null: {mystery}"
+        );
+        assert_eq!(v["schema_version"], "1.1");
+        assert_eq!(v["machine"]["estimated_models"], 1);
+    }
+
+    /// #1819 review finding 3: a 1.1 binary must tolerate a 1.0 peer's
+    /// ledger (a real cross-fleet path — `darkmux machine resources
+    /// <machine>` deserializes a remote payload, `src/main.rs::
+    /// cmd_machine_resources`) that predates `estimated_models` entirely.
+    /// Without `#[serde(default)]` this is a hard deserialization error
+    /// (unlike `Option<T>` fields, which serde already treats as
+    /// implicitly optional-on-read — `potential_source` needs no such
+    /// annotation, only this newly-added non-`Option` field does).
+    #[test]
+    fn estimated_models_defaults_to_zero_on_a_pre_1819_payload_missing_the_field() {
+        // A hand-built 1.0-shaped `machine` object — literally what a
+        // pre-#1819 daemon would have emitted, with no `estimated_models`
+        // key at all.
+        let pre_1819_machine = serde_json::json!({
+            "potential_bytes": 24565385183u64,
+            "unpriced_models": 0,
+            "current_bytes": 19506757632u64,
+            "state": "green"
+        });
+        let totals: MachineTotals =
+            serde_json::from_value(pre_1819_machine).expect("a 1.0 payload missing estimated_models must still parse");
+        assert_eq!(totals.estimated_models, 0, "absent field defaults to zero, never an error");
     }
 }

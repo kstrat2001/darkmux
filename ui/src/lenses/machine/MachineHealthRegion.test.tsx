@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { render } from "@testing-library/react";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency } from "./machineGauge";
-import type { MachineResources } from "../../types/handwritten";
+import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
 // #1806 Stage 2/3's structural DOM claims, at the component level — the
 // browser-level proof lives in `tests/e2e/viewer-machine.spec.js` (XSS
@@ -48,7 +48,7 @@ const BASE: MachineResources = {
       state: "unknown",
     },
   ],
-  machine: { potential_bytes: 19272177280, unpriced_models: 1, current_bytes: 20841952256, state: "unknown" },
+  machine: { potential_bytes: 19272177280, unpriced_models: 1, estimated_models: 0, current_bytes: 20841952256, state: "unknown" },
   attribution: "per_process",
   warnings: [],
   cache_ttl_ms: 2000,
@@ -494,5 +494,125 @@ describe("MachineHealthRegion — the utility row-chip (identity marker, never a
     const ghostRow = [...container.querySelectorAll(".mm-row.is-ghost")].find((r) => r.textContent?.includes("priced-model"))!;
     expect(ghostRow).toBeTruthy();
     expect([...ghostRow.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
+  });
+});
+
+/**
+ * #1819 — an estimated resident (a GGUF download with no readable
+ * `config.json`, priced by the size-based fallback instead) is priced, not
+ * absent: it must NOT hit the `pot == null` UNPRICED branch anywhere on the
+ * page, and it must carry its own provenance disclosure everywhere the
+ * verdict appears (row chip, kv line, machine chip, machine detail row).
+ * These tests exist alongside — never replacing — the existing UNPRICED
+ * coverage above, so a future edit can't quietly satisfy one case while
+ * breaking the other.
+ */
+const ESTIMATED_MODEL: MachineResourcesModel = {
+  identifier: "microsoft/phi-4-Q4_K_M",
+  model_key: "phi-4-gguf",
+  owner: "user",
+  loaded_ctx: 8192,
+  weights_bytes: 9053136497,
+  kv_per_token_bytes: null as unknown as number,
+  kv_bytes_at_ctx: null as unknown as number,
+  potential_bytes: 11480858097,
+  potential_source: "estimated",
+  current_bytes: 9200000000,
+  state: "green",
+};
+
+describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its provenance everywhere the verdict appears", () => {
+  function withEstimated(machineOverrides: Partial<MachineResources["machine"]> = {}): MachineResources {
+    return {
+      ...BASE,
+      models: [BASE.models[0], ESTIMATED_MODEL],
+      machine: { ...BASE.machine, unpriced_models: 0, estimated_models: 1, state: "green", ...machineOverrides },
+    };
+  }
+
+  it("renders the ESTIMATED chip, not the UNPRICED one, for a row with a fallback-priced potential", () => {
+    const resources = withEstimated();
+    const { container } = renderRegion(resources, { residencyRows: residencyRowsFor(resources) });
+    const row = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("phi-4"))!;
+    expect(row.querySelector(".mm-row-chip.is-estimated")).not.toBeNull();
+    expect(row.textContent).toContain("ESTIMATED");
+    expect(row.querySelector(".mm-row-chip.is-warn")).toBeNull();
+    expect(row.textContent).not.toContain("UNPRICED · potential unknown");
+    // A priced row DOES draw the commit layer — it is not treated as absent.
+    expect(row.querySelector(".mm-row-pot")).not.toBeNull();
+  });
+
+  it("the ESTIMATED chip's title states the dense-attention assumption and its consequence", () => {
+    const resources = withEstimated();
+    const { container } = renderRegion(resources, { residencyRows: residencyRowsFor(resources) });
+    const row = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("phi-4"))!;
+    const chip = row.querySelector(".mm-row-chip.is-estimated")!;
+    expect(chip.getAttribute("title")?.toLowerCase()).toContain("dense");
+    expect(chip.getAttribute("title")?.toLowerCase()).toContain("hybrid");
+  });
+
+  it("the row's kv line marks the estimated potential with `~` and `(estimated)`", () => {
+    const resources = withEstimated();
+    const { container } = renderRegion(resources, { residencyRows: residencyRowsFor(resources) });
+    const row = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("phi-4"))!;
+    expect(row.textContent).toContain("potential ~10.69 GiB (estimated)");
+  });
+
+  it("the row carries an explanatory hint naming the assumption, like the unpriced row's own hint", () => {
+    const resources = withEstimated();
+    const { container } = renderRegion(resources, { residencyRows: residencyRowsFor(resources) });
+    const row = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("phi-4"))!;
+    const hint = [...row.querySelectorAll(".mm-hint")].find((h) => h.textContent?.includes("estimated:"));
+    expect(hint).toBeTruthy();
+    expect(hint!.textContent?.toLowerCase()).toContain("dense");
+  });
+
+  it("decision 1: a GREEN machine verdict is reachable with an estimated resident present, and the chip discloses the count", () => {
+    const resources = withEstimated({ state: "green" });
+    const { container } = renderRegion(resources, { residencyRows: residencyRowsFor(resources) });
+    const chip = container.querySelector(".mm-gcap .mm-chip")!;
+    expect(chip.textContent).toContain("GREEN");
+    expect(chip.textContent).toContain("1 estimated");
+  });
+
+  it("the machine detail row discloses the estimated count alongside (not instead of) the unpriced count", () => {
+    const resources = withEstimated();
+    const { container } = renderRegion(resources, { residencyRows: residencyRowsFor(resources) });
+    const detail = container.querySelector(".mm-kv--machine")!;
+    expect(detail.textContent).toContain("unpriced");
+    expect(detail.textContent).toContain("estimated");
+    expect(detail.textContent).toContain("1 model");
+  });
+
+  it("the inverted case: the estimated disclosure is entirely absent when nothing was estimated (BASE's own default)", () => {
+    const { container } = renderRegion(BASE);
+    expect(container.querySelector(".mm-row-chip.is-estimated")).toBeNull();
+    const chip = container.querySelector(".mm-gcap .mm-chip")!;
+    expect(chip.textContent).not.toContain("estimated");
+    const detail = container.querySelector(".mm-kv--machine")!;
+    expect(detail.textContent).not.toContain("estimated");
+  });
+
+  it("a genuinely unpriceable resident still forces the machine to UNKNOWN even alongside an estimated one — an estimate never substitutes for a real price", () => {
+    const resources: MachineResources = {
+      ...BASE,
+      // BASE.models[1] is the genuinely unpriced fixture. The estimated
+      // row's own `state` is "unknown" here too — matching what the real
+      // per-model tint would compute under a machine-Unknown verdict
+      // (`compute_ledger`'s tint keys on `machine_state`, not on
+      // `potential_source`), so this fixture stays honest about what the
+      // server would actually send.
+      models: [BASE.models[0], BASE.models[1], { ...ESTIMATED_MODEL, state: "unknown" }],
+      machine: { ...BASE.machine, unpriced_models: 1, estimated_models: 1, state: "unknown" },
+    };
+    const { container } = renderRegion(resources, { residencyRows: residencyRowsFor(resources) });
+    const chip = container.querySelector(".mm-gcap .mm-chip")!;
+    expect(chip.textContent).toContain("UNKNOWN");
+    expect(chip.textContent).not.toMatch(/\b(GREEN|AMBER|RED)\b/);
+    // The estimated row still renders its own chip even though the MACHINE
+    // verdict stayed undecided — provenance is a per-row fact, independent
+    // of whether the whole-machine cascade could reach a verdict.
+    const estimatedRow = [...container.querySelectorAll(".mm-row")].find((c) => c.textContent?.includes("phi-4"))!;
+    expect(estimatedRow.querySelector(".mm-row-chip.is-estimated")).not.toBeNull();
   });
 });

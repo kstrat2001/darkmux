@@ -70,7 +70,7 @@ name (`memoryLedgerLines.ts` and its tests).
 | ④ | `32.9 GiB — IN USE` (odometer center + needle) | `/machine/resources` → `machine.current_bytes` | Σ of per-model attributed RSS (see *machine total* below); needle angle = `current / limit_bytes`, clamped at 100%. The odometer cells are centered on the hub with the unit hung outside that centering (`odoLayout`) | Σ model currents = 35357818880 = field ✓; 25.7% of scale ✓ |
 | ⑤ | arc ticks `0 · 32 · 64 · 96` | `limit_bytes` | quarter marks of the scale, `limit × k/4` in whole **binary** GiB (`gaugeTickLabel`) | 128 × ¾ = 96 ✓ — decimal labeled this same arc `0 · 34 · 69 · 103`, finding 3 |
 | ⑥ | `128 / LIMIT` at the max position (+ the redline end-cap) | `limit_bytes` + `limit_source` | limit resolution: `budget > physical pool > none` (`compute_ledger`, `model_ledger.rs:383`); word is LIMIT, or BUDGET when `limit_source:"budget"` | `limit == pool.capacity`, source `physical_pool` ✓; **budget arm currently unreachable — finding 4** |
-| ⑦ | `╌ committed 42.06 GiB (+1 unpriced)` | `machine.potential_bytes`, `machine.unpriced_models` | Σ of **priced** models' potential only; unpriced count appended — the undercount is stated, never hidden | Σ priced = 45163330707 = field ✓; count 1 ✓ |
+| ⑦ | `╌ committed 42.06 GiB (+1 unpriced)`, or `╌ committed … (1 estimated)` since #1819 | `machine.potential_bytes`, `machine.unpriced_models`, `machine.estimated_models` | Σ of **priced** models' potential — this now includes ESTIMATED rows, not just measured ones (#1819); `unpriced_models` (genuinely unpriceable, uncounted) and `estimated_models` (counted, but via a labeled guess) are DIFFERENT facts and never collapse into one word — see "The #1819 estimate" below | Σ priced = 45163330707 = field ✓; count 1 ✓ |
 | ⑧ | `UNKNOWN` state chip | `machine.state` | uppercased verbatim (`modelLines`/port uppercases the string, not CSS) | cascade verified — see *the state cascade* below |
 | ⑨ | tell-tale lamps | `machine.state` (STATE), `unpriced_models` (UNPRICED), `pressure.red` (PRESSURE), fetch-failure + `generated_at_ms` age (STALE), `warnings.length` (WARN), `current ≥ limit` (OVER LIMIT — see PROPOSAL §redline) | each lamp keys on exactly one named field; lit = word + border + glow, never color alone | field values reproduce the lit set shown ✓ |
 | ⑩ | `87 % free — memory free` | `pressure.memory_free_percent` | sysctl **`kern.memorystatus_level`** — the kernel's pressure headroom, 0–100. Sole red trigger: `pressure.red = level < 15` (`MEMORY_FREE_PERCENT_RED`, `model_ledger.rs:122`) | live sysctl read = 87 = field ✓; 87 ≥ 15 → `red: false` ✓ |
@@ -79,7 +79,7 @@ name (`memoryLedgerLines.ts` and its tests).
 | ⑬ | `limit source · pool 128.00 GiB · pool free · unpriced` detail row | `limit_source`, `pool.capacity_bytes`, `pool.available_bytes`, `machine.unpriced_models` | capacity = sysctl `hw.memsize`; **available = `vm_stat` "Pages free" × page size** — deliberately conservative (finding 2) | capacity/2³⁰ = 128.00 ✓, agreeing with ①; pool free 1.84 GiB = live field ✓ |
 | ⑭ | model name + `DARKMUX`/`USER` chip | `models[].identifier`, `.owner` | owner = namespace test `swap::is_darkmux_owned(identifier)` — the `darkmux:` prefix IS the ownership record | prefix ⇔ owner on both residents ✓ |
 | ⑮ | `ctx · weights · kv@ctx · potential · current` | `models[].loaded_ctx`, `.weights_bytes`, `.kv_bytes_at_ctx`, `.potential_bytes`, `.current_bytes` | ctx from `lms ps`; weights from `lms ls` `sizeBytes`; the rest derived — see *per-model math* below | all identities verified ✓ |
-| ⑯ | `UNPRICED · potential unknown` chip | `models[].kv_per_token_bytes == null` | no readable arch facts → kv, potential stay `null`; the bar/dial draws **no committed extent** (absence, never zero) | phi-4: all three null ✓ |
+| ⑯ | `UNPRICED · potential unknown` chip | `models[].potential_bytes == null` (the UI keys on this ONE field, `MachineHealthRegion.tsx`'s `pot == null` — `kv_per_token_bytes` staying `null` is a consequence of the same unreadable-arch-facts cause, not a second condition the component itself tests) | no readable arch facts AND no catalog size either → kv, potential stay `null`; the bar/dial draws **no committed extent** (absence, never zero). **Since #1819 this is the NARROWER case** — see "The #1819 estimate" below for the sibling `ESTIMATED` chip, which DOES draw a committed extent | a resident with no catalog entry either (the genuinely unpriceable case): all three null ✓ |
 | ⑰ | `kv@ctx — no arch facts` | same null | `modelLines()` renders the reason, not a dash alone | ✓ |
 | ⑱ | warning text | `warnings[]` | composed server-side in `compute_ledger` (`model_ledger.rs:368`) — verbatim on the page, never summarized | text matches byte-for-byte ✓ |
 | ⑲ | attribution line | `attribution`, `attribution_note` | `attribute_current()`'s self-documenting degradation ladder (per-process RSS → rank-matched → estimated split → unavailable) | note matches live payload ✓ |
@@ -102,13 +102,18 @@ provenance (#1257) refines it — kv@ctx is an estimate with a stated width,
 not a measurement.
 
 **Machine total:** `current` is the Σ of attributed per-model RSS;
-`potential` is the Σ of **priced** models only, with `unpriced_models`
-counting what the sum omits. The page must always carry the `(+N unpriced)`
-tag with the committed figure — dropping it would turn an honest undercount
-into a silent one.
+`potential` is the Σ of **priced** models — arch-measured AND
+size-estimated (#1819) — with `unpriced_models` counting what the sum still
+omits (the genuinely unpriceable remainder). The page must always carry the
+`(+N unpriced)` tag with the committed figure — dropping it would turn an
+honest undercount into a silent one. Since #1819 it must ALSO carry an
+`(N estimated)` tag whenever `estimated_models > 0` — a different honesty
+gap (counted, but by a labeled guess rather than a measurement) that must
+not be silently folded into the "priced" bucket the way a reader would
+otherwise assume it is.
 
-**The state cascade** (`compute_ledger`, `model_ledger.rs:398-410`, in
-order):
+**The state cascade** (`compute_ledger`, `model_ledger.rs`, in order — line
+numbers drift with #1819's additions, so given by name rather than pinned):
 
 1. `pressure.red` → **Red**
 2. `current_total > limit` → **Red** (this boundary is the redline's
@@ -119,13 +124,107 @@ order):
    **Unknown** — no fit guarantee exists, and no shrink target is computable
 6. no limit readable → **Unknown**
 
+**Unchanged by #1819, and that is the load-bearing fact.** Arm 3's gate is
+`unpriced_models == 0` — never `estimated_models == 0`. An estimated
+resident's potential IS counted in `Σ potential`, so it can carry the
+machine straight to Green (arm 3) or Amber (arm 4) exactly like a
+measured one; it never forces arm 5. Only a GENUINELY unpriceable resident
+(no arch facts and no catalog size — nothing left to estimate FROM) still
+forces Unknown. See "The #1819 estimate" below for what changed and what
+deliberately did not.
+
 Per-model tint then follows the machine state (shared-fate unified memory),
 with one nuance: under machine-Amber, a model whose current has fully
 materialized its potential shows Green (its commitment is already paid);
-unpriceable models stay Unknown.
+GENUINELY unpriceable models stay Unknown. An ESTIMATED row is priced, so it
+carries no such exception — it follows the machine state like any other
+row.
 
 **Limit resolution:** `#1243 budget > physical pool capacity > none`
 (`model_ledger.rs:383`). See finding 4.
+
+## The #1819 estimate — the covenant's first exception
+
+This document's opening line is a covenant: *every figure on the machine
+page traces to a probe.* Until #1819, that was true without qualification —
+a figure was either a probe's own reading, an arithmetic transform of one,
+or absent. #1819 introduces the first figure on this page that is **neither
+a probe reading nor absent**: a resident's `potential_bytes` can now be a
+**labeled estimate**, computed from a catalog size the daemon DID read plus
+a constant the daemon did NOT measure on this model.
+
+**What triggers it.** `ArchEstimator` needs a resident's own `config.json`
+to price it (`num_hidden_layers`, `num_key_value_heads`, `head_dim`,
+`layer_types`). A GGUF download carries its architecture inside the binary
+weights file instead of a sidecar `config.json`, so `ArchEstimator` comes up
+empty — the exact trace this whole page's #1819 predecessor issue is built
+from (`microsoft/phi-4` resolving to a GGUF with no `config.json`, while its
+MLX sibling `mlx-community/phi-4-8bit` prices normally because MLX builds DO
+ship one).
+
+**The formula.** `ArchWithSizeFallback` (`model_ledger.rs`) tries
+`ArchEstimator` first (a measurement); only when that returns `None` does it
+fall to `V1Estimator`, then adds the SAME post-load transient margin
+`ArchEstimator` already includes — the fallback and the measured path price
+on one basis, never a cheaper one for the guess:
+
+```
+potential_bytes = catalog.size_bytes
+                 + V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN × loaded_ctx
+                 + DEFAULT_TRANSIENT_MARGIN_BYTES
+```
+
+`V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN = 204_800` bytes/token (204.8 KB/token,
+decimal) — traceable, not invented, and traced to the exact model this
+issue is ABOUT: `microsoft/phi-4`'s own architecture, published verbatim by
+Microsoft (`huggingface.co/microsoft/phi-4/raw/main/config.json`, fetched
+2026-08-15): `num_hidden_layers: 40, num_attention_heads: 40,
+num_key_value_heads: 10, hidden_size: 5120` (`model_type: "phi3"` — Phi-4
+reuses the Phi-3 architecture class; no `sliding_window`, no
+`rope_scaling` — a homogeneous DENSE decoder). `head_dim = 5120 / 40 = 128`,
+so `2 × 40 layers × 10 kv_heads × 128 head_dim × 2 bytes fp16 = 204_800`.
+
+An earlier draft of this constant used the crate's #1286 devstral-24B
+referent (163,840 B/token) instead — a real probed number, but one that
+undershoots phi-4 itself by roughly 20%, which would have meant the
+fallback UNDERPRICED the exact resident that motivated the feature, on the
+very first machine it runs on. Deriving from phi-4's own published numbers
+instead closes that gap for the model the issue traces; it remains a
+REFERENT rather than a proven ceiling over every dense architecture
+(caught in review, 2026-08-15 — see finding 7).
+
+**The assumption, named where the covenant demands it.** This formula
+assumes DENSE attention — every layer holds a KV cache. That is knowingly
+wrong for a hybrid linear-attention model (the Qwen 3.5/3.6 generation,
+#1286's own finding): those hold a KV cache on as few as 1 in 4 layers, so
+pricing one at the dense rate OVERSTATES its true cost, sometimes 4× or
+more. That is the deliberately chosen failure direction (#1819 decision 3):
+this fallback only fires when the real architecture is unreadable, and
+reserving MORE than a hybrid model actually needs is the safe mistake — the
+alternative (assuming hybrid, underpricing a genuinely dense GGUF model)
+is not.
+
+**How a reader tells it apart on screen — every consumer of this figure,
+named:**
+
+| Surface | What changes |
+|---|---|
+| Row chip | `ESTIMATED` — a THIRD chip family alongside `.is-state` (outline+hue=status) and `.is-identity` (fill+grey=identity): `.is-estimated` is a DASHED outline in the neutral `--dim` hue, the one axis neither existing family had claimed. Title states the dense-attention assumption. |
+| Row kv line | `potential ~10.69 GiB (estimated)` — the `~` and suffix travel WITH the number, not just beside it in a separate badge, so the figure can't be read (or copy-pasted) out of its own caveat. |
+| Row hint | A `↳ estimated: …` line beside the row, mirroring the existing `↳ unpriceable: …` hint's shape and position. |
+| Machine chip | `GREEN · 1 estimated` (decision 1 — an estimated resident MAY produce a decided verdict; the count travels with the word, `machineStateWord()`). Never prefixed `fit ` — that's a separate, still-open decision named explicitly in the code so a future edit doesn't confuse the two. |
+| Machine detail row | `unpriced 0 models · estimated 1 model` — the SAME row that already named the unpriced count, extended rather than replaced. |
+| `warnings[]` | A dedicated warning naming the estimated resident(s) and the assumption, SEPARATE from the existing unpriceable-resident warning — the two are different facts (counted-via-guess vs. genuinely-uncounted) and must never share one sentence. |
+| CLI (`darkmux machine resources`) | The row's STATE column carries `(estimated)`; the POTENTIAL column itself carries the same `~` prefix the kv line uses; the machine line's parenthetical names both counts when both are nonzero: `(+1 unpriced, 2 estimated)`. |
+| Amber shrink hint | An estimated resident CAN be the shrink target — `hint_target_key`/`shrink_hint` read a row's kv rate through `effective_kv_rate()`, which uses `V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN` for an estimated row rather than treating it as un-shrinkable (an earlier draft could render the FALSE "no shrinkable context" line when the estimated resident was the only one with room — caught in review). When the target itself is estimated, the hint's own saving figure carries a parenthetical noting it's computed from the same conservative assumption. |
+| `darkmux doctor` | A dedicated check (`resident pricing`) names residents that are STILL genuinely unpriceable after the fallback — i.e. no catalog size either — and hints the concrete remedy (load an MLX build of the same model, when one exists). It does NOT warn on an estimated resident; estimation is the intended, working path, not a defect to flag. |
+
+**What #1819 deliberately did NOT build.** Reading the GGUF header directly
+would convert this from an ESTIMATE into a MEASUREMENT — strictly better
+where it applies, since the real architecture genuinely lives inside the
+file. That is a named follow-up issue, not built here: the size-based
+fallback is the honest floor for every unreadable architecture in the
+meantime, GGUF or otherwise, and never silently claims to be more than that.
 
 ## Findings
 
@@ -155,6 +254,21 @@ unpriceable models stay Unknown.
    UNKNOWN and the redline stays dark. Making the *verdict* colored more
    often is still server-side work (pricing more models, or a partial-fit
    arm), never a client guess.
+
+   **Addendum (#1819, 2026-08-15) — the "pricing more models" work named
+   above landed.** This finding's own live snapshot is left UNCHANGED above
+   — it is a dated record of what was true on 2026-08-14, not a claim about
+   today. What changed: `microsoft/phi-4` is no longer unpriceable on a
+   machine where it has a resolvable catalog size (it did, in that same
+   snapshot — `9,053,136,497` bytes) — it now prices via the size-based
+   `ArchWithSizeFallback` and shows `ESTIMATED`, not `UNPRICED`. The
+   green/amber/red vocabulary is no longer permanently inert on a machine
+   whose only unpriceable resident is a GGUF download with a catalog entry;
+   it stays inert only for a resident with NEITHER arch facts NOR a
+   resolvable catalog size — narrower, and rarer. See "The #1819 estimate"
+   above for the mechanism and decision 1's own honesty requirement (the
+   estimated count travels with the verdict everywhere it appears, so this
+   fix could not simply repaint UNKNOWN as GREEN without saying why).
 
 2. **`pool free` and `memory free %` disagree by design, and the labels hide
    it.** `pool.available` is `vm_stat` "Pages free" × page size —
@@ -211,6 +325,45 @@ unpriceable models stay Unknown.
    728 → 907 MB, gather 438 → 454 ms. Any static rendering of this page is
    one dated poll; the figures in the mockups are labeled with their
    snapshot date for that reason.
+
+7. **#1819's own implementation shipped one real bug and one weaker-than-
+   claimed constant, both caught by an independent review before merge —
+   recorded here because the covenant this document keeps applies to the
+   PR that adds the estimate too, not just to the feature once it's already
+   in.**
+
+   The bug: the first draft's fallback estimate omitted the 750 MB
+   transient margin every arch-priced row already includes, so an
+   ESTIMATED row priced 750 MB cheaper than a measured row with identical
+   weights and ctx — making Green systematically EASIER to reach for a
+   guess than for a measurement, the exact silent optimism this feature's
+   whole framing is against. Fixed by adding
+   `DEFAULT_TRANSIENT_MARGIN_BYTES` to the fallback arm, with a test
+   pinning that an estimated row and an arch-priced row sharing weights,
+   ctx, and kv rate now price byte-for-byte identically.
+
+   The weaker-than-claimed constant: the first draft derived
+   `V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN` from the crate's #1286 devstral-24B
+   probe (163,840 B/token) and asserted it "overstates" dense models in
+   general. Independent verification against `microsoft/phi-4`'s own
+   published `config.json` — the exact model this issue's trace names —
+   found phi-4 itself costs 204,800 B/token, ~20% ABOVE the devstral
+   referent. Re-derived from phi-4's own architecture instead ("The
+   #1819 estimate" above has the arithmetic); the doc language was also
+   softened to "a referent, not a proven ceiling" rather than an
+   unconditional overstatement claim, since dense-model KV rates vary with
+   head/layer geometry the same way #1286 first found for the hybrid case.
+
+   Also fixed in the same pass: `estimated_models` gained `#[serde(default)]`
+   (a required, non-`Option` field added in a MINOR schema bump breaks
+   contract 5's lenient-on-read guarantee for cross-fleet reads without it
+   — `darkmux machine resources <peer>` against an older machine would
+   otherwise hard-fail and silently fall back to raw JSON); the amber
+   shrink hint's target search was extended (`effective_kv_rate()`) so an
+   estimated resident can be picked as a shrink target instead of
+   potentially rendering a false "no shrinkable context" line; and the CLI
+   table's POTENTIAL column now carries the same `~` prefix the UI's kv
+   line does, so the caveat travels with the CLI figure too.
 
 ## What in the mockups is synthetic
 

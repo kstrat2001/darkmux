@@ -177,7 +177,8 @@ export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry
 }
 
 /** The machine chip's word, with its REASON attached when the verdict is
- * `unknown`.
+ * `unknown` — and, since #1819, the ESTIMATE disclosure attached when the
+ * verdict is DECIDED (green/amber/red) but partly rests on an estimate.
  *
  * A bare `UNKNOWN` is jargon that comes out of nowhere: nothing else on the
  * page defines it, and — per docs/design/machine-lens/provenance.md finding
@@ -194,12 +195,28 @@ export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry
  * Order matters and mirrors the server's: the `Some(limit)` arms cannot fire
  * at all when the limit is absent, so a missing limit is checked FIRST.
  *
- * Green/amber/red stay bare — they are self-evident, and a reason appended
- * to a self-evident word is noise. This never invents a verdict; it only
- * annotates one the server already reached. */
-export function machineStateWord(state: string | null | undefined, limitBytes: number | null | undefined, unpricedModels: number): string {
+ * #1819 decision 1: an estimated resident MAY produce a decided verdict
+ * (Green included) — but the count travels WITH the word everywhere the
+ * word appears, so a reader never sees a bare "GREEN" that quietly rests on
+ * a guess: `GREEN · 1 estimated`. This is deliberately NOT prefixed with
+ * "fit " (`fit GREEN · 1 estimated`, as #1819's own issue body writes it) —
+ * that prefix does not exist on this word yet and is a separate, still-open
+ * decision; only the estimate disclosure is added here.
+ *
+ * Green/amber/red otherwise stay bare when nothing is estimated — they are
+ * self-evident, and a reason appended to a self-evident word is noise. This
+ * never invents a verdict; it only annotates one the server already
+ * reached. */
+export function machineStateWord(
+  state: string | null | undefined,
+  limitBytes: number | null | undefined,
+  unpricedModels: number,
+  estimatedModels: number = 0,
+): string {
   const word = (state || "unknown").toUpperCase();
-  if (word !== "UNKNOWN") return word;
+  if (word !== "UNKNOWN") {
+    return estimatedModels > 0 ? `${word} · ${estimatedModels} estimated` : word;
+  }
   if (limitBytes == null) return "UNKNOWN · no limit readable";
   if (unpricedModels > 0) return "UNKNOWN · unpriced resident";
   return word; // defensive: unknown for neither named reason — never invent one
@@ -308,7 +325,7 @@ export function deriveLamps(inputs: LampInputs): LampView[] {
       word: inputs.unprivedCount > 0 ? `⚠ UNPRICED ×${inputs.unprivedCount}` : "UNPRICED",
       lit: inputs.unprivedCount > 0,
       severity: "warn",
-      title: "resident model(s) with no readable arch facts — see the warning below",
+      title: "resident model(s) genuinely unpriceable — no readable arch facts AND no catalog size either (#1819) — see the warning below",
     },
     {
       key: "pressure",
@@ -551,6 +568,15 @@ export { perModelScale } from "./memoryLedgerLines";
  * raw in a class attribute). */
 export { memStateCls };
 
+/** Whether a row's potential was priced by the #1819 size-based fallback
+ * rather than measured arch facts — the ESTIMATED marker's own condition,
+ * named once here rather than an inline string compare repeated at every
+ * call site (matching this module's convention of naming every condition a
+ * marker renders on: `rowStateDiffers`, `isOverLimit`, `redlineLit`). */
+export function isEstimatedRow(m: Pick<MachineResourcesModel, "potential_source">): boolean {
+  return m.potential_source === "estimated";
+}
+
 /** The per-model detail line — `ctx · weights · kv@ctx · potential ·
  * current`, the same shape the retired `modelLines()` produced as its
  * fourth element, kept verbatim because it is a well-tested, genuinely good
@@ -559,7 +585,14 @@ export { memStateCls };
  * k/v row, not the glance layer. */
 export function modelKvLine(m: MachineResourcesModel): string {
   const kv = m.kv_bytes_at_ctx != null ? `kv@ctx ${memBytes(m.kv_bytes_at_ctx)}` : "kv unknown (no arch facts)";
-  return `ctx ${m.loaded_ctx} · weights ${memBytes(m.weights_bytes)} · ${kv} · potential ${memBytes(m.potential_bytes)} · current ${memBytes(m.current_bytes)}`;
+  // #1819: an ESTIMATED row's potential is a labeled guess, not a
+  // measurement — the `~` and `(estimated)` suffix travel with the FIGURE
+  // itself, not just a separate badge, so the number can never be read out
+  // of context (e.g. copy-pasted into a bug report without its caveat).
+  const potential = isEstimatedRow(m)
+    ? `potential ~${memBytes(m.potential_bytes)} (estimated)`
+    : `potential ${memBytes(m.potential_bytes)}`;
+  return `ctx ${m.loaded_ctx} · weights ${memBytes(m.weights_bytes)} · ${kv} · ${potential} · current ${memBytes(m.current_bytes)}`;
 }
 
 /** Whether this residency row IS the machine's configured utility-tier

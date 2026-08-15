@@ -129,6 +129,14 @@ export interface MachineResourcesModel {
   kv_per_token_bytes: number;
   kv_bytes_at_ctx: number;
   potential_bytes: number;
+  /** #1819 — where `potential_bytes` came from. `"arch"` = measured from the
+   * model's own `config.json`; `"estimated"` = the size-based fallback
+   * (catalog size + a conservative dense-attention KV constant, #1819's
+   * `ArchWithSizeFallback`), used when arch facts are unreadable (commonly
+   * a GGUF download with no sidecar `config.json`). OMITTED (not `null`)
+   * when `potential_bytes` itself is `null` — nothing priced the row at
+   * all. Source: `crates/darkmux-profiles/src/model_ledger.rs::ModelRow`. */
+  potential_source?: "arch" | "estimated";
   current_bytes: number;
   state: "green" | "yellow" | "red" | string;
 }
@@ -295,6 +303,12 @@ export interface MachineResources {
   machine: {
     potential_bytes: number;
     unpriced_models: number;
+    /** #1819 — residents priced by the size-based fallback rather than
+     * measured arch facts. Counted separately from `unpriced_models`: an
+     * estimated resident DOES contribute to `potential_bytes` and does NOT
+     * block a Green verdict — only `unpriced_models` (genuinely
+     * unpriceable, no potential at all) does that. */
+    estimated_models: number;
     current_bytes: number;
     state: "green" | "yellow" | "red" | string;
   };

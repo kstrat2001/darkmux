@@ -162,6 +162,7 @@ pub fn run() -> DoctorReport {
         check_audit_write_drops(),
         check_daemon_auth(),
         check_utility_model_binding(),
+        check_unpriceable_residents(),
         check_role_profiles(),
         check_role_tool_vocab_typos(),
         check_beat33_legacy_crew_dir(),
@@ -903,6 +904,66 @@ fn utility_binding_status(
                 }
             }
         }
+    }
+}
+
+/// (#1819) Names resident models the memory ledger genuinely CANNOT price —
+/// no readable `config.json` arch facts AND no catalog size either, so even
+/// the #1819 size-based fallback estimate has nothing to work from. This is
+/// the narrower, worse case than "estimated": an estimated resident still
+/// gets a labeled potential; this check is about the residents that get
+/// none at all, and are the reason `machine.state` stays UNKNOWN forever
+/// while they're loaded (`model_ledger.rs`'s cascade — `unpriced_models >
+/// 0` blocks Green even when the priced sum fits).
+///
+/// The live trace this check exists for (#1819's issue body):
+/// `microsoft/phi-4` resolves to a GGUF download
+/// (`lmstudio-community/phi-4-GGUF/phi-4-Q4_K_M.gguf`) with no sidecar
+/// `config.json` — the architecture lives inside the GGUF binary itself,
+/// which darkmux does not parse (tracked as a follow-up, not built here).
+/// The concrete remedy in that trace: `mlx-community/phi-4-8bit` IS the
+/// same model as an MLX build, and MLX builds ship a `config.json` — load
+/// that instead and the resident prices normally.
+///
+/// Calls the SAME `model_ledger::gather()` the machine page's `/machine/
+/// resources` endpoint uses, rather than re-deriving "unpriceable" from
+/// `lms ps`/`lms ls` directly — the ledger's own compute is the one source
+/// of truth for what counts as unpriceable (arch AND size fallback both
+/// failed), so this check can never drift from what the page shows.
+fn check_unpriceable_residents() -> Check {
+    let ledger = darkmux_profiles::model_ledger::gather();
+    unpriceable_residents_status(&ledger.models)
+}
+
+/// Pure decision for [`check_unpriceable_residents`], split out so every arm
+/// is unit-testable without a live LMStudio / `vm_stat` / `sysctl` round
+/// trip (same split as `utility_binding_status`).
+fn unpriceable_residents_status(models: &[darkmux_profiles::model_ledger::ModelRow]) -> Check {
+    let name = "resident pricing".to_string();
+    let unpriceable: Vec<&str> = models
+        .iter()
+        .filter(|m| m.potential_bytes.is_none())
+        .map(|m| m.model_key.as_str())
+        .collect();
+    if unpriceable.is_empty() {
+        return Check {
+            name,
+            status: Status::Pass,
+            message: "every resident model is priceable (measured arch facts or the #1819 size-based estimate)".into(),
+            hint: None,
+        };
+    }
+    Check {
+        name,
+        status: Status::Warn,
+        message: format!(
+            "{} resident model(s) genuinely unpriceable — no readable config.json arch facts AND no catalog size either, so even the size-based estimate has nothing to work from: {} — the machine's fit verdict stays UNKNOWN while any of these are loaded",
+            unpriceable.len(),
+            unpriceable.join(", ")
+        ),
+        hint: Some(
+            "Commonly a GGUF download whose weights file darkmux can locate but whose architecture it cannot read (no sidecar config.json — darkmux does not parse GGUF headers yet). If an MLX build of the same model exists (check the LMStudio catalog for a `-mlx`/`-bit` variant), load that instead — MLX builds ship a config.json and price normally. Otherwise this resident's commitment is invisible to the machine page's totals and its fit verdict for the whole machine stays UNKNOWN for as long as it's loaded.".into(),
+        ),
     }
 }
 
@@ -4863,10 +4924,11 @@ mod tests {
         // [#934] + binary-split-brain [#934] + crew-validation [#1269] +
         // mission-config-registry [#1284] + daemon-freshness +
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
-        // [#1475] + gh-verb-allowlist [#1685]) + one per active eureka rule.
+        // [#1475] + gh-verb-allowlist [#1685] + unpriceable-residents
+        // [#1819]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 36 + darkmux_eureka::all_rules().len();
+        let expected = 37 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -5043,6 +5105,70 @@ mod tests {
                 "no verb needs this resident first — naming {verb:?} implies one does: {hint}"
             );
         }
+    }
+
+    // ─── check_unpriceable_residents (#1819) ──────────────────────────────
+
+    /// Minimal `ModelRow` builder for these tests — every field but the two
+    /// this check reads (`model_key`, `potential_bytes`) is filler, matching
+    /// the fixture-construction style already used for `ArchFacts` above.
+    fn row(model_key: &str, potential_bytes: Option<u64>) -> darkmux_profiles::model_ledger::ModelRow {
+        use darkmux_profiles::model_ledger::{LedgerState, ModelRow, Owner};
+        ModelRow {
+            identifier: model_key.to_string(),
+            model_key: model_key.to_string(),
+            owner: Owner::User,
+            loaded_ctx: 8_192,
+            weights_bytes: None,
+            kv_per_token_bytes: None,
+            kv_bytes_at_ctx: None,
+            potential_bytes,
+            potential_source: None,
+            current_bytes: None,
+            state: LedgerState::Unknown,
+            shrink_hint: None,
+        }
+    }
+
+    #[test]
+    fn unpriceable_residents_empty_ledger_passes() {
+        let c = super::unpriceable_residents_status(&[]);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.message.contains("priceable"));
+    }
+
+    #[test]
+    fn unpriceable_residents_all_priced_passes() {
+        let rows = [row("qwen3.6-35b-a3b", Some(24_000_000_000)), row("phi-4-gguf", Some(10_000_000_000))];
+        let c = super::unpriceable_residents_status(&rows);
+        assert_eq!(c.status, Status::Pass);
+    }
+
+    /// The live #1819 trace: `microsoft/phi-4` has no `potential_bytes` at
+    /// all (neither arch facts nor a resolvable catalog size) — WARN, name
+    /// it, and hint the MLX-build remedy.
+    #[test]
+    fn unpriceable_residents_names_the_gguf_case_and_hints_the_mlx_remedy() {
+        let rows = [row("qwen3.6-35b-a3b", Some(24_000_000_000)), row("microsoft/phi-4-Q4_K_M", None)];
+        let c = super::unpriceable_residents_status(&rows);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("microsoft/phi-4-Q4_K_M"), "names the unpriceable model: {}", c.message);
+        assert!(
+            !c.message.contains("qwen3.6-35b-a3b"),
+            "a priced sibling is not swept into the warning: {}",
+            c.message
+        );
+        let hint = c.hint.expect("a warn carries a remedy");
+        assert!(hint.to_lowercase().contains("mlx"), "hint names the concrete remedy (an MLX build): {hint}");
+    }
+
+    #[test]
+    fn unpriceable_residents_counts_every_unpriceable_model_not_just_the_first() {
+        let rows = [row("a", None), row("b", Some(1)), row("c", None)];
+        let c = super::unpriceable_residents_status(&rows);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.message.contains("2 resident model"), "counts both unpriceable rows: {}", c.message);
+        assert!(c.message.contains('a') && c.message.contains('c'));
     }
 
     // ─── role_profiles coherence (#1475 packet 1, #1547) ─────────────────
