@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import {
   computeGaugeGeometry,
   deriveLamps,
@@ -207,9 +208,16 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
             {centerVal.unit}
           </text>
         </g>
-        <text className="mm-gauge-center-caption" x={CX} y={164} textAnchor="middle">
-          {faceCaption}
-        </text>
+        {/* Rendered only when there IS a reason — see `gaugeFaceCaption`.
+            The slot exists to name which disjunct put the machine in Red,
+            beneath the reading where the eye already is; in every other
+            state it used to say `IN USE`, restating the one thing a needle
+            over a 0→LIMIT scale cannot fail to communicate. */}
+        {faceCaption && (
+          <text className="mm-gauge-center-caption" x={CX} y={164} textAnchor="middle">
+            {faceCaption}
+          </text>
+        )}
       </svg>
     </div>
   );
@@ -266,24 +274,87 @@ function LampRow({
 
 // ── Odometer tiles ───────────────────────────────────────────────────────
 
+/**
+ * The three pressure instruments. Each tile's explanatory note is revealed
+ * ON DEMAND behind an `(i)` toggle rather than rendered permanently.
+ *
+ * The notes used to be a third, always-on line of 8.5px `#4a5162` text under
+ * every tile — the operator's read, and it is right: "very small and dim
+ * text at the very bottom that adds an extra row under the meters. no one
+ * will read all this." Each note says something true and worth knowing
+ * exactly ONCE (which figure can trigger red; that swap and compressor are
+ * high-water marks; that the compressor is macOS's, not darkmux's
+ * compactor), and then it is permanent furniture — the same defect that got
+ * the `darkmux/utility` card deleted, one row down.
+ *
+ * Deliberately a `<button>` that TOGGLES, not a `title` tooltip: this
+ * dashboard is read over the tailnet on a phone, where hover does not exist
+ * and a `title` is simply invisible. Tap and hover both work on a button,
+ * it is keyboard-reachable, and `aria-expanded` states the relationship for
+ * a screen reader. The revealed note is the SAME text either way — no
+ * desktop-only knowledge.
+ */
 function Odometer({ resources }: { resources: MachineResources }) {
   const tiles = odometerTiles(resources.pressure);
+  const [openLabel, setOpenLabel] = useState<string | null>(null);
+  const rowRef = useRef<HTMLDivElement>(null);
+
+  // A popover has to be dismissible by the two gestures every popover
+  // supports, or it is just a div that will not go away: Escape, and a click
+  // anywhere outside it. Both listeners exist ONLY while one is open — an
+  // idle machine page registers nothing (the observer-must-not-perturb rule
+  // applies to the client too, and this component re-renders on every 5s
+  // poll).
+  useEffect(() => {
+    if (openLabel == null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpenLabel(null);
+    };
+    const onDown = (e: MouseEvent) => {
+      if (!rowRef.current?.contains(e.target as Node)) setOpenLabel(null);
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [openLabel]);
+
   return (
-    <div className="mm-odorow">
-      {tiles.map((t) => (
-        <div className="mm-odo" key={t.label}>
-          <span className="mm-odo-cells">
-            {t.digits.map((d, i) => (
-              <span className="mm-odo-c" key={i}>
-                {d}
-              </span>
-            ))}
-          </span>
-          <span className="mm-odo-unit">{t.unit}</span>
-          <div className="mm-odo-k">{t.label}</div>
-          <div className="mm-odo-n">{t.note}</div>
-        </div>
-      ))}
+    <div className="mm-odorow" ref={rowRef}>
+      {tiles.map((t) => {
+        const open = openLabel === t.label;
+        return (
+          <div className="mm-odo" key={t.label}>
+            <span className="mm-odo-cells">
+              {t.digits.map((d, i) => (
+                <span className="mm-odo-c" key={i}>
+                  {d}
+                </span>
+              ))}
+            </span>
+            <span className="mm-odo-unit">{t.unit}</span>
+            <div className="mm-odo-k">
+              {t.label}{" "}
+              <button
+                type="button"
+                className={`mm-odo-i${open ? " is-open" : ""}`}
+                aria-expanded={open}
+                aria-label={`What is ${t.label}?`}
+                onClick={() => setOpenLabel(open ? null : t.label)}
+              >
+                i
+              </button>
+            </div>
+            {open && (
+              <div className="mm-odo-n" role="note">
+                {t.note}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
