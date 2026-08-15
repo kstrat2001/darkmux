@@ -2,11 +2,14 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { LiveStatusBadge, PlaybackModeBadge } from "./LiveStatusBadge";
 import { CatalogPanel } from "../lenses/catalog/CatalogPanel";
+import { AboutDialog } from "./AboutDialog";
+import { openModalEl } from "../lib/dialogManager";
 import { isLiveRoute, type Route } from "../lib/route";
 import { todayUTC } from "../lib/flow";
 import { injectedMeta } from "../lib/injectedMeta";
 import { isStaticBuild } from "../lib/staticSource";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
+import type { MachineSpecs } from "../types/handwritten";
 
 /**
  * The masthead (`.top`, viewer.html:802-816) — brand, build-identifier chip,
@@ -27,13 +30,13 @@ import type { LiveTailStatus } from "../hooks/useLiveTail";
  * golden flaky. See that function's own doc for why normalizing (not
  * excluding the region) was the chosen fix.
  *
- * **Deliberately NOT wired to an about-modal.** Legacy's populated chip is
- * also the trigger for `#imodalbg` (viewer.html:1132, the build/status
- * snapshot dialog) — out of scope for this packet (not itemized in the
- * masthead's carried-over piece list), so the chip here is informational
- * only (a `title` attribute repeats the same text on hover, same as
- * legacy's `vb.title`), not `role="button"`. Named here as a follow-up
- * rather than half-wiring a modal with no content behind it.
+ * **Now wired to the about modal (#1640).** Legacy's populated chip is also
+ * the trigger for `#imodalbg` (viewer.html:1132, the build/status snapshot
+ * dialog) — this component's `verbadge` is a real `data-act="about"` button
+ * (only when it has content: an empty chip has nothing to show a dialog
+ * about, matching legacy's own `if(vb&&verMeta)` gate) rendering
+ * `AboutDialog`, restored now that the shared dialog/focus machinery exists
+ * to hold it.
  *
  * **The catalog trigger (legacy's `#srcbadge`, "today"/a specific date,
  * doubling as the playback-catalog toggle) is represented by the EXISTING,
@@ -89,7 +92,18 @@ import type { LiveTailStatus } from "../hooks/useLiveTail";
  * `position:absolute`-based dropdown positioning is anchor-relative, not
  * page-relative, so the move doesn't affect it.
  */
-export function Masthead({ route, liveStatus }: { route: Route; liveStatus: LiveTailStatus }) {
+export function Masthead({
+  route,
+  liveStatus,
+  specs = null,
+}: {
+  route: Route;
+  liveStatus: LiveTailStatus;
+  /** Passed through to `AboutDialog` for its "machine"/"hardware" rows —
+   *  optional (defaults to `null`) so every existing caller/test that
+   *  doesn't pass it is unaffected; only a live route ever reads it. */
+  specs?: MachineSpecs | null;
+}) {
   const queryClient = useQueryClient();
   const [spinning, setSpinning] = useState(false);
   const live = isLiveRoute(route);
@@ -130,12 +144,20 @@ export function Masthead({ route, liveStatus }: { route: Route; liveStatus: Live
         </a>
       </span>
       {verText ? (
-        <span className="masthead__ver" id="verbadge" title={verTitle}>
+        <button
+          type="button"
+          className="masthead__ver"
+          id="verbadge"
+          data-act="about"
+          title={verTitle}
+          onClick={() => openModalEl("imodalbg")}
+        >
           {verText}
-        </span>
+        </button>
       ) : (
         <span className="masthead__ver" id="verbadge" />
       )}
+      <AboutDialog route={route} liveStatus={liveStatus} specs={specs} />
       {isStaticBuild() ? (
         // (#1801) No `<CatalogPanel>` here — see this component's own doc
         // for why a static build gets inert text instead of a button that

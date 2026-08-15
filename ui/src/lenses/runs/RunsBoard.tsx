@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useState, type KeyboardEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
@@ -164,6 +164,49 @@ export function RunsBoard({
     writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null, machine: machineUid }));
   }
 
+  // (drill-in packet) A one-shot suppression flag for the deep-link re-sync
+  // guard just below `onLabRunUnresolvable`, needed for a race that ONLY
+  // this callback hits (measured live, not theorized): every OTHER writer
+  // here (`openLabRun`/`closeLabRun`/`selectKind`/`clearMachinePin`) fires
+  // from a DOM `onClick`, so React's own event-batching keeps its state
+  // setters and `writeHash`'s synthetic `hashchange` in the SAME commit —
+  // the guard's `initialRun === labRunDir` check sees both sides already
+  // agreeing and never fires. `onLabRunUnresolvable` instead fires from
+  // `LabRunDetail`'s `useEffect` (a passive effect, outside any click's
+  // batch scope): `hashchange` forces an EARLIER, separate synchronous
+  // commit carrying the new route but the OLD `labRunDir` state, queuing
+  // the guard's effect against that stale pairing — REGARDLESS of whether
+  // `writeHash` or the state setters run first in this function (both
+  // orderings were measured live and both raced: state-then-hash let the
+  // guard's reset land AFTER this function's own `setRowClickNotice`,
+  // clobbering the message; hash-then-state let the guard's reset win
+  // instead, since its own queued update lands after this function's). The
+  // flag sidesteps the ordering question entirely: set it before touching
+  // anything, and the guard (below) treats its own firing as an ECHO of
+  // THIS call rather than a fresh external deep-link, skipping its reset.
+  const suppressResyncRef = useRef(false);
+
+  // (drill-in packet) `LabRunDetail`'s `onUnresolvable` — the port of
+  // legacy's `drillLabRun` fallback (see that component's own doc):
+  // `state.level="runs"; state.labRunDir=null;` plus a notice, never a stuck
+  // error page. `MISSION_GRAPH_UNREACHABLE_NOTICE`-style daemon-awareness
+  // lives here (not in `LabRunDetail`) because this board already owns the
+  // other daemon-reachability notice, via the SAME `missionGraphReachable()`
+  // predicate legacy's own `drillLabRun` branches on — the honest reason on
+  // a daemon-less static build is the missing capability, not a stale link
+  // (matching `MISSION_GRAPH_UNREACHABLE_NOTICE`'s identical judgment call).
+  function onLabRunUnresolvable() {
+    const dir = labRunDir;
+    suppressResyncRef.current = true;
+    setLabRunDir(null);
+    setRowClickNotice(
+      !missionGraphReachable()
+        ? "run detail needs a running daemon — this static build lists runs without their per-run pipeline and event feed."
+        : `couldn't open run "${dir}" — it may have been removed, or the link is stale. Showing the run list.`,
+    );
+    writeHash(canonicalHash({ kind: "runs", runsKind: kind, run: null, machine: machineUid }));
+  }
+
   // (#1809) Clears the machine pin — the "back to all machines" half of
   // "visible AND clearable" the packet brief requires. Preserves whichever
   // kind filter/lab-run drill-in was active, matching `selectKind`'s own
@@ -229,6 +272,15 @@ export function RunsBoard({
   // look like a fresh deep-link and reset `series`/`showAll` right after
   // the operator clicked.
   useEffect(() => {
+    // (drill-in packet) See `suppressResyncRef`'s own doc above
+    // `onLabRunUnresolvable` — this run of the effect IS that call's own
+    // echo (its `writeHash` is what changed `initialRun`), so treat it as
+    // already handled rather than re-deriving the same reset a second,
+    // conflicting way.
+    if (suppressResyncRef.current) {
+      suppressResyncRef.current = false;
+      return;
+    }
     if (initialKind === kind && initialRun === labRunDir && initialMachineUid === machineUid) return;
     setKind(initialKind);
     setSeries(false);
@@ -275,7 +327,7 @@ export function RunsBoard({
   // waiting on the two queries above and independent of `kind` (see
   // `labRunDir`'s own doc above for why it isn't gated to kind==="lab").
   if (labRunDir) {
-    return <LabRunDetail dir={labRunDir} onBack={closeLabRun} />;
+    return <LabRunDetail dir={labRunDir} onBack={closeLabRun} onUnresolvable={onLabRunUnresolvable} />;
   }
 
   // Pending: neither query has resolved yet (matches `RUNS_LOADED===null`).

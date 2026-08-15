@@ -228,22 +228,17 @@ test('drilling a lab row from the list opens its detail and updates the hash', a
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
 
-// (port gap, not a naming/mechanism difference — reported, not silently
-// narrowed) `LabRunDetail` (`ui/src/lenses/runs/LabRunDetail.tsx`) has no
-// fallback-to-list branch at all: on a `detailQuery.data.ok === false`
-// (this test's 400), it renders its OWN inline `data-state="error"` page
-// ("couldn't reach /lab/run/detail (HTTP 400): bad dir") and STAYS there —
-// `RunsBoard.tsx`'s `if (labRunDir) return <LabRunDetail .../>` hands off
-// unconditionally and never gets control back to bounce to `.labrunrow`.
-// Confirmed live (not inferred): this harness never renders `.labrunrow`
-// or `.labnotice` after booting on `run=no-such-run` — the DOM sits on
-// `data-state="error"` indefinitely. Fixme rather than deleted per this
-// packet's brief: the fallback-to-list-with-a-notice behavior genuinely
-// isn't built, which is a real product decision for the parent session
-// (build the fallback, or decide the inline HTTP error is the intended,
-// arguably more honest, replacement — it already names the exact status
-// code legacy's generic notice never did).
-test.fixme('deep link with an unresolvable run falls back to the run list with a notice', async ({ page }) => {
+// (drill-in packet) `LabRunDetail` now reports an unresolvable dir back to
+// `RunsBoard` (`onUnresolvable`, `LabRunDetail.tsx`'s own doc) instead of
+// staying on its own inline `data-state="error"` page forever — the port of
+// legacy's `drillLabRun` fallback (`viewer.html:4101-4126`:
+// `state.level="runs"; state.labRunDir=null;` plus a notice). The daemon-
+// vs-static message split is legacy's own `missionGraphReachable()` branch,
+// ported verbatim in `RunsBoard.tsx`'s `onLabRunUnresolvable` — this harness
+// is a static-flow-src build (no daemon), so it takes the "needs a running
+// daemon" arm, matching legacy's own reasoning for why "may have been
+// removed" would be a dishonest message here.
+test('deep link with an unresolvable run falls back to the run list with a notice', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
   // Detail endpoint rejects (the daemon 400s a bad/out-of-bounds dir; the

@@ -23,16 +23,20 @@
 // `SessionReplay` for that route kind, and `hashSync.ts`'s `useSyncHash`
 // writes the canonical `session=<id>` form back on every route change — the
 // exact same `location.hash` write every other drill-in in this app uses
-// (`FleetLens`'s machine cards, `NavChrome`'s tabs). What's genuinely
-// UNBUILT is a CLICKABLE entry point into a session from anywhere in the
-// UI — `MachineLens`'s run rows are plain `<div>`s with no session-drill
-// link (removed with the machine page's runs list in #1809; the "open →" link legacy's
-// `recentRow()` details panel carried is a named, deliberate cut, not
-// ported yet). So three of the four tests below are rewritten to drive the
-// SAME `location.hash` mechanism a future click affordance would use
-// (documented per-test, not hidden), and the fourth — the one that is
-// actually about clicking something to get IN — is `test.fixme`d with the
-// gap named, not silently adapted around.
+// (`FleetLens`'s machine cards, `NavChrome`'s tabs). Three of the four tests
+// below drive that mechanism directly via a boot-time deep link; the fourth
+// (below) now drives the CLICK affordance itself.
+//
+// (drill-in packet) `MachineLens`'s run rows are still plain `<div>`s with
+// no session-drill link (removed with the machine page's runs list in
+// #1809; the "open →" link legacy's `recentRow()` details panel carried is
+// a named, deliberate cut, not ported back). The click affordance this
+// packet builds instead lives on the fleet lens's own activity-lane bars
+// (`FleetLens.tsx`'s `.sbar` elements, `data-act="session"`) — legacy's OWN
+// timeline bars are inert (no click handler anywhere in that code), so this
+// is a genuine, documented WIDENING beyond legacy's address-bar behavior,
+// not a port of an existing legacy control. See `FleetLens.tsx`'s own doc
+// on the bar's `onClick` for the full reasoning.
 const { test, expect } = require('@playwright/test');
 
 // A minimal, real-shaped `/flow-session/<id>` response — a clean
@@ -91,18 +95,74 @@ async function bootLive(page, hash) {
 
 const hash = (page) => page.evaluate(() => location.hash);
 
-// (port gap, reported not papered over) There is currently no clickable
-// affordance ANYWHERE in the port that enters a session view — the
-// underlying mechanism (writing `location.hash = "session=<id>"`) is real,
-// but nothing in the rendered UI does that write on the operator's behalf
-// today. `MachineLens`'s run rows are the natural home for it (matching
-// legacy's `data-act="session"` "open →" link) and don't have it yet — see
-// this file's own module doc. Testing "drilling into a session writes it
-// to the address bar" requires an actual drill action to exist; writing
-// `location.hash` directly here would test the SAME mechanism the other
-// three tests below already cover, under a name that claims to test a user
-// interaction that doesn't exist in this build.
-test.fixme('drilling into a session writes it to the address bar', async () => {});
+// Boots the live fleet hero with ONE session on ONE machine, recent enough
+// (5 minutes ago) to land inside the 24h activity-timeline window
+// (`timeline.ts`'s `LIVE_WINDOW_MS`/default preset) — enough for a real
+// `.sbar` bar to render, matching this port's own machine-uid/session-id
+// field shapes (`machine_uid`/`session_id`, the `dispatch start`
+// space-spelling `normalizeAction` dots). `mockSession` (above) covers the
+// `/flow-session/<id>` fetch the click's destination needs.
+async function bootLiveWithSession(page, sid) {
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  // A CLOSED session (start, then complete a minute later) rather than a
+  // still-open one — deliberately: an open bar's right edge sits at
+  // `pct(tMax)`, the SAME x-position `timeline.ts` computes for the
+  // playhead (`playheadPct: pct(tMax)`), so an open bar's own tip is
+  // exactly where `.ph` renders — the click lands on the playhead div, not
+  // the bar, on any date/window where "now" is close to the record's own
+  // timestamp (i.e. every real run of this test). A closed bar's right
+  // edge sits at its OWN close time, clearly left of the live playhead.
+  const startTs = new Date(Date.now() - 10 * 60_000).toISOString();
+  const completeTs = new Date(Date.now() - 9 * 60_000).toISOString();
+  // A trailing, session-less record a minute ago — later than the bar's own
+  // close. Without this, the bar's own `dispatch.complete` would ALSO be the
+  // window's single latest record, and `timeline.ts` positions the playhead
+  // at `pct(tMax)` where `tMax` is that SAME latest-record timestamp — so
+  // the bar's right edge and the playhead would coincide again, for the
+  // identical reason a still-open bar's edge does (see the comment above).
+  const laterTs = new Date(Date.now() - 60_000).toISOString();
+  const records = [
+    {
+      ts: startTs, level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+      source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
+      action: 'dispatch start', handle: 'coder', session_id: sid, payload: { runtime: 'internal' },
+    },
+    {
+      ts: completeTs, level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+      source: 'crew_dispatch', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID',
+      action: 'dispatch complete', handle: 'coder', session_id: sid,
+      payload: { runtime: 'internal', result_class: 'ok', total_turns: 1, total_tools: 0, total_tokens: 100 },
+    },
+    {
+      ts: laterTs, level: 'info', category: 'machinery', tier: 'local', stage: 'dispatch',
+      source: 'presence-reconciler', machine_id: 'fixture-box', machine_uid: 'FIXTURE-UID', action: 'machine.online',
+    },
+  ];
+  await page.route(/\/flow\/\d{4}-\d{2}-\d{2}(\?.*)?$/, (r) =>
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify(records) })
+  );
+  await page.route(/\/flow\/\d{4}-\d{2}-\d{2}\/stream(\?.*)?$/, (r) =>
+    r.fulfill({ contentType: 'text/event-stream', body: '' })
+  );
+  await mockSession(page, sid);
+  await page.goto('/index-live.html');
+  await page.waitForSelector('.app-shell');
+  return errors;
+}
+
+test('drilling into a session writes it to the address bar', async ({ page }) => {
+  const sid = 'sess-clickable';
+  const errors = await bootLiveWithSession(page, sid);
+
+  const bar = page.locator(`.sbar[title*="${sid}"]`);
+  await expect(bar).toBeVisible();
+  await bar.click();
+
+  await expect(page.locator('.session-run')).toBeVisible();
+  expect(await hash(page), 'clicking the activity-lane bar must write #session=<id>').toContain(`session=${sid}`);
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});
 
 test('booting on #session= restores the session view, not the fleet hero', async ({ page }) => {
   await mockSession(page, 'sess-in-flight');
