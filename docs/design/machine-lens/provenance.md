@@ -3,10 +3,23 @@
 Every figure on the machine page traces to a probe on your own machine, through
 a named transformation, to the pixel you see. This document is that trace,
 **tested against a live daemon** rather than asserted: every row below was
-re-verified on 2026-08-14 against a live `/machine/resources` +
-`/machine/specs` pair on the operator's own machine, with the verification
-method noted per row. This is operator sovereignty (#44) applied to the page
-itself — the operator never has to wonder where a number came from.
+re-verified on 2026-08-15 against a live `/machine/resources` +
+`/machine/specs` pair on the operator's own machine (the same daemon at
+`http://127.0.0.1:8765` this doc has always tested against), with the
+verification method noted per row. This is operator sovereignty (#44) applied
+to the page itself — the operator never has to wonder where a number came
+from.
+
+**This is a same-day reconciliation pass, not a fresh trace.** The page
+changed repeatedly on 2026-08-14/15 (#1811, #1818, #1819, #1821 all landed
+same-day) and this document was updated piecemeal, mid-flight, by several
+different passes. This pass re-read every row against the code as it stands
+now and re-ran the two probes; it found real drift (the gauge's center
+readout and needle changed SUBJECT, not just units; the tell-tale lamp row
+lost a lamp the doc never recorded; the "committed" caption pixel the table
+described no longer exists as one string) and one live code defect (a
+message string that renders a KB/token rate as `2` instead of `204.8` —
+documented as an open finding, not silently corrected here).
 
 The figures are one real snapshot and will not match your machine, or this
 machine tomorrow — what is being asserted is the **identity** in each
@@ -30,12 +43,24 @@ recorded knob, never silent.
 
 ![Provenance key — circled numbers map to the table](provenance-key.jpg)
 
-> **The key image predates both of this day's changes.** It still shows the
-> decimal figures (`137`, `32.4 GB`) that finding 3 describes, and it circles
-> as ② and ③ a `darkmux/utility` card that no longer renders at all — ② is
-> now the small `utility` badge on a residency row. Every other circled
-> number still maps to its row, which is what the image is load-bearing for;
-> retake it when the annotated overlay is next regenerated.
+> **The key image is stale on more than units and one card, and this pass
+> widens the warning rather than narrowing it.** It still shows the decimal
+> figures (`137`, `32.4 GB`) that finding 3 describes, and it circles as ②
+> and ③ a `darkmux/utility` card that no longer renders at all — ② is now
+> the small `utility` badge on a residency row. That much was already known.
+> What this pass found in addition: the image's gauge is a SINGLE-RING
+> instrument with a plain centered `IN USE` readout and no legend — the dial
+> it shows no longer exists in the code at all. The dial is now a stacked
+> band (darkmux / other / committed growth) with a three-item legend below
+> it, the center readout reads the MACHINE's used memory (not darkmux's own,
+> which is what the image's circled ④ actually pointed at), and there is no
+> dashed commit tick. **Do not use the image to locate ④ or the gauge's fill
+> color** — read the table row and the new "stacked band + legend" section
+> below instead. The image is still directionally useful for the lamp row,
+> the odometer tiles, and the residency rows below the gauge, which are
+> visually close to what it shows. Retake it (and re-circle ④ and the new
+> legend) when the annotated overlay is next regenerated — not done in this
+> pass, per this doc's own rule against fabricating a replacement.
 
 ## The trace, value by value
 
@@ -67,41 +92,105 @@ name (`memoryLedgerLines.ts` and its tests).
 |---|---|---|---|---|
 | ① | `Apple M5 Max · 128 GB` | `/machine/specs` → `cpu_brand` (sysctl `machdep.cpu.brand_string`), `ram_total_bytes` (sysctl `hw.memsize`) | `specOf()` (`lenses/fleet/cards.ts:65`): **binary**, `round(bytes/2³⁰)` — labeled `GB`, see finding 3 | 137438953472 / 2³⁰ = 128 ✓ — and ⑬ now reads `128.00 GiB` for the same field |
 | ② | the small `utility` badge on one residency row | `/machine/specs` → `utility_model.id` + the row itself | `utilityModelId()` + `isUtilityTierRow()`: badges the row whose `identifier` **or** `model_key` is the configured id — mirroring the server's own two-field test (`m.identifier == id \|\| m.model == id`). Needs no `loaded` flag: a row exists iff `lms ps` lists the model, so the ROW is the residency claim and the badge only answers identity. Neutral, never a severity color — identity is not a verdict | badge present on exactly the 4b row live ✓; ledger rows == `lms ps` verified 3-for-3 ✓; inverted cases unit-tested ✓ |
-| ④ | `32.9 GiB — IN USE` (odometer center + needle) | `/machine/resources` → `machine.current_bytes` | Σ of per-model attributed RSS (see *machine total* below); needle angle = `current / limit_bytes`, clamped at 100%. The odometer cells are centered on the hub with the unit hung outside that centering (`odoLayout`) | Σ model currents = 35357818880 = field ✓; 25.7% of scale ✓ |
-| ⑤ | arc ticks `0 · 32 · 64 · 96` | `limit_bytes` | quarter marks of the scale, `limit × k/4` in whole **binary** GiB (`gaugeTickLabel`) | 128 × ¾ = 96 ✓ — decimal labeled this same arc `0 · 34 · 69 · 103`, finding 3 |
-| ⑥ | `128 / LIMIT` at the max position (+ the redline end-cap) | `limit_bytes` + `limit_source` | limit resolution: `budget > physical pool > none` (`compute_ledger`, `model_ledger.rs:383`); word is LIMIT, or BUDGET when `limit_source:"budget"` | `limit == pool.capacity`, source `physical_pool` ✓; **budget arm currently unreachable — finding 4** |
-| ⑦ | `╌ committed 42.06 GiB (+1 unpriced)`, or `╌ committed … (1 estimated)` since #1819 | `machine.potential_bytes`, `machine.unpriced_models`, `machine.estimated_models` | Σ of **priced** models' potential — this now includes ESTIMATED rows, not just measured ones (#1819); `unpriced_models` (genuinely unpriceable, uncounted) and `estimated_models` (counted, but via a labeled guess) are DIFFERENT facts and never collapse into one word — see "The #1819 estimate" below | Σ priced = 45163330707 = field ✓; count 1 ✓ |
-| ⑧ | `UNKNOWN` state chip | `machine.state` | uppercased verbatim (`modelLines`/port uppercases the string, not CSS) | cascade verified — see *the state cascade* below |
-| ⑨ | tell-tale lamps | `machine.state` (STATE), `unpriced_models` (UNPRICED), `pressure.red` (PRESSURE), fetch-failure + `generated_at_ms` age (STALE), `messages[]` filtered to `warn`/`error` severity (WARN — **#1821, was `warnings.length`**), `current ≥ limit` (OVER LIMIT — see PROPOSAL §redline) | each lamp keys on exactly one named field; lit = word + border + glow, never color alone. The WARN lamp's condition changed shape in #1821: an `info`-severity message (the #1819 estimate disclosure) no longer counts — only `warn`/`error` do, which is the actual fix to a working-as-designed disclosure lighting an alarm lamp | field values reproduce the lit set shown ✓; `alarmMessagesCount` unit-tested against a mixed-severity payload ✓ |
-| ⑩ | `82 % margin — margin` (was `% free — memory free`) | `pressure.margin_percent` (renamed from `memory_free_percent`, #1821) | sysctl **`kern.memorystatus_level`** = `(capacity − wired − compressor) / capacity` — the kernel's own pressure headroom, 0–100. Sole red trigger: `pressure.red = level < 15` (`MARGIN_PERCENT_RED`, `model_ledger.rs`). **Renamed from "free" (operator-approved, #1821):** live, the same instant, this read 82% while truly-free pages read 30.8% — a 51-point gap under a label that implied "how much RAM is left". `margin` borrows this project's own NASA register (mass margin, power margin, propellant margin); the redline is where margin runs out | live sysctl read = 82 = field ✓; 82 ≥ 15 → `red: false` ✓; cross-checked against truly-free (30.8%) the same instant — finding 8 |
-| ⑪ | `5.03 GiB — swap used` | `pressure.swap_used_bytes` | sysctl `vm.swapusage` (used), parsed by `parse_swapusage_used_bytes` | rendered = memBytes(field) ✓ — a monotonic high-water mark: reports, never alarms (by design, `model_ledger.rs:462`) |
-| ⑫ | `1220 MiB — compressor` | `pressure.compressor_bytes` | `vm_stat` "Pages occupied by compressor" × page size | rendered = memBytes(field) ✓; same reports-never-alarms rule |
-| ⑬ | `limit source · pool 128.00 GiB · used 64.54 GiB · available 67.06 GiB · unpriced` detail row (was `· pool free ·`) | `limit_source`, `pool.capacity_bytes`, `pool.used_bytes`, `pool.available_bytes`, `machine.unpriced_models` | **#1821 — a real machine-memory decomposition, one `vm_stat` read, zero added probe cost:** `used = wired + compressor_occupied + (active + inactive − purgeable)` (Activity-Monitor-style); `available = free + inactive + speculative` (the colloquial "how much is left" — the figure this row now leads with, in the slot `pool free` used to occupy); `free = "Pages free" × page size` (truly-free pages — kept in the payload as `pool.free_bytes`, deliberately NOT rendered in this row: two figures both reading "how much is left" was the defect finding 7 fixed, not something to preserve under a new label) | capacity/2³⁰ = 128.00 ✓, agreeing with ①; live `used` 69.3 GiB cross-checked against `top`'s ~66 GiB used, seconds apart ✓; `used + free` ≈ capacity (69.3 + 58.7 ≈ 128) ✓ |
+| ④ | `104.0 GiB` — `MACHINE USED` (odometer center + needle) | `/machine/resources` → `pool.used_bytes` (needle + center reading), falling back to `machine.current_bytes` only when `pool` is absent | **Changed subject, not just units (`MachineHealthRegion.tsx:117-132`, #1821).** The center readout and the needle both track the MACHINE's used memory now, not darkmux's own share — the operator caught the two disagreeing (a needle at ~82% beside a readout reading darkmux's own 36.8 GiB) and the fix made both read the same subject. `centerVal = gaugeValueParts(pool.used_bytes ?? machine.current_bytes)`; needle angle = `band.needleAngleDeg = band.usedPct × 1.8°`, where `usedPct = max(pool.used_bytes/scale, machine.current_bytes/scale) × 100` (`computeBandGeometry`, `machineGauge.ts:192-213`) — the `max()` guards against `pool.used` reading below darkmux's own share on a degraded pool read. darkmux's OWN figure is still on the face, but moved to the legend (see "The stacked band + legend" below), not the center. The odometer cells are centered on the hub with the unit hung outside that centering (`odoLayout`, `MachineHealthRegion.tsx:102-112`) | live: `pool.used_bytes` = 111662612480 → `gaugeValueParts` = 104.0 GiB ✓ = field, rendered center digits; `usedPct` = 111662612480/137438953472 = 81.25% → needle at 146.25° ✓; darkmux's own share (`current_bytes`=39219799696) is 28.5% — the two figures visibly disagree on this machine right now, which is exactly the case the fix targets |
+| ⑤ | arc ticks `0 · 32 · 64 · 96` | `limit_bytes` | quarter marks of the scale, `limit × k/4` in whole **binary** GiB (`gaugeTickLabel`, `machineGauge.ts:79-83`) | 128 × ¾ = 96 ✓ — decimal labeled this same arc `0 · 34 · 69 · 103`, finding 3 |
+| ⑥ | `128 / LIMIT` at the max position (+ the redline end-cap) | `limit_bytes` + `limit_source` | limit resolution: `budget > physical pool > none` (`compute_ledger`, `model_ledger.rs:895-899` — line drifted from the last-cited `:383` as #1819/#1821 grew the file above it; see the derived section's own note that names by function, not line, for exactly this reason); word is LIMIT, or BUDGET when `limit_source:"budget"` | `limit == pool.capacity` (137438953472 both) ✓, source `physical_pool` ✓; **budget arm currently unreachable — finding 4** |
+| ⑦ | `machine total [GREEN · 1 estimated]` (+N unpriced when nonzero) — `GaugeCaption`; the dashed `╌ committed 42.06 GiB (+1 unpriced)` line this row used to describe **no longer exists as one pixel** | `machine.state`, `machine.potential_bytes`/`current_bytes` (for the legend's growth figure), `machine.unpriced_models`, `machine.estimated_models` | **Split across two components (#1821), not one string.** `GaugeCaption` (`MachineHealthRegion.tsx:316-331`) renders `machine total [chip]` where the chip's word comes from `machineStateWord()` (`machineGauge.ts:309-322` — folds the estimated count into the word itself, `GREEN · 1 estimated`) plus a conditional `(+N unpriced)` suffix, shown only when `unpriced_models > 0`. The GiB figure this row used to name moved to `GaugeLegend`'s growth entry (see "The stacked band + legend" below) — `committed +X GiB → Y GiB`, computed from `potential_bytes − current_bytes` and `pool.used_bytes + that delta`, rendered only when the growth band has positive length. `estimated_models`/`unpriced_models` still never collapse into one word — see "The #1819 estimate" below | live: caption reads `machine total [GREEN · 1 estimated]` with no `(+N unpriced)` suffix (`unpriced_models` is 0 today) ✓ matches `machineStateWord(...)` output for these fields; the legend's growth entry (separately, see below) reads `committed +17.79 GiB → 121.77 GiB` (`memBytes()`'s 2-decimal convention, not the gauge's 1-decimal glance layer — the legend is a detail-layer element) ✓ |
+| ⑧ | `UNKNOWN` state chip | `machine.state` | uppercased verbatim by `machineStateWord()` (`machineGauge.ts:309-322`, not CSS — `modelLines()`/the flat-card renderer this cites is retired, see `memoryLedgerLines.ts`'s own module doc) | cascade verified — see *the state cascade* below |
+| ⑨ | tell-tale lamps | `residencyChanged` (Δ RESIDENCY), `unpriced_models` (UNPRICED), `pressure.red` (PRESSURE), `current ≥ limit` (OVER LIMIT), `resourcesErrored` (STALE — fetch failure ONLY, not `generated_at_ms` age), `messages[]` filtered to `warn`/`error` severity (WARN — **#1821, was `warnings.length`**) | **Six lamps, and the lineup itself drifted today, which the prior draft of this row never recorded.** There is deliberately **no STATE lamp** — it was deleted today (`e0eaf778`/`f9364796`, 2026-08-15): it used to relabel ITSELF with the machine's verdict (`STATE GREEN`/`STATE AMBER`) while ALSO changing its lit-ness, duplicating the machine chip a few inches away in a dimmer color. In its place — not new today, but never listed in this row before — is **Δ RESIDENCY**, keyed on `residencyChanged` (true when this poll's rows include any `new`/`ghost` status; see `advanceResidency`, `MachineHealthRegion.tsx`). Each lamp keys on exactly one named condition (`deriveLamps`, `machineGauge.ts:437-482`); lit = word + border + glow, never color alone. The WARN lamp's condition changed shape in #1821: an `info`-severity message (the #1819 estimate disclosure) no longer counts — only `warn`/`error` do. STALE is fetch-failure only (`resourcesErrored`); the snapshot's age is displayed (footer ⑳, the stale banner) but does not itself light this lamp | live: RESIDENCY unlit (no swap this poll), UNPRICED unlit (`unpriced_models`=0), PRESSURE unlit (`red`=false), OVER LIMIT unlit (36.53 GiB current < 128.00 GiB limit), STALE unlit (poll succeeded), WARN unlit (the payload's one message is `info` severity, not `warn`/`error` — `alarmMessagesCount`=0, which is the exact case #1821 exists to keep this lamp dark) ✓; `alarmMessagesCount` unit-tested against a mixed-severity payload ✓ |
+| ⑩ | `85 % margin` (odometer tile, `(i)` popover for the note) | `pressure.margin_percent` (renamed from `memory_free_percent`, #1821) | sysctl **`kern.memorystatus_level`** = `(capacity − wired − compressor) / capacity` — the kernel's own pressure headroom, 0–100. Sole red trigger: `pressure.red = level < 15` (`MARGIN_PERCENT_RED`, `model_ledger.rs:244`). Tile label is `margin` (`odometerTiles`, `machineGauge.ts:515-555`) — this project's own NASA register (mass margin, power margin, propellant margin); the redline is where margin runs out | live sysctl read = 85 = field ✓; 85 ≥ 15 → `red: false` ✓ — matches live `pressure.red: false` |
+| ⑪ | `7.22 GiB — swap used` (odometer tile) | `pressure.swap_used_bytes` | sysctl `vm.swapusage` (used), parsed by `parse_swapusage_used_bytes` (`model_ledger.rs:1552`) | rendered = memBytes(field) ✓ — a monotonic high-water mark: "reports, never alarms" is now UI copy on the tile's popover note (`machineGauge.ts:540`), not a Rust-side comment at a pinned line — the design rationale for why it isn't a trigger still lives in `model_ledger.rs`'s historical comment (~lines 208–230, where the old swap threshold used to be) |
+| ⑫ | `4.43 GiB — compressor` (odometer tile) | `pressure.compressor_bytes` | `vm_stat` "Pages occupied by compressor" × page size (`model_ledger.rs:1531,1544`) | rendered = memBytes(field) ✓; same reports-never-alarms rule; popover note now also disambiguates from darkmux's own compactor (`machineGauge.ts:546-552`) |
+| ⑬ | `limit source physical pool (no budget configured) · pool 128.00 GiB · used 103.98 GiB · available 60.29 GiB (48.92 GiB reclaimable) · unpriced 0 models · estimated 1 model` detail row | `limit_source`, `pool.capacity_bytes`, `pool.used_bytes`, `pool.available_bytes`, `pool.free_bytes` (feeds the reclaimable note only), `machine.unpriced_models`, `machine.estimated_models` | **#1821 machine-memory decomposition, one `vm_stat` read, zero added probe cost:** `used = wired + compressor_occupied + (active + inactive − purgeable)` (Activity-Monitor-style, `PoolSnapshot::used_bytes` doc); `available = free + inactive + speculative` (the colloquial "how much is left"); `free = "Pages free" × page size` (truly-free pages, `pool.free_bytes`) — kept in the payload but not given its own clause in this row; instead a `reclaimableNote()` (`format.ts:167-175`, added #1821 same day as the rest of this row) appends `(N GiB reclaimable)` after `available`, where `reclaimable = available − free`. This exists because `used` and `available` **deliberately overlap** (both count inactive pages, from opposite framings) and summed to 152.78 GiB on a 128 GiB machine the first time they were shown side by side — the note is what stops that from reading as broken arithmetic. `estimated N model(s)` clause (#1819) renders only when `estimated_models > 0`, same shape as `unpriced` | capacity/2³⁰ = 128.00 ✓, agreeing with ①; live `used` 103.98 GiB cross-checked against `top -l 1`'s report of `106G used`, sampled seconds apart ✓ (same-instant `top` compressor figure 4522M also agrees with live `compressor_bytes` 4.43 GiB, within sampling drift); `available − free` = 64735068160 − 12209979392 = 52525088768 = 48.92 GiB = the rendered reclaimable figure ✓. **The prior draft's claimed identity `used + free ≈ capacity` does not hold on this snapshot** (103.98 + 11.37 = 115.35 ≠ 128.00, a 12.65 GiB gap — the omitted category is exactly `available − free`'s inactive/speculative pages) and was likely a labeling slip for `used + available` in an earlier snapshot; that sum does not approximate capacity either (103.98 + 60.29 = 164.27, far over 128, BY DESIGN per the overlap above). Replaced with the real, code-asserted identity (`available − free` = the rendered reclaimable figure) rather than repeating an approximation that does not hold today |
 | ⑭ | model name + `DARKMUX`/`USER` chip | `models[].identifier`, `.owner` | owner = namespace test `swap::is_darkmux_owned(identifier)` — the `darkmux:` prefix IS the ownership record | prefix ⇔ owner on both residents ✓ |
-| ⑮ | `ctx · weights · kv@ctx · potential · current` | `models[].loaded_ctx`, `.weights_bytes`, `.kv_bytes_at_ctx`, `.potential_bytes`, `.current_bytes` | ctx from `lms ps`; weights from `lms ls` `sizeBytes`; the rest derived — see *per-model math* below | all identities verified ✓ |
-| ⑯ | `UNPRICED · potential unknown` chip | `models[].potential_bytes == null` (the UI keys on this ONE field, `MachineHealthRegion.tsx`'s `pot == null` — `kv_per_token_bytes` staying `null` is a consequence of the same unreadable-arch-facts cause, not a second condition the component itself tests) | no readable arch facts AND no catalog size either → kv, potential stay `null`; the bar/dial draws **no committed extent** (absence, never zero). **Since #1819 this is the NARROWER case** — see "The #1819 estimate" below for the sibling `ESTIMATED` chip, which DOES draw a committed extent | a resident with no catalog entry either (the genuinely unpriceable case): all three null ✓ |
-| ⑰ | `kv@ctx — no arch facts` | same null | `modelLines()` renders the reason, not a dash alone | ✓ |
+| ⑮ | `ctx · weights · kv@ctx · potential · current` | `models[].loaded_ctx`, `.weights_bytes`, `.kv_bytes_at_ctx`, `.potential_bytes`, `.current_bytes` | ctx from `lms ps`; weights from `lms ls` `sizeBytes`; the rest derived — see *per-model math* below; rendered by `modelKvLine()` (`machineGauge.ts:737-747` — the retired `modelLines()` this row used to cite is gone, see the module doc at the top of `memoryLedgerLines.ts`) | all identities verified ✓ |
+| ⑯ | `UNPRICED · potential unknown` chip | `models[].potential_bytes == null` (the UI keys on this ONE field, `MachineHealthRegion.tsx:507`'s `pot == null` — `kv_per_token_bytes` staying `null` is a consequence of the same unreadable-arch-facts cause, not a second condition the component itself tests) | no readable arch facts AND no catalog size either → kv, potential stay `null`; the bar/dial draws **no committed extent** (absence, never zero). **Since #1819 this is the NARROWER case** — see "The #1819 estimate" below for the sibling `ESTIMATED` chip, which DOES draw a committed extent | live: 0 residents in this state (all 3 loaded models price successfully — 2 arch, 1 estimated); structurally verified via the unit tests's genuinely-unpriceable fixture (no catalog entry either): all three null ✓ |
+| ⑰ | `kv unknown (no arch facts)` (the exact live wording — not the `kv@ctx — no arch facts` this row previously paraphrased) | same null | `modelKvLine()` (`machineGauge.ts:738`) renders the reason, not a dash alone: `m.kv_bytes_at_ctx != null ? "kv@ctx <bytes>" : "kv unknown (no arch facts)"` | ✓ — no live row currently exercises this arm (see ⑯); wording confirmed by reading the ternary directly |
 | ⑱ | message text, severity-keyed | `messages[]` (renamed AND retyped from `warnings[]`, #1821 — `LEDGER_SCHEMA_VERSION` 1.1 → 2.0) | composed server-side in `compute_ledger`, each entry `{severity, text}` — `info` (a disclosure, e.g. the #1819 estimate note), `warn` (a real degradation, e.g. the unpriceable undercount), `error` (the reading itself is untrustworthy — a probe/enumeration failure). Rendered verbatim, never summarized, with the severity carried as a CSS class (`.memmsg-info`/`.memmsg-warn`/`.memmsg-error`) rather than one uniform amber treatment | text matches byte-for-byte ✓; severity round-trips through JSON ✓; an `info` message renders visually distinct from `warn`/`error` (component-tested) ✓ |
-| ⑲ | attribution line | `attribution`, `attribution_note` | `attribute_current()`'s self-documenting degradation ladder (per-process RSS → rank-matched → estimated split → unavailable) | note matches live payload ✓ |
-| ⑳ | `snapshot Ns ago · gather 438 ms (zero model dispatches) · server cache 2000 ms · polled every 5s` | `generated_at_ms`, `gather_ms`, `cache_ttl_ms` + client constant | the observer stamps its own cost into the payload — "the gather was negligible" is a verifiable claim, not an assumption | fields present; `gather_ms` 438–494 across polls ✓ |
-| ㉑ | **the arc fill's color** (not circled in the key image — added 2026-08-14) | `machine.current_bytes` ÷ the scale — i.e. the needle's own position, and NOTHING else | `gaugeFillSeverity(pct)`: green < 50 ≤ amber < 85 ≤ red. **The one client-derived color on the page**, and deliberately so — see finding 1 | live fill `is-green` at 25.7% ✓; component tests pin an UNKNOWN-state payload rendering `is-red` at 94% and `is-green` at 3% ✓ |
+| ⑲ | attribution line | `attribution`, `attribution_note` | `attribute_current()`'s self-documenting ladder — **corrected from the prior draft's 4-stage description, which was wrong on two counts.** It is THREE states, not four (`PerProcess`/`Estimated`/`Unavailable` — `PerProcess` already means rank-matched, not a separate stage before it), and the per-worker figure it attributes is `max(rss, phys_footprint)` (`WorkerProc::memory_bytes`, `model_ledger.rs:600-603`), not bare `RSS` — a change from today (#1821): RSS alone understated the live machine total by roughly 97× on this operator's machine because MLX models hold almost nothing in RSS (weights live in Metal buffers). Rank-matching within `PerProcess` also changed basis, from potential to WEIGHTS (`model_ledger.rs:1079` — "rank by weights, falling back to potential" — weights are the materialized floor a loaded model holds no matter what, where potential includes KV that may not exist yet) | live `attribution_note`: *"3 worker(s) for 3 resident(s) — per-model footprint (max of rss and phys_footprint), workers rank-matched to models by weights (largest worker ↔ largest weights)"* — matches the code path exactly (3 workers, 3 residents → `PerProcess` arm) ✓ |
+| ⑳ | `snapshot Ns ago · gather 459 ms (zero model dispatches) · server cache 2000 ms · polled every 5s` | `generated_at_ms`, `gather_ms`, `cache_ttl_ms` + client constant | the observer stamps its own cost into the payload — "the gather was negligible" is a verifiable claim, not an assumption (`stampLine()`, `memoryLedgerLines.ts:81-85`) | fields present; live `gather_ms` = 459 ✓ |
+| ㉑ | **the arc fill's color** (not circled in the key image) | `band.usedPct` — **NOT** the needle's raw position alone; since #1821 this is `max(pool.used_bytes, machine.current_bytes) ÷ scale` (`computeBandGeometry`, `machineGauge.ts:192-213`), the same figure row ④'s needle now uses. The prior draft of this row described it as `machine.current_bytes ÷ scale` — true only until #1821 landed the machine-vs-darkmux split same day | `gaugeFillSeverity(pct)`: green < 50 ≤ amber < 85 ≤ red (`machineGauge.ts:109-113`). **The one client-derived color on the page**, and deliberately so — see finding 1 | live: `usedPct` = 81.25% → `gaugeFillSeverity` → `is-amber` — **worth naming explicitly: the fill reads AMBER on this snapshot while `machine.state` is GREEN**, which is the split working exactly as designed (finding 1) rather than a bug — the fill answers "how full", the chip answers "will it fit", and they are allowed to disagree; component tests separately pin an UNKNOWN-state payload rendering `is-red` at 94% and `is-green` at 3% ✓ |
+
+## The stacked band + legend — uncircled, and the day's largest gap in this doc
+
+Not one entry in the numbered table above, because the key image predates
+it entirely (see the callout above the table). This is real page surface —
+three drawn arcs plus a legend below the gauge — that the prior drafts of
+this document never traced at all. Reconciled here rather than jammed into
+a numbered row, since there is no circled number to hang it on.
+
+**The three arcs** (`computeBandGeometry`, `machineGauge.ts:192-213`;
+rendered `MachineHealthRegion.tsx:169-205`), stacked in scale order, each a
+`BandSegment { startPct, lengthPct }` as a percent of the gauge's own scale
+(`limit_bytes`):
+
+| Arc | Source | Formula |
+|---|---|---|
+| `darkmux` (from 0) | `machine.current_bytes` | `pctOf(current_bytes)` |
+| `other` (stacked on `darkmux`, ending at the needle) | derived, not probed | `[darkmuxPct, usedPct − darkmuxPct]` — the span between darkmux's own end and the machine's used position; drawn, not left as an undrawn gap between two rings (see the two-rings-vs-one-band rationale in the code comment this table paraphrases) |
+| `growth` (hatched, beyond the needle) | `machine.potential_bytes − machine.current_bytes` | `[usedPct, min(100 − usedPct, committedPct − darkmuxPct)]`, clamped so it never draws past the scale's own end |
+
+This replaced an EARLIER same-day design (two concentric rings — darkmux
+inside, machine outside) that this document never got a chance to trace
+before it was itself replaced (`bb0a7b1f` → `f1aca74f`, both 2026-08-15).
+The rings were abandoned because "everything else" (`other`) was left as an
+undrawn gap between two different-radius arcs, which required cross-radius
+mental subtraction to read and under-drew at the inner radius; stacking
+makes `other` a visible span and restores additivity (the page's actual
+question — "will it fit" — is a sum, and a sum is what a stacked band can
+show that two rings could not).
+
+**The legend** (`GaugeLegend`, `MachineHealthRegion.tsx:284-314`) — the
+three arcs' only textual companion, since neither the caption (row ⑦) nor
+the odometer names them:
+
+| Legend entry | Rendered when | Text | Source |
+|---|---|---|---|
+| `darkmux` | always | `darkmux <b>{memBytes(current_bytes)}</b>` | `machine.current_bytes` |
+| `other` | `other != null` (i.e. both `pool.used_bytes` and `machine.current_bytes` are readable) | `other <b>{memBytes(other)}</b>` | `max(0, pool.used_bytes − machine.current_bytes)` — computed independently in the component, not read off `machine.other_used_bytes`, though the two formulas are the same arithmetic (see finding below) |
+| `committed +…` | growth band has positive length | `committed +<b>{memBytes(potential−current)}</b> → <b>{memBytes(projected)}</b>` | `potential_bytes − current_bytes`, and `pool.used_bytes + max(0, that delta)` |
+
+**Live, this snapshot:** `darkmux 36.53 GiB` · `other 67.46 GiB` · `committed
++17.79 GiB → 121.77 GiB`. Cross-checked: `other` = 111662612480 −
+39219799696 = 72442812784 = 67.46 GiB, which equals `machine.other_used_bytes`
+from the JSON exactly (72442812784) — the two independent computations
+(one server-side for the cascade, one client-side for the legend) agree
+byte-for-byte on this payload, which is worth stating as a checked identity
+rather than an assumption, per this doc's own covenant. `committed`'s
+target, 121.77 GiB, equals `machine.projected_total_bytes` (130764723188 =
+121.77 GiB) — again independently computed, again agreeing.
+
+**Ownership note for a future edit:** the legend's `other`/`projected`
+figures duplicate arithmetic the server already exposes as
+`other_used_bytes`/`projected_total_bytes` (see #1821 below). They agree
+today because both sides implement the same formula, not because one reads
+the other — a future change to either formula could silently diverge them.
+Not fixed here (this pass is documentation, not code — see the constraint
+against editing `.tsx`/`.rs` in this pass's instructions); named as a
+finding instead (see Findings, below).
 
 ## The derived values, expanded
 
-**Per-model math** (`compute_ledger`, `model_ledger.rs:329-360`):
+**Per-model math** (`compute_ledger`'s per-model loop, `model_ledger.rs:785-822`
+— line drifted from the last-cited `:329-360` as #1819/#1821 grew the module
+above it; still the same loop, unrenamed):
 
 ```
 kv_bytes_at_ctx = kv_per_token_bytes × loaded_ctx
 potential_bytes = weights + kv_bytes_at_ctx + 750 MB transient margin   (ArchEstimator)
 ```
 
-Tested live: qwen3.6-35b at ctx 262,144 → 20480 × 262144 = 5,368,709,120 =
-the field, and `potential − weights − kv` = exactly 750,000,000. The KV width
-is **priced at fp16** (`KV_BYTES_PER_ELEMENT_V1 = 2`) until load-config
-provenance (#1257) refines it — kv@ctx is an estimate with a stated width,
-not a measurement.
+Tested live (same identity, same model, still true today): qwen3.6-35b at
+ctx 262,144 → 20480 × 262144 = 5,368,709,120 = the field, and
+`potential − weights − kv` = exactly 750,000,000. The KV width is **priced
+at fp16** (`KV_BYTES_PER_ELEMENT_V1 = 2`) until load-config provenance
+(#1257) refines it — kv@ctx is an estimate with a stated width, not a
+measurement.
 
-**Machine total:** `current` is the Σ of attributed per-model RSS;
+**Machine total:** `current` is the Σ of attributed per-model footprint
+(`max(rss, phys_footprint)` since #1821 — see row ⑲; the prior draft of
+this paragraph still said "RSS", which understated the live total ~97× on
+this machine before the fix);
 `potential` is the Σ of **priced** models — arch-measured AND
 size-estimated (#1819) — with `unpriced_models` counting what the sum still
 omits (the genuinely unpriceable remainder). The page must always carry the
@@ -128,6 +217,12 @@ underestimate — the safe direction when darkmux's own share is unknown.
 `projected_total_bytes` answers the question this cascade has always been
 trying to answer: *if darkmux's own commitment fully materializes while
 everything else holds what it holds now, what is the machine's total?*
+
+Tested live, this snapshot: `other_used_bytes` = 111662612480 − 39219799696
+= 72442812784 = the field ✓; `projected_total_bytes` = 72442812784 +
+58321910404 = 130764723188 = the field ✓, and 130764723188 ≤ 137438953472
+(the limit) with `unpriced_models == 0` — arm 3 fires, `machine.state` =
+`green`, matching the live payload exactly.
 
 **The state cascade** (`compute_ledger`, `model_ledger.rs`, in order — line
 numbers drift with #1819/#1821's additions, so given by name rather than
@@ -170,7 +265,7 @@ carries no such exception — it follows the machine state like any other
 row.
 
 **Limit resolution:** `#1243 budget > physical pool capacity > none`
-(`model_ledger.rs:383`). See finding 4.
+(`model_ledger.rs:895-899`). See finding 4.
 
 ## The #1819 estimate — the covenant's first exception
 
@@ -191,23 +286,43 @@ from (`microsoft/phi-4` resolving to a GGUF with no `config.json`, while its
 MLX sibling `mlx-community/phi-4-8bit` prices normally because MLX builds DO
 ship one).
 
-**The formula.** `ArchWithSizeFallback` (`model_ledger.rs`) tries
+**The formula.** `ArchWithSizeFallback` (`model_ledger.rs:714-763`) tries
 `ArchEstimator` first (a measurement); only when that returns `None` does it
 fall to `V1Estimator`, then adds the SAME post-load transient margin
 `ArchEstimator` already includes — the fallback and the measured path price
 on one basis, never a cheaper one for the guess:
 
 ```
+kv_rate         = fallback_kv_rate_for_size(catalog.size_bytes)   -- SIZE-TIERED, see below
 potential_bytes = catalog.size_bytes
-                 + V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN × loaded_ctx
+                 + kv_rate × loaded_ctx
                  + DEFAULT_TRANSIENT_MARGIN_BYTES
 ```
 
+**This pseudocode is itself a same-day correction.** The prior draft of this
+section showed the KV rate as the single flat constant
+`V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN` — true when #1819 first merged, no
+longer true after a same-day follow-up (`FALLBACK_KV_TIERS`,
+`model_ledger.rs:148-196`, its own merge-gate finding, 2026-08-15): a single
+constant UNDER-reserved the population most likely to hit this fallback in
+the first place — large dense GGUF downloads. Working the crate's own
+`kv_per_token` formula over published architectures found a 70B model short
+by ~4 GB at 32K ctx and ~16 GB at 128K, none of it absorbed elsewhere. The
+rate is now selected from the model's own catalog `size_bytes`
+(`fallback_kv_rate_for_size()`, `model_ledger.rs:190-196`):
+
+| size tier | KV rate | representative class |
+|---|---|---|
+| ≤ 15 GiB | `V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN` = 204,800 B/token | phi-4 class |
+| ≤ 45 GiB | 327,680 B/token | 70B/72B class |
+| above | 409,600 B/token | 123B class and up |
+
 `V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN = 204_800` bytes/token (204.8 KB/token,
-decimal) — traceable, not invented, and traced to the exact model this
-issue is ABOUT: `microsoft/phi-4`'s own architecture, published verbatim by
-Microsoft (`huggingface.co/microsoft/phi-4/raw/main/config.json`, fetched
-2026-08-15): `num_hidden_layers: 40, num_attention_heads: 40,
+decimal) remains the TIER-1 rate and is still derived the way the rest of
+this section describes — traceable, not invented, and traced to the exact
+model this issue is ABOUT: `microsoft/phi-4`'s own architecture, published
+verbatim by Microsoft (`huggingface.co/microsoft/phi-4/raw/main/config.json`,
+fetched 2026-08-15): `num_hidden_layers: 40, num_attention_heads: 40,
 num_key_value_heads: 10, hidden_size: 5120` (`model_type: "phi3"` — Phi-4
 reuses the Phi-3 architecture class; no `sliding_window`, no
 `rope_scaling` — a homogeneous DENSE decoder). `head_dim = 5120 / 40 = 128`,
@@ -221,6 +336,24 @@ very first machine it runs on. Deriving from phi-4's own published numbers
 instead closes that gap for the model the issue traces; it remains a
 REFERENT rather than a proven ceiling over every dense architecture
 (caught in review, 2026-08-15 — see finding 7).
+
+**Stated where the covenant demands it: even the size-tiered table has a
+named gap.** Pre-GQA multi-head-attention architectures (Llama-2-13B: 40
+layers × 40 kv_heads × 128 = 819,200 B/token) exceed every tier here,
+because MHA's kv_heads equals its attention-head count instead of a small
+fraction of it — the size looks small while the true KV rate is enormous,
+and no size-derived rate can catch that. Reading arch facts directly out of
+the GGUF header (a named follow-up, #1820) is the real fix; the tiered
+table is the honest approximation until then, and the live `info` message
+(row ⑱; see the open finding below about its rendering) states this gap in
+its own text.
+
+**Tested live:** phi-4's weights (9,053,136,497 bytes ≈ 8.43 GiB) fall in
+the ≤ 15 GiB tier → rate 204,800. Reversing the arithmetic from the live
+payload confirms it exactly: `(potential_bytes − weights_bytes −
+DEFAULT_TRANSIENT_MARGIN_BYTES) / loaded_ctx` = `(13158579697 − 9053136497
+− 750000000) / 16384` = `3355443200 / 16384` = `204800.0` — the tier-1 rate,
+to the byte.
 
 **The assumption, named where the covenant demands it.** This formula
 assumes DENSE attention — every layer holds a KV cache. That is knowingly
@@ -239,13 +372,13 @@ named:**
 | Surface | What changes |
 |---|---|
 | Row chip | `ESTIMATED` — a THIRD chip family alongside `.is-state` (outline+hue=status) and `.is-identity` (fill+grey=identity): `.is-estimated` is a DASHED outline in the neutral `--dim` hue, the one axis neither existing family had claimed. Title states the dense-attention assumption. |
-| Row kv line | `potential ~10.69 GiB (estimated)` — the `~` and suffix travel WITH the number, not just beside it in a separate badge, so the figure can't be read (or copy-pasted) out of its own caveat. |
+| Row kv line | `potential ~12.25 GiB (estimated)` (live, phi-4 today) — the `~` and suffix travel WITH the number, not just beside it in a separate badge, so the figure can't be read (or copy-pasted) out of its own caveat. |
 | Row hint | A `↳ estimated: …` line beside the row, mirroring the existing `↳ unpriceable: …` hint's shape and position. |
 | Machine chip | `GREEN · 1 estimated` (decision 1 — an estimated resident MAY produce a decided verdict; the count travels with the word, `machineStateWord()`). Never prefixed `fit ` — that's a separate, still-open decision named explicitly in the code so a future edit doesn't confuse the two. |
 | Machine detail row | `unpriced 0 models · estimated 1 model` — the SAME row that already named the unpriced count, extended rather than replaced. |
-| `messages[]` | A dedicated `info`-severity message naming the estimated resident(s) and the assumption, SEPARATE from the existing `warn`-severity unpriceable-resident message — the two are different facts (counted-via-guess vs. genuinely-uncounted) AND different severities (a disclosure vs. a real degradation) and must never share one sentence or one lamp (#1821 — this is the fix to the WARN-lamp-lights-on-a-disclosure defect the estimate feature itself surfaced). |
-| CLI (`darkmux machine resources`) | The row's STATE column carries `(estimated)`; the POTENTIAL column itself carries the same `~` prefix the kv line uses; the machine line's parenthetical names both counts when both are nonzero: `(+1 unpriced, 2 estimated)`. |
-| Amber shrink hint | An estimated resident CAN be the shrink target — `hint_target_key`/`shrink_hint` read a row's kv rate through `effective_kv_rate()`, which uses `V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN` for an estimated row rather than treating it as un-shrinkable (an earlier draft could render the FALSE "no shrinkable context" line when the estimated resident was the only one with room — caught in review). When the target itself is estimated, the hint's own saving figure carries a parenthetical noting it's computed from the same conservative assumption. |
+| `messages[]` | A dedicated `info`-severity message naming the estimated resident(s) and the assumption, SEPARATE from the existing `warn`-severity unpriceable-resident message — the two are different facts (counted-via-guess vs. genuinely-uncounted) AND different severities (a disclosure vs. a real degradation) and must never share one sentence or one lamp (#1821 — this is the fix to the WARN-lamp-lights-on-a-disclosure defect the estimate feature itself surfaced). **This message currently renders its KB/token figure wrong — see the open finding below; the message otherwise lands correctly (right severity, right lamp behavior, right resident named).** |
+| CLI (`darkmux machine resources`) | The row's STATE column carries `(estimated)`; the POTENTIAL column itself carries the same `~` prefix the kv line uses; the machine line's parenthetical names both counts when both are nonzero: `(+1 unpriced, 2 estimated)`. Not independently re-verified against a live CLI invocation this pass — flagged as unverified, not asserted. |
+| Amber shrink hint | An estimated resident CAN be the shrink target — `hint_target_key`/`shrink_hint` read a row's kv rate through `effective_kv_rate()` (`model_ledger.rs:1150-1164`), which for an estimated row now resolves `fallback_kv_rate_for_size(row.weights_bytes)` — the SAME size-tiered rate the row was priced with — rather than the flat `V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN` this table previously described (that flat read was accurate before the size-tiering follow-up landed same day; see "The formula" above). Reading the flat constant here today would reintroduce, one level down, the exact defect this function exists to prevent — a shrink saving computed at a different rate than the commitment it is shrinking. An earlier draft also omitted estimated rows from shrink-hint targeting entirely, which could render the FALSE "no shrinkable context" line — caught in review. When the target itself is estimated, the hint's own saving figure carries a parenthetical noting it's computed from the same conservative assumption. |
 | `darkmux doctor` | A dedicated check (`resident pricing`) names residents that are STILL genuinely unpriceable after the fallback — i.e. no catalog size either — and hints the concrete remedy (load an MLX build of the same model, when one exists). It does NOT warn on an estimated resident; estimation is the intended, working path, not a defect to flag. |
 
 **What #1819 deliberately did NOT build.** Reading the GGUF header directly
@@ -257,8 +390,15 @@ meantime, GGUF or otherwise, and never silently claims to be more than that.
 
 ## Findings
 
-1. **`unknown` is the normal state on this machine, and that is correct —
-   which is why the fill stopped keying on it.** The live snapshot takes arm
+Each finding below now opens with an explicit **Status** line — open,
+addressed, or superseded, and by what — per this pass's instructions to
+reconcile rather than just append. Findings 1–9 predate this pass; 10–14 are
+new, found while re-verifying every row against the code.
+
+1. **Status: addressed for the fill (row ㉑); the underlying UNKNOWN
+   prevalence is unchanged and not a defect.** `unknown` is the normal state
+   on this machine, and that is correct — which is why the fill stopped
+   keying on it. The live snapshot takes arm
    5 above: the priced sum (42.06 GiB) fits the 128 GiB limit, but
    `microsoft/phi-4` is unpriceable, so the ledger honestly declines to
    promise a fit. Consequence: with any user-loaded model lacking readable
@@ -299,8 +439,10 @@ meantime, GGUF or otherwise, and never silently claims to be more than that.
    estimated count travels with the verdict everywhere it appears, so this
    fix could not simply repaint UNKNOWN as GREEN without saying why).
 
-2. **`pool free` and `memory free %` disagree by design, and the labels hide
-   it.** `pool.available` is `vm_stat` "Pages free" × page size —
+2. **Status: addressed (#1821), and see finding 12 for a second layer of the
+   same defect this reconciliation pass found in the gauge itself.**
+   `pool free` and `memory free %` disagreed by design, and the labels hid
+   it. `pool.available` is `vm_stat` "Pages free" × page size —
    deliberately conservative, and macOS keeps free pages near zero by
    reclaiming everything into cache, so a couple of GiB on an idle 128 GiB
    machine is normal (1.84 GiB in this snapshot). `memory_free_percent` is `kern.memorystatus_level` — the
@@ -327,8 +469,10 @@ meantime, GGUF or otherwise, and never silently claims to be more than that.
    See rows ⑩ and ⑬ above, and "The pool decomposition" below for the full
    derivation.
 
-3. **The same physical quantity used to render as both `128 GB` and
-   `137.44 GB` — fixed by moving the page to binary (#1811).** The header's
+3. **Status: addressed, with one named remainder still open (the `specOf`
+   unit-suffix mismatch, below) — the operator has already declined to
+   force it.** The same physical quantity used to render as both `128 GB` and
+   `137.44 GB` — fixed by moving the page to binary (#1811). The header's
    RAM figure was binary (matching Apple's marketing number); every ledger
    figure was decimal (`memBytes`). Both derive from the identical
    `hw.memsize` = 137,438,953,472 bytes, so the page showed one quantity as
@@ -351,7 +495,9 @@ meantime, GGUF or otherwise, and never silently claims to be more than that.
    reclaimable estimate minus residents — is **not rendered on this page at
    all**.)
 
-4. **The BUDGET limit arm is currently unreachable in production.**
+4. **Status: open, unchanged — still a server-side prerequisite (#1243), not
+   touched by any of today's other changes.** The BUDGET limit arm is
+   currently unreachable in production.
    `compute_ledger` fully supports `limit_source:"budget"`, but `gather()`
    passes `budget_bytes: None` with a comment naming the future wiring
    (`runtime.max_model_ram_gb`, #1243). The redesign's budget renderings
@@ -360,22 +506,37 @@ meantime, GGUF or otherwise, and never silently claims to be more than that.
    prerequisite, stated here so the mockup is not read as a claim about
    current behavior.
 
-5. **No mismatches found.** Every arithmetic identity the page depends on
-   verified against the live daemon: Σ current, Σ priced potential, kv@ctx,
-   the 750 MB margin, the owner/namespace equivalence, the limit = pool
-   equality, the state cascade's arm, and the red threshold (87 ≥ 15).
+5. **Status: superseded by this pass's own findings 10–14 — the claim "no
+   mismatches" no longer holds and should not be read forward from this
+   entry.** At the time this finding was written (2026-08-14), every
+   arithmetic identity the page depended on verified against the live
+   daemon: Σ current, Σ priced potential, kv@ctx, the 750 MB margin, the
+   owner/namespace equivalence, the limit = pool equality, the state
+   cascade's arm, and the red threshold. This pass (2026-08-15) re-ran the
+   same class of check against the code as it now stands and found one real
+   mismatch (finding 10 — a message renders the wrong number) plus several
+   places where the DOC had drifted from correct code (findings 12–13, and
+   the several table-row corrections above) — a different failure mode from
+   "the code is wrong," but the entry's original claim ("no mismatches
+   found," full stop) is no longer an accurate standing summary of this
+   document's own trustworthiness. Read this entry as a dated snapshot of
+   one day's verification, not a durable guarantee.
 
-6. **Snapshots move.** Between the mockups' snapshot and this test's
-   snapshot (same day, minutes apart): pool free 4.63 → 6.33 GB, compressor
-   728 → 907 MB, gather 438 → 454 ms. Any static rendering of this page is
-   one dated poll; the figures in the mockups are labeled with their
-   snapshot date for that reason.
+6. **Status: standing note, not a bug — still true today.** Snapshots move.
+   Between the mockups' snapshot and that day's live test (same day, minutes
+   apart): pool free 4.63 → 6.33 GB, compressor 728 → 907 MB, gather
+   438 → 454 ms. Any static rendering of this page is one dated poll; the
+   figures in the mockups are labeled with their snapshot date for that
+   reason. This pass's own live snapshot (2026-08-15, gather 459 ms) is
+   already a different poll from every number quoted in findings 1–9 above —
+   the same lesson, one day later.
 
-7. **#1819's own implementation shipped one real bug and one weaker-than-
-   claimed constant, both caught by an independent review before merge —
-   recorded here because the covenant this document keeps applies to the
-   PR that adds the estimate too, not just to the feature once it's already
-   in.**
+7. **Status: addressed, and see finding 11 for a THIRD merge-gate catch on
+   the same feature, same day, not originally recorded here.** #1819's own
+   implementation shipped one real bug and one weaker-than-claimed constant,
+   both caught by an independent review before merge — recorded here because
+   the covenant this document keeps applies to the PR that adds the estimate
+   too, not just to the feature once it's already in.
 
    The bug: the first draft's fallback estimate omitted the 750 MB
    transient margin every arch-priced row already includes, so an
@@ -410,8 +571,11 @@ meantime, GGUF or otherwise, and never silently claims to be more than that.
    table's POTENTIAL column now carries the same `~` prefix the UI's kv
    line does, so the caveat travels with the CLI figure too.
 
-8. **#1821 — the machine-total cascade measured darkmux's commitment against
-   the WHOLE machine's capacity, as though darkmux were the only tenant.**
+8. **Status: addressed, and re-verified live by this pass (see the #1821
+   arithmetic block above — `projected_total_bytes` matched the field
+   exactly on today's snapshot too).** #1821 — the machine-total cascade
+   measured darkmux's commitment against the WHOLE machine's capacity, as
+   though darkmux were the only tenant.
    `Σ potential ≤ limit` (arm 3, pre-#1821) compares darkmux's own models
    against `hw.memsize`. Live: darkmux's committed ~42 GiB fit inside 128
    GiB — GREEN — while ~44 GiB was already held by other processes, so real
@@ -437,9 +601,12 @@ meantime, GGUF or otherwise, and never silently claims to be more than that.
    enough to matter, which is exactly the case arm 3 used to get wrong
    silently.
 
-9. **`messages[]` replaces `warnings[]` — a rename AND a retype
-   (`LEDGER_SCHEMA_VERSION` 1.1 → 2.0), because a disclosure and a
-   degradation were rendering identically.** `warnings: Vec<String>` had no
+9. **Status: addressed, and re-verified live by this pass (the live payload
+   today is `schema_version: "2.0"` with a single `info`-severity message
+   that correctly leaves the WARN lamp unlit — see row ⑨).** `messages[]`
+   replaces `warnings[]` — a rename AND a retype (`LEDGER_SCHEMA_VERSION`
+   1.1 → 2.0), because a disclosure and a degradation were rendering
+   identically. `warnings: Vec<String>` had no
    severity channel, so the #1819 estimate note — a disclosure, working
    exactly as designed, permanently true on any machine with a GGUF
    resident — lit the same amber WARN lamp as a genuine degradation (the
@@ -452,6 +619,84 @@ meantime, GGUF or otherwise, and never silently claims to be more than that.
    finding 2's sibling). Tolerable as a MAJOR bump: every consumer (CLI,
    `/machine/resources`, the viewer) ships in this same binary; no
    external reader is stranded.
+
+10. **Status: OPEN — a live code defect, flagged per this pass's
+    instructions rather than fixed (docs-only pass).** The #1819 estimate
+    `info` message (row ⑱, the "How a reader tells it apart" table above)
+    renders its KB/token rate wrong. Live text today: *"potential assumes
+    dense attention at a size-tiered **2** KB/token"* — should read `204.8`.
+
+    **Root cause, read directly from the format string**
+    (`model_ledger.rs:860-887`): the outer `format!` applies a `{:.1}`
+    specifier to the 4th positional argument, which is itself the RESULT of
+    an inner `match` that already returns a pre-formatted `String` (e.g.
+    `"204.8"`). In Rust's `std::fmt`, a precision specifier on a *string*
+    argument means "truncate to at most N characters," not "N decimal
+    places" — that meaning only applies to numeric types. So `{:.1}` on the
+    string `"204.8"` truncates it to its first character, `"2"`. The
+    underlying arithmetic is correct throughout (confirmed above, reversed
+    from the live payload: exactly 204,800 B/token for phi-4) — this is a
+    display-only defect, not a pricing defect, and it does not affect
+    `machine.state`, any chip, any lamp, or any byte figure — only this one
+    sentence's own number.
+
+    No test pins this message's literal text against its numeric inputs,
+    which is why it shipped. Not corrected in this document by substituting
+    the intended value — the covenant requires reporting what the live
+    daemon actually returns, not what it was meant to return.
+
+11. **Status: addressed by this pass — a real same-day code change that no
+    prior draft of this document recorded.** The #1819 fallback KV rate is
+    SIZE-TIERED (`FALLBACK_KV_TIERS`, `model_ledger.rs:148-196`,
+    `fallback_kv_rate_for_size()`), not the single flat constant every
+    earlier version of "The formula" (above) described. A single rate
+    under-reserved large dense models — the population most likely to need
+    the fallback in the first place (a 70B model priced short by ~4 GB at
+    32K ctx, ~16 GB at 128K) — which is the exact "sum comes in low, cascade
+    promises Green, machine overruns at materialization" failure this
+    feature exists to refuse. Tiers now key on catalog `size_bytes`; see
+    "The formula" above for the table and the live cross-check.
+
+12. **Status: addressed by this pass — the gauge's center readout, needle,
+    and fill hue all changed SUBJECT (not just style) same day (#1821), and
+    no prior draft of this document recorded the change.** The center
+    readout used to read `machine.current_bytes` (darkmux's own share); it
+    now reads `pool.used_bytes` (the whole machine's used memory), labeled
+    `MACHINE USED` rather than `IN USE`. The needle moved with it — from
+    `current / limit` to `max(pool.used, current) / limit`. This is finding
+    2 and finding 8's own shape recurring a third time, this time in the
+    gauge itself: the operator caught a needle at ~82% sitting beside a
+    readout of 36.8 GiB (darkmux's own figure) — the same "two things
+    sharing one instrument, only one of them labeled" defect that findings 2
+    and 8 already named at the pressure-tile and cascade layers. See row ④
+    above for the corrected trace, and the new "stacked band + legend"
+    section for the darkmux/other/growth decomposition that replaced the
+    figure the needle used to show alone.
+
+13. **Status: addressed by this pass.** The tell-tale lamp row (row ⑨) lost
+    its STATE lamp today (an operator-caught duplicate of the machine chip
+    that also broke the "a tell-tale never relabels itself" rule — it
+    printed the verdict word in a dim, unlit color) and this document never
+    recorded that the row's remaining six lamps include a Δ RESIDENCY lamp
+    that predates today's changes but was never listed in this row by any
+    prior draft. Net effect on the documented lineup: STATE removed,
+    RESIDENCY added for the first time to this doc — both real, but only
+    one of them is new to the CODE; the other was always there and simply
+    never traced here.
+
+14. **Status: OPEN, minor — flagged for the operator, not fixed in this
+    pass (docs-only).** The new gauge legend (see "The stacked band +
+    legend" above) computes `other` and `projected` client-side from
+    `pool.used_bytes`/`machine.current_bytes`/`machine.potential_bytes`
+    (`GaugeLegend`, `MachineHealthRegion.tsx:286-291`) rather than reading
+    the server's own `machine.other_used_bytes`/`machine.projected_total_bytes`
+    fields, which carry the identical formula (#1821). They agree
+    byte-for-byte on today's live payload because both sides currently
+    implement the same arithmetic — but nothing enforces that the two stay
+    in lockstep if either formula changes later. Not a live bug today;
+    named because this document's own covenant is to trace every figure to
+    ONE named source, and this figure currently has two independent ones
+    that happen to agree.
 
 ## The pool decomposition (#1821)
 
@@ -466,12 +711,31 @@ available_bytes = free + inactive + speculative
 free_bytes      = free
 ```
 
-`used_bytes` is Activity-Monitor-style. Cross-checked live against `top`
-the same instant: 69.3 GiB from this formula vs `top`'s ~66 GiB used — far
-closer than the implied `capacity - free` this page leaned on before
-(73.4 GiB the same instant, and the reason `pool free` alone swung between
-1.8 and 61 GiB across one earlier session: `free` is the most volatile of
-the three page classes, since macOS reclaims aggressively into cache).
+`used_bytes` is Activity-Monitor-style. Cross-checked live (2026-08-14)
+against `top` the same instant: 69.3 GiB from this formula vs `top`'s
+~66 GiB used — far closer than the implied `capacity - free` this page
+leaned on before (73.4 GiB the same instant, and the reason `pool free`
+alone swung between 1.8 and 61 GiB across one earlier session: `free` is
+the most volatile of the three page classes, since macOS reclaims
+aggressively into cache). **Re-checked this pass (2026-08-15):** live
+`used_bytes` = 111662612480 = 103.98 GiB, `top -l 1`'s same-instant
+`PhysMem:` line read `106G used` — same-shape agreement, different
+snapshot, one day later.
+
+**A prior draft of this document also claimed `used + free ≈ capacity`
+as a cross-check identity elsewhere (row ⑬'s Tested cell) — that does not
+hold, on this snapshot or in general, and has been corrected there.**
+`used` and `available` (not `free`) deliberately OVERLAP — both count
+inactive pages, from opposite framings — which is why the UI now renders
+a `reclaimableNote()` (`format.ts:167-175`, #1821, same day) after the
+`available` figure: `available − free` names the overlap explicitly
+(`reclaimable = inactive + speculative`) so `used` and `available` summing
+to MORE than capacity (152.78 GiB the first time they were shown side by
+side on this 128 GiB machine) reads as by-design rather than broken
+arithmetic. The one identity that DOES hold by construction is
+`available − free = reclaimable`, cross-checked live above (row ⑬):
+64735068160 − 12209979392 = 52525088768, the exact figure the note
+renders.
 
 `available_bytes` is the colloquial "how much is left" — reclaimable
 inactive and speculative pages counted as available, matching what a
@@ -494,12 +758,32 @@ Stated so nothing implies API origin: the **demo strip** in every mockup
 **scaling demo**'s departed/NEW/EXPECTED rows and its 46.6 GB machine figure,
 and every `BUDGET` rendering (finding 4). The EXPECTED row additionally
 depends on a server-side `expected[]` set that does not exist yet
-(PROPOSAL §8). Everything else in the mockups is the live 2026-08-14
-snapshot, transformed exactly as the table above describes.
+(PROPOSAL §8).
+
+**The closing claim that used to sit here — "everything else in the mockups
+is the live 2026-08-14 snapshot, transformed exactly as the table above
+describes" — is no longer true, and this pass is not the one that can fix
+it.** The table above now describes the STACKED-BAND gauge (darkmux / other
+/ growth, a legend, a `MACHINE USED` center readout) that landed AFTER the
+mockups this section describes were made; the mockups (and the key image)
+show the earlier single-ring gauge with a plain `IN USE` caption. The
+mockup HTML files themselves (`level3.html`, `scaling.html`) are not
+tracked in this repo (`docs/design/machine-lens/` holds only `proposal.md`,
+`provenance.md`, and `provenance-key.jpg` — confirmed via `git log`, no
+history for any `.html` under this path), so this document cannot verify
+or update their content directly; it can only flag that any surviving copy
+of them is now stale in the same way the key image is. If they still exist
+somewhere outside this repo, they need the same disclosure the key image
+callout carries at the top of this document.
 
 ---
 
-*Verification artifacts: `live-resources.json`, `live-specs.json` (the tested
-snapshots), `provenance.html` (the annotated page), `provenance-key.jpg` (the
-keyed screenshot). Code references are to this worktree at the time of
-writing; line numbers drift, function names rarely do.*
+*Verification artifacts: `live-resources.json`, `live-specs.json` (the
+2026-08-14 snapshots the earlier findings cite), `provenance.html` (the
+annotated page), `provenance-key.jpg` (the keyed screenshot, now stale per
+the callout above). This pass's own live re-verification (2026-08-15) was
+read directly from `http://127.0.0.1:8765/machine/resources` +
+`/machine/specs` rather than saved to a new snapshot file — the specific
+field values it cites are reproducible by curling the same daemon. Code
+references are to this worktree at the time of writing; line numbers
+drift, function names rarely do.*
