@@ -11,6 +11,77 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
 
 ## [Unreleased]
 
+The machine page's numbers were wrong, and now they are not. Per-model memory
+was read from a counter (`ps rss`) that does not count MLX weights at all, so
+the gauge reported **271 MiB held while three loaded models held ~25 GiB** —
+understated roughly 97×, with a green verdict beside it. That single defect,
+and everything it touched once the real number was visible, is almost the
+whole of this release; the gauge itself was also redrawn twice along the way
+as each fix changed what there was to look at.
+
+### Breaking
+
+- **`LEDGER_SCHEMA_VERSION` 1.1 → 2.0** (#1821). Anyone parsing
+  `/machine/resources` or `darkmux machine resources` output directly is
+  affected:
+  - **`warnings: string[]` is replaced by `messages: {severity, text}[]`**
+    (`info` / `warn` / `error`). The old field rendered every entry the same
+    amber regardless of whether it was a real degradation or a note about how
+    a figure was derived; severity is now explicit instead of implied by
+    which field it landed in.
+  - **`pool.available_bytes` changed meaning.** It used to be the truly-free
+    page count (`vm_stat` "Pages free"); it now means the colloquial "how much
+    is left" (free + inactive + speculative). The old meaning is preserved
+    under a new name, **`pool.free_bytes`** — if your integration wants the
+    old number, read that field instead.
+  - **`pressure.memory_free_percent` is renamed `pressure.margin_percent`.**
+    It was always a 0–100 kernel pressure reading (`kern.memorystatus_level`),
+    not a byte count, and the old name read as one next to the pool's byte
+    figures.
+  - **New, additive fields**: `pool.used_bytes` (Activity-Monitor-style: wired
+    + compressor + (active + inactive − purgeable)); `machine.other_used_bytes`
+    and `machine.projected_total_bytes` (what everything *besides* darkmux is
+    holding, and what the machine would total if darkmux's own
+    committed-but-unmaterialized models fully load); `potential_source` per
+    model (`"arch"` for a measured estimate, `"estimated"` for the size-tiered
+    fallback below, omitted when a model has no potential at all) and
+    `machine.estimated_models` (counted separately from `unpriced_models` —
+    an estimated resident is priced and does not block a green verdict; only
+    a resident with no arch facts *and* no catalog size still forces the
+    machine to unknown).
+
+  The new fields are purely additive and ignorable by an old reader.
+  `warnings` and `memory_free_percent` are gone from the payload outright — a
+  reader keyed on those exact names gets nothing back and needs to move to
+  `messages` and `margin_percent`. `available_bytes` is the sharper case: the
+  field is still present under the same name, but its **value now means
+  something different** — a reader that kept using it silently gets the
+  colloquial figure instead of the truly-free one it was reading before. Move
+  to `free_bytes` for the old meaning.
+
+### Added
+
+- **An unpriceable resident gets an estimate instead of blocking the machine's
+  verdict forever.** Pricing a resident needs its `config.json` (hidden layer
+  count, KV heads, head dim); a GGUF download carries that architecture inside
+  the binary instead of a sidecar file, so one such resident — even a small
+  one — forced the *entire* machine's fit verdict to `unknown` permanently,
+  regardless of how comfortably everything else fit. A fallback estimator now
+  prices those residents from catalog size alone, selecting a KV-cost rate
+  tiered to size (larger dense models get a higher per-token rate, since a
+  flat rate under-reserved exactly the large downloads most likely to hit this
+  path). The estimate is disclosed everywhere the verdict appears — a dashed
+  `ESTIMATED` chip on the model row, an `info`-severity message, the CLI table
+  and its `~`-prefixed POTENTIAL column, and a new `darkmux doctor` check
+  naming any resident that is still genuinely unpriceable after the fallback
+  (no arch facts and no catalog size), with the fix (load an MLX build of the
+  same model when one exists). **Known limit, stated rather than hidden:** the
+  size-tiered rate under-reserves pre-GQA multi-head models such as
+  Llama-2-13B, where KV-head count equals attention-head count instead of a
+  small fraction of it — no size-derived rate can catch that shape. Reading
+  the GGUF header directly (#1820) is the real fix and is not in this release.
+  (#1819, #1823)
+
 ### Changed
 
 - **The machine page reads in binary GiB, so its numbers match the machine you
@@ -18,25 +89,85 @@ intentionally decoupled from these version numbers, and the `RULES_SCHEMA` /
   `137.44 GB`, and the gauge inherited it — labeling its arc `0 · 34 · 69 · 103
   · 137` on the one screen whose whole job is telling you how much room you
   have. Every figure in the memory ledger and on the gauge face now divides by
-  a power of two and is labeled `GiB`/`MiB`: the arc reads `0 · 32 · 64 · 96 · 128`, the pool
-  reads `128.00 GiB`, and the ` (128 GiB)` parenthetical that used to patch the
-  mismatch is gone along with it. The stage header's own RAM figure keeps its
-  `GB` label for now — it was always computed in binary, so it now agrees
-  numerically; only the suffix still differs.
-- **The gauge's fill shows how full the machine is, instead of a verdict that is
-  almost never colored.** The arc was tinted by `machine.state`, which reads
-  `unknown` whenever any resident model is unpriceable — the normal case — so
-  the hero instrument swept from empty to full in permanent dim grey. The fill
-  now ramps green → amber → red off the needle's own position, and the needle
-  stopped being dimmed by that same verdict. **The verdict is unchanged and
-  still server-only**: the state chip, the seven tell-tale lamps, the face
-  caption and the redline each still key on their own single field, so an amber
-  fill never means the arbiter said amber.
-- **The gauge's center readout is an odometer, centered on the hub.** It was one
-  centered text run, which centered the number *and* its unit together and so
-  left the figure itself sitting off-axis. The digits now render as recessed
-  odometer cells matching the pressure tiles, centered on the dial's own axis,
-  with the unit hung outside that centering.
+  a power of two and is labeled `GiB`/`MiB`: the arc reads `0 · 32 · 64 · 96 ·
+  128`, the pool reads `128.00 GiB`, and the ` (128 GiB)` parenthetical that
+  used to patch the mismatch is gone along with it. The stage header's own RAM
+  figure keeps its `GB` label for now — it was always computed in binary, so
+  it now agrees numerically; only the suffix still differs.
+- **The gauge is a stacked band, not a single needle over one number.** It
+  used to fill from darkmux's own committed memory alone, against a scale
+  ending at the machine's *whole* RAM — so a near-empty darkmux on an
+  87%-full machine still read green, because the fill never accounted for
+  what anything else on the machine was holding. Two intermediate redesigns
+  (a color-only fix, then a pair of concentric rings) were each superseded
+  once the real problem was visible: the dial now stacks darkmux's own
+  memory, everything else on the machine, and darkmux's committed-but-not-yet-
+  materialized growth (hatched) in one band, so the sum — the actual "will it
+  fit" question this page exists to answer — is legible at a glance instead
+  of requiring cross-radius mental arithmetic. The needle lands on the
+  machine's real current usage; the center readout shows that same figure
+  (labeled `MACHINE USED`), not darkmux's share of it; the fill color follows
+  the machine's overall state, not darkmux's alone; and a legend pairs each
+  band with the figure it represents. The always-on `IN USE` caption is gone
+  — the caption now appears only when it has something to say (which disjunct
+  put the machine in red), the same way the per-row state chip and the
+  now-deleted `darkmux/utility` card were quieted.
+- **The `darkmux`/utility block moved, then was deleted outright.** It first
+  moved from the top of the page (config given priority it hadn't earned)
+  to below the ledger, then — on a closer look — was cut entirely: it
+  described what the utility tier is *responsible for*, a property of
+  configuration rather than of this machine's memory, and every fact it
+  carried already existed elsewhere (the model's own ledger row, or
+  `darkmux doctor`). What survives is a single neutral `utility` badge on
+  that resident's own ledger row. (#1818)
+- **The pressure tiles' explanatory notes are behind an `(i)` popover** instead
+  of always-on 8.5px text at the bottom of the page — readable on request
+  instead of illegible by default, and rewritten while there: the memory-free
+  reading is now named as the only figure that can trigger red, and is a
+  0–100 pressure reading rather than a byte count; the compressor note now
+  spells out that it is macOS's own memory compressor, not darkmux's
+  compaction. The `STATE` lamp — a second, less-informed copy of the verdict
+  the machine chip already carries — is deleted. (#1822)
+- **The per-row `UNKNOWN`/`ESTIMATED` state chip only renders where a row's
+  state actually disagrees with the machine's overall verdict**, instead of
+  stamping every row with the same word regardless of whether that row was
+  the reason for it. On a healthy or uniformly-unknown machine, no row
+  carries it at all. (#1818, #1819)
+
+### Fixed
+
+- **Per-model memory now reads what a model actually occupies.** `ps rss`
+  does not count MLX model memory at all — MLX places weights in
+  Metal/IOAccelerator buffers, which only `phys_footprint` sees; llama.cpp's
+  GGUF weights are memory-mapped as evictable file-backed pages, which only
+  `rss` sees. Neither counter alone is correct for the mix of backends
+  darkmux actually runs. Per-worker memory is now `max(rss, phys_footprint)`,
+  with both raw figures kept in the payload so the number is checkable rather
+  than trusted. Workers are also now paired to models by weight size rather
+  than by projected potential (potential includes context that may not be
+  materialized yet, which could rank two residents in the wrong order and
+  swap their reported figures).
+- **The machine's memory is decomposed into real, distinct quantities instead
+  of calling three different things "free."** There was no machine-wide
+  "used" figure at all, so the operator's own read of darkmux's usage stood
+  in for the machine's; the truly-free-pages percentage and the kernel's own
+  pressure-margin percentage — both plausibly "how much is free" — differed
+  by 51 percentage points (31% vs 82%) on the same screen, for the same
+  machine, at the same instant. See **Breaking** above for the field-level
+  detail.
+- **The fit verdict now accounts for everything else running on the machine**,
+  not just darkmux's own commitment against the machine's total capacity. A
+  machine with tens of GiB held by other processes could previously read
+  green as though those processes did not exist; the green/amber cascade and
+  the amber shrink-hint's own arithmetic now key off the projected total
+  (everything else, plus darkmux's own commitment), not darkmux's commitment
+  alone.
+- The gauge's aria label no longer announces a fabricated "0% full" when the
+  current reading is unreadable — it now reports the reading as unreadable,
+  the same thing the visible dial does.
+- A popover tile note no longer pushes the rows below it down the page when
+  opened, and the gauge's needle no longer stops short of the band it is
+  meant to point at.
 
 ## [2.7.0] - 2026-08-14
 
