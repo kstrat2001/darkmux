@@ -11,6 +11,8 @@ import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
 import { tokensOffMeter } from "./savings";
 import { hybridNote } from "./hybridNote";
+import { NotesDialog } from "../../components/NotesDialog";
+import { openModalEl } from "../../lib/dialogManager";
 import { buildFleetCard } from "./cards";
 import { buildActivityTimeline, ACTIVITY_WINDOW_PRESETS, DEFAULT_ACTIVITY_WINDOW_MIN } from "./timeline";
 import type { MachineSpecs } from "../../types/handwritten";
@@ -78,10 +80,17 @@ function SavingsHero({
   tokens: t,
   note,
   liveMode,
+  data,
+  nowMs,
 }: {
   tokens: ReturnType<typeof tokensOffMeter>;
   note: ReturnType<typeof hybridNote>;
   liveMode: boolean;
+  /** The window this hero's numbers derive from — passed through to
+   *  `NotesDialog` so "history →" opens the SAME notes those numbers came
+   *  from, not a second, differently-scoped fetch. */
+  data: FlowRecord[];
+  nowMs: number;
 }) {
   const hours = Math.round(LIVE_WINDOW_MS / 3600000);
   return (
@@ -125,15 +134,21 @@ function SavingsHero({
       </div>
       <div className="hybnote">
         <b className="hybpre">Orchestrator note:</b> {note.text}
-        {/* (QA) Legacy's `history →` opens a notes modal that is NOT ported.
-            Rendering it as a pointer-cursor accent link on the default view
-            would be a trap control: it looks clickable, it is the README
-            screenshot, and nothing happens. Kept as a plain marker so the
-            information ("there are older notes") survives without promising
-            an interaction that does not exist. Restore the link when the
-            modal lands. */}
-        {note.hasHistory ? <span className="hybmore"> (older notes exist)</span> : null}
+        {/* (#1640) Legacy's real `<a class="hyblink" data-act="notes">history
+            →</a>` (viewer.html:1584) — restored now that `NotesDialog`
+            exists to open. Previously a plain, deliberately non-interactive
+            `<span>` (a trap control would have looked clickable and done
+            nothing, before the modal existed to back it). */}
+        {note.hasHistory ? (
+          <a className="hyblink" data-act="notes" href="#" onClick={(e) => {
+            e.preventDefault();
+            openModalEl("nmodalbg");
+          }}>
+            {" "}history →
+          </a>
+        ) : null}
       </div>
+      <NotesDialog data={data} nowMs={nowMs} />
     </div>
   );
 }
@@ -320,7 +335,7 @@ export function FleetLens({
 
   return (
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
-      <SavingsHero tokens={tokens} note={note} liveMode={liveMode} />
+      <SavingsHero tokens={tokens} note={note} liveMode={liveMode} data={flowWindow.data} nowMs={nowMs} />
       <FleetCoverageNotice historical={historical} />
       <div className="fleet">
         {cards.map((card) => (
@@ -410,8 +425,49 @@ export function FleetLens({
                 {lane.name}
               </div>
               <div className="tltrack">
+                {/* (#1639, drill-in packet) Session drill — click a bar, land
+                    on `#session=<sid>`. Legacy's OWN `.sbar` bars are inert
+                    (no `data-act`, no click handler anywhere in
+                    `viewer.html`'s timeline code); legacy's only session-drill
+                    click was `recentRow()`'s "open →" link on the machine
+                    page's per-run list, which #1809 removed outright when it
+                    replaced that list with a link into the runs lens (see
+                    `MachineLens.tsx`'s own doc, and `viewer-session-url.spec.js`'s
+                    module doc for the full gap history). Since #1809 nothing
+                    ANYWHERE in this port reaches `SessionReplay` by clicking,
+                    even though the fetch + render it needs (`/flow-session/<id>`
+                    → `runRegions`) has worked since Packet 4.
+                    This is a deliberate WIDENING beyond legacy's own address-bar
+                    behavior, same precedent as `machineDrillHash`'s `uid=` and
+                    the `machine=` runs-lens pin above: the activity lane already
+                    names every session on screen (`bar.sid`, carried into
+                    `bar.title`), so it is the least-surprising place to attach
+                    the click legacy never wired. A real `location.hash` write
+                    (not `writeHash`/`replaceState`) — the same mechanism every
+                    other cross-lens hop in this file uses — so `hashchange`
+                    fires, back/forward/copy-paste all behave, and `useSyncHash`
+                    never has to reconcile a route no navigation actually
+                    happened for. */}
                 {lane.bars.map((bar) => (
-                  <div key={bar.sid} className={`sbar ${bar.cls}`} style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }} title={bar.title} />
+                  <div
+                    key={bar.sid}
+                    className={`sbar ${bar.cls}`}
+                    style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }}
+                    title={bar.title}
+                    data-act="session"
+                    data-arg={bar.sid}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => {
+                      location.hash = `session=${encodeURIComponent(bar.sid)}`;
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        location.hash = `session=${encodeURIComponent(bar.sid)}`;
+                      }
+                    }}
+                  />
                 ))}
                 <div className="ph" style={{ left: `${timeline.playheadPct}%` }} />
               </div>

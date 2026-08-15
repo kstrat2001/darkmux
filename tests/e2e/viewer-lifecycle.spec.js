@@ -62,54 +62,73 @@ test('activity lane brackets a session.end-only session as ended, not in-flight'
   expect(pageErrors, `viewer threw: ${pageErrors.join('; ')}`).toHaveLength(0);
 });
 
-// (port gap, reported not papered over) The drilling half of the original
-// test — machine card → expand a collapsible recent-run row → click
-// through to the session's own detail view, to prove the fix doesn't
-// TypeError on a session.end-only session's undefined close-edge fields.
+// (drill-in packet) The drilling half of the original test — click through
+// from the activity lane to the session's own detail view, to prove the fix
+// doesn't TypeError on a session.end-only session's undefined close-edge
+// fields — is now real. The pre-#1809 machine-page path this test used to
+// drive (card → expand a collapsible recent-run row → the "open →" link) is
+// gone for good (#1809 removed that whole per-run list — see
+// `viewer-session-url.spec.js`'s own module doc for the full history); the
+// drill this packet built instead lives directly on the activity lane's own
+// bars (`FleetLens.tsx`'s `.sbar` `onClick`, `data-act="session"`), which is
+// exactly where THIS test already looks (`.lane .sbar`, the test right above
+// this one) — no separate machine-page detour needed.
 //
-// #1809 (finishing #1508 step 4) changed the SHAPE of this gap, not its
-// existence. Pre-#1809 the blocker was that `MachineLens`'s run rows were
-// plain non-collapsible `<div>`s with no session-drill affordance at all
-// (`runLines.ts`'s own module doc named the missing "open →" link). #1809
-// removed that whole per-run list — the machine page now links out to the
-// Runs lens (`#lens=runs&machine=<uid>`) instead of rendering rows itself.
-// `RunsBoard`'s own rows carry their OWN drill-ins now (`/mission/<id>/graph`
-// for a tracked mission/dispatch, an in-page lab-run detail for a lab run —
-// see `RunsBoard.tsx`'s `activateRun`), but NEITHER of those is a
-// `#session=` drill either. So the gap this test names is unchanged in
-// substance: no path from a machine-scoped list reaches a bare session-
-// subsystem view, only relocated from one lens to another.
-//
-// The underlying claim this half exists to protect (a session.end-only
-// session's detail view renders without throwing) is still worth
-// verifying once that gap closes — `SessionReplay.tsx` already renders
-// real content off `runRegions()` for any resolvable session id (see
-// `viewer-session-url.spec.js`'s own coverage of that component via a
-// direct hash boot), so the remaining risk is specifically whether a
-// session.end-only close edge reaches it cleanly. Kept here verbatim
-// (fixme, not deleted) as the tracked record — the body below is left
-// UNUPDATED to the pre-#1809 selectors deliberately: rewriting it to
-// "work" against the new DOM would misrepresent a gap that is still open
-// as one that is merely stale, and this fixme was never runnable anyway.
-test.fixme('activity lane: drilling a session.end-only session does not throw', async ({ page }) => {
+// This asserts more than "no throw": `runRegions()`'s `c` derivation (the
+// non-`session.end` close record, `sessionRun.ts`) exists SPECIFICALLY so a
+// session.end-only close reads CANCELED, not COMPLETE — the session-drill
+// twin of the activity-lane bug this whole file exists to guard (a session
+// that closed only via the reconciler's `session.end`, with no clean
+// `dispatch.complete`, must not read as though it succeeded). A bare
+// "does not throw" assertion would pass even if that mapping regressed to
+// "complete" — asserting the label is what makes this a real, non-vacuous
+// regression gate for the close-edge, not just the crash.
+test('activity lane: drilling a session.end-only session does not throw', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
+
+  // The session-drill's own destination fetch (`SessionReplay` →
+  // `/flow-session/<id>`) — this static-playback harness has no daemon
+  // behind it, so it needs the same real-shaped mock every other
+  // `#session=` spec in this suite uses (`viewer-session-url.spec.js`'s
+  // `mockSession`), scoped to exactly the fixture's two records for this
+  // session id (dispatch.start, then ONLY session.end — no
+  // dispatch.complete/error at all).
+  await page.route('**/flow-session/sess-ended-via-sessionend', (r) =>
+    r.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        records: [
+          {
+            ts: '2026-01-01T00:01:00Z', level: 'info', category: 'work', tier: 'local', stage: 'dispatch',
+            action: 'dispatch.start', handle: 'darkmux/coder', model: 'qwen',
+            session_id: 'sess-ended-via-sessionend', machine_id: 'lifecycle-mac', machine_uid: 'lifecycle-mac-uid',
+            payload: { prompt_chars: 42 },
+          },
+          {
+            ts: '2026-01-01T00:02:00Z', level: 'info', category: 'machinery', tier: 'local', stage: 'dispatch',
+            action: 'session.end', source: 'presence-reconciler',
+            session_id: 'sess-ended-via-sessionend', machine_id: 'lifecycle-mac', machine_uid: 'lifecycle-mac-uid',
+          },
+        ],
+        count: 2,
+        truncated: false,
+        generated_at_ms: 0,
+      }),
+    })
+  );
 
   await page.goto('/index-lifecycle.html');
   await page.waitForSelector('.lane .sbar', { timeout: 15_000 });
 
-  // (#1508) The nav tab now shares data-act="machine" with the fleet cards
-  // (they differ by data-arg — a card carries the machine id, the tab drills
-  // the local box). Target a CARD (has data-arg), not the tab, to drill a
-  // specific machine.
-  await page.locator('[data-act="machine"][data-arg]').first().click();
-  await page.waitForSelector('.stagehdr');
-  // (#1508) The unified machine page lists runs as collapsible recentRow
-  // <details>; the session-drill "open →" lives in the expanded body, so
-  // expand the run first, then click through to its session detail.
-  await page.locator('details[data-expand="recent:sess-ended-via-sessionend"] > summary').first().click();
-  await page.locator('[data-act="session"][data-arg="sess-ended-via-sessionend"]').first().click();
-  await page.waitForSelector('.sub', { timeout: 10_000 });
+  await page.locator('.sbar[title*="sess-ended-via-sessionend"]').click();
+
+  await expect(page.locator('.session-run')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => location.hash)).toContain('session=sess-ended-via-sessionend');
+  // The regression gate itself: CANCELED (the fallback for "closed, but not
+  // by a clean dispatch.complete"), never COMPLETE.
+  await expect(page.locator('.session-run .pill')).toHaveText('CANCELED');
+  await expect(page.locator('.session-run .pill')).not.toHaveText('COMPLETE');
 
   expect(pageErrors, `viewer threw: ${pageErrors.join('; ')}`).toHaveLength(0);
 });

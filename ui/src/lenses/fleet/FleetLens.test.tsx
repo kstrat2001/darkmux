@@ -3,10 +3,14 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
 import { todayUTC, prevDateUTC } from "../../lib/flow";
+import { closeOpenModal } from "../../lib/dialogManager";
 
 afterEach(() => {
   vi.unstubAllGlobals();
   window.location.hash = "";
+  // See EventLogColumn.test.tsx's own comment: dialogManager's open/close
+  // state is a module-level singleton that outlives `render()`/unmount.
+  closeOpenModal({ restore: false });
 });
 
 function renderFleetLens() {
@@ -101,7 +105,7 @@ describe("FleetLens", () => {
     expect(screen.getByText("idle")).toBeInTheDocument(); // no live session -> idle, not "dispatch in flight"
   });
 
-  it("renders the '(older notes exist)' marker with its styling class when notes history exists", async () => {
+  it("renders a real 'history →' link (#1640) when notes history exists, and it opens the notes dialog", async () => {
     const today = todayUTC();
     mockFleetFetch({
       flowToday: [
@@ -111,9 +115,25 @@ describe("FleetLens", () => {
     });
     const { container } = renderFleetLens();
     await waitFor(() => expect(screen.getByText(/shipped another thing/)).toBeInTheDocument());
-    const marker = container.querySelector(".hybmore");
-    expect(marker).toBeInTheDocument();
-    expect(marker!.textContent).toMatch(/older notes exist/i);
+    const link = container.querySelector('[data-act="notes"]');
+    expect(link).toBeInTheDocument();
+    expect(link!.textContent).toMatch(/history/i);
+
+    expect(document.getElementById("nmodalbg")!.style.display).toBe("none");
+    fireEvent.click(link!);
+    expect(document.getElementById("nmodalbg")!.style.display).toBe("flex");
+    // Both notes render, newest first (`openNotes()`'s `.reverse()`).
+    const rows = document.querySelectorAll(".dialog__nrow");
+    expect(rows.length).toBe(2);
+    expect(rows[0].textContent).toContain("shipped another thing");
+    expect(rows[1].textContent).toContain("shipped the thing");
+  });
+
+  it("no history link when there are no orchestrator notes", async () => {
+    mockFleetFetch({});
+    const { container } = renderFleetLens();
+    await waitFor(() => expect(screen.getByText(/going hybrid takes nerve/i)).toBeInTheDocument());
+    expect(container.querySelector('[data-act="notes"]')).not.toBeInTheDocument();
   });
 
   it("honesty about incomplete data: a session with no dispatch bookend renders as 'unattributed', not silently local", async () => {

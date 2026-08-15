@@ -51,8 +51,36 @@ import type { LabRunDetailResponse, LabRunEvent, LabRunEventsResponse } from "..
  *   have errored (a garbage `run=` deep link) rather than hitting
  *   `/lab/run/events` every tick behind an error page nothing will ever
  *   resolve.
+ *
+ * (drill-in packet) `onUnresolvable` — the port of legacy's `drillLabRun`
+ * fallback (`viewer.html:4101-4126`): `if(!LAB_DETAIL){ ...state.level="runs";
+ * state.labRunDir=null; render(); ... }`. A stale/mistyped `run=` deep link,
+ * a dir deleted since the list was fetched, or (on a daemon-less static
+ * build) the genuine absence of `/lab/run/detail` all land here the same
+ * way legacy's does — fired once, from an effect keyed on the detail
+ * query's own settled `!ok` state, mirroring legacy's `await
+ * loadLabRunDetail(dir); if(!LAB_DETAIL)`. This component does NOT choose
+ * the fallback MESSAGE (the daemon-vs-static split legacy's own
+ * `missionGraphReachable()` check makes) — that judgment stays in
+ * `RunsBoard.tsx`, right beside `MISSION_GRAPH_UNREACHABLE_NOTICE`, the
+ * other daemon-reachability notice this board already owns; this component
+ * only reports THAT its dir was unresolvable, not why. Before this, the
+ * component had no such callback at all: a bad `run=` rendered its own
+ * `data-state="error"` page (below) and stayed there permanently — see
+ * `viewer-lab.spec.js`'s own fixme note for the confirmed-live finding.
  */
-export function LabRunDetail({ dir, onBack }: { dir: string; onBack: () => void }) {
+export function LabRunDetail({
+  dir,
+  onBack,
+  onUnresolvable,
+}: {
+  dir: string;
+  onBack: () => void;
+  /** Called once the detail fetch is known to have failed for THIS `dir` —
+   * see the module doc above. `RunsBoard` responds by clearing `labRunDir`
+   * (falling back to the run list) and showing its own notice text. */
+  onUnresolvable: () => void;
+}) {
   const detailQuery = useQuery({
     queryKey: queryKeys.labRunDetail(dir),
     queryFn: () => fetchJson<LabRunDetailResponse>(`/lab/run/detail?dir=${encodeURIComponent(dir)}`),
@@ -77,6 +105,23 @@ export function LabRunDetail({ dir, onBack }: { dir: string; onBack: () => void 
   // secondary MUST FIX: a garbage `run=` deep link must not keep hitting
   // `/lab/run/events` every tick behind a page that will never resolve).
   const detailErrored = detailQuery.data ? !detailQuery.data.ok : false;
+
+  // (drill-in packet) Reports the unresolvable dir to `RunsBoard` exactly
+  // once — a ref, not state, since it exists purely to de-dupe a callback
+  // firing (`onUnresolvable` change identity, a refetch retriggering the
+  // same failure) rather than to drive a render. Guarded per-`dir` rather
+  // than a bare boolean, matching legacy's own `state.labRunDir===dir`
+  // check in `drillLabRun` — the same defense against a race where the
+  // operator has already moved on to a DIFFERENT run by the time an older
+  // fetch settles.
+  const reportedUnresolvableRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (detailErrored && reportedUnresolvableRef.current !== dir) {
+      reportedUnresolvableRef.current = dir;
+      onUnresolvable();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detailErrored, dir]);
 
   useEffect(() => {
     // Fresh entry into a (possibly different) run dir: legacy resets
