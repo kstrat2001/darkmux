@@ -63,7 +63,7 @@
 //! capacity with the fallback named in [`LimitSource`].
 
 use crate::gestalt_host::lms_host::{run_bounded, StdoutMode};
-use crate::gestalt_host::ArchFactsReader;
+use crate::gestalt_host::{ArchFactsReader, GgufFactsReader};
 use darkmux_gestalt::{
     ArchEstimator, ArchFacts, CatalogFact, Deadline, FootprintEstimator, V1Estimator,
 };
@@ -99,10 +99,15 @@ pub const LEDGER_SCHEMA_VERSION: &str = "2.0";
 pub const KV_BYTES_PER_ELEMENT_V1: u32 = 2;
 
 /// #1819 fallback KV-cache byte rate per context token — used ONLY when a
-/// resident's `config.json` arch facts are unreadable (today, this is
-/// always a GGUF download: the architecture lives inside the binary, not a
-/// sidecar `config.json` — reading it directly is a follow-up, not built
-/// here) but the model DOES have a catalog `size_bytes`. Feeds
+/// resident's `config.json` arch facts are unreadable AND (#1820) its own
+/// GGUF header is unreadable too (a corrupt/unusual download, an ambiguous
+/// multi-file directory the GGUF reader declines to guess between, or a
+/// weights format neither reader understands) but the model DOES have a
+/// catalog `size_bytes`. Before #1820 this fired for EVERY GGUF resident,
+/// since a GGUF's architecture lives inside the binary and nothing read it
+/// directly; `GgufFactsReader` (`gestalt_host::gguf_facts`) now reads that
+/// header as a measurement, so this fallback fires only on the narrower
+/// unreadable-format case named above. Feeds
 /// [`V1Estimator`] as the [`ArchWithSizeFallback`]'s second stage.
 ///
 /// **Derivation — traceable, not invented, and traced to the exact model
@@ -177,8 +182,16 @@ pub const V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN: u64 = 204_800;
 /// 819_200 B/token) exceed every tier here, because MHA's kv_heads equals its
 /// attention heads instead of a small fraction of them. No size-derived rate
 /// can catch that — the size looks small while the KV rate is enormous.
-/// Reading arch facts out of the GGUF header (#1820) is the real fix; this
-/// table is the honest approximation until then.
+///
+/// **#1820 shipped the real fix — reading arch facts out of the GGUF header
+/// directly (`gestalt_host::gguf_facts::GgufFactsReader`), tried BEFORE this
+/// fallback in `gather_with_bin`.** A Llama-2-13B GGUF now prices from its
+/// own measured 819_200 B/token, not this table's tier estimate. This table
+/// remains the honest approximation for whatever the GGUF reader itself
+/// can't parse (see [`GgufFactsReader`]'s module docs for its own named
+/// limitations) — narrower than "every GGUF" now, not eliminated.
+///
+/// [`GgufFactsReader`]: crate::gestalt_host::GgufFactsReader
 const FALLBACK_KV_TIERS: [(u64, u64); 3] = [
     (15 * 1024 * 1024 * 1024, V1_FALLBACK_KV_BYTES_PER_CTX_TOKEN), // ≤15 GiB: phi-4 class
     (45 * 1024 * 1024 * 1024, 327_680),                            // ≤45 GiB: 70B/72B class
@@ -688,11 +701,14 @@ pub struct LedgerInputs {
 /// fallback is then visible in the wiring, never implicit in the math").
 ///
 /// Arch first because it is a MEASUREMENT — real per-model layer/head/dtype
-/// facts read off the model's own `config.json`. The V1 fallback only fires
-/// when those facts are unreadable — today, entirely the GGUF case (a
-/// download that carries its architecture inside the binary rather than a
-/// sidecar `config.json`; reading it directly is a named follow-up, not
-/// built here).
+/// facts, read either off the model's own `config.json` (`ArchFactsReader`)
+/// or, since #1820, off a GGUF download's own binary metadata header
+/// (`GgufFactsReader`) — `gather_with_bin` tries both BEFORE this estimator
+/// ever sees the model, so `self.arch` already carries GGUF-derived facts
+/// as measurements by the time `estimate_with_source` runs; this type has
+/// no GGUF-specific branch of its own. The V1 fallback now fires only when
+/// NEITHER reader could answer — a corrupt/unusual GGUF, an ambiguous
+/// multi-file directory, or a weights format neither reader understands.
 ///
 /// [`Self::estimate_with_source`] is the ONLY port this type exposes —
 /// there is no bare `FootprintEstimator::estimate_bytes` impl, because
@@ -1289,22 +1305,18 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
         })
         .collect();
 
-    // Arch facts for each distinct resident model — located via the ls
-    // entries' path fields (the #1290 reader), priced with the v1 fp16 KV
-    // width. An unreadable model simply stays out of the map — NOT the
-    // unpriceable path since #1819: `compute_ledger`'s `ArchWithSizeFallback`
-    // then tries the size-based estimate before giving up, so an absence
-    // here means "estimated" for any model with a catalog size, and only
-    // "genuinely unpriceable" for one without.
-    let reader = ArchFactsReader::from_ls_entries(&ls_rows);
-    let mut arch: BTreeMap<String, ArchFacts> = BTreeMap::new();
-    for r in &residents {
-        if !arch.contains_key(&r.model_key) {
-            if let Some(raw) = reader.read(&r.model_key) {
-                arch.insert(r.model_key.clone(), arch_facts_v1(&raw));
-            }
-        }
-    }
+    // Arch facts for each distinct resident model — resolution order
+    // (#1820): a real `config.json` first (a model that ships one is read
+    // directly, never reconstructed from a binary), then the GGUF header
+    // reader (a measurement pulled out of the `.gguf` file's own metadata,
+    // for the common config.json-less case), then — for whichever model
+    // NEITHER reader could answer — `compute_ledger`'s `ArchWithSizeFallback`
+    // tries the #1819 size-based estimate before giving up. So an absence
+    // from this map means "estimated" for any model with a catalog size,
+    // and only "genuinely unpriceable" for one without either.
+    let arch_reader = ArchFactsReader::from_ls_entries(&ls_rows);
+    let gguf_reader = GgufFactsReader::from_ls_entries(&ls_rows);
+    let arch = resolve_arch_facts(&residents, &arch_reader, &gguf_reader);
 
     // Kernel counters — ONE vm_stat read feeds the pool decomposition
     // (#1821), the compressor row, AND (unchanged) the memorystatus
@@ -1366,6 +1378,36 @@ pub fn gather_with_bin(lms_bin: &str) -> ModelLedger {
     );
     ledger.gather_ms = started.elapsed().as_millis() as u64;
     ledger
+}
+
+/// Resolves architecture facts for every distinct resident model key,
+/// trying `config.json` first, then a GGUF header, in that order (#1820).
+/// Pulled out of [`gather_with_bin`] as its own function so the RESOLUTION
+/// ORDER is a directly-testable unit — not provable only by exercising the
+/// two readers separately, which would leave the wiring itself (which one
+/// gets tried first, and that a hit on the first short-circuits the second)
+/// unverified. A model neither reader can answer is simply absent from the
+/// returned map; `ArchWithSizeFallback` (in [`compute_ledger`]) is what
+/// turns that absence into the #1819 size-tiered estimate.
+fn resolve_arch_facts(
+    residents: &[ResidentInput],
+    arch_reader: &ArchFactsReader,
+    gguf_reader: &GgufFactsReader,
+) -> BTreeMap<String, ArchFacts> {
+    let mut arch: BTreeMap<String, ArchFacts> = BTreeMap::new();
+    for r in residents {
+        if arch.contains_key(&r.model_key) {
+            continue;
+        }
+        if let Some(raw) = arch_reader.read(&r.model_key) {
+            arch.insert(r.model_key.clone(), arch_facts_v1(&raw));
+            continue;
+        }
+        if let Some(raw) = gguf_reader.read(&r.model_key) {
+            arch.insert(r.model_key.clone(), arch_facts_v1(&raw));
+        }
+    }
+    arch
 }
 
 /// `ArchFactsRaw` → gestalt [`ArchFacts`] with the v1 KV dtype width. NOT a
@@ -2438,6 +2480,168 @@ mod tests {
         // gather_ms is stamped (may legitimately be 0 ms on a fast box, so
         // just assert the render path carries it).
         assert!(render_human(&ledger).contains("gather:"));
+    }
+
+    // ── #1820: config.json → GGUF header → (absent) resolution order ────
+    //
+    // These tests exercise `resolve_arch_facts` — the WIRING between the
+    // two readers, not the byte-level GGUF parser itself (that gets its own
+    // exhaustive coverage in `gestalt_host::gguf_facts`). Real filesystem
+    // fixtures in a temp dir, never the operator's real `~/.lmstudio`.
+
+    /// Minimal valid synthetic GGUF bytes carrying just the scalar fields
+    /// `resolve_arch_facts` needs (no tokenizer arrays — the array-skip path
+    /// is `gguf_facts`'s own concern, already covered there).
+    fn tiny_gguf_bytes(block_count: u32, head_count: u32, head_count_kv: u32, embedding_length: u32) -> Vec<u8> {
+        fn write_string(buf: &mut Vec<u8>, s: &str) {
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        fn write_u32_kv(buf: &mut Vec<u8>, key: &str, v: u32) {
+            write_string(buf, key);
+            buf.extend_from_slice(&4u32.to_le_bytes()); // GGUF T_UINT32
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&5u64.to_le_bytes()); // kv_count
+        write_string(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes()); // GGUF T_STRING
+        write_string(&mut buf, "testarch");
+        write_u32_kv(&mut buf, "testarch.block_count", block_count);
+        write_u32_kv(&mut buf, "testarch.attention.head_count", head_count);
+        write_u32_kv(&mut buf, "testarch.attention.head_count_kv", head_count_kv);
+        write_u32_kv(&mut buf, "testarch.embedding_length", embedding_length);
+        buf
+    }
+
+    fn write_fixture_config_json(dir: &std::path::Path, layers: u64, kv_heads: u64, head_dim: u64) {
+        std::fs::create_dir_all(dir).unwrap();
+        let body = serde_json::json!({
+            "num_hidden_layers": layers,
+            "num_key_value_heads": kv_heads,
+            "head_dim": head_dim,
+            "quantization": { "bits": 4 }
+        });
+        std::fs::write(dir.join("config.json"), serde_json::to_vec(&body).unwrap()).unwrap();
+    }
+
+    /// A fresh, uniquely-named temp root per test, removed on drop — real
+    /// filesystem fixtures without leaving anything behind and without a
+    /// name collision across parallel test threads.
+    struct TempTestRoot(std::path::PathBuf);
+    impl TempTestRoot {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("darkmux-ledger-arch-resolve-test-{}-{label}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempTestRoot(dir)
+        }
+    }
+    impl Drop for TempTestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn resolve_arch_facts_prefers_config_json_over_gguf_when_both_present() {
+        let root = TempTestRoot::new("precedence");
+        let dir = root.0.join("dual-format-model");
+        write_fixture_config_json(&dir, 8, 8, 64); // config.json: 8/8/64
+        std::fs::write(dir.join("weights.gguf"), tiny_gguf_bytes(40, 40, 10, 5120)).unwrap(); // gguf: 40/10/128
+
+        let residents =
+            vec![ResidentInput { identifier: "darkmux:dual".into(), model_key: "dual-format-model".into(), loaded_ctx: 4096 }];
+        let arch_reader = ArchFactsReader::with_root(&root.0);
+        let gguf_reader = GgufFactsReader::with_root(&root.0);
+        let arch = resolve_arch_facts(&residents, &arch_reader, &gguf_reader);
+        let facts = arch.get("dual-format-model").expect("resolved");
+        assert_eq!(facts.total_layers, 8, "config.json must win — GGUF never overrides an existing config.json");
+        assert_eq!(facts.kv_heads, 8);
+        assert_eq!(facts.head_dim, 64);
+    }
+
+    #[test]
+    fn resolve_arch_facts_falls_to_gguf_header_when_no_config_json() {
+        let root = TempTestRoot::new("gguf-fallback");
+        let dir = root.0.join("gguf-only-model");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("weights.gguf"), tiny_gguf_bytes(40, 40, 10, 5120)).unwrap();
+
+        let residents = vec![ResidentInput {
+            identifier: "darkmux:gguf-only".into(),
+            model_key: "gguf-only-model".into(),
+            loaded_ctx: 4096,
+        }];
+        let arch_reader = ArchFactsReader::with_root(&root.0);
+        let gguf_reader = GgufFactsReader::with_root(&root.0);
+        let arch = resolve_arch_facts(&residents, &arch_reader, &gguf_reader);
+        let facts = arch.get("gguf-only-model").expect("resolved via GGUF header");
+        assert_eq!(facts.total_layers, 40);
+        assert_eq!(facts.kv_heads, 10);
+        assert_eq!(facts.head_dim, 128);
+        assert_eq!(facts.full_attention_layers, 40, "dense default — no layer_types-equivalent in GGUF");
+        assert_eq!(facts.kv_bytes_per_element, KV_BYTES_PER_ELEMENT_V1);
+    }
+
+    #[test]
+    fn resolve_arch_facts_leaves_model_absent_when_neither_readable() {
+        let root = TempTestRoot::new("neither");
+        let residents = vec![ResidentInput {
+            identifier: "darkmux:nowhere".into(),
+            model_key: "no-such-model".into(),
+            loaded_ctx: 4096,
+        }];
+        let arch_reader = ArchFactsReader::with_root(&root.0);
+        let gguf_reader = GgufFactsReader::with_root(&root.0);
+        let arch = resolve_arch_facts(&residents, &arch_reader, &gguf_reader);
+        assert!(
+            !arch.contains_key("no-such-model"),
+            "neither reader has anything for this model — must stay absent, never guessed"
+        );
+    }
+
+    /// The end-to-end product-level guarantee #1820 promises, proven through
+    /// the SAME `compute_ledger` entry point the live gather uses (not just
+    /// the isolated `resolve_arch_facts` helper): a GGUF-only resident's
+    /// `potential_bytes` prices via `PotentialSource::Arch` — a
+    /// MEASUREMENT — never `PotentialSource::Estimated`.
+    #[test]
+    fn gguf_only_resident_prices_as_arch_not_estimated_through_compute_ledger() {
+        let root = TempTestRoot::new("e2e");
+        let dir = root.0.join("gguf-e2e-model");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("weights.gguf"), tiny_gguf_bytes(40, 40, 10, 5120)).unwrap();
+
+        let residents = vec![ResidentInput {
+            identifier: "darkmux:gguf-e2e".into(),
+            model_key: "gguf-e2e-model".into(),
+            loaded_ctx: 4096,
+        }];
+        let arch_reader = ArchFactsReader::with_root(&root.0);
+        let gguf_reader = GgufFactsReader::with_root(&root.0);
+        let arch = resolve_arch_facts(&residents, &arch_reader, &gguf_reader);
+
+        let mut inputs = base_inputs();
+        inputs.residents = residents;
+        inputs.arch = arch;
+        inputs.catalog =
+            vec![CatalogFact { model_key: "gguf-e2e-model".into(), size_bytes: Some(9_000_000_000) }];
+        let ledger = compute_ledger(inputs, 1);
+        let row = ledger.models.iter().find(|m| m.model_key == "gguf-e2e-model").expect("row present");
+        assert_eq!(
+            row.potential_source,
+            Some(PotentialSource::Arch),
+            "GGUF-derived facts must price as a MEASUREMENT, not an estimate: {row:?}"
+        );
+        assert!(row.potential_bytes.is_some());
     }
 
     #[test]

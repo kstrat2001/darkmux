@@ -22,6 +22,13 @@
 //!   `indexedModelIdentifier`) — the modelKey is NOT the directory for most
 //!   real models; catalog-alias models with no matching directory are a
 //!   named `None` limitation (see the module docs).
+//! - [`GgufFactsReader`] — the #1820 architecture-facts source for
+//!   `config.json`-less residents: parses a GGUF download's OWN metadata
+//!   header (layers / kv heads / head_dim) directly out of the binary,
+//!   turning what #1819 could only estimate into a measurement. Tried
+//!   AFTER [`ArchFactsReader`] in `crate::model_ledger::gather_with_bin` —
+//!   a real `config.json`, when one exists, is read directly rather than
+//!   reconstructed from the weights file.
 //!
 //! These adapters are NEW surface: `swap.rs` / `lms.rs` call paths are
 //! untouched (cutover is packet 3). Nothing here mutates host state except
@@ -30,12 +37,14 @@
 //! structural at the adapter layer too.
 
 mod arch_facts;
+mod gguf_facts;
 // pub(crate): the #1286 memory ledger (`crate::model_ledger`) reuses the
 // bounded-run mechanics (`run_bounded`/`StdoutMode`) for its own probes.
 pub(crate) mod lms_host;
 mod mac_probe;
 
 pub use arch_facts::{ArchFactsRaw, ArchFactsReader};
+pub use gguf_facts::GgufFactsReader;
 pub use lms_host::LmsHost;
 pub use mac_probe::MacProbe;
 
