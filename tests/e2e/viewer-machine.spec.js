@@ -134,7 +134,13 @@ test('machine lens renders the ledger inertly — gauge, lamps, odometer, rows, 
   expect(await page.locator('.mm-row-pot').count()).toBe(2);
   expect(await page.locator('.mm-row-cur').count()).toBe(2);
   // The tell-tale lamp row and odometer tiles render, unconditionally.
-  expect(await page.locator('.mm-lamp').count()).toBe(7);
+  // SIX lamps, not seven: the STATE lamp is gone. It relabelled itself with
+  // the machine state AND changed its lit-ness, so a healthy machine showed
+  // the word "GREEN" in grey beside the same word in green on the machine
+  // chip — and it duplicated a verdict the chip already carries with its
+  // cause. Every remaining lamp keys on a CONDITION.
+  expect(await page.locator('.mm-lamp').count()).toBe(6);
+  expect(await page.locator('.mm-lamp').filter({ hasText: /^STATE/ })).toHaveCount(0);
   expect(await page.locator('.mm-odo').count()).toBe(3);
   // The MACHINE's own shrink hint renders (escaped) — it sits ABOVE the
   // model rows (right after the machine k/v detail row it's a footnote to).

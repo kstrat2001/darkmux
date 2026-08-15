@@ -2323,9 +2323,66 @@ body {
   color: var(--dim);
   margin-top: 4px;
 }
+/* The `(i)` affordance. A real <button> rather than a `title` tooltip: this
+   page is read over the tailnet on a phone, where hover does not exist and a
+   `title` never appears at all. Sized to a comfortable tap target while
+   drawing as a small glyph — the padding does the touch work, the border
+   does the seeing. */
+.mm-odo-i {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-left: 2px;
+  padding: 0;
+  font: 600 9px/1 "JetBrains Mono", monospace;
+  color: var(--dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.mm-odo-i:hover,
+.mm-odo-i:focus-visible {
+  color: var(--fg);
+  border-color: var(--dim);
+}
+.mm-odo-i.is-open {
+  color: var(--bg);
+  background: var(--dim);
+  border-color: var(--dim);
+}
+/* Revealed on demand — so it can afford to be READABLE, which the permanent
+   8.5px `#4a5162` line it replaced could not. It is asked for, not endured.
+
+   A POPOVER, not an inline reveal: it is absolutely positioned so opening one
+   does not reflow the page. The first cut expanded the tile in place, which
+   pushed every row below it down — the operator's read, and correct: a
+   disclosure that moves the thing you were looking at costs more than the
+   sentence it shows you. `z-index` clears the sibling tiles; the tile itself
+   is the positioning context. */
+.mm-odo {
+  position: relative;
+}
 .mm-odo-n {
-  font-size: 8.5px;
-  color: #4a5162;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  width: max-content;
+  max-width: 30ch;
+  padding: 7px 9px;
+  font-size: 9.5px;
+  line-height: 1.5;
+  color: var(--fg);
+  text-align: left;
+  background: #11151f;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
 }
 
 .mm-kv {

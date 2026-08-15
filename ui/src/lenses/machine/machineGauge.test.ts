@@ -212,10 +212,17 @@ describe("redlineLit / isOverLimit / gaugeFaceCaption — the redline's provenan
     expect(isOverLimit(100, null)).toBe(false);
   });
 
-  it("the face caption stays 'IN USE' for every non-red state — the live mockups' own shape", () => {
-    expect(gaugeFaceCaption("green", false, false)).toBe("IN USE");
-    expect(gaugeFaceCaption("amber", false, false)).toBe("IN USE");
-    expect(gaugeFaceCaption("unknown", false, false)).toBe("IN USE");
+  it("is SILENT for every non-red state — the slot exists to name a red reason, not to restate the instrument", () => {
+    // It used to read `IN USE` here, carried from the level-3 mockups. That
+    // restated the one thing a needle over a 0→LIMIT scale cannot fail to
+    // communicate, in the most valuable pixels on the page.
+    expect(gaugeFaceCaption("green", false, false)).toBeNull();
+    expect(gaugeFaceCaption("amber", false, false)).toBeNull();
+    expect(gaugeFaceCaption("unknown", false, false)).toBeNull();
+    // ...including the case where the CAUSE flags are set but the server has
+    // not actually declared red: the caption follows the verdict, never the
+    // client's own reading of the disjuncts.
+    expect(gaugeFaceCaption("amber", true, true)).toBeNull();
   });
 
   it("flips to the alarm word only when red, pressure checked first (the server's own cascade order)", () => {
@@ -229,16 +236,35 @@ describe("redlineLit / isOverLimit / gaugeFaceCaption — the redline's provenan
 describe("deriveLamps — every lamp keys on exactly one field", () => {
   const base = { state: "green", pressureRed: false, overLimit: false, unprivedCount: 0, warningsCount: 0, resourcesErrored: false, residencyChanged: false };
 
-  it("all seven lamps render, unlit, on a clean green payload", () => {
+  it("all six lamps render, unlit, on a clean green payload", () => {
     const lamps = deriveLamps(base);
-    expect(lamps.map((l) => l.key)).toEqual(["state", "residency", "unpriced", "pressure", "overLimit", "stale", "warn"]);
+    expect(lamps.map((l) => l.key)).toEqual(["residency", "unpriced", "pressure", "overLimit", "stale", "warn"]);
     expect(lamps.every((l) => !l.lit)).toBe(true);
   });
 
-  it("the STATE lamp lights for any non-green state — the inverted case is green staying unlit", () => {
-    expect(deriveLamps({ ...base, state: "unknown" }).find((l) => l.key === "state")!.lit).toBe(true);
-    expect(deriveLamps({ ...base, state: "amber" }).find((l) => l.key === "state")!.lit).toBe(true);
-    expect(deriveLamps({ ...base, state: "green" }).find((l) => l.key === "state")!.lit).toBe(false);
+  /**
+   * There is no STATE lamp, and its absence is the assertion. One rendered
+   * here until the operator caught what it did: it relabelled ITSELF with the
+   * state (`STATE GREEN`) *and* changed its lit-ness, so a healthy machine
+   * showed the word "GREEN" in grey, beside the same word in actual green on
+   * the machine chip. A tell-tale never renames itself — its lit-ness IS the
+   * message — and the verdict already has a home that carries its cause and
+   * its estimated-count qualifier too.
+   */
+  it("has NO state lamp — a verdict is not a condition, and it is already rendered as a chip", () => {
+    for (const st of ["green", "amber", "red", "unknown", null]) {
+      const lamps = deriveLamps({ ...base, state: st });
+      expect(lamps.some((l) => l.key === ("state" as unknown as typeof l.key))).toBe(false);
+      // ...and no lamp anywhere restates the bare verdict word.
+      expect(lamps.some((l) => /^STATE\b/.test(l.word))).toBe(false);
+    }
+  });
+
+  it("every remaining lamp keys on a CONDITION, so a state change alone lights nothing", () => {
+    // The inverted case for the deletion: an amber/unknown machine with no
+    // actual condition present leaves the whole row dark.
+    expect(deriveLamps({ ...base, state: "amber" }).every((l) => !l.lit)).toBe(true);
+    expect(deriveLamps({ ...base, state: "unknown" }).every((l) => !l.lit)).toBe(true);
   });
 
   it("UNPRICED lights only when the count is > 0 and names the count", () => {
@@ -276,11 +302,36 @@ describe("deriveLamps — every lamp keys on exactly one field", () => {
 describe("odometerTiles", () => {
   it("splits memory free / swap / compressor into digit cells with detail-layer (two-decimal) precision", () => {
     const tiles = odometerTiles({ swap_used_bytes: 5453843005, compressor_bytes: 727711744, memory_free_percent: 87, red: false });
-    expect(tiles[0]).toEqual({ digits: ["8", "7"], unit: "% free", label: "memory free", note: "sole pressure trigger" });
+    expect(tiles[0].digits).toEqual(["8", "7"]);
+    expect(tiles[0].unit).toBe("% free");
+    expect(tiles[0].label).toBe("memory free");
     expect(tiles[1].digits.join("")).toBe("5.08");
     expect(tiles[1].unit).toBe("GiB");
     expect(tiles[2].digits.join("")).toBe("694");
     expect(tiles[2].unit).toBe("MiB");
+  });
+
+  /**
+   * The notes moved behind an `(i)` toggle, so they can afford to actually
+   * SAY something — the permanent 8.5px line they replaced could not. These
+   * assert the two facts a reader most needs and most easily gets wrong.
+   */
+  it("the memory-free note says it is the sole red trigger AND that it is not a byte count", () => {
+    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, memory_free_percent: 87, red: false });
+    expect(tiles[0].note).toMatch(/only figure that can trigger RED/i);
+    expect(tiles[0].note).toMatch(/not a byte count/i);
+    // The inverted case: the two byte-count tiles must NOT claim to be triggers.
+    expect(tiles[1].note).not.toMatch(/trigger/i);
+    expect(tiles[2].note).not.toMatch(/trigger/i);
+  });
+
+  it("the compressor note disambiguates macOS's compressor from darkmux's compactor", () => {
+    // The operator hit this exactly: "Is compressor the 'utility' model?"
+    // One letter apart, three rows apart on the page. The label stays (the
+    // CLI and JSON use it); the note is where they get told apart.
+    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, memory_free_percent: 50, red: false });
+    expect(tiles[2].note).toMatch(/macOS/);
+    expect(tiles[2].note).toMatch(/compactor/);
   });
 
   it("renders a single — cell rather than a fabricated 0% when the percent is missing", () => {
