@@ -243,15 +243,29 @@ export function isOverLimit(cur: number | null | undefined, limit: number | null
   return cur != null && limit != null && Number(cur) >= Number(limit);
 }
 
-/** The gauge face's own caption word — `RED · PRESSURE` / `RED · OVER
- * LIMIT` when lit, `IN USE` otherwise (verbatim from the live mockups —
- * `level3.html`/`scaling.html` both render plain "IN USE" while UNKNOWN;
- * only a RED verdict changes the face word, matching the redline section's
- * own framing of "the same flip"). `pressureRed` is checked first because
- * the server's own cascade checks it first (arm 1 before arm 2) — a machine
- * that is red for BOTH reasons reports the one the server would name first. */
-export function gaugeFaceCaption(state: string | null | undefined, pressureRed: boolean, overLimit: boolean): string {
-  if (!redlineLit(state)) return "IN USE";
+/** The gauge face's caption — the RED REASON when the redline is lit, and
+ * `null` (nothing rendered) otherwise.
+ *
+ * It used to read `IN USE` in the normal case, carried over verbatim from
+ * the level-3 mockups. The operator called it on the live page, and he is
+ * right: it is noise. A semicircle with a needle, a filled arc, a scale
+ * running 0→128 and a max tick labeled LIMIT is *self-evidently* a gauge of
+ * how much is in use — the caption restates the one thing the instrument
+ * cannot fail to communicate, in the most valuable pixels on the page,
+ * directly beneath the reading.
+ *
+ * What the slot is actually FOR is the other branch: naming which disjunct
+ * put the machine in Red, right where the eye already is. So it now renders
+ * only when it has that to say — the same rule the per-row state chip
+ * follows (`rowStateDiffers`), and the same one that deleted the
+ * `darkmux/utility` card: an element that always says the same thing is
+ * furniture, and this page has been shedding furniture all day.
+ *
+ * `pressureRed` is checked first because the server's own cascade checks it
+ * first (arm 1 before arm 2) — a machine red for BOTH reasons reports the
+ * one the server would name first. */
+export function gaugeFaceCaption(state: string | null | undefined, pressureRed: boolean, overLimit: boolean): string | null {
+  if (!redlineLit(state)) return null;
   if (pressureRed) return "RED · PRESSURE";
   if (overLimit) return "RED · OVER LIMIT";
   return "RED"; // defensive: red for neither known disjunct — never invent a reason
@@ -380,9 +394,32 @@ export function odometerTiles(pressure: MachineResources["pressure"]): OdometerV
   const swap = splitFormatted(memBytes(pressure.swap_used_bytes));
   const comp = splitFormatted(memBytes(pressure.compressor_bytes));
   return [
-    { digits: digitCells(freeText), unit: "% free", label: "memory free", note: "sole pressure trigger" },
-    { digits: digitCells(swap.num), unit: swap.unit, label: "swap used", note: "high-water · reports, never alarms" },
-    { digits: digitCells(comp.num), unit: comp.unit, label: "compressor", note: "high-water · reports, never alarms" },
+    {
+      digits: digitCells(freeText),
+      unit: "% free",
+      label: "memory free",
+      // The one figure here that can put the machine in Red, and the one
+      // most easily misread: it sits beside two BYTE COUNTS but is not one.
+      note: "the only figure that can trigger RED — kern.memorystatus_level, the kernel's own 0–100 pressure headroom, not a byte count",
+    },
+    {
+      digits: digitCells(swap.num),
+      unit: swap.unit,
+      label: "swap used",
+      note: "vm.swapusage — a monotonic high-water mark since boot. Reports, never alarms: it does not fall when pressure eases",
+    },
+    {
+      digits: digitCells(comp.num),
+      unit: comp.unit,
+      label: "compressor",
+      // The disambiguation the operator asked for on 2026-08-15, after
+      // reasonably wondering whether this was the utility tier. It is not —
+      // and the collision is ours: darkmux's utility model does COMPACTION,
+      // macOS has a COMPRESSOR, one letter apart, three rows apart on this
+      // page. The label stays (it is the term the CLI and JSON use); the
+      // note is where the two get told apart.
+      note: "macOS's own memory compressor (vm_stat) — RAM holding compressed inactive pages. Nothing to do with darkmux's compactor, which is a model",
+    },
   ];
 }
 

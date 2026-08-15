@@ -212,10 +212,17 @@ describe("redlineLit / isOverLimit / gaugeFaceCaption — the redline's provenan
     expect(isOverLimit(100, null)).toBe(false);
   });
 
-  it("the face caption stays 'IN USE' for every non-red state — the live mockups' own shape", () => {
-    expect(gaugeFaceCaption("green", false, false)).toBe("IN USE");
-    expect(gaugeFaceCaption("amber", false, false)).toBe("IN USE");
-    expect(gaugeFaceCaption("unknown", false, false)).toBe("IN USE");
+  it("is SILENT for every non-red state — the slot exists to name a red reason, not to restate the instrument", () => {
+    // It used to read `IN USE` here, carried from the level-3 mockups. That
+    // restated the one thing a needle over a 0→LIMIT scale cannot fail to
+    // communicate, in the most valuable pixels on the page.
+    expect(gaugeFaceCaption("green", false, false)).toBeNull();
+    expect(gaugeFaceCaption("amber", false, false)).toBeNull();
+    expect(gaugeFaceCaption("unknown", false, false)).toBeNull();
+    // ...including the case where the CAUSE flags are set but the server has
+    // not actually declared red: the caption follows the verdict, never the
+    // client's own reading of the disjuncts.
+    expect(gaugeFaceCaption("amber", true, true)).toBeNull();
   });
 
   it("flips to the alarm word only when red, pressure checked first (the server's own cascade order)", () => {
@@ -276,11 +283,36 @@ describe("deriveLamps — every lamp keys on exactly one field", () => {
 describe("odometerTiles", () => {
   it("splits memory free / swap / compressor into digit cells with detail-layer (two-decimal) precision", () => {
     const tiles = odometerTiles({ swap_used_bytes: 5453843005, compressor_bytes: 727711744, memory_free_percent: 87, red: false });
-    expect(tiles[0]).toEqual({ digits: ["8", "7"], unit: "% free", label: "memory free", note: "sole pressure trigger" });
+    expect(tiles[0].digits).toEqual(["8", "7"]);
+    expect(tiles[0].unit).toBe("% free");
+    expect(tiles[0].label).toBe("memory free");
     expect(tiles[1].digits.join("")).toBe("5.08");
     expect(tiles[1].unit).toBe("GiB");
     expect(tiles[2].digits.join("")).toBe("694");
     expect(tiles[2].unit).toBe("MiB");
+  });
+
+  /**
+   * The notes moved behind an `(i)` toggle, so they can afford to actually
+   * SAY something — the permanent 8.5px line they replaced could not. These
+   * assert the two facts a reader most needs and most easily gets wrong.
+   */
+  it("the memory-free note says it is the sole red trigger AND that it is not a byte count", () => {
+    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, memory_free_percent: 87, red: false });
+    expect(tiles[0].note).toMatch(/only figure that can trigger RED/i);
+    expect(tiles[0].note).toMatch(/not a byte count/i);
+    // The inverted case: the two byte-count tiles must NOT claim to be triggers.
+    expect(tiles[1].note).not.toMatch(/trigger/i);
+    expect(tiles[2].note).not.toMatch(/trigger/i);
+  });
+
+  it("the compressor note disambiguates macOS's compressor from darkmux's compactor", () => {
+    // The operator hit this exactly: "Is compressor the 'utility' model?"
+    // One letter apart, three rows apart on the page. The label stays (the
+    // CLI and JSON use it); the note is where they get told apart.
+    const tiles = odometerTiles({ swap_used_bytes: 1, compressor_bytes: 1, memory_free_percent: 50, red: false });
+    expect(tiles[2].note).toMatch(/macOS/);
+    expect(tiles[2].note).toMatch(/compactor/);
   });
 
   it("renders a single — cell rather than a fabricated 0% when the percent is missing", () => {

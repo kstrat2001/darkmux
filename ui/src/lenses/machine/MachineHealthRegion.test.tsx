@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { render } from "@testing-library/react";
+import { fireEvent, render } from "@testing-library/react";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency } from "./machineGauge";
 import type { MachineResources } from "../../types/handwritten";
@@ -171,7 +171,9 @@ describe("MachineHealthRegion — the fill answers 'how full', not 'what state'"
     expect(chip.textContent).toContain("UNKNOWN");
     expect(chip.textContent).not.toMatch(/\b(GREEN|AMBER|RED)\b/);
     expect(container.querySelector(".mm-gauge-redline.lit")).toBeNull();
-    expect(container.querySelector(".mm-gauge-center-caption")!.textContent).toBe("IN USE");
+    // The caption slot is silent unless the server declared red — it names a
+    // red REASON, and there is none to name here.
+    expect(container.querySelector(".mm-gauge-center-caption")).toBeNull();
   });
 });
 
@@ -232,6 +234,12 @@ describe("MachineHealthRegion — the redline keys on exactly machine.state === 
     const { container } = renderRegion(red, { residencyRows: residencyRowsFor(red) });
     expect(container.querySelector(".mm-gauge-redline.lit")).not.toBeNull();
     expect(container.querySelector(".mm-gauge-center-val.lit")).not.toBeNull();
+  });
+
+  it("renders the red REASON in the caption slot — the one job that slot has", () => {
+    const red: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "red", current_bytes: 140000000000 }, pressure: { ...BASE.pressure, red: true } };
+    const { container } = renderRegion(red, { residencyRows: residencyRowsFor(red) });
+    expect(container.querySelector(".mm-gauge-center-caption")!.textContent).toBe("RED · PRESSURE");
   });
 
   it("the inverted case: amber does NOT light the redline, even at high current", () => {
@@ -427,6 +435,55 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
  * `machineGauge.test.ts`, but a mutation that made this component render the
  * chip unconditionally passed the whole suite until these existed.
  */
+/**
+ * The pressure tiles' explanatory notes are revealed on demand, not rendered
+ * permanently. A `title` tooltip would have been simpler and WRONG: this page
+ * is read over the tailnet on a phone, where hover does not exist, so the
+ * notes would silently cease to exist on the surface the operator uses most.
+ * A button works for tap, hover, and keyboard alike.
+ */
+describe("MachineHealthRegion — the pressure tiles explain themselves on demand", () => {
+  it("renders no note until asked, and every tile offers the affordance", () => {
+    const { container } = renderRegion(BASE);
+    expect(container.querySelectorAll(".mm-odo-n").length).toBe(0);
+    expect(container.querySelectorAll(".mm-odo-i").length).toBe(3);
+  });
+
+  it("reveals THAT tile's note on click, and states the relationship for a screen reader", () => {
+    const { container } = renderRegion(BASE);
+    const btn = container.querySelectorAll(".mm-odo-i")[0] as HTMLButtonElement;
+    expect(btn.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(btn);
+    expect(btn.getAttribute("aria-expanded")).toBe("true");
+    const notes = container.querySelectorAll(".mm-odo-n");
+    expect(notes.length).toBe(1); // exactly one — not all three
+    expect(notes[0].textContent).toMatch(/only figure that can trigger RED/i);
+  });
+
+  it("closes on a second click, and opening another tile closes the first", () => {
+    const { container } = renderRegion(BASE);
+    const [free, , comp] = [...container.querySelectorAll(".mm-odo-i")] as HTMLButtonElement[];
+    fireEvent.click(free);
+    fireEvent.click(free);
+    expect(container.querySelectorAll(".mm-odo-n").length).toBe(0);
+
+    fireEvent.click(free);
+    fireEvent.click(comp);
+    const notes = container.querySelectorAll(".mm-odo-n");
+    expect(notes.length).toBe(1);
+    expect(notes[0].textContent).toMatch(/macOS/);
+    expect(free.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("is a real button — reachable without a pointer at all", () => {
+    const { container } = renderRegion(BASE);
+    const btn = container.querySelector(".mm-odo-i")!;
+    expect(btn.tagName).toBe("BUTTON");
+    expect(btn.getAttribute("type")).toBe("button");
+    expect(btn.getAttribute("aria-label")).toMatch(/memory free/i);
+  });
+});
+
 describe("MachineHealthRegion — the per-row state chip only speaks when it disagrees", () => {
   it("renders NO state chip on a row that agrees with the machine", () => {
     // BASE: machine `unknown`, and the unpriced row is `unknown` too.
