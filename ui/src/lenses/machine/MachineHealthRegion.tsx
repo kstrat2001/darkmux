@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   computeGaugeGeometry,
+  computeRingGeometry,
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
@@ -67,6 +68,13 @@ const CY = 120;
 const R = 86;
 const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
 
+/** The inner ring's radius — darkmux's own share, concentric inside the
+ * machine's. Set so the two bands read as separate instruments with the GAP
+ * between them legible, since that gap IS "everything else" (#1821) and is
+ * deliberately never drawn as a band of its own. */
+const R_INNER = 66;
+const INNER_ARC_D = `M 54 120 A ${R_INNER} ${R_INNER} 0 0 1 186 120`;
+
 /** Where a tick label sits, in the arc's own local geometry — one fixed
  * layout per quarter-tick index (0/25/50/75/100%), matching `level3.html`'s
  * hand-placed label coordinates (a computed trig placement would drift off
@@ -117,7 +125,10 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   const faceCaption = gaugeFaceCaption(resources.machine.state, pressureRed, overLimit);
   // The fill's hue answers "how full", NOT "what did the arbiter decide" —
   // see `gaugeFillSeverity`'s own doc for why that separation is load-bearing.
-  const fillCls = gaugeFillSeverity(geo.pct);
+  const rings = computeRingGeometry(resources);
+  // Hue follows the MACHINE's fill now, not darkmux's share — the ring it
+  // colours is the machine's.
+  const fillCls = gaugeFillSeverity(rings.outer.solidPct);
   const odo = odoLayout(digitCells(centerVal.num));
 
   const committed = gaugeValueParts(resources.machine.potential_bytes);
@@ -140,13 +151,40 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
     <div className="mm-gauge">
       <svg width="300" height="212" viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
         <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={11} pathLength={100} />
+        {/* OUTER ring — the machine. Solid = used now; the hatched extension
+            beyond it = darkmux's committed-but-unmaterialised growth, so the
+            ring's end is the PROJECTED total and the needle lands there.
+            Drawn hatched-first so the solid band paints over its start and
+            the two meet without a seam. */}
+        {rings.outer.hatchedPct > 0 && (
+          <path
+            className="mm-gauge-growth"
+            d={HALF_ARC_D}
+            fill="none"
+            strokeWidth={11}
+            pathLength={100}
+            strokeDasharray={`${rings.outer.solidPct + rings.outer.hatchedPct} 100`}
+          />
+        )}
         <path
           className={`mm-gauge-val is-${fillCls}`}
           d={HALF_ARC_D}
           fill="none"
           strokeWidth={11}
           pathLength={100}
-          strokeDasharray={`${geo.pct} 100`}
+          strokeDasharray={`${rings.outer.solidPct} 100`}
+        />
+        {/* INNER ring — darkmux's share alone, read from 0 on the same scale.
+            "Everything else" is the visible gap between this and the outer
+            band; it is derived (`used - darkmux`) and is never drawn. */}
+        <path className="mm-gauge-inner-track" d={INNER_ARC_D} fill="none" strokeWidth={7} pathLength={100} />
+        <path
+          className="mm-gauge-inner-val"
+          d={INNER_ARC_D}
+          fill="none"
+          strokeWidth={7}
+          pathLength={100}
+          strokeDasharray={`${rings.inner.solidPct} 100`}
         />
         {geo.commitAngleDeg != null && (
           <line
@@ -193,7 +231,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
             carries the how-full channel and the lamps carry the verdict, so a
             third, permanently-grey encoding of the same question is subtraction
             rather than information. */}
-        <line className="mm-gauge-needle" x1={CX} y1={CY} x2={52} y2={CY} transform={`rotate(${geo.needleAngleDeg} ${CX} ${CY})`} />
+        <line className="mm-gauge-needle" x1={CX} y1={CY} x2={52} y2={CY} transform={`rotate(${rings.needleAngleDeg} ${CX} ${CY})`} />
         <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
         <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
           {odo.cells.map((c, i) => (

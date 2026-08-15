@@ -2133,6 +2133,31 @@ body {
 .mm-gauge-track {
   stroke: #222a3c;
 }
+/* The OUTER ring's hatched extension: darkmux's committed-but-unmaterialised
+   growth, drawn beyond the solid used band so the ring ends at the PROJECTED
+   total. Hatched rather than tinted because it is not memory anyone holds yet
+   — the same "not yet, but committed" idiom the ESTIMATED chip uses (dashed),
+   kept visually distinct from every solid band on the dial. */
+.mm-gauge-growth {
+  stroke: var(--dim);
+  opacity: 0.55;
+  stroke-dasharray: 3 3;
+}
+
+/* The INNER ring: darkmux's own share, on the same scale, read from 0.
+   Thinner than the machine's band so the two never read as one thick arc, and
+   deliberately achromatic — the machine's ring carries the how-full hue, and a
+   second hue here would imply a second verdict. The GAP between the two rings
+   is "everything else" (#1821): derived, never drawn as a band, visible as the
+   difference. */
+.mm-gauge-inner-track {
+  stroke: #1a2030;
+}
+.mm-gauge-inner-val {
+  stroke: var(--fg);
+  opacity: 0.85;
+}
+
 /* The fill's three zones. There is deliberately no `.is-unknown` arm: the fill
    is driven by `gaugeFillSeverity(pct)` (how full), which is total over
    green/amber/red, and no longer by `machine.state` (the arbiter's verdict),

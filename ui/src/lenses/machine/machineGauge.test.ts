@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   advanceResidency,
   computeGaugeGeometry,
+  computeRingGeometry,
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
@@ -599,5 +600,92 @@ describe("rowStateDiffers — the per-row chip's whole condition", () => {
     // Both degrade to "unknown" through memStateCls — not two distinct values.
     expect(rowStateDiffers("bogus", null)).toBe(false);
     expect(rowStateDiffers(undefined, "not-a-state")).toBe(false);
+  });
+});
+
+/**
+ * The two concentric rings (#1821). The dial used to fill from darkmux's
+ * `current` alone against a scale ending at the MACHINE's whole RAM — so it
+ * read as "how full is this machine" while measuring a fraction of it. The
+ * operator misread it for hours and was right to.
+ */
+describe("computeRingGeometry — the machine outside, darkmux inside", () => {
+  const G = 1073741824;
+  const res = (over: Record<string, unknown>): MachineResources =>
+    resources({
+      limit_bytes: 128 * G,
+      pool: { capacity_bytes: 128 * G, used_bytes: 64 * G, available_bytes: 40 * G, free_bytes: 20 * G },
+      machine: { potential_bytes: 48 * G, unpriced_models: 0, current_bytes: 32 * G, state: "green" },
+      ...over,
+    } as Partial<MachineResources>);
+
+  it("puts the machine on the outer ring and darkmux on the inner, on one scale", () => {
+    const r = computeRingGeometry(res({}));
+    expect(r.outer.solidPct).toBeCloseTo(50, 5); // 64 of 128
+    expect(r.inner.solidPct).toBeCloseTo(25, 5); // 32 of 128
+  });
+
+  it("draws darkmux's growth as an extension of the OUTER ring only, never twice", () => {
+    const r = computeRingGeometry(res({}));
+    // committed 48 - current 32 = 16 GiB of growth = 12.5% of the scale.
+    expect(r.outer.hatchedPct).toBeCloseTo(12.5, 5);
+    // The inner ring carries no hatched band: drawing the same quantity on
+    // both rings is duplication, so it appears once, where "will it fit" is
+    // answered.
+    expect(r.inner.hatchedPct).toBe(0);
+  });
+
+  it("lands the needle at the PROJECTED total, not at what is used today", () => {
+    const r = computeRingGeometry(res({}));
+    // (50 + 12.5)% of 180deg
+    expect(r.needleAngleDeg).toBeCloseTo(62.5 * 1.8, 4);
+  });
+
+  it("reports everything-else as the gap, which is never a band of its own", () => {
+    const r = computeRingGeometry(res({}));
+    expect(r.otherPct).toBeCloseTo(25, 5); // used 64 - darkmux 32
+    // The three quantities compose the outer ring exactly.
+    expect(r.inner.solidPct + r.otherPct).toBeCloseTo(r.outer.solidPct, 5);
+  });
+
+  /**
+   * The degenerate case that DEFINED the outer ring. Small residents, huge
+   * commitment, quiet machine: if the outer ring were "used" alone, darkmux's
+   * inner ring could exceed it and the dial would look broken. Defining outer
+   * as the PROJECTED total keeps outer >= inner in every case.
+   */
+  it("never lets the inner ring overshoot the outer, however large the commitment", () => {
+    const r = computeRingGeometry(
+      res({
+        pool: { capacity_bytes: 128 * G, used_bytes: 20 * G, available_bytes: 100 * G, free_bytes: 100 * G },
+        machine: { potential_bytes: 100 * G, unpriced_models: 0, current_bytes: 5 * G, state: "green" },
+      }),
+    );
+    const outerEnd = r.outer.solidPct + r.outer.hatchedPct;
+    expect(outerEnd).toBeGreaterThanOrEqual(r.inner.solidPct);
+    expect(outerEnd).toBeCloseTo(20 / 128 * 100 + 95 / 128 * 100, 4);
+  });
+
+  it("clamps at the scale rather than sweeping past it when over-committed", () => {
+    const r = computeRingGeometry(
+      res({ machine: { potential_bytes: 400 * G, unpriced_models: 0, current_bytes: 100 * G, state: "amber" } }),
+    );
+    expect(r.outer.solidPct + r.outer.hatchedPct).toBeLessThanOrEqual(100);
+    expect(r.needleAngleDeg).toBeLessThanOrEqual(180);
+  });
+
+  it("never reports negative growth for a fully materialised model", () => {
+    const r = computeRingGeometry(
+      res({ machine: { potential_bytes: 10 * G, unpriced_models: 0, current_bytes: 30 * G, state: "green" } }),
+    );
+    expect(r.outer.hatchedPct).toBe(0);
+  });
+
+  it("never lets the machine read as less full than darkmux's own share", () => {
+    // A degraded/absent pool reading must not produce an outer ring shorter
+    // than the inner one — darkmux's memory IS part of the machine's.
+    const r = computeRingGeometry(res({ pool: { capacity_bytes: 128 * G, used_bytes: 1 * G, available_bytes: 1, free_bytes: 1 } }));
+    expect(r.outer.solidPct).toBeGreaterThanOrEqual(r.inner.solidPct);
+    expect(r.otherPct).toBe(0);
   });
 });

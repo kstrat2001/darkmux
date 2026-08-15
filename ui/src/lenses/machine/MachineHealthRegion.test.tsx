@@ -147,10 +147,35 @@ describe("MachineHealthRegion — the fill answers 'how full', not 'what state'"
     expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-red");
   });
 
-  it("the inverted case: the SAME unknown state on a near-empty machine is green", () => {
-    const empty: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "unknown", current_bytes: 4000000000 } };
+  it("the inverted case: the SAME unknown state on a near-empty MACHINE is green", () => {
+    // The whole machine near-empty, not merely darkmux's share of it — the
+    // outer ring is the machine, so its hue must follow the machine.
+    const empty: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, state: "unknown", current_bytes: 4000000000 },
+      pool: { ...BASE.pool!, used_bytes: 6000000000 },
+    };
     const { container } = renderRegion(empty, { residencyRows: residencyRowsFor(empty) });
     expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-green");
+  });
+
+  /**
+   * The hue follows the MACHINE, not darkmux's slice of it. This is the
+   * labelling error #1821 exists to fix, expressed as colour: a dial that
+   * ends at the machine's `128 LIMIT` must not be tinted by a quantity that
+   * is only ever a fraction of it.
+   */
+  it("tints by the machine's fill, not by darkmux's share of it", () => {
+    // darkmux barely present; the MACHINE two-thirds full.
+    const busyElsewhere: MachineResources = {
+      ...BASE,
+      machine: { ...BASE.machine, current_bytes: 2_000_000_000 },
+      pool: { ...BASE.pool!, used_bytes: 120_000_000_000 },
+    };
+    const { container } = renderRegion(busyElsewhere, { residencyRows: residencyRowsFor(busyElsewhere) });
+    // 120e9 bytes = 111.8 GiB = 87.3% of the 128 GiB scale -> red.
+    // Tinting by darkmux's 1.6% share would have said green.
+    expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-red");
   });
 
   it("never lands the arbiter's verdict on the fill — an is-unknown fill is what the fix removed", () => {

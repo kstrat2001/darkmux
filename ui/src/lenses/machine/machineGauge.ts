@@ -142,6 +142,78 @@ export function resolveGaugeScale(limit: number | null, poolCap: number | null, 
  * the single source every element on the face (needle, ticks, commit
  * marker, redline) reads from, so none of them can disagree about what the
  * scale means. */
+/** One concentric ring's drawable extent, in percent of the dial's scale.
+ * `solid` is measured now; `hatched` is committed-but-not-yet-materialised
+ * and is drawn as an EXTENSION beyond the solid, never from zero. */
+export interface RingExtent {
+  solidPct: number;
+  hatchedPct: number;
+}
+
+export interface RingGeometry {
+  /** The MACHINE: everything in use, plus darkmux's unmaterialised growth. */
+  outer: RingExtent;
+  /** DARKMUX only, solid — its share of the same scale, read from 0. */
+  inner: RingExtent;
+  /** Memory held by everything that is not darkmux. NEVER drawn: it is the
+   * visible GAP between the two rings. Carried for the caption and for
+   * tests, so the relationship is checkable. */
+  otherPct: number;
+  /** The needle sits at the outer ring's end — the projected machine total. */
+  needleAngleDeg: number;
+}
+
+/**
+ * The two concentric rings (#1821).
+ *
+ * The dial used to fill from `machine.current` alone against a scale ending
+ * at the machine's whole RAM — so it read as "how full is this machine" while
+ * measuring only darkmux's share. The operator misread it for hours, and was
+ * right to: it is the MACHINE tab, the scale says `128 LIMIT`, and the caption
+ * said `IN USE`.
+ *
+ * Now:
+ * - **outer** = the machine's used memory (solid) + darkmux's unmaterialised
+ *   growth (hatched). The needle lands at its end. Defining the outer ring as
+ *   the PROJECTED total is what keeps `outer >= inner` in every case,
+ *   including the degenerate one — small residents, huge commitment, quiet
+ *   machine — where an outer ring of used-only would let the inner overshoot
+ *   it and look broken.
+ * - **inner** = darkmux's current share, solid only. The hatched band is drawn
+ *   ONCE, on the outer ring: its length is identical on both (darkmux's growth
+ *   is the only projected quantity), so drawing it twice would be the same
+ *   duplication this page spent a session deleting. darkmux's committed TOTAL
+ *   remains available as caption text.
+ * - **everything else** is never drawn. It is the difference between the
+ *   rings. That is deliberate: it is a DERIVED quantity (`used - darkmux`),
+ *   and drawing it would render it as though it had been measured.
+ *
+ * All four extents clamp to the scale, so an over-committed machine pins at
+ * the line rather than sweeping past it.
+ */
+export function computeRingGeometry(resources: MachineResources): RingGeometry {
+  const geo = computeGaugeGeometry(resources);
+  const scale = geo.scale;
+  const pctOf = (b: number | null | undefined): number => (b == null || !scale ? 0 : Math.max(0, Math.min(100, (Number(b) / scale) * 100)));
+
+  const darkmux = pctOf(resources.machine.current_bytes);
+  const used = Math.max(pctOf(resources.pool?.used_bytes), darkmux);
+  const committed = pctOf(resources.machine.potential_bytes);
+
+  // darkmux's growth: what its models will take beyond what they hold now.
+  // Never negative — a fully materialised model has no growth left.
+  const growth = Math.max(0, committed - darkmux);
+  const outerSolid = used;
+  const outerHatched = Math.max(0, Math.min(100 - outerSolid, growth));
+
+  return {
+    outer: { solidPct: outerSolid, hatchedPct: outerHatched },
+    inner: { solidPct: darkmux, hatchedPct: 0 },
+    otherPct: Math.max(0, used - darkmux),
+    needleAngleDeg: (outerSolid + outerHatched) * 1.8,
+  };
+}
+
 export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry {
   const limit = resources.limit_bytes != null ? Number(resources.limit_bytes) : null;
   const poolCap = resources.pool?.capacity_bytes != null ? Number(resources.pool.capacity_bytes) : null;
