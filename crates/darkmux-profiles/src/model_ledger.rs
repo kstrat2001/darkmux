@@ -857,9 +857,18 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         // resident. `info`, so it stops lighting the WARN lamp (#1821 —
         // the whole point of this change).
         messages.push(LedgerMessage::info(format!(
-            "{} resident model(s) priced by ESTIMATE, not measurement (no readable config.json — commonly a GGUF download): {} — potential assumes dense attention at a size-tiered {:.1} KB/token. Set at or above every modern GQA architecture in its size class; it OVERSTATES hybrid-attention models (safe), and UNDER-reserves pre-GQA multi-head models such as Llama-2-13B (~819 KB/token), whose real cost no size-derived rate can predict",
+            "{} resident model(s) priced by ESTIMATE, not measurement (no readable config.json — commonly a GGUF download): {} — potential assumes dense attention at a size-tiered {} KB/token. Set at or above every modern GQA architecture in its size class; it OVERSTATES hybrid-attention models (safe), and UNDER-reserves pre-GQA multi-head models such as Llama-2-13B (~819 KB/token), whose real cost no size-derived rate can predict",
             estimated.len(),
             estimated.join(", "),
+            // NOTE the bare `{}` above, not `{:.1}`. This argument is a
+            // pre-formatted String (it may be a RANGE, "204.8–327.7", when
+            // several tiers are in play), and `{:.1}` on a String is not
+            // decimal precision — it is a max-width truncation. It silently
+            // rendered "204.8" as "2", understating the disclosed assumption
+            // 100x in the one message whose entire job is stating that
+            // assumption honestly. Shipped because no test pinned the literal
+            // text; one does now.
+            //
             // The rate(s) ACTUALLY applied, re-derived per row from the same
             // size that selected them — never the bare tier-1 constant. The
             // tiers made a single hardcoded figure wrong here the moment a
@@ -2844,6 +2853,34 @@ mod tests {
         // enum-only assertion.
         let v = serde_json::to_value(&ledger).expect("serializes");
         assert_eq!(v["models"][0]["potential_source"], "arch");
+    }
+
+    /// The estimate message must state the ACTUAL rate, and this pins the
+    /// literal text because nothing did — which is why it shipped wrong.
+    ///
+    /// The argument is a pre-formatted `String` (it may be a range when
+    /// several tiers apply). `{:.1}` on a `String` is a max-width truncation,
+    /// not decimal precision, so "204.8" rendered as "2" — a 100x understated
+    /// disclosure in the one message that exists to disclose the assumption.
+    #[test]
+    fn the_estimate_message_states_the_whole_rate_not_a_truncated_one() {
+        let mut inputs = base_inputs();
+        inputs
+            .catalog
+            .push(CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) });
+        inputs.residents.push(resident("microsoft/phi-4", "phi-4-gguf", 8_192));
+
+        let ledger = compute_ledger(inputs, 1);
+        let msg = ledger
+            .messages
+            .iter()
+            .find(|m| m.text.contains("priced by ESTIMATE"))
+            .expect("estimate message");
+
+        assert!(msg.text.contains("204.8 KB/token"), "rate was mangled: {}", msg.text);
+        // The exact shape of the bug: a single leading digit where the figure
+        // should be.
+        assert!(!msg.text.contains("a size-tiered 2 KB/token"), "truncated to one character: {}", msg.text);
     }
 
     /// #1819 decision 2: `estimated_models` counts separately from
