@@ -384,6 +384,31 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     expect(kv.textContent).not.toContain("physical pool");
   });
 
+  /**
+   * `used` and `available` overlap by design, so adjacent in one row they
+   * read as an addition that exceeds the machine — 152.78 GiB on a 128 GiB
+   * box when first shown (#1821). The parenthetical is what refuses that
+   * reading, and it must be RENDERED, not merely available: a mutation that
+   * dropped it from this row passed all 688 tests while the helper stayed
+   * green.
+   */
+  it("names the reclaimable overlap in the row, so used + available cannot read as a sum", () => {
+    const { container } = renderRegion(BASE);
+    const kv = container.querySelector(".mm-kv--machine")!;
+    expect(kv.textContent).toMatch(/reclaimable/);
+    // available 67.06 GiB - free 3.48 GiB = 63.57 GiB counted by both.
+    expect(kv.textContent).toContain("63.57 GiB reclaimable");
+  });
+
+  it("omits the parenthetical when there is no overlap to explain", () => {
+    const flush: MachineResources = {
+      ...BASE,
+      pool: { ...BASE.pool!, available_bytes: BASE.pool!.free_bytes },
+    };
+    const { container } = renderRegion(flush);
+    expect(container.querySelector(".mm-kv--machine")!.textContent).not.toMatch(/reclaimable/);
+  });
+
   it("renders the pool in binary GiB, agreeing with the header's own figure (#1811)", () => {
     const { container } = renderRegion(BASE);
     const kv = container.querySelector(".mm-kv--machine")!;

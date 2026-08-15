@@ -19,7 +19,7 @@ import {
   redlineLit,
   type ResidencyRowView,
 } from "./machineGauge";
-import { memBytes } from "../../lib/format";
+import { memBytes, reclaimableNote } from "../../lib/format";
 import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
@@ -623,7 +623,8 @@ export function MachineHealthRegion({
             here — two figures both reading as "how much is left" was the
             defect being fixed, not something to preserve under a new name. */}
         limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b>{" "}
-        · used <b>{memBytes(b.pool?.used_bytes)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>{" "}
+        · used <b>{memBytes(b.pool?.used_bytes)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>
+        {reclaimableNote(b.pool?.available_bytes, b.pool?.free_bytes)}{" "}
         · unpriced{" "}
         <b>{Number(b.machine.unpriced_models) || 0} model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}</b>
         {/* #1819: the same row that already discloses the genuinely-unpriced

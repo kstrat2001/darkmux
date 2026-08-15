@@ -147,3 +147,29 @@ export function memPct(part: number | null | undefined, scale: number): number {
   if (part == null || !scale) return 0;
   return Math.max(0, Math.min(100, (Number(part) / scale) * 100));
 }
+
+/** ` (35.45 GiB reclaimable)` — the parenthetical that stops `used` and
+ * `available` from reading as an addition.
+ *
+ * They deliberately OVERLAP. `used` is Activity-Monitor-style and counts
+ * inactive pages as app memory; `available` counts those same pages as
+ * reclaimable. Both are correct, and on a 128 GiB machine they summed to
+ * 152.78 GiB when first shown side by side (#1821) — two right numbers making
+ * an impossible impression, which is the same defect class as the two figures
+ * that both called themselves "free" and differed by 51 points.
+ *
+ * `available - free` IS the overlap: inactive + speculative, the pages counted
+ * in both. Naming it is what makes `available > capacity - used` legible
+ * instead of looking like broken arithmetic.
+ *
+ * Returns `""` whenever it would not clarify — either figure unreadable, or a
+ * non-positive difference (nothing reclaimable, so nothing to explain). */
+export function reclaimableNote(availableBytes: number | null | undefined, freeBytes: number | null | undefined): string {
+  if (availableBytes == null || freeBytes == null) return "";
+  const a = Number(availableBytes);
+  const f = Number(freeBytes);
+  if (!Number.isFinite(a) || !Number.isFinite(f)) return "";
+  const reclaimable = a - f;
+  if (reclaimable <= 0) return "";
+  return ` (${memBytes(reclaimable)} reclaimable)`;
+}

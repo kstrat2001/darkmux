@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { memBytes, memPct, memStateCls } from "./format";
+import { memBytes, memPct, memStateCls, reclaimableNote } from "./format";
 
 // `memStateCls` was ported (format.ts) ahead of its first consumer; #1806
 // Stage 1, then Stage 2/3's `MachineHealthRegion.tsx`, is that consumer —
@@ -108,5 +108,32 @@ describe("memBytes", () => {
     expect(memBytes(null)).toBe("—");
     expect(memBytes(undefined)).toBe("—");
     expect(memBytes(Number.NaN)).toBe("—");
+  });
+});
+
+/**
+ * `used` and `available` deliberately overlap — `used` counts inactive pages
+ * as app memory, `available` counts them as reclaimable — so side by side they
+ * summed to 152.78 GiB on a 128 GiB machine (#1821). Two correct numbers, one
+ * impossible impression. This parenthetical names the overlap.
+ */
+describe("reclaimableNote", () => {
+  it("names the overlap between available and free — the pages counted twice", () => {
+    // Live figures the day this shipped: available 76.82, free 41.37 GiB.
+    const G = 1073741824;
+    expect(reclaimableNote(76.82 * G, 41.37 * G)).toBe(" (35.45 GiB reclaimable)");
+  });
+
+  it("stays silent when there is nothing reclaimable to explain", () => {
+    const G = 1073741824;
+    expect(reclaimableNote(10 * G, 10 * G)).toBe("");
+    // ...and never renders a negative, whatever the probe reports.
+    expect(reclaimableNote(5 * G, 9 * G)).toBe("");
+  });
+
+  it("stays silent rather than guessing on an unreadable figure", () => {
+    expect(reclaimableNote(null, 1)).toBe("");
+    expect(reclaimableNote(1, null)).toBe("");
+    expect(reclaimableNote(Number.NaN, 1)).toBe("");
   });
 });
