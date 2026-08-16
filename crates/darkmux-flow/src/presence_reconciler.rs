@@ -445,6 +445,7 @@ mod tests {
             schema_version: "1.11.0".to_string(),
             beat_ts_ms: 1,
             specs: None,
+            darkmux_version: None,
             loaded_models: Vec::new(),
         }
     }
