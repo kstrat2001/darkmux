@@ -64,6 +64,18 @@ pub struct PresenceBeat {
     /// LMStudio loaded-model ids, best-effort (may be empty / omitted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loaded_models: Vec<String>,
+    /// (#1580) The darkmux version this daemon's binary is. `None` from a peer
+    /// running a build that predates this field.
+    ///
+    /// It lives HERE, on the heartbeat, and not only on `machine list --deep`,
+    /// because presence needs no HTTP reachability — it travels the shared
+    /// Redis. The failure that motivated #1580 is exactly the case where the
+    /// deep probe cannot answer: a peer whose daemon is up and heartbeating
+    /// but whose HTTP surface is unreachable. `schema_version` above already
+    /// proved the pattern works; the darkmux version is the other half of the
+    /// same question and was the half nobody could get.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub darkmux_version: Option<String>,
 }
 
 /// The Redis key for a machine's presence beat (keyed on the stable uid).
@@ -202,6 +214,7 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
                     beat_ts_ms: now_ms(),
                     specs: None,
                     loaded_models: Vec::new(),
+                    darkmux_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 };
                 match write_beat(&client, &beat, DEFAULT_TTL_SECS) {
                     Ok(()) => {
@@ -251,7 +264,42 @@ mod tests {
             beat_ts_ms: 1_780_000_000_000,
             specs: Some("Apple Silicon · 128 GB".into()),
             loaded_models: vec!["qwen3.6-35b".into()],
+            darkmux_version: Some("2.8.0".into()),
         }
+    }
+
+    /// (#1580) The whole point of putting the version HERE: a beat carries it
+    /// over Redis, so a peer's darkmux version is readable without its HTTP
+    /// daemon being reachable. That is precisely the case `machine list
+    /// --deep` cannot serve, and the case that motivated the issue — a hub
+    /// that was up and heartbeating while nothing could ask it anything.
+    #[test]
+    fn a_beat_carries_the_darkmux_version_over_the_wire() {
+        let json = serde_json::to_string(&sample_beat()).unwrap();
+        assert!(json.contains("darkmux_version"), "field must reach the wire: {json}");
+        let back: PresenceBeat = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.darkmux_version.as_deref(), Some("2.8.0"));
+    }
+
+    /// A peer on a build that predates this field still parses — the reader
+    /// must degrade to "unknown", never fail. Same leniency `specs` and
+    /// `loaded_models` already have.
+    #[test]
+    fn a_beat_from_an_older_peer_without_the_field_still_parses() {
+        let old = r#"{"machine_uid":"U","display_name":"studio","schema_version":"1.19.0","beat_ts_ms":1}"#;
+        let back: PresenceBeat = serde_json::from_str(old).expect("older beat must still parse");
+        assert_eq!(back.darkmux_version, None, "absent means unknown, not an error");
+        assert_eq!(back.display_name, "studio");
+    }
+
+    /// The field is omitted rather than serialized as `null` when unset, so an
+    /// older reader sees the same bytes it always did.
+    #[test]
+    fn an_unset_version_is_omitted_from_the_wire_entirely() {
+        let mut b = sample_beat();
+        b.darkmux_version = None;
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(!json.contains("darkmux_version"), "must be omitted, not null: {json}");
     }
 
     #[test]
@@ -278,6 +326,7 @@ mod tests {
             schema_version: "1.10.0".into(),
             beat_ts_ms: 1,
             specs: None,
+            darkmux_version: None,
             loaded_models: vec![],
         };
         let json = serde_json::to_string(&beat).unwrap();
@@ -323,6 +372,7 @@ mod tests {
             schema_version: crate::FLOW_SCHEMA_VERSION.to_string(),
             beat_ts_ms: now_ms(),
             specs: None,
+            darkmux_version: None,
             loaded_models: Vec::new(),
         };
         write_beat(&client, &beat, DEFAULT_TTL_SECS).expect("write_beat");
