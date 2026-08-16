@@ -12,7 +12,7 @@ fully offline-capable, matching `viewer.html`'s own `include_str!` posture.
 | `reactflow-bundle.min.css` | reactflow's `dist/style.css`, minified. | MIT |
 | `LICENSE-react`, `LICENSE-react-dom`, `LICENSE-reactflow` | Upstream MIT license text, copied verbatim from each package's own `LICENSE` file at the pinned version. | MIT |
 
-All three upstream packages are MIT-licensed — compatible with darkmux's own MIT license, no attribution notices required beyond keeping these `LICENSE-*` files in the tree.
+All three upstream packages are MIT — compatible with darkmux's own MIT license. Their notices are kept here **and prepended to the built bundle**, because MIT requires the notice to travel with copies of the code, and the bundle is the copy that actually reaches users (it is `include_str!`'d into the binary and served to browsers). Keeping `LICENSE-*` in the source tree addresses source distribution only; it does not put the notice with the artifact. Re-prepend after any rebuild — see the recipe below. (#1842)
 
 ## Why one merged bundle, not three separate vendor files
 
@@ -56,6 +56,26 @@ cp reactflow-bundle.min.js reactflow-bundle.min.css \
 cp node_modules/react/LICENSE      <darkmux-repo>/crates/darkmux-serve/assets/vendor/LICENSE-react
 cp node_modules/react-dom/LICENSE  <darkmux-repo>/crates/darkmux-serve/assets/vendor/LICENSE-react-dom
 cp node_modules/reactflow/LICENSE  <darkmux-repo>/crates/darkmux-serve/assets/vendor/LICENSE-reactflow
+
+# (#1842) LAST STEP, and it is not optional: prepend the notices to the bundle
+# itself. esbuild --minify strips upstream `@license` banners, so a freshly
+# built bundle ships React's and webkid's MIT code with no attribution in the
+# artifact that actually reaches users. Skipping this silently regresses it.
+cd <darkmux-repo>/crates/darkmux-serve/assets/vendor
+python3 - <<'PY'
+parts = []
+for f in ('LICENSE-react', 'LICENSE-react-dom', 'LICENSE-reactflow'):
+    parts.append(f"{f.replace('LICENSE-','')}\n\n" + open(f).read().strip())
+sep = "\n\n" + "-"*64 + "\n\n"
+hdr = ("/*!\n * Vendored third-party code. License notices follow, as MIT requires.\n"
+       " * Full texts also live beside this file in assets/vendor/.\n *\n"
+       " * " + "="*64 + "\n *\n"
+       + "\n".join(" * " + l if l.strip() else " *" for l in sep.join(parts).splitlines())
+       + "\n */\n")
+b = 'reactflow-bundle.min.js'
+open(b, 'w').write(hdr + open(b).read())
+PY
+grep -c 'Copyright (c)' reactflow-bundle.min.js   # expect 3
 ```
 
 Bump a pinned version by changing the three `npm install` version numbers above and re-running. Re-run `cargo test -p darkmux-serve` after any bundle rebuild — the route tests assert the served bytes are non-empty and content-typed correctly, not a content hash, so a legitimate rebuild never breaks CI on its own.
