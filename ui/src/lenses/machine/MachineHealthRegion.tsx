@@ -22,7 +22,7 @@ import {
   type ResidencyRowView,
 } from "./machineGauge";
 import { memBytes, reclaimableNote } from "../../lib/format";
-import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
+import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
 /**
@@ -320,11 +320,19 @@ function GaugeCaption({ resources }: { resources: MachineResources }) {
     resources.limit_bytes,
     Number(resources.machine.unpriced_models) || 0,
     Number(resources.machine.estimated_models) || 0,
+    resources.machine.amber_reason,
   );
   const unpriced = Number(resources.machine.unpriced_models) || 0;
   return (
     <div className="mm-gcap">
-      <b>machine total</b> <span className={`mm-chip is-${stateCls}`}>{stateText}</span>
+      {/* (#1827 item 1, resolved) `machine total` was the label until the
+          operator read this line cold and called it noise — and it was, but
+          the CONTENT was not: it is the only element on the face answering
+          "does darkmux's commitment fit under the limit". Labeled `machine
+          total` it sat under an odometer labeled MACHINE USED and a legend
+          summing the same bytes, so it read as a third restatement of the
+          number above it rather than an answer to a different question. */}
+      <b>fit</b> <span className={`mm-chip is-${stateCls}`}>{stateText}</span>
       {unpriced ? ` (+${unpriced} unpriced)` : ""}
     </div>
   );
@@ -574,6 +582,12 @@ function ModelRow({
           ↳ estimated: no readable config.json and no readable GGUF header — priced from catalog size + a size-tiered dense-attention KV rate (every layer assumed to hold a KV cache). Set at or above every modern GQA architecture in its size class; it over-reserves hybrid-attention models, and under-reserves pre-GQA multi-head models like Llama-2-13B
         </div>
       )}
+      {/* #1854 — the row this is ABOUT carries the fact (which resident, by
+          how much, what the projection now counts); the machine caption one
+          altitude up carries only the consequence. Neither repeats the
+          other's sentence. A ghost row is excluded like every other hint
+          here: its figures are a last observation, not a live claim. */}
+      {!isGhost && overPriceHint(m) && <div className="mm-hint">↳ {overPriceHint(m)}</div>}
       {!isGhost && (m as { shrink_hint?: string }).shrink_hint && <div className="mm-hint">↳ {(m as { shrink_hint?: string }).shrink_hint}</div>}
     </div>
   );

@@ -305,16 +305,26 @@ export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry
  * Green/amber/red otherwise stay bare when nothing is estimated — they are
  * self-evident, and a reason appended to a self-evident word is noise. This
  * never invents a verdict; it only annotates one the server already
- * reached. */
+ * reached.
+ *
+ * #1835 makes AMBER the exception to that "self-evident" clause, by the
+ * clause's own logic: amber now has two causes that call for OPPOSITE
+ * responses — `OVERCOMMITTED` (shrink something) and `NO MARGIN` (it fits;
+ * do not load anything else). A bare AMBER can no longer tell you which, so
+ * the cause stops being noise and becomes the word's content. It is read
+ * from the server's `amber_reason`, never re-derived here: the margin floor
+ * that decides it lives server-side and only server-side. */
 export function machineStateWord(
   state: string | null | undefined,
   limitBytes: number | null | undefined,
   unpricedModels: number,
   estimatedModels: number = 0,
+  amberReason?: "overcommitted" | "no_margin" | null,
 ): string {
   const word = (state || "unknown").toUpperCase();
   if (word !== "UNKNOWN") {
-    return estimatedModels > 0 ? `${word} · ${estimatedModels} estimated` : word;
+    const cause = amberReason ? ` · ${amberReason.replace("_", " ").toUpperCase()}` : "";
+    return estimatedModels > 0 ? `${word}${cause} · ${estimatedModels} estimated` : `${word}${cause}`;
   }
   if (limitBytes == null) return "UNKNOWN · no limit readable";
   if (unpricedModels > 0) return "UNKNOWN · unpriced resident";

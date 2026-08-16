@@ -34,8 +34,32 @@
  * is all that survives of it, and why.
  */
 
+import { memBytes } from "../../lib/format";
 import { MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
+
+/** (#1854, altitude 1 — the row it is about) The `↳` hint under a resident
+ * whose measured footprint has outgrown the potential darkmux priced it at.
+ * `null` for every other row, which is nearly all of them.
+ *
+ * Reads the server's `over_price_bytes` rather than comparing
+ * `current_bytes > potential_bytes` here: the condition includes a flap
+ * floor, and a client that re-derives it will eventually disagree with the
+ * machine-level count computed from the same condition one altitude up.
+ *
+ * The copy says what happened and what darkmux DID about it, in that order,
+ * because the second half is the part that changes how the operator reads
+ * the verdict above. The row's own STATE line is deliberately NOT touched —
+ * this resident is healthy; the price was wrong, which is an epistemic fact
+ * and not a severity. Spending the state channel on it would mint a second
+ * meaning for colour (the same argument that rejected forcing the machine
+ * verdict to UNKNOWN — see #1854). */
+export function overPriceHint(m: Pick<MachineResourcesModel, "over_price_bytes" | "current_bytes">): string | null {
+  const over = m.over_price_bytes;
+  if (over == null || !(Number(over) > 0)) return null;
+  return `holds ${memBytes(over)} more than priced — the fit projection counts the measured ${memBytes(m.current_bytes)}`;
+}
+
 
 /** The configured utility-tier model's id, or `null` — the ONE thing the
  * machine page still needs to know about the utility tier, used to badge

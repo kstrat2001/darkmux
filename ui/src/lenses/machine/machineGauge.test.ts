@@ -703,3 +703,31 @@ describe("hatchedSegmentDash — extent and hatching in ONE value", () => {
     expect(hatchedSegmentDash(50, -3)).toBe("0 100");
   });
 });
+
+// (#1835) Amber grew a second cause, and the two call for OPPOSITE
+// responses: `OVERCOMMITTED` means shrink something; `NO MARGIN` means it
+// fits, so do not load anything else. A bare AMBER cannot say which — which
+// is what promotes the cause from noise to content on this word.
+describe("machineStateWord — amber carries which disjunct fired", () => {
+  it("names the cause when the server reports one", () => {
+    expect(machineStateWord("amber", 137438953472, 0, 0, "no_margin")).toBe("AMBER · NO MARGIN");
+    expect(machineStateWord("amber", 137438953472, 0, 0, "overcommitted")).toBe("AMBER · OVERCOMMITTED");
+  });
+
+  it("leaves a self-evident verdict bare — the reason is read, never derived", () => {
+    // The inverted case, and the one that keeps this honest: GREEN has one
+    // meaning, so appending anything to it would be the noise this rule
+    // exists to prevent. A client that inferred "no margin" from its own
+    // arithmetic could also contradict the chip beside it.
+    expect(machineStateWord("green", 137438953472, 0, 0, null)).toBe("GREEN");
+    expect(machineStateWord("green", 137438953472, 0)).toBe("GREEN");
+    expect(machineStateWord("red", 137438953472, 0, 0, undefined)).toBe("RED");
+  });
+
+  it("still carries the #1819 estimate disclosure alongside the cause", () => {
+    // Both annotations are true at once and neither may swallow the other:
+    // the cause is what the verdict IS, the estimate count is what it RESTS
+    // ON.
+    expect(machineStateWord("amber", 137438953472, 0, 2, "no_margin")).toBe("AMBER · NO MARGIN · 2 estimated");
+  });
+});

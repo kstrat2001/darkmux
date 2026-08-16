@@ -891,3 +891,53 @@ describe("MachineHealthRegion — messages[] severity (#1821: an info disclosure
     expect(infoMsg.className).not.toMatch(/memmsg-warn/);
   });
 });
+
+// (#1854) A resident whose measured footprint outgrew the potential darkmux
+// priced it at. Measured live on an IDLE MLX model: 28.40 GiB held against a
+// priced 22.88 GiB, steady to the byte across repeated samples. The server
+// clamps the projection to what is actually held and flags the row; these
+// tests pin the two places the page SAYS so, because a silently-repaired
+// estimate is one nobody ever fixes.
+const OVER_PRICE: MachineResources = {
+  ...BASE,
+  models: [
+    { ...BASE.models[0], potential_bytes: 24565385183, current_bytes: 30493331456, over_price_bytes: 5927946273, state: "green" },
+    BASE.models[1],
+  ],
+  machine: { ...BASE.machine, over_price_models: 1, state: "green" },
+};
+
+describe("MachineHealthRegion — #1854 a resident holding more than darkmux priced it", () => {
+  it("says it on the row it is about: the overage, and what the projection now counts", () => {
+    const { container } = renderRegion(OVER_PRICE);
+    const hints = [...container.querySelectorAll(".mm-hint")].map((n) => n.textContent);
+    expect(hints.some((t) => /holds 5\.52 GiB more than priced/.test(t || ""))).toBe(true);
+    expect(hints.some((t) => /the fit projection counts the measured 28\.40 GiB/.test(t || ""))).toBe(true);
+  });
+
+
+  it("does NOT flip the row's state chip — the price was wrong, the model is not unhealthy", () => {
+    // The severity channel stays reserved for fit severity. A row whose only
+    // distinction is an outgrown ESTIMATE must not borrow the vocabulary the
+    // machine uses to say "this does not fit" — that mints a second meaning
+    // for colour, the same argument that rejected forcing the verdict to
+    // UNKNOWN. The chip only speaks when a row DISAGREES with the machine.
+    const { container } = renderRegion(OVER_PRICE);
+    const row = [...container.querySelectorAll(".mm-row")].find((n) => /more than priced/.test(n.textContent || ""));
+    expect(row).toBeTruthy();
+    expect(row!.querySelector(".mm-row-chip.is-state")).toBeNull();
+    // Scoped deliberately: BASE's genuinely-unpriced row DOES disagree with
+    // the machine and keeps its UNKNOWN chip, so a page-wide assertion here
+    // would pass or fail for the wrong reason.
+    expect(container.querySelectorAll(".mm-row-chip.is-state").length).toBe(1);
+  });
+
+  it("the inverted case: an ordinary machine's caption and rows are untouched", () => {
+    // BASE has no over-price resident, and must gain neither the
+    // parenthetical nor a second hint — a marker that renders always carries
+    // no information.
+    const { container } = renderRegion(BASE);
+    const hints = [...container.querySelectorAll(".mm-hint")].map((n) => n.textContent);
+    expect(hints.some((t) => /more than priced/.test(t || ""))).toBe(false);
+  });
+});

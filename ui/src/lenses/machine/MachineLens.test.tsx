@@ -80,7 +80,7 @@ describe("MachineLens", () => {
   it("uid: null (nav-tab/deep-link) is always the local machine — resources loads with real figures", async () => {
     const resourcesCalled = mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 } });
     renderMachine(null);
-    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/^fit$/i)).toBeInTheDocument());
     expect(resourcesCalled.value).toBe(true);
     expect(screen.queryByText(/not reported from here/i)).not.toBeInTheDocument();
   });
@@ -98,7 +98,7 @@ describe("MachineLens", () => {
     await waitFor(() => expect(screen.getByText(/machine · studio/)).toBeInTheDocument());
     expect(screen.getByText(/residency \/ RAM not reported from here — local-probe only/i)).toBeInTheDocument();
     expect(screen.getByText(/View the machine page on studio directly/i)).toBeInTheDocument();
-    expect(screen.queryByText(/machine total/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^fit$/i)).not.toBeInTheDocument();
     // The whole point of the gate — never even ISSUE the local probe request
     // for a page that can't honestly show its answer.
     expect(resourcesCalled.value).toBe(false);
@@ -114,7 +114,7 @@ describe("MachineLens", () => {
     // A fleet-card drill (uid explicit, machineIsLocal=false) into the uid
     // that resolves to THIS daemon's own specs.machine_id.
     renderMachine("self-uid");
-    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/^fit$/i)).toBeInTheDocument());
     expect(resourcesCalled.value).toBe(true);
     expect(screen.queryByText(/not reported from here/i)).not.toBeInTheDocument();
   });
@@ -154,14 +154,14 @@ describe("MachineLens", () => {
   it("the local machine page still settles on data-state=\"loaded\" once /machine/resources resolves", async () => {
     mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 } });
     renderMachine(null);
-    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/^fit$/i)).toBeInTheDocument());
     expect(document.querySelector(".machine-lens__health")).toHaveAttribute("data-state", "loaded");
   });
 
   it("the 'fleet' back-link writes an empty hash", async () => {
     mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" } });
     renderMachine(null);
-    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/^fit$/i)).toBeInTheDocument());
     window.location.hash = "#lens=machine";
     screen.getByRole("button", { name: "fleet" }).click();
     expect(window.location.hash).toBe("");
@@ -214,7 +214,7 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
   it("renders NO utility card, in the state that used to render the fullest one", async () => {
     mockMachineFetch(withUtility);
     const { container } = renderMachine(null);
-    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/^fit$/i)).toBeInTheDocument());
     expect(container.querySelector(".machine-lens__util")).toBeNull();
     expect(container.querySelector(".mm-util-hdr")).toBeNull();
     // The card's own copy, gone with it — `handles` was the clearest case of
@@ -226,7 +226,7 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
   it("badges the configured tier's row instead — the seam that replaced the card", async () => {
     mockMachineFetch(withUtility);
     const { container } = renderMachine(null);
-    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/^fit$/i)).toBeInTheDocument());
     const row = [...container.querySelectorAll(".mm-row")].find((r) => r.textContent?.includes("darkmux:qwen3-4b"))!;
     expect(row).toBeTruthy();
     const chip = [...row.querySelectorAll(".mm-row-chip")].find((c) => c.textContent === "utility")!;
@@ -246,7 +246,7 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
       resources: RESIDENT_UTILITY, // the row is THERE; only the binding is absent
     });
     const { container } = renderMachine(null);
-    await waitFor(() => expect(screen.getByText(/machine total/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/^fit$/i)).toBeInTheDocument());
     expect([...container.querySelectorAll(".mm-row-chip")].some((c) => c.textContent === "utility")).toBe(false);
     expect(container.querySelector(".machine-lens__util")).toBeNull();
   });

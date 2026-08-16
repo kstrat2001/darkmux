@@ -144,6 +144,20 @@ export interface MachineResourcesModel {
   potential_source?: "arch" | "estimated";
   current_bytes: number;
   state: "green" | "yellow" | "red" | string;
+  /** #1854 — how much this resident holds ABOVE its priced
+   * `potential_bytes`, when that overage is material. OMITTED (not `null`)
+   * in the normal case: the resident is at or under its price.
+   *
+   * The server computes the condition, including the flap floor, so the row
+   * hint and the machine caption's count read ONE definition rather than
+   * each re-deriving `current > potential` — #1852's lesson about figures
+   * whose definition lives in two places.
+   *
+   * NOT a severity: a row carrying this is not unhealthy, and `state` is
+   * deliberately untouched by it. What was falsified is the estimate's
+   * ceiling, not the fit.
+   * Source: `crates/darkmux-profiles/src/model_ledger.rs::ModelRow`. */
+  over_price_bytes?: number;
 }
 
 /** `GET /lab/runs`'s per-seat staffing snapshot — only the fields the runs
@@ -334,6 +348,9 @@ export interface MachineResources {
   };
   models: MachineResourcesModel[];
   machine: {
+    /** #1854 — summed as `max(potential, current)` per resident. A declared
+     * maximum sitting below that resident's own measured footprint is a
+     * disproved number, not a conservative one; see `over_price_models`. */
     potential_bytes: number;
     unpriced_models: number;
     /** #1819 — residents priced by the size-based fallback rather than
@@ -342,7 +359,25 @@ export interface MachineResources {
      * block a Green verdict — only `unpriced_models` (genuinely
      * unpriceable, no potential at all) does that. */
     estimated_models: number;
+    /** #1854 — residents counted at their MEASURED size because it exceeded
+     * the price they declared. It qualifies the verdict rather than changing
+     * it: a green with zero here is CEILING-backed (fits even if every
+     * resident grows to its declared maximum); a green with a non-zero count
+     * is FLOOR-backed (fits at the larger of each price and each observed
+     * size, with that many maxima known to be wrong). Same chip, weaker
+     * promise — which is why the count renders beside the chip.
+     *
+     * `?` for a pre-2.1 peer's ledger, matching the server's `serde(default)`. */
+    over_price_models?: number;
     current_bytes: number;
+    /** #1835 — WHICH disjunct produced an amber `state`; absent for every
+     * other verdict. `"overcommitted"` = the projected total exceeds the
+     * limit outright (shrink something). `"no_margin"` = it fits, but the
+     * headroom left is under the server's margin floor (do not load anything
+     * else). The two call for opposite responses, so the lamp row keys on
+     * this rather than on a threshold re-derived client-side — the floor
+     * lives server-side and only server-side. */
+    amber_reason?: "overcommitted" | "no_margin";
     /** #1821 — everything ELSE on the machine, right now:
      * `pool.used_bytes - current_bytes`, floored at 0. */
     other_used_bytes?: number;
