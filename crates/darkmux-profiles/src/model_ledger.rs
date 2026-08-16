@@ -955,7 +955,55 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     // reusing the old darkmux-only comparison.
     let other_used_bytes: Option<u64> =
         pool.and_then(|p| p.used_bytes).map(|used| used.saturating_sub(current_total.unwrap_or(0)));
-    let projected_total_bytes: Option<u64> = other_used_bytes.map(|o| o + sum_potential);
+    // (#1854) `potential` is the fit contract — "the most this resident will
+    // ever hold". It can be WRONG, and measurably so: an idle MLX resident was
+    // observed at 28.40 GiB against a priced potential of 22.88 GiB, steady to
+    // the byte across repeated samples, having measured UNDER potential a day
+    // earlier (see this module's own note at the ArchEstimator doc). A maximum
+    // that sits below an observed value is not a policy choice, it is wrong —
+    // so the projection counts `max(potential, current)` per row. Without the
+    // clamp the fit verdict is optimistic by exactly the overage, in the one
+    // direction that makes an operator load another model.
+    //
+    // Deliberately NOT a new threshold or a widened margin: widening the
+    // estimator needs measurement across models and residency durations, and
+    // guessing a constant here would bury the very signal that says the
+    // estimate needs work. This only stops darkmux from believing a number it
+    // has already disproved.
+    // Flap guard: only a MATERIAL overage counts. A few MB of jitter flipping
+    // this on and off every poll would teach the operator to ignore it inside
+    // a day — the same "signal with no variance carries no information"
+    // lesson as the always-grey lamps, arriving from the other side.
+    let over_floor = |potential: u64| (potential / 100).max(256 * 1024 * 1024);
+    let mispriced: Vec<(&str, u64, u64)> = rows
+        .iter()
+        .filter_map(|r| match (r.current_bytes, r.potential_bytes) {
+            (Some(c), Some(p)) if c > p && c - p > over_floor(p) => Some((r.identifier.as_str(), p, c)),
+            _ => None,
+        })
+        .collect();
+    let effective_potential: u64 = rows
+        .iter()
+        .map(|r| match (r.current_bytes, r.potential_bytes) {
+            (Some(c), Some(p)) => c.max(p),
+            (_, Some(p)) => p,
+            _ => 0,
+        })
+        .sum();
+    for (id, priced, measured) in &mispriced {
+        // Carry BOTH numbers, deliberately. The clamp removes this defect's
+        // pressure on the verdict, so the only thing keeping the real fix
+        // alive afterwards is the specificity of this message — the
+        // priced-vs-measured pairs ARE the corpus the estimator work needs.
+        messages.push(LedgerMessage::warn(format!(
+            "`{id}` holds {} more than darkmux priced it (potential {}, measured {}); \
+             the fit projection counts the measured size",
+            fmt_bytes(measured - priced),
+            fmt_bytes(*priced),
+            fmt_bytes(*measured)
+        )));
+    }
+    let projected_total_bytes: Option<u64> = other_used_bytes.map(|o| o + effective_potential);
 
     // Machine-total color per the #1286 semantics, updated by #1821: arms 3
     // and 4 now key on `projected_total`, not `sum_potential` alone.
@@ -1910,6 +1958,113 @@ mod tests {
         let ledger = compute_ledger(base_inputs(), 1);
         assert_eq!(ledger.models[0].owner, Owner::Darkmux);
         assert_eq!(ledger.models[1].owner, Owner::User);
+    }
+
+    /// (#1854) `potential` is the fit contract — "the most this resident will
+    /// ever hold". Measured live on an IDLE MLX resident: current 28.40 GiB
+    /// against a potential of 22.88 GiB, steady to the byte across repeated
+    /// samples, and the code's own comment records the same model measured
+    /// UNDER potential a day earlier. So the estimate can be exceeded, and
+    /// silently: the projection is built from `potential`, which means the
+    /// machine's fit verdict was optimistic by the whole overage.
+    ///
+    /// A maximum that sits below an observed value is simply wrong. Clamp it
+    /// — `max(potential, current)` — so the projection reflects what the
+    /// machine is actually holding, and say so, because a silently-corrected
+    /// estimate is one nobody ever fixes.
+    #[test]
+    fn a_resident_holding_more_than_its_potential_raises_the_projection_and_is_disclosed() {
+        let mut inputs = base_inputs();
+        // One worker far above its priced potential; the other normal.
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: 60_000_000_000, footprint_bytes: None },
+            WorkerProc { pid: 2, rss_bytes: 5_000_000_000, footprint_bytes: None },
+        ]);
+        inputs.pool = Some(PoolSnapshot {
+            capacity_bytes: 137_438_953_472,
+            used_bytes: Some(70_000_000_000),
+            available_bytes: Some(60_000_000_000),
+            free_bytes: Some(3_000_000_000),
+        });
+
+        let ledger = compute_ledger(inputs, 1);
+        let over: Vec<&ModelRow> = ledger
+            .models
+            .iter()
+            .filter(|r| matches!((r.current_bytes, r.potential_bytes), (Some(c), Some(p)) if c > p))
+            .collect();
+        assert!(!over.is_empty(), "fixture must produce an over-potential row: {:?}", ledger.models);
+
+        // The projection must count what is actually held, not the stale estimate.
+        let effective: u64 = ledger
+            .models
+            .iter()
+            .map(|r| match (r.current_bytes, r.potential_bytes) {
+                (Some(c), Some(p)) => c.max(p),
+                (_, Some(p)) => p,
+                _ => 0,
+            })
+            .sum();
+        let other = ledger.machine.other_used_bytes.expect("other_used");
+        assert_eq!(
+            ledger.machine.projected_total_bytes,
+            Some(other + effective),
+            "projection must use max(potential, current), not potential alone"
+        );
+
+        // And it must be SAID — a silent correction is one nobody fixes.
+        assert!(
+            ledger
+                .messages
+                .iter()
+                .any(|m| m.severity == Severity::Warn && m.text.contains("more than darkmux priced it")),
+            "an over-potential resident must be disclosed: {:?}",
+            ledger.messages
+        );
+    }
+
+    /// (#1854, flap guard) A few MB of jitter above potential must NOT light
+    /// the condition. A signal that flickers every poll teaches the operator
+    /// to ignore it inside a day — the same "no variance, no information"
+    /// lesson as the always-grey lamps, arriving from the other side. Floor is
+    /// `max(1% of potential, 256 MiB)`.
+    ///
+    /// The clamp itself still applies below the floor: the projection always
+    /// counts what is held. Only the DISCLOSURE is gated, because that is the
+    /// part with an attention cost.
+    #[test]
+    fn a_trivial_overage_clamps_the_projection_but_stays_silent() {
+        let mut inputs = base_inputs();
+        // Nudge one worker a hair over its potential — well under the floor.
+        let over_by = 10 * 1024 * 1024; // 10 MiB
+        let priced = compute_ledger(base_inputs(), 1).models[0].potential_bytes.expect("priced");
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: priced + over_by, footprint_bytes: None },
+            WorkerProc { pid: 2, rss_bytes: 1_000_000_000, footprint_bytes: None },
+        ]);
+        let ledger = compute_ledger(inputs, 1);
+        assert!(
+            !ledger.messages.iter().any(|m| m.text.contains("more than darkmux priced it")),
+            "a sub-floor overage must not be announced: {:?}",
+            ledger.messages
+        );
+    }
+
+    /// The clamp must not fire on the ordinary case, or every machine grows a
+    /// permanent warning and the signal is worthless.
+    #[test]
+    fn a_resident_within_its_potential_is_untouched_and_unremarked() {
+        let ledger = compute_ledger(base_inputs(), 1);
+        for r in &ledger.models {
+            if let (Some(c), Some(p)) = (r.current_bytes, r.potential_bytes) {
+                assert!(c <= p, "fixture should be well-priced: {} cur={c} pot={p}", r.identifier);
+            }
+        }
+        assert!(
+            !ledger.messages.iter().any(|m| m.text.contains("more than darkmux priced it")),
+            "no over-potential message on a well-priced machine: {:?}",
+            ledger.messages
+        );
     }
 
     #[test]
