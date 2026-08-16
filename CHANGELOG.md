@@ -14,6 +14,80 @@ darkmux release.
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-08-16
+
+A remediation release. An audit of every user-facing surface asked one question
+— does darkmux describe its own state, or does it render verdicts on yours? —
+and found that in several places it did the second. It also found 323 KB of
+MIT-licensed code shipping with no attribution. Those are the release.
+
+### Fixed
+
+- **`darkmux config get <secret>` told you a secret was not in your config
+  without opening the file.** It short-circuited on the known secret keys and
+  answered "darkmux never stores it in config.json". That claim was made
+  without looking, and it is false in a reachable state: `config set` refuses
+  to write these keys, but a hand-added one is preserved verbatim by the
+  lenient whole-file writeback on every subsequent `set`. So the one command
+  you would run to check whether a secret leaked into your config actively
+  reassured you it had not. It now reads the file and reports presence either
+  way — and when the key IS there, says to remove it and treat the value as
+  exposed.
+- **`darkmux config list` printed it.** A hand-added secret went straight to
+  the terminal, defeating the entire point of the Keychain carve-out. Secret
+  keys now render as `(redacted …)`; the KEY still shows, because its presence
+  is exactly what you need to know. Fixed in the shared reader, so the radio
+  answering seat's config grounding is covered by the same change.
+- **`darkmux doctor` stopped adjudicating your setup.** Three strings went:
+  "Safe as-is for a single machine" (conditionally true, and false for the
+  reverse-proxy setup the guide recommends — the check never looked at the
+  proxy), "Password-less is fine for a local/Tailnet-trusted Redis" (a verdict
+  on an unverified condition, in the hint of a Warn, i.e. telling you the
+  warning was safe to ignore), and a clause volunteering a compliance
+  interpretation of a dropped audit write. What each check reports about
+  darkmux's own configuration is unchanged.
+- The `serve daemon auth` check is renamed **`serve daemon token`**. Both arms
+  return Pass by design — loopback-only with no token is the ordinary
+  single-machine state — but a check that named a security concern while being
+  structurally incapable of any other status read, inside `● ok — every check
+  passed`, as a security check that had cleared. It never checked that.
+- **The always-on hub guide was wrong in two places.** It said a plain LAN
+  substitutes for Tailscale; it does not — the password-less Redis posture in
+  that guide depends on the network being an authentication boundary, and a
+  reader following it would have ended up with an unauthenticated Redis on
+  whatever network the machine joined. And it recommended enabling automatic
+  login under a "harden the OS" heading, which is a security-weakening step
+  (it defeats FileVault across a reboot) presented as hardening.
+- The Homebrew formula's caveats claimed `flow integrity-check` surfaces "any
+  post-hoc edit". It does not, by SECURITY.md's own account — tail truncation
+  and whole-file deletion are undetectable. That text prints in
+  `brew info darkmux`. `SECURITY.md`'s supported-versions table also still
+  said `1.x (current)`.
+
+### Legal
+
+- **The built viewer ships the MIT notices for the code it embeds.** `next.html`
+  bundles react, react-dom and @tanstack/react-query and is compiled into the
+  binary, served at `GET /`, and republished on the website — and it carried
+  **zero copyright notices**, because the minifier strips `@license` banners.
+  MIT requires the notice to travel with copies. The notices are now prepended
+  at build time from vendored license texts, and the build FAILS if that
+  directory is missing rather than silently shipping unattributed code. The
+  mission-graph bundle had the mirror-image gap — React's banners present, no
+  React Flow notice at all — now fixed, with the prepend written into its
+  rebuild recipe as a named step.
+
+### Added
+
+- **A peer's darkmux version now rides the presence heartbeat**, so it is
+  readable over the shared Redis without that peer's HTTP daemon being
+  reachable at all. Presence already carried the flow-schema version for the
+  same reason; this is the other half of the same question, and it was the
+  half that went missing exactly when it was most wanted — a hub that is up
+  and heartbeating but that nothing can reach. A peer on an older build
+  reports no version rather than failing to parse.
+
+
 ## [2.8.0] - 2026-08-15
 
 The machine page's numbers were wrong, and now they are not. Per-model memory
@@ -660,6 +734,7 @@ schema changes (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`).
   "ready" with no time reference at all, indistinguishable from a fleet that
   had never dispatched.
 
+[2.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.9.0
 [2.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.8.0
 [2.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.7.0
 [2.6.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.6.0
