@@ -47,7 +47,14 @@ export function prevDateUTC(d: string): string {
   return dt.toISOString().slice(0, 10);
 }
 
-function normalizeAction(a: string | undefined): string | undefined {
+/** (#1852) Exported so a consumer that does NOT receive its data through
+ * `buildFlowWindow` can normalize for itself, instead of comparing a literal
+ * and being silently wrong for one of the two producer lineages.
+ *
+ * `savings.ts` matches the dotted form only, and is correct today *purely*
+ * because its records passed through `buildFlowWindow` first — a coupling
+ * nothing stated or tested until now. See `isDispatchStart` below. */
+export function normalizeAction(a: string | undefined): string | undefined {
   // flowToRenderModel() — viewer.html:3164-3170. Only the dispatch
   // lifecycle normalization matters for this lens (the turn/compaction
   // telemetry synthesis in the legacy function feeds OTHER lenses' log
@@ -58,6 +65,22 @@ function normalizeAction(a: string | undefined): string | undefined {
   if (a === "dispatch error") return "dispatch.error";
   return a;
 }
+
+/** (#1852) Bookend matchers that accept EITHER producer lineage's spelling.
+ *
+ * `darkmux-crew` and the CLI emit `"dispatch start"`; `darkmux-lab` and the
+ * runtime emit `"dispatch.start"`. Which one a record carries is not a
+ * property a call site can reason about locally, so comparing a literal is
+ * a coin flip. These mirror `darkmux_flow::is_dispatch_*` on the Rust side. */
+export const isDispatchStart = (a: string | undefined): boolean =>
+  a === "dispatch.start" || a === "dispatch start";
+export const isDispatchComplete = (a: string | undefined): boolean =>
+  a === "dispatch.complete" || a === "dispatch complete";
+export const isDispatchError = (a: string | undefined): boolean =>
+  a === "dispatch.error" || a === "dispatch error";
+/** Either terminal — the "did this dispatch stop" question. */
+export const isDispatchTerminal = (a: string | undefined): boolean =>
+  isDispatchComplete(a) || isDispatchError(a);
 
 /** `recKey()` — viewer.html:3390/3397. Dedup key for the two-day fetch
  * overlap AND (Packet 5) the live tail's SSE-append / reconcile-backstop

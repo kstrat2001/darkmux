@@ -145,3 +145,51 @@ describe("tokensOffMeter", () => {
     });
   });
 });
+
+/** (#1852) Before this, `savings.ts` compared the DOTTED literal only, and was
+ * correct purely because its records had passed through `buildFlowWindow`,
+ * which normalizes. Nothing stated or tested that coupling — so a caller that
+ * fed it raw records (a direct Redis consumer, a new lens, a test) got silent
+ * misattribution: every crew-lineage dispatch would fall to `unknown`.
+ *
+ * These feed RAW, un-normalized records in the spaced spelling the crew path
+ * actually writes to disk. Red-proved: reverting to the literal comparison
+ * flips `local` to 0 and dumps the whole total into `unknown`. */
+describe("bookend spelling independence (#1852)", () => {
+  const raw = (action: string, payload: Record<string, unknown>) =>
+    ({
+      ts: "2026-08-16T00:00:00Z",
+      action,
+      session_id: "s1",
+      category: "machinery",
+      source: "dispatch",
+      payload,
+    }) as unknown as FlowRecord;
+
+  const tokens = () =>
+    ({
+      ts: "2026-08-16T00:00:01Z",
+      action: "telemetry.tokens",
+      session_id: "s1",
+      category: "telemetry",
+      source: "tokens",
+      payload: { total_tokens: 1000, prompt_tokens: 900, completion_tokens: 100, turn_seq: 0 },
+    }) as unknown as FlowRecord;
+
+  it("attributes a SPACED-spelling completion as local, not unknown", () => {
+    const out = tokensOffMeter([raw("dispatch complete", {}), tokens()]);
+    expect(out.unknown).toBe(0);
+    expect(out.total).toBe(1000);
+  });
+
+  it("still attributes the DOTTED spelling as local", () => {
+    const out = tokensOffMeter([raw("dispatch.complete", {}), tokens()]);
+    expect(out.unknown).toBe(0);
+  });
+
+  it("a SPACED completion naming an endpoint is still cloud, not local", () => {
+    const out = tokensOffMeter([raw("dispatch complete", { endpoint: "azure" }), tokens()]);
+    expect(out.cloud).toBe(1000);
+    expect(out.unknown).toBe(0);
+  });
+});

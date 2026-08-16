@@ -1077,8 +1077,10 @@ fn build_flow_session_index(
 /// The flow stream carries both the dotted (`dispatch.start`) and spaced
 /// (`dispatch start`) action forms across schema history — tolerate both,
 /// matching `scan_flow_days`/`scan_flow_missions`'s own dual-form checks.
+/// (#1852) Delegates to the shared matcher rather than re-spelling the
+/// vocabulary — this was one of five independent local defenses.
 fn is_dispatch_start_action(action: &str) -> bool {
-    action == "dispatch start" || action == "dispatch.start"
+    darkmux_flow::is_dispatch_start(action)
 }
 
 fn is_dispatch_lifecycle_action(action: &str) -> bool {
