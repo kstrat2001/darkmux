@@ -2786,7 +2786,7 @@ fn scan_flow_days(flows_dir: &std::path::Path) -> Vec<serde_json::Value> {
             // A dispatch = a dispatch.start edge (tolerate the dotted + spaced
             // action forms the flow stream carries).
             let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
-            if action == "dispatch.start" || action == "dispatch start" {
+            if darkmux_flow::is_dispatch_start(action) {
                 if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
                     dispatches.insert(s.to_string());
                 }
@@ -2987,7 +2987,7 @@ fn scan_flow_missions(
             e.last_date = date.to_string();
         }
         let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
-        if action == "dispatch.start" || action == "dispatch start" {
+        if darkmux_flow::is_dispatch_start(action) {
             if let Some(s) = v.get("session_id").and_then(|s| s.as_str()) {
                 e.dispatches.insert(s.to_string());
             }

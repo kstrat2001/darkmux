@@ -1440,3 +1440,75 @@ mod tests {
         assert_eq!(ok.session_id, err.session_id);
     }
 }
+
+#[cfg(test)]
+mod action_vocabulary_conformance {
+    //! (#1852) The conformance test Contract 2 never had.
+    //!
+    //! Every other test on this seam asserts a hand-written literal on its own
+    //! side: the producer test checks the string its author typed, the consumer
+    //! test builds a fixture with the string ITS author typed. Both stay green
+    //! forever no matter how far apart the two drift, because nothing ever
+    //! takes a REAL emitted record and hands it to a REAL consumer matcher.
+    //!
+    //! That is the gap CLAUDE.md's contract registry names — "tests exercise
+    //! the subsystem, not its alignment" — and it is why five separate
+    //! consumers each had to rediscover the spelling split and patch it
+    //! locally. This test closes the loop for the dispatch bookends.
+    use super::*;
+
+    /// Build through the REAL producer, match through the REAL consumer
+    /// predicate. Nothing here types a bookend literal.
+    fn emitted(action: &str) -> darkmux_flow::FlowRecord {
+        build_dispatch_record(darkmux_flow::Level::Info, action, "coder", "sess-1", Some("m"))
+    }
+
+    #[test]
+    fn a_record_this_crate_emits_is_recognized_by_the_shared_matcher() {
+        let start = emitted(darkmux_flow::DISPATCH_START);
+        let complete = emitted(darkmux_flow::DISPATCH_COMPLETE);
+        let error = emitted(darkmux_flow::DISPATCH_ERROR);
+
+        assert!(darkmux_flow::is_dispatch_start(&start.action), "start: {}", start.action);
+        assert!(darkmux_flow::is_dispatch_complete(&complete.action), "complete: {}", complete.action);
+        assert!(darkmux_flow::is_dispatch_error(&error.action), "error: {}", error.action);
+        assert!(darkmux_flow::is_dispatch_terminal(&complete.action));
+        assert!(darkmux_flow::is_dispatch_terminal(&error.action));
+        assert!(!darkmux_flow::is_dispatch_terminal(&start.action), "a start is not a terminal");
+    }
+
+    /// The OTHER lineage. `darkmux-lab` and `runtime` emit the dotted form, so
+    /// a consumer sees both shapes depending on which path ran. Pin that the
+    /// matchers accept it — this is the half a literal comparison gets wrong.
+    #[test]
+    fn the_dotted_lineage_is_recognized_too() {
+        for (dotted, ok) in [
+            ("dispatch.start", darkmux_flow::is_dispatch_start as fn(&str) -> bool),
+            ("dispatch.complete", darkmux_flow::is_dispatch_complete),
+            ("dispatch.error", darkmux_flow::is_dispatch_error),
+        ] {
+            assert!(ok(dotted), "the dotted lineage must be recognized: {dotted}");
+        }
+    }
+
+    /// The constants must keep their ON-DISK value. Changing them is a
+    /// data-shape change: every historical record in the per-day JSONL and in
+    /// Redis carries the spaced form, and a silent flip would strand all of it
+    /// while every test that compares constant-to-constant stayed green.
+    #[test]
+    fn the_constants_still_carry_the_value_that_is_on_disk() {
+        assert_eq!(darkmux_flow::DISPATCH_START, "dispatch start");
+        assert_eq!(darkmux_flow::DISPATCH_COMPLETE, "dispatch complete");
+        assert_eq!(darkmux_flow::DISPATCH_ERROR, "dispatch error");
+    }
+
+    /// A near-miss must NOT match. Without this the matchers could degrade to
+    /// `starts_with("dispatch")` and every test above would still pass.
+    #[test]
+    fn unrelated_dispatch_actions_are_not_bookends() {
+        for a in ["dispatch.turn", "dispatch.tool", "dispatch.reasoning", "dispatch route", "dispatch"] {
+            assert!(!darkmux_flow::is_dispatch_start(a), "{a} is not a start");
+            assert!(!darkmux_flow::is_dispatch_terminal(a), "{a} is not a terminal");
+        }
+    }
+}

@@ -11,6 +11,60 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The dispatch-lifecycle action vocabulary (#1852).
+///
+/// `FlowRecord::action` is a bare `String` while its neighbours (`category`,
+/// `tier`, `stage`) are enums — so the one field every consumer JOINS on is
+/// the only one nothing constrains. Two producer lineages consequently spell
+/// the bookends differently: `darkmux-crew` and the CLI emit the SPACED form,
+/// `darkmux-lab` and the runtime emit the DOTTED one. Consumers cope through
+/// five independent defenses (a normalizer in the React viewer's `flow.ts`,
+/// another in `viewer.html`, and `||` hedges in `serve/lib.rs` x2,
+/// `serve/runs.rs`, and `mission-graph.html`).
+///
+/// That is not currently a live bug — every consumer that needs to cope, does.
+/// It is fragile in the obvious way: it works until a sixth consumer forgets,
+/// and `savings.ts` is already correct only *because* its data passed through
+/// `buildFlowWindow` first, a coupling nothing states or tests.
+///
+/// These constants carry the SPACED value deliberately: it is what is on disk,
+/// in Redis, and in every historical record. Changing the emitted string would
+/// be a data-shape change requiring a `FLOW_SCHEMA_VERSION` bump and would
+/// strand history. The point here is to make the string un-retypeable, not to
+/// pick a winner — that is a separate decision, and a migration.
+pub const DISPATCH_START: &str = "dispatch start";
+/// See [`DISPATCH_START`].
+pub const DISPATCH_COMPLETE: &str = "dispatch complete";
+/// See [`DISPATCH_START`].
+pub const DISPATCH_ERROR: &str = "dispatch error";
+
+/// True for either spelling of a dispatch-start bookend.
+///
+/// Consumers MUST use these rather than comparing a literal: a record may
+/// carry either spelling depending on which lineage emitted it, and which
+/// spelling arrives is not a property a call site can reason about locally.
+pub fn is_dispatch_start(action: &str) -> bool {
+    action == DISPATCH_START || action == "dispatch.start"
+}
+
+/// True for either spelling of a dispatch-complete bookend. See
+/// [`is_dispatch_start`].
+pub fn is_dispatch_complete(action: &str) -> bool {
+    action == DISPATCH_COMPLETE || action == "dispatch.complete"
+}
+
+/// True for either spelling of a dispatch-error bookend. See
+/// [`is_dispatch_start`].
+pub fn is_dispatch_error(action: &str) -> bool {
+    action == DISPATCH_ERROR || action == "dispatch.error"
+}
+
+/// True for any dispatch-lifecycle terminal (complete OR error) — the
+/// "did this dispatch stop" question, which several consumers ask.
+pub fn is_dispatch_terminal(action: &str) -> bool {
+    is_dispatch_complete(action) || is_dispatch_error(action)
+}
+
 pub const FLOW_SCHEMA_VERSION: &str = "1.19.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)

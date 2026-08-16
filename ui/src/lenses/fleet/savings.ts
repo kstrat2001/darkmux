@@ -1,3 +1,4 @@
+import { isDispatchStart, isDispatchComplete } from "../../lib/flow";
 /**
  * `tokensOffMeter()` — viewer.html:1416-1531 (#783, #1186, #1607). The
  * savings hero's summing logic: tokens kept off the (frontier) meter, split
@@ -71,11 +72,11 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   for (const r of data) {
     const p = r.payload as TokenPayload | undefined;
     if (!r.session_id || !p || !p.endpoint) continue;
-    if (r.action === "dispatch.start" || r.action === "dispatch.complete") {
+    if (isDispatchStart(r.action) || isDispatchComplete(r.action)) {
       epBySid.set(r.session_id, String(p.endpoint));
     }
     if (
-      r.action === "dispatch.complete" &&
+      isDispatchComplete(r.action) &&
       (p.total_tokens || p.prompt_tokens || p.completion_tokens || p.remote_tokens)
     ) {
       dcTok.set(r.session_id, p);
@@ -93,7 +94,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   for (const r of data) {
     const p = r.payload as TokenPayload | undefined;
     if (!r.session_id || !p) continue;
-    if (r.action === "dispatch.complete" && !p.endpoint) localSids.add(r.session_id);
+    if (isDispatchComplete(r.action) && !p.endpoint) localSids.add(r.session_id);
   }
 
   let total = 0;
