@@ -87,7 +87,7 @@ darkmux mission finalize &lt;your-mission-id&gt;   <span class="comment"># cyan:
 brew services restart darkmux     <span class="comment"># after `brew upgrade darkmux`</span>
 brew services stop darkmux        <span class="comment"># stop + unregister from login</span>
 brew services info darkmux        <span class="comment"># is it running? where are the logs?</span></code></pre>
-    <p>The brew service binds <code>127.0.0.1:8765</code> and resolves its Redis connection (if any) from <code>config.redis</code> plus the Keychain. For the production-grade always-on setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">secure hub guide</a>.</p>
+    <p>The brew service binds <code>127.0.0.1:8765</code> and resolves its Redis connection (if any) from <code>config.redis</code> plus the Keychain. For the production-grade always-on setup (Redis hardening, audit substrate, log rotation, daily integrity checks), see the <a href="always-on-hub.html">always-on hub guide</a>.</p>
 
     <h3>From source (manual)</h3>
     <p>A <code>cargo install</code> build has no brew service, so you run the daemon yourself. It is a foreground process that blocks until you Ctrl-C, so give it its own terminal tab:</p>
@@ -97,7 +97,7 @@ darkmux serve --port 9000 --bind 127.0.0.1   <span class="comment"># override th
 
     <div class="callout warn">
       <strong>Keep the bind on loopback.</strong>
-      <p style="margin: 6px 0 0;">The daemon's data surface (flow records + the mission/phase state of whatever you're working on) is fleet-wide. Don't bind it to <code>0.0.0.0</code>. To reach the viewer from another device on your tailnet, keep the daemon on <code>127.0.0.1</code> and put Tailscale Serve in front of it (HTTPS terminated at the tailnet node, daemon untouched): see the <a href="always-on-hub.html#viewer">secure hub guide</a>. A non-loopback bind also trips darkmux's remote-auth gate, which a browser page-load can't satisfy.</p>
+      <p style="margin: 6px 0 0;">The daemon's data surface (flow records + the mission/phase state of whatever you're working on) is fleet-wide. Don't bind it to <code>0.0.0.0</code>. To reach the viewer from another device on your tailnet, keep the daemon on <code>127.0.0.1</code> and put Tailscale Serve in front of it (HTTPS terminated at the tailnet node, daemon untouched): see the <a href="always-on-hub.html#viewer">always-on hub guide</a>. A non-loopback bind also trips darkmux's remote-auth gate, which a browser page-load can't satisfy.</p>
     </div>
 
     <h3>Verify it's up</h3>

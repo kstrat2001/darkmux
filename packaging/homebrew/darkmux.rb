@@ -124,8 +124,9 @@ class Darkmux < Formula
         4. brew services start darkmux
 
       For the production-grade hub posture — Redis AOF persistence, audit
-      substrate (BLAKE3 hash-chained JSONL; any post-hoc edit is surfaced by
-      `darkmux flow integrity-check`), log rotation, and daily integrity
+      substrate (BLAKE3 hash-chained JSONL; `darkmux flow integrity-check`
+      recomputes each chain and reports the first divergence — see SECURITY.md
+      for what it does and does not catch), log rotation, and daily integrity
       checks — see the guide:
 
         https://darkmux.com/guide/always-on-hub.html
