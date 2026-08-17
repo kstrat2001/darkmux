@@ -190,6 +190,65 @@ export function gaugeRampSwatch(startPct: number, endPct: number): string {
   return `linear-gradient(90deg, ${a}, ${b})`;
 }
 
+
+// ── Seven-segment glyphs ─────────────────────────────────────────────────
+
+/** Which segments are lit for each character this readout can show, in the
+ * conventional `a`–`g` naming (`a` top, clockwise to `f` upper-left, `g`
+ * middle). Anything unmapped renders blank rather than throwing — a readout
+ * handed an unexpected character shows an empty cell, which is honest, where
+ * a crash would take the whole machine page with it. */
+const SEVEN_SEG_LIT: Record<string, string> = {
+  "0": "abcdef", "1": "bc", "2": "abged", "3": "abgcd", "4": "fgbc",
+  "5": "afgcd", "6": "afgedc", "7": "abc", "8": "abcdefg", "9": "abfgcd",
+  "-": "g",
+};
+
+/** Segment polygons in a 60x100 cell — the canonical grid every consumer
+ * scales into its own box, so the hero figure inside the gauge SVG and the
+ * pressure tiles in HTML cannot drift into two different glyph shapes. */
+const SEVEN_SEG_POLY: Record<string, string> = (() => {
+  const h = (cy: number) => `12,${cy} 17,${cy - 5} 43,${cy - 5} 48,${cy} 43,${cy + 5} 17,${cy + 5}`;
+  const v = (cx: number, y1: number, y2: number) =>
+    `${cx},${y1} ${cx + 5},${y1 + 5} ${cx + 5},${y2 - 5} ${cx},${y2} ${cx - 5},${y2 - 5} ${cx - 5},${y1 + 5}`;
+  return { a: h(6), g: h(50), d: h(94), f: v(6, 12, 44), b: v(54, 12, 44), e: v(6, 56, 88), c: v(54, 56, 88) };
+})();
+
+export const SEVEN_SEG_CELL = { w: 60, h: 100 } as const;
+
+/** How visible an UNLIT segment is.
+ *
+ * A real LCD shows its whole character cell, lit or not, and that ghosting
+ * is what separates a display from a typeface — it also anchors a narrow
+ * glyph like `1` in its cell, so a figure like `110.6` reads as evenly
+ * spaced rather than as digits floating in their own gaps.
+ *
+ * Chosen by looking, not reasoning: 8% / 4.5% / 2% / 0% rendered side by
+ * side at both the hero and pressure-tile sizes, then 0%, 3% and 5% in the
+ * running page on the screens it is actually read on. 8% held the cell but
+ * read as a period reference and smudged at tile size; 0% was clean but let
+ * a narrow `1` drift in its own gap. 5% is the operator's call — enough that
+ * the cell exists, not enough to date the design.
+ *
+ * ONE constant, because the hero figure and the pressure tiles must agree:
+ * two readouts on one face ghosting differently would read as a rendering
+ * bug, not a choice. */
+export const SEVEN_SEG_GHOST = 0.05;
+
+/** Every segment of one character's cell, each flagged lit or not, so a
+ * consumer can render the unlit ones at [`SEVEN_SEG_GHOST`] without knowing
+ * the segment naming. */
+export function sevenSegmentPolygons(ch: string): { points: string; lit: boolean }[] {
+  const on = SEVEN_SEG_LIT[ch] ?? "";
+  return Object.entries(SEVEN_SEG_POLY).map(([k, points]) => ({ points, lit: on.includes(k) }));
+}
+
+/** Whether this character is drawn as a decimal point rather than segments —
+ * named here so both consumers branch on one rule. */
+export function isSevenSegDot(ch: string): boolean {
+  return ch === ".";
+}
+
 /** The scale's own end-label word — `LIMIT`, or `BUDGET` once a #1243
  * budget is configured (`limit_source === "budget"`). Never a bare number;
  * docs/design/machine-lens/proposal.md §3's whole argument for moving the denominator off the face

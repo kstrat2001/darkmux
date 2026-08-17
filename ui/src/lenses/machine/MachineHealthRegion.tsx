@@ -7,6 +7,10 @@ import {
   digitCells,
   gaugeFaceCaption,
   gaugeRampStops,
+  sevenSegmentPolygons,
+  isSevenSegDot,
+  SEVEN_SEG_CELL,
+  SEVEN_SEG_GHOST,
   gaugeRampSwatch,
   gaugeValueParts,
   groupResidencyRows,
@@ -250,14 +254,23 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
         <line className="mm-gauge-needle" x1={CX} y1={CY} x2={42} y2={CY} transform={`rotate(${band.needleAngleDeg} ${CX} ${CY})`} />
         <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
         <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
-          {odo.cells.map((c, i) => (
-            <g key={i}>
-              <rect className="mm-gauge-odo-cell" x={c.x} y={ODO_TOP} width={c.w} height={ODO_H} rx={2.5} />
-              <text className="mm-gauge-odo-digit" x={c.x + c.w / 2} y={ODO_BASELINE} textAnchor="middle">
-                {c.ch}
-              </text>
-            </g>
-          ))}
+          {/* Seven-segment, drawn as polygons in the SAME cell geometry the
+              boxed odometer used, so the figure still centres on the hub and
+              the unit still sits where it sat. `currentColor` keeps colour
+              with the CSS (`.mm-gauge-center-val`) rather than moving it into
+              the component — the glyph form is what changed here, not the
+              palette. */}
+          {odo.cells.map((c, i) =>
+            isSevenSegDot(c.ch) ? (
+              <circle key={i} cx={c.x + c.w / 2} cy={ODO_TOP + ODO_H - 3.5} r={1.7} fill="currentColor" />
+            ) : (
+              <g key={i} transform={`translate(${c.x} ${ODO_TOP}) scale(${c.w / SEVEN_SEG_CELL.w} ${ODO_H / SEVEN_SEG_CELL.h})`}>
+                {sevenSegmentPolygons(c.ch).map((sg, j) => (
+                  <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
+                ))}
+              </g>
+            ),
+          )}
           <text className="mm-gauge-center-unit" x={CX + odo.width / 2 + 5} y={ODO_BASELINE} textAnchor="start">
             {centerVal.unit}
           </text>
@@ -423,11 +436,26 @@ function Odometer({ resources }: { resources: MachineResources }) {
         return (
           <div className="mm-odo" key={t.label}>
             <span className="mm-odo-cells">
-              {t.digits.map((d, i) => (
-                <span className="mm-odo-c" key={i}>
-                  {d}
-                </span>
-              ))}
+              {t.digits.map((d, i) =>
+                isSevenSegDot(d) ? (
+                  <span className="mm-odo-dot" key={i} />
+                ) : (
+                  <svg
+                    className="mm-odo-seg"
+                    key={i}
+                    viewBox={`0 0 ${SEVEN_SEG_CELL.w} ${SEVEN_SEG_CELL.h}`}
+                    aria-hidden="true"
+                  >
+                    {sevenSegmentPolygons(d).map((sg, j) => (
+                      <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
+                    ))}
+                  </svg>
+                ),
+              )}
+              {/* The figure stays available to assistive tech as TEXT — the
+                  glyphs above are decorative shapes and a screen reader would
+                  otherwise read nothing at all where a number used to be. */}
+              <span className="mm-sr-only">{t.digits.join("")}</span>
             </span>
             <span className="mm-odo-unit">{t.unit}</span>
             <div className="mm-odo-k">

@@ -2451,6 +2451,41 @@ body {
 .mm-odo-cells {
   display: inline-flex;
   gap: 2px;
+  /* Bottom-aligned so the decimal point sits on the digits' own baseline —
+     a flex container ignores `vertical-align`, which is what a
+     baseline-aligned inline layout would have used. */
+  align-items: flex-end;
+  position: relative;
+}
+/* Seven-segment cells for the pressure tiles (operator call, replacing the
+   boxed odometer digits). Sized to sit on the same baseline as the unit
+   label beside them; colour comes from `currentColor` so the tile's own
+   rules still govern it. */
+.mm-odo-seg {
+  width: 11px;
+  height: 19px;
+  display: inline-block;
+  vertical-align: baseline;
+  color: var(--fg);
+}
+.mm-odo-dot {
+  width: 3.5px;
+  height: 3.5px;
+  border-radius: 50%;
+  background: var(--fg);
+  display: inline-block;
+  margin: 0 1px 1.5px;
+}
+.mm-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 .mm-odo-c {
   display: inline-block;
