@@ -310,8 +310,14 @@ describe("odometerTiles", () => {
   it("splits margin / swap / compressor into digit cells with detail-layer (two-decimal) precision", () => {
     const tiles = odometerTiles({ swap_used_bytes: 5453843005, compressor_bytes: 727711744, margin_percent: 87, red: false });
     expect(tiles[0].digits).toEqual(["8", "7"]);
-    expect(tiles[0].unit).toBe("% margin");
+    // The unit is a pure unit and the label is the subject — the same
+    // shape as the two byte tiles beside it. `% margin` over a `MARGIN`
+    // label printed the word twice.
+    expect(tiles[0].unit).toBe("%");
     expect(tiles[0].label).toBe("margin");
+    for (const t of tiles) {
+      expect(t.unit.toLowerCase()).not.toContain(t.label.toLowerCase());
+    }
     expect(tiles[1].digits.join("")).toBe("5.08");
     expect(tiles[1].unit).toBe("GiB");
     expect(tiles[2].digits.join("")).toBe("694");

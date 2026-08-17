@@ -669,7 +669,13 @@ export function odometerTiles(pressure: MachineResources["pressure"]): OdometerV
   return [
     {
       digits: digitCells(marginText),
-      unit: "% margin",
+      // Bare `%`, not `% margin`: the label below already says MARGIN, and
+      // the tile was printing the word twice. A leftover from the #1821
+      // rename — the unit read `% free` against a `MARGIN` label, which did
+      // not collide, and correcting the unit made it a duplicate that
+      // nobody re-read the pair for. Now it matches its two siblings, where
+      // the unit is a pure unit (`GiB`) and the label is the subject.
+      unit: "%",
       label: "margin",
       // #1821 (operator-approved rename): this tile used to read "% free"
       // — measured live, the SAME instant, this figure read 82% while
