@@ -6,7 +6,8 @@ import {
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
-  gaugeFillSeverity,
+  gaugeRampStops,
+  gaugeRampSwatch,
   gaugeValueParts,
   groupResidencyRows,
   isEstimatedRow,
@@ -68,6 +69,11 @@ const CY = 120;
 const R = 86;
 const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
 
+/** The arc ramp's gradient id. One gauge renders per page, so a fixed id is
+ * safe; it is named rather than generated so the same string can be asserted
+ * in tests and found in the built artifact. */
+const RAMP_ID = "mm-gauge-ramp";
+
 
 /** Where a tick label sits, in the arc's own local geometry — one fixed
  * layout per quarter-tick index (0/25/50/75/100%), matching `level3.html`'s
@@ -127,7 +133,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   const band = computeBandGeometry(resources);
   // Hue follows the MACHINE's fill now, not darkmux's share — the ring it
   // colours is the machine's.
-  const fillCls = gaugeFillSeverity(band.usedPct);
+
   const odo = odoLayout(digitCells(centerVal.num));
 
   const committed = gaugeValueParts(resources.machine.potential_bytes);
@@ -164,6 +170,16 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   return (
     <div className="mm-gauge">
       <svg width="300" height="212" viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
+        {/* The colour ramp lives across the arc's SWEEP, not in any figure
+            about the machine — laid across the arc's bounding box in user
+            space so it is independent of how much of the arc is filled. */}
+        <defs>
+          <linearGradient id={RAMP_ID} gradientUnits="userSpaceOnUse" x1={CX - R} y1={0} x2={CX + R} y2={0}>
+            {gaugeRampStops().map((s) => (
+              <stop key={s.offset} offset={s.offset} stopColor={s.color} />
+            ))}
+          </linearGradient>
+        </defs>
         <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={11} pathLength={100} />
         {/* ONE STACKED BAND, in scale order: darkmux from 0, everything
             else on top of it ending at the needle, then darkmux's committed
@@ -174,7 +190,8 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
             needle, its derivedness is self-evident, where as an undrawn gap
             between two radii it was simply missing. */}
         <path
-          className={`mm-gauge-val is-${fillCls}`}
+          className="mm-gauge-val"
+          stroke={`url(#${RAMP_ID})`}
           d={HALF_ARC_D}
           fill="none"
           strokeWidth={11}
@@ -183,7 +200,8 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
         />
         {band.other.lengthPct > 0 && (
           <path
-            className={`mm-gauge-other is-${fillCls}`}
+            className="mm-gauge-other"
+            stroke={`url(#${RAMP_ID})`}
             d={HALF_ARC_D}
             fill="none"
             strokeWidth={11}
@@ -280,7 +298,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
  * (`used - darkmux`), and giving it a swatch would present arithmetic as a
  * measured band.
  */
-function GaugeLegend({ resources, band, fillCls }: { resources: MachineResources; band: ReturnType<typeof computeBandGeometry>; fillCls: string }) {
+function GaugeLegend({ resources, band }: { resources: MachineResources; band: ReturnType<typeof computeBandGeometry> }) {
   const growth = band.growth.lengthPct > 0;
   const other = resources.pool?.used_bytes != null && resources.machine.current_bytes != null
     ? Math.max(0, Number(resources.pool.used_bytes) - Number(resources.machine.current_bytes))
@@ -291,11 +309,11 @@ function GaugeLegend({ resources, band, fillCls }: { resources: MachineResources
   return (
     <div className="mm-legend">
       <span className="mm-legend-item">
-        <span className={`mm-legend-sw is-${fillCls}`} /> darkmux <b>{memBytes(resources.machine.current_bytes)}</b>
+        <span className="mm-legend-sw" style={{ background: gaugeRampSwatch(0, band.darkmux.lengthPct) }} /> darkmux <b>{memBytes(resources.machine.current_bytes)}</b>
       </span>
       {other != null && (
         <span className="mm-legend-item">
-          <span className={`mm-legend-sw is-other is-${fillCls}`} /> other <b>{memBytes(other)}</b>
+          <span className="mm-legend-sw is-other" style={{ background: gaugeRampSwatch(band.other.startPct, band.usedPct) }} /> other <b>{memBytes(other)}</b>
         </span>
       )}
       {growth && (
@@ -674,7 +692,7 @@ export function MachineHealthRegion({
         <div className="mm-heroline">
           <div className="mm-semi">
             <Gauge resources={b} stale={stale} />
-            <GaugeLegend resources={b} band={bandGeo} fillCls={gaugeFillSeverity(bandGeo.usedPct)} />
+            <GaugeLegend resources={b} band={bandGeo} />
           </div>
           <div>
             <LampRow resources={b} resourcesErrored={resourcesErrored} residencyChanged={residencyChanged} />
