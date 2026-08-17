@@ -7,14 +7,12 @@ import {
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
-  gaugeFillSeverity,
   gaugeScaleWord,
   gaugeTickLabel,
   gaugeValueParts,
   groupResidencyRows,
   isEstimatedRow,
   isOverLimit,
-  machineStateWord,
   rowStateDiffers,
   isUtilityTierRow,
   modelKvLine,
@@ -108,20 +106,6 @@ describe("gaugeTickLabel — bare on-arc numbers", () => {
  *    unrepeatable — asserted at the component level too, where the payload
  *    carrying `state:"unknown"` is actually available to get it wrong.
  */
-describe("gaugeFillSeverity — how full, NOT what the arbiter decided", () => {
-  it("ramps green → amber → red across the operator's own thresholds", () => {
-    expect(gaugeFillSeverity(0)).toBe("green");
-    expect(gaugeFillSeverity(49.9)).toBe("green");
-    expect(gaugeFillSeverity(50)).toBe("amber"); // inclusive at the boundary
-    expect(gaugeFillSeverity(84.9)).toBe("amber");
-    expect(gaugeFillSeverity(85)).toBe("red"); // inclusive at the boundary
-    expect(gaugeFillSeverity(100)).toBe("red");
-  });
-
-  it("is total — a non-finite percentage degrades to green, never to a missing class", () => {
-    expect(gaugeFillSeverity(Number.NaN)).toBe("green");
-  });
-});
 
 describe("gaugeScaleWord — the max tick's own meaning", () => {
   it("names LIMIT for the physical-pool source", () => {
@@ -536,48 +520,6 @@ describe("isUtilityTierRow — the row-chip identity marker (follow-up to the ut
  * unknown arms fired turns jargon into a sentence, using the same fields the
  * server branched on.
  */
-describe("machineStateWord — UNKNOWN carries its reason", () => {
-  it("names the unpriced-resident arm — the permanent-normal case on a real machine", () => {
-    expect(machineStateWord("unknown", 137438953472, 1)).toBe("UNKNOWN · unpriced resident");
-  });
-
-  it("names the no-limit arm, and checks it FIRST — the server's own arm order", () => {
-    // With no limit, none of the server's `Some(limit)` arms can fire, so a
-    // missing limit dominates even when unpriced residents also exist.
-    expect(machineStateWord("unknown", null, 3)).toBe("UNKNOWN · no limit readable");
-  });
-
-  it("leaves green/amber/red bare — a reason on a self-evident word is noise", () => {
-    expect(machineStateWord("green", 100, 0)).toBe("GREEN");
-    expect(machineStateWord("amber", 100, 0)).toBe("AMBER");
-    expect(machineStateWord("red", 100, 2)).toBe("RED");
-  });
-
-  it("never invents a reason it cannot name", () => {
-    // Unknown for neither named cause: a limit exists and nothing is
-    // unpriced. Degrades to the bare word rather than guessing.
-    expect(machineStateWord("unknown", 100, 0)).toBe("UNKNOWN");
-    expect(machineStateWord(null, 100, 0)).toBe("UNKNOWN");
-  });
-
-  // #1819 decision 1: a DECIDED verdict (green/amber/red) may rest partly on
-  // an estimate — the count travels with the word.
-  it("appends the estimate disclosure to a decided verdict", () => {
-    expect(machineStateWord("green", 100, 0, 1)).toBe("GREEN · 1 estimated");
-    expect(machineStateWord("amber", 100, 0, 2)).toBe("AMBER · 2 estimated");
-    expect(machineStateWord("red", 100, 0, 1)).toBe("RED · 1 estimated");
-  });
-
-  it("does NOT prepend a 'fit ' word — that prefix is a separate, not-yet-built decision", () => {
-    expect(machineStateWord("green", 100, 0, 1)).not.toContain("fit");
-    expect(machineStateWord("green", 100, 0, 1).toLowerCase()).not.toContain("fit ");
-  });
-
-  it("omits the disclosure entirely when nothing was estimated (the default, and every pre-#1819 call site)", () => {
-    expect(machineStateWord("green", 100, 0, 0)).toBe("GREEN");
-    expect(machineStateWord("green", 100, 0)).toBe("GREEN"); // no 4th arg at all
-  });
-});
 
 /**
  * The per-row state chip renders only where it disagrees with the machine.
@@ -714,26 +656,3 @@ describe("hatchedSegmentDash — extent and hatching in ONE value", () => {
 // responses: `OVERCOMMITTED` means shrink something; `NO MARGIN` means it
 // fits, so do not load anything else. A bare AMBER cannot say which — which
 // is what promotes the cause from noise to content on this word.
-describe("machineStateWord — amber carries which disjunct fired", () => {
-  it("names the cause when the server reports one", () => {
-    expect(machineStateWord("amber", 137438953472, 0, 0, "no_margin")).toBe("AMBER · NO MARGIN");
-    expect(machineStateWord("amber", 137438953472, 0, 0, "overcommitted")).toBe("AMBER · OVERCOMMITTED");
-  });
-
-  it("leaves a self-evident verdict bare — the reason is read, never derived", () => {
-    // The inverted case, and the one that keeps this honest: GREEN has one
-    // meaning, so appending anything to it would be the noise this rule
-    // exists to prevent. A client that inferred "no margin" from its own
-    // arithmetic could also contradict the chip beside it.
-    expect(machineStateWord("green", 137438953472, 0, 0, null)).toBe("GREEN");
-    expect(machineStateWord("green", 137438953472, 0)).toBe("GREEN");
-    expect(machineStateWord("red", 137438953472, 0, 0, undefined)).toBe("RED");
-  });
-
-  it("still carries the #1819 estimate disclosure alongside the cause", () => {
-    // Both annotations are true at once and neither may swallow the other:
-    // the cause is what the verdict IS, the estimate count is what it RESTS
-    // ON.
-    expect(machineStateWord("amber", 137438953472, 0, 2, "no_margin")).toBe("AMBER · NO MARGIN · 2 estimated");
-  });
-});

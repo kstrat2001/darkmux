@@ -132,8 +132,10 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   // inner ring it belongs to.
   const centerVal = gaugeValueParts(resources.pool?.used_bytes ?? resources.machine.current_bytes);
   const faceCaption = gaugeFaceCaption(resources.machine.state, pressureRed, overLimit);
-  // The fill's hue answers "how full", NOT "what did the arbiter decide" —
-  // see `gaugeFillSeverity`'s own doc for why that separation is load-bearing.
+  // The band's colour is not computed here at all: it comes from the arc
+  // ramp (`gaugeRampStops`), which is fixed to the dial and identical on
+  // every machine. Nothing about this machine's state can reach it, which is
+  // the separation the old bucketed fill only approximated.
   const band = computeBandGeometry(resources);
   // Hue follows the MACHINE's fill now, not darkmux's share — the ring it
   // colours is the machine's.
@@ -262,9 +264,20 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
               palette. */}
           {odo.cells.map((c, i) =>
             isSevenSegDot(c.ch) ? (
-              <circle key={i} cx={c.x + c.w / 2} cy={ODO_TOP + ODO_H - 3.5} r={1.7} fill="currentColor" />
+              <circle
+                key={i}
+                className="mm-gauge-odo-cell"
+                cx={c.x + c.w / 2}
+                cy={ODO_TOP + ODO_H - 3.5}
+                r={1.7}
+                fill="currentColor"
+              />
             ) : (
-              <g key={i} transform={`translate(${c.x} ${ODO_TOP}) scale(${c.w / SEVEN_SEG_CELL.w} ${ODO_H / SEVEN_SEG_CELL.h})`}>
+              <g
+                key={i}
+                className="mm-gauge-odo-cell"
+                transform={`translate(${c.x} ${ODO_TOP}) scale(${c.w / SEVEN_SEG_CELL.w} ${ODO_H / SEVEN_SEG_CELL.h})`}
+              >
                 {sevenSegmentPolygons(c.ch).map((sg, j) => (
                   <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
                 ))}

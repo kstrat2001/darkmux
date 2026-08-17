@@ -14,6 +14,24 @@ import type { MachineResources, MachineResourcesModel } from "../../types/handwr
 // case in one file so a future edit can't quietly satisfy one and break
 // the other.
 
+
+/** The centre readout's cells are seven-segment `<g>`s carrying a
+ * `translate(x y) scale(sx sy)` into the canonical 60x100 glyph cell (or a
+ * `<circle>` for the decimal point). Their drawn extent is therefore
+ * `x .. x + sx*60`, which this recovers so the centering assertions can
+ * stay geometric rather than being softened into "roughly centred". */
+function odoCellExtents(container: HTMLElement): { left: number; right: number }[] {
+  return [...container.querySelectorAll(".mm-gauge-odo-cell")].map((n) => {
+    const t = n.getAttribute("transform");
+    if (t) {
+      const [, x, sx] = /translate\(([-\d.]+) [-\d.]+\) scale\(([-\d.]+)/.exec(t)!;
+      return { left: Number(x), right: Number(x) + Number(sx) * 60 };
+    }
+    const cx = Number(n.getAttribute("cx")), r = Number(n.getAttribute("r"));
+    return { left: cx - r, right: cx + r };
+  });
+}
+
 const BASE: MachineResources = {
   schema_version: "1.0",
   generated_at_ms: 1000,
@@ -175,78 +193,88 @@ describe("MachineHealthRegion — hostile state strings degrade to 'unknown', ne
  * operator actually saw and reported. A test that only exercised green/red
  * payloads would have passed against the broken version.
  */
-describe("MachineHealthRegion — the fill answers 'how full', not 'what state'", () => {
-  it("goes red on a nearly-full machine whose state is UNKNOWN", () => {
-    const full: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "unknown", current_bytes: 130000000000 } };
-    const { container } = renderRegion(full, { residencyRows: residencyRowsFor(full) });
-    expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-red");
+describe("MachineHealthRegion — the arc's colour is a fixed ramp, never a verdict", () => {
+  // The fill used to be `gaugeFillSeverity(usedPct)` — three buckets with
+  // edges at 50% and 85%. Those edges were thresholds darkmux invented, and
+  // a machine at 84% and one at 86% are not different in kind. The ramp is
+  // now painted across the arc's SWEEP (green at 0, red at the scale end),
+  // so the colour under any point states only where that point sits.
+  //
+  // These tests replace the bucket-boundary ones. The claim they protected —
+  // the fill answers "how full", never "what the arbiter decided" — is not
+  // weakened by the change; it is now true BY CONSTRUCTION, and that is what
+  // is asserted.
+
+  it("paints the band from the arc ramp, not from a per-machine colour", () => {
+    const { container } = renderRegion(BASE);
+    expect(container.querySelector(".mm-gauge-val")!.getAttribute("stroke")).toBe("url(#mm-gauge-ramp)");
+    expect(container.querySelector("linearGradient#mm-gauge-ramp")).not.toBeNull();
   });
 
-  it("the inverted case: the SAME unknown state on a near-empty MACHINE is green", () => {
-    // The whole machine near-empty, not merely darkmux's share of it — the
-    // outer ring is the machine, so its hue must follow the machine.
-    const empty: MachineResources = {
-      ...BASE,
-      machine: { ...BASE.machine, state: "unknown", current_bytes: 4000000000 },
-      pool: { ...BASE.pool!, used_bytes: 6000000000 },
+  it("is IDENTICAL under two different server verdicts at the same fill", () => {
+    // The strongest form of "the fill is not a verdict": vary only
+    // `machine.state` and the drawn arc must not differ by one character.
+    const at = (state: string): string => {
+      const r: MachineResources = { ...BASE, machine: { ...BASE.machine, state } };
+      const { container } = renderRegion(r, { residencyRows: residencyRowsFor(r) });
+      return container.querySelector(".mm-gauge-val")!.outerHTML;
     };
-    const { container } = renderRegion(empty, { residencyRows: residencyRowsFor(empty) });
-    expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-green");
+    expect(at("unknown")).toBe(at("green"));
+    expect(at("unknown")).toBe(at("red"));
   });
 
-  /**
-   * The hue follows the MACHINE, not darkmux's slice of it. This is the
-   * labelling error #1821 exists to fix, expressed as colour: a dial that
-   * ends at the machine's `128 LIMIT` must not be tinted by a quantity that
-   * is only ever a fraction of it.
-   */
-  it("tints by the machine's fill, not by darkmux's share of it", () => {
-    // darkmux barely present; the MACHINE two-thirds full.
+  it("moves with the MACHINE's fill, not with darkmux's share of it", () => {
+    // The labelling error #1821 exists to fix, expressed as geometry: a dial
+    // ending at the machine's `128 LIMIT` must not be driven by a quantity
+    // that is only ever a fraction of it. darkmux barely present; the
+    // MACHINE nearly full.
     const busyElsewhere: MachineResources = {
       ...BASE,
       machine: { ...BASE.machine, current_bytes: 2_000_000_000 },
       pool: { ...BASE.pool!, used_bytes: 120_000_000_000 },
     };
     const { container } = renderRegion(busyElsewhere, { residencyRows: residencyRowsFor(busyElsewhere) });
-    // 120e9 bytes = 111.8 GiB = 87.3% of the 128 GiB scale -> red.
-    // Tinting by darkmux's 1.6% share would have said green.
-    expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val is-red");
+    // The needle is the fill's own channel now. 120e9 = 111.8 GiB of the
+    // 128 GiB scale = 87.3% -> 157.2 degrees. Driving it from darkmux's 1.6%
+    // share would have put it at 2.8.
+    const deg = Number(/rotate\(([-\d.]+)/.exec(container.querySelector(".mm-gauge-needle")!.getAttribute("transform")!)![1]);
+    expect(deg).toBeGreaterThan(150);
   });
 
-  it("never lands the arbiter's verdict on the fill — an is-unknown fill is what the fix removed", () => {
+  it("never lands the arbiter's verdict on the fill or the needle", () => {
     const { container } = renderRegion(BASE);
-    expect(container.querySelector(".mm-gauge-val.is-unknown")).toBeNull();
-    // ...and the needle stops carrying it too: position is its whole job.
+    // No severity class survives on either — the classes are gone from the
+    // markup entirely, not merely unset for this fixture.
+    expect(container.querySelector(".mm-gauge-val")!.getAttribute("class")).toBe("mm-gauge-val");
     expect(container.querySelector(".mm-gauge-needle")!.getAttribute("class")).toBe("mm-gauge-needle");
   });
 
-  it("keeps the VERDICT channels server-driven — the unknown state still reaches the chip and the lamp", () => {
+  it("states no verdict anywhere on the gauge face", () => {
+    // The verdict chip is gone by operator decision: it interpreted data the
+    // reader can already see. The lamp row still carries server-declared
+    // CONDITIONS (pressure, over-limit, unpriced) — those are facts, not an
+    // assessment of whether the machine is doing well.
     const full: MachineResources = { ...BASE, machine: { ...BASE.machine, state: "unknown", current_bytes: 130000000000 } };
     const { container } = renderRegion(full, { residencyRows: residencyRowsFor(full) });
-    // A red FILL must not be mistakable for a red machine anywhere it counts.
-    // The chip still reports the SERVER's verdict — now carrying its cause
-    // (`machineStateWord`), so the assertion is on the state word rather than
-    // the whole string, and on the absence of any decided verdict.
-    const chip = container.querySelector(".mm-gcap .mm-chip")!;
-    expect(chip.textContent).toContain("UNKNOWN");
-    expect(chip.textContent).not.toMatch(/\b(GREEN|AMBER|RED)\b/);
-    expect(container.querySelector(".mm-gauge-redline.lit")).toBeNull();
-    // The caption slot is silent unless the server declared red — it names a
-    // red REASON, and there is none to name here.
-    expect(container.querySelector(".mm-gauge-center-caption")).toBeNull();
+    expect(container.querySelector(".mm-gcap")).toBeNull();
+    expect(container.querySelector(".mm-chip")).toBeNull();
+    expect(container.textContent).not.toMatch(/\bmachine total\b/i);
+    // …while the lamp row is untouched.
+    expect(container.querySelectorAll(".mm-lamp").length).toBeGreaterThan(0);
   });
 });
 
 describe("MachineHealthRegion — the center readout is centered on the hub", () => {
   it("centers the digit cells on the gauge's own axis, independently of the unit beside them", () => {
     const { container } = renderRegion(BASE);
-    const cells = [...container.querySelectorAll(".mm-gauge-odo-cell")] as SVGRectElement[];
+    const cells = odoCellExtents(container);
     expect(cells.length).toBe(4); // "19.4"
-    const left = Math.min(...cells.map((c) => Number(c.getAttribute("x"))));
-    const right = Math.max(...cells.map((c) => Number(c.getAttribute("x")) + Number(c.getAttribute("width"))));
+    const left = Math.min(...cells.map((c) => c.left));
+    const right = Math.max(...cells.map((c) => c.right));
     // CX is 120. The old single <text x=120 textAnchor="middle"> centered the
     // number AND the unit as one run, so the figure itself always sat left of
-    // the hub by half of " GB" — the nit this fixes.
+    // the hub by half of " GB" — the nit this fixes. The glyphs changed from
+    // boxed digits to seven-segment cells; the layout claim did not.
     expect((left + right) / 2).toBeCloseTo(120, 6);
     // The unit hangs off the right edge and takes no part in that centering.
     expect(Number(container.querySelector(".mm-gauge-center-unit")!.getAttribute("x"))).toBeGreaterThan(right);
@@ -311,11 +339,9 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
     // five cells.
     const wide: MachineResources = { ...BASE, pool: { ...BASE.pool!, used_bytes: 130000000000 } };
     const { container } = renderRegion(wide, { residencyRows: residencyRowsFor(wide) });
-    const cells = [...container.querySelectorAll(".mm-gauge-odo-cell")] as SVGRectElement[];
+    const cells = odoCellExtents(container);
     expect(cells.length).toBe(5);
-    const left = Math.min(...cells.map((c) => Number(c.getAttribute("x"))));
-    const right = Math.max(...cells.map((c) => Number(c.getAttribute("x")) + Number(c.getAttribute("width"))));
-    expect((left + right) / 2).toBeCloseTo(120, 6);
+    expect((Math.min(...cells.map((c) => c.left)) + Math.max(...cells.map((c) => c.right))) / 2).toBeCloseTo(120, 6);
 
     // Both sources unreadable — the readout falls back through pool.used to
     // machine.current, and with neither present renders "—", never a 0.
@@ -325,9 +351,13 @@ describe("MachineHealthRegion — the center readout is centered on the hub", ()
       pool: { ...BASE.pool!, used_bytes: null as unknown as number },
     };
     const r2 = renderRegion(none, { residencyRows: residencyRowsFor(none) });
-    const oneCell = [...r2.container.querySelectorAll(".mm-gauge-odo-cell")] as SVGRectElement[];
+    const oneCell = odoCellExtents(r2.container);
     expect(oneCell.length).toBe(1); // the "—" cell, not a fabricated 0
-    expect(Number(oneCell[0].getAttribute("x")) + Number(oneCell[0].getAttribute("width")) / 2).toBeCloseTo(120, 6);
+    expect((oneCell[0].left + oneCell[0].right) / 2).toBeCloseTo(120, 6);
+    // …and it must be VISIBLE as absence. A seven-segment cell handed a
+    // character it cannot draw renders empty, which would turn the honest
+    // "—" into a blank hub — absence rendered as nothing at all.
+    expect(r2.container.querySelectorAll(".mm-gauge-odo-cell polygon").length).toBeGreaterThan(0);
   });
 });
 
@@ -367,7 +397,13 @@ describe("MachineHealthRegion — #1812: stale keeps the last-good reading, visi
     // The reading itself is still there — never blanked. The readout shows
     // the MACHINE's used memory (what the needle points at), not darkmux's
     // share: pool.used_bytes 69.3e9 = 64.5 GiB.
-    expect(container.querySelector(".mm-gauge-center-val")?.textContent).toContain("64.5");
+    //
+    // The figure is drawn as seven-segment polygons, so it carries no text
+    // to assert on. Asserted through the gauge's own accessible narrative
+    // instead, which states the same figure — and which therefore MUST stay
+    // in step with the glyphs, making this the stronger place to pin it.
+    expect(container.querySelector("svg[role='img']")!.getAttribute("aria-label")).toContain("64.5");
+    expect(odoCellExtents(container).length).toBe(4); // "64.5", not blanked
   });
 
   it("the inverted case: no stale banner and no desaturation when the latest poll succeeded", () => {
@@ -793,12 +829,17 @@ describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its prove
     expect(hint!.textContent?.toLowerCase()).toContain("dense");
   });
 
-  it("decision 1: a GREEN machine verdict is reachable with an estimated resident present, and the chip discloses the count", () => {
+  it("decision 1: an estimated resident is disclosed on its own row and in the machine detail row", () => {
+    // #1819 required the count to travel WITH the verdict word everywhere
+    // that word appeared. The verdict word is gone from this page (the chip
+    // interpreted data the reader can already see), so the requirement now
+    // binds on the two channels that remain — and BOTH must carry it, or a
+    // reader who glances at the machine line never learns the figure rests
+    // on a guess.
     const resources = withEstimated({ state: "green" });
     const { container } = renderRegion(resources, { residencyRows: residencyRowsFor(resources) });
-    const chip = container.querySelector(".mm-gcap .mm-chip")!;
-    expect(chip.textContent).toContain("GREEN");
-    expect(chip.textContent).toContain("1 estimated");
+    expect(container.querySelector(".mm-row-chip.is-estimated")).not.toBeNull();
+    expect(container.querySelector(".mm-kv--machine")!.textContent).toContain("estimated");
   });
 
   it("the machine detail row discloses the estimated count alongside (not instead of) the unpriced count", () => {
@@ -813,8 +854,6 @@ describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its prove
   it("the inverted case: the estimated disclosure is entirely absent when nothing was estimated (BASE's own default)", () => {
     const { container } = renderRegion(BASE);
     expect(container.querySelector(".mm-row-chip.is-estimated")).toBeNull();
-    const chip = container.querySelector(".mm-gcap .mm-chip")!;
-    expect(chip.textContent).not.toContain("estimated");
     const detail = container.querySelector(".mm-kv--machine")!;
     expect(detail.textContent).not.toContain("estimated");
   });
@@ -832,9 +871,12 @@ describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its prove
       machine: { ...BASE.machine, unpriced_models: 1, estimated_models: 1, state: "unknown" },
     };
     const { container } = renderRegion(resources, { residencyRows: residencyRowsFor(resources) });
-    const chip = container.querySelector(".mm-gcap .mm-chip")!;
-    expect(chip.textContent).toContain("UNKNOWN");
-    expect(chip.textContent).not.toMatch(/\b(GREEN|AMBER|RED)\b/);
+    // The machine-level verdict has no display channel any more, so what is
+    // asserted is that an UNPRICEABLE resident is still disclosed as such —
+    // the fact the undecided verdict used to stand for. An estimate must not
+    // paper over it.
+    expect(container.querySelector(".mm-row-chip.is-warn")!.textContent).toContain("UNPRICED");
+    expect(container.querySelector(".mm-kv--machine")!.textContent).toContain("unpriced");
     // The estimated row still renders its own chip even though the MACHINE
     // verdict stayed undecided — provenance is a per-row fact, independent
     // of whether the whole-machine cascade could reach a verdict.

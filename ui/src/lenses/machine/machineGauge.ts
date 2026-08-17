@@ -82,35 +82,6 @@ export function gaugeTickLabel(bytes: number): string {
   return String(Math.round(n / GIB));
 }
 
-/** The arc fill's hue — the ONE color on this face derived from client
- * arithmetic rather than a server verdict, and the deliberate exception to
- * this module's otherwise strict "the server decides, we render" rule.
- *
- * Why it has to be an exception (docs/design/machine-lens/provenance.md
- * finding 1): the fill used to key on `machine.state`, and on a real machine
- * `machine.state` is almost always `unknown` — the ledger honestly refuses to
- * promise a fit whenever ANY resident model is unpriceable, which is the
- * normal case. A fill keyed to that verdict is therefore a permanently grey
- * fill, and a gauge whose needle sweeps a grey arc from empty to full has
- * thrown away the one thing a gauge is for: showing you, without reading a
- * number, that the tank is filling.
- *
- * So the two questions are separated, and each is answered by the channel that
- * can actually answer it:
- * - **"how full is it?"** — this ramp, off the needle's own position. Pure
- *   arithmetic on two server numbers (`current / scale`), no verdict implied.
- * - **"is the machine in trouble?"** — unchanged and still server-only: the
- *   state chip, the seven lamps, the redline (`redlineLit`, one field), and
- *   the face caption. An amber fill NEVER means the arbiter said amber.
- *
- * Thresholds are the operator's own (2026-08-14): green to half, amber past
- * half, red approaching the line. They are fill-level marks, not the server's
- * cascade, and nothing else on the page reads them. */
-export function gaugeFillSeverity(pct: number): "green" | "amber" | "red" {
-  if (!Number.isFinite(pct) || pct < 50) return "green";
-  if (pct < 85) return "amber";
-  return "red";
-}
 
 /** The dial fill's colour ramp stops — `--good`, `--warn`, `--bad` from
  * `styles.css`, duplicated here as literals because an SVG `stroke` has to
@@ -201,7 +172,13 @@ export function gaugeRampSwatch(startPct: number, endPct: number): string {
 const SEVEN_SEG_LIT: Record<string, string> = {
   "0": "abcdef", "1": "bc", "2": "abged", "3": "abgcd", "4": "fgbc",
   "5": "afgcd", "6": "afgedc", "7": "abc", "8": "abcdefg", "9": "abfgcd",
-  "-": "g",
+  // Every dash this readout can be handed lights the middle bar, which is
+  // exactly what a dash looks like on a seven-segment cell. The EM dash is
+  // the one that matters: `gaugeValueParts` returns "—" for an unreadable
+  // figure, and without it the no-data case drew an empty cell — an
+  // invisible readout where the page's whole honesty rule is that absence
+  // must be VISIBLE as absence and never a fabricated 0.
+  "-": "g", "\u2013": "g", "\u2014": "g",
 };
 
 /** Segment polygons in a 60x100 cell — the canonical grid every consumer
@@ -412,61 +389,6 @@ export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry
   };
 }
 
-/** The machine chip's word, with its REASON attached when the verdict is
- * `unknown` — and, since #1819, the ESTIMATE disclosure attached when the
- * verdict is DECIDED (green/amber/red) but partly rests on an estimate.
- *
- * A bare `UNKNOWN` is jargon that comes out of nowhere: nothing else on the
- * page defines it, and — per docs/design/machine-lens/provenance.md finding
- * 1 — it is the PERMANENT state on any machine with an unpriceable resident,
- * i.e. most real ones. So the one word a first-time reader most needs
- * explained is also the one they will see every single time.
- *
- * The cascade has exactly two `Unknown` arms and they are distinguishable
- * from the SAME fields the server branched on, so this names which one fired
- * rather than guessing:
- *   - `limit_bytes == null` → the server's `None` arm, "no limit readable".
- *   - otherwise (a limit exists, the priced sum fits, but residents are
- *     unpriceable) → the `Some(_)` arm, "unpriced resident".
- * Order matters and mirrors the server's: the `Some(limit)` arms cannot fire
- * at all when the limit is absent, so a missing limit is checked FIRST.
- *
- * #1819 decision 1: an estimated resident MAY produce a decided verdict
- * (Green included) — but the count travels WITH the word everywhere the
- * word appears, so a reader never sees a bare "GREEN" that quietly rests on
- * a guess: `GREEN · 1 estimated`. This is deliberately NOT prefixed with
- * "fit " (`fit GREEN · 1 estimated`, as #1819's own issue body writes it) —
- * that prefix does not exist on this word yet and is a separate, still-open
- * decision; only the estimate disclosure is added here.
- *
- * Green/amber/red otherwise stay bare when nothing is estimated — they are
- * self-evident, and a reason appended to a self-evident word is noise. This
- * never invents a verdict; it only annotates one the server already
- * reached.
- *
- * #1835 makes AMBER the exception to that "self-evident" clause, by the
- * clause's own logic: amber now has two causes that call for OPPOSITE
- * responses — `OVERCOMMITTED` (shrink something) and `NO MARGIN` (it fits;
- * do not load anything else). A bare AMBER can no longer tell you which, so
- * the cause stops being noise and becomes the word's content. It is read
- * from the server's `amber_reason`, never re-derived here: the margin floor
- * that decides it lives server-side and only server-side. */
-export function machineStateWord(
-  state: string | null | undefined,
-  limitBytes: number | null | undefined,
-  unpricedModels: number,
-  estimatedModels: number = 0,
-  amberReason?: "overcommitted" | "no_margin" | null,
-): string {
-  const word = (state || "unknown").toUpperCase();
-  if (word !== "UNKNOWN") {
-    const cause = amberReason ? ` · ${amberReason.replace("_", " ").toUpperCase()}` : "";
-    return estimatedModels > 0 ? `${word}${cause} · ${estimatedModels} estimated` : `${word}${cause}`;
-  }
-  if (limitBytes == null) return "UNKNOWN · no limit readable";
-  if (unpricedModels > 0) return "UNKNOWN · unpriced resident";
-  return word; // defensive: unknown for neither named reason — never invent one
-}
 
 /** Whether a row's own state chip carries information the MACHINE chip does
  * not — i.e. whether this row disagrees with the machine's verdict.

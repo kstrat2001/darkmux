@@ -370,14 +370,6 @@ export interface MachineResources {
      * `?` for a pre-2.1 peer's ledger, matching the server's `serde(default)`. */
     over_price_models?: number;
     current_bytes: number;
-    /** #1835 — WHICH disjunct produced an amber `state`; absent for every
-     * other verdict. `"overcommitted"` = the projected total exceeds the
-     * limit outright (shrink something). `"no_margin"` = it fits, but the
-     * headroom left is under the server's margin floor (do not load anything
-     * else). The two call for opposite responses, so the lamp row keys on
-     * this rather than on a threshold re-derived client-side — the floor
-     * lives server-side and only server-side. */
-    amber_reason?: "overcommitted" | "no_margin";
     /** #1821 — everything ELSE on the machine, right now:
      * `pool.used_bytes - current_bytes`, floored at 0. */
     other_used_bytes?: number;

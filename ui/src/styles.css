@@ -2115,11 +2115,10 @@ body {
    laid out in `MachineHealthRegion.tsx::odoLayout`, because an SVG has no
    flexbox and the whole point of the nit was that the FIGURE has to center on
    the hub independently of the unit sitting beside it. */
-.mm-gauge-odo-cell {
-  fill: #0d1120;
-  stroke: #2c3446;
-  stroke-width: 1;
-}
+/* The seven-segment cells (operator call, replacing the boxed odometer
+   digits). No fill/stroke of their own — the glyph polygons inside take
+   `currentColor` from `.mm-gauge-center-val`, so colour stays with the CSS
+   and this class exists to name the cell for layout and for tests. */
 .mm-gauge-odo-digit {
   fill: var(--fg);
   font-size: 15px;
@@ -2194,10 +2193,14 @@ body {
   opacity: 0.85;
 }
 
-/* The fill's three zones. There is deliberately no `.is-unknown` arm: the fill
-   is driven by `gaugeFillSeverity(pct)` (how full), which is total over
-   green/amber/red, and no longer by `machine.state` (the arbiter's verdict),
-   which is `unknown` on a real machine and painted the whole sweep dim grey.
+/* The fill's colour is no longer a class at all: the band takes its stroke
+   from the arc ramp (`gaugeRampStops`, an SVG gradient across the sweep), so
+   there are no zones and no thresholds. The bucketed
+   `is-green`/`is-amber`/`is-red` arms that stood here keyed on 50% and 85%
+   edges darkmux invented — a machine at 84% and one at 86% are not different
+   in kind. The rule they replaced was worse still: the fill once keyed on
+   `machine.state` (the arbiter's verdict), which is `unknown` on a real
+   machine and painted the whole sweep dim grey.
    See that function's doc for why the two questions were split. */
 .mm-gauge-val.is-green {
   stroke: var(--good);
@@ -2306,15 +2309,6 @@ body {
   opacity: 0.75;
 }
 
-.mm-gcap {
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  color: var(--dim);
-  text-align: center;
-}
-.mm-gcap b {
-  color: var(--fg);
-}
 
 /* Reused, tightly-scoped chip — the gauge caption's own state word
    (`.mm-chip`) and a model row's owner/state/unpriced/new/departed markers

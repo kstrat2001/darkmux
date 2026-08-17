@@ -99,40 +99,7 @@ use std::time::Duration;
 /// field, not a shape change: the field's documented meaning ("the most
 /// this machine's residents will hold") is what it already claimed to be,
 /// and it was simply wrong whenever a resident had outgrown its price.
-///
-/// 2.1 → 2.2 (#1835): additive field only (`MachineTotals::amber_reason`,
-/// with the new [`AmberReason`] enum). The fit arm is SPLIT, so a machine
-/// that fits by a hair now reports Amber where it reported Green — again a
-/// value change inside an unchanged field, and the point of the change: the
-/// old arm could not tell "fits with 40 GiB to spare" from "fits by 700
-/// MiB". A 2.1 reader sees an amber it understands and simply cannot name
-/// the cause, which is the graceful degradation minor bumps promise.
-pub const LEDGER_SCHEMA_VERSION: &str = "2.2";
-
-/// (#1835) How much of the limit must remain unspoken-for before the fit
-/// verdict will say Green. Below it the verdict is Amber with
-/// [`AmberReason::NoMargin`].
-///
-/// The fit arm used to be BINARY at the limit — it could not tell "fits with
-/// 40 GiB to spare" from "fits by 5.68 GiB", and reported the same word for
-/// both while the dial beside it drew a needle in the redline. This is the
-/// number that separates them.
-///
-/// **A FRACTION OF THE LIMIT, deliberately — not "can the machine still
-/// absorb its largest resident".** That alternative needs no magic number
-/// and was the first proposal, but it fails the wallpaper test: an operator
-/// running one 60 GiB model on a 128 GiB machine can essentially never
-/// satisfy it (the headroom would have to exceed a resident already holding
-/// half the pool), so the verdict would be permanently non-green for
-/// exactly the operators who run big models. A signal with no variance
-/// carries no information. A fixed fraction is clearable — free some memory
-/// and it goes green — and it does not get harder to satisfy just because
-/// you loaded something large.
-///
-/// 10% is a judgment call, and it is the operator's to revisit; it is stated
-/// here as one constant so that revisiting it is a one-line change with one
-/// test to update, rather than a threshold smeared across surfaces.
-pub const MARGIN_FLOOR_FRACTION: f64 = 0.10;
+pub const LEDGER_SCHEMA_VERSION: &str = "2.1";
 
 /// v1 KV-cache dtype width: 2 bytes/element (fp16 cache, the MLX default).
 /// Deliberately a named constant, not a guess from weight quantization —
@@ -321,38 +288,6 @@ impl LedgerState {
             LedgerState::Amber => "amber",
             LedgerState::Red => "red",
             LedgerState::Unknown => "unknown",
-        }
-    }
-}
-
-/// (#1835) WHICH disjunct produced an [`LedgerState::Amber`] verdict.
-///
-/// Amber used to have exactly one cause, so the word carried its own
-/// explanation. Splitting the fit arm gives it two, and they call for
-/// opposite responses: `Overcommitted` says the machine does not fit what it
-/// has promised (shrink something); `NoMargin` says it fits and has nothing
-/// left over (do not load anything else). A single amber word cannot say
-/// which, and every surface that renders a cause — the lamp row, the CLI —
-/// must key on the CASCADE ARM rather than re-deriving the condition, or the
-/// page can show a cause the verdict does not agree with.
-///
-/// `None` for every non-amber verdict, which keeps the field's absence
-/// meaningful rather than needing a `NotAmber` variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AmberReason {
-    /// Arm 4 — the projected total exceeds the limit outright.
-    Overcommitted,
-    /// Arm 3b — the projected total fits, but the headroom left under the
-    /// limit is below [`MARGIN_FLOOR_FRACTION`] of it.
-    NoMargin,
-}
-
-impl AmberReason {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AmberReason::Overcommitted => "overcommitted",
-            AmberReason::NoMargin => "no_margin",
         }
     }
 }
@@ -651,12 +586,6 @@ pub struct MachineTotals {
     #[serde(default)]
     pub projected_total_bytes: Option<u64>,
     pub state: LedgerState,
-    /// #1835: WHICH disjunct produced an amber [`Self::state`] — `None` for
-    /// every other verdict. Emitted so the lamp row and the CLI can NAME the
-    /// cause without re-deriving the threshold client-side; the margin floor
-    /// ([`MARGIN_FLOOR_FRACTION`]) lives server-side and only server-side.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amber_reason: Option<AmberReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shrink_hint: Option<String>,
 }
@@ -1140,61 +1069,13 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     // Machine-total color per the #1286 semantics, updated by #1821: arms 3
     // and 4 now key on `projected_total`, not `sum_potential` alone.
     let mut machine_shrink: Option<String> = None;
-    let mut amber_reason: Option<AmberReason> = None;
-    // (#1835) The margin floor, in bytes, for whichever limit this machine
-    // actually has. Computed once so arm 3's two halves and the message that
-    // explains them cannot disagree about where the line is.
-    let margin_floor_bytes =
-        |limit: u64| ((limit as f64) * MARGIN_FLOOR_FRACTION).round() as u64;
     let machine_state = match limit_bytes {
         _ if pressure.red => LedgerState::Red,
         Some(limit) if current_total.is_some_and(|c| c > limit) => LedgerState::Red,
-        // Arm 3a — fits, WITH room to spare.
-        Some(limit)
-            if projected_total_bytes
-                .is_some_and(|p| p <= limit && limit - p >= margin_floor_bytes(limit))
-                && unpriced_models == 0 =>
-        {
+        Some(limit) if projected_total_bytes.is_some_and(|p| p <= limit) && unpriced_models == 0 => {
             LedgerState::Green
         }
-        // (#1835) Arm 3b — fits, with nothing left over.
-        //
-        // This arm exists because the fit question was BINARY at the limit:
-        // "fits with 40 GiB to spare" and "fits by 700 MiB" both returned
-        // Green, while the dial beside the chip drew a needle deep in the
-        // redline. The page rendered the number that should alarm and then
-        // evaluated nothing against it.
-        //
-        // It is a SPLIT of the green arm, not a lamp beside it. A lamp that
-        // lit while the chip still said Green would be the same
-        // contradiction relocated one row down — every lamp in that row
-        // names a cause of a NON-green verdict, which is what makes the row
-        // readable at all.
-        Some(limit) if projected_total_bytes.is_some_and(|p| p <= limit) && unpriced_models == 0 => {
-            amber_reason = Some(AmberReason::NoMargin);
-            let headroom = limit - projected_total_bytes.unwrap_or(limit);
-            messages.push(LedgerMessage::warn(format!(
-                "projected total leaves {} under the limit, below the {} floor ({:.0}% of the limit) — \
-                 this machine fits what it is holding but has no room for another resident",
-                fmt_bytes(headroom),
-                fmt_bytes(margin_floor_bytes(limit)),
-                MARGIN_FLOOR_FRACTION * 100.0
-            )));
-            // Both amber arms name a shrink, and they can share one
-            // computation because the hint aims at the GREEN TARGET rather
-            // than the limit (#1835). "No margin" without a way to recover
-            // margin would be an alarm with no verb — the same complaint
-            // that made a bare amber word unsatisfying in the first place.
-            machine_shrink = Some(shrink_hint(
-                &rows,
-                projected_total_bytes.unwrap_or(effective_potential),
-                limit.saturating_sub(margin_floor_bytes(limit)),
-                unpriced_models,
-            ));
-            LedgerState::Amber
-        }
         Some(limit) if projected_total_bytes.is_some_and(|p| p > limit) => {
-            amber_reason = Some(AmberReason::Overcommitted);
             // The shrink hint's own overshoot has to be measured against
             // the SAME total the verdict was — `projected_total`, not
             // `sum_potential` — or a suggested cut could land exactly on
@@ -1203,7 +1084,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
             machine_shrink = Some(shrink_hint(
                 &rows,
                 projected_total_bytes.unwrap_or(effective_potential),
-                limit.saturating_sub(margin_floor_bytes(limit)),
+                limit,
                 unpriced_models,
             ));
             LedgerState::Amber
@@ -1225,26 +1106,15 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     //   machine amber → amber while current < potential (this model's lazy
     //   allocation is part of the luck), green once fully materialized (its
     //   commitment is already paid). Unpriceable models stay unknown.
-    //
-    // (#1835) …with ONE exception, and it follows from that same sentence:
-    // the "luck" being described is the machine not fitting if commitments
-    // materialize, which is [`AmberReason::Overcommitted`]. Under
-    // [`AmberReason::NoMargin`] the machine fits even fully materialized —
-    // there is no luck to be part of — so no row is implicated and every
-    // row keeps its green. Tinting them would put a severity on models that
-    // are individually fine, purely because the machine is close to full,
-    // which is exactly the mislocated-severity the split arm exists to fix.
-    let rows_inherit_amber = amber_reason != Some(AmberReason::NoMargin);
     for row in &mut rows {
         row.state = match (machine_state, row.potential_bytes) {
             (_, None) => LedgerState::Unknown,
             (LedgerState::Green, _) => LedgerState::Green,
             (LedgerState::Red, _) => LedgerState::Red,
-            (LedgerState::Amber, Some(pot)) if rows_inherit_amber => match row.current_bytes {
+            (LedgerState::Amber, Some(pot)) => match row.current_bytes {
                 Some(cur) if cur >= pot => LedgerState::Green,
                 _ => LedgerState::Amber,
             },
-            (LedgerState::Amber, Some(_)) => LedgerState::Green,
             (LedgerState::Unknown, _) => LedgerState::Unknown,
         };
     }
@@ -1253,9 +1123,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         if let Some(key) = hint_target_key(
             &rows,
             projected_total_bytes.unwrap_or(effective_potential),
-            // Same target the hint itself was computed against (#1835) — the
-            // row it lands on must be the row the sentence names.
-            limit_bytes.map(|l| l.saturating_sub(margin_floor_bytes(l))).unwrap_or(0),
+            limit_bytes.unwrap_or(0),
         ) {
             if let Some(row) = rows.iter_mut().find(|r| r.model_key == key) {
                 row.shrink_hint = Some(hint.clone());
@@ -1280,7 +1148,6 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
             other_used_bytes,
             projected_total_bytes,
             state: machine_state,
-            amber_reason,
             shrink_hint: machine_shrink,
         },
         models: rows,
@@ -1494,22 +1361,15 @@ fn hint_target_key(rows: &[ModelRow], total_bytes: u64, limit: u64) -> Option<St
 /// `total_bytes` — see [`hint_target_key`]'s doc: since #1821 this is
 /// `projected_total`, not darkmux's Σ potential alone, so a saving computed
 /// here actually closes the gap the verdict is amber about.
-///
-/// `green_target` — (#1835) the total this cut must reach, which is NOT the
-/// limit: since the fit arm split, landing exactly at the limit is
-/// [`AmberReason::NoMargin`], not green. The caller passes
-/// `limit - MARGIN_FLOOR_FRACTION * limit`. This function's contract is
-/// "applying this hint reaches GREEN" — a property test asserts exactly
-/// that by applying the hint and recomputing — so it has to aim at whatever
-/// green currently means, not at a limit that stopped being the boundary.
+
 ///
 /// When `unpriced_models > 0` the promised fit is NOT green — green requires
 /// zero unpriceable residents (their commitment is uncounted), so applying
 /// the shrink lands the machine total at Unknown, not Green. The hint carries
 /// that caveat rather than over-promising green (#1286 honesty).
-fn shrink_hint(rows: &[ModelRow], total_bytes: u64, green_target: u64, unpriced_models: u32) -> String {
-    let overshoot = total_bytes.saturating_sub(green_target);
-    let base = match hint_target_key(rows, total_bytes, green_target) {
+fn shrink_hint(rows: &[ModelRow], total_bytes: u64, limit: u64, unpriced_models: u32) -> String {
+    let overshoot = total_bytes.saturating_sub(limit);
+    let base = match hint_target_key(rows, total_bytes, limit) {
         None => format!(
             "over the limit by {} with no shrinkable context — unload a resident or load a smaller quant to reach green at load time",
             fmt_bytes(overshoot)
@@ -1544,7 +1404,7 @@ fn shrink_hint(rows: &[ModelRow], total_bytes: u64, green_target: u64, unpriced_
                     _ => priced_off,
                 };
                 format!(
-                    "reload {} at ctx {} (now {}) — cuts {} of KV commitment{saving_note}; the projected total then clears the margin floor at load time",
+                    "reload {} at ctx {} (now {}) — cuts {} of KV commitment{saving_note}; Σ potential then fits the limit at load time",
                     row.model_key,
                     new_ctx,
                     row.loaded_ctx,
@@ -2083,13 +1943,7 @@ pub fn render_human(ledger: &ModelLedger) -> String {
         fmt_opt(ledger.machine.current_bytes),
         fmt_opt(ledger.limit_bytes),
         limit_desc,
-        match ledger.machine.amber_reason {
-            // (#1835) Amber has two causes now, and they call for opposite
-            // responses — shrink something, versus do not load anything
-            // else. The bare word cannot say which.
-            Some(r) => format!("{} ({})", ledger.machine.state.as_str(), r.as_str()),
-            None => ledger.machine.state.as_str().to_string(),
-        },
+        ledger.machine.state.as_str(),
     ));
     // #1821: the cascade's own arithmetic, checkable from this line —
     // "other tenants" plus darkmux's Σ potential is what the verdict above
@@ -2200,27 +2054,6 @@ mod tests {
     // Expected potentials from the probed arithmetic (same rows as the
     // estimator tests): judge@65536 = weights + 1,342,177,280 + margin;
     // devstral@32768 = weights + 5,368,709,120 + margin.
-    /// A budget for which the fixture's shrink hint is still the COVERING
-    /// kind (it names a reload ctx) rather than the honest
-    /// "no single reduction reaches green" branch.
-    ///
-    /// The window is genuinely narrow, and the narrowness is the physics, not
-    /// a fixture smell. Two walls close it in:
-    /// - **Below ~38.08 GB** the cut needed to clear the margin floor exceeds
-    ///   what a ctx reduction can ever reclaim here. devstral is HOLDING
-    ///   15.00 GB against a 19.12 GB potential, so ctx can reclaim at most
-    ///   4.12 GB no matter how far it is cut — you cannot shrink a
-    ///   resident's commitment below its measured footprint
-    ///   ([`achievable_ctx_saving`]).
-    /// - **At or above Σ potential (38.39 GB)** the machine is no longer
-    ///   overcommitted at all, so there is no overshoot to cover.
-    ///
-    /// If a future change to [`MARGIN_FLOOR_FRACTION`] moves the lower wall
-    /// past this value, this constant is the one thing to retune — and the
-    /// assertion below names which branch it fell into, so the failure says
-    /// so directly.
-    const COVERING_HINT_BUDGET: u64 = 38_200_000_000;
-
     const JUDGE_POTENTIAL: u64 = 17_180_000_000 + 1_342_177_280 + 750_000_000;
     const DEVSTRAL_POTENTIAL: u64 = 13_000_000_000 + 5_368_709_120 + 750_000_000;
 
@@ -2462,60 +2295,28 @@ mod tests {
         assert_eq!(achievable_ctx_saving(&unattributed), naive);
     }
 
-    /// (#1835) The no-margin arm is a real verdict, not a decoration: it
-    /// names its cause, says how much headroom is left against what floor,
-    /// and still points at a way back to green. An alarm with no verb is the
-    /// same complaint that made a bare amber word unsatisfying.
-    #[test]
-    fn fitting_with_nothing_left_over_is_amber_named_and_actionable() {
-        let projected = JUDGE_POTENTIAL + DEVSTRAL_POTENTIAL;
-        let mut inputs = base_inputs();
-        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
-        // Fits, but with only ~1% of the limit to spare.
-        inputs.budget_bytes = Some(projected + projected / 100);
-        let ledger = compute_ledger(inputs, 1);
 
-        assert_eq!(ledger.machine.state, LedgerState::Amber);
-        assert_eq!(ledger.machine.amber_reason, Some(AmberReason::NoMargin));
-        assert!(ledger.machine.shrink_hint.is_some(), "no-margin names a way back to green");
-        assert!(
-            ledger.messages.iter().any(|m| m.severity == Severity::Warn && m.text.contains("below the")),
-            "the message names the headroom and the floor it is under: {:?}",
-            ledger.messages
-        );
-
-        // The ROWS stay green. Under no-margin the machine fits even fully
-        // materialized, so no individual model is implicated — tinting them
-        // would put a severity on models that are individually fine, which
-        // is the mislocated severity this split exists to fix.
-        for r in &ledger.models {
-            assert_eq!(r.state, LedgerState::Green, "{} should not inherit no-margin amber", r.model_key);
-        }
-    }
-
-    /// The inverted case for the row-tint carve-out above: under the OTHER
-    /// amber (overcommitted) a row carrying unmaterialized commitment IS
-    /// implicated, and must still tint. Without this, "rows stay green under
-    /// amber" could be satisfied by simply never tinting rows at all.
-    #[test]
-    fn overcommitted_amber_still_tints_the_rows_carrying_unmaterialized_commitment() {
-        let mut inputs = base_inputs();
-        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
-        inputs.budget_bytes = Some(COVERING_HINT_BUDGET);
-        let ledger = compute_ledger(inputs, 1);
-        assert_eq!(ledger.machine.amber_reason, Some(AmberReason::Overcommitted));
-        assert!(
-            ledger.models.iter().any(|r| r.state == LedgerState::Amber),
-            "an overcommitted machine implicates its lazily-allocated rows: {:?}",
-            ledger.models.iter().map(|r| (&r.model_key, r.state)).collect::<Vec<_>>()
-        );
-    }
 
     /// (#1854) The CLI is the viewer's twin, so it discloses in the same two
     /// places: a footnote on the ROW (which is where the confusing
     /// `potential X · current Y` pair with Y > X actually prints, and the
     /// machine-level warning several lines below cannot repair it in place)
     /// and the warning itself. NOT on the machine-total line — see below.
+    #[test]
+    fn sum_potential_equal_to_limit_is_green_inclusive() {
+        // projected_total == limit: the green arm's `≤` is inclusive at
+        // equality. `used_bytes` pinned to Σ current so `other_used` is
+        // exactly 0 (#1821) — projected_total then equals Σ potential
+        // exactly, isolating the equality-boundary claim this test makes
+        // from the separate other-tenants arithmetic.
+        let mut inputs = base_inputs();
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
+        inputs.budget_bytes = Some(JUDGE_POTENTIAL + DEVSTRAL_POTENTIAL);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Green);
+        assert!(ledger.machine.shrink_hint.is_none());
+    }
+
     #[test]
     fn render_human_footnotes_the_over_price_row_but_keeps_it_off_the_machine_line() {
         let mut inputs = base_inputs();
@@ -2655,10 +2456,9 @@ mod tests {
         // projected_total_not_darkmux_alone` below covers directly.
         let mut inputs = base_inputs();
         inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
-        inputs.budget_bytes = Some(COVERING_HINT_BUDGET);
+        inputs.budget_bytes = Some(35_000_000_000);
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.state, LedgerState::Amber);
-        assert_eq!(ledger.machine.amber_reason, Some(AmberReason::Overcommitted));
         let hint = ledger.machine.shrink_hint.as_deref().expect("amber names the shrink");
         // devstral is the KV hog (160 KB/token vs the judge's 20) — the
         // hint targets it, and its full reduction covers the overshoot.
@@ -3369,62 +3169,6 @@ mod tests {
         assert_eq!(bin_label("vm_stat"), "vm_stat");
     }
 
-    /// (#1835) `projected_total == limit` used to be the green arm's
-    /// inclusive boundary, and this test pinned it there. The fit arm split
-    /// moves the boundary: fitting EXACTLY at the limit is the canonical
-    /// no-margin machine, and calling it green was the defect — a needle in
-    /// the redline under a chip reading GREEN.
-    ///
-    /// The `≤` is still inclusive; it is inclusive at the MARGIN FLOOR now.
-    /// Both halves are asserted, found by binary search rather than
-    /// hand-arithmetic so the test follows [`MARGIN_FLOOR_FRACTION`] if the
-    /// operator retunes it instead of silently pinning today's 10%.
-    #[test]
-    fn the_fit_arm_is_inclusive_at_the_margin_floor_and_amber_one_byte_inside_it() {
-        let verdict = |limit: u64| {
-            let mut inputs = base_inputs();
-            // `used_bytes` pinned to Σ current so `other_used` is exactly 0
-            // (#1821) — projected_total then equals Σ potential exactly,
-            // isolating the boundary claim from the other-tenants arithmetic.
-            inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
-            inputs.budget_bytes = Some(limit);
-            compute_ledger(inputs, 1).machine
-        };
-        let projected = JUDGE_POTENTIAL + DEVSTRAL_POTENTIAL;
-
-        // Fitting exactly at the limit is NO LONGER green — this is the
-        // whole point of the split, and the inverted case for everything
-        // below it.
-        let exactly = verdict(projected);
-        assert_eq!(exactly.state, LedgerState::Amber);
-        assert_eq!(exactly.amber_reason, Some(AmberReason::NoMargin));
-        assert!(exactly.shrink_hint.is_some(), "no-margin still names a way back to green");
-
-        // Binary-search the smallest limit that reports green.
-        let (mut lo, mut hi) = (projected, projected * 2);
-        assert_eq!(verdict(hi).state, LedgerState::Green, "search must bracket the boundary");
-        while lo + 1 < hi {
-            let mid = lo + (hi - lo) / 2;
-            if verdict(mid).state == LedgerState::Green {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-
-        // At the boundary: green, and the headroom is exactly the floor —
-        // inclusive, not one byte past it.
-        let at = verdict(hi);
-        assert_eq!(at.state, LedgerState::Green);
-        assert_eq!(at.amber_reason, None);
-        let floor = ((hi as f64) * MARGIN_FLOOR_FRACTION).round() as u64;
-        assert_eq!(hi - projected, floor, "green begins exactly AT the floor, inclusively");
-
-        // One byte inside it: amber, named.
-        let inside = verdict(hi - 1);
-        assert_eq!(inside.state, LedgerState::Amber);
-        assert_eq!(inside.amber_reason, Some(AmberReason::NoMargin));
-    }
 
     #[test]
     fn memory_free_exactly_at_threshold_is_not_red() {
@@ -3491,20 +3235,14 @@ mod tests {
     #[test]
     fn shrink_hint_ctx_actually_reaches_green_when_applied() {
         // Property: derive the hinted ctx, reload the target at it, and the
-        // recomputed ledger must be Green — where GREEN now includes clearing
-        // the #1835 margin floor. This property is what caught the split's
-        // one real defect: `shrink_hint` computed its cut against the raw
-        // limit, so every hint it emitted landed exactly in the new no-margin
-        // band and promised a green it could not deliver.
-        //
-        // Pins the floor-rounding DIRECTION —
+        // recomputed ledger must be Green. Pins the floor-rounding DIRECTION —
         // a future ceil-flip that shipped a hint landing just shy of green
         // would fail here. `used_bytes` pinned to Σ current so `other_used`
         // is exactly 0 (#1821) — this property is about the ROUNDING
         // direction, not the other-tenants arithmetic.
         let mut inputs = base_inputs();
         inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
-        inputs.budget_bytes = Some(COVERING_HINT_BUDGET);
+        inputs.budget_bytes = Some(35_000_000_000);
         let ledger = compute_ledger(inputs, 1);
         assert_eq!(ledger.machine.state, LedgerState::Amber);
         let hint = ledger.machine.shrink_hint.as_deref().expect("amber names a shrink");
@@ -3512,7 +3250,7 @@ mod tests {
 
         let mut applied = base_inputs();
         applied.pool = applied.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
-        applied.budget_bytes = Some(COVERING_HINT_BUDGET);
+        applied.budget_bytes = Some(35_000_000_000);
         for r in &mut applied.residents {
             if r.model_key == "devstral" {
                 r.loaded_ctx = new_ctx;
@@ -3986,8 +3724,8 @@ mod tests {
         // A LITERAL, deliberately — the sibling assertion elsewhere compares
         // against the constant and so can never fail. This one is the pin
         // that makes a schema bump a conscious edit; #1854 took it 2.0 → 2.1
-        // and #1835 took it 2.1 → 2.2.
-        assert_eq!(v["schema_version"], "2.2");
+        //.
+        assert_eq!(v["schema_version"], "2.1");
         assert_eq!(v["machine"]["estimated_models"], 1);
     }
 
