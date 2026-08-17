@@ -126,7 +126,13 @@ test('machine lens renders the ledger inertly — gauge, lamps, odometer, rows, 
 
   // The hero gauge renders off the payload.
   await page.waitForSelector('.mm-gauge');
-  await expect(page.locator('.mm-gcap')).toContainText('machine total');
+  // The dial renders off the payload, and asserts NOTHING about it. The
+  // `machine total GREEN` chip that stood here interpreted data the reader
+  // can already see; the arc's colour is now a ramp fixed to the dial, so a
+  // severity class on the band would be a regression to a verdict.
+  await expect(page.locator('.mm-gauge-val')).toHaveAttribute('stroke', 'url(#mm-gauge-ramp)');
+  expect(await page.locator('.mm-gcap').count()).toBe(0);
+  expect(await page.locator('.mm-chip').count()).toBe(0);
   // Two model rows, grouped darkmux-first (LEDGER's judge=darkmux,
   // devstral=user).
   expect(await page.locator('.mm-row').count()).toBe(2);
@@ -140,8 +146,10 @@ test('machine lens renders the ledger inertly — gauge, lamps, odometer, rows, 
   // SIX lamps, not seven: the STATE lamp is gone. It relabelled itself with
   // the machine state AND changed its lit-ness, so a healthy machine showed
   // the word "GREEN" in grey beside the same word in green on the machine
-  // chip — and it duplicated a verdict the chip already carries with its
-  // cause. Every remaining lamp keys on a CONDITION.
+  // chip. That chip has since been removed outright, which is what makes the
+  // lamp row the ONLY channel left here — and every lamp in it keys on a
+  // server-declared CONDITION (pressure, over-limit, unpriced), never on an
+  // assessment of whether the machine is doing well.
   expect(await page.locator('.mm-lamp').count()).toBe(6);
   expect(await page.locator('.mm-lamp').filter({ hasText: /^STATE/ })).toHaveCount(0);
   expect(await page.locator('.mm-odo').count()).toBe(3);
@@ -177,7 +185,7 @@ test('deep link #lens=machine boots directly into the machine lens', async ({ pa
   // No tab click — boot itself must land in the machine lens.
   await expect(page.locator('#lens-machine')).toHaveClass(/\bon\b/);
   await page.waitForSelector('.mm-gauge');
-  await expect(page.locator('.mm-gcap')).toContainText('machine total');
+  await expect(page.locator('.mm-kv--machine')).toContainText('limit source');
   await assertInert(page, 'machine lens deep link');
   expect(pageErrors, `page errors: ${pageErrors.join('\n')}`).toEqual([]);
 });
@@ -216,8 +224,12 @@ test('unreachable daemon shows the no-daemon notice, then a stale banner once da
   await page.unroute('**/machine/resources*');
   await expect(page.locator('.mm-stalebanner').first()).toContainText('stale', { timeout: 10_000 });
   await expect(page.locator('.mm-hero')).toHaveClass(/is-stale/);
-  await expect(page.locator('.mm-gcap')).toContainText('machine total');
-  await expect(page.locator('.mm-gauge-center-val')).toContainText('64.5');
+  // The reading survives the stale poll — never blanked. It is drawn as
+  // seven-segment polygons and so carries no text; the gauge's own aria
+  // narrative states the same figure, which is the stronger place to pin it
+  // because the two must stay in step.
+  await expect(page.locator('.mm-gauge svg[role="img"]')).toHaveAttribute('aria-label', /64\.5/);
+  expect(await page.locator('.mm-gauge-center-val .mm-gauge-odo-cell').count()).toBeGreaterThan(0);
 
   expect(pageErrors, `page errors: ${pageErrors.join('\n')}`).toEqual([]);
 });

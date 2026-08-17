@@ -1361,7 +1361,6 @@ fn hint_target_key(rows: &[ModelRow], total_bytes: u64, limit: u64) -> Option<St
 /// `total_bytes` — see [`hint_target_key`]'s doc: since #1821 this is
 /// `projected_total`, not darkmux's Σ potential alone, so a saving computed
 /// here actually closes the gap the verdict is amber about.
-
 ///
 /// When `unpriced_models > 0` the promised fit is NOT green — green requires
 /// zero unpriceable residents (their commitment is uncounted), so applying
