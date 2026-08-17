@@ -11,7 +11,6 @@ import {
   groupResidencyRows,
   isEstimatedRow,
   isOverLimit,
-  machineStateWord,
   rowStateDiffers,
   isUtilityTierRow,
   memStateCls,
@@ -313,30 +312,6 @@ function GaugeLegend({ resources, band, fillCls }: { resources: MachineResources
   );
 }
 
-function GaugeCaption({ resources }: { resources: MachineResources }) {
-  const stateCls = memStateCls(resources.machine.state);
-  const stateText = machineStateWord(
-    resources.machine.state,
-    resources.limit_bytes,
-    Number(resources.machine.unpriced_models) || 0,
-    Number(resources.machine.estimated_models) || 0,
-    resources.machine.amber_reason,
-  );
-  const unpriced = Number(resources.machine.unpriced_models) || 0;
-  return (
-    <div className="mm-gcap">
-      {/* (#1827 item 1, resolved) `machine total` was the label until the
-          operator read this line cold and called it noise — and it was, but
-          the CONTENT was not: it is the only element on the face answering
-          "does darkmux's commitment fit under the limit". Labeled `machine
-          total` it sat under an odometer labeled MACHINE USED and a legend
-          summing the same bytes, so it read as a third restatement of the
-          number above it rather than an answer to a different question. */}
-      <b>fit</b> <span className={`mm-chip is-${stateCls}`}>{stateText}</span>
-      {unpriced ? ` (+${unpriced} unpriced)` : ""}
-    </div>
-  );
-}
 
 // ── Tell-tale lamp row ───────────────────────────────────────────────────
 
@@ -700,7 +675,6 @@ export function MachineHealthRegion({
           <div className="mm-semi">
             <Gauge resources={b} stale={stale} />
             <GaugeLegend resources={b} band={bandGeo} fillCls={gaugeFillSeverity(bandGeo.usedPct)} />
-            <GaugeCaption resources={b} />
           </div>
           <div>
             <LampRow resources={b} resourcesErrored={resourcesErrored} residencyChanged={residencyChanged} />
