@@ -15,11 +15,11 @@ import type { MachineResources, MachineResourcesModel } from "../../types/handwr
 // the other.
 
 
-/** The centre readout's cells are seven-segment `<g>`s carrying a
+/** The center readout's cells are seven-segment `<g>`s carrying a
  * `translate(x y) scale(sx sy)` into the canonical 60x100 glyph cell (or a
  * `<circle>` for the decimal point). Their drawn extent is therefore
  * `x .. x + sx*60`, which this recovers so the centering assertions can
- * stay geometric rather than being softened into "roughly centred". */
+ * stay geometric rather than being softened into "roughly centered". */
 function odoCellExtents(container: HTMLElement): { left: number; right: number }[] {
   return [...container.querySelectorAll(".mm-gauge-odo-cell")].map((n) => {
     const t = n.getAttribute("transform");
@@ -189,7 +189,7 @@ describe("MachineHealthRegion — hostile state strings degrade to 'unknown', ne
  * The `state` on every payload here is BASE's own `"unknown"` — deliberately.
  * That is the state a real machine reports (any unpriceable resident makes the
  * ledger decline to promise a fit — provenance finding 1), and under the old
- * code it painted the fill dim grey at every fill level, which is what the
+ * code it painted the fill dim gray at every fill level, which is what the
  * operator actually saw and reported. A test that only exercised green/red
  * payloads would have passed against the broken version.
  */
@@ -224,7 +224,7 @@ describe("MachineHealthRegion — the arc's color is a fixed ramp, never a verdi
   });
 
   it("moves with the MACHINE's fill, not with darkmux's share of it", () => {
-    // The labelling error #1821 exists to fix, expressed as geometry: a dial
+    // The labeling error #1821 exists to fix, expressed as geometry: a dial
     // ending at the machine's `128 LIMIT` must not be driven by a quantity
     // that is only ever a fraction of it. darkmux barely present; the
     // MACHINE nearly full.
@@ -261,6 +261,32 @@ describe("MachineHealthRegion — the arc's color is a fixed ramp, never a verdi
     expect(container.textContent).not.toMatch(/\bmachine total\b/i);
     // …while the lamp row is untouched.
     expect(container.querySelectorAll(".mm-lamp").length).toBeGreaterThan(0);
+  });
+});
+
+describe("MachineHealthRegion — the pressure tiles' seven-segment readout", () => {
+  it("renders a decimal point as its own dot cell, between digit cells", () => {
+    // 7.22 GiB of swap: the tile figure carries a `.`, which is drawn as a
+    // `.mm-odo-dot` span rather than a segment glyph. This is the FOOTER
+    // odometer's own branch (the hero readout has a separate copy) — it had
+    // never fired in a test before this one.
+    const swapped: MachineResources = {
+      ...BASE,
+      pressure: { ...BASE.pressure, swap_used_bytes: 7_752_000_000 },
+    };
+    const { container } = renderRegion(swapped, { residencyRows: residencyRowsFor(swapped) });
+    const tiles = container.querySelectorAll(".mm-odo-cells");
+    expect(tiles.length).toBeGreaterThan(0);
+    const dots = container.querySelectorAll(".mm-odo-cells .mm-odo-dot");
+    expect(dots.length).toBeGreaterThan(0);
+    // and the sr-only text carries the full figure with its point
+    const sr = Array.from(container.querySelectorAll(".mm-sr-only")).map((n) => n.textContent ?? "");
+    expect(sr.some((t) => /7\.2\d/.test(t))).toBe(true);
+  });
+
+  it("draws NO dot cell when no tile figure carries a decimal point", () => {
+    const { container } = renderRegion(BASE);
+    expect(container.querySelectorAll(".mm-odo-cells .mm-odo-dot").length).toBe(0);
   });
 });
 

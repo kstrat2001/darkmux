@@ -1025,7 +1025,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     // Flap guard: only a MATERIAL overage counts. A few MB of jitter flipping
     // this on and off every poll would teach the operator to ignore it inside
     // a day — the same "signal with no variance carries no information"
-    // lesson as the always-grey lamps, arriving from the other side.
+    // lesson as the always-gray lamps, arriving from the other side.
     let over_floor = |potential: u64| (potential / 100).max(256 * 1024 * 1024);
     let effective_potential: u64 = rows
         .iter()
@@ -1423,10 +1423,19 @@ fn shrink_hint(rows: &[ModelRow], total_bytes: u64, limit: u64, unpriced_models:
                     fmt_bytes(saved)
                 )
             } else {
+                // The ctx that REACHES the largest saving. Before #1854's cap
+                // that was always the floor (the saving WAS `kv × (ctx −
+                // floor)`); with the cap binding, the whole achievable saving
+                // arrives long before the floor, and naming 4096 beside it
+                // would tell the operator to gut a context for a saving a
+                // far smaller cut already delivers.
+                let at_ctx = ((row.loaded_ctx.saturating_sub(max_saving.div_ceil(kv))) / SHRINK_CTX_FLOOR
+                    * SHRINK_CTX_FLOOR)
+                    .max(SHRINK_CTX_FLOOR);
                 format!(
                     "no single ctx reduction reaches green — largest single saving is {} at ctx {} ({}){saving_note}; shrink several contexts, unload a resident, or load a smaller quant",
                     row.model_key,
-                    SHRINK_CTX_FLOOR,
+                    at_ctx,
                     fmt_bytes(max_saving)
                 )
             }
@@ -2186,7 +2195,7 @@ mod tests {
     /// (#1854, flap guard) A few MB of jitter above potential must NOT light
     /// the condition. A signal that flickers every poll teaches the operator
     /// to ignore it inside a day — the same "no variance, no information"
-    /// lesson as the always-grey lamps, arriving from the other side. Floor is
+    /// lesson as the always-gray lamps, arriving from the other side. Floor is
     /// `max(1% of potential, 256 MiB)`.
     ///
     /// The clamp itself still applies below the floor: the projection always
@@ -2463,6 +2472,83 @@ mod tests {
         let hint = ledger.machine.shrink_hint.clone().expect("amber names a hint");
         assert!(hint.contains("no shrinkable context"), "hint: {hint}");
         assert!(!hint.contains("0 B"), "hint: {hint}");
+    }
+
+    /// (#1854 review) The fallback hint's "largest single saving is X at
+    /// ctx N (bytes)" pairs a byte figure with the ctx that REACHES it. Before
+    /// the cap the two were one formula (`kv × (ctx − floor)`, so N was always
+    /// the floor). With the cap binding, the whole achievable saving is
+    /// reached long before the floor — printing 4096 beside it tells the
+    /// operator to gut a context for a saving a far smaller cut delivers.
+    #[test]
+    fn the_fallback_hint_names_the_ctx_that_reaches_the_capped_saving_not_the_floor() {
+        // Workers rank-match by weights, so judge (17.18 GB weights) takes the
+        // larger RSS. judge priced at 19,272,177,280 and holding 18.95 GB:
+        // 322,177,280 B reclaimable at most, which its 20,480 B/token rate
+        // reaches 15,732 tokens in — 65536 − 15732 = 49,804, floored to a 4K
+        // multiple = 49152. devstral holds 18.90 GB against 19.12 GB: 0.22 GB.
+        // Overshoot 0.39 GB exceeds both, so the fallback branch fires and
+        // names the larger (judge).
+        let mut inputs = base_inputs();
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: 18_950_000_000, footprint_bytes: None },
+            WorkerProc { pid: 2, rss_bytes: 18_900_000_000, footprint_bytes: None },
+        ]);
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(37_850_000_000), ..p });
+        inputs.budget_bytes = Some(38_000_000_000);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Amber, "{:?}", ledger.machine);
+        let hint = ledger.machine.shrink_hint.clone().expect("amber names a hint");
+        assert!(hint.contains("no single ctx reduction reaches green"), "hint: {hint}");
+        assert!(hint.contains("largest single saving is judge at ctx 49152 (322 MB)"), "hint: {hint}");
+    }
+
+    /// (#1854 review) The materiality floor is a strict `>`: an overage of
+    /// EXACTLY the floor is not disclosed (still clamped, still silent), one
+    /// byte more is.
+    #[test]
+    fn the_over_price_floor_is_exclusive_at_the_boundary() {
+        // devstral's floor is max(1% of its 19.12 GB price, 256 MiB) = 256 MiB.
+        // judge is given a larger RSS (30 GB) so rank-pairing sends the
+        // boundary figure to devstral; judge is over its own price and
+        // disclosed regardless — this test reads the devstral row only.
+        let floor = 256u64 * 1024 * 1024;
+        let at_floor = DEVSTRAL_POTENTIAL + floor;
+        for (rss, expect_disclosed) in [(at_floor, false), (at_floor + 1, true)] {
+            let mut inputs = base_inputs();
+            inputs.workers = Some(vec![
+                WorkerProc { pid: 1, rss_bytes: 30_000_000_000, footprint_bytes: None },
+                WorkerProc { pid: 2, rss_bytes: rss, footprint_bytes: None },
+            ]);
+            let ledger = compute_ledger(inputs, 1);
+            let dev = ledger.models.iter().find(|r| r.model_key == "devstral").unwrap();
+            assert_eq!(dev.current_bytes, Some(rss), "fixture pairing");
+            assert_eq!(dev.over_price_bytes.is_some(), expect_disclosed, "rss={rss} {dev:?}");
+            // Clamped either way: the projection never reads below measured.
+            assert_eq!(ledger.machine.potential_bytes, 30_000_000_000 + rss);
+        }
+    }
+
+    /// (#1854 review) The machine line's counts parenthetical, every arm:
+    /// unpriced alone, estimated alone (pinned elsewhere), and both together
+    /// in this order with this separator.
+    #[test]
+    fn render_human_machine_line_counts_join_unpriced_then_estimated() {
+        let mut inputs = base_inputs();
+        // estimated: a GGUF resident with a catalog size but no arch facts.
+        inputs.catalog.push(CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) });
+        inputs.residents.push(resident("microsoft/phi-4", "phi-4-gguf", 8_192));
+        // unpriced: no arch facts AND no catalog entry.
+        inputs.residents.push(resident("mystery", "mystery", 8_192));
+        let ledger = compute_ledger(inputs.clone(), 1);
+        assert_eq!((ledger.machine.unpriced_models, ledger.machine.estimated_models), (1, 1));
+        let text = render_human(&ledger);
+        assert!(text.contains(" (+1 unpriced, 1 estimated) · current"), "{text}");
+
+        // unpriced alone
+        inputs.residents.retain(|r| r.model_key != "phi-4-gguf");
+        let text = render_human(&compute_ledger(inputs, 1));
+        assert!(text.contains(" (+1 unpriced) · current"), "{text}");
     }
 
     #[test]

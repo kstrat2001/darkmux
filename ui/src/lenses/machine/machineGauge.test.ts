@@ -244,7 +244,7 @@ describe("deriveLamps — every lamp keys on exactly one field", () => {
    * There is no STATE lamp, and its absence is the assertion. One rendered
    * here until the operator caught what it did: it relabelled ITSELF with the
    * state (`STATE GREEN`) *and* changed its lit-ness, so a healthy machine
-   * showed the word "GREEN" in grey, beside the same word in actual green on
+   * showed the word "GREEN" in gray, beside the same word in actual green on
    * the machine chip. A tell-tale never renames itself — its lit-ness IS the
    * message — and the verdict already has a home that carries its cause and
    * its estimated-count qualifier too.
@@ -788,6 +788,40 @@ describe("sevenSegmentPolygons", () => {
       expect(Math.min(...ys)).toBeGreaterThan(SEVEN_SEG_CELL.h * 0.4);
       expect(Math.max(...ys)).toBeLessThan(SEVEN_SEG_CELL.h * 0.6);
     }
+  });
+
+  // Which cell zone each polygon occupies, read from its own points — so a
+  // transposed table row (6↔9, 2↔5) or a swapped polygon (a↔d, b↔f, c↔e)
+  // shows here even though every COUNT stays the same.
+  const zoneOf = (points: string) => {
+    const pts = points.split(" ").map((p) => p.split(",").map(Number));
+    const cx = pts.reduce((a, [x]) => a + x, 0) / pts.length;
+    const cy = pts.reduce((a, [, y]) => a + y, 0) / pts.length;
+    const W = SEVEN_SEG_CELL.w, H = SEVEN_SEG_CELL.h;
+    const wide = Math.max(...pts.map(([x]) => x)) - Math.min(...pts.map(([x]) => x)) > W / 2;
+    if (wide) return cy < H / 4 ? "top" : cy > (3 * H) / 4 ? "bottom" : "middle";
+    return `${cy < H / 2 ? "upper" : "lower"}-${cx < W / 2 ? "left" : "right"}`;
+  };
+  const litZones = (ch: string) =>
+    sevenSegmentPolygons(ch).filter((s) => s.lit).map((s) => zoneOf(s.points)).sort();
+
+  it("lays the seven polygons out in the seven zones of the cell, exactly once each", () => {
+    const zones = sevenSegmentPolygons("8").map((s) => zoneOf(s.points)).sort();
+    expect(zones).toEqual(
+      ["bottom", "lower-left", "lower-right", "middle", "top", "upper-left", "upper-right"].sort(),
+    );
+  });
+
+  it("lights the RIGHT zones per digit — 6 is dark upper-right, 9 is dark lower-left, 2 and 5 mirror", () => {
+    expect(litZones("6")).toEqual(["bottom", "lower-left", "lower-right", "middle", "top", "upper-left"].sort());
+    expect(litZones("9")).toEqual(["bottom", "lower-right", "middle", "top", "upper-left", "upper-right"].sort());
+    expect(litZones("2")).toEqual(["bottom", "lower-left", "middle", "top", "upper-right"].sort());
+    expect(litZones("5")).toEqual(["bottom", "lower-right", "middle", "top", "upper-left"].sort());
+    expect(litZones("7")).toEqual(["lower-right", "top", "upper-right"].sort());
+    expect(litZones("1")).toEqual(["lower-right", "upper-right"].sort());
+    expect(litZones("4")).toEqual(["lower-right", "middle", "upper-left", "upper-right"].sort());
+    expect(litZones("0")).toEqual(["bottom", "lower-left", "lower-right", "top", "upper-left", "upper-right"].sort());
+    expect(litZones("3")).toEqual(["bottom", "lower-right", "middle", "top", "upper-right"].sort());
   });
 
   it("renders an unmapped character as a dark cell rather than throwing", () => {

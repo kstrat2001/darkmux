@@ -173,7 +173,7 @@ body {
    loop gated only on the badge being live. It does NOT track record arrival
    or connection health — so it says "live" a second time rather than adding
    information. An arrival-driven pulse would genuinely signal a stream going
-   quiet; that is new behaviour, not a port, and is left as its own call. */
+   quiet; that is new behavior, not a port, and is left as its own call. */
 @keyframes lpulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
@@ -2286,13 +2286,11 @@ body {
   opacity: 0.75;
 }
 
-
-/* Reused, tightly-scoped chip — the gauge caption's own state word
-   (`.mm-chip`) and a model row's owner/state/unpriced/new/departed markers
-   (`.mm-row-chip`) share one visual language: a bordered pill, colored ONLY
-   from a server-verified severity class, the word always present alongside
-   the color (never color-alone). */
-.mm-chip,
+/* A model row's owner/state/unpriced/new/departed markers: a bordered pill,
+   colored ONLY from a server-verified severity class, the word always present
+   alongside the color (never color-alone). (The gauge caption's `.mm-chip`
+   that once shared these rules is retired — the face carries no verdict
+   word.) */
 .mm-row-chip {
   display: inline-block;
   padding: 1px 7px;
@@ -2304,17 +2302,14 @@ body {
   color: var(--dim);
   vertical-align: middle;
 }
-.mm-chip.is-green,
 .mm-row-chip.is-state.is-green {
   color: var(--good);
   border-color: var(--good);
 }
-.mm-chip.is-amber,
 .mm-row-chip.is-state.is-amber {
   color: var(--warn);
   border-color: var(--warn);
 }
-.mm-chip.is-red,
 .mm-row-chip.is-state.is-red {
   color: var(--bad);
   border-color: var(--bad);
@@ -2340,7 +2335,7 @@ body {
    health verdict.
 
    The rule this establishes, and the one to follow for any future marker:
-   **outline + hue = status; fill + grey = identity.** The lowercase word is
+   **outline + hue = status; fill + gray = identity.** The lowercase word is
    a deliberate second signal on top (every status chip is UPPERCASE) —
    double-coding keeps the two families apart at 10px.
 
@@ -2363,7 +2358,7 @@ body {
    (that's `.is-identity`'s job). It says something about the FIGURE itself
    — this potential is a labeled conservative guess, not a measurement.
 
-   Both existing axes are taken (outline+hue = status; fill+grey =
+   Both existing axes are taken (outline+hue = status; fill+gray =
    identity), so this spends the one that is genuinely unclaimed: BORDER
    STYLE. A dashed outline reads as "this line is provisional" without
    borrowing a color that already means something else, and keeps the

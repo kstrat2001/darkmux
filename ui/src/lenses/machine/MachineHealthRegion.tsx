@@ -248,16 +248,16 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
         />
         {/* The needle is deliberately UNCOLORED by state. It used to carry
             `is-${stateCls}`, which on a real machine means `is-unknown` — a dim
-            grey needle over a dim grey fill, permanently (provenance finding
+            gray needle over a dim gray fill, permanently (provenance finding
             1). Position is the needle's whole job; the fill beside it now
             carries the how-full channel and the lamps carry the verdict, so a
-            third, permanently-grey encoding of the same question is subtraction
+            third, permanently-gray encoding of the same question is subtraction
             rather than information. */}
         <line className="mm-gauge-needle" x1={CX} y1={CY} x2={42} y2={CY} transform={`rotate(${band.needleAngleDeg} ${CX} ${CY})`} />
         <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
         <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
           {/* Seven-segment, drawn as polygons in the SAME cell geometry the
-              boxed odometer used, so the figure still centres on the hub and
+              boxed odometer used, so the figure still centers on the hub and
               the unit still sits where it sat. `currentColor` keeps color
               with the CSS (`.mm-gauge-center-val`) rather than moving it into
               the component — the glyph form is what changed here, not the
@@ -451,7 +451,7 @@ function Odometer({ resources }: { resources: MachineResources }) {
             <span className="mm-odo-cells">
               {t.digits.map((d, i) =>
                 isSevenSegDot(d) ? (
-                  <span className="mm-odo-dot" key={i} />
+                  <span className="mm-odo-dot" key={i} aria-hidden="true" />
                 ) : (
                   <svg
                     className="mm-odo-seg"
@@ -518,6 +518,7 @@ function ModelRow({
   const m: MachineResourcesModel = row.model;
   const isGhost = row.status === "ghost";
   const isNew = row.status === "new";
+  const overHint = overPriceHint(m);
   const isUtility = isUtilityTierRow(m.identifier, m.model_key, utilityModelId);
   const stateCls = memStateCls(m.state);
   const pot = m.potential_bytes != null ? Number(m.potential_bytes) : null;
@@ -621,7 +622,7 @@ function ModelRow({
           altitude up carries only the consequence. Neither repeats the
           other's sentence. A ghost row is excluded like every other hint
           here: its figures are a last observation, not a live claim. */}
-      {!isGhost && overPriceHint(m) && <div className="mm-hint">↳ {overPriceHint(m)}</div>}
+      {!isGhost && overHint && <div className="mm-hint">↳ {overHint}</div>}
       {!isGhost && (m as { shrink_hint?: string }).shrink_hint && <div className="mm-hint">↳ {(m as { shrink_hint?: string }).shrink_hint}</div>}
     </div>
   );

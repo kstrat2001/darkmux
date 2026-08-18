@@ -493,7 +493,7 @@ export interface LampInputs {
  * There is deliberately NO `STATE` lamp. One rendered here until the operator
  * caught what it was doing (2026-08-15): it relabelled ITSELF with the state
  * (`STATE GREEN` / `STATE AMBER`) *and* changed its lit-ness, so on a healthy
- * machine it sat UNLIT rendering the word "GREEN" in grey — a few inches from
+ * machine it sat UNLIT rendering the word "GREEN" in gray — a few inches from
  * the same word rendered in actual green on the machine chip. A tell-tale
  * never renames itself; the oil light says "oil pressure" whether it is lit
  * or not, and its lit-ness is the entire message.

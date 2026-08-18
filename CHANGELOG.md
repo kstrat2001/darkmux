@@ -38,7 +38,7 @@ darkmux release.
   `MARGIN` label. A leftover from the #1821 rename, where the unit had read
   `% free` against that label and did not collide. Now a bare `%`, matching
   its two siblings where the unit is a unit and the label is the subject.
-- **An unreadable figure could render as nothing at all.** The centre readout
+- **An unreadable figure could render as nothing at all.** The center readout
   shows `—` when neither memory source can be read; the new seven-segment
   cells had no glyph for it, so absence drew a blank hub instead of being
   visible as absence.
@@ -54,21 +54,19 @@ darkmux release.
   (pressure, over-limit, unpriced), which are facts rather than an assessment
   of whether the machine is doing well. Extends #1839's rule from `doctor` to
   the page: darkmux describes its own state; the reading is yours.
-- **The gauge's colour ramp is painted across the arc's sweep** — green at 0,
+- **The gauge's color ramp is painted across the arc's sweep** — green at 0,
   amber at mid-scale, red at the limit — fixed to the dial and identical on
   every machine and every poll, with the filled band revealing its own slice.
-  A band's colour travel therefore also states its width. The stops are
+  A band's color travel therefore also states its width. The stops are
   cosine-spaced, because a horizontal gradient interpolates along X while an
-  arc advances by angle, so the mid-scale colour lands on the mid-scale tick.
-- **Seven-segment readouts** replace the boxed odometer digits on the centre
+  arc advances by angle, so the mid-scale color lands on the mid-scale tick.
+- **Seven-segment readouts** replace the boxed odometer digits on the center
   figure and the three pressure tiles. Boxed cells quote a mechanical counter;
   seven-segment quotes an instrument, which is what the rest of this page
   already is. Drawn as polygons rather than an embedded font, so the unlit
   segments render too — that ghosting is what anchors a narrow `1` in its
   cell. The pressure tiles carry a visually-hidden text copy of each figure,
   since the glyphs are decorative shapes.
-
-### Schema
 
 - `LEDGER_SCHEMA_VERSION` **2.0 → 2.1** (minor, additive): `ModelRow.
   over_price_bytes` and `MachineTotals.over_price_models`. A 2.0 reader
@@ -77,7 +75,6 @@ darkmux release.
   a release behind. `MachineTotals.potential_bytes` is now summed as
   `max(potential, current)` per resident: a value change inside an unchanged
   field, and the fix above.
-
 
 ## [2.9.0] - 2026-08-16
 
@@ -403,7 +400,7 @@ at all, and the machine page stopped being a wall of numbers.
 
 - The end-to-end viewer suite now grades the **shipped** viewer rather than the
   legacy one it was written against — 71 passing, with 8 kept as `test.fixme`
-  naming behaviours the port does not have yet rather than deleted (#1806).
+  naming behaviors the port does not have yet rather than deleted (#1806).
   The legacy `viewer.html` deliberately stays on disk as the reference
   implementation for exactly those, and is unreachable at runtime.
 - `FLOW_SCHEMA_VERSION` is unchanged at 1.19.0 — no cross-machine schema lock
