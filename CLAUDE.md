@@ -326,7 +326,7 @@ crates/
   darkmux-lab/                Lab harness (lab/, providers/, workloads/) + the review pipeline (lab/review.rs)
   darkmux-fleet/              Roster + cross-machine routing
   darkmux-flow/               Flow sinks (LocalFile/Audit/Redis/Tee) + Keychain-secret machinery
-  darkmux-serve/              HTTP daemon + the bundled viewer (assets/viewer.html)
+  darkmux-serve/              HTTP daemon + the bundled viewer (assets/next.html, built from ui/src)
   darkmux-doctor/             `darkmux doctor` checks
   darkmux-eureka/             Rules engine (RULES_SCHEMA_VERSION)
   darkmux-hardware/ darkmux-heuristics/  Apple-Silicon tier detection + heuristics providers

@@ -1,92 +1,88 @@
 # Viewer parity harness (Packet 0a)
 
-This is the **executable specification** the viewer → React port (see the
-plan) is graded against. It is not a test of the React port — there is no
-React code yet. It records what the *legacy* viewer
-(`crates/darkmux-serve/assets/viewer.html`) actually shows, from a real
-daemon, and freezes that into `goldens/*.txt`. When the port lands, its own
-parity spec compares against these files. A change to a goldenfile is a
-change to the spec — it happens in a reviewed diff, on purpose, never as a
-side effect of a code change elsewhere.
+`goldens/*.txt` is a **frozen specification**: what the *legacy* viewer
+(`crates/darkmux-serve/assets/viewer.html`) actually showed, from a real
+daemon, at the point it was captured. The React port
+(`ui/src/`, built to `crates/darkmux-serve/assets/next.html`) is graded
+against these files by the `next-parity*` suites in this directory. A
+change to a golden file is a change to the spec — it happens in a reviewed
+diff, on purpose, never as a side effect of a code change elsewhere.
 
-Self-contained: bun-managed, its own `playwright.config.js`, its own port
-(47919, distinct from `tests/e2e`'s 47823 so both suites can run
-concurrently). Does not touch `tests/e2e/`.
+**The legacy viewer is retired (#1806).** `viewer.html` is gone from the
+tree, along with the extraction harness that regenerated goldens from it
+(`extract.spec.ts`, its dedicated `playwright.config.js`, `redprove.spec.ts`,
+`verify-goldens.mjs`, `determinism.mjs`). The goldens survive as the frozen
+spec; recovering the legacy source they were captured from is:
 
-## The four pieces
+```bash
+git show v2.9.0:crates/darkmux-serve/assets/viewer.html
+```
+
+**Rebaselining a golden is now a hand-edit, not a script.** There is no more
+regeneration path — a `goldens/<lens>.txt` change is a direct edit, reviewed
+like any other diff, checked by hand against real port output (`curl` the
+daemon's endpoints, or load the port and eyeball the lens) rather than
+trusted because a script produced it.
+
+Self-contained: bun-managed, its own port for the `next-parity*` configs
+(47919+, distinct from `tests/e2e`'s 47823 so suites can run concurrently).
+Does not touch `tests/e2e/`.
+
+## What's still here
 
 1. **`bun run record`** — hits the operator's LIVE daemon
    (`http://127.0.0.1:8765` by default; override with `DARKMUX_DAEMON_URL`)
    for every endpoint the viewer's lenses fetch, sanitizes every response
    (see below), and writes `corpus/*.json` + `corpus/meta.json`. Refuses to
    write anything if the daemon is unreachable or a response isn't valid
-   JSON — no fabricated fixtures.
-2. **`bun run extract`** (alias: `bun run rebaseline`) — Playwright serves
-   the real `viewer.html` with `darkmux-mode=live` injected (the only way to
-   reach its real daemon-fetch code path), intercepts every request with the
-   sanitized corpus via `page.route()`, **pauses the clock** at the corpus's
-   capture time (`page.clock.install()` + `pauseAt()` — `install()` alone
-   sets an origin but leaves timers running in real wall-clock time from
-   there, which is NOT frozen; see `lib/extract-lens.js`'s
-   `installFrozenClock`), waits for each lens's own post-fetch content
-   marker (never a bare network-idle sample — see MUST-FIX 2's fix in the
-   module doc of `lib/extract-lens.js`), walks every lens, and
-   **unconditionally overwrites** `goldens/<lens>.txt`. This is the
-   deliberate regeneration path — run it when the legacy viewer's recorded
-   behavior has genuinely changed (a fresh `bun run record`) and you mean to
-   update the spec.
-3. **`bun run verify`** — the NON-mutating check `bun run check` actually
-   calls. Snapshots the current `goldens/`, runs the same extraction as
-   above, diffs the result against the snapshot, and — critically — restores
-   the snapshot if anything differs, so a failed verify never leaves
-   `goldens/` silently migrated. `check` calling `extract` directly would
-   defeat the point of goldens entirely: extraction always overwrites
-   `goldens/`, so a corrupted or accidentally-changed golden would be
-   silently repaired (and reported green) before anything downstream ever
-   saw it — this is exactly what happened before this split existed.
-4. **`bun run redprove`** — runs the *identical* extraction (same
-   `lib/extract-lens.js`, not a re-implementation) against a blank page where
-   every endpoint 404s, and asserts every result DIFFERS from the real
-   golden. If this ever passes vacuously, the goldens are worthless as a
-   spec — this is what makes the harness trustworthy instead of decorative.
-5. **`bun run determinism`** — runs `extract` twice back-to-back and asserts
-   the goldens are byte-identical. Catches unfrozen time, unstable sorts, or
-   a live-poll tick sneaking into the render. Verified stable under both the
-   ambient shell's ambient timezone AND an explicit `TZ=UTC` override —
-   `playwright.config.js` pins `timezoneId: 'UTC'` / `locale: 'en-US'` at the
-   BROWSER CONTEXT level, which wins regardless of what timezone the
-   wrapping shell process happens to be in (verified: without the pin, 4 of
-   6 goldens differ between a run under `TZ=UTC` and one under
-   `TZ=Asia/Kuala_Lumpur`; with it, they're byte-identical).
-6. **`bun run tripwire`** — independent, standalone scan of everything under
-   `corpus/` and `goldens/` for the canary substrings in
-   `lib/sanitize.mjs`'s `CANARIES` list (broader than what the sanitizer
-   actively redacts — see the field-policy section below). `record.mjs`
-   already refuses to write a fixture with a hit; this is the second,
-   separate check over what's actually on disk (a hand-edited fixture, a
-   stale file, a golden that quoted raw corpus text — all get caught here
-   too).
+   JSON — no fabricated fixtures. Still useful for capturing a fresh corpus
+   to eyeball against the frozen goldens by hand; it no longer feeds an
+   automated golden regeneration.
+2. **`bun run tripwire`** (== `bun run check`) — independent, standalone
+   scan of everything under `corpus/` and `goldens/` for the canary
+   substrings in `lib/sanitize.mjs`'s `CANARIES` list (broader than what
+   the sanitizer actively redacts — see the field-policy section below).
+   `record.mjs` already refuses to write a fixture with a hit; this is the
+   second, separate check over what's actually on disk (a hand-edited
+   fixture, a stale file, a golden that quoted raw corpus text — all get
+   caught here too). It already asserts `corpus/`/`goldens/` are non-empty,
+   so it doubles as the existence check a plain rename would otherwise need.
+   This is the pre-commit gate for this directory.
+3. **`next-parity*` suites** (`next-parity`, `next-parity-runs`,
+   `next-parity-catalog`, `next-parity-console`, `next-parity-live`,
+   `next-parity-chrome`) — unchanged by this retirement. Each grades the
+   React port's rendered text against the same frozen `goldens/*.txt` this
+   README describes, using the extraction/normalization logic in
+   `lib/extract-lens.js` (imported verbatim, the same module the retired
+   legacy extractor used — see that file's own doc comment). These are the
+   directory's actual acceptance gate; run them via their own
+   `bun run next-parity*` scripts. **CI runs five of the six**
+   (`ci.yml`'s `Next-parity suites` step loops `next-parity`,
+   `next-parity-chrome`, `next-parity-runs`, `next-parity-catalog`,
+   `next-parity-console`) — `next-parity-live` is not in that loop and is
+   not part of the CI gate today; run it locally when touching the live/SSE
+   lens. The five that ARE gated bind fixed ports and share `goldens/`, so
+   concurrent runs flake for reasons unrelated to the code under test —
+   that's why CI runs them serially.
 
-`bun run check` runs verify → redprove → determinism → tripwire in one shot
-— note it calls `verify`, NOT `extract`; that's the fix described in (3)
-above. That's the pre-commit gate for this directory.
-
-## Re-recording
+## Re-recording the corpus
 
 ```bash
 cd tests/parity
 bun run record      # needs the live daemon at 127.0.0.1:8765 (or DARKMUX_DAEMON_URL)
 bun run check
-git diff corpus/ goldens/   # review before committing — see "goldens change on purpose" above
+git diff corpus/   # review before committing
 ```
 
 Re-recording reflects the operator's live daemon state at record time (which
 missions exist, fleet composition, etc.) — a corpus diff after re-recording
-is expected to be large and is not itself a bug. What must NOT differ for
-the *same* underlying data is a double-`extract` run (that's what
-`determinism` checks) or the sanitizer's mapping for a repeated identifier
-(same input → same synthetic output, always — see `lib/sanitize.mjs`'s
-module doc).
+is expected to be large and is not itself a bug. The corpus is a
+debugging/reference aid; it no longer drives an automated `goldens/`
+regeneration. If a golden genuinely needs to change, edit
+`goldens/<lens>.txt` directly (see "Rebaselining" above). What must not
+differ for the same underlying input is the sanitizer's mapping for a
+repeated identifier (same input → same synthetic output, always — see
+`lib/sanitize.mjs`'s module doc).
 
 ## Sanitization (mandatory, not a flag) — FIELD POLICY, not word-scanning
 
@@ -302,12 +298,11 @@ scope:
 - **Deep-link boot paths other than `#session=<id>`, `#lens=runs`,
   `#lens=machine`, `#mission=<id>`, and a bare `#<date>`** (`#lens=runs` and
   `#lens=machine` closed by Packets 3 and 2 — `runs-lens-boot.txt` /
-  `machine-deeplink.txt`) — `#lens=console&panel=<id>` AS A FRESH BOOT is
-  still not exercised on the LEGACY side specifically
-  (`extract.spec.ts`/`redprove.spec.ts` only reach every console panel via a
-  CLICK sequence starting from the fleet default, same shape every OTHER
-  lens's click-through used before its own deep-link-boot golden landed —
-  see the file's own comments). Precedent (`runs-lens-boot.txt` vs `runs.txt`,
+  `machine-deeplink.txt`) — `#lens=console&panel=<id>` AS A FRESH BOOT was
+  never exercised on the LEGACY side specifically (the now-retired legacy
+  extractor only reached every console panel via a CLICK sequence starting
+  from the fleet default, same shape every OTHER lens's click-through used
+  before its own deep-link-boot golden landed). Precedent (`runs-lens-boot.txt` vs `runs.txt`,
   Packet 3; `machine-deeplink.txt` vs `machine.txt`, Packet 2) is that
   `#stage` content is identical whichever way a lens is reached, so this is
   believed-safe rather than a real content gap — a future packet wanting to

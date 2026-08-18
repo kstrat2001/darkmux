@@ -19,6 +19,11 @@
 // for what was checked and how. This file has been bitten once already by a
 // security walk quietly narrowed until it passed; see the #1622 and #1631
 // notes further down for that history.
+//
+// Every `viewer.html:NNNN` citation in this file (retired #1806) points at
+// the legacy file's last revision, recoverable with
+// `git show v2.9.0:crates/darkmux-serve/assets/viewer.html` — not a file
+// present anywhere in the current tree.
 const { test, expect } = require('@playwright/test');
 const fs = require('fs');
 const path = require('path');

@@ -3,14 +3,15 @@
 // lens ported onto the React + TanStack Query scaffold). Loads the
 // COMMITTED BUILT `/next` artifact (`crates/darkmux-serve/assets/next.html`,
 // served via `next-parity.playwright.config.js`'s dedicated webServer) the
-// same way `extract.spec.ts` loads the legacy `viewer.html`: the SAME
-// sanitized corpus fixtures via `page.route()` interception
-// (`installCorpusRoutes`, `lib/mock-routes.js` — shared verbatim with the
-// legacy extraction, not a lookalike reimplementation), the SAME frozen
-// clock, the SAME extraction logic (`lib/extract-lens.js`'s
-// `extractLensText`, also shared verbatim). Then it asserts the result
-// against `goldens/machine.txt` / `goldens/machine-deeplink.txt` — the
-// executable spec `extract.spec.ts` recorded from the legacy viewer.
+// same way the legacy extractor (`extract.spec.ts`, retired #1806) once
+// loaded the legacy `viewer.html`: the SAME sanitized corpus fixtures via
+// `page.route()` interception (`installCorpusRoutes`, `lib/mock-routes.js`
+// — shared verbatim with the retired legacy extractor, not a lookalike
+// reimplementation), the SAME frozen clock, the SAME extraction logic
+// (`lib/extract-lens.js`'s `extractLensText`, also shared verbatim). Then
+// it asserts the result against `goldens/machine.txt` /
+// `goldens/machine-deeplink.txt` — the frozen spec the (now-retired)
+// legacy extractor originally recorded from the legacy viewer.
 //
 // This is deliberately the FIRST file of its kind — later lens packets
 // (missions/runs, catalog/replay, console panels, lab) ADD their own

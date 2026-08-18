@@ -8,6 +8,11 @@
 // run-DETAIL endpoints (`/lab/run/detail` + `/lab/run/events`) have no meta
 // override, so specs that drill into a run route-mock them (the catalog.spec
 // pattern).
+//
+// Every `viewer.html:NNNN` citation in this file (retired #1806) points at
+// the legacy file's last revision, recoverable with
+// `git show v2.9.0:crates/darkmux-serve/assets/viewer.html` — not a file
+// present anywhere in the current tree.
 const { test, expect } = require('@playwright/test');
 
 // Minimal-but-real-shaped mocks for one run's detail + events.
@@ -386,5 +391,13 @@ test('an empty lab slice explains WHERE it scanned, and only when empty', async 
 //
 // Removing it rather than shipping a seventh test that passes for a reason it
 // does not name. The fix itself (a named `LAB_FEED_CAP` and a "newest N of M"
-// header) is in viewer.html and reviewable there; the harness work needed to
-// exercise the drill-down is tracked with the other fixture gaps.
+// header) IS ported — `ui/src/lenses/runs/labRun.ts`'s `LAB_FEED_CAP` +
+// `labFeedCountText`, unit-tested directly in `labRun.test.ts` — this file's
+// gap is narrower than "untested": it's specifically that no E2E harness here
+// can drive the real drill-down interaction to REACH that header live. The
+// legacy `viewer.html` this comment originally pointed at is retired
+// (#1806); its own copy of the same fix is recoverable with
+// `git show v2.9.0:crates/darkmux-serve/assets/viewer.html` if the history is
+// wanted, but the current, reviewable source is the port file named above.
+// The harness work needed to exercise the drill-down is tracked with the
+// other fixture gaps.

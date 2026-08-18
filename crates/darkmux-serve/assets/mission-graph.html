@@ -19,13 +19,23 @@
 <meta name="apple-mobile-web-app-title" content="darkmux">
 <meta name="theme-color" content="#0a0a0b">
 <!--
-  Mission graph lens (#1284 Packet 5) — a DEDICATED page, separate from
-  viewer.html on purpose (that file's own header explains why it stays one
-  file for the flow-record timeline; this page renders a different shape of
-  data — a Phase/Task/Step node-link graph — via a vendored React Flow
-  bundle, and mixing the two rendering models into one file would make
-  viewer.html's own `stageSig()` re-render-gap discipline harder to reason
-  about, not easier).
+  Mission graph lens (#1284 Packet 5) — a DEDICATED page, separate from the
+  main viewer on purpose (this page renders a different shape of data — a
+  Phase/Task/Step node-link graph — via a vendored React Flow bundle, and
+  mixing the two rendering models into one file would make the timeline
+  view's own re-render-gap discipline harder to reason about, not easier).
+  Unlike the main viewer (the React port under `ui/src/`, built to
+  `assets/next.html`), this page is DELIBERATELY still hand-written vanilla
+  JS with no build step (see below) — it was never in scope for the port.
+
+  Every `viewer.html` reference below this point (retired #1806; the main
+  viewer before the React port) is a historical design-consistency citation
+  — this file mirrored several of the legacy viewer's implementation
+  choices (SSE liveness shape, evidence-based status claims, 44px touch
+  targets, reconcile-on-a-timer discipline) and the comments still name
+  where that consistency came from. The cited file's last revision is
+  recoverable with `git show v2.9.0:crates/darkmux-serve/assets/viewer.html`
+  — it is not present anywhere in the current tree.
 
   Served at `GET /mission/<id>/graph` by `darkmux-serve`. Data comes from
   two same-origin sources, both same-origin (no CDN, no cross-origin
@@ -34,9 +44,9 @@
     - `GET /mission/<id>/graph.json` — the initial node/edge snapshot
       (`crates/darkmux-serve/src/mission_graph.rs` builds it from the
       persisted Phase/Task/Step JSON under `~/.darkmux/missions/<id>/`).
-    - `GET /flow/<date>/stream` (SSE, the SAME stream viewer.html tails) —
-      live status deltas, filtered client-side to records whose `handle`
-      matches a node id already present in the snapshot.
+    - `GET /flow/<date>/stream` (SSE, the SAME stream the main viewer
+      tails) — live status deltas, filtered client-side to records whose
+      `handle` matches a node id already present in the snapshot.
 
   No JSX, no build step for THIS file — only the third-party vendor bundle
   (`assets/vendor/reactflow-bundle.min.js`) goes through a bundler. This

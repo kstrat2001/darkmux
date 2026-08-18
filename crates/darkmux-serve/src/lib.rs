@@ -120,50 +120,27 @@ fn is_valid_date(date: &str) -> Option<&str> {
     }
 }
 
-// Embedded HTML for the observability viewer. Shared between the live
-// route (`GET /`) and the playback route (`GET /play/:date`); each handler
-// injects a `<meta name="darkmux-mode">` tag the viewer's boot() reads to
-// decide whether to start the SSE tail (live) or skip it (playback).
-//
-// Lives at `crates/darkmux-serve/assets/viewer.html` (not under `docs/`)
-// specifically so GitHub Pages doesn't also serve it at `darkmux.com/viewer/`.
-// `darkmux.com` is reserved for the demo (`/demo`) + marketing surface; the
-// live and playback viewers only exist where there's a daemon to talk to
-// (operator's localhost or tailnet). See #624.
-//
-// **(the flip, #1800) NOTHING SERVES THIS ANYMORE.** `/` and `/play/:date`
-// both serve `NEXT_HTML` below; the constant that used to hold this file is
-// gone, because the compiler correctly called it dead the moment the last
-// handler stopped reading it.
-//
-// The FILE stays, for two live consumers that read it directly rather than
-// through a constant:
-//
-//  - `scripts/build-demo.sh` generates `docs/demo/index.html` from it, and
-//    CI's docs-drift guard checks the result. Deleting the file before the
-//    demo derives from the port instead (#1801) would break darkmux.com/demo.
-//  - `lib_tests.rs`'s XSS/escaping gates `include_str!` it themselves, so
-//    they keep guarding it for as long as the demo ships it.
-//
-// Delete the file, those tests, and this comment together once #1801 lands.
-
 /// (UI port Packet 1, #1717) The committed React + TanStack Query build
 /// artifact — a SINGLE self-contained HTML file (inlined JS/CSS, no separate
 /// chunks; see `ui/vite.config.ts`'s `vite-plugin-singlefile` config) built
 /// from `ui/` by `bun run build` and committed here so the release binary
-/// stays self-contained and node-free, same posture as `VIEWER_HTML` above.
+/// stays self-contained and node-free.
 /// **Serves `GET /` and `GET /play/:date`** as of the flip (#1800) — this IS
-/// the viewer now. `/next` remains as a permanent redirect to `/` so the
+/// the viewer. `/next` remains as a permanent redirect to `/` so the
 /// bookmarks minted during the port keep working (see `next_html`). The gate
 /// for the flip was a number, not a judgement: 21 of 22 recorded legacy
 /// goldens asserting real byte parity, with the 22nd (`mission-replay`)
-/// blocked on a missing corpus fixture rather than on the port. Regenerate:
+/// blocked on a missing corpus fixture rather than on the port. The legacy
+/// viewer this replaced (`assets/viewer.html`) is retired (#1806) — its
+/// frozen render output lives on as `tests/parity/goldens/*.txt`, and its
+/// source is recoverable with
+/// `git show v2.9.0:crates/darkmux-serve/assets/viewer.html`. Regenerate:
 /// `cd ui && bun run build` (writes `assets/next.html` directly; see that
 /// package's `copy-artifact` script).
 const NEXT_HTML: &str = include_str!("../assets/next.html");
 
 /// Mission graph lens page (#1284 Packet 5) — a SEPARATE file from
-/// `VIEWER_HTML` by design; see `assets/mission-graph.html`'s own header
+/// `NEXT_HTML` by design; see `assets/mission-graph.html`'s own header
 /// comment for why the two rendering models (flow-record timeline vs.
 /// Phase/Task/Step node-link graph) don't share one file. Served at
 /// `GET /mission/:id/graph`.
@@ -238,7 +215,7 @@ fn inject_mode_meta(html: &str, mode: &str, date: Option<&str>) -> String {
 /// playback route `GET /play/:date` instead.
 ///
 /// darkmux.com/demo is THIS viewer in playback mode, generated from
-/// `assets/viewer.html` by `scripts/build-demo.sh` and fed a committed flow
+/// `assets/next.html` by `scripts/build-demo.sh` and fed a committed flow
 /// file (`docs/demo/demo-flow.jsonl`) — identical to a local `/play`, not a
 /// separate fork.
 async fn root_html(headers: axum::http::HeaderMap) -> impl IntoResponse {
@@ -3239,7 +3216,7 @@ async fn aggregate_flow_records_for_date(
 /// present only locally — including the `machine.online` record emitted DURING
 /// the outage. The store was intact; only the read path lost it.
 ///
-/// Keyed to match the viewer's own `recKey` convention (`assets/viewer.html`)
+/// Keyed to match the viewer's own `recKey` convention (`ui/src/lib/flow.ts`)
 /// so both layers agree on what "the same record" means; the payload is part
 /// of the identity because two records can otherwise share every scalar field.
 /// Redis order is preserved and local-only records append — callers sort by

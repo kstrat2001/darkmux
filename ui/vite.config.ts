@@ -8,7 +8,7 @@ import { viteSingleFile } from "vite-plugin-singlefile";
 // `crates/darkmux-serve/assets/next.html`. That file is `include_str!`'d by
 // the daemon at `GET /next` (see `crates/darkmux-serve/src/lib.rs`) so the
 // release binary stays self-contained and node-free — the same posture the
-// legacy `viewer.html` already has.
+// legacy `viewer.html` had before its retirement (#1806).
 //
 // `base: "./"` matters even for a singlefile build: with the default `/`
 // base, Vite would still emit an absolute-rooted asset reference in the HTML

@@ -18,14 +18,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// the only one nothing constrains. Two producer lineages consequently spell
 /// the bookends differently: `darkmux-crew` and the CLI emit the SPACED form,
 /// `darkmux-lab` and the runtime emit the DOTTED one. Consumers cope through
-/// five independent defenses (a normalizer in the React viewer's `flow.ts`,
-/// another in `viewer.html`, and `||` hedges in `serve/lib.rs` x2,
-/// `serve/runs.rs`, and `mission-graph.html`).
+/// THREE independent defenses: a normalizer in the React viewer's `flow.ts`
+/// (the sole surviving normalizer since the legacy viewer's own, in
+/// `viewer.html`, retired along with that file, #1806); the
+/// [`is_dispatch_start`]/[`is_dispatch_complete`]/[`is_dispatch_error`]
+/// helpers right here, which are now the ONE Rust-side hedge — both
+/// `serve/lib.rs` call sites and `serve/runs.rs` route through these
+/// functions rather than each carrying its own `||` comparison, so a fix
+/// here fixes every Rust consumer at once; and `mission-graph.html`'s own
+/// inline `||` hedges (`action === "dispatch complete" || action ===
+/// "dispatch.complete"`, etc.), which stay genuinely independent because
+/// that file is plain JS with no Rust binding to share this module's
+/// helpers through.
 ///
 /// That is not currently a live bug — every consumer that needs to cope, does.
-/// It is fragile in the obvious way: it works until a sixth consumer forgets,
-/// and `savings.ts` is already correct only *because* its data passed through
-/// `buildFlowWindow` first, a coupling nothing states or tests.
+/// It is fragile in the obvious way: it works until the next consumer
+/// forgets, and `savings.ts` is already correct only *because* its data
+/// passed through `buildFlowWindow` first, a coupling nothing states or
+/// tests.
 ///
 /// These constants carry the SPACED value deliberately: it is what is on disk,
 /// in Redis, and in every historical record. Changing the emitted string would

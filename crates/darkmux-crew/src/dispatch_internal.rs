@@ -2256,11 +2256,13 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // that must land in `dispatch_start_payload`'s `endpoint` field below, the
     // SAME field the light single-shot `dispatch_remote` path already sets
     // (see its `label` var). Missing this was a real gap: the viewer's route
-    // display (`sp.endpoint` in viewer.html) falls back to rendering
-    // "LMStudio · local · this machine" whenever `endpoint` is absent — so an
-    // agentic-remote dispatch that correctly ran on Azure would still show up
-    // in the viewer as a local dispatch, an operator-sovereignty violation
-    // (the operator has no way to tell where the model actually ran).
+    // display (`sp.endpoint` in `ui/src/lenses/session/sessionRun.ts`; the
+    // legacy `viewer.html`'s copy of this logic retired along with that
+    // file, #1806) falls back to rendering "LMStudio · local · this
+    // machine" whenever `endpoint` is absent — so an agentic-remote
+    // dispatch that correctly ran on Azure would still show up in the
+    // viewer as a local dispatch, an operator-sovereignty violation (the
+    // operator has no way to tell where the model actually ran).
     let remote_endpoint_raw_label = agentic_pm
         .as_ref()
         .and_then(|pm| pm.endpoint.as_ref().map(|ep| remote_endpoint_label(ep, &pm.id)));

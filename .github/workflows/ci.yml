@@ -614,12 +614,14 @@ jobs:
         working-directory: tests/parity
         run: bunx playwright install --with-deps chromium
 
-      # The LEGACY goldens: verify (extraction reproduces them byte-for-
-      # byte), redprove (a blank page must FAIL every golden — the guard
-      # against a comparison that cannot fail), determinism (two runs
-      # byte-identical), tripwire (no sanitizer sentinel ever reaches a
-      # committed fixture).
-      - name: Legacy parity goldens
+      # Goldens tripwire: no sanitizer sentinel ever reaches a committed
+      # corpus/goldens fixture (also asserts corpus/ + goldens/ are non-
+      # empty). The legacy extraction/verify/redprove/determinism machinery
+      # this step used to run against `viewer.html` retired in #1806 —
+      # goldens/*.txt is now a FROZEN spec (recover the legacy source with
+      # `git show v2.9.0:crates/darkmux-serve/assets/viewer.html`); a golden
+      # change is a reviewed hand-edit, not a regeneration this job checks.
+      - name: Parity goldens tripwire
         if: steps.filter.outputs.ui == 'true'
         working-directory: tests/parity
         run: bun run check

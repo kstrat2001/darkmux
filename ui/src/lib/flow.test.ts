@@ -6,7 +6,10 @@ import {
   machineNames,
   localMachineUid,
   nameOf,
+  buildFlowWindow,
 } from "./flow";
+import { tokensOffMeter } from "../lenses/fleet/savings";
+import type { FlowRecord } from "../types/handwritten";
 
 /**
  * (#1801) The static-demo record pipeline: `parseFlowJsonl` (the flowSrc
@@ -97,6 +100,72 @@ describe("fetchStaticFlowRecords", () => {
       }),
     );
     expect(await fetchStaticFlowRecords("./demo-flow.jsonl")).toEqual([]);
+  });
+});
+
+/**
+ * (#794 regression coverage, restored post-#1806) The live SSE tail must be
+ * idempotent — a re-delivered record (reconnect / snapshot-stream overlap;
+ * `/flow/:date/stream` is at-least-once, and `startFlowTail`,
+ * `lib/sse.ts:74`, appends every message it receives with NO dedup of its
+ * own) must not be double-counted. On the port that guarantee lives
+ * entirely in `buildFlowWindow`'s `seen`-Set filter — `useFlowWindow`
+ * concatenates the raw day-fetch with whatever `useLiveTail` has appended
+ * to the SSE-tail cache slot and feeds the result through
+ * `buildFlowWindow` before anything (including the savings hero) reads it.
+ * These tests exercise that filter directly, and the consumer (
+ * `tokensOffMeter`) that would silently double-count without it — legacy's
+ * equivalent coverage (`live_tail_dedups_records`, source-text assertions
+ * against `SEEN_KEYS`/`recKey` in `viewer.html`) retired with that file
+ * (#1806); this is its behavioral replacement against the port's own dedup
+ * boundary.
+ */
+describe("buildFlowWindow dedup (#794)", () => {
+  const ts = "2026-08-08T00:00:00.000Z";
+  const nowMs = Date.parse(ts);
+
+  const tokenRecord: FlowRecord = {
+    ts,
+    session_id: "s-live",
+    action: "dispatch.complete",
+    category: "telemetry",
+    source: "tokens",
+    payload: { total_tokens: 300, prompt_tokens: 250, completion_tokens: 50 },
+  };
+
+  it("a record fed twice (identical recKey) collapses to one", () => {
+    const result = buildFlowWindow([], [tokenRecord, { ...tokenRecord }], nowMs);
+    expect(result).toHaveLength(1);
+  });
+
+  it("distinct records (different session_id) both survive — this is dedup, not dedup-by-content", () => {
+    const other: FlowRecord = { ...tokenRecord, session_id: "s-other" };
+    const result = buildFlowWindow([], [tokenRecord, other], nowMs);
+    expect(result).toHaveLength(2);
+  });
+
+  it("tokensOffMeter over a re-delivered-record window does not double-count (#794)", () => {
+    const start: FlowRecord = { ts, session_id: "s-live", action: "dispatch.start", handle: "coder" };
+    // Simulates the SSE at-least-once redelivery `startFlowTail` does nothing
+    // to prevent: the identical telemetry record appears twice in what
+    // `useFlowWindow` hands to `buildFlowWindow`.
+    const window = buildFlowWindow([], [start, tokenRecord, { ...tokenRecord }], nowMs);
+    const meter = tokensOffMeter(window);
+    expect(meter.total).toBe(300);
+    expect(meter.local).toBe(300);
+  });
+
+  it("RED-PROVE: without the dedup filter, the same window WOULD double-count (documents what buildFlowWindow prevents)", () => {
+    const start: FlowRecord = { ts, session_id: "s-live", action: "dispatch.start", handle: "coder" };
+    // The undeduped shape `startFlowTail`'s append actually produces —
+    // straight concatenation, no `seen`-Set. If `buildFlowWindow` ever loses
+    // its dedup filter, this is the number the savings hero would show.
+    const undeduped = [start, tokenRecord, { ...tokenRecord }];
+    const meter = tokensOffMeter(undeduped);
+    expect(meter.total).toBe(600);
+    // The real path never sees this — buildFlowWindow always runs first.
+    const deduped = buildFlowWindow([], [start, tokenRecord, { ...tokenRecord }], nowMs);
+    expect(tokensOffMeter(deduped).total).toBe(300);
   });
 });
 

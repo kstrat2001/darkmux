@@ -1,9 +1,12 @@
-// The extraction logic itself — shared verbatim by extract.spec.ts (writes
-// the result to goldens/) and redprove.spec.ts (compares the result against
-// the existing golden and asserts they DIFFER). Sharing this module is the
-// point: red-prove has to run the SAME extraction, not a hand-written
-// lookalike that could quietly diverge from what actually produces the
-// goldens and stop meaning anything.
+// The extraction logic itself. Originally shared verbatim by the legacy
+// extractor's extract.spec.ts (wrote goldens/) and redprove.spec.ts
+// (asserted a blank-page run DIFFERED from every golden) — both retired in
+// #1806 along with viewer.html itself. This module lives on: every
+// `next-parity*.spec.ts` suite (and `lib/extract-next-lens.js`, its
+// next.html-flavored wrapper) imports it verbatim so the port is graded
+// with the SAME extraction/normalization logic the frozen `goldens/*.txt`
+// were originally captured with — not a hand-written lookalike that could
+// quietly diverge and stop meaning anything.
 
 function normalize(raw) {
   return (

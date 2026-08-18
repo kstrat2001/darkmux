@@ -38,7 +38,7 @@ t-flow = "nextest run -p darkmux-flow -p darkmux-types"
 t-review = "nextest run -p darkmux-lab -p darkmux-crew"
 
 # The HTTP daemon and the bundled viewer.
-# (Viewer CHANGES are verified by reloading the page — viewer.html is an
+# (Viewer CHANGES are verified by reloading the page — next.html is an
 # include_str!'d asset the Rust tests never render. See CONTRIBUTING.md.)
 t-serve = "nextest run -p darkmux-serve"
 

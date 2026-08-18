@@ -2,7 +2,7 @@
   "name": "darkmux-viewer-e2e",
   "version": "0.0.0",
   "private": true,
-  "description": "Headless browser e2e gate for the observability viewer (crates/darkmux-serve/assets/viewer.html). Dev-only; not part of the shipped binary. The WHOLE suite runs in ~11s, so it is the fast loop for anything rendered \u2014 prefer it over the ~10min cargo workspace suite when the change is UI (#1622).",
+  "description": "Headless browser e2e gate for the observability viewer (the React port under ui/src/, built to crates/darkmux-serve/assets/next.html). Dev-only; not part of the shipped binary. The WHOLE suite runs in ~11s, so it is the fast loop for anything rendered \u2014 prefer it over the ~10min cargo workspace suite when the change is UI (#1622).",
   "scripts": {
     "test": "playwright test",
     "ui": "playwright test",

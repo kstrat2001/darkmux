@@ -5,8 +5,11 @@
 # Purpose: keep `docs/demo/index.html` in lockstep with the canonical viewer,
 # WITHOUT relying on anyone remembering to run the generator.
 #
-# darkmux.com/demo IS `crates/darkmux-serve/assets/viewer.html` in playback
-# mode, produced by `scripts/build-demo.sh`. CI enforces this (the "docs drift
+# darkmux.com/demo IS whatever `GET /` currently serves — `assets/next.html`
+# today, derived structurally rather than hardcoded (see `build-demo.sh`'s own
+# doc, #1801 — `assets/viewer.html` was the source before the React port's
+# route flip, #1800; that file is now retired, #1806) — in playback mode,
+# produced by `scripts/build-demo.sh`. CI enforces this (the "docs drift
 # guard" job regenerates and diffs), so a viewer edit committed without the
 # regeneration fails the build AND — until someone notices — ships a stale
 # public demo page.

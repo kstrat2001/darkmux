@@ -106,8 +106,9 @@ const SERVED_VIEWER = path.join('crates', 'darkmux-serve', 'assets', 'next.html'
   );
 
   // (#1471) Mission-graph harness. The mission-graph lens is a SEPARATE asset
-  // from viewer.html with its own vendored React Flow bundle (assets/vendor/),
-  // served same-origin. The events-panel backfill spec
+  // from the main viewer (next.html, formerly viewer.html — retired #1806)
+  // with its own vendored React Flow bundle (assets/vendor/), served
+  // same-origin. The events-panel backfill spec
   // (mission-graph-events.spec.js) route-mocks the DATA endpoints (graph.json,
   // /flow/<date>, the SSE stream) but the page shell + its vendor bundle load
   // from here: the spec fulfills the `/mission/<id>/graph` route with these
