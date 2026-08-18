@@ -11,10 +11,14 @@ from the legacy viewer asserting real byte parity in a real browser
 (`tests/parity/`), with the 22nd (`mission-replay`) blocked on a missing
 corpus fixture rather than on the port.
 
-The legacy `viewer.html` still exists but nothing serves it — it survives only
-as `scripts/build-demo.sh`'s input until the demo derives from this build
-instead (#1801), at which point the file, its XSS golden tests, and the
-`e2e` gate that points at it all retire together.
+**The legacy `viewer.html` is retired (#1806)** — deleted from the tree along
+with its XSS golden tests and the legacy half of `tests/parity/`. Its frozen
+render output survives as `tests/parity/goldens/*.txt` (the spec this port is
+graded against); its source is recoverable with
+`git show v2.9.0:crates/darkmux-serve/assets/viewer.html`. Every
+`viewer.html:NNNN` line-citation comment under `src/` below (and the
+provenance references in this file) point at that same recoverable revision —
+not a file present anywhere in the current tree.
 
 ## The stack, and why
 

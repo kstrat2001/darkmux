@@ -1,8 +1,13 @@
-// Route-interception tables shared by extract.spec.ts (serve the recorded,
-// sanitized corpus) and redprove.spec.ts (serve nothing — the harness must
-// fail every golden comparison against this). One handler function per mode,
-// both driven by the SAME endpoint inventory so a new endpoint added to one
-// can't silently be forgotten in the other.
+// Route-interception tables. Originally shared by the legacy extractor's
+// extract.spec.ts (serve the recorded, sanitized corpus) and
+// redprove.spec.ts (serve nothing — the harness must fail every golden
+// comparison against this) — both retired in #1806. Now shared by the
+// `next-parity*.spec.ts` suites the same way: `installCorpusRoutes` serves
+// the recorded corpus against the React port, `installBlankRoutes` proves
+// the port's own red-prove assertions (a blank/unreachable daemon must not
+// match a real golden). One handler function per mode, both driven by the
+// SAME endpoint inventory so a new endpoint added to one can't silently be
+// forgotten in the other.
 
 const { readFileSync } = require("fs");
 const path = require("path");

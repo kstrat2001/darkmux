@@ -3264,8 +3264,9 @@ mod tests {
 
     #[test]
     fn launch_session_id_carries_the_viewer_mission_run_prefix() {
-        // (#1284 review round 1, must-fix 4) viewer.html's mission lens keys
-        // per-run session grouping on the `mission-run-` prefix.
+        // (#1284 review round 1, must-fix 4) the viewer's mission lens keys
+        // per-run session grouping on the `mission-run-` prefix (originally
+        // the legacy `viewer.html`'s convention; that file retired #1806).
         let sid = launch_session_id("m1", "m1-build");
         assert_eq!(sid, "mission-run-m1-m1-build");
         assert!(sid.starts_with("mission-run-"));

@@ -26,10 +26,11 @@ git config core.hooksPath .githooks
 ```
 
 This wires up `.githooks/pre-commit`, which regenerates `docs/demo/index.html`
-whenever you commit a change to `crates/darkmux-serve/assets/viewer.html`.
-darkmux.com/demo **is** that viewer in playback mode (see
-`scripts/build-demo.sh`), and CI fails on drift; the hook keeps you from
-having to remember. `git commit --no-verify` bypasses it.
+whenever you commit a change to `crates/darkmux-serve/assets/next.html` (the
+committed React-port build artifact — see `ui/README.md`). darkmux.com/demo
+**is** that viewer in playback mode (see `scripts/build-demo.sh`), and CI
+fails on drift; the hook keeps you from having to remember.
+`git commit --no-verify` bypasses it.
 
 ## Development loop
 
@@ -71,9 +72,12 @@ Kick the lane off first, then keep working. A lane is a full target directory
 (~13 GB warm) — keep two or three, not one per area; `rm -rf target/lanes/<name>`
 any time.
 
-**Working on the viewer?** Verify it by reloading the page, not by running the
-suite: `viewer.html` is an `include_str!`'d asset, so the Rust tests never
-render it. `cargo build -p darkmux-serve` + restart the daemon is the loop;
+**Working on the viewer?** The viewer is the React port under `ui/src/` — see
+`ui/README.md` for its own dev loop (`bun run dev`, `bun run test`). The
+committed build artifact `crates/darkmux-serve/assets/next.html` is an
+`include_str!`'d asset the Rust suite never renders, so after `cd ui && bun run
+build`, verify by reloading the page rather than by running `cargo test`.
+`cargo build -p darkmux-serve` + restart the daemon is the Rust-side loop;
 `cargo install --path .` is a full release build and far slower than you need.
 
 ## Code style
@@ -96,7 +100,7 @@ Tests that depend on a real `lms` binary or a real LMStudio runtime should set `
 
 ### Viewer e2e (headless browser)
 
-The observability viewer (`crates/darkmux-serve/assets/viewer.html`) has a headless Playwright suite under `tests/e2e/` that drives the *real* viewer over a flow file of attacker-controlled records (`tests/fixtures/xss-flow.jsonl`) and asserts every render path stays inert (output-encoding / XSS gate). It replaces the old manual "open `/play/<date>` and check `window.__xss`" walkthrough.
+The observability viewer (the React port under `ui/src/`, built to `crates/darkmux-serve/assets/next.html`) has a headless Playwright suite under `tests/e2e/` that drives the *real* viewer over a flow file of attacker-controlled records (`tests/fixtures/xss-flow.jsonl`) and asserts every render path stays inert (output-encoding / XSS gate). It replaces the old manual "open `/play/<date>` and check `window.__xss`" walkthrough.
 
 ```bash
 cd tests/e2e

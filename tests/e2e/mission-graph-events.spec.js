@@ -18,8 +18,9 @@
 // tests mock THAT endpoint; changing them back to a date-scoped URL IS the
 // regression.
 //
-// The mission-graph lens is a SEPARATE asset from viewer.html (its own vendored
-// React Flow bundle), so this spec route-mocks the page's three same-origin data
+// The mission-graph lens is a SEPARATE asset from the main viewer (next.html;
+// its legacy predecessor viewer.html retired #1806) with its own vendored
+// React Flow bundle, so this spec route-mocks the page's three same-origin data
 // sources (graph.json snapshot, /flow-mission/<id> backfill, the SSE stream) and
 // fulfills the `/mission/<id>/graph` route with the served HTML shell so
 // `missionIdFromPath()` sees the real path. The /vendor/* bundle falls through

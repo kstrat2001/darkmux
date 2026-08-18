@@ -5,21 +5,34 @@
     use tower::util::ServiceExt;
     use tempfile::TempDir;
 
-    /// XSS guard, layer 1: the viewer must contain ZERO inline event-handler
-    /// attributes. All clicks route through one delegated listener reading
-    /// `data-act`/`data-arg` (dataset values are plain strings — no JS-string
-    /// context for a malicious flow-record identifier to break out of). A new
-    /// `onclick="…"` carrying a record-derived value is exactly the injection
-    /// shape this PR removed; fail the build on any reintroduction. JS-side
-    /// property assignment (`$("play").onclick=…`) is fine and not matched.
+    /// XSS guard, layer 1: the served document must contain ZERO inline
+    /// event-handler attributes. Originally written against the legacy
+    /// viewer (hand-written JS routing clicks through one delegated listener
+    /// reading `data-act`/`data-arg`); retargeted at `next.html` (#1806 —
+    /// the legacy viewer is retired) because the guard's premise — no
+    /// `on<event>="…"` HTML attribute anywhere in the served document — is
+    /// just as meaningful against the React port's built bundle. React's
+    /// synthetic event system never emits inline HTML handler attributes
+    /// (it wires listeners via JS, not `onclick="…"` markup), so a genuine
+    /// zero-hit result here is real signal, not a premise that stopped
+    /// applying — verified empirically against `next.html` before this
+    /// retarget landed. JS-side property assignment (`x.onclick=…`) is fine
+    /// and not matched. Not a general XSS proof against a minified bundle:
+    /// it is blind to an escaped-quote `onerror=\"…\"` sitting inside a JS
+    /// string literal, and to a no-leading-whitespace object-literal shape
+    /// like `{onclick:"…"}` (no attribute syntax for the byte scanner to
+    /// find). Its practical value is narrower — guarding `ui/index.html`
+    /// shell regressions and a stray `dangerouslySetInnerHTML` literal
+    /// making it into the bundle — not a substitute for the real XSS walk
+    /// in `tests/e2e/viewer-xss.spec.js`.
     #[test]
     fn viewer_has_no_inline_event_handlers() {
-        let html = include_str!("../assets/viewer.html");
+        let html = include_str!("../assets/next.html");
         // Scan the WHOLE inline-handler attribute class, not a fixed name list:
         // an HTML `on<event>=` attribute is leading whitespace, `on`, lowercase
         // letters, optional whitespace, `=`, then a quote. Matches onclick/
         // ontoggle/oninput/onkeydown/onsubmit/… alike, so reintroducing ANY of
-        // them fails the build. (`$("x").onclick=` JS property assignment is NOT
+        // them fails the build. (`x.onclick=` JS property assignment is NOT
         // matched — it has no leading-whitespace `on…="` attribute shape.)
         let bytes = html.as_bytes();
         for (i, w) in bytes.windows(3).enumerate() {
@@ -40,9 +53,9 @@
                     if matches!(bytes.get(q), Some(b'"') | Some(b'\'')) {
                         let attr = String::from_utf8_lossy(&bytes[i + 1..j]);
                         panic!(
-                            "viewer.html contains inline event handler `{attr}=…` \
-                             (byte {i}) — use data-act/data-arg + the delegated \
-                             listener instead (XSS hardening)"
+                            "next.html contains inline event handler `{attr}=…` \
+                             (byte {i}) — the React port must never emit one \
+                             (XSS hardening)"
                         );
                     }
                 }
@@ -52,185 +65,45 @@
         // record-derived scheme would dodge the attribute scan above).
         assert!(
             !html.to_lowercase().contains("javascript:"),
-            "viewer.html contains a javascript: URL — not allowed (XSS hardening)"
+            "next.html contains a javascript: URL — not allowed (XSS hardening)"
         );
     }
 
-    /// XSS guard, layer 2: tripwire for raw (unescaped) interpolation of
-    /// record-derived values into rendered templates. Curated needles — each
-    /// is an exact pattern this hardening pass replaced with an `esc()`-wrapped
-    /// form; matching one means an escape was dropped. NOT a proof of safety
-    /// (string construction that's escaped downstream is legitimate and
-    /// unmatched) — the proof is review + the malicious fixture walkthrough
-    /// (tests/fixtures/xss-flow.jsonl).
-    #[test]
-    fn viewer_has_no_raw_record_interpolations() {
-        let html = include_str!("../assets/viewer.html");
-        for needle in [
-            "${missionLabel()}", "${DATA_SOURCE}", "${nameOf(", "${specOf(",
-            "${m}", "${sid}", "${pm}", "${mid}", "${q}", "${a}",
-            "${role}", "${handle}", "${model}", "${mission}", "${tag}", "${turns}",
-            "${state.machine}", "${state.session}",
-            "${s.handle}", "${s.model}", "${s.mission_id}", "${s.role}", "${s.machine}",
-            "${n.sid}", "${n.handle}", "${n.model}", "${n.mission}",
-            "${r.category}", "${r.machine_id}", "${r.session_id}",
-            "${f.k}", "${f.d}", "${f.f}", "${f.s}",
-        ] {
-            assert!(
-                !html.contains(needle),
-                "viewer.html interpolates `{needle}` without esc() — wrap it \
-                 (record-derived values must be escaped at the template edge)"
-            );
-        }
-    }
-
-    /// (#794) The live SSE tail must be idempotent — a re-delivered record
-    /// (reconnect / snapshot-stream overlap; the stream is at-least-once) must
-    /// not be re-counted, or cumulative readouts (the savings hero) inflate
-    /// past the persisted truth and "reset" on refresh. Lock the dedup so it
-    /// can't be removed without this failing.
-    #[test]
-    fn live_tail_dedups_records() {
-        let html = include_str!("../assets/viewer.html");
-        assert!(
-            html.contains("const SEEN_KEYS=new Set();") && html.contains("const recKey="),
-            "viewer.html lost the live-tail dedup primitives (SEEN_KEYS / recKey)"
-        );
-        // The SSE onmessage handler must consult SEEN_KEYS before RAW.push so a
-        // re-delivered record is dropped rather than re-counted.
-        let onmsg = html
-            .split("LIVE_ES.onmessage")
-            .nth(1)
-            .expect("viewer.html has no LIVE_ES.onmessage handler");
-        let guard = onmsg.find("if(SEEN_KEYS.has(k))return;");
-        let push = onmsg.find("RAW.push(rec);");
-        assert!(
-            matches!((guard, push), (Some(g), Some(p)) if g < p),
-            "the live SSE onmessage must guard on SEEN_KEYS.has(k) BEFORE RAW.push(rec) \
-             (idempotent append — #794)"
-        );
-    }
-
-    /// (#803) The savings hero's token-class breakdown + hybrid note. Locks:
-    /// (a) the educational class labels exist (generated / fresh / re-read —
-    /// the decomposition IS the feature), (b) the hint stays TOKENS-ONLY
-    /// (names rate classes, supplies no currency or rate figure), (c) the
-    /// hybrid note's record-derived mission id is esc()-wrapped.
-    #[test]
-    fn savings_hero_breakdown_is_classed_and_currency_free() {
-        let html = include_str!("../assets/viewer.html");
-        for needle in ["generated", "fresh input", "re-read", "unclassified"] {
-            assert!(
-                html.contains(needle),
-                "savings hero lost the `{needle}` token-class label (#803)"
-            );
-        }
-        assert!(
-            html.contains("${esc(mr.mission_id)}"),
-            "hybridNote must esc() the mission id"
-        );
-        assert!(
-            !html.contains("${mr.mission_id}"),
-            "hybridNote interpolates mission_id without esc()"
-        );
-        // (#807) The real orchestrator-note channel: the tagged-note lookup
-        // must exist, and note text (orchestrator-authored free text) must be
-        // esc()-wrapped both on the hero line and in the history modal.
-        assert!(
-            html.contains("r.source===\"orchestrator\"&&!r.session_id"),
-            "viewer lost the orchestrator-note source filter or its mission-level \
-             (no session_id) restriction — session-scoped notes are adjudication-\
-             shaped and never belong on the card (#807/#819)"
-        );
-        for (escaped, raw) in [
-            ("${esc(last.handle)}", "${last.handle}"),
-            ("${esc(n.handle)}", "${n.handle}"),
-        ] {
-            assert!(
-                html.contains(escaped),
-                "orchestrator note text lost its esc() wrap (`{escaped}`)"
-            );
-            assert!(
-                !html.contains(raw),
-                "orchestrator note text interpolated raw (`{raw}`)"
-            );
-        }
-        assert!(
-            html.contains("id=\"nmodalbg\"") && html.contains("data-act=\"notes\""),
-            "notes-history modal or its dispatcher hook is missing (#807)"
-        );
-        // Tokens-only invariant: no currency or rate figure anywhere in the
-        // hero region (hybridNote through the end of savingsHero, bounded by
-        // the next top-level function) — the operator prices each class
-        // themselves. Region-based extraction so a template reshuffle can't
-        // silently shrink the scanned text (QA finding on the first cut).
-        let start = html
-            .find("function hybridNote(")
-            .expect("viewer.html lost hybridNote");
-        let end = html[start..]
-            .find("function renderFleet(")
-            .map(|i| start + i)
-            .expect("renderFleet no longer follows the hero region");
-        let hero = &html[start..end];
-        for sym in ["USD", "$0", "$1", "€", "£", "/M", "per million"] {
-            assert!(
-                !hero.contains(sym),
-                "savings hero must not carry a currency/rate figure (`{sym}`) — tokens only"
-            );
-        }
-    }
-
-    /// (#1387) The what-changed panel renders daemon-derived strings (the
-    /// worktree path, the base ref) — it must stay output-encoded at the
-    /// template edge and must never fetch outside live mode (playback and
-    /// the static demo have no daemon). Lock both invariants in source so a
-    /// refactor can't quietly drop them. Replaces the retired #756
-    /// `diff_panel_is_live_gated_and_escaped` (the live-diff panel it
-    /// covered no longer exists).
-    #[test]
-    fn wt_sum_panel_is_live_gated_and_escaped() {
-        let html = include_str!("../assets/viewer.html");
-        // The esc() implementation the assertions below depend on must itself
-        // exist — if a refactor drops it, every wrapped interpolation throws
-        // rather than escaping (QA finding, #756 viewer review).
-        assert!(
-            html.contains("const esc="),
-            "viewer.html lost the esc() helper the output-encoding invariant rests on"
-        );
-        let panel = html
-            .split("function wtSumPanel(")
-            .nth(1)
-            .expect("viewer.html lost the #1387 wtSumPanel function");
-        assert!(
-            panel.contains("if(!document.body.classList.contains('live-mode'))return \"\";"),
-            "wtSumPanel must early-return outside live mode (static demo / playback never fetch)"
-        );
-        // Every daemon-derived value must pass through esc() — the base ref
-        // label, the worktree path (both the `<code>` text and the zed href,
-        // which is additionally URI-encoded first), and the numeric totals
-        // (numbers today, but the panel's invariant is esc-at-the-template-
-        // edge for everything daemon-derived — no unescaped drift).
-        for needle in [
-            "${esc(d.base)}",
-            "${esc(path)}",
-            "${esc(encodeURI(path))}",
-            "${esc(files)}",
-            "${esc(adds)}",
-            "${esc(dels)}",
-        ] {
-            assert!(
-                panel.contains(needle),
-                "wtSumPanel lost the esc() wrap on `{needle}` — daemon-derived \
-                 values must be output-encoded"
-            );
-        }
-        for raw in ["${d.base}", "${path}", "${encodeURI(path)}", "${files}", "${adds}", "${dels}"] {
-            assert!(
-                !panel.contains(raw),
-                "wtSumPanel interpolates `{raw}` without esc()"
-            );
-        }
-    }
+    // The following four viewer-source-scanning tests were retired in #1806
+    // along with `viewer.html` itself, rather than retargeted at
+    // `crates/darkmux-serve/assets/next.html`:
+    //
+    //   - `viewer_has_no_raw_record_interpolations` (XSS guard, layer 2 —
+    //     curated `${...}`-template needles like `${m}`/`${sid}`/`${role}`)
+    //   - `live_tail_dedups_records` (#794 — `SEEN_KEYS`/`recKey`/
+    //     `LIVE_ES.onmessage` source-text assertions)
+    //   - `savings_hero_breakdown_is_classed_and_currency_free` (#803 —
+    //     `function hybridNote(`/`function renderFleet(` region bounds,
+    //     `${esc(...)}` interpolation needles)
+    //   - `wt_sum_panel_is_live_gated_and_escaped` (#1387 — `function
+    //     wtSumPanel(` boundary, `${esc(...)}` interpolation needles)
+    //
+    // Each asserted on EXACT source-code text — legacy function names,
+    // variable names, and hand-written `${...}` template-literal
+    // interpolation syntax — that is specific to the legacy viewer's
+    // hand-written vanilla-JS implementation. None of that text exists in
+    // `next.html` (a Vite-bundled, minified React app with no source-level
+    // resemblance), so retargeting `include_str!` alone would not preserve
+    // these tests' intent: every needle search would either find nothing
+    // (an `.expect()`/`assert!` failure unrelated to any real regression)
+    // or — worse — silently pass vacuously for the wrong reason. The
+    // properties they were guarding (output encoding at the render edge,
+    // live-tail dedup, tokens-only savings copy) still matter for the port,
+    // but proving them needs port-shaped tests written against the port's
+    // own render output, not a source-text scan of code that no longer
+    // exists. XSS/escaping coverage for the port lives in
+    // `tests/e2e/viewer-xss.spec.js` (walks the port with the same
+    // attacker-controlled fixture, asserting zero unescaped payload
+    // surfaces — see #1806's own audit of that suite). Live-tail dedup and
+    // the savings-hero/wt-sum-panel copy have no ported equivalent test
+    // yet; that gap is real and belongs to whoever next touches those
+    // features on the port, not to a source-text scan pointed at a file
+    // that no longer exists.
 
     /// The XSS regression fixture must stay a valid FLOW_SCHEMA day file —
     /// the manual walkthrough (copy to ~/.darkmux/flows/2026-01-01.jsonl,
@@ -4010,10 +3883,11 @@
         let html = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(html.contains("/vendor/reactflow-bundle.min.js"));
         assert!(html.contains("/vendor/reactflow-bundle.min.css"));
-        // Same XSS-hardening posture as viewer.html: no raw HTML injection
-        // sink. React's `createElement` escapes text content by
-        // construction; this page must never reach for the one API that
-        // opts back OUT of that (`dangerouslySetInnerHTML`).
+        // Same XSS-hardening GOAL the legacy `viewer.html` held before its
+        // retirement (#1806) — no raw HTML injection sink — reached by a
+        // different mechanism here: React's `createElement` escapes text
+        // content by construction, so this page must never reach for the
+        // one API that opts back OUT of that (`dangerouslySetInnerHTML`).
         assert!(!html.contains("dangerouslySetInnerHTML"));
         assert!(!html.to_lowercase().contains("javascript:"));
     }
@@ -4110,9 +3984,10 @@
     /// surfaced at the flip as "my home-screen darkmux suddenly has a URL
     /// bar". Fixed in `ui/index.html`.
     ///
-    /// The legacy file is no longer checked here because nothing serves it —
-    /// `viewer.html` survives only as `scripts/build-demo.sh`'s input until
-    /// #1801, and a static demo page has no home screen to be added to.
+    /// The legacy file is no longer checked here because nothing serves it,
+    /// and it is now deleted entirely (#1806) — `scripts/build-demo.sh`
+    /// derives the demo from `NEXT_HTML` (the same constant this test
+    /// checks) rather than reading the legacy file.
     #[test]
     fn html_shells_declare_standalone_app() {
         for (name, html) in [("next", NEXT_HTML), ("mission-graph", MISSION_GRAPH_HTML)] {

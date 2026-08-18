@@ -99,6 +99,59 @@ darkmux release.
   `max(potential, current)` per resident: a value change inside an unchanged
   field, and the fix above.
 
+### Removed
+
+- **The legacy viewer (`crates/darkmux-serve/assets/viewer.html`, 319 KB)
+  is deleted** (#1806), completing the UI transition #1800/#1804 started.
+  Nothing served it after the route flip (#1800) moved `/` and
+  `/play/:date` onto the React port; it survived only as the parity
+  harness's extraction source and the reference the port's remaining 11
+  `test.fixme`s (#1806's own list) named as blocking its removal. All
+  eleven are now built and passing on the port — the filters/notes/about
+  modal system and its focus trap, the machine lens's memory-ledger bars,
+  a clickable affordance into a session view, the lab-run detail
+  fallback-to-list, the lifecycle-drill tail, and the XSS walk's
+  previously-unreachable surfaces — closing the gap #1806 measured.
+  - `tests/parity/`'s legacy extraction path retires with it:
+    `extract.spec.ts`, its dedicated `playwright.config.js` (served
+    `viewer.html` with `darkmux-mode=live` injected), `redprove.spec.ts`,
+    `verify-goldens.mjs`, and `determinism.mjs` are deleted, along with
+    the `extract`/`rebaseline`/`verify`/`redprove`/`determinism` `package.json`
+    scripts. **`goldens/*.txt` survives as a FROZEN spec** — what the
+    legacy viewer actually rendered against a real daemon, captured once
+    and now locked in — and the `next-parity*` suites keep grading the
+    React port against those same files, unaffected. `record.mjs` and
+    `tripwire.mjs` (now aliased as `check`) remain for capturing and
+    scanning `corpus/` fixtures. Rebaselining a golden is no longer a
+    regeneration script; it is a direct hand-edit of `goldens/<lens>.txt`
+    in a reviewed diff, checked against real port output.
+  - `crates/darkmux-serve/src/lib_tests.rs`: of the five Rust tests that
+    `include_str!`'d `viewer.html`, one (`viewer_has_no_inline_event_handlers`,
+    the general "no inline `on<event>=` HTML attribute" XSS guard) is
+    retargeted at `next.html` — its premise holds for any served document,
+    and React's synthetic event system emits no such attributes, verified
+    empirically before the retarget (it is blind to an escaped-quote
+    `onerror=\"…\"` inside a JS string, or a no-leading-whitespace
+    `{onclick:"…"}` object literal — its practical value is guarding
+    `ui/index.html` shell regressions and a stray `dangerouslySetInnerHTML`,
+    not a general XSS proof). The other four
+    (`viewer_has_no_raw_record_interpolations`, `live_tail_dedups_records`,
+    `savings_hero_breakdown_is_classed_and_currency_free`,
+    `wt_sum_panel_is_live_gated_and_escaped`) asserted on exact legacy
+    source text — function names, variable names, hand-written `${...}`
+    template syntax — that has no analog in a bundled, minified React app,
+    and are deleted rather than retargeted. XSS/escaping coverage for the
+    port lives in `tests/e2e/viewer-xss.spec.js`; live-tail dedup and the
+    tokens-only savings-hero copy get their own port-shaped regression
+    coverage instead (`ui/src/lib/flow.test.ts`'s `buildFlowWindow dedup
+    (#794)` suite; `ui/src/lenses/fleet/FleetLens.test.tsx`'s tokens-only
+    hero test). The wt-sum panel is **not ported** — `ui/src` has no
+    consumer of `GET /worktree-summary/:session_id` at all (the daemon
+    still routes it; nothing in the React port calls it), so there is no
+    port-side behavior for a test to cover.
+  - The legacy file's source is recoverable with
+    `git show v2.9.0:crates/darkmux-serve/assets/viewer.html`.
+
 ## [2.9.0] - 2026-08-16
 
 A remediation release. An audit of every user-facing surface asked one question

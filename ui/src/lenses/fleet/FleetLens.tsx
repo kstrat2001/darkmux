@@ -98,7 +98,7 @@ function SavingsHero({
       {/* (operator) "tokens · last 24h" rather than "by your fleet · last 24h",
           to match the event pane's "events last 24h". Two panels counting two
           things over the same window should say so the same way; "by your
-          fleet" named the SOURCE where its neighbour named the SUBJECT.
+          fleet" named the SOURCE where its neighbor named the SUBJECT.
 
           The window suffix is LIVE-ONLY — `const win=...live-mode...?` last
           ${h}h`:''` (viewer.html:1660). A replay's numbers cover the recorded

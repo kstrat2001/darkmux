@@ -225,10 +225,12 @@ pub fn remote_route_label(host: &str, model_id: &str) -> String {
 /// `dispatch_remote`/container path, and — the actual bug fix this
 /// function exists for — `pr_review.rs`'s `with_dispatch_bookends`, which
 /// previously stamped `remote_tokens` alone). `payload.endpoint` is the
-/// ONLY field `crates/darkmux-serve/assets/viewer.html`'s `tokensOffMeter()`
-/// reads to classify a session as cloud vs. local; a payload carrying
-/// `remote_tokens` without it renders as 100% local savings even though
-/// real cloud tokens were spent.
+/// ONLY field the viewer's own `tokensOffMeter()`
+/// (`ui/src/lenses/fleet/savings.ts`; the legacy `viewer.html`'s copy of
+/// this function retired along with that file, #1806) reads to classify a
+/// session as cloud vs. local; a payload carrying `remote_tokens` without
+/// it renders as 100% local savings even though real cloud tokens were
+/// spent.
 ///
 /// No-op per field when its argument is `None` — a fully-local dispatch
 /// (no remote seat) calls this with `(None, None)` and the payload is left

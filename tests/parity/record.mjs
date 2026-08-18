@@ -1,9 +1,12 @@
 #!/usr/bin/env bun
 // Corpus recorder — Packet 0a (the parity harness). Records the operator's
-// LIVE darkmux daemon into sanitized JSON fixtures under corpus/, which
-// extract.spec.ts then replays through Playwright's route interception to
-// take the legacy viewer.html down its real daemon-fetch code path with zero
-// live network access. See tests/parity/README.md for the full picture.
+// LIVE darkmux daemon into sanitized JSON fixtures under corpus/. The
+// `next-parity*.spec.ts` suites replay these through Playwright's route
+// interception against the React port, with zero live network access — the
+// same replay shape the (now-retired, #1806) legacy extractor originally
+// used to take `viewer.html` down its real daemon-fetch code path when the
+// goldens under `goldens/` were first captured. See tests/parity/README.md
+// for the full picture.
 //
 // Endpoints recorded: the plan's named set (/runs /missions /phases
 // /flow-days /flow-missions /flow/<today> /fleet/machines/live

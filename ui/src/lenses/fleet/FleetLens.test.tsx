@@ -256,4 +256,33 @@ describe("FleetLens", () => {
     fireEvent.click(studio);
     expect(window.location.hash).toBe("#lens=runs&machine=u2");
   });
+
+  it("the savings hero renders tokens-only — no currency symbol or rate figure, even with non-zero savings (#803 regression coverage, restored post-#1806)", async () => {
+    // Legacy's equivalent coverage
+    // (`savings_hero_breakdown_is_classed_and_currency_free`, a source-text
+    // scan of `viewer.html`'s `hybridNote`..`renderFleet` region) retired
+    // with that file. This exercises the RENDERED hero instead — a fixture
+    // with real, non-zero local tokens, so the assertion isn't vacuously
+    // true against an empty "0" hero.
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        {
+          ts: `${today}T10:00:05.000Z`,
+          machine_uid: "u1",
+          session_id: "s1",
+          category: "telemetry",
+          source: "tokens",
+          payload: { turn_seq: 1, prompt_tokens: 500, completion_tokens: 100, total_tokens: 600 },
+        },
+        { ts: `${today}T10:01:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: { total_tokens: 600 } },
+      ],
+    });
+    const { container } = renderFleetLens();
+    await waitFor(() => expect(screen.getByText("600")).toBeInTheDocument());
+    const hero = container.querySelector(".savings");
+    expect(hero).not.toBeNull();
+    expect(hero!.textContent).not.toMatch(/[$€£]|USD|per million|\/M\b/);
+  });
 });

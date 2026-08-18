@@ -23,8 +23,9 @@ function collectPageErrors(page) {
 }
 
 /** The three render-sanity checks. `mainSelector` defaults to `#stage` —
- * the same output target the parity harness's extraction targets (every
- * `render*()` function in viewer.html writes here). */
+ * the same output target the parity harness's extraction targets (both
+ * the React port and, historically, the retired `viewer.html`, #1806,
+ * render their lens content there). */
 async function assertRenderSanity(page, pageErrors, { mainSelector = "#stage", minHeight = 20 } = {}) {
   const main = page.locator(mainSelector).first();
   await expect(main, `${mainSelector} should be visible`).toBeVisible();

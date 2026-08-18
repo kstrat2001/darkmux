@@ -23,7 +23,8 @@ module.exports = defineConfig({
     // forwarding doesn't preserve loopback identity, so darkmux serve's
     // #881 auth gate treats every request here as remote and requires
     // this bearer token — attached context-wide so it rides on BOTH page
-    // navigation and every fetch() the loaded viewer.html issues itself.
+    // navigation and every fetch() the loaded viewer (next.html) issues
+    // itself.
     extraHTTPHeaders: { Authorization: `Bearer ${SERVE_TOKEN}` },
   },
   // QA finding (M2): a top-level `use.viewport` is NOT the last word —

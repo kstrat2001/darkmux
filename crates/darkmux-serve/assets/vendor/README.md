@@ -2,7 +2,9 @@
 
 Self-contained, no-CDN bundle serving the `/mission/<id>/graph` page's
 React Flow diagram. Committed as static bytes so the daemon binary stays
-fully offline-capable, matching `viewer.html`'s own `include_str!` posture.
+fully offline-capable, matching the main viewer's own `include_str!`
+posture (`assets/next.html`; the legacy `assets/viewer.html` this
+convention was originally matched to is retired, #1806).
 
 ## Contents
 

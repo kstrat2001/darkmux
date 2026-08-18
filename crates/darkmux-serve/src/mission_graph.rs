@@ -714,10 +714,14 @@ where
             entry.cloud = true;
         }
         // (#1626) A clean terminal with NO endpoint is the only positive
-        // evidence of local. Mirrors `localSids` in viewer.html and `localOk`
-        // in the page's live fold, so the backfilled and live paths classify
-        // the same step identically — they did not before, so a page opened
-        // after a run finished disagreed with one watched live.
+        // evidence of local. Mirrors the same `localSids` convention the
+        // React port's `tokensOffMeter` uses (`ui/src/lenses/fleet/
+        // savings.ts`; the legacy `viewer.html`'s original copy of this
+        // convention retired along with that file, #1806) and `localOk` in
+        // THIS page's own live fold (below), so the backfilled and live
+        // paths classify the same step identically — they did not before,
+        // so a page opened after a run finished disagreed with one watched
+        // live.
         if is_complete && !endpoint {
             entry.local_ok = true;
         }
