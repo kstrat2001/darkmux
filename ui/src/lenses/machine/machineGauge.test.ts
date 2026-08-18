@@ -7,12 +7,19 @@ import {
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
+  gaugeFillColor,
+  gaugeRampStops,
+  gaugeRampSwatch,
   gaugeScaleWord,
   gaugeTickLabel,
   gaugeValueParts,
   groupResidencyRows,
   isEstimatedRow,
   isOverLimit,
+  isSevenSegDot,
+  sevenSegmentPolygons,
+  SEVEN_SEG_CELL,
+  SEVEN_SEG_GHOST,
   rowStateDiffers,
   isUtilityTierRow,
   modelKvLine,
@@ -652,7 +659,168 @@ describe("hatchedSegmentDash — extent and hatching in ONE value", () => {
   });
 });
 
-// (#1835) Amber grew a second cause, and the two call for OPPOSITE
-// responses: `OVERCOMMITTED` means shrink something; `NO MARGIN` means it
-// fits, so do not load anything else. A bare AMBER cannot say which — which
-// is what promotes the cause from noise to content on this word.
+// ── The arc ramp ─────────────────────────────────────────────────────────
+
+const rgb = (hex: string) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+
+describe("gaugeFillColor", () => {
+  it("is pure green at 0%, the palette amber at 50%, pure red at 100%", () => {
+    expect(gaugeFillColor(0)).toBe("#4ade80");
+    expect(gaugeFillColor(50)).toBe("#f0b429");
+    expect(gaugeFillColor(100)).toBe("#f56565");
+  });
+
+  it("runs green→red, not the other way: red rises and green falls with fullness", () => {
+    // The direction is the whole claim of the ramp — a reversed gradient
+    // would paint an empty machine red and be wrong everywhere at once.
+    const [r0, g0] = rgb(gaugeFillColor(10));
+    const [r1, g1] = rgb(gaugeFillColor(90));
+    expect(r1).toBeGreaterThan(r0);
+    expect(g1).toBeLessThan(g0);
+  });
+
+  it("is monotone in red across the whole sweep — no dip through a muddy midpoint", () => {
+    // Three stops via amber, rather than a straight green→red mix, exist to
+    // avoid the olive trough a two-stop blend produces at 50%. Red never
+    // decreases as fullness increases.
+    let last = -1;
+    for (let p = 0; p <= 100; p += 5) {
+      const [r] = rgb(gaugeFillColor(p));
+      expect(r).toBeGreaterThanOrEqual(last);
+      last = r;
+    }
+  });
+
+  it("clamps rather than extrapolates, and is total over non-finite input", () => {
+    expect(gaugeFillColor(140)).toBe(gaugeFillColor(100));
+    expect(gaugeFillColor(-20)).toBe(gaugeFillColor(0));
+    expect(gaugeFillColor(NaN)).toBe(gaugeFillColor(0));
+    expect(gaugeFillColor(Infinity)).toBe(gaugeFillColor(100));
+    expect(gaugeFillColor(-Infinity)).toBe(gaugeFillColor(0));
+    for (const c of [gaugeFillColor(NaN), gaugeFillColor(33.3)]) expect(c).toMatch(/^#[0-9a-f]{6}$/);
+  });
+});
+
+describe("gaugeRampStops", () => {
+  it("emits segments+1 stops spanning offset 0..1, first green and last red", () => {
+    const stops = gaugeRampStops(24);
+    expect(stops).toHaveLength(25);
+    expect(stops[0]).toEqual({ offset: 0, color: "#4ade80" });
+    expect(stops[24].offset).toBeCloseTo(1, 12);
+    expect(stops[24].color).toBe("#f56565");
+  });
+
+  it("spaces offsets by cosine, not linearly — the 50% stop lands at the dial's crown", () => {
+    // A horizontal gradient interpolates in X while the arc advances by
+    // angle: x = cx − r·cos(pct·π). Linear offsets would put the amber stop
+    // at the wrong tick. The midpoint stop must sit at exactly 0.5 and the
+    // quarter stops at (1 − cos(π/4))/2, not at 0.25 / 0.75.
+    const stops = gaugeRampStops(4);
+    expect(stops.map((s) => s.offset)).toEqual([
+      0,
+      (1 - Math.cos(Math.PI / 4)) / 2,
+      0.5,
+      (1 - Math.cos((3 * Math.PI) / 4)) / 2,
+      1,
+    ].map((v) => expect.closeTo(v, 12)));
+    // and the offsets are strictly increasing, or the gradient would fold.
+    for (let i = 1; i < stops.length; i++) expect(stops[i].offset).toBeGreaterThan(stops[i - 1].offset);
+  });
+
+  it("colors each stop by its own percentage of the sweep", () => {
+    const stops = gaugeRampStops(10);
+    expect(stops[5].color).toBe(gaugeFillColor(50));
+    expect(stops[3].color).toBe(gaugeFillColor(30));
+  });
+});
+
+describe("gaugeRampSwatch", () => {
+  it("is a horizontal CSS gradient from the band's start color to its end color", () => {
+    expect(gaugeRampSwatch(0, 50)).toBe("linear-gradient(90deg, #4ade80, #f0b429)");
+    expect(gaugeRampSwatch(50, 100)).toBe("linear-gradient(90deg, #f0b429, #f56565)");
+  });
+});
+
+// ── Seven-segment glyphs ─────────────────────────────────────────────────
+
+const litCount = (ch: string) => sevenSegmentPolygons(ch).filter((s) => s.lit).length;
+
+describe("sevenSegmentPolygons", () => {
+  it("always returns all seven segments, lit or not, so the ghost cell exists", () => {
+    for (const ch of ["0", "8", "1", ".", "x", ""]) {
+      const segs = sevenSegmentPolygons(ch);
+      expect(segs).toHaveLength(7);
+      for (const s of segs) expect(s.points).toMatch(/^(\d+,\d+ ){5}\d+,\d+$/);
+    }
+  });
+
+  it("lights the conventional segment counts for the digits", () => {
+    // 8 is every segment; 1 is two; 0 is six with the middle bar dark; 7 is
+    // three; 4 is four. A transposed table would show here.
+    expect(litCount("8")).toBe(7);
+    expect(litCount("1")).toBe(2);
+    expect(litCount("0")).toBe(6);
+    expect(litCount("7")).toBe(3);
+    expect(litCount("4")).toBe(4);
+    expect(litCount("2")).toBe(5);
+    expect(litCount("5")).toBe(5);
+    expect(litCount("3")).toBe(5);
+    expect(litCount("6")).toBe(6);
+    expect(litCount("9")).toBe(6);
+  });
+
+  it("distinguishes 6 from 9 and 2 from 5 by WHICH segments are lit, not how many", () => {
+    const lit = (ch: string) => sevenSegmentPolygons(ch).map((s) => s.lit);
+    expect(lit("6")).not.toEqual(lit("9"));
+    expect(lit("2")).not.toEqual(lit("5"));
+    expect(lit("0")).not.toEqual(lit("6"));
+  });
+
+  it("draws every dash the readout can be handed as the middle bar, so a no-data figure is visible", () => {
+    // `gaugeValueParts` returns an EM dash for an unreadable figure. Before
+    // this mapping the cell rendered blank — absence disguised as nothing.
+    for (const dash of ["-", "\u2013", "\u2014"]) {
+      const segs = sevenSegmentPolygons(dash);
+      expect(segs.filter((s) => s.lit)).toHaveLength(1);
+      // the lit one is the middle bar: its points sit around the cell's mid-height.
+      const lit = segs.find((s) => s.lit)!;
+      const ys = lit.points.split(" ").map((p) => Number(p.split(",")[1]));
+      expect(Math.min(...ys)).toBeGreaterThan(SEVEN_SEG_CELL.h * 0.4);
+      expect(Math.max(...ys)).toBeLessThan(SEVEN_SEG_CELL.h * 0.6);
+    }
+  });
+
+  it("renders an unmapped character as a dark cell rather than throwing", () => {
+    expect(() => sevenSegmentPolygons("Z")).not.toThrow();
+    expect(litCount("Z")).toBe(0);
+    expect(litCount("")).toBe(0);
+  });
+
+  it("stays inside the canonical cell", () => {
+    for (const s of sevenSegmentPolygons("8")) {
+      for (const p of s.points.split(" ")) {
+        const [x, y] = p.split(",").map(Number);
+        expect(x).toBeGreaterThanOrEqual(0);
+        expect(x).toBeLessThanOrEqual(SEVEN_SEG_CELL.w);
+        expect(y).toBeGreaterThanOrEqual(0);
+        expect(y).toBeLessThanOrEqual(SEVEN_SEG_CELL.h);
+      }
+    }
+  });
+});
+
+describe("seven-segment constants", () => {
+  it("ghosts unlit segments faintly but not invisibly", () => {
+    // 0 would let a narrow `1` float in its gap; anything near opaque reads
+    // as a lit segment. The value is an operator call (5%); the test pins the
+    // band it must stay in, not the exact figure.
+    expect(SEVEN_SEG_GHOST).toBeGreaterThan(0);
+    expect(SEVEN_SEG_GHOST).toBeLessThan(0.15);
+  });
+
+  it("names the decimal point as the one non-segment character", () => {
+    expect(isSevenSegDot(".")).toBe(true);
+    expect(isSevenSegDot("0")).toBe(false);
+    expect(isSevenSegDot("-")).toBe(false);
+  });
+});

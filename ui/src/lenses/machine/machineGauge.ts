@@ -83,7 +83,7 @@ export function gaugeTickLabel(bytes: number): string {
 }
 
 
-/** The dial fill's colour ramp stops — `--good`, `--warn`, `--bad` from
+/** The dial fill's color ramp stops — `--good`, `--warn`, `--bad` from
  * `styles.css`, duplicated here as literals because an SVG `stroke` has to
  * be a concrete value and reading a CSS custom property at render time
  * would mean a `getComputedStyle` call per frame.
@@ -92,7 +92,7 @@ export function gaugeTickLabel(bytes: number): string {
  * palette's green (`#4ade80`) straight to its red (`#f56565`) passes through
  * `#9fa172` — a muddy olive, because both endpoints are pastels carrying a
  * lot of blue. Routing through the palette's own amber puts a real yellow at
- * the midpoint AND keeps every colour the dial can show inside the
+ * the midpoint AND keeps every color the dial can show inside the
  * vocabulary the rest of the page already uses. */
 const FILL_STOPS = ["#4ade80", "#f0b429", "#f56565"] as const;
 
@@ -102,31 +102,34 @@ function mixHex(a: string, b: string, k: number): string {
   return `#${out.map((n) => n.toString(16).padStart(2, "0")).join("")}`;
 }
 
-/** (operator request) The fill colour as a CONTINUOUS function of how full
+/** (operator request) The fill color as a CONTINUOUS function of how full
  * the machine is: pure green at 0%, the palette's amber at 50%, pure red at
  * 100%.
  *
  * This replaces `gaugeFillSeverity`'s three buckets, and the reason is the
  * same one that removed the verdict chip: **the bucket edges at 50% and 85%
  * were thresholds darkmux invented.** A machine at 84% and one at 86% are
- * not different in kind, and painting them different colours asserted that
+ * not different in kind, and painting them different colors asserted that
  * they were. A ramp asserts nothing — it maps a ratio the operator can
  * already read off the needle onto a hue, and every boundary in it is
  * arbitrary in the same tiny degree, which is to say not a boundary at all.
  *
  * Clamps rather than extrapolating: a machine past its limit is drawn at the
- * red end, not at some colour beyond red. */
+ * red end, not at some color beyond red — and that includes `+Infinity`,
+ * which is what a zero limit divides out to. Only `NaN` (no figure at all)
+ * falls to the green end, and it is the caller's job not to draw a band for
+ * a figure it does not have. */
 export function gaugeFillColor(pct: number): string {
-  const t = (Number.isFinite(pct) ? Math.max(0, Math.min(100, Number(pct))) : 0) / 100;
+  const t = (Number.isNaN(pct) ? 0 : Math.max(0, Math.min(100, Number(pct)))) / 100;
   return t < 0.5
     ? mixHex(FILL_STOPS[0], FILL_STOPS[1], t * 2)
     : mixHex(FILL_STOPS[1], FILL_STOPS[2], (t - 0.5) * 2);
 }
 
 /** The ramp painted ACROSS THE ARC'S SWEEP — green at 0, red at the scale's
- * end — so a band takes its colour from WHERE IT SITS on the dial rather
+ * end — so a band takes its color from WHERE IT SITS on the dial rather
  * than from a figure computed about it. The needle's position and the
- * colour under it then carry the same information, and nothing is asserted:
+ * color under it then carry the same information, and nothing is asserted:
  * the ramp is the same whatever the machine is doing, and the fill simply
  * reveals its own slice of it.
  *
@@ -136,11 +139,11 @@ export function gaugeFillColor(pct: number): string {
  * **The offsets are cosine-spaced, not linear, and that is the whole
  * subtlety.** A horizontal gradient interpolates along X, while the arc
  * advances by ANGLE; for a semicircle the two are related by
- * `x = cx − r·cos(pct·π)`, so evenly-spaced colours in X would bunch
+ * `x = cx − r·cos(pct·π)`, so evenly-spaced colors in X would bunch
  * visibly wrong against the tick marks — the 50% stop would not land at the
  * top of the dial. Placing each stop at its own `(1 − cos(pct·π)) / 2`
- * makes the gradient track the arc exactly, so the colour at any tick is
- * the colour that tick's percentage maps to.
+ * makes the gradient track the arc exactly, so the color at any tick is
+ * the color that tick's percentage maps to.
  *
  * 24 segments is a legibility choice, not a precision one: the ramp is
  * piecewise-linear between stops and the eye cannot resolve the banding
@@ -154,7 +157,7 @@ export function gaugeRampStops(segments = 24): { offset: number; color: string }
 
 /** A CSS `linear-gradient(...)` spanning ONE band's own slice of the arc
  * ramp — for the legend swatch that labels it. A flat swatch beside a
- * multi-coloured band would break the mapping the legend exists to state. */
+ * multi-colored band would break the mapping the legend exists to state. */
 export function gaugeRampSwatch(startPct: number, endPct: number): string {
   const a = gaugeFillColor(startPct);
   const b = gaugeFillColor(endPct);

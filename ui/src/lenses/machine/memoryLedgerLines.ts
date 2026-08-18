@@ -52,7 +52,7 @@ import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../.
  * the verdict above. The row's own STATE line is deliberately NOT touched —
  * this resident is healthy; the price was wrong, which is an epistemic fact
  * and not a severity. Spending the state channel on it would mint a second
- * meaning for colour (the same argument that rejected forcing the machine
+ * meaning for color (the same argument that rejected forcing the machine
  * verdict to UNKNOWN — see #1854). */
 export function overPriceHint(m: Pick<MachineResourcesModel, "over_price_bytes" | "current_bytes">): string | null {
   const over = m.over_price_bytes;

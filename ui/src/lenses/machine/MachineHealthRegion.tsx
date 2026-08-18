@@ -132,13 +132,13 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   // inner ring it belongs to.
   const centerVal = gaugeValueParts(resources.pool?.used_bytes ?? resources.machine.current_bytes);
   const faceCaption = gaugeFaceCaption(resources.machine.state, pressureRed, overLimit);
-  // The band's colour is not computed here at all: it comes from the arc
+  // The band's color is not computed here at all: it comes from the arc
   // ramp (`gaugeRampStops`), which is fixed to the dial and identical on
   // every machine. Nothing about this machine's state can reach it, which is
   // the separation the old bucketed fill only approximated.
   const band = computeBandGeometry(resources);
   // Hue follows the MACHINE's fill now, not darkmux's share — the ring it
-  // colours is the machine's.
+  // colors is the machine's.
 
   const odo = odoLayout(digitCells(centerVal.num));
 
@@ -176,7 +176,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   return (
     <div className="mm-gauge">
       <svg width="300" height="212" viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
-        {/* The colour ramp lives across the arc's SWEEP, not in any figure
+        {/* The color ramp lives across the arc's SWEEP, not in any figure
             about the machine — laid across the arc's bounding box in user
             space so it is independent of how much of the arc is filled. */}
         <defs>
@@ -258,7 +258,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
         <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
           {/* Seven-segment, drawn as polygons in the SAME cell geometry the
               boxed odometer used, so the figure still centres on the hub and
-              the unit still sits where it sat. `currentColor` keeps colour
+              the unit still sits where it sat. `currentColor` keeps color
               with the CSS (`.mm-gauge-center-val`) rather than moving it into
               the component — the glyph form is what changed here, not the
               palette. */}

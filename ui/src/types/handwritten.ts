@@ -360,12 +360,13 @@ export interface MachineResources {
      * unpriceable, no potential at all) does that. */
     estimated_models: number;
     /** #1854 — residents counted at their MEASURED size because it exceeded
-     * the price they declared. It qualifies the verdict rather than changing
-     * it: a green with zero here is CEILING-backed (fits even if every
-     * resident grows to its declared maximum); a green with a non-zero count
-     * is FLOOR-backed (fits at the larger of each price and each observed
-     * size, with that many maxima known to be wrong). Same chip, weaker
-     * promise — which is why the count renders beside the chip.
+     * the price they declared. It qualifies the projection rather than
+     * changing it: zero here means the projection is CEILING-backed (holds
+     * even if every resident grows to its declared maximum); non-zero means
+     * FLOOR-backed (holds at the larger of each price and each observed
+     * size, with that many maxima known to be wrong). The viewer discloses
+     * this per row (`over_price_bytes`) and in the warning text; it draws no
+     * machine-level verdict from it.
      *
      * `?` for a pre-2.1 peer's ledger, matching the server's `serde(default)`. */
     over_price_models?: number;

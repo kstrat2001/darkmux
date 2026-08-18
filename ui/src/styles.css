@@ -167,7 +167,7 @@ body {
 /* (operator: "should live be pulsing like it did before?") — it should, and
    it was MISSING: legacy has `@keyframes lpulse` + `.pb.live{animation:…}`
    and this port had neither. Another purely visual element the text goldens
-   could not see, alongside the machine icon and the status dot's colour.
+   could not see, alongside the machine icon and the status dot's color.
 
    Worth knowing what it does and does not mean: the pulse is a fixed 1.6s
    loop gated only on the badge being live. It does NOT track record arrival
@@ -1883,7 +1883,7 @@ body {
 .rv__rawtoggle { display: block; margin-top: 4px; }
 
 /* `#meta`'s ready headline — ported from viewer.html (`.rdot`, `.mco`). All
-   four rules were MISSING from this port: the dot rendered uncoloured and the
+   four rules were MISSING from this port: the dot rendered uncolored and the
    machine icon was absent entirely, invisible to the goldens because neither
    a class nor an SVG contributes text. See ReadyHeadline.tsx. */
 .rdot { font-weight: 700; }
@@ -1892,7 +1892,7 @@ body {
 .mco svg { width: 13px; height: 13px; vertical-align: -2px; margin-left: 2px; color: var(--accent-dim, var(--accent)); }
 
 /* (#238, ported) Reduced-motion drops the pulse. Live stays distinguishable
-   WITHOUT motion — the badge keeps its colour, the ● glyph and the word. */
+   WITHOUT motion — the badge keeps its color, the ● glyph and the word. */
 #modebadge.pb.live .pbdot {
   animation: lpulse 1.6s ease-in-out infinite;
 }
@@ -2109,21 +2109,16 @@ body {
   font-size: 6.5px;
   letter-spacing: 0.14em;
 }
-/* The center readout is an odometer: recessed cells matching the pressure
-   tiles (`.mm-odo-c`), so the face carries one numeric idiom rather than two.
+/* The center readout is a seven-segment figure, the same idiom as the
+   pressure tiles (`.mm-odo-seg`), so the face carries one numeric idiom.
    Geometry — cell widths, the narrow `.` cell, the centering on the hub — is
    laid out in `MachineHealthRegion.tsx::odoLayout`, because an SVG has no
-   flexbox and the whole point of the nit was that the FIGURE has to center on
-   the hub independently of the unit sitting beside it. */
-/* The seven-segment cells (operator call, replacing the boxed odometer
-   digits). No fill/stroke of their own — the glyph polygons inside take
-   `currentColor` from `.mm-gauge-center-val`, so colour stays with the CSS
-   and this class exists to name the cell for layout and for tests. */
-.mm-gauge-odo-digit {
-  fill: var(--fg);
-  font-size: 15px;
-  font-weight: 600;
-}
+   flexbox and the FIGURE has to center on the hub independently of the unit
+   sitting beside it. */
+/* The seven-segment cells (`.mm-gauge-odo-cell`, replacing the boxed
+   odometer digits) have no fill/stroke of their own — the glyph polygons
+   inside take `currentColor` from `.mm-gauge-center-val`, so color stays
+   with the CSS and the class exists to name the cell for layout and tests. */
 .mm-gauge-center-unit {
   font-size: 10px;
   font-weight: 600;
@@ -2172,9 +2167,6 @@ body {
 .mm-gauge-other {
   opacity: 0.32;
 }
-.mm-gauge-other.is-green { stroke: var(--good); }
-.mm-gauge-other.is-amber { stroke: var(--warn); }
-.mm-gauge-other.is-red { stroke: var(--bad); }
 
 /* Legend swatch for that segment — same dimming, so the mapping holds. */
 .mm-legend-sw.is-other { opacity: 0.32; }
@@ -2193,24 +2185,10 @@ body {
   opacity: 0.85;
 }
 
-/* The fill's colour is no longer a class at all: the band takes its stroke
-   from the arc ramp (`gaugeRampStops`, an SVG gradient across the sweep), so
-   there are no zones and no thresholds. The bucketed
-   `is-green`/`is-amber`/`is-red` arms that stood here keyed on 50% and 85%
-   edges darkmux invented — a machine at 84% and one at 86% are not different
-   in kind. The rule they replaced was worse still: the fill once keyed on
-   `machine.state` (the arbiter's verdict), which is `unknown` on a real
-   machine and painted the whole sweep dim grey.
-   See that function's doc for why the two questions were split. */
-.mm-gauge-val.is-green {
-  stroke: var(--good);
-}
-.mm-gauge-val.is-amber {
-  stroke: var(--warn);
-}
-.mm-gauge-val.is-red {
-  stroke: var(--bad);
-}
+/* The fill's color is not a class: the band takes its stroke from the arc
+   ramp (`gaugeRampStops`, an SVG gradient across the sweep), so there are no
+   zones and no thresholds — a machine at 84% and one at 86% are not different
+   in kind. See that function's doc. */
 .mm-gauge-commit {
   stroke: var(--fg);
   stroke-width: 2;
@@ -2240,16 +2218,18 @@ body {
     drop-shadow(0 0 4px var(--bad))
     drop-shadow(0 0 9px var(--bad));
 }
-/* Redline glow on the readout. The digits carry their own `fill`, so the
-   group's `fill` alone would not reach them — the descendant rule is what
-   actually turns the number red; the cells stay recessed and dark. */
+/* Redline glow on the readout, and the readout itself going red with it.
+   The seven-segment glyphs are `<polygon fill="currentColor">`, so `color`
+   is what reaches them — including the decimal point, which is a `<circle>`
+   with the same fill. The rule that stood here targeted
+   `.mm-gauge-odo-digit`, a `<text>` element the seven-segment rewrite
+   deleted, so the digits silently stayed white on a red machine while the
+   glow, the redline and the unit text all fired correctly. */
 .mm-gauge-center-val.lit {
+  color: var(--bad);
   filter:
     drop-shadow(0 0 3px var(--bad))
     drop-shadow(0 0 8px var(--bad));
-}
-.mm-gauge-center-val.lit .mm-gauge-odo-digit {
-  fill: var(--bad);
 }
 .mm-gauge-center-val.lit .mm-gauge-center-unit {
   fill: var(--bad);
@@ -2293,9 +2273,6 @@ body {
   border-radius: 2px;
   background: var(--dim);
 }
-.mm-legend-sw.is-green { background: var(--good); }
-.mm-legend-sw.is-amber { background: var(--warn); }
-.mm-legend-sw.is-red { background: var(--bad); }
 /* darkmux's inner ring: achromatic and thinner on the dial, so the swatch
    matches — the machine's band carries the how-full hue, this one does not. */
 .mm-legend-sw.is-darkmux {
@@ -2453,7 +2430,7 @@ body {
 }
 /* Seven-segment cells for the pressure tiles (operator call, replacing the
    boxed odometer digits). Sized to sit on the same baseline as the unit
-   label beside them; colour comes from `currentColor` so the tile's own
+   label beside them; color comes from `currentColor` so the tile's own
    rules still govern it. */
 .mm-odo-seg {
   width: 11px;
@@ -2480,17 +2457,6 @@ body {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
-}
-.mm-odo-c {
-  display: inline-block;
-  font: 600 16px/1 "JetBrains Mono", monospace;
-  color: var(--fg);
-  background: #0d1120;
-  border: 1px solid #2c3446;
-  border-radius: 3px;
-  padding: 5px 4px;
-  min-width: 20px;
-  box-shadow: inset 0 3px 5px rgba(0, 0, 0, 0.6);
 }
 .mm-odo-unit {
   font: 600 11px "JetBrains Mono", monospace;

@@ -552,12 +552,14 @@ pub struct MachineTotals {
     /// counted in [`Self::potential_bytes`] — at their MEASURED size, not
     /// their priced one, which is the whole point.
     ///
-    /// It exists to qualify the verdict rather than change it. A green with
-    /// zero here is CEILING-backed: it fits even if every resident grows to
-    /// its declared maximum. A green with a non-zero count is FLOOR-backed:
-    /// it fits at the larger of each price and each observed size, and the
-    /// declared maxima are known to be wrong for that many residents. Same
-    /// chip, weaker promise — so the count travels beside the chip.
+    /// It qualifies the projection rather than changing it. A projection
+    /// with zero here is CEILING-backed: it holds even if every resident
+    /// grows to its declared maximum. With a non-zero count it is
+    /// FLOOR-backed: it holds at the larger of each price and each observed
+    /// size, and the declared maxima are known to be wrong for that many
+    /// residents. The count is emitted so a consumer can say so; the viewer
+    /// discloses it per row (`ModelRow::over_price_bytes`) and in the
+    /// warning, never as a machine-level verdict.
     ///
     /// `#[serde(default)]` for the same lenient-on-read reason as
     /// [`Self::estimated_models`] above (contract 5).
@@ -1350,7 +1352,18 @@ fn hint_target_key(rows: &[ModelRow], total_bytes: u64, limit: u64) -> Option<St
         .filter(|r| achievable_ctx_saving(r) >= overshoot)
         .max_by_key(|r| effective_kv_rate(r));
     covering
-        .or_else(|| candidates.iter().max_by_key(|r| achievable_ctx_saving(r)))
+        // The fallback names the biggest partial saving — but only a REAL
+        // one. A candidate whose whole achievable saving is 0 (its measured
+        // footprint already sits at or above its price, #1854) would make
+        // the hint read "largest single saving is X at ctx 4096 (0 B)",
+        // which is a no-op dressed as advice; with no positive saving
+        // anywhere the honest hint is the no-shrinkable-context arm.
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|r| achievable_ctx_saving(r) > 0)
+                .max_by_key(|r| achievable_ctx_saving(r))
+        })
         .map(|r| r.model_key.clone())
 }
 
@@ -2156,7 +2169,7 @@ mod tests {
         // …and it does NOT move the row's severity. What was falsified is the
         // estimate's ceiling, not the fit — the fit is measured. Spending the
         // state channel on an epistemic condition would mint a second meaning
-        // for colour.
+        // for color.
         assert_ne!(r.state, LedgerState::Amber, "an over-price row is not thereby unhealthy");
 
         // And it must be SAID — a silent correction is one nobody fixes.
@@ -2295,12 +2308,6 @@ mod tests {
     }
 
 
-
-    /// (#1854) The CLI is the viewer's twin, so it discloses in the same two
-    /// places: a footnote on the ROW (which is where the confusing
-    /// `potential X · current Y` pair with Y > X actually prints, and the
-    /// machine-level warning several lines below cannot repair it in place)
-    /// and the warning itself. NOT on the machine-total line — see below.
     #[test]
     fn sum_potential_equal_to_limit_is_green_inclusive() {
         // projected_total == limit: the green arm's `≤` is inclusive at
@@ -2316,6 +2323,11 @@ mod tests {
         assert!(ledger.machine.shrink_hint.is_none());
     }
 
+    /// (#1854) The CLI is the viewer's twin, so it discloses in the same two
+    /// places: a footnote on the ROW (which is where the confusing
+    /// `potential X · current Y` pair with Y > X actually prints, and the
+    /// machine-level warning several lines below cannot repair it in place)
+    /// and the warning itself. NOT on the machine-total line.
     #[test]
     fn render_human_footnotes_the_over_price_row_but_keeps_it_off_the_machine_line() {
         let mut inputs = base_inputs();
@@ -2394,6 +2406,65 @@ mod tests {
     /// push the projected total over the limit. Under the pre-#1821 rule
     /// (`sum_potential <= limit`) this machine would have reported GREEN;
     /// it must not.
+    /// (#1854) The hint's PRINTED saving is capped the same way the
+    /// projection is. The suggested ctx rounds down to a 4 K multiple, so
+    /// the KV arithmetic for the rounded cut can exceed the overshoot by a
+    /// wide margin — and here it also exceeds what the resident can give
+    /// back at all: devstral is priced at 19.12 GB and already holding
+    /// 15.00 GB, so no ctx cut reclaims more than 4.12 GB, however the
+    /// formula reads. Before this cap the hint promised the formula's
+    /// 4.70 GB. Red-provable: swap `saved` for `priced_off` and the string
+    /// says "cuts 4.70 GB".
+    #[test]
+    fn the_shrink_hint_prints_the_saving_that_can_materialize_not_the_kv_formula() {
+        let mut inputs = base_inputs();
+        // Pin `used_bytes` to Σ current so `other_used` is 0 and the budget
+        // arithmetic below is exact.
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
+        // Overshoot chosen so devstral (the KV hog) COVERS it — but only just
+        // under its 4.12 GB ceiling — while the rounded-down ctx (4096) prices
+        // off the full 4.70 GB.
+        let projected = JUDGE_POTENTIAL + DEVSTRAL_POTENTIAL;
+        let overshoot = 4_100_000_000u64;
+        inputs.budget_bytes = Some(projected - overshoot);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Amber);
+        let hint = ledger.machine.shrink_hint.clone().expect("amber names a shrink");
+        assert!(hint.contains("reload devstral at ctx 4096"), "hint: {hint}");
+        // devstral's potential minus what it holds: 19,118,709,120 − 15,000,000,000.
+        assert!(hint.contains("cuts 4.12 GB"), "hint: {hint}");
+        assert!(!hint.contains("4.70 GB"), "the KV formula's figure must not print: {hint}");
+    }
+
+    /// (#1854) When every shrinkable resident is already holding at least
+    /// its price, no ctx cut reclaims anything — and the hint must say so
+    /// rather than name one of them with a 0 B saving.
+    ///
+    /// Amber needs `Σ current ≤ limit < projected`, and a clamped row's
+    /// projection IS its current — so with both rows clamped the lift past
+    /// the limit has to come from OTHER tenants (#1821), which is exactly
+    /// the case where a ctx cut helps nothing: darkmux is not the one
+    /// holding the difference.
+    #[test]
+    fn a_hint_with_no_positive_saving_anywhere_falls_to_the_no_shrinkable_context_arm() {
+        let mut inputs = base_inputs();
+        // Both workers above their rows' prices (judge ~19.27 GB, devstral
+        // ~19.12 GB): both rows clamp to 20 GB, both achievable savings are 0.
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: 20_000_000_000, footprint_bytes: None },
+            WorkerProc { pid: 2, rss_bytes: 20_000_000_000, footprint_bytes: None },
+        ]);
+        // Σ current 40 GB ≤ budget 44 GB < projected 47 GB (7 GB of others).
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(47_000_000_000), ..p });
+        inputs.budget_bytes = Some(44_000_000_000);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.over_price_models, 2, "{:?}", ledger.models);
+        assert_eq!(ledger.machine.state, LedgerState::Amber, "{:?}", ledger.machine);
+        let hint = ledger.machine.shrink_hint.clone().expect("amber names a hint");
+        assert!(hint.contains("no shrinkable context"), "hint: {hint}");
+        assert!(!hint.contains("0 B"), "hint: {hint}");
+    }
+
     #[test]
     fn amber_verdict_and_shrink_hint_key_on_projected_total_not_darkmux_alone() {
         let mut inputs = base_inputs();
@@ -2445,11 +2516,7 @@ mod tests {
         // running under the limit only because lazy allocation hasn't
         // materialized — amber, with the config shrink named.
         //
-        // (#1835) [`COVERING_HINT_BUDGET`], not the 35 GB this fixture used
-        // before the fit arm split — see that constant for why the window is
-        // narrow. The claim under test (a covering hint targets the KV hog)
-        // is unchanged; only the fixture's headroom moved. `used_bytes`
-        // pinned to Σ current so `other_used` is exactly 0 (#1821) — this
+        // `used_bytes` pinned to Σ current so `other_used` is exactly 0 (#1821) — this
         // test is about the shrink-hint TARGET, not the other-tenants
         // arithmetic, which `amber_verdict_and_shrink_hint_key_on_
         // projected_total_not_darkmux_alone` below covers directly.

@@ -193,19 +193,19 @@ describe("MachineHealthRegion — hostile state strings degrade to 'unknown', ne
  * operator actually saw and reported. A test that only exercised green/red
  * payloads would have passed against the broken version.
  */
-describe("MachineHealthRegion — the arc's colour is a fixed ramp, never a verdict", () => {
+describe("MachineHealthRegion — the arc's color is a fixed ramp, never a verdict", () => {
   // The fill used to be `gaugeFillSeverity(usedPct)` — three buckets with
   // edges at 50% and 85%. Those edges were thresholds darkmux invented, and
   // a machine at 84% and one at 86% are not different in kind. The ramp is
   // now painted across the arc's SWEEP (green at 0, red at the scale end),
-  // so the colour under any point states only where that point sits.
+  // so the color under any point states only where that point sits.
   //
   // These tests replace the bucket-boundary ones. The claim they protected —
   // the fill answers "how full", never "what the arbiter decided" — is not
   // weakened by the change; it is now true BY CONSTRUCTION, and that is what
   // is asserted.
 
-  it("paints the band from the arc ramp, not from a per-machine colour", () => {
+  it("paints the band from the arc ramp, not from a per-machine color", () => {
     const { container } = renderRegion(BASE);
     expect(container.querySelector(".mm-gauge-val")!.getAttribute("stroke")).toBe("url(#mm-gauge-ramp)");
     expect(container.querySelector("linearGradient#mm-gauge-ramp")).not.toBeNull();
@@ -962,7 +962,7 @@ describe("MachineHealthRegion — #1854 a resident holding more than darkmux pri
     // The severity channel stays reserved for fit severity. A row whose only
     // distinction is an outgrown ESTIMATE must not borrow the vocabulary the
     // machine uses to say "this does not fit" — that mints a second meaning
-    // for colour, the same argument that rejected forcing the verdict to
+    // for color, the same argument that rejected forcing the verdict to
     // UNKNOWN. The chip only speaks when a row DISAGREES with the machine.
     const { container } = renderRegion(OVER_PRICE);
     const row = [...container.querySelectorAll(".mm-row")].find((n) => /more than priced/.test(n.textContent || ""));
