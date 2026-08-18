@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { attributionLine, limitDescription, perModelScale, stampLine, utilityModelId } from "./memoryLedgerLines";
+import { attributionLine, limitDescription, overPriceHint, perModelScale, stampLine, utilityModelId } from "./memoryLedgerLines";
 import type { MachineResources, MachineResourcesModel, MachineSpecs } from "../../types/handwritten";
 
 // #1806 Stage 1 refactored the health region's text builders from one flat
@@ -131,3 +131,38 @@ describe("stampLine / attributionLine", () => {
     expect(attributionLine(machineResources({ attribution: "" }))).toBe("attribution: —");
   });
 });
+
+// (#1854) `potential` is the fit contract — "the most this resident will ever
+// hold" — and it has been falsified in the field: an IDLE MLX resident
+// measured 28.40 GiB against a priced 22.88 GiB, steady to the byte. The
+// server clamps the projection to what is actually held; these two builders
+// are the only places that say so, which makes them load-bearing rather than
+// decorative. Without the disclosure the clamp silently repairs the estimate
+// and nobody ever fixes the estimator.
+describe("overPriceHint", () => {
+  it("names the overage AND what the projection now counts", () => {
+    expect(
+      overPriceHint({ over_price_bytes: 5_927_827_046, current_bytes: 30_493_331_456 }),
+    ).toBe("holds 5.52 GiB more than priced — the fit projection counts the measured 28.40 GiB");
+  });
+
+  it("is silent for an ordinary resident — nearly every row, every poll", () => {
+    expect(overPriceHint({ over_price_bytes: undefined, current_bytes: 1_000 })).toBeNull();
+  });
+
+  it("reads the server's flag rather than re-deriving current > potential", () => {
+    // The inverted case that proves the rule: a row whose CURRENT plainly
+    // exceeds a potential the client could compare against, but which the
+    // server did not flag (below the flap floor). A client that re-derived
+    // the condition would light here and disagree with the machine-level
+    // count computed from the same condition one altitude up.
+    expect(
+      overPriceHint({ potential_bytes: 100, current_bytes: 200 } as unknown as Parameters<typeof overPriceHint>[0]),
+    ).toBeNull();
+  });
+
+  it("treats a zero overage as nothing to say", () => {
+    expect(overPriceHint({ over_price_bytes: 0, current_bytes: 1_000 })).toBeNull();
+  });
+});
+

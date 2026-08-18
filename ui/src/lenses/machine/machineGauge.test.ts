@@ -7,14 +7,19 @@ import {
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
-  gaugeFillSeverity,
+  gaugeFillColor,
+  gaugeRampStops,
+  gaugeRampSwatch,
   gaugeScaleWord,
   gaugeTickLabel,
   gaugeValueParts,
   groupResidencyRows,
   isEstimatedRow,
   isOverLimit,
-  machineStateWord,
+  isSevenSegDot,
+  sevenSegmentPolygons,
+  SEVEN_SEG_CELL,
+  SEVEN_SEG_GHOST,
   rowStateDiffers,
   isUtilityTierRow,
   modelKvLine,
@@ -108,20 +113,6 @@ describe("gaugeTickLabel — bare on-arc numbers", () => {
  *    unrepeatable — asserted at the component level too, where the payload
  *    carrying `state:"unknown"` is actually available to get it wrong.
  */
-describe("gaugeFillSeverity — how full, NOT what the arbiter decided", () => {
-  it("ramps green → amber → red across the operator's own thresholds", () => {
-    expect(gaugeFillSeverity(0)).toBe("green");
-    expect(gaugeFillSeverity(49.9)).toBe("green");
-    expect(gaugeFillSeverity(50)).toBe("amber"); // inclusive at the boundary
-    expect(gaugeFillSeverity(84.9)).toBe("amber");
-    expect(gaugeFillSeverity(85)).toBe("red"); // inclusive at the boundary
-    expect(gaugeFillSeverity(100)).toBe("red");
-  });
-
-  it("is total — a non-finite percentage degrades to green, never to a missing class", () => {
-    expect(gaugeFillSeverity(Number.NaN)).toBe("green");
-  });
-});
 
 describe("gaugeScaleWord — the max tick's own meaning", () => {
   it("names LIMIT for the physical-pool source", () => {
@@ -253,7 +244,7 @@ describe("deriveLamps — every lamp keys on exactly one field", () => {
    * There is no STATE lamp, and its absence is the assertion. One rendered
    * here until the operator caught what it did: it relabelled ITSELF with the
    * state (`STATE GREEN`) *and* changed its lit-ness, so a healthy machine
-   * showed the word "GREEN" in grey, beside the same word in actual green on
+   * showed the word "GREEN" in gray, beside the same word in actual green on
    * the machine chip. A tell-tale never renames itself — its lit-ness IS the
    * message — and the verdict already has a home that carries its cause and
    * its estimated-count qualifier too.
@@ -310,8 +301,14 @@ describe("odometerTiles", () => {
   it("splits margin / swap / compressor into digit cells with detail-layer (two-decimal) precision", () => {
     const tiles = odometerTiles({ swap_used_bytes: 5453843005, compressor_bytes: 727711744, margin_percent: 87, red: false });
     expect(tiles[0].digits).toEqual(["8", "7"]);
-    expect(tiles[0].unit).toBe("% margin");
+    // The unit is a pure unit and the label is the subject — the same
+    // shape as the two byte tiles beside it. `% margin` over a `MARGIN`
+    // label printed the word twice.
+    expect(tiles[0].unit).toBe("%");
     expect(tiles[0].label).toBe("margin");
+    for (const t of tiles) {
+      expect(t.unit.toLowerCase()).not.toContain(t.label.toLowerCase());
+    }
     expect(tiles[1].digits.join("")).toBe("5.08");
     expect(tiles[1].unit).toBe("GiB");
     expect(tiles[2].digits.join("")).toBe("694");
@@ -530,48 +527,6 @@ describe("isUtilityTierRow — the row-chip identity marker (follow-up to the ut
  * unknown arms fired turns jargon into a sentence, using the same fields the
  * server branched on.
  */
-describe("machineStateWord — UNKNOWN carries its reason", () => {
-  it("names the unpriced-resident arm — the permanent-normal case on a real machine", () => {
-    expect(machineStateWord("unknown", 137438953472, 1)).toBe("UNKNOWN · unpriced resident");
-  });
-
-  it("names the no-limit arm, and checks it FIRST — the server's own arm order", () => {
-    // With no limit, none of the server's `Some(limit)` arms can fire, so a
-    // missing limit dominates even when unpriced residents also exist.
-    expect(machineStateWord("unknown", null, 3)).toBe("UNKNOWN · no limit readable");
-  });
-
-  it("leaves green/amber/red bare — a reason on a self-evident word is noise", () => {
-    expect(machineStateWord("green", 100, 0)).toBe("GREEN");
-    expect(machineStateWord("amber", 100, 0)).toBe("AMBER");
-    expect(machineStateWord("red", 100, 2)).toBe("RED");
-  });
-
-  it("never invents a reason it cannot name", () => {
-    // Unknown for neither named cause: a limit exists and nothing is
-    // unpriced. Degrades to the bare word rather than guessing.
-    expect(machineStateWord("unknown", 100, 0)).toBe("UNKNOWN");
-    expect(machineStateWord(null, 100, 0)).toBe("UNKNOWN");
-  });
-
-  // #1819 decision 1: a DECIDED verdict (green/amber/red) may rest partly on
-  // an estimate — the count travels with the word.
-  it("appends the estimate disclosure to a decided verdict", () => {
-    expect(machineStateWord("green", 100, 0, 1)).toBe("GREEN · 1 estimated");
-    expect(machineStateWord("amber", 100, 0, 2)).toBe("AMBER · 2 estimated");
-    expect(machineStateWord("red", 100, 0, 1)).toBe("RED · 1 estimated");
-  });
-
-  it("does NOT prepend a 'fit ' word — that prefix is a separate, not-yet-built decision", () => {
-    expect(machineStateWord("green", 100, 0, 1)).not.toContain("fit");
-    expect(machineStateWord("green", 100, 0, 1).toLowerCase()).not.toContain("fit ");
-  });
-
-  it("omits the disclosure entirely when nothing was estimated (the default, and every pre-#1819 call site)", () => {
-    expect(machineStateWord("green", 100, 0, 0)).toBe("GREEN");
-    expect(machineStateWord("green", 100, 0)).toBe("GREEN"); // no 4th arg at all
-  });
-});
 
 /**
  * The per-row state chip renders only where it disagrees with the machine.
@@ -701,5 +656,205 @@ describe("hatchedSegmentDash — extent and hatching in ONE value", () => {
   it("draws nothing at all for an empty segment", () => {
     expect(hatchedSegmentDash(50, 0)).toBe("0 100");
     expect(hatchedSegmentDash(50, -3)).toBe("0 100");
+  });
+});
+
+// ── The arc ramp ─────────────────────────────────────────────────────────
+
+const rgb = (hex: string) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+
+describe("gaugeFillColor", () => {
+  it("is pure green at 0%, the palette amber at 50%, pure red at 100%", () => {
+    expect(gaugeFillColor(0)).toBe("#4ade80");
+    expect(gaugeFillColor(50)).toBe("#f0b429");
+    expect(gaugeFillColor(100)).toBe("#f56565");
+  });
+
+  it("runs green→red, not the other way: red rises and green falls with fullness", () => {
+    // The direction is the whole claim of the ramp — a reversed gradient
+    // would paint an empty machine red and be wrong everywhere at once.
+    const [r0, g0] = rgb(gaugeFillColor(10));
+    const [r1, g1] = rgb(gaugeFillColor(90));
+    expect(r1).toBeGreaterThan(r0);
+    expect(g1).toBeLessThan(g0);
+  });
+
+  it("is monotone in red across the whole sweep — no dip through a muddy midpoint", () => {
+    // Three stops via amber, rather than a straight green→red mix, exist to
+    // avoid the olive trough a two-stop blend produces at 50%. Red never
+    // decreases as fullness increases.
+    let last = -1;
+    for (let p = 0; p <= 100; p += 5) {
+      const [r] = rgb(gaugeFillColor(p));
+      expect(r).toBeGreaterThanOrEqual(last);
+      last = r;
+    }
+  });
+
+  it("clamps rather than extrapolates, and is total over non-finite input", () => {
+    expect(gaugeFillColor(140)).toBe(gaugeFillColor(100));
+    expect(gaugeFillColor(-20)).toBe(gaugeFillColor(0));
+    expect(gaugeFillColor(NaN)).toBe(gaugeFillColor(0));
+    expect(gaugeFillColor(Infinity)).toBe(gaugeFillColor(100));
+    expect(gaugeFillColor(-Infinity)).toBe(gaugeFillColor(0));
+    for (const c of [gaugeFillColor(NaN), gaugeFillColor(33.3)]) expect(c).toMatch(/^#[0-9a-f]{6}$/);
+  });
+});
+
+describe("gaugeRampStops", () => {
+  it("emits segments+1 stops spanning offset 0..1, first green and last red", () => {
+    const stops = gaugeRampStops(24);
+    expect(stops).toHaveLength(25);
+    expect(stops[0]).toEqual({ offset: 0, color: "#4ade80" });
+    expect(stops[24].offset).toBeCloseTo(1, 12);
+    expect(stops[24].color).toBe("#f56565");
+  });
+
+  it("spaces offsets by cosine, not linearly — the 50% stop lands at the dial's crown", () => {
+    // A horizontal gradient interpolates in X while the arc advances by
+    // angle: x = cx − r·cos(pct·π). Linear offsets would put the amber stop
+    // at the wrong tick. The midpoint stop must sit at exactly 0.5 and the
+    // quarter stops at (1 − cos(π/4))/2, not at 0.25 / 0.75.
+    const stops = gaugeRampStops(4);
+    expect(stops.map((s) => s.offset)).toEqual([
+      0,
+      (1 - Math.cos(Math.PI / 4)) / 2,
+      0.5,
+      (1 - Math.cos((3 * Math.PI) / 4)) / 2,
+      1,
+    ].map((v) => expect.closeTo(v, 12)));
+    // and the offsets are strictly increasing, or the gradient would fold.
+    for (let i = 1; i < stops.length; i++) expect(stops[i].offset).toBeGreaterThan(stops[i - 1].offset);
+  });
+
+  it("colors each stop by its own percentage of the sweep", () => {
+    const stops = gaugeRampStops(10);
+    expect(stops[5].color).toBe(gaugeFillColor(50));
+    expect(stops[3].color).toBe(gaugeFillColor(30));
+  });
+});
+
+describe("gaugeRampSwatch", () => {
+  it("is a horizontal CSS gradient from the band's start color to its end color", () => {
+    expect(gaugeRampSwatch(0, 50)).toBe("linear-gradient(90deg, #4ade80, #f0b429)");
+    expect(gaugeRampSwatch(50, 100)).toBe("linear-gradient(90deg, #f0b429, #f56565)");
+  });
+});
+
+// ── Seven-segment glyphs ─────────────────────────────────────────────────
+
+const litCount = (ch: string) => sevenSegmentPolygons(ch).filter((s) => s.lit).length;
+
+describe("sevenSegmentPolygons", () => {
+  it("always returns all seven segments, lit or not, so the ghost cell exists", () => {
+    for (const ch of ["0", "8", "1", ".", "x", ""]) {
+      const segs = sevenSegmentPolygons(ch);
+      expect(segs).toHaveLength(7);
+      for (const s of segs) expect(s.points).toMatch(/^(\d+,\d+ ){5}\d+,\d+$/);
+    }
+  });
+
+  it("lights the conventional segment counts for the digits", () => {
+    // 8 is every segment; 1 is two; 0 is six with the middle bar dark; 7 is
+    // three; 4 is four. A transposed table would show here.
+    expect(litCount("8")).toBe(7);
+    expect(litCount("1")).toBe(2);
+    expect(litCount("0")).toBe(6);
+    expect(litCount("7")).toBe(3);
+    expect(litCount("4")).toBe(4);
+    expect(litCount("2")).toBe(5);
+    expect(litCount("5")).toBe(5);
+    expect(litCount("3")).toBe(5);
+    expect(litCount("6")).toBe(6);
+    expect(litCount("9")).toBe(6);
+  });
+
+  it("distinguishes 6 from 9 and 2 from 5 by WHICH segments are lit, not how many", () => {
+    const lit = (ch: string) => sevenSegmentPolygons(ch).map((s) => s.lit);
+    expect(lit("6")).not.toEqual(lit("9"));
+    expect(lit("2")).not.toEqual(lit("5"));
+    expect(lit("0")).not.toEqual(lit("6"));
+  });
+
+  it("draws every dash the readout can be handed as the middle bar, so a no-data figure is visible", () => {
+    // `gaugeValueParts` returns an EM dash for an unreadable figure. Before
+    // this mapping the cell rendered blank — absence disguised as nothing.
+    for (const dash of ["-", "\u2013", "\u2014"]) {
+      const segs = sevenSegmentPolygons(dash);
+      expect(segs.filter((s) => s.lit)).toHaveLength(1);
+      // the lit one is the middle bar: its points sit around the cell's mid-height.
+      const lit = segs.find((s) => s.lit)!;
+      const ys = lit.points.split(" ").map((p) => Number(p.split(",")[1]));
+      expect(Math.min(...ys)).toBeGreaterThan(SEVEN_SEG_CELL.h * 0.4);
+      expect(Math.max(...ys)).toBeLessThan(SEVEN_SEG_CELL.h * 0.6);
+    }
+  });
+
+  // Which cell zone each polygon occupies, read from its own points — so a
+  // transposed table row (6↔9, 2↔5) or a swapped polygon (a↔d, b↔f, c↔e)
+  // shows here even though every COUNT stays the same.
+  const zoneOf = (points: string) => {
+    const pts = points.split(" ").map((p) => p.split(",").map(Number));
+    const cx = pts.reduce((a, [x]) => a + x, 0) / pts.length;
+    const cy = pts.reduce((a, [, y]) => a + y, 0) / pts.length;
+    const W = SEVEN_SEG_CELL.w, H = SEVEN_SEG_CELL.h;
+    const wide = Math.max(...pts.map(([x]) => x)) - Math.min(...pts.map(([x]) => x)) > W / 2;
+    if (wide) return cy < H / 4 ? "top" : cy > (3 * H) / 4 ? "bottom" : "middle";
+    return `${cy < H / 2 ? "upper" : "lower"}-${cx < W / 2 ? "left" : "right"}`;
+  };
+  const litZones = (ch: string) =>
+    sevenSegmentPolygons(ch).filter((s) => s.lit).map((s) => zoneOf(s.points)).sort();
+
+  it("lays the seven polygons out in the seven zones of the cell, exactly once each", () => {
+    const zones = sevenSegmentPolygons("8").map((s) => zoneOf(s.points)).sort();
+    expect(zones).toEqual(
+      ["bottom", "lower-left", "lower-right", "middle", "top", "upper-left", "upper-right"].sort(),
+    );
+  });
+
+  it("lights the RIGHT zones per digit — 6 is dark upper-right, 9 is dark lower-left, 2 and 5 mirror", () => {
+    expect(litZones("6")).toEqual(["bottom", "lower-left", "lower-right", "middle", "top", "upper-left"].sort());
+    expect(litZones("9")).toEqual(["bottom", "lower-right", "middle", "top", "upper-left", "upper-right"].sort());
+    expect(litZones("2")).toEqual(["bottom", "lower-left", "middle", "top", "upper-right"].sort());
+    expect(litZones("5")).toEqual(["bottom", "lower-right", "middle", "top", "upper-left"].sort());
+    expect(litZones("7")).toEqual(["lower-right", "top", "upper-right"].sort());
+    expect(litZones("1")).toEqual(["lower-right", "upper-right"].sort());
+    expect(litZones("4")).toEqual(["lower-right", "middle", "upper-left", "upper-right"].sort());
+    expect(litZones("0")).toEqual(["bottom", "lower-left", "lower-right", "top", "upper-left", "upper-right"].sort());
+    expect(litZones("3")).toEqual(["bottom", "lower-right", "middle", "top", "upper-right"].sort());
+  });
+
+  it("renders an unmapped character as a dark cell rather than throwing", () => {
+    expect(() => sevenSegmentPolygons("Z")).not.toThrow();
+    expect(litCount("Z")).toBe(0);
+    expect(litCount("")).toBe(0);
+  });
+
+  it("stays inside the canonical cell", () => {
+    for (const s of sevenSegmentPolygons("8")) {
+      for (const p of s.points.split(" ")) {
+        const [x, y] = p.split(",").map(Number);
+        expect(x).toBeGreaterThanOrEqual(0);
+        expect(x).toBeLessThanOrEqual(SEVEN_SEG_CELL.w);
+        expect(y).toBeGreaterThanOrEqual(0);
+        expect(y).toBeLessThanOrEqual(SEVEN_SEG_CELL.h);
+      }
+    }
+  });
+});
+
+describe("seven-segment constants", () => {
+  it("ghosts unlit segments faintly but not invisibly", () => {
+    // 0 would let a narrow `1` float in its gap; anything near opaque reads
+    // as a lit segment. The value is an operator call (5%); the test pins the
+    // band it must stay in, not the exact figure.
+    expect(SEVEN_SEG_GHOST).toBeGreaterThan(0);
+    expect(SEVEN_SEG_GHOST).toBeLessThan(0.15);
+  });
+
+  it("names the decimal point as the one non-segment character", () => {
+    expect(isSevenSegDot(".")).toBe(true);
+    expect(isSevenSegDot("0")).toBe(false);
+    expect(isSevenSegDot("-")).toBe(false);
   });
 });

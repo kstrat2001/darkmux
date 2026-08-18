@@ -167,13 +167,13 @@ body {
 /* (operator: "should live be pulsing like it did before?") — it should, and
    it was MISSING: legacy has `@keyframes lpulse` + `.pb.live{animation:…}`
    and this port had neither. Another purely visual element the text goldens
-   could not see, alongside the machine icon and the status dot's colour.
+   could not see, alongside the machine icon and the status dot's color.
 
    Worth knowing what it does and does not mean: the pulse is a fixed 1.6s
    loop gated only on the badge being live. It does NOT track record arrival
    or connection health — so it says "live" a second time rather than adding
    information. An arrival-driven pulse would genuinely signal a stream going
-   quiet; that is new behaviour, not a port, and is left as its own call. */
+   quiet; that is new behavior, not a port, and is left as its own call. */
 @keyframes lpulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
@@ -1883,7 +1883,7 @@ body {
 .rv__rawtoggle { display: block; margin-top: 4px; }
 
 /* `#meta`'s ready headline — ported from viewer.html (`.rdot`, `.mco`). All
-   four rules were MISSING from this port: the dot rendered uncoloured and the
+   four rules were MISSING from this port: the dot rendered uncolored and the
    machine icon was absent entirely, invisible to the goldens because neither
    a class nor an SVG contributes text. See ReadyHeadline.tsx. */
 .rdot { font-weight: 700; }
@@ -1892,7 +1892,7 @@ body {
 .mco svg { width: 13px; height: 13px; vertical-align: -2px; margin-left: 2px; color: var(--accent-dim, var(--accent)); }
 
 /* (#238, ported) Reduced-motion drops the pulse. Live stays distinguishable
-   WITHOUT motion — the badge keeps its colour, the ● glyph and the word. */
+   WITHOUT motion — the badge keeps its color, the ● glyph and the word. */
 #modebadge.pb.live .pbdot {
   animation: lpulse 1.6s ease-in-out infinite;
 }
@@ -2109,22 +2109,16 @@ body {
   font-size: 6.5px;
   letter-spacing: 0.14em;
 }
-/* The center readout is an odometer: recessed cells matching the pressure
-   tiles (`.mm-odo-c`), so the face carries one numeric idiom rather than two.
+/* The center readout is a seven-segment figure, the same idiom as the
+   pressure tiles (`.mm-odo-seg`), so the face carries one numeric idiom.
    Geometry — cell widths, the narrow `.` cell, the centering on the hub — is
    laid out in `MachineHealthRegion.tsx::odoLayout`, because an SVG has no
-   flexbox and the whole point of the nit was that the FIGURE has to center on
-   the hub independently of the unit sitting beside it. */
-.mm-gauge-odo-cell {
-  fill: #0d1120;
-  stroke: #2c3446;
-  stroke-width: 1;
-}
-.mm-gauge-odo-digit {
-  fill: var(--fg);
-  font-size: 15px;
-  font-weight: 600;
-}
+   flexbox and the FIGURE has to center on the hub independently of the unit
+   sitting beside it. */
+/* The seven-segment cells (`.mm-gauge-odo-cell`, replacing the boxed
+   odometer digits) have no fill/stroke of their own — the glyph polygons
+   inside take `currentColor` from `.mm-gauge-center-val`, so color stays
+   with the CSS and the class exists to name the cell for layout and tests. */
 .mm-gauge-center-unit {
   font-size: 10px;
   font-weight: 600;
@@ -2173,9 +2167,6 @@ body {
 .mm-gauge-other {
   opacity: 0.32;
 }
-.mm-gauge-other.is-green { stroke: var(--good); }
-.mm-gauge-other.is-amber { stroke: var(--warn); }
-.mm-gauge-other.is-red { stroke: var(--bad); }
 
 /* Legend swatch for that segment — same dimming, so the mapping holds. */
 .mm-legend-sw.is-other { opacity: 0.32; }
@@ -2194,20 +2185,10 @@ body {
   opacity: 0.85;
 }
 
-/* The fill's three zones. There is deliberately no `.is-unknown` arm: the fill
-   is driven by `gaugeFillSeverity(pct)` (how full), which is total over
-   green/amber/red, and no longer by `machine.state` (the arbiter's verdict),
-   which is `unknown` on a real machine and painted the whole sweep dim grey.
-   See that function's doc for why the two questions were split. */
-.mm-gauge-val.is-green {
-  stroke: var(--good);
-}
-.mm-gauge-val.is-amber {
-  stroke: var(--warn);
-}
-.mm-gauge-val.is-red {
-  stroke: var(--bad);
-}
+/* The fill's color is not a class: the band takes its stroke from the arc
+   ramp (`gaugeRampStops`, an SVG gradient across the sweep), so there are no
+   zones and no thresholds — a machine at 84% and one at 86% are not different
+   in kind. See that function's doc. */
 .mm-gauge-commit {
   stroke: var(--fg);
   stroke-width: 2;
@@ -2237,16 +2218,18 @@ body {
     drop-shadow(0 0 4px var(--bad))
     drop-shadow(0 0 9px var(--bad));
 }
-/* Redline glow on the readout. The digits carry their own `fill`, so the
-   group's `fill` alone would not reach them — the descendant rule is what
-   actually turns the number red; the cells stay recessed and dark. */
+/* Redline glow on the readout, and the readout itself going red with it.
+   The seven-segment glyphs are `<polygon fill="currentColor">`, so `color`
+   is what reaches them — including the decimal point, which is a `<circle>`
+   with the same fill. The rule that stood here targeted
+   `.mm-gauge-odo-digit`, a `<text>` element the seven-segment rewrite
+   deleted, so the digits silently stayed white on a red machine while the
+   glow, the redline and the unit text all fired correctly. */
 .mm-gauge-center-val.lit {
+  color: var(--bad);
   filter:
     drop-shadow(0 0 3px var(--bad))
     drop-shadow(0 0 8px var(--bad));
-}
-.mm-gauge-center-val.lit .mm-gauge-odo-digit {
-  fill: var(--bad);
 }
 .mm-gauge-center-val.lit .mm-gauge-center-unit {
   fill: var(--bad);
@@ -2290,9 +2273,6 @@ body {
   border-radius: 2px;
   background: var(--dim);
 }
-.mm-legend-sw.is-green { background: var(--good); }
-.mm-legend-sw.is-amber { background: var(--warn); }
-.mm-legend-sw.is-red { background: var(--bad); }
 /* darkmux's inner ring: achromatic and thinner on the dial, so the swatch
    matches — the machine's band carries the how-full hue, this one does not. */
 .mm-legend-sw.is-darkmux {
@@ -2306,22 +2286,11 @@ body {
   opacity: 0.75;
 }
 
-.mm-gcap {
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  color: var(--dim);
-  text-align: center;
-}
-.mm-gcap b {
-  color: var(--fg);
-}
-
-/* Reused, tightly-scoped chip — the gauge caption's own state word
-   (`.mm-chip`) and a model row's owner/state/unpriced/new/departed markers
-   (`.mm-row-chip`) share one visual language: a bordered pill, colored ONLY
-   from a server-verified severity class, the word always present alongside
-   the color (never color-alone). */
-.mm-chip,
+/* A model row's owner/state/unpriced/new/departed markers: a bordered pill,
+   colored ONLY from a server-verified severity class, the word always present
+   alongside the color (never color-alone). (The gauge caption's `.mm-chip`
+   that once shared these rules is retired — the face carries no verdict
+   word.) */
 .mm-row-chip {
   display: inline-block;
   padding: 1px 7px;
@@ -2333,17 +2302,14 @@ body {
   color: var(--dim);
   vertical-align: middle;
 }
-.mm-chip.is-green,
 .mm-row-chip.is-state.is-green {
   color: var(--good);
   border-color: var(--good);
 }
-.mm-chip.is-amber,
 .mm-row-chip.is-state.is-amber {
   color: var(--warn);
   border-color: var(--warn);
 }
-.mm-chip.is-red,
 .mm-row-chip.is-state.is-red {
   color: var(--bad);
   border-color: var(--bad);
@@ -2369,7 +2335,7 @@ body {
    health verdict.
 
    The rule this establishes, and the one to follow for any future marker:
-   **outline + hue = status; fill + grey = identity.** The lowercase word is
+   **outline + hue = status; fill + gray = identity.** The lowercase word is
    a deliberate second signal on top (every status chip is UPPERCASE) —
    double-coding keeps the two families apart at 10px.
 
@@ -2392,7 +2358,7 @@ body {
    (that's `.is-identity`'s job). It says something about the FIGURE itself
    — this potential is a labeled conservative guess, not a measurement.
 
-   Both existing axes are taken (outline+hue = status; fill+grey =
+   Both existing axes are taken (outline+hue = status; fill+gray =
    identity), so this spends the one that is genuinely unclaimed: BORDER
    STYLE. A dashed outline reads as "this line is provisional" without
    borrowing a color that already means something else, and keeps the
@@ -2451,17 +2417,41 @@ body {
 .mm-odo-cells {
   display: inline-flex;
   gap: 2px;
+  /* Bottom-aligned so the decimal point sits on the digits' own baseline —
+     a flex container ignores `vertical-align`, which is what a
+     baseline-aligned inline layout would have used. */
+  align-items: flex-end;
+  position: relative;
 }
-.mm-odo-c {
+/* Seven-segment cells for the pressure tiles (operator call, replacing the
+   boxed odometer digits). Sized to sit on the same baseline as the unit
+   label beside them; color comes from `currentColor` so the tile's own
+   rules still govern it. */
+.mm-odo-seg {
+  width: 11px;
+  height: 19px;
   display: inline-block;
-  font: 600 16px/1 "JetBrains Mono", monospace;
+  vertical-align: baseline;
   color: var(--fg);
-  background: #0d1120;
-  border: 1px solid #2c3446;
-  border-radius: 3px;
-  padding: 5px 4px;
-  min-width: 20px;
-  box-shadow: inset 0 3px 5px rgba(0, 0, 0, 0.6);
+}
+.mm-odo-dot {
+  width: 3.5px;
+  height: 3.5px;
+  border-radius: 50%;
+  background: var(--fg);
+  display: inline-block;
+  margin: 0 1px 1.5px;
+}
+.mm-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 .mm-odo-unit {
   font: 600 11px "JetBrains Mono", monospace;

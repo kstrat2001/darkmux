@@ -82,34 +82,151 @@ export function gaugeTickLabel(bytes: number): string {
   return String(Math.round(n / GIB));
 }
 
-/** The arc fill's hue — the ONE color on this face derived from client
- * arithmetic rather than a server verdict, and the deliberate exception to
- * this module's otherwise strict "the server decides, we render" rule.
+
+/** The dial fill's color ramp stops — `--good`, `--warn`, `--bad` from
+ * `styles.css`, duplicated here as literals because an SVG `stroke` has to
+ * be a concrete value and reading a CSS custom property at render time
+ * would mean a `getComputedStyle` call per frame.
  *
- * Why it has to be an exception (docs/design/machine-lens/provenance.md
- * finding 1): the fill used to key on `machine.state`, and on a real machine
- * `machine.state` is almost always `unknown` — the ledger honestly refuses to
- * promise a fit whenever ANY resident model is unpriceable, which is the
- * normal case. A fill keyed to that verdict is therefore a permanently grey
- * fill, and a gauge whose needle sweeps a grey arc from empty to full has
- * thrown away the one thing a gauge is for: showing you, without reading a
- * number, that the tank is filling.
+ * THREE stops, not two, and that is not a flourish. Interpolating this
+ * palette's green (`#4ade80`) straight to its red (`#f56565`) passes through
+ * `#9fa172` — a muddy olive, because both endpoints are pastels carrying a
+ * lot of blue. Routing through the palette's own amber puts a real yellow at
+ * the midpoint AND keeps every color the dial can show inside the
+ * vocabulary the rest of the page already uses. */
+const FILL_STOPS = ["#4ade80", "#f0b429", "#f56565"] as const;
+
+function mixHex(a: string, b: string, k: number): string {
+  const ch = (h: string, i: number) => parseInt(h.slice(1 + i * 2, 3 + i * 2), 16);
+  const out = [0, 1, 2].map((i) => Math.round(ch(a, i) + (ch(b, i) - ch(a, i)) * k));
+  return `#${out.map((n) => n.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** (operator request) The fill color as a CONTINUOUS function of how full
+ * the machine is: pure green at 0%, the palette's amber at 50%, pure red at
+ * 100%.
  *
- * So the two questions are separated, and each is answered by the channel that
- * can actually answer it:
- * - **"how full is it?"** — this ramp, off the needle's own position. Pure
- *   arithmetic on two server numbers (`current / scale`), no verdict implied.
- * - **"is the machine in trouble?"** — unchanged and still server-only: the
- *   state chip, the seven lamps, the redline (`redlineLit`, one field), and
- *   the face caption. An amber fill NEVER means the arbiter said amber.
+ * This replaces `gaugeFillSeverity`'s three buckets, and the reason is the
+ * same one that removed the verdict chip: **the bucket edges at 50% and 85%
+ * were thresholds darkmux invented.** A machine at 84% and one at 86% are
+ * not different in kind, and painting them different colors asserted that
+ * they were. A ramp asserts nothing — it maps a ratio the operator can
+ * already read off the needle onto a hue, and every boundary in it is
+ * arbitrary in the same tiny degree, which is to say not a boundary at all.
  *
- * Thresholds are the operator's own (2026-08-14): green to half, amber past
- * half, red approaching the line. They are fill-level marks, not the server's
- * cascade, and nothing else on the page reads them. */
-export function gaugeFillSeverity(pct: number): "green" | "amber" | "red" {
-  if (!Number.isFinite(pct) || pct < 50) return "green";
-  if (pct < 85) return "amber";
-  return "red";
+ * Clamps rather than extrapolating: a machine past its limit is drawn at the
+ * red end, not at some color beyond red — and that includes `+Infinity`,
+ * which is what a zero limit divides out to. Only `NaN` (no figure at all)
+ * falls to the green end, and it is the caller's job not to draw a band for
+ * a figure it does not have. */
+export function gaugeFillColor(pct: number): string {
+  const t = (Number.isNaN(pct) ? 0 : Math.max(0, Math.min(100, Number(pct)))) / 100;
+  return t < 0.5
+    ? mixHex(FILL_STOPS[0], FILL_STOPS[1], t * 2)
+    : mixHex(FILL_STOPS[1], FILL_STOPS[2], (t - 0.5) * 2);
+}
+
+/** The ramp painted ACROSS THE ARC'S SWEEP — green at 0, red at the scale's
+ * end — so a band takes its color from WHERE IT SITS on the dial rather
+ * than from a figure computed about it. The needle's position and the
+ * color under it then carry the same information, and nothing is asserted:
+ * the ramp is the same whatever the machine is doing, and the fill simply
+ * reveals its own slice of it.
+ *
+ * Returned as `{offset, color}` stops for an SVG `linearGradient` laid
+ * horizontally across the arc's bounding box.
+ *
+ * **The offsets are cosine-spaced, not linear, and that is the whole
+ * subtlety.** A horizontal gradient interpolates along X, while the arc
+ * advances by ANGLE; for a semicircle the two are related by
+ * `x = cx − r·cos(pct·π)`, so evenly-spaced colors in X would bunch
+ * visibly wrong against the tick marks — the 50% stop would not land at the
+ * top of the dial. Placing each stop at its own `(1 − cos(pct·π)) / 2`
+ * makes the gradient track the arc exactly, so the color at any tick is
+ * the color that tick's percentage maps to.
+ *
+ * 24 segments is a legibility choice, not a precision one: the ramp is
+ * piecewise-linear between stops and the eye cannot resolve the banding
+ * past roughly this density at the dial's rendered size. */
+export function gaugeRampStops(segments = 24): { offset: number; color: string }[] {
+  return Array.from({ length: segments + 1 }, (_, i) => {
+    const pct = i / segments;
+    return { offset: (1 - Math.cos(pct * Math.PI)) / 2, color: gaugeFillColor(pct * 100) };
+  });
+}
+
+/** A CSS `linear-gradient(...)` spanning ONE band's own slice of the arc
+ * ramp — for the legend swatch that labels it. A flat swatch beside a
+ * multi-colored band would break the mapping the legend exists to state. */
+export function gaugeRampSwatch(startPct: number, endPct: number): string {
+  const a = gaugeFillColor(startPct);
+  const b = gaugeFillColor(endPct);
+  return `linear-gradient(90deg, ${a}, ${b})`;
+}
+
+
+// ── Seven-segment glyphs ─────────────────────────────────────────────────
+
+/** Which segments are lit for each character this readout can show, in the
+ * conventional `a`–`g` naming (`a` top, clockwise to `f` upper-left, `g`
+ * middle). Anything unmapped renders blank rather than throwing — a readout
+ * handed an unexpected character shows an empty cell, which is honest, where
+ * a crash would take the whole machine page with it. */
+const SEVEN_SEG_LIT: Record<string, string> = {
+  "0": "abcdef", "1": "bc", "2": "abged", "3": "abgcd", "4": "fgbc",
+  "5": "afgcd", "6": "afgedc", "7": "abc", "8": "abcdefg", "9": "abfgcd",
+  // Every dash this readout can be handed lights the middle bar, which is
+  // exactly what a dash looks like on a seven-segment cell. The EM dash is
+  // the one that matters: `gaugeValueParts` returns "—" for an unreadable
+  // figure, and without it the no-data case drew an empty cell — an
+  // invisible readout where the page's whole honesty rule is that absence
+  // must be VISIBLE as absence and never a fabricated 0.
+  "-": "g", "\u2013": "g", "\u2014": "g",
+};
+
+/** Segment polygons in a 60x100 cell — the canonical grid every consumer
+ * scales into its own box, so the hero figure inside the gauge SVG and the
+ * pressure tiles in HTML cannot drift into two different glyph shapes. */
+const SEVEN_SEG_POLY: Record<string, string> = (() => {
+  const h = (cy: number) => `12,${cy} 17,${cy - 5} 43,${cy - 5} 48,${cy} 43,${cy + 5} 17,${cy + 5}`;
+  const v = (cx: number, y1: number, y2: number) =>
+    `${cx},${y1} ${cx + 5},${y1 + 5} ${cx + 5},${y2 - 5} ${cx},${y2} ${cx - 5},${y2 - 5} ${cx - 5},${y1 + 5}`;
+  return { a: h(6), g: h(50), d: h(94), f: v(6, 12, 44), b: v(54, 12, 44), e: v(6, 56, 88), c: v(54, 56, 88) };
+})();
+
+export const SEVEN_SEG_CELL = { w: 60, h: 100 } as const;
+
+/** How visible an UNLIT segment is.
+ *
+ * A real LCD shows its whole character cell, lit or not, and that ghosting
+ * is what separates a display from a typeface — it also anchors a narrow
+ * glyph like `1` in its cell, so a figure like `110.6` reads as evenly
+ * spaced rather than as digits floating in their own gaps.
+ *
+ * Chosen by looking, not reasoning: 8% / 4.5% / 2% / 0% rendered side by
+ * side at both the hero and pressure-tile sizes, then 0%, 3% and 5% in the
+ * running page on the screens it is actually read on. 8% held the cell but
+ * read as a period reference and smudged at tile size; 0% was clean but let
+ * a narrow `1` drift in its own gap. 5% is the operator's call — enough that
+ * the cell exists, not enough to date the design.
+ *
+ * ONE constant, because the hero figure and the pressure tiles must agree:
+ * two readouts on one face ghosting differently would read as a rendering
+ * bug, not a choice. */
+export const SEVEN_SEG_GHOST = 0.05;
+
+/** Every segment of one character's cell, each flagged lit or not, so a
+ * consumer can render the unlit ones at [`SEVEN_SEG_GHOST`] without knowing
+ * the segment naming. */
+export function sevenSegmentPolygons(ch: string): { points: string; lit: boolean }[] {
+  const on = SEVEN_SEG_LIT[ch] ?? "";
+  return Object.entries(SEVEN_SEG_POLY).map(([k, points]) => ({ points, lit: on.includes(k) }));
+}
+
+/** Whether this character is drawn as a decimal point rather than segments —
+ * named here so both consumers branch on one rule. */
+export function isSevenSegDot(ch: string): boolean {
+  return ch === ".";
 }
 
 /** The scale's own end-label word — `LIMIT`, or `BUDGET` once a #1243
@@ -275,51 +392,6 @@ export function computeGaugeGeometry(resources: MachineResources): GaugeGeometry
   };
 }
 
-/** The machine chip's word, with its REASON attached when the verdict is
- * `unknown` — and, since #1819, the ESTIMATE disclosure attached when the
- * verdict is DECIDED (green/amber/red) but partly rests on an estimate.
- *
- * A bare `UNKNOWN` is jargon that comes out of nowhere: nothing else on the
- * page defines it, and — per docs/design/machine-lens/provenance.md finding
- * 1 — it is the PERMANENT state on any machine with an unpriceable resident,
- * i.e. most real ones. So the one word a first-time reader most needs
- * explained is also the one they will see every single time.
- *
- * The cascade has exactly two `Unknown` arms and they are distinguishable
- * from the SAME fields the server branched on, so this names which one fired
- * rather than guessing:
- *   - `limit_bytes == null` → the server's `None` arm, "no limit readable".
- *   - otherwise (a limit exists, the priced sum fits, but residents are
- *     unpriceable) → the `Some(_)` arm, "unpriced resident".
- * Order matters and mirrors the server's: the `Some(limit)` arms cannot fire
- * at all when the limit is absent, so a missing limit is checked FIRST.
- *
- * #1819 decision 1: an estimated resident MAY produce a decided verdict
- * (Green included) — but the count travels WITH the word everywhere the
- * word appears, so a reader never sees a bare "GREEN" that quietly rests on
- * a guess: `GREEN · 1 estimated`. This is deliberately NOT prefixed with
- * "fit " (`fit GREEN · 1 estimated`, as #1819's own issue body writes it) —
- * that prefix does not exist on this word yet and is a separate, still-open
- * decision; only the estimate disclosure is added here.
- *
- * Green/amber/red otherwise stay bare when nothing is estimated — they are
- * self-evident, and a reason appended to a self-evident word is noise. This
- * never invents a verdict; it only annotates one the server already
- * reached. */
-export function machineStateWord(
-  state: string | null | undefined,
-  limitBytes: number | null | undefined,
-  unpricedModels: number,
-  estimatedModels: number = 0,
-): string {
-  const word = (state || "unknown").toUpperCase();
-  if (word !== "UNKNOWN") {
-    return estimatedModels > 0 ? `${word} · ${estimatedModels} estimated` : word;
-  }
-  if (limitBytes == null) return "UNKNOWN · no limit readable";
-  if (unpricedModels > 0) return "UNKNOWN · unpriced resident";
-  return word; // defensive: unknown for neither named reason — never invent one
-}
 
 /** Whether a row's own state chip carries information the MACHINE chip does
  * not — i.e. whether this row disagrees with the machine's verdict.
@@ -421,7 +493,7 @@ export interface LampInputs {
  * There is deliberately NO `STATE` lamp. One rendered here until the operator
  * caught what it was doing (2026-08-15): it relabelled ITSELF with the state
  * (`STATE GREEN` / `STATE AMBER`) *and* changed its lit-ness, so on a healthy
- * machine it sat UNLIT rendering the word "GREEN" in grey — a few inches from
+ * machine it sat UNLIT rendering the word "GREEN" in gray — a few inches from
  * the same word rendered in actual green on the machine chip. A tell-tale
  * never renames itself; the oil light says "oil pressure" whether it is lit
  * or not, and its lit-ness is the entire message.
@@ -522,7 +594,13 @@ export function odometerTiles(pressure: MachineResources["pressure"]): OdometerV
   return [
     {
       digits: digitCells(marginText),
-      unit: "% margin",
+      // Bare `%`, not `% margin`: the label below already says MARGIN, and
+      // the tile was printing the word twice. A leftover from the #1821
+      // rename — the unit read `% free` against a `MARGIN` label, which did
+      // not collide, and correcting the unit made it a duplicate that
+      // nobody re-read the pair for. Now it matches its two siblings, where
+      // the unit is a pure unit (`GiB`) and the label is the subject.
+      unit: "%",
       label: "margin",
       // #1821 (operator-approved rename): this tile used to read "% free"
       // — measured live, the SAME instant, this figure read 82% while

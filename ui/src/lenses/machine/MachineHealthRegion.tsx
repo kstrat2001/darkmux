@@ -6,12 +6,16 @@ import {
   deriveLamps,
   digitCells,
   gaugeFaceCaption,
-  gaugeFillSeverity,
+  gaugeRampStops,
+  sevenSegmentPolygons,
+  isSevenSegDot,
+  SEVEN_SEG_CELL,
+  SEVEN_SEG_GHOST,
+  gaugeRampSwatch,
   gaugeValueParts,
   groupResidencyRows,
   isEstimatedRow,
   isOverLimit,
-  machineStateWord,
   rowStateDiffers,
   isUtilityTierRow,
   memStateCls,
@@ -22,7 +26,7 @@ import {
   type ResidencyRowView,
 } from "./machineGauge";
 import { memBytes, reclaimableNote } from "../../lib/format";
-import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
+import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
 /**
@@ -68,6 +72,11 @@ const CX = 120;
 const CY = 120;
 const R = 86;
 const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
+
+/** The arc ramp's gradient id. One gauge renders per page, so a fixed id is
+ * safe; it is named rather than generated so the same string can be asserted
+ * in tests and found in the built artifact. */
+const RAMP_ID = "mm-gauge-ramp";
 
 
 /** Where a tick label sits, in the arc's own local geometry — one fixed
@@ -123,12 +132,14 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   // inner ring it belongs to.
   const centerVal = gaugeValueParts(resources.pool?.used_bytes ?? resources.machine.current_bytes);
   const faceCaption = gaugeFaceCaption(resources.machine.state, pressureRed, overLimit);
-  // The fill's hue answers "how full", NOT "what did the arbiter decide" —
-  // see `gaugeFillSeverity`'s own doc for why that separation is load-bearing.
+  // The band's color is not computed here at all: it comes from the arc
+  // ramp (`gaugeRampStops`), which is fixed to the dial and identical on
+  // every machine. Nothing about this machine's state can reach it, which is
+  // the separation the old bucketed fill only approximated.
   const band = computeBandGeometry(resources);
   // Hue follows the MACHINE's fill now, not darkmux's share — the ring it
-  // colours is the machine's.
-  const fillCls = gaugeFillSeverity(band.usedPct);
+  // colors is the machine's.
+
   const odo = odoLayout(digitCells(centerVal.num));
 
   const committed = gaugeValueParts(resources.machine.potential_bytes);
@@ -165,6 +176,16 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
   return (
     <div className="mm-gauge">
       <svg width="300" height="212" viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
+        {/* The color ramp lives across the arc's SWEEP, not in any figure
+            about the machine — laid across the arc's bounding box in user
+            space so it is independent of how much of the arc is filled. */}
+        <defs>
+          <linearGradient id={RAMP_ID} gradientUnits="userSpaceOnUse" x1={CX - R} y1={0} x2={CX + R} y2={0}>
+            {gaugeRampStops().map((s) => (
+              <stop key={s.offset} offset={s.offset} stopColor={s.color} />
+            ))}
+          </linearGradient>
+        </defs>
         <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={11} pathLength={100} />
         {/* ONE STACKED BAND, in scale order: darkmux from 0, everything
             else on top of it ending at the needle, then darkmux's committed
@@ -175,7 +196,8 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
             needle, its derivedness is self-evident, where as an undrawn gap
             between two radii it was simply missing. */}
         <path
-          className={`mm-gauge-val is-${fillCls}`}
+          className="mm-gauge-val"
+          stroke={`url(#${RAMP_ID})`}
           d={HALF_ARC_D}
           fill="none"
           strokeWidth={11}
@@ -184,7 +206,8 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
         />
         {band.other.lengthPct > 0 && (
           <path
-            className={`mm-gauge-other is-${fillCls}`}
+            className="mm-gauge-other"
+            stroke={`url(#${RAMP_ID})`}
             d={HALF_ARC_D}
             fill="none"
             strokeWidth={11}
@@ -225,22 +248,42 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
         />
         {/* The needle is deliberately UNCOLORED by state. It used to carry
             `is-${stateCls}`, which on a real machine means `is-unknown` — a dim
-            grey needle over a dim grey fill, permanently (provenance finding
+            gray needle over a dim gray fill, permanently (provenance finding
             1). Position is the needle's whole job; the fill beside it now
             carries the how-full channel and the lamps carry the verdict, so a
-            third, permanently-grey encoding of the same question is subtraction
+            third, permanently-gray encoding of the same question is subtraction
             rather than information. */}
         <line className="mm-gauge-needle" x1={CX} y1={CY} x2={42} y2={CY} transform={`rotate(${band.needleAngleDeg} ${CX} ${CY})`} />
         <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
         <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
-          {odo.cells.map((c, i) => (
-            <g key={i}>
-              <rect className="mm-gauge-odo-cell" x={c.x} y={ODO_TOP} width={c.w} height={ODO_H} rx={2.5} />
-              <text className="mm-gauge-odo-digit" x={c.x + c.w / 2} y={ODO_BASELINE} textAnchor="middle">
-                {c.ch}
-              </text>
-            </g>
-          ))}
+          {/* Seven-segment, drawn as polygons in the SAME cell geometry the
+              boxed odometer used, so the figure still centers on the hub and
+              the unit still sits where it sat. `currentColor` keeps color
+              with the CSS (`.mm-gauge-center-val`) rather than moving it into
+              the component — the glyph form is what changed here, not the
+              palette. */}
+          {odo.cells.map((c, i) =>
+            isSevenSegDot(c.ch) ? (
+              <circle
+                key={i}
+                className="mm-gauge-odo-cell"
+                cx={c.x + c.w / 2}
+                cy={ODO_TOP + ODO_H - 3.5}
+                r={1.7}
+                fill="currentColor"
+              />
+            ) : (
+              <g
+                key={i}
+                className="mm-gauge-odo-cell"
+                transform={`translate(${c.x} ${ODO_TOP}) scale(${c.w / SEVEN_SEG_CELL.w} ${ODO_H / SEVEN_SEG_CELL.h})`}
+              >
+                {sevenSegmentPolygons(c.ch).map((sg, j) => (
+                  <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
+                ))}
+              </g>
+            ),
+          )}
           <text className="mm-gauge-center-unit" x={CX + odo.width / 2 + 5} y={ODO_BASELINE} textAnchor="start">
             {centerVal.unit}
           </text>
@@ -281,7 +324,7 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
  * (`used - darkmux`), and giving it a swatch would present arithmetic as a
  * measured band.
  */
-function GaugeLegend({ resources, band, fillCls }: { resources: MachineResources; band: ReturnType<typeof computeBandGeometry>; fillCls: string }) {
+function GaugeLegend({ resources, band }: { resources: MachineResources; band: ReturnType<typeof computeBandGeometry> }) {
   const growth = band.growth.lengthPct > 0;
   const other = resources.pool?.used_bytes != null && resources.machine.current_bytes != null
     ? Math.max(0, Number(resources.pool.used_bytes) - Number(resources.machine.current_bytes))
@@ -292,11 +335,11 @@ function GaugeLegend({ resources, band, fillCls }: { resources: MachineResources
   return (
     <div className="mm-legend">
       <span className="mm-legend-item">
-        <span className={`mm-legend-sw is-${fillCls}`} /> darkmux <b>{memBytes(resources.machine.current_bytes)}</b>
+        <span className="mm-legend-sw" style={{ background: gaugeRampSwatch(0, band.darkmux.lengthPct) }} /> darkmux <b>{memBytes(resources.machine.current_bytes)}</b>
       </span>
       {other != null && (
         <span className="mm-legend-item">
-          <span className={`mm-legend-sw is-other is-${fillCls}`} /> other <b>{memBytes(other)}</b>
+          <span className="mm-legend-sw is-other" style={{ background: gaugeRampSwatch(band.other.startPct, band.usedPct) }} /> other <b>{memBytes(other)}</b>
         </span>
       )}
       {growth && (
@@ -313,22 +356,6 @@ function GaugeLegend({ resources, band, fillCls }: { resources: MachineResources
   );
 }
 
-function GaugeCaption({ resources }: { resources: MachineResources }) {
-  const stateCls = memStateCls(resources.machine.state);
-  const stateText = machineStateWord(
-    resources.machine.state,
-    resources.limit_bytes,
-    Number(resources.machine.unpriced_models) || 0,
-    Number(resources.machine.estimated_models) || 0,
-  );
-  const unpriced = Number(resources.machine.unpriced_models) || 0;
-  return (
-    <div className="mm-gcap">
-      <b>machine total</b> <span className={`mm-chip is-${stateCls}`}>{stateText}</span>
-      {unpriced ? ` (+${unpriced} unpriced)` : ""}
-    </div>
-  );
-}
 
 // ── Tell-tale lamp row ───────────────────────────────────────────────────
 
@@ -422,11 +449,26 @@ function Odometer({ resources }: { resources: MachineResources }) {
         return (
           <div className="mm-odo" key={t.label}>
             <span className="mm-odo-cells">
-              {t.digits.map((d, i) => (
-                <span className="mm-odo-c" key={i}>
-                  {d}
-                </span>
-              ))}
+              {t.digits.map((d, i) =>
+                isSevenSegDot(d) ? (
+                  <span className="mm-odo-dot" key={i} aria-hidden="true" />
+                ) : (
+                  <svg
+                    className="mm-odo-seg"
+                    key={i}
+                    viewBox={`0 0 ${SEVEN_SEG_CELL.w} ${SEVEN_SEG_CELL.h}`}
+                    aria-hidden="true"
+                  >
+                    {sevenSegmentPolygons(d).map((sg, j) => (
+                      <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
+                    ))}
+                  </svg>
+                ),
+              )}
+              {/* The figure stays available to assistive tech as TEXT — the
+                  glyphs above are decorative shapes and a screen reader would
+                  otherwise read nothing at all where a number used to be. */}
+              <span className="mm-sr-only">{t.digits.join("")}</span>
             </span>
             <span className="mm-odo-unit">{t.unit}</span>
             <div className="mm-odo-k">
@@ -476,6 +518,7 @@ function ModelRow({
   const m: MachineResourcesModel = row.model;
   const isGhost = row.status === "ghost";
   const isNew = row.status === "new";
+  const overHint = overPriceHint(m);
   const isUtility = isUtilityTierRow(m.identifier, m.model_key, utilityModelId);
   const stateCls = memStateCls(m.state);
   const pot = m.potential_bytes != null ? Number(m.potential_bytes) : null;
@@ -574,6 +617,12 @@ function ModelRow({
           ↳ estimated: no readable config.json and no readable GGUF header — priced from catalog size + a size-tiered dense-attention KV rate (every layer assumed to hold a KV cache). Set at or above every modern GQA architecture in its size class; it over-reserves hybrid-attention models, and under-reserves pre-GQA multi-head models like Llama-2-13B
         </div>
       )}
+      {/* #1854 — the row this is ABOUT carries the fact (which resident, by
+          how much, what the projection now counts); the machine caption one
+          altitude up carries only the consequence. Neither repeats the
+          other's sentence. A ghost row is excluded like every other hint
+          here: its figures are a last observation, not a live claim. */}
+      {!isGhost && overHint && <div className="mm-hint">↳ {overHint}</div>}
       {!isGhost && (m as { shrink_hint?: string }).shrink_hint && <div className="mm-hint">↳ {(m as { shrink_hint?: string }).shrink_hint}</div>}
     </div>
   );
@@ -685,8 +734,7 @@ export function MachineHealthRegion({
         <div className="mm-heroline">
           <div className="mm-semi">
             <Gauge resources={b} stale={stale} />
-            <GaugeLegend resources={b} band={bandGeo} fillCls={gaugeFillSeverity(bandGeo.usedPct)} />
-            <GaugeCaption resources={b} />
+            <GaugeLegend resources={b} band={bandGeo} />
           </div>
           <div>
             <LampRow resources={b} resourcesErrored={resourcesErrored} residencyChanged={residencyChanged} />

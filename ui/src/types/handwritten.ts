@@ -144,6 +144,20 @@ export interface MachineResourcesModel {
   potential_source?: "arch" | "estimated";
   current_bytes: number;
   state: "green" | "yellow" | "red" | string;
+  /** #1854 — how much this resident holds ABOVE its priced
+   * `potential_bytes`, when that overage is material. OMITTED (not `null`)
+   * in the normal case: the resident is at or under its price.
+   *
+   * The server computes the condition, including the flap floor, so the row
+   * hint and the machine caption's count read ONE definition rather than
+   * each re-deriving `current > potential` — #1852's lesson about figures
+   * whose definition lives in two places.
+   *
+   * NOT a severity: a row carrying this is not unhealthy, and `state` is
+   * deliberately untouched by it. What was falsified is the estimate's
+   * ceiling, not the fit.
+   * Source: `crates/darkmux-profiles/src/model_ledger.rs::ModelRow`. */
+  over_price_bytes?: number;
 }
 
 /** `GET /lab/runs`'s per-seat staffing snapshot — only the fields the runs
@@ -334,6 +348,9 @@ export interface MachineResources {
   };
   models: MachineResourcesModel[];
   machine: {
+    /** #1854 — summed as `max(potential, current)` per resident. A declared
+     * maximum sitting below that resident's own measured footprint is a
+     * disproved number, not a conservative one; see `over_price_models`. */
     potential_bytes: number;
     unpriced_models: number;
     /** #1819 — residents priced by the size-based fallback rather than
@@ -342,6 +359,17 @@ export interface MachineResources {
      * block a Green verdict — only `unpriced_models` (genuinely
      * unpriceable, no potential at all) does that. */
     estimated_models: number;
+    /** #1854 — residents counted at their MEASURED size because it exceeded
+     * the price they declared. It qualifies the projection rather than
+     * changing it: zero here means the projection is CEILING-backed (holds
+     * even if every resident grows to its declared maximum); non-zero means
+     * FLOOR-backed (holds at the larger of each price and each observed
+     * size, with that many maxima known to be wrong). The viewer discloses
+     * this per row (`over_price_bytes`) and in the warning text; it draws no
+     * machine-level verdict from it.
+     *
+     * `?` for a pre-2.1 peer's ledger, matching the server's `serde(default)`. */
+    over_price_models?: number;
     current_bytes: number;
     /** #1821 — everything ELSE on the machine, right now:
      * `pool.used_bytes - current_bytes`, floored at 0. */

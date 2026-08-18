@@ -91,7 +91,15 @@ use std::time::Duration;
 /// see that struct's doc. Tolerable as a major: every consumer (CLI,
 /// `/machine/resources`, the viewer) ships in this same binary; no external
 /// reader is stranded.
-pub const LEDGER_SCHEMA_VERSION: &str = "2.0";
+///
+/// 2.0 → 2.1 (#1854): additive fields only (`ModelRow::over_price_bytes`,
+/// `MachineTotals::over_price_models`) — a 2.0 reader tolerates the payload
+/// unchanged. The `potential_bytes` totals now count `max(potential,
+/// current)` per resident, which is a VALUE change inside an unchanged
+/// field, not a shape change: the field's documented meaning ("the most
+/// this machine's residents will hold") is what it already claimed to be,
+/// and it was simply wrong whenever a resident had outgrown its price.
+pub const LEDGER_SCHEMA_VERSION: &str = "2.1";
 
 /// v1 KV-cache dtype width: 2 bytes/element (fp16 cache, the MLX default).
 /// Deliberately a named constant, not a guess from weight quantization —
@@ -479,6 +487,23 @@ pub struct ModelRow {
     /// [`Attribution::Unavailable`].
     pub current_bytes: Option<u64>,
     pub state: LedgerState,
+    /// #1854: how much this resident holds ABOVE its priced
+    /// [`Self::potential_bytes`], when that overage is material (past the
+    /// flap floor in `compute_ledger`). `None` is the normal case — the
+    /// resident is at or under its price, or one of the two figures is
+    /// missing.
+    ///
+    /// A number rather than a rendered sentence, so the row hint, the
+    /// machine caption's count and the CLI all read ONE server-computed
+    /// condition instead of each re-deriving `current > potential` with its
+    /// own floor. Not serialized when absent, like `shrink_hint`.
+    ///
+    /// This is an EPISTEMIC field, not a severity one: a row carrying it is
+    /// not unhealthy, and it deliberately does not move [`Self::state`].
+    /// What was falsified is the estimate's ceiling, not the fit — the fit
+    /// is measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_price_bytes: Option<u64>,
     /// Amber only: the config shrink that reaches green at load time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shrink_hint: Option<String>,
@@ -489,6 +514,15 @@ pub struct MachineTotals {
     /// Σ potential over PRICEABLE residents (arch-priced AND estimated —
     /// see [`Self::estimated_models`]). When `unpriced_models > 0` this
     /// UNDERCOUNTS — a warning names the gap.
+    ///
+    /// #1854: summed as `max(potential, current)` per resident, not
+    /// `potential` alone. The field's meaning is unchanged — "the most this
+    /// machine's residents will hold" — but a per-resident maximum sitting
+    /// BELOW that resident's own measured footprint is not a conservative
+    /// estimate, it is a disproved one, and summing it made this total (and
+    /// every verdict downstream of it) optimistic by exactly the overage.
+    /// [`Self::over_price_models`] counts how many residents were counted
+    /// at their measured size, so the qualification travels with the figure.
     pub potential_bytes: u64,
     /// Residents whose potential is genuinely unknowable — no readable arch
     /// facts AND no catalog size either (counted as 0 above). Distinct from
@@ -513,6 +547,24 @@ pub struct MachineTotals {
     /// 1819_payload_missing_the_field`).
     #[serde(default)]
     pub estimated_models: u32,
+    /// #1854: residents whose measured footprint has materially exceeded
+    /// their priced potential (`ModelRow::over_price_bytes`). These ARE
+    /// counted in [`Self::potential_bytes`] — at their MEASURED size, not
+    /// their priced one, which is the whole point.
+    ///
+    /// It qualifies the projection rather than changing it. A projection
+    /// with zero here is CEILING-backed: it holds even if every resident
+    /// grows to its declared maximum. With a non-zero count it is
+    /// FLOOR-backed: it holds at the larger of each price and each observed
+    /// size, and the declared maxima are known to be wrong for that many
+    /// residents. The count is emitted so a consumer can say so; the viewer
+    /// discloses it per row (`ModelRow::over_price_bytes`) and in the
+    /// warning, never as a machine-level verdict.
+    ///
+    /// `#[serde(default)]` for the same lenient-on-read reason as
+    /// [`Self::estimated_models`] above (contract 5).
+    #[serde(default)]
+    pub over_price_models: u32,
     /// Total inference-worker footprint; `None` under
     /// [`Attribution::Unavailable`].
     pub current_bytes: Option<u64>,
@@ -837,12 +889,12 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
                 potential_source,
                 current_bytes: None, // attribution below
                 state: LedgerState::Unknown,
+                over_price_bytes: None,
                 shrink_hint: None,
             }
         })
         .collect();
 
-    let sum_potential: u64 = rows.iter().filter_map(|r| r.potential_bytes).sum();
     // Genuinely unpriceable: neither arch facts NOR a catalog size could
     // answer — `potential_bytes` itself is `None`. Distinct from an
     // ESTIMATED row (below), which DOES have a `potential_bytes`.
@@ -955,7 +1007,66 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     // reusing the old darkmux-only comparison.
     let other_used_bytes: Option<u64> =
         pool.and_then(|p| p.used_bytes).map(|used| used.saturating_sub(current_total.unwrap_or(0)));
-    let projected_total_bytes: Option<u64> = other_used_bytes.map(|o| o + sum_potential);
+    // (#1854) `potential` is the fit contract — "the most this resident will
+    // ever hold". It can be WRONG, and measurably so: an idle MLX resident was
+    // observed at 28.40 GiB against a priced potential of 22.88 GiB, steady to
+    // the byte across repeated samples, having measured UNDER potential a day
+    // earlier (see this module's own note at the ArchEstimator doc). A maximum
+    // that sits below an observed value is not a policy choice, it is wrong —
+    // so the projection counts `max(potential, current)` per row. Without the
+    // clamp the fit verdict is optimistic by exactly the overage, in the one
+    // direction that makes an operator load another model.
+    //
+    // Deliberately NOT a new threshold or a widened margin: widening the
+    // estimator needs measurement across models and residency durations, and
+    // guessing a constant here would bury the very signal that says the
+    // estimate needs work. This only stops darkmux from believing a number it
+    // has already disproved.
+    // Flap guard: only a MATERIAL overage counts. A few MB of jitter flipping
+    // this on and off every poll would teach the operator to ignore it inside
+    // a day — the same "signal with no variance carries no information"
+    // lesson as the always-gray lamps, arriving from the other side.
+    let over_floor = |potential: u64| (potential / 100).max(256 * 1024 * 1024);
+    let effective_potential: u64 = rows
+        .iter()
+        .map(|r| match (r.current_bytes, r.potential_bytes) {
+            (Some(c), Some(p)) => c.max(p),
+            (_, Some(p)) => p,
+            _ => 0,
+        })
+        .sum();
+    // The overage is stamped on the ROW as a number, not only spelled out in
+    // the message: every surface that discloses this (the row's own hint, the
+    // machine caption's count, the CLI) then reads ONE server-computed
+    // condition instead of re-deriving `current > potential + floor` client
+    // side. #1852's lesson — a figure whose definition lives in two places is
+    // a figure with no definition.
+    for r in rows.iter_mut() {
+        r.over_price_bytes = match (r.current_bytes, r.potential_bytes) {
+            (Some(c), Some(p)) if c > p && c - p > over_floor(p) => Some(c - p),
+            _ => None,
+        };
+    }
+    let over_price_models = rows.iter().filter(|r| r.over_price_bytes.is_some()).count() as u32;
+    for r in rows.iter() {
+        let (Some(over), Some(priced), Some(measured)) = (r.over_price_bytes, r.potential_bytes, r.current_bytes)
+        else {
+            continue;
+        };
+        // Carry BOTH numbers, deliberately. The clamp removes this defect's
+        // pressure on the verdict, so the only thing keeping the real fix
+        // alive afterwards is the specificity of this message — the
+        // priced-vs-measured pairs ARE the corpus the estimator work needs.
+        messages.push(LedgerMessage::warn(format!(
+            "`{}` holds {} more than darkmux priced it (potential {}, measured {}); \
+             the fit projection counts the measured size",
+            r.identifier,
+            fmt_bytes(over),
+            fmt_bytes(priced),
+            fmt_bytes(measured)
+        )));
+    }
+    let projected_total_bytes: Option<u64> = other_used_bytes.map(|o| o + effective_potential);
 
     // Machine-total color per the #1286 semantics, updated by #1821: arms 3
     // and 4 now key on `projected_total`, not `sum_potential` alone.
@@ -974,7 +1085,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
             // real limit once other tenants are counted.
             machine_shrink = Some(shrink_hint(
                 &rows,
-                projected_total_bytes.unwrap_or(sum_potential),
+                projected_total_bytes.unwrap_or(effective_potential),
                 limit,
                 unpriced_models,
             ));
@@ -1013,7 +1124,7 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
     if let (Some(hint), LedgerState::Amber) = (&machine_shrink, machine_state) {
         if let Some(key) = hint_target_key(
             &rows,
-            projected_total_bytes.unwrap_or(sum_potential),
+            projected_total_bytes.unwrap_or(effective_potential),
             limit_bytes.unwrap_or(0),
         ) {
             if let Some(row) = rows.iter_mut().find(|r| r.model_key == key) {
@@ -1031,9 +1142,10 @@ pub fn compute_ledger(inputs: LedgerInputs, generated_at_ms: u64) -> ModelLedger
         pool,
         pressure,
         machine: MachineTotals {
-            potential_bytes: sum_potential,
+            potential_bytes: effective_potential,
             unpriced_models,
             estimated_models,
+            over_price_models,
             current_bytes: current_total,
             other_used_bytes,
             projected_total_bytes,
@@ -1193,6 +1305,33 @@ fn effective_kv_rate(row: &ModelRow) -> u64 {
     })
 }
 
+
+/// (#1835 + #1854) The most a ctx reduction on this row can ACTUALLY remove
+/// from the machine's projected total.
+///
+/// The naive answer — `kv_rate × (loaded_ctx − SHRINK_CTX_FLOOR)` — assumes
+/// a resident's commitment falls all the way with its price. It does not:
+/// since #1854 the projection counts `max(potential, current)`, so once the
+/// shrunken potential drops below what the model is ALREADY HOLDING, further
+/// cutting saves nothing. You cannot shrink a resident's commitment below
+/// its measured footprint; a reload at a smaller ctx does not evict the
+/// weights.
+///
+/// Found by running the hint rather than reading it: a fixture's hint
+/// promised 4.70 GB, delivered 4.12 GB, and landed the machine back in the
+/// no-margin band it was supposed to escape. The rounding cushion in the
+/// suggested ctx used to absorb the difference, which is why this survived
+/// until a margin floor consumed the cushion.
+fn achievable_ctx_saving(row: &ModelRow) -> u64 {
+    let kv = effective_kv_rate(row);
+    let by_ctx = kv.saturating_mul(row.loaded_ctx.saturating_sub(SHRINK_CTX_FLOOR));
+    match (row.potential_bytes, row.current_bytes) {
+        // The floor the projection will not go below for this row.
+        (Some(pot), Some(cur)) => by_ctx.min(pot.saturating_sub(cur)),
+        _ => by_ctx,
+    }
+}
+
 /// Which model the amber shrink hint targets: the priceable resident whose
 /// ctx reduction saves the most per token (highest effective kv rate — see
 /// [`effective_kv_rate`] — with shrinkable ctx), preferring one whose full
@@ -1210,13 +1349,21 @@ fn hint_target_key(rows: &[ModelRow], total_bytes: u64, limit: u64) -> Option<St
         .collect();
     let covering = candidates
         .iter()
-        .filter(|r| {
-            let kv = effective_kv_rate(r);
-            kv * (r.loaded_ctx - SHRINK_CTX_FLOOR) >= overshoot
-        })
+        .filter(|r| achievable_ctx_saving(r) >= overshoot)
         .max_by_key(|r| effective_kv_rate(r));
     covering
-        .or_else(|| candidates.iter().max_by_key(|r| effective_kv_rate(r) * (r.loaded_ctx - SHRINK_CTX_FLOOR)))
+        // The fallback names the biggest partial saving — but only a REAL
+        // one. A candidate whose whole achievable saving is 0 (its measured
+        // footprint already sits at or above its price, #1854) would make
+        // the hint read "largest single saving is X at ctx 4096 (0 B)",
+        // which is a no-op dressed as advice; with no positive saving
+        // anywhere the honest hint is the no-shrinkable-context arm.
+        .or_else(|| {
+            candidates
+                .iter()
+                .filter(|r| achievable_ctx_saving(r) > 0)
+                .max_by_key(|r| achievable_ctx_saving(r))
+        })
         .map(|r| r.model_key.clone())
 }
 
@@ -1242,7 +1389,7 @@ fn shrink_hint(rows: &[ModelRow], total_bytes: u64, limit: u64, unpriced_models:
         Some(key) => {
             let row = rows.iter().find(|r| r.model_key == key).expect("target from rows");
             let kv = effective_kv_rate(row).max(1);
-            let max_saving = kv * (row.loaded_ctx - SHRINK_CTX_FLOOR);
+            let max_saving = achievable_ctx_saving(row);
             let target_is_estimated = row.potential_source == Some(PotentialSource::Estimated);
             let saving_note = if target_is_estimated {
                 // #1819: the saving itself was computed from the same
@@ -1259,7 +1406,15 @@ fn shrink_hint(rows: &[ModelRow], total_bytes: u64, limit: u64, unpriced_models:
                 // floor) so the hint reads as a real load config.
                 let new_ctx = ((row.loaded_ctx - cut_tokens) / SHRINK_CTX_FLOOR * SHRINK_CTX_FLOOR)
                     .max(SHRINK_CTX_FLOOR);
-                let saved = kv * (row.loaded_ctx - new_ctx);
+                // The saving that will actually MATERIALIZE, not the KV
+                // arithmetic: the projection floors this row at its measured
+                // footprint (#1854), so report the number the operator will
+                // see rather than the one the formula produces.
+                let priced_off = kv * (row.loaded_ctx - new_ctx);
+                let saved = match (row.potential_bytes, row.current_bytes) {
+                    (Some(pot), Some(cur)) => priced_off.min(pot.saturating_sub(cur)),
+                    _ => priced_off,
+                };
                 format!(
                     "reload {} at ctx {} (now {}) — cuts {} of KV commitment{saving_note}; Σ potential then fits the limit at load time",
                     row.model_key,
@@ -1268,10 +1423,19 @@ fn shrink_hint(rows: &[ModelRow], total_bytes: u64, limit: u64, unpriced_models:
                     fmt_bytes(saved)
                 )
             } else {
+                // The ctx that REACHES the largest saving. Before #1854's cap
+                // that was always the floor (the saving WAS `kv × (ctx −
+                // floor)`); with the cap binding, the whole achievable saving
+                // arrives long before the floor, and naming 4096 beside it
+                // would tell the operator to gut a context for a saving a
+                // far smaller cut already delivers.
+                let at_ctx = ((row.loaded_ctx.saturating_sub(max_saving.div_ceil(kv))) / SHRINK_CTX_FLOOR
+                    * SHRINK_CTX_FLOOR)
+                    .max(SHRINK_CTX_FLOOR);
                 format!(
                     "no single ctx reduction reaches green — largest single saving is {} at ctx {} ({}){saving_note}; shrink several contexts, unload a resident, or load a smaller quant",
                     row.model_key,
-                    SHRINK_CTX_FLOOR,
+                    at_ctx,
                     fmt_bytes(max_saving)
                 )
             }
@@ -1747,6 +1911,16 @@ pub fn render_human(ledger: &ModelLedger) -> String {
             fmt_opt(m.current_bytes),
             state_word,
         ));
+        // #1854: footnote the row where the confusing pair actually appears —
+        // this line prints `potential X · current Y` with Y > X, and the
+        // machine-level message six lines down cannot repair that in place.
+        if let (Some(over), Some(cur)) = (m.over_price_bytes, m.current_bytes) {
+            out.push_str(&format!(
+                "  ↳ holds {} more than priced — the fit projection counts the measured {}\n",
+                fmt_bytes(over),
+                fmt_bytes(cur)
+            ));
+        }
         if let Some(h) = &m.shrink_hint {
             out.push_str(&format!("  ↳ {h}\n"));
         }
@@ -1762,12 +1936,27 @@ pub fn render_human(ledger: &ModelLedger) -> String {
     // present — "unpriced" (uncounted, undercounts the sum) and "estimated"
     // (counted, but via a labeled guess) are different facts and must not
     // collapse into one word.
-    let counts_paren = match (ledger.machine.unpriced_models, ledger.machine.estimated_models) {
-        (0, 0) => String::new(),
-        (u, 0) => format!(" (+{u} unpriced)"),
-        (0, e) => format!(" ({e} estimated)"),
-        (u, e) => format!(" (+{u} unpriced, {e} estimated)"),
-    };
+    //
+    // Built as a clause list rather than matched combinatorially so a third
+    // gap does not mean eight arms. Same rule as before: each clause names a
+    // different gap and none of them collapse into one word.
+    //
+    // #1854 deliberately does NOT add a clause here. Its own count
+    // (`over_price_models`) stays in the payload for `--json` consumers, but
+    // read cold at glance a `(1 at measured)` parenthetical said nothing to
+    // the operator — it only parses if you already know the ceiling-vs-floor
+    // argument behind it. The condition is disclosed where it can be acted
+    // on: a footnote on the row it is about, and the warning below carrying
+    // both figures.
+    let mut count_clauses: Vec<String> = Vec::new();
+    if ledger.machine.unpriced_models > 0 {
+        count_clauses.push(format!("+{} unpriced", ledger.machine.unpriced_models));
+    }
+    if ledger.machine.estimated_models > 0 {
+        count_clauses.push(format!("{} estimated", ledger.machine.estimated_models));
+    }
+    let counts_paren =
+        if count_clauses.is_empty() { String::new() } else { format!(" ({})", count_clauses.join(", ")) };
     out.push_str(&format!(
         "\nmachine: potential {}{} · current {} · limit {} ({}) → {}\n",
         fmt_bytes(ledger.machine.potential_bytes),
@@ -1912,6 +2101,298 @@ mod tests {
         assert_eq!(ledger.models[1].owner, Owner::User);
     }
 
+    /// (#1854) `potential` is the fit contract — "the most this resident will
+    /// ever hold". Measured live on an IDLE MLX resident: current 28.40 GiB
+    /// against a potential of 22.88 GiB, steady to the byte across repeated
+    /// samples, and the code's own comment records the same model measured
+    /// UNDER potential a day earlier. So the estimate can be exceeded, and
+    /// silently: the projection is built from `potential`, which means the
+    /// machine's fit verdict was optimistic by the whole overage.
+    ///
+    /// A maximum that sits below an observed value is simply wrong. Clamp it
+    /// — `max(potential, current)` — so the projection reflects what the
+    /// machine is actually holding, and say so, because a silently-corrected
+    /// estimate is one nobody ever fixes.
+    #[test]
+    fn a_resident_holding_more_than_its_potential_raises_the_projection_and_is_disclosed() {
+        let mut inputs = base_inputs();
+        // One worker far above its priced potential; the other normal.
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: 60_000_000_000, footprint_bytes: None },
+            WorkerProc { pid: 2, rss_bytes: 5_000_000_000, footprint_bytes: None },
+        ]);
+        inputs.pool = Some(PoolSnapshot {
+            capacity_bytes: 137_438_953_472,
+            used_bytes: Some(70_000_000_000),
+            available_bytes: Some(60_000_000_000),
+            free_bytes: Some(3_000_000_000),
+        });
+
+        let ledger = compute_ledger(inputs, 1);
+        let over: Vec<&ModelRow> = ledger
+            .models
+            .iter()
+            .filter(|r| matches!((r.current_bytes, r.potential_bytes), (Some(c), Some(p)) if c > p))
+            .collect();
+        assert!(!over.is_empty(), "fixture must produce an over-potential row: {:?}", ledger.models);
+
+        // The projection must count what is actually held, not the stale estimate.
+        let effective: u64 = ledger
+            .models
+            .iter()
+            .map(|r| match (r.current_bytes, r.potential_bytes) {
+                (Some(c), Some(p)) => c.max(p),
+                (_, Some(p)) => p,
+                _ => 0,
+            })
+            .sum();
+        let other = ledger.machine.other_used_bytes.expect("other_used");
+        assert_eq!(
+            ledger.machine.projected_total_bytes,
+            Some(other + effective),
+            "projection must use max(potential, current), not potential alone"
+        );
+
+        // The machine's own Σ potential is the SAME clamped sum — the
+        // reconciliation identity this page prints (`projected = other +
+        // potential`) has to keep holding, and a Σ maximum below Σ current
+        // is wrong for exactly the reason a per-row one is.
+        assert_eq!(
+            ledger.machine.potential_bytes, effective,
+            "machine Σ potential must be the clamped sum too"
+        );
+        assert_eq!(
+            ledger.machine.projected_total_bytes,
+            Some(other + ledger.machine.potential_bytes),
+            "projected = other_used + Σ potential must reconcile exactly"
+        );
+
+        // Stamped on the ROW as a number, so every surface reads one
+        // server-computed condition instead of re-deriving the floor.
+        let flagged: Vec<&ModelRow> = ledger.models.iter().filter(|r| r.over_price_bytes.is_some()).collect();
+        assert_eq!(flagged.len(), 1, "exactly the over-potential row carries the overage");
+        let r = flagged[0];
+        assert_eq!(r.over_price_bytes, Some(r.current_bytes.unwrap() - r.potential_bytes.unwrap()));
+        assert_eq!(ledger.machine.over_price_models, 1);
+
+        // …and it does NOT move the row's severity. What was falsified is the
+        // estimate's ceiling, not the fit — the fit is measured. Spending the
+        // state channel on an epistemic condition would mint a second meaning
+        // for color.
+        assert_ne!(r.state, LedgerState::Amber, "an over-price row is not thereby unhealthy");
+
+        // And it must be SAID — a silent correction is one nobody fixes.
+        assert!(
+            ledger
+                .messages
+                .iter()
+                .any(|m| m.severity == Severity::Warn && m.text.contains("more than darkmux priced it")),
+            "an over-potential resident must be disclosed: {:?}",
+            ledger.messages
+        );
+    }
+
+    /// (#1854, flap guard) A few MB of jitter above potential must NOT light
+    /// the condition. A signal that flickers every poll teaches the operator
+    /// to ignore it inside a day — the same "no variance, no information"
+    /// lesson as the always-gray lamps, arriving from the other side. Floor is
+    /// `max(1% of potential, 256 MiB)`.
+    ///
+    /// The clamp itself still applies below the floor: the projection always
+    /// counts what is held. Only the DISCLOSURE is gated, because that is the
+    /// part with an attention cost.
+    #[test]
+    fn a_trivial_overage_clamps_the_projection_but_stays_silent() {
+        let mut inputs = base_inputs();
+        // Nudge one worker a hair over its potential — well under the floor.
+        let over_by = 10 * 1024 * 1024; // 10 MiB
+        let priced = compute_ledger(base_inputs(), 1).models[0].potential_bytes.expect("priced");
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: priced + over_by, footprint_bytes: None },
+            WorkerProc { pid: 2, rss_bytes: 1_000_000_000, footprint_bytes: None },
+        ]);
+        let ledger = compute_ledger(inputs, 1);
+        assert!(
+            !ledger.messages.iter().any(|m| m.text.contains("more than darkmux priced it")),
+            "a sub-floor overage must not be announced: {:?}",
+            ledger.messages
+        );
+        // Silent at BOTH disclosure altitudes — the row hint and the machine
+        // caption's count read this one field, so gating it here gates both.
+        assert!(ledger.models.iter().all(|r| r.over_price_bytes.is_none()));
+        assert_eq!(ledger.machine.over_price_models, 0);
+        // …but the arithmetic still counts the measured size. The clamp is
+        // not what has an attention cost; the disclosure is.
+        assert_eq!(
+            ledger.machine.potential_bytes,
+            ledger
+                .models
+                .iter()
+                .map(|r| match (r.current_bytes, r.potential_bytes) {
+                    (Some(c), Some(p)) => c.max(p),
+                    (_, Some(p)) => p,
+                    _ => 0,
+                })
+                .sum::<u64>(),
+            "the clamp applies below the floor even though nothing is said"
+        );
+        assert!(
+            ledger.machine.potential_bytes > priced + 1_000_000_000,
+            "sanity: the clamped sum reflects the nudged worker"
+        );
+    }
+
+    /// The clamp must not fire on the ordinary case, or every machine grows a
+    /// permanent warning and the signal is worthless.
+    #[test]
+    fn a_resident_within_its_potential_is_untouched_and_unremarked() {
+        let ledger = compute_ledger(base_inputs(), 1);
+        for r in &ledger.models {
+            if let (Some(c), Some(p)) = (r.current_bytes, r.potential_bytes) {
+                assert!(c <= p, "fixture should be well-priced: {} cur={c} pot={p}", r.identifier);
+            }
+        }
+        assert!(
+            !ledger.messages.iter().any(|m| m.text.contains("more than darkmux priced it")),
+            "no over-potential message on a well-priced machine: {:?}",
+            ledger.messages
+        );
+        assert!(ledger.models.iter().all(|r| r.over_price_bytes.is_none()));
+        assert_eq!(ledger.machine.over_price_models, 0);
+        // A CEILING-backed total: no resident was counted at anything other
+        // than the price it declared. This is the green the verdict has
+        // always claimed to be, and the count is what distinguishes it from
+        // the floor-backed one.
+        assert_eq!(
+            ledger.machine.potential_bytes,
+            ledger.models.iter().filter_map(|r| r.potential_bytes).sum::<u64>(),
+            "with nothing over price, the clamped sum IS the priced sum"
+        );
+    }
+
+    /// (#1835 + #1854) The shrink hint may not promise a saving that cannot
+    /// materialize. Cutting a resident's ctx lowers its PRICE, but the
+    /// projection floors every row at its measured footprint — so once the
+    /// shrunken potential falls under what the model is already holding,
+    /// further cutting reclaims nothing.
+    ///
+    /// Found by RUNNING the hint, not reading it: the fixture's hint claimed
+    /// 4.70 GB, delivered 4.12 GB, and left the machine in the very band it
+    /// was supposed to escape. Reading the formula could not have shown this
+    /// — the shortfall only exists once the recomputed ledger re-prices the
+    /// row and #1854's clamp catches it.
+    #[test]
+    fn a_ctx_shrink_cannot_reclaim_below_what_the_resident_is_already_holding() {
+        let row = ModelRow {
+            identifier: "m".into(),
+            model_key: "m".into(),
+            owner: Owner::Darkmux,
+            loaded_ctx: 32_768,
+            weights_bytes: Some(13_000_000_000),
+            kv_per_token_bytes: Some(163_840),
+            kv_bytes_at_ctx: Some(163_840 * 32_768),
+            potential_bytes: Some(19_118_709_120),
+            potential_source: Some(PotentialSource::Arch),
+            current_bytes: Some(15_000_000_000),
+            state: LedgerState::Green,
+            over_price_bytes: None,
+            shrink_hint: None,
+        };
+        // Naive KV arithmetic: 163_840 x (32_768 - 4_096) = 4.70 GB.
+        let naive = 163_840u64 * (32_768 - 4_096);
+        assert_eq!(naive, 4_697_620_480);
+        // What can actually be reclaimed: down to the measured footprint.
+        assert_eq!(achievable_ctx_saving(&row), 19_118_709_120 - 15_000_000_000);
+        assert!(achievable_ctx_saving(&row) < naive, "the cap must bind here");
+
+        // The inverted case: a resident holding far less than its price is
+        // bounded by ctx arithmetic as before, and the cap must not bite.
+        let lazy = ModelRow { current_bytes: Some(1_000_000_000), ..row.clone() };
+        assert_eq!(achievable_ctx_saving(&lazy), naive);
+
+        // And with no measured footprint at all there is nothing to floor
+        // against — never a fabricated cap.
+        let unattributed = ModelRow { current_bytes: None, ..row };
+        assert_eq!(achievable_ctx_saving(&unattributed), naive);
+    }
+
+
+    #[test]
+    fn sum_potential_equal_to_limit_is_green_inclusive() {
+        // projected_total == limit: the green arm's `≤` is inclusive at
+        // equality. `used_bytes` pinned to Σ current so `other_used` is
+        // exactly 0 (#1821) — projected_total then equals Σ potential
+        // exactly, isolating the equality-boundary claim this test makes
+        // from the separate other-tenants arithmetic.
+        let mut inputs = base_inputs();
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
+        inputs.budget_bytes = Some(JUDGE_POTENTIAL + DEVSTRAL_POTENTIAL);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Green);
+        assert!(ledger.machine.shrink_hint.is_none());
+    }
+
+    /// (#1854) The CLI is the viewer's twin, so it discloses in the same two
+    /// places: a footnote on the ROW (which is where the confusing
+    /// `potential X · current Y` pair with Y > X actually prints, and the
+    /// machine-level warning several lines below cannot repair it in place)
+    /// and the warning itself. NOT on the machine-total line.
+    #[test]
+    fn render_human_footnotes_the_over_price_row_but_keeps_it_off_the_machine_line() {
+        let mut inputs = base_inputs();
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: 60_000_000_000, footprint_bytes: None },
+            WorkerProc { pid: 2, rss_bytes: 5_000_000_000, footprint_bytes: None },
+        ]);
+        inputs.pool = Some(PoolSnapshot {
+            capacity_bytes: 137_438_953_472,
+            used_bytes: Some(70_000_000_000),
+            available_bytes: Some(60_000_000_000),
+            free_bytes: Some(3_000_000_000),
+        });
+        let text = render_human(&compute_ledger(inputs, 1));
+        assert!(text.contains("more than priced"), "the row carries its own footnote: {text}");
+        // …and NOT at glance. `(1 at measured)` read as noise to the operator
+        // cold — it only parses for a reader who already knows the argument
+        // behind it — so the machine line stays about fit.
+        assert!(!text.contains("at measured"), "no glance-layer jargon: {text}");
+    }
+
+    /// The inverted case for the parenthetical's rebuild from a 2x2 match to
+    /// a clause list: a well-priced machine's machine-total line must gain no
+    /// parenthetical at all, and the existing clauses must not have changed
+    /// shape in the rewrite.
+    #[test]
+    fn render_human_leaves_an_ordinary_machine_line_unparenthesized() {
+        let text = render_human(&compute_ledger(base_inputs(), 1));
+        assert!(!text.contains("at measured"), "nothing over price ⇒ no clause: {text}");
+        assert!(!text.contains("more than priced"), "and no row footnote: {text}");
+        // Scoped to the COUNTS parenthetical: the limit-source description
+        // later on the same line legitimately carries its own parentheses.
+        let machine_line = text.lines().find(|l| l.starts_with("machine: ")).expect("machine line");
+        let potential_clause = machine_line.split(" · ").next().expect("potential clause");
+        assert!(!potential_clause.contains('('), "no counts parenthetical at all: {machine_line}");
+    }
+
+    /// Contract 5 (schema leniency) for the #1854 additions — a 2.0 payload
+    /// has neither key. Same guarantee `estimated_models_defaults_to_zero_on_
+    /// a_pre_1819_payload_missing_the_field` pins for #1819's pair, and the
+    /// same real path: a heterogeneous fleet where one machine is a release
+    /// behind (`main.rs::cmd_machine_resources` parses a peer's ledger).
+    /// Without `serde(default)` the whole table silently degrades to a raw
+    /// JSON dump.
+    #[test]
+    fn the_over_price_fields_default_to_absent_on_a_pre_1854_payload() {
+        let mut v = serde_json::to_value(compute_ledger(base_inputs(), 1)).expect("serialize");
+        v["machine"].as_object_mut().unwrap().remove("over_price_models");
+        for m in v["models"].as_array_mut().unwrap() {
+            m.as_object_mut().unwrap().remove("over_price_bytes");
+        }
+        let back: ModelLedger = serde_json::from_value(v).expect("a 2.0 payload must still parse");
+        assert_eq!(back.machine.over_price_models, 0);
+        assert!(back.models.iter().all(|r| r.over_price_bytes.is_none()));
+    }
+
     #[test]
     fn green_when_sum_potential_fits_the_limit() {
         // 128 GiB pool, ~37 GB of potential → green, and the limit falls
@@ -1934,6 +2415,142 @@ mod tests {
     /// push the projected total over the limit. Under the pre-#1821 rule
     /// (`sum_potential <= limit`) this machine would have reported GREEN;
     /// it must not.
+    /// (#1854) The hint's PRINTED saving is capped the same way the
+    /// projection is. The suggested ctx rounds down to a 4 K multiple, so
+    /// the KV arithmetic for the rounded cut can exceed the overshoot by a
+    /// wide margin — and here it also exceeds what the resident can give
+    /// back at all: devstral is priced at 19.12 GB and already holding
+    /// 15.00 GB, so no ctx cut reclaims more than 4.12 GB, however the
+    /// formula reads. Before this cap the hint promised the formula's
+    /// 4.70 GB. Red-provable: swap `saved` for `priced_off` and the string
+    /// says "cuts 4.70 GB".
+    #[test]
+    fn the_shrink_hint_prints_the_saving_that_can_materialize_not_the_kv_formula() {
+        let mut inputs = base_inputs();
+        // Pin `used_bytes` to Σ current so `other_used` is 0 and the budget
+        // arithmetic below is exact.
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
+        // Overshoot chosen so devstral (the KV hog) COVERS it — but only just
+        // under its 4.12 GB ceiling — while the rounded-down ctx (4096) prices
+        // off the full 4.70 GB.
+        let projected = JUDGE_POTENTIAL + DEVSTRAL_POTENTIAL;
+        let overshoot = 4_100_000_000u64;
+        inputs.budget_bytes = Some(projected - overshoot);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Amber);
+        let hint = ledger.machine.shrink_hint.clone().expect("amber names a shrink");
+        assert!(hint.contains("reload devstral at ctx 4096"), "hint: {hint}");
+        // devstral's potential minus what it holds: 19,118,709,120 − 15,000,000,000.
+        assert!(hint.contains("cuts 4.12 GB"), "hint: {hint}");
+        assert!(!hint.contains("4.70 GB"), "the KV formula's figure must not print: {hint}");
+    }
+
+    /// (#1854) When every shrinkable resident is already holding at least
+    /// its price, no ctx cut reclaims anything — and the hint must say so
+    /// rather than name one of them with a 0 B saving.
+    ///
+    /// Amber needs `Σ current ≤ limit < projected`, and a clamped row's
+    /// projection IS its current — so with both rows clamped the lift past
+    /// the limit has to come from OTHER tenants (#1821), which is exactly
+    /// the case where a ctx cut helps nothing: darkmux is not the one
+    /// holding the difference.
+    #[test]
+    fn a_hint_with_no_positive_saving_anywhere_falls_to_the_no_shrinkable_context_arm() {
+        let mut inputs = base_inputs();
+        // Both workers above their rows' prices (judge ~19.27 GB, devstral
+        // ~19.12 GB): both rows clamp to 20 GB, both achievable savings are 0.
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: 20_000_000_000, footprint_bytes: None },
+            WorkerProc { pid: 2, rss_bytes: 20_000_000_000, footprint_bytes: None },
+        ]);
+        // Σ current 40 GB ≤ budget 44 GB < projected 47 GB (7 GB of others).
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(47_000_000_000), ..p });
+        inputs.budget_bytes = Some(44_000_000_000);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.over_price_models, 2, "{:?}", ledger.models);
+        assert_eq!(ledger.machine.state, LedgerState::Amber, "{:?}", ledger.machine);
+        let hint = ledger.machine.shrink_hint.clone().expect("amber names a hint");
+        assert!(hint.contains("no shrinkable context"), "hint: {hint}");
+        assert!(!hint.contains("0 B"), "hint: {hint}");
+    }
+
+    /// (#1854 review) The fallback hint's "largest single saving is X at
+    /// ctx N (bytes)" pairs a byte figure with the ctx that REACHES it. Before
+    /// the cap the two were one formula (`kv × (ctx − floor)`, so N was always
+    /// the floor). With the cap binding, the whole achievable saving is
+    /// reached long before the floor — printing 4096 beside it tells the
+    /// operator to gut a context for a saving a far smaller cut delivers.
+    #[test]
+    fn the_fallback_hint_names_the_ctx_that_reaches_the_capped_saving_not_the_floor() {
+        // Workers rank-match by weights, so judge (17.18 GB weights) takes the
+        // larger RSS. judge priced at 19,272,177,280 and holding 18.95 GB:
+        // 322,177,280 B reclaimable at most, which its 20,480 B/token rate
+        // reaches 15,732 tokens in — 65536 − 15732 = 49,804, floored to a 4K
+        // multiple = 49152. devstral holds 18.90 GB against 19.12 GB: 0.22 GB.
+        // Overshoot 0.39 GB exceeds both, so the fallback branch fires and
+        // names the larger (judge).
+        let mut inputs = base_inputs();
+        inputs.workers = Some(vec![
+            WorkerProc { pid: 1, rss_bytes: 18_950_000_000, footprint_bytes: None },
+            WorkerProc { pid: 2, rss_bytes: 18_900_000_000, footprint_bytes: None },
+        ]);
+        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(37_850_000_000), ..p });
+        inputs.budget_bytes = Some(38_000_000_000);
+        let ledger = compute_ledger(inputs, 1);
+        assert_eq!(ledger.machine.state, LedgerState::Amber, "{:?}", ledger.machine);
+        let hint = ledger.machine.shrink_hint.clone().expect("amber names a hint");
+        assert!(hint.contains("no single ctx reduction reaches green"), "hint: {hint}");
+        assert!(hint.contains("largest single saving is judge at ctx 49152 (322 MB)"), "hint: {hint}");
+    }
+
+    /// (#1854 review) The materiality floor is a strict `>`: an overage of
+    /// EXACTLY the floor is not disclosed (still clamped, still silent), one
+    /// byte more is.
+    #[test]
+    fn the_over_price_floor_is_exclusive_at_the_boundary() {
+        // devstral's floor is max(1% of its 19.12 GB price, 256 MiB) = 256 MiB.
+        // judge is given a larger RSS (30 GB) so rank-pairing sends the
+        // boundary figure to devstral; judge is over its own price and
+        // disclosed regardless — this test reads the devstral row only.
+        let floor = 256u64 * 1024 * 1024;
+        let at_floor = DEVSTRAL_POTENTIAL + floor;
+        for (rss, expect_disclosed) in [(at_floor, false), (at_floor + 1, true)] {
+            let mut inputs = base_inputs();
+            inputs.workers = Some(vec![
+                WorkerProc { pid: 1, rss_bytes: 30_000_000_000, footprint_bytes: None },
+                WorkerProc { pid: 2, rss_bytes: rss, footprint_bytes: None },
+            ]);
+            let ledger = compute_ledger(inputs, 1);
+            let dev = ledger.models.iter().find(|r| r.model_key == "devstral").unwrap();
+            assert_eq!(dev.current_bytes, Some(rss), "fixture pairing");
+            assert_eq!(dev.over_price_bytes.is_some(), expect_disclosed, "rss={rss} {dev:?}");
+            // Clamped either way: the projection never reads below measured.
+            assert_eq!(ledger.machine.potential_bytes, 30_000_000_000 + rss);
+        }
+    }
+
+    /// (#1854 review) The machine line's counts parenthetical, every arm:
+    /// unpriced alone, estimated alone (pinned elsewhere), and both together
+    /// in this order with this separator.
+    #[test]
+    fn render_human_machine_line_counts_join_unpriced_then_estimated() {
+        let mut inputs = base_inputs();
+        // estimated: a GGUF resident with a catalog size but no arch facts.
+        inputs.catalog.push(CatalogFact { model_key: "phi-4-gguf".into(), size_bytes: Some(9_053_136_497) });
+        inputs.residents.push(resident("microsoft/phi-4", "phi-4-gguf", 8_192));
+        // unpriced: no arch facts AND no catalog entry.
+        inputs.residents.push(resident("mystery", "mystery", 8_192));
+        let ledger = compute_ledger(inputs.clone(), 1);
+        assert_eq!((ledger.machine.unpriced_models, ledger.machine.estimated_models), (1, 1));
+        let text = render_human(&ledger);
+        assert!(text.contains(" (+1 unpriced, 1 estimated) · current"), "{text}");
+
+        // unpriced alone
+        inputs.residents.retain(|r| r.model_key != "phi-4-gguf");
+        let text = render_human(&compute_ledger(inputs, 1));
+        assert!(text.contains(" (+1 unpriced) · current"), "{text}");
+    }
+
     #[test]
     fn amber_verdict_and_shrink_hint_key_on_projected_total_not_darkmux_alone() {
         let mut inputs = base_inputs();
@@ -1981,10 +2598,11 @@ mod tests {
 
     #[test]
     fn amber_made_it_by_luck_names_a_shrink_hint() {
-        // Budget between Σ current (33 GB) and Σ potential (~37.6 GB):
+        // Budget between Σ current (33 GB) and Σ potential (~38.4 GB):
         // running under the limit only because lazy allocation hasn't
-        // materialized — amber, with the config shrink named. `used_bytes`
-        // pinned to Σ current so `other_used` is exactly 0 (#1821) — this
+        // materialized — amber, with the config shrink named.
+        //
+        // `used_bytes` pinned to Σ current so `other_used` is exactly 0 (#1821) — this
         // test is about the shrink-hint TARGET, not the other-tenants
         // arithmetic, which `amber_verdict_and_shrink_hint_key_on_
         // projected_total_not_darkmux_alone` below covers directly.
@@ -2703,20 +3321,6 @@ mod tests {
         assert_eq!(bin_label("vm_stat"), "vm_stat");
     }
 
-    #[test]
-    fn sum_potential_equal_to_limit_is_green_inclusive() {
-        // projected_total == limit: the green arm's `≤` is inclusive at
-        // equality. `used_bytes` pinned to Σ current so `other_used` is
-        // exactly 0 (#1821) — projected_total then equals Σ potential
-        // exactly, isolating the equality-boundary claim this test makes
-        // from the separate other-tenants arithmetic.
-        let mut inputs = base_inputs();
-        inputs.pool = inputs.pool.map(|p| PoolSnapshot { used_bytes: Some(33_000_000_000), ..p });
-        inputs.budget_bytes = Some(JUDGE_POTENTIAL + DEVSTRAL_POTENTIAL);
-        let ledger = compute_ledger(inputs, 1);
-        assert_eq!(ledger.machine.state, LedgerState::Green);
-        assert!(ledger.machine.shrink_hint.is_none());
-    }
 
     #[test]
     fn memory_free_exactly_at_threshold_is_not_red() {
@@ -2993,6 +3597,7 @@ mod tests {
             current_bytes: None,
             state: LedgerState::Unknown,
             potential_source: Some(PotentialSource::Estimated),
+            over_price_bytes: None,
             shrink_hint: None,
         };
         assert_eq!(effective_kv_rate(&row), 327_680);
@@ -3268,7 +3873,11 @@ mod tests {
             mystery.get("potential_source").is_none(),
             "no potential at all ⇒ the field is OMITTED, not null: {mystery}"
         );
-        assert_eq!(v["schema_version"], "2.0");
+        // A LITERAL, deliberately — the sibling assertion elsewhere compares
+        // against the constant and so can never fail. This one is the pin
+        // that makes a schema bump a conscious edit; #1854 took it 2.0 → 2.1
+        //.
+        assert_eq!(v["schema_version"], "2.1");
         assert_eq!(v["machine"]["estimated_models"], 1);
     }
 
@@ -3295,4 +3904,5 @@ mod tests {
             serde_json::from_value(pre_1819_machine).expect("a 1.0 payload missing estimated_models must still parse");
         assert_eq!(totals.estimated_models, 0, "absent field defaults to zero, never an error");
     }
+
 }

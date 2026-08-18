@@ -5164,6 +5164,7 @@ mod tests {
             potential_source: None,
             current_bytes: None,
             state: LedgerState::Unknown,
+            over_price_bytes: None,
             shrink_hint: None,
         }
     }
