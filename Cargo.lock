@@ -694,6 +694,7 @@ dependencies = [
  "darkmux-eureka",
  "darkmux-fleet",
  "darkmux-flow",
+ "darkmux-gestalt",
  "darkmux-hardware",
  "darkmux-heuristics",
  "darkmux-lab",

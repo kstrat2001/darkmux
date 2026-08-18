@@ -483,6 +483,229 @@ fn mission_run_verb_absent_from_help_but_launch_present() {
     );
 }
 
+// (#1860) `mission config list`/`show` wiring — help-level presence plus one
+// real end-to-end invocation of each, isolated via `DARKMUX_CREW_DIR` so the
+// user tier is empty and deterministic (the on-disk `templates/builtin/`
+// tier still resolves from cwd, and the two embedded built-ins always
+// resolve regardless of either).
+
+#[test]
+fn mission_help_lists_config() {
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["mission", "--help"])
+        .output()
+        .expect("mission --help runs");
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.lines().any(|l| l.trim_start().starts_with("config")),
+        "mission help must list `config` (#1860); got:\n{help}"
+    );
+}
+
+#[test]
+fn mission_config_help_lists_list_and_show() {
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["mission", "config", "--help"])
+        .output()
+        .expect("mission config --help runs");
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("list"), "got:\n{help}");
+    assert!(help.contains("show"), "got:\n{help}");
+}
+
+#[test]
+fn mission_config_list_json_includes_the_two_embedded_builtins() {
+    let tmp = TempDir::new().unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        // (merge-gate CONSIDER 5) `DARKMUX_HOME` isolates config.json +
+        // profiles.json + mission-configs all at once (never the
+        // operator's real `~/.darkmux`); `DARKMUX_LMS_BIN=/usr/bin/true`
+        // means `lms ps --json` never shells to a real LMStudio.
+        .env("DARKMUX_HOME", tmp.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "config", "list", "--json"])
+        .output()
+        .expect("mission config list --json runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let configs = v["configs"].as_array().expect("configs is an array");
+    let ids: Vec<&str> = configs.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"review"), "got ids: {ids:?}");
+    assert!(ids.contains(&"coder-phase"), "got ids: {ids:?}");
+    for c in configs {
+        assert!(c.get("error").is_some(), "every row must carry an `error` key even when null");
+    }
+}
+
+#[test]
+fn mission_config_show_review_names_every_phase_and_flags_unconstructible_kinds() {
+    let tmp = TempDir::new().unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "config", "show", "review", "--json"])
+        .output()
+        .expect("mission config show review --json runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["id"], "review");
+    let phase_ids: Vec<&str> =
+        v["phases"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(phase_ids, vec!["investigate", "adjudicate", "report"]);
+    // Every step review.json declares is a real registered kind (Tier 1 +
+    // the review Tier 3 kinds) — none should be flagged unconstructible.
+    for phase in v["phases"].as_array().unwrap() {
+        for task in phase["tasks"].as_array().unwrap() {
+            for step in task["steps"].as_array().unwrap() {
+                assert_eq!(
+                    step["constructible"], true,
+                    "step {:?} in the built-in review config must be constructible",
+                    step
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mission_config_show_unknown_id_exits_nonzero_with_hint() {
+    let tmp = TempDir::new().unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args(["mission", "config", "show", "totally-not-a-real-config"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+/// (merge-gate MUST-FIX 3, end to end) `--param` applies as a launch
+/// binding on the review route: with a `role_profiles` map naming a REAL
+/// profile for `review-judge`, `show`'s JSON must report `provenance:
+/// "role_profiles map"` (unmapped roles still resolve too) — this
+/// specific test overrides via `--param` and checks the override wins.
+#[test]
+fn mission_config_show_review_param_override_applies_with_launch_override_provenance() {
+    let tmp = TempDir::new().unwrap();
+    let profiles_path = tmp.path().join("profiles.json");
+    fs::write(
+        &profiles_path,
+        r#"{"profiles":{"deep":{"models":[{"id":"m-deep","n_ctx":8000}]}},"default_profile":"deep"}"#,
+    )
+    .unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args([
+            "mission",
+            "config",
+            "show",
+            "review",
+            "--json",
+            "--profiles-file",
+            profiles_path.to_str().unwrap(),
+            "--param",
+            "review-judge=deep",
+        ])
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["warnings"].as_array().unwrap().len(), 0, "a role the review config declares must not warn");
+    let judge_role = v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|p| p["tasks"].as_array().unwrap())
+        .find_map(|t| {
+            let r = &t["role"];
+            (r["role_id"] == "review-judge").then(|| r.clone())
+        })
+        .expect("review-judge task must be present");
+    assert_eq!(judge_role["provenance"], "launch override (--param)");
+    assert_eq!(judge_role["profile"], "deep");
+}
+
+/// (merge-gate MUST-FIX 3, end to end) `mission launch` never converts
+/// `--param <role>=<profile>` into a binding for a NON-review-route config
+/// (coder-phase's `--param role=<id>` is a different knob entirely). `show`
+/// must neuter the override and warn, not silently apply it.
+#[test]
+fn mission_config_show_coder_phase_param_is_neutered_with_warning() {
+    let tmp = TempDir::new().unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args([
+            "mission",
+            "config",
+            "show",
+            "coder-phase",
+            "--json",
+            "--param",
+            "coder=deep",
+        ])
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = v["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap().contains("ignored")),
+        "got warnings: {warnings:?}"
+    );
+    let coder_role = v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|p| p["tasks"].as_array().unwrap())
+        .find_map(|t| {
+            let r = &t["role"];
+            (r["role_id"] == "coder").then(|| r.clone())
+        })
+        .expect("coder task must be present");
+    assert_ne!(
+        coder_role["provenance"], "launch override (--param)",
+        "a non-review-route config must never claim the launch-override provenance from --param"
+    );
+}
+
+/// (merge-gate CONSIDER 7) Mirrors `machine_status_explicit_bad_profiles_file_errors_loudly`:
+/// an EXPLICIT `--profiles-file` that fails to load errors loudly. Only
+/// the no-arg default degrades.
+#[test]
+fn mission_config_show_explicit_bad_profiles_file_errors_loudly() {
+    let tmp = TempDir::new().unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .env("DARKMUX_LMS_BIN", "/usr/bin/true")
+        .args([
+            "mission",
+            "config",
+            "show",
+            "review",
+            "--profiles-file",
+            "/no/such/path.json",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("registry not found")
+                .or(predicate::str::contains("no profile registry"))
+                .or(predicate::str::contains("profiles-file")),
+        );
+}
+
 // (#1426 phase 3) `swap`, `status`, `model`, `fleet`, and `recommendations`
 // all retired as top-level verbs with NO compat alias (pre-2.0 clean removal).
 // `swap` (the second residency writer) is gone entirely; `status`/`model`/

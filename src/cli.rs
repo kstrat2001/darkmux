@@ -684,6 +684,72 @@ pub(crate) enum MissionCmd {
         #[arg(long, value_name = "ID")]
         phase: Option<String>,
     },
+    /// Inspect the mission-config registry (list / show).
+    ///
+    /// (#1860) A `role list`/`role show` equivalent for
+    /// `templates/builtin/mission-configs/`. Distinct from every other
+    /// `mission` verb: those act on a mission RUN (an instance under
+    /// `~/.darkmux/missions/`); this reads the CONFIG a `mission launch
+    /// <config-id>` would mint one from.
+    Config {
+        #[command(subcommand)]
+        sub: MissionConfigCmd,
+    },
+}
+
+/// (#1860) `darkmux mission config list`/`show` — a READ-ONLY projection
+/// of the same registry `mission launch` resolves through
+/// (`mission_config::list_ids`/`load`), the step-kind registry `launch`
+/// exits `4` against, and the role→profile resolution `launch`/`dispatch`
+/// perform silently at run time. No new data, no new resolution logic, no
+/// mutation (#1860's own "Non-goals"). Never fails the process for a
+/// missing profiles registry or an unreachable `lms` — both degrade to an
+/// inline "unavailable" marker so one broken piece never hides the rest of
+/// the graph (operator sovereignty, #44).
+#[derive(Subcommand)]
+pub(crate) enum MissionConfigCmd {
+    /// List every registered mission config.
+    ///
+    /// One row per id: name, source tier, phase/task counts, whether it
+    /// advertises a panel command, and its `gh_verb` (if any), across the
+    /// same user, on-disk, and embedded tiers `mission launch` searches. A
+    /// config that fails to load prints as a row naming the error instead
+    /// of being silently dropped, so one broken user-tier override never
+    /// hides every other registered config. Read-only.
+    List {
+        #[command(flatten)]
+        json: JsonFlag,
+    },
+    /// Show one mission config's graph and the model each role resolves to now.
+    ///
+    /// Every phase, task, and step; the step kind each step names and
+    /// whether this binary can construct it (the same check `mission
+    /// launch` exits `4` against, surfaced before launch instead of at
+    /// it); and, per task with a `role_id`, the profile and model that
+    /// role resolves to right now, with the resolution's provenance (a
+    /// launch override, the `role_profiles` map, or the `default_profile`
+    /// fallback, so the operator never has to wonder where a decision came
+    /// from, #44) and whether that model is currently loaded. Read-only:
+    /// resolves state, mutates nothing.
+    Show {
+        /// Mission config id to show (e.g. `review`, `coder-phase`).
+        id: String,
+        /// A per-run `ROLE=PROFILE` binding override.
+        ///
+        /// Applied exactly as `mission launch <id> --param <role>=<profile>`
+        /// would apply it, which is ONLY on the review-route configs
+        /// (`review`, and any variant whose graph uses the review step
+        /// kinds). On any other config (e.g. `coder-phase`), `mission
+        /// launch` ignores `--param <role>=<profile>` entirely, and `show`
+        /// mirrors that: the override is neutered and a warning names why,
+        /// rather than claiming a parity that doesn't hold. Repeatable.
+        #[arg(long = "param", value_name = "ROLE=PROFILE")]
+        params: Vec<String>,
+        #[command(flatten)]
+        profiles: ProfilesFileArg,
+        #[command(flatten)]
+        json: JsonFlag,
+    },
 }
 
 #[derive(Subcommand)]

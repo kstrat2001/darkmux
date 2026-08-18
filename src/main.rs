@@ -59,6 +59,7 @@ mod config_cmd;
 mod conventions;
 mod mission_propose;
 mod mission_status;
+mod mission_config_cli;
 mod coder_phase;
 mod mission_launch;
 mod mission_launch_review;
@@ -919,6 +920,7 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             mission_id,
             phase,
         } => coder_phase::abort(&mission_id, phase.as_deref()),
+        MissionCmd::Config { sub } => mission_config_cli::run(sub),
     }
 }
 

@@ -14,6 +14,29 @@ darkmux release.
 
 ## [Unreleased]
 
+### Added
+
+- **`darkmux mission config list` / `show <id>`** — a `role list`/`role show`
+  equivalent for the mission-config registry (#1860). `list` enumerates every
+  config id across the user → on-disk → embedded tiers `mission launch`
+  searches, one row each with name, source tier, phase/task counts, and
+  whether it's panel-advertised; a config that fails to load prints as a row
+  naming the error rather than vanishing. `show <id>` renders the whole
+  graph — every phase, task, and step, whether this binary can construct
+  each step's kind (the identical check `mission launch` exits `4` against),
+  and, per role, the profile + model it resolves to RIGHT NOW plus the
+  resolution's provenance (a launch override, the `role_profiles` map, or
+  `default_profile`) and whether that model is currently loaded, reusing
+  `darkmux_gestalt::decide_residency` (#1274) for the residency verdict —
+  the same ownership + ctx-sufficiency arbiter every real acquire path
+  plans against — and `ProfileModel::require_n_ctx` for the same local-model
+  gate every dispatch path applies, rather than re-deriving either. `--param
+  <role>=<profile>` previews a planned override on the review route only
+  (the only route `mission launch` itself applies it on); any other config
+  gets the override neutered with a warning naming why, never a false
+  parity claim. Read-only end to end; no new data or resolution logic, just
+  a surface for what `mission launch`/`dispatch` already resolve silently.
+
 ### Fixed
 
 - **The machine page's fit projection believed a number it had already

@@ -158,7 +158,11 @@ const REVIEW_TIER3_KINDS: &[&str] = &[
 /// was structurally impossible while `review`'s dedicated launcher and this
 /// module's coder-phase path each built their own PARTIAL registry (see
 /// `both_families_resolve_against_one_registry` in this module's tests).
-fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
+/// (#1860) `pub(crate)` so `mission_config_cli::show` can build THE SAME
+/// registry `mission launch` constructs its execution registry from — a
+/// step's constructibility must be the identical check in both places, not
+/// a re-derived approximation.
+pub(crate) fn all_step_kinds() -> Result<crew::step_kinds::StepKindRegistry> {
     let registry = crew::step_kinds::StepKindRegistry::with_builtins();
     darkmux_lab::lab::review::register_review_kinds(&registry)
         .context("registering review step kinds")?;

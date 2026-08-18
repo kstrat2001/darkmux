@@ -46,6 +46,12 @@ darkmux-fleet = { path = "crates/darkmux-fleet" }
 darkmux-lab = { path = "crates/darkmux-lab" }
 darkmux-doctor = { path = "crates/darkmux-doctor" }
 darkmux-serve = { path = "crates/darkmux-serve" }
+# (#1860 merge-gate fix) `mission_config_cli`'s residency read reuses the
+# canonical `decide_residency` arbiter directly rather than re-deriving its
+# ownership/ctx-sufficiency verdict — already a workspace member (every
+# other crate here pulls it in transitively via darkmux-profiles), just not
+# previously wired as a DIRECT dependency of the binary itself.
+darkmux-gestalt = { path = "crates/darkmux-gestalt" }
 anyhow = "1.0"
 axum = "0.7"
 clap = { version = "4.5", features = ["derive"] }
