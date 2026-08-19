@@ -636,7 +636,7 @@ jobs:
         working-directory: tests/parity
         run: |
           set -e
-          for suite in next-parity next-parity-chrome next-parity-runs next-parity-catalog next-parity-console; do
+          for suite in next-parity next-parity-chrome next-parity-runs next-parity-catalog next-parity-console next-parity-graph; do
             echo "── $suite ──"
             bun run "$suite"
           done

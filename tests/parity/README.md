@@ -50,23 +50,26 @@ Does not touch `tests/e2e/`.
    This is the pre-commit gate for this directory.
 3. **`next-parity*` suites** (`next-parity`, `next-parity-runs`,
    `next-parity-catalog`, `next-parity-console`, `next-parity-live`,
-   `next-parity-chrome`) — unchanged by this retirement. Each grades the
-   React port's rendered text against the same frozen `goldens/*.txt` this
-   README describes, using the extraction/normalization logic in
-   `lib/extract-lens.js` (imported verbatim, the same module the retired
-   legacy extractor used — see that file's own doc comment). These are the
-   directory's actual acceptance gate; run them via their own
-   `bun run next-parity*` scripts. **CI runs five of the six**
-   (`ci.yml`'s `Next-parity suites` step loops `next-parity`,
-   `next-parity-chrome`, `next-parity-runs`, `next-parity-catalog`,
-   `next-parity-console`) — `next-parity-live` is not in that loop and is
-   not part of the CI gate today; run it locally when touching the live/SSE
-   lens. The five that ARE gated bind fixed ports and share `goldens/`, so
-   concurrent runs flake for reasons unrelated to the code under test —
-   that's why CI runs them serially.
+   `next-parity-chrome`, `next-parity-graph`) — unchanged by this
+   retirement. Each grades the React port's rendered text against the same
+   frozen `goldens/*.txt` this README describes, using the extraction/
+   normalization logic in `lib/extract-lens.js` (imported verbatim, the same
+   module the retired legacy extractor used — see that file's own doc
+   comment) — `next-parity-graph.spec.ts` is the one exception, reusing
+   `lib/extract-graph.js`'s extractors instead (see item 4 below and that
+   suite's own module doc for why). These are the directory's actual
+   acceptance gate; run them via their own `bun run next-parity*` scripts.
+   **CI runs six of the seven** (`ci.yml`'s `Next-parity suites` step loops
+   `next-parity`, `next-parity-chrome`, `next-parity-runs`,
+   `next-parity-catalog`, `next-parity-console`, `next-parity-graph`) —
+   `next-parity-live` is not in that loop and is not part of the CI gate
+   today; run it locally when touching the live/SSE lens. The suites that
+   ARE gated bind fixed ports and share `goldens/`, so concurrent runs flake
+   for reasons unrelated to the code under test — that's why CI runs them
+   serially.
 4. **`mission-graph-goldens.spec.ts`** (`bun run mission-graph-goldens`),
    #1868 packet 1: captures `goldens/mission-graph-canvas.txt` /
-   `goldens/mission-graph-timeline.txt` from the CURRENT standalone
+   `goldens/mission-graph-timeline.txt` from the standalone
    `crates/darkmux-serve/assets/mission-graph.html` page (served live at
    `/mission/:id/graph`, not a build artifact; its own
    `mission-graph-goldens.playwright.config.js` points `baseURL` straight at
@@ -82,13 +85,26 @@ Does not touch `tests/e2e/`.
    asserts the corpus mocks actually SERVED both fixtures, because this is
    the one suite whose `baseURL` is a live daemon: without that assertion a
    deleted route branch would fall through to real daemon data and stay
-   green (proved by mutation, #1868). These two goldens are the frozen spec the FUTURE
-   `next-parity-graph.spec.ts` (the later #1868 packet, once the graph lens is
-   ported into `ui/src`) will grade against; that packet reuses this
-   packet's own `lib/extract-graph.js` extraction helpers rather than
-   re-deriving them. Not part of the CI gate yet (no port to grade against
-   exists); run it locally against a live daemon when touching
-   `mission-graph.html` or preparing the graph-lens port.
+   green (proved by mutation, #1868). These two goldens are the frozen spec `next-parity-graph.spec.ts` (item 5)
+   grades the ported lens against, reusing this suite's own
+   `lib/extract-graph.js` helpers rather than re-deriving them. Run this
+   capture suite locally against a live daemon only when RE-capturing the
+   standalone page's goldens (e.g. after a deliberate change to
+   `mission-graph.html` itself, which #1868's third packet retires along
+   with this suite); not part of the CI gate (needs a live daemon).
+5. **`next-parity-graph.spec.ts`** (`bun run next-parity-graph`), #1868
+   packet 2: grades `MissionGraphLens` (`ui/src/lenses/mission/`, the
+   `#mission=<id>` lens) against the SAME two goldens packet 1 captured —
+   `.phasegroup`/`.mnode`/`.steprow`/`.tlphase`/`.tltask`/`.tlt-step` are
+   kept byte-identical to the standalone page's DOM on purpose, so those
+   sections grade with the EXACT SAME `lib/extract-graph.js` functions
+   packet 1's capture used, zero new extraction code. The header and events
+   sections use two NEW port-side extractors in that same module
+   (`extractPortHeaderText`/`extractPortEventsText`) that normalize to the
+   golden's own shape, since the port has different chrome (a real app-shell
+   masthead) and a different events pane (`EventLogColumn`'s `.eventlog__rec`
+   rows, not the standalone page's `.evrow`) — see each extractor's own doc
+   for exactly what's normalized and why. Part of the CI gate (item 3 above).
 
 ## Re-recording the corpus
 
@@ -220,24 +236,29 @@ one's vocabulary.
 | machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
 | session drill-in | `#session=<id>` | `session-task-list.txt` |
 | catalog picker | `#catpanel` (toggled via `#srcbadge`, not a hash route — global chrome, Packet 4) | `catalog-open.txt` (six regions: topbar/crumb/meta/logscope/stage + the `=== catalog ===` section — see "Extraction target" below) |
-| mission replay-by-query | `#mission=<id>` (Packet 4) | `mission-replay.txt` (the unknown-id in-page path only — see the note below) |
+| mission graph lens | `#mission=<id>` (#1868, renamed from "mission replay-by-query") | `mission-graph-canvas.txt` / `mission-graph-timeline.txt` (graded by the SEPARATE `next-parity-graph` suite, item 5 above — see that suite's own doc); `mission-replay.txt` survives only as a historical record, see the note below |
 | bare-date playback | `#<date>` (Packet 4) | `playback-date.txt` |
 
-**`#mission=<id>` (Packet 4 — was "out of scope" through Packet 3, see git
-history for the prior wording).** On a live daemon (exactly this harness's
-setup — `darkmux-mode` present, no `darkmux-flow-src`), `missionGraphReachable()`
-is true, so a POPULATED `/flow-mission/<id>` response would still navigate
-`boot()` straight to `/mission/<id>/graph` — a full navigation to
-`mission-graph.html`, a SEPARATE asset with its own vendored React Flow
-bundle, which remains genuinely out of scope for a `#stage`-text extractor
-(different render target, canvas/DOM graph nodes). What Packet 4 actually
-closes is the OTHER branch: this corpus's `/flow-mission/:id` mock answers
-every id with an honest `{records:[],count:0}` (see `lib/mock-routes.js`'s
-own comment for why, and why it's a NO-OP for every prior golden), so
-`mission-replay.txt` captures the in-page empty-fleet render this specific
-corpus can actually produce — not a stand-in for the populated/navigates-away
-case, which would need real per-mission record fixtures this corpus doesn't
-have.
+**`#mission=<id>` (#1868 — renamed from "mission replay-by-query"; before
+that, "out of scope" through Packet 3, see git history for the prior
+wording).** Through #1868's second packet, this hash routed to
+`MissionReplay.tsx`, whose only job on a live daemon was a full
+cross-document navigation to `/mission/<id>/graph` (`mission-graph.html`, a
+SEPARATE asset with its own vendored React Flow bundle) — genuinely out of
+scope for a `#stage`-text extractor, hence `mission-replay.txt` only ever
+captured the DAEMON-LESS fallback (this corpus's `/flow-mission/:id` mock
+answers every id with an honest `{records:[],count:0}`, so the golden is
+an in-page empty-fleet render, not the populated/navigates-away case).
+#1868's mission-graph lens (`MissionGraphLens.tsx`) now renders the mission
+graph itself, in-place — no navigation, and no daemon-less fallback branch
+of legacy's to stand in for. It's graded against its OWN goldens
+(`mission-graph-*.txt`, captured from the standalone page in #1868's first
+packet) by `next-parity-graph.spec.ts`, not this suite.
+`next-parity-catalog.spec.ts`'s own `#mission=<id>` tests now assert this
+port's real honest-error behavior directly (not-found, naming a peer
+machine when the flow stream knows one) rather than comparing against
+`mission-replay.txt`, which stays committed as the historical record of
+what legacy's daemon-less fallback once showed.
 
 ONE id is the exception, as of #1868 packet 1: `GRAPH_FIXTURE_MISSION_ID`
 (`lib/graph-fixture.js`) has a real, populated `/flow-mission/` fixture

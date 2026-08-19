@@ -37,9 +37,10 @@ const GRAPH: MissionGraph = {
   edges: [{ id: "e1", source: "p1", target: "a", kind: "contains" }],
 };
 
-function mockFetch(opts: { graphStatus?: number; graph?: MissionGraph } = {}) {
+function mockFetch(opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[] } = {}) {
   const graph = opts.graph ?? GRAPH;
   const graphStatus = opts.graphStatus ?? 200;
+  const flowMissionRecords = opts.flowMissionRecords ?? [];
   vi.stubGlobal(
     "fetch",
     vi.fn((url: string) => {
@@ -51,7 +52,9 @@ function mockFetch(opts: { graphStatus?: number; graph?: MissionGraph } = {}) {
         );
       }
       if (url.includes("/flow-mission/")) {
-        return Promise.resolve(new Response(JSON.stringify({ records: [], count: 0, truncated: false, generated_at_ms: 0 }), { status: 200 }));
+        return Promise.resolve(
+          new Response(JSON.stringify({ records: flowMissionRecords, count: flowMissionRecords.length, truncated: false, generated_at_ms: 0 }), { status: 200 }),
+        );
       }
       if (url.startsWith(`/flow/${todayUTC()}`)) {
         return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }));
@@ -113,6 +116,70 @@ describe("MissionGraphLens", () => {
     expect(document.querySelector(".eventlog")?.className).not.toMatch(/eventlog--hidden/);
     fireEvent.click(evbtn);
     expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
+  });
+
+  it("renders the mission-scoped events newest-first, regardless of backfill fetch order", async () => {
+    // Regression coverage for a real bug caught while writing the parity
+    // harness: `EventLogColumn` (reused as this lens's events pane) expects
+    // ASCENDING input (`.slice(-LOG_CAP).reverse()` internally) — the same
+    // convention every OTHER caller of it already follows. This lens's own
+    // `events` derivation initially sorted descending (matching legacy's
+    // own array shape) and fed that straight in, which made the column
+    // show the OLDEST records instead of the newest.
+    mockFetch({
+      flowMissionRecords: [
+        { ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:02Z", action: "phase start", handle: "p1", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:03Z", action: "mission close", handle: "m1", mission_id: "m1" },
+      ],
+    });
+    renderLens();
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(3));
+    const rows = [...document.querySelectorAll(".eventlog__ractivity")].map((el) => el.textContent);
+    expect(rows).toEqual(["mission close", "phase start", "mission start"]);
+  });
+
+  it("preserves the ORIGINAL backfill order among same-timestamp events, matching legacy's stable descending sort", async () => {
+    // A second, narrower regression than the one above: fixing the
+    // ascending/descending direction bug (previous test) is not enough on
+    // its own — a naive ascending sort + EventLogColumn's own internal
+    // `.reverse()` is stable in the WRONG direction for tied timestamps
+    // (caught live against the parity goldens, see MissionGraphLens.tsx's
+    // own `events` doc for the two-reversals-cancel fix). Three records
+    // sharing one ts must render in their ORIGINAL array order, newest
+    // group first — not reversed relative to each other.
+    mockFetch({
+      flowMissionRecords: [
+        { ts: "2026-08-19T00:00:01Z", action: "phase complete", handle: "investigate", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:01Z", action: "phase complete", handle: "adjudicate", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:01Z", action: "phase complete", handle: "report", mission_id: "m1" },
+        { ts: "2026-08-19T00:00:01Z", action: "mission close", handle: "m1", mission_id: "m1" },
+      ],
+    });
+    renderLens();
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(4));
+    const subjects = [...document.querySelectorAll(".eventlog__rec")].map((el) => el.getAttribute("title"));
+    expect(subjects).toEqual(["investigate", "adjudicate", "report", "m1"]);
+  });
+
+  it("never collapses two genuinely different records that happen to share ts+action+handle", async () => {
+    // Regression coverage for a real bug caught while writing the e2e
+    // suite: an earlier dedup key (`ts+action+handle` alone, matching
+    // mission-graph.html's OWN `backfillEvents` dedup key verbatim) is
+    // legacy-faithful for the narrow job legacy uses it for (guarding one
+    // events-panel backfill against itself), but this port also folds the
+    // SAME deduped set into the METRICS accumulator, which legacy never
+    // dedupes at all. Two sibling seats erroring in the same wall-clock
+    // second, sharing a generic `handle`, collapsed into one — silently
+    // dropping one seat's real tokens from the header meter.
+    mockFetch({
+      flowMissionRecords: [
+        { ts: "2026-08-19T00:00:01Z", action: "dispatch start", handle: "h", session_id: "step-a", mission_id: "m1", payload: {} },
+        { ts: "2026-08-19T00:00:01Z", action: "dispatch start", handle: "h", session_id: "step-b", mission_id: "m1", payload: {} },
+      ],
+    });
+    renderLens();
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(2));
   });
 
   it("a daemon-less static build shows an honest 'needs a daemon' notice, never attempts a fetch", () => {

@@ -2,8 +2,9 @@
 
 `vite build` produces one self-contained `dist/index.html`, committed to
 `crates/darkmux-serve/assets/next.html` and `include_str!`'d into the binary.
-That single file **embeds** react, react-dom and @tanstack/react-query, and it
-is served at `GET /` and republished as `docs/demo/index.html` on the website.
+That single file **embeds** react, react-dom, @tanstack/react-query, and
+(#1868) reactflow — the mission-graph lens's canvas renderer — and it is
+served at `GET /` and republished as `docs/demo/index.html` on the website.
 
 MIT requires its notice to be "included in all copies or substantial portions
 of the Software." A minified bundle compiled into a binary and served to
@@ -38,7 +39,11 @@ empty, so a wholesale deletion cannot ship silently — but it cannot detect a
 | `LICENSE-react` | react | 18.3.1 |
 | `LICENSE-react-dom` | react-dom | 18.3.1 |
 | `LICENSE-tanstack-react-query` | @tanstack/react-query | 5.101.4 |
+| `LICENSE-reactflow` | reactflow | 11.11.4 |
 
-The React 18 pin is deliberate and documented in
-`crates/darkmux-serve/assets/vendor/README.md` — the mission-graph bundle,
-which is a **separate** artifact with its own vendored notices, requires it.
+The React 18 pin is deliberate — `crates/darkmux-serve/assets/vendor/README.md`
+documented it for the (pre-#1868) standalone mission-graph page's own separate
+vendored bundle, which used the same react/reactflow version pair this `ui/`
+dependency now uses for real (#1868 folded that page's canvas renderer into
+this build; the standalone bundle + its README are scheduled for removal in
+#1868's third packet).

@@ -35,11 +35,17 @@
 //     small change instead of a large one. The narrower honest assertion
 //     was the right call while it stood, and the golden earned its keep as
 //     the record of what legacy does until the port could meet it.
-//   - `mission-replay`: still NOT byte parity, and for a data reason rather
-//     than a rendering one — this id has no `/flow-mission` fixture (only the
-//     #1868 graph fixture's id does), so
-//     the route legitimately has zero records to render. The test asserts
-//     the real fetch happened and the empty state is named.
+//   - `mission-replay`: still NOT byte parity, and now for a DIFFERENT
+//     reason than before #1868 — `mission-replay.txt` is legacy's fleet-hero
+//     render for `#mission=<id>`, a route this port no longer stands in
+//     front of at all: `MissionGraphLens` (#1868) renders the mission graph
+//     itself in-place, graded byte-for-byte against its OWN goldens
+//     (`goldens/mission-graph-*.txt`) by the SEPARATE `next-parity-graph`
+//     suite. This golden survives only as the historical record of what
+//     legacy's own daemon-less fallback once showed; the tests below assert
+//     THIS port's real, current honest-error behavior (not-found, naming a
+//     peer machine when the flow stream knows one) rather than comparing
+//     against it.
 
 import { test, expect } from "@playwright/test";
 import { readFileSync, mkdirSync } from "node:fs";
@@ -170,14 +176,19 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     });
   });
 
-  test("#mission=<known-corpus-mission>: real fetch, honest empty render (this id has no /flow-mission fixture)", async ({
-    page,
-  }) => {
-    // See this file's own module doc for why this does NOT byte-compare
-    // against `mission-replay.txt`'s `#stage` (legacy's fleet-hero render,
-    // which `/next` doesn't own yet) — this asserts `/next`'s OWN honest
-    // behavior: the fetch really happened, and a zero-record response
-    // renders a real, named empty state rather than silently doing nothing.
+  test("#mission=<known-corpus-mission>: real fetch, honest not-found render naming the peer machine (#1868)", async ({ page }) => {
+    // GRADUATED (#1868): this used to assert `MissionReplay`'s honest-empty
+    // `/flow-mission/<id>` render before doing a full cross-document
+    // navigation to `/mission/<id>/graph`. `MissionGraphLens` now renders
+    // in-place instead, fetching `/mission/:id/graph.json` directly — this
+    // corpus mission id has no recorded GRAPH fixture (only
+    // `GRAPH_FIXTURE_MISSION_ID`, in `lib/graph-fixture.js`, does — see
+    // `mock-routes.js`'s own comment on that explicit match), so the fetch
+    // 404s and the lens takes its `errorNotFound` branch. This id DOES
+    // appear in `flow-today.json` with a `machine_id` stamped, so the
+    // lens's own peer-lookup (`lookupOwningMachine`) resolves it and names
+    // the machine — the SAME honest behavior `mission-graph.html` itself
+    // has always had (see `MissionGraphLens.tsx`'s own doc).
     const meta = loadMeta();
     await installFrozenClock(page, meta.frozen_clock_ms);
     installCorpusRoutes(page, meta);
@@ -185,7 +196,7 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     page.on("pageerror", (e) => pageErrors.push(String(e)));
 
     await page.goto("/index.html#mission=acp-ephemeral-pr-ship-1786152707367180000-5");
-    await expect(page.getByText(/no records found for mission/i)).toBeVisible({ timeout: 15000 });
+    await expect(page.getByText(/this mission ran on `MacBook-Pro`/i)).toBeVisible({ timeout: 15000 });
     expect(page.url()).toContain("/index.html");
     expect(pageErrors, `pageerror events: ${pageErrors.join("; ")}`).toHaveLength(0);
 
@@ -317,19 +328,24 @@ test.describe("next-parity: catalog panel red-prove (harness self-test, Packet 4
     );
   });
 
-  test("blank routes: mission replay renders a visible unreachable-daemon error, never a blank page", async ({ page }) => {
-    // installBlankRoutes 404s EVERY api path uniformly (simulating total
-    // daemon unreachability) — unlike installCorpusRoutes' /flow-mission/
-    // fixture (Packet 4's own fix, see mock-routes.js's comment), which
-    // deliberately answers 200+empty because that's what the REAL endpoint
-    // does for an unmatched id. A blank/unreachable daemon is a genuinely
-    // different case (an actual non-2xx), so MissionReplay's error branch —
-    // not its empty branch — is the correct, honest render here.
+  test("blank routes: mission-graph lens renders a visible not-found error, never a blank page (#1868)", async ({ page }) => {
+    // GRADUATED (#1868): `installBlankRoutes` 404s `/mission/:id/graph.json`
+    // for EVERY id (matching the real daemon's own 404 for "no local graph
+    // for this mission" — see `mock-routes.js`'s #1868-packet-1 comment on
+    // that route), the SAME response shape a genuinely unmatched id gets
+    // under `installCorpusRoutes` too. Unlike the retired `MissionReplay`
+    // (whose `/flow-mission/<id>` fetch DID distinguish "empty" 200 from a
+    // real non-2xx error), `MissionGraphLens` has one honest branch for
+    // "no local graph data" regardless of which of those two produced the
+    // 404 — matching `mission-graph.html`'s own `errorNotFound` handling,
+    // which never made that distinction either. `lookupOwningMachine` also
+    // 404s here (every path is blanked), so the message falls back to the
+    // generic "ephemeral or cleared run" wording, not a named peer.
     await installFrozenClock(page, Date.UTC(2026, 0, 1));
     installBlankRoutes(page);
 
     await page.goto("/index.html#mission=acp-ephemeral-pr-ship-1786152707367180000-5");
-    await expect(page.getByText(/couldn't reach \/flow-mission\//i)).toBeVisible({ timeout: 15000 });
+    await expect(page.getByText(/ephemeral or cleared run/i)).toBeVisible({ timeout: 15000 });
   });
 
   // (drill-in packet) The session drill-in's own red-prove, matching the

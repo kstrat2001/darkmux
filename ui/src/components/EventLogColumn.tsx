@@ -379,6 +379,16 @@ export function EventLogColumn({
                   data-act="rec"
                   role="button"
                   tabIndex={0}
+                  // (#1868) The row's own `handle` — hover provenance, same
+                  // convention `.smodel`/`.mn-label` elsewhere in this app
+                  // use for a value that's meaningful but too long/noisy for
+                  // the row's always-visible text. Doubles as the mission
+                  // lens's own parity-extraction hook
+                  // (`tests/parity/lib/extract-graph.js`'s port-side events
+                  // extractor reads it) — a real, minimal, independently
+                  // justified addition to this shared component, not a
+                  // fork of it.
+                  title={r.handle || undefined}
                   onClick={() => selectRecord(r)}
                   onKeyDown={onActivateKeyDown(() => selectRecord(r))}
                 >

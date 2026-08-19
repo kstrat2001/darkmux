@@ -41,7 +41,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
-import { queryKeys } from "../../lib/queryKeys";
+import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
 import { isStaticBuild } from "../../lib/staticSource";
 import { useLiveTail } from "../../hooks/useLiveTail";
 import { asRecordArray, todayUTC } from "../../lib/flow";
@@ -66,11 +66,29 @@ import type { FlowRecord } from "../../types/handwritten";
 
 const EVENTS_CAP = 250;
 
-/** Dedup key — mission-graph.html's own `backfillEvents` dedup: two sources
+/** Dedup key — this port's counterpart to mission-graph.html's own
+ * `backfillEvents` dedup (`ts + action + handle`): two sources
  * (`/flow-mission/:id` and `/flow/<today>`) can carry the same record, and
- * live SSE can race a backfill that just landed. */
+ * live SSE can race a backfill that just landed.
+ *
+ * WIDER than legacy's own key on purpose. Legacy's `ts+action+handle` key
+ * is only ever applied within `backfillEvents`, which dedupes a fetched
+ * record against rows ALREADY HELD — a narrow, events-panel-only concern.
+ * This port folds the SAME deduped `allRecords` set into BOTH the events
+ * pane AND the per-step metrics accumulator (`applyRecordToMetrics`, which
+ * legacy never dedupes at all — every SSE record is folded exactly once,
+ * unconditionally). Two genuinely DIFFERENT records sharing one
+ * `ts+action+handle` are common in test fixtures (and can arise for real
+ * — e.g. two sibling seats erroring in the same wall-clock second) and are
+ * disambiguated by `session_id`/`mission_id` in practice; the full
+ * `JSON.stringify` is the safe general case: two records are "the same"
+ * only when EVERY field agrees, which is what "the same JSON object,
+ * fetched twice" actually means. Caught live, not theorized: an early
+ * version of this key (`ts+action+handle` alone) silently collapsed two
+ * same-mission-id-less test records issued in the same second into one,
+ * dropping real tokens from the metrics fold. */
 function recKey(r: FlowRecord): string {
-  return `${r.ts} ${r.action || ""} ${r.handle || ""}`;
+  return JSON.stringify(r);
 }
 
 /** `lookupOwningMachine` — mission-graph.html. Best-effort: which MACHINE a
@@ -153,10 +171,21 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
   const daemonBacked = !isStaticBuild();
   const today = todayUTC();
 
+  // (#1628 lineage) `refetchInterval` — the safety-net reconcile poll for a
+  // disk-level status delta that has NO accompanying flow record (e.g. an
+  // out-of-band write to the mission's state file). Folding the known flow
+  // record set (`foldFlowRecords`, below) replays every STATUS TRANSITION
+  // this page has ever heard of, which already self-heals a REGRESSED
+  // snapshot value (a lagging disk write reporting a stale status the fold
+  // then re-advances past) — but it cannot invent a transition that arrived
+  // only as a fresh snapshot value, never as a record. Same 20s cadence
+  // mission-graph.html's own `setInterval(reconcile, 20000)` used — see
+  // `RECONCILE_BACKSTOP_MS`'s own doc in `queryKeys.ts`.
   const graphQuery = useQuery({
     queryKey: queryKeys.missionGraph(missionId),
     queryFn: () => fetchJson<MissionGraph>(`/mission/${encodeURIComponent(missionId)}/graph.json`),
     enabled: daemonBacked,
+    refetchInterval: daemonBacked ? RECONCILE_BACKSTOP_MS : false,
   });
   const flowMissionQuery = useQuery({
     queryKey: queryKeys.flowMission(missionId),
@@ -240,11 +269,31 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
     return m;
   }, [baseGraph, idx, ascendingRecords, missionId]);
 
+  // `EventLogColumn` (the shared component, reused here as this lens's own
+  // events pane) expects ASCENDING input (oldest first) — it takes
+  // `.slice(-LOG_CAP).reverse()` internally to show the most recent rows
+  // newest-first, the same shape every other caller feeds it
+  // (`normalizeRecords`'s own ascending sort).
+  //
+  // This is built in two steps, not one ascending sort, because of a real
+  // tie-break bug caught while writing the parity harness
+  // (`next-parity-graph.spec.ts`): mission-graph.html's own events panel
+  // sorts DESCENDING (newest-first) with a STABLE sort, so records sharing
+  // one timestamp keep their ORIGINAL backfill-array order. A single
+  // ascending sort here (also stable) preserves that same original
+  // tie-order — but `EventLogColumn`'s OWN `.reverse()` then flips it,
+  // inverting same-timestamp records relative to legacy's order. Sorting
+  // DESCENDING first (matching legacy's own comparator exactly, same
+  // tie-break) and then reversing OURSELVES undoes `EventLogColumn`'s own
+  // reverse in advance, so the two reversals cancel and the FINAL display
+  // order — including tie order — matches legacy's byte-for-byte (see the
+  // parity spec's events-triple assertion).
   const events = useMemo(() => {
     if (!idx) return [];
     const scoped = allRecords.filter((r) => recordInMission(r, idx, missionId));
     scoped.sort((a, b) => (b.ts < a.ts ? -1 : b.ts > a.ts ? 1 : 0));
-    return scoped.slice(0, EVENTS_CAP);
+    const capped = scoped.length > EVENTS_CAP ? scoped.slice(0, EVENTS_CAP) : scoped;
+    return capped.slice().reverse();
   }, [allRecords, idx, missionId]);
 
   const anyRunning = !!(
