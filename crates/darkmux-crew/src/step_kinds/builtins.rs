@@ -16,9 +16,9 @@
 //! CONFIG on one of these four kinds. See `step_kinds::patterns`'s module
 //! doc for the full three-tier picture.
 
-use super::types::{
-    MapDispatchOverride, MapRemoteBucket, OverrideDispatchCall, StepKind, StepOutcome, StepRunCtx,
-};
+use super::types::{MapDispatchOverride, OverrideDispatchCall, StepKind, StepOutcome, StepRunCtx};
+use super::MIN_VIABLE_MAP_GRANT;
+use crate::remote_budget::RemoteBudget;
 use crate::types::{Step, Task};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
@@ -665,14 +665,14 @@ impl StepKind for DispatchSingleShotStepKind {
 
 // ─── dispatch.map (#1442) ───────────────────────────────────────────────
 
-// (#1442) `MapRemoteBucket` moved to `super::types` so the SCHEDULER can
-// own a `bucket_group -> Arc<Mutex<MapRemoteBucket>>` map and hand the same
-// bucket to sibling `dispatch.map` steps (the "allowance multiplication"
-// carry-forward — see that type's doc and `StepRunCtx`). The budget-0
-// divergence (a grouped-or-ungrouped `dispatch.map` completes `Ok` with
-// every item skipped rather than a step-level `Err`, unlike
-// `dispatch.single_shot`'s hosted arm) is unchanged and documented on
-// `run` below.
+// (#1442) `RemoteBudget` (`crate::remote_budget`, #1877's shared home) lets
+// the SCHEDULER own a `bucket_group -> Arc<Mutex<RemoteBudget>>` map and
+// hand the same bucket to sibling `dispatch.map` steps (the "allowance
+// multiplication" carry-forward — see that type's doc and `StepRunCtx`).
+// The budget-0 divergence (a grouped-or-ungrouped `dispatch.map` completes
+// `Ok` with every item skipped rather than a step-level `Err`, unlike
+// `dispatch.single_shot`'s hosted arm) is unchanged and documented on `run`
+// below.
 
 /// (#1442 gate C4) What one hosted map item SPENDS from the bucket: the
 /// reply's reported `usage.total_tokens` when present, else — conservatively
@@ -872,7 +872,7 @@ fn resolve_map_collection(
 /// It is [`DispatchSingleShotStepKind`]'s sibling that ITERATES — the same
 /// LOCAL/HOSTED dialect split, the same per-item `max_tokens` clamp, the same
 /// per-item record shape — with a per-item loop and a step-scoped remote
-/// bucket ([`MapRemoteBucket`]) added on top. That there is no genuinely-new
+/// bucket ([`RemoteBudget`]) added on top. That there is no genuinely-new
 /// *pluggable algorithm* (only a new outer loop shape over existing
 /// primitives) is why it lands in `builtins` and not `patterns/`.
 ///
@@ -1271,7 +1271,7 @@ impl DispatchMapStepKind {
         // value the scheduler honors when it creates a group bucket —
         // instead of this block re-reading the environment at run time;
         // absent, the `config_access` resolution applies as before.
-        let bucket: Arc<Mutex<MapRemoteBucket>> = match ctx.and_then(|c| c.remote_bucket()) {
+        let bucket: Arc<Mutex<RemoteBudget>> = match ctx.and_then(|c| c.remote_bucket()) {
             Some(shared) => shared.clone(),
             None => {
                 let budget = step
@@ -1279,7 +1279,7 @@ impl DispatchMapStepKind {
                     .get("bucket_budget")
                     .and_then(|v| v.as_u64())
                     .unwrap_or_else(darkmux_types::config_access::remote_max_tokens_per_execution);
-                Arc::new(Mutex::new(MapRemoteBucket::new(budget)))
+                Arc::new(Mutex::new(RemoteBudget::new(budget, MIN_VIABLE_MAP_GRANT)))
             }
         };
         // (#1442 ship-2b) The scheduler-supplied dispatch override, if any —
@@ -1720,7 +1720,7 @@ fn map_local_item(
 #[allow(clippy::too_many_arguments)]
 fn map_hosted_item(
     index: usize,
-    bucket: &Arc<Mutex<MapRemoteBucket>>,
+    bucket: &Arc<Mutex<RemoteBudget>>,
     endpoint: &darkmux_types::ModelEndpoint,
     model: &str,
     system: &str,
@@ -1819,7 +1819,7 @@ fn map_hosted_item(
                 bucket
                     .lock()
                     .expect("map remote bucket mutex poisoned")
-                    .settle(clamped, conservative_hosted_spend(reply.total_tokens, clamped));
+                    .settle(clamped, conservative_hosted_spend(reply.total_tokens, clamped), 1);
                 if let Some(t) = reply.total_tokens {
                     sum += t;
                     any_usage = true;
@@ -1860,7 +1860,7 @@ fn map_hosted_item(
             Err(e) => {
                 // Release the reservation — a dispatch-level error spent
                 // nothing (the pre-reserve accounting billed 0 here too).
-                bucket.lock().expect("map remote bucket mutex poisoned").settle(clamped, 0);
+                bucket.lock().expect("map remote bucket mutex poisoned").settle(clamped, 0, 1);
                 if error_budget == 0 {
                     return MapItemResult {
                         index,
@@ -2479,11 +2479,11 @@ mod tests {
         // but they sit below `MIN_VIABLE_MAP_GRANT` — so once the starvation
         // floor landed, this test was measuring the floor instead of the
         // accounting it exists to pin. Same shape, realistic token counts.
-        let mut b = MapRemoteBucket::new(100_000);
+        let mut b = RemoteBudget::new(100_000, MIN_VIABLE_MAP_GRANT);
         let g1 = b.admit_reserve(60_000).expect("fresh bucket admits");
-        b.settle(g1, 60_000);
+        b.settle(g1, 60_000, 1);
         let g2 = b.admit_reserve(60_000).expect("still under budget");
-        b.settle(g2, 60_000); // now 120k >= 100k (the endpoint reported above its grant)
+        b.settle(g2, 60_000, 1); // now 120k >= 100k (the endpoint reported above its grant)
         assert!(b.admit_reserve(60_000).is_none(), "over budget -> skip");
         assert_eq!(b.skipped(), 1);
     }
@@ -2509,7 +2509,7 @@ mod tests {
         // first call and drains the shared bucket from inside that call, so
         // by the time the retry asks to be admitted there is nothing left.
         let budget = 10_000u64;
-        let bucket = Arc::new(Mutex::new(MapRemoteBucket::new(budget)));
+        let bucket = Arc::new(Mutex::new(RemoteBudget::new(budget, MIN_VIABLE_MAP_GRANT)));
         let drain = Arc::clone(&bucket);
         let calls = Arc::new(Mutex::new(0usize));
         let seen = Arc::clone(&calls);
@@ -2519,7 +2519,7 @@ mod tests {
             // concurrent sibling step would.
             if let Ok(mut b) = drain.lock() {
                 if let Some(g) = b.admit_reserve(budget as u32) {
-                    b.settle(g, budget);
+                    b.settle(g, budget, 1);
                 }
             }
             anyhow::bail!("endpoint refused the draw")
@@ -2556,18 +2556,18 @@ mod tests {
         // never the untouched balance (the allowance-multiplication race a
         // spend-after pair reintroduces under `seats x k` sibling
         // concurrency).
-        let mut b = MapRemoteBucket::new(100);
+        let mut b = RemoteBudget::new(100, MIN_VIABLE_MAP_GRANT);
         let granted = b.admit_reserve(4096).expect("admits");
         assert_eq!(granted, 100, "the grant clamps to what remains");
         assert!(b.admit_reserve(10).is_none(), "an in-flight reservation blocks siblings");
         assert_eq!(b.skipped(), 1);
         // Settling with the real (higher) usage keeps the overshoot honest…
-        b.settle(granted, 600);
+        b.settle(granted, 600, 1);
         assert!(b.exhausted());
         // …and settling an ERRORED call with 0 releases the whole grant.
-        let mut b2 = MapRemoteBucket::new(100);
+        let mut b2 = RemoteBudget::new(100, MIN_VIABLE_MAP_GRANT);
         let g = b2.admit_reserve(4096).expect("admits");
-        b2.settle(g, 0);
+        b2.settle(g, 0, 1);
         assert_eq!(b2.remaining(), 100, "an errored call spends nothing");
     }
 
@@ -2583,9 +2583,9 @@ mod tests {
     fn map_remote_bucket_denies_a_starved_grant_instead_of_truncating() {
         // A budget that was never small, spent down to a sliver: a probe asks
         // for a usable cap and would be handed 40 tokens. That is the failure.
-        let mut b = MapRemoteBucket::new(100_000);
+        let mut b = RemoteBudget::new(100_000, MIN_VIABLE_MAP_GRANT);
         let g = b.admit_reserve(99_960).expect("the first draw admits");
-        b.settle(g, 99_960);
+        b.settle(g, 99_960, 1);
         assert_eq!(b.remaining(), 40);
         assert!(
             b.admit_reserve(4096).is_none(),
@@ -2596,7 +2596,7 @@ mod tests {
         // Not starvation: the operator configured a tiny BUDGET. That is
         // policy — the only documented refusal value for the knob is 0, so a
         // floor that swallowed small budgets would invent a second one.
-        let mut tiny = MapRemoteBucket::new(100);
+        let mut tiny = RemoteBudget::new(100, MIN_VIABLE_MAP_GRANT);
         assert_eq!(
             tiny.admit_reserve(4096),
             Some(100),
@@ -2606,7 +2606,7 @@ mod tests {
 
         // A healthy bucket grants the full ask untouched — the floor must be
         // invisible on the path that matters most.
-        let mut healthy = MapRemoteBucket::new(100_000);
+        let mut healthy = RemoteBudget::new(100_000, MIN_VIABLE_MAP_GRANT);
         assert_eq!(healthy.admit_reserve(4096), Some(4096));
         assert_eq!(healthy.skipped(), 0);
     }
@@ -2615,7 +2615,7 @@ mod tests {
     fn map_remote_bucket_zero_budget_is_exhausted_from_the_first_item() {
         // The hard opt-out: a 0 allowance refuses every hosted call, the same
         // as `admit_remote_execution` refuses a single hosted dispatch.
-        let mut b = MapRemoteBucket::new(0);
+        let mut b = RemoteBudget::new(0, MIN_VIABLE_MAP_GRANT);
         assert!(b.admit_reserve(10).is_none(), "zero budget admits nothing");
         assert!(b.exhausted());
     }
@@ -2628,17 +2628,17 @@ mod tests {
         // `..._admits_until_exhausted_then_skips` above: the original numbers
         // are below the starvation floor, so they would exercise it rather
         // than the clamp arithmetic this test is about.
-        let mut b = MapRemoteBucket::new(100_000);
+        let mut b = RemoteBudget::new(100_000, MIN_VIABLE_MAP_GRANT);
         assert_eq!(b.remaining(), 100_000);
         let g = b.admit_reserve(70_000).expect("admits");
-        b.settle(g, 70_000);
+        b.settle(g, 70_000, 1);
         assert_eq!(b.remaining(), 30_000, "a later item's grant clamps to 30k, not 100k");
         assert_eq!(
             b.admit_reserve(40_960).expect("still admits"),
             30_000,
             "the grant reads the remaining allowance"
         );
-        b.settle(30_000, 60_000); // overshoot: the endpoint reported above its grant
+        b.settle(30_000, 60_000, 1); // overshoot: the endpoint reported above its grant
         assert_eq!(b.remaining(), 0, "saturating, never an underflow wrap");
     }
 

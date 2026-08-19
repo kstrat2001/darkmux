@@ -49,6 +49,11 @@ pub mod loader;
 // which those two functions (`darkmux-lab::lab::review`, `src/coder_phase.rs`)
 // now call as thin launchers — the configs ARE the executable graphs.
 pub mod mission_config;
+// (#1877 first extraction) The shared remote-token-bucket type — the
+// promotion of what was two hand-copied buckets (`step_kinds::MapRemoteBucket`
+// and `darkmux-lab`'s own `RemoteBucket`) into one public home both the
+// `dispatch.map` fan-out and `darkmux-lab`'s review pipeline construct.
+pub mod remote_budget;
 pub mod resourcing;
 pub mod select;
 // (#1230 Packet 2) Generic dependency-graph scheduler over `Step`/`Phase`

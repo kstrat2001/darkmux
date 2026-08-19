@@ -41,6 +41,22 @@ pub mod patterns;
 mod registry;
 mod types;
 
+/// (#1610 / #1617 review) Smallest grant [`RemoteBudget::admit_reserve`]
+/// will hand a single `dispatch.map` item — the floor this module's own
+/// callers (the `bucket_group` fan-out in `builtins.rs`; the shared-group
+/// bucket in `scheduler.rs`) construct their buckets with.
+///
+/// Deliberately its own constant rather than a reference to the review
+/// pipeline's `MIN_VIABLE_JUDGE_GRANT`: they happen to share a value but
+/// answer different questions (how small a JUDGE ruling can be vs how small
+/// any `dispatch.map` item's reply can be), and `darkmux-crew` must not
+/// depend on `darkmux-lab` to know its own floor. Same reasoning as
+/// `MIN_WRAP_ROOM` vs `MIN_NAME_COLS` in the mission board — tying two
+/// numbers together because they match today makes one move silently when
+/// the other is tuned. See `crate::remote_budget`'s module doc for the
+/// #1877 extraction that made the floor a per-construction parameter.
+pub(crate) const MIN_VIABLE_MAP_GRANT: u32 = 512;
+
 pub use builtins::{
     parse_failed_verifiers, resolve_local_placement, DispatchInternalStepKind,
     DispatchMapStepKind, DispatchSingleShotStepKind, FailedVerifier, MapItemResult,
@@ -49,9 +65,13 @@ pub use builtins::{
 pub use builtins::MAP_BUDGET_SKIP_ERROR;
 pub use registry::StepKindRegistry;
 pub use types::{
-    ArtifactBus, MapDispatchOverride, MapRemoteBucket, OverrideDispatchCall, Port, PortKind,
-    StepKind, StepOutcome, StepRunCtx, WaveSignal,
+    ArtifactBus, MapDispatchOverride, OverrideDispatchCall, Port, PortKind, StepKind,
+    StepOutcome, StepRunCtx, WaveSignal,
 };
+// (#1877) `RemoteBudget`'s canonical home is `crate::remote_budget` (a
+// shared, public module of this crate); re-exported here too so a caller
+// of `StepRunCtx::remote_bucket()` can name the type without a second `use`.
+pub use crate::remote_budget::RemoteBudget;
 
 /// Re-exported so callers OUTSIDE this crate (e.g. `darkmux`'s own
 /// `coder_phase` — the `run_step_graph`/`StepKind::residency` caller for
