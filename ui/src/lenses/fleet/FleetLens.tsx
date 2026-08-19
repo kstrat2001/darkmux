@@ -333,6 +333,17 @@ export function FleetLens({
   // makes scrubbing before a session's completion drop that session's
   // tokens out of "local" and into "unattributed" — the token half of the
   // issue's own acceptance test.
+  //
+  // (#1869 code review) This scopes only what THIS component owns — the
+  // hero + timeline + fleet cards below. It does NOT reach the event log:
+  // that's App-level chrome, a DOM SIBLING of this whole lens (mounted by
+  // `App.tsx` beside `#stage`, not inside it), so it was never in scope for
+  // a fix made from in here. That was a real, separate gap (the log kept
+  // listing the whole day regardless of where the scrubber sat, while this
+  // hero already tracked it) — closed at the App level instead, via
+  // `PlaybackLens`'s `onPlayheadChange` reporting the same `playheadT` this
+  // line reads up to `App`, which threads it into `EventLogColumn`. See
+  // `App.tsx`'s own `eventLogRecords` doc for that half.
   const scopedData = useMemo(
     () => flowWindow.data.filter((r) => T(r.ts) <= playheadT),
     [flowWindow.data, playheadT],

@@ -64,8 +64,17 @@ const PLAY_SPAN_DIVISOR = 120;
  * the static demo build, by construction — both branches below call the
  * same
  * `renderTransportStage` closure.
+ *
+ * (#1869 code review) `onPlayheadChange` reports the resolved playhead
+ * (`playheadT`, the same value `Scrubber` and `FleetLens`'s `scopedData`
+ * already read) up to `App`, which threads it into `EventLogColumn` — a
+ * SIBLING of this whole lens in the DOM, not a descendant, so it can't
+ * reach it any other way (see `App.tsx`'s own `eventLogRecords` doc).
+ * Optional: every test in `PlaybackLens.test.tsx` mounts this component
+ * standalone with no callback, which is fine — the reporter below no-ops
+ * when it isn't given one.
  */
-export function PlaybackLens({ date }: { date: string | null }) {
+export function PlaybackLens({ date, onPlayheadChange }: { date: string | null; onPlayheadChange?: (t: number | null) => void }) {
   const flowSrc = staticFlowSrc();
 
   const dayQuery = useQuery({
@@ -248,6 +257,7 @@ export function PlaybackLens({ date }: { date: string | null }) {
           totalCount={dayRecords.length}
         />
         <PlayLoop playing={playing} t={playheadT} tMin={tMin} tMax={tMax} speed={speed} setT={setT} setPlaying={setPlaying} />
+        {onPlayheadChange ? <PlayheadReporter t={playheadT} onChange={onPlayheadChange} /> : null}
       </>
     );
   }
@@ -310,5 +320,39 @@ function PlayLoop({
   useEffect(() => {
     if (playing && t >= tMax) setPlaying(false);
   }, [playing, t, tMax, setPlaying]);
+  return null;
+}
+
+/**
+ * (#1869 code review) Reports the resolved playhead up to `App` — see
+ * `PlaybackLens`'s own `onPlayheadChange` prop doc for why this exists (the
+ * event log is a DOM sibling of this whole lens, not a descendant it could
+ * otherwise pass state to directly).
+ *
+ * A separate mounted component, not a `useEffect` called directly inside
+ * `renderTransportStage`: that function is a plain closure invoked from
+ * DIFFERENT branches of `PlaybackLens`'s own render (loading/error/empty
+ * return early WITHOUT calling it) — a hook called inside it would violate
+ * the rules of hooks the moment the branch taken changes across renders.
+ * Mounting a real child component sidesteps that: only ITS OWN hook order
+ * has to stay stable, which it trivially does (`PlayLoop`, just above,
+ * already uses the same pattern for the tick effect).
+ *
+ * Two separate effects, not one with a cleanup that reports `null`: a
+ * cleanup fires on EVERY dependency change, not just unmount, so folding
+ * "report t" and "report null" into one effect's body/cleanup would flash
+ * `null` between every scrub tick. The first effect reports on every `t`
+ * change; the second's cleanup — keyed only on the stable `onChange`
+ * setter — fires ONLY on true unmount (leaving the playback route, or a
+ * date change while the day is re-fetching), resetting `App`'s scope back
+ * to "show everything" rather than leaving it pinned at a stale timestamp.
+ */
+function PlayheadReporter({ t, onChange }: { t: number; onChange: (t: number | null) => void }) {
+  useEffect(() => {
+    onChange(t);
+  }, [t, onChange]);
+  useEffect(() => {
+    return () => onChange(null);
+  }, [onChange]);
   return null;
 }
