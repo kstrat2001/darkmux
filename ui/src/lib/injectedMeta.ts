@@ -21,12 +21,22 @@ export function injectedMeta(name: string): string | null {
   return el ? el.getAttribute("content") : null;
 }
 
-/** `missionGraphReachable()` — viewer.html:2732. `/mission/<id>/graph` is a
- * SEPARATE document (the vendored React Flow mission-graph page) that only
- * exists behind a real daemon (`darkmux-mode` present) serving a genuinely
- * live/playback page (`darkmux-flow-src` ABSENT — that meta marks a
- * daemon-less static build, e.g. the GitHub Pages demo, which has no
- * `/mission/<id>/graph` route to navigate to at all). */
+/** `missionGraphReachable()` — viewer.html:2732. The predicate outlived its
+ * original reason and keeps a NEW one (#1868 third packet): it used to mean
+ * "is there a separate mission-graph document to navigate to", back when
+ * `/mission/<id>/graph` served a standalone page with its own vendored
+ * React Flow bundle. That page is retired and the graph is now a lens
+ * inside this app (`ui/src/lenses/mission/`), so navigation is never the
+ * question any more.
+ *
+ * What it means NOW: the lens needs a live daemon to answer
+ * `/mission/<id>/graph.json`. `darkmux-mode` present + `darkmux-flow-src`
+ * ABSENT is exactly "a real daemon serving a live/playback page"; the meta
+ * being present marks a daemon-less static build (the GitHub Pages demo),
+ * which has no graph data at all. Do NOT delete this gate on the reasoning
+ * that the separate page is gone: without it the demo build renders a
+ * permanently-loading mission lens instead of the honest
+ * `MISSION_GRAPH_UNREACHABLE_NOTICE` (`RunsBoard.tsx`). */
 export function missionGraphReachable(): boolean {
   return !!injectedMeta("darkmux-mode") && !injectedMeta("darkmux-flow-src");
 }

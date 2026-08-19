@@ -308,7 +308,7 @@
       "http_status": 200,
       "ok": true,
       "extra": {
-        "reason": "mission-graph-goldens.spec.ts canvas/timeline node+edge snapshot",
+        "reason": "next-parity-graph.spec.ts canvas/timeline node+edge snapshot (recorded by the now-retired mission-graph-goldens.spec.ts, #1868 packet 1)",
         "mission_id": "sanity-review-shape-1784702742-76e0c1"
       },
       "bytes": 5134,
@@ -331,7 +331,7 @@
       "http_status": 200,
       "ok": true,
       "extra": {
-        "reason": "mission-graph-goldens.spec.ts events panel backfill",
+        "reason": "next-parity-graph.spec.ts events panel backfill (recorded by the now-retired mission-graph-goldens.spec.ts, #1868 packet 1)",
         "mission_id": "sanity-review-shape-1784702742-76e0c1"
       },
       "bytes": 4767,

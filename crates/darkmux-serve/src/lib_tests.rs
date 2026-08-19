@@ -3906,22 +3906,34 @@
 
     /// A structurally invalid mission id (fails [`is_valid_catalog_id`]) is
     /// rejected here directly, matching `graph.json`'s own gate, rather than
-    /// built into a redirect target — the id's allowlist excludes every
-    /// character (`#`, `/`, whitespace) that could otherwise reinterpret or
-    /// truncate the hand-built `#mission=<id>` fragment.
+    /// built into a redirect target. Two classes are pinned, because they
+    /// fail for different reasons (#1868 review finding): `#` would
+    /// truncate the hand-built `#mission=<id>` fragment at the URL level,
+    /// while `&` is a legal RFC 3986 fragment character that happens to be
+    /// the PORT's hash-param separator — admitting it would let
+    /// `a&lens=console` redirect a bookmark into the console lens. A
+    /// widening of the allowlist that only considered URL syntax would keep
+    /// the `#` case green while breaking the `&` one, which is exactly why
+    /// both are here.
     #[tokio::test]
     async fn mission_graph_route_rejects_invalid_mission_id() {
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/mission/bad%23id/graph")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        for encoded in ["bad%23id", "a%26lens%3Dconsole"] {
+            let app = build_router_local(PathBuf::new());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/mission/{encoded}/graph"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "id `{encoded}` must be refused, not redirected"
+            );
+        }
     }
 
     /// (#1403) The standalone-shell manifest serves at the well-known path with

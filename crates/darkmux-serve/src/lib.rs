@@ -1602,10 +1602,20 @@ async fn phases_handler() -> axum::Json<serde_json::Value> {
 /// not just on the bare app shell.
 ///
 /// Validates `id` with [`is_valid_catalog_id`] before building the redirect
-/// target — the same allowlist `graph.json` gates on, which excludes every
-/// character (`#`, `/`, whitespace) that could reinterpret or truncate the
-/// fragment this handler builds by hand (no percent-encoding dependency
-/// needed: the allowed charset is already fragment-safe). A structurally
+/// target — the same allowlist `graph.json` gates on. Two separate classes
+/// of character are excluded, and the second is the one worth naming
+/// explicitly (#1868 review finding): `#`, `/` and whitespace would
+/// reinterpret or truncate the fragment at the URL level, while **`&` and
+/// `=` are the port's OWN hash-param separators**. `&` is a perfectly legal
+/// fragment character per RFC 3986, so a future widening of this allowlist
+/// that reasons only about URL syntax would admit it — and
+/// `/mission/a&lens=console/graph` would then redirect to
+/// `/#mission=a&lens=console`, which `parseRoute` resolves to the CONSOLE
+/// lens (`lens=` outranks a co-present `mission=`; see `route.test.ts`).
+/// The bookmark would land somewhere else entirely, silently. Widen this
+/// charset only against the port's hash grammar, not just against RFC 3986
+/// (no percent-encoding dependency needed today: the allowed charset is
+/// already both fragment-safe and separator-free). A structurally
 /// invalid id was always a `400` from `graph.json`'s own gate; this route
 /// now surfaces that same `400` immediately rather than redirecting into a
 /// port render that would only rediscover it on fetch. A VALID id that

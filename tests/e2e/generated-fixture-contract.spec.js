@@ -26,7 +26,7 @@ const MISSION_ID = graphFixture.mission_id;
 // (#1868) `/flow-mission/<id>` + `/flow/<date>` — the SAME two backfill
 // sources `MissionGraphLens.tsx` reads, and the SSE stream it subscribes to.
 const MISSION_RE = /\/flow-mission\/[^/?]+(\?.*)?$/;
-const BACKFILL_RE = /\/flow\/\d{4}-\d{2}-\d{2}(?!\/stream)(\?.*)?$/;
+const BACKFILL_RE = /\/flow\/\d{4}-\d{2}-\d{2}(\?.*)?$/;
 const STREAM_RE = /\/flow\/\d{4}-\d{2}-\d{2}\/stream(\?.*)?$/;
 
 test('the generated graph fixture renders — the shape is the server\'s, not mine', async ({
