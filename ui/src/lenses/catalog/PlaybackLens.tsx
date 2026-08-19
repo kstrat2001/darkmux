@@ -247,7 +247,7 @@ export function PlaybackLens({ date }: { date: string | null }) {
           visibleCount={visibleCount}
           totalCount={dayRecords.length}
         />
-        <PlayLoop playing={playing} tMin={tMin} tMax={tMax} speed={speed} setT={setT} setPlaying={setPlaying} />
+        <PlayLoop playing={playing} t={playheadT} tMin={tMin} tMax={tMax} speed={speed} setT={setT} setPlaying={setPlaying} />
       </>
     );
   }
@@ -266,9 +266,21 @@ export function PlaybackLens({ date }: { date: string | null }) {
  * },100)` (viewer.html:2852) — a full span plays out in ~12s at 1×. Caps at
  * `tMax` and stops, matching legacy's own `if(state.t>=tMax){state.t=tMax;
  * clearInterval(...);state.playing=false;...}`.
+ *
+ * (#1869 code review) The interval's `setT` updater stays PURE — it only
+ * returns the next value, never calls `setPlaying`. Updaters must be pure:
+ * `<StrictMode>` (`main.tsx`) double-invokes them, and React's eager-state
+ * path can run one outside render entirely. Calling `setPlaying(false)`
+ * from inside was harmless only because it is idempotent — a second call
+ * during a double-invoke is a no-op, not a visible bug — but it is still
+ * the wrong shape. Stopping the loop at the end is a SEPARATE concern,
+ * handled below by an effect that watches the resolved playhead (`t`,
+ * passed down from `PlaybackLens` — the same `playheadT` `Scrubber` reads)
+ * against `tMax`.
  */
 function PlayLoop({
   playing,
+  t,
   tMin,
   tMax,
   speed,
@@ -276,6 +288,7 @@ function PlayLoop({
   setPlaying,
 }: {
   playing: boolean;
+  t: number;
   tMin: number;
   tMax: number;
   speed: number;
@@ -286,17 +299,16 @@ function PlayLoop({
     if (!playing) return;
     const step = ((tMax - tMin) / PLAY_SPAN_DIVISOR) * speed;
     const id = setInterval(() => {
-      setT((prev) => {
-        const cur = prev ?? tMax;
-        const next = cur + step;
-        if (next >= tMax) {
-          setPlaying(false);
-          return tMax;
-        }
-        return next;
-      });
+      setT((prev) => Math.min((prev ?? tMax) + step, tMax));
     }, PLAY_TICK_MS);
     return () => clearInterval(id);
-  }, [playing, tMin, tMax, speed, setT, setPlaying]);
+  }, [playing, tMin, tMax, speed, setT]);
+  // The stop condition, moved out of the updater above — see this
+  // function's own doc. Fires once `t` (the resolved playhead) has been
+  // capped at `tMax` by the tick above, matching legacy's own
+  // `if(state.t>=tMax){...state.playing=false;}`.
+  useEffect(() => {
+    if (playing && t >= tMax) setPlaying(false);
+  }, [playing, t, tMax, setPlaying]);
   return null;
 }
