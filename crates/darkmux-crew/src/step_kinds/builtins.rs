@@ -533,12 +533,15 @@ fn clamp_hosted_max_tokens(requested: u32, budget: u64) -> u32 {
 /// gated by `admit_remote_execution`) counts as one execution. This is the
 /// minimum regime, not the full one: there is no cross-call bucket here
 /// (each step gets a fresh allowance check), unlike the review funnel's
-/// per-stage `RemoteBucket` (`darkmux-lab::lab::review`), which accumulates
-/// spend across many calls in one stage. `darkmux-lab` depends on
-/// `darkmux-crew`, not the reverse, so `RemoteBucket` cannot be reused here
-/// without moving it — that consolidation is #1414's job. This PR closes
-/// the silent-bypass gap (#1412); the shared-bucket regime is a deliberate
-/// follow-up, not a scope cut hiding in this diff.
+/// per-stage `crate::remote_budget::RemoteBudget` (#1877 promoted it into
+/// this crate — it no longer lives only in `darkmux-lab::lab::review`),
+/// which accumulates spend across many calls in one stage. The type being
+/// reachable now does not make this kind's regime the same one: wiring
+/// this kind onto a shared `RemoteBudget` bucket instead of a fresh
+/// per-step allowance is a real behavior change, not a rename — that
+/// consolidation is #1414's job. This PR closes the silent-bypass gap
+/// (#1412); the shared-bucket regime is a deliberate follow-up, not a
+/// scope cut hiding in this diff.
 pub struct DispatchSingleShotStepKind;
 
 impl StepKind for DispatchSingleShotStepKind {

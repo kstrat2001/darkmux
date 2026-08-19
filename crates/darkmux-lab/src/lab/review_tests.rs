@@ -3048,19 +3048,19 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         );
     }
 
-    /// (CONSIDER c) `RemoteBucket::exhausted()` boundary: under < at == over.
+    /// (CONSIDER c) `RemoteBudget::exhausted()` boundary: under < at == over.
     /// A mutation of `>=` to `>` must fail this table (the `at` row).
     #[test]
     fn remote_bucket_exhausted_boundary_table() {
-        let mut under = RemoteBucket::new("s", 100);
+        let mut under = RemoteBudget::with_stage("s", 100, MIN_VIABLE_JUDGE_GRANT);
         under.spend(99, 1);
         assert!(!under.exhausted(), "under budget: 99 < 100");
 
-        let mut at = RemoteBucket::new("s", 100);
+        let mut at = RemoteBudget::with_stage("s", 100, MIN_VIABLE_JUDGE_GRANT);
         at.spend(100, 1);
         assert!(at.exhausted(), "at budget: 100 >= 100 (a `>` mutation breaks here)");
 
-        let mut over = RemoteBucket::new("s", 100);
+        let mut over = RemoteBudget::with_stage("s", 100, MIN_VIABLE_JUDGE_GRANT);
         over.spend(101, 1);
         assert!(over.exhausted(), "over budget: 101 >= 100");
     }
@@ -3088,7 +3088,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// could not be judged must read as UNJUDGED, never as rejected.
     #[test]
     fn a_grant_too_small_to_buy_a_ruling_is_denied_and_counted_as_skipped() {
-        let mut b = RemoteBucket::new("s", 100_000);
+        let mut b = RemoteBudget::with_stage("s", 100_000, MIN_VIABLE_JUDGE_GRANT);
         // Spend down to a sliver.
         let g = b.admit_reserve(99_900).unwrap();
         b.settle(g, 99_900, 1);
@@ -3097,13 +3097,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
         // The old behavior was `Some(100)` — a cap that cannot close a JSON
         // ruling. It is now refused, and the refusal is REPORTED.
-        let before = b.skipped;
+        let before = b.skipped();
         assert_eq!(
             b.admit_reserve(20_000),
             None,
             "a 100-token cap on a 20k ruling request must not be dispatched"
         );
-        assert_eq!(b.skipped, before + 1, "the denial is visible to the degraded gates");
+        assert_eq!(b.skipped(), before + 1, "the denial is visible to the degraded gates");
         // Denying must not consume the sliver — a later, smaller-appetite
         // caller is still entitled to it.
         assert_eq!(b.remaining(), 100, "a denied request reserves nothing");
@@ -3115,7 +3115,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // scale-free, but `admit_reserve` now denies a grant too small to buy
         // a parseable ruling — so a fixture in tens of tokens would trip that
         // floor and test the wrong thing. Same arithmetic, real magnitudes.
-        let mut b = RemoteBucket::new("s", 100_000);
+        let mut b = RemoteBudget::with_stage("s", 100_000, MIN_VIABLE_JUDGE_GRANT);
         // First caller wants 80k — granted in full, and RESERVED.
         assert_eq!(b.admit_reserve(80_000), Some(80_000));
         // Second caller wants 80k — the reservation is already debited, so
@@ -3125,7 +3125,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(b.admit_reserve(10_000), None);
 
         // Settle releases the unspent part of a reservation back.
-        let mut c = RemoteBucket::new("s", 100_000);
+        let mut c = RemoteBudget::with_stage("s", 100_000, MIN_VIABLE_JUDGE_GRANT);
         let granted = c.admit_reserve(80_000).unwrap();
         c.settle(granted, 30_000, 1);
         assert_eq!(c.remaining(), 70_000, "unspent reservation returns to the pool");
@@ -3143,7 +3143,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// byte-identical for the one caller that still uses it.
     #[test]
     fn remote_bucket_sequential_admit_then_spend_gates_and_accounts() {
-        let mut b = RemoteBucket::new("s", 100);
+        let mut b = RemoteBudget::with_stage("s", 100, MIN_VIABLE_JUDGE_GRANT);
         assert!(b.admit(), "a fresh bucket admits");
         b.spend(60, 1);
         assert!(!b.exhausted(), "60 < 100");
@@ -3153,7 +3153,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // Exhausted: admit refuses and counts the refusal, spend is never
         // reached by a correct caller (verify's own loop gates on this).
         assert!(!b.admit(), "exhausted bucket refuses");
-        assert_eq!(b.skipped, 1, "the refusal is counted");
+        assert_eq!(b.skipped(), 1, "the refusal is counted");
     }
 
     /// (#1877 pre-move conformance) `record()`'s emitted `RemoteBudgetRecord`
@@ -3163,7 +3163,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// can be checked against the exact same fixture afterward.
     #[test]
     fn remote_bucket_record_reports_stage_budget_used_exhausted_and_skips() {
-        let mut b = RemoteBucket::new("judge-pass1", 1_000);
+        let mut b = RemoteBudget::with_stage("judge-pass1", 1_000, MIN_VIABLE_JUDGE_GRANT);
         let g = b.admit_reserve(600).expect("first draw admits");
         b.settle(g, 600, 1);
         // Second draw is denied by the floor (400 remaining < 512 floor).
@@ -3180,7 +3180,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// a call emits no row — local-only envelopes carry no budget rows.
     #[test]
     fn remote_bucket_record_is_none_when_the_stage_never_touched_it() {
-        let b = RemoteBucket::new("verify", 1_000);
+        let b = RemoteBudget::with_stage("verify", 1_000, MIN_VIABLE_JUDGE_GRANT);
         assert!(b.record().is_none(), "an untouched bucket emits no row");
     }
 
@@ -6120,7 +6120,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
 
     /// (#1442 gate CONSIDER) A usage-OMITTING remote verify endpoint (a reply
     /// with no `total_tokens`) still EXHAUSTS the conservatively-metered
-    /// `MapRemoteBucket` — the map settles each reply at its granted cap when
+    /// `RemoteBudget` — the map settles each reply at its granted cap when
     /// usage is absent — so a later confirmed flag's adjudication is SKIPPED.
     /// The reconstructed verify budget row SUMS the endpoint-REPORTED usage
     /// (here 0, all omitted), which would read `exhausted: false` under a bare

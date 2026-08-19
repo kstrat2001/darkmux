@@ -139,8 +139,15 @@ pub struct PhaseOutcome {
 
 /// One pipeline stage's remote token-bucket outcome — the generic shape
 /// every mission-type-specific budget record (e.g. `darkmux-lab`'s
-/// `RemoteBudgetRecord`) maps onto. Field-for-field identical by design so
-/// a mapping is a pure struct-literal copy, never a lossy translation.
+/// `ReviewEnvelope::remote_budgets`, typed
+/// `Vec<crate::remote_budget::RemoteBudgetRecord>`) maps onto. Field-for-
+/// field identical by design so a mapping is a pure struct-literal copy,
+/// never a lossy translation. `RemoteBudgetRecord` moved into this crate
+/// alongside its producing bucket type in #1877, but stays a DISTINCT type
+/// from this row on purpose — `RemoteBudgetRecord` is a review-pipeline
+/// stage's own accounting output, `RemoteBudgetRow` is `MissionEnvelope`'s
+/// generic mapping target; unifying them is a separate call from the
+/// bucket-type extraction #1877 made.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteBudgetRow {
     pub stage: String,
