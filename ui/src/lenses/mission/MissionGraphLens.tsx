@@ -64,8 +64,6 @@ import {
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
 import type { FlowRecord } from "../../types/handwritten";
 
-const EVENTS_CAP = 250;
-
 /** Dedup key — this port's counterpart to mission-graph.html's own
  * `backfillEvents` dedup (`ts + action + handle`): two sources
  * (`/flow-mission/:id` and `/flow/<today>`) can carry the same record, and
@@ -288,12 +286,20 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
   // reverse in advance, so the two reversals cancel and the FINAL display
   // order — including tie order — matches legacy's byte-for-byte (see the
   // parity spec's events-triple assertion).
+  //
+  // No pre-cap here (an earlier version sliced to a 250-record `EVENTS_CAP`
+  // before handing the list to `EventLogColumn`) — that was the exact
+  // truncation-as-total bug #1569 removed, one layer up: `EventLogColumn`
+  // renders `${LOG_CAP} of ${filtered.length}` honestly, but `filtered.length`
+  // was already the 250 cap by the time it got here, so a 400-record mission
+  // read "50 of 250" instead of "50 of 400". `EventLogColumn` owns its own
+  // display cap (`LOG_CAP`) and discloses the real total on its own — the
+  // full scoped list is what it needs to do that honestly.
   const events = useMemo(() => {
     if (!idx) return [];
     const scoped = allRecords.filter((r) => recordInMission(r, idx, missionId));
     scoped.sort((a, b) => (b.ts < a.ts ? -1 : b.ts > a.ts ? 1 : 0));
-    const capped = scoped.length > EVENTS_CAP ? scoped.slice(0, EVENTS_CAP) : scoped;
-    return capped.slice().reverse();
+    return scoped.slice().reverse();
   }, [allRecords, idx, missionId]);
 
   const anyRunning = !!(

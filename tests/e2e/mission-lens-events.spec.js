@@ -118,9 +118,16 @@ test("the events pane discloses its cap instead of printing it as a total (Event
   await page.setViewportSize({ width: 1280, height: 900 });
   await routeGraph(page);
 
-  const N = 80; // > EventLogColumn's LOG_CAP (50)
+  // N is deliberately ABOVE any cap this lens has ever pre-sliced to (an
+  // earlier version of `MissionGraphLens` capped the scoped record list to
+  // 250 BEFORE handing it to `EventLogColumn`, which then honestly reported
+  // its own LOG_CAP against that already-capped length — "50 of 250"
+  // instead of "50 of 400". Matches the legacy standalone page's own
+  // regression test (`mission-graph-events.spec.js`), which used N=400 for
+  // exactly this reason: N=80 alone never exercises a 250-record pre-cap.
+  const N = 400;
   const records = Array.from({ length: N }, (_, i) => ({
-    ts: `${TODAY}T10:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z`,
+    ts: `${TODAY}T${String(Math.floor(i / 3600)).padStart(2, '0')}:${String(Math.floor((i % 3600) / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z`,
     action: 'step start', handle: 'step-1', category: 'work', level: 'info',
   }));
   await mockEmpty(page, MISSION_RE);
