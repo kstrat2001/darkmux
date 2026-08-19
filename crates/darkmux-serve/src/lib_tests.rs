@@ -206,9 +206,14 @@
     /// to pick between a full re-download every load and a heuristically
     /// cached (stale) copy — the operator hit BOTH during the 2.3.0 release
     /// dogfood.
+    ///
+    /// `/mission/:id/graph` dropped out of this loop (#1868): it is now a
+    /// 308 redirect, not an HTML document, so it carries no `ETag`/
+    /// `Cache-Control` pair to assert here — see
+    /// `mission_graph_route_redirects_into_the_port` for its own coverage.
     #[tokio::test]
     async fn html_documents_carry_cache_validators() {
-        for uri in ["/", "/play/2026-07-28", "/mission/m1/graph"] {
+        for uri in ["/", "/play/2026-07-28"] {
             let app = build_router_local(PathBuf::new());
             let response = app
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -3862,8 +3867,14 @@
         assert_eq!(json["runs"].as_array().unwrap().len(), 0);
     }
 
+    /// (#1868) The standalone mission-graph page and its `/vendor/*` bundle
+    /// routes are retired; `/mission/:id/graph` is now a 308 redirect into
+    /// the port's own `#mission=<id>` hash route, so an old bookmark or
+    /// shared link still lands the visitor on the mission graph — just
+    /// inside `next.html` instead of a separate document. Permanent +
+    /// method-preserving, matching `next_html`'s own redirect to `/`.
     #[tokio::test]
-    async fn mission_graph_html_serves_the_page() {
+    async fn mission_graph_route_redirects_into_the_port() {
         let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
@@ -3874,63 +3885,31 @@
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
         assert_eq!(
-            response.headers().get("content-type").unwrap(),
-            "text/html; charset=utf-8"
+            response.headers().get("location").unwrap(),
+            "/#mission=any-id"
         );
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        let html = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(html.contains("/vendor/reactflow-bundle.min.js"));
-        assert!(html.contains("/vendor/reactflow-bundle.min.css"));
-        // Same XSS-hardening GOAL the legacy `viewer.html` held before its
-        // retirement (#1806) — no raw HTML injection sink — reached by a
-        // different mechanism here: React's `createElement` escapes text
-        // content by construction, so this page must never reach for the
-        // one API that opts back OUT of that (`dangerouslySetInnerHTML`).
-        assert!(!html.contains("dangerouslySetInnerHTML"));
-        assert!(!html.to_lowercase().contains("javascript:"));
     }
 
+    /// A structurally invalid mission id (fails [`is_valid_catalog_id`]) is
+    /// rejected here directly, matching `graph.json`'s own gate, rather than
+    /// built into a redirect target — the id's allowlist excludes every
+    /// character (`#`, `/`, whitespace) that could otherwise reinterpret or
+    /// truncate the hand-built `#mission=<id>` fragment.
     #[tokio::test]
-    async fn vendor_reactflow_js_served_with_correct_content_type() {
+    async fn mission_graph_route_rejects_invalid_mission_id() {
         let app = build_router_local(PathBuf::new());
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/vendor/reactflow-bundle.min.js")
+                    .uri("/mission/bad%23id/graph")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get("content-type").unwrap(),
-            "application/javascript; charset=utf-8"
-        );
-        let bytes = to_bytes(response.into_body(), 8 << 20).await.unwrap();
-        assert!(bytes.len() > 10_000, "vendor bundle unexpectedly tiny: {} bytes", bytes.len());
-        let js = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(js.contains("MissionGraphVendor"));
-    }
-
-    #[tokio::test]
-    async fn vendor_reactflow_css_served_with_correct_content_type() {
-        let app = build_router_local(PathBuf::new());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/vendor/reactflow-bundle.min.css")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers().get("content-type").unwrap(), "text/css; charset=utf-8");
-        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        assert!(!bytes.is_empty());
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// (#1403) The standalone-shell manifest serves at the well-known path with
@@ -3984,26 +3963,33 @@
     /// surfaced at the flip as "my home-screen darkmux suddenly has a URL
     /// bar". Fixed in `ui/index.html`.
     ///
-    /// The legacy file is no longer checked here because nothing serves it,
-    /// and it is now deleted entirely (#1806) — `scripts/build-demo.sh`
-    /// derives the demo from `NEXT_HTML` (the same constant this test
-    /// checks) rather than reading the legacy file.
+    /// The legacy `viewer.html` is no longer checked here because nothing
+    /// serves it, and it is now deleted entirely (#1806) —
+    /// `scripts/build-demo.sh` derives the demo from `NEXT_HTML` (the same
+    /// constant this test checks) rather than reading the legacy file.
+    ///
+    /// The standalone `mission-graph.html` shell dropped out of this check
+    /// the same way, for the same reason (#1868): it is deleted, and
+    /// `/mission/:id/graph` now redirects into `NEXT_HTML` rather than
+    /// serving a second document — see
+    /// `mission_graph_route_redirects_into_the_port`. `NEXT_HTML` is the
+    /// ONLY HTML shell the daemon serves as of #1868, so what was a loop
+    /// over two documents collapses to a direct check of the one that's
+    /// left rather than a loop of one.
     #[test]
-    fn html_shells_declare_standalone_app() {
-        for (name, html) in [("next", NEXT_HTML), ("mission-graph", MISSION_GRAPH_HTML)] {
-            assert!(
-                html.contains("rel=\"manifest\"") && html.contains("/manifest.webmanifest"),
-                "{name}.html lost its web-manifest link (#1403 standalone shell)"
-            );
-            assert!(
-                html.contains("apple-touch-icon"),
-                "{name}.html lost its apple-touch-icon link (#1403 standalone shell)"
-            );
-            assert!(
-                html.contains("apple-mobile-web-app-capable"),
-                "{name}.html lost the apple-mobile-web-app-capable meta (#1403)"
-            );
-        }
+    fn html_shell_declares_standalone_app() {
+        assert!(
+            NEXT_HTML.contains("rel=\"manifest\"") && NEXT_HTML.contains("/manifest.webmanifest"),
+            "next.html lost its web-manifest link (#1403 standalone shell)"
+        );
+        assert!(
+            NEXT_HTML.contains("apple-touch-icon"),
+            "next.html lost its apple-touch-icon link (#1403 standalone shell)"
+        );
+        assert!(
+            NEXT_HTML.contains("apple-mobile-web-app-capable"),
+            "next.html lost the apple-mobile-web-app-capable meta (#1403)"
+        );
     }
 
     /// (#1403) The graph.json StepRow wire contract now carries the raw `kind`
@@ -4084,24 +4070,29 @@
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Same parity check for the HTML page and the vendor bundle routes —
-    /// all three ride the same `timed` router group as `/`/`/play/:date`.
+    /// Same parity check for the HTML route — it rides the same `timed`
+    /// router group as `/`/`/play/:date`, so the auth gate must run BEFORE
+    /// the redirect handler, not just before whatever the redirect target
+    /// eventually renders. (The sibling `/vendor/*` bundle routes this test
+    /// used to cover alongside it are retired, #1868 — see
+    /// `mission_graph_route_redirects_into_the_port`.)
     #[tokio::test]
     #[serial_test::serial]
-    async fn mission_graph_html_and_vendor_bundle_require_token_from_remote_peer() {
+    async fn mission_graph_html_requires_token_from_remote_peer() {
         unsafe {
             std::env::set_var("DARKMUX_SERVE_TOKEN", TEST_TOKEN);
         }
         let app = build_router_local(PathBuf::new());
-        for uri in ["/mission/some-mission/graph", "/vendor/reactflow-bundle.min.js", "/vendor/reactflow-bundle.min.css"] {
-            let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
-            req.extensions_mut().insert(remote_peer());
-            let resp = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri} should require a token from a remote peer");
-        }
+        let mut req = Request::builder()
+            .uri("/mission/some-mission/graph")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(remote_peer());
+        let resp = app.oneshot(req).await.unwrap();
         unsafe {
             std::env::remove_var("DARKMUX_SERVE_TOKEN");
         }
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -4469,7 +4460,7 @@
             .any(|e| e["source"] == "task-a" && e["target"] == "task-b" && e["kind"] == "depends_on"));
     }
 
-    /// (review-gate C2) Pin the SSE action-string contract: the page's
+    /// (review-gate C2) Pin the SSE action-string contract: the lens's
     /// STATUS_ACTIONS map must contain every action string the emitting
     /// side actually writes (`scheduler::step_lifecycle_record`'s
     /// "step start"/"step complete"/"step error";
@@ -4478,9 +4469,19 @@
     /// A rename on either side must fail a test, not silently kill the
     /// live animation. The emit side is pinned by darkmux-crew's own
     /// `run_step_graph_emits_step_start_and_step_complete_records`; this
-    /// pins the page side against the same literals.
+    /// pins the lens side against the same literals.
+    ///
+    /// Retargeted at `ui/src/lenses/mission/graph.ts`'s own `STATUS_ACTIONS`
+    /// map (#1868) — the standalone `mission-graph.html` page this test
+    /// used to scan is retired; the map itself moved verbatim into the
+    /// React port. `include_str!` reaches outside this crate into `ui/` on
+    /// purpose (test-only, `#[cfg(test)]`-gated via this module's own
+    /// `#[path]` attribute, so it never ships in the release binary) —
+    /// there is no Rust-side binding to pin against on the TS side of this
+    /// contract, so a text scan is the only mechanical tie available.
     #[test]
-    fn mission_graph_page_pins_flow_action_strings() {
+    fn mission_graph_lens_pins_flow_action_strings() {
+        let graph_ts = include_str!("../../../ui/src/lenses/mission/graph.ts");
         for action in [
             "step start",
             "step complete",
@@ -4494,29 +4495,33 @@
             "mission resume",
         ] {
             assert!(
-                MISSION_GRAPH_HTML.contains(&format!("\"{action}\"")),
-                "mission-graph.html lost the \"{action}\" entry from its STATUS_ACTIONS map — \
-                 the SSE delta layer silently stops animating that transition"
+                graph_ts.contains(&format!("\"{action}\"")),
+                "ui/src/lenses/mission/graph.ts lost the \"{action}\" entry from its \
+                 STATUS_ACTIONS map — the SSE delta layer silently stops animating that transition"
             );
         }
     }
 
     /// (F3, #1397/#1399 gate remediation) The MECHANICAL tie between the
-    /// emit-side vocabulary constant and the page-side consumer: iterates
+    /// emit-side vocabulary constant and the lens-side consumer: iterates
     /// `darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS` itself (not
-    /// re-typed literals) and asserts each string appears in the embedded
-    /// mission-graph asset. The test above pins the page against literals
-    /// (covering the phase/mission verbs too, which have no shared Rust
-    /// constant yet); this one guarantees that if the SCHEDULER's canonical
-    /// step vocabulary ever changes, this crate fails to build/pass until
-    /// the page's STATUS_ACTIONS map catches up — the two hand-maintained
-    /// lists (Rust constant, JS map) can no longer drift silently.
+    /// re-typed literals) and asserts each string appears in the lens's own
+    /// source. The test above pins the lens against literals (covering the
+    /// phase/mission verbs too, which have no shared Rust constant yet);
+    /// this one guarantees that if the SCHEDULER's canonical step vocabulary
+    /// ever changes, this crate fails to build/pass until the lens's
+    /// STATUS_ACTIONS map catches up — the two hand-maintained lists (Rust
+    /// constant, TS map) can no longer drift silently.
+    ///
+    /// Retargeted at `ui/src/lenses/mission/graph.ts` (#1868) — same
+    /// retirement as the test above.
     #[test]
-    fn mission_graph_page_contains_every_scheduler_step_lifecycle_action() {
+    fn mission_graph_lens_contains_every_scheduler_step_lifecycle_action() {
+        let graph_ts = include_str!("../../../ui/src/lenses/mission/graph.ts");
         for action in darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS {
             assert!(
-                MISSION_GRAPH_HTML.contains(&format!("\"{action}\"")),
-                "mission-graph.html's STATUS_ACTIONS map is missing scheduler \
+                graph_ts.contains(&format!("\"{action}\"")),
+                "ui/src/lenses/mission/graph.ts's STATUS_ACTIONS map is missing scheduler \
                  STEP_LIFECYCLE_ACTIONS entry \"{action}\" — the graph lens would silently \
                  stop animating that step transition"
             );
