@@ -22,9 +22,37 @@
  * "AUG 12–AUG 13" axis and zero bars — every bar fell before `tlMin` and was
  * dropped by the window filter below.
  *
- * `state.t` (the playhead) is `tMax` in both modes — this port has no
- * scrubber; see `savings.ts`'s module doc for the same reasoning applied to
- * the token sums.
+ * (#1869) `state.t` (the playhead) and `tMax` (the day's fixed ceiling) are
+ * TWO SEPARATE VALUES in legacy — `tMax` is set once by `recompute()` at
+ * boot and never moves; `state.t` is what the scrubber drags around. This
+ * port's `tMax` PARAMETER used to serve both roles at once, silently,
+ * because before the playback transport existed nothing ever hands this
+ * function a `state.t` that differs from `tMax` — every caller was always
+ * pinned at the ceiling, so the conflation was invisible. It stopped being
+ * invisible against a real daemon: rewinding to the start of a day made
+ * `tlMax` (still fed from the SAME argument) collapse to `tlMin`, and the
+ * activity axis read "16:56–16:56" instead of showing the day's whole span
+ * with the playhead marker swept back to its left edge — exactly the
+ * conflation this doc now separates out.
+ *
+ * So this function keeps `tMax` as the axis CEILING (`tlMax` in replay is
+ * still `tMax`, unmoved by scrubbing) and takes a SEPARATE `playheadT`
+ * parameter (defaulting to `tMax`, so every existing caller — anything that
+ * never had a scrubber to begin with — is unaffected) for everything that
+ * legacy keys on `state.t`: the bar loop's "not started yet" guard,
+ * `sessionRunning`'s close-edge comparison, an open bar's `end`, and
+ * `playheadPct`. `FleetLens` is the caller that now passes these as two
+ * genuinely different numbers on a replay route (see its own doc for the
+ * `tMax`/`playhead` prop split this traces back to).
+ *
+ * The bar loop's "not started yet" guard restores legacy's own
+ * `bars=sessionsOn(m).map(sid=>{const s=dispatch(sid,"start");
+ * if(!s||T(s.ts)>state.t)return""; ...})` — a session that hasn't started
+ * yet as of the PLAYHEAD (not the axis ceiling) must not draw a bar at all;
+ * without it, `sessionRunning` finds no close-edge for it (there's nothing
+ * to close yet) and defaults to "running", drawing a phantom sliver. See
+ * `savings.ts`'s module doc for the parallel restoration applied to the
+ * token sums (a caller-side gate, not a change to this file).
  */
 
 import {
@@ -93,6 +121,9 @@ export function buildActivityTimeline(
   liveMachines: Map<string, PresenceBeat>,
   uids: string[],
   liveSet: Set<string>,
+  /** The axis CEILING — `computeTMax` over the live window, or (in replay)
+   * the day's true, fixed max. Never moved by scrubbing; see this module's
+   * own doc for why that fixedness is load-bearing. */
   tMax: number,
   nowMs: number,
   windowMinutes: number,
@@ -103,6 +134,13 @@ export function buildActivityTimeline(
    * replay, where it IS the left edge; ignored in live mode, whose left edge
    * is `tlMax - window`. */
   tMin = 0,
+  /** (#1869) The PLAYHEAD — `state.t` in legacy terms, a genuinely separate
+   * value from `tMax` once a replay can scrub. Defaults to `tMax` so every
+   * caller that predates the transport (live mode; any test that only ever
+   * passed one number) keeps its exact prior behavior — playhead == ceiling,
+   * unconditionally. See this module's own doc for the bug this default
+   * exists to NOT reproduce when a real caller passes something else. */
+  playheadT = tMax,
 ): ActivityTimeline {
   const winMs = windowMinutes * 60000;
   const tlMax = liveMode ? Math.max(tMax, nowMs) : tMax;
@@ -114,7 +152,13 @@ export function buildActivityTimeline(
     const bars: TimelineBar[] = [];
     for (const sid of sessionsOn(data, m)) {
       const s = dispatchRec(data, sid, "start");
-      if (!s) continue;
+      // (#1869) `T(s.ts) > playheadT` — restores legacy's
+      // `if(!s||T(s.ts)>state.t)return"";`. A session that hasn't started
+      // yet as of the PLAYHEAD (not the axis ceiling) must not draw a bar at
+      // all; without it, `sessionRunning` finds no close-edge for it
+      // (there's nothing to close) and defaults to "running", drawing a
+      // phantom sliver at the track's right edge.
+      if (!s || T(s.ts) > playheadT) continue;
       const term = dispatchEnd(data, sid);
       const e = sessEnd(data, sid);
       const closeCands = [term ? T(term.ts) : null, e ? T(e.ts) : null].filter((x): x is number => x != null);
@@ -123,13 +167,13 @@ export function buildActivityTimeline(
       // `sessionRunning` — live keys on presence, replay on the close-edge at
       // the playhead. (#1800 P2: this was `!liveSet.has(sid)`, the live arm
       // inlined, which read every session of a replayed day as running.)
-      const done = !sessionRunning(data, liveSet, sid, liveMode, tMax);
+      const done = !sessionRunning(data, liveSet, sid, liveMode, playheadT);
       const errored = done && dispatchErrored(term);
       const killed = dispatchKilled(term);
       const clean = done && !!term && !dispatchErrored(term);
       const lbl = statusLabel({ open: !done, errored, killed, clean });
       const cls: TimelineBar["cls"] = !done ? "run" : errored ? "err" : clean ? "done" : "canceled";
-      const end = !done ? tMax : closeTs != null ? closeTs : lastTs(data, sid) || tMax;
+      const end = !done ? playheadT : closeTs != null ? closeTs : lastTs(data, sid) || playheadT;
       if (end < tlMin) continue; // ended entirely before the window
       const cst = Math.max(T(s.ts), tlMin); // clip a straddling start to the window edge
       const widthPct = Math.max(0.6, pct(end) - pct(cst));
@@ -147,7 +191,7 @@ export function buildActivityTimeline(
     headerText: `${liveMode ? "recent activity" : "activity"} · ${clkrange(tlMin, tlMax)}`,
     lanes,
     axis: [clkhm(tlMin), clkhm(tlMin + span / 2), clkhm(tlMax)],
-    playheadPct: pct(tMax),
+    playheadPct: pct(playheadT),
     labelWidthPx: labelWidthPx(uids, data, liveMachines),
   };
 }

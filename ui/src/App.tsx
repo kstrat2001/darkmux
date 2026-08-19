@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useHashRoute } from "./lib/useHashRoute";
 import { useSyncHash } from "./lib/hashSync";
 import { FleetLens } from "./lenses/fleet/FleetLens";
@@ -19,7 +19,7 @@ import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { primaryReplayMission, replayMetaLines } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
-import { firstRecordDate, localMachineUid, nameOf, todayUTC } from "./lib/flow";
+import { T, firstRecordDate, localMachineUid, nameOf, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
@@ -115,6 +115,35 @@ export function App() {
   // still the rolling window. Before this, every route got the live window,
   // so a session's stage and its event log described different things.
   const routeRecords = useRouteRecords(route, flowWindow);
+  // (#1869 code review) The event log's own playhead scope, on a playback
+  // route only. `EventLogColumn` is App-level chrome — a SIBLING of
+  // `PlaybackLens` (mounted inside `#stage` by `renderRoute` below), not a
+  // descendant of it — so it can't read `PlaybackLens`'s own `t` state
+  // directly. `PlaybackLens` reports its resolved playhead up through
+  // `onPlaybackPlayheadChange` (threaded through `renderRoute`, playback-
+  // route-only; every other lens ignores the extra argument) each time it
+  // changes, and this is where that value lands.
+  //
+  // Before this, the log stayed on `routeRecords.records` UNSCOPED on every
+  // route — a no-op on live routes (nothing there ever narrows it), but on
+  // playback it meant the log kept listing the WHOLE day regardless of
+  // where the scrubber sat, while `FleetLens`'s own hero already scoped
+  // itself to the same playhead (`scopedData`, `FleetLens.tsx`) — two
+  // surfaces on the same screen disagreeing about how much of the day had
+  // "happened yet". Measured live: rewound to the day's start, the hero
+  // read zero tokens/dispatches while the log still listed rows stamped
+  // hours later.
+  //
+  // `null` means "no scrub has happened yet on this playback mount" (the
+  // pre-transport default: playhead == the day's ceiling, i.e. everything),
+  // so no filtering — matches `PlaybackLens`'s own `t ?? tMax` convention.
+  // Guarded on `route.kind === "playback"` so a stale value left over from
+  // a previous playback visit can never leak into a live route's log.
+  const [playbackPlayheadMs, setPlaybackPlayheadMs] = useState<number | null>(null);
+  const eventLogRecords = useMemo(() => {
+    if (route.kind !== "playback" || playbackPlayheadMs === null) return routeRecords.records;
+    return routeRecords.records.filter((r) => T(r.ts) <= playbackPlayheadMs);
+  }, [route.kind, playbackPlayheadMs, routeRecords.records]);
   // (#1800 P2, QA gate) Route-gated for the same reason `useLiveTail` above
   // is, and the gate is load-bearing in a way that is easy to get wrong:
   // `FleetLens` already passed `enabled: false` on a replay, but a DISABLED
@@ -273,11 +302,11 @@ export function App() {
           row on its own — no separate CSS class needed here. */}
       <div className="app-shell__content">
         <main className="app-shell__stage" id="stage">
-          {renderRoute(route)}
+          {renderRoute(route, setPlaybackPlayheadMs)}
         </main>
         <EventLogColumn
           scopeLabel={logscope}
-          records={routeRecords.records}
+          records={eventLogRecords}
           visible={showsEventLog(route)}
           loading={routeRecords.loading}
           error={routeRecords.error}
@@ -414,7 +443,17 @@ function routeChrome(
   return { crumb: "", logscope: "" };
 }
 
-function renderRoute(route: Route) {
+/**
+ * `onPlaybackPlayheadChange` is only ever read by the `playback` case below
+ * — every other lens ignores the extra argument. Threaded through here
+ * (rather than a context) because this function is App's own single
+ * dispatch point for `#stage`'s content, not a shared ancestor of unrelated
+ * lenses: only `App` (which owns the `playbackPlayheadMs` state this
+ * callback writes) and `PlaybackLens` (which is the only lens that ever
+ * calls it) know this parameter exists. See `App`'s own
+ * `playbackPlayheadMs`/`eventLogRecords` doc for why the event log needs it.
+ */
+function renderRoute(route: Route, onPlaybackPlayheadChange: (t: number | null) => void) {
   switch (route.kind) {
     case "fleet":
       return <FleetLens />;
@@ -438,7 +477,7 @@ function renderRoute(route: Route) {
       // (#1800 P2) A bare #<date> hash — a REAL historical render now: the
       // fleet hero over that day's records, with every one of legacy's
       // replay-mode branches taken. See PlaybackLens's own doc.
-      return <PlaybackLens date={route.date} />;
+      return <PlaybackLens date={route.date} onPlayheadChange={onPlaybackPlayheadChange} />;
     case "unknown":
       return <LensPlaceholder label="unrecognized" hash={route.hash} />;
   }

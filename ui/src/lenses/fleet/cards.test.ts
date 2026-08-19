@@ -60,6 +60,22 @@ describe("machActive", () => {
     ];
     expect(machActive(data, new Set(), "m1", false, T_MAX)).toBe(false);
   });
+
+  // (#1869) `T_MAX` was always the day's true max pre-scrubber, so a
+  // `dispatch.start` was never AFTER it — this restores legacy's own
+  // `visible()` gate (`machActive(m){return visible().some(...)}`), which
+  // this port had dropped as an unconditional no-op. A scrubbable playhead
+  // makes it a real case: a session that hasn't started yet as of the
+  // playhead must not read "in flight", even though `sessionRunning`'s
+  // close-edge check (finding no close, because there's nothing to close
+  // yet) would otherwise call it running.
+  it("replay: a session that hasn't started yet as of the playhead is NOT active", () => {
+    const playhead = Date.parse("2026-08-08T00:00:00.000Z"); // before the fixture's own default ts
+    const data: FlowRecord[] = [
+      rec({ machine_uid: "m1", session_id: "s1", action: "dispatch.start", ts: "2026-08-08T00:05:00.000Z" }),
+    ];
+    expect(machActive(data, new Set(), "m1", false, playhead)).toBe(false);
+  });
 });
 
 describe("specOf", () => {

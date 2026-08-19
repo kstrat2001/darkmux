@@ -13,9 +13,19 @@
  * Legacy's replay arm counts ALL of the day's sessions and labels them
  * "specialist(s)" — `goldens/playback-date.txt` reads "48 specialists" where
  * `goldens/fleet.txt` reads "0 running", from this one branch.
+ *
+ * (#1869) `t` (named `tMax` at some call sites, but it is the PLAYHEAD, see
+ * `buildFleetCard`'s own doc) is now genuinely scrubbable — `PlaybackLens`
+ * owns a `t` state and can hand this module anything from `tMin` to the
+ * day's true max, not just the max. `runsCount` deliberately still counts
+ * the WHOLE day's sessions in replay mode regardless of the playhead
+ * (`all.length`, unchanged — legacy's own `runs=liveMode?...:all.length`
+ * reads the same unfiltered `sessionsOn(m)`); `machActive` is the one
+ * derivation that DOES need the playhead honored, and its own doc explains
+ * why.
  */
 
-import { uidOf, sessionsOn, sessionRunning } from "../../lib/flow";
+import { uidOf, sessionsOn, sessionRunning, T } from "../../lib/flow";
 import type { FlowRecord, MachineSpecs, PresenceBeat } from "../../types/handwritten";
 import { nameOf, machineNames } from "../../lib/flow";
 
@@ -23,7 +33,18 @@ import { nameOf, machineNames } from "../../lib/flow";
  * of its started sessions is still running — routed through the shared
  * `sessionRunning()` (live = presence, replay = close-edge at the playhead)
  * so the running-forever bug class can't be fixed at one site and linger at
- * another. */
+ * another.
+ *
+ * (#1869) `T(r.ts) <= t` restores legacy's own `visible()` gate — legacy's
+ * `machActive` reads `visible().some(...)`, `visible = () =>
+ * DATA.filter(r=>T(r.ts)<=state.t)`. This port dropped the gate because,
+ * before the playback transport existed, `t` was always the day's true max
+ * (`computeTMax`), making it an unconditional no-op. Now that `PlaybackLens`
+ * can hand this a playhead BEFORE the day's end, a `dispatch.start` that
+ * hasn't happened yet as of that playhead must not read as "in flight" —
+ * without this guard, scrubbing to before a machine's first session of the
+ * day still rendered it active, because `sessionRunning`'s close-edge check
+ * finds no close (there's nothing to close yet) and defaults to "running". */
 export function machActive(
   data: FlowRecord[],
   liveSet: Set<string>,
@@ -32,7 +53,11 @@ export function machActive(
   t: number,
 ): boolean {
   return data.some(
-    (r) => uidOf(r) === m && r.action === "dispatch.start" && sessionRunning(data, liveSet, r.session_id ?? "", liveMode, t),
+    (r) =>
+      T(r.ts) <= t &&
+      uidOf(r) === m &&
+      r.action === "dispatch.start" &&
+      sessionRunning(data, liveSet, r.session_id ?? "", liveMode, t),
   );
 }
 
@@ -96,9 +121,10 @@ export function buildFleetCard(
   machAbsent: boolean,
   m: string,
   liveMode: boolean,
-  /** The playhead. `tMax` in both modes today (`/next` has no scrubber), but
-   * named rather than assumed — `sessionRunning`'s replay arm is defined
-   * against it, and a scrubber would change only this argument. */
+  /** The playhead — `PlaybackLens`'s scrubbable `t` (#1869), pinned to the
+   * day's true max in live mode (there is no scrubber on `/next`'s default
+   * route). `sessionRunning`'s replay arm and `machActive`'s `T(r.ts) <= t`
+   * gate are both defined against it. */
   t: number,
 ): FleetCard {
   const active = machActive(data, liveSet, m, liveMode, t);

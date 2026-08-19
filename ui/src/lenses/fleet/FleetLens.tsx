@@ -5,7 +5,7 @@ import { queryKeys } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useFleetCoverage, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { localMachineUid, machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS } from "../../lib/flow";
+import { localMachineUid, machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS, T } from "../../lib/flow";
 import type { FlowRecord } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
@@ -219,16 +219,47 @@ function FleetCoverageNotice({ historical = false }: { historical?: boolean }) {
  * describing NOW, so a replay must neither fetch nor consult them. Asserting
  * today's presence over a past day is exactly the "confidently WRONG:
  * machines read idle, running work reads zero" failure this file's own
- * coverage notice exists to warn about. */
+ * coverage notice exists to warn about.
+ *
+ * (#1869) `tMax` was a fixed ceiling (`computeTMax(records)`, the day's true
+ * max) AND the de facto playhead until this packet — the two were always
+ * the same number, because nothing before `PlaybackLens`'s own transport
+ * ever scrubbed. `PlaybackLens` now owns a real `t` (playhead) state and can
+ * pass anything from `tMin` up to that ceiling, driven by its `Scrubber`.
+ * That makes `tMax`-as-playhead a real conflation instead of a harmless one
+ * — measured live: rewinding to a day's start collapsed the activity axis
+ * itself (`tlMin..tlMax`) down to a single instant instead of staying fixed
+ * while the playhead marker swept back across it, because the SAME number
+ * was feeding both roles. This component now takes a separate `playhead`
+ * prop (below) and threads TWO numbers where it used to thread one:
+ * `flowWindow.tMax` stays the fixed axis ceiling everywhere it already fed
+ * `cards.ts`/`timeline.ts`'s ceiling-shaped arguments; `playheadT` (derived
+ * below) is the actual bracketing value — `machPresent`, `buildFleetCard`'s
+ * `t`, `buildActivityTimeline`'s new `playheadT` argument, and `scopedData`
+ * (the token hero has no playhead argument of its own, so its "as of the
+ * playhead" gate is applied to the array it's handed instead). See
+ * `timeline.ts`'s own module doc for the fuller account of the bug this
+ * split fixes. */
 export function FleetLens({
   records,
   tMax,
   tMin,
+  playhead,
   historical = false,
 }: {
   records?: FlowRecord[];
   tMax?: number;
   tMin?: number;
+  /** (#1869) The scrub PLAYHEAD — a genuinely separate value from `tMax`
+   * once `PlaybackLens` has a real transport. Defaults to `tMax` (the old,
+   * pre-transport behavior: playhead == ceiling, always). `tMax` itself
+   * stays the FIXED axis ceiling — `PlaybackLens` passes the day's true
+   * `computeTMax(records)` there, unmoved by scrubbing, and its scrubbable
+   * `t` state here instead. See `timeline.ts`'s own module doc for the bug
+   * this split fixes: collapsing both into one number made the activity
+   * axis itself shrink as the playhead scrubbed back, instead of staying
+   * fixed while a marker sweeps across it. */
+  playhead?: number;
   historical?: boolean;
 } = {}) {
   const nowMs = Date.now();
@@ -239,6 +270,10 @@ export function FleetLens({
   const flowWindow = records !== undefined
     ? { data: records, tMax: tMax ?? 0, settled: true }
     : liveWindow;
+  // The playhead every bracketing derivation below reads — `flowWindow.tMax`
+  // when the caller didn't separate the two (live mode; any pre-#1869
+  // caller), or the real scrub position when it did.
+  const playheadT = playhead ?? flowWindow.tMax;
   // `enabled: false` stops the REQUEST, not just the result: an earlier draft
   // discarded the data while the hook kept polling `/fleet/machines/live`
   // every few seconds behind a replay.
@@ -287,8 +322,34 @@ export function FleetLens({
     [flowWindow.data, liveMachines, specs],
   );
 
-  const tokens = useMemo(() => tokensOffMeter(flowWindow.data), [flowWindow.data]);
-  const note = useMemo(() => hybridNote(flowWindow.data, tokens), [flowWindow.data, tokens]);
+  // (#1869) The token hero + hybrid note are "as of the playhead" — legacy's
+  // own `visible()` gate (`DATA.filter(r=>T(r.ts)<=state.t)`), restored at
+  // this call site rather than inside `tokensOffMeter`/`hybridNote`
+  // themselves (see `savings.ts`'s module doc for the full reasoning). A
+  // no-op in live mode: `playheadT` there is `flowWindow.tMax`, which is
+  // `computeTMax(flowWindow.data)` by construction, so every record already
+  // satisfies `ts <= playheadT`. In replay, `playheadT` is the scrubbable
+  // position `PlaybackLens` passes as its `playhead` prop, so this is what
+  // makes scrubbing before a session's completion drop that session's
+  // tokens out of "local" and into "unattributed" — the token half of the
+  // issue's own acceptance test.
+  //
+  // (#1869 code review) This scopes only what THIS component owns — the
+  // hero + timeline + fleet cards below. It does NOT reach the event log:
+  // that's App-level chrome, a DOM SIBLING of this whole lens (mounted by
+  // `App.tsx` beside `#stage`, not inside it), so it was never in scope for
+  // a fix made from in here. That was a real, separate gap (the log kept
+  // listing the whole day regardless of where the scrubber sat, while this
+  // hero already tracked it) — closed at the App level instead, via
+  // `PlaybackLens`'s `onPlayheadChange` reporting the same `playheadT` this
+  // line reads up to `App`, which threads it into `EventLogColumn`. See
+  // `App.tsx`'s own `eventLogRecords` doc for that half.
+  const scopedData = useMemo(
+    () => flowWindow.data.filter((r) => T(r.ts) <= playheadT),
+    [flowWindow.data, playheadT],
+  );
+  const tokens = useMemo(() => tokensOffMeter(scopedData), [scopedData]);
+  const note = useMemo(() => hybridNote(scopedData, tokens), [scopedData, tokens]);
 
   const liveSet = useMemo(
     // The flow-derived liveness FALLBACK inside `liveSessionSet` is itself
@@ -308,13 +369,13 @@ export function FleetLens({
           liveMachines,
           specs,
           liveSet,
-          machPresent(flowWindow.data, liveMachines, flowWindow.tMax, m) === false,
+          machPresent(flowWindow.data, liveMachines, playheadT, m) === false,
           m,
           liveMode,
-          flowWindow.tMax,
+          playheadT,
         ),
       ),
-    [uids, flowWindow.data, flowWindow.tMax, liveMachines, specs, liveSet, liveMode],
+    [uids, flowWindow.data, playheadT, liveMachines, specs, liveSet, liveMode],
   );
 
   const timeline = useMemo(
@@ -324,18 +385,22 @@ export function FleetLens({
         liveMachines,
         uids,
         liveSet,
+        // The FIXED axis ceiling — never the playhead. See timeline.ts's own
+        // doc + this component's `playhead` prop doc for why the two must
+        // stay separate arguments once a replay can scrub.
         flowWindow.tMax,
         nowMs,
         windowMinutes,
         liveMode,
         tMin ?? 0,
+        playheadT,
       ),
-    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, nowMs, windowMinutes, liveMode, tMin],
+    [flowWindow.data, liveMachines, uids, liveSet, flowWindow.tMax, nowMs, windowMinutes, liveMode, tMin, playheadT],
   );
 
   return (
     <div className="fleet-lens" data-state={flowWindow.settled ? "loaded" : "loading"}>
-      <SavingsHero tokens={tokens} note={note} liveMode={liveMode} data={flowWindow.data} nowMs={nowMs} />
+      <SavingsHero tokens={tokens} note={note} liveMode={liveMode} data={scopedData} nowMs={nowMs} />
       <FleetCoverageNotice historical={historical} />
       <div className="fleet">
         {cards.map((card) => (

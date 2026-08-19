@@ -591,4 +591,60 @@ describe("App", () => {
     // The live arm's headline must NOT appear — it is what used to render here.
     expect(meta).not.toContain("last dispatch");
   });
+
+  /**
+   * (#1869 code review) `EventLogColumn` is global chrome, mounted here in
+   * `App` and fed `routeRecords.records` — the WHOLE day on a playback
+   * route, never scoped by the scrubber. `FleetLens`'s own hero already
+   * scopes itself to the playhead (`scopedData`, `FleetLens.tsx:336`); this
+   * is the sibling gap that left, at range=0, the hero saying "0 local
+   * tokens, 0 dispatches" beside a log still listing rows from six hours
+   * later. Measured live on the daemon before this fix: scrubber read
+   * "16:56 · 3/257 rec" (3 records at-or-before the playhead) while the log
+   * still said "50 of 257 events" and rendered rows stamped `23:11:22`.
+   *
+   * Three records spanning the whole recorded day, at tMin/mid/tMax: at the
+   * un-scrubbed default (playhead pinned at tMax) all three are visible;
+   * scrubbed to tMin (range value 0), only the record AT tMin remains.
+   */
+  it("scrubbing a playback route to tMin scopes the event log to the playhead, not the whole day", async () => {
+    window.location.hash = "#2026-08-07";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (String(url) === "/flow/2026-08-07") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify([
+                { ts: "2026-08-07T02:09:42.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1" },
+                { ts: "2026-08-07T10:00:00.000Z", category: "dispatch", action: "dispatch.reasoning", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1" },
+                { ts: "2026-08-07T18:28:15.000Z", category: "dispatch", action: "dispatch.complete", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1" },
+              ]),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response("[]", { status: 200 }));
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
+    // Un-scrubbed default: playhead pinned at tMax, so all three records
+    // are at-or-before it.
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(3));
+    expect(document.getElementById("qcount")?.textContent).toBe("3 events");
+
+    fireEvent.change(screen.getByRole("slider"), { target: { value: "0" } });
+
+    // Only the record AT tMin (02:09:42) is at-or-before the playhead now —
+    // the log must agree with the hero, not keep showing the whole day.
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1));
+    expect(document.getElementById("qcount")?.textContent).toBe("1 events");
+  });
 });

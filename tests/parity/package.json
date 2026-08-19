@@ -2,7 +2,7 @@
   "name": "darkmux-viewer-parity",
   "version": "0.0.0",
   "private": true,
-  "description": "The React port's parity harness. goldens/*.txt is a FROZEN spec captured from the legacy viewer (retired in #1806; recover its source with `git show v2.9.0:crates/darkmux-serve/assets/viewer.html`) against a real daemon. The next-parity* suites grade the React port against those goldens. record.mjs + tripwire.mjs remain for capturing/scanning corpus/ fixtures; rebaselining a golden is now a direct hand-edit in a reviewed diff, not a regeneration script. Self-contained; does not touch tests/e2e.",
+  "description": "The React port's parity harness. goldens/*.txt is a FROZEN spec captured from the legacy viewer (retired in #1806; recover its source with `git show v2.9.0:crates/darkmux-serve/assets/viewer.html`) against a real daemon -- with ONE named exception: goldens/playback-date.txt carries the #1869 playback transport's lines hand-added directly into the golden, not a legacy capture, because legacy's own equivalent markup lived outside the captured region entirely (see next-parity-catalog.spec.ts's own module doc for the full account). The next-parity* suites grade the React port against those goldens. record.mjs + tripwire.mjs remain for capturing/scanning corpus/ fixtures; rebaselining a golden is now a direct hand-edit in a reviewed diff, not a regeneration script. Self-contained; does not touch tests/e2e.",
   "scripts": {
     "record": "bun run record.mjs",
     "record:graph": "bun run record.mjs --only graph",

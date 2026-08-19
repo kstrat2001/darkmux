@@ -285,4 +285,64 @@ describe("FleetLens", () => {
     expect(hero).not.toBeNull();
     expect(hero!.textContent).not.toMatch(/[$€£]|USD|per million|\/M\b/);
   });
+
+  // (#1869) The playback transport (`Scrubber`, rewind/play/speed/range)
+  // only ever mounts inside `PlaybackLens`, which composes THIS component
+  // rather than the other way around — `FleetLens` itself never renders it,
+  // on any route. This is the live (default, no-hash) route's own coverage
+  // of that: no `records`/`tMax`/`tMin`/`historical` props at all, the same
+  // call every OTHER test in this file already makes.
+  it("never renders a playback transport on the live route — the scrubber is PlaybackLens-only", async () => {
+    mockFleetFetch();
+    renderFleetLens();
+    await waitFor(() => expect(screen.getByText(/tokens · last/i)).toBeInTheDocument());
+    expect(document.querySelector(".scrub")).toBeNull();
+    expect(screen.queryByRole("slider")).not.toBeInTheDocument();
+  });
+
+  // (#1869, QA gate — caught against a real daemon, not by any prior test)
+  // `tMax` (the day's FIXED ceiling, used for the activity axis span) and
+  // `playhead` (the scrub position) are two separate props now. A first
+  // cut passed only one number for both, which was invisible in every unit
+  // test above because none of them separate the two — this is the
+  // integration-level regression test that does. Scrubbing all the way
+  // back to `tMin` must NOT collapse the "ACTIVITY" axis header down to a
+  // single repeated instant; the day's whole recorded span stays on
+  // screen, with only the playhead marker (and the token hero, and the bar
+  // classes) moving.
+  it("a scrubbed playhead moves the hero and the bars, but the activity axis stays the day's whole fixed span", async () => {
+    const today = todayUTC();
+    const dayTMin = Date.parse(`${today}T10:00:00.000Z`);
+    const dayTMax = Date.parse(`${today}T12:00:00.000Z`);
+    const records = [
+      { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: `${today}T12:00:00.000Z`, machine_uid: "u1", session_id: "s1", action: "dispatch.complete", payload: { total_tokens: 600 } },
+    ];
+
+    const { rerender } = render(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={records} tMax={dayTMax} tMin={dayTMin} playhead={dayTMax} historical />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".fleettl")).not.toBeNull());
+    // Read the un-scrubbed axis text off the DOM (rather than asserting a
+    // literal) — `clkhm`/`clkrange` render in the runner's local timezone,
+    // so the only portable assertion is "unchanged after scrubbing", below.
+    const axisBefore = document.querySelector(".tlhdr span")!.textContent;
+    expect(axisBefore).toBeTruthy();
+
+    rerender(
+      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+        <FleetLens records={records} tMax={dayTMax} tMin={dayTMin} playhead={dayTMin} historical />
+      </QueryClientProvider>,
+    );
+
+    // The axis header is BYTE-IDENTICAL before and after scrubbing to tMin —
+    // the bug this test guards collapsed it to a single repeated instant.
+    expect(document.querySelector(".tlhdr span")!.textContent).toBe(axisBefore);
+    // The playhead marker DID move, to the left edge of that fixed axis.
+    expect((document.querySelector(".ph") as HTMLElement).style.left).toBe("0%");
+    // The hero moved too — the completion is no longer visible at tMin.
+    expect(screen.getByText("local tokens").previousSibling?.textContent).toBe("0");
+  });
 });
