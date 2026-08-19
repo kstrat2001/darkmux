@@ -334,7 +334,7 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
       <div className="missionlens" data-state="no-daemon">
         <div className="stagehdr">mission graph</div>
         <div className="none">
-          mission graph needs a running daemon behind this page, which this one doesn't have — open it in the classic viewer at / instead
+          mission graph needs a running daemon behind this page — this static build has no mission graph data to show.
         </div>
       </div>
     );

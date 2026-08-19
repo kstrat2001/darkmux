@@ -177,7 +177,7 @@ describe("RunsBoard", () => {
     const notice = screen.getByText(/needs a running daemon/i);
     expect(notice).toBeInTheDocument();
     expect(notice).toHaveAttribute("role", "status");
-    expect(notice.textContent).toMatch(/open it in the classic viewer at \//i);
+    expect(notice.textContent).toMatch(/this static build has no mission graph data to show/i);
   });
 
   it("the daemon-less notice also fires from a keyboard Enter activation", async () => {

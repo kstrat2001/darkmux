@@ -110,9 +110,17 @@ import {
  * `MissionReplay.tsx`/`PlaybackLens.tsx` already made for their own
  * daemon-less edges). A named, honest notice stands in instead, per the
  * operator-authored posture: a stuck feature gets a visible placeholder,
- * not a silent no-op. */
+ * not a silent no-op.
+ *
+ * The notice used to point at "the classic viewer at /" — `viewer.html` was
+ * deleted in #1865 and `/` now serves THIS SAME app, so a daemon-less
+ * visitor was being told to go to the page they were already on. There is
+ * genuinely nowhere else to send them (a static build has no daemon to
+ * reach, full stop), so the fix names the missing capability instead of a
+ * bogus destination — matching `onLabRunUnresolvable`'s own
+ * `"run detail needs a running daemon — …"` phrasing below. */
 const MISSION_GRAPH_UNREACHABLE_NOTICE =
-  "mission graph needs a running daemon behind this page, which this one doesn't have — open it in the classic viewer at / instead";
+  "mission graph needs a running daemon behind this page — this static build has no mission graph data to show.";
 
 export function RunsBoard({
   initialKind,
