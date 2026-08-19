@@ -116,8 +116,8 @@ describe("canonicalHash / parseRoute round-trip", () => {
     expect(roundTrip(route)).toEqual(route);
   });
 
-  it("mission-redirect is never canonicalized (legacy does a full navigation, nothing to write back)", () => {
-    const route: Route = { kind: "mission-redirect", missionId: "my-mission" };
+  it("mission is never canonicalized (#1868 — the hash it arrives on already IS canonical, nothing to compress)", () => {
+    const route: Route = { kind: "mission", missionId: "my-mission" };
     expect(canonicalHash(route)).toBeNull();
   });
 
@@ -151,9 +151,9 @@ describe("writeHash", () => {
     expect(window.location.hash).toBe("");
   });
 
-  it("null is a no-op — mission-redirect/unknown routes are never rewritten", () => {
+  it("null is a no-op — mission/unknown routes are never rewritten", () => {
     window.location.hash = "#mission=my-mission";
-    writeHash(canonicalHash({ kind: "mission-redirect", missionId: "my-mission" }));
+    writeHash(canonicalHash({ kind: "mission", missionId: "my-mission" }));
     expect(window.location.hash).toBe("#mission=my-mission");
   });
 });

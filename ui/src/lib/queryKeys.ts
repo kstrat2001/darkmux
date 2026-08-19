@@ -85,6 +85,11 @@ export const queryKeys = {
   flowDays: () => ["flow", "days"] as const,
   flowMissions: () => ["flow", "missions"] as const,
   flowMission: (id: string) => ["flow", "mission", id] as const,
+  /** `GET /mission/:id/graph.json` — the mission-graph lens's node/edge
+   * snapshot (#1868). Distinct from `flowMission` above, which reads the
+   * FLOW RECORD backfill for the same mission id, not the persisted
+   * Phase/Task/Step graph structure. */
+  missionGraph: (id: string) => ["mission", id, "graph"] as const,
   flowSession: (id: string) => ["flow", "session", id] as const,
   /** `GET /lab/run/detail?dir=` — the lab-run detail view's one-shot fetch
    * (`LabRunDetail.tsx`). The event-feed poll (`/lab/run/events`) is NOT a

@@ -70,9 +70,9 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "session", sessionId: "abc-123" });
   });
 
-  it("parses #mission=<id> as a redirect route, not a rendered lens", () => {
+  it("parses #mission=<id> as the mission-graph lens route (#1868)", () => {
     setHash("#mission=my-mission");
-    expect(parseRoute()).toEqual({ kind: "mission-redirect", missionId: "my-mission" });
+    expect(parseRoute()).toEqual({ kind: "mission", missionId: "my-mission" });
   });
 
   it("mission precedence: lens=runs wins over a co-present mission= param", () => {
@@ -123,7 +123,7 @@ describe("parseRoute", () => {
     url.hash = "";
     url.search = "?mission=my-mission&date=2026-08-07";
     window.history.replaceState(null, "", url.toString());
-    expect(parseRoute()).toEqual({ kind: "mission-redirect", missionId: "my-mission" });
+    expect(parseRoute()).toEqual({ kind: "mission", missionId: "my-mission" });
     window.history.replaceState(null, "", "/");
   });
 });
@@ -135,8 +135,11 @@ describe("parseRoute", () => {
 // (e.g. revert to `route.kind !== "runs" && route.kind !== "machine"`,
 // dropping the console exclusion) and this test for "console" goes red.
 describe("showsEventLog", () => {
-  const hidden: Route["kind"][] = ["runs", "console", "machine"];
-  const shown: Route["kind"][] = ["fleet", "session", "playback", "mission-redirect", "unknown"];
+  // (#1868) `mission` moved from `shown` to `hidden`: MissionGraphLens owns
+  // its own events pane now (a second EventLogColumn mount, mission-scoped),
+  // so the App-level column must not ALSO render for this route.
+  const hidden: Route["kind"][] = ["runs", "console", "machine", "mission"];
+  const shown: Route["kind"][] = ["fleet", "session", "playback", "unknown"];
 
   it.each(hidden)("hides the event log on %s", (kind) => {
     expect(showsEventLog({ kind } as Route)).toBe(false);
@@ -331,7 +334,7 @@ describe("isLiveRoute — a daemon-less build is never live, on any lens", () =>
   it("historical routes are non-live either way — the kind test still stands on its own", () => {
     expect(isLiveRoute({ kind: "playback", date: "2026-08-07" })).toBe(false);
     expect(isLiveRoute({ kind: "session", sessionId: "s1" })).toBe(false);
-    expect(isLiveRoute({ kind: "mission-redirect", missionId: "m1" })).toBe(false);
+    expect(isLiveRoute({ kind: "mission", missionId: "m1" })).toBe(false);
   });
 
   it("an unrelated darkmux meta does not make a page static — flow-src is the signal", () => {

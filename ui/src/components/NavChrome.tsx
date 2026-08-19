@@ -15,25 +15,27 @@ type TabAct = (typeof TABS)[number]["act"];
  * `(inMission||inRuns||inMachine||inConsole)?"":" on"`) — which includes
  * the `session` drill-in (legacy's `state.level==="subsystem"` state also
  * leaves fleet lit, since a session drills IN from fleet, not from a lens
- * tab) AND `mission-redirect`.
+ * tab) AND `mission`.
  *
- * QA correction (2026-08-09): an earlier version of this comment mapped
- * `mission-redirect` to the CONSOLE tab, reasoning from `inMission` in the
- * `.on`-class assignment above. QA MEASURED live against the real corpus
- * that this is wrong for the path our port actually exercises: `inMission`
- * (`state.level==="mission"`) is only ever reached through
- * `renderMissionStatic()`, legacy's DAEMON-LESS static-build fallback for
- * `#mission=<id>` — a code path this app never runs (see `route.ts`'s own
- * module doc: this app always has a daemon). On a live daemon (this
- * harness's setup, and every real `/next` deployment), `#mission=<id>`
- * does a FULL NAVIGATION (`location.href = "/mission/<id>/graph"`) before
- * `inMission` is ever computed — nothing about `.lenstabs` is observable
- * mid-redirect, and the `#mission=` hash is typically reached FROM the
- * fleet hero (a mission card), not the console board. `fleet` is the
- * faithful placeholder-state mapping for the live-daemon path; if a future
- * packet reaches `#mission=<id>` some other way (e.g. from within the
- * console board), revisit this mapping against how THAT click actually
- * arrives.
+ * QA correction (2026-08-09, pre-#1868): an earlier version of this comment
+ * mapped the mission route to the CONSOLE tab, reasoning from `inMission` in
+ * the `.on`-class assignment above. QA MEASURED live against the real corpus
+ * that this was wrong for the path this port actually exercised at the
+ * time: legacy's `inMission` (`state.level==="mission"`) is only ever
+ * reached through `renderMissionStatic()`, its DAEMON-LESS static-build
+ * fallback for `#mission=<id>` — a code path this app never ran (this app
+ * always has a daemon). `fleet` was the faithful placeholder mapping then,
+ * matching legacy's real live-daemon behavior (a full navigation before
+ * `inMission` was ever computed).
+ *
+ * That reasoning still holds post-#1868, for a different concrete reason:
+ * `MissionGraphLens` (#1868) now genuinely RENDERS for this route, but it is
+ * reached FROM the fleet hero (a mission card) or the runs board, not from
+ * any `.lenstabs` tab — there is no dedicated "mission" tab to light, and
+ * the lens's own header (not `NavChrome`) is its in-page navigation.
+ * `fleet` stays the honest placeholder mapping: an operator arriving here
+ * came from fleet-adjacent surfaces, and no OTHER tab claims to be "where
+ * you are" either.
  *
  * `unknown` lights no tab — there's no legacy analog (an unrecognized
  * `lens=` silently falls back to fleet there; this port renders it as a
@@ -44,7 +46,7 @@ function isActive(route: Route, tab: TabAct): boolean {
   switch (route.kind) {
     case "fleet":
     case "session":
-    case "mission-redirect":
+    case "mission":
       return tab === "fleet";
     case "runs":
       return tab === "runs";

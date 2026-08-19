@@ -9,7 +9,7 @@ import { EventLogColumn } from "./components/EventLogColumn";
 import { MachineLens } from "./lenses/machine/MachineLens";
 import { RunsBoard } from "./lenses/runs/RunsBoard";
 import { ConsolePanel } from "./lenses/console/ConsolePanel";
-import { MissionReplay } from "./lenses/catalog/MissionReplay";
+import { MissionGraphLens } from "./lenses/mission/MissionGraphLens";
 import { SessionReplay } from "./lenses/catalog/SessionReplay";
 import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
@@ -34,8 +34,10 @@ import type { Route } from "./lib/route";
  * scaffold's original `FleetStrip` presence-only proof region, still tested
  * standalone in `components/FleetStrip.test.tsx` but no longer mounted
  * here), `runs` (`RunsBoard`, Packet 3), and `machine` (`MachineLens`,
- * Packet 2) are real regions driven by `useQuery`; `session`/`mission-redirect`/`playback`
- * (Packet 4) do REAL fetches/navigation wiring per the catalog+replay
+ * Packet 2) are real regions driven by `useQuery`; `mission`
+ * (`MissionGraphLens`, #1868) is a real, self-contained region with its own
+ * header/events pane; `session`/`playback` (Packet 4) do REAL fetches/
+ * navigation wiring per the catalog+replay
  * lens's own doc comments; every other lens renders [[LensPlaceholder]]
  * naming what still needs to be built, per the render-sanity contract
  * (never a blank page).
@@ -101,7 +103,7 @@ export function App() {
 
   // (Packet 5) The SSE tail + reconcile backstop + date-rollover handler —
   // gated by `isLiveRoute` (see that function's own doc) so a genuinely
-  // historical route (`playback`/`session`/`mission-redirect`) doesn't run
+  // historical route (`playback`/`session`) doesn't run
   // a live tail behind it, matching legacy's own `wantsPlayback` gate on
   // `startLiveTail`. Feeds `flowWindow` below via the Query cache
   // (`useFlowWindow`'s own doc), not a direct return-value dependency here.
@@ -288,10 +290,11 @@ export function App() {
 
 /** `renderCrumb()` (viewer.html:2476-2568) + each lens's own
  * `$("logscope").textContent=` assignment, folded into one lookup keyed on
- * [[Route]]. `machine`/`fleet`/`session`/`playback`/`mission-redirect` all
- * have a real, source-cited `logscope` mapping (the last three added this
- * packet, once `EventLogColumn` gave `#logscope` somewhere to render — see
- * that function's own doc); `unknown` stays at the empty `crumb`/`logscope`
+ * [[Route]]. `machine`/`fleet`/`session`/`playback` all have a real,
+ * source-cited `logscope` mapping (added once `EventLogColumn` gave
+ * `#logscope` somewhere to render — see that function's own doc); `mission`
+ * carries none (its own component owns that chrome, see the `mission`
+ * branch below). `unknown` stays at the empty `crumb`/`logscope`
  * default (matching legacy's actual default for those levels — see e.g.
  * `goldens/fleet.txt`'s `(empty)` crumb).
  *
@@ -383,14 +386,14 @@ function routeChrome(
     const pm = replayRecords ? primaryReplayMission(replayRecords) : null;
     return { crumb: pm != null ? `◆ ${pm}` : "", logscope: "fleet" };
   }
-  if (route.kind === "mission-redirect") {
-    // `$("logscope").textContent="mission"` (viewer.html:2730,
-    // `renderMissionStatic()`) — the daemon-less static summary this route
-    // stands in for. Moot in practice (a real daemon always navigates away
-    // before this would paint — see `MissionReplay`'s own doc), named for
-    // completeness. A VISIBLE-log route (`mission` isn't in `showsEventLog`'s
-    // hidden set), so uppercased.
-    return { crumb: "", logscope: "mission" };
+  if (route.kind === "mission") {
+    // `MissionGraphLens` (#1868) owns its own header + events pane — see
+    // that component's own doc. `#crumb`/`#logscope` at the App level carry
+    // nothing for this route (`showsEventLog` already excludes it, so
+    // `#logscope`'s value here is moot — kept empty rather than a stale
+    // "mission" string from the pre-#1868 daemon-less-static-summary era,
+    // since nothing renders it now).
+    return { crumb: "", logscope: "" };
   }
   if (route.kind === "console") {
     // `$("logscope").textContent="console"` (viewer.html:4513) — a HIDDEN-
@@ -426,12 +429,11 @@ function renderRoute(route: Route) {
       // own doc for why the RENDER (not the fetch) is still a not-ported
       // notice.
       return <SessionReplay sessionId={route.sessionId} />;
-    case "mission-redirect":
-      // Packet 4: a real fetch to /flow-mission/<id>, conditionally
-      // navigating to /mission/<id>/graph exactly like legacy's boot() does
-      // — see MissionReplay's own doc for why this completes Packet 1's
-      // deferred placeholder rather than staying inert.
-      return <MissionReplay missionId={route.missionId} />;
+    case "mission":
+      // #1868: the mission-graph lens, folded in-place — see
+      // `MissionGraphLens`'s own doc for the data sources and why this
+      // replaces the earlier `MissionReplay` full-navigation stub.
+      return <MissionGraphLens missionId={route.missionId} />;
     case "playback":
       // (#1800 P2) A bare #<date> hash — a REAL historical render now: the
       // fleet hero over that day's records, with every one of legacy's

@@ -227,10 +227,19 @@ export function Masthead({
  * component (dropping the "Flow · " prefix — not byte-tested for this
  * route and this app has no real playback data pipeline behind it yet, see
  * `PlaybackLens`'s own doc, so a literal date reads more honestly than a
- * borrowed live-mode phrase). `session`/`mission-redirect` have no natural
- * "source date" in this app (no historical fetch pipeline backs them
+ * borrowed live-mode phrase). `session`/`mission` have no natural
+ * "source date" in THIS badge (no historical fetch pipeline backs `session`
  * either) — "REPLAY" names what they are without inventing a fake date.
- * Pre-uppercased (see this component's own module doc for why: matches
+ * `mission` (#1868) keeps this same "REPLAY" label deliberately, even
+ * though `MissionGraphLens` is now a genuinely live-tailing view: this
+ * outer masthead badge describes the App-level FLEET flow window's data
+ * source, which this route doesn't use (see `route.ts`'s `isLiveRoute` doc)
+ * — the lens's OWN header renders its real live/reconnecting status. A
+ * mismatch between this outer badge and the lens's inner status is a known,
+ * narrow rough edge (this badge is chrome ABOVE a self-contained region, not
+ * a claim about that region's own liveness); revisit if it proves
+ * confusing in practice. Pre-uppercased (see this component's own module
+ * doc for why: matches
  * `App.tsx`'s `routeChrome` precedent for the fleet `#logscope` value)
  * except the literal ISO date, which has no case to begin with. */
 function srcbadgeText(route: Route): string {
@@ -252,6 +261,6 @@ function srcbadgeText(route: Route): string {
     const date = route.date ?? todayUTC();
     return date === todayUTC() ? "TODAY" : `FLOW · ${date}`;
   }
-  if (route.kind === "session" || route.kind === "mission-redirect") return "REPLAY";
+  if (route.kind === "session" || route.kind === "mission") return "REPLAY";
   return "TODAY";
 }

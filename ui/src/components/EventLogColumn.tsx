@@ -47,11 +47,21 @@ function onActivateKeyDown(onActivate: () => void) {
  * The event-log column (`.log`, viewer.html:829-849) — the per-record
  * stream, its search box + the full checkbox-per-facet filters modal, the
  * follow-latest toggle, the drag-to-resize `.split` handle, and the
- * `#detail` selected-event panel. Rendered by `App.tsx` only when
- * `lib/route.ts`'s `showsEventLog(route)` is true (fleet / a session
- * drill-in / a bare-date playback / the mission-redirect fallback — see
- * that function's own doc for the verified visibility rule, which corrects
- * a wrong packet-brief claim about `console`).
+ * `#detail` selected-event panel. Mounted by `App.tsx` for every route
+ * EXCEPT `mission` (fleet / a session drill-in / a bare-date playback — see
+ * `lib/route.ts`'s `showsEventLog` doc for the verified visibility rule,
+ * which corrects a wrong packet-brief claim about `console`), toggled via
+ * its `visible` prop rather than conditionally unmounted (see that prop's
+ * own doc below).
+ *
+ * **Second call site (#1868):** `MissionGraphLens.tsx` mounts its OWN
+ * instance of this SAME component for the `mission` route — the route
+ * `showsEventLog` excludes precisely because the lens owns its own events
+ * pane rather than sharing the App-level one (two mounted instances would
+ * be two event logs disagreeing about scope; see that component's own
+ * doc). `scopeLabel`/`records` are what make one component serve two call
+ * sites: the App-level mount feeds it whatever `useRouteRecords` says the
+ * ROUTE means, the mission lens feeds it its own mission-scoped fold.
  *
  * **`records` is whatever `useRouteRecords` says this ROUTE means** — the
  * rolling live 2-day window on live routes, and the FETCHED SLICE on
