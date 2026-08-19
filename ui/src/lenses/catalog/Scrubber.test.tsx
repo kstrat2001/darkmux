@@ -106,7 +106,16 @@ describe("Scrubber", () => {
     expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${clkhm(TMIN)} · 2/9 rec`);
   });
 
-  it("a zero-span day (tMin === tMax) never divides by zero", () => {
+  // (#1869 code review) A zero-span day pins the thumb at the RIGHT edge
+  // (100), not the left (0) — legacy's own rule (`span > 0 ? Math.round(...)
+  // : 100`, viewer.html:2618, named at #1640). A previous version of this
+  // test pinned the WRONG value (0): with `tMin === tMax`, `t - tMin` is 0,
+  // and the pre-fix code floored `span` to 1 before dividing, so `raw`
+  // silently computed to 0 instead of following legacy's explicit `else
+  // 100` branch — thumb hard left while the clock reads "1/1 rec" and the
+  // hero shows the whole day. Never divides by zero either way; only the
+  // RENDERED VALUE was wrong.
+  it("a zero-span day (tMin === tMax) pins the thumb at the end, not the start (#1640)", () => {
     render(
       <Scrubber
         t={TMIN}
@@ -122,6 +131,6 @@ describe("Scrubber", () => {
         totalCount={1}
       />,
     );
-    expect(screen.getByRole("slider")).toHaveValue("0");
+    expect(screen.getByRole("slider")).toHaveValue("100");
   });
 });

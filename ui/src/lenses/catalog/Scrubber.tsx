@@ -60,8 +60,19 @@ export function Scrubber({
   totalCount,
 }: ScrubberProps) {
   const rangeId = useId();
-  const span = Math.max(1, tMax - tMin);
-  const raw = ((t - tMin) / span) * 100;
+  // `span` (floored to 1) feeds `onScrub`'s drag math below, so a drag on a
+  // zero-span day never divides by zero. The RENDERED value is a separate
+  // question — legacy's own rule is `span > 0 ? Math.round(...) : 100`
+  // (viewer.html:2618, `#1640`): a zero-span day pins the thumb at the END,
+  // not the start. Flooring `span` to 1 before that branch (a prior version
+  // of this line did) silently took the `span > 0` arm with a floored span
+  // instead of the real one, computing 0 instead of following legacy's
+  // explicit `else 100` — thumb hard left while the clock read "1/1 rec"
+  // and the hero showed the whole day. `realSpan` (unfloored) is what the
+  // branch itself must test.
+  const realSpan = tMax - tMin;
+  const span = Math.max(1, realSpan);
+  const raw = realSpan > 0 ? ((t - tMin) / realSpan) * 100 : 100;
   const value = Number.isFinite(raw) ? Math.min(100, Math.max(0, Math.round(raw))) : 100;
 
   return (
