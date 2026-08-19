@@ -42,10 +42,13 @@ not a file present anywhere in the current tree.
   field group — see that file's own doc for which endpoints and why.
 - **reactflow** (#1868) — the mission-graph lens's (`#mission=<id>`,
   `src/lenses/mission/`) canvas renderer. Pinned to 11.11.4, matching the
-  version the standalone `mission-graph.html` page's own vendored bundle
-  used (`crates/darkmux-serve/assets/vendor/README.md`) — a real dependency
-  of this workspace now, bundled by Vite like everything else, rather than
-  a separately-vendored IIFE. Its MIT notice lives in
+  version the pre-#1868 standalone `mission-graph.html` page's own vendored
+  bundle used — a real dependency of this workspace now, bundled by Vite
+  like everything else, rather than a separately-vendored IIFE. That
+  standalone page and its vendor dir (`crates/darkmux-serve/assets/vendor/`)
+  are retired (#1868's third packet); recoverable with
+  `git show v2.9.0:crates/darkmux-serve/assets/vendor/README.md` if the
+  pinning history is ever needed again. Its MIT notice lives in
   `vendor-licenses/LICENSE-reactflow` alongside react/react-dom/
   @tanstack/react-query's, prepended to the built artifact the same way
   (see that directory's own README).
