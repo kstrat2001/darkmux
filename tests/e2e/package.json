@@ -8,7 +8,7 @@
     "ui": "playwright test",
     "one": "playwright test --",
     "grep": "playwright test -g",
-    "graph": "playwright test mission-graph",
+    "graph": "playwright test mission-lens",
     "panel": "playwright test viewer-panel",
     "phone": "playwright test chrome-order",
     "headed": "playwright test --headed --",
