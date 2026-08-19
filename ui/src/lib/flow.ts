@@ -188,10 +188,10 @@ export function asRecordArray(body: unknown): FlowRecord[] {
  * `crates/darkmux-serve/src/lib.rs`'s `collect_records_by_field`, capped at
  * `MAX_CATALOG_RECORDS` (10,000). A bare array (the shape every OTHER
  * `/flow/...` caller tolerates per `asRecordArray` above) never carries this
- * flag and reads as `false`. `mission-graph.html`'s own `backfillEvents`
- * reads the SAME field (`bodies[0].truncated`) into `srvTruncRef` for the
- * same reason: a mission past the server cap must say so, or "N of 10000"
- * silently restates the cap as the mission's whole history. */
+ * flag and reads as `false`. `MissionGraphLens.tsx`'s own `srvTruncated`
+ * reads the SAME field (`bodies[0].truncated`) for the same reason: a
+ * mission past the server cap must say so, or "N of 10000" silently
+ * restates the cap as the mission's whole history. */
 export function bodyTruncated(body: unknown): boolean {
   if (!body || typeof body !== "object" || Array.isArray(body)) return false;
   return !!(body as { truncated?: boolean }).truncated;

@@ -1,7 +1,7 @@
 // #1868 packet 2 retarget of mission-graph-status-vocab.spec.js against
 // `MissionGraphLens` (`#mission=<id>`).
 //
-// This file NARROWS the original 9-test suite deliberately, per #1868's own
+// This file NARROWS the original 10-test suite deliberately, per #1868's own
 // packet brief ("if a behavior is genuinely not reproducible in the port,
 // say so explicitly rather than dropping it silently"). Named, not silent:
 //

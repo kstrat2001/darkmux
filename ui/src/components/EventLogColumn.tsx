@@ -145,8 +145,9 @@ export function EventLogColumn({
    *  response (`/flow-mission/:id`'s own `truncated` flag, capped at
    *  `MAX_CATALOG_RECORDS`) — a cap this component's own `LOG_CAP`
    *  disclosure can't see, because the server already dropped the rest
-   *  before `records` ever arrives here. `mission-graph.html`'s own
-   *  `eventsPanelEls` appends the same "+" to its total for the same
+   *  before `records` ever arrives here. The pre-#1868 standalone
+   *  `mission-graph.html` page's own `eventsPanelEls` appended the same "+"
+   *  to its total for the same
    *  reason: "50 of 10000" would otherwise restate the server cap as the
    *  mission's whole history. Rendered only where this component ALREADY
    *  reports a real total (not the search-match count, which is a

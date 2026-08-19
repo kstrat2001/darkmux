@@ -41,9 +41,10 @@ empty, so a wholesale deletion cannot ship silently — but it cannot detect a
 | `LICENSE-tanstack-react-query` | @tanstack/react-query | 5.101.4 |
 | `LICENSE-reactflow` | reactflow | 11.11.4 |
 
-The React 18 pin is deliberate — `crates/darkmux-serve/assets/vendor/README.md`
-documented it for the (pre-#1868) standalone mission-graph page's own separate
-vendored bundle, which used the same react/reactflow version pair this `ui/`
-dependency now uses for real (#1868 folded that page's canvas renderer into
-this build; the standalone bundle + its README are scheduled for removal in
-#1868's third packet).
+The React 18 pin is deliberate — it matches the version the (pre-#1868)
+standalone mission-graph page's own separate vendored bundle used, the same
+react/reactflow version pair this `ui/` dependency now uses for real (#1868
+folded that page's canvas renderer into this build). The standalone bundle
+and its own README, `crates/darkmux-serve/assets/vendor/README.md`, are
+retired (#1868's third packet); recoverable with
+`git show v2.9.0:crates/darkmux-serve/assets/vendor/README.md`.

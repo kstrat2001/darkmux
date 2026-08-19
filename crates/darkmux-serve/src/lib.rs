@@ -139,24 +139,6 @@ fn is_valid_date(date: &str) -> Option<&str> {
 /// package's `copy-artifact` script).
 const NEXT_HTML: &str = include_str!("../assets/next.html");
 
-/// Mission graph lens page (#1284 Packet 5) — a SEPARATE file from
-/// `NEXT_HTML` by design; see `assets/mission-graph.html`'s own header
-/// comment for why the two rendering models (flow-record timeline vs.
-/// Phase/Task/Step node-link graph) don't share one file. Served at
-/// `GET /mission/:id/graph`.
-const MISSION_GRAPH_HTML: &str = include_str!("../assets/mission-graph.html");
-
-/// Vendored React + ReactDOM + reactflow, bundled into one minified IIFE —
-/// see `assets/vendor/README.md` for the pinned versions, licenses (all
-/// MIT), and rebuild recipe. No CDN, no source map; served same-origin at
-/// `GET /vendor/reactflow-bundle.min.js` so the mission-graph page never
-/// makes an external network request.
-const VENDOR_REACTFLOW_JS: &str = include_str!("../assets/vendor/reactflow-bundle.min.js");
-
-/// reactflow's own stylesheet, minified — see `assets/vendor/README.md`.
-/// Served at `GET /vendor/reactflow-bundle.min.css`.
-const VENDOR_REACTFLOW_CSS: &str = include_str!("../assets/vendor/reactflow-bundle.min.css");
-
 /// (#1403) Standalone-app shell assets — the operator runs the viewer as a
 /// chromeless home-screen shortcut on mobile, so the app icon + web manifest
 /// are served same-origin, matching the viewer's self-contained-by-convention
@@ -251,10 +233,10 @@ async fn next_html() -> impl IntoResponse {
 ///
 /// Found by the 2.3.0 release dogfood — the operator's viewer was both slow
 /// to load AND showing stale data, and both symptoms trace to this one
-/// omission. The vendored-bundle comment below (`vendor_reactflow_js`)
-/// assumed "a stale browser cache is cleared by a normal page reload"; that
-/// assumption does not hold for a document served with no validator, since
-/// a heuristic cache is free to skip revalidation entirely.
+/// omission. An earlier assumption elsewhere in this file — "a stale
+/// browser cache is cleared by a normal page reload" — does not hold for a
+/// document served with no validator, since a heuristic cache is free to
+/// skip revalidation entirely.
 ///
 /// FNV-1a rather than a hashing crate: the dep set is deliberately small
 /// (see CLAUDE.md — a short inline routine beats a crate for a one-off), and
@@ -408,8 +390,6 @@ pub(crate) fn build_router_full(
         .route("/phases", get(phases_handler))
         .route("/mission/:id/graph", get(mission_graph_html))
         .route("/mission/:id/graph.json", get(mission_graph_json_handler))
-        .route("/vendor/reactflow-bundle.min.js", get(vendor_reactflow_js))
-        .route("/vendor/reactflow-bundle.min.css", get(vendor_reactflow_css))
         .route("/manifest.webmanifest", get(web_manifest_handler))
         .route("/apple-touch-icon.png", get(apple_touch_icon_handler))
         .route("/icon-192.png", get(icon_192_handler))
@@ -1610,18 +1590,56 @@ async fn phases_handler() -> axum::Json<serde_json::Value> {
     }))
 }
 
-// ─── Mission graph lens (#1284 Packet 5) ────────────────────────────────
+// ─── Mission graph lens (#1284 Packet 5; folded into the React port #1868) ──
 
-/// `GET /mission/:id/graph` — the dedicated mission-graph HTML page. Static
-/// bytes (no per-mission templating; the id is already in the URL the
-/// browser loaded, and the page's own JS reads it from `location.pathname`
-/// — see `assets/mission-graph.html`'s `missionIdFromPath()`). Never 404s
-/// on an unknown mission id here — that's `graph.json`'s job; the page
-/// itself always loads and reports the fetch error inline (item 6's
-/// graceful-degradation posture extends to "id doesn't exist" too, not just
-/// "mission has no task/step data").
-async fn mission_graph_html(headers: axum::http::HeaderMap) -> impl IntoResponse {
-    html_response(&headers, MISSION_GRAPH_HTML.to_string())
+/// `GET /mission/:id/graph` — the standalone mission-graph HTML page this
+/// route used to serve is retired (#1868 third packet); the graph lens now
+/// lives IN the React port as `MissionGraphLens` (`ui/src/lenses/mission/`),
+/// reached at the hash route `#mission=<id>`. A **308 permanent redirect**
+/// (method-preserving, cacheable — same reasoning as `next_html`'s redirect
+/// to `/`) keeps every bookmark and shared link minted against this path
+/// working: the browser lands on `/` with the mission already selected,
+/// not just on the bare app shell.
+///
+/// Validates `id` with [`is_valid_catalog_id`] before building the redirect
+/// target — the same allowlist `graph.json` gates on. Two separate classes
+/// of character are excluded, and the second is the one worth naming
+/// explicitly (#1868 review finding): `#`, `/` and whitespace would
+/// reinterpret or truncate the fragment at the URL level, while **`&` and
+/// `=` are the port's OWN hash-param separators**. `&` is a perfectly legal
+/// fragment character per RFC 3986, so a future widening of this allowlist
+/// that reasons only about URL syntax would admit it — and
+/// `/mission/a&lens=console/graph` would then redirect to
+/// `/#mission=a&lens=console`, which `parseRoute` resolves to the CONSOLE
+/// lens (`lens=` outranks a co-present `mission=`; see `route.test.ts`).
+/// The bookmark would land somewhere else entirely, silently. Widen this
+/// charset only against the port's hash grammar, not just against RFC 3986
+/// (no percent-encoding dependency needed today: the allowed charset is
+/// already both fragment-safe and separator-free). A structurally
+/// invalid id was always a `400` from `graph.json`'s own gate; this route
+/// now surfaces that same `400` immediately rather than redirecting into a
+/// port render that would only rediscover it on fetch. A VALID id that
+/// doesn't name a real mission still redirects — the port's own lens
+/// reports that "not found" inline (graceful-degradation posture
+/// unchanged, item 6), exactly as the retired standalone page did.
+///
+/// (#1868 QA finding) The `is_valid_catalog_id` gate is load-bearing for
+/// more than fragment safety: `axum::response::Redirect::permanent`
+/// PANICS if its argument isn't a valid HTTP header value. Today's
+/// allowlist (visible ASCII only) can never trip that, but if a future
+/// change widens the catalog-id charset (e.g. to accommodate a new id
+/// scheme), this handler's failure mode flips silently from a clean `400`
+/// to a request-handler panic unless the widened charset is re-checked
+/// against `HeaderValue`'s own constraints first.
+async fn mission_graph_html(Path(id): Path<String>) -> axum::response::Response {
+    if !is_valid_catalog_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid mission id (alphanumeric + -_.: , <=128 chars)",
+        )
+            .into_response();
+    }
+    axum::response::Redirect::permanent(&format!("/#mission={id}")).into_response()
 }
 
 /// `GET /mission/:id/graph.json` — the node/edge snapshot
@@ -1668,35 +1686,6 @@ async fn mission_graph_json_handler(
         )
             .into_response(),
     }
-}
-
-/// `GET /vendor/reactflow-bundle.min.js` — same-origin vendored bundle
-/// (see `assets/vendor/README.md`). Long `Cache-Control` is safe: the
-/// bundle is content-addressed by the daemon's own build (a new darkmux
-/// version ships a new bundle at a byte-identical URL, but daemons are
-/// short-lived personal processes, not a CDN-fronted deploy — a stale
-/// browser cache is cleared by a normal page reload after upgrade).
-///
-/// The HTML documents do NOT share this policy: they carry
-/// `Cache-Control: no-cache` + an `ETag` (see [`html_response`]), because
-/// unlike this bundle they change on every darkmux build, and the 2.3.0
-/// dogfood showed that serving them with no validator produces exactly the
-/// stale-page-on-reload failure this comment used to assume away.
-async fn vendor_reactflow_js() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("content-type", "application/javascript; charset=utf-8")],
-        VENDOR_REACTFLOW_JS,
-    )
-}
-
-/// `GET /vendor/reactflow-bundle.min.css` — see `vendor_reactflow_js`'s doc.
-async fn vendor_reactflow_css() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("content-type", "text/css; charset=utf-8")],
-        VENDOR_REACTFLOW_CSS,
-    )
 }
 
 /// (#1403) `GET /manifest.webmanifest` — the standalone-app manifest so a

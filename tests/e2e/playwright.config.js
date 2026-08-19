@@ -105,25 +105,14 @@ const SERVED_VIEWER = path.join('crates', 'darkmux-serve', 'assets', 'next.html'
     fs.readFileSync(path.join(repo, 'tests', 'fixtures', 'runs-fixture.json'), 'utf8')
   );
 
-  // (#1471) Mission-graph harness. The mission-graph lens is a SEPARATE asset
-  // from the main viewer (next.html, formerly viewer.html — retired #1806)
-  // with its own vendored React Flow bundle (assets/vendor/), served
-  // same-origin. The events-panel backfill spec
-  // (mission-graph-events.spec.js) route-mocks the DATA endpoints (graph.json,
-  // /flow/<date>, the SSE stream) but the page shell + its vendor bundle load
-  // from here: the spec fulfills the `/mission/<id>/graph` route with these
-  // bytes (missionIdFromPath() needs the real path), and the page's own
-  // `/vendor/*` requests fall through to this static server.
-  fs.writeFileSync(
-    path.join(SERVED, 'mission-graph.html'),
-    fs.readFileSync(path.join(repo, 'crates', 'darkmux-serve', 'assets', 'mission-graph.html'), 'utf8')
-  );
-  const vendorSrc = path.join(repo, 'crates', 'darkmux-serve', 'assets', 'vendor');
-  const vendorDst = path.join(SERVED, 'vendor');
-  fs.mkdirSync(vendorDst, { recursive: true });
-  for (const f of fs.readdirSync(vendorSrc)) {
-    fs.copyFileSync(path.join(vendorSrc, f), path.join(vendorDst, f));
-  }
+  // (#1868) The standalone mission-graph harness this block used to build —
+  // a separate `mission-graph.html` shell + its vendored React Flow bundle
+  // (`assets/vendor/`), fulfilled at `/mission/<id>/graph` for the
+  // mission-graph-*.spec.js suite — is retired along with that page and its
+  // consuming specs. The mission-lens-*.spec.js suite that replaced those
+  // specs exercises the SAME surface through `index-live.html#mission=<id>`
+  // instead: reactflow is now a real `ui/` dependency bundled straight into
+  // `next.html`, so no separate shell or vendor copy is needed here.
 })();
 
 // Serve over HTTP (not file://) so the viewer's boot() fetch('./xss-flow.jsonl')

@@ -25,11 +25,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// helpers right here, which are now the ONE Rust-side hedge — both
 /// `serve/lib.rs` call sites and `serve/runs.rs` route through these
 /// functions rather than each carrying its own `||` comparison, so a fix
-/// here fixes every Rust consumer at once; and `mission-graph.html`'s own
-/// inline `||` hedges (`action === "dispatch complete" || action ===
-/// "dispatch.complete"`, etc.), which stay genuinely independent because
-/// that file is plain JS with no Rust binding to share this module's
-/// helpers through.
+/// here fixes every Rust consumer at once; and the mission-graph lens's
+/// own inline `||` hedges (`ui/src/lenses/mission/graph.ts`: `action ===
+/// "dispatch complete" || action === "dispatch.complete"`, etc. — folded
+/// into the React port #1868, the standalone `mission-graph.html` page
+/// this doc used to cite is retired), which stay genuinely independent
+/// because nothing routes this module's action matching through
+/// `flow.ts`'s shared normalizer either.
 ///
 /// That is not currently a live bug — every consumer that needs to cope, does.
 /// It is fragile in the obvious way: it works until the next consumer

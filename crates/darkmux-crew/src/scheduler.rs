@@ -944,8 +944,10 @@ fn now_unix() -> u64 {
 /// The complete, canonical step-lifecycle `FlowRecord.action` vocabulary
 /// (#1399 — contract 2 territory, "dispatch/lifecycle liveness must be
 /// uniform across producers"). `run_step_graph` is ONE producer; the graph
-/// lens's SSE matcher (`crates/darkmux-serve/assets/mission-graph.html`'s
-/// `STATUS_ACTIONS`) is the consumer every producer must stay aligned
+/// lens's SSE matcher (`ui/src/lenses/mission/graph.ts`'s `STATUS_ACTIONS`,
+/// folded into the React port #1868 — the standalone
+/// `crates/darkmux-serve/assets/mission-graph.html` page this doc used to
+/// cite is retired) is the consumer every producer must stay aligned
 /// with. ANY execution path that runs a `Task`/`Step` graph — the generic
 /// scheduler here, or a Tier-3 driver with its own runner (e.g.
 /// `darkmux-lab`'s review pipeline) — emits ONLY these three strings for

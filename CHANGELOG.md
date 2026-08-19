@@ -52,10 +52,13 @@ darkmux release.
   component every other lens's event log already uses) instead of a
   second, separate implementation. `reactflow` is now a real `ui/`
   dependency (bundled by Vite), matching the pinned version the standalone
-  page's vendored bundle already used. The standalone page itself, its
-  vendored bundle, and the daemon's `/mission/:id/graph` route are
-  unchanged in this release — they retire in a follow-up once the port has
-  had a release cycle to prove itself. (#1868)
+  page's vendored bundle already used. (Superseded by the Removed entry
+  below, landing in this same [Unreleased] window: an earlier version of
+  this entry said the standalone page and its route would stay "unchanged
+  in this release... until the port has had a release cycle to prove
+  itself." That condition was never met — the port has shipped zero
+  release cycles — and darkmux is pre-1.0 with no compat-baggage policy, so
+  the retirement lands in the same cycle instead of waiting on one.) (#1868)
 
 ### Fixed
 
@@ -171,6 +174,45 @@ darkmux release.
     port-side behavior for a test to cover.
   - The legacy file's source is recoverable with
     `git show v2.9.0:crates/darkmux-serve/assets/viewer.html`.
+- **The standalone mission-graph page is deleted** (#1868 third packet),
+  completing the arc this same release's mission-graph lens (Added, above)
+  started: `crates/darkmux-serve/assets/mission-graph.html` (~2,100 lines of
+  hand-written `React.createElement` JS) and its vendored bundle
+  (`crates/darkmux-serve/assets/vendor/` — React + ReactDOM + reactflow as
+  one minified IIFE, plus the upstream MIT `LICENSE-*` files) are gone.
+  Their MIT notices already travel with the artifact that reaches users
+  independently of that directory: `ui/vendor-licenses/LICENSE-reactflow`
+  (added alongside reactflow becoming a real `ui/` dependency) is prepended
+  into `next.html` the same way react/react-dom/@tanstack/react-query's
+  notices already were, verified byte-identical to the deleted copies
+  before removal.
+  - `GET /mission/:id/graph` is now a **308 permanent redirect** into the
+    port's own `#mission=<id>` hash route (`/#mission=<id>`) rather than a
+    second HTML document — every bookmark and shared link minted against
+    the old path still lands on the mission's graph, now rendered inline by
+    `MissionGraphLens`. `GET /mission/:id/graph.json` (the data endpoint)
+    and the `/vendor/reactflow-bundle.min.{js,css}` routes: the JSON route
+    is unchanged; the vendor routes are deleted along with the bundle they
+    served.
+  - `tests/e2e/mission-graph-*.spec.js` (8 specs) are deleted — superseded
+    by the `mission-lens-*.spec.js` suite #1871 already shipped against the
+    ported lens (plus one new mobile-legend spec with no legacy analog).
+    The `.served/mission-graph.html` + `/vendor/*` harness wiring in
+    `tests/e2e/playwright.config.js` that existed only to serve those specs
+    is removed with them; the lens specs already run against the port's
+    own `index-live.html`.
+  - `tests/parity/mission-graph-goldens.spec.ts` (the capture suite that
+    recorded `goldens/mission-graph-{canvas,timeline}.txt` from the live
+    standalone page) is retired, its own config and `package.json` script
+    removed — same shape as `viewer.html`'s own extraction harness
+    retirement above. **The two goldens it captured survive as a frozen
+    spec**, same as `viewer.html`'s: `next-parity-graph.spec.ts` (shipped in
+    this same release, see Added above) keeps grading the ported lens
+    against them, byte-for-byte on the DOM regions kept identical on
+    purpose. Rebaselining either is now a direct hand-edit, not a
+    re-capture. Recoverable with
+    `git show v2.9.0:crates/darkmux-serve/assets/mission-graph.html` and
+    `git show v2.9.0:tests/parity/mission-graph-goldens.spec.ts`.
 
 ## [2.9.0] - 2026-08-16
 

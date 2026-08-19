@@ -180,21 +180,27 @@ test('viewer renders attacker-controlled flow records inertly across every view'
     await page.waitForSelector('[data-act="machine"][data-arg]');
   }
 
-  // Mission view (mission_id + per-dispatch role/machine/model rows). NOT
-  // hardened, and this is a genuine, current finding, re-verified against
-  // the actual source rather than inherited from the pre-#1640 note this
-  // comment used to carry: `grep -rn 'data-act="mission"' ui/src` returns
-  // ZERO matches anywhere in the port. The only mission-shaped affordance
-  // that exists is `data-act="gomission"` (`RunsBoard.tsx`/`CatalogPanel.tsx`),
-  // and it does something architecturally different from what this walk is
-  // named for — it's a FULL PAGE NAVIGATION to `/mission/<id>/graph`, a
-  // separate document with its own vendored React Flow bundle
-  // (`mission-graph.html`), not an inline `/next` render. `#mission=<id>`'s
-  // own inline component (`MissionReplay.tsx`) never renders per-dispatch
-  // role/machine/model rows either way — only loading/error/"nothing to
-  // replay" text ahead of that same redirect. So there is no inline mission
-  // drill-in for this walk to reach, by construction, not by omission; left
-  // soft, same as recent-run above.
+  // Mission view (mission_id + per-dispatch role/machine/model rows).
+  // `grep -rn 'data-act="mission"' ui/src` still returns ZERO matches
+  // anywhere in the port, so this locator has never once matched and this
+  // branch stays a no-op — unchanged by #1868. The only mission-shaped
+  // affordance that exists is `data-act="gomission"`
+  // (`RunsBoard.tsx`/`CatalogPanel.tsx`), which used to do something
+  // architecturally different from what this walk is named for: a FULL PAGE
+  // NAVIGATION to `/mission/<id>/graph`, a separate document with its own
+  // vendored React Flow bundle (`mission-graph.html`). Post-#1868 it no
+  // longer does — that page is retired, `/mission/:id/graph` is now a
+  // redirect into `/#mission=<id>`, and the hash renders `MissionGraphLens`
+  // (renamed from `MissionReplay.tsx`) IN-PLACE, WITH real per-dispatch
+  // role/machine/model rows (`StepRow.tsx`). Its compiled JS ships inside
+  // the SAME `next.html` document this file's broader walk already covers
+  // (and the Rust-side `viewer_has_no_inline_event_handlers` test scans
+  // whole), which narrows the "not hardened" concern but doesn't close it:
+  // `gomission` lives on the runs/catalog lenses, not the fleet stage this
+  // particular walk visits, so this walk still never clicks through to it
+  // and the per-dispatch-row render path stays genuinely unexercised here.
+  // A real, current gap — worth a future packet's attention, not silently
+  // closed by #1868's retirement.
   const miss = page.locator('[data-act="mission"]').first();
   if (await miss.count()) {
     await miss.click();

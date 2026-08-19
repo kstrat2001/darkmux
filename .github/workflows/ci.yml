@@ -90,6 +90,13 @@ jobs:
               - '**/Cargo.lock'
               - 'templates/**'
               - '.github/workflows/ci.yml'
+              # (#1868) A Rust test reads this TS file directly (the
+              # `graph_ts_status_actions_map` pin ties `graph.ts`'s
+              # STATUS_ACTIONS map to the emitter's own list), so a UI-only
+              # edit to it must run the rust job. Without this line the pin's
+              # own gate skips and reports green on exactly the PR that
+              # breaks it.
+              - 'ui/src/lenses/mission/graph.ts'
               - '!runtime/**'
 
       - name: Install Rust stable toolchain

@@ -23,28 +23,29 @@ const graphFixture = JSON.parse(fs.readFileSync(path.join(GEN, 'mission-graph.js
 const runsRow = JSON.parse(fs.readFileSync(path.join(GEN, 'runs-row.json'), 'utf8'));
 
 const MISSION_ID = graphFixture.mission_id;
+// (#1868) `/flow-mission/<id>` + `/flow/<date>` — the SAME two backfill
+// sources `MissionGraphLens.tsx` reads, and the SSE stream it subscribes to.
+const MISSION_RE = /\/flow-mission\/[^/?]+(\?.*)?$/;
 const BACKFILL_RE = /\/flow\/\d{4}-\d{2}-\d{2}(\?.*)?$/;
 const STREAM_RE = /\/flow\/\d{4}-\d{2}-\d{2}\/stream(\?.*)?$/;
-const MISSION_GRAPH_HTML = fs.readFileSync(
-  path.join(__dirname, '..', '..', 'crates', 'darkmux-serve', 'assets', 'mission-graph.html'),
-  'utf8'
-);
 
 test('the generated graph fixture renders — the shape is the server\'s, not mine', async ({
   page,
 }) => {
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
-  await page.route(`**/mission/${MISSION_ID}/graph`, (r) =>
-    r.fulfill({ contentType: 'text/html; charset=utf-8', body: MISSION_GRAPH_HTML })
-  );
   await page.route(`**/mission/${MISSION_ID}/graph.json*`, (r) =>
     r.fulfill({ contentType: 'application/json', body: JSON.stringify(graphFixture) })
   );
+  await page.route(MISSION_RE, (r) => r.fulfill({ contentType: 'application/json', body: '[]' }));
   await page.route(BACKFILL_RE, (r) => r.fulfill({ contentType: 'application/json', body: '[]' }));
   await page.route(STREAM_RE, (r) => r.fulfill({ contentType: 'text/event-stream', body: '' }));
   await page.setViewportSize({ width: 1280, height: 900 });
-  await page.goto(`/mission/${MISSION_ID}/graph`);
+  // (#1868) The standalone `/mission/<id>/graph` page is retired; the graph
+  // lens now renders IN-PLACE inside the port at `#mission=<id>`, the same
+  // hash route `MissionGraphLens.tsx` owns — matching every mission-lens-*
+  // spec's own navigation.
+  await page.goto(`/index-live.html#mission=${MISSION_ID}`);
 
   // Rendering AT ALL is the assertion that matters. A hand-written shape the
   // server cannot produce yields an empty canvas, and every downstream

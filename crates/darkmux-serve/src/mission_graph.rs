@@ -3,15 +3,19 @@
 //! Reads the persisted Phase/Task/Step graph for one mission (the JSON
 //! source-of-truth under `~/.darkmux/missions/<id>/`, via
 //! `darkmux_crew::loader`/`lifecycle`) and shapes it into a node-link
-//! diagram the mission-graph page's vendored React Flow renders.
+//! diagram the mission-graph lens's React Flow renders (#1868 —
+//! `ui/src/lenses/mission/MissionCanvas.tsx`, folded into the React port;
+//! the standalone `assets/mission-graph.html` page this module originally
+//! fed is retired, recoverable with
+//! `git show v2.9.0:crates/darkmux-serve/assets/mission-graph.html`).
 //!
 //! **Live status is NOT this module's job.** This builds the INITIAL
-//! snapshot only; the page's own SSE subscription (`/flow/:date/stream`)
+//! snapshot only; the lens's own SSE subscription (`/flow/:date/stream`)
 //! layers status deltas on top client-side by matching a step-lifecycle
 //! record's `handle` field against a node id already present in this
 //! snapshot, and a row within that node's `steps` array (see
-//! `assets/mission-graph.html`'s `applyFlowRecord`). No flow-record read
-//! happens here.
+//! `ui/src/lenses/mission/graph.ts`'s `applyFlowRecord`). No flow-record
+//! read happens here.
 //!
 //! **Steps render as ROWS inside their owning Task node, not separate
 //! nodes (#1401).** post-#1341, `Step` carries no `depends_on` of its own —
@@ -45,8 +49,8 @@ use std::collections::{BTreeMap, BTreeSet};
 /// rows inside a Task node, see the module doc — #1401).
 ///
 /// **Wire casing contract:** serialized `camelCase` (`parentId`,
-/// `startedTs`, `completedTs`) because the CONSUMER is JS
-/// (`assets/mission-graph.html` reads `n.parentId` in `computeLayout`).
+/// `startedTs`, `completedTs`) because the CONSUMER is JS/TS
+/// (`ui/src/lenses/mission/graph.ts` reads `n.parentId` in `computeLayout`).
 /// The review gate on the first cut of this feature caught the mismatch
 /// (Rust emitted `parent_id`, JS read `parentId` — every task grouped
 /// under a missing parent and the whole layout collapsed to the origin);
@@ -242,9 +246,10 @@ fn phase_status_to_node(s: PhaseStatus) -> NodeStatus {
     }
 }
 
-/// (#1472) How advanced a node status is, mirroring the viewer's
-/// `statusRank` (`mission-graph.html`): `planned` < `running` < any
-/// terminal state (`complete` / `error` / `abandoned` share the top rank).
+/// (#1472) How advanced a node status is, mirroring the mission-graph
+/// lens's own `statusRank` (`ui/src/lenses/mission/graph.ts`, #1868):
+/// `planned` < `running` < any terminal state (`complete` / `error` /
+/// `abandoned` share the top rank).
 /// Used by the phase rollup's monotone-authority rule so a persisted
 /// terminal phase status is never regressed by a lower-ranked task rollup.
 fn node_status_rank(s: NodeStatus) -> u8 {
@@ -332,7 +337,8 @@ fn derive_task_status(step_statuses: &[NodeStatus]) -> NodeStatus {
 /// lifecycle status: for a finalized/aborted mission the persisted phase
 /// status is the lifecycle-authoritative terminal, so the task-derived
 /// status wins ONLY when STRICTLY more advanced (by `node_status_rank`,
-/// mirroring the viewer's `statusRank` merge in `mission-graph.html`).
+/// mirroring the mission-graph lens's `statusRank` merge in
+/// `ui/src/lenses/mission/graph.ts`, #1868).
 ///
 /// - Mid-run: persisted=`Running`, derived=`Complete` → `Complete` (the
 ///   live #1472 case — the review launcher only advances persisted phase
@@ -601,9 +607,10 @@ fn substitute_id_placeholder_prefix(id: &str, doc_phase_id: &str, real_phase_id:
 // `MISSION_CONFIG_SCHEMA` doc (schema 2.0) for why.
 
 /// (#1432 item 4) The finalized token/turn totals folded for one step from
-/// this mission's flow records. Mirrors the page's own
-/// `applyRecordToMetrics` FINAL branch (`assets/mission-graph.html`) so the
-/// server backfill and the live SSE channel agree on what "finalized" means.
+/// this mission's flow records. Mirrors the lens's own
+/// `applyRecordToMetrics` FINAL branch (`ui/src/lenses/mission/graph.ts`,
+/// #1868) so the server backfill and the live SSE channel agree on what
+/// "finalized" means.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct StepFinals {
     pub tokens: Option<u64>,
@@ -1082,8 +1089,8 @@ pub fn build_mission_graph(
                     // actually started" is a correctness condition, not
                     // just a display nicety — mirrors the client's
                     // `startTs > 0` gate on the live SSE fold
-                    // (`assets/mission-graph.html`, #1488) on the SERVER
-                    // side for the finalized total. Confirmed live against
+                    // (`ui/src/lenses/mission/graph.ts`, #1488/#1868) on the
+                    // SERVER side for the finalized total. Confirmed live against
                     // review-1e47c34023: a fully-planned verify step read
                     // 46832 finalized tokens folded from an unrelated,
                     // already-closed same-day mission's real verify run.

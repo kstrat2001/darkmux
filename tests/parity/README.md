@@ -67,32 +67,33 @@ Does not touch `tests/e2e/`.
    ARE gated bind fixed ports and share `goldens/`, so concurrent runs flake
    for reasons unrelated to the code under test — that's why CI runs them
    serially.
-4. **`mission-graph-goldens.spec.ts`** (`bun run mission-graph-goldens`),
-   #1868 packet 1: captures `goldens/mission-graph-canvas.txt` /
-   `goldens/mission-graph-timeline.txt` from the standalone
-   `crates/darkmux-serve/assets/mission-graph.html` page (served live at
-   `/mission/:id/graph`, not a build artifact; its own
-   `mission-graph-goldens.playwright.config.js` points `baseURL` straight at
-   the operator's daemon rather than staging a static bundle), then red-proves
-   both against `installBlankRoutes`. This is a CAPTURE suite, not a grading
-   one: it writes the goldens it also runs the harness self-test against, the
-   same shape the retired legacy `extract.spec.ts`/`redprove.spec.ts` pair
-   used before #1806. Because a capture run OVERWRITES the goldens, set
-   `GOLDEN_CHECK=1` to flip it into verify mode (compare, never write) and
-   always `git diff goldens/` after a capture run: a golden must change only
-   as a reviewed hand-edit, never as a side effect of somebody running this
-   suite against a locally modified `mission-graph.html`. The suite also
-   asserts the corpus mocks actually SERVED both fixtures, because this is
-   the one suite whose `baseURL` is a live daemon: without that assertion a
-   deleted route branch would fall through to real daemon data and stay
-   green (proved by mutation, #1868). These two goldens are the frozen spec `next-parity-graph.spec.ts` (item 5)
-   grades the ported lens against, reusing this suite's own
-   `lib/extract-graph.js` helpers rather than re-deriving them. Run this
-   capture suite locally against a live daemon only when RE-capturing the
-   standalone page's goldens (e.g. after a deliberate change to
-   `mission-graph.html` itself, which #1868's third packet retires along
-   with this suite); not part of the CI gate (needs a live daemon).
-5. **`next-parity-graph.spec.ts`** (`bun run next-parity-graph`), #1868
+**`mission-graph-goldens.spec.ts` is retired (#1868 third packet).** It used
+to hold the item-4 slot in the list below; `next-parity-graph.spec.ts` (the
+suite that WAS item 5) now fills that slot instead, so the numbering below
+still runs 1 through 4 with nothing skipped — only the retired suite's own
+name is gone from it. It captured
+`goldens/mission-graph-canvas.txt` / `goldens/mission-graph-timeline.txt`
+from the standalone `crates/darkmux-serve/assets/mission-graph.html` page
+(served live at `/mission/:id/graph`, not a build artifact; its own
+`mission-graph-goldens.playwright.config.js` pointed `baseURL` straight at
+the operator's daemon rather than staging a static bundle), then red-proved
+both against `installBlankRoutes` — the same capture-suite shape the
+retired legacy `extract.spec.ts`/`redprove.spec.ts` pair used before #1806.
+That standalone page is gone (folded into the React port as
+`MissionGraphLens`, #1868), and with it the only thing this suite ever
+regenerated goldens FROM. Exactly like `viewer.html`'s own retirement
+above, **the two goldens it captured survive as a frozen spec** — item 4
+below now grades the ported lens against them, reusing this retired
+suite's own `lib/extract-graph.js` helpers rather than re-deriving them.
+**Rebaselining either golden is now a hand-edit, not a re-capture** — the
+same rule "Rebaselining a golden" above states for the `next-parity*`
+goldens, checked by hand against real port output rather than trusted
+because a script produced it. The retired suite's source (and the page it
+captured from) is recoverable with
+`git show v2.9.0:tests/parity/mission-graph-goldens.spec.ts` and
+`git show v2.9.0:crates/darkmux-serve/assets/mission-graph.html`.
+
+4. **`next-parity-graph.spec.ts`** (`bun run next-parity-graph`), #1868
    packet 2: grades `MissionGraphLens` (`ui/src/lenses/mission/`, the
    `#mission=<id>` lens) against the SAME two goldens packet 1 captured —
    `.phasegroup`/`.mnode`/`.steprow`/`.tlphase`/`.tltask`/`.tlt-step` are
@@ -236,7 +237,7 @@ one's vocabulary.
 | machine | `#lens=machine` | `machine.txt` (click-navigation path), `machine-deeplink.txt` (fresh boot with `#lens=machine` already set — Packet 2, a genuinely different code path: `boot()`'s `machineQuery()` branch fires before `renderFleet()` ever runs) |
 | session drill-in | `#session=<id>` | `session-task-list.txt` |
 | catalog picker | `#catpanel` (toggled via `#srcbadge`, not a hash route — global chrome, Packet 4) | `catalog-open.txt` (six regions: topbar/crumb/meta/logscope/stage + the `=== catalog ===` section — see "Extraction target" below) |
-| mission graph lens | `#mission=<id>` (#1868, renamed from "mission replay-by-query") | `mission-graph-canvas.txt` / `mission-graph-timeline.txt` (graded by the SEPARATE `next-parity-graph` suite, item 5 above — see that suite's own doc); `mission-replay.txt` survives only as a historical record, see the note below |
+| mission graph lens | `#mission=<id>` (#1868, renamed from "mission replay-by-query") | `mission-graph-canvas.txt` / `mission-graph-timeline.txt` (graded by the SEPARATE `next-parity-graph` suite, item 4 above — see that suite's own doc); `mission-replay.txt` survives only as a historical record, see the note below |
 | bare-date playback | `#<date>` (Packet 4) | `playback-date.txt` |
 
 **`#mission=<id>` (#1868 — renamed from "mission replay-by-query"; before
@@ -323,8 +324,10 @@ required to reach it honestly:
   mission id gets the SAME generic stub these routes have always answered
   with (`installBlankRoutes`'s existing `/flow-mission/` fallback; a fresh
   404 for `/mission/:id/graph.json`, which nothing previously handled at
-  all, see `lib/mock-routes.js`'s own comment). Consumed by
-  `mission-graph-goldens.spec.ts`, not by any `next-parity*` suite.
+  all, see `lib/mock-routes.js`'s own comment). Originally recorded for the
+  now-retired `mission-graph-goldens.spec.ts` (its own retirement note
+  above, before item 4); consumed today by `next-parity-graph.spec.ts`, a
+  real `next-parity*` suite.
 
 ## Extraction target
 
