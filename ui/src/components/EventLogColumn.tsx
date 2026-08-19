@@ -125,6 +125,7 @@ export function EventLogColumn({
   loading = false,
   error = null,
   historical = false,
+  serverTruncated = false,
 }: {
   records: FlowRecord[];
   visible: boolean;
@@ -140,6 +141,17 @@ export function EventLogColumn({
   /** Not shown — written into a hidden span purely so this port's parity
    *  extraction matches legacy's. See App's `routeChrome` note. */
   scopeLabel: string;
+  /** (#1868) True when `records` is itself a slice of a SERVER-capped
+   *  response (`/flow-mission/:id`'s own `truncated` flag, capped at
+   *  `MAX_CATALOG_RECORDS`) — a cap this component's own `LOG_CAP`
+   *  disclosure can't see, because the server already dropped the rest
+   *  before `records` ever arrives here. `mission-graph.html`'s own
+   *  `eventsPanelEls` appends the same "+" to its total for the same
+   *  reason: "50 of 10000" would otherwise restate the server cap as the
+   *  mission's whole history. Rendered only where this component ALREADY
+   *  reports a real total (not the search-match count, which is a
+   *  different metric). */
+  serverTruncated?: boolean;
 }) {
   // The full facet-filter model (activity/category/tier/telemetry-source +
   // free-text search) — `FiltersDialog` renders the checkbox grid for it,
@@ -262,9 +274,14 @@ export function EventLogColumn({
     // The CAP itself is legacy's (`all.slice(-50)`, viewer.html:2443) — what
     // this port adds is SAYING so. Legacy hides 684 records in silence; the
     // label is the honest half and worth keeping.
+    //
+    // `serverTruncated` appends "+" to that total exactly where legacy's own
+    // `eventsPanelEls` does — the total this component reports is itself a
+    // slice of a server-capped response, so "of 734" would understate the
+    // real count without it.
     : capped
-      ? `${LOG_CAP} of ${filtered.length} events`
-      : `${filtered.length} events`;
+      ? `${LOG_CAP} of ${filtered.length}${serverTruncated ? "+" : ""} events`
+      : `${filtered.length}${serverTruncated ? "+" : ""} events`;
 
   return (
     <div className={`eventlog${visible ? "" : " eventlog--hidden"}`} ref={columnRef}>

@@ -109,6 +109,14 @@ test('records from a PRIOR day still backfill — the cross-day case', async ({ 
   const titles = await page.$$eval('.missionlens .eventlog__rec', (els) => els.map((e) => e.getAttribute('title')));
   expect(titles).toContain('phase-a');
 
+  // (#1868) The header must NOT claim a rolling "last 24h" window over
+  // these records — they were selected by MISSION, spanning three days, not
+  // by a 24h time window. `EventLogColumn`'s `historical` prop exists
+  // precisely to drop that suffix for a fetched slice; passing it `false`
+  // here (an earlier version of the port did) would have this exact
+  // contradiction on screen: "events last 24h" over a 3-day-old record.
+  await expect(page.locator('.missionlens .eventlog__head h3')).not.toContainText(/last \d+h/i);
+
   expect(pageErrors).toEqual([]);
 });
 

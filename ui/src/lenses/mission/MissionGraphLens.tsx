@@ -44,7 +44,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
 import { isStaticBuild } from "../../lib/staticSource";
 import { useLiveTail } from "../../hooks/useLiveTail";
-import { asRecordArray, todayUTC } from "../../lib/flow";
+import { asRecordArray, bodyTruncated, todayUTC } from "../../lib/flow";
 import { EventLogColumn } from "../../components/EventLogColumn";
 import { MissionCanvas } from "./MissionCanvas";
 import { MissionTimelineView } from "./MissionTimelineView";
@@ -251,6 +251,13 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
     return out;
   }, [flowMissionQuery.data, flowTodayQuery.data, flowTailQuery.data]);
 
+  // Whether the SERVER capped its own `/flow-mission/:id` response
+  // (`MAX_CATALOG_RECORDS`) — see `bodyTruncated`'s own doc. `/flow/<today>`
+  // and the live tail carry no equivalent cap for a single day, so this is
+  // scoped to the mission-spanning source alone, same as legacy's own
+  // `srvTruncRef` (mission-graph.html reads `bodies[0].truncated` only).
+  const srvTruncated = flowMissionQuery.data?.ok ? bodyTruncated(flowMissionQuery.data.data) : false;
+
   const idx = useMemo(() => (baseGraph ? indexGraph(baseGraph) : null), [baseGraph]);
 
   const ascendingRecords = useMemo(() => [...allRecords].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0)), [allRecords]);
@@ -396,7 +403,24 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
         ) : (
           <MissionCanvas nodes={graph.nodes} edges={graph.edges} metrics={metrics} now={now} note={graph.note} minimapOn={minimapOn} />
         )}
-        <EventLogColumn scopeLabel={graph.mission_id} records={events} visible={evOpen} loading={false} error={null} historical={false} />
+        <EventLogColumn
+          scopeLabel={graph.mission_id}
+          records={events}
+          visible={evOpen}
+          loading={false}
+          error={null}
+          // (#1868) `events` is this mission's own scoped fold across TWO
+          // backfill sources (`/flow-mission/:id` spanning every day the
+          // mission touched, `/flow/<today>` for step records the scheduler
+          // never stamps `mission_id` on) plus the live tail — never the
+          // rolling 24h live window `EventLogColumn`'s header otherwise
+          // claims. A mission that ran three days ago and is still
+          // finalizing today would have its header say "last 24h" over
+          // records selected by MISSION, not by TIME — the exact overclaim
+          // `historical` exists to prevent (see that prop's own doc).
+          historical
+          serverTruncated={srvTruncated}
+        />
       </div>
     </div>
   );

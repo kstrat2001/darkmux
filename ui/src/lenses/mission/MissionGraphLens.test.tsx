@@ -37,10 +37,13 @@ const GRAPH: MissionGraph = {
   edges: [{ id: "e1", source: "p1", target: "a", kind: "contains" }],
 };
 
-function mockFetch(opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[] } = {}) {
+function mockFetch(
+  opts: { graphStatus?: number; graph?: MissionGraph; flowMissionRecords?: unknown[]; flowMissionTruncated?: boolean } = {},
+) {
   const graph = opts.graph ?? GRAPH;
   const graphStatus = opts.graphStatus ?? 200;
   const flowMissionRecords = opts.flowMissionRecords ?? [];
+  const flowMissionTruncated = opts.flowMissionTruncated ?? false;
   vi.stubGlobal(
     "fetch",
     vi.fn((url: string) => {
@@ -53,7 +56,10 @@ function mockFetch(opts: { graphStatus?: number; graph?: MissionGraph; flowMissi
       }
       if (url.includes("/flow-mission/")) {
         return Promise.resolve(
-          new Response(JSON.stringify({ records: flowMissionRecords, count: flowMissionRecords.length, truncated: false, generated_at_ms: 0 }), { status: 200 }),
+          new Response(
+            JSON.stringify({ records: flowMissionRecords, count: flowMissionRecords.length, truncated: flowMissionTruncated, generated_at_ms: 0 }),
+            { status: 200 },
+          ),
         );
       }
       if (url.startsWith(`/flow/${todayUTC()}`)) {
@@ -192,5 +198,35 @@ describe("MissionGraphLens", () => {
     renderLens();
     expect(screen.getByText(/needs a running daemon/i)).toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("discloses the SERVER's own truncated cap on the events pane when /flow-mission/:id reports truncated:true (proved failing pre-fix: an earlier port discarded this flag entirely)", async () => {
+    mockFetch({
+      flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" }],
+      flowMissionTruncated: true,
+    });
+    renderLens();
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(1));
+    // A single record, well under EventLogColumn's own LOG_CAP (50) — the
+    // "1+" is the SERVER's cap, not the client display cap, and must show
+    // even when the client-side count isn't itself capped.
+    expect(document.querySelector(".eventlog__qcount")?.textContent).toMatch(/1\+ events/);
+  });
+
+  it("does NOT append the server-truncated '+' when /flow-mission/:id reports truncated:false", async () => {
+    mockFetch({
+      flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" }],
+      flowMissionTruncated: false,
+    });
+    renderLens();
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(1));
+    expect(document.querySelector(".eventlog__qcount")?.textContent).toMatch(/^1 events$/);
+  });
+
+  it("the events pane header never claims a rolling 24h window — these are mission-scoped records, not the live window (#1868)", async () => {
+    mockFetch();
+    renderLens();
+    await waitFor(() => expect(document.querySelector(".eventlog__head h3")).not.toBeNull());
+    expect(document.querySelector(".eventlog__head h3")?.textContent).not.toMatch(/last \d+h/i);
   });
 });
