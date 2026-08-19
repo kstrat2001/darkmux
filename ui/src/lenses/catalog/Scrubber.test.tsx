@@ -44,6 +44,20 @@ describe("Scrubber", () => {
     expect(slider).toHaveAttribute("aria-valuetext", `${clkhm(t)} of ${clkrange(TMIN, TMAX)}`);
   });
 
+  // (#1869 code review) `.mm-sr-only` uses `clip`, which keeps the node in
+  // the accessibility tree AND in `innerText` — a visually-hidden `<label>`
+  // here would announce "playback position" TWICE (once as loose row text
+  // a screen reader hits walking the DOM, once as the slider's own
+  // computed name) and leak an extra line into the parity golden.
+  // `aria-label` is this port's established pattern for naming an input
+  // without a rendered node (`EventLogColumn.tsx`'s search box).
+  it("names the range via aria-label, not a visually-hidden <label> that would still enter innerText", () => {
+    renderScrubber();
+    const slider = screen.getByRole("slider", { name: /playback position/i });
+    expect(slider).toHaveAttribute("aria-label", "playback position");
+    expect(document.querySelector("label")).toBeNull();
+  });
+
   it("dragging the range calls onScrub with the timestamp that percentage maps to", () => {
     const { onScrub } = renderScrubber();
     fireEvent.change(screen.getByRole("slider"), { target: { value: "25" } });

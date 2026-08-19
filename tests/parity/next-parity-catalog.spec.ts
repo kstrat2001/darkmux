@@ -24,9 +24,11 @@
 //     `lenses/session/sessionRun.ts`'s own module doc for how this port
 //     validated the derivation against this SAME golden at the pure-logic
 //     layer first.
-//   - `playback-date`: full byte parity as of #1800 P2, with ONE named
-//     normalization (the unported notes-modal link — see the test itself).
-//     It was NOT parity before, for a reason worth keeping: this golden
+//   - `playback-date`: full byte parity as of #1800 P2, with TWO named
+//     divergences from a pure legacy capture (the unported notes-modal
+//     link, normalized in the test itself; the playback TRANSPORT rows,
+//     rebaselined directly into the golden at #1869 — see below). It was
+//     NOT parity before #1800 P2, for a reason worth keeping: this golden
 //     captures legacy's fleet-hero render, and at the time `/next` had no
 //     fleet-hero pipeline at all, so forcing parity would have meant
 //     building one inside a catalog packet — scope creep wearing that
@@ -35,6 +37,25 @@
 //     small change instead of a large one. The narrower honest assertion
 //     was the right call while it stood, and the golden earned its keep as
 //     the record of what legacy does until the port could meet it.
+//
+//     #1869 added the playback transport (rewind/play/scrub/speed/clock),
+//     and it is rendered INSIDE `#stage` in this port — a real, deliberate
+//     layout difference from legacy, whose equivalent `.scrub` markup was a
+//     body-level SIBLING of `.wrap`, outside `#stage` entirely
+//     (viewer.html:854). That is why legacy's OWN capture of this golden
+//     could not, structurally, contain any transport text — extracting
+//     `#stage.innerText` from legacy never reached `.scrub` no matter what
+//     it rendered. So `goldens/playback-date.txt` is no longer a pure
+//     legacy capture: the five transport lines this port added
+//     (⏮ / ▶ / 1× / the clock) are this port's own text, hand-added to the
+//     golden, not bytes legacy ever emitted into this region. The
+//     overlapping content diverges too, and on purpose: legacy's clock read
+//     an ELAPSED duration (`fmt(t-tMin)+" / "+fmt(tMax-tMin)+" · N/M rec"`,
+//     viewer.html:2619); this port renders absolute wall time
+//     (`clkhm(t)` — "18:28 · 2008/2008 rec") instead, kept deliberately
+//     because it matches how every other clock in this viewer already
+//     reads and is more useful than an elapsed counter. Nothing else in
+//     this golden changed at #1869.
 //   - `mission-replay`: still NOT byte parity, and now for a DIFFERENT
 //     reason than before #1868 — `mission-replay.txt` is legacy's fleet-hero
 //     render for `#mission=<id>`, a route this port no longer stands in
@@ -213,18 +234,33 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     // to the same standard as every other lens here: the REAL browser's
     // `#stage.innerText` against the golden recorded from legacy.
     //
-    // ONE named normalization, per this file's "never a silent fuzzy match"
-    // rule. Legacy's hybrid note ends with `history →`, an anchor that opens
-    // a notes modal. That modal is NOT ported, and `FleetLens` deliberately
-    // renders "(older notes exist)" instead — rendering a link that looks
-    // clickable and does nothing would be a trap control (see `FleetLens.tsx`'s
-    // own note). The INFORMATION is identical ("there are older notes"); only
-    // the affordance differs. Normalizing the port's text to legacy's keeps
-    // that one deliberate UX divergence from masking any OTHER difference in
-    // the same string — which is the whole reason to normalize narrowly and
-    // name it rather than relaxing the compare.
+    // ONE runtime normalization applied below, per this file's "never a
+    // silent fuzzy match" rule. Legacy's hybrid note ends with `history →`,
+    // an anchor that opens a notes modal. That modal is NOT ported, and
+    // `FleetLens` deliberately renders "(older notes exist)" instead —
+    // rendering a link that looks clickable and does nothing would be a
+    // trap control (see `FleetLens.tsx`'s own note). The INFORMATION is
+    // identical ("there are older notes"); only the affordance differs.
+    // Normalizing the port's text to legacy's keeps that one deliberate UX
+    // divergence from masking any OTHER difference in the same string —
+    // which is the whole reason to normalize narrowly and name it rather
+    // than relaxing the compare.
     //
     // Delete this normalization when the notes modal lands.
+    //
+    // A SECOND divergence lives baked directly into the golden itself
+    // (not a runtime normalization): the playback transport's five lines
+    // (⏮ / ▶ / 1× / the clock), added at #1869. This port renders the
+    // transport INSIDE `#stage`; legacy's own `.scrub` markup was a
+    // body-level sibling of `.wrap`, OUTSIDE `#stage` — so legacy's own
+    // capture of this golden could not, structurally, have contained that
+    // text no matter what the transport rendered. See this file's own
+    // module doc (top of file, the `playback-date` bullet) for the full
+    // account, including the deliberate absolute-vs-elapsed clock format
+    // difference. `goldens/playback-date.txt` is therefore no longer a
+    // pure legacy capture for this one region — it is this port's own
+    // transport text, hand-added and reviewed, not bytes legacy ever
+    // emitted here.
     const meta = loadMeta();
     await installFrozenClock(page, meta.frozen_clock_ms);
     installCorpusRoutes(page, meta);

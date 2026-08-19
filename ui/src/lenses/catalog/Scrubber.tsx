@@ -1,4 +1,3 @@
-import { useId } from "react";
 import { clkhm, clkrange } from "../../lib/format";
 
 /**
@@ -17,16 +16,26 @@ import { clkhm, clkrange } from "../../lib/format";
  * component is purely a controlled view over (`t`/`playing`/`speed` all
  * live there, not here).
  *
- * Accessibility: the range carries a real `<label>` (visually hidden, same
- * `.mm-sr-only` pattern the rest of this port uses) plus `aria-valuetext`
- * — a bare `0..100` means nothing to a screen reader, but "14:32 of
- * 09:00:00–18:20:00" does. Both icon-only buttons keep a `title`/
- * `aria-label` pair that stays correct across the glyph flip (#1067's own
- * rule: the glyph carries visual state, the name carries meaning). Every
- * control is a real `<button>` or the native range input, so keyboard
- * operation (Tab, Space/Enter, arrow keys on the range) works without any
- * extra wiring. No transition is added by this component, so there is
- * nothing here to gate under `prefers-reduced-motion`.
+ * Accessibility: the range is named via `aria-label` (#1869 code review;
+ * this port's established pattern for naming an input without a rendered
+ * node — see `EventLogColumn.tsx`'s search box) plus `aria-valuetext` — a
+ * bare `0..100` means nothing to a screen reader, but "14:32 of
+ * 09:00:00–18:20:00" does. A visually-hidden `<label>` (`.mm-sr-only`, this
+ * component's first cut) is the WRONG tool for this: `.mm-sr-only` uses
+ * `clip`, which keeps the node in the accessibility tree AND in
+ * `innerText` — a real element there announces "playback position" TWICE
+ * (once as loose row text, once as the range's own computed name) and
+ * leaks an extra line into the parity golden that has nothing to do with
+ * the transport's actual content. `aria-label` names the control with no
+ * rendered node to leak. `.scrub` itself carries `role="group"` +
+ * `aria-label` so its four controls announce as a named group instead of
+ * ungrouped siblings. Both icon-only buttons keep a `title`/`aria-label`
+ * pair that stays correct across the glyph flip (#1067's own rule: the
+ * glyph carries visual state, the name carries meaning). Every control is
+ * a real `<button>` or the native range input, so keyboard operation (Tab,
+ * Space/Enter, arrow keys on the range) works without any extra wiring. No
+ * transition is added by this component, so there is nothing here to gate
+ * under `prefers-reduced-motion`.
  */
 export interface ScrubberProps {
   /** The playhead — `tMin <= t <= tMax`. */
@@ -59,7 +68,6 @@ export function Scrubber({
   visibleCount,
   totalCount,
 }: ScrubberProps) {
-  const rangeId = useId();
   // `span` (floored to 1) feeds `onScrub`'s drag math below, so a drag on a
   // zero-span day never divides by zero. The RENDERED value is a separate
   // question — legacy's own rule is `span > 0 ? Math.round(...) : 100`
@@ -76,7 +84,7 @@ export function Scrubber({
   const value = Number.isFinite(raw) ? Math.min(100, Math.max(0, Math.round(raw))) : 100;
 
   return (
-    <div className="scrub" data-testid="scrubber">
+    <div className="scrub" data-testid="scrubber" role="group" aria-label="playback transport">
       <button type="button" onClick={onRewind} title="jump to start" aria-label="jump to start">
         ⏮
       </button>
@@ -89,15 +97,12 @@ export function Scrubber({
       >
         {playing ? "⏸" : "▶"}
       </button>
-      <label htmlFor={rangeId} className="mm-sr-only">
-        playback position
-      </label>
       <input
-        id={rangeId}
         type="range"
         min={0}
         max={100}
         value={value}
+        aria-label="playback position"
         onChange={(e) => onScrub(tMin + (span * Number(e.target.value)) / 100)}
         aria-valuetext={`${clkhm(t)} of ${clkrange(tMin, tMax)}`}
       />
