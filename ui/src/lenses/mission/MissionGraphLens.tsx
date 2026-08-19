@@ -211,7 +211,7 @@ function useIsMobile(): boolean {
 function legendDots() {
   const entries: Array<[string, string]> = [
     ["var(--dim)", "planned"],
-    ["var(--run, #ffd166)", "running"],
+    ["var(--ml-run)", "running"],
     ["var(--good)", "complete"],
     ["var(--bad)", "error"],
     ["var(--dim)", "abandoned"],
