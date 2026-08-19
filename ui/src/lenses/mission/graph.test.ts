@@ -312,6 +312,36 @@ describe("applyRecordToMetrics", () => {
     m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch.tool", payload: { tool_calls_so_far: 7 } }), idx, "m1");
     expect(stepDisplayMetrics(m["a-step"]).tools).toBe(7);
   });
+
+  it("(#1640) a heartbeat record that moves NO counter still advances lastTs, through the REAL fold — not a hand-constructed MetricsMap", () => {
+    // `stepMeterFor liveness` (below) proves `stepMeterFor` reads `lastTs`
+    // correctly by hand-building a `MetricsMap` with `lastTs` already set —
+    // a valid unit test of THAT function, but it never proves this port's
+    // OWN `applyRecordToMetrics` (a from-scratch reimplementation of
+    // legacy's imperative reducer, per this module's own doc) still
+    // advances `lastTs` for a record that touches no other field. That is
+    // the exact mechanism #1640 fixed: a heartbeat with no accompanying
+    // token/turn/tool/terminal action must still count as "heard from",
+    // or a slow-but-alive seat's generating pulse goes dark early.
+    let m: MetricsMap = {};
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "dispatch start", ts: "2026-08-19T00:00:00Z" }), idx, "m1");
+    const afterStart = m;
+    const startLastTs = afterStart["a-step"].lastTs;
+
+    // An action `applyRecordToMetrics` doesn't recognize as tok/turn/tool/
+    // complete/stepResult/start/terminal — a pure heartbeat.
+    m = applyRecordToMetrics(m, rec({ handle: "a-step", action: "telemetry.heartbeat", ts: "2026-08-19T00:05:00Z" }), idx, "m1");
+
+    expect(m, "a changed lastTs must produce a NEW map reference (the no-op guard's own contract)").not.toBe(afterStart);
+    expect(m["a-step"].lastTs).toBeGreaterThan(startLastTs);
+    expect(m["a-step"].lastTs).toBe(Date.parse("2026-08-19T00:05:00Z"));
+    // Genuinely no counter moved — only the liveness signal.
+    expect(m["a-step"].tokRun).toBe(afterStart["a-step"].tokRun);
+    expect(m["a-step"].turnRun).toBe(afterStart["a-step"].turnRun);
+    expect(m["a-step"].toolRun).toBe(afterStart["a-step"].toolRun);
+    expect(m["a-step"].startTs).toBe(afterStart["a-step"].startTs);
+    expect(m["a-step"].endTs).toBe(afterStart["a-step"].endTs);
+  });
 });
 
 describe("seedMetricsFromGraph", () => {
