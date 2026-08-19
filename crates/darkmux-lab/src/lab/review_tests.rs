@@ -3136,6 +3136,54 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(c.exhausted(), "over-report lands as real spend: 30k+90k >= 100k");
     }
 
+    /// (#1877 pre-move conformance) `admit()`/`spend()` — the SEQUENTIAL
+    /// unshared pair the verify stage uses (never `admit_reserve`/`settle`).
+    /// Pinned directly rather than only through the verify e2e tests, since
+    /// this is the pair the #1877 extraction's unified type must keep
+    /// byte-identical for the one caller that still uses it.
+    #[test]
+    fn remote_bucket_sequential_admit_then_spend_gates_and_accounts() {
+        let mut b = RemoteBucket::new("s", 100);
+        assert!(b.admit(), "a fresh bucket admits");
+        b.spend(60, 1);
+        assert!(!b.exhausted(), "60 < 100");
+        assert!(b.admit(), "still under budget");
+        b.spend(50, 1);
+        assert!(b.exhausted(), "110 >= 100");
+        // Exhausted: admit refuses and counts the refusal, spend is never
+        // reached by a correct caller (verify's own loop gates on this).
+        assert!(!b.admit(), "exhausted bucket refuses");
+        assert_eq!(b.skipped, 1, "the refusal is counted");
+    }
+
+    /// (#1877 pre-move conformance) `record()`'s emitted `RemoteBudgetRecord`
+    /// — direct unit coverage of the fields the envelope actually carries,
+    /// rather than only exercising them indirectly through a full pipeline
+    /// run. Pinned before the #1877 move so the unified type's `record()`
+    /// can be checked against the exact same fixture afterward.
+    #[test]
+    fn remote_bucket_record_reports_stage_budget_used_exhausted_and_skips() {
+        let mut b = RemoteBucket::new("judge-pass1", 1_000);
+        let g = b.admit_reserve(600).expect("first draw admits");
+        b.settle(g, 600, 1);
+        // Second draw is denied by the floor (400 remaining < 512 floor).
+        assert!(b.admit_reserve(600).is_none(), "a starved grant is denied");
+        let rec = b.record().expect("a bucket with calls must emit a row");
+        assert_eq!(rec.stage, "judge-pass1");
+        assert_eq!(rec.max_tokens, 1_000);
+        assert_eq!(rec.used_tokens, 600);
+        assert!(!rec.exhausted, "600 < 1000 is not exhausted");
+        assert_eq!(rec.skipped_calls, 1);
+    }
+
+    /// (#1877 pre-move conformance) A bucket that never admitted or skipped
+    /// a call emits no row — local-only envelopes carry no budget rows.
+    #[test]
+    fn remote_bucket_record_is_none_when_the_stage_never_touched_it() {
+        let b = RemoteBucket::new("verify", 1_000);
+        assert!(b.record().is_none(), "an untouched bucket emits no row");
+    }
+
     // ─── (#1230/#1341 DRY pass) Task/Step graph orchestration ───────────
 
     /// (#1530) `bundles` no longer lands on `ReviewStepContext` directly
