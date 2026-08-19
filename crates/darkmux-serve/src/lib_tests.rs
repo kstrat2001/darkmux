@@ -22,9 +22,21 @@
     /// string literal, and to a no-leading-whitespace object-literal shape
     /// like `{onclick:"…"}` (no attribute syntax for the byte scanner to
     /// find). Its practical value is narrower — guarding `ui/index.html`
-    /// shell regressions and a stray `dangerouslySetInnerHTML` literal
-    /// making it into the bundle — not a substitute for the real XSS walk
-    /// in `tests/e2e/viewer-xss.spec.js`.
+    /// shell regressions — not a substitute for the real XSS walk in
+    /// `tests/e2e/viewer-xss.spec.js`.
+    ///
+    /// (#1868 QA finding) This test does NOT also guard
+    /// `dangerouslySetInnerHTML`, despite an earlier version of this doc
+    /// claiming it did. It can't: `next.html` is a SINGLE bundled document
+    /// (react + react-dom + reactflow + this app's own code, inlined by
+    /// `vite-plugin-singlefile`) and React's own runtime legitimately
+    /// contains the literal string `dangerouslySetInnerHTML` dozens of
+    /// times (it has to reference the prop name to validate/guard against
+    /// misuse) — a whole-bundle scan for that string always fails, on
+    /// React's own code, regardless of whether darkmux's app code uses it.
+    /// The real check (`ui/src/no-danger.test.ts`) runs source-side, before
+    /// bundling, where the app's own files are cleanly distinguishable from
+    /// the framework's.
     #[test]
     fn viewer_has_no_inline_event_handlers() {
         let html = include_str!("../assets/next.html");
@@ -4460,6 +4472,28 @@
             .any(|e| e["source"] == "task-a" && e["target"] == "task-b" && e["kind"] == "depends_on"));
     }
 
+    /// Slice out just the `STATUS_ACTIONS` map body from `graph.ts`'s source
+    /// (#1868 QA finding). The three step-lifecycle literals this map holds
+    /// ("step start"/"step complete"/"step error") ALSO appear, independently,
+    /// in this same file's `applyRecordToMetrics` hedges (`isStart`/
+    /// `isComplete`, around the `"dispatch start" || ... || "step start"`
+    /// checks) — so a whole-file `contains()` scan can't actually prove the
+    /// STATUS_ACTIONS entry exists; deleting the map's own three step lines
+    /// while leaving the metrics hedges intact still passes. Scoping the scan
+    /// to the map's own body (between its `{` and the matching `};`) closes
+    /// that gap; the `expect` turns "someone renamed/restructured the map"
+    /// into a loud failure instead of a silently-vacuous pass.
+    fn graph_ts_status_actions_map() -> &'static str {
+        let graph_ts = include_str!("../../../ui/src/lenses/mission/graph.ts");
+        let (_, after) = graph_ts
+            .split_once("const STATUS_ACTIONS")
+            .expect("STATUS_ACTIONS map not found in ui/src/lenses/mission/graph.ts — the pin lost its subject");
+        let (body, _) = after
+            .split_once("};")
+            .expect("STATUS_ACTIONS map has no closing `};` in ui/src/lenses/mission/graph.ts — the pin lost its subject");
+        body
+    }
+
     /// (review-gate C2) Pin the SSE action-string contract: the lens's
     /// STATUS_ACTIONS map must contain every action string the emitting
     /// side actually writes (`scheduler::step_lifecycle_record`'s
@@ -4478,10 +4512,13 @@
     /// purpose (test-only, `#[cfg(test)]`-gated via this module's own
     /// `#[path]` attribute, so it never ships in the release binary) —
     /// there is no Rust-side binding to pin against on the TS side of this
-    /// contract, so a text scan is the only mechanical tie available.
+    /// contract, so a text scan is the only mechanical tie available. Scans
+    /// [`graph_ts_status_actions_map`]'s SLICE, not the whole file — see
+    /// that helper's own doc for why the whole-file scan this test used to
+    /// run was provably vacuous for the three step-lifecycle literals.
     #[test]
     fn mission_graph_lens_pins_flow_action_strings() {
-        let graph_ts = include_str!("../../../ui/src/lenses/mission/graph.ts");
+        let map = graph_ts_status_actions_map();
         for action in [
             "step start",
             "step complete",
@@ -4495,7 +4532,7 @@
             "mission resume",
         ] {
             assert!(
-                graph_ts.contains(&format!("\"{action}\"")),
+                map.contains(&format!("\"{action}\"")),
                 "ui/src/lenses/mission/graph.ts lost the \"{action}\" entry from its \
                  STATUS_ACTIONS map — the SSE delta layer silently stops animating that transition"
             );
@@ -4514,13 +4551,17 @@
     /// constant, TS map) can no longer drift silently.
     ///
     /// Retargeted at `ui/src/lenses/mission/graph.ts` (#1868) — same
-    /// retirement as the test above.
+    /// retirement as the test above. Scans
+    /// [`graph_ts_status_actions_map`]'s SLICE, not the whole file — see
+    /// that helper's own doc; the naive whole-file scan cannot fail for any
+    /// of these three actions, because the same three literals also appear,
+    /// independently, in this file's `applyRecordToMetrics` hedges.
     #[test]
     fn mission_graph_lens_contains_every_scheduler_step_lifecycle_action() {
-        let graph_ts = include_str!("../../../ui/src/lenses/mission/graph.ts");
+        let map = graph_ts_status_actions_map();
         for action in darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS {
             assert!(
-                graph_ts.contains(&format!("\"{action}\"")),
+                map.contains(&format!("\"{action}\"")),
                 "ui/src/lenses/mission/graph.ts's STATUS_ACTIONS map is missing scheduler \
                  STEP_LIFECYCLE_ACTIONS entry \"{action}\" — the graph lens would silently \
                  stop animating that step transition"

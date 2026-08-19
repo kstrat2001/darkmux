@@ -28,14 +28,18 @@ function fixture(file) {
  */
 /**
  * (#1868 packet 1) `installCorpusRoutes` returns a per-fixture fulfillment
- * counter (`{ "<file>.json": n }`). A suite whose `baseURL` is a LIVE
- * daemon (this directory's `mission-graph-goldens` suite is the only one)
- * cannot tell "replayed from corpus/" from "fell through to the daemon" by
- * looking at the render: on the machine the corpus was recorded from, both
- * produce the same bytes. Asserting a fixture was actually SERVED is what
- * makes the interception load-bearing, so deleting a route branch fails the
- * suite instead of silently recording live daemon state into a golden.
- * Every other suite ignores the return value.
+ * counter (`{ "<file>.json": n }`). Its one consumer was a suite whose
+ * `baseURL` was a LIVE daemon — `mission-graph-goldens.spec.ts`, which
+ * could not tell "replayed from corpus/" from "fell through to the daemon"
+ * by looking at the render alone (on the machine the corpus was recorded
+ * from, both produce the same bytes), so it asserted a fixture was actually
+ * SERVED to make the interception load-bearing. That suite is retired
+ * (#1868 packet 3) along with the standalone page it graded against — every
+ * suite still calling `installCorpusRoutes` today (`next-parity*`) has a
+ * static `baseURL` and no live-daemon fallback to distinguish from, so none
+ * of them consume this return value. Kept rather than deleted: cheap,
+ * generic infrastructure a future live-daemon suite could reuse without
+ * re-deriving it.
  */
 function installCorpusRoutes(page, meta) {
   const served = {};

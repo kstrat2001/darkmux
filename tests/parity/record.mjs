@@ -23,14 +23,19 @@
 // so the #session=<id> drill-in lens has something real to replay. All three
 // additions are logged in the transcript below exactly like the named set.
 //
-// (#1868 packet 1) TWO more, for the standalone mission-graph parity fixture
-// (`mission-graph-goldens.spec.ts`, captured BEFORE the graph lens gets
-// folded into the React port): /mission/<GRAPH_FIXTURE_MISSION_ID>/graph.json
-// (the node/edge snapshot the page's canvas + timeline renderers both read)
-// and /flow-mission/<GRAPH_FIXTURE_MISSION_ID> (the mission-scoped event
-// backfill the page's events panel reads). The fixture id lives once in
-// `lib/graph-fixture.js`, imported here and by `lib/mock-routes.js` +
-// the spec, so it can't drift between the three.
+// (#1868 packet 1) TWO more, for the mission-graph parity fixture:
+// /mission/<GRAPH_FIXTURE_MISSION_ID>/graph.json (the node/edge snapshot
+// the graph lens's canvas + timeline renderers both read) and
+// /flow-mission/<GRAPH_FIXTURE_MISSION_ID> (the mission-scoped event
+// backfill the lens's events panel reads). Originally captured by
+// `mission-graph-goldens.spec.ts` against the standalone mission-graph
+// page, BEFORE the graph lens got folded into the React port; that capture
+// suite and the standalone page are both retired (#1868 packet 3) — the
+// same two endpoints are now read by `next-parity-graph.spec.ts`, which
+// grades the ported lens against the goldens the retired suite captured.
+// The fixture id lives once in `lib/graph-fixture.js`, imported here and
+// by `lib/mock-routes.js` + that spec, so it can't drift between the
+// three.
 //
 // SANITIZATION IS MANDATORY AND UNCONDITIONAL: every response body is run
 // through lib/sanitize.mjs's field-policy sanitizer BEFORE it touches disk,
@@ -110,13 +115,13 @@ function graphFixtureEndpointSpecs() {
       name: "mission-graph-sanity",
       urlPath: `/mission/${encodeURIComponent(GRAPH_FIXTURE_MISSION_ID)}/graph.json`,
       file: "mission-graph-sanity.json",
-      extra: { reason: "mission-graph-goldens.spec.ts canvas/timeline node+edge snapshot", mission_id: GRAPH_FIXTURE_MISSION_ID },
+      extra: { reason: "next-parity-graph.spec.ts canvas/timeline node+edge snapshot (recorded by the now-retired mission-graph-goldens.spec.ts, #1868 packet 1)", mission_id: GRAPH_FIXTURE_MISSION_ID },
     },
     {
       name: "flow-mission-sanity",
       urlPath: `/flow-mission/${encodeURIComponent(GRAPH_FIXTURE_MISSION_ID)}`,
       file: "flow-mission-sanity.json",
-      extra: { reason: "mission-graph-goldens.spec.ts events panel backfill", mission_id: GRAPH_FIXTURE_MISSION_ID },
+      extra: { reason: "next-parity-graph.spec.ts events panel backfill (recorded by the now-retired mission-graph-goldens.spec.ts, #1868 packet 1)", mission_id: GRAPH_FIXTURE_MISSION_ID },
     },
   ];
 }

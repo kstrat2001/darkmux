@@ -1,10 +1,13 @@
 /**
- * Minimal ambient declarations for the handful of Node built-ins two test
+ * Minimal ambient declarations for the handful of Node built-ins a few test
  * files use to read real fixtures off disk (`sessionRun.test.ts`'s
  * byte-parity check against the real `tests/parity/goldens/
  * session-task-list.txt`, and `SessionReplay.test.tsx`'s render of the same
  * real corpus — see those files' own docs for why reading the REAL
- * recorded legacy output is the point, not a hand-rolled approximation).
+ * recorded legacy output is the point, not a hand-rolled approximation) or
+ * walk the source tree (`no-danger.test.ts`, #1868 — see that file's own
+ * doc for why a source-level walk, not a scan of the built bundle, is the
+ * only sound way to check for `dangerouslySetInnerHTML` usage).
  *
  * NOT a new dependency — `@types/node` is deliberately not installed (this
  * project's `tsconfig.json` scopes `types` to `["vite/client",
@@ -21,6 +24,8 @@
 
 declare module "node:fs" {
   export function readFileSync(path: string, encoding: string): string;
+  export function readdirSync(path: string): string[];
+  export function statSync(path: string): { isDirectory(): boolean };
 }
 
 declare module "node:url" {

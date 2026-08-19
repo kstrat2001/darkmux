@@ -52,7 +52,13 @@ darkmux release.
   component every other lens's event log already uses) instead of a
   second, separate implementation. `reactflow` is now a real `ui/`
   dependency (bundled by Vite), matching the pinned version the standalone
-  page's vendored bundle already used. (#1868)
+  page's vendored bundle already used. (Superseded by the Removed entry
+  below, landing in this same [Unreleased] window: an earlier version of
+  this entry said the standalone page and its route would stay "unchanged
+  in this release... until the port has had a release cycle to prove
+  itself." That condition was never met — the port has shipped zero
+  release cycles — and darkmux is pre-1.0 with no compat-baggage policy, so
+  the retirement lands in the same cycle instead of waiting on one.) (#1868)
 
 ### Fixed
 

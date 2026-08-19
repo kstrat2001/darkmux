@@ -1612,6 +1612,15 @@ async fn phases_handler() -> axum::Json<serde_json::Value> {
 /// doesn't name a real mission still redirects — the port's own lens
 /// reports that "not found" inline (graceful-degradation posture
 /// unchanged, item 6), exactly as the retired standalone page did.
+///
+/// (#1868 QA finding) The `is_valid_catalog_id` gate is load-bearing for
+/// more than fragment safety: `axum::response::Redirect::permanent`
+/// PANICS if its argument isn't a valid HTTP header value. Today's
+/// allowlist (visible ASCII only) can never trip that, but if a future
+/// change widens the catalog-id charset (e.g. to accommodate a new id
+/// scheme), this handler's failure mode flips silently from a clean `400`
+/// to a request-handler panic unless the widened charset is re-checked
+/// against `HeaderValue`'s own constraints first.
 async fn mission_graph_html(Path(id): Path<String>) -> axum::response::Response {
     if !is_valid_catalog_id(&id) {
         return (

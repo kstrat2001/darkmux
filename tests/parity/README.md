@@ -67,8 +67,11 @@ Does not touch `tests/e2e/`.
    ARE gated bind fixed ports and share `goldens/`, so concurrent runs flake
    for reasons unrelated to the code under test — that's why CI runs them
    serially.
-**`mission-graph-goldens.spec.ts` is retired (#1868 third packet)**, so the
-list below skips straight from item 3 to item 4. It captured
+**`mission-graph-goldens.spec.ts` is retired (#1868 third packet).** It used
+to hold the item-4 slot in the list below; `next-parity-graph.spec.ts` (the
+suite that WAS item 5) now fills that slot instead, so the numbering below
+still runs 1 through 4 with nothing skipped — only the retired suite's own
+name is gone from it. It captured
 `goldens/mission-graph-canvas.txt` / `goldens/mission-graph-timeline.txt`
 from the standalone `crates/darkmux-serve/assets/mission-graph.html` page
 (served live at `/mission/:id/graph`, not a build artifact; its own
@@ -322,9 +325,9 @@ required to reach it honestly:
   with (`installBlankRoutes`'s existing `/flow-mission/` fallback; a fresh
   404 for `/mission/:id/graph.json`, which nothing previously handled at
   all, see `lib/mock-routes.js`'s own comment). Originally recorded for the
-  now-retired `mission-graph-goldens.spec.ts` (item 4's retirement note
-  above); consumed today by `next-parity-graph.spec.ts`, a real
-  `next-parity*` suite.
+  now-retired `mission-graph-goldens.spec.ts` (its own retirement note
+  above, before item 4); consumed today by `next-parity-graph.spec.ts`, a
+  real `next-parity*` suite.
 
 ## Extraction target
 
