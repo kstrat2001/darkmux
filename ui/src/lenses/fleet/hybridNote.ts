@@ -15,6 +15,14 @@
  *
  * Deterministic templates only (no generation); the ONE real free-text
  * source (case 1) is operator/orchestrator-authored, not model-generated.
+ *
+ * (#1869) Like `savings.ts`'s `tokensOffMeter`, this function carries no
+ * playhead of its own — legacy's own `orchNotes()`/`mission.run*` scans are
+ * both gated `T(r.ts)<=state.t`, and that gate is restored at the SAME call
+ * site: `FleetLens` passes its `scopedData` (already filtered to `ts <=
+ * playhead`) as this function's `data` argument, not the raw window. See
+ * `savings.ts`'s module doc for the full reasoning; it applies here
+ * verbatim.
  */
 
 import { T } from "../../lib/flow";

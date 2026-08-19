@@ -8,14 +8,31 @@ import { isDispatchStart, isDispatchComplete } from "../../lib/flow";
  * so summing both would double-count.
  *
  * Playhead-aware in legacy (`ts<=state.t`, so the odometer accumulates as
- * playback scrubs); this port has no scrubber — `/next`'s fleet lens is
- * always the live rolling window (`useFlowWindow`'s `nowMs - LIVE_WINDOW_MS`
- * boundary is already applied before this function ever sees `data`, and
- * every record in that window satisfies `ts <= tMax` by construction of
- * `tMax`). So the `T(r.ts)<=state.t` / `T(r.ts)>state.t` gates in the
- * legacy source are simply absent here — dropping them changes nothing,
- * since they were always-true / always-false respectively for this port's
- * live-only view.
+ * playback scrubs) — but this function itself carries NO playhead
+ * parameter, and still doesn't after #1869 restored the scrubber. The gate
+ * lives at the CALL SITE instead: `FleetLens` filters `data` to `ts <=
+ * playhead` (its `scopedData`, built from the SAME `tMax` prop it already
+ * threads through `cards.ts`/`timeline.ts`) before handing it to this
+ * function, so every record `tokensOffMeter` ever sees is already
+ * "visible as of the playhead" — no record here needs its own ts check
+ * because none of them are in the future.
+ *
+ * That caller-side gate is a REAL behavior now, where before #1869 it was
+ * vacuous: `/next`'s fleet lens was always the live rolling window
+ * (`useFlowWindow`'s `nowMs - LIVE_WINDOW_MS` boundary already applied
+ * before this function ever saw `data`), and `PlaybackLens` always passed
+ * `computeTMax(records)` — the day's own true max — so `data` and
+ * `data.filter(ts<=tMax)` were the same array either way. Scrubbing before
+ * the day's end is what makes the filter load-bearing: a session's
+ * `dispatch.complete` (the ONLY positive evidence a session ran local — see
+ * `localSids` below) sliding past the playhead is exactly how "moving the
+ * playhead back drops a session's tokens from the hero" happens — its
+ * telemetry can stay in `data` while its completion falls out, which
+ * reclassifies the session from local to unattributed. Live mode's filter
+ * stays the same no-op it always was — `flowWindow.tMax` there is
+ * `computeTMax(flowWindow.data)` by definition, so every record already
+ * satisfies `ts <= tMax`. This function's own body is unchanged by any of
+ * this; the caller does the work.
  *
  * TOKENS ONLY — never a currency figure (the operator multiplies by their
  * own per-token rate; darkmux supplies no rate and makes no $ claim, on

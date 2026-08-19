@@ -190,4 +190,41 @@ describe("buildActivityTimeline — replay (liveMode = false)", () => {
     const live = buildActivityTimeline(open, new Map(), uids, new Set(), TMAX, TMAX, 1440, true, TMIN);
     expect(live.lanes[0].bars[0].cls).not.toBe("run");
   });
+
+  // (#1869) Omitting the 10th argument (`playheadT`) defaults it to `tMax`
+  // — the exact pre-transport behavior, where a session start could never
+  // be after the day's true max, so legacy's own
+  // `if(!s||T(s.ts)>state.t)return"";` guard was dropped as an
+  // unconditional no-op. A scrubbable playhead makes it reachable: a
+  // session starting AFTER `tMax` (here, one minute past the day's true
+  // ceiling — a stand-in for "hasn't happened yet as of the playhead")
+  // must draw no bar at all, not a phantom sliver at the track's right edge
+  // (which is what `sessionRunning` finding no close-edge — because
+  // there's nothing to close yet — would otherwise produce).
+  it("a session that hasn't started yet as of the playhead draws no bar at all", () => {
+    const notYetStarted: FlowRecord[] = [
+      rec({ machine_uid: "m1", session_id: "s-future", action: "dispatch.start", ts: new Date(TMAX + 60000).toISOString() }),
+    ];
+    const tl = buildActivityTimeline(notYetStarted, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
+    expect(tl.lanes[0].bars).toHaveLength(0);
+  });
+
+  // (#1869, QA gate — caught live, not by any prior test) `tMax` (the axis
+  // CEILING) and `playheadT` (the scrub position) are separate arguments
+  // now — this is the regression test for what happens when they're NOT
+  // the same number, which every test above this one never exercises
+  // (`playheadT` always defaults to `tMax` when omitted). Scrubbing all the
+  // way back to `tMin` must NOT collapse the axis down to a single instant
+  // — `tlMin..tlMax` stays the day's whole recorded span; only the
+  // PLAYHEAD marker (`playheadPct`) moves. The bug this guards: a first
+  // cut fed the SAME number as both the axis ceiling and the playhead, so
+  // rewinding drew "16:56–16:56" (an axis with zero width) instead of the
+  // full day with the marker swept to its left edge.
+  it("scrubbing the playhead back to tMin does NOT collapse the axis — it stays the day's whole span", () => {
+    const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN, TMIN);
+    expect(tl.axis).toEqual([clkhm(TMIN), clkhm(TMIN + (TMAX - TMIN) / 2), clkhm(TMAX)]);
+    expect(tl.headerText).toBe(`activity · ${clkrange(TMIN, TMAX)}`);
+    // The marker itself DID move — to the axis's own left edge.
+    expect(tl.playheadPct).toBe(0);
+  });
 });
