@@ -23,22 +23,25 @@
 //   arrival-vs-held asymmetry) is covered by `graph.test.ts`'s
 //   "statusRank / keepPageStatus" describe block.
 // - "every phase container has a visible border" (a WCAG contrast-ratio
-//   measurement against the STANDALONE PAGE'S OWN palette) is NOT ported:
-//   this lens uses this port's own CSS variables (`styles.css`'s
-//   `.missionlens` block), a different palette with its own contrast
-//   values never derived from the original bug's specific numbers. The
-//   STRUCTURAL rule it protects (every phase status gets ITS OWN border
-//   rule, none falling through to an invisible default) is preserved by
-//   inspection (`styles.css`'s `.phasegroup.s-*` rules each set a real
-//   border-color) but not re-verified numerically here.
+//   measurement) IS ported below, re-measured against THIS port's own
+//   palette (`styles.css`'s `.missionlens .phasegroup` block) rather than
+//   the standalone page's — this port's `.phasegroup` base rule (no
+//   `.s-planned` override needed; the UNSTYLED default already carries a
+//   real border) measures ~12.57:1 against the app-shell background,
+//   comfortably clear of the 1.4 threshold the original bug/fix pair
+//   straddled at ~1.21/~1.65. Coverage against this port's own
+//   hand-rewritten ~650-line CSS regressing the same way (no unit test
+//   substitutes for a rendered contrast measurement), not evidence of a
+//   live defect.
 //
 // What's ported, because each proves something the port could uniquely get
 // wrong: the aborted/finalized visual distinction (a real CSS class check),
 // the unknown-status-wins-the-reconcile-poll ratchet (#1628 — this port's
 // OWN reconcile path, `graph.json`'s `refetchInterval`, differs
 // structurally from the standalone page's timer and needed its own wiring —
-// see `MissionGraphLens.tsx`'s own doc), and the no-sideways-scroll
-// render-sanity check (a real, cheap regression guard).
+// see `MissionGraphLens.tsx`'s own doc), the no-sideways-scroll
+// render-sanity check (a real, cheap regression guard), and the phase
+// border contrast (re-measured against this port's own CSS).
 const { test, expect } = require('@playwright/test');
 
 const MISSION_ID = 'm-vocab';
@@ -135,6 +138,37 @@ test('a status this build does not know wins the RECONCILE POLL instead of being
     page.locator('.mnode.s-running'),
     'a real transition must not be discarded — the reconcile refetch must have fired and folded the new status'
   ).toHaveCount(0);
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});
+
+test('every phase container has a visible border, not one that matches the background (#1868 — re-measured against this port\'s own CSS)', async ({ page }) => {
+  // Ported from mission-graph-status-vocab.spec.js's identical-named test —
+  // same method (a real WCAG contrast ratio, not a luminance delta; see that
+  // file's own comment for why a subtraction of gamma-encoded values passed
+  // against the original broken border). This port's numbers are its own:
+  // the standalone page's bug measured ~1.21 and its fix ~1.65; this port's
+  // `.phasegroup` base rule was never derived from either number and needs
+  // its own measurement to be trusted at all.
+  const { errors } = await open(page, [graph('active', 'planned')]);
+  const box = page.locator('.missionlens .phasegroup').first();
+  await expect(box).toBeVisible();
+
+  const ratio = await box.evaluate((el) => {
+    const rel = (css) => {
+      const [r, g, b] = css.match(/\d+/g).map(Number).slice(0, 3);
+      const ch = (v) => {
+        const c = v / 255;
+        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+      };
+      return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b);
+    };
+    const a = rel(getComputedStyle(el).borderTopColor);
+    const b = rel(getComputedStyle(document.body).backgroundColor);
+    const [hi, lo] = a > b ? [a, b] : [b, a];
+    return (hi + 0.05) / (lo + 0.05);
+  });
+
+  expect(ratio, `phase container border contrast is ${ratio.toFixed(2)}:1`).toBeGreaterThan(1.4);
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
