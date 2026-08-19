@@ -260,6 +260,17 @@ const SAFE_FIELDS = new Set([
 // unused by any other currently-recorded endpoint when these were added
 // (`grep -l '"label"' corpus/*.json` etc. all came back empty), so this
 // doesn't loosen coverage anywhere already recorded.
+//
+// One caveat worth carrying forward (review finding, #1868): `label` is
+// NOT purely structural the way the other three are. `mission_graph.rs`
+// resolves it to a task's/phase's `display_name` (falling back to the id),
+// which is operator-authored config text, the same character as
+// `display_name` already on this list. It is safe for the CURRENT fixture
+// because every built-in mission config labels its work with structural
+// verbs (Investigate, Bundle, Verify). Anyone recording a SECOND graph
+// fixture from a hand-authored engagement mission must read its labels
+// before committing the corpus file. (`description`, which for coder-phase
+// doubles as the coder's dispatch brief, is correctly in PROSE_FIELDS.)
 
 function classifyField(fieldName) {
   if (PROSE_FIELDS.has(fieldName)) return "prose";

@@ -64,6 +64,39 @@ const {
   expandAllTimelineTasks,
 } = require("./lib/extract-graph.js");
 
+/** (#1868 packet 1, review finding) `GOLDEN_CHECK=1` turns this suite from
+ * a CAPTURE run into a VERIFY run: the extracted text is compared against
+ * the committed golden instead of overwriting it. Capture is the default
+ * (this is the suite that MINTS the spec), but a golden must never change
+ * as a silent side effect of somebody running the suite with a locally
+ * modified `mission-graph.html`, so CI and any "did anything drift" check
+ * run with this set. See README.md's "Rebaselining" doctrine. */
+const GOLDEN_CHECK = !!process.env.GOLDEN_CHECK;
+
+/** Capture-or-verify, per `GOLDEN_CHECK`. */
+function writeOrCheckGolden(golden, goldenPath, label) {
+  expect(golden.length, "captured golden must not be empty").toBeGreaterThan(0);
+  if (GOLDEN_CHECK) {
+    expect(readFileSync(goldenPath, "utf8"), `${label} golden must match the committed spec (GOLDEN_CHECK=1)`).toBe(golden);
+    return;
+  }
+  mkdirSync(GOLDENS_DIR, { recursive: true });
+  writeFileSync(goldenPath, golden, "utf8");
+}
+
+/** The two fixture files whose service by `installCorpusRoutes` is what
+ * makes this suite's interception load-bearing. Unlike every sibling
+ * suite, this one's `baseURL` IS the live daemon, so an unmatched route
+ * `route.continue()`s to a REAL response instead of 404ing: on the machine
+ * the corpus was recorded from, a deleted route branch would keep the
+ * suite green while quietly recording live daemon state into the golden.
+ * These assertions are the mutation guard (verified by deleting each
+ * branch in `lib/mock-routes.js` and watching this fail). */
+function expectFixturesServed(served) {
+  expect(served["mission-graph-sanity.json"], "corpus mock must have served graph.json").toBeGreaterThan(0);
+  expect(served["flow-mission-sanity.json"], "corpus mock must have served the flow-mission backfill").toBeGreaterThan(0);
+}
+
 const CANVAS_GOLDEN_PATH = path.join(GOLDENS_DIR, "mission-graph-canvas.txt");
 const TIMELINE_GOLDEN_PATH = path.join(GOLDENS_DIR, "mission-graph-timeline.txt");
 
@@ -87,11 +120,30 @@ async function installHangingSseStream(page, meta) {
 }
 
 test.describe("mission-graph goldens (#1868 packet 1)", () => {
+  // Preflight, matching `record.mjs`'s own ergonomics: this suite's baseURL
+  // is a live daemon (it serves the page's HTML/CSS/JS and the vendored
+  // React Flow bundle; the DATA all comes from the corpus). A stopped
+  // daemon should say so, not surface as a raw ERR_CONNECTION_REFUSED from
+  // `page.goto`.
+  test.beforeAll(async ({ baseURL }) => {
+    let reachable = false;
+    try {
+      const res = await fetch(`${baseURL}/flow-days`, { headers: { accept: "application/json" } });
+      reachable = res.ok;
+    } catch (_e) {
+      reachable = false;
+    }
+    expect(
+      reachable,
+      `darkmux daemon unreachable at ${baseURL}. This suite serves the page itself from a live daemon (its DATA is replayed from corpus/). Start one, or point DARKMUX_DAEMON_URL at it.`,
+    ).toBe(true);
+  });
+
   test("canvas: desktop viewport (viewMode=auto -> canvas)", async ({ page }) => {
     const meta = loadMeta();
     await page.setViewportSize(DESKTOP_VIEWPORT);
     await installFrozenClock(page, meta.frozen_clock_ms);
-    installCorpusRoutes(page, meta);
+    const served = installCorpusRoutes(page, meta);
     await installHangingSseStream(page, meta);
 
     await page.goto(`/mission/${GRAPH_FIXTURE_MISSION_ID}/graph`);
@@ -130,17 +182,17 @@ test.describe("mission-graph goldens (#1868 packet 1)", () => {
     expect(edgeCount, "react-flow edges").toBe(6);
     expect(eventCount, "event rows (8 flow-mission records)").toBe(8);
 
+    expectFixturesServed(served);
+
     const golden = await extractCanvasGolden(page);
-    expect(golden.length, "captured golden must not be empty").toBeGreaterThan(0);
-    mkdirSync(GOLDENS_DIR, { recursive: true });
-    writeFileSync(CANVAS_GOLDEN_PATH, golden, "utf8");
+    writeOrCheckGolden(golden, CANVAS_GOLDEN_PATH, "canvas");
   });
 
   test("timeline: mobile viewport (viewMode=auto -> timeline)", async ({ page }) => {
     const meta = loadMeta();
     await page.setViewportSize(MOBILE_VIEWPORT);
     await installFrozenClock(page, meta.frozen_clock_ms);
-    installCorpusRoutes(page, meta);
+    const served = installCorpusRoutes(page, meta);
     await installHangingSseStream(page, meta);
 
     await page.goto(`/mission/${GRAPH_FIXTURE_MISSION_ID}/graph`);
@@ -175,10 +227,10 @@ test.describe("mission-graph goldens (#1868 packet 1)", () => {
     expect(stepCount, "timeline steps (all 5 tasks expanded, 1 step each)").toBe(5);
     expect(eventCount, "event rows (8 flow-mission records)").toBe(8);
 
+    expectFixturesServed(served);
+
     const golden = await extractTimelineGolden(page);
-    expect(golden.length, "captured golden must not be empty").toBeGreaterThan(0);
-    mkdirSync(GOLDENS_DIR, { recursive: true });
-    writeFileSync(TIMELINE_GOLDEN_PATH, golden, "utf8");
+    writeOrCheckGolden(golden, TIMELINE_GOLDEN_PATH, "timeline");
   });
 });
 

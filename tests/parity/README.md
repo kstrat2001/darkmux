@@ -74,7 +74,15 @@ Does not touch `tests/e2e/`.
    both against `installBlankRoutes`. This is a CAPTURE suite, not a grading
    one: it writes the goldens it also runs the harness self-test against, the
    same shape the retired legacy `extract.spec.ts`/`redprove.spec.ts` pair
-   used before #1806. These two goldens are the frozen spec the FUTURE
+   used before #1806. Because a capture run OVERWRITES the goldens, set
+   `GOLDEN_CHECK=1` to flip it into verify mode (compare, never write) and
+   always `git diff goldens/` after a capture run: a golden must change only
+   as a reviewed hand-edit, never as a side effect of somebody running this
+   suite against a locally modified `mission-graph.html`. The suite also
+   asserts the corpus mocks actually SERVED both fixtures, because this is
+   the one suite whose `baseURL` is a live daemon: without that assertion a
+   deleted route branch would fall through to real daemon data and stay
+   green (proved by mutation, #1868). These two goldens are the frozen spec the FUTURE
    `next-parity-graph.spec.ts` (the later #1868 packet, once the graph lens is
    ported into `ui/src`) will grade against; that packet reuses this
    packet's own `lib/extract-graph.js` extraction helpers rather than
@@ -230,6 +238,13 @@ own comment for why, and why it's a NO-OP for every prior golden), so
 corpus can actually produce — not a stand-in for the populated/navigates-away
 case, which would need real per-mission record fixtures this corpus doesn't
 have.
+
+ONE id is the exception, as of #1868 packet 1: `GRAPH_FIXTURE_MISSION_ID`
+(`lib/graph-fixture.js`) has a real, populated `/flow-mission/` fixture
+recorded for the mission-graph goldens, so a `#mission=<that id>` render
+would take the POPULATED branch (navigate away) rather than the empty one
+described above. Every other id still gets the empty stub. A future golden
+that wants the empty branch must not use the graph fixture's id.
 
 `runs-kind-lab` and `session-task-list` are folded into the same suite as
 bonus goldens rather than being separately catalogued lenses: the former is

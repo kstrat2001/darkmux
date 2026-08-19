@@ -26,12 +26,27 @@ function fixture(file) {
  * Install corpus-backed routes on `page`. Every fetch/EventSource the viewer
  * issues resolves from the sanitized corpus — no live network access.
  */
+/**
+ * (#1868 packet 1) `installCorpusRoutes` returns a per-fixture fulfillment
+ * counter (`{ "<file>.json": n }`). A suite whose `baseURL` is a LIVE
+ * daemon (this directory's `mission-graph-goldens` suite is the only one)
+ * cannot tell "replayed from corpus/" from "fell through to the daemon" by
+ * looking at the render: on the machine the corpus was recorded from, both
+ * produce the same bytes. Asserting a fixture was actually SERVED is what
+ * makes the interception load-bearing, so deleting a route branch fails the
+ * suite instead of silently recording live daemon state into a golden.
+ * Every other suite ignores the return value.
+ */
 function installCorpusRoutes(page, meta) {
+  const served = {};
   page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const p = url.pathname;
 
-    const json = (file) => route.fulfill({ status: 200, contentType: "application/json", body: fixture(file) });
+    const json = (file) => {
+      served[file] = (served[file] || 0) + 1;
+      return route.fulfill({ status: 200, contentType: "application/json", body: fixture(file) });
+    };
     const jsonInline = (body) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
     const notFound = (msg) => route.fulfill({ status: 404, contentType: "text/plain", body: msg || "not recorded in this corpus\n" });
 
@@ -126,6 +141,7 @@ function installCorpusRoutes(page, meta) {
     // real daemon-less static context).
     return route.continue();
   });
+  return served;
 }
 
 /**
