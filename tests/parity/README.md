@@ -64,24 +64,89 @@ Does not touch `tests/e2e/`.
    lens. The five that ARE gated bind fixed ports and share `goldens/`, so
    concurrent runs flake for reasons unrelated to the code under test —
    that's why CI runs them serially.
+4. **`mission-graph-goldens.spec.ts`** (`bun run mission-graph-goldens`),
+   #1868 packet 1: captures `goldens/mission-graph-canvas.txt` /
+   `goldens/mission-graph-timeline.txt` from the CURRENT standalone
+   `crates/darkmux-serve/assets/mission-graph.html` page (served live at
+   `/mission/:id/graph`, not a build artifact; its own
+   `mission-graph-goldens.playwright.config.js` points `baseURL` straight at
+   the operator's daemon rather than staging a static bundle), then red-proves
+   both against `installBlankRoutes`. This is a CAPTURE suite, not a grading
+   one: it writes the goldens it also runs the harness self-test against, the
+   same shape the retired legacy `extract.spec.ts`/`redprove.spec.ts` pair
+   used before #1806. Because a capture run OVERWRITES the goldens, set
+   `GOLDEN_CHECK=1` to flip it into verify mode (compare, never write) and
+   always `git diff goldens/` after a capture run: a golden must change only
+   as a reviewed hand-edit, never as a side effect of somebody running this
+   suite against a locally modified `mission-graph.html`. The suite also
+   asserts the corpus mocks actually SERVED both fixtures, because this is
+   the one suite whose `baseURL` is a live daemon: without that assertion a
+   deleted route branch would fall through to real daemon data and stay
+   green (proved by mutation, #1868). These two goldens are the frozen spec the FUTURE
+   `next-parity-graph.spec.ts` (the later #1868 packet, once the graph lens is
+   ported into `ui/src`) will grade against; that packet reuses this
+   packet's own `lib/extract-graph.js` extraction helpers rather than
+   re-deriving them. Not part of the CI gate yet (no port to grade against
+   exists); run it locally against a live daemon when touching
+   `mission-graph.html` or preparing the graph-lens port.
 
 ## Re-recording the corpus
+
+**The real rule (corrected, #1868 packet 1 review): the `next-parity*`
+goldens are pinned to the exact DATA in the currently-committed `corpus/`,
+not just its shape.** An earlier version of this section said a corpus diff
+after re-recording was "expected to be large and not itself a bug"; that
+was true while the legacy extractor still regenerated `goldens/` FROM the
+corpus in the same step, so the two always moved together. That extractor
+retired in #1806. Since then, `goldens/*.txt` is a frozen, hand-edited spec
+and `corpus/*.json` is what the `next-parity*` suites replay against it, so
+a full re-record changes the replayed data while the goldens stay exactly
+as they were. Verified directly: re-recording the whole corpus and running
+the six `next-parity*` suites against it failed 3+5+5+3 assertions;
+reverting the 21 pre-existing fixture files (keeping only a genuinely new
+one) made all of them pass again.
+
+Two different needs, two different commands:
+
+**1. A FULL re-record** (`bun run record`) reflects the operator's live
+daemon state at record time (which missions exist, fleet composition,
+etc.) into every committed fixture. Treat it as **invalidating every
+`next-parity*` golden until a deliberate rebaseline follows**: re-record,
+run every `next-parity*` suite, and for each failure either restore the
+prior fixture content (if the diff is noise you don't want to lock in) or
+hand-edit the affected `goldens/<lens>.txt` file to match the new real
+content (see "Rebaselining" above), reviewed like any other diff, on
+purpose, never as an automatic side effect of running the recorder. Do not
+commit a re-recorded `corpus/` without also committing whatever golden
+changes it demands.
 
 ```bash
 cd tests/parity
 bun run record      # needs the live daemon at 127.0.0.1:8765 (or DARKMUX_DAEMON_URL)
 bun run check
-git diff corpus/   # review before committing
+git diff corpus/    # review before committing
+# then run every next-parity* suite and rebaseline any golden it breaks
 ```
 
-Re-recording reflects the operator's live daemon state at record time (which
-missions exist, fleet composition, etc.) — a corpus diff after re-recording
-is expected to be large and is not itself a bug. The corpus is a
-debugging/reference aid; it no longer drives an automated `goldens/`
-regeneration. If a golden genuinely needs to change, edit
-`goldens/<lens>.txt` directly (see "Rebaselining" above). What must not
-differ for the same underlying input is the sanitizer's mapping for a
-repeated identifier (same input → same synthetic output, always — see
+**2. Adding a NEW fixture, or refreshing ONE existing fixture in place**
+(the mission-graph parity fixture is the first example) uses the targeted
+mode instead: `bun run record -- --only graph` (equivalently `bun run
+record:graph`). It records only that fixture's own endpoint(s), writes them
+into the EXISTING `corpus/` directory in place (no whole-directory swap),
+and updates only that fixture's own transcript entries in `meta.json`;
+every other fixture and every other `meta.json` field, most importantly
+`frozen_clock_ms` (what every OTHER golden's relative-time text is captured
+against), is left untouched. This is the safe way to add or refresh a
+single fixture without invalidating the 21 (and growing) fixtures the
+`next-parity*` suites already depend on. `--only graph` is the only
+targeted mode today; extend `record.mjs`'s `graphFixtureEndpointSpecs()`
+pattern with a new `--only <mode>` when a future fixture needs the same
+treatment.
+
+Both modes share the same non-negotiable invariants: sanitization and the
+residual-canary tripwire check run unconditionally either way, and what
+must never differ for the same underlying input is the sanitizer's mapping
+for a repeated identifier (same input → same synthetic output, always, see
 `lib/sanitize.mjs`'s module doc).
 
 ## Sanitization (mandatory, not a flag) — FIELD POLICY, not word-scanning
@@ -174,6 +239,13 @@ corpus can actually produce — not a stand-in for the populated/navigates-away
 case, which would need real per-mission record fixtures this corpus doesn't
 have.
 
+ONE id is the exception, as of #1868 packet 1: `GRAPH_FIXTURE_MISSION_ID`
+(`lib/graph-fixture.js`) has a real, populated `/flow-mission/` fixture
+recorded for the mission-graph goldens, so a `#mission=<that id>` render
+would take the POPULATED branch (navigate away) rather than the empty one
+described above. Every other id still gets the empty stub. A future golden
+that wants the empty branch must not use the graph fixture's id.
+
 `runs-kind-lab` and `session-task-list` are folded into the same suite as
 bonus goldens rather than being separately catalogued lenses: the former is
 a client-side re-filter of the runs lens's already-loaded data (no new
@@ -223,6 +295,15 @@ required to reach it honestly:
   gather (it probes the machine) but that's a one-time recording cost, not a
   test-suite cost — the extraction/parity specs replay the RECORDED body,
   they never re-invoke the real command.
+- `/mission/<id>/graph.json` and `/flow-mission/<id>` (#1868 packet 1): the
+  mission-graph parity fixture's own two endpoints, recorded ONLY for
+  `GRAPH_FIXTURE_MISSION_ID` (`lib/graph-fixture.js`), a synthetic
+  sanity-check mission with no client-identifying content. Every other
+  mission id gets the SAME generic stub these routes have always answered
+  with (`installBlankRoutes`'s existing `/flow-mission/` fallback; a fresh
+  404 for `/mission/:id/graph.json`, which nothing previously handled at
+  all, see `lib/mock-routes.js`'s own comment). Consumed by
+  `mission-graph-goldens.spec.ts`, not by any `next-parity*` suite.
 
 ## Extraction target
 

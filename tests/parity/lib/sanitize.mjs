@@ -241,16 +241,36 @@ const SAFE_FIELDS = new Set([
   "decision", "dir", "display_name", "endpoint", "event", "exec_mode",
   "extra", "file", "finish_reason", "first_date", "first_ts",
   "flow_schema_version", "handle", "http_status", "id", "identifier",
-  "image", "inputs_fingerprint", "kind", "last_date", "last_ts", "level",
-  "limit_source", "machine", "machine_id", "machines", "mission_id",
-  "missions", "model", "model_key", "name", "orchestrator", "origin", "os",
-  "owner", "panel", "path", "phase_id", "phase_ids", "profile",
-  "recorded_at_iso", "redis_url_redacted", "reasoning_format",
-  "result_class", "role", "role_id", "route", "ruling", "runtime",
-  "schema_version", "served_model", "session_id", "size", "source",
-  "stage", "state", "status", "step_id", "surface", "task_ids", "tier",
-  "ts", "url", "version", "workspace",
+  "image", "inputs_fingerprint", "kind", "label", "last_date", "last_ts",
+  "level", "limit_source", "machine", "machine_id", "machines",
+  "mission_id", "mission_status", "missions", "model", "model_key", "name",
+  "orchestrator", "origin", "os", "owner", "panel", "parentId", "path",
+  "phase_id", "phase_ids", "profile", "recorded_at_iso",
+  "redis_url_redacted", "reasoning_format", "result_class", "role",
+  "role_id", "route", "ruling", "runtime", "schema_version", "served_model",
+  "session_id", "size", "source", "stage", "state", "status", "step_id",
+  "surface", "target", "task_ids", "tier", "ts", "url", "version",
+  "workspace",
 ]);
+// (#1868 packet 1) `label`, `mission_status`, `parentId`, `target` added for
+// /mission/:id/graph.json, the mission-graph parity fixture's node/edge
+// shape (crates/darkmux-serve/src/mission_graph.rs). Short structural
+// display strings and graph-linkage ids, the same character as `handle`/
+// `phase_id`/`step_id` already on this list, not free-text prose. Verified
+// unused by any other currently-recorded endpoint when these were added
+// (`grep -l '"label"' corpus/*.json` etc. all came back empty), so this
+// doesn't loosen coverage anywhere already recorded.
+//
+// One caveat worth carrying forward (review finding, #1868): `label` is
+// NOT purely structural the way the other three are. `mission_graph.rs`
+// resolves it to a task's/phase's `display_name` (falling back to the id),
+// which is operator-authored config text, the same character as
+// `display_name` already on this list. It is safe for the CURRENT fixture
+// because every built-in mission config labels its work with structural
+// verbs (Investigate, Bundle, Verify). Anyone recording a SECOND graph
+// fixture from a hand-authored engagement mission must read its labels
+// before committing the corpus file. (`description`, which for coder-phase
+// doubles as the coder's dispatch brief, is correctly in PROSE_FIELDS.)
 
 function classifyField(fieldName) {
   if (PROSE_FIELDS.has(fieldName)) return "prose";

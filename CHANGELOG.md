@@ -36,6 +36,12 @@ darkmux release.
   gets the override neutered with a warning naming why, never a false
   parity claim. Read-only end to end; no new data or resolution logic, just
   a surface for what `mission launch`/`dispatch` already resolve silently.
+- **Mission-graph parity goldens**: `tests/parity/mission-graph-goldens.spec.ts`
+  captures frozen canvas- and timeline-mode text goldens from the standalone
+  `/mission/:id/graph` page against a sanity fixture, so the graph lens's
+  future port into the React viewer (#1868) has a spec to grade against
+  before any of its own code changes. Dev/test infrastructure only; no
+  runtime behavior changes. (#1868)
 
 ### Fixed
 

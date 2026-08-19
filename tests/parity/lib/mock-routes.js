@@ -12,6 +12,7 @@
 const { readFileSync } = require("fs");
 const path = require("path");
 const { CORPUS_DIR, META_JSON } = require("./paths.js");
+const { GRAPH_FIXTURE_MISSION_ID } = require("./graph-fixture.js");
 
 function loadMeta() {
   return JSON.parse(readFileSync(META_JSON, "utf8"));
@@ -25,12 +26,27 @@ function fixture(file) {
  * Install corpus-backed routes on `page`. Every fetch/EventSource the viewer
  * issues resolves from the sanitized corpus — no live network access.
  */
+/**
+ * (#1868 packet 1) `installCorpusRoutes` returns a per-fixture fulfillment
+ * counter (`{ "<file>.json": n }`). A suite whose `baseURL` is a LIVE
+ * daemon (this directory's `mission-graph-goldens` suite is the only one)
+ * cannot tell "replayed from corpus/" from "fell through to the daemon" by
+ * looking at the render: on the machine the corpus was recorded from, both
+ * produce the same bytes. Asserting a fixture was actually SERVED is what
+ * makes the interception load-bearing, so deleting a route branch fails the
+ * suite instead of silently recording live daemon state into a golden.
+ * Every other suite ignores the return value.
+ */
 function installCorpusRoutes(page, meta) {
+  const served = {};
   page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     const p = url.pathname;
 
-    const json = (file) => route.fulfill({ status: 200, contentType: "application/json", body: fixture(file) });
+    const json = (file) => {
+      served[file] = (served[file] || 0) + 1;
+      return route.fulfill({ status: 200, contentType: "application/json", body: fixture(file) });
+    };
     const jsonInline = (body) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
     const notFound = (msg) => route.fulfill({ status: 404, contentType: "text/plain", body: msg || "not recorded in this corpus\n" });
 
@@ -44,6 +60,20 @@ function installCorpusRoutes(page, meta) {
     if (p === "/fleet/sessions/live") return json("fleet-sessions-live.json");
     if (p === "/machine/resources") return json("machine-resources.json");
     if (p === "/machine/specs") return json("machine-specs.json");
+
+    // (#1868 packet 1) The mission-graph parity fixture's node/edge snapshot.
+    // Matched explicitly: unlike every other endpoint here, NOTHING
+    // previously handled `/mission/:id/graph.json` at all, so it silently
+    // fell through to `route.continue()` at the bottom of this handler and
+    // hit the REAL daemon. Only the fixture id resolves to a recorded
+    // fixture; any other id 404s, mirroring the `/flow-session/` pattern
+    // below and matching the real daemon's own 404 for a mission with no
+    // local graph on this box (crates/darkmux-serve/src/mission_graph.rs).
+    const missionGraphJsonMatch = p.match(/^\/mission\/([^/]+)\/graph\.json$/);
+    if (missionGraphJsonMatch) {
+      if (decodeURIComponent(missionGraphJsonMatch[1]) === GRAPH_FIXTURE_MISSION_ID) return json("mission-graph-sanity.json");
+      return notFound(`no recorded graph fixture for mission \`${missionGraphJsonMatch[1]}\`\n`);
+    }
 
     const flowDateMatch = p.match(/^\/flow\/(\d{4}-\d{2}-\d{2})$/);
     if (flowDateMatch) {
@@ -84,6 +114,13 @@ function installCorpusRoutes(page, meta) {
     // `/next`'s MissionReplay takes (its real "empty" state instead of an
     // artificial "couldn't reach" error, which the real endpoint would never
     // actually produce for this case).
+    //
+    // (#1868 packet 1) The mission-graph fixture's OWN mission-scoped event
+    // backfill is matched first, ahead of the generic empty-stub fallback
+    // immediately below, so the fixture id replays the real recorded
+    // records the events panel needs, and every OTHER id keeps getting the
+    // generic `records:[]` stub this corpus has always answered with.
+    if (p === `/flow-mission/${encodeURIComponent(GRAPH_FIXTURE_MISSION_ID)}`) return json("flow-mission-sanity.json");
     if (p.startsWith("/flow-mission/")) return jsonInline({ records: [], count: 0, truncated: false, generated_at_ms: meta.frozen_clock_ms });
 
     if (p === "/panel/mission-status") return json("panel-mission-status.json");
@@ -104,6 +141,7 @@ function installCorpusRoutes(page, meta) {
     // real daemon-less static context).
     return route.continue();
   });
+  return served;
 }
 
 /**
@@ -130,6 +168,10 @@ function installBlankRoutes(page) {
       "/machine/specs",
     ];
     if (apiPaths.includes(p)) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness — nothing recorded\n" });
+    // (#1868 packet 1) The mission-graph fixture's own endpoint, blanked the
+    // same way every other id-scoped route below is: a 404, matching the
+    // real daemon's own 404 for a mission with no local graph on this box.
+    if (/^\/mission\/[^/]+\/graph\.json$/.test(p)) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
     if (/^\/flow\/\d{4}-\d{2}-\d{2}$/.test(p)) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });
     if (/^\/flow\/\d{4}-\d{2}-\d{2}\/stream$/.test(p)) return route.fulfill({ status: 200, contentType: "text/event-stream", body: "" });
     if (p.startsWith("/flow-session/")) return route.fulfill({ status: 404, contentType: "text/plain", body: "blank harness\n" });

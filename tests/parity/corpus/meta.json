@@ -300,6 +300,52 @@
         "unknown": 0,
         "unknownFields": []
       }
+    },
+    {
+      "name": "mission-graph-sanity",
+      "path": "/mission/sanity-review-shape-1784702742-76e0c1/graph.json",
+      "file": "mission-graph-sanity.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": {
+        "reason": "mission-graph-goldens.spec.ts canvas/timeline node+edge snapshot",
+        "mission_id": "sanity-review-shape-1784702742-76e0c1"
+      },
+      "bytes": 5134,
+      "sanitized": {
+        "identifiers": 0,
+        "tickets": 0,
+        "shas": 0,
+        "ips": 0,
+        "prose": 0,
+        "paths": 0,
+        "uuids": 0,
+        "unknown": 0,
+        "unknownFields": []
+      }
+    },
+    {
+      "name": "flow-mission-sanity",
+      "path": "/flow-mission/sanity-review-shape-1784702742-76e0c1",
+      "file": "flow-mission-sanity.json",
+      "http_status": 200,
+      "ok": true,
+      "extra": {
+        "reason": "mission-graph-goldens.spec.ts events panel backfill",
+        "mission_id": "sanity-review-shape-1784702742-76e0c1"
+      },
+      "bytes": 4767,
+      "sanitized": {
+        "identifiers": 0,
+        "tickets": 0,
+        "shas": 0,
+        "ips": 0,
+        "prose": 2,
+        "paths": 0,
+        "uuids": 8,
+        "unknown": 0,
+        "unknownFields": []
+      }
     }
   ]
 }

@@ -1,0 +1,135 @@
+{
+  "records": [
+    {
+      "ts": "2026-07-22T06:45:42Z",
+      "level": "info",
+      "category": "work",
+      "tier": "operator",
+      "stage": "scope",
+      "action": "mission start",
+      "handle": "sanity-review-shape-1784702742-76e0c1",
+      "session_id": "mission-sanity-review-shape-1784702742-76e0c1",
+      "source": "mission_lifecycle",
+      "reasoning": "nostrud do aliqua veniam id elit mollit du",
+      "mission_id": "sanity-review-shape-1784702742-76e0c1",
+      "machine_id": "MacBook-Pro",
+      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+    },
+    {
+      "ts": "2026-07-22T06:45:43Z",
+      "level": "info",
+      "category": "work",
+      "tier": "operator",
+      "stage": "scope",
+      "action": "phase start",
+      "handle": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "phase_id": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "session_id": "mission-sanity-review-shape-1784702742-76e0c1",
+      "source": "phase_lifecycle",
+      "mission_id": "sanity-review-shape-1784702742-76e0c1",
+      "machine_id": "MacBook-Pro",
+      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+    },
+    {
+      "ts": "2026-07-22T06:45:48Z",
+      "level": "info",
+      "category": "work",
+      "tier": "operator",
+      "stage": "scope",
+      "action": "phase start",
+      "handle": "sanity-review-shape-1784702742-76e0c1-adjudicate",
+      "phase_id": "sanity-review-shape-1784702742-76e0c1-adjudicate",
+      "session_id": "mission-sanity-review-shape-1784702742-76e0c1",
+      "source": "phase_lifecycle",
+      "mission_id": "sanity-review-shape-1784702742-76e0c1",
+      "machine_id": "MacBook-Pro",
+      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+    },
+    {
+      "ts": "2026-07-22T06:45:48Z",
+      "level": "info",
+      "category": "work",
+      "tier": "operator",
+      "stage": "scope",
+      "action": "phase start",
+      "handle": "sanity-review-shape-1784702742-76e0c1-report",
+      "phase_id": "sanity-review-shape-1784702742-76e0c1-report",
+      "session_id": "mission-sanity-review-shape-1784702742-76e0c1",
+      "source": "phase_lifecycle",
+      "mission_id": "sanity-review-shape-1784702742-76e0c1",
+      "machine_id": "MacBook-Pro",
+      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+    },
+    {
+      "ts": "2026-07-22T06:45:49Z",
+      "level": "info",
+      "category": "work",
+      "tier": "operator",
+      "stage": "scope",
+      "action": "phase complete",
+      "handle": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "phase_id": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "session_id": "mission-sanity-review-shape-1784702742-76e0c1",
+      "source": "phase_lifecycle",
+      "mission_id": "sanity-review-shape-1784702742-76e0c1",
+      "machine_id": "MacBook-Pro",
+      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+    },
+    {
+      "ts": "2026-07-22T06:45:49Z",
+      "level": "info",
+      "category": "work",
+      "tier": "operator",
+      "stage": "scope",
+      "action": "phase complete",
+      "handle": "sanity-review-shape-1784702742-76e0c1-adjudicate",
+      "phase_id": "sanity-review-shape-1784702742-76e0c1-adjudicate",
+      "session_id": "mission-sanity-review-shape-1784702742-76e0c1",
+      "source": "phase_lifecycle",
+      "mission_id": "sanity-review-shape-1784702742-76e0c1",
+      "machine_id": "MacBook-Pro",
+      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+    },
+    {
+      "ts": "2026-07-22T06:45:49Z",
+      "level": "info",
+      "category": "work",
+      "tier": "operator",
+      "stage": "scope",
+      "action": "phase complete",
+      "handle": "sanity-review-shape-1784702742-76e0c1-report",
+      "phase_id": "sanity-review-shape-1784702742-76e0c1-report",
+      "session_id": "mission-sanity-review-shape-1784702742-76e0c1",
+      "source": "phase_lifecycle",
+      "mission_id": "sanity-review-shape-1784702742-76e0c1",
+      "machine_id": "MacBook-Pro",
+      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+    },
+    {
+      "ts": "2026-07-22T06:45:49Z",
+      "level": "info",
+      "category": "work",
+      "tier": "operator",
+      "stage": "scope",
+      "action": "mission close",
+      "handle": "sanity-review-shape-1784702742-76e0c1",
+      "session_id": "mission-sanity-review-shape-1784702742-76e0c1",
+      "source": "mission_lifecycle",
+      "reasoning": "minim excepteur s",
+      "mission_id": "sanity-review-shape-1784702742-76e0c1",
+      "machine_id": "MacBook-Pro",
+      "machine_uid": "ABFCA777-9F06-A6BF-52CB-589A5D164929"
+    }
+  ],
+  "count": 8,
+  "truncated": false,
+  "generated_at_ms": 1787099442183,
+  "meta": {
+    "sources": {
+      "fleet": {
+        "state": "ok"
+      }
+    },
+    "complete": true
+  }
+}

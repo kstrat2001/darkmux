@@ -36,7 +36,8 @@
 //     was the right call while it stood, and the golden earned its keep as
 //     the record of what legacy does until the port could meet it.
 //   - `mission-replay`: still NOT byte parity, and for a data reason rather
-//     than a rendering one — this corpus has no `/flow-mission` fixture, so
+//     than a rendering one — this id has no `/flow-mission` fixture (only the
+//     #1868 graph fixture's id does), so
 //     the route legitimately has zero records to render. The test asserts
 //     the real fetch happened and the empty state is named.
 
@@ -169,7 +170,7 @@ test.describe("next-parity: catalog panel + replay-by-query (Packet 4)", () => {
     });
   });
 
-  test("#mission=<known-corpus-mission>: real fetch, honest empty render (this corpus has no /flow-mission fixture)", async ({
+  test("#mission=<known-corpus-mission>: real fetch, honest empty render (this id has no /flow-mission fixture)", async ({
     page,
   }) => {
     // See this file's own module doc for why this does NOT byte-compare
