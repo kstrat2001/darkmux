@@ -1,17 +1,36 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MissionGraphLens } from "./MissionGraphLens";
 import { todayUTC } from "../../lib/flow";
+import { queryKeys } from "../../lib/queryKeys";
 import type { MissionGraph } from "./graph";
+import type { FlowRecord } from "../../types/handwritten";
 
+/** Returns the `QueryClient` too (unused by most callers) so a test can
+ *  seed a cache slot this component doesn't fetch into itself — the live
+ *  tail's `flowTail` slot, owned by `useLiveTail` (mounted internally, no
+ *  SSE test seam on this component) — the same way `useLiveTail` itself
+ *  would via `queryClient.setQueryData`. See the `.mproc` readout tests. */
 function renderLens(missionId = "m1") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const result = render(
     <QueryClientProvider client={queryClient}>
       <MissionGraphLens missionId={missionId} />
     </QueryClientProvider>,
   );
+  return { ...result, queryClient };
+}
+
+/** Seeds the live-tail cache slot `useLiveTail` writes into — the SAME
+ *  mechanism a real SSE `telemetry.process` message would use
+ *  (`mergeTailRecords`/`setQueryData`), without standing up a real
+ *  `EventSource` (this component has no injectable `eventSourceFactory`
+ *  seam of its own). */
+function seedLiveTail(queryClient: QueryClient, records: FlowRecord[]) {
+  act(() => {
+    queryClient.setQueryData(queryKeys.flowTail(todayUTC()), records);
+  });
 }
 
 afterEach(() => {
@@ -228,5 +247,74 @@ describe("MissionGraphLens", () => {
     renderLens();
     await waitFor(() => expect(document.querySelector(".eventlog__head h3")).not.toBeNull());
     expect(document.querySelector(".eventlog__head h3")?.textContent).not.toMatch(/last \d+h/i);
+  });
+
+  it("(#1483) shows the host-activity readout once a telemetry.process sample lands on the live tail", async () => {
+    mockFetch();
+    const { queryClient } = renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    expect(document.querySelector(".mproc")).toBeNull();
+
+    seedLiveTail(queryClient, [
+      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 41, gpu: 72, mem: 0.5 } },
+    ]);
+
+    await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
+    const proc = document.querySelector(".mproc");
+    expect(proc?.textContent).toContain("gpu");
+    expect(proc?.textContent).toContain("72%");
+    expect(proc?.textContent).toContain("cpu");
+    expect(proc?.textContent).toContain("41%");
+    // 72% is >= the 60% "hot" threshold — the GPU figure gets the emphasis
+    // class, matching legacy's own `proc.gpu >= 60 ? "hot" : ""`.
+    expect(document.querySelector(".mproc b.hot")?.textContent).toBe("72%");
+  });
+
+  it("(#1483) MACHINE-level, not mission-scoped — a telemetry.process sample with no mission_id still shows", async () => {
+    // Host telemetry is never stamped with a mission_id (it's a whole-box
+    // sample, not per-dispatch) — this proves the readout isn't accidentally
+    // filtered through `recordInMission` the way the events pane is.
+    mockFetch();
+    const { queryClient } = renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+
+    seedLiveTail(queryClient, [
+      { ts: new Date().toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 10, gpu: 5 } },
+    ]);
+
+    await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
+  });
+
+  it("(#1483) the readout is absent when no telemetry.process sample has ever arrived", async () => {
+    mockFetch();
+    renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    expect(document.querySelector(".mproc")).toBeNull();
+  });
+
+  it("(#1483) a telemetry.process sample expires after the 12s freshness window, on the next render", async () => {
+    mockFetch();
+    const { queryClient } = renderLens();
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+
+    const t0 = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(t0);
+    try {
+      seedLiveTail(queryClient, [
+        { ts: new Date(t0).toISOString(), action: "telemetry.process", category: "telemetry", source: "process", payload: { cpu: 10, gpu: 5 } },
+      ]);
+      await waitFor(() => expect(document.querySelector(".mproc")).not.toBeNull());
+
+      // Advance PAST the 12s freshness window and force a re-render —
+      // `ProcEl` recomputes freshness from `Date.now()` at RENDER time
+      // (matching legacy's own inline `Date.now() - proc.rx < 12000`, not a
+      // ticking clock), so a re-render is what surfaces the expiry.
+      nowSpy.mockReturnValue(t0 + 13_000);
+      fireEvent.click(screen.getByTitle("toggle minimap"));
+
+      await waitFor(() => expect(document.querySelector(".mproc")).toBeNull());
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });

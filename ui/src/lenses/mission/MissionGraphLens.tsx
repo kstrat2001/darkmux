@@ -115,6 +115,89 @@ function useNow(anyRunning: boolean): number {
   return now;
 }
 
+/** (#1483) How recent a `telemetry.process` sample must be (client receive
+ * time) to still count as fresh — mission-graph.html's own literal `12000`. */
+const PROC_FRESH_MS = 12000;
+
+interface ProcSample {
+  cpu?: number;
+  gpu?: number;
+  mem?: number;
+  /** Our OWN receive wall-clock, not the record's `ts` — see this hook's
+   *  own doc for why (host/client clock skew). */
+  rx: number;
+}
+
+function isTelemetryProcessRecord(r: FlowRecord): boolean {
+  return (
+    (r.action === "telemetry.process" || (r.category === "telemetry" && r.source === "process")) &&
+    !!r.payload &&
+    typeof r.payload === "object"
+  );
+}
+
+/** (#1868, #1483) The header's `.mproc` host-activity readout — the OFF-
+ * MODEL corroboration that the box is actually working (host kernel
+ * counters, zero model dispatches — observability doctrine), not chrome.
+ * Ported from mission-graph.html's own `proc`/`setProc` state, which its
+ * SSE `onMessage` stamps directly: `rec.action==="telemetry.process" ? setProc({...,
+ * rx: Date.now()}) : ...`.
+ *
+ * This port has no per-record `onMessage` callback (the pure-fold
+ * architecture re-derives from the whole known record set on every change —
+ * see this module's own doc), so "stamp OUR OWN receive time" is reproduced
+ * via a `useEffect` keyed on the IDENTITY of the latest qualifying record:
+ * `flowTailQuery.data` only grows (new SSE records append; `mergeTailRecords`
+ * never re-clones an existing entry — see that function's own doc), so the
+ * object reference selected as "latest" changes ONLY when a genuinely NEW
+ * sample streams in. The effect then fires once, for that sample, at
+ * (very nearly) the moment it actually arrived — same invariant legacy's
+ * inline stamp gives, reached a different way because this port's data flow
+ * is a fold, not a per-message reducer.
+ *
+ * MACHINE-level, not mission-scoped, matching legacy exactly: `tail` is the
+ * live tail UNFILTERED by mission (`recordInMission` is never applied to
+ * this source) — a host sample corroborates the whole box, not one mission. */
+function useProcReadout(tail: FlowRecord[] | undefined): ProcSample | null {
+  const latest = useMemo(() => {
+    if (!tail || !tail.length) return null;
+    let found: FlowRecord | null = null;
+    for (const r of tail) {
+      if (!r || typeof r !== "object" || !isTelemetryProcessRecord(r)) continue;
+      if (!found || (r.ts ?? "") >= (found.ts ?? "")) found = r;
+    }
+    return found;
+  }, [tail]);
+
+  const [proc, setProc] = useState<ProcSample | null>(null);
+  useEffect(() => {
+    if (!latest || !latest.payload) return;
+    const p = latest.payload as { cpu?: unknown; gpu?: unknown; mem?: unknown };
+    setProc({
+      cpu: typeof p.cpu === "number" ? p.cpu : undefined,
+      gpu: typeof p.gpu === "number" ? p.gpu : undefined,
+      mem: typeof p.mem === "number" ? p.mem : undefined,
+      rx: Date.now(),
+    });
+  }, [latest]);
+  return proc;
+}
+
+function ProcEl({ proc }: { proc: ProcSample | null }) {
+  const fresh = !!proc && Date.now() - proc.rx < PROC_FRESH_MS;
+  if (!fresh || !proc) return null;
+  return (
+    <span className="mproc" title="host activity (telemetry.process)">
+      {typeof proc.gpu === "number" ? (
+        <span>
+          gpu <b className={proc.gpu >= 60 ? "hot" : ""}>{proc.gpu}%</b>
+        </span>
+      ) : null}
+      {typeof proc.cpu === "number" ? <span>cpu {proc.cpu}%</span> : null}
+    </span>
+  );
+}
+
 function useIsMobile(): boolean {
   const [isMobile, setIsMobile] = useState(() => (typeof window !== "undefined" ? isNarrowViewport(window.innerWidth) : false));
   useEffect(() => {
@@ -322,6 +405,7 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
     graph.nodes.some((n) => n.status === "running" || (n.steps || []).some((s) => s.status === "running"))
   );
   const now = useNow(anyRunning);
+  const proc = useProcReadout(flowTailQuery.data);
 
   function refresh() {
     void queryClient.invalidateQueries({ queryKey: queryKeys.missionGraph(missionId) });
@@ -389,6 +473,7 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
           <span className={`livepill${liveStatus === "live" ? " on" : " off"}`}>{liveStatus === "live" ? "● live" : "○ reconnecting"}</span>
         ) : null}
         <MeterEl tot={tot} />
+        <ProcEl proc={proc} />
         <button type="button" className="evbtn" title="refresh — refetch graph + events" onClick={refresh}>
           ↻
         </button>

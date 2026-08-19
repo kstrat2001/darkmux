@@ -3251,6 +3251,25 @@ body {
   color: var(--dim);
   font-style: italic;
 }
+/* (#1868, #1483) Header host-activity readout — cpu/gpu from
+   telemetry.process, the OFF-model corroboration that the box is actually
+   working (host kernel counters, zero model dispatches — observability
+   doctrine). */
+.missionlens .mproc {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.missionlens .mproc b {
+  color: var(--good);
+  font-weight: 700;
+}
+.missionlens .mproc .hot {
+  color: var(--ml-run);
+}
 .missionlens .evbtn {
   font: 600 10px/1 "JetBrains Mono", monospace;
   letter-spacing: 0.08em;
