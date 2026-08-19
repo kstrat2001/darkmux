@@ -1,138 +1,12 @@
 //! `StepKind` trait + `StepOutcome` — the step-kind execution contract.
 
+use crate::remote_budget::RemoteBudget;
 use crate::types::{Step, Task};
 use anyhow::Result;
 use darkmux_flow::FlowRecord;
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-
-/// (#1610 / #1617 review) Smallest grant that can hold a usable reply.
-///
-/// Deliberately its own constant rather than a reference to the review
-/// pipeline's `MIN_VIABLE_JUDGE_GRANT`: they happen to share a value but answer
-/// different questions (how small a JUDGE ruling can be vs how small any
-/// `dispatch.map` item's reply can be), and `darkmux-crew` must not depend on
-/// `darkmux-lab` to know its own floor. Same reasoning as `MIN_WRAP_ROOM` vs
-/// `MIN_NAME_COLS` in the mission board — tying two numbers together because
-/// they match today makes one move silently when the other is tuned.
-const MIN_VIABLE_MAP_GRANT: u32 = 512;
-
-/// (#1442) One remote-token bucket metering the per-EXECUTION remote
-/// allowance (`DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`, where one
-/// execution = one pipeline stage). Local dispatches never touch it. A
-/// `budget` of 0 is exhausted from the FIRST item (`used (0) >= budget
-/// (0)`), so a zero allowance refuses every hosted call — the same hard
-/// opt-out `admit_remote_execution` gives a single hosted dispatch.
-///
-/// **The ceiling is SOFT (approximate), by construction (#1451 gate).**
-/// Admission is checked BEFORE a call ([`admit`](Self::admit)) and tokens
-/// are spent AFTER it ([`spend`](Self::spend)), so a stage can overshoot
-/// `budget` by at most ONE granted call — the per-item `max_tokens` is
-/// clamped to what the bucket has LEFT ([`remaining`](Self::remaining), gate
-/// C6), which bounds that overshoot to whatever the endpoint itself reports
-/// ABOVE its granted cap. This is deliberate: a per-execution allowance is a
-/// spend GUARDRAIL, not a hard byte gate, and a call's exact cost is
-/// unknowable until it runs.
-///
-/// **Bucket-group semantics (#1442 gate — the highest-stakes carry-forward
-/// of the ship-2b rewiring).** Where it once lived private in `builtins`,
-/// scoped to a SINGLE `dispatch.map` step, the bucket now lives here so the
-/// SCHEDULER can own a `group -> Arc<Mutex<MapRemoteBucket>>` map and hand
-/// the SAME bucket to every sibling step that names a `bucket_group` in its
-/// config (`run_step_graph`). That is what stops `seats x k` sibling
-/// `dispatch.map` probe steps from EACH minting a fresh full per-execution
-/// allowance (which would multiply the effective stage ceiling by the step
-/// count — the "allowance multiplication" the block's own doc named as the
-/// follow-on's obligation). The block stays Tier-1-pure: a `dispatch.map`
-/// step that names NO group still creates its own step-scoped bucket from
-/// the same budget, so grouped and ungrouped both read the one-execution
-/// contract; the caller's `Arc` never becomes a field of the kind itself,
-/// it arrives through the scheduler-supplied [`StepRunCtx`].
-#[derive(Debug)]
-pub struct MapRemoteBucket {
-    budget: u64,
-    used: u64,
-    skipped: u32,
-}
-
-impl MapRemoteBucket {
-    pub(crate) fn new(budget: u64) -> Self {
-        Self { budget, used: 0, skipped: 0 }
-    }
-    pub(crate) fn exhausted(&self) -> bool {
-        self.used >= self.budget
-    }
-    /// What is left to grant a single call (#1442 gate C6): per-item
-    /// `max_tokens` clamps to THIS, not the full budget, so one late item
-    /// cannot request more than the bucket has left.
-    pub(crate) fn remaining(&self) -> u64 {
-        self.budget.saturating_sub(self.used)
-    }
-    /// (#1442 fan-out) Admit one call and RESERVE its granted `max_tokens`
-    /// up front, returning the granted (clamped) cap — or `None` when the
-    /// bucket is already exhausted (counted as skipped, for the item's
-    /// named-reason result). The reserve-then-[`settle`](Self::settle) shape
-    /// replaces the old admit-then-spend-after pair because sibling
-    /// `dispatch.map` steps of one `bucket_group` (the probe stage's
-    /// `seats x k` fan-out) run CONCURRENTLY on `run_bounded` worker
-    /// threads: with spend-after accounting, every in-flight sibling could
-    /// admit against the same untouched balance and the stage would
-    /// overshoot by one call PER SIBLING. Reserving the granted cap at
-    /// admission bounds the whole group's overshoot to what an endpoint
-    /// itself reports ABOVE a granted cap — the same soft-ceiling reading as
-    /// before, now independent of sibling concurrency. In a sequential
-    /// per-item loop the observable behavior is identical to the old pair
-    /// (settle always lands before the next admit).
-    pub(crate) fn admit_reserve(&mut self, requested: u32) -> Option<u32> {
-        if self.exhausted() {
-            self.skipped += 1;
-            return None;
-        }
-        let granted = u32::try_from(self.remaining()).unwrap_or(u32::MAX).min(requested);
-        // (#1610 / #1617 review) A grant too small to hold a reply is worse
-        // than no grant. The call "succeeds", the endpoint truncates mid-JSON,
-        // and the caller reads the debris as a result — silently. That is the
-        // exact failure #1610 fixed for the judge bucket, and this bucket (the
-        // `dispatch.map` fan-out — the probe stage, and the graph verify path)
-        // carried the identical mechanism with no floor at all.
-        //
-        // Milder consequences here than for the judge, which is why it was not
-        // release-blocking: a starved probe draw is reduced COVERAGE rather
-        // than a deleted finding. But "reduced coverage, unreported" is exactly
-        // the silence this floor exists to break — a low-flag review has to
-        // mean "few flags", never "we stopped looking and said nothing".
-        //
-        // Capped by the CONFIGURED budget, exactly as the judge bucket's floor
-        // is: an operator who sets a deliberately tiny allowance is stating
-        // policy, not being starved, and denying it would turn every small
-        // budget into an undocumented hard opt-out of a knob whose only
-        // documented refusal value is 0. Starvation is the other shape — a
-        // budget that was never small, spent down to a sliver.
-        let floor = MIN_VIABLE_MAP_GRANT.min(u32::try_from(self.budget).unwrap_or(u32::MAX));
-        if granted < floor {
-            self.skipped += 1;
-            return None;
-        }
-        self.used = self.used.saturating_add(u64::from(granted));
-        Some(granted)
-    }
-    /// Settle a reserved call against its ACTUAL spend (the reply's reported
-    /// usage, or — conservatively — the granted cap when the endpoint omits
-    /// usage; see `conservative_hosted_spend`). Replaces the reservation
-    /// with the real number; an endpoint that reports above its granted cap
-    /// pushes the bucket over (the documented soft-ceiling overshoot), one
-    /// that reports under releases the difference back to its siblings.
-    pub(crate) fn settle(&mut self, granted: u32, actual: u64) {
-        self.used = self.used.saturating_sub(u64::from(granted)).saturating_add(actual);
-    }
-    /// Count of calls refused because the bucket was exhausted — read by
-    /// tests asserting the skip path fired.
-    #[cfg(test)]
-    pub(crate) fn skipped(&self) -> u32 {
-        self.skipped
-    }
-}
 
 /// (#1442, ship-2b probe/verify retirement) One dispatch a `dispatch.map`
 /// item is about to make, surfaced to the scheduler-supplied
@@ -219,7 +93,7 @@ pub type MapDispatchOverride =
 ///   reference through [`StepRunCtx::artifact`]. Use this for state that
 ///   must be visible to and mutated by MULTIPLE steps across the same run
 ///   — an accumulator, a shared counter, a scratch collection — the same
-///   shape `MapRemoteBucket`'s `bucket_group` already proves out for the
+///   shape `RemoteBudget`'s `bucket_group` already proves out for the
 ///   one case that exists today (see the module doc note on why that
 ///   mechanism is NOT retrofitted onto this bus in this packet). Carries a
 ///   `factory` the scheduler calls (at most once per name, per run) to
@@ -235,7 +109,7 @@ pub type MapDispatchOverride =
 /// [`StepKind::provides`]/[`StepKind::requires`] stays a zero-cost empty
 /// slice rather than an allocated empty `Vec`. A future artifact that
 /// genuinely needs a runtime-captured factory (e.g. a budget value read
-/// from config, the shape `MapRemoteBucket` needs) is exactly the case
+/// from config, the shape `RemoteBudget` needs) is exactly the case
 /// that stays OUTSIDE this mechanism — see the module doc note below.
 #[derive(Clone, Copy)]
 pub struct Port {
@@ -294,7 +168,7 @@ pub enum PortKind {
 /// `BTreeMap`'s key set is closed before it ever crosses a thread
 /// boundary, and each entry's own concurrency (if any — e.g. an
 /// `Arc<Mutex<Vec<_>>>` artifact) is the CONCRETE type's own concern, not
-/// the bus's. Contrast with `MapRemoteBucket`'s `bucket_group` map, which
+/// the bus's. Contrast with `RemoteBudget`'s `bucket_group` map, which
 /// stays mutable across the whole run (a NEW group name can appear in a
 /// later wave) and is therefore resolved per-step, inline in the main
 /// loop, rather than pre-scanned like this bus — see the module doc note
@@ -382,7 +256,7 @@ impl ArtifactBus {
 ///    through this channel preserves that boundary.
 /// 2. **Scheduler-supplied shared remote bucket (#1442).** When a step
 ///    names a `bucket_group`, the scheduler resolves the group's shared
-///    [`MapRemoteBucket`] and hands it here; sibling steps of the same group
+///    [`RemoteBudget`] and hands it here; sibling steps of the same group
 ///    meter one allowance BETWEEN them. `None` when the step named no group
 ///    (the kind falls back to a step-scoped bucket). Deliberately NOT
 ///    unified with seam 4 below — see [`ArtifactBus`]'s doc for why.
@@ -397,7 +271,7 @@ impl ArtifactBus {
 ///    a lookup by name is the "is it there" check.
 pub struct StepRunCtx {
     emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
-    remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
+    remote_bucket: Option<Arc<Mutex<RemoteBudget>>>,
     dispatch_override: Option<MapDispatchOverride>,
     artifacts: Arc<ArtifactBus>,
 }
@@ -455,7 +329,7 @@ impl StepRunCtx {
     /// passes `None`/`None` for those two and only a real `ArtifactBus`.
     pub fn new(
         emitter: Option<std::sync::mpsc::Sender<WaveSignal>>,
-        remote_bucket: Option<Arc<Mutex<MapRemoteBucket>>>,
+        remote_bucket: Option<Arc<Mutex<RemoteBudget>>>,
         dispatch_override: Option<MapDispatchOverride>,
         artifacts: Arc<ArtifactBus>,
     ) -> Self {
@@ -480,7 +354,7 @@ impl StepRunCtx {
     /// `bucket_group`, if the step named one. A grouped `dispatch.map` uses
     /// THIS across its whole collection loop; an ungrouped one gets `None`
     /// here and creates its own step-scoped bucket.
-    pub fn remote_bucket(&self) -> Option<&Arc<Mutex<MapRemoteBucket>>> {
+    pub fn remote_bucket(&self) -> Option<&Arc<Mutex<RemoteBudget>>> {
         self.remote_bucket.as_ref()
     }
 

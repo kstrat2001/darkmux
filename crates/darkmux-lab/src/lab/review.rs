@@ -123,6 +123,7 @@
 //! `telemetry.process` today applies unchanged.
 
 use anyhow::{anyhow, bail, Context, Result};
+use darkmux_crew::remote_budget::{RemoteBudget, RemoteBudgetRecord};
 use darkmux_crew::single_shot::SingleShotReply;
 use darkmux_crew::step_kinds::patterns::dedup::{dedup as pattern_dedup, DedupStrategy};
 use darkmux_crew::step_kinds::patterns::multi_pass_confirm::{multi_pass_confirm, ConfirmTier, PassClass};
@@ -944,135 +945,14 @@ fn usize_is_zero(n: &usize) -> bool {
     *n == 0
 }
 
-/// (#1260) One pipeline stage's remote token-bucket outcome — see
-/// [`ReviewEnvelope::remote_budgets`]. An "execution" is one stage (the
-/// probe pass, each judge pass, the verify pass), each drawing from its own
-/// `remote.max_tokens_per_execution` allowance so a runaway stage is caught
-/// at the cap without starving later stages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemoteBudgetRecord {
-    /// `probe` | `judge-pass1` | `judge-pass2` | `verify`.
-    pub stage: String,
-    pub max_tokens: u64,
-    pub used_tokens: u64,
-    pub exhausted: bool,
-    /// Remote calls NOT made because the bucket had already exhausted.
-    pub skipped_calls: u32,
-}
-
-/// (#1260) In-flight bucket state for one stage's remote calls. Local calls
-/// never touch it. `record()` yields `None` when the stage made no remote
-/// calls at all, so local-only envelopes carry no budget rows.
-pub(crate) struct RemoteBucket {
-    stage: &'static str,
-    budget: u64,
-    used: u64,
-    calls: u32,
-    skipped: u32,
-}
-
-impl RemoteBucket {
-    fn new(stage: &'static str, budget: u64) -> Self {
-        Self { stage, budget, used: 0, calls: 0, skipped: 0 }
-    }
-
-    fn exhausted(&self) -> bool {
-        self.used >= self.budget
-    }
-
-    /// Gate one remote call: `false` ⇒ the bucket is exhausted and the call
-    /// must not fire (counted as skipped, for the envelope's named reason).
-    fn admit(&mut self) -> bool {
-        if self.exhausted() {
-            self.skipped += 1;
-            false
-        } else {
-            true
-        }
-    }
-
-    fn spend(&mut self, tokens: u64, calls: u32) {
-        self.used += tokens;
-        self.calls += calls;
-    }
-
-    fn remaining(&self) -> u64 {
-        self.budget.saturating_sub(self.used)
-    }
-
-    /// (#swarm-6) Admit AND reserve in one operation — the concurrent-caller
-    /// twin of [`Self::admit`], mirroring `MapRemoteBucket::admit_reserve`
-    /// (the probe stage's shared-bucket discipline, #1442). Grants the
-    /// clamped completion cap and reserves it immediately, so concurrent
-    /// judges sharing this bucket under a briefly-held lock cannot all admit
-    /// against the same untouched balance. `admit`/`spend` stay for the
-    /// verify stage's sequential unshared loop, where the pair is already
-    /// race-free by construction.
-    fn admit_reserve(&mut self, requested: u32) -> Option<u32> {
-        if self.exhausted() {
-            self.skipped += 1;
-            return None;
-        }
-        let granted = u32::try_from(self.remaining()).unwrap_or(u32::MAX).min(requested);
-        // (#1610) A grant too small to buy a parseable ruling is a DENIAL, not
-        // a grant. Clamping without a floor dispatched judge calls with caps
-        // like 60 tokens against a JSON-ruling prompt: the reply truncates,
-        // parses as `Unparsed`, classifies as `Reject`, and
-        // `multi_pass_confirm` archives the flag on pass 1 with an empty note
-        // and no confirmation pass — a real finding deleted.
-        //
-        // And silently: because this returned `Some`, `skipped` never
-        // incremented, so none of the degraded gates fired. The run reported
-        // healthy. A flag that could not be judged must read as UNJUDGED, never
-        // as rejected — the whole point of the skip counter is that a review
-        // says when it did less than it claims.
-        //
-        // The floor is deliberately generous relative to a ruling's real cost;
-        // erring toward "deny and report" is correct here, because a denial is
-        // visible and a starved grant is not.
-        // The floor is capped by the CONFIGURED budget, because the operator's
-        // budget is the authority on what "enough" means. If they configured
-        // 100 tokens total, a 100-token grant is not starvation — it is their
-        // policy, and denying it would silently turn every budget under the
-        // floor into a hard opt-out, redefining a documented config knob
-        // (`remote.max_tokens_per_execution`, whose only documented refusal
-        // value is 0). Starvation is the OTHER shape: a large budget whose
-        // remainder has dwindled to a sliver.
-        //
-        // `MapRemoteBucket::admit_reserve` carries the identical floor for the
-        // identical reason (#1617 review) — the two buckets meter different
-        // stages but share this failure mode.
-        let floor = MIN_VIABLE_JUDGE_GRANT.min(u32::try_from(self.budget).unwrap_or(u32::MAX));
-        if granted < floor {
-            self.skipped += 1;
-            return None;
-        }
-        self.used = self.used.saturating_add(u64::from(granted));
-        Some(granted)
-    }
-
-    /// Settle a reserved call against its ACTUAL spend. An endpoint that
-    /// reports under the granted cap releases the difference back to its
-    /// siblings; one that reports above pushes the bucket over — the same
-    /// documented soft-ceiling overshoot reading as the map path.
-    fn settle(&mut self, granted: u32, actual_tokens: u64, calls: u32) {
-        self.used = self.used.saturating_sub(u64::from(granted)).saturating_add(actual_tokens);
-        self.calls += calls;
-    }
-
-    fn record(&self) -> Option<RemoteBudgetRecord> {
-        if self.calls == 0 && self.skipped == 0 {
-            return None;
-        }
-        Some(RemoteBudgetRecord {
-            stage: self.stage.to_string(),
-            max_tokens: self.budget,
-            used_tokens: self.used,
-            exhausted: self.exhausted(),
-            skipped_calls: self.skipped,
-        })
-    }
-}
+// (#1877) `RemoteBudgetRecord`/`RemoteBucket` moved to
+// `darkmux_crew::remote_budget` (as `RemoteBudgetRecord`/`RemoteBudget`) —
+// the shared home for what used to be two hand-copied buckets, this one and
+// `step_kinds::MapRemoteBucket`. `MIN_VIABLE_JUDGE_GRANT` below stays here,
+// unmoved: it is THIS pipeline's own floor policy, passed to
+// `RemoteBudget::with_stage` at construction rather than baked into the
+// type, so darkmux-crew's own `MIN_VIABLE_MAP_GRANT` never has to reference
+// it (or vice versa) — see `remote_budget`'s module doc.
 
 /// (#1260) The dispatch identity for one seat. LOCAL seats use the
 /// darkmux-namespaced LMStudio identifier (`swap::namespaced_identifier`);
@@ -2544,8 +2424,8 @@ struct JudgeOutcome {
 /// from its own allowance). `None` for a local judge, whose calls never
 /// touch a bucket.
 struct JudgeBudgets {
-    pass1: RemoteBucket,
-    pass2: RemoteBucket,
+    pass1: RemoteBudget,
+    pass2: RemoteBudget,
 }
 
 /// (#1260) The named-reason record for a judge call the remote bucket
@@ -2604,7 +2484,7 @@ fn run_budgeted_pass(
     // the narrow lock safe: the granted cap is debited at admission, so
     // siblings can't collectively overshoot the #1260 ceiling by admitting
     // against an untouched balance (the same discipline the probe stage's
-    // `MapRemoteBucket` uses, #1442).
+    // `RemoteBudget` uses, #1442).
     match budgets {
         Some(m) => {
             let granted = {
@@ -2914,7 +2794,7 @@ struct VerifyBudgetOutcome {
     remote_budget_row: Option<RemoteBudgetRecord>,
 }
 
-fn verify_budget_outcome(bucket: &RemoteBucket, docket: usize) -> VerifyBudgetOutcome {
+fn verify_budget_outcome(bucket: &RemoteBudget, docket: usize) -> VerifyBudgetOutcome {
     let rec = bucket.record();
     let warning = rec.as_ref().filter(|r| r.skipped_calls > 0).map(|r| {
         // (#1260, ruling applied) Verify-bucket exhaustion degrades the
@@ -2953,7 +2833,7 @@ fn run_verify_stage(
     let endpoint = seat_endpoint(&vstaff.pm);
     let endpoint_host = seat_endpoint_host(&vstaff.pm);
     let max_tokens = resolve_seat_max_tokens(vstaff, DEFAULT_JUDGE_MAX_TOKENS);
-    let mut bucket = RemoteBucket::new("verify", inputs.remote_max_tokens_per_execution);
+    let mut bucket = RemoteBudget::with_stage("verify", inputs.remote_max_tokens_per_execution, MIN_VIABLE_JUDGE_GRANT);
 
     if !vstaff.pm.is_remote() {
         cycler.ensure_loaded(&vstaff.pm)?;
@@ -3127,7 +3007,7 @@ fn judge_gate_outcome(
         if let Some(rec) = b.pass2.record() {
             remote_budget_rows.push(rec);
         }
-        let skipped = b.pass1.skipped + b.pass2.skipped;
+        let skipped = b.pass1.skipped() + b.pass2.skipped();
         if skipped > 0 {
             degen_reasons.push(format!(
                 "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
@@ -3612,8 +3492,8 @@ fn finish_review(
     // uncontended, and `into_inner` below reads the final state without one.
     let judge_budgets = judge_endpoint.map(|_| {
         std::sync::Mutex::new(JudgeBudgets {
-            pass1: RemoteBucket::new("judge-pass1", inputs.remote_max_tokens_per_execution),
-            pass2: RemoteBucket::new("judge-pass2", inputs.remote_max_tokens_per_execution),
+            pass1: RemoteBudget::with_stage("judge-pass1", inputs.remote_max_tokens_per_execution, MIN_VIABLE_JUDGE_GRANT),
+            pass2: RemoteBudget::with_stage("judge-pass2", inputs.remote_max_tokens_per_execution, MIN_VIABLE_JUDGE_GRANT),
         })
     });
 
@@ -5169,7 +5049,7 @@ pub(crate) fn reconstruct_probe_stage(
             max_tokens: budget,
             used_tokens: remote_used,
             // (#1442 gate CONSIDER) `remote_used` SUMS the endpoint-REPORTED
-            // tokens, but the live `MapRemoteBucket` meters CONSERVATIVELY
+            // tokens, but the live `RemoteBudget` meters CONSERVATIVELY
             // (it settles a usage-omitting reply at its granted cap). So a
             // usage-omitting endpoint can exhaust the bucket — producing
             // `remote_skips > 0` — while the summed reported total stays
@@ -5554,8 +5434,8 @@ impl StepKind for ReviewJudgeStepKind {
         let judge_system = ctx.judge_system.as_str();
         let judge_budgets = judge_endpoint.map(|_| {
             StdMutex::new(JudgeBudgets {
-                pass1: RemoteBucket::new("judge-pass1", ctx.remote_max_tokens_per_execution),
-                pass2: RemoteBucket::new("judge-pass2", ctx.remote_max_tokens_per_execution),
+                pass1: RemoteBudget::with_stage("judge-pass1", ctx.remote_max_tokens_per_execution, MIN_VIABLE_JUDGE_GRANT),
+                pass2: RemoteBudget::with_stage("judge-pass2", ctx.remote_max_tokens_per_execution, MIN_VIABLE_JUDGE_GRANT),
             })
         });
         // (#1530) The bundle set — published by `review-bundle-task`'s own
@@ -6138,7 +6018,7 @@ pub(crate) fn apply_verify_results(
         max_tokens: budget,
         used_tokens: tokens,
         // (#1442 gate CONSIDER) `tokens` sums the endpoint-REPORTED usage
-        // while the live `MapRemoteBucket` meters conservatively — a
+        // while the live `RemoteBudget` meters conservatively — a
         // usage-omitting endpoint can skip calls (`skipped > 0`) with the
         // summed total still below `budget`. A skip is itself proof the
         // bucket exhausted, so it keeps `exhausted` truthful. (Same corner as

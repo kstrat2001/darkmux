@@ -426,19 +426,20 @@ pub fn run_step_graph(
     // `ArtifactBus` entry's factory is a plain `fn() -> Arc<dyn Any + Send
     // + Sync>` chosen specifically for `Port` to stay `const`-constructible
     // (see `Port`'s doc) — it cannot capture a runtime budget value, so
-    // retrofitting `MapRemoteBucket` onto it would need either a captured-
-    // closure factory (abandoning the const-array ergonomics `Port` is
-    // built around) or resolving the bucket_group's budget BEFORE the
-    // artifact-bus pre-scan below (which does not know per-step config,
-    // only the STATIC ports a `StepKind` impl declares). Either path is a
-    // real design change for zero behavior gain in a zero-behavior-change
-    // packet, so `bucket_groups` keeps its own dedicated map — the BINDING
-    // requirement is that `dispatch.map`'s allowance-sharing stays byte-
-    // identical, and leaving its proven mechanism untouched is how this
-    // packet guarantees that.
+    // retrofitting `RemoteBudget` (`crate::remote_budget`, #1877's shared
+    // home) onto it would need either a captured-closure factory
+    // (abandoning the const-array ergonomics `Port` is built around) or
+    // resolving the bucket_group's budget BEFORE the artifact-bus pre-scan
+    // below (which does not know per-step config, only the STATIC ports a
+    // `StepKind` impl declares). Either path is a real design change for
+    // zero behavior gain in a zero-behavior-change packet, so
+    // `bucket_groups` keeps its own dedicated map — the BINDING requirement
+    // is that `dispatch.map`'s allowance-sharing stays byte-identical, and
+    // leaving its proven mechanism untouched is how this packet guarantees
+    // that.
     let mut bucket_groups: std::collections::BTreeMap<
         String,
-        std::sync::Arc<std::sync::Mutex<crate::step_kinds::MapRemoteBucket>>,
+        std::sync::Arc<std::sync::Mutex<crate::remote_budget::RemoteBudget>>,
     > = std::collections::BTreeMap::new();
 
     // (#1530 Packet 0) Materialize the run-scoped `ArtifactBus` ONCE, on
@@ -701,7 +702,10 @@ pub fn run_step_graph(
                         .entry(group.to_string())
                         .or_insert_with(|| {
                             std::sync::Arc::new(std::sync::Mutex::new(
-                                crate::step_kinds::MapRemoteBucket::new(budget),
+                                crate::remote_budget::RemoteBudget::new(
+                                    budget,
+                                    crate::step_kinds::MIN_VIABLE_MAP_GRANT,
+                                ),
                             ))
                         })
                         .clone()

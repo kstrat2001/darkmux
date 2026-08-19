@@ -1041,10 +1041,14 @@ fn single_shot_body(
 /// `pub(crate)` (#1412): `step_kinds::builtins::DispatchSingleShotStepKind`'s
 /// hosted arm reuses this exact gate rather than inventing a second zero-
 /// allowance check — same minimum regime, one definition of "budget 0
-/// refuses." The full per-stage `RemoteBucket` regime (`darkmux-lab`'s
-/// review funnel) stays out of `darkmux-crew` on purpose (dependency
-/// direction: `darkmux-lab` depends on `darkmux-crew`, not the reverse) —
-/// consolidating the two regimes is #1414's job, not this one's.
+/// refuses." The full per-stage regime (`crate::remote_budget::RemoteBudget`
+/// — #1877 promoted it into this crate from `darkmux-lab`'s review funnel)
+/// is a SEPARATE, richer mechanism this gate does not call into: this
+/// function is a one-shot admission check with no ongoing bucket state,
+/// while `RemoteBudget` accumulates spend across many calls in one stage.
+/// Wiring this single-shot path onto `RemoteBudget` instead is a real
+/// behavior change (a fresh allowance per call today vs. a shared one),
+/// not a rename — #1414's job, not #1877's.
 pub(crate) fn admit_remote_execution(budget: u64) -> Result<()> {
     if budget == 0 {
         bail!(
