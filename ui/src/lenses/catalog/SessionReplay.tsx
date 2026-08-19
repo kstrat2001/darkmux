@@ -26,7 +26,7 @@ import type { FlowRecordsResponse } from "../../types/handwritten";
  * An EMPTY response is a genuine no-data state (this corpus's own
  * `flow-session-task-list.json` fixture is non-empty, so the parity spec
  * exercises the populated branch — the empty branch is honest but
- * unexercised by this corpus, same shape as `MissionReplay`'s empty case).
+ * unexercised by this corpus).
  */
 export function SessionReplay({ sessionId }: { sessionId: string }) {
   const query = useQuery({

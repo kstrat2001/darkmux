@@ -14,9 +14,18 @@
  * |                              |        | fleet/sessions/machines + machine/specs poll.     |
  * | `RECONCILE_BACKSTOP_MS`      | 20000  | Every 4th presence tick (`tick%4===0`,            |
  * |                              |        | `reconcileLiveWindow()`) — backstops a dropped SSE|
- * |                              |        | reconnect gap. Not wired to a query in this       |
- * |                              |        | packet (no SSE-fed query exists yet); recorded    |
- * |                              |        | here for the live/SSE lens packet to pick up.     |
+ * |                              |        | reconnect gap. `hooks/useLiveTail.ts` reproduces  |
+ * |                              |        | this cadence via its own tick-counter rather than |
+ * |                              |        | importing the constant (both resolve to 20000ms — |
+ * |                              |        | 4 × `PRESENCE_POLL_MS` — a pre-existing wrinkle,  |
+ * |                              |        | not touched here). `MissionGraphLens.tsx` (#1868) |
+ * |                              |        | DOES import it directly: `graph.json`'s own       |
+ * |                              |        | `refetchInterval`, mirroring mission-graph.html's |
+ * |                              |        | own `setInterval(reconcile, 20000)` — a disk-level|
+ * |                              |        | status delta with NO accompanying flow record     |
+ * |                              |        | (the unknown-status-wins-the-merge case, #1628)   |
+ * |                              |        | can only ever be caught by re-fetching the         |
+ * |                              |        | snapshot itself; folding flow records alone can't. |
  * | `MACHINE_RESOURCES_CACHE_MS` | 2000   | Server-side cache TTL                             |
  * |                              |        | (`MACHINE_RESOURCES_CACHE_TTL` in                 |
  * |                              |        | `crates/darkmux-serve/src/lib.rs`) — the daemon   |
@@ -85,6 +94,11 @@ export const queryKeys = {
   flowDays: () => ["flow", "days"] as const,
   flowMissions: () => ["flow", "missions"] as const,
   flowMission: (id: string) => ["flow", "mission", id] as const,
+  /** `GET /mission/:id/graph.json` — the mission-graph lens's node/edge
+   * snapshot (#1868). Distinct from `flowMission` above, which reads the
+   * FLOW RECORD backfill for the same mission id, not the persisted
+   * Phase/Task/Step graph structure. */
+  missionGraph: (id: string) => ["mission", id, "graph"] as const,
   flowSession: (id: string) => ["flow", "session", id] as const,
   /** `GET /lab/run/detail?dir=` — the lab-run detail view's one-shot fetch
    * (`LabRunDetail.tsx`). The event-feed poll (`/lab/run/events`) is NOT a

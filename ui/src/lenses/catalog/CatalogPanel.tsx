@@ -39,12 +39,10 @@ import { CATALOG_MISSION_CAP, daySummary, missionSummary, missionsHeader, todayU
  *     it just isn't real YET. Once Packet 5 ports the fleet-hero pipeline,
  *     this becomes what the original wording claimed.
  *   - a mission row → `location.hash = "mission=<id>"`, reusing the
- *     `mission-redirect` route `route.ts` already recognizes — see
- *     `MissionReplay.tsx` for what that now does (real fetch + conditional
- *     navigation, replacing Packet 1's placeholder). This ONE destination
- *     really is fully real today (`/mission/<id>/graph` is a permanent,
- *     separate, already-working page — verified live against a real daemon,
- *     see the packet report).
+ *     `mission` route `route.ts` already recognizes — see
+ *     `lenses/mission/MissionGraphLens.tsx` (#1868) for what that now
+ *     renders IN-PLACE (the earlier `MissionReplay.tsx` full-navigation
+ *     stub this packet retires).
  *   - a day row → `location.hash = "<date>"`, the NEW `playback` route this
  *     packet adds — see `PlaybackLens.tsx` for why that's a visible
  *     not-ported notice rather than a full historical render (legacy's OWN

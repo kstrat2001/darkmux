@@ -3139,3 +3139,727 @@ body {
   border-top: 1px solid var(--border);
   margin: 10px 0;
 }
+
+/* ── Mission-graph lens (#1868) — a port of `mission-graph.html`'s own
+   inline <style> block. DOM class names (`.mnode`, `.phasegroup`,
+   `.steprow`, `.tlphase`, `.tltask`, `.evbtn`, …) are kept IDENTICAL to that
+   page on purpose (see `MissionCanvas.tsx`/`MissionTimelineView.tsx`'s own
+   doc — the parity goldens and e2e specs key on them); the SELECTORS are
+   scoped under `.missionlens` so this rule set can't collide with anything
+   else in this file. Colors are mapped onto this file's OWN `:root`
+   palette (`--fg`/`--dim`/`--border`/`--accent`/`--accent-dim`/`--good`/
+   `--warn`/`--bad`) rather than reintroducing mission-graph.html's parallel
+   `--text`/`--muted`/`--line` names; `--ml-bg2`/`--ml-panel`/`--ml-run` are
+   the three colors that file's palette has no equivalent for here.
+   Deliberately NOT a pixel-exact port of that file's extensive mobile
+   safe-area/100dvh/sticky-nav handling — this lens lives inside the app
+   shell's own document flow (a real `<Masthead>`/`<NavChrome>` already sits
+   above it), not a standalone chromeless PWA shell, so that machinery has
+   no analog here. */
+.missionlens {
+  --ml-bg2: #131316;
+  --ml-panel: #1c1c22;
+  --ml-run: #ffd166;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.missionlens .top {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--ml-bg2);
+  flex-wrap: wrap;
+  row-gap: 6px;
+  /* (#1868) Positioning context for `.legendpop`, anchored to this row's
+     own bottom edge — see that rule's own doc. */
+  position: relative;
+}
+.missionlens .midname {
+  font: 600 13px "JetBrains Mono", monospace;
+  color: var(--fg);
+}
+.missionlens .mstatus {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 3px 7px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--dim);
+}
+.missionlens .mstatus.active {
+  color: var(--good);
+  border-color: var(--good);
+}
+.missionlens .mstatus.finalized {
+  color: var(--dim);
+}
+.missionlens .mstatus.aborted,
+.missionlens .mstatus.paused {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.missionlens .livepill {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+  border-radius: 3px;
+}
+@keyframes ml-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+.missionlens .livepill.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  animation: ml-pulse 1.6s ease-in-out infinite;
+}
+.missionlens .livepill.off {
+  color: var(--warn);
+  border-color: var(--warn);
+  animation: ml-pulse 1s ease-in-out infinite;
+}
+.missionlens .mmeter {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font: 11px/1 "JetBrains Mono", monospace;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.missionlens .mmeter b {
+  color: var(--accent);
+  font-weight: 700;
+}
+.missionlens .mmeter .cloud {
+  color: var(--warn);
+}
+.missionlens .mmeter .unknown {
+  color: var(--dim);
+  font-style: italic;
+}
+/* (#1868, #1483) Header host-activity readout — cpu/gpu from
+   telemetry.process, the OFF-model corroboration that the box is actually
+   working (host kernel counters, zero model dispatches — observability
+   doctrine). */
+.missionlens .mproc {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.missionlens .mproc b {
+  color: var(--good);
+  font-weight: 700;
+}
+.missionlens .mproc .hot {
+  color: var(--ml-run);
+}
+.missionlens .evbtn {
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px 9px;
+  background: none;
+  cursor: pointer;
+}
+.missionlens .evbtn:hover {
+  color: var(--fg);
+  border-color: var(--accent-dim);
+}
+.missionlens .evbtn.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.missionlens .legend {
+  margin-left: auto;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+.missionlens .legend .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+/* (#1868) `.legbtn` — the mobile stand-in for `.legend` (mission-graph.html:
+   299-302,379-381,432,448). Shares `.evbtn`'s appearance; hidden above the
+   ~700px breakpoint, where the inline dots already show. `.legendpop` is
+   its tap-to-open popover, anchored to the bottom of `.top` — the ONLY
+   status-legend affordance a phone has once `.legend` hides below. */
+.missionlens .legbtn {
+  display: none;
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px 9px;
+  background: none;
+  cursor: pointer;
+}
+.missionlens .legbtn:hover {
+  color: var(--fg);
+  border-color: var(--accent-dim);
+}
+.missionlens .legendpop {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 8px;
+  z-index: 30;
+  background: var(--ml-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+.missionlens .legendpop.on {
+  display: flex;
+}
+.missionlens .legendpop .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+.missionlens .body {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 480px;
+  position: relative;
+}
+.missionlens .canvas {
+  flex: 1 1 auto;
+  position: relative;
+}
+.missionlens .note {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 20;
+  background: var(--ml-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font: 12px/1.4 sans-serif;
+  color: var(--dim);
+  max-width: 420px;
+}
+
+/* React Flow node/edge chrome — the vendored `reactflow/dist/style.css`
+   supplies layout/interaction CSS; this styles OUR node content. */
+.missionlens .mnode {
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--ml-panel);
+  padding: 8px 10px;
+  min-width: 170px;
+  max-width: 260px;
+  font-family: sans-serif;
+  position: relative;
+}
+.missionlens .mnode .mn-label {
+  font: 600 12px/1.3 "JetBrains Mono", monospace;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.missionlens .mnode .mn-kind {
+  font: 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 3px;
+}
+.missionlens .mnode.k-phase {
+  background: var(--ml-bg2);
+  border-color: var(--accent-dim);
+  min-width: 200px;
+}
+.missionlens .mnode.s-planned {
+  border-color: var(--border);
+}
+.missionlens .mnode.s-running {
+  border-color: var(--ml-run);
+  box-shadow: 0 0 0 1px var(--ml-run);
+}
+.missionlens .mnode.s-running .mn-label {
+  color: var(--ml-run);
+}
+.missionlens .mnode.s-running::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ml-run);
+  animation: ml-pulse 1.1s ease-in-out infinite;
+}
+.missionlens .mnode.s-complete {
+  border-color: var(--good);
+}
+.missionlens .mnode.s-complete .mn-kind {
+  color: var(--good);
+}
+.missionlens .mnode.s-error {
+  border-color: var(--bad);
+}
+.missionlens .mnode.s-error .mn-label {
+  color: var(--bad);
+}
+.missionlens .mnode.s-abandoned {
+  border-color: var(--dim);
+  opacity: 0.6;
+}
+.missionlens .mnode .mn-steps {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.missionlens .react-flow__edge-path {
+  stroke: var(--dim);
+}
+.missionlens .react-flow__edge.edge-depends_on .react-flow__edge-path {
+  stroke: var(--accent-dim);
+  stroke-width: 1.6;
+}
+.missionlens .react-flow__edge.edge-contains .react-flow__edge-path {
+  stroke: var(--border);
+  stroke-dasharray: 3 3;
+}
+.missionlens .react-flow__edge.edge-phase_order .react-flow__edge-path {
+  stroke: var(--good);
+  stroke-width: 2.4;
+  opacity: 0.85;
+}
+.missionlens .phasegroup {
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  border: 1px solid rgba(138, 138, 146, 0.34);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.028);
+  pointer-events: none;
+  position: relative;
+}
+.missionlens .phasegroup .pg-label {
+  position: absolute;
+  top: 10px;
+  left: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.1;
+}
+.missionlens .phasegroup .pg-kind {
+  font: 600 9px "JetBrains Mono", monospace;
+  letter-spacing: 0.14em;
+  color: var(--dim);
+  opacity: 0.8;
+}
+.missionlens .phasegroup .pg-name {
+  font: 600 13px "JetBrains Mono", monospace;
+  color: var(--fg);
+  opacity: 0.85;
+}
+.missionlens .phasegroup.s-running {
+  border-color: var(--ml-run);
+}
+.missionlens .phasegroup.s-running .pg-name {
+  color: var(--ml-run);
+}
+.missionlens .phasegroup.s-complete {
+  border-color: rgba(126, 231, 135, 0.45);
+}
+.missionlens .phasegroup.s-error {
+  border-color: var(--bad);
+}
+.missionlens .phasegroup.s-error .pg-name {
+  color: var(--bad);
+}
+.missionlens .phasegroup.s-abandoned {
+  border-style: dashed;
+  opacity: 0.6;
+}
+.missionlens .react-flow__minimap {
+  background: var(--ml-bg2) !important;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.missionlens .react-flow__attribution {
+  display: none;
+}
+
+/* Concept A step hierarchy — shared by both renderers (see `StepRow.tsx`'s
+   own doc). */
+.missionlens .steprow {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0 5px 32px;
+  font: 11px/1.3 "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+.missionlens .steprow::before {
+  content: "";
+  position: absolute;
+  left: 9px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--accent-dim);
+  opacity: 0.5;
+}
+.missionlens .steprow:first-child::before {
+  top: 50%;
+}
+.missionlens .steprow:last-child::before {
+  bottom: 50%;
+}
+.missionlens .steprow::after {
+  content: "";
+  position: absolute;
+  left: 9px;
+  top: 50%;
+  width: 8px;
+  height: 1px;
+  background: var(--accent-dim);
+  opacity: 0.5;
+}
+.missionlens .steprow .sring {
+  position: absolute;
+  left: 17px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1.5px solid var(--dim);
+  background: var(--ml-bg2);
+  box-sizing: border-box;
+}
+.missionlens .steprow.s-running .sring {
+  border-color: var(--ml-run);
+  animation: ml-pulse 1.1s ease-in-out infinite;
+}
+.missionlens .steprow.s-complete .sring {
+  border-color: var(--good);
+}
+.missionlens .steprow.s-error .sring {
+  border-color: var(--bad);
+}
+.missionlens .steprow.s-abandoned .sring {
+  border-color: var(--dim);
+  opacity: 0.55;
+}
+.missionlens .steprow .slead {
+  flex: 0 0 auto;
+  font: 600 9px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--dim);
+  min-width: 58px;
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.missionlens .steprow .sname {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.missionlens .steprow.s-running .sname {
+  color: var(--ml-run);
+}
+.missionlens .steprow.s-error .sname {
+  color: var(--bad);
+}
+.missionlens .steprow .smodel {
+  flex: 0 1 auto;
+  min-width: 0;
+  font: 9px/1 "JetBrains Mono", monospace;
+  color: var(--accent-dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 140px;
+}
+.missionlens .mnode .steprow .smodel {
+  max-width: 86px;
+}
+.missionlens .mn-step-meter {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  gap: 6px;
+  font: 10px/1 "JetBrains Mono", monospace;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.missionlens .mn-step-meter .tok {
+  color: var(--accent);
+}
+.missionlens .mn-step-meter .tok.cloud {
+  color: var(--warn);
+}
+.missionlens .mn-step-meter .idle {
+  opacity: 0.45;
+}
+.missionlens .mn-step-meter .gen {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ml-run);
+  font-weight: 700;
+}
+.missionlens .mn-step-meter .genpulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ml-run);
+  animation: ml-pulse 1.1s ease-in-out infinite;
+}
+.missionlens .mnode .steprow {
+  padding-left: 30px;
+}
+.missionlens .mnode .steprow::before,
+.missionlens .mnode .steprow::after {
+  left: 8px;
+}
+.missionlens .mnode .steprow .sring {
+  left: 15px;
+}
+.missionlens .mnode .steprow .slead {
+  min-width: 50px;
+}
+
+/* Mobile vertical-timeline renderer (#1404 lineage). */
+.missionlens .timeline {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px 12px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.missionlens .tlphase {
+  border: 1px solid var(--accent-dim);
+  border-radius: 8px;
+  background: var(--ml-bg2);
+  overflow: hidden;
+}
+.missionlens .tlphase .tlph-hd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.missionlens .tlphase .tlph-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border);
+}
+.missionlens .tlphase.s-running .tlph-dot {
+  background: var(--ml-run);
+  animation: ml-pulse 1.1s ease-in-out infinite;
+}
+.missionlens .tlphase.s-complete .tlph-dot {
+  background: var(--good);
+}
+.missionlens .tlphase.s-error .tlph-dot {
+  background: var(--bad);
+}
+.missionlens .tlphase.s-abandoned {
+  opacity: 0.6;
+}
+.missionlens .tlphase .tlph-hd .tlph-name {
+  font: 600 13px/1.3 "JetBrains Mono", monospace;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.missionlens .tlphase .tlph-hd .tlph-tag {
+  margin-left: auto;
+  font: 10px/1 "JetBrains Mono", monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+}
+.missionlens .tltasks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+}
+.missionlens .tltask {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--ml-panel);
+  overflow: hidden;
+}
+.missionlens .tltask .tlt-hd {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto auto;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 11px;
+  cursor: pointer;
+  min-height: 44px;
+}
+.missionlens .tltask .tlt-hd .tlt-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--border);
+}
+.missionlens .tltask.s-running {
+  border-color: var(--ml-run);
+}
+.missionlens .tltask.s-running .tlt-dot {
+  background: var(--ml-run);
+  animation: ml-pulse 1.1s ease-in-out infinite;
+}
+.missionlens .tltask.s-running .tlt-name {
+  color: var(--ml-run);
+}
+.missionlens .tltask.s-complete {
+  border-color: var(--good);
+}
+.missionlens .tltask.s-complete .tlt-dot {
+  background: var(--good);
+}
+.missionlens .tltask.s-error {
+  border-color: var(--bad);
+}
+.missionlens .tltask.s-abandoned {
+  opacity: 0.6;
+}
+.missionlens .tltask .tlt-name {
+  font: 600 12px/1.3 "JetBrains Mono", monospace;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.missionlens .tltask .tlt-count {
+  font: 10px/1 "JetBrains Mono", monospace;
+  color: var(--dim);
+  white-space: nowrap;
+}
+.missionlens .tltask .tlt-hd .tlt-meter-cell {
+  display: inline-flex;
+  min-width: 0;
+}
+.missionlens .tltask .tlt-hd .tlt-meter-cell .mn-step-meter {
+  margin-left: 0;
+}
+.missionlens .tltask .tlt-chev {
+  flex: 0 0 auto;
+  color: var(--dim);
+  font-size: 11px;
+  transition: transform 0.15s;
+}
+.missionlens .tltask.open .tlt-chev {
+  transform: rotate(90deg);
+}
+.missionlens .tltask .tlt-waits {
+  padding: 0 11px 8px;
+  font: 10px/1.3 "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+.missionlens .tltask .tlt-steps {
+  border-top: 1px solid var(--border);
+  padding: 8px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.missionlens .tltask .tlt-empty {
+  padding: 5px 2px;
+  font: 11px/1.3 "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+.missionlens .tlnote {
+  padding: 14px;
+  color: var(--dim);
+  font: 12px/1.4 sans-serif;
+  background: var(--ml-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .missionlens *,
+  .missionlens *::before,
+  .missionlens *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+@media (max-width: 700px) {
+  .missionlens .top {
+    padding: 7px 10px;
+  }
+  .missionlens .legend {
+    display: none;
+  }
+  /* (#1868) `.legend`'s tap-to-open stand-in — only shown below this
+     breakpoint, mirroring mission-graph.html's own rule exactly. */
+  .missionlens .legbtn {
+    display: inline-flex;
+  }
+  .missionlens .body {
+    flex-direction: column;
+  }
+}

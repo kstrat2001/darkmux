@@ -101,13 +101,15 @@ export type Route =
    * `nq` leaves the existing default untouched rather than overwriting it). */
   | { kind: "console"; panelId: PanelId | "" }
   | { kind: "session"; sessionId: string }
-  /** `#mission=<id>` is a FULL NAVIGATION in the legacy viewer
-   * (`location.href = "/mission/<id>/graph"`) — a separate asset with its own
-   * vendored React Flow bundle. Out of scope for this packet (see
-   * `tests/parity/README.md`'s lens inventory); the router recognizes the
-   * hash shape and reports it distinctly from `unknown` so a lens packet can
-   * wire the redirect without re-deriving the grammar. */
-  | { kind: "mission-redirect"; missionId: string }
+  /** `#mission=<id>` — the mission-graph lens (#1868). A FULL NAVIGATION in
+   * the LEGACY viewer (`location.href = "/mission/<id>/graph"`, a separate
+   * document with its own vendored React Flow bundle); this port instead
+   * renders `MissionGraphLens` IN-PLACE — no navigation, the hash IS the
+   * route. Renamed from `mission-redirect` (#1868 — the earlier packets'
+   * placeholder name, back when this route only recognized the shape and
+   * deferred rendering to the standalone page) now that it renders for
+   * real. */
+  | { kind: "mission"; missionId: string }
   /** A bare `#<date>` hash (or `?date=<date>`, its query-string form) —
    * `viewer.html`'s `targetDate()` fallback. Distinct from `fleet`: legacy's
    * `boot()` computes `live = date===todayUTC()`, which is false for any
@@ -130,16 +132,26 @@ export type Route =
   | { kind: "playback"; date: string | null }
   | { kind: "unknown"; hash: string };
 
-/** (Packet 5) Should the live tail (`hooks/useLiveTail.ts` — SSE + reconcile
- * backstop) be running for this route? Mirrors legacy's `wantsPlayback`
- * (viewer.html:3853: `injectedMode==="play" || !!flowSrc || !!cq`, where
- * `cq` is a mission/session catalog query) — `playback`/`session`/
- * `mission-redirect` are all requests for a SPECIFIC historical slice, not
- * the rolling live window, so `boot()` never starts `startLiveTail` for any
- * of them. `fleet`/`runs`/`machine`/`console`/`unknown` are the live routes
- * — every one of them renders the SAME rolling `useFlowWindow` this app has
- * no separate playback data pipeline for yet (see `PlaybackLens`'s own
- * module doc). */
+/** (Packet 5) Should the App-level live tail (`hooks/useLiveTail.ts` — SSE +
+ * reconcile backstop feeding the FLEET-wide rolling window) be running for
+ * this route? Mirrors legacy's `wantsPlayback` (viewer.html:3853:
+ * `injectedMode==="play" || !!flowSrc || !!cq`, where `cq` is a mission/
+ * session catalog query) — `playback`/`session`/`mission` are all requests
+ * for a SPECIFIC slice, not the rolling live window, so `boot()` never
+ * started `startLiveTail` for any of them. `fleet`/`runs`/`machine`/
+ * `console`/`unknown` are the live routes — every one of them renders the
+ * SAME rolling `useFlowWindow` this app has no separate playback data
+ * pipeline for yet (see `PlaybackLens`'s own module doc).
+ *
+ * `mission` stays excluded even though `MissionGraphLens` (#1868) genuinely
+ * IS live (it runs its own SSE subscription): the App-level tail this flag
+ * gates is scoped to the FLEET-WIDE two-day window `useFlowWindow` builds,
+ * which the mission lens doesn't need — it mounts its OWN
+ * `useLiveTail(true)` call, the same shared primitive, independently (see
+ * `MissionGraphLens.tsx`'s own doc). Two mounts of the SAME hook against the
+ * SAME `queryKeys.flowTail(date)` slot would be redundant, not wrong, but
+ * this app never does both at once: the App-level copy is gated off here
+ * specifically so only the lens's own copy runs while this route is active. */
 export function isLiveRoute(route: Route): boolean {
   // (#1801) A daemon-less build is NEVER live, on any lens. Legacy's gate is
   // GLOBAL — `wantsPlayback = injectedMode==="play" || !!flowSrc || !!cq`
@@ -155,7 +167,7 @@ export function isLiveRoute(route: Route): boolean {
   // — a page asserting there is something to reconnect TO, on a marketing
   // site with no daemon anywhere near it.
   if (isStaticBuild()) return false;
-  return route.kind !== "playback" && route.kind !== "session" && route.kind !== "mission-redirect";
+  return route.kind !== "playback" && route.kind !== "session" && route.kind !== "mission";
 }
 
 /** Should the event-log column (`components/EventLogColumn.tsx` — the
@@ -183,14 +195,20 @@ export function isLiveRoute(route: Route): boolean {
  * sets `runs-mode`/`machine-mode` for), and shown everywhere else — `fleet`,
  * a session drill-in (`state.level==="subsystem"`), a bare-date playback
  * (stays at the `fleet` level, per `targetDate()`'s boot path never
- * reassigning `state.level`), and the daemon-less static mission summary
- * (`state.level==="mission"`, reached here as `mission-redirect` — moot in
- * practice since a real daemon always navigates away before render, but
- * named for completeness). `unknown` has no legacy analog; defaults to
+ * reassigning `state.level`). `unknown` has no legacy analog; defaults to
  * shown (the fleet-like default) rather than inventing a hide rule with no
- * source to verify it against. */
+ * source to verify it against.
+ *
+ * `mission` (#1868) is a NEW exclusion this packet adds, with no legacy
+ * analog to verify against (legacy's `#mission=<id>` was always a full
+ * navigation away, past render — see `route.ts`'s own `mission` doc). Once
+ * `MissionGraphLens` renders in-place, it owns its OWN events pane (fed by
+ * `EventLogColumn` — same component, second call site — mission-scoped
+ * records rather than the fleet window), so the App-level column must not
+ * ALSO render alongside it; that would be two event logs on one page,
+ * disagreeing about scope. */
 export function showsEventLog(route: Route): boolean {
-  return route.kind !== "runs" && route.kind !== "console" && route.kind !== "machine";
+  return route.kind !== "runs" && route.kind !== "console" && route.kind !== "machine" && route.kind !== "mission";
 }
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -234,7 +252,7 @@ export function parseRoute(): Route {
 
   const mission = get("mission");
   if (mission) {
-    return { kind: "mission-redirect", missionId: mission };
+    return { kind: "mission", missionId: mission };
   }
 
   const session = get("session");

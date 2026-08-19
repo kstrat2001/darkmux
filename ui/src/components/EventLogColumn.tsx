@@ -47,11 +47,21 @@ function onActivateKeyDown(onActivate: () => void) {
  * The event-log column (`.log`, viewer.html:829-849) — the per-record
  * stream, its search box + the full checkbox-per-facet filters modal, the
  * follow-latest toggle, the drag-to-resize `.split` handle, and the
- * `#detail` selected-event panel. Rendered by `App.tsx` only when
- * `lib/route.ts`'s `showsEventLog(route)` is true (fleet / a session
- * drill-in / a bare-date playback / the mission-redirect fallback — see
- * that function's own doc for the verified visibility rule, which corrects
- * a wrong packet-brief claim about `console`).
+ * `#detail` selected-event panel. Mounted by `App.tsx` for every route
+ * EXCEPT `mission` (fleet / a session drill-in / a bare-date playback — see
+ * `lib/route.ts`'s `showsEventLog` doc for the verified visibility rule,
+ * which corrects a wrong packet-brief claim about `console`), toggled via
+ * its `visible` prop rather than conditionally unmounted (see that prop's
+ * own doc below).
+ *
+ * **Second call site (#1868):** `MissionGraphLens.tsx` mounts its OWN
+ * instance of this SAME component for the `mission` route — the route
+ * `showsEventLog` excludes precisely because the lens owns its own events
+ * pane rather than sharing the App-level one (two mounted instances would
+ * be two event logs disagreeing about scope; see that component's own
+ * doc). `scopeLabel`/`records` are what make one component serve two call
+ * sites: the App-level mount feeds it whatever `useRouteRecords` says the
+ * ROUTE means, the mission lens feeds it its own mission-scoped fold.
  *
  * **`records` is whatever `useRouteRecords` says this ROUTE means** — the
  * rolling live 2-day window on live routes, and the FETCHED SLICE on
@@ -115,6 +125,7 @@ export function EventLogColumn({
   loading = false,
   error = null,
   historical = false,
+  serverTruncated = false,
 }: {
   records: FlowRecord[];
   visible: boolean;
@@ -130,6 +141,17 @@ export function EventLogColumn({
   /** Not shown — written into a hidden span purely so this port's parity
    *  extraction matches legacy's. See App's `routeChrome` note. */
   scopeLabel: string;
+  /** (#1868) True when `records` is itself a slice of a SERVER-capped
+   *  response (`/flow-mission/:id`'s own `truncated` flag, capped at
+   *  `MAX_CATALOG_RECORDS`) — a cap this component's own `LOG_CAP`
+   *  disclosure can't see, because the server already dropped the rest
+   *  before `records` ever arrives here. `mission-graph.html`'s own
+   *  `eventsPanelEls` appends the same "+" to its total for the same
+   *  reason: "50 of 10000" would otherwise restate the server cap as the
+   *  mission's whole history. Rendered only where this component ALREADY
+   *  reports a real total (not the search-match count, which is a
+   *  different metric). */
+  serverTruncated?: boolean;
 }) {
   // The full facet-filter model (activity/category/tier/telemetry-source +
   // free-text search) — `FiltersDialog` renders the checkbox grid for it,
@@ -252,9 +274,14 @@ export function EventLogColumn({
     // The CAP itself is legacy's (`all.slice(-50)`, viewer.html:2443) — what
     // this port adds is SAYING so. Legacy hides 684 records in silence; the
     // label is the honest half and worth keeping.
+    //
+    // `serverTruncated` appends "+" to that total exactly where legacy's own
+    // `eventsPanelEls` does — the total this component reports is itself a
+    // slice of a server-capped response, so "of 734" would understate the
+    // real count without it.
     : capped
-      ? `${LOG_CAP} of ${filtered.length} events`
-      : `${filtered.length} events`;
+      ? `${LOG_CAP} of ${filtered.length}${serverTruncated ? "+" : ""} events`
+      : `${filtered.length}${serverTruncated ? "+" : ""} events`;
 
   return (
     <div className={`eventlog${visible ? "" : " eventlog--hidden"}`} ref={columnRef}>
@@ -369,6 +396,16 @@ export function EventLogColumn({
                   data-act="rec"
                   role="button"
                   tabIndex={0}
+                  // (#1868) The row's own `handle` — hover provenance, same
+                  // convention `.smodel`/`.mn-label` elsewhere in this app
+                  // use for a value that's meaningful but too long/noisy for
+                  // the row's always-visible text. Doubles as the mission
+                  // lens's own parity-extraction hook
+                  // (`tests/parity/lib/extract-graph.js`'s port-side events
+                  // extractor reads it) — a real, minimal, independently
+                  // justified addition to this shared component, not a
+                  // fork of it.
+                  title={r.handle || undefined}
                   onClick={() => selectRecord(r)}
                   onKeyDown={onActivateKeyDown(() => selectRecord(r))}
                 >

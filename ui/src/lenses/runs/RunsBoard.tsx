@@ -72,14 +72,19 @@ import {
  *   param) seeds `labRunDir` on mount/deep-link, so pasting a `run=` URL
  *   lands here directly — same `initialKind` echo-guard pattern below,
  *   widened to cover both.
- * - a tracked (mission/dispatch) row opens `/mission/<id>/graph`
- *   (`data-act="gomission"`, `ACTIONS.gomission→goMissionGraph(id)`) — a
- *   REAL cross-document navigation (`location.href=`), exactly matching
- *   legacy, when `missionGraphReachable()` (`lib/injectedMeta.ts`) says a
- *   daemon is actually behind this page. The daemon-less fallback
- *   (`renderMissionStatic()`'s static summary) is genuinely out of scope —
- *   see `MISSION_GRAPH_UNREACHABLE_NOTICE`'s own doc for why a named notice
- *   stands in for it instead.
+ * - a tracked (mission/dispatch) row opens the mission-graph lens
+ *   (`data-act="gomission"` in legacy, `ACTIONS.gomission→
+ *   goMissionGraph(id)`, a REAL cross-DOCUMENT navigation there) — this port
+ *   instead sets `location.hash = "mission=<id>"` (#1868), an IN-APP hop to
+ *   `MissionGraphLens`, when `missionGraphReachable()` (`lib/injectedMeta.ts`)
+ *   says a daemon is actually behind this page. The gate itself is
+ *   unchanged from before #1868: the lens still needs a real
+ *   `/mission/:id/graph.json` endpoint to fetch from, which a daemon-less
+ *   static build doesn't have — only the DESTINATION changed, from a
+ *   cross-document `location.href` to an in-app hash. The daemon-less
+ *   fallback (`renderMissionStatic()`'s static summary) is genuinely out of
+ *   scope — see `MISSION_GRAPH_UNREACHABLE_NOTICE`'s own doc for why a
+ *   named notice stands in for it instead.
  * - an untracked ghost row has nothing to open (unchanged: `interactive`
  *   stays false, no click affordance at all).
  *
@@ -105,9 +110,17 @@ import {
  * `MissionReplay.tsx`/`PlaybackLens.tsx` already made for their own
  * daemon-less edges). A named, honest notice stands in instead, per the
  * operator-authored posture: a stuck feature gets a visible placeholder,
- * not a silent no-op. */
+ * not a silent no-op.
+ *
+ * The notice used to point at "the classic viewer at /" — `viewer.html` was
+ * deleted in #1865 and `/` now serves THIS SAME app, so a daemon-less
+ * visitor was being told to go to the page they were already on. There is
+ * genuinely nowhere else to send them (a static build has no daemon to
+ * reach, full stop), so the fix names the missing capability instead of a
+ * bogus destination — matching `onLabRunUnresolvable`'s own
+ * `"run detail needs a running daemon — …"` phrasing below. */
 const MISSION_GRAPH_UNREACHABLE_NOTICE =
-  "mission graph needs a running daemon behind this page, which this one doesn't have — open it in the classic viewer at / instead";
+  "mission graph needs a running daemon behind this page — this static build has no mission graph data to show.";
 
 export function RunsBoard({
   initialKind,
@@ -229,7 +242,11 @@ export function RunsBoard({
     }
     if (!run.tracked) return; // an untracked ghost has nothing to open
     if (missionGraphReachable()) {
-      location.href = `/mission/${encodeURIComponent(run.id)}/graph`;
+      // (#1868) In-app navigation to `MissionGraphLens`, not a cross-document
+      // `location.href` — a real `hashchange` (not `history.replaceState`)
+      // so this is a normal, back-button-friendly navigation, matching how
+      // an operator reaches every other in-app destination.
+      location.hash = `mission=${encodeURIComponent(run.id)}`;
       return;
     }
     setRowClickNotice(MISSION_GRAPH_UNREACHABLE_NOTICE);

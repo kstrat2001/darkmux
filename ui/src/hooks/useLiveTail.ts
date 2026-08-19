@@ -31,10 +31,16 @@ import type { FlowRecord } from "../types/handwritten";
  * INVALIDATE it on rollover; it doesn't own that cache's content, only the
  * tail's.
  *
- * Not gated by `enabled` internally — the caller (`App.tsx`) passes
- * `isLiveRoute(route)` so the tail only runs on a genuinely live route (see
- * `lib/route.ts`'s own doc for why `playback`/`session`/`mission-redirect`
- * are excluded, mirroring legacy's `wantsPlayback` gate on `startLiveTail`).
+ * Not gated by `enabled` internally — the caller passes whether the tail
+ * should run. `App.tsx` passes `isLiveRoute(route)` for its OWN (fleet-wide)
+ * mount, so its copy only runs on a genuinely live route (see `lib/route.ts`'s
+ * own doc for why `playback`/`session`/`mission` are excluded there,
+ * mirroring legacy's `wantsPlayback` gate on `startLiveTail`).
+ * `MissionGraphLens.tsx` (#1868) is a SECOND caller — it mounts its own copy
+ * of this exact hook, unconditionally enabled while it's mounted, precisely
+ * because the App-level copy is gated OFF for its route; see that
+ * component's own doc for why one mounted copy at a time is what actually
+ * runs, never two.
  */
 export type LiveTailStatus = "live" | "reconnecting";
 

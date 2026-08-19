@@ -35,10 +35,15 @@ import type { Route } from "./route";
  *   effect just names it in the address bar.
  *
  * Scope: the params every ported lens drives (`lens`/`kind`/`panel`/
- * `session`/`uid`/`machine`) are written. `mission` (the mission-graph
- * full-navigation) stays out of scope for this write-back path: legacy does
- * a full navigation away when it fires, so there's nothing left to write
- * back to.
+ * `session`/`uid`/`machine`) are written. `mission` (#1868 — the
+ * mission-graph lens) stays out of scope for this write-back path too, for
+ * a DIFFERENT reason than before this packet: `#mission=<id>` used to be a
+ * full navigation away (nothing to write back to); now it renders in-place,
+ * but the hash the operator/a caller navigates to (`location.hash =
+ * "mission=<id>"`, set directly by `RunsBoard`/`CatalogPanel`) IS already
+ * the canonical form — there is no derived/compressible state on top of it
+ * the way `runs`' kind/run/machine params fold together, so there is
+ * nothing for this function to add.
  *
  * `run` (the lab-run-detail deep link, drill-in packet): now WRITTEN, once
  * `LabRunDetail` (`lenses/runs/LabRunDetail.tsx`) gave `run` a real
@@ -52,12 +57,11 @@ import type { Route } from "./route";
  * of a since-closed gap.
  *
 
- * `mission-redirect` and `unknown` routes are likewise never
- * canonicalized: legacy does a full navigation away for the former
- * (nothing left to write back to), and rewriting an `unknown` hash would
- * silently "fix" what should stay a visible, debuggable broken bookmark
- * (`LensPlaceholder` names the raw hash for exactly this reason — see
- * that component's doc).
+ * `mission` and `unknown` routes are likewise never canonicalized: see the
+ * module doc above for why `mission` has nothing to add, and rewriting an
+ * `unknown` hash would silently "fix" what should stay a visible,
+ * debuggable broken bookmark (`LensPlaceholder` names the raw hash for
+ * exactly this reason — see that component's doc).
  */
 export function canonicalHash(route: Route): string | null {
   switch (route.kind) {
@@ -112,7 +116,7 @@ export function canonicalHash(route: Route): string | null {
       p.set("session", route.sessionId);
       return p.toString();
     }
-    case "mission-redirect":
+    case "mission":
     case "unknown":
       return null;
     case "playback":

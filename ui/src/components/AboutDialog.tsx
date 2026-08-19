@@ -78,13 +78,17 @@ function connectionText(route: Route, liveStatus: LiveTailStatus): string {
   if (isLiveRoute(route)) return liveStatus === "live" ? "live · connected" : "live · reconnecting";
   if (route.kind === "playback") return `flow · ${route.date ?? ""}`;
   if (route.kind === "session") return `flow · session ${route.sessionId}`;
-  if (route.kind === "mission-redirect") return `flow · mission ${route.missionId}`;
+  // (#1868) `mission` keeps this dialog's SAME pre-#1868 wording — see
+  // `Masthead.tsx`'s `srcbadgeText` doc for why this outer chrome
+  // deliberately doesn't try to reflect `MissionGraphLens`'s own real
+  // live/reconnecting status.
+  if (route.kind === "mission") return `flow · mission ${route.missionId}`;
   return "no records yet";
 }
 
 function modeText(route: Route): string {
   if (isLiveRoute(route)) return "live";
   if (route.kind === "playback") return `playback · ${route.date ?? ""}`;
-  if (route.kind === "session" || route.kind === "mission-redirect") return "replay";
+  if (route.kind === "session" || route.kind === "mission") return "replay";
   return "";
 }

@@ -11,13 +11,31 @@
 // reused verbatim from `extract-lens.js` (imported below) since those three
 // have nothing lens-specific about them.
 //
-// `mission-graph-goldens.spec.ts` (packet 1, THIS packet) imports these to
-// capture `goldens/mission-graph-canvas.txt` / `goldens/mission-graph-
-// timeline.txt` from the live standalone page. The future graph-lens PR
-// (#1868's later packet, porting this page into `ui/src`) is meant to
-// import the SAME functions to grade the port against these same goldens;
-// that reuse is the whole point of a dedicated module rather than inlining
-// the extraction in the spec file.
+// `mission-graph-goldens.spec.ts` (packet 1) captured `goldens/mission-
+// graph-canvas.txt` / `goldens/mission-graph-timeline.txt` from the live
+// standalone page using the extractors above this comment.
+//
+// `next-parity-graph.spec.ts` (packet 2, THIS addition — #1868) grades the
+// PORT (`MissionGraphLens`, `#mission=<id>`) against those SAME goldens,
+// reusing `extractPhaseGroupsText`/`extractMissionNodesText`/
+// `extractEdgeCount`/`extractTimelineNodesText`/`extractCanvasGolden`/
+// `extractTimelineGolden` VERBATIM — the port keeps `.phasegroup`/`.mnode`/
+// `.steprow`/`.tlphase`/`.tltask`/`.tlt-step` byte-identical to the
+// standalone page on purpose (see `MissionCanvas.tsx`/
+// `MissionTimelineView.tsx`'s own doc), so those sections grade
+// byte-for-byte with ZERO new extraction code.
+//
+// The header and events sections do NOT reuse `extractHeaderText`/
+// `extractEventRowsText` — the port has its own chrome (a real app-shell
+// masthead sits above the lens) and its events pane is `EventLogColumn`
+// (`.eventlog__rec` rows), not the standalone page's `.evrow` markup. Two
+// NEW port-side extractors below normalize each to the SAME shape the
+// standalone extractors already produce (mission id + status for the
+// header; `time | action | subject` triples for events), so the SPEC can
+// still assert real equality against the golden's corresponding section —
+// just via a normalizing comparator instead of a raw string diff. See each
+// function's own doc for the one field EventLogColumn's row doesn't render
+// natively (`handle`) and how it's recovered.
 
 const { normalize } = require("./extract-lens.js");
 
@@ -218,6 +236,122 @@ async function extractTimelineGolden(page) {
   return normalize(text);
 }
 
+// ─── Port-side extractors (#1868 packet 2) ─────────────────────────────────
+// `MissionGraphLens` (`ui/src/lenses/mission/`), not the standalone page.
+// See this module's own doc above for why these are separate functions
+// rather than reusing `extractHeaderText`/`extractEventRowsText`.
+
+/** The port's own header — mission id (`.midname`) + status (`.mstatus`),
+ * normalized to the SAME two facts `sectionOf(golden, "header")` is graded
+ * against via `headerFactsOf` below. Deliberately does NOT try to match the
+ * standalone page's `.top` bar byte-for-byte (refresh/view/minimap/events/
+ * legend button labels, the live pill) — that's real, DIFFERENT chrome (a
+ * real app-shell masthead sits above this lens too), not a parity target. */
+async function extractPortHeaderText(page) {
+  const missionId = (await page.locator(".missionlens .midname").textContent().catch(() => "")) || "";
+  const status = (await page.locator(".missionlens .mstatus").textContent().catch(() => "")) || "";
+  return normalize(`${missionId.trim()} | ${status.trim()}`);
+}
+
+/** Pull "mission id | status" out of a captured standalone-page golden's
+ * own `=== header ===` section, so `extractPortHeaderText`'s output can be
+ * graded against a REAL fact from the golden rather than a value hand-typed
+ * into the spec. The standalone header's line 3 is always the raw mission
+ * id (`g.mission_id`, unstyled — no text-transform rule touches it) and
+ * line 4 is the uppercase status badge (`.mstatus`, `text-transform:
+ * uppercase`) — see `mission-graph.html`'s own header JSX order (nav,
+ * brand, midname, mstatus, ...). Lowercases the status back, since the
+ * port's OWN `.mstatus` carries no such CSS rule (this app's status text is
+ * lowercase everywhere else too — see `App.tsx`'s `routeChrome` doc on the
+ * same "uppercase the STRING directly, never lean on CSS" discipline). */
+function headerFactsOf(fullGoldenText) {
+  const section = sectionOf(fullGoldenText, "header");
+  const lines = section
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  // lines[0] is the "=== header ===" marker itself (`sectionOf` returns the
+  // marker line PREPENDED to the body); lines[1] the "‹ VIEWER" back link;
+  // lines[2] the brand ("darkmux · mission" on canvas, bare "darkmux" on
+  // the timeline's narrower header — the `.sub` text hides below 700px, see
+  // mission-graph.html's own CSS); the mission id is the first line after
+  // that, in both viewports.
+  const missionId = lines[3];
+  const status = lines[4];
+  return normalize(`${missionId} | ${status.toLowerCase()}`);
+}
+
+/** `EventLogColumn`'s own rows (`.eventlog__rec`), normalized to the SAME
+ * `time | action | subject` triple shape `extractEventRowsText` produces
+ * from the standalone page's `.evrow`s. Two real differences from that
+ * page's markup, both accounted for rather than silently glossed over:
+ *
+ * 1. `activityOf()` (`lib/eventFilters.ts`) is a richer label mapping than
+ *    the standalone page's raw `rec.action` display — but for every action
+ *    this fixture's records carry ("mission start"/"phase start"/
+ *    "phase complete"/"mission close"), `activityOf` has no explicit branch
+ *    and falls through to `a || "other"`, i.e. the RAW action string
+ *    verbatim. So the two sides agree for this fixture's action vocabulary
+ *    without any translation layer — a real property of the shared code,
+ *    not a coincidence papered over by normalization.
+ * 2. `EventLogColumn`'s row never renders `handle` as visible text (unlike
+ *    the standalone page's `.evh`) — this app's shared event log wasn't
+ *    designed around a "subject" concept. #1868 added a minimal, real
+ *    `title` attribute carrying the record's `handle` to `.eventlog__rec`
+ *    (see that component's own doc for why this is a genuine addition, not
+ *    test scaffolding: hover provenance, same convention `.smodel`/
+ *    `.mn-label` already use elsewhere in this app) — read via
+ *    `getAttribute("title")` here, which is how the "subject" field
+ *    survives into this extractor at all.
+ *
+ * Scoped to `.missionlens .eventlog__rec`, NOT a bare `.eventlog__rec` —
+ * `EventLogColumn` is ALWAYS mounted at the App level too (never
+ * conditionally unmounted, only CSS-hidden via its `visible` prop — see
+ * that component's own doc), so on `#mission=<id>` there are genuinely TWO
+ * `EventLogColumn` instances in the DOM at once: the App-level one
+ * (`visible={showsEventLog(route)===false}` here, CSS-hidden but still
+ * rendering the FLEET-WIDE window's rows) and this lens's own (visible,
+ * mission-scoped). A bare selector caught both — measured live: 8 real rows
+ * plus 50 (`LOG_CAP`) unrelated fleet-window rows from the hidden instance,
+ * a real find while building this extractor, not a hypothetical. */
+async function extractPortEventsText(page) {
+  return page.$$eval(".missionlens .eventlog__rec", (els) =>
+    els.map((el) => {
+      const timeEl = el.querySelector(".eventlog__rectime");
+      const actEl = el.querySelector(".eventlog__ractivity");
+      const time = timeEl ? timeEl.textContent.trim() : "";
+      const action = actEl ? actEl.textContent.trim() : "";
+      const subject = el.getAttribute("title") || "";
+      return `${time} | ${action} | ${subject}`;
+    }),
+  );
+}
+
+/** Slice one `=== name ===` section out of a full golden file, stopping at
+ * the NEXT `=== ` marker (unlike `extract-next-lens.js`'s `stageSectionOf`/
+ * `catalogSectionOf`, which slice to end-of-string because `#stage` is
+ * always their golden's LAST section) — every mission-graph golden has
+ * multiple sections after `header`, so this harness needs the narrower cut. */
+function sectionOf(fullGoldenText, name) {
+  const marker = `=== ${name} ===\n`;
+  const start = fullGoldenText.indexOf(marker);
+  if (start === -1) throw new Error(`sectionOf: no "${marker.trim()}" marker found in golden text`);
+  const contentStart = start + marker.length;
+  const nextMarker = fullGoldenText.indexOf("\n=== ", contentStart);
+  const body = nextMarker === -1 ? fullGoldenText.slice(contentStart) : fullGoldenText.slice(contentStart, nextMarker + 1);
+  return `${marker}${body}`;
+}
+
+/** The golden's own `=== events ===` section, trimmed to just its row
+ * lines — already in the EXACT `time | action | subject` shape
+ * `extractPortEventsText` produces (see that function's own doc), so this
+ * is a real byte-equality target, not a second normalization pass. */
+function eventsBodyOf(fullGoldenText) {
+  const section = sectionOf(fullGoldenText, "events");
+  const body = section.slice(section.indexOf("\n") + 1).trim();
+  return body === "(none)" ? "" : body;
+}
+
 module.exports = {
   extractHeaderText,
   extractPhaseGroupsText,
@@ -228,4 +362,9 @@ module.exports = {
   expandAllTimelineTasks,
   extractCanvasGolden,
   extractTimelineGolden,
+  extractPortHeaderText,
+  headerFactsOf,
+  extractPortEventsText,
+  sectionOf,
+  eventsBodyOf,
 };

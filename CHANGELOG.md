@@ -42,6 +42,20 @@ darkmux release.
   future port into the React viewer (#1868) has a spec to grade against
   before any of its own code changes. Dev/test infrastructure only; no
   runtime behavior changes. (#1868)
+- **The mission graph is now a real lens in the React viewer** — `#mission=<id>`
+  renders `MissionGraphLens` in-place (a React Flow canvas on desktop, a
+  vertical timeline on phones), replacing the old redirect that navigated
+  away to the standalone `/mission/:id/graph` page. Same node/edge/step
+  vocabulary, the same live status/token/turn metrics fold, the same
+  peer-machine-naming honesty on a 404 — now inside the same app shell as
+  every other lens, with its events pane sharing `EventLogColumn` (the
+  component every other lens's event log already uses) instead of a
+  second, separate implementation. `reactflow` is now a real `ui/`
+  dependency (bundled by Vite), matching the pinned version the standalone
+  page's vendored bundle already used. The standalone page itself, its
+  vendored bundle, and the daemon's `/mission/:id/graph` route are
+  unchanged in this release — they retire in a follow-up once the port has
+  had a release cycle to prove itself. (#1868)
 
 ### Fixed
 

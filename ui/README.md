@@ -40,6 +40,15 @@ not a file present anywhere in the current tree.
   `serde_json::json!({...})` (no typed Rust struct to derive from) are typed
   by hand in `src/types/handwritten.ts`, which names its Rust source per
   field group — see that file's own doc for which endpoints and why.
+- **reactflow** (#1868) — the mission-graph lens's (`#mission=<id>`,
+  `src/lenses/mission/`) canvas renderer. Pinned to 11.11.4, matching the
+  version the standalone `mission-graph.html` page's own vendored bundle
+  used (`crates/darkmux-serve/assets/vendor/README.md`) — a real dependency
+  of this workspace now, bundled by Vite like everything else, rather than
+  a separately-vendored IIFE. Its MIT notice lives in
+  `vendor-licenses/LICENSE-reactflow` alongside react/react-dom/
+  @tanstack/react-query's, prepended to the built artifact the same way
+  (see that directory's own README).
 - **vitest + @testing-library/react** — unit/component tests.
 - **@playwright/test** (`ui/verify/`, NOT wired into `test`/`build`) — the
   one-shot LIVE render-proof harness against a throwaway daemon. Not a

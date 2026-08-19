@@ -17,37 +17,10 @@ function renderBoard(
   );
 }
 
-/**
- * jsdom throws "Not implemented: navigation" on a real `location.href`
- * assignment (same gotcha `MissionReplay.test.tsx` documents for the
- * identical mission-graph redirect) — stub JUST the `href` setter for the
- * duration of `fn`, scoped to the one test that needs it, then restore the
- * real jsdom `location` so every OTHER test keeps its real
- * `history.replaceState`/`location.hash` behavior (`writeHash` — the
- * kind-chip/lab-run-open/lab-run-close writes — depends on that still
- * working, so this is deliberately NOT a blanket `beforeEach` override).
- */
-async function withHrefStub<T>(fn: (hrefSets: string[]) => Promise<T>): Promise<T> {
-  const original = window.location;
-  const hrefSets: string[] = [];
-  Object.defineProperty(window, "location", {
-    configurable: true,
-    value: {
-      ...original,
-      set href(v: string) {
-        hrefSets.push(v);
-      },
-      get href() {
-        return "http://localhost/";
-      },
-    },
-  });
-  try {
-    return await fn(hrefSets);
-  } finally {
-    Object.defineProperty(window, "location", { configurable: true, value: original });
-  }
-}
+// The `location.href` cross-document-navigation stub this file used to need
+// for the mission-row test (`withHrefStub`) is gone (#1868) — that row now
+// navigates in-app via `location.hash`, which jsdom handles natively, same
+// as every other hash-driven test in this file.
 
 const RUNS = [
   { id: "m1", kind: "mission", status: "complete", tracked: true, updated_ts: 300, machine: "MacBook-Pro" },
@@ -165,26 +138,28 @@ describe("RunsBoard", () => {
     await waitFor(() => expect(screen.getByText(/no runs recorded yet/i)).toBeInTheDocument());
   });
 
-  it("clicking a tracked mission row navigates to /mission/<id>/graph when a real daemon is behind the page", async () => {
+  it("clicking a tracked mission row navigates in-app to #mission=<id> when a real daemon is behind the page (#1868)", async () => {
     mockFetch();
-    await withHrefStub(async (hrefSets) => {
-      // No <meta name="darkmux-mode"> is injected by this test harness, so
-      // `missionGraphReachable()` defaults false — inject it, matching what
-      // a REAL `darkmux serve`-served page does (see `Masthead.tsx`'s own
-      // `injectedMeta` doc).
-      const meta = document.createElement("meta");
-      meta.name = "darkmux-mode";
-      meta.content = "live";
-      document.head.appendChild(meta);
-      try {
-        renderBoard();
-        await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
-        fireEvent.click(screen.getByText("m1").closest(".labrunrow")!);
-        expect(hrefSets).toEqual(["/mission/m1/graph"]);
-      } finally {
-        meta.remove();
-      }
-    });
+    // No <meta name="darkmux-mode"> is injected by this test harness, so
+    // `missionGraphReachable()` defaults false — inject it, matching what a
+    // REAL `darkmux serve`-served page does (see `Masthead.tsx`'s own
+    // `injectedMeta` doc). Unlike the pre-#1868 version of this test, no
+    // `location.href` stub is needed: the destination is now a real
+    // in-app `location.hash` write (a `hashchange`-firing navigation, not a
+    // cross-document one), which jsdom handles natively.
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-mode";
+    meta.content = "live";
+    document.head.appendChild(meta);
+    try {
+      renderBoard();
+      await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+      fireEvent.click(screen.getByText("m1").closest(".labrunrow")!);
+      expect(window.location.hash).toBe("#mission=m1");
+    } finally {
+      meta.remove();
+      window.location.hash = "";
+    }
   });
 
   it("clicking a tracked mission row with NO daemon behind the page surfaces a visible, honest notice — not a silent no-op or a broken nav", async () => {
@@ -202,7 +177,7 @@ describe("RunsBoard", () => {
     const notice = screen.getByText(/needs a running daemon/i);
     expect(notice).toBeInTheDocument();
     expect(notice).toHaveAttribute("role", "status");
-    expect(notice.textContent).toMatch(/open it in the classic viewer at \//i);
+    expect(notice.textContent).toMatch(/this static build has no mission graph data to show/i);
   });
 
   it("the daemon-less notice also fires from a keyboard Enter activation", async () => {
