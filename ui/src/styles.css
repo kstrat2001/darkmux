@@ -1838,6 +1838,66 @@ body {
   color: var(--dim);
 }
 
+/* ── Playback transport (#1869) — `.scrub`: rewind + play/pause + the
+   scrub range + speed + clock, restored from the legacy viewer
+   (`git show v2.9.0:crates/darkmux-serve/assets/viewer.html`, CSS around
+   line 379). PLAYBACK-ONLY by construction: `Scrubber` only ever mounts
+   inside `PlaybackLens`, so unlike legacy (a global, always-in-the-DOM
+   `.scrub` gated by `body.live-mode .scrub{display:none}`) there is no
+   live-mode hiding rule to port — a live route never renders this markup
+   at all. No transition is added here, so there is nothing to gate under
+   `prefers-reduced-motion`. */
+.scrub {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 4px 0;
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.scrub button {
+  background: var(--bg);
+  border: 1px solid var(--accent-dim);
+  color: var(--fg);
+  padding: 7px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+  font: 600 12px "JetBrains Mono", monospace;
+}
+.scrub button:hover {
+  border-color: var(--accent);
+}
+.scrub button:focus-visible,
+.scrub input[type="range"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.scrub button.primary {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+.scrub input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+.scrub .clock {
+  flex: none;
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  white-space: nowrap;
+}
+@media (max-width: 560px) {
+  .scrub {
+    flex-wrap: wrap;
+  }
+  .scrub .clock {
+    flex: 1 1 100%;
+    text-align: right;
+  }
+}
+
 /* (#1729) Fleet-coverage marker on the default view — shown ONLY when the
    presence substrate could not be read (or is stale). An unconfigured fleet
    is not a degradation, so a standalone machine never sees this. */
