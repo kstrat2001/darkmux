@@ -1,0 +1,34 @@
+=== header ===
+‹ VIEWER
+darkmux
+sanity-review-shape-1784702742-76e0c1
+FINALIZED
+↻
+GRAPH
+EVENTS
+LEGEND
+
+=== timeline ===
+PHASE [s-complete] Investigate (complete)
+  TASK [s-complete open] bundle
+    STEP [s-complete] Shell
+  TASK [s-complete open] probe
+    STEP [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | · tok
+  TASK [s-complete open] dedup
+    STEP [s-complete] No-op
+PHASE [s-complete] Adjudicate (complete)
+  TASK [s-complete open] judge
+    STEP [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | · tok
+PHASE [s-complete] Report (complete)
+  TASK [s-complete open] synthesis
+    STEP [s-complete] No-op
+
+=== events ===
+06:45:49 | phase complete | sanity-review-shape-1784702742-76e0c1-investigate
+06:45:49 | phase complete | sanity-review-shape-1784702742-76e0c1-adjudicate
+06:45:49 | phase complete | sanity-review-shape-1784702742-76e0c1-report
+06:45:49 | mission close | sanity-review-shape-1784702742-76e0c1
+06:45:48 | phase start | sanity-review-shape-1784702742-76e0c1-adjudicate
+06:45:48 | phase start | sanity-review-shape-1784702742-76e0c1-report
+06:45:43 | phase start | sanity-review-shape-1784702742-76e0c1-investigate
+06:45:42 | mission start | sanity-review-shape-1784702742-76e0c1

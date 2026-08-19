@@ -23,6 +23,15 @@
 // so the #session=<id> drill-in lens has something real to replay. All three
 // additions are logged in the transcript below exactly like the named set.
 //
+// (#1868 packet 1) TWO more, for the standalone mission-graph parity fixture
+// (`mission-graph-goldens.spec.ts`, captured BEFORE the graph lens gets
+// folded into the React port): /mission/<GRAPH_FIXTURE_MISSION_ID>/graph.json
+// (the node/edge snapshot the page's canvas + timeline renderers both read)
+// and /flow-mission/<GRAPH_FIXTURE_MISSION_ID> (the mission-scoped event
+// backfill the page's events panel reads). The fixture id lives once in
+// `lib/graph-fixture.js`, imported here and by `lib/mock-routes.js` +
+// the spec, so it can't drift between the three.
+//
 // SANITIZATION IS MANDATORY AND UNCONDITIONAL: every response body is run
 // through lib/sanitize.mjs's field-policy sanitizer BEFORE it touches disk,
 // and the tripwire re-scans everything written before this script reports
@@ -35,10 +44,28 @@
 // front, so a daemon hiccup or a sanitize failure partway through a re-record
 // left the committed corpus destroyed instead of merely stale. Now a failed
 // run leaves the existing corpus/ untouched and reports what failed.
+//
+// A FULL re-record is NOT harmless (QA finding, #1868 packet 1 review): the
+// next-parity* goldens are pinned to the exact DATA in the committed
+// corpus/, not just its shape, so running plain `bun run record` changes
+// every fixture's content (whatever the operator's live daemon happens to
+// hold right now) and fails 3+5+5+3 next-parity assertions against the
+// frozen goldens until someone deliberately rebaselines them. See
+// README.md's "Re-recording the corpus" section for the real rule.
+//
+// TARGETED MODE (`--only graph`, #1868 packet 1): records ONLY the two
+// mission-graph parity fixture endpoints and writes them into the EXISTING
+// corpus/ in place, with no whole-directory delete-then-rename swap, and no
+// change to meta.json's `frozen_clock_ms`/`recorded_at_ms`/`captured_date`/
+// anything else, only that pair's own transcript entries. This is how a
+// NEW fixture gets added (or the mission-graph fixture specifically
+// refreshed) without invalidating the other 21 fixtures' goldens. See
+// `recordGraphOnly()` below.
 
-import { mkdirSync, writeFileSync, rmSync, renameSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, renameSync, readFileSync, existsSync } from "node:fs";
 import { sanitizeText, scanForSentinels } from "./lib/sanitize.mjs";
-import { CORPUS_DIR } from "./lib/paths.js";
+import { CORPUS_DIR, META_JSON } from "./lib/paths.js";
+import { GRAPH_FIXTURE_MISSION_ID } from "./lib/graph-fixture.js";
 
 const DAEMON_URL = process.env.DARKMUX_DAEMON_URL || "http://127.0.0.1:8765";
 const TMP_DIR = `${CORPUS_DIR}.tmp-${process.pid}`;
@@ -58,6 +85,42 @@ function prevDateUTC(d) {
   return dt.toISOString().slice(0, 10);
 }
 
+/** `--only <mode>` / `--only=<mode>`. No other flags exist today. */
+function parseArgs(argv) {
+  let only = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--only") {
+      only = argv[i + 1];
+      i++;
+    } else if (a.startsWith("--only=")) {
+      only = a.slice("--only=".length);
+    }
+  }
+  return { only };
+}
+
+/** The mission-graph parity fixture's own two endpoints (#1868 packet 1),
+ * used both by a FULL record (below, folded into the named endpoint list)
+ * and by `recordGraphOnly()`'s targeted `--only graph` mode. One definition
+ * so the two paths can't drift. */
+function graphFixtureEndpointSpecs() {
+  return [
+    {
+      name: "mission-graph-sanity",
+      urlPath: `/mission/${encodeURIComponent(GRAPH_FIXTURE_MISSION_ID)}/graph.json`,
+      file: "mission-graph-sanity.json",
+      extra: { reason: "mission-graph-goldens.spec.ts canvas/timeline node+edge snapshot", mission_id: GRAPH_FIXTURE_MISSION_ID },
+    },
+    {
+      name: "flow-mission-sanity",
+      urlPath: `/flow-mission/${encodeURIComponent(GRAPH_FIXTURE_MISSION_ID)}`,
+      file: "flow-mission-sanity.json",
+      extra: { reason: "mission-graph-goldens.spec.ts events panel backfill", mission_id: GRAPH_FIXTURE_MISSION_ID },
+    },
+  ];
+}
+
 async function fetchJson(pathAndQuery, { headers = {} } = {}) {
   const url = DAEMON_URL + pathAndQuery;
   const res = await fetch(url, { headers: { accept: "application/json", ...headers } });
@@ -65,51 +128,160 @@ async function fetchJson(pathAndQuery, { headers = {} } = {}) {
   return { ok: res.ok, status: res.status, text, url };
 }
 
-async function recordEndpoint(entry, targetDir, { name, urlPath, file, headers, extra }) {
+/** Fetch, sanitize, and residual-canary-check one endpoint. Does NOT write
+ * anything to disk; the caller decides where and how (a plain write into a
+ * staging dir for a full record, or a per-file temp-then-rename for the
+ * targeted `--only graph` mode). Returns `{ rec, text }`, where `text` is
+ * `null` on any failure (HTTP, non-JSON, or a residual sentinel hit) and
+ * `rec.error` names why. */
+async function fetchAndSanitize({ name, urlPath, file, headers, extra }) {
   const res = await fetchJson(urlPath, { headers });
   const rec = { name, path: urlPath, file, http_status: res.status, ok: res.ok, extra: extra || null };
   if (!res.ok) {
     rec.error = `HTTP ${res.status}`;
-    entry.push(rec);
     console.error(`  FAIL  ${urlPath}  -> HTTP ${res.status}`);
-    return rec;
+    return { rec, text: null };
   }
   let sanitized;
   try {
     sanitized = sanitizeText(res.text);
   } catch (e) {
     rec.error = `sanitize failed: ${e.message}`;
-    entry.push(rec);
     console.error(`  FAIL  ${urlPath}  -> response was not valid JSON (${e.message}); refusing to write a fixture (no fabrication)`);
-    return rec;
+    return { rec, text: null };
   }
   const residual = scanForSentinels(sanitized.text);
   if (residual.length) {
     // This should be structurally impossible given the field policy's
-    // coverage, but the tripwire doctrine is "verify, don't assume" — if it
+    // coverage, but the tripwire doctrine is "verify, don't assume": if it
     // ever DID slip through, fail loud right here instead of writing the
     // file into the staging dir at all.
     rec.error = `TRIPWIRE: residual canary hits after sanitization: ${JSON.stringify(residual)}`;
-    entry.push(rec);
     console.error(`  FAIL  ${urlPath}  -> ${rec.error}`);
-    return rec;
+    return { rec, text: null };
   }
-  const filePath = `${targetDir}/${file}`;
-  writeFileSync(filePath, sanitized.text, "utf8");
   rec.bytes = Buffer.byteLength(sanitized.text, "utf8");
   rec.sanitized = sanitized.matched;
-  entry.push(rec);
   const m = sanitized.matched;
   const unknownNote = m.unknownFields.length ? ` UNKNOWN-FIELDS=${JSON.stringify(m.unknownFields)}` : "";
   console.log(
     `  OK    ${urlPath.padEnd(38)} -> ${file.padEnd(28)} ${String(rec.bytes).padStart(8)}B  ` +
       `entity(id=${m.identifiers},ticket=${m.tickets},sha=${m.shas},ip=${m.ips}) prose=${m.prose} path=${m.paths} uuid=${m.uuids}${unknownNote}`
   );
+  return { rec, text: sanitized.text };
+}
+
+/** Full-record wrapper: fetch/sanitize, then write straight into `targetDir`
+ * (the staging temp dir `main()` later swaps into place). Preserves the
+ * original `recordEndpoint` behavior byte-for-byte. */
+async function recordEndpoint(entry, targetDir, spec) {
+  const { rec, text } = await fetchAndSanitize(spec);
+  if (text !== null) {
+    writeFileSync(`${targetDir}/${spec.file}`, text, "utf8");
+  }
+  entry.push(rec);
   return rec;
 }
 
+/**
+ * `--only graph` (#1868 packet 1): records ONLY `graphFixtureEndpointSpecs()`
+ * and writes them into the EXISTING `corpus/` in place. No whole-directory
+ * swap (there is nothing to swap: 21 other fixtures are untouched), and
+ * `meta.json`'s `recorded_at_ms`/`recorded_at_iso`/`daemon_health`/
+ * `captured_date`/`captured_prev_date`/`freeze_offset_ms`/`frozen_clock_ms`
+ * are NEVER rewritten by this mode; only the two targeted entries in
+ * `meta.endpoints` are added or replaced. Sanitization and the residual
+ * tripwire check are exactly as unconditional as the full path (both run
+ * through the same `fetchAndSanitize`).
+ *
+ * All-or-nothing, same invariant as a full record: if either endpoint
+ * fails, NOTHING is written (no partial fixture, no partial meta.json
+ * update) and the process exits non-zero. Each surviving write is its own
+ * temp-file-then-rename (same filesystem, so the rename is atomic), so a
+ * crash between the two files' writes still leaves each individual file
+ * either fully old or fully new, never truncated.
+ */
+async function recordGraphOnly() {
+  console.log(`Recording GRAPH-ONLY fixtures (--only graph) from ${DAEMON_URL} ...`);
+  const health = await fetchJson("/health");
+  if (!health.ok) {
+    console.error(`Daemon unreachable at ${DAEMON_URL} (health check: HTTP ${health.status}). Aborting, refusing to fabricate fixtures.`);
+    process.exit(1);
+  }
+  if (!existsSync(CORPUS_DIR) || !existsSync(META_JSON)) {
+    console.error(
+      `No existing corpus/meta.json found at ${CORPUS_DIR}. --only graph updates an EXISTING corpus in place; ` +
+        `it does not create one from scratch. Run a full \`bun run record\` first (and then deliberately ` +
+        `rebaseline the next-parity goldens, per README.md), or restore the committed corpus/.`
+    );
+    process.exit(1);
+  }
+
+  const results = [];
+  for (const spec of graphFixtureEndpointSpecs()) {
+    results.push(await fetchAndSanitize(spec));
+  }
+
+  const failed = results.filter((r) => r.rec.error);
+  if (failed.length) {
+    console.error(`FAILED endpoints: ${failed.map((r) => r.rec.name).join(", ")}`);
+    console.error(`Nothing written: corpus/ and meta.json are UNCHANGED (all-or-nothing, same as a full record).`);
+    process.exit(1);
+  }
+
+  // Per-file atomic write: temp file, then rename over the final path (same
+  // filesystem, so the rename is atomic); no whole-directory swap needed
+  // since only these two files are in scope.
+  for (const { rec, text } of results) {
+    const finalPath = `${CORPUS_DIR}/${rec.file}`;
+    const tmpPath = `${finalPath}.tmp-${process.pid}`;
+    writeFileSync(tmpPath, text, "utf8");
+    renameSync(tmpPath, finalPath);
+  }
+
+  // meta.json: update ONLY these endpoints' transcript entries, in place.
+  // Every other field stays exactly what the last FULL record wrote, most
+  // importantly `frozen_clock_ms`, which every next-parity golden's
+  // relative-time text is captured against; changing it here would
+  // invalidate every OTHER golden even though their underlying fixture
+  // files never moved.
+  const meta = JSON.parse(readFileSync(META_JSON, "utf8"));
+  const byName = new Map(meta.endpoints.map((e, i) => [e.name, i]));
+  for (const { rec } of results) {
+    const idx = byName.get(rec.name);
+    if (idx === undefined) {
+      meta.endpoints.push(rec);
+    } else {
+      meta.endpoints[idx] = rec;
+    }
+  }
+  const metaTmpPath = `${META_JSON}.tmp-${process.pid}`;
+  writeFileSync(metaTmpPath, JSON.stringify(meta, null, 2) + "\n", "utf8");
+  renameSync(metaTmpPath, META_JSON);
+
+  console.log("");
+  console.log(`Recorded ${results.length}/${results.length} graph endpoint(s) in place; every other corpus/ fixture and meta.json field is unchanged.`);
+}
+
 async function main() {
+  const { only } = parseArgs(process.argv.slice(2));
+  if (only === "graph") {
+    await recordGraphOnly();
+    return;
+  }
+  if (only) {
+    console.error(`Unknown --only mode "${only}" (recognized: "graph"). Aborting.`);
+    process.exit(1);
+  }
+
   console.log(`Recording corpus from ${DAEMON_URL} ...`);
+  console.warn(
+    "WARNING: this re-records the WHOLE corpus. The next-parity* goldens are pinned to the exact data " +
+      "in the CURRENT committed corpus/, so this changes every fixture's content and will fail next-parity " +
+      "assertions until someone deliberately rebaselines the goldens (see README.md's \"Re-recording the " +
+      "corpus\" section). To add or refresh only the mission-graph fixture without touching anything else, " +
+      "use `bun run record -- --only graph` instead."
+  );
   const health = await fetchJson("/health");
   if (!health.ok) {
     console.error(`Daemon unreachable at ${DAEMON_URL} (health check: HTTP ${health.status}). Aborting — refusing to fabricate fixtures.`);
@@ -184,6 +356,12 @@ async function main() {
     file: "flow-session-task-list.json",
     extra: { reason: "#session=<id> deep-link golden target; task-list chosen because it carries no client identifiers, sidestepping URL-encoding of a sanitized compound id" },
   });
+  // (#1868 packet 1) The mission-graph parity fixture's own two endpoints;
+  // see the module doc above and `graphFixtureEndpointSpecs()` (the SAME
+  // spec `--only graph` uses, so the two paths can't drift apart).
+  for (const spec of graphFixtureEndpointSpecs()) {
+    await rec(spec);
+  }
 
   const failed = endpoints.filter((e) => e.error);
   const meta = {

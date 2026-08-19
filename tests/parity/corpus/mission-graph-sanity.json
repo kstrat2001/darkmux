@@ -1,0 +1,193 @@
+{
+  "mission_id": "sanity-review-shape-1784702742-76e0c1",
+  "mission_status": "finalized",
+  "nodes": [
+    {
+      "id": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "label": "Investigate",
+      "kind": "phase",
+      "status": "complete",
+      "startedTs": 1784702743,
+      "completedTs": 1784702749,
+      "depth": 0
+    },
+    {
+      "id": "bundle",
+      "label": "bundle",
+      "kind": "task",
+      "status": "complete",
+      "parentId": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "startedTs": 1784702743,
+      "completedTs": 1784702744,
+      "depth": 0,
+      "steps": [
+        {
+          "id": "bundle-step",
+          "label": "Shell",
+          "kind": "procedural.shell",
+          "status": "complete",
+          "startedTs": 1784702743,
+          "completedTs": 1784702744
+        }
+      ]
+    },
+    {
+      "id": "dedup",
+      "label": "dedup",
+      "kind": "task",
+      "status": "complete",
+      "parentId": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "startedTs": 1784702747,
+      "completedTs": 1784702747,
+      "depth": 2,
+      "steps": [
+        {
+          "id": "dedup-step",
+          "label": "No-op",
+          "kind": "procedural.noop",
+          "status": "complete",
+          "startedTs": 1784702747,
+          "completedTs": 1784702747
+        }
+      ]
+    },
+    {
+      "id": "probe",
+      "label": "probe",
+      "kind": "task",
+      "status": "complete",
+      "parentId": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "startedTs": 1784702744,
+      "completedTs": 1784702747,
+      "depth": 1,
+      "steps": [
+        {
+          "id": "probe-step",
+          "label": "Dispatch (single-shot)",
+          "kind": "dispatch.single_shot",
+          "status": "complete",
+          "startedTs": 1784702744,
+          "completedTs": 1784702747,
+          "model": "qwen3-4b-instruct-2507"
+        }
+      ]
+    },
+    {
+      "id": "sanity-review-shape-1784702742-76e0c1-adjudicate",
+      "label": "Adjudicate",
+      "kind": "phase",
+      "status": "complete",
+      "startedTs": 1784702748,
+      "completedTs": 1784702749,
+      "depth": 1
+    },
+    {
+      "id": "judge",
+      "label": "judge",
+      "kind": "task",
+      "status": "complete",
+      "parentId": "sanity-review-shape-1784702742-76e0c1-adjudicate",
+      "startedTs": 1784702747,
+      "completedTs": 1784702748,
+      "depth": 3,
+      "steps": [
+        {
+          "id": "judge-step",
+          "label": "Dispatch (single-shot)",
+          "kind": "dispatch.single_shot",
+          "status": "complete",
+          "startedTs": 1784702747,
+          "completedTs": 1784702748,
+          "model": "qwen3-4b-instruct-2507"
+        }
+      ]
+    },
+    {
+      "id": "sanity-review-shape-1784702742-76e0c1-report",
+      "label": "Report",
+      "kind": "phase",
+      "status": "complete",
+      "startedTs": 1784702748,
+      "completedTs": 1784702749,
+      "depth": 2
+    },
+    {
+      "id": "synthesis",
+      "label": "synthesis",
+      "kind": "task",
+      "status": "complete",
+      "parentId": "sanity-review-shape-1784702742-76e0c1-report",
+      "startedTs": 1784702748,
+      "completedTs": 1784702748,
+      "depth": 4,
+      "steps": [
+        {
+          "id": "synthesis-step",
+          "label": "No-op",
+          "kind": "procedural.noop",
+          "status": "complete",
+          "startedTs": 1784702748,
+          "completedTs": 1784702748
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "contains:sanity-review-shape-1784702742-76e0c1-investigate:bundle",
+      "source": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "target": "bundle",
+      "kind": "contains"
+    },
+    {
+      "id": "contains:sanity-review-shape-1784702742-76e0c1-investigate:dedup",
+      "source": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "target": "dedup",
+      "kind": "contains"
+    },
+    {
+      "id": "depends_on:probe:dedup",
+      "source": "probe",
+      "target": "dedup",
+      "kind": "depends_on"
+    },
+    {
+      "id": "contains:sanity-review-shape-1784702742-76e0c1-investigate:probe",
+      "source": "sanity-review-shape-1784702742-76e0c1-investigate",
+      "target": "probe",
+      "kind": "contains"
+    },
+    {
+      "id": "depends_on:bundle:probe",
+      "source": "bundle",
+      "target": "probe",
+      "kind": "depends_on"
+    },
+    {
+      "id": "contains:sanity-review-shape-1784702742-76e0c1-adjudicate:judge",
+      "source": "sanity-review-shape-1784702742-76e0c1-adjudicate",
+      "target": "judge",
+      "kind": "contains"
+    },
+    {
+      "id": "depends_on:dedup:judge",
+      "source": "dedup",
+      "target": "judge",
+      "kind": "depends_on"
+    },
+    {
+      "id": "contains:sanity-review-shape-1784702742-76e0c1-report:synthesis",
+      "source": "sanity-review-shape-1784702742-76e0c1-report",
+      "target": "synthesis",
+      "kind": "contains"
+    },
+    {
+      "id": "depends_on:judge:synthesis",
+      "source": "judge",
+      "target": "synthesis",
+      "kind": "depends_on"
+    }
+  ],
+  "legacy": false,
+  "generated_at_ms": 1787099441528
+}

@@ -1,0 +1,48 @@
+=== header ===
+‹ VIEWER
+darkmux · mission
+sanity-review-shape-1784702742-76e0c1
+FINALIZED
+↻
+LIST
+MAP
+EVENTS
+planned
+running
+complete
+error
+abandoned
+
+=== phasegroups ===
+[s-complete] PHASE Investigate
+[s-complete] PHASE Adjudicate
+[s-complete] PHASE Report
+
+=== nodes ===
+[k-task s-complete] bundle (title="bundle")
+    [s-complete] Shell
+
+[k-task s-complete] dedup (title="dedup")
+    [s-complete] No-op
+
+[k-task s-complete] probe (title="probe")
+    [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | · tok
+
+[k-task s-complete] judge (title="judge")
+    [s-complete] Dispatch (single-shot) | qwen3-4b-instruct-2507 | · tok
+
+[k-task s-complete] synthesis (title="synthesis")
+    [s-complete] No-op
+
+=== edges ===
+edge_count: 6
+
+=== events ===
+06:45:49 | phase complete | sanity-review-shape-1784702742-76e0c1-investigate
+06:45:49 | phase complete | sanity-review-shape-1784702742-76e0c1-adjudicate
+06:45:49 | phase complete | sanity-review-shape-1784702742-76e0c1-report
+06:45:49 | mission close | sanity-review-shape-1784702742-76e0c1
+06:45:48 | phase start | sanity-review-shape-1784702742-76e0c1-adjudicate
+06:45:48 | phase start | sanity-review-shape-1784702742-76e0c1-report
+06:45:43 | phase start | sanity-review-shape-1784702742-76e0c1-investigate
+06:45:42 | mission start | sanity-review-shape-1784702742-76e0c1
