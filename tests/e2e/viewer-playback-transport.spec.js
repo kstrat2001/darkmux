@@ -45,8 +45,13 @@ test('pressing play on the static build actually advances the playhead', async (
   await expect(range).toHaveValue('0');
   await expect(playBtn).toHaveAttribute('title', 'pause');
   // The record count half of the clock readout drops too — rewound to the
-  // start, only the first record (if any) is at-or-before the playhead.
-  await expect(clock).toContainText(`/${total} rec`);
+  // start, only the record(s) at-or-before tMin remain visible. Asserting
+  // the NUMERATOR here, not the denominator: `total` (the day's whole
+  // count) is invariant across the entire test, so a denominator-only
+  // assertion would pass even if the numerator never moved at all.
+  const clockAfterRewind = await clock.innerText();
+  const numeratorAfterRewind = Number(clockAfterRewind.match(/(\d+)\/\d+ rec$/)[1]);
+  expect(numeratorAfterRewind).toBeLessThan(Number(total));
 
   // Real wall-clock, real `setInterval` — poll until the playhead has
   // measurably moved off zero. The fixture's ~13s span at 1x advances the
