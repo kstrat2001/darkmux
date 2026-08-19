@@ -223,6 +223,14 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
   const [evOpen, setEvOpen] = useState(() => !(typeof window !== "undefined" && isNarrowViewport(window.innerWidth)));
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [minimapOn, setMinimapOn] = useState(() => initMinimap());
+  // (#1868) The mobile tap-to-open legend popover — `mission-graph.html`'s
+  // own `legendOpen` state (`_leg`). Below the ~700px breakpoint `.legend`
+  // hides via CSS (ported already) but nothing replaced it, leaving phones
+  // with zero status-legend affordance — the timeline renderer's primary
+  // audience per #1404. `.legbtn` is itself hidden above that breakpoint
+  // (CSS), so this button only ever shows where the popover is the only way
+  // to reach the legend.
+  const [legendOpen, setLegendOpen] = useState(false);
   const toggleTask = (id: string) => setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
   const toggleMinimap = () =>
     setMinimapOn((prev) => {
@@ -395,7 +403,15 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
         <button type="button" className={`evbtn${evOpen ? " on" : ""}`} title="mission events" onClick={() => setEvOpen(!evOpen)}>
           events
         </button>
+        {/* (#1868) `.legbtn` — hidden above the ~700px breakpoint (CSS),
+            visible only where `.legend` itself is hidden. A real `<button>`
+            gets Tab/Enter/Space activation for free, matching every other
+            control in this header. */}
+        <button type="button" className="legbtn" title="status legend" onClick={() => setLegendOpen((v) => !v)}>
+          legend
+        </button>
         <div className="legend">{legendDots()}</div>
+        {legendOpen ? <div className="legendpop on">{legendDots()}</div> : null}
       </div>
       <div className="body missionlens__body">
         {useTimeline ? (

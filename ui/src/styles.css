@@ -3175,6 +3175,9 @@ body {
   background: var(--ml-bg2);
   flex-wrap: wrap;
   row-gap: 6px;
+  /* (#1868) Positioning context for `.legendpop`, anchored to this row's
+     own bottom edge — see that rule's own doc. */
+  position: relative;
 }
 .missionlens .midname {
   font: 600 13px "JetBrains Mono", monospace;
@@ -3276,6 +3279,53 @@ body {
   color: var(--dim);
 }
 .missionlens .legend .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+/* (#1868) `.legbtn` — the mobile stand-in for `.legend` (mission-graph.html:
+   299-302,379-381,432,448). Shares `.evbtn`'s appearance; hidden above the
+   ~700px breakpoint, where the inline dots already show. `.legendpop` is
+   its tap-to-open popover, anchored to the bottom of `.top` — the ONLY
+   status-legend affordance a phone has once `.legend` hides below. */
+.missionlens .legbtn {
+  display: none;
+  font: 600 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 5px 9px;
+  background: none;
+  cursor: pointer;
+}
+.missionlens .legbtn:hover {
+  color: var(--fg);
+  border-color: var(--accent-dim);
+}
+.missionlens .legendpop {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 8px;
+  z-index: 30;
+  background: var(--ml-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  font: 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+}
+.missionlens .legendpop.on {
+  display: flex;
+}
+.missionlens .legendpop .dot {
   display: inline-block;
   width: 8px;
   height: 8px;
@@ -3784,6 +3834,11 @@ body {
   }
   .missionlens .legend {
     display: none;
+  }
+  /* (#1868) `.legend`'s tap-to-open stand-in — only shown below this
+     breakpoint, mirroring mission-graph.html's own rule exactly. */
+  .missionlens .legbtn {
+    display: inline-flex;
   }
   .missionlens .body {
     flex-direction: column;
