@@ -3764,6 +3764,14 @@ const MISSION_ENVELOPE_READABILITY_CHECK_NAME: &str = "mission envelope readabil
 /// Scope: every FINALIZED mission has (or once had) a real envelope to
 /// read; a mission with no `envelope.json` at all (`Ok(None)`) is not
 /// drift — see `load_envelope`'s own doc — and is not reported here.
+///
+/// (#1881, second half) `MissionOutcomeStatus`/`RunOutcome` later gained
+/// `#[serde(other)]` catch-alls so a genuinely NEW variant no longer fails
+/// the whole `serde_json::from_str` — an envelope carrying one now returns
+/// `Ok(Some(envelope))`, not `Err`. That is real progress (the rest of the
+/// document survives), but a `status: Unknown` is still exactly the schema
+/// drift this check exists to name, so it's reported here too — see the
+/// `Ok(Some(envelope)) if envelope.status == ... Unknown` arm below.
 fn check_mission_envelope_readability() -> Check {
     let missions_root = darkmux_crew::loader::missions_dir();
     let mut unreadable: Vec<String> = Vec::new();
@@ -3778,6 +3786,19 @@ fn check_mission_envelope_readability() -> Check {
                 continue;
             };
             match darkmux_crew::lifecycle::load_envelope(mission_id) {
+                // (#1881) `status` itself is now lenient on read
+                // (`MissionOutcomeStatus`'s `#[serde(other)]` catch-all —
+                // see `crates/darkmux-crew/src/envelope.rs`) so a `status`
+                // value this binary doesn't recognize no longer fails this
+                // `Ok(Some(_))` arm the way it did before that leniency
+                // landed. It is still exactly the schema-drift condition
+                // this check exists to name — the JSON parsed, but this
+                // binary genuinely does not understand what the run's
+                // outcome was — so it's reported the same way a hard parse
+                // failure is, not silently folded into "readable."
+                Ok(Some(envelope)) if envelope.status == darkmux_crew::envelope::MissionOutcomeStatus::Unknown => {
+                    unreadable.push(format!("{mission_id} (unrecognized status)"));
+                }
                 Ok(Some(_)) => readable_count += 1,
                 Ok(None) => {}
                 Err(e) => unreadable.push(format!("{mission_id} ({e})")),
@@ -6524,6 +6545,34 @@ mod tests {
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("m-broken"), "{}", check.message);
         assert!(check.hint.is_some());
+    }
+
+    /// (#1881 second half) `MissionOutcomeStatus`'s `#[serde(other)]`
+    /// leniency means an envelope with a `status` value this binary
+    /// doesn't recognize NOW parses successfully (`Ok(Some(_))`, not the
+    /// `Err` the previous test exercises) — but it is still exactly the
+    /// schema drift `darkmux doctor` exists to name, so it must still warn.
+    #[serial_test::serial]
+    #[test]
+    fn mission_envelope_readability_warns_on_an_envelope_that_parses_with_an_unrecognized_status() {
+        let guard = CrewRootGuard::new();
+        let mission_dir = guard.path().join("missions").join("m-future-status");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        std::fs::write(
+            mission_dir.join("envelope.json"),
+            r#"{"mission_id":"m-future-status","status":"throttled","phases":[]}"#,
+        )
+        .unwrap();
+
+        // Confirm the fixture really does parse (not an Err) — this test's
+        // whole point is the leniency path, not the malformed-JSON path
+        // the sibling test above already covers.
+        let loaded = darkmux_crew::lifecycle::load_envelope("m-future-status");
+        assert!(matches!(loaded, Ok(Some(_))), "fixture must parse leniently, got {loaded:?}");
+
+        let check = check_mission_envelope_readability();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("m-future-status"), "{}", check.message);
     }
 
     #[serial_test::serial]

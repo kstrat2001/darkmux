@@ -45,6 +45,33 @@
 //! own docket (files touched, QA findings addressed) is exactly the kind
 //! of partitioned work this type exists to describe, but wiring it up is
 //! its own acceptance test.
+//!
+//! # Forward-compat leniency (#1881)
+//!
+//! [`RunOutcome::Unknown`] closes a gap #1877 QA flagged but deliberately
+//! left open (`crates/darkmux-crew/src/envelope.rs`'s
+//! `MISSION_ENVELOPE_SCHEMA` doc, pre-#1881): before this variant existed,
+//! a `state` value this binary didn't recognize failed the deserialize of
+//! the ENTIRE `MissionEnvelope` — not just `outcome` — because
+//! `#[serde(tag = "state")]` has no unknown-variant tolerance on its own.
+//! `#[serde(other)]` on a unit fallback variant fixes this even though the
+//! OTHER variants (`Partial`, `Empty`) carry data: serde buffers the whole
+//! tagged value before dispatching on `state`, so a sibling's fields never
+//! constrain what the fallback arm can accept. Verified directly by
+//! `an_unrecognized_state_degrades_to_unknown_and_the_rest_of_the_document_still_parses`
+//! in `envelope.rs`.
+//!
+//! **What this does NOT do:** the original `state` string is discarded
+//! (serde's `other` catch-all buffers-then-drops unmatched content) — a
+//! consumer that needs to know WHAT the unrecognized state actually was
+//! has to go read the raw `envelope.json` off disk, this typed value can't
+//! say. And `Unknown` is never read by `mission_run_status`'s `RunStatus`
+//! derivation (`crates/darkmux-serve/src/runs.rs`) — `outcome` never has
+//! been (#1877 item 4); the run's `status` field alone remains
+//! authoritative for that. A known `status` paired with an unrecognized
+//! `outcome` therefore still renders per that known status, honestly —
+//! see `MissionOutcomeStatus`'s own forward-compat note in `envelope.rs`
+//! for the field `RunStatus` DOES read leniently.
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +93,14 @@ pub enum RunOutcome {
     /// Nothing in the docket produced a usable outcome — the run has no
     /// signal worth rendering. `reason` is the caller's own honest "why."
     Empty { reason: String },
+    /// (#1881) A `state` this binary does not recognize — written by a
+    /// NEWER darkmux than this one. Forward-compat READ-ONLY fallback: no
+    /// writer in this codebase ever constructs this variant on purpose
+    /// (every driver holds a real, freshly-computed `RunOutcome`; this only
+    /// ever arises from deserializing someone else's envelope). See the
+    /// module doc's "Forward-compat leniency" section.
+    #[serde(other)]
+    Unknown,
 }
 
 impl RunOutcome {
@@ -75,6 +110,12 @@ impl RunOutcome {
 
     pub fn is_partial(&self) -> bool {
         matches!(self, RunOutcome::Partial { .. })
+    }
+
+    /// (#1881) `true` only for the deserialize-time forward-compat
+    /// fallback — see [`RunOutcome::Unknown`].
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, RunOutcome::Unknown)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -102,6 +143,25 @@ mod tests {
         assert!(!empty.is_complete());
         assert!(!empty.is_partial());
         assert!(empty.is_empty());
+
+        let unknown = RunOutcome::Unknown;
+        assert!(!unknown.is_complete());
+        assert!(!unknown.is_partial());
+        assert!(!unknown.is_empty());
+        assert!(unknown.is_unknown());
+        assert!(!complete.is_unknown());
+    }
+
+    /// (#1881) A `state` this binary doesn't recognize degrades to
+    /// `Unknown` via `#[serde(other)]` instead of failing the deserialize —
+    /// even though the sibling `Partial`/`Empty` variants carry data. Extra
+    /// unrecognized fields alongside the unrecognized `state` are silently
+    /// discarded, same as any `#[serde(other)]` catch-all.
+    #[test]
+    fn an_unrecognized_state_degrades_to_unknown_instead_of_failing_to_parse() {
+        let json = r#"{"state":"throttled","some_future_field":123}"#;
+        let outcome: RunOutcome = serde_json::from_str(json).expect("must degrade, not error");
+        assert_eq!(outcome, RunOutcome::Unknown);
     }
 
     /// The `state` tag round-trips through JSON — this is the shape a

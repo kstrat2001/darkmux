@@ -119,33 +119,43 @@ use serde::{Deserialize, Serialize};
 /// `outcome: None`, and nothing about `status`/`reason`/`warnings` changes
 /// shape for an old reader.
 ///
-/// **Adding a new [`RunOutcome`] VARIANT is a MAJOR bump, not additive,
-/// even though `outcome` itself is optional (#1877 QA ALSO FIX 3).**
-/// `#[serde(default)]` only supplies `None` when the `outcome` KEY is
-/// ABSENT from the document; it does nothing when the key is PRESENT with
-/// content an older binary's `RunOutcome` doesn't recognize — serde fails
-/// deserializing that field, which fails deserializing the WHOLE
-/// `MissionEnvelope`, including `status`/`reason`/`warnings`, none of
-/// which actually changed shape. Verified directly (pinned by
-/// `an_unrecognized_outcome_variant_fails_the_whole_envelope_parse`,
-/// below): decoding `{"state":"throttled"}` into today's `RunOutcome`
-/// (`Complete` | `Partial` | `Empty`, no catch-all/unknown arm) errors
-/// with `` unknown variant `throttled`, expected one of `complete`,
-/// `partial`, `empty` `` — not a graceful `None`. `RunOutcome` has none of
-/// `config.json`'s
-/// lenient-on-read machinery (`#[serde(flatten)] extras` overflow, all-
-/// `Option` fields) — it is a closed `#[serde(tag = "state")]` enum by
-/// design (`crates/darkmux-crew/src/run_outcome.rs`), so a future minor
-/// bump that only ADDS a `RunOutcome` variant would still make an OLDER
-/// darkmux binary refuse to parse a NEWER one's envelope whenever that new
-/// variant actually appears. Treat any new `RunOutcome` variant as a MAJOR
-/// bump on `MISSION_ENVELOPE_SCHEMA`, or give `RunOutcome` its own
-/// unknown-variant tolerance (an `Other`/catch-all arm) before treating it
-/// as additive.
-pub const MISSION_ENVELOPE_SCHEMA: &str = "1.1";
+/// **1.1 -> 1.2 (#1881), CLOSES the exposure the paragraph above used to
+/// document.** Both `RunOutcome` (`outcome`'s tag) and `MissionOutcomeStatus`
+/// (`status` itself) now carry a `#[serde(other)]` catch-all
+/// ([`RunOutcome::Unknown`], [`MissionOutcomeStatus::Unknown`]). Verified
+/// directly: `an_unrecognized_state_degrades_to_unknown_and_the_rest_of_the_document_still_parses`
+/// (below) decodes `{"status":"clean","outcome":{"state":"throttled"}}` and
+/// gets back a full `MissionEnvelope` with `status`/`mission_id`/`phases`
+/// intact and `outcome: Some(RunOutcome::Unknown)` — not an `Err`. Adding a
+/// new `RunOutcome` variant OR a new `MissionOutcomeStatus` variant is
+/// therefore safely additive (a MINOR bump) again, same as any other
+/// optional field: an older reader degrades the unrecognized value to its
+/// own `Unknown` rather than failing the whole document.
+///
+/// **What stayed true from 1.1, unaffected by this bump:** a document that
+/// fails to parse for a reason NEITHER catch-all can rescue (malformed
+/// JSON, a required field missing or of the wrong type, `outcome` present
+/// but not even a JSON object) is still a hard error from
+/// `darkmux_crew::lifecycle::load_envelope` — that is precisely what
+/// `RunStatus::Unparseable` exists for
+/// (`crates/darkmux-serve/src/runs.rs`'s `mission_run_status`). Leniency
+/// widens what counts as "understood," it does not promise every possible
+/// malformed document parses.
+pub const MISSION_ENVELOPE_SCHEMA: &str = "1.2";
 
 /// The overall outcome a mission's run reached — see the module doc's
 /// "Status decision" section for how each value is decided and consumed.
+///
+/// **Forward-compat leniency (#1881):** [`MissionOutcomeStatus::Unknown`]
+/// is a `#[serde(other)]` catch-all — a `status` value this binary doesn't
+/// recognize (written by a newer darkmux) degrades to `Unknown` instead of
+/// failing the WHOLE `MissionEnvelope` deserialize. This is the field
+/// `crates/darkmux-serve/src/runs.rs`'s `mission_run_status` actually
+/// reads to decide `RunStatus`, so unlike `RunOutcome::Unknown` (supplementary,
+/// never read for that decision — see `run_outcome.rs`'s own note),
+/// `MissionOutcomeStatus::Unknown` maps to `RunStatus::Unparseable` there —
+/// the honest "this binary cannot tell you whether this run succeeded,"
+/// never the pre-#1881 silent fallback to `Complete`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MissionOutcomeStatus {
@@ -153,6 +163,11 @@ pub enum MissionOutcomeStatus {
     Degraded,
     Degenerate,
     Error,
+    /// (#1881) A `status` this binary does not recognize. Forward-compat
+    /// READ-ONLY fallback, same shape as [`RunOutcome::Unknown`] — never
+    /// constructed on purpose by any writer in this codebase.
+    #[serde(other)]
+    Unknown,
 }
 
 impl MissionOutcomeStatus {
@@ -172,11 +187,22 @@ impl MissionOutcomeStatus {
     ///   see `darkmux_lab::lab::review::review_mission_outcome`'s doc.
     /// - [`RunOutcome::Empty`] -> `Degenerate` — no usable signal, the
     ///   "worth retrying" gate.
+    /// - [`RunOutcome::Unknown`] -> `Degraded` (#1881). Unreachable from any
+    ///   real driver today — every caller of `from_outcome` passes a
+    ///   freshly-computed `RunOutcome` it just built, never one round-tripped
+    ///   through deserialize first, and `Unknown` only ever arises from
+    ///   deserializing (see `run_outcome.rs`). Kept exhaustive (not a
+    ///   wildcard) so a future caller that DOES round-trip an outcome
+    ///   through this function gets a deliberate, conservative answer
+    ///   rather than an accidental one: `Degraded`, the same "some real
+    ///   signal, treat with caution" bucket `Partial` uses, rather than
+    ///   assuming either a clean pass or a hard failure it can't back up.
     pub fn from_outcome(outcome: &RunOutcome) -> Self {
         match outcome {
             RunOutcome::Complete => MissionOutcomeStatus::Clean,
             RunOutcome::Partial { .. } => MissionOutcomeStatus::Degraded,
             RunOutcome::Empty { .. } => MissionOutcomeStatus::Degenerate,
+            RunOutcome::Unknown => MissionOutcomeStatus::Degraded,
         }
     }
 
@@ -187,7 +213,15 @@ impl MissionOutcomeStatus {
     pub fn phase_outcome(self) -> PhaseOutcomeKind {
         match self {
             MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => PhaseOutcomeKind::Complete,
-            MissionOutcomeStatus::Degenerate | MissionOutcomeStatus::Error => PhaseOutcomeKind::Abandoned,
+            // (#1881) `Unknown` only ever arises from deserializing a
+            // status this binary doesn't recognize — `finalize_mission`
+            // always drives a FRESHLY-constructed `status`, never a loaded
+            // one, so this arm is unreachable in practice. Abandoned is the
+            // conservative default if it's ever reached: a status we can't
+            // interpret must never be assumed to have completed.
+            MissionOutcomeStatus::Degenerate | MissionOutcomeStatus::Error | MissionOutcomeStatus::Unknown => {
+                PhaseOutcomeKind::Abandoned
+            }
         }
     }
 
@@ -201,6 +235,7 @@ impl MissionOutcomeStatus {
             MissionOutcomeStatus::Degraded => "mission completed (degraded)",
             MissionOutcomeStatus::Degenerate => "mission ended degenerate",
             MissionOutcomeStatus::Error => "mission errored",
+            MissionOutcomeStatus::Unknown => "mission status unrecognized by this darkmux version",
         }
     }
 }
@@ -852,16 +887,19 @@ mod tests {
         );
     }
 
-    /// (#1877 QA ALSO FIX 3) Structural proof for `MISSION_ENVELOPE_SCHEMA`'s
-    /// doc claim: an `outcome` key present with a `RunOutcome` variant this
-    /// binary doesn't recognize fails deserializing the WHOLE
-    /// `MissionEnvelope`, not just `outcome`. `#[serde(default)]` on
-    /// `outcome` only rescues an ABSENT key — a PRESENT-but-unrecognized one
-    /// still errors, taking `status`/`reason`/`warnings` down with it even
-    /// though none of those fields changed shape. This is why adding a
-    /// `RunOutcome` variant is a MAJOR schema bump, not additive-minor.
+    /// (#1881, supersedes the pre-#1881 `an_unrecognized_outcome_variant_fails_the_whole_envelope_parse`)
+    /// Structural proof for `MISSION_ENVELOPE_SCHEMA` 1.2's doc claim: an
+    /// `outcome` key present with a `RunOutcome` variant this binary
+    /// doesn't recognize now degrades `outcome` to `Unknown` via
+    /// `#[serde(other)]` — it no longer fails the whole `MissionEnvelope`
+    /// parse. `status`/`mission_id`/`phases` come through intact, unaware
+    /// anything was unrecognized. Before #1881, decoding this exact JSON
+    /// errored with `` unknown variant `throttled`, expected one of
+    /// `complete`, `partial`, `empty` `` (this test's own earlier
+    /// version — see the git history on this test name — pinned exactly
+    /// that failure and observed it passing on unmodified pre-#1881 code).
     #[test]
-    fn an_unrecognized_outcome_variant_fails_the_whole_envelope_parse() {
+    fn an_unrecognized_outcome_variant_degrades_to_unknown_and_the_rest_of_the_document_still_parses() {
         let json = r#"{
             "mission_id": "m1",
             "schema_version": "1.2",
@@ -869,15 +907,34 @@ mod tests {
             "outcome": {"state": "throttled"},
             "phases": []
         }"#;
-        let err = serde_json::from_str::<MissionEnvelope>(json)
-            .expect_err("an unrecognized RunOutcome variant must fail the whole envelope parse, not degrade to None");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unknown variant `throttled`")
-                && msg.contains("complete")
-                && msg.contains("partial")
-                && msg.contains("empty"),
-            "got: {msg}"
-        );
+        let envelope: MissionEnvelope =
+            serde_json::from_str(json).expect("an unrecognized RunOutcome variant must degrade, not fail the whole parse");
+        assert_eq!(envelope.outcome, Some(RunOutcome::Unknown));
+        assert_eq!(envelope.mission_id, "m1");
+        assert_eq!(envelope.status, MissionOutcomeStatus::Degraded);
+        assert!(envelope.phases.is_empty());
+    }
+
+    /// (#1881) The `status` field itself — not just `outcome` — also
+    /// degrades leniently now: a `status` value this binary doesn't
+    /// recognize becomes `MissionOutcomeStatus::Unknown` rather than
+    /// failing the whole parse, and the rest of the document (mission_id,
+    /// phases) still comes through. This is the field
+    /// `RunStatus` derivation actually reads
+    /// (`crates/darkmux-serve/src/runs.rs`'s `mission_run_status`), unlike
+    /// `outcome` above — see that module's own tests for what `Unknown`
+    /// status maps to (`RunStatus::Unparseable`, never `Complete`).
+    #[test]
+    fn an_unrecognized_status_degrades_to_unknown_and_the_rest_of_the_document_still_parses() {
+        let json = r#"{
+            "mission_id": "m2",
+            "schema_version": "1.2",
+            "status": "throttled",
+            "phases": []
+        }"#;
+        let envelope: MissionEnvelope =
+            serde_json::from_str(json).expect("an unrecognized status value must degrade, not fail the whole parse");
+        assert_eq!(envelope.status, MissionOutcomeStatus::Unknown);
+        assert_eq!(envelope.mission_id, "m2");
     }
 }
