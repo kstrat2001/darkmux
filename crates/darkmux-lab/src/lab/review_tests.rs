@@ -8197,6 +8197,64 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         }
     }
 
+    /// (#1877 QA ALSO FIX 1) `review_outcome` reads `env.remote_budgets`
+    /// (structured), `review_mission_outcome` reads `env.warnings` (prose).
+    /// They agree today ONLY because `judge_gate_outcome`'s two call sites
+    /// push BOTH onto the envelope from the same gate result — a fact
+    /// enforced by convention at each call site, not by any type. This
+    /// test drives the REAL gate (not a hand-built envelope) with a
+    /// starved judge-pass1 bucket and asserts both predicates land
+    /// non-`Complete` off that one input, so a later cleanup that drops
+    /// the coverage-warning string in favor of the structured rows alone
+    /// cannot silently recreate #1876's shape (PR banner says "Incomplete
+    /// review", mission board says `Clean`) without failing here first.
+    #[test]
+    fn judge_gate_outcome_keeps_review_outcome_and_review_mission_outcome_in_sync() {
+        let mut pass1 = RemoteBudget::with_stage("judge-pass1", 1_000, MIN_VIABLE_JUDGE_GRANT);
+        let g = pass1.admit_reserve(600).expect("first draw admits");
+        pass1.settle(g, 600, 1);
+        // Second draw: 400 remaining < the 512 floor — denied, counted as
+        // a skip. This is the real starved-bucket shape #1876 fixed, not a
+        // hand-set `skipped_calls` field.
+        assert!(pass1.admit_reserve(600).is_none(), "the starved grant must be denied");
+        let pass2 = RemoteBudget::with_stage("judge-pass2", 1_000, MIN_VIABLE_JUDGE_GRANT);
+        let budgets = JudgeBudgets { pass1, pass2 };
+
+        let gate = judge_gate_outcome(
+            true, // is_remote
+            2,    // judged_len
+            1,    // usable — one flag still got a real ruling
+            0,    // dispatch_errors
+            Some(&budgets),
+            1_000, // remote_max_tokens_per_execution
+            false, // strict — the #1876 default policy
+        );
+
+        // Mirror the real call sites (`run_judge_only`, the graph judge
+        // step): push both the structured rows and the coverage warning
+        // onto the same envelope.
+        let mut env = ReviewEnvelope {
+            degenerate: None,
+            judged: (0..2).map(archived_flag_for_outcome_test).collect(),
+            ..Default::default()
+        };
+        env.remote_budgets.extend(gate.remote_budget_rows);
+        if let Some(w) = gate.coverage_warning {
+            env.warnings.push(w);
+        }
+
+        assert_ne!(
+            review_outcome(&env),
+            RunOutcome::Complete,
+            "review_outcome must see the skipped judge-pass1 row"
+        );
+        assert_ne!(
+            review_mission_outcome(&env),
+            RunOutcome::Complete,
+            "review_mission_outcome must see the coverage warning"
+        );
+    }
+
     /// A minimal `JudgedFlag` fixture for `review_outcome`'s own unit
     /// tests — distinct from `src/pr_review.rs`'s richer `archived_flag`
     /// (that one is `pub(crate)` to `pr_review`'s own test module, not
