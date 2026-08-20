@@ -1089,6 +1089,7 @@
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             bundles: None,
             source: None,
         };
@@ -1119,6 +1120,7 @@
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             bundles: None,
             source: None,
         };
@@ -1154,6 +1156,7 @@
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             bundles: None,
             source: None,
         };
@@ -1626,6 +1629,7 @@
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             bundles: None,
             source: Some(&source),
         };
@@ -1673,6 +1677,7 @@
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             bundles: None,
             source: Some(&source),
         };
@@ -1719,6 +1724,7 @@
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             bundles: None,
             source: None,
         };
@@ -1773,6 +1779,7 @@
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             bundles: None,
             source: None,
         };
@@ -1809,18 +1816,23 @@
         assert_eq!(env.verified, 1, "the retry's verdict counts toward the verified tally");
     }
 
-    /// (#1355/#1357 review round) `finish_review`'s judge remote-budget
-    /// honesty gates are STILL PRODUCTION CODE via the `--charges-file`
-    /// path (`mission launch review --param charges_file=...` -> `run_judge_only` ->
-    /// `finish_review`) — but every test that used to pin them routed
-    /// through the deleted `run_review` driver, so the migration would have
-    /// left them coverage-free. This ONE test pins all three gates through
-    /// the surviving caller (the graph path lacks these gates entirely —
-    /// that's the KNOWN GAP the migrated graph tests characterize):
+    /// (#1355/#1357 review round; renamed + re-scoped #1876/#1877) `finish_
+    /// review`'s judge remote-budget honesty gates are STILL PRODUCTION
+    /// CODE via the `--charges-file` path (`mission launch review --param
+    /// charges_file=...` -> `run_judge_only` -> `finish_review`) — but every
+    /// test that used to pin them routed through the deleted `run_review`
+    /// driver, so the migration would have left them coverage-free. This
+    /// ONE test pins all three gates through the surviving caller (the
+    /// graph path lacks these gates entirely — that's the KNOWN GAP the
+    /// migrated graph tests characterize), under the STRICT policy
+    /// (`judge_exhaustion_strict: true`, the operator opt-in that restores
+    /// today's pre-#1876 "any skip is fatal" behavior):
     ///
     /// 1. the judge's per-pass budget rows reach `env.remote_budgets`;
     /// 2. bucket exhaustion (`skipped > 0`) degrades the run with the
-    ///    reason named — never a silent pass (#1260);
+    ///    reason named — never a silent pass (#1260) — because the STRICT
+    ///    policy is set; the default (partial) policy's own version of this
+    ///    scenario is the companion test right below.
     /// 3. a remote judge dispatch failure is named in `env.warnings`
     ///    UNCONDITIONALLY, whether or not the run also degrades (#1329's
     ///    loud-beats-quiet half).
@@ -1833,7 +1845,7 @@
     /// separate execution per #1260); f3.p1 is REFUSED by the exhausted
     /// pass-1 bucket -> ruled Error with the reason, no chat call.
     #[test]
-    fn run_judge_only_remote_budget_exhaustion_rows_degrade_and_warn() {
+    fn run_judge_only_remote_budget_exhaustion_strict_policy_degrades_and_warns() {
         let crew = crew_with(vec![
             ("review-probe", vec![staffing("fast", "probe-model", 1)]),
             ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
@@ -1849,6 +1861,7 @@
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 100, // one 600-token ruling exhausts a pass bucket
+            judge_exhaustion_strict: true,
             bundles: None,
             source: None,
         };
@@ -1910,6 +1923,102 @@
         assert_eq!(env.judged[1].tier, Tier::Confirmed, "f2's real ruling survives");
         assert_eq!(env.judged[2].pass1.ruling, JudgeRuling::Error, "f3 was refused, not faked");
         assert!(env.judged[2].pass1.note_for_author.contains("remote token budget exhausted"));
+    }
+
+    /// (#1876/#1877) The DEFAULT policy's version of the scenario above
+    /// (`judge_exhaustion_strict: false`, byte-identical scripted dispatch
+    /// order otherwise): one skipped call (f3's pass-1, refused by the
+    /// exhausted bucket) alongside two real rulings — f2's confirm and f1's
+    /// dispatch-error archive. Fixes the production incident's own shape at
+    /// the mechanism that caused it: a skip must not degrade the run when
+    /// USABLE rulings exist. "One skipped call out of a thousand" and "one
+    /// skipped call out of three" are the same bug; this pins the smaller
+    /// case directly, and `synthesize_review`'s own tests
+    /// (`src/pr_review.rs`) pin the exact 134-flag production shape on the
+    /// render side.
+    #[test]
+    fn run_judge_only_remote_budget_exhaustion_default_policy_is_partial_not_degenerate() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
+        ]);
+        let mut inputs = ReviewInputs {
+            case_id: "c-judge-only-budget-partial".to_string(),
+            roles: &crew,
+            intent_title: "t",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 100, // one 600-token ruling exhausts a pass bucket
+            judge_exhaustion_strict: false,
+            bundles: None,
+            source: None,
+        };
+        inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts"), bundle_input("c.ts")]);
+        let flags = vec![
+            flag("a.ts", "member-a", 0, "charge one"),
+            flag("b.ts", "member-a", 0, "charge two"),
+            flag("c.ts", "member-a", 0, "charge three"),
+        ];
+        let mut cycler = RecordingCycler::new();
+        let remote_calls = RefCell::new(0u32);
+        let mut chat = |call: &ChatCall| {
+            assert!(call.endpoint.is_some(), "judge-only + remote judge ⇒ every call is remote");
+            let idx = *remote_calls.borrow();
+            *remote_calls.borrow_mut() += 1;
+            if idx == 0 {
+                Err(anyhow!("endpoint 503"))
+            } else {
+                Ok(SingleShotReply {
+                    content: CONFIRM_JSON.to_string(),
+                    total_tokens: Some(600),
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: None,
+                })
+            }
+        };
+        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+
+        // The budget row still reaches the envelope — coverage data is
+        // NEVER dropped, only the VERDICT changes.
+        let p1 = env.remote_budgets.iter().find(|r| r.stage == "judge-pass1").expect("judge-pass1 row");
+        assert!(p1.exhausted);
+        assert_eq!(p1.skipped_calls, 1, "f3's pass-1 was refused by the exhausted bucket, same as strict");
+
+        // The fix: the run is NOT degenerate — real signal (f2's confirm)
+        // exists, so the skip is a coverage fact, not a discard-everything
+        // verdict.
+        assert!(
+            env.degenerate.is_none(),
+            "a single skip must not degrade a run with usable rulings: {:?}",
+            env.degenerate
+        );
+        assert_eq!(env.judged[1].tier, Tier::Confirmed, "f2's real ruling still renders");
+        assert_eq!(env.judged[2].pass1.ruling, JudgeRuling::Error, "f3 is honestly Error, never faked confirmed");
+
+        // The dispatch-error warning (a SEPARATE, always-independent
+        // mechanism, #1329) is unaffected by the policy change.
+        assert!(
+            env.warnings.iter().any(|w| w.contains("remote judge dispatch failed on 1 of 3 flag")),
+            "the #1329 warning is independent of the exhaustion policy: {:?}",
+            env.warnings
+        );
+
+        // `review_outcome` (the render-facing predicate) reads this
+        // envelope as Partial, naming the real skip/total numbers.
+        let outcome = review_outcome(&env);
+        match outcome {
+            RunOutcome::Partial { reasons } => {
+                assert_eq!(reasons.len(), 1);
+                assert!(reasons[0].contains("1 of 3 flags went unjudged"), "got: {}", reasons[0]);
+                assert!(reasons[0].contains("judge-pass1"), "got: {}", reasons[0]);
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
     }
 
     // ── ExecMode auto-resolution (#1230 Packet 1: gestalt wave scheduler) ──
@@ -2759,6 +2868,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             judge_system: "judge sys",
             verify_system: "verify sys",
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             bundles: Some(bundles),
             source: None,
         };
@@ -3208,6 +3318,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             judge_system: "judge persona".to_string(),
             verify_system: "verify persona".to_string(),
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             timeout_seconds: 30,
             chat_override: None,
             bundle_override: Some(Arc::new(move || Ok(bundles.clone()))),
@@ -3487,6 +3598,11 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             judge_system: "judge persona".to_string(),
             verify_system: "verify persona".to_string(),
             remote_max_tokens_per_execution,
+            // (#1876/#1877) Default `false` (partial policy) — callers that
+            // want the strict pin flip it after construction via
+            // `Arc::get_mut` (this helper's single strong ref is still
+            // uncloned at that point).
+            judge_exhaustion_strict: false,
             timeout_seconds: 30,
             chat_override: Some(Arc::new(chat_fn)),
             // (#1530) See `step_ctx`'s own doc — same `bundle_override` wiring.
@@ -5849,8 +5965,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// shared `judge_gate_outcome` helper — a partially-exhausted remote
     /// judge bucket degrades the whole run, and its pass1/pass2 budget rows
     /// reach `env.remote_budgets`.
+    ///
+    /// Re-scoped (#1876/#1877): this is now the STRICT-policy pin
+    /// (`ctx.judge_exhaustion_strict = true`) — the operator opt-in that
+    /// restores exactly this pre-#1876 behavior. The companion test right
+    /// below is the SAME scripted scenario under the default (partial)
+    /// policy, which is what actually fixes #1876's own production shape.
     #[test]
-    fn graph_remote_judge_budget_exhaustion_is_an_honest_degraded_run() {
+    fn graph_remote_judge_budget_exhaustion_strict_policy_is_an_honest_degraded_run() {
         let crew = crew_with(vec![
             ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
             ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
@@ -5858,6 +5980,70 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         // Two bundles ⇒ two anchor-less flags in different bundles ⇒ both
         // survive dedup ⇒ the second flag's pass-1 hits the exhausted
         // bucket (one 600-token ruling exhausts a 100-token allowance).
+        let bundles = vec![bundle_input("a.ts"), bundle_input("b.ts")];
+        let mut ctx = step_ctx_with_chat_and_budget(&crew, bundles, 100, |call: &ChatCall| {
+            if call.endpoint.is_some() {
+                Ok(SingleShotReply {
+                    content: CONFIRM_JSON.to_string(),
+                    total_tokens: Some(600),
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    model: None,
+                })
+            } else {
+                Ok(reply("a real defect"))
+            }
+        });
+        Arc::get_mut(&mut ctx).expect("sole strong ref before the graph runs").judge_exhaustion_strict = true;
+        let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
+
+        // CORRECT (preserved per-flag logic): the pre-exhaustion flag still
+        // carries a real ruling, and the post-exhaustion flag is honestly
+        // marked Error, never silently confirmed.
+        assert_eq!(env.judged.len(), 2);
+        assert!(env.judged.iter().any(|j| j.tier == Tier::Confirmed), "the pre-exhaustion flag rules normally");
+        let skipped = env
+            .judged
+            .iter()
+            .find(|j| j.pass1.ruling == JudgeRuling::Error)
+            .expect("the post-exhaustion flag is ruled Error, never silently confirmed");
+        assert!(skipped.pass1.note_for_author.contains("remote token budget exhausted"));
+
+        // (#1373 gate b, FIXED; #1876 STRICT policy) ANY judge-bucket
+        // exhaustion degrades the whole run under the strict opt-in — even
+        // though this scenario has one flag that DID get a real ruling
+        // before the bucket ran out (the "zero usable pass-1 rulings" gate
+        // alone would NOT have caught this; the budget-exhaustion gate is
+        // the one that fires).
+        let reason = env.degenerate.as_deref().expect("strict policy: a partially-exhausted remote judge degrades the run");
+        assert!(reason.contains("remote judge token budget exhausted"), "got: {reason}");
+        // (#1373 gate a, FIXED) judge-pass1/pass2 budget rows now reach
+        // `env.remote_budgets` alongside probe's own bucket row.
+        assert!(
+            env.remote_budgets.iter().any(|r| r.stage == "judge-pass1"),
+            "judge-pass1 budget row must reach the envelope: {:?}",
+            env.remote_budgets
+        );
+        assert!(
+            env.remote_budgets.iter().any(|r| r.stage == "judge-pass2"),
+            "judge-pass2 budget row must reach the envelope: {:?}",
+            env.remote_budgets
+        );
+    }
+
+    /// (#1876/#1877) The DEFAULT policy's version of the test above — same
+    /// scripted scenario, `ctx.judge_exhaustion_strict` left at its default
+    /// `false`. This is the graph path's own pin of the #1876 fix: a
+    /// partially-exhausted remote judge bucket with a real usable ruling
+    /// alongside it must NOT degrade the run. The graph path is the one
+    /// `mission launch review` (the real CI/production entry point) drives —
+    /// this is the exact code path the production incident hit.
+    #[test]
+    fn graph_remote_judge_budget_exhaustion_default_policy_is_partial_not_degraded() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![graph_staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
+        ]);
         let bundles = vec![bundle_input("a.ts"), bundle_input("b.ts")];
         let ctx = step_ctx_with_chat_and_budget(&crew, bundles, 100, |call: &ChatCall| {
             if call.endpoint.is_some() {
@@ -5874,9 +6060,6 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         });
         let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
 
-        // CORRECT (preserved per-flag logic): the pre-exhaustion flag still
-        // carries a real ruling, and the post-exhaustion flag is honestly
-        // marked Error, never silently confirmed.
         assert_eq!(env.judged.len(), 2);
         assert!(env.judged.iter().any(|j| j.tier == Tier::Confirmed), "the pre-exhaustion flag rules normally");
         let skipped = env
@@ -5886,25 +6069,21 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             .expect("the post-exhaustion flag is ruled Error, never silently confirmed");
         assert!(skipped.pass1.note_for_author.contains("remote token budget exhausted"));
 
-        // (#1373 gate b, FIXED) ANY judge-bucket exhaustion degrades the
-        // whole run (operator decision, #1260) — even though this scenario
-        // has one flag that DID get a real ruling before the bucket ran
-        // out (the "zero usable pass-1 rulings" gate alone would NOT have
-        // caught this; the budget-exhaustion gate is the one that fires).
-        let reason = env.degenerate.as_deref().expect("a partially-exhausted remote judge degrades the run");
-        assert!(reason.contains("remote judge token budget exhausted"), "got: {reason}");
-        // (#1373 gate a, FIXED) judge-pass1/pass2 budget rows now reach
-        // `env.remote_budgets` alongside probe's own bucket row.
+        // The #1876 fix, exercised on the real production entry point: the
+        // run is NOT degenerate — the skip is a coverage fact, the real
+        // ruling still renders.
         assert!(
-            env.remote_budgets.iter().any(|r| r.stage == "judge-pass1"),
-            "judge-pass1 budget row must reach the envelope: {:?}",
-            env.remote_budgets
+            env.degenerate.is_none(),
+            "default policy: a partially-exhausted remote judge with a usable ruling must not degrade the run: {:?}",
+            env.degenerate
         );
         assert!(
-            env.remote_budgets.iter().any(|r| r.stage == "judge-pass2"),
-            "judge-pass2 budget row must reach the envelope: {:?}",
+            env.remote_budgets.iter().any(|r| r.stage == "judge-pass1" && r.skipped_calls > 0),
+            "the budget row (with its skip) still reaches the envelope: {:?}",
             env.remote_budgets
         );
+        let outcome = review_outcome(&env);
+        assert!(outcome.is_partial(), "expected Partial, got {outcome:?}");
     }
 
     /// Was `remote_probe_failure_is_a_warning_and_the_run_continues`.
@@ -6182,6 +6361,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     /// verify's task ever becomes ready, since `verify_task.depends_on ==
     /// [judge_task]`) — CONSIDER g, no frontier spend on a run the judge
     /// already doomed.
+    ///
+    /// (#1876/#1877) `judge_exhaustion_strict: true` here on purpose: this
+    /// test is about the CONSIDER-g "verify never spends on an already-
+    /// doomed run" behavior, which needs a genuinely degenerate judge stage
+    /// to exercise — the default (partial) policy would make this same
+    /// scripted scenario NOT degenerate (see the sibling `..._default_
+    /// policy_is_partial_not_degraded` test above), which would make this
+    /// test's own premise false, not wrong.
     #[test]
     fn graph_verify_stage_skipped_when_judge_already_degraded() {
         let crew = crew_with(vec![
@@ -6192,7 +6379,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let bundles = vec![bundle_input("a.ts"), bundle_input("b.ts")];
         let verify_dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let verify_dispatched_write = verify_dispatched.clone();
-        let ctx = step_ctx_with_chat_and_budget(&crew, bundles, 100, move |call: &ChatCall| {
+        let mut ctx = step_ctx_with_chat_and_budget(&crew, bundles, 100, move |call: &ChatCall| {
             if call.model == "darkmux:verify-model" {
                 verify_dispatched_write.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(reply("```json\n{\"ruling\": \"verified\", \"decisive_evidence\": \"e\", \"note_for_author\": \"n\"}\n```"))
@@ -6208,12 +6395,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 Ok(reply("a real defect"))
             }
         });
+        Arc::get_mut(&mut ctx).expect("sole strong ref before the graph runs").judge_exhaustion_strict = true;
         let env = run_graph(&ctx, &mut NullEmitter).expect("graph run completes");
         // One flag confirmed before the judge's remote bucket exhausted —
         // the SAME preserved per-flag logic as
-        // `graph_remote_judge_budget_exhaustion_is_an_honest_degraded_run`
-        // — but the run is now degenerate (gate b), so verify's non-empty
-        // docket never dispatches at all.
+        // `graph_remote_judge_budget_exhaustion_strict_policy_is_an_honest_degraded_run`
+        // — but the run is now degenerate (gate b, strict policy), so
+        // verify's non-empty docket never dispatches at all.
         assert_eq!(env.confirmed, 1, "the pre-exhaustion flag stays confirmed — verify never touches it");
         assert!(env.degenerate.is_some(), "the judge-bucket exhaustion still degrades the run (gate b)");
         assert!(
@@ -7170,6 +7358,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             judge_system: String::new(),
             verify_system: String::new(),
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             timeout_seconds: 30,
             chat_override: None,
             bundle_override: None,
@@ -7274,6 +7463,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             judge_system: String::new(),
             verify_system: String::new(),
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             timeout_seconds: 30,
             chat_override: None,
             bundle_override: None,
@@ -7440,6 +7630,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             judge_system: String::new(),
             verify_system: String::new(),
             remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
             timeout_seconds: 30,
             chat_override: Some(Arc::new(|_call: &ChatCall| {
                 Ok(SingleShotReply {
@@ -7684,4 +7875,126 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let skip = BundleSkipReport { files_considered: 3, files_skipped: Vec::new() };
         let (_msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
         assert_eq!(kind, DegenerateKind::Error);
+    }
+
+    // ── (#1876/#1877) review_outcome: the review-owned RunOutcome mapping ──
+
+    /// A healthy envelope (no `degenerate`, no exhausted judge budget row)
+    /// maps to `Complete`.
+    #[test]
+    fn review_outcome_healthy_envelope_is_complete() {
+        let env = ReviewEnvelope { degenerate: None, ..Default::default() };
+        assert_eq!(review_outcome(&env), RunOutcome::Complete);
+    }
+
+    /// `env.degenerate` set (Gate 2's zero-usable-rulings honesty gate, the
+    /// strict-policy Gate 1, or any other reason review has ever set it
+    /// for) always maps to `Empty` — the "no signal" wording's message
+    /// carries through verbatim, unmodified by this function.
+    #[test]
+    fn review_outcome_degenerate_envelope_is_empty_with_the_reason_carried_verbatim() {
+        let env = ReviewEnvelope {
+            degenerate: Some("judge produced no usable ruling on any of 5 flags (all errored/unparsed)".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            review_outcome(&env),
+            RunOutcome::Empty {
+                reason: "judge produced no usable ruling on any of 5 flags (all errored/unparsed)".to_string()
+            }
+        );
+    }
+
+    /// The #1876 production shape, built directly against `review_outcome`
+    /// (not through a real dispatch): no `degenerate`, but a `judge-pass1`
+    /// remote-budget row with `skipped_calls > 0` — maps to `Partial`, with
+    /// a reason built from the row's OWN numbers (never a fixed string).
+    #[test]
+    fn review_outcome_judge_budget_row_with_skips_and_no_degenerate_is_partial() {
+        let env = ReviewEnvelope {
+            degenerate: None,
+            judged: (0..134).map(|i| archived_flag_for_outcome_test(i)).collect(),
+            remote_budgets: vec![RemoteBudgetRecord {
+                stage: "judge-pass1".to_string(),
+                max_tokens: 500_000,
+                used_tokens: 500_497,
+                exhausted: true,
+                skipped_calls: 11,
+            }],
+            ..Default::default()
+        };
+        match review_outcome(&env) {
+            RunOutcome::Partial { reasons } => {
+                assert_eq!(reasons.len(), 1);
+                assert!(reasons[0].contains("11 of 134 flags went unjudged"), "got: {}", reasons[0]);
+                assert!(reasons[0].contains("judge-pass1"), "got: {}", reasons[0]);
+                assert!(reasons[0].contains("500497"), "the used-token count is the row's own number: {}", reasons[0]);
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    /// A PROBE-stage budget row with skips (already its own correct,
+    /// independently-tested "reduced coverage" warning treatment) must NOT
+    /// also trigger `Partial` — scoped to judge stages only, per
+    /// `review_outcome`'s own doc. Same for a VERIFY-stage row: it already
+    /// renders normally with its own `env.warnings` note
+    /// (`synthesize_verify_exhaustion_posts_verified_plus_header_marker_
+    /// plus_warning` in `src/pr_review.rs` pins that treatment); folding it
+    /// into `Partial` too would double-announce an already-correct outcome.
+    #[test]
+    fn review_outcome_ignores_non_judge_stage_budget_rows() {
+        let env = ReviewEnvelope {
+            degenerate: None,
+            remote_budgets: vec![
+                RemoteBudgetRecord {
+                    stage: "probe".to_string(),
+                    max_tokens: 1_000,
+                    used_tokens: 1_000,
+                    exhausted: true,
+                    skipped_calls: 2,
+                },
+                RemoteBudgetRecord {
+                    stage: "verify".to_string(),
+                    max_tokens: 1_000,
+                    used_tokens: 1_000,
+                    exhausted: true,
+                    skipped_calls: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(review_outcome(&env), RunOutcome::Complete, "non-judge budget skips must not trigger Partial");
+    }
+
+    /// A minimal `JudgedFlag` fixture for `review_outcome`'s own unit
+    /// tests — distinct from `src/pr_review.rs`'s richer `archived_flag`
+    /// (that one is `pub(crate)` to `pr_review`'s own test module, not
+    /// reachable here), and this module only needs a flag that exists and
+    /// carries a distinct bundle id.
+    fn archived_flag_for_outcome_test(i: usize) -> JudgedFlag {
+        JudgedFlag {
+            flag: ProbeFlag {
+                bundle_id: format!("fn{i}@src/x.ts"),
+                fact_family: "unscoped".to_string(),
+                member: "darkmux:probe-model".to_string(),
+                draw: 0,
+                charge_text: "a flagged concern".to_string(),
+                anchor: None,
+                also_flagged: Vec::new(),
+            },
+            pass1: JudgeRecord {
+                ruling: JudgeRuling::FalsePositive,
+                decisive_evidence: String::new(),
+                note_for_author: String::new(),
+                pass: 1,
+                seconds: 0.0,
+            },
+            pass2: None,
+            tier: Tier::Archived,
+            demoted_by_pass2: false,
+            verify: None,
+            demoted_by_verify: false,
+            absence_backstop: None,
+        }
     }

@@ -1101,6 +1101,9 @@ fn run_funnel_case(
         // (#1260) Per-execution remote token allowance, resolved through the
         // one precedence home (`env > config.remote.* > 500000`).
         remote_max_tokens_per_execution: darkmux_types::config_access::remote_max_tokens_per_execution(),
+        // (#1876/#1877) Same accessor, same resolution point — see the
+        // production launcher's identical wiring in `mission_launch_review.rs`.
+        judge_exhaustion_strict: darkmux_types::config_access::review_judge_fail_on_any_skip(),
         timeout_seconds,
         chat_override: None,
         // (#1530) None — bench bundles through the step, like production.

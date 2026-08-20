@@ -124,6 +124,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::remote_budget::{RemoteBudget, RemoteBudgetRecord};
+use darkmux_crew::run_outcome::RunOutcome;
 use darkmux_crew::single_shot::SingleShotReply;
 use darkmux_crew::step_kinds::patterns::dedup::{dedup as pattern_dedup, DedupStrategy};
 use darkmux_crew::step_kinds::patterns::multi_pass_confirm::{multi_pass_confirm, ConfirmTier, PassClass};
@@ -943,6 +944,57 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
 /// crews without the verify seat byte-identical to pre-#1260 ones.
 fn usize_is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+/// (#1877 item 5, fixing #1876) Review's OWN predicate mapping from its
+/// existing envelope fields onto the generic
+/// [`darkmux_crew::run_outcome::RunOutcome`] — the type names three shapes;
+/// this function is the review-specific decision of which of THIS run's
+/// facts lands in which one. Never mutates the envelope; a read-only view
+/// `synthesize_review` (`src/pr_review.rs`) builds its render decision on.
+///
+/// - [`RunOutcome::Empty`] — `env.degenerate` is set. Unchanged by #1876:
+///   this is Gate 2's zero-usable-rulings honesty gate (or a genuinely dead
+///   bundle/probe stage, or the `strict` judge-exhaustion policy opting back
+///   into the pre-#1876 behavior via `judge_gate_outcome`'s Gate 1) — the
+///   SAME condition that has always meant "produced no signal."
+/// - [`RunOutcome::Partial`] — `env.degenerate` is `None` but at least one
+///   `remote_budgets` row for a JUDGE stage (`"judge-pass1"`/`"judge-pass2"`)
+///   carries `skipped_calls > 0`. This is the #1876 fix's own case: the
+///   judge stage's remote token bucket ran out before the whole docket was
+///   judged, but usable rulings exist. Scoped to judge stages ONLY —
+///   probe-stage exhaustion already renders as a "reduced coverage" warning
+///   on a healthy run (never touched `env.degenerate`, nothing to fix), and
+///   verify-stage exhaustion already renders normally with its own
+///   `env.warnings` note (`run_verify_stage` never sets `env.degenerate`
+///   either) — folding those into `Partial` too would double-announce an
+///   already-correct treatment, not fix a bug.
+/// - [`RunOutcome::Complete`] — neither of the above.
+pub fn review_outcome(env: &ReviewEnvelope) -> RunOutcome {
+    if let Some(reason) = &env.degenerate {
+        return RunOutcome::Empty { reason: reason.clone() };
+    }
+    let reasons: Vec<String> = env
+        .remote_budgets
+        .iter()
+        .filter(|r| r.stage.starts_with("judge") && r.skipped_calls > 0)
+        .map(|r| {
+            format!(
+                "{} of {} flags went unjudged on the `{}` stage — its remote token budget \
+                 exhausted ({} of {} tokens used)",
+                r.skipped_calls,
+                env.judged.len(),
+                r.stage,
+                r.used_tokens,
+                r.max_tokens
+            )
+        })
+        .collect();
+    if reasons.is_empty() {
+        RunOutcome::Complete
+    } else {
+        RunOutcome::Partial { reasons }
+    }
 }
 
 // (#1877) `RemoteBudgetRecord`/`RemoteBucket` moved to
@@ -2198,6 +2250,14 @@ pub struct ReviewInputs<'a> {
     /// max_tokens_per_execution > 500000`) — injected here, not read in the
     /// driver, so the pipeline stays config-free and unit-testable.
     pub remote_max_tokens_per_execution: u64,
+    /// (#1876/#1877) The judge stage's remote-budget exhaustion policy —
+    /// `false` (the operator default) treats a skipped judge call as a
+    /// coverage fact, never a verdict, as long as some flag was usably
+    /// judged; `true` restores the pre-#1876 "any skip degrades the whole
+    /// run" behavior. Callers resolve it through `darkmux_types::
+    /// config_access::review_judge_fail_on_any_skip()`, same injection
+    /// discipline as `remote_max_tokens_per_execution` above.
+    pub judge_exhaustion_strict: bool,
     /// (#1748) The SAME `FileSource` the bundler read from — threaded
     /// through so [`apply_absence_backstop`] can check a confirmed
     /// finding's absence claim against the WHOLE FILE, not just the
@@ -2949,26 +3009,33 @@ fn run_verify_stage(
     Ok(())
 }
 
-/// (#1373 gates a/b/c + the reason-specificity fix) One judge stage's
-/// honesty-gate decision — the SAME budget-exhaustion / dispatch-error /
-/// no-usable-ruling logic `finish_review` has always applied, extracted so
-/// `ReviewJudgeStepKind` (the graph path) can apply it too without the two
-/// callers drifting again (CLAUDE.md's #1352 tiering: "shared logic that
-/// both `run_judge_only` and the graph path use should live once").
+/// (#1373 gates a/b/c + the reason-specificity fix; #1876/#1877 Gate 1
+/// rewrite) One judge stage's honesty-gate decision — the SAME
+/// budget-exhaustion / dispatch-error / no-usable-ruling logic
+/// `finish_review` has always applied, extracted so `ReviewJudgeStepKind`
+/// (the graph path) can apply it too without the two callers drifting again
+/// (CLAUDE.md's #1352 tiering: "shared logic that both `run_judge_only` and
+/// the graph path use should live once").
 ///
 /// At most ONE `degenerate_reason` ever comes back — budget exhaustion
-/// wins over the "no usable ruling" gate, mirroring the original
-/// `degen_reasons.is_empty()` short-circuit this was extracted from (never
-/// a "combine every reason" accumulator, #1329). `dispatch_error_warning`
-/// is independent and UNCONDITIONAL (#1329's loud-beats-quiet half) —
-/// present whenever a remote judge had ANY per-flag dispatch failure,
-/// whether or not the run also degenerates.
+/// (under the `strict` policy — see below) wins over the "no usable ruling"
+/// gate, mirroring the original `degen_reasons.is_empty()` short-circuit
+/// this was extracted from (never a "combine every reason" accumulator,
+/// #1329). `dispatch_error_warning` is independent and UNCONDITIONAL
+/// (#1329's loud-beats-quiet half) — present whenever a remote judge had
+/// ANY per-flag dispatch failure, whether or not the run also degenerates.
 struct JudgeGateOutcome {
     remote_budget_rows: Vec<RemoteBudgetRecord>,
     dispatch_error_warning: Option<String>,
     degenerate_reason: Option<String>,
 }
 
+/// (#1876/#1877) `strict` is `darkmux_types::config_access::
+/// review_judge_fail_on_any_skip()` (`env(DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_
+/// SKIP) > config.review.judge_fail_on_any_skip > false`), resolved by the
+/// CALLER (this function stays config-free/pure, per `ReviewInputs::
+/// remote_max_tokens_per_execution`'s own "injected here, not read in the
+/// driver" doctrine) and threaded through `ReviewInputs`/`ReviewStepContext`.
 fn judge_gate_outcome(
     is_remote: bool,
     judged_len: usize,
@@ -2976,6 +3043,7 @@ fn judge_gate_outcome(
     dispatch_errors: usize,
     budgets: Option<&JudgeBudgets>,
     remote_max_tokens_per_execution: u64,
+    strict: bool,
 ) -> JudgeGateOutcome {
     let mut degen_reasons: Vec<String> = Vec::new();
     let mut remote_budget_rows = Vec::new();
@@ -2997,9 +3065,21 @@ fn judge_gate_outcome(
         None
     };
 
-    // Gate 1: a REMOTE judge whose per-pass token bucket EXHAUSTED (a
-    // load-bearing stage — operator decision, DARKMUX_REMOTE_MAX_TOKENS_
-    // PER_EXECUTION). Any exhaustion degrades the run regardless of scale.
+    // Gate 1 (#1876 fix): a REMOTE judge whose per-pass token bucket
+    // EXHAUSTED (a load-bearing stage — operator decision,
+    // DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) is a COVERAGE fact, not a
+    // verdict, under the default `strict == false` policy — the row below
+    // still reaches `env.remote_budgets` regardless, so `review_outcome`
+    // can build the honest Partial outcome (and its rendered banner) from
+    // it. Production incident this replaces: a judge that had ruled 123 of
+    // 134 flags (7 confirmed, 67 needs-check, complete with evidence)
+    // discarded all of it and posted "the review produced no signal"
+    // because the last 11 calls were skipped when the bucket ran out — one
+    // skipped call out of a thousand did the exact same thing, regardless
+    // of how much real signal existed. `strict == true` (an explicit
+    // operator opt-in, `review.judge_fail_on_any_skip`) restores that exact
+    // pre-#1876 behavior: ANY skip degrades the whole run, no matter how
+    // much was judged.
     if let Some(b) = budgets {
         if let Some(rec) = b.pass1.record() {
             remote_budget_rows.push(rec);
@@ -3008,11 +3088,11 @@ fn judge_gate_outcome(
             remote_budget_rows.push(rec);
         }
         let skipped = b.pass1.skipped() + b.pass2.skipped();
-        if skipped > 0 {
+        if skipped > 0 && strict {
             degen_reasons.push(format!(
                 "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
                  per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) ran out; \
-                 degenerate run, never a silent pass"
+                 degenerate run, never a silent pass (review.judge_fail_on_any_skip is set)"
             ));
         }
     }
@@ -3648,6 +3728,7 @@ fn finish_review(
         judge_dispatch_errors,
         judge_budgets.as_ref(),
         inputs.remote_max_tokens_per_execution,
+        inputs.judge_exhaustion_strict,
     );
     if let Some(w) = gate.dispatch_error_warning {
         env.warnings.push(w);
@@ -4026,6 +4107,12 @@ pub struct ReviewStepContext {
     pub judge_system: String,
     pub verify_system: String,
     pub remote_max_tokens_per_execution: u64,
+    /// (#1876/#1877) See [`ReviewInputs::judge_exhaustion_strict`]'s doc —
+    /// same knob, same injection discipline, the graph path's own copy.
+    /// Defaults to `false` (the partial-coverage policy) via `#[derive(Default)]`
+    /// on this struct — every test-fixture construction that doesn't
+    /// explicitly opt into `true` gets the operator-default behavior.
+    pub judge_exhaustion_strict: bool,
     pub timeout_seconds: u32,
     /// (#1355 follow-up) Test-only dispatch seam for [`dispatch_chat`] —
     /// `None` at every production call site (`src/pr_review.rs`,
@@ -5598,6 +5685,7 @@ impl StepKind for ReviewJudgeStepKind {
             judge_dispatch_errors,
             budgets_final.as_ref(),
             ctx.remote_max_tokens_per_execution,
+            ctx.judge_exhaustion_strict,
         );
         {
             let mut env = env.lock().expect("shared review envelope mutex poisoned");

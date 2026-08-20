@@ -999,6 +999,11 @@ fn run_dispatch(
     let crew_name_for_bookends = crew.distinct_profile_names();
     let model_for_bookends = crew_model_summary(&crew);
     let remote_max_tokens_per_execution = darkmux_types::config_access::remote_max_tokens_per_execution();
+    // (#1876/#1877) The judge stage's remote-budget exhaustion policy —
+    // resolved once here, same as the token budget above, and passed
+    // through to both the `--charges-file` (`ReviewInputs`) and the graph
+    // (`ReviewStepContext`) launch shapes below.
+    let judge_exhaustion_strict = darkmux_types::config_access::review_judge_fail_on_any_skip();
 
     // (#1641) `mission_id` starts unset — `--charges-file` never mints a
     // Mission, so it stays `None` on that path. The real-launch branch
@@ -1032,6 +1037,7 @@ fn run_dispatch(
                 "charges_bundles is always Some when input `charges_file` is set (computed above)",
             )),
             remote_max_tokens_per_execution,
+            judge_exhaustion_strict,
             // (#1748) The same `FileSource` bundling used above — lets the
             // mechanical absence-claim backstop check a confirmed finding
             // against the whole file on the `--charges-file` re-judge path
@@ -1126,6 +1132,7 @@ fn run_dispatch(
             judge_system,
             verify_system,
             remote_max_tokens_per_execution,
+            judge_exhaustion_strict,
             timeout_seconds,
             chat_override: None,
             // (#1530) Production dispatch always reconstructs a real
