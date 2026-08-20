@@ -301,22 +301,58 @@ pub struct SchedulerReport {
     pub iterations: usize,
     pub warnings: Vec<String>,
     /// (#1877 item 3) One [`StepRecord`] per step that reached a terminal
-    /// transition through the LIVE `WaveSignal::StepTerminal` path — i.e.
-    /// every completed or errored step, timed with an `Instant` pair taken
-    /// strictly around that step's own `kind.run_streaming(...)` call on
-    /// its own worker thread (see the job closure below), so a sibling's
-    /// duration in here is never inflated by queueing or by a slower wave
-    /// member. `items_in`/`items_out` are always `None` — the scheduler
-    /// observes that a step ran and how long it took, never how many
-    /// items it processed (that is per-kind business semantics; see
-    /// `run_record`'s module doc for the full reconciliation-with-review
-    /// argument). A step whose `StepRunCtx` job PANICKED never streamed a
-    /// terminal, so it gets no entry here (it still lands in `errored`) —
-    /// there is no honest per-step duration to report for it, and this
-    /// module does not report a wave-clock number in its place. This is a
-    /// NEW, additive field: no existing caller of `run_step_graph` is
-    /// required to read it, and none does yet (a mission gets these BY
-    /// CONSTRUCTION but is free to ignore the field entirely).
+    /// transition through the LIVE `WaveSignal::StepTerminal` path, timed
+    /// with an `Instant` pair taken strictly around that step's own
+    /// `kind.run_streaming(...)` call on its own worker thread (see the
+    /// job closure below), so a sibling's duration in here is never
+    /// inflated by queueing or by a slower wave member. `items_in`/
+    /// `items_out` are always `None` — the scheduler observes that a step
+    /// ran and how long it took, never how many items it processed (that
+    /// is per-kind business semantics; see `run_record`'s module doc for
+    /// the full reconciliation-with-review argument).
+    ///
+    /// This is NOT simply "every completed or errored step" — a step can
+    /// land in `errored` through THREE distinct no-live-terminal paths,
+    /// and only one of them streamed a real duration:
+    /// - A step whose `StepRunCtx` job PANICKED never streamed a
+    ///   terminal (it still lands in `errored`).
+    /// - A step whose LOCAL wave never even got to dispatch — either
+    ///   `plan_waves` refused its placement outright, or the wave's own
+    ///   `ensure_wave_loaded` failed to make it resident (see
+    ///   `concurrent_dispatch::run_local_waves`) — is pushed straight into
+    ///   the executor's results as an `Err` with no job closure ever
+    ///   having run, so it likewise never streamed a terminal.
+    ///
+    /// Both of the above reconcile through the SAME post-scope
+    /// `apply_step_terminal(..., None, ...)` call as the panic path (see
+    /// that function's own doc) — there is no honest per-step duration to
+    /// report for a step that never actually dispatched or never finished
+    /// its own `run_streaming` call, and this module never substitutes a
+    /// wave-clock number or a fabricated `0` in its place. So `errored`
+    /// can be, and in practice often is, larger than the set of steps
+    /// that have an entry here: a run where every dispatch step fails to
+    /// load its model (the machine cannot fit it) produces N `errored`
+    /// entries and an EMPTY `step_records` — nothing to render a timeline
+    /// from, and nothing in `errored` alone says why.
+    ///
+    /// Two more properties worth knowing before treating this as a
+    /// complete run log: (1) `run_step_graph` returns its `Result` via
+    /// `?` from a couple of points mid-loop (an unregistered step kind;
+    /// the wave-drain thread scope itself erroring) — either one discards
+    /// the WHOLE `SchedulerReport`, including the records of every step
+    /// that completed in EARLIER waves of the same call, and there is no
+    /// partial-report recovery on that path (see
+    /// `dispatch_as_crew_of_one::reconcile_on_error`, which cannot recover
+    /// them either). (2) The `Vec` is in COMPLETION order (arrival at the
+    /// live drain), not step-graph or wave order — concurrent siblings
+    /// finish in a genuinely nondeterministic sequence, so a consumer
+    /// rendering a timeline from this field should sort by whatever field
+    /// it actually needs ordered, not rely on `Vec` order.
+    ///
+    /// This is a NEW, additive field: no existing caller of
+    /// `run_step_graph` is required to read it, and none does yet (a
+    /// mission gets these BY CONSTRUCTION but is free to ignore the field
+    /// entirely, subject to the caveats above).
     pub step_records: Vec<StepRecord>,
 }
 
@@ -826,10 +862,14 @@ pub fn run_step_graph(
         // crossing into worker threads carry only owned `WaveSignal`s.
         //
         // (#1483 Bug 3) `applied` tracks which steps were already flushed live
-        // from a `StepTerminal` signal, so the post-scope reconcile only has to
-        // handle a step that produced NO terminal signal — i.e. a job that
-        // PANICKED mid-wave (`run_bounded` synthesizes a terminal `Err` for it,
-        // #1452), never a normal completion.
+        // from a `StepTerminal` signal, so the post-scope reconcile only has
+        // to handle a step that produced NO terminal signal — never a normal
+        // completion. That is not only a job that PANICKED mid-wave
+        // (`run_bounded` synthesizes a terminal `Err` for it, #1452): a step
+        // whose local wave was refused by `plan_waves` or failed
+        // `ensure_wave_loaded` (see `concurrent_dispatch::run_local_waves`)
+        // is pushed straight into `run_bounded`'s results with no job
+        // closure ever having run, so it lands here too (#1877 item 3).
         let mut applied: HashSet<usize> = HashSet::new();
         let results = std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
@@ -858,11 +898,16 @@ pub fn run_step_graph(
         })?;
 
         // (#1483 Bug 3) Reconcile only the indices that never streamed a
-        // terminal — the panic path. Every normally-completed job already
-        // flipped its step live above, so its index is in `applied` and is
-        // skipped here. A panicked job left its step `Running`; `run_bounded`
-        // handed back a terminal `Err` for it (#1452), applied here as an error
-        // so the run fails loud rather than stranding the step.
+        // terminal. Every normally-completed job already flipped its step
+        // live above, so its index is in `applied` and is skipped here. A
+        // panicked job left its step `Running`; `run_bounded` handed back a
+        // terminal `Err` for it (#1452), applied here as an error so the run
+        // fails loud rather than stranding the step. A step whose local wave
+        // never dispatched at all (refused by `plan_waves`, or the wave's
+        // `ensure_wave_loaded` failed) arrives here the same way, also as an
+        // `Err` with no job ever having run (#1877 item 3) — see this
+        // function's own errored-vs-step_records distinction above and
+        // `apply_step_terminal`'s doc.
         let finished_at = now_unix();
         for (idx, outcome) in results {
             if applied.contains(&idx) {
@@ -880,10 +925,12 @@ pub fn run_step_graph(
                 &mut *persist,
                 &id,
                 finished_at,
-                // A panicked job's closure never reached the point where it
-                // would send its own `wall_ms` — no honest duration exists
-                // for it, so no `StepRecord` (see `apply_step_terminal`'s
-                // own doc). It still lands in `report.errored` above.
+                // Neither a panicked job's closure nor a step whose local
+                // wave never dispatched (refused / load-failed, #1877 item
+                // 3) reached the point where a real `wall_ms` exists — no
+                // honest duration to report, so no `StepRecord` (see
+                // `apply_step_terminal`'s own doc). It still lands in
+                // `report.errored` above.
                 None,
                 result,
                 flow_records,
@@ -901,18 +948,24 @@ pub fn run_step_graph(
 /// lifecycle record, and a durable `persist` — to `steps`/`report`. Shared by
 /// three callers: the gate-declined path (a step that never ran at all), the
 /// live per-seat drain (a `WaveSignal::StepTerminal` the moment a job
-/// finishes), and the post-scope reconcile (a panicked job's synthesized
-/// terminal `Err`, #1452) — so all three flip a step identically. `at` is the
-/// step's own completion epoch (seconds); `result` is `Ok(output)` /
-/// `Err(message)`.
+/// finishes), and the post-scope reconcile — so all three flip a step
+/// identically. `at` is the step's own completion epoch (seconds); `result`
+/// is `Ok(output)` / `Err(message)`.
 ///
 /// (#1877 item 3) `wall_ms` is `Some(duration)` ONLY from the live drain,
 /// where a real per-step `Instant` pair exists (see the job closure above).
-/// It is `None` from the other two callers, honestly: a gate-declined step
-/// never dispatched at all (nothing to time), and a panicked job's job
-/// closure never reached the point where it would have sent its own
-/// `wall_ms` — there is no real duration recoverable for it, and this
-/// function does not substitute a wave-clock number or a `0` in its place.
+/// It is `None` from the other two callers, honestly:
+/// - A gate-declined step never dispatched at all — nothing to time.
+/// - The post-scope reconcile covers every index that never streamed a
+///   live terminal, which is NOT only a panicked job's synthesized `Err`
+///   (#1452): it also catches a step whose local wave was refused by
+///   `plan_waves` or failed `ensure_wave_loaded` (see
+///   `concurrent_dispatch::run_local_waves`), pushed straight into the
+///   executor's results with no job closure ever having run. None of
+///   these three sub-cases has a real duration recoverable — this
+///   function does not substitute a wave-clock number or a `0` in its
+///   place for any of them.
+///
 /// A [`crate::run_record::StepRecord`] is pushed onto `report.step_records`
 /// only when `wall_ms` is `Some` — so every entry there carries a genuine,
 /// per-step-measured duration, never a fabricated one.
