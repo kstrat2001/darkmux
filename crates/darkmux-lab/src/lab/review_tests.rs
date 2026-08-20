@@ -8098,6 +8098,105 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         }
     }
 
+    // ── (#1877 item 2) review_mission_outcome: the MissionEnvelope-facing
+    // ── RunOutcome mapping, deliberately distinct from `review_outcome` ──
+
+    #[test]
+    fn review_mission_outcome_healthy_envelope_is_complete() {
+        let env = ReviewEnvelope { degenerate: None, warnings: Vec::new(), ..Default::default() };
+        assert_eq!(review_mission_outcome(&env), RunOutcome::Complete);
+    }
+
+    /// The neutral carve-out (#1654/#1757): a `BenignEmpty` degenerate
+    /// reason maps to `Complete`, NOT `Empty` — `review_outcome` (the
+    /// banner-facing function) would call this `Empty`, and that
+    /// divergence is the whole reason this is a separate function. Pins
+    /// the exact regression this PR must not introduce: a benign-empty
+    /// review flipping the mission board from `Clean` to `Degenerate`.
+    #[test]
+    fn review_mission_outcome_benign_empty_degenerate_is_complete_not_empty() {
+        let env = ReviewEnvelope {
+            degenerate: Some("no bundles produced from the diff — 2 skipped (2 non-code)".to_string()),
+            degenerate_kind: Some(DegenerateKind::BenignEmpty),
+            ..Default::default()
+        };
+        assert_eq!(
+            review_mission_outcome(&env),
+            RunOutcome::Complete,
+            "a benign-empty review must not read Empty on the mission-envelope outcome"
+        );
+    }
+
+    /// Same carve-out, the `UnsupportedLanguage` half (#1757).
+    #[test]
+    fn review_mission_outcome_unsupported_language_degenerate_is_complete_not_empty() {
+        let env = ReviewEnvelope {
+            degenerate: Some(
+                "no bundles produced from the diff — 1 skipped (1 real source in an unsupported language)"
+                    .to_string(),
+            ),
+            degenerate_kind: Some(DegenerateKind::UnsupportedLanguage),
+            ..Default::default()
+        };
+        assert_eq!(review_mission_outcome(&env), RunOutcome::Complete);
+    }
+
+    /// The control: a genuine `Error`-kind degenerate run stays `Empty`.
+    #[test]
+    fn review_mission_outcome_error_kind_degenerate_is_empty() {
+        let env = ReviewEnvelope {
+            degenerate: Some("no bundles produced from the diff".to_string()),
+            degenerate_kind: Some(DegenerateKind::Error),
+            ..Default::default()
+        };
+        assert_eq!(
+            review_mission_outcome(&env),
+            RunOutcome::Empty { reason: "no bundles produced from the diff".to_string() }
+        );
+    }
+
+    /// The other divergence from `review_outcome`: ANY non-empty
+    /// `env.warnings` maps to `Partial`, not only a judge-stage remote
+    /// budget skip. A probe-seat bounded-retry failure (no judge exhaustion
+    /// at all) must still flag the mission board, matching the pre-#1877
+    /// `!env.warnings.is_empty() -> Degraded` rule this function replaces.
+    #[test]
+    fn review_mission_outcome_any_warning_is_partial_not_only_judge_stage_skips() {
+        let env = ReviewEnvelope {
+            degenerate: None,
+            warnings: vec!["remote probe seat failed after bounded retries".to_string()],
+            remote_budgets: Vec::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            review_mission_outcome(&env),
+            RunOutcome::Partial { reasons: vec!["remote probe seat failed after bounded retries".to_string()] }
+        );
+    }
+
+    /// The #1876 production shape carries through this function too, with
+    /// its real numbers intact.
+    #[test]
+    fn review_mission_outcome_judge_budget_warning_is_partial_with_real_numbers() {
+        let env = ReviewEnvelope {
+            degenerate: None,
+            warnings: vec![
+                "11 of 134 flags went unjudged on the `judge-pass1` stage — it exceeded its 500000-token \
+                 allowance (500497 used)"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+        match review_mission_outcome(&env) {
+            RunOutcome::Partial { reasons } => {
+                assert_eq!(reasons.len(), 1);
+                assert!(reasons[0].contains("11 of 134 flags went unjudged"));
+                assert!(reasons[0].contains("500497"));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
     /// A minimal `JudgedFlag` fixture for `review_outcome`'s own unit
     /// tests — distinct from `src/pr_review.rs`'s richer `archived_flag`
     /// (that one is `pub(crate)` to `pr_review`'s own test module, not
