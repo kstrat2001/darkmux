@@ -22,6 +22,22 @@
 //! matching variant. This type only names the three shapes an outcome picks
 //! from; the mapping stays with the mission that owns the data. See
 //! `darkmux_lab::lab::review::review_outcome` for review's own mapping.
+//!
+//! **Known gap, deliberately NOT closed here (#1876/#1877 QA follow-up —
+//! next step for #1877):** `MissionEnvelope` (`crew::envelope`) does not
+//! carry a `RunOutcome` field. Its own `MissionOutcomeStatus` (`Clean` /
+//! `Degraded` / `Degenerate` / `Error`) is a SECOND, independently
+//! hand-maintained encoding of the same Complete/Partial/Empty shape this
+//! type names — `review_result_to_mission_envelope`
+//! (`src/mission_launch_review.rs`) re-derives it from `env.degenerate` /
+//! `env.warnings` rather than from a `RunOutcome` it could just convert.
+//! Any second mission that wants the same "did this run finish its own
+//! docket" signal on its `MissionEnvelope` will hit the same "re-implement
+//! the encode-partial-as-a-warning-string convention" wall review just
+//! climbed. Putting `RunOutcome` directly on `MissionEnvelope` and deriving
+//! `MissionOutcomeStatus` from it (rather than the reverse) would close
+//! that gap for every future mission at once — real, but out of scope for
+//! this PR; tracked as the next step under #1877.
 
 use serde::{Deserialize, Serialize};
 
