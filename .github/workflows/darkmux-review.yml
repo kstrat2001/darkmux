@@ -359,9 +359,19 @@ jobs:
               # never a failure, and never a green approval either.
               jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md" ;;
-            *)
+            comment)
+              # Zero confirmed findings (needs-check only, or nothing at
+              # all) — no formal review payload, just the honest prose
+              # summary. A real signal-bearing outcome, so post and exit 0.
               jq -r .comment "$RUNNER_TEMP/qa/rendered.json" > "$RUNNER_TEMP/qa/comment.md"
               gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/qa/comment.md" ;;
+            *)
+              # (#1889) An unrecognized `Rendered.mode` must fail loudly,
+              # never fall through to a silent post-and-pass — the same
+              # "a produced-nothing review must never read as a green
+              # check" doctrine the `degraded)` arm above states explicitly.
+              echo "::error::unrecognized rendered mode: $MODE_RESULT"
+              exit 1 ;;
           esac
 
       - name: Upload review envelope (debugging + audit)
