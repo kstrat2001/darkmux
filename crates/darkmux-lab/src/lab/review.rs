@@ -154,10 +154,21 @@
 //!
 //! What the two numbers DO guarantee, because one strictly contains the
 //! other in wall-clock: for the same step, the scheduler's `wall_ms` is
-//! always `>=` this module's own reported `wall_ms`. That relationship,
-//! not either side's absolute duration, is the thing worth pinning in a
-//! test — see `scheduler.rs`'s `#1877` invariant test for where it's
-//! asserted.
+//! always `>=` the `wall_ms` THIS MODULE emits in its own `step result`
+//! flow record (the `t0.elapsed()` passed to [`emit_review_step_result`]
+//! above — e.g. the judge step's combined pass-1 + pass-2 wall time).
+//! This is deliberately NOT the same thing as `MemberRecord::wall_ms`:
+//! for the judge seat that field is `pass1_wall_ms + pass2_wall_ms`
+//! summed ACROSS EVERY FLAG's own dispatches — a COST metric, not a
+//! timeline (see the doc at its assignment site) — and under
+//! `review.judge_concurrency > 1` (an operator knob, always stamped onto
+//! `review-judge-step` as a step-config override) those per-flag
+//! dispatches overlap in wall-clock, so the sum can exceed both this
+//! module's own elapsed `wall_ms` and the scheduler's number. The `>=`
+//! relationship holds for the `step result` `wall_ms`; it does NOT hold
+//! for `MemberRecord::wall_ms`. That relationship, not either side's
+//! absolute duration, is the thing worth pinning in a test — see
+//! `scheduler.rs`'s `#1877` invariant test for where it's asserted.
 //!
 //! (Today the two producers are also structurally disjoint at the envelope
 //! level — `SchedulerReport::step_records` is not merged into
