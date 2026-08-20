@@ -311,6 +311,15 @@ pub struct SchedulerReport {
     /// is per-kind business semantics; see `run_record`'s module doc for
     /// the full reconciliation-with-review argument).
     ///
+    /// This field's `wall_ms` strictly CONTAINS a review step kind's own
+    /// reported `wall_ms` when both exist for the same step: the kind's
+    /// own record is computed and emitted BEFORE `run_streaming` returns;
+    /// this one is timed around that SAME call, from outside it, so it
+    /// can never be smaller. See `darkmux_lab::lab::review`'s "Timing: two
+    /// scopes, not one duplicated" module doc (#1877) for why that
+    /// containment is correct design, not duplication, and this file's own
+    /// `#1877` invariant test for where the `>=` relationship is pinned.
+    ///
     /// This is NOT simply "every completed or errored step" — a step can
     /// land in `errored` through THREE distinct no-live-terminal paths,
     /// and only one of them streamed a real duration:
