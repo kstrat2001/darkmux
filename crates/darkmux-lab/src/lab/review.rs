@@ -2556,8 +2556,8 @@ fn run_verify_stage(
     env.steps.push(StepRecord {
         step_id: "verify".to_string(),
         kind: "dispatch".to_string(),
-        items_in: docket,
-        items_out: docket,
+        items_in: Some(docket),
+        items_out: Some(docket),
         wall_ms,
     });
     // The verify stage's single completion record — the SAME shape the graph
@@ -3172,8 +3172,8 @@ fn finish_review(
     env.steps.push(StepRecord {
         step_id: "dedup".to_string(),
         kind: "procedural".to_string(),
-        items_in: env.raw_flags,
-        items_out: deduped.len(),
+        items_in: Some(env.raw_flags),
+        items_out: Some(deduped.len()),
         wall_ms: dedup_ms,
     });
     obs.step_result(
@@ -3296,16 +3296,16 @@ fn finish_review(
     env.steps.push(StepRecord {
         step_id: "judge-pass1".to_string(),
         kind: "dispatch".to_string(),
-        items_in: deduped.len(),
-        items_out: deduped.len(),
+        items_in: Some(deduped.len()),
+        items_out: Some(deduped.len()),
         wall_ms: pass1_ms,
     });
     if pass2_flags > 0 {
         env.steps.push(StepRecord {
             step_id: "judge-pass2".to_string(),
             kind: "dispatch".to_string(),
-            items_in: pass2_flags,
-            items_out: pass2_flags,
+            items_in: Some(pass2_flags),
+            items_out: Some(pass2_flags),
             wall_ms: pass2_ms,
         });
     }
@@ -3460,8 +3460,8 @@ pub fn run_judge_only(
     env.steps.push(StepRecord {
         step_id: "bundle".to_string(),
         kind: "procedural".to_string(),
-        items_in: 1,
-        items_out: bundles.len(),
+        items_in: Some(1),
+        items_out: Some(bundles.len()),
         wall_ms: bundle_ms,
     });
     obs.step_result("review.bundle", "bundle", json!({ "items_out": bundles.len() }));
