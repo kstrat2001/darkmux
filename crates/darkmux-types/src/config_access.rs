@@ -1381,6 +1381,44 @@ mod tests {
         }
     }
 
+    /// (#1876/#1877 QA follow-up, ALSO FIX 6) The test above pins env-set,
+    /// env-false, env-garbage, and the built-in default, but never the
+    /// `config.review.judge_fail_on_any_skip` MIDDLE tier the doc above
+    /// advertises as part of `env > config.json > built-in default`. It
+    /// can't be pinned by calling `review_judge_fail_on_any_skip()`
+    /// directly — `config()` is unconditionally the empty test config under
+    /// `cfg(test)` (#811's process-wide-`OnceLock` isolation, see this
+    /// module's own doc), so no test in this crate can inject a real
+    /// `config.json` value through that accessor. `pick_parsed` is the
+    /// documented escape hatch for exactly this (see
+    /// `pick_parsed_precedence_and_unparseable`, which pins the same
+    /// generic property for `u64`): it takes `cfg` as an explicit
+    /// argument, so calling it with THIS setting's own key/type/default
+    /// pins the middle tier for review_judge_fail_on_any_skip specifically,
+    /// not just for `pick_parsed` in the generic/u64 case.
+    #[serial_test::serial]
+    #[test]
+    fn review_judge_fail_on_any_skip_config_tier_beats_default_when_env_unset() {
+        let k = "DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_SKIP";
+        let prev = std::env::var(k).ok();
+        unsafe {
+            std::env::remove_var(k);
+        }
+        assert_eq!(
+            pick_parsed::<bool>(k, Some(true), Some(false)),
+            Some(true),
+            "config.review.judge_fail_on_any_skip must beat the built-in false default \
+             when no env override is set — the exact call review_judge_fail_on_any_skip() \
+             makes internally"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     // ── role_profiles / role_profile (#1475 packet 1) ──
     // Under the empty test config (#811) the map is empty and every role is
     // unmapped — the fresh-user floor. Populated-map resolution is exercised by
