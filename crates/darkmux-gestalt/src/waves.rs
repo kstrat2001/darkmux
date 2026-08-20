@@ -556,6 +556,54 @@ mod tests {
         )])
     }
 
+    // ── #1877: wave_schedule_to_exec_mode's own table ────────────────────
+    //
+    // This function moved here from `darkmux_lab::lab::review` unchanged,
+    // but its only coverage stayed behind as
+    // `review_tests::wave_schedule_to_exec_mode_one_wave_is_parallel_more_is_sequential`,
+    // reached only through the `pub use` re-export — `cargo test -p
+    // darkmux-gestalt` never exercised it. This crate's own doc
+    // ("every behavior is one `assert_eq!` table row") applies here same
+    // as anywhere else in this file; the review-side test stays too (it
+    // still earns its place as a regression guard on the re-export
+    // itself — a caller could accidentally stop importing the gestalt
+    // function and fall back to a stale local one without this crate's
+    // own table catching it).
+
+    fn exec_mode_schedule(n_waves: usize) -> WaveSchedule {
+        WaveSchedule {
+            waves: (0..n_waves).map(|i| vec![placement(&format!("m{i}"), 8_000)]).collect(),
+            refusals: Vec::new(),
+            mode: WaveMode::Auto,
+            effective_limit_bytes: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn wave_schedule_to_exec_mode_table() {
+        assert_eq!(
+            wave_schedule_to_exec_mode(&exec_mode_schedule(0)),
+            ExecMode::Parallel,
+            "zero waves (nothing to co-reside) is Parallel"
+        );
+        assert_eq!(
+            wave_schedule_to_exec_mode(&exec_mode_schedule(1)),
+            ExecMode::Parallel,
+            "one wave (everything fits together) is Parallel"
+        );
+        assert_eq!(
+            wave_schedule_to_exec_mode(&exec_mode_schedule(2)),
+            ExecMode::Sequential,
+            "two waves (doesn't all fit) is Sequential"
+        );
+        assert_eq!(
+            wave_schedule_to_exec_mode(&exec_mode_schedule(3)),
+            ExecMode::Sequential,
+            "more than two waves is still Sequential"
+        );
+    }
+
     // ── the required #1285 rows ──────────────────────────────────────────
 
     #[test]
