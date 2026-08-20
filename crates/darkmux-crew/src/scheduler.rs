@@ -2844,6 +2844,114 @@ mod tests {
         assert_eq!(steps["a-step"].status, NodeStatus::Complete);
     }
 
+    // ─── #1877 (this issue): the outer/inner timing relationship ───────
+    //
+    // See `darkmux_lab::lab::review`'s "Timing: two scopes, not one
+    // duplicated" module doc for the full argument. In short: a graph step
+    // kind (review's `ReviewJudgeStepKind` etc.) times its OWN inner work
+    // and reports it before `run_streaming` returns; the scheduler wraps
+    // that same `run_streaming` call in its own `Instant` pair, strictly
+    // outside it, and that is what lands in `StepRecord::wall_ms` here.
+    // One strictly contains the other in wall-clock, so the scheduler's
+    // number can never be smaller than an honestly-reported inner number —
+    // that containment, not any specific duration, is what this test pins.
+
+    /// A synthetic `StepKind` shaped like review's own step kinds: it takes
+    /// its own `Instant` at the top of `run_streaming`, does a small amount
+    /// of real work, and reports its OWN measured wall time back — via
+    /// `StepOutcome.output` (parsed as a plain `u64` millisecond count),
+    /// standing in for the `wall_ms` field review's kinds put in their
+    /// `emit_review_step_result` payload. `report_ms_override`, when set,
+    /// makes the kind report a DISHONEST wall (bigger than what it actually
+    /// did) — this is the knob used to red-prove the invariant test below
+    /// before trusting it (see that test's doc for what was observed).
+    struct SelfTimedKind {
+        report_ms_override: Option<u64>,
+    }
+    impl StepKind for SelfTimedKind {
+        fn id(&self) -> &'static str {
+            "test.self-timed"
+        }
+        fn run(&self, _s: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+            panic!("SelfTimedKind only runs through run_streaming")
+        }
+        fn run_streaming(
+            &self,
+            _step: &Step,
+            _task: &Task,
+            _input: &BTreeMap<String, String>,
+            _ctx: &StepRunCtx,
+        ) -> Result<StepOutcome> {
+            let t0 = Instant::now();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let real_wall_ms = t0.elapsed().as_millis() as u64;
+            let reported_ms = self.report_ms_override.unwrap_or(real_wall_ms);
+            Ok(StepOutcome { output: reported_ms.to_string(), flow_records: vec![] })
+        }
+    }
+
+    /// (#1877, correcting the earlier "kinds should stop re-measuring"
+    /// plan) The invariant the two timing scopes actually owe each other:
+    /// for the same step, the scheduler's `StepRecord::wall_ms` (measured
+    /// strictly around the kind's `run_streaming` call) must be `>=` the
+    /// kind's own honestly-reported inner wall (here, `SelfTimedKind`'s
+    /// `output`, standing in for review's `wall_ms` payload field). Never
+    /// assert a specific duration on either side — only the relationship,
+    /// which is what stays deterministic under CI load.
+    ///
+    /// **Proved failing first**, by construction rather than by deleting
+    /// scheduler code: run once with `report_ms_override: Some(60_000)` (a
+    /// kind that lies and claims an inner wall of one full minute for 15ms
+    /// of real work) — the assertion below fails exactly as expected,
+    /// `scheduler wall_ms (…) must be >= the kind's own reported wall
+    /// (60000)`, proving the assertion is capable of catching a real
+    /// violation and is not vacuously true. Then run with
+    /// `report_ms_override: None` (the version committed here) — the kind
+    /// reports its own honest elapsed time and the assertion passes. Both
+    /// runs were observed directly while writing this test.
+    #[test]
+    fn scheduler_outer_wall_is_never_less_than_the_kinds_own_inner_wall() {
+        let kind = Arc::new(SelfTimedKind { report_ms_override: None });
+        let (ta, sa) = kinded_step("timed", "test.self-timed", json!({}), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa)]);
+
+        let kinds = StepKindRegistry::new();
+        kinds.register(kind).unwrap();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(report.step_records.len(), 1, "one record for the one step that ran");
+        let scheduler_wall_ms = report.step_records[0].wall_ms;
+        let kind_reported_wall_ms: u64 = steps["timed-step"]
+            .output
+            .as_ref()
+            .expect("step completed and stored its self-reported wall")
+            .parse()
+            .expect("SelfTimedKind's output is a plain millisecond count");
+
+        assert!(
+            scheduler_wall_ms >= kind_reported_wall_ms,
+            "scheduler wall_ms ({scheduler_wall_ms}) must be >= the kind's own reported wall \
+             ({kind_reported_wall_ms}) — the scheduler measures strictly around the kind's \
+             run_streaming call, so it can never be shorter than an honest inner measurement"
+        );
+    }
+
     /// (#1442 ship-2b, the operator-recorded seam decision on PR #1455) The
     /// `MapDispatchOverride` conformance test: an override handed to
     /// `run_step_graph` reaches a REAL `dispatch.map` step's item loop on the

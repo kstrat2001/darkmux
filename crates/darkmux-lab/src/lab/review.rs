@@ -110,6 +110,56 @@
 //! (its [`JudgeOutcome`] is emitted from by the caller in `finish_review`'s
 //! loop, after the call returns).
 //!
+//! ## Timing: two scopes, not one duplicated (#1877, correcting an earlier
+//! plan in that issue)
+//!
+//! Every graph step kind below (`ReviewBundleStepKind`, `ReviewDedupStepKind`,
+//! `ReviewJudgeStepKind`, etc.) takes its own `Instant` at the top of
+//! `run_streaming`, computes its own `wall_ms`, and passes it to
+//! [`emit_review_step_result`] — this is the emission site referenced below.
+//! Separately, `darkmux_crew::scheduler::run_step_graph` (the caller that
+//! invokes `run_streaming`, see `build_review_graph_from_config` below) wraps
+//! that SAME call in its own `Instant` pair and pushes the result into
+//! `SchedulerReport::step_records` (see that field's doc in
+//! `crates/darkmux-crew/src/scheduler.rs` and the module doc in
+//! `crates/darkmux-crew/src/run_record.rs`).
+//!
+//! An earlier plan for this arc proposed collapsing these into one
+//! measurement — "the kinds should stop re-measuring, read the scheduler's
+//! record instead." That is not implementable and not desirable, and it is
+//! worth stating plainly here so nobody "consolidates" this module's own
+//! `t0`/`wall_ms` locals and quietly loses either half:
+//!
+//! - **It is not implementable**: a step kind's `wall_ms` above is computed
+//!   and emitted BEFORE `run_streaming` returns. The scheduler's own timer
+//!   does not stop, and its `StepRecord` does not exist, until AFTER
+//!   `run_streaming` returns. There is no ordering in which this module's
+//!   emission site could read the scheduler's number instead of its own.
+//! - **It is not duplication even where both exist for the same step**: this
+//!   module's record carries `items_in`/`items_out` and, for the judge step,
+//!   a `pass1_wall_ms`/`pass2_wall_ms` breakdown — real per-kind business
+//!   semantics the scheduler cannot observe from outside the call (see
+//!   `StepRecord::items_in`'s own doc in `run_record.rs`: the scheduler
+//!   always leaves those `None`). This is INNER work, with a breakdown,
+//!   emitted into the flow stream the viewer renders. The scheduler's number
+//!   is OUTER duration — it includes dispatch/reconcile overhead around the
+//!   call and is recorded uniformly for every step of every mission, whether
+//!   or not the kind cooperates. Dropping either loses something real: the
+//!   breakdown, or the uniform coverage.
+//!
+//! What the two numbers DO guarantee, because one strictly contains the
+//! other in wall-clock: for the same step, the scheduler's `wall_ms` is
+//! always `>=` this module's own reported `wall_ms`. That relationship,
+//! not either side's absolute duration, is the thing worth pinning in a
+//! test — see `scheduler.rs`'s `#1877` invariant test for where it's
+//! asserted.
+//!
+//! (Today the two producers are also structurally disjoint at the envelope
+//! level — `SchedulerReport::step_records` is not merged into
+//! `ReviewEnvelope::steps` on the graph path, so there is no double count to
+//! reconcile there either. See `run_record.rs`'s module doc for that half of
+//! the story.)
+//!
 //! ## Host telemetry sampling (#1247 doctrine surface — "No blind runs")
 //!
 //! `run_review_graph`/`run_judge_only` also start a background host cpu/ram/gpu
