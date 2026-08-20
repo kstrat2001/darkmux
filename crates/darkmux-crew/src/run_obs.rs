@@ -82,6 +82,28 @@ pub const DEFAULT_TELEMETRY_POLL: Duration = Duration::from_millis(500);
 /// agnostic (the lab-vs-fleet scope boundary: a bench run's records stay
 /// per-run-local; a live mission's ride the fleet stream — same driver
 /// code, different injected [`RunEmitter`]).
+///
+/// **Not `Send`, and taken as `&mut dyn`.** A [`RunEmitter`] can only be
+/// held and called from one thread at a time — there is no blanket `Sync`
+/// bound and no interior locking, deliberately (see [`HostTelemetrySampler`]'s
+/// doc for why the sampler routes samples through an `mpsc` channel instead
+/// of calling `emit` straight from its background thread). A driver whose
+/// steps genuinely run concurrently (a `run_step_graph` wave dispatching
+/// several steps in parallel worker threads) cannot hand each worker its
+/// own `&mut dyn RunEmitter` — `run_review_graph` (this substrate's own
+/// consumer) works around this by keeping the emit call itself on the MAIN
+/// thread: the scheduler drains each wave's worker results before invoking
+/// its emit closure, so `emitter.emit(...)` is only ever called
+/// single-threaded even though the STEPS it reports on ran concurrently.
+/// The actual model-dispatch work happening inside those worker threads
+/// still emits its own liveness bookends (contract 2) straight to the
+/// global `darkmux_flow::record` sink, never through this trait — a
+/// `RunEmitter` only ever reports what the main thread already knows.
+/// A future driver reaching for this substrate should expect the same
+/// shape: [`RunEmitter`] threads records off the MAIN thread only; genuine
+/// worker-thread concurrency needs its own bridge back (a channel, same as
+/// [`HostTelemetrySampler`]'s) rather than passing the emitter itself
+/// across threads.
 pub trait RunEmitter {
     fn emit(&mut self, record: darkmux_flow::FlowRecord);
 }
