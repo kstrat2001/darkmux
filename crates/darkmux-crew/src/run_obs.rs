@@ -22,13 +22,28 @@
 //! performs model work, on every exit — clean finish, an early `?`-return,
 //! or a panic. [`RunObs`] bundles the injected emitter with its
 //! [`HostTelemetrySampler`] and drains pending samples before every
-//! `step result` it emits AND once more in `Drop`, so a caller cannot hold
-//! one without also getting the drain-on-every-exit-path guarantee — there
-//! is no method that lets a caller emit a step result while skipping the
+//! `step result` it emits AND once more in `Drop`, so a caller that goes
+//! through [`RunObs`] cannot hold one without also getting the
+//! drain-on-every-exit-path guarantee — there is no method on [`RunObs`]
+//! itself that lets a caller emit a step result while skipping the
 //! telemetry drain, and no way to reach the sampler's thread handle or
-//! receiver directly (both stay private; [`HostTelemetrySampler::try_drain`]
-//! is the only way in or out). The wrong thing — holding the sampler
-//! without the guard, or draining it without emitting — does not compile.
+//! receiver directly through it (both stay private on
+//! [`HostTelemetrySampler`]; [`HostTelemetrySampler::try_drain`] is the
+//! only way to read a sample out).
+//!
+//! **This guarantee is scoped to [`RunObs`], not to [`HostTelemetrySampler`]
+//! itself.** `HostTelemetrySampler::start` is `pub` on purpose: a driver
+//! that already owns its own liveness bookend and already interleaves
+//! telemetry with its own step-lifecycle record stream — `run_review_graph`
+//! is exactly this shape, see its own "(#1349) Host telemetry only — no
+//! bookend struct" comment — can hold the sampler directly and drain it by
+//! hand instead of going through [`RunObs`]. Nothing at the type level
+//! stops that caller from holding the sampler undrained, or dropping it
+//! without ever draining; the obligation is the caller's, not the
+//! compiler's, for that path. Reach for [`RunObs`] by default — it is the
+//! batteries-included wrapper for a driver that does NOT already have this
+//! machinery — and reach for the bare sampler only when a caller already
+//! owns the interleaving discipline [`RunObs`] would otherwise provide.
 //!
 //! **Renamed on the move** (`ReviewEmitter` → [`RunEmitter`], `ReviewObs` →
 //! [`RunObs`]): both were review-flavored names for genuinely mission-
