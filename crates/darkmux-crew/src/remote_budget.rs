@@ -353,6 +353,7 @@ mod tests {
     ///   += calls;` from `spend()`) makes this test fail the same way:
     ///   with `self.calls` stuck at 0 and `self.skipped` at 0, even the
     ///   UN-mutated `&&` guard reads "empty" and `record()` returns `None`.
+    ///
     /// Both were verified by hand: reverting either line reproduces the
     /// `record() returned None for a healthy run` panic below.
     #[test]
