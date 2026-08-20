@@ -269,6 +269,14 @@ impl HostTelemetrySampler {
                 let sample = sample_fn();
                 if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
                     let mut payload = serde_json::Map::new();
+                    // (#1247 "no blind runs" — the cadence is a recorded
+                    // knob, never adaptive-silent) Stamp the ACTUAL
+                    // interval this sampler runs at into every sample it
+                    // emits, so a second consumer choosing a different
+                    // `interval` from `DEFAULT_TELEMETRY_INTERVAL`
+                    // produces an artifact that says so, instead of one
+                    // indistinguishable from the production cadence.
+                    payload.insert("interval_ms".into(), (interval.as_millis() as u64).into());
                     if let Some(c) = sample.cpu {
                         payload.insert("cpu".into(), c.into());
                     }
@@ -559,5 +567,11 @@ mod tests {
         assert_eq!(payload["cpu"], serde_json::json!(42));
         assert_eq!(payload["mem"], serde_json::json!(50));
         assert_eq!(payload["gpu"], serde_json::json!(7));
+        // (#1247 "no blind runs" — the cadence must be a recorded knob,
+        // never adaptive-silent) This test drives the sampler at a 5ms
+        // interval, not the production 2000ms default — if the payload
+        // didn't stamp the ACTUAL interval it ran at, this artifact would
+        // be indistinguishable from one sampled at production cadence.
+        assert_eq!(payload["interval_ms"], serde_json::json!(5));
     }
 }
