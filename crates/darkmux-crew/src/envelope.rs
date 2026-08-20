@@ -118,6 +118,30 @@ use serde::{Deserialize, Serialize};
 /// so a 1.0 envelope with no `outcome` key at all deserializes cleanly as
 /// `outcome: None`, and nothing about `status`/`reason`/`warnings` changes
 /// shape for an old reader.
+///
+/// **Adding a new [`RunOutcome`] VARIANT is a MAJOR bump, not additive,
+/// even though `outcome` itself is optional (#1877 QA ALSO FIX 3).**
+/// `#[serde(default)]` only supplies `None` when the `outcome` KEY is
+/// ABSENT from the document; it does nothing when the key is PRESENT with
+/// content an older binary's `RunOutcome` doesn't recognize — serde fails
+/// deserializing that field, which fails deserializing the WHOLE
+/// `MissionEnvelope`, including `status`/`reason`/`warnings`, none of
+/// which actually changed shape. Verified directly (pinned by
+/// `an_unrecognized_outcome_variant_fails_the_whole_envelope_parse`,
+/// below): decoding `{"state":"throttled"}` into today's `RunOutcome`
+/// (`Complete` | `Partial` | `Empty`, no catch-all/unknown arm) errors
+/// with `` unknown variant `throttled`, expected one of `complete`,
+/// `partial`, `empty` `` — not a graceful `None`. `RunOutcome` has none of
+/// `config.json`'s
+/// lenient-on-read machinery (`#[serde(flatten)] extras` overflow, all-
+/// `Option` fields) — it is a closed `#[serde(tag = "state")]` enum by
+/// design (`crates/darkmux-crew/src/run_outcome.rs`), so a future minor
+/// bump that only ADDS a `RunOutcome` variant would still make an OLDER
+/// darkmux binary refuse to parse a NEWER one's envelope whenever that new
+/// variant actually appears. Treat any new `RunOutcome` variant as a MAJOR
+/// bump on `MISSION_ENVELOPE_SCHEMA`, or give `RunOutcome` its own
+/// unknown-variant tolerance (an `Other`/catch-all arm) before treating it
+/// as additive.
 pub const MISSION_ENVELOPE_SCHEMA: &str = "1.1";
 
 /// The overall outcome a mission's run reached — see the module doc's
@@ -825,6 +849,35 @@ mod tests {
         assert_eq!(
             persisted.outcome,
             Some(RunOutcome::Partial { reasons: vec!["2 of 9 flags went unjudged".to_string()] })
+        );
+    }
+
+    /// (#1877 QA ALSO FIX 3) Structural proof for `MISSION_ENVELOPE_SCHEMA`'s
+    /// doc claim: an `outcome` key present with a `RunOutcome` variant this
+    /// binary doesn't recognize fails deserializing the WHOLE
+    /// `MissionEnvelope`, not just `outcome`. `#[serde(default)]` on
+    /// `outcome` only rescues an ABSENT key — a PRESENT-but-unrecognized one
+    /// still errors, taking `status`/`reason`/`warnings` down with it even
+    /// though none of those fields changed shape. This is why adding a
+    /// `RunOutcome` variant is a MAJOR schema bump, not additive-minor.
+    #[test]
+    fn an_unrecognized_outcome_variant_fails_the_whole_envelope_parse() {
+        let json = r#"{
+            "mission_id": "m1",
+            "schema_version": "1.2",
+            "status": "degraded",
+            "outcome": {"state": "throttled"},
+            "phases": []
+        }"#;
+        let err = serde_json::from_str::<MissionEnvelope>(json)
+            .expect_err("an unrecognized RunOutcome variant must fail the whole envelope parse, not degrade to None");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant `throttled`")
+                && msg.contains("complete")
+                && msg.contains("partial")
+                && msg.contains("empty"),
+            "got: {msg}"
         );
     }
 }
