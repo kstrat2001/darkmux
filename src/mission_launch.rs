@@ -813,6 +813,16 @@ pub fn launch(
     print_run_summary(&mission_id, &steps);
 
     use crew::envelope::MissionOutcomeStatus;
+    // (#1877 item 4 — stated decision) `build_envelope` (below) never
+    // constructs a `RunOutcome` — the generic scheduler-graph path
+    // aggregates per-STEP statuses into one mission-level status, which is
+    // a different shape from review's per-FLAG docket a `RunOutcome`
+    // describes. So this match only ever sees `status` directly, never
+    // `outcome`. That's unaffected either way: `MissionOutcomeStatus::
+    // from_outcome` collapses a future `RunOutcome::Partial` into
+    // `Degraded`, which already exits 0 here — a mission driver that
+    // adopts `RunOutcome` later inherits this exit code for free, with no
+    // match arm to add.
     let exit_code = match status {
         MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => 0,
         MissionOutcomeStatus::Degenerate | MissionOutcomeStatus::Error => 1,
@@ -3938,6 +3948,11 @@ mod tests {
         let env = build_envelope(mid, &config, &real, &tasks, &steps);
         use crew::envelope::{MissionOutcomeStatus, PhaseOutcomeKind};
         assert_eq!(env.status, MissionOutcomeStatus::Degraded, "some complete + some errored → Degraded");
+        // (#1877 item 4 — stated decision, pinned) The generic scheduler
+        // graph never produces a `RunOutcome` — its per-step aggregation is
+        // a different shape from review's per-flag docket. `outcome` stays
+        // `None` even on a Degraded run.
+        assert!(env.outcome.is_none());
 
         let outcome = |pid: &str| env.phases.iter().find(|p| p.phase_id == pid).map(|p| p.outcome);
         assert_eq!(outcome(&rp1), Some(PhaseOutcomeKind::Complete), "p1's steps all completed → Complete");

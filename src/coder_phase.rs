@@ -1131,6 +1131,16 @@ fn resolve_run_workdir(mission_id: &str, phase_id: &str, root: &Path) -> PathBuf
 /// abandoned one reads `Abandoned`. Best-effort — a load hiccup leaves the
 /// mission as-is (reconcilable via `darkmux mission finalize`), never fails the
 /// abort.
+///
+/// (#1877 item 4 — deliberately deferred, NOT this PR) coder-phase does not
+/// construct a `RunOutcome` here or anywhere else in this file. #1877's own
+/// tracking issue names coder-phase as the SECOND consumer `RunOutcome`/
+/// `MissionEnvelope::outcome` exists to serve (a coder's own docket — files
+/// touched, QA findings addressed — is exactly the kind of partitioned work
+/// review's flags already are), but wiring it up is its own acceptance test
+/// and explicitly out of scope for the PR that put the contract on
+/// `MissionEnvelope` in the first place. This function keeps constructing
+/// `status` directly via `MissionEnvelope::new`, same as before.
 fn finalize_mission_if_complete(mission_id: &str) {
     use crew::envelope::{MissionEnvelope, MissionOutcomeStatus, PhaseOutcome, PhaseOutcomeKind};
     use crew::types::PhaseStatus;

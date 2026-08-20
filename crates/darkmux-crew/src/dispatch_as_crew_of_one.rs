@@ -249,6 +249,16 @@ fn step_result_reason(exit_code: i32) -> Option<String> {
 /// `MissionOutcomeStatus::phase_outcome` (Clean/Degraded -> phase Complete;
 /// Degenerate/Error -> phase Abandoned) — see that type's own doc for the
 /// full mapping this function defers to entirely rather than re-deciding.
+///
+/// (#1877 item 4 — stated decision) Builds via `MissionEnvelope::new`
+/// (`status` set directly), never `MissionEnvelope::from_outcome` — a
+/// crew-of-one dispatch is a SINGLE step with a binary
+/// exit-code-zero-or-not result, not a docket of independently-judgeable
+/// items the way review's flags are. There is no partition of work here for
+/// a `RunOutcome::Partial { reasons }` to describe, so `outcome` stays
+/// `None` on every envelope this function produces. If a future crew-of-one
+/// variant genuinely gains a partitioned docket (e.g. a multi-file batch
+/// dispatch), THAT is the point to adopt `RunOutcome` here — not before.
 fn finalize(mission_id: &str, phase_id: &str, status: MissionOutcomeStatus, reason: Option<String>) {
     let mut envelope = MissionEnvelope::new(mission_id, status, &[phase_id]);
     envelope.reason = reason;
@@ -951,6 +961,13 @@ mod tests {
             envelope.status,
             MissionOutcomeStatus::Error,
             "the envelope must record Error, not Degraded/Clean, for a hard dispatch() failure"
+        );
+        // (#1877 item 4 — stated decision, pinned) A crew-of-one dispatch
+        // has no partitioned docket, so `finalize` never adopts `RunOutcome`
+        // — `outcome` stays `None` on every envelope this path produces.
+        assert!(
+            envelope.outcome.is_none(),
+            "crew-of-one has no RunOutcome producer yet; a non-None outcome here would be unintentional"
         );
     }
 
