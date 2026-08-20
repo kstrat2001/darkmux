@@ -614,7 +614,8 @@ function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boole
 }
 
 /** viewer.html: `function labBadge(run)` — the SEPARATE lab-series badge
- * (finished/live), distinct from `runStatusBadge`'s five-status badge above. */
+ * (finished/live), distinct from `runStatusBadge`'s six-status badge above
+ * (#1881 added `unparseable`). */
 function LabBadge({ finished }: { finished: boolean }) {
   return <span className={`labbadge ${finished ? "finished" : "live"}`}>{finished ? "finished" : "● live"}</span>;
 }

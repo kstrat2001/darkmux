@@ -3751,7 +3751,7 @@ const MISSION_ENVELOPE_READABILITY_CHECK_NAME: &str = "mission envelope readabil
 /// (#1881) Every mission dir's `envelope.json`, read the same way
 /// `crates/darkmux-serve/src/runs.rs`'s `mission_run_status` reads it
 /// (`darkmux_crew::lifecycle::load_envelope`), and named LOUDLY when this
-/// binary cannot deserialize one. This is exactly the contract-registry
+/// binary cannot fully resolve one. This is exactly the contract-registry
 /// item 5 obligation ("complaints are LOUD in `darkmux doctor`") applied to
 /// the specific failure `mission_run_status` used to swallow: an envelope a
 /// NEWER darkmux wrote (a `status`/`outcome` value this binary's enums
@@ -3761,20 +3761,42 @@ const MISSION_ENVELOPE_READABILITY_CHECK_NAME: &str = "mission envelope readabil
 /// laptop on a `cargo install`ed main, the Studio on brew/stable) is
 /// supposed to be named.
 ///
-/// Scope: every FINALIZED mission has (or once had) a real envelope to
-/// read; a mission with no `envelope.json` at all (`Ok(None)`) is not
-/// drift — see `load_envelope`'s own doc — and is not reported here.
+/// Scope: this scans every directory under `missions_dir()`, regardless of
+/// the owning mission's `MissionStatus` — a mission's `mission.json` isn't
+/// even loaded here, only its sibling `envelope.json`. A mission with no
+/// `envelope.json` at all (`Ok(None)`) is not drift — see `load_envelope`'s
+/// own doc — and is not reported here. In practice this means an envelope
+/// left behind by an Aborted or still-Active mission can also be named
+/// (`mission_run_status` never reads an Aborted mission's envelope at
+/// all — `crates/darkmux-serve/src/runs.rs`'s `MissionStatus::Aborted`
+/// arm — so that specific case warns here without ever affecting the
+/// dashboard); harmless, since this check only ever WARNS, never fails,
+/// but worth knowing before assuming every name here is dashboard-visible.
 ///
 /// (#1881, second half) `MissionOutcomeStatus`/`RunOutcome` later gained
 /// `#[serde(other)]` catch-alls so a genuinely NEW variant no longer fails
 /// the whole `serde_json::from_str` — an envelope carrying one now returns
-/// `Ok(Some(envelope))`, not `Err`. That is real progress (the rest of the
-/// document survives), but a `status: Unknown` is still exactly the schema
-/// drift this check exists to name, so it's reported here too — see the
-/// `Ok(Some(envelope)) if envelope.status == ... Unknown` arm below.
+/// `Ok(Some(envelope))`, not `Err`. That's real progress, but the two
+/// fields mean different things for the dashboard (see
+/// `crates/darkmux-crew/src/envelope.rs`'s own doc on `MissionOutcomeStatus`
+/// vs. `RunOutcome` leniency), so this check reports them as two SEPARATE
+/// buckets rather than folding both into "could not parse":
+///   - `status: Unknown` — `mission_run_status` renders this
+///     `RunStatus::Unparseable`, same severity as a hard `Err`. Reported
+///     alongside hard parse failures.
+///   - `outcome: Some(RunOutcome::Unknown)` with a KNOWN `status` — the
+///     dashboard renders this run correctly (by its real, known status);
+///     only the docket-coverage DETAIL is unrecognized. Reported
+///     separately, so the message never implies a dashboard row is wrong
+///     when it isn't.
 fn check_mission_envelope_readability() -> Check {
     let missions_root = darkmux_crew::loader::missions_dir();
-    let mut unreadable: Vec<String> = Vec::new();
+    // Renders `RunStatus::Unparseable` on the dashboard — a hard parse
+    // `Err`, or an `Ok(Some(_))` whose `status` itself is the catch-all.
+    let mut unparseable: Vec<String> = Vec::new();
+    // Renders correctly (by its known `status`) but carries an
+    // unrecognized `outcome` detail — narrower drift, no dashboard impact.
+    let mut outcome_drift: Vec<String> = Vec::new();
     let mut readable_count = 0u32;
     if let Ok(entries) = std::fs::read_dir(&missions_root) {
         for entry in entries.flatten() {
@@ -3797,39 +3819,63 @@ fn check_mission_envelope_readability() -> Check {
                 // outcome was — so it's reported the same way a hard parse
                 // failure is, not silently folded into "readable."
                 Ok(Some(envelope)) if envelope.status == darkmux_crew::envelope::MissionOutcomeStatus::Unknown => {
-                    unreadable.push(format!("{mission_id} (unrecognized status)"));
+                    unparseable.push(format!("{mission_id} (unrecognized status)"));
                 }
-                Ok(Some(_)) => readable_count += 1,
+                Ok(Some(envelope)) => {
+                    readable_count += 1;
+                    // (#1881, QA-caught) `outcome` has its OWN, separate
+                    // leniency (`RunOutcome::Unknown`) that a known `status`
+                    // does not cover — without this arm, an envelope with a
+                    // real status but an unrecognized outcome DETAIL was
+                    // silently counted as fully clean, the one shape of
+                    // drift this check couldn't name.
+                    // `RunOutcome::is_unknown` exists for exactly this read.
+                    if envelope.outcome.as_ref().is_some_and(|o| o.is_unknown()) {
+                        outcome_drift.push(mission_id.to_string());
+                    }
+                }
                 Ok(None) => {}
-                Err(e) => unreadable.push(format!("{mission_id} ({e})")),
+                Err(e) => unparseable.push(format!("{mission_id} ({e})")),
             }
         }
     }
-    if unreadable.is_empty() {
-        Check {
+    if unparseable.is_empty() && outcome_drift.is_empty() {
+        return Check {
             name: MISSION_ENVELOPE_READABILITY_CHECK_NAME.into(),
             status: Status::Pass,
             message: format!("{readable_count} mission envelope(s) parsed cleanly"),
             hint: None,
-        }
-    } else {
-        Check {
-            name: MISSION_ENVELOPE_READABILITY_CHECK_NAME.into(),
-            status: Status::Warn,
-            message: format!(
-                "{} mission envelope(s) this binary could not parse: {}",
-                unreadable.len(),
-                unreadable.join(", ")
-            ),
-            hint: Some(
-                "Likely schema drift between fleet machines — a newer darkmux wrote a \
-                 status/outcome value this binary's release doesn't recognize yet. Affected runs \
-                 render as \"unparseable\" on the dashboard, never as a false completed/green run. \
-                 Compare `darkmux --version` here against the machine that wrote the envelope, and \
-                 upgrade this machine if it's behind."
-                    .into(),
-            ),
-        }
+        };
+    }
+    let mut parts: Vec<String> = vec![format!("{readable_count} fully clean")];
+    if !unparseable.is_empty() {
+        parts.push(format!(
+            "{} this binary could not resolve a status for: {}",
+            unparseable.len(),
+            unparseable.join(", ")
+        ));
+    }
+    if !outcome_drift.is_empty() {
+        parts.push(format!(
+            "{} render correctly but carry an unrecognized outcome detail: {}",
+            outcome_drift.len(),
+            outcome_drift.join(", ")
+        ));
+    }
+    Check {
+        name: MISSION_ENVELOPE_READABILITY_CHECK_NAME.into(),
+        status: Status::Warn,
+        message: parts.join("; "),
+        hint: Some(
+            "Likely schema drift between fleet machines — a newer darkmux wrote a \
+             status/outcome value this binary's release doesn't recognize yet. A run with an \
+             unrecognized STATUS renders \"unparseable\" on the dashboard, never a false \
+             completed/green run; a run with only an unrecognized OUTCOME detail still renders \
+             correctly by its known status — only the docket-coverage detail is unreadable. \
+             Compare `darkmux --version` here against the machine that wrote the envelope, and \
+             upgrade this machine if it's behind."
+                .into(),
+        ),
     }
 }
 
@@ -6522,7 +6568,9 @@ mod tests {
         .unwrap();
         let check = check_mission_envelope_readability();
         assert_eq!(check.status, Status::Pass, "{}", check.message);
-        assert!(check.message.contains('1'), "{}", check.message);
+        // (#1881, QA-caught) `contains('1')` would also pass on "10", "11",
+        // "21"… — pin the exact string so the count is actually verified.
+        assert_eq!(check.message, "1 mission envelope(s) parsed cleanly");
     }
 
     /// (#1881 RED proof) A malformed `envelope.json` — no leniency of any
@@ -6573,6 +6621,35 @@ mod tests {
         let check = check_mission_envelope_readability();
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("m-future-status"), "{}", check.message);
+    }
+
+    /// (#1881, QA-caught) An envelope whose `status` is fully known (renders
+    /// correctly on the dashboard) but whose `outcome` detail carries a
+    /// `#[serde(other)]`-caught `state` this binary doesn't recognize. This
+    /// used to be counted as "fully clean" — `RunOutcome::is_unknown` has no
+    /// production caller without this arm — even though it is real,
+    /// narrower schema drift the check exists to name.
+    #[serial_test::serial]
+    #[test]
+    fn mission_envelope_readability_warns_on_a_known_status_with_an_unrecognized_outcome_detail() {
+        let guard = CrewRootGuard::new();
+        let mission_dir = guard.path().join("missions").join("m-outcome-drift");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        std::fs::write(
+            mission_dir.join("envelope.json"),
+            r#"{"mission_id":"m-outcome-drift","status":"degraded","outcome":{"state":"throttled"},"phases":[]}"#,
+        )
+        .unwrap();
+
+        // Confirm the fixture's status really is known (this test is about
+        // the OUTCOME leniency specifically, not the status one).
+        let loaded = darkmux_crew::lifecycle::load_envelope("m-outcome-drift").unwrap().unwrap();
+        assert_eq!(loaded.status, darkmux_crew::envelope::MissionOutcomeStatus::Degraded, "fixture's status must be known");
+        assert!(loaded.outcome.as_ref().unwrap().is_unknown(), "fixture's outcome must be unrecognized");
+
+        let check = check_mission_envelope_readability();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("m-outcome-drift"), "{}", check.message);
     }
 
     #[serial_test::serial]
