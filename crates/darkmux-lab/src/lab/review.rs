@@ -135,9 +135,16 @@ use darkmux_crew::run_outcome::RunOutcome;
 // review-flavored to begin with).
 use darkmux_crew::run_obs::{self, HostTelemetrySampler, RunObs as ReviewObs};
 pub use darkmux_crew::run_obs::{NullEmitter, RunEmitter as ReviewEmitter};
+// `seat_endpoint`/`seat_endpoint_host` were PRIVATE on `origin/main` and
+// have no caller outside this file (only doc-comment mentions in
+// `src/mission_launch_review.rs` and `crates/darkmux-flow/src/bookend.rs`)
+// — a plain `use` keeps `seat_endpoint_host`'s #1530 credential-sanitizer
+// off the crate's public surface. The other five names DO have external
+// `impl`/reference sites (mirroring `ReviewEmitter` above), so they stay
+// `pub use`.
+use darkmux_crew::run_record::{seat_endpoint, seat_endpoint_host};
 pub use darkmux_crew::run_record::{
-    seat_endpoint, seat_endpoint_host, seat_identifier, staffing_snapshot, MemberRecord, SeatStaffingSnapshot,
-    StaffingSnapshot, StepRecord,
+    seat_identifier, staffing_snapshot, MemberRecord, SeatStaffingSnapshot, StaffingSnapshot, StepRecord,
 };
 use darkmux_crew::single_shot::SingleShotReply;
 use darkmux_crew::step_kinds::patterns::dedup::{dedup as pattern_dedup, DedupStrategy};
@@ -734,8 +741,13 @@ pub fn review_mission_outcome(env: &ReviewEnvelope) -> RunOutcome {
 
 // (#1877 item 2) `seat_identifier`/`seat_endpoint_host`/`seat_endpoint`/
 // `SeatStaffingSnapshot`/`StaffingSnapshot`/`staffing_snapshot` moved to
-// `darkmux_crew::run_record` — see that module's doc. Re-exported below
-// under their original names.
+// `darkmux_crew::run_record` — see that module's doc. `seat_identifier`,
+// `staffing_snapshot`, `MemberRecord`, `SeatStaffingSnapshot`, and
+// `StaffingSnapshot` are re-exported below under their original names;
+// `seat_endpoint`/`seat_endpoint_host` are imported plain (not
+// re-exported) — both were private on `origin/main` with no caller
+// outside this file, so keeping them off the crate's public surface
+// preserves that.
 
 // ─── model cycling ────────────────────────────────────────────────────────
 
