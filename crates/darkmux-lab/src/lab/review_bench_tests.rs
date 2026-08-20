@@ -58,6 +58,7 @@
             verdict: "flag".into(),
             findings,
             parsed: true,
+            partial: false,
         }
     }
 
@@ -284,14 +285,14 @@
 
     #[test]
     fn score_clean_pass_is_correct() {
-        let s = score(&lbl("clean", None), &Review { verdict: "pass".into(), findings: vec![], parsed: true });
+        let s = score(&lbl("clean", None), &Review { verdict: "pass".into(), findings: vec![], parsed: true, partial: false });
         assert_eq!(s.fp, 0);
         assert!(s.correct);
     }
 
     #[test]
     fn score_clean_with_finding_is_false_positive() {
-        let r = Review { verdict: "pass".into(), findings: vec![Finding { severity: "medium".into(), ..Default::default() }], parsed: true };
+        let r = Review { verdict: "pass".into(), findings: vec![Finding { severity: "medium".into(), ..Default::default() }], parsed: true, partial: false };
         let s = score(&lbl("clean", None), &r);
         assert_eq!(s.fp, 1);
         assert!(!s.correct); // a finding on a clean diff is wrong even if verdict=pass
@@ -299,7 +300,7 @@
 
     #[test]
     fn score_bug_recall_via_anchor() {
-        let r = Review { verdict: "flag".into(), findings: vec![Finding { severity: "high".into(), anchor: "let sql = format!(\"SELECT ...\", name)".into(), title: "SQLi".into() }], parsed: true };
+        let r = Review { verdict: "flag".into(), findings: vec![Finding { severity: "high".into(), anchor: "let sql = format!(\"SELECT ...\", name)".into(), title: "SQLi".into() }], parsed: true, partial: false };
         let s = score(&lbl("bug", Some("format!(\"SELECT")), &r);
         assert!(s.recall);
         assert!(s.anchor_ok);
@@ -308,7 +309,7 @@
 
     #[test]
     fn score_bug_recall_via_high_severity_without_anchor_match() {
-        let r = Review { verdict: "flag".into(), findings: vec![Finding { severity: "high".into(), anchor: "wrong line".into(), title: "SQLi".into() }], parsed: true };
+        let r = Review { verdict: "flag".into(), findings: vec![Finding { severity: "high".into(), anchor: "wrong line".into(), title: "SQLi".into() }], parsed: true, partial: false };
         let s = score(&lbl("bug", Some("format!")), &r);
         assert!(s.recall); // high severity counts as caught
         assert!(!s.anchor_ok); // but the anchor missed
@@ -317,7 +318,7 @@
     #[test]
     fn score_bug_empty_flag_is_contract_violation_not_recall() {
         // verdict=flag with zero findings (the gpt-oss failure mode).
-        let r = Review { verdict: "flag".into(), findings: vec![], parsed: true };
+        let r = Review { verdict: "flag".into(), findings: vec![], parsed: true, partial: false };
         let s = score(&lbl("bug", Some("format!")), &r);
         assert!(s.empty_flag);
         assert!(!s.recall);
@@ -442,6 +443,7 @@
             verdict: "pass".into(),
             findings: vec![finding("high", "alpha.rs:10", "real bug")],
             parsed: true,
+            partial: false,
         };
         let s = score(&label, &r);
         assert_eq!(s.bugs_caught, 0, "pass verdict: not flagged");
@@ -972,6 +974,60 @@
         }];
         let r = review_from_funnel(&env);
         assert!(!r.parsed, "a partial-coverage funnel run must score distinctly from a real, complete pass");
+    }
+
+    /// (#1876/#1877 QA follow-up, MUST FIX 4) `review_from_funnel` must
+    /// mark `Review::partial` (not just `parsed: false`) for a
+    /// judge-coverage shortfall — otherwise `score()`/`describe()` can't
+    /// tell it apart from a genuinely empty/unparseable reply, and the
+    /// bench summary prints "DEGENERATE (empty/unparseable review — e.g.
+    /// #1050)" for a case that produced real, usable rulings. That is
+    /// precisely the false "produced no signal" statement #1876 removed,
+    /// reappearing one layer further out in review-bench's own output.
+    #[test]
+    fn review_from_funnel_partial_coverage_envelope_marks_review_partial_end_to_end() {
+        use darkmux_crew::remote_budget::RemoteBudgetRecord;
+        use super::super::review::Tier;
+        let mut env = funnel_env(vec![judged_flag(Some("a real defect"), Tier::Confirmed, "note", "evidence")], None);
+        env.remote_budgets = vec![RemoteBudgetRecord {
+            stage: "judge-pass1".to_string(),
+            max_tokens: 1_000,
+            used_tokens: 900,
+            exhausted: true,
+            skipped_calls: 1,
+        }];
+        let r = review_from_funnel(&env);
+        assert!(r.partial, "a judge-coverage shortfall must set Review::partial");
+
+        let label = lbl("bug", Some("a real defect"));
+        let s = score(&label, &r);
+        assert!(s.degenerate, "still scored distinctly from a real pass");
+        assert!(s.partial, "CaseScore must carry the same distinction as Review::partial");
+
+        let text = describe(&label, &s);
+        assert!(
+            text.contains("PARTIAL") && text.contains("coverage shortfall"),
+            "must not read as empty/unparseable: {text}"
+        );
+        assert!(
+            !text.starts_with("DEGENERATE"),
+            "a run with real rulings must never print the DEGENERATE/empty-unparseable wording: {text}"
+        );
+    }
+
+    /// A genuinely empty/unparseable funnel reply (no judge-coverage row at
+    /// all) must keep the ORIGINAL wording — the new PARTIAL branch must
+    /// not swallow the real degenerate case.
+    #[test]
+    fn review_from_funnel_degenerate_envelope_still_reads_as_empty_unparseable() {
+        let env = funnel_env(vec![], Some("zero flags from all probe draws — never a silent pass"));
+        let r = review_from_funnel(&env);
+        assert!(!r.partial, "a genuinely dead run is not partial");
+
+        let label = lbl("bug", Some("anything"));
+        let s = score(&label, &r);
+        let text = describe(&label, &s);
+        assert!(text.contains("DEGENERATE") && text.contains("empty/unparseable"), "got: {text}");
     }
 
     #[test]

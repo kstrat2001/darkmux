@@ -122,6 +122,16 @@ pub struct Review {
     pub verdict: String,
     pub findings: Vec<Finding>,
     pub parsed: bool,
+    /// (#1876/#1877 QA follow-up) `parsed == false` for TWO different
+    /// reasons on the funnel path: a genuinely empty/unparseable reply, or
+    /// `review_outcome`'s `Partial` (real rulings, judge coverage
+    /// shortfall). Only the funnel path (`review_from_funnel`) can ever set
+    /// this true — `parse_review`/`parse_freeform_review` have no notion of
+    /// judge coverage, so they always leave it `false`. Threaded into
+    /// `CaseScore::partial` so `describe()` doesn't print the
+    /// empty/unparseable wording for a run that actually produced usable
+    /// signal.
+    pub partial: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -136,6 +146,15 @@ pub struct CaseScore {
     pub verdict: String,
     pub findings: usize,
     pub degenerate: bool,
+    /// (#1876/#1877 QA follow-up) Set alongside `degenerate` — never
+    /// without it — when the underlying `Review::partial` is true: the
+    /// funnel judge stage ruled on the docket's usable portion, real
+    /// signal exists, and coverage merely fell short. Lets `describe()`
+    /// (and any future aggregate) print "judge coverage shortfall" instead
+    /// of "empty/unparseable", which would be false for this case — that
+    /// exact false statement was the #1876 bug this PR removes, one layer
+    /// further out.
+    pub partial: bool,
     /// false-positive findings — clean: all findings; bug (multi path): findings
     /// matching no expected bug. (Legacy bug path leaves this 0.)
     pub fp: usize,
@@ -967,9 +986,11 @@ fn review_from_funnel(env: &super::review::ReviewEnvelope) -> Review {
             }
         })
         .collect();
+    let outcome = super::review::review_outcome(env);
     Review {
         verdict: if findings.is_empty() { "pass".to_string() } else { "flag".to_string() },
-        parsed: super::review::review_outcome(env).is_complete(),
+        parsed: outcome.is_complete(),
+        partial: outcome.is_partial(),
         findings,
     }
 }
@@ -1230,6 +1251,7 @@ pub fn parse_review(text: &str) -> Review {
                     verdict: verdict.to_lowercase(),
                     findings,
                     parsed: true,
+                    partial: false,
                 };
             }
         }
@@ -1313,6 +1335,7 @@ pub fn parse_freeform_review(text: &str) -> Review {
         verdict: verdict.to_string(),
         findings,
         parsed: !text.trim().is_empty(),
+        partial: false,
     }
 }
 
@@ -1344,6 +1367,7 @@ pub fn score(label: &Label, r: &Review) -> CaseScore {
     };
     if !r.parsed {
         s.degenerate = true;
+        s.partial = r.partial;
         return s;
     }
     // Bug cases carrying the multi-finding schema (#1119) take the per-bug path;
@@ -1507,7 +1531,17 @@ fn finding_matches_expected(f: &Finding, e: &ExpectedFinding) -> bool {
 
 fn describe(label: &Label, s: &CaseScore) -> String {
     if s.degenerate {
-        return "DEGENERATE (empty/unparseable review — e.g. #1050)".to_string();
+        // (#1876/#1877 QA follow-up) `s.partial` distinguishes a genuine
+        // empty/unparseable reply from a funnel run that DID rule on most
+        // of its docket and merely fell short on judge coverage — printing
+        // the empty/unparseable wording for the latter is exactly the
+        // false "produced no signal" statement this PR removed one layer
+        // in (`review_outcome`/`env.warnings`).
+        return if s.partial {
+            "PARTIAL (judge coverage shortfall — real rulings, not empty/unparseable)".to_string()
+        } else {
+            "DEGENERATE (empty/unparseable review — e.g. #1050)".to_string()
+        };
     }
     if label.kind == "bug" {
         let mut bits = vec![format!("recall={}", yn(s.recall)), format!("anchor={}", yn(s.anchor_ok))];
@@ -1571,12 +1605,25 @@ fn print_summary(scored: &[(&Case, CaseScore)], meta: &[EnvelopeMeta], opts: &Re
     let anchor = bugs.iter().filter(|s| s.anchor_ok).count();
     // Degenerate is now the CAPABILITY-degenerate count (model ran, produced
     // unparseable output) — infra-degenerate cases are reported separately.
-    let degenerate = capability.iter().filter(|(_, s)| s.degenerate).count();
+    // (#1876/#1877 QA follow-up) Split further into genuinely
+    // empty/unparseable vs `partial` (the funnel path's judge-coverage
+    // shortfall — real rulings exist, only coverage fell short): folding a
+    // partial run into "model unfit for this role" is the same false
+    // "produced no signal" statement #1876 removed, reappearing in this
+    // aggregate line.
+    let degenerate = capability.iter().filter(|(_, s)| s.degenerate && !s.partial).count();
+    let partial = capability.iter().filter(|(_, s)| s.degenerate && s.partial).count();
     println!("\n── summary ({}) ──", opts.profile_name.as_deref().unwrap_or("default"));
     println!("clean: {}/{} pass · {} false positives", clean_pass, clean.len(), fp_total);
     println!("bug:   {}/{} recall · {}/{} correct anchor", recall, bugs.len(), anchor, bugs.len());
     if degenerate > 0 {
         println!("degenerate: {} (empty/unparseable — model unfit for this role)", degenerate);
+    }
+    if partial > 0 {
+        println!(
+            "partial: {} (judge coverage shortfall — real rulings, excluded from capability scores)",
+            partial
+        );
     }
     if infra > 0 {
         println!(

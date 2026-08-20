@@ -911,6 +911,7 @@ pub fn synthesize_review(charges: &[Charge], rulings: &Rulings) -> Review {
         verdict: if findings.is_empty() { "pass" } else { "flag" }.to_string(),
         findings,
         parsed: true,
+        partial: false,
     }
 }
 
@@ -956,6 +957,7 @@ pub fn run_debate(
                 verdict: String::new(),
                 findings: Vec::new(),
                 parsed: false,
+                partial: false,
             },
             env,
         ));
@@ -971,6 +973,7 @@ pub fn run_debate(
                 verdict: "pass".to_string(),
                 findings: Vec::new(),
                 parsed: true,
+                partial: false,
             },
             env,
         ));
@@ -1026,6 +1029,7 @@ pub fn run_debate(
                 verdict: String::new(),
                 findings: Vec::new(),
                 parsed: false,
+                partial: false,
             }
         }
     };
