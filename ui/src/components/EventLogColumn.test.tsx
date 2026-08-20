@@ -82,6 +82,49 @@ describe("EventLogColumn", () => {
     expect(screen.getByText("no match")).toBeInTheDocument();
   });
 
+  // (#1891) The entire nonzero-match branch of `qcountText` had exactly
+  // zero coverage before this — only the zero-match "no match" case above
+  // was ever exercised. These four pin the grammar, the cap disclosure,
+  // and the server-truncation marker this branch has to carry.
+
+  it("shows a singular match count with no plural 's' for exactly one match", () => {
+    const records = [rec({ session_id: "s-alpha" }), rec({ session_id: "s-beta" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "s-alpha" } });
+    expect(document.getElementById("qcount")?.textContent).toBe("1 match");
+  });
+
+  it("shows a plural match count for more than one match", () => {
+    const records = [
+      rec({ session_id: "s-alpha-1" }),
+      rec({ session_id: "s-alpha-2" }),
+      rec({ session_id: "s-beta" }),
+    ];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "s-alpha" } });
+    expect(document.getElementById("qcount")?.textContent).toBe("2 matches");
+  });
+
+  it("appends the LOG_CAP disclosure once the match count exceeds what's shown", () => {
+    const records = Array.from({ length: 60 }, (_, i) =>
+      rec({ ts: `2026-08-08T12:${String(i).padStart(2, "0")}:00.000Z`, session_id: `s-alpha-${i}` }),
+    );
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "s-alpha" } });
+    expect(document.getElementById("qcount")?.textContent).toBe("60 matches · 50 shown");
+  });
+
+  it("carries the server-truncation marker into a filtered match count too", () => {
+    // (#1891 RED-proved defect) Before the fix, the search branch never
+    // consulted `serverTruncated` at all — this "+" disappeared the moment
+    // a search filter was active, even though the underlying `records`
+    // slice was exactly as truncated as it was with no filter typed.
+    const records = [rec({ session_id: "s-alpha-1" }), rec({ session_id: "s-alpha-2" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible serverTruncated />);
+    fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "s-alpha" } });
+    expect(document.getElementById("qcount")?.textContent).toBe("2+ matches");
+  });
+
   it("clicking a row selects it (turns follow off) and shows it in the detail panel", () => {
     const records = [
       rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-old" }),
