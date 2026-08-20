@@ -10,7 +10,7 @@
 //! silently degrades when it drifts.
 //!
 //! The output is one JSON object:
-//! `{ "mode": "review"|"comment"|"degraded"|"noop", "review": <gh-review-payload>|null,
+//! `{ "mode": "review"|"comment"|"partial"|"degraded"|"noop", "review": <gh-review-payload>|null,
 //!    "comment": <markdown>|null }`. The thin workflow YAML posts it (so the
 //! operator keeps control of the model/profile, trigger, and the `gh` call).
 //! `mode: "degraded"` (#1113) means NO review signal was produced (a
@@ -19,6 +19,18 @@
 //! outcome from `"degraded"`: a genuinely non-code diff (every file the
 //! bundler touched declined for a benign reason) posts a neutral note
 //! naming what the diff contained — not a failure, not a green approval.
+//! `mode: "partial"` (#1876/#1877) is a FOURTH outcome, distinct from all
+//! three: the judge stage did not rule on every flag (its remote token
+//! budget exhausted mid-docket), but everything it DID rule on is real,
+//! posted signal — the `review`/`comment` payload renders exactly as it
+//! would on a complete run, plus a prominent banner naming the shortfall.
+//! Never a clean, green pass (the workflow fails the run after posting, the
+//! same way `"degraded"` does) and never a discard (unlike `"degraded"`,
+//! the findings post). Production incident this exists to fix: a judge that
+//! had ruled 123 of 134 flags (7 confirmed, 67 needs-check, both complete
+//! with evidence) got posted as "the review produced no signal" and the
+//! findings were never rendered, because 11 skipped calls tripped the SAME
+//! gate a fully-dead judge would.
 //!
 //! **`comment` in `review` mode is the FALLBACK, not the default action**
 //! (#1583). `mode` alone decides what to post; in `review` mode the workflow
@@ -52,6 +64,7 @@
 //! module to `mission launch review` in #1284 Packet 4b.
 
 use anyhow::{Context, Result};
+use darkmux_crew::run_outcome::RunOutcome;
 use darkmux_lab::lab::bundle::{SkipReason, SkippedFile};
 use darkmux_lab::lab::review::{DegenerateKind, JudgeRecord, ReviewEnvelope, Tier, VerifyRecord, VerifyRuling};
 use serde_json::{json, Value};
@@ -66,7 +79,7 @@ const REVIEW_TAGLINE: &str = "Advisory, not a merge gate.";
 
 /// What the verb emits: the posting mode + the payload for it.
 pub struct Rendered {
-    pub mode: &'static str, // "review" | "comment" | "degraded" (#1113: no review signal) | "noop" (#1605: benign-empty, not a failure)
+    pub mode: &'static str, // "review" | "comment" | "partial" (#1876/#1877: coverage shortfall, real signal still posts) | "degraded" (#1113: no review signal) | "noop" (#1605: benign-empty, not a failure)
     pub review: Option<Value>,
     pub comment: Option<String>,
 }
@@ -562,10 +575,20 @@ fn public_safe_note(note: &str) -> String {
 ///   comment names the file count + extensions that went unreviewed and
 ///   points at the `--bundler` escape hatch's guide page instead of saying
 ///   "nothing to review" — see [`render_unsupported_language_comment`].
-/// - Any OTHER degenerate envelope (`env.degenerate.is_some()`, `degenerate_kind`
-///   absent or [`DegenerateKind::Error`]) -> `"degraded"`, the same contract
-///   [`degraded_fallback`] (#1113) uses elsewhere in this module — no review
-///   signal was produced.
+/// - An envelope whose [`darkmux_lab::lab::review::review_outcome`] reads
+///   [`RunOutcome::Empty`] (`env.degenerate.is_some()`, `degenerate_kind`
+///   absent or [`DegenerateKind::Error`] — Gate 2's zero-usable-rulings
+///   honesty gate, or the strict judge-exhaustion policy) -> `"degraded"`,
+///   via [`degraded_with_footer`] (#1113) — no review signal was produced.
+/// - (#1876/#1877) An envelope whose `review_outcome` reads
+///   [`RunOutcome::Partial`] (a judge-stage remote token budget exhausted
+///   before the whole docket was judged, but usable rulings exist) ->
+///   `"partial"`. Renders EXACTLY the `"review"`/`"comment"` body it would
+///   on a Complete run — same findings, same fallback — plus a prominent
+///   banner at the top ([`render_partial_coverage_banner`]) naming the
+///   shortfall in the envelope's own numbers. Never the discard `"degraded"`
+///   uses (the judged flags are real signal) and never a clean pass either
+///   (`mode` alone tells the workflow to fail the run after posting).
 pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&str>) -> Rendered {
     if env.degenerate_kind == Some(DegenerateKind::BenignEmpty) {
         // (#1605) A genuinely non-code diff is an honest outcome, not a
@@ -587,14 +610,32 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
             comment: Some(render_unsupported_language_comment(env, &review_footer(env, attribution))),
         };
     }
-    if let Some(note) = &env.degenerate {
+    // (#1876/#1877) `review_outcome` is review's own predicate mapping onto
+    // the generic `RunOutcome` — `Empty` here is EXACTLY the condition the
+    // old `if let Some(note) = &env.degenerate` check used (Gate 2's
+    // zero-usable-rulings honesty gate, or the strict judge-exhaustion
+    // policy opting back into the pre-#1876 behavior); the "produced no
+    // signal" wording and the full discard are reserved for it alone.
+    let outcome = darkmux_lab::lab::review::review_outcome(env);
+    if let RunOutcome::Empty { reason } = &outcome {
         // (#1298) Even a degenerate run posts the envelope-derived footer, so a
         // remote crew that produced no signal never claims "no cloud API".
         return degraded_with_footer(
-            &format!("The review produced no signal: {}.", public_safe_note(note)),
+            &format!("The review produced no signal: {}.", public_safe_note(reason)),
             &review_footer(env, attribution),
         );
     }
+    // `Partial` names a judge-stage coverage shortfall (#1876: a remote
+    // token budget exhausted before the whole docket was judged, but usable
+    // rulings exist) — the findings below still render normally; this only
+    // adds a prominent, never-omittable banner and swaps the posted `mode`
+    // so the workflow can refuse to read it as a clean, green pass. See
+    // `render_partial_coverage_banner`.
+    let partial_reasons: Vec<String> = match outcome {
+        RunOutcome::Partial { reasons } => reasons,
+        RunOutcome::Complete | RunOutcome::Empty { .. } => Vec::new(),
+    };
+    let partial = !partial_reasons.is_empty();
 
     let index = new_side_index(diff);
     let mut inline: Vec<Value> = Vec::new();
@@ -673,6 +714,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
 
     if confirmed_total == 0 {
         let mut lines = vec!["### 🤖 PR review".to_string(), String::new()];
+        lines.extend(render_partial_coverage_banner(&partial_reasons));
         if needs_check_count == 0 {
             lines.push(format!(
                 "review ran: {} flags investigated across {} bundles, none confirmed. _{}_",
@@ -698,13 +740,14 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
         lines.extend(run_warnings_block(env));
         lines.extend(size_cap_notice_lines(env));
         return Rendered {
-            mode: "comment",
+            mode: if partial { "partial" } else { "comment" },
             review: None,
             comment: Some(format!("{}{}", lines.join("\n"), review_footer(env, attribution))),
         };
     }
 
     let mut body = vec!["### 🤖 PR review".to_string(), String::new()];
+    body.extend(render_partial_coverage_banner(&partial_reasons));
     body.push(format!(
         "**Verdict: flag** · {} confirmed ({} inline, {} general)",
         confirmed_total,
@@ -744,10 +787,12 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
     // review can't be mistaken for a thin one — the same "never read as
     // something it isn't" contract `mode: degraded` carries (#1113).
     let mut fallback = vec!["### 🤖 PR review".to_string(), String::new()];
+    fallback.extend(render_partial_coverage_banner(&partial_reasons));
     fallback.push(format!("**Verdict: flag** · {confirmed_total} confirmed"));
     fallback.push(
         "_Inline anchoring was unavailable for this run, so every finding is listed below with \
-         its file. This is the full review, not a partial one._"
+         its file. This lists every anchored AND unanchored confirmed finding — nothing is \
+         dropped for lack of an anchor._"
             .to_string(),
     );
     if any_unverified {
@@ -781,7 +826,7 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
     };
 
     Rendered {
-        mode: "review",
+        mode: if partial { "partial" } else { "review" },
         review: Some(json!({
             "event": event,
             "body": format!("{}{}", body.join("\n"), review_footer(env, attribution)),
@@ -806,6 +851,32 @@ fn run_warnings_block(env: &ReviewEnvelope) -> Vec<String> {
     }
     let mut lines = vec![String::new(), "**⚠ Run warnings**".to_string()];
     lines.extend(env.warnings.iter().map(|w| format!("- {w}")));
+    lines
+}
+
+/// (#1876/#1877) A PROMINENT banner for a partial-coverage run — deliberately
+/// its own block, placed at the very TOP of the body/comment (never folded
+/// into [`run_warnings_block`]'s small bullet list at the bottom), because a
+/// coverage shortfall changes how the WHOLE posted review should be read,
+/// not just one more thing to note in passing. `reasons` comes straight from
+/// [`RunOutcome::Partial`] — already built from the envelope's own numbers
+/// (`darkmux_lab::lab::review::review_outcome`), so this function never
+/// invents a count of its own; a fixed string here would defeat the whole
+/// point. Empty `reasons` (never reached by `synthesize_review`'s own call
+/// site, but kept total rather than partial) renders nothing.
+fn render_partial_coverage_banner(reasons: &[String]) -> Vec<String> {
+    if reasons.is_empty() {
+        return Vec::new();
+    }
+    let mut lines =
+        vec![String::new(), "> [!WARNING]".to_string(), "> **Incomplete review — coverage shortfall:**".to_string()];
+    lines.extend(reasons.iter().map(|r| format!("> - {r}.")));
+    lines.push(
+        "> The findings below are everything that WAS judged. This is not a clean pass — some work \
+         never got a ruling."
+            .to_string(),
+    );
+    lines.push(String::new());
     lines
 }
 
@@ -1026,6 +1097,10 @@ mod tests {
     // report by hand; production code only ever receives one already
     // populated by `ReviewBundleStepKind::run_streaming`.
     use darkmux_lab::lab::bundle::{BundleSkipReport, SkipReason, SkippedFile};
+    // (#1876/#1877) Test-only — the partial-coverage tests build a
+    // `remote_budgets` row by hand; production code only ever reads one
+    // already populated by `judge_gate_outcome`/`RemoteBudget::record`.
+    use darkmux_crew::remote_budget::RemoteBudgetRecord;
 
     const DIFF: &str = "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,3 +1,4 @@\n const a = 1;\n+const b = 2;\n const c = 3;\n-const d = 4;\n+const d = 5;\n";
 
@@ -2263,6 +2338,91 @@ mod tests {
         );
         assert!(body.contains("Run warnings"), "the warnings block renders on the review: {body}");
         assert!(body.contains("verify budget exhausted after 1 of 2 adjudications"), "{body}");
+    }
+
+    /// (#1876/#1877) The exact production incident shape: a judge stage
+    /// that ruled 134 flags — 7 confirmed, 67 needs-check, 60 archived —
+    /// and a `judge-pass1` remote-budget row naming 11 skipped calls after
+    /// the per-execution allowance ran out. BEFORE the fix, this exact
+    /// envelope (`env.degenerate` set by the old unconditional Gate 1)
+    /// rendered "the review produced no signal" and discarded every one of
+    /// the 7 confirmed findings; the fix leaves `env.degenerate` unset for
+    /// this shape (a `judge_gate_outcome` unit-level concern, pinned in
+    /// `crates/darkmux-lab/src/lab/review_tests.rs`) and this test pins the
+    /// RENDER side: the findings post normally, plus a banner.
+    #[test]
+    fn synthesize_review_with_partial_judge_coverage_renders_findings_and_a_banner() {
+        let mut judged: Vec<JudgedFlag> = Vec::new();
+        for i in 0..7 {
+            judged.push(confirmed_flag(
+                &format!("fn{i}@src/x.ts"),
+                None,
+                &format!("confirmed note {i}"),
+                &format!("evidence {i}"),
+            ));
+        }
+        for i in 0..67 {
+            judged.push(needs_check_flag(&format!("fn{i}@src/y.ts"), None, &format!("needs-check note {i}"), false));
+        }
+        for i in 0..60 {
+            judged.push(archived_flag(&format!("fn{i}@src/z.ts")));
+        }
+        assert_eq!(judged.len(), 134);
+        let mut env = healthy_envelope(judged);
+        env.remote_budgets = vec![RemoteBudgetRecord {
+            stage: "judge-pass1".to_string(),
+            max_tokens: 500_000,
+            used_tokens: 500_497,
+            exhausted: true,
+            skipped_calls: 11,
+        }];
+
+        let r = synthesize_review(&env, DIFF, None);
+        assert_ne!(r.mode, "degraded", "usable rulings exist — must never discard as no signal");
+        assert_eq!(r.mode, "partial", "a coverage shortfall with real signal renders as the partial case");
+        let review = r.review.expect("7 confirmed findings still produce a formal review payload");
+        let body = review["body"].as_str().unwrap();
+        assert!(body.contains("Incomplete review"), "the banner is present: {body}");
+        assert!(body.contains("11 of 134 flags went unjudged"), "banner names the envelope's real numbers: {body}");
+        assert!(body.contains("confirmed note 0"), "confirmed findings still render: {body}");
+        assert!(body.contains("7 confirmed"), "the verdict line still counts confirmed findings: {body}");
+        assert!(
+            body.contains("Confirmed findings not anchored to a diff line"),
+            "the 7 unanchored confirms still render in the general section: {body}"
+        );
+        let fallback = r.comment.expect("the summary-only fallback is still built");
+        assert!(fallback.contains("Incomplete review"), "the banner also carries into the fallback: {fallback}");
+    }
+
+    /// (#1876) The banner is built from THIS envelope's own numbers, never
+    /// a fixed string — deliberately different numbers than the production
+    /// shape above (4 of 9, not 11 of 134), so a hardcoded banner string
+    /// would fail this test even though it passed that one.
+    #[test]
+    fn synthesize_review_partial_banner_names_the_envelopes_own_numbers_never_a_fixed_string() {
+        let mut judged: Vec<JudgedFlag> = Vec::new();
+        for i in 0..3 {
+            judged.push(confirmed_flag(&format!("fn{i}@src/x.ts"), None, &format!("note {i}"), "evidence"));
+        }
+        for i in 0..6 {
+            judged.push(archived_flag(&format!("fn{i}@src/z.ts")));
+        }
+        assert_eq!(judged.len(), 9);
+        let mut env = healthy_envelope(judged);
+        env.remote_budgets = vec![RemoteBudgetRecord {
+            stage: "judge-pass1".to_string(),
+            max_tokens: 1_000,
+            used_tokens: 999,
+            exhausted: true,
+            skipped_calls: 4,
+        }];
+
+        let r = synthesize_review(&env, DIFF, None);
+        assert_eq!(r.mode, "partial");
+        let review = r.review.unwrap();
+        let body = review["body"].as_str().unwrap();
+        assert!(body.contains("4 of 9 flags went unjudged"), "{body}");
+        assert!(!body.contains("11 of 134"), "must not accidentally carry another fixture's numbers: {body}");
     }
 
     /// (#1260) A REFUTED finding arrives already demoted (tier = Archived,
