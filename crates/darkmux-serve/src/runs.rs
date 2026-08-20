@@ -638,7 +638,18 @@ fn mission_to_run(
     // copy by `start_ts` (rather than trusting HashSet iteration order)
     // keeps "first" deterministic; ISO-8601 sorts correctly as a plain
     // string, same property `earliest_by_start` itself relies on.
-    let mut sessions_by_start: Vec<&SessionAgg> = sessions.clone();
+    //
+    // (#1877 QA must-fix 2) Filter to `start_ts.is_some()` BEFORE the sort,
+    // matching `earliest_by_start`'s own filter — a session with a terminal
+    // record but no `dispatch start` (a start truncated out of the
+    // `RUNS_FLOW_SCAN_WINDOW_DAYS` window, or evicted by Redis's `XADD
+    // MAXLEN ~` while its complete survives) carries `start_ts: None`, and
+    // `Option::cmp` orders `None` BEFORE `Some` — so an unfiltered sort put
+    // that start-less session first and let its `handle`/`model` win both
+    // attributes over every real dispatch session, exactly the corruption
+    // `earliest_by_start` itself is already immune to.
+    let mut sessions_by_start: Vec<&SessionAgg> =
+        sessions.iter().copied().filter(|s| s.start_ts.is_some()).collect();
     sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
 
     // Model is simple: the bookend's own record NEVER carries one
@@ -2872,6 +2883,112 @@ mod tests {
             parse_flow_ts("2026-01-01T08:00:00Z"),
             "start_ts must still come from the earliest session — only role/model attribution changed: {runs:?}"
         );
+    }
+
+    /// (#1877 QA must-fix 2) A session with a TERMINAL record but no
+    /// `dispatch start` at all must never win role OR model — reachable via
+    /// `RUNS_FLOW_SCAN_WINDOW_DAYS` truncating the start out of the scan
+    /// window while the complete stays inside it, or a Redis `XADD MAXLEN ~`
+    /// eviction of the oldest (the start) while the complete survives.
+    /// `sessions_by_start`'s sort used to compare `Option<String>` directly
+    /// with no filter, and `Option::cmp` orders `None` before `Some`, so a
+    /// start-less session sorted to the front and its `find_map` lookups
+    /// won both attributes ahead of the mission's real dispatch session.
+    ///
+    /// RED PROVED: against the pre-fix `sessions_by_start.sort_by(|a, b|
+    /// a.start_ts.cmp(&b.start_ts))` (no filter), this test's role/model
+    /// assertions failed with `Some("STALE-ROLE")` / `Some("STALE-MODEL")`
+    /// — exactly the injected startless session's own handle/model, in
+    /// place of the real coder session's `"coder"` / `"qwen3.6-35b-a3b"`.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_1877_startless_session_never_wins_role_or_model() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mut mission = minimal_mission(
+            "bookend-mission-2",
+            vec!["p-bookend2".to_string()],
+            Some(MissionSpec {
+                config_id: "coder-phase".to_string(),
+                inputs_fingerprint: "fpb2".to_string(),
+                origin: None,
+            }),
+        );
+        mission.started_ts = None;
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase("p-bookend2", "bookend-mission-2", vec!["t-bookend2".to_string()]);
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task = minimal_task("t-bookend2", "p-bookend2", vec!["s-bookend2".to_string()], Some("coder"));
+        darkmux_crew::lifecycle::save_task("bookend-mission-2", &task).unwrap();
+        let step = minimal_step("s-bookend2", "t-bookend2", Some("crew-dispatch-coder-bookend2"));
+        darkmux_crew::lifecycle::save_step("bookend-mission-2", "p-bookend2", &step).unwrap();
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                // The #1877 whole-run bookend — earliest ts, wins
+                // `earliest_by_start`'s `representative` pick.
+                serde_json::json!({
+                    "ts": "2026-01-01T08:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "bookend-mission-2",
+                    "handle": "coder-phase",
+                    "mission_id": "bookend-mission-2",
+                    "source": "mission",
+                    "machine_id": "studio",
+                }),
+                // The coder step's OWN dispatch — a real role and model.
+                serde_json::json!({
+                    "ts": "2026-01-01T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "crew-dispatch-coder-bookend2",
+                    "handle": "coder",
+                    "machine_id": "different-peer",
+                }),
+                serde_json::json!({
+                    "ts": "2026-01-01T09:10:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "crew-dispatch-coder-bookend2",
+                    "handle": "coder",
+                    "model": "qwen3.6-35b-a3b",
+                    "machine_id": "different-peer",
+                }),
+                // (#1877 QA must-fix 2) A terminal-only record — NO
+                // matching `dispatch start` for this `session_id` anywhere
+                // in this scenario — timestamped LATEST of all three so a
+                // buggy `None`-sorts-first comparison still puts it at the
+                // FRONT of `sessions_by_start` despite the late `ts`.
+                serde_json::json!({
+                    "ts": "2026-01-01T09:20:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "startless-session",
+                    "handle": "STALE-ROLE",
+                    "model": "STALE-MODEL",
+                    "mission_id": "bookend-mission-2",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None, &[]);
+        assert_eq!(runs.len(), 1, "exactly one Run: {runs:?}");
+        assert_eq!(runs[0].id, "bookend-mission-2");
+        assert_eq!(
+            runs[0].role.as_deref(),
+            Some("coder"),
+            "a start-less terminal-only session must never win role: {runs:?}"
+        );
+        assert_eq!(
+            runs[0].model.as_deref(),
+            Some("qwen3.6-35b-a3b"),
+            "a start-less terminal-only session must never win model: {runs:?}"
+        );
+        // `machine` already goes through `earliest_by_start`, which already
+        // filters `start_ts.is_some()` — unaffected by this bug either way,
+        // pinned here so a future regression on THIS sort doesn't silently
+        // also break the field that was never broken.
+        assert_eq!(runs[0].machine.as_deref(), Some("studio"), "{runs:?}");
     }
 
     /// A mission with NO other dispatching session at all — a Tier-1-only
