@@ -59,6 +59,15 @@ pub mod resourcing;
 // outcome — see the module doc for why a budget-exhausted-but-mostly-
 // completed run needs a THIRD state, not just a binary degenerate flag.
 pub mod run_outcome;
+// (#1877 item 2) The run-record substrate — StepRecord/MemberRecord and the
+// resolved-staffing snapshot — extracted out of `darkmux_lab::lab::review`,
+// the one mission that had built it for itself. See the module doc.
+pub mod run_record;
+// (#1877 item 2) The run-observability RAII substrate — the sink-agnostic
+// emitter seam, the host telemetry sampling loop, and the guard that ties
+// a run's samples and `step result` records to its own lifetime. See the
+// module doc.
+pub mod run_obs;
 pub mod select;
 // (#1230 Packet 2) Generic dependency-graph scheduler over `Step`/`Phase`
 // — see the module doc for the DependencyNode/is_ready/reachable/
