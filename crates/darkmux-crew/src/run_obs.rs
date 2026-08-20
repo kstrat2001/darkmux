@@ -184,6 +184,14 @@ impl HostTelemetrySampler {
     /// `io::Result`, unlike the panicking `thread::spawn`) so an OS-level
     /// spawn failure degrades to "no samples" — sampling must never affect
     /// the run it's observing.
+    ///
+    /// `#[must_use]`: dropping the returned guard immediately stops the
+    /// sampler thread before it ever samples (`Drop` joins it right away),
+    /// so `HostTelemetrySampler::start(...)` with no binding is silently a
+    /// no-op — the cheap structural check for the "held without a drain
+    /// plan" mistake this module's doc names as a real, reachable failure
+    /// mode now that `start` is `pub`.
+    #[must_use]
     pub fn start(
         case_id: String,
         crew: String,
@@ -366,6 +374,14 @@ impl<'a> RunObs<'a> {
     /// passes `"review"`) — stamped on every [`step_result_record`] this
     /// guard builds, the one piece [`step_result_record`]'s generalization
     /// took out of a hardcoded literal.
+    ///
+    /// `#[must_use]`: `let _ = RunObs::new(...)` drops the guard on the
+    /// spot — its `Drop` runs, its `HostTelemetrySampler` stops, and every
+    /// step result the caller meant to route through it never gets built.
+    /// That compiles today (`let_underscore_drop` is restriction-tier and
+    /// off), so this is the cheap structural catch in place of the
+    /// compile-time redesign this module's doc correctly declined.
+    #[must_use]
     pub fn new(emitter: &'a mut dyn RunEmitter, case_id: &str, crew: &str, source: &str) -> Self {
         Self::new_with_telemetry(
             emitter,
@@ -388,6 +404,7 @@ impl<'a> RunObs<'a> {
     /// [`DEFAULT_TELEMETRY_INTERVAL`] and the samplers at the real
     /// `sample_host` / `darkmux_profiles::lms::list_loaded`.
     #[allow(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new_with_telemetry(
         emitter: &'a mut dyn RunEmitter,
         case_id: &str,
