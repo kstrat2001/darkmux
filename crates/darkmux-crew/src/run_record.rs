@@ -375,6 +375,12 @@ mod tests {
     /// compile (`expected Option<usize>, found integer`) — the type change
     /// forces every existing call site to say explicitly whether it knows
     /// the count.
+    ///
+    /// Compares the SERIALIZED STRING, not `serde_json::to_value` (which is
+    /// order-insensitive and so would not fail on a field reorder, even
+    /// though "byte-identical" is exactly what this test claims to pin) —
+    /// see `serialization_is_actually_byte_identical_not_just_value_equal`
+    /// below for the test that proves this distinction matters.
     #[test]
     fn step_record_with_known_items_serializes_with_the_pre_move_shape() {
         let step = StepRecord {
@@ -385,14 +391,45 @@ mod tests {
             wall_ms: 87_000,
         };
         assert_eq!(
+            serde_json::to_string(&step).unwrap(),
+            r#"{"step_id":"judge-pass1","kind":"dispatch","items_in":134,"items_out":123,"wall_ms":87000}"#,
+        );
+    }
+
+    /// (#1877 QA) `serde_json::to_value` is order-insensitive — two structs
+    /// with the SAME fields in a DIFFERENT order compare equal under
+    /// `to_value`, so a golden test using it can never actually catch a
+    /// field reorder, no matter how confidently its doc claims
+    /// "byte-identical." This test proves the distinction is real: the same
+    /// `StepRecord` reordered under `to_value` is still `==`, but its
+    /// SERIALIZED STRING differs — which is exactly why the golden test
+    /// above compares strings, not values.
+    #[test]
+    fn serialization_is_actually_byte_identical_not_just_value_equal() {
+        let step = StepRecord {
+            step_id: "judge-pass1".into(),
+            kind: "dispatch".into(),
+            items_in: Some(134),
+            items_out: Some(123),
+            wall_ms: 87_000,
+        };
+        let reordered = serde_json::json!({
+            "kind": "dispatch",
+            "step_id": "judge-pass1",
+            "wall_ms": 87000,
+            "items_out": 123,
+            "items_in": 134
+        });
+        assert_eq!(
             serde_json::to_value(&step).unwrap(),
-            serde_json::json!({
-                "step_id": "judge-pass1",
-                "kind": "dispatch",
-                "items_in": 134,
-                "items_out": 123,
-                "wall_ms": 87000
-            })
+            reordered,
+            "to_value is order-insensitive — this passing is expected, not a guarantee of byte order"
+        );
+        assert_ne!(
+            serde_json::to_string(&step).unwrap(),
+            serde_json::to_string(&reordered).unwrap(),
+            "the actual serialized bytes DO differ by field order — a to_value-only golden \
+             would have silently let a real reorder through"
         );
     }
 
