@@ -1104,17 +1104,24 @@ fn resolve_auto_via_waves(placements: &[Placement]) -> ExecMode {
 }
 
 /// (#1877, this issue) Stays here rather than moving to `darkmux-gestalt`
-/// with the rest of this arc's move — this is the one function of the six
-/// named in the issue that is genuinely review-shaped, not general. Its
-/// signature is `probes: &[ResolvedSeatStaffing], judge: &ResolvedSeatStaffing`:
-/// a specific two-role seat vocabulary (`darkmux_crew::resourcing`'s
-/// review-specific `ResolvedSeatStaffing`, chained as `probes.iter().
-/// chain(once(judge))`) with no general "list of seats" abstraction to
-/// generalize it against yet. Building one now, with a single caller,
-/// would be inventing an abstraction ahead of a second consumer — the same
-/// discipline #1352's StepKind tiering already applies elsewhere in this
-/// codebase. What IS general here — turning a set of local placements into
-/// an `ExecMode` — is exactly [`resolve_auto_via_waves`] and
+/// with the rest of this arc's move. Its signature is
+/// `probes: &[ResolvedSeatStaffing], judge: &ResolvedSeatStaffing`, and the
+/// real blocker is the same dependency cycle that kept the rest of this
+/// arc's non-moved functions in place: `ResolvedSeatStaffing`
+/// (`darkmux_crew::resourcing`, documented there as "the resolver's per-seat
+/// output") is NOT review-specific — the review driver + envelope snapshot
+/// consume it, but so do crew's own `run_record.rs` and the binary
+/// (`src/mission_launch_review.rs`) — it just lives in `darkmux-crew`,
+/// which depends on `darkmux-gestalt`
+/// (`crates/darkmux-crew/Cargo.toml:19`). Moving this function down into
+/// `darkmux-gestalt` would need `darkmux-gestalt` to depend back on
+/// `darkmux-crew` for that type, inverting the edge into a cycle. The
+/// `probes`/`judge` two-arg shape IS review-shaped, but it's cosmetic
+/// (`probes.iter().chain(once(judge))` — trivially generalizable to "a
+/// slice of seats") and will not survive re-litigation on its own; the
+/// cycle is the real reason it stays. What IS general here — turning a set
+/// of local placements into an `ExecMode` — is exactly
+/// [`resolve_auto_via_waves`] and
 /// `darkmux_gestalt::waves::wave_schedule_to_exec_mode`, both already moved
 /// or already gestalt's; this function's own job is purely the review-
 /// specific translation from probe/judge staffing into that generic
