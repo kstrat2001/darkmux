@@ -155,6 +155,7 @@ pub fn run() -> DoctorReport {
         check_openai_base_url_conflict(),
         check_redis_config(),
         check_gh_allowlist(),
+        check_review_judge_exhaustion_policy(),
         check_remote_endpoint_credentials(),
         check_env_masks_config(),
         check_binary_split_brain(),
@@ -1364,6 +1365,43 @@ fn check_gh_allowlist() -> Check {
         message: format!("enabled ({provenance}) — allowed: {}", allowed.join(", ")),
         hint: None,
     }
+}
+
+/// (#1876/#1877) Informational: the review pipeline's judge-stage
+/// remote-budget exhaustion policy. Always `Pass` (it's a two-value operator
+/// preference, not a health signal) — surfaces the resolved value with
+/// provenance so an operator who set the strict knob (or is wondering why
+/// they DIDN'T) doesn't have to go read `config.json`/env by hand. Mirrors
+/// `check_fleet_mode`'s provenance-display shape.
+fn check_review_judge_exhaustion_policy() -> Check {
+    let name = "review.judge_fail_on_any_skip";
+    let env_set = std::env::var("DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_SKIP")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
+        .review
+        .and_then(|r| r.judge_fail_on_any_skip)
+        .is_some();
+    let provenance = if env_set {
+        "from DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_SKIP env"
+    } else if cfg_set {
+        "from config.json"
+    } else {
+        "default"
+    };
+    let strict = darkmux_types::config_access::review_judge_fail_on_any_skip();
+    let message = if strict {
+        format!(
+            "strict ({provenance}) — ANY judge-stage remote-token skip degrades the whole review \
+             run, even when most flags were judged"
+        )
+    } else {
+        format!(
+            "partial ({provenance}) — a judge-stage remote-token skip renders the flags that WERE \
+             judged, with a banner naming the shortfall; only a run with zero usable rulings degrades"
+        )
+    };
+    Check { name: name.into(), status: Status::Pass, message, hint: None }
 }
 
 /// (#85/#91) Surface profile models declaring a remote endpoint
@@ -4936,10 +4974,11 @@ mod tests {
         // mission-config-registry [#1284] + daemon-freshness +
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + gh-verb-allowlist [#1685] + unpriceable-residents
-        // [#1819]) + one per active eureka rule.
+        // [#1819] + review-judge-exhaustion-policy [#1876/#1877]) + one per
+        // active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 37 + darkmux_eureka::all_rules().len();
+        let expected = 38 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

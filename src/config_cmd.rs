@@ -109,6 +109,11 @@ const KEYS: &[(&str, Ty)] = &[
     ("mission.stale_active_days", Ty::Uint),
     // (#1349) The PR-review pipeline's judge-step bounded-concurrency cap.
     ("review.judge_concurrency", Ty::Uint),
+    // (#1876/#1877) The judge stage's remote-budget exhaustion policy —
+    // `false` (default): a skip is a coverage fact, findings still render
+    // plus a banner; `true`: restores the pre-#1876 "any skip is fatal"
+    // behavior.
+    ("review.judge_fail_on_any_skip", Ty::Bool),
     // (#1698 Packet B2) The radio interpreter's staffing + persona knobs.
     ("radio.router_profile", Ty::Str),
     ("radio.answerer_profile", Ty::Str),
