@@ -965,41 +965,18 @@ pub fn launch(
         // branches at all — the gate holds regardless of which graph shape
         // a `gh_verb` config happens to declare.
         let success = matches!(&outcome, Ok(code) if *code == 0);
-        // (#1877, QA must-fix) Explicit close on the coder branch's early
-        // return — a coder-phase run doing real dispatch work needs a
-        // terminal record, not just the Drop backstop. The bookend's
-        // complete-vs-error split is `reached_gate`, NOT `success`:
-        // `coder_phase_gate_outcome`'s own table has THREE gate-reached
-        // outcomes (`Ok(0)` clean, `Ok(2)` QA found blockers, `Ok(3)` QA
-        // unavailable) that all leave the mission Active, awaiting
-        // operator sign-off — real dispatch work that started and
-        // FINISHED, same as a clean run. `gate_outcome_reached_no_gate`
-        // is the function that already draws this line (`Err` and
-        // `Ok(1)` are the only two outcomes that never reached the gate);
-        // using `success` (`exit == 0` only) here would mismark
-        // `Ok(2)`/`Ok(3)` as `dispatch error`, flipping those missions to
-        // Error on the Runs lens even though they're the expected "QA
-        // has findings, come look" outcome. `success` still gates the
-        // gh-verb AUDIT record below — that one genuinely wants
-        // exit-code success, not gate-reached.
-        let reached_gate = !gate_outcome_reached_no_gate(&outcome);
+        // (#1877, QA must-fix; extraction #1877 QA must-fix 3) Explicit
+        // close on the coder branch's early return — a coder-phase run
+        // doing real dispatch work needs a terminal record, not just the
+        // Drop backstop. `success` still gates the gh-verb AUDIT call
+        // below — that one genuinely wants exit-code success, not
+        // gate-reached; see `coder_branch_terminal_bookend`'s own doc for
+        // why the bookend record itself keys on `reached_gate` instead.
+        let (_reached_gate, record) = coder_branch_terminal_bookend(&outcome, config_id, &mission_id);
         for sample in drained_telemetry(&telemetry, &mission_id) {
             bookend.emit_now(sample);
         }
-        bookend.close(
-            "dispatch",
-            mission_bookend_record(
-                if reached_gate { flow::Level::Info } else { flow::Level::Error },
-                if reached_gate { "dispatch complete" } else { "dispatch error" },
-                config_id,
-                &mission_id,
-                serde_json::json!({
-                    "runtime": "mission",
-                    "result_class": if reached_gate { "ok" } else { "error" },
-                    "gate": "coder-phase",
-                }),
-            ),
-        );
+        bookend.close("dispatch", record);
         emit_launch_gh_verb_audit(config, &collected, &mission_id, gate_confirmed.get(), success);
         return outcome;
     }
@@ -1735,6 +1712,53 @@ fn register_coder_phase_kinds(
 /// `Ok(2)` would close the mission under QA-blockers before sign-off).
 fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
     matches!(outcome, Err(_) | Ok(1))
+}
+
+/// (#1877 QA must-fix 3) The coder branch's terminal mission-level bookend
+/// record — extracted out of `launch`'s `if let Some(handles) = &coder_
+/// handles` arm so the `reached_gate` decision and the record it produces
+/// are unit-testable directly against a scripted `outcome`, without driving
+/// a real coder-phase dispatch through the scheduler (`launch` hardcodes
+/// `crew::concurrent_dispatch::lms_host_factory` — there is no injectable
+/// mock host on this path, so a full `launch()` integration test can only
+/// ever reach an `Err` outcome here via a cheap, real failure like an
+/// invalid worktree `base`, never `Ok(2)`/`Ok(3)`, which need a real
+/// dispatch to produce).
+///
+/// Returns `(reached_gate, record)` — `launch` still owns EMITTING it
+/// (`bookend.close`, the telemetry drain immediately before, and the
+/// gh-verb audit call after), this function owns only the DECISION: same
+/// split responsibility `mission_bookend_record` itself already has
+/// relative to its callers.
+///
+/// The complete-vs-error split is `reached_gate`
+/// (`!gate_outcome_reached_no_gate(outcome)`), NOT `outcome == Ok(0)` —
+/// see `gate_outcome_reached_no_gate`'s own doc for why: `Ok(2)` (QA found
+/// blockers) and `Ok(3)` (QA unavailable) both leave the mission Active at
+/// the sign-off gate, which is real dispatch work that started and
+/// FINISHED, same as a clean `Ok(0)`. Reading `outcome == Ok(0)` here
+/// instead would mismark `Ok(2)`/`Ok(3)` as `dispatch error`, flipping
+/// those missions to Error on the Runs lens even though they are the
+/// expected "QA has findings, come look" outcome — the exact regression
+/// this function's own tests pin against.
+fn coder_branch_terminal_bookend(
+    outcome: &Result<i32>,
+    config_id: &str,
+    mission_id: &str,
+) -> (bool, flow::FlowRecord) {
+    let reached_gate = !gate_outcome_reached_no_gate(outcome);
+    let record = mission_bookend_record(
+        if reached_gate { flow::Level::Info } else { flow::Level::Error },
+        if reached_gate { "dispatch complete" } else { "dispatch error" },
+        config_id,
+        mission_id,
+        serde_json::json!({
+            "runtime": "mission",
+            "result_class": if reached_gate { "ok" } else { "error" },
+            "gate": "coder-phase",
+        }),
+    );
+    (reached_gate, record)
 }
 
 /// (#1530 Packet 2) Resolve WHICH step in `steps` is the graph's declared
@@ -4517,6 +4541,88 @@ mod tests {
         assert_ne!(rec.source.as_deref(), Some("review"));
     }
 
+    // ── #1877 QA must-fix 3 — the coder branch's terminal bookend must ──
+    // key on `reached_gate`, not `outcome == Ok(0)`, and the record it
+    // produces must be distinguishable from the `BookendGuard` Drop
+    // backstop's generic abort record.
+    //
+    // RED PROVED (mutation per the QA finding): swapping this function's
+    // `let reached_gate = !gate_outcome_reached_no_gate(outcome);` for
+    // `let reached_gate = matches!(outcome, Ok(0));` (the literal
+    // `reached_gate = success` mutation named in the finding) failed
+    // `coder_branch_terminal_bookend_ok_2_qa_blockers_still_reaches_the_gate`
+    // and `..._ok_3_qa_unavailable_still_reaches_the_gate` below: both
+    // asserted `action == "dispatch complete"` and instead got
+    // `"dispatch error"`.
+
+    #[test]
+    fn coder_branch_terminal_bookend_ok_0_clean_reaches_the_gate() {
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(0), "coder-phase", "m-1");
+        assert!(reached_gate);
+        assert_eq!(rec.action, "dispatch complete");
+        assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
+        assert_eq!(rec.payload.as_ref().unwrap()["result_class"], serde_json::json!("ok"));
+        assert_eq!(rec.payload.as_ref().unwrap()["gate"], serde_json::json!("coder-phase"));
+    }
+
+    #[test]
+    fn coder_branch_terminal_bookend_ok_2_qa_blockers_still_reaches_the_gate() {
+        // `coder_phase_gate_outcome`'s own table: QA found blocker(s)
+        // leaves the phase Running at the sign-off gate — real dispatch
+        // work that started and FINISHED, same as clean. Must close
+        // `dispatch complete`, never `dispatch error`.
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(2), "coder-phase", "m-2");
+        assert!(reached_gate, "Ok(2) (QA blockers) must still reach the gate");
+        assert_eq!(rec.action, "dispatch complete");
+        assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
+    }
+
+    #[test]
+    fn coder_branch_terminal_bookend_ok_3_qa_unavailable_still_reaches_the_gate() {
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(3), "coder-phase", "m-3");
+        assert!(reached_gate, "Ok(3) (QA unavailable) must still reach the gate");
+        assert_eq!(rec.action, "dispatch complete");
+        assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
+    }
+
+    #[test]
+    fn coder_branch_terminal_bookend_ok_1_coder_dispatch_failure_never_reaches_the_gate() {
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(1), "coder-phase", "m-4");
+        assert!(!reached_gate);
+        assert_eq!(rec.action, "dispatch error");
+        assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
+        assert_eq!(rec.payload.as_ref().unwrap()["result_class"], serde_json::json!("error"));
+    }
+
+    #[test]
+    fn coder_branch_terminal_bookend_err_worktree_failure_never_reaches_the_gate() {
+        let (reached_gate, rec) =
+            coder_branch_terminal_bookend(&Err(anyhow!("worktree already exists")), "coder-phase", "m-5");
+        assert!(!reached_gate);
+        assert_eq!(rec.action, "dispatch error");
+        assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
+    }
+
+    /// (#1877 QA must-fix 3) The explicit close's payload always carries
+    /// `gate: "coder-phase"` and NEVER an `error` key — the opposite shape
+    /// from the `BookendGuard` Drop backstop's generic abort record (see
+    /// `launch`'s `bookend` construction: `on_abort` builds a payload with
+    /// `"error": "mission dispatch terminated before completion..."` and no
+    /// `gate` key). Distinguishing the two shapes is what lets
+    /// `launch_coder_phase_worktree_failure_still_closes_the_mission_
+    /// bookend_as_dispatch_error` (below) prove the explicit close actually
+    /// ran, not just that SOME "dispatch error" record landed.
+    #[test]
+    fn coder_branch_terminal_bookend_payload_never_carries_an_error_key() {
+        let (_, rec) = coder_branch_terminal_bookend(&Err(anyhow!("boom")), "coder-phase", "m-6");
+        let payload = rec.payload.as_ref().unwrap();
+        assert!(
+            payload.get("error").is_none(),
+            "the explicit close's payload must not carry the Drop backstop's `error` key: {payload:?}"
+        );
+        assert_eq!(payload["gate"], serde_json::json!("coder-phase"));
+    }
+
     /// `HostTelemetrySampler` itself never stamps `mission_id` (it doesn't
     /// know one — see its own doc). `drained_telemetry` is the one place
     /// that backfill happens for the generic launch path, mirroring
@@ -4861,6 +4967,36 @@ mod tests {
              rely on the Drop backstop for a KNOWN outcome: {mission_records:#?}"
         );
         assert_eq!(errors[0]["mission_id"], serde_json::json!(mission_id));
+        // (#1877 QA must-fix 3) `errors.len() == 1` alone can't tell the
+        // explicit `bookend.close(...)` apart from the `BookendGuard` Drop
+        // backstop — both emit exactly one "dispatch error" record. Only
+        // the PAYLOAD shape distinguishes them: the explicit close stamps
+        // `gate: "coder-phase"` (see `coder_branch_terminal_bookend`) and
+        // carries no `error` key; the Drop backstop's `on_abort` closure
+        // does the opposite (an `error` key naming "terminated before
+        // completion", no `gate` key). Asserting `gate` here is what
+        // proves this test exercises the explicit close this arc added —
+        // not just "some dispatch-error record landed" — which is exactly
+        // what this test's own docstring claims but, before this
+        // assertion, never actually checked.
+        //
+        // RED PROVED: deleting the `bookend.close(...)` call in `launch`'s
+        // coder branch (leaving only the Drop backstop to fire on the
+        // early `return outcome`) still left `starts.len() == 1` and
+        // `errors.len() == 1` passing, but this `payload["gate"]`
+        // assertion failed (`gate` absent) and `payload["error"]` was
+        // present instead.
+        assert_eq!(
+            errors[0]["payload"]["gate"],
+            serde_json::json!("coder-phase"),
+            "must be the explicit coder-branch close, not the Drop backstop's generic abort \
+             record: {mission_records:#?}"
+        );
+        assert!(
+            errors[0]["payload"].get("error").is_none(),
+            "the Drop backstop's abort record carries an `error` key instead of `gate` — seeing \
+             one here means `bookend.close` was never called: {mission_records:#?}"
+        );
         drop(guard);
     }
 }
