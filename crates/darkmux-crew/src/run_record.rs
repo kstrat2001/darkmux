@@ -24,16 +24,40 @@
 //! keeps resolving unchanged. See that module's own doc for how the
 //! [`StepRecord`]s/[`MemberRecord`]s it constructs feed `ReviewEnvelope`.
 //!
-//! **What did NOT move here (deliberately, named so the gap doesn't read as
-//! an oversight):** the scheduler (`crate::scheduler::run_step_graph`) does
-//! not itself produce a [`StepRecord`] per step today — every existing
-//! `StepRecord` in the tree is still hand-built by the mission that ran the
-//! step (review's `run_judge_only`/`run_review_graph`), timing it with its
-//! own `Instant::now()` pair. Teaching the scheduler to observe and emit
-//! these itself (so a mission gets them BY CONSTRUCTION rather than by
-//! writing the same five call sites review already has) is #1877's own
-//! item 3 territory — real scheduler surgery, not a move — and is left for
-//! its own PR rather than folded in here.
+//! **#1877 item 3 (this module's own follow-up, now shipped):**
+//! `crate::scheduler::run_step_graph` now times and emits a [`StepRecord`]
+//! per step itself — see `apply_step_terminal` and the job closure in
+//! `scheduler.rs`. A mission gets these BY CONSTRUCTION, with no opt-in and
+//! no cooperation required from the `StepKind` that ran: `step_id`/`kind`/
+//! `wall_ms` are things the scheduler genuinely observes (which step ran,
+//! what kind it was registered under, how long its own `run_streaming` call
+//! took — timed per-step, on that step's own worker thread, never a
+//! wave-wide clock). `items_in`/`items_out` are NOT scheduler-observable —
+//! they are per-kind business semantics (review's dedup step knows it took
+//! N deduped flags and produced M; the scheduler only knows a step ran) —
+//! so [`StepRecord::items_in`]/[`StepRecord::items_out`] are `Option<usize>`
+//! and the scheduler always leaves them `None`. `None` is the honest
+//! "the producer does not know this," never a lying `Some(0)`: this is the
+//! same discipline this arc has applied everywhere else a run's substrate
+//! cannot claim more than it actually observed.
+//!
+//! `darkmux_lab::lab::review`'s two drivers still hand-build their OWN
+//! `StepRecord`s (`finish_review`/`run_judge_only`'s five call sites, which
+//! know real `items_in`/`items_out` counts the scheduler cannot) and this is
+//! a deliberate, reconciled choice, not an oversight: review's sequential
+//! `run_judge_only` path never calls `run_step_graph` at all (no scheduler
+//! involved), and the scheduler's new `SchedulerReport::step_records` is not
+//! merged into `ReviewEnvelope::steps` on the graph path either (confirmed
+//! by `review_tests.rs`'s own comment: no graph step kind writes
+//! `env.steps`, so it stays empty end-to-end there, unchanged by this PR).
+//! The two producers are structurally disjoint today — nothing combines
+//! them, so there is no double count to reconcile. Wiring the graph path's
+//! `env.steps` from `SchedulerReport::step_records` (recovering
+//! `items_in`/`items_out` from wherever a mission's own business logic
+//! knows them) is left for a later PR — likely the same one that gives
+//! `coder-phase` its own typed envelope home, since that is the arc's next
+//! item and the natural place to decide how a mission backfills the
+//! scheduler's `None`s.
 
 use crate::resourcing::{ResolvedSeatStaffing, StaffingProvenance};
 use darkmux_profiles::swap;
@@ -78,17 +102,35 @@ pub struct MemberRecord {
 /// a future flow-record consumer can render a run as a step timeline
 /// without re-deriving it from a nested-array envelope. Realized by the
 /// `step result` flow record (#1247 Part 1) — the live-run counterpart of
-/// this end-of-run summary. See this module's doc for why the SCHEDULER
-/// does not yet produce these itself.
+/// this end-of-run summary. See this module's doc for who produces these
+/// today: `crate::scheduler::run_step_graph` (every step, every mission,
+/// `items_in`/`items_out` always `None`) and review's own two drivers
+/// (`items_in`/`items_out` always `Some`, since they know the counts).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecord {
     /// Mission-defined step identity (review's steps are `bundle` |
-    /// `probe` | `dedup` | `judge-pass1` | `judge-pass2`).
+    /// `probe` | `dedup` | `judge-pass1` | `judge-pass2`). A
+    /// scheduler-produced record uses the step's own `Step::id`.
     pub step_id: String,
-    /// `procedural` (no dispatch) | `dispatch` (LMStudio calls).
+    /// Review's hand-built records use the coarse `procedural` (no
+    /// dispatch) | `dispatch` (LMStudio calls) convention. A
+    /// scheduler-produced record uses the step's own `Step::kind` — the
+    /// full step-kind-registry id (e.g. `"dispatch.internal"`,
+    /// `"procedural.shell"`) — since that is the genuine, precise value
+    /// the scheduler has in hand; it does not know which registry kinds
+    /// count as "dispatch" in review's coarser sense.
     pub kind: String,
-    pub items_in: usize,
-    pub items_out: usize,
+    /// How many items this step consumed, when the producer knows —
+    /// per-kind business semantics the scheduler cannot observe from
+    /// outside a `StepKind::run_streaming` call. `None` means "not known
+    /// to this producer," never a lying `Some(0)`. Skipped from JSON
+    /// entirely when `None`, so an old reader parsing a scheduler-produced
+    /// record never mistakes absence for a real zero-item step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items_in: Option<usize>,
+    /// See [`Self::items_in`] — same honesty contract, output side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items_out: Option<usize>,
     pub wall_ms: u64,
 }
 
@@ -324,27 +366,106 @@ mod tests {
         );
     }
 
-    /// Golden JSON for [`StepRecord`] — no `skip_serializing_if` on this
-    /// type, so every field always appears.
+    /// Golden JSON for [`StepRecord`] when the producer KNOWS its item
+    /// counts (review's own hand-built records, both before and after
+    /// #1877 item 3's `Option` change) — pins that `Some(n)` still
+    /// serializes as the bare number, byte-identical to the pre-`Option`
+    /// shape review.rs has always emitted. **Proved failing first**: before
+    /// wrapping `items_in`/`items_out` in `Some(..)`, this test failed to
+    /// compile (`expected Option<usize>, found integer`) — the type change
+    /// forces every existing call site to say explicitly whether it knows
+    /// the count.
+    ///
+    /// Compares the SERIALIZED STRING, not `serde_json::to_value` (which is
+    /// order-insensitive and so would not fail on a field reorder, even
+    /// though "byte-identical" is exactly what this test claims to pin) —
+    /// see `serialization_is_actually_byte_identical_not_just_value_equal`
+    /// below for the test that proves this distinction matters.
     #[test]
-    fn step_record_serializes_with_the_pre_move_shape() {
+    fn step_record_with_known_items_serializes_with_the_pre_move_shape() {
         let step = StepRecord {
             step_id: "judge-pass1".into(),
             kind: "dispatch".into(),
-            items_in: 134,
-            items_out: 123,
+            items_in: Some(134),
+            items_out: Some(123),
             wall_ms: 87_000,
         };
         assert_eq!(
-            serde_json::to_value(&step).unwrap(),
-            serde_json::json!({
-                "step_id": "judge-pass1",
-                "kind": "dispatch",
-                "items_in": 134,
-                "items_out": 123,
-                "wall_ms": 87000
-            })
+            serde_json::to_string(&step).unwrap(),
+            r#"{"step_id":"judge-pass1","kind":"dispatch","items_in":134,"items_out":123,"wall_ms":87000}"#,
         );
+    }
+
+    /// (#1877 QA) `serde_json::to_value` is order-insensitive — two structs
+    /// with the SAME fields in a DIFFERENT order compare equal under
+    /// `to_value`, so a golden test using it can never actually catch a
+    /// field reorder, no matter how confidently its doc claims
+    /// "byte-identical." This test proves the distinction is real: the same
+    /// `StepRecord` reordered under `to_value` is still `==`, but its
+    /// SERIALIZED STRING differs — which is exactly why the golden test
+    /// above compares strings, not values.
+    #[test]
+    fn serialization_is_actually_byte_identical_not_just_value_equal() {
+        let step = StepRecord {
+            step_id: "judge-pass1".into(),
+            kind: "dispatch".into(),
+            items_in: Some(134),
+            items_out: Some(123),
+            wall_ms: 87_000,
+        };
+        let reordered = serde_json::json!({
+            "kind": "dispatch",
+            "step_id": "judge-pass1",
+            "wall_ms": 87000,
+            "items_out": 123,
+            "items_in": 134
+        });
+        assert_eq!(
+            serde_json::to_value(&step).unwrap(),
+            reordered,
+            "to_value is order-insensitive — this passing is expected, not a guarantee of byte order"
+        );
+        assert_ne!(
+            serde_json::to_string(&step).unwrap(),
+            serde_json::to_string(&reordered).unwrap(),
+            "the actual serialized bytes DO differ by field order — a to_value-only golden \
+             would have silently let a real reorder through"
+        );
+    }
+
+    /// (#1877 item 3) The scheduler's own honesty contract: when a producer
+    /// genuinely does not know a step's item counts (every
+    /// `crate::scheduler::run_step_graph`-produced record), the fields must
+    /// be OMITTED, never written as `0`. A reader that sees `items_in`
+    /// absent knows "not measured here"; a reader that saw `"items_in":0`
+    /// would read it as "measured — zero items," which is false. **Proved
+    /// failing first**: temporarily changing `items_in`/`items_out` back to
+    /// `#[serde(default)]` without `skip_serializing_if` made this test fail
+    /// with `"items_in":null` present in the JSON (still not `0`, but not
+    /// absent either) — restored before committing. This test also locks
+    /// the decision in place: a later change cannot quietly turn `None`
+    /// into a serialized `0` without this test catching it.
+    #[test]
+    fn step_record_omits_item_counts_when_unknown_never_a_lying_zero() {
+        let step = StepRecord {
+            step_id: "dispatch.internal-step".into(),
+            kind: "dispatch.internal".into(),
+            items_in: None,
+            items_out: None,
+            wall_ms: 4_200,
+        };
+        let value = serde_json::to_value(&step).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "step_id": "dispatch.internal-step",
+                "kind": "dispatch.internal",
+                "wall_ms": 4200
+            }),
+            "an unknown item count must be ABSENT from the JSON, not present as 0 or null"
+        );
+        assert!(value.get("items_in").is_none(), "items_in must not appear at all when unknown");
+        assert!(value.get("items_out").is_none(), "items_out must not appear at all when unknown");
     }
 
     fn staffing(name: &str, model: &str, k: u32) -> ResolvedSeatStaffing {
