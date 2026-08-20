@@ -651,6 +651,27 @@ fn review_result_to_mission_envelope(
                 .or_else(|| (status == MissionOutcomeStatus::Degraded).then(|| env.warnings.join("; ")));
             let mut envelope = MissionEnvelope::from_outcome(mission_id, outcome, phase_ids);
             envelope.reason = reason;
+            // (#1877 QA ALSO FIX 2) INVARIANT, not enforced by any type:
+            // when `envelope.outcome` is `Some(RunOutcome::Partial {
+            // reasons })`, `reasons` is `env.warnings.clone()` — the SAME
+            // `Vec` `review_mission_outcome` built `outcome` from (see its
+            // own doc). So `envelope.warnings` here duplicates
+            // `envelope.outcome`'s `reasons` verbatim in that case; every
+            // warning rides `envelope.json` twice. Deliberate, not
+            // accidental: `warnings` is the field every EXISTING consumer
+            // reads (the PR banner via `review_outcome`, the mission board,
+            // `darkmux-serve/src/runs.rs` — see `envelope.rs`'s module doc
+            // on why those consumers stay on `status`/`warnings`, never
+            // `outcome`, until a separately-reviewed change), so it can't
+            // be dropped here without breaking them; `outcome.reasons` is
+            // kept as the new typed value #1877 adds. A future cleanup that
+            // wants to stop the duplication has to migrate every one of
+            // those consumers onto `outcome` first, not just delete this
+            // line — `judge_gate_outcome_keeps_review_outcome_and_review_
+            // mission_outcome_in_sync` (darkmux-lab's review_tests.rs) and
+            // `a_partial_coverage_review_round_trips_as_a_typed_partial_
+            // outcome_with_real_numbers` (below) both pin that the two
+            // copies agree today.
             envelope.warnings = env.warnings.clone();
             envelope.remote_budgets = env
                 .remote_budgets
@@ -1959,6 +1980,14 @@ mod tests {
     /// rather than conventional" claim from #1877's own tracking issue,
     /// proven on the actual review->envelope path, not just on
     /// `MissionEnvelope::from_outcome` in isolation.
+    ///
+    /// (#1877 QA ALSO FIX 2) Also pins the deliberate duplication this
+    /// function's own doc names: `envelope.warnings` and
+    /// `envelope.outcome`'s `Partial.reasons` are the SAME `Vec` assigned
+    /// twice, not two independently-derived values that happen to agree.
+    /// If a future change drops one copy without updating the other, THIS
+    /// assertion is what catches the drift — not the shape of the JSON,
+    /// which would still parse fine either way.
     #[test]
     fn a_partial_coverage_review_round_trips_as_a_typed_partial_outcome_with_real_numbers() {
         let env = ReviewEnvelope {
@@ -1977,6 +2006,11 @@ mod tests {
                 assert_eq!(reasons.len(), 1);
                 assert!(reasons[0].contains("11 of 134 flags went unjudged"), "got: {}", reasons[0]);
                 assert!(reasons[0].contains("500497"), "the used-token count is the real number: {}", reasons[0]);
+                assert_eq!(
+                    &out.warnings, reasons,
+                    "envelope.warnings must stay in lockstep with outcome's Partial.reasons — \
+                     they are the same Vec assigned twice, per this function's own doc"
+                );
             }
             other => panic!("expected Some(Partial), got {other:?}"),
         }
@@ -1988,6 +2022,12 @@ mod tests {
         let back: crew::envelope::MissionEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(back.status, crew::envelope::MissionOutcomeStatus::Degraded);
         assert_eq!(back.outcome, out.outcome);
+        match &back.outcome {
+            Some(darkmux_crew::run_outcome::RunOutcome::Partial { reasons }) => {
+                assert_eq!(&back.warnings, reasons, "the two copies survive the round-trip in lockstep too");
+            }
+            other => panic!("expected Some(Partial) after round-trip, got {other:?}"),
+        }
     }
 
     /// The `Clean`/`Degenerate` cases produce `outcome: Some(Complete)` /
