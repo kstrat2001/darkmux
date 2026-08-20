@@ -752,6 +752,18 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) 
             let envelope = darkmux_crew::lifecycle::load_envelope(&mission.id)
                 .ok()
                 .flatten();
+            // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
+            // `RunOutcome::Partial` is NOT read here. `RunStatus` has no
+            // partial-coverage value among its states
+            // (`Planned`/`Running`/`Complete`/`Abandoned`/`Error`), and
+            // `status` already collapses
+            // `Partial` into `Degraded` before this match ever runs
+            // (`MissionOutcomeStatus::from_outcome`), so a Partial review's
+            // `Degraded` status falls into the `_ => Complete` arm below —
+            // same as it did before #1877, when Degraded was purely
+            // convention. Widening `RunStatus` to distinguish "complete" from
+            // "complete but constrained" is a real, separate feature (a
+            // dashboard-visible partial badge) this PR does not add.
             match envelope.map(|e| e.status) {
                 Some(MissionOutcomeStatus::Error) | Some(MissionOutcomeStatus::Degenerate) => RunStatus::Error,
                 _ => RunStatus::Complete,
@@ -1717,6 +1729,32 @@ mod tests {
         let err_env = MissionEnvelope::new("m7", MissionOutcomeStatus::Error, &[]);
         darkmux_crew::envelope::finalize_mission(&err_env);
         assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Error);
+    }
+
+    /// (#1877 item 4 — stated decision, pinned) A `RunOutcome::Partial`
+    /// envelope collapses into `RunStatus::Complete` here, same as a plain
+    /// `Degraded` one — `RunStatus` has no partial-coverage state and this
+    /// site deliberately does not read `envelope.outcome` to invent one. If
+    /// this test ever needs to change, that is the moment `RunStatus` grows
+    /// a real partial state, not an accidental regression.
+    #[test]
+    #[serial_test::serial]
+    fn mission_run_status_finalized_partial_outcome_envelope_reads_complete_not_a_new_state() {
+        let _g = CrewGuard::new();
+        darkmux_crew::lifecycle::save_mission(&minimal_mission("m8", vec![], None)).unwrap();
+        let mut m = minimal_mission("m8", vec![], None);
+        m.status = MissionStatus::Finalized;
+
+        let partial_env = MissionEnvelope::from_outcome(
+            "m8",
+            darkmux_crew::run_outcome::RunOutcome::Partial {
+                reasons: vec!["11 of 134 flags went unjudged".to_string()],
+            },
+            &[],
+        );
+        assert_eq!(partial_env.status, MissionOutcomeStatus::Degraded);
+        darkmux_crew::envelope::finalize_mission(&partial_env);
+        assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Complete);
     }
 
     // ── mission_run_status: the staleness gate (#1642, #1633) ───────────

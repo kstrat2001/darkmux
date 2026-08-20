@@ -1030,6 +1030,54 @@ fn judge_budget_shortfall_reason(env: &ReviewEnvelope, r: &RemoteBudgetRecord) -
     }
 }
 
+/// (#1877 item 2) Review's OWN predicate mapping from its envelope fields
+/// onto [`RunOutcome`], scoped for what `src/mission_launch_review.rs`'s
+/// `review_result_to_mission_envelope` puts on `MissionEnvelope::outcome`.
+/// **Deliberately a DIFFERENT function from [`review_outcome`] above**, not
+/// a thin wrapper around it, because the two answer different questions
+/// with different consumers:
+///
+/// - [`review_outcome`] answers "did every item in the docket get a
+///   ruling" for the PR-COMMENT banner (`src/pr_review.rs`'s
+///   `synthesize_review`) — narrowly scoped to judge-stage coverage on
+///   purpose (see its own doc: probe/verify-stage warnings already render
+///   normally and folding them in would double-announce an
+///   already-correct treatment).
+/// - This function answers "does the MISSION BOARD need to flag this run"
+///   — the question `review_result_to_mission_envelope` has always
+///   answered via two signals that predate `RunOutcome` entirely:
+///   `env.degenerate` (with the `BenignEmpty`/`UnsupportedLanguage`
+///   carve-out folded back to healthy, #1654/#1757 — a diff with nothing
+///   to review is not a failure worth flagging) and `env.warnings` (ANY
+///   non-empty warning, not only a judge-stage one — a probe-seat retry
+///   failure is real degraded coverage the board should show, #1876).
+///
+/// Reusing [`review_outcome`] here would silently CHANGE existing mission
+/// statuses for two real input shapes: a benign/unsupported-language
+/// degenerate run (today `Clean`; `review_outcome` would call it `Empty` ->
+/// `Degenerate`) and a probe/verify-only warning with no judge-stage skip
+/// (today `Degraded`; `review_outcome` would call it `Complete` -> `Clean`,
+/// since its `Partial` predicate is judge-stage-scoped by design). This
+/// function exists so that does NOT happen — every existing
+/// `review_result_to_mission_envelope` test still gets the SAME status it
+/// got before #1877, because this function reproduces that same predicate,
+/// just expressed as a `RunOutcome` instead of an inline if/else chain.
+pub fn review_mission_outcome(env: &ReviewEnvelope) -> RunOutcome {
+    let neutral_zero_bundle = matches!(
+        env.degenerate_kind,
+        Some(DegenerateKind::BenignEmpty) | Some(DegenerateKind::UnsupportedLanguage)
+    );
+    if let Some(reason) = &env.degenerate {
+        if !neutral_zero_bundle {
+            return RunOutcome::Empty { reason: reason.clone() };
+        }
+    }
+    if !env.warnings.is_empty() {
+        return RunOutcome::Partial { reasons: env.warnings.clone() };
+    }
+    RunOutcome::Complete
+}
+
 // (#1877) `RemoteBudgetRecord`/`RemoteBucket` moved to
 // `darkmux_crew::remote_budget` (as `RemoteBudgetRecord`/`RemoteBudget`) —
 // the shared home for what used to be two hand-copied buckets, this one and

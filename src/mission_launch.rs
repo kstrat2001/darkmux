@@ -813,6 +813,33 @@ pub fn launch(
     print_run_summary(&mission_id, &steps);
 
     use crew::envelope::MissionOutcomeStatus;
+    // (#1877 item 4 — deliberately deferred, corrected) `build_envelope`
+    // (above, only reached for a gate-less generic Tier-1-only graph — a
+    // coder-phase config's `coder_handles` branch above `return`s before
+    // this point, either into `reconcile_and_finalize_on_error` on a
+    // pre-gate failure or by stopping at the operator gate with no
+    // finalize at all) still constructs `status` directly, never a
+    // `RunOutcome`. An earlier version of this note reasoned that per-step
+    // aggregation is "a different shape" from review's per-flag docket —
+    // that reasoning was wrong: `build_envelope`'s all-errored arm
+    // (`completed.is_empty()` → `MissionOutcomeStatus::Error`) already IS
+    // a docket-style verdict (no step produced usable output), which is
+    // semantically `RunOutcome::Empty`, not `Error`.
+    //
+    // The REAL blocker is `MissionOutcomeStatus::from_outcome`
+    // (`crates/darkmux-crew/src/envelope.rs`): it maps `Complete`/
+    // `Partial`/`Empty` and has no route to `Error` at all. Adopting
+    // `RunOutcome` here would silently change the all-errored arm's status
+    // from `Error` to `Degenerate` (`Empty` mapped through `from_outcome`)
+    // — a real status/exit-code change for that input shape, not a pure
+    // refactor. So this match only ever sees `status` directly, never
+    // `outcome`, and stays that way until `from_outcome` grows a fourth
+    // arm (or this site gets a documented reason to keep constructing
+    // `Error` by hand). What's unaffected regardless: `from_outcome`
+    // already collapses a future `RunOutcome::Partial` into `Degraded`,
+    // which already exits 0 here — a mission driver that adopts
+    // `RunOutcome` for its Partial case inherits this exit code for free,
+    // with no match arm to add.
     let exit_code = match status {
         MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => 0,
         MissionOutcomeStatus::Degenerate | MissionOutcomeStatus::Error => 1,
@@ -2021,6 +2048,14 @@ fn phase_finalization(phase_steps: &[&crew::types::Step]) -> (crew::envelope::Ph
 /// Per-phase finalization outcomes come from [`derive_phase_outcomes`]; the
 /// run-level `status` is NOT stamped uniformly onto every phase (#1406). See
 /// `envelope.rs`'s own module doc for the phase/mission-outcome mapping.
+///
+/// Reached ONLY by a gate-less generic Tier-1-only graph — a coder-phase
+/// config's `coder_handles` branch (see `launch`, above) always `return`s
+/// before this call. See the `MissionOutcomeStatus::from_outcome` /
+/// `RunOutcome` deferral note attached to `launch`'s exit-code match, right
+/// after this call site, for why this function still constructs `status`
+/// directly and the real (not "different shape") reason it hasn't adopted
+/// `RunOutcome` yet.
 fn build_envelope(
     mission_id: &str,
     config: &MissionConfig,
@@ -2100,6 +2135,14 @@ fn build_envelope(
 /// own discipline: the caller still propagates the original `Err`, so the
 /// failure is never swallowed; a persistence hiccup here degrades only the
 /// mission-board VIEW.
+///
+/// (#1877 item 4) THIS is the site that actually owns a coder-phase
+/// `launch`'s Error-status envelope on a pre-gate failure — hand-
+/// constructs `MissionOutcomeStatus::Error` directly, same as
+/// [`build_envelope`] and `coder_phase.rs`'s `finalize_mission_if_complete`.
+/// Same deferred blocker as both: `MissionOutcomeStatus::from_outcome` has
+/// no route to `Error`, so adopting `RunOutcome` here is a status change,
+/// not a pure refactor — see `build_envelope`'s doc.
 fn reconcile_and_finalize_on_error(
     mission_id: &str,
     config: &MissionConfig,
@@ -3938,6 +3981,12 @@ mod tests {
         let env = build_envelope(mid, &config, &real, &tasks, &steps);
         use crew::envelope::{MissionOutcomeStatus, PhaseOutcomeKind};
         assert_eq!(env.status, MissionOutcomeStatus::Degraded, "some complete + some errored → Degraded");
+        // (#1877 item 4 — deferred, pinned) The generic scheduler graph
+        // never produces a `RunOutcome` yet — see `build_envelope`'s own
+        // doc for why (the `MissionOutcomeStatus::from_outcome` Error-gap,
+        // not a "different shape" mismatch). `outcome` stays `None` even
+        // on a Degraded run.
+        assert!(env.outcome.is_none());
 
         let outcome = |pid: &str| env.phases.iter().find(|p| p.phase_id == pid).map(|p| p.outcome);
         assert_eq!(outcome(&rp1), Some(PhaseOutcomeKind::Complete), "p1's steps all completed → Complete");

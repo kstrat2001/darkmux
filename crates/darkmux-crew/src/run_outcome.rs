@@ -23,21 +23,28 @@
 //! from; the mapping stays with the mission that owns the data. See
 //! `darkmux_lab::lab::review::review_outcome` for review's own mapping.
 //!
-//! **Known gap, deliberately NOT closed here (#1876/#1877 QA follow-up —
-//! next step for #1877):** `MissionEnvelope` (`crew::envelope`) does not
-//! carry a `RunOutcome` field. Its own `MissionOutcomeStatus` (`Clean` /
-//! `Degraded` / `Degenerate` / `Error`) is a SECOND, independently
-//! hand-maintained encoding of the same Complete/Partial/Empty shape this
-//! type names — `review_result_to_mission_envelope`
-//! (`src/mission_launch_review.rs`) re-derives it from `env.degenerate` /
-//! `env.warnings` rather than from a `RunOutcome` it could just convert.
-//! Any second mission that wants the same "did this run finish its own
-//! docket" signal on its `MissionEnvelope` will hit the same "re-implement
-//! the encode-partial-as-a-warning-string convention" wall review just
-//! climbed. Putting `RunOutcome` directly on `MissionEnvelope` and deriving
-//! `MissionOutcomeStatus` from it (rather than the reverse) would close
-//! that gap for every future mission at once — real, but out of scope for
-//! this PR; tracked as the next step under #1877.
+//! **Gap closed (#1877 item 2):** `MissionEnvelope` (`crew::envelope`) now
+//! carries an `outcome: Option<RunOutcome>` field, and its own
+//! `MissionOutcomeStatus` (`Clean`/`Degraded`/`Degenerate`/`Error`) is
+//! derived FROM `outcome` (`MissionOutcomeStatus::from_outcome`,
+//! `MissionEnvelope::from_outcome`) rather than hand-computed a second time.
+//! Review is the first (and, as of this PR, only) adopter —
+//! `review_result_to_mission_envelope` (`src/mission_launch_review.rs`)
+//! builds its `RunOutcome` via `darkmux_lab::lab::review::
+//! review_mission_outcome` and hands it straight to `MissionEnvelope::
+//! from_outcome`, so "partial" is a typed `RunOutcome::Partial { reasons }`
+//! on the envelope, not only an untyped warning string. See
+//! `crate::envelope`'s module doc (the "`outcome` — the typed source"
+//! section) for the full mapping and why `MissionOutcomeStatus` itself
+//! stays four-valued (`Partial` collapses into `Degraded` for every
+//! existing consumer, a stated decision, not an oversight).
+//!
+//! **Still open, deliberately deferred (#1877 item 5, next step):**
+//! coder-phase (`src/coder_phase.rs`) does not construct a `RunOutcome`
+//! yet — it still builds `status` directly via `MissionEnvelope::new`. Its
+//! own docket (files touched, QA findings addressed) is exactly the kind
+//! of partitioned work this type exists to describe, but wiring it up is
+//! its own acceptance test.
 
 use serde::{Deserialize, Serialize};
 

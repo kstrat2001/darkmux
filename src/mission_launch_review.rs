@@ -95,8 +95,8 @@ use darkmux_crew::single_shot::{
 };
 use darkmux_lab::lab::bundle::{build_bundles, external_bundles, FileSource};
 use darkmux_lab::lab::review::{
-    build_review_graph_from_config, bundle_inputs_from_set, fingerprint, run_judge_only, run_review_graph,
-    seat_identifier, staffing_snapshot, BundleBuildSpec, BundleInput, BundleSourceSpec, ChatCall,
+    build_review_graph_from_config, bundle_inputs_from_set, fingerprint, review_mission_outcome, run_judge_only,
+    run_review_graph, seat_identifier, staffing_snapshot, BundleBuildSpec, BundleInput, BundleSourceSpec, ChatCall,
     ExecMode, LmsCycler, ProbeFlag, ReviewEmitter, ReviewEnvelope, ReviewInputs, ReviewStepContext,
 };
 use darkmux_crew::resourcing::{resolve_review_roles, ResolvedReviewRoles, ResolvedSeatStaffing, ReviewRoleStaffing};
@@ -598,17 +598,39 @@ fn crew_detail(roles: &ResolvedReviewRoles) -> String {
     format!("crew={} seats={seat_count} remote_hosts={hosts_str}", roles.distinct_profile_names())
 }
 
-/// (#1284 Packet 2) Map a review dispatch's `Result<ReviewEnvelope>` onto
-/// the generalized [`crew::envelope::MissionEnvelope`] contract:
+/// (#1284 Packet 2; #1877 item 2) Map a review dispatch's
+/// `Result<ReviewEnvelope>` onto the generalized
+/// [`crew::envelope::MissionEnvelope`] contract.
 ///
-/// - `Err` -> `Error` (a hard failure before any envelope was produced).
-/// - `Ok(env)` with `env.degenerate.is_some()` -> `Degenerate` (the
-///   operator-decision "no usable signal" gate fired).
-/// - `Ok(env)` with `env.degenerate.is_none()` but `!env.warnings.is_empty()`
-///   -> `Degraded` (real, postable output, but some sub-stage was
-///   constrained).
-/// - `Ok(env)` with `env.degenerate.is_none()` and `env.warnings.is_empty()`
-///   -> `Clean`.
+/// **ONE source of truth (#1877 item 2):** `status` is no longer computed
+/// here by its own if/else chain over `env.degenerate`/`env.warnings` — it
+/// is [`crew::envelope::MissionOutcomeStatus::from_outcome`] applied to
+/// [`darkmux_lab::lab::review::review_mission_outcome(env)`], via
+/// [`crew::envelope::MissionEnvelope::from_outcome`]. That function is
+/// where the `Degenerate`/`Degraded`/`Clean` predicate now lives (see its
+/// own doc for why it's a DIFFERENT function from
+/// `darkmux_lab::lab::review::review_outcome`, the PR-banner one) — this
+/// function only reads the result:
+///
+/// - `Err` -> `Error` (a hard failure before any envelope was produced;
+///   `Error` has no `RunOutcome` counterpart — there was no run to summarize).
+/// - `Ok(env)` -> whatever `review_mission_outcome(env)` decides, mapped
+///   through `MissionOutcomeStatus::from_outcome`. Reproduces the exact
+///   status this function computed before #1877 for every input that
+///   produced one then (pinned by this module's own tests): a benign or
+///   unsupported-language `degenerate` still reads `Clean` (#1654/#1757 —
+///   `Degenerate` is a retry signal, and a diff with nothing to review
+///   produces the identical result on every repeat, so flagging it would
+///   manufacture an unbounded retry loop); any other `degenerate` still
+///   reads `Degenerate`; any non-empty `env.warnings` with no degenerate
+///   still reads `Degraded`; otherwise `Clean`.
+///
+/// `reason`'s computation is UNCHANGED by this migration — it still reads
+/// `env.degenerate`/`env.warnings` directly rather than `outcome`, because
+/// its wording (`"review degenerate: {r}"`, present even on the neutral
+/// `Clean` case so the "why zero findings" provenance survives) predates
+/// `RunOutcome` and is prose review owns, not a mission-agnostic concept
+/// worth generalizing in this PR.
 ///
 /// The FULL `ReviewEnvelope` rides in `MissionEnvelope::payload`.
 fn review_result_to_mission_envelope(
@@ -620,48 +642,36 @@ fn review_result_to_mission_envelope(
 
     match result {
         Ok(env) => {
-            // (#1654, operator direction) A BENIGN-empty run is not a
-            // degenerate one. `Degenerate` is a retry signal — it tells the
-            // session waiting on this review that something went wrong and
-            // the run is worth repeating. For a diff that legitimately
-            // contained no reviewable code, every repeat produces the
-            // identical empty result, so mapping it to `Degenerate`
-            // manufactures an unbounded retry loop out of a correct outcome.
-            // Same reasoning as the posted comment's "re-running will
-            // produce the same result", applied one layer up: the board and
-            // the comment must agree, or the operator reads a friendly note
-            // on the PR and a red phase on the board for the same run.
-            //
-            // `Clean` rather than a new outcome variant: the review ran, the
-            // bundler worked, nothing was wrong. The envelope still carries
-            // `degenerate` + its `DegenerateKind` and the reason string
-            // below, so the "why zero findings" provenance is intact for
-            // anyone who looks — this narrows what gets FLAGGED, not what
-            // gets RECORDED. (#1757) `UnsupportedLanguage` gets the same
-            // carve-out as `BenignEmpty` for the identical reason: a diff
-            // that's real source in a language the built-in bundler can't
-            // parse produces the identical result on every repeat, so
-            // flagging it `Degenerate` would manufacture the same unbounded
-            // retry loop this carve-out exists to prevent.
-            let neutral_zero_bundle = matches!(
-                env.degenerate_kind,
-                Some(darkmux_lab::lab::review::DegenerateKind::BenignEmpty)
-                    | Some(darkmux_lab::lab::review::DegenerateKind::UnsupportedLanguage)
-            );
-            let status = if env.degenerate.is_some() && !neutral_zero_bundle {
-                MissionOutcomeStatus::Degenerate
-            } else if !env.warnings.is_empty() {
-                MissionOutcomeStatus::Degraded
-            } else {
-                MissionOutcomeStatus::Clean
-            };
+            let outcome = review_mission_outcome(env);
+            let status = MissionOutcomeStatus::from_outcome(&outcome);
             let reason = env
                 .degenerate
                 .as_deref()
                 .map(|r| format!("review degenerate: {r}"))
                 .or_else(|| (status == MissionOutcomeStatus::Degraded).then(|| env.warnings.join("; ")));
-            let mut envelope = MissionEnvelope::new(mission_id, status, phase_ids);
+            let mut envelope = MissionEnvelope::from_outcome(mission_id, outcome, phase_ids);
             envelope.reason = reason;
+            // (#1877 QA ALSO FIX 2) INVARIANT, not enforced by any type:
+            // when `envelope.outcome` is `Some(RunOutcome::Partial {
+            // reasons })`, `reasons` is `env.warnings.clone()` — the SAME
+            // `Vec` `review_mission_outcome` built `outcome` from (see its
+            // own doc). So `envelope.warnings` here duplicates
+            // `envelope.outcome`'s `reasons` verbatim in that case; every
+            // warning rides `envelope.json` twice. Deliberate, not
+            // accidental: `warnings` is the field every EXISTING consumer
+            // reads (the PR banner via `review_outcome`, the mission board,
+            // `darkmux-serve/src/runs.rs` — see `envelope.rs`'s module doc
+            // on why those consumers stay on `status`/`warnings`, never
+            // `outcome`, until a separately-reviewed change), so it can't
+            // be dropped here without breaking them; `outcome.reasons` is
+            // kept as the new typed value #1877 adds. A future cleanup that
+            // wants to stop the duplication has to migrate every one of
+            // those consumers onto `outcome` first, not just delete this
+            // line — `judge_gate_outcome_keeps_review_outcome_and_review_
+            // mission_outcome_in_sync` (darkmux-lab's review_tests.rs) and
+            // `a_partial_coverage_review_round_trips_as_a_typed_partial_
+            // outcome_with_real_numbers` (below) both pin that the two
+            // copies agree today.
             envelope.warnings = env.warnings.clone();
             envelope.remote_budgets = env
                 .remote_budgets
@@ -1960,6 +1970,98 @@ mod tests {
             "the WHY is recorded: {:?}",
             out.reason
         );
+    }
+
+    /// (#1877 item 2) The SAME `a_partial_coverage_review_is_degraded_not_clean`
+    /// shape, now also asserting the typed `outcome` field: `status` alone
+    /// tells you "Degraded", but `outcome` is what carries the REAL number
+    /// (11 skipped judge calls) as a typed `Partial { reasons }` instead of
+    /// only a free-text warning string. This is the "Partial becomes typed
+    /// rather than conventional" claim from #1877's own tracking issue,
+    /// proven on the actual review->envelope path, not just on
+    /// `MissionEnvelope::from_outcome` in isolation.
+    ///
+    /// (#1877 QA ALSO FIX 2) Also pins the deliberate duplication this
+    /// function's own doc names: `envelope.warnings` and
+    /// `envelope.outcome`'s `Partial.reasons` are the SAME `Vec` assigned
+    /// twice, not two independently-derived values that happen to agree.
+    /// If a future change drops one copy without updating the other, THIS
+    /// assertion is what catches the drift — not the shape of the JSON,
+    /// which would still parse fine either way.
+    #[test]
+    fn a_partial_coverage_review_round_trips_as_a_typed_partial_outcome_with_real_numbers() {
+        let env = ReviewEnvelope {
+            degenerate: None,
+            warnings: vec![
+                "11 of 134 flags went unjudged on the `judge-pass1` stage — it exceeded its 500000-token \
+                 allowance (500497 used)"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+        let out = review_result_to_mission_envelope("m-1", &["p-1"], &Ok(env));
+        assert_eq!(out.status, crew::envelope::MissionOutcomeStatus::Degraded);
+        match &out.outcome {
+            Some(darkmux_crew::run_outcome::RunOutcome::Partial { reasons }) => {
+                assert_eq!(reasons.len(), 1);
+                assert!(reasons[0].contains("11 of 134 flags went unjudged"), "got: {}", reasons[0]);
+                assert!(reasons[0].contains("500497"), "the used-token count is the real number: {}", reasons[0]);
+                assert_eq!(
+                    &out.warnings, reasons,
+                    "envelope.warnings must stay in lockstep with outcome's Partial.reasons — \
+                     they are the same Vec assigned twice, per this function's own doc"
+                );
+            }
+            other => panic!("expected Some(Partial), got {other:?}"),
+        }
+
+        // Round-trip the whole envelope through JSON (what actually gets
+        // persisted as `envelope.json`) — the typed reasons must survive
+        // serde, not just live as an in-memory value.
+        let json = serde_json::to_string(&out).unwrap();
+        let back: crew::envelope::MissionEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, crew::envelope::MissionOutcomeStatus::Degraded);
+        assert_eq!(back.outcome, out.outcome);
+        match &back.outcome {
+            Some(darkmux_crew::run_outcome::RunOutcome::Partial { reasons }) => {
+                assert_eq!(&back.warnings, reasons, "the two copies survive the round-trip in lockstep too");
+            }
+            other => panic!("expected Some(Partial) after round-trip, got {other:?}"),
+        }
+    }
+
+    /// The `Clean`/`Degenerate` cases produce `outcome: Some(Complete)` /
+    /// `Some(Empty { .. })` too — `outcome` is populated on EVERY `Ok(env)`
+    /// path through this function now, not only the `Partial` one.
+    #[test]
+    fn a_clean_review_carries_outcome_complete_and_a_degenerate_one_carries_outcome_empty() {
+        let clean = review_result_to_mission_envelope("m-1", &["p-1"], &Ok(ReviewEnvelope::default()));
+        assert_eq!(clean.outcome, Some(darkmux_crew::run_outcome::RunOutcome::Complete));
+
+        let degenerate_env = ReviewEnvelope {
+            degenerate: Some("no bundles produced from the diff".to_string()),
+            degenerate_kind: Some(darkmux_lab::lab::review::DegenerateKind::Error),
+            ..Default::default()
+        };
+        let degenerate = review_result_to_mission_envelope("m-1", &["p-1"], &Ok(degenerate_env));
+        assert_eq!(
+            degenerate.outcome,
+            Some(darkmux_crew::run_outcome::RunOutcome::Empty {
+                reason: "no bundles produced from the diff".to_string()
+            })
+        );
+    }
+
+    /// An `Err` result (a hard failure before any envelope was produced)
+    /// still carries `outcome: None` — there was no run to summarize into a
+    /// `RunOutcome`, and fabricating one would misrepresent "no run
+    /// happened" as "a run happened and covered nothing," which is what
+    /// `RunOutcome::Empty` actually means.
+    #[test]
+    fn an_error_result_carries_no_outcome() {
+        let err = review_result_to_mission_envelope("m-1", &["p-1"], &Err(anyhow!("probe dispatch failed")));
+        assert_eq!(err.status, crew::envelope::MissionOutcomeStatus::Error);
+        assert!(err.outcome.is_none());
     }
 
     #[test]

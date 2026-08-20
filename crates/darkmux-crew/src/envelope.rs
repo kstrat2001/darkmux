@@ -47,6 +47,37 @@
 //!   producing any envelope at all (a scheduling failure, a resolution
 //!   failure before dispatch began).
 //!
+//! # `outcome` — the typed source `status` derives from (#1877 item 2)
+//!
+//! [`MissionEnvelope::outcome`] carries a [`crate::run_outcome::RunOutcome`]
+//! when the mission driver has one — today, only the PR-review pipeline
+//! (`src/mission_launch_review.rs`'s `review_result_to_mission_envelope`)
+//! does. Before this field existed, "a run was partially covered" lived as
+//! a CONVENTION: review pushed a warning string into `warnings` and this
+//! module's own status derivation read "non-empty warnings" as `Degraded`.
+//! That convention still decides `Degraded` today (see the table below),
+//! but now it does so by way of a typed [`RunOutcome::Partial`] a driver
+//! constructs explicitly, rather than an ad hoc `if !warnings.is_empty()`
+//! a driver has to reinvent. [`MissionOutcomeStatus::from_outcome`] is the
+//! ONE place that mapping lives — a driver with a `RunOutcome` calls
+//! [`MissionEnvelope::from_outcome`] and never separately decides `status`
+//! by hand.
+//!
+//! **`MissionOutcomeStatus` itself gains no `Partial` variant.** A driver
+//! that adopts `RunOutcome` gets a typed, inspectable `Partial { reasons }`
+//! on `outcome` — real progress over the untyped-warning convention — but
+//! `status` still collapses `Partial` into `Degraded` for every
+//! finalization/exit-code/render consumer, because every one of those
+//! consumers already treats `Degraded` as "real output, something was
+//! constrained" and none of them has a THIRD bucket to put a partial run
+//! in without a deliberate, separately-reviewed change to what each of
+//! those consumers reports (mission-board coloring, `mission launch`'s
+//! exit code, the `/runs` `RunStatus` a poller sees). Collapsing here is a
+//! stated decision, not an oversight — see the per-consumer notes in
+//! `crates/darkmux-serve/src/runs.rs`, `crates/darkmux-crew/src/dispatch_as_crew_of_one.rs`,
+//! and `src/mission_launch.rs` for why each one keeps reading `status`
+//! (never `outcome`) and is therefore unaffected by this field's arrival.
+//!
 //! **Finalization consumes ONLY the status**, via
 //! [`MissionOutcomeStatus::phase_outcome`]:
 //!
@@ -70,6 +101,7 @@
 //! indistinguishable from a stuck mission in `darkmux mission status`).
 
 use crate::lifecycle;
+use crate::run_outcome::RunOutcome;
 use crate::types::{MissionStatus, PhaseStatus};
 use serde::{Deserialize, Serialize};
 
@@ -78,7 +110,39 @@ use serde::{Deserialize, Serialize};
 /// (`crate::mission_config`), `RULES_SCHEMA_VERSION` (`darkmux-eureka`),
 /// `FLOW_SCHEMA_VERSION` (`darkmux-flow`). See `CLAUDE.md`'s "Versioning"
 /// section for the additive-minor / breaking-major bump discipline.
-pub const MISSION_ENVELOPE_SCHEMA: &str = "1.0";
+///
+/// **1.0 -> 1.1 (#1877 item 2):** adds the optional `outcome` field
+/// ([`MissionEnvelope::outcome`]). Additive per the documented rule — a new
+/// OPTIONAL field a future consumer can safely ignore — so this is a MINOR
+/// bump, not major. Readers stay lenient: `outcome` is `#[serde(default)]`,
+/// so a 1.0 envelope with no `outcome` key at all deserializes cleanly as
+/// `outcome: None`, and nothing about `status`/`reason`/`warnings` changes
+/// shape for an old reader.
+///
+/// **Adding a new [`RunOutcome`] VARIANT is a MAJOR bump, not additive,
+/// even though `outcome` itself is optional (#1877 QA ALSO FIX 3).**
+/// `#[serde(default)]` only supplies `None` when the `outcome` KEY is
+/// ABSENT from the document; it does nothing when the key is PRESENT with
+/// content an older binary's `RunOutcome` doesn't recognize — serde fails
+/// deserializing that field, which fails deserializing the WHOLE
+/// `MissionEnvelope`, including `status`/`reason`/`warnings`, none of
+/// which actually changed shape. Verified directly (pinned by
+/// `an_unrecognized_outcome_variant_fails_the_whole_envelope_parse`,
+/// below): decoding `{"state":"throttled"}` into today's `RunOutcome`
+/// (`Complete` | `Partial` | `Empty`, no catch-all/unknown arm) errors
+/// with `` unknown variant `throttled`, expected one of `complete`,
+/// `partial`, `empty` `` — not a graceful `None`. `RunOutcome` has none of
+/// `config.json`'s
+/// lenient-on-read machinery (`#[serde(flatten)] extras` overflow, all-
+/// `Option` fields) — it is a closed `#[serde(tag = "state")]` enum by
+/// design (`crates/darkmux-crew/src/run_outcome.rs`), so a future minor
+/// bump that only ADDS a `RunOutcome` variant would still make an OLDER
+/// darkmux binary refuse to parse a NEWER one's envelope whenever that new
+/// variant actually appears. Treat any new `RunOutcome` variant as a MAJOR
+/// bump on `MISSION_ENVELOPE_SCHEMA`, or give `RunOutcome` its own
+/// unknown-variant tolerance (an `Other`/catch-all arm) before treating it
+/// as additive.
+pub const MISSION_ENVELOPE_SCHEMA: &str = "1.1";
 
 /// The overall outcome a mission's run reached — see the module doc's
 /// "Status decision" section for how each value is decided and consumed.
@@ -92,6 +156,30 @@ pub enum MissionOutcomeStatus {
 }
 
 impl MissionOutcomeStatus {
+    /// Derive a `status` from a [`RunOutcome`] — the ONE place a driver's
+    /// typed outcome becomes the untyped four-value status every existing
+    /// consumer reads. See the module doc's "`outcome` — the typed source"
+    /// section for why `Partial` collapses into `Degraded` rather than
+    /// growing a fifth `MissionOutcomeStatus` variant.
+    ///
+    /// - [`RunOutcome::Complete`] -> `Clean` — the docket was fully covered.
+    /// - [`RunOutcome::Partial`] -> `Degraded` — same bucket every
+    ///   `warnings`-driven degraded run already lands in; a driver that
+    ///   ALSO wants `warnings` non-empty on a `Complete` outcome to read
+    ///   `Degraded` (review's own pre-#1877 rule: any warning, not only a
+    ///   docket-coverage one, downgrades from `Clean`) folds that into its
+    ///   own `RunOutcome` construction rather than this generic mapping —
+    ///   see `darkmux_lab::lab::review::review_mission_outcome`'s doc.
+    /// - [`RunOutcome::Empty`] -> `Degenerate` — no usable signal, the
+    ///   "worth retrying" gate.
+    pub fn from_outcome(outcome: &RunOutcome) -> Self {
+        match outcome {
+            RunOutcome::Complete => MissionOutcomeStatus::Clean,
+            RunOutcome::Partial { .. } => MissionOutcomeStatus::Degraded,
+            RunOutcome::Empty { .. } => MissionOutcomeStatus::Degenerate,
+        }
+    }
+
     /// The phase-level outcome [`finalize_mission`] applies for every phase
     /// named in [`MissionEnvelope::phases`] — see the module doc's mapping
     /// table. Clean/Degraded both complete (a degraded run still posted
@@ -166,6 +254,17 @@ pub struct MissionEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
     pub status: MissionOutcomeStatus,
+    /// (#1877 item 2) The typed docket-coverage outcome `status` was
+    /// derived from, when the driver has one — see the module doc's
+    /// `outcome` section. `None` for every driver that still constructs
+    /// `status` directly via [`MissionEnvelope::new`] (the crew-of-one
+    /// dispatch path, the generic scheduler-graph path, coder-phase — none
+    /// of those partition their work into an independently-judgeable
+    /// docket the way review does, so there is no `RunOutcome` for them to
+    /// report yet) and for every envelope written before this field
+    /// existed (1.0 envelopes deserialize with `outcome: None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RunOutcome>,
     /// Human-readable provenance for `status` — e.g. the review pipeline's
     /// `env.degenerate` text, or a hard error's `Display` — recorded on the
     /// mission-close flow record so the board never shows a bare status
@@ -204,20 +303,41 @@ impl MissionEnvelope {
     /// abandon, from the SAME run) constructs `phases` by hand instead of
     /// calling this constructor.
     pub fn new(mission_id: impl Into<String>, status: MissionOutcomeStatus, phase_ids: &[&str]) -> Self {
-        let outcome = status.phase_outcome();
+        // Named `phase_outcome_kind`, not `outcome`, to keep this local
+        // distinct from `MissionEnvelope::outcome` (the `RunOutcome` field
+        // added in #1877 item 2) — different concept entirely, this is
+        // per-phase `Complete`/`Abandoned`, that one is docket coverage.
+        let phase_outcome_kind = status.phase_outcome();
         MissionEnvelope {
             mission_id: mission_id.into(),
             schema_version: Some(MISSION_ENVELOPE_SCHEMA.to_string()),
             status,
+            outcome: None,
             reason: None,
             phases: phase_ids
                 .iter()
-                .map(|id| PhaseOutcome { phase_id: id.to_string(), outcome, reason: None })
+                .map(|id| PhaseOutcome { phase_id: id.to_string(), outcome: phase_outcome_kind, reason: None })
                 .collect(),
             warnings: Vec::new(),
             remote_budgets: Vec::new(),
             payload: serde_json::Value::Null,
         }
+    }
+
+    /// (#1877 item 2) Construct a `MissionEnvelope` from a typed
+    /// [`RunOutcome`] rather than a hand-computed `status` — the
+    /// "callers set both independently" gap this field closes. `status` is
+    /// ALWAYS [`MissionOutcomeStatus::from_outcome`] applied to `outcome`;
+    /// there is no way to call this constructor and get a `status` that
+    /// disagrees with the `outcome` sitting right next to it on the same
+    /// envelope. `outcome` is recorded on the returned envelope so a later
+    /// reader (the mission board, a future graph lens) can render the real
+    /// `Partial { reasons }` detail `status` alone collapses away.
+    pub fn from_outcome(mission_id: impl Into<String>, outcome: RunOutcome, phase_ids: &[&str]) -> Self {
+        let status = MissionOutcomeStatus::from_outcome(&outcome);
+        let mut envelope = MissionEnvelope::new(mission_id, status, phase_ids);
+        envelope.outcome = Some(outcome);
+        envelope
     }
 }
 
@@ -615,5 +735,149 @@ mod tests {
         let _g = CrewGuard::new();
         seed_mission("m7");
         assert!(lifecycle::load_envelope("m7").unwrap().is_none());
+    }
+
+    // ── #1877 item 2: `outcome` field + `MissionOutcomeStatus::from_outcome` ──
+
+    #[test]
+    fn from_outcome_maps_all_three_run_outcome_variants() {
+        assert_eq!(MissionOutcomeStatus::from_outcome(&RunOutcome::Complete), MissionOutcomeStatus::Clean);
+        assert_eq!(
+            MissionOutcomeStatus::from_outcome(&RunOutcome::Partial { reasons: vec!["x".to_string()] }),
+            MissionOutcomeStatus::Degraded
+        );
+        assert_eq!(
+            MissionOutcomeStatus::from_outcome(&RunOutcome::Empty { reason: "y".to_string() }),
+            MissionOutcomeStatus::Degenerate
+        );
+    }
+
+    #[test]
+    fn mission_envelope_from_outcome_never_lets_status_disagree_with_outcome() {
+        // The whole point of `from_outcome`: there is no path to construct
+        // an envelope where `status` and `outcome` tell a different story —
+        // unlike the pre-#1877 shape, where a driver computed `status` by
+        // hand and could (in principle) drift from what `outcome` says.
+        let reasons = vec!["3 of 12 flags went unjudged on the `judge-pass1` stage".to_string()];
+        let envelope =
+            MissionEnvelope::from_outcome("m-partial", RunOutcome::Partial { reasons: reasons.clone() }, &["p1"]);
+        assert_eq!(envelope.status, MissionOutcomeStatus::Degraded);
+        assert_eq!(envelope.outcome, Some(RunOutcome::Partial { reasons: reasons.clone() }));
+        // The REAL numbers survive intact on `outcome.reasons` — not folded
+        // into a generic string the way `warnings` alone would lose them.
+        assert_eq!(
+            match &envelope.outcome {
+                Some(RunOutcome::Partial { reasons }) => reasons.clone(),
+                other => panic!("expected Partial, got {other:?}"),
+            },
+            reasons
+        );
+        // Phase outcome still derives from `status`, same as `new()`.
+        assert_eq!(envelope.phases[0].outcome, PhaseOutcomeKind::Complete);
+    }
+
+    #[test]
+    fn mission_envelope_new_leaves_outcome_none() {
+        // Every driver that hasn't adopted `RunOutcome` yet (crew-of-one,
+        // the generic scheduler graph, coder-phase) keeps calling `new()`
+        // directly — its envelopes must have no `outcome` at all, not a
+        // fabricated `Some(Complete)` that would misrepresent "this driver
+        // has no docket-coverage concept" as "this driver checked and the
+        // docket was fully covered."
+        let envelope = MissionEnvelope::new("m-plain", MissionOutcomeStatus::Clean, &[]);
+        assert!(envelope.outcome.is_none());
+    }
+
+    #[test]
+    fn older_envelope_json_without_the_outcome_field_deserializes_with_a_sensible_default() {
+        // A real 1.0-era envelope.json, hand-written (no `outcome` key at
+        // all — the field did not exist when this was written). Must load
+        // cleanly under the 1.1 struct, per the additive-minor discipline:
+        // an older document is not just tolerated, it round-trips its own
+        // fields unchanged.
+        let old_json = r#"{
+            "mission_id": "m-old",
+            "schema_version": "1.0",
+            "status": "degraded",
+            "reason": "remote judge token budget exhausted",
+            "phases": [],
+            "warnings": ["remote judge token budget exhausted"],
+            "remote_budgets": []
+        }"#;
+        let envelope: MissionEnvelope =
+            serde_json::from_str(old_json).expect("a pre-#1877 envelope must still deserialize");
+        assert_eq!(envelope.mission_id, "m-old");
+        assert_eq!(envelope.status, MissionOutcomeStatus::Degraded);
+        assert_eq!(envelope.warnings, vec!["remote judge token budget exhausted".to_string()]);
+        // The sensible default for a document that predates the field:
+        // `None`, never a guessed `RunOutcome`.
+        assert!(envelope.outcome.is_none());
+    }
+
+    #[test]
+    fn outcome_field_round_trips_through_json_when_present() {
+        let envelope = MissionEnvelope::from_outcome(
+            "m-rt",
+            RunOutcome::Empty { reason: "no bundles produced from the diff".to_string() },
+            &[],
+        );
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains(r#""outcome":{"state":"empty""#), "outcome must serialize under its own key: {json}");
+        let back: MissionEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.outcome, envelope.outcome);
+        assert_eq!(back.status, MissionOutcomeStatus::Degenerate);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn finalize_mission_persists_the_outcome_field_alongside_status() {
+        let _g = CrewGuard::new();
+        seed_mission("m8");
+        seed_phase("m8", "p1");
+
+        let envelope = MissionEnvelope::from_outcome(
+            "m8",
+            RunOutcome::Partial { reasons: vec!["2 of 9 flags went unjudged".to_string()] },
+            &["p1"],
+        );
+        finalize_mission(&envelope);
+
+        let persisted = lifecycle::load_envelope("m8")
+            .expect("load_envelope must succeed")
+            .expect("an envelope.json must exist after finalize_mission");
+        assert_eq!(persisted.status, MissionOutcomeStatus::Degraded);
+        assert_eq!(
+            persisted.outcome,
+            Some(RunOutcome::Partial { reasons: vec!["2 of 9 flags went unjudged".to_string()] })
+        );
+    }
+
+    /// (#1877 QA ALSO FIX 3) Structural proof for `MISSION_ENVELOPE_SCHEMA`'s
+    /// doc claim: an `outcome` key present with a `RunOutcome` variant this
+    /// binary doesn't recognize fails deserializing the WHOLE
+    /// `MissionEnvelope`, not just `outcome`. `#[serde(default)]` on
+    /// `outcome` only rescues an ABSENT key — a PRESENT-but-unrecognized one
+    /// still errors, taking `status`/`reason`/`warnings` down with it even
+    /// though none of those fields changed shape. This is why adding a
+    /// `RunOutcome` variant is a MAJOR schema bump, not additive-minor.
+    #[test]
+    fn an_unrecognized_outcome_variant_fails_the_whole_envelope_parse() {
+        let json = r#"{
+            "mission_id": "m1",
+            "schema_version": "1.2",
+            "status": "degraded",
+            "outcome": {"state": "throttled"},
+            "phases": []
+        }"#;
+        let err = serde_json::from_str::<MissionEnvelope>(json)
+            .expect_err("an unrecognized RunOutcome variant must fail the whole envelope parse, not degrade to None");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant `throttled`")
+                && msg.contains("complete")
+                && msg.contains("partial")
+                && msg.contains("empty"),
+            "got: {msg}"
+        );
     }
 }
