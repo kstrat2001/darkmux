@@ -72,4 +72,7 @@ pub use plan::{
 pub use planner::{plan_acquire, plan_release, AcquireOpts, AcquireScope};
 pub use ports::{Deadline, HostError, LoadReport, ModelHost, ProbeError, ResourceProbe};
 pub use residency::{decide_residency, ResidencyDecision};
-pub use waves::{plan_waves, ForceParallelRefused, WaveMode, WaveRefusal, WaveSchedule};
+pub use waves::{
+    plan_waves, wave_schedule_to_exec_mode, ExecMode, ForceParallelRefused, WaveMode, WaveRefusal,
+    WaveSchedule,
+};

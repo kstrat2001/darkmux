@@ -110,6 +110,72 @@
 //! (its [`JudgeOutcome`] is emitted from by the caller in `finish_review`'s
 //! loop, after the call returns).
 //!
+//! ## Timing: two scopes, not one duplicated (#1877, correcting an earlier
+//! plan in that issue)
+//!
+//! Every graph step kind below (`ReviewBundleStepKind`, `ReviewDedupStepKind`,
+//! `ReviewJudgeStepKind`, etc.) takes its own `Instant` at the top of
+//! `run_streaming`, computes its own `wall_ms`, and passes it to
+//! [`emit_review_step_result`] — this is the emission site referenced below.
+//! Separately, `darkmux_crew::scheduler::run_step_graph` (the caller that
+//! invokes `run_streaming`, see `build_review_graph_from_config` below) wraps
+//! that SAME call in its own `Instant` pair and pushes the result into
+//! `SchedulerReport::step_records` (see that field's doc in
+//! `crates/darkmux-crew/src/scheduler.rs` and the module doc in
+//! `crates/darkmux-crew/src/run_record.rs`).
+//!
+//! An earlier plan for this arc proposed collapsing these into one
+//! measurement — "the kinds should stop re-measuring, read the scheduler's
+//! record instead." That is not implementable and not desirable, and it is
+//! worth stating plainly here so nobody "consolidates" this module's own
+//! `t0`/`wall_ms` locals and quietly loses either half:
+//!
+//! - **It is not implementable**: a step kind's `wall_ms` above is computed
+//!   and emitted BEFORE `run_streaming` returns. The scheduler's own timer
+//!   does not stop, and its `StepRecord` does not exist, until AFTER
+//!   `run_streaming` returns. There is no ordering in which this module's
+//!   emission site could read the scheduler's number instead of its own.
+//! - **It is not duplication even where both exist for the same step**: this
+//!   module's record carries `items_in`/`items_out` and, for the judge step,
+//!   a `pass1_wall_ms`/`pass2_wall_ms` breakdown — real per-kind business
+//!   semantics the scheduler cannot observe from outside the call (see
+//!   `StepRecord::items_in`'s own doc in `run_record.rs`: the scheduler
+//!   always leaves those `None`). This is INNER work, with a breakdown,
+//!   emitted into the flow stream the viewer renders. The scheduler's
+//!   number is timed strictly around that SAME `run_streaming` call, on
+//!   the step's own worker thread (`scheduler.rs:808`-`:811`) — it
+//!   EXCLUDES queueing behind `remote_cap`, `ensure_wave_loaded`,
+//!   `apply_step_terminal`, and `persist` (see
+//!   `SchedulerReport::step_records`'s own doc in `scheduler.rs` for the
+//!   full list of what a `StepRecord` does and doesn't cover), and it is
+//!   recorded uniformly for every step of every mission, whether or not
+//!   the kind cooperates. Dropping either loses something real: the
+//!   breakdown, or the uniform coverage.
+//!
+//! What the two numbers DO guarantee, because one strictly contains the
+//! other in wall-clock: for the same step, the scheduler's `wall_ms` is
+//! always `>=` the `wall_ms` THIS MODULE emits in its own `step result`
+//! flow record (the `t0.elapsed()` passed to [`emit_review_step_result`]
+//! above — e.g. the judge step's combined pass-1 + pass-2 wall time).
+//! This is deliberately NOT the same thing as `MemberRecord::wall_ms`:
+//! for the judge seat that field is `pass1_wall_ms + pass2_wall_ms`
+//! summed ACROSS EVERY FLAG's own dispatches — a COST metric, not a
+//! timeline (see the doc at its assignment site) — and under
+//! `review.judge_concurrency > 1` (an operator knob, always stamped onto
+//! `review-judge-step` as a step-config override) those per-flag
+//! dispatches overlap in wall-clock, so the sum can exceed both this
+//! module's own elapsed `wall_ms` and the scheduler's number. The `>=`
+//! relationship holds for the `step result` `wall_ms`; it does NOT hold
+//! for `MemberRecord::wall_ms`. That relationship, not either side's
+//! absolute duration, is the thing worth pinning in a test — see
+//! `scheduler.rs`'s `#1877` invariant test for where it's asserted.
+//!
+//! (Today the two producers are also structurally disjoint at the envelope
+//! level — `SchedulerReport::step_records` is not merged into
+//! `ReviewEnvelope::steps` on the graph path, so there is no double count to
+//! reconcile there either. See `run_record.rs`'s module doc for that half of
+//! the story.)
+//!
 //! ## Host telemetry sampling (#1247 doctrine surface — "No blind runs")
 //!
 //! `run_review_graph`/`run_judge_only` also start a background host cpu/ram/gpu
@@ -171,6 +237,18 @@ use std::time::Instant;
 
 // ─── execution mode ───────────────────────────────────────────────────────
 
+// (#1877, this issue) `ExecMode` and `wave_schedule_to_exec_mode` moved to
+// `darkmux_gestalt::waves` — see their doc comments there for the full
+// argument (deciding sequential-vs-parallel residency cycling is a hardware
+// residency question gestalt already owns; this module used to ask gestalt
+// for a `WaveSchedule` and then re-derive the answer itself). Re-exported
+// under the SAME names so every existing reference in this crate and in
+// `src/mission_launch_review.rs` (the binary crate) keeps resolving
+// unchanged — `pub use` for `ExecMode` since it crosses that crate
+// boundary; a plain `use` for `wave_schedule_to_exec_mode`, which was never
+// `pub` (no caller outside this module ever named it), so this import
+// keeps it at the exact same visibility it had before the move.
+
 /// How probe/judge models are cycled through LMStudio across the review's
 /// dispatches. `Auto` resolves once, up front, to `Sequential` or
 /// `Parallel` (see [`resolve_mode`]) — the resolved choice is what
@@ -184,12 +262,12 @@ use std::time::Instant;
 /// releasing between them (dispatches themselves still run one at a time
 /// through the injected `chat` closure — true concurrent dispatch is a
 /// separate, unaddressed concern).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecMode {
-    Sequential,
-    Parallel,
-    Auto,
-}
+///
+/// (This module's own usage doc — the type itself, `Sequential`/`Parallel`/
+/// `Auto`, now lives in `darkmux_gestalt::waves` since it is genuinely
+/// general, not review-specific; see the `pub use` below.)
+pub use darkmux_gestalt::ExecMode;
+use darkmux_gestalt::wave_schedule_to_exec_mode;
 
 fn mode_label(mode: ExecMode) -> &'static str {
     match mode {
@@ -750,6 +828,42 @@ pub fn review_mission_outcome(env: &ReviewEnvelope) -> RunOutcome {
 // preserves that.
 
 // ─── model cycling ────────────────────────────────────────────────────────
+//
+// (#1877, this issue) `ModelCycler`, `LmsCycler`, and `gather_facts` were
+// candidates to move into `darkmux-gestalt` alongside `ExecMode` above —
+// deciding whether/how a model gets loaded is exactly the residency
+// question gestalt owns. They stay here instead, and this is the honest
+// boundary rather than a forced move:
+//
+// - `gather_facts` takes `&mut LmsHost` and `LmsCycler::ensure_loaded`/
+//   `release` construct one directly — `LmsHost`/`MacProbe` live in
+//   `darkmux_profiles::gestalt_host`, and `darkmux-profiles` already
+//   depends on `darkmux-gestalt` (it implements gestalt's `ModelHost`/
+//   `ResourceProbe` port traits). `darkmux-gestalt` depending back on
+//   `darkmux-profiles` for these would be the exact cycle the #602/#604
+//   port-adapter split exists to prevent — the same shape that already
+//   blocks `resolve_auto_via_waves` below.
+// - `ModelCycler`'s own trait signature (`fn ensure_loaded(&mut self, pm:
+//   &ProfileModel) -> Result<()>`, `Result` = `anyhow::Result`) is the
+//   deeper reason even the TRAIT alone does not move cleanly: every
+//   existing gestalt port trait (`ModelHost`, `ResourceProbe` in
+//   `ports.rs`) deliberately uses gestalt's OWN typed error vocabulary
+//   (`HostError`/`ProbeError`), and `darkmux-gestalt`'s `Cargo.toml` has
+//   no `anyhow` dependency today — that omission is part of the crate's
+//   stated "pure planning core" discipline, not an oversight. Moving
+//   `ModelCycler` as literally written would mean either adding a new
+//   dependency edge to a crate whose own module doc enumerates its
+//   dependency/purity rules (out of scope for a move-only change, and
+//   against this task's own "no new dependencies" constraint), or
+//   retyping it to `HostError`/a new gestalt-native error — a real API
+//   change to every caller, not a move. So `ModelCycler` stays paired
+//   with its one production implementor, `LmsCycler`, which needs the
+//   same host types anyway.
+//
+// None of the three cross a worker-thread boundary that would otherwise
+// impose a `Send`/`Sync` requirement on the trait — `LmsCycler` is used
+// only on the sequential `run_judge_only` path (see `ReviewStepContext`'s
+// doc above: "no `ModelCycler` anywhere in the graph's dispatch path").
 
 /// Load/release one [`ProfileModel`] into/out of LMStudio. Injected so
 /// tests can assert on cycling ORDER via a recording mock without a live
@@ -934,37 +1048,36 @@ fn resolve_seat_max_tokens(s: &ResolvedSeatStaffing, local_default: u32) -> u32 
     }
 }
 
-/// (#1230 Packet 1 cutover) Auto-resolution: `Parallel` iff gestalt's
-/// co-residency wave scheduler ([`darkmux_gestalt::plan_waves`],
-/// `WaveMode::Auto`) packs every distinct LOCAL model (probe seats + judge,
-/// deduped) into ONE wave — i.e. the same arithmetic `plan_acquire`'s
-/// budget/pool-headroom arms use judges them safe to hold resident
-/// together, against REAL facts (a live `MacProbe` pool snapshot, and the
-/// #1243 AI-RAM budget when an operator has configured one). More than one
-/// wave means they don't fit — the same shape `Sequential` always meant,
-/// now DERIVED from live facts instead of a static hardware-tier lookup
-/// table.
-///
-/// Replaces the deleted `resolve_auto` tier table. `darkmux_gestalt::waves`'s
-/// own module doc already claimed the hardware-tier-threshold concept "was
-/// removed end-to-end in #602/#604/#605" — that claim was aspirational until
-/// this function, the review's last holdout, stopped re-deriving one.
-fn wave_schedule_to_exec_mode(schedule: &darkmux_gestalt::WaveSchedule) -> ExecMode {
-    if schedule.waves.len() <= 1 {
-        ExecMode::Parallel
-    } else {
-        ExecMode::Sequential
-    }
-}
+// (#1877, this issue) The old `wave_schedule_to_exec_mode` used to live
+// here: `Parallel` iff gestalt's co-residency wave scheduler
+// ([`darkmux_gestalt::plan_waves`], `WaveMode::Auto`) packs every distinct
+// LOCAL model (probe seats + judge, deduped) into ONE wave — i.e. the same
+// arithmetic `plan_acquire`'s budget/pool-headroom arms use judges them
+// safe to hold resident together, against REAL facts. It moved to
+// `darkmux_gestalt::waves::wave_schedule_to_exec_mode` unchanged (imported
+// above) — this was the pure projection half of the review's last
+// hardware-tier-threshold holdout; `darkmux_gestalt::waves`'s own module
+// doc already claimed that concept "was removed end-to-end in
+// #602/#604/#605," and this move is what makes that claim true rather than
+// aspirational (see that function's doc for the full argument).
 
 /// Gathers real facts and asks gestalt's wave scheduler whether `placements`
 /// fit one wave. Separated from [`wave_schedule_to_exec_mode`] (the pure
-/// projection, directly unit-testable against a scripted `WaveSchedule`) so
+/// projection, now `darkmux_gestalt::waves::wave_schedule_to_exec_mode` —
+/// see its own doc for why it moved and this function did not) so
 /// the I/O — `LmsHost::list_resident` + `MacProbe::pools`, the SAME adapters
 /// [`LmsCycler`] wires — lives in exactly one place. A residency-read
 /// failure degrades to `Sequential` (never guess `Parallel` without knowing
 /// what's already resident) with a loud stderr line, never a silent
 /// downgrade to a riskier mode.
+///
+/// (#1877, this issue) This function itself stays here, unmoved: it opens
+/// its own `LmsHost` and calls [`gather_facts`], both of which need
+/// `darkmux_profiles::gestalt_host` — a crate that already depends on
+/// `darkmux-gestalt` (for the port traits it implements), so `darkmux-
+/// gestalt` depending back on it would be a cycle. Only the pure
+/// wave-count judgment moved; the host-facing glue that gathers the facts
+/// stays with its caller, exactly like [`LmsCycler`]/[`gather_facts`] below.
 fn resolve_auto_via_waves(placements: &[Placement]) -> ExecMode {
     if placements.is_empty() {
         return ExecMode::Parallel;
@@ -990,6 +1103,29 @@ fn resolve_auto_via_waves(placements: &[Placement]) -> ExecMode {
     }
 }
 
+/// (#1877, this issue) Stays here rather than moving to `darkmux-gestalt`
+/// with the rest of this arc's move. Its signature is
+/// `probes: &[ResolvedSeatStaffing], judge: &ResolvedSeatStaffing`, and the
+/// real blocker is the same dependency cycle that kept the rest of this
+/// arc's non-moved functions in place: `ResolvedSeatStaffing`
+/// (`darkmux_crew::resourcing`, documented there as "the resolver's per-seat
+/// output") is NOT review-specific — the review driver + envelope snapshot
+/// consume it, but so do crew's own `run_record.rs` and the binary
+/// (`src/mission_launch_review.rs`) — it just lives in `darkmux-crew`,
+/// which depends on `darkmux-gestalt`
+/// (`crates/darkmux-crew/Cargo.toml:19`). Moving this function down into
+/// `darkmux-gestalt` would need `darkmux-gestalt` to depend back on
+/// `darkmux-crew` for that type, inverting the edge into a cycle. The
+/// `probes`/`judge` two-arg shape IS review-shaped, but it's cosmetic
+/// (`probes.iter().chain(once(judge))` — trivially generalizable to "a
+/// slice of seats") and will not survive re-litigation on its own; the
+/// cycle is the real reason it stays. What IS general here — turning a set
+/// of local placements into an `ExecMode` — is exactly
+/// [`resolve_auto_via_waves`] and
+/// `darkmux_gestalt::waves::wave_schedule_to_exec_mode`, both already moved
+/// or already gestalt's; this function's own job is purely the review-
+/// specific translation from probe/judge staffing into that generic
+/// `Placement` list.
 fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &ResolvedSeatStaffing) -> ExecMode {
     match mode {
         ExecMode::Auto => {
