@@ -3,9 +3,27 @@
     // (`build_review_graph` stopped constructing `Step` literals directly
     // once it became a thin `mission_config::interpret` launcher).
     use darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS;
+    // (#1877 item 2) `HostSample` — test-only, same reasoning as
+    // `ArtifactBus` below: production review.rs code never names this type
+    // directly any more (only passes `sample_host`'s value through), so
+    // this import stays out of review.rs's own `use` block.
+    use darkmux_crew::telemetry_sampler::HostSample;
     use darkmux_crew::types::NodeStatus;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    // (#1877 item 2) `Ordering`/`mpsc`/`thread`/`Duration` were pulled in
+    // via `super::*` from review.rs's own top-level imports before this PR
+    // — that file no longer needs them in its production code (the
+    // sampler thread/channel/stop-flag machinery moved to
+    // `darkmux_crew::run_obs`), so the sampler + concurrency tests in this
+    // module import them directly, same convention as `HostSample`/
+    // `ArtifactBus`. `AtomicBool` itself stays out — this module's one use
+    // (`verify_dispatched`, further down) already spells it out fully
+    // qualified (`std::sync::atomic::AtomicBool`).
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
     // (#1530 Packet 1) Only test code hand-builds an `ArtifactBus` — a
     // production `run_review_graph` call always builds its bus through
     // `run_step_graph`'s own pre-scan + caller-seed path. Imported here
@@ -979,6 +997,7 @@
                 &mut emitter,
                 "case-1",
                 "crew-1",
+                "review",
                 Duration::from_millis(5),
                 Duration::from_millis(2),
                 fake_sample,
@@ -1009,6 +1028,7 @@
                     &mut emitter,
                     "case-2",
                     "crew-2",
+                    "review",
                     Duration::from_millis(5),
                     Duration::from_millis(2),
                     fake_sample,

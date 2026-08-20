@@ -125,10 +125,30 @@
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::remote_budget::{RemoteBudget, RemoteBudgetRecord};
 use darkmux_crew::run_outcome::RunOutcome;
+// (#1877 item 2) The run-record + run-observability substrate — see this
+// file's own "moved to" comments at the old call sites for the full
+// rationale. `RunObs`/`RunEmitter` are aliased back to their pre-move names
+// (`ReviewObs`/`ReviewEmitter`) so this file's ~15 internal call sites and
+// every external `impl ReviewEmitter for X` (`src/mission_launch_review.rs`,
+// `review_bench.rs`, this module's own tests) keep compiling unchanged;
+// `NullEmitter`/`HostTelemetrySampler` keep their names as-is (never
+// review-flavored to begin with).
+use darkmux_crew::run_obs::{self, HostTelemetrySampler, RunObs as ReviewObs};
+pub use darkmux_crew::run_obs::{NullEmitter, RunEmitter as ReviewEmitter};
+pub use darkmux_crew::run_record::{
+    seat_endpoint, seat_endpoint_host, seat_identifier, staffing_snapshot, MemberRecord, SeatStaffingSnapshot,
+    StaffingSnapshot, StepRecord,
+};
 use darkmux_crew::single_shot::SingleShotReply;
 use darkmux_crew::step_kinds::patterns::dedup::{dedup as pattern_dedup, DedupStrategy};
 use darkmux_crew::step_kinds::patterns::multi_pass_confirm::{multi_pass_confirm, ConfirmTier, PassClass};
-use darkmux_crew::telemetry_sampler::{sample_host, HostSample};
+// (#1877 item 2) `HostSample` itself is no longer named directly in this
+// file's production code (only passed through as `sample_host`'s inferred
+// return type) — it moved to `review_tests.rs`'s own `use` block, the same
+// "test-only import stays out of the production block so a non-test build
+// never warns about it going unused" convention `ArtifactBus`'s import
+// already follows there.
+use darkmux_crew::telemetry_sampler::sample_host;
 // (#1230 Packet 1) LmsCycler's residency mechanism now routes through
 // gestalt's pure planner, executed via the real LmsHost/MacProbe port
 // adapters (their first production call site) — see the "model cycling"
@@ -136,15 +156,11 @@ use darkmux_crew::telemetry_sampler::{sample_host, HostSample};
 use darkmux_gestalt::{AcquireOpts, AcquireScope, Action, CallerIntent, Facts, ModelHost, Placement, ResourceProbe, V1Estimator};
 use darkmux_crew::resourcing::{ResolvedReviewRoles, ResolvedSeatStaffing};
 use darkmux_profiles::gestalt_host::{resolved_load_deadline, LmsHost, MacProbe};
-use darkmux_profiles::swap;
 use darkmux_types::{BundleSelector, ModelEndpoint, ProfileModel};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // ─── execution mode ───────────────────────────────────────────────────────
 
@@ -346,389 +362,18 @@ pub struct AbsenceBackstopNote {
     pub line: Option<u32>,
 }
 
-// ─── telemetry ────────────────────────────────────────────────────────────
-
-/// Per-model resource accounting — one row per probe staffing plus one for
-/// the judge seat.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MemberRecord {
-    pub model: String,
-    pub seat: String,
-    pub draws: u32,
-    pub wall_ms: u64,
-    pub total_tokens: u64,
-    /// (#1260/#1186) `true` when this seat dispatched to a remote endpoint —
-    /// its `total_tokens` are CLOUD tokens, which downstream savings
-    /// surfaces must exclude (remote work is never "off the meter").
-    /// Skipped when `false` so local-only envelopes serialize unchanged.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub remote: bool,
-    /// (#1260) Endpoint HOST only (e.g. `myorg.cognitiveservices.azure.com`)
-    /// — never credentials, never the full deployment path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    /// (#1300) The model the endpoint's response body actually reported it
-    /// served (`SingleShotReply.model`, the OpenAI-compatible completion's
-    /// top-level `model` field) — DISTINCT from `model` above, which is the
-    /// requested/declared identifier (a deployment name can alias to a
-    /// different underlying model; for local seats `lms ps` is ground truth
-    /// and this is always `None`). `None` when the response omitted the
-    /// field, not when they match — provenance surfaces compare the two and
-    /// only call out a mismatch, never assume aliasing from absence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub served_model: Option<String>,
-}
-
-/// One pipeline step's in/out counts + wall time — the issue #1230 bridge:
-/// a future flow-record consumer can render the review as a step timeline
-/// without re-deriving it from the envelope's nested arrays. Realized by
-/// the `step result` flow record (#1247 Part 1, see the module doc) — the
-/// live-run counterpart of this end-of-run summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StepRecord {
-    /// `bundle` | `probe` | `dedup` | `judge-pass1` | `judge-pass2`.
-    pub step_id: String,
-    /// `procedural` (no dispatch — bundling, dedup) | `dispatch` (LMStudio
-    /// calls).
-    pub kind: String,
-    pub items_in: usize,
-    pub items_out: usize,
-    pub wall_ms: u64,
-}
-
-// ─── flow-record emission (#1247 Part 1 — see the module doc) ───────────
-
-/// Sink for the review driver's run-observability records. The driver only
-/// knows how to build [`darkmux_flow::FlowRecord`]s and hand them to
-/// `emit` — it never decides where they land. See the module doc's
-/// "Flow-record emission" section for the action/payload vocabulary and
-/// why the driver stays sink-agnostic (lab-vs-fleet scope boundary).
-pub trait ReviewEmitter {
-    fn emit(&mut self, record: darkmux_flow::FlowRecord);
-}
-
-/// No-op emitter — the "at minimum a no-op-able sink" default for callers
-/// (and this module's own tests that don't assert on flow records) that
-/// don't want review observability output.
-pub struct NullEmitter;
-
-impl ReviewEmitter for NullEmitter {
-    fn emit(&mut self, _record: darkmux_flow::FlowRecord) {}
-}
-
-// ─── host telemetry sampling (#1247 doctrine surface) ────────────────────
-
-/// Production sample cadence — identical to `dispatch_internal`'s always-on
-/// sampler (`TELEMETRY_SAMPLE_INTERVAL`/`SAMPLER_POLL_INTERVAL`). `interval`
-/// is the time between samples; `poll` is how often the sampler thread
-/// re-checks the stop flag while sleeping out `interval`, so teardown is
-/// prompt (≤`poll`) instead of blocking for a full tick.
-const REVIEW_TELEMETRY_INTERVAL: Duration = Duration::from_millis(2000);
-const REVIEW_TELEMETRY_POLL: Duration = Duration::from_millis(500);
-
-/// (#1247 doctrine surface — "No blind runs") Best-effort host cpu/ram/gpu
-/// sampler for the review driver. The container dispatch path
-/// (`darkmux_crew::dispatch_internal`) has always sampled host load at
-/// ~2s cadence; the review path bypasses `dispatch_internal` entirely
-/// (it dispatches through the container-free single-shot primitive) and
-/// so, until now, produced zero host telemetry — a review envelope
-/// recorded per-step wall-clock with no visibility into concurrent
-/// machine load. Measured motivation (#1247 host-telemetry comment): a
-/// 35B judge's tok/s dropped ~12–15% exactly when concurrent
-/// `cargo test`/build bursts began on the same machine, invisible in the
-/// envelope.
-///
-/// Reuses the EXACT host-reading mechanism `dispatch_internal` uses
-/// (`darkmux_crew::telemetry_sampler::sample_host` — shells out to
-/// `top`/`vm_stat`+`sysctl`/`ioreg`, extracted there for this reuse) and
-/// the exact record shape (`darkmux_crew::dispatch::build_telemetry_record`,
-/// `category=telemetry, source="process", action="telemetry.process"`,
-/// payload `{cpu, mem, gpu}`), so the run-monitor/viewer code that already
-/// renders `telemetry.process` records applies unchanged. `handle`/
-/// `session_id` carry the crew name / case id — the same identity fields
-/// [`emit_review_step_result`] stamps on the `step result` action family, so a
-/// telemetry record for this run groups with its other records under the
-/// same `session_id`.
-///
-/// The sampling FUNCTION is injected (`sample_fn`, a plain fn pointer
-/// defaulting to `sample_host` at every production call site — see
-/// [`ReviewObs::new`]) so tests can drive the sampler with an
-/// instant fake instead of racing real `top -l 1` subprocess latency
-/// (~600-900ms per call) against a scripted deadline on a shared CI
-/// runner — the same injection discipline as `chat`/`cycler`/`emitter`.
-/// The real `sample_host` gets its own direct coverage in
-/// `darkmux-crew` (macOS-gated, since the commands it shells to are
-/// macOS-only).
-///
-/// Samples land on an `mpsc` channel rather than being emitted directly
-/// from the background thread: the review driver's [`ReviewEmitter`] is a
-/// caller-injected `&mut dyn` trait object — not thread-safe, and
-/// deliberately not wrapped in a `Mutex` (that would force every
-/// `ReviewEmitter` impl and every existing emission call site in this file
-/// through lock-guarded access for a feature this narrow). Instead,
-/// [`ReviewObs`] (the sequential `run_judge_only` path) drains the channel
-/// immediately before every `step result` record it emits, and
-/// `run_review_graph` drains it inside the scheduler's own emit closure,
-/// so telemetry interleaves with the
-/// run's other records close to when it was sampled — never batched at
-/// end-of-run, which is exactly the failure the doctrine calls out
-/// ("per-event records stream durably as they happen").
-struct HostTelemetrySampler {
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-    rx: Receiver<darkmux_flow::FlowRecord>,
-}
-
-impl HostTelemetrySampler {
-    /// Spawn the sampler thread. Uses `Builder::spawn` (which returns
-    /// `io::Result`, unlike the panicking `thread::spawn`) so an OS-level
-    /// spawn failure degrades to "no samples" — sampling must never affect
-    /// the review run it's observing.
-    fn start(
-        case_id: String,
-        crew: String,
-        interval: Duration,
-        poll: Duration,
-        sample_fn: fn() -> HostSample,
-        lms_fn: fn() -> anyhow::Result<Vec<darkmux_types::LoadedModel>>,
-    ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        let stop_thread = Arc::clone(&stop);
-        // (#1247 follow-up) lms load/unload deltas — the diff-state twin of
-        // dispatch_internal.rs's `run_telemetry_sampler`. `sample_host` was
-        // already shared (the doctrine surface this module's own doc names),
-        // but `lms_diff` wasn't wired up here at all, so a review run's
-        // "model (lms)" viewer track always read "no telemetry yet" — the
-        // run-detail view has host cpu/mem/gpu (from the sampling below) but
-        // never which models were actually resident. `seeded` mirrors
-        // dispatch_internal's baseline-emission: the FIRST successful sample
-        // diffs against empty so the models already resident when the run
-        // started show up immediately, not only on a later load/unload edge.
-        // `lms_fn` is injected (same discipline as `sample_fn`, same reason)
-        // — the real `darkmux_profiles::lms::list_loaded` shells out to the
-        // `lms` CLI, and an un-injected real subprocess call in this loop
-        // raced and broke the fast-cadence telemetry test's tight timing
-        // margin (this file has 20+ sub-millisecond mocked review runs).
-        let mut prev_loaded: Vec<darkmux_types::LoadedModel> = Vec::new();
-        let mut seeded = false;
-        let handle = thread::Builder::new()
-            .name("review-telemetry".to_string())
-            .spawn(move || loop {
-                // Sleep out `interval` FIRST, THEN sample — deliberately
-                // NOT sample-then-sleep. A review run's own dispatches
-                // (bundling, probe draws, judge passes) are real LMStudio
-                // round trips that take real wall-clock, so a run genuinely
-                // running past one `interval` gets its first sample right
-                // on schedule. The load-bearing side effect: at the
-                // PRODUCTION cadence ([`REVIEW_TELEMETRY_INTERVAL`], 2s),
-                // this makes it structurally impossible for a synchronous,
-                // sub-millisecond MOCKED test run (of which this file has
-                // 20+) to race a sample into its `RecordingEmitter` — the
-                // thread can't reach the sample point before `stop()` +
-                // `join()` in `HostTelemetrySampler::drop` already won.
-                // Only a run whose OWN cadence deliberately shortens
-                // `interval` (this module's telemetry tests) or a real
-                // dispatch that outlives 2s ever observes one.
-                let mut slept = Duration::ZERO;
-                while slept < interval {
-                    if stop_thread.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let nap = poll.min(interval - slept);
-                    thread::sleep(nap);
-                    slept += nap;
-                }
-                // lms load/unload deltas. Only diff against a SUCCESSFUL
-                // probe — a failed `list_loaded` is skipped (leaves
-                // `prev_loaded` intact) so a transient lms hiccup doesn't
-                // emit a flurry of spurious unloads (same guard as
-                // dispatch_internal.rs's sampler).
-                if let Ok(cur) = lms_fn() {
-                    let diffs = if seeded {
-                        darkmux_crew::telemetry_sampler::lms_diff(&prev_loaded, &cur)
-                    } else {
-                        seeded = true;
-                        darkmux_crew::telemetry_sampler::lms_diff(&[], &cur)
-                    };
-                    for payload in diffs {
-                        let record = darkmux_crew::dispatch::build_telemetry_record(
-                            darkmux_flow::Level::Info,
-                            "telemetry.lms",
-                            "lms",
-                            &crew,
-                            &case_id,
-                            None,
-                            None,
-                            None,
-                            payload,
-                        );
-                        let _ = tx.send(record);
-                    }
-                    prev_loaded = cur;
-                }
-                let sample = sample_fn();
-                if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
-                    let mut payload = serde_json::Map::new();
-                    if let Some(c) = sample.cpu {
-                        payload.insert("cpu".into(), c.into());
-                    }
-                    if let Some(m) = sample.mem {
-                        payload.insert("mem".into(), m.into());
-                    }
-                    if let Some(g) = sample.gpu {
-                        payload.insert("gpu".into(), g.into());
-                    }
-                    let record = darkmux_crew::dispatch::build_telemetry_record(
-                        darkmux_flow::Level::Info,
-                        "telemetry.process",
-                        "process",
-                        &crew,
-                        &case_id,
-                        None,
-                        None,
-                        None,
-                        serde_json::Value::Object(payload),
-                    );
-                    // A disconnected receiver (the guard already tore
-                    // down) just means this sample is lost — best-effort,
-                    // never a reason to abort the loop.
-                    let _ = tx.send(record);
-                }
-            })
-            .ok();
-        Self { stop, handle, rx }
-    }
-
-    /// Signal the stop flag and join the thread. Called from `Drop` — the
-    /// RAII tie-in that guarantees no orphaned sampler thread outlives its
-    /// owner ([`ReviewObs`] on the sequential path, `run_review_graph`'s own
-    /// local sampler on the graph path), on every exit path (clean finish,
-    /// early `?`-return, or panic).
-    fn stop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-impl Drop for HostTelemetrySampler {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// (#1434) Run-observability helper for the sequential `run_judge_only`
-/// path (the `--charges-file` re-judge). Emits the SAME generic
-/// `step result` records `run_review_graph`'s step kinds emit (via
-/// [`emit_review_step_result`]) — but through the injected [`ReviewEmitter`]
-/// rather than the global `darkmux_flow::record`, so the sink-agnostic /
-/// lab-vs-fleet-boundary discipline the driver has always kept is preserved
-/// (a bench emitter suppresses; `FleetFlowEmitter` writes the real stream).
-///
-/// It also owns the run's [`HostTelemetrySampler`] (#1247 "no blind runs")
-/// and interleaves its samples with the run's own records: [`Self::drain`]
-/// fires before every `step result` emission (and once more in `Drop`), so
-/// telemetry streams alongside the run rather than batching at the end. The
-/// sampler thread is torn down by [`HostTelemetrySampler`]'s own `Drop`
-/// (a field of this struct, run automatically after `ReviewObs::drop`
-/// returns), so it never outlives the run on any exit path.
-///
-/// There is deliberately NO task-level liveness bookend here — the caller's
-/// `with_dispatch_bookends` wrap (`src/mission_launch_review.rs`) opens/closes
-/// the canonical `dispatch start`/`dispatch complete`/`dispatch error`
-/// record around the whole `run_judge_only` call (contract 2 / #1349), the
-/// same edge the graph path relies on. A second review-scoped bookend would
-/// be exactly the competing-vocabulary duplication #1349 retired.
-struct ReviewObs<'a> {
-    case_id: String,
-    emitter: &'a mut dyn ReviewEmitter,
-    telemetry: HostTelemetrySampler,
-}
-
-impl<'a> ReviewObs<'a> {
-    fn new(emitter: &'a mut dyn ReviewEmitter, case_id: &str, crew: &str) -> Self {
-        Self::new_with_telemetry(
-            emitter,
-            case_id,
-            crew,
-            REVIEW_TELEMETRY_INTERVAL,
-            REVIEW_TELEMETRY_POLL,
-            sample_host,
-            darkmux_profiles::lms::list_loaded,
-        )
-    }
-
-    /// Same as [`Self::new`] but with a caller-chosen telemetry cadence AND
-    /// sampling functions — the test-only seam a scripted run uses to
-    /// observe deterministic samples without a multi-second sleep and
-    /// without shelling to the real (macOS-only, ~600-900ms-per-call)
-    /// `top`/`vm_stat`/`ioreg` commands, or to the real `lms` CLI.
-    /// Production always goes through `new`, which fixes the cadence at
-    /// [`REVIEW_TELEMETRY_INTERVAL`] and the samplers at the real
-    /// `sample_host` / `darkmux_profiles::lms::list_loaded`.
-    fn new_with_telemetry(
-        emitter: &'a mut dyn ReviewEmitter,
-        case_id: &str,
-        crew: &str,
-        telemetry_interval: Duration,
-        telemetry_poll: Duration,
-        sample_fn: fn() -> HostSample,
-        lms_fn: fn() -> anyhow::Result<Vec<darkmux_types::LoadedModel>>,
-    ) -> Self {
-        Self {
-            telemetry: HostTelemetrySampler::start(
-                case_id.to_string(),
-                crew.to_string(),
-                telemetry_interval,
-                telemetry_poll,
-                sample_fn,
-                lms_fn,
-            ),
-            case_id: case_id.to_string(),
-            emitter,
-        }
-    }
-
-    /// Drain every telemetry sample buffered since the last drain and emit
-    /// each through the injected emitter — called immediately before every
-    /// `step result` record so telemetry streams alongside the run rather
-    /// than batching at the end.
-    fn drain(&mut self) {
-        let records: Vec<darkmux_flow::FlowRecord> = self.telemetry.rx.try_iter().collect();
-        for record in records {
-            self.emitter.emit(record);
-        }
-    }
-
-    /// Drain pending telemetry, then emit one generic `step result` record —
-    /// the SAME shape [`emit_review_step_result`] builds for the graph path
-    /// (`action = "step result"`, `handle = step_id`, `session_id = case_id`,
-    /// a `kind` field), just routed through the injected emitter.
-    fn step_result(&mut self, kind: &str, step_id: &str, payload: serde_json::Value) {
-        self.drain();
-        // (#1641) `run_judge_only` (this struct's one caller) mints no
-        // Mission — see `review_step_result_record`'s own doc.
-        self.emitter
-            .emit(review_step_result_record(kind, step_id, &self.case_id, None, payload));
-    }
-}
-
-impl Drop for ReviewObs<'_> {
-    fn drop(&mut self) {
-        // Flush any sample the sampler produced since the last drain. The
-        // sampler thread itself stops right after, via
-        // `HostTelemetrySampler`'s own `Drop` (a field, torn down after this
-        // body returns), so it never outlives the run on any exit path.
-        //
-        // Known, accepted loss window: a sample the sampler thread sends
-        // AFTER this final drain but BEFORE the join in the sampler's `Drop`
-        // completes is dropped with the channel — at most one final-tick
-        // sample, consistent with the sampler's best-effort framing.
-        self.drain();
-    }
-}
+// (#1877 item 2) `MemberRecord`/`StepRecord`/`ReviewEmitter`/`NullEmitter`/
+// `HostTelemetrySampler`/`ReviewObs` moved to `darkmux_crew::run_record`/
+// `darkmux_crew::run_obs` — the shared run-record + run-observability
+// substrate a second mission (coder-phase) can now reach directly instead
+// of copying it. Re-exported/aliased below under their original names so
+// every existing reference in this file (and every external
+// `darkmux_lab::lab::review::<Name>` reference) keeps resolving unchanged.
+// See both modules' doc comments for the full rationale, including the
+// two deliberate renames (`ReviewEmitter` -> `RunEmitter`, `ReviewObs` ->
+// `RunObs`) and why `HostTelemetrySampler`'s `rx` field is no longer
+// directly reachable (`try_drain()` replaces the old `.rx.try_iter()`
+// field access at this file's two remaining call sites).
 
 // ─── the envelope ─────────────────────────────────────────────────────────
 
@@ -1087,170 +732,10 @@ pub fn review_mission_outcome(env: &ReviewEnvelope) -> RunOutcome {
 // type, so darkmux-crew's own `MIN_VIABLE_MAP_GRANT` never has to reference
 // it (or vice versa) — see `remote_budget`'s module doc.
 
-/// (#1260) The dispatch identity for one seat. LOCAL seats use the
-/// darkmux-namespaced LMStudio identifier (`swap::namespaced_identifier`);
-/// REMOTE seats keep the profile's bare model id — nothing is loaded into
-/// LMStudio, so no `darkmux:` namespace entry is ever minted for them (the
-/// namespace marks darkmux-owned LOCAL residency, and a remote seat has
-/// none).
-pub fn seat_identifier(pm: &ProfileModel) -> String {
-    if pm.is_remote() {
-        pm.id.clone()
-    } else {
-        swap::namespaced_identifier(pm)
-    }
-}
-
-/// (#1260) The remote endpoint HOST for provenance records — host only,
-/// NEVER credentials and never the full deployment path (an Azure
-/// deployment URL embeds the deployment name; the host is the boundary
-/// operators reason about). `None` for local seats.
-fn seat_endpoint_host(pm: &ProfileModel) -> Option<String> {
-    let ep = pm.endpoint.as_ref().filter(|e| e.is_remote())?;
-    let url = ep.base_url();
-    let authority = url.split("://").nth(1).and_then(|s| s.split('/').next()).unwrap_or("remote");
-    // (#1530) Strip URL userinfo before the `@`. This function's contract is
-    // HOST ONLY, NEVER CREDENTIALS — and its output is stamped into step
-    // config, `MemberRecord.endpoint`, and the run envelope, which CI uploads
-    // as a public artifact. The sanctioned way to carry a key is
-    // `EndpointAuth` (a Keychain item name or an env-var name, never a
-    // value), but nothing stops an operator pasting `https://tok@proxy/v1`
-    // into a profile's `url` — some LiteLLM/proxy setups document exactly
-    // that form. Without this, that token would ride to a public surface.
-    Some(authority.rsplit('@').next().unwrap_or(authority).to_string())
-}
-
-/// (#1260) The endpoint a seat's chat calls should route through — `Some`
-/// only when the staffing's resolved model declares a remote endpoint.
-fn seat_endpoint(pm: &ProfileModel) -> Option<&ModelEndpoint> {
-    pm.endpoint.as_ref().filter(|e| e.is_remote())
-}
-
-/// One seat staffing's resolved config, snapshotted as ACTUALLY used —
-/// see [`ReviewEnvelope::staffing`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SeatStaffingSnapshot {
-    pub name: String,
-    /// (#1475 packet 2) The review ROLE this seat was staffed for
-    /// (`review-probe-high`/`-mid`/`-low`, `review-judge`, `review-verify`)
-    /// when the role→profile flip produced it — so the envelope names WHICH
-    /// role bound this seat's profile+model, the truthful record of the
-    /// task→role→profile→model rollup (operator sovereignty #44). `Option` +
-    /// `#[serde(default)]`: absent on the legacy roster-scoring staffings and
-    /// on pre-#1475 snapshots, the module's standard schema-lenience.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role_id: Option<String>,
-    /// The darkmux-namespaced LMStudio identifier for a LOCAL seat; the
-    /// profile's bare model id for a REMOTE one — the same form
-    /// [`MemberRecord::model`] records, so the two line up at a glance.
-    pub model: String,
-    /// (#1260) `true` when the staffing's model declares a remote endpoint.
-    /// Skipped when `false` so pre-#1260 snapshots round-trip unchanged.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub remote: bool,
-    /// (#1260) Endpoint HOST only — never credentials, never the full
-    /// deployment path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    pub k: u32,
-    /// (#1266) The judge seat's resolved consensus depth (`passes` — 1
-    /// single / 2 double-confirm / N unanimous), snapshotted so every run is
-    /// self-describing. Present on every seat's snapshot the same way `k` is
-    /// (the judge is the consumer; other seats carry it inertly). Defaults to
-    /// 2 on read so a pre-1.3 snapshot (this field didn't exist) deserializes
-    /// as today's double-confirm rather than a hard parse failure — the
-    /// module's standard schema-lenience.
-    #[serde(default = "default_snapshot_passes")]
-    pub passes: u32,
-    /// The resolved `ProfileModel`'s DECLARED context length — settings
-    /// provenance per run, so "what context was this model loaded at" is
-    /// never a forensic question (a sibling concern to the config-vs-
-    /// measured-context mismatch class of bug #1135 shipped). `Option` +
-    /// `#[serde(default)]` so a pre-#1256 snapshot (staffing existed, this
-    /// field didn't) deserializes as `None` rather than a hard parse failure
-    /// — the same schema-lenience discipline every field in this module
-    /// follows. (#1282: `n_ctx` is optional on `ProfileModel` itself now —
-    /// resolution requires it for LOCAL seats, so their snapshots always
-    /// carry a value; a REMOTE seat, #1260, has no local context and stays
-    /// `None` here.)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub n_ctx: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selector: Option<BundleSelector>,
-    /// (#1426 ship-2 / #44) HOW this seat's model was chosen — `scored`
-    /// (capability scoring against the roster profile, with what it scored
-    /// against) or `pinned` (which launch param pinned it). The snapshot
-    /// already recorded WHAT resolved; this records WHY, so the operator
-    /// never wonders where the staffing decision came from. `Option` +
-    /// `#[serde(default)]` — a pre-ship-2 snapshot (field absent)
-    /// deserializes as `None`, the module's standard schema-lenience.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provenance: Option<darkmux_crew::resourcing::StaffingProvenance>,
-}
-
-/// Per-seat resolved staffing snapshot — `review-probe` (one or more
-/// staffings) + `review-judge` (exactly one) + the optional `review-verify`
-/// seat (#1260). See [`ReviewEnvelope::staffing`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StaffingSnapshot {
-    pub probes: Vec<SeatStaffingSnapshot>,
-    pub judge: Option<SeatStaffingSnapshot>,
-    /// (#1260) Present iff the crew declares the `review-verify` seat —
-    /// absent (and never serialized) otherwise, so pre-#1260 snapshots
-    /// round-trip unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify: Option<SeatStaffingSnapshot>,
-    /// (#1302) The crew's resolved `request_changes` flag — snapshotted so the
-    /// render path reads the run's own blocking-vs-advisory choice from its
-    /// self-describing artifact, and a serialized envelope re-rendered later
-    /// picks the same review event. Defaults to `false` on read (skipped when
-    /// `false`) so pre-#1302 snapshots round-trip unchanged as the non-blocking
-    /// default.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub request_changes: bool,
-}
-
-/// (#1266) Snapshot default for `SeatStaffingSnapshot::passes` — 2 (double-
-/// confirm), so a pre-1.3 envelope missing the field reads as today's judge.
-fn default_snapshot_passes() -> u32 {
-    2
-}
-
-pub fn staffing_snapshot(
-    probes: &[ResolvedSeatStaffing],
-    judge: &ResolvedSeatStaffing,
-    verify: Option<&ResolvedSeatStaffing>,
-    request_changes: bool,
-) -> StaffingSnapshot {
-    fn one(s: &ResolvedSeatStaffing) -> SeatStaffingSnapshot {
-        SeatStaffingSnapshot {
-            name: s.name.clone(),
-            // (#1475 packet 2) Carry the seat's bound role verbatim so the
-            // envelope records role → profile → model, not just profile+model.
-            role_id: s.role_id.clone(),
-            model: seat_identifier(&s.pm),
-            remote: s.pm.is_remote(),
-            endpoint: seat_endpoint_host(&s.pm),
-            k: s.k,
-            passes: s.passes,
-            n_ctx: s.pm.n_ctx,
-            max_tokens: s.max_tokens,
-            selector: s.selector.clone(),
-            // (#44) Scored-vs-pinned, carried verbatim from the resolver.
-            provenance: s.provenance.clone(),
-        }
-    }
-    StaffingSnapshot {
-        probes: probes.iter().map(one).collect(),
-        judge: Some(one(judge)),
-        verify: verify.map(one),
-        // (#1302) The run's blocking-vs-advisory choice, snapshotted for the
-        // render path (see `StaffingSnapshot::request_changes`).
-        request_changes,
-    }
-}
+// (#1877 item 2) `seat_identifier`/`seat_endpoint_host`/`seat_endpoint`/
+// `SeatStaffingSnapshot`/`StaffingSnapshot`/`staffing_snapshot` moved to
+// `darkmux_crew::run_record` — see that module's doc. Re-exported below
+// under their original names.
 
 // ─── model cycling ────────────────────────────────────────────────────────
 
@@ -3955,7 +3440,11 @@ pub fn run_judge_only(
     // task-level bookend here — the caller's `with_dispatch_bookends` wrap
     // owns run liveness (contract 2). `obs` drops at function end (early
     // `?`-return or clean), tearing down its sampler thread.
-    let mut obs = ReviewObs::new(emitter, &inputs.case_id, &crew_name);
+    // (#1877 item 2) `source: "review"` — the one hardcoded bit
+    // `RunObs`/`step_result_record` took out and made a parameter, so this
+    // driver's own `step result` records stay stamped `source="review"`,
+    // byte-identical to before the move.
+    let mut obs = ReviewObs::new(emitter, &inputs.case_id, &crew_name, "review");
     env.steps.push(StepRecord {
         step_id: "bundle".to_string(),
         kind: "procedural".to_string(),
@@ -4456,32 +3945,12 @@ fn review_step_result_record(
     mission_id: Option<&str>,
     payload: serde_json::Value,
 ) -> darkmux_flow::FlowRecord {
-    let mut full = serde_json::json!({ "step_id": step_id, "kind": kind });
-    if let (serde_json::Value::Object(extra), serde_json::Value::Object(base)) = (payload, &mut full) {
-        base.extend(extra);
-    }
-    darkmux_flow::FlowRecord {
-        ts: darkmux_flow::ts_utc_now(),
-        level: darkmux_flow::Level::Info,
-        category: darkmux_flow::Category::Work,
-        tier: darkmux_flow::Tier::Local,
-        stage: darkmux_flow::Stage::Dispatch,
-        action: "step result".to_string(),
-        handle: step_id.to_string(),
-        phase_id: None,
-        session_id: Some(case_id.to_string()),
-        source: Some("review".to_string()),
-        model: None,
-        reasoning: None,
-        mission_id: mission_id.map(String::from),
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
-        payload: Some(full),
-        work_id: None,
-        attempt: None,
-    }
+    // (#1877 item 2) The record shape itself moved to
+    // `darkmux_crew::run_obs::step_result_record`, generalized so `source`
+    // (hardcoded `"review"` here, always) is a parameter instead of a
+    // literal baked into the builder — this wrapper is what keeps every
+    // caller in this file byte-identical to before the move.
+    run_obs::step_result_record("review", kind, step_id, case_id, mission_id, payload)
 }
 
 /// Emit a [`review_step_result_record`] to the GLOBAL flow sink
@@ -7537,8 +7006,8 @@ pub fn run_review_graph(
     let telemetry = HostTelemetrySampler::start(
         ctx.case_id.clone(),
         crew_name.to_string(),
-        REVIEW_TELEMETRY_INTERVAL,
-        REVIEW_TELEMETRY_POLL,
+        run_obs::DEFAULT_TELEMETRY_INTERVAL,
+        run_obs::DEFAULT_TELEMETRY_POLL,
         sample_host,
         darkmux_profiles::lms::list_loaded,
     );
@@ -7566,7 +7035,7 @@ pub fn run_review_graph(
         8,
         &darkmux_crew::concurrent_dispatch::lms_host_factory,
         &mut |record| {
-            for sample in telemetry.rx.try_iter().collect::<Vec<_>>() {
+            for sample in telemetry.try_drain() {
                 emitter.emit(sample);
             }
             emitter.emit(record);
@@ -7610,7 +7079,7 @@ pub fn run_review_graph(
             let mut env = shared_env.lock().expect("shared review envelope mutex poisoned").clone();
             env.degenerate = Some(format!("review graph scheduling failed: {e:#}"));
             env.degenerate_kind = Some(DegenerateKind::Error);
-            for sample in telemetry.rx.try_iter().collect::<Vec<_>>() {
+            for sample in telemetry.try_drain() {
                 emitter.emit(sample);
             }
             return Ok((env, steps));
@@ -7723,7 +7192,7 @@ pub fn run_review_graph(
     // sampler thread) — same "known, accepted loss window" the retired
     // bookend guard documented: at most one final-tick sample can land in
     // the brief window between this drain and the thread join completing.
-    for sample in telemetry.rx.try_iter().collect::<Vec<_>>() {
+    for sample in telemetry.try_drain() {
         emitter.emit(sample);
     }
     Ok((env, steps))
