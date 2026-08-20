@@ -124,6 +124,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use darkmux_crew::remote_budget::{RemoteBudget, RemoteBudgetRecord};
+use darkmux_crew::run_outcome::RunOutcome;
 use darkmux_crew::single_shot::SingleShotReply;
 use darkmux_crew::step_kinds::patterns::dedup::{dedup as pattern_dedup, DedupStrategy};
 use darkmux_crew::step_kinds::patterns::multi_pass_confirm::{multi_pass_confirm, ConfirmTier, PassClass};
@@ -943,6 +944,90 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
 /// crews without the verify seat byte-identical to pre-#1260 ones.
 fn usize_is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+/// (#1877 item 5, fixing #1876) Review's OWN predicate mapping from its
+/// existing envelope fields onto the generic
+/// [`darkmux_crew::run_outcome::RunOutcome`] — the type names three shapes;
+/// this function is the review-specific decision of which of THIS run's
+/// facts lands in which one. Never mutates the envelope; a read-only view
+/// `synthesize_review` (`src/pr_review.rs`) builds its render decision on.
+///
+/// - [`RunOutcome::Empty`] — `env.degenerate` is set. Unchanged by #1876:
+///   this is Gate 2's zero-usable-rulings honesty gate (or a genuinely dead
+///   bundle/probe stage, or the `strict` judge-exhaustion policy opting back
+///   into the pre-#1876 behavior via `judge_gate_outcome`'s Gate 1) — the
+///   SAME condition that has always meant "produced no signal."
+/// - [`RunOutcome::Partial`] — `env.degenerate` is `None` but at least one
+///   `remote_budgets` row for a JUDGE stage (`"judge-pass1"`/`"judge-pass2"`)
+///   carries `skipped_calls > 0`. This is the #1876 fix's own case: the
+///   judge stage's remote token bucket ran out before the whole docket was
+///   judged, but usable rulings exist. Scoped to judge stages ONLY —
+///   probe-stage exhaustion already renders as a "reduced coverage" warning
+///   on a healthy run (never touched `env.degenerate`, nothing to fix), and
+///   verify-stage exhaustion already renders normally with its own
+///   `env.warnings` note (`run_verify_stage` never sets `env.degenerate`
+///   either) — folding those into `Partial` too would double-announce an
+///   already-correct treatment, not fix a bug.
+/// - [`RunOutcome::Complete`] — neither of the above.
+pub fn review_outcome(env: &ReviewEnvelope) -> RunOutcome {
+    if let Some(reason) = &env.degenerate {
+        return RunOutcome::Empty { reason: reason.clone() };
+    }
+    let reasons: Vec<String> = env
+        .remote_budgets
+        .iter()
+        // (#1876/#1877 QA follow-up) Exact stage names, not a `starts_with`
+        // prefix — a future `judge-*` row that ISN'T one of the two real
+        // stages should never silently flip a run to Partial by accident.
+        .filter(|r| matches!(r.stage.as_str(), "judge-pass1" | "judge-pass2") && r.skipped_calls > 0)
+        .map(|r| judge_budget_shortfall_reason(env, r))
+        .collect();
+    if reasons.is_empty() {
+        RunOutcome::Complete
+    } else {
+        RunOutcome::Partial { reasons }
+    }
+}
+
+/// (#1876/#1877 QA follow-up) `judge-pass1` and `judge-pass2` skips mean
+/// DIFFERENT things and need different wording — conflating them was a
+/// real bug this function's own predecessor had. A pass-1 skip means the
+/// flag NEVER got a ruling at all (`budget_exhausted_outcome` -> `Error` ->
+/// excluded from `usable`, per `judge_gate_outcome`'s own filter) — the
+/// flag is genuinely unjudged. A pass-2 skip means the flag's pass-1
+/// ALREADY ruled it `Confirmed`; only the CONFIRMATION pass was skipped,
+/// which `multi_pass_confirm`'s `PassClass::Reject` arm demotes to
+/// `Tier::NeedsCheck` (`demoted_by_pass2 = true`) — that flag WAS judged
+/// and DOES render, just at a lower tier than a from-scratch double-confirm
+/// would have given it. Reporting a pass-2 skip as "N flags went unjudged"
+/// (the pass-1 wording) would be factually wrong on both halves: the flags
+/// were judged, and `env.judged.len()` is the wrong denominator (pass-2's
+/// docket is pass-1's CONFIRMS, not the whole run).
+fn judge_budget_shortfall_reason(env: &ReviewEnvelope, r: &RemoteBudgetRecord) -> String {
+    // (#1876/#1877 QA follow-up) "{used} of {max} tokens used" reads like a
+    // typo when `used` overshoots `max` — which it routinely does, by
+    // design: the ceiling is SOFT (`RemoteBudget`'s own module doc), so a
+    // grant can land a reply that reports usage slightly above what was
+    // admitted. "exceeded its N-token allowance" states the same fact
+    // without inviting a "did you mean 500000 of 500497?" double-take.
+    if r.stage == "judge-pass1" {
+        format!(
+            "{} of {} flags went unjudged on the `judge-pass1` stage — it exceeded its {}-token \
+             allowance ({} used)",
+            r.skipped_calls,
+            env.judged.len(),
+            r.max_tokens,
+            r.used_tokens
+        )
+    } else {
+        format!(
+            "{} confirmed finding(s) were conservatively demoted to needs-check because their \
+             confirmation pass was skipped on the `judge-pass2` stage — it exceeded its {}-token \
+             allowance ({} used)",
+            r.skipped_calls, r.max_tokens, r.used_tokens
+        )
+    }
 }
 
 // (#1877) `RemoteBudgetRecord`/`RemoteBucket` moved to
@@ -2198,6 +2283,14 @@ pub struct ReviewInputs<'a> {
     /// max_tokens_per_execution > 500000`) — injected here, not read in the
     /// driver, so the pipeline stays config-free and unit-testable.
     pub remote_max_tokens_per_execution: u64,
+    /// (#1876/#1877) The judge stage's remote-budget exhaustion policy —
+    /// `false` (the operator default) treats a skipped judge call as a
+    /// coverage fact, never a verdict, as long as some flag was usably
+    /// judged; `true` restores the pre-#1876 "any skip degrades the whole
+    /// run" behavior. Callers resolve it through `darkmux_types::
+    /// config_access::review_judge_fail_on_any_skip()`, same injection
+    /// discipline as `remote_max_tokens_per_execution` above.
+    pub judge_exhaustion_strict: bool,
     /// (#1748) The SAME `FileSource` the bundler read from — threaded
     /// through so [`apply_absence_backstop`] can check a confirmed
     /// finding's absence claim against the WHOLE FILE, not just the
@@ -2949,26 +3042,52 @@ fn run_verify_stage(
     Ok(())
 }
 
-/// (#1373 gates a/b/c + the reason-specificity fix) One judge stage's
-/// honesty-gate decision — the SAME budget-exhaustion / dispatch-error /
-/// no-usable-ruling logic `finish_review` has always applied, extracted so
-/// `ReviewJudgeStepKind` (the graph path) can apply it too without the two
-/// callers drifting again (CLAUDE.md's #1352 tiering: "shared logic that
-/// both `run_judge_only` and the graph path use should live once").
+/// (#1373 gates a/b/c + the reason-specificity fix; #1876/#1877 Gate 1
+/// rewrite) One judge stage's honesty-gate decision — the SAME
+/// budget-exhaustion / dispatch-error / no-usable-ruling logic
+/// `finish_review` has always applied, extracted so `ReviewJudgeStepKind`
+/// (the graph path) can apply it too without the two callers drifting again
+/// (CLAUDE.md's #1352 tiering: "shared logic that both `run_judge_only` and
+/// the graph path use should live once").
 ///
 /// At most ONE `degenerate_reason` ever comes back — budget exhaustion
-/// wins over the "no usable ruling" gate, mirroring the original
-/// `degen_reasons.is_empty()` short-circuit this was extracted from (never
-/// a "combine every reason" accumulator, #1329). `dispatch_error_warning`
-/// is independent and UNCONDITIONAL (#1329's loud-beats-quiet half) —
-/// present whenever a remote judge had ANY per-flag dispatch failure,
-/// whether or not the run also degenerates.
+/// (under the `strict` policy — see below) wins over the "no usable ruling"
+/// gate, mirroring the original `degen_reasons.is_empty()` short-circuit
+/// this was extracted from (never a "combine every reason" accumulator,
+/// #1329). `dispatch_error_warning` is independent and UNCONDITIONAL
+/// (#1329's loud-beats-quiet half) — present whenever a remote judge had
+/// ANY per-flag dispatch failure, whether or not the run also degenerates.
+/// `coverage_warning` (#1876/#1877 QA follow-up) is the same shape for the
+/// non-strict Gate 1 skip: `env.warnings` is what `review_result_to_mission_
+/// envelope` (`src/mission_launch_review.rs`) reads to classify a run
+/// `Degraded` vs `Clean` for the mission board, and what
+/// `with_dispatch_bookends` (same file) reads to flip the flow record's
+/// `dispatch complete` `result_class` from `"ok"` to `"partial"` — those two
+/// consumers never see `env.remote_budgets` or `env.judged`, only
+/// `degenerate`/`warnings`. NOT the CLI exit code: `mission launch review`
+/// always returns `Ok(0)` (`src/cli.rs:552` documents why — CI-facing
+/// pass/fail comes from the rendered payload's `mode`, not the process exit
+/// status). Without stamping `env.warnings`, a partial-coverage run (real
+/// signal, real gap) read `Clean` everywhere except the posted PR comment —
+/// exactly the "board and the comment must agree" property this module's
+/// own `review_result_to_mission_envelope` doc already promises, silently
+/// broken by the render-only half of this fix. Probe exhaustion
+/// (`review.rs`'s probe stage) and verify exhaustion (`verify_budget_
+/// outcome`) already push their own warning this same way; this closes the
+/// one stage that didn't.
 struct JudgeGateOutcome {
     remote_budget_rows: Vec<RemoteBudgetRecord>,
     dispatch_error_warning: Option<String>,
+    coverage_warning: Option<String>,
     degenerate_reason: Option<String>,
 }
 
+/// (#1876/#1877) `strict` is `darkmux_types::config_access::
+/// review_judge_fail_on_any_skip()` (`env(DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_
+/// SKIP) > config.review.judge_fail_on_any_skip > false`), resolved by the
+/// CALLER (this function stays config-free/pure, per `ReviewInputs::
+/// remote_max_tokens_per_execution`'s own "injected here, not read in the
+/// driver" doctrine) and threaded through `ReviewInputs`/`ReviewStepContext`.
 fn judge_gate_outcome(
     is_remote: bool,
     judged_len: usize,
@@ -2976,9 +3095,11 @@ fn judge_gate_outcome(
     dispatch_errors: usize,
     budgets: Option<&JudgeBudgets>,
     remote_max_tokens_per_execution: u64,
+    strict: bool,
 ) -> JudgeGateOutcome {
     let mut degen_reasons: Vec<String> = Vec::new();
     let mut remote_budget_rows = Vec::new();
+    let mut coverage_warning: Option<String> = None;
 
     // (#1329 fix) A REMOTE judge dispatch failure on a MINORITY of flags is
     // already handled honestly at the per-flag level (archive/demote, never
@@ -2997,9 +3118,22 @@ fn judge_gate_outcome(
         None
     };
 
-    // Gate 1: a REMOTE judge whose per-pass token bucket EXHAUSTED (a
-    // load-bearing stage — operator decision, DARKMUX_REMOTE_MAX_TOKENS_
-    // PER_EXECUTION). Any exhaustion degrades the run regardless of scale.
+    // Gate 1 (#1876 fix): a REMOTE judge whose per-pass token bucket
+    // EXHAUSTED (a load-bearing stage — operator decision,
+    // DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION) is a COVERAGE fact, not a
+    // verdict, under the default `strict == false` policy — the row below
+    // still reaches `env.remote_budgets` regardless, so `review_outcome`
+    // can build the honest Partial outcome (and its rendered banner) from
+    // it. Production incident this replaces: a judge that had ruled 123 of
+    // 134 flags (7 confirmed, 67 needs-check, complete with evidence)
+    // discarded all of it and posted "the review produced no signal"
+    // because the last 11 calls were skipped when the bucket ran out — one
+    // skipped call out of a thousand did the exact same thing, regardless
+    // of how much real signal existed. `strict == true` (an explicit
+    // operator opt-in, `review.judge_fail_on_any_skip`) restores that exact
+    // pre-#1876 behavior: ANY skip degrades the whole run, no matter how
+    // much was judged.
+    let mut skipped_total: u32 = 0;
     if let Some(b) = budgets {
         if let Some(rec) = b.pass1.record() {
             remote_budget_rows.push(rec);
@@ -3007,23 +3141,45 @@ fn judge_gate_outcome(
         if let Some(rec) = b.pass2.record() {
             remote_budget_rows.push(rec);
         }
-        let skipped = b.pass1.skipped() + b.pass2.skipped();
-        if skipped > 0 {
-            degen_reasons.push(format!(
-                "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
-                 per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) ran out; \
-                 degenerate run, never a silent pass"
-            ));
+        skipped_total = b.pass1.skipped() + b.pass2.skipped();
+        if skipped_total > 0 {
+            if strict {
+                degen_reasons.push(format!(
+                    "remote judge token budget exhausted — {skipped_total} judge call(s) skipped after \
+                     the per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) \
+                     ran out; degenerate run, never a silent pass (review.judge_fail_on_any_skip is set)"
+                ));
+            } else {
+                coverage_warning = Some(format!(
+                    "remote judge token budget exhausted — {skipped_total} judge call(s) skipped after \
+                     the per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) \
+                     ran out — the flags that WERE judged still render; see the envelope's \
+                     remote_budgets for the full accounting"
+                ));
+            }
         }
     }
 
     // Gate 2: the judge-dead honesty gate — NO flag produced a usable
     // pass-1 ruling, so the whole judge phase produced no signal worth
-    // rendering. Names the specific "remote dispatch failed on N of M"
-    // shape when that's the cause, rather than the generic wording, so the
-    // operator sees WHY the judge went dead, not just THAT it did.
+    // rendering. Names the specific shape that caused it (budget
+    // exhaustion, then a remote dispatch failure) rather than the generic
+    // wording, so the operator sees WHY the judge went dead, not just THAT
+    // it did. (#1876/#1877 QA follow-up) The budget-exhaustion arm fires on
+    // `skipped_total > 0` regardless of `strict` — a NON-strict policy
+    // still reaches this gate when literally nothing was usable (Gate 1
+    // above deliberately left `degen_reasons` empty in that case), and the
+    // operator still deserves the specific diagnosis, not the generic
+    // "all errored/unparsed" wording that used to be the only option here.
     if degen_reasons.is_empty() && judged_len > 0 && usable == 0 {
-        if is_remote && dispatch_errors > 0 {
+        if skipped_total > 0 {
+            degen_reasons.push(format!(
+                "remote judge token budget exhausted — {skipped_total} judge call(s) skipped after the \
+                 per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) ran out, \
+                 and none of the flags that WERE judged produced a usable ruling — degenerate run, \
+                 never a silent pass"
+            ));
+        } else if is_remote && dispatch_errors > 0 {
             degen_reasons.push(format!(
                 "remote judge dispatch failed on {dispatch_errors} of {judged_len} flag(s) after \
                  bounded retries — degraded run, the affected flag(s) carry no adjudication"
@@ -3038,6 +3194,7 @@ fn judge_gate_outcome(
     JudgeGateOutcome {
         remote_budget_rows,
         dispatch_error_warning,
+        coverage_warning,
         degenerate_reason: if degen_reasons.is_empty() { None } else { Some(degen_reasons.join("; ")) },
     }
 }
@@ -3648,8 +3805,12 @@ fn finish_review(
         judge_dispatch_errors,
         judge_budgets.as_ref(),
         inputs.remote_max_tokens_per_execution,
+        inputs.judge_exhaustion_strict,
     );
     if let Some(w) = gate.dispatch_error_warning {
+        env.warnings.push(w);
+    }
+    if let Some(w) = gate.coverage_warning {
         env.warnings.push(w);
     }
     env.remote_budgets.extend(gate.remote_budget_rows);
@@ -4026,6 +4187,12 @@ pub struct ReviewStepContext {
     pub judge_system: String,
     pub verify_system: String,
     pub remote_max_tokens_per_execution: u64,
+    /// (#1876/#1877) See [`ReviewInputs::judge_exhaustion_strict`]'s doc —
+    /// same knob, same injection discipline, the graph path's own copy.
+    /// Defaults to `false` (the partial-coverage policy) via `#[derive(Default)]`
+    /// on this struct — every test-fixture construction that doesn't
+    /// explicitly opt into `true` gets the operator-default behavior.
+    pub judge_exhaustion_strict: bool,
     pub timeout_seconds: u32,
     /// (#1355 follow-up) Test-only dispatch seam for [`dispatch_chat`] —
     /// `None` at every production call site (`src/pr_review.rs`,
@@ -5598,11 +5765,15 @@ impl StepKind for ReviewJudgeStepKind {
             judge_dispatch_errors,
             budgets_final.as_ref(),
             ctx.remote_max_tokens_per_execution,
+            ctx.judge_exhaustion_strict,
         );
         {
             let mut env = env.lock().expect("shared review envelope mutex poisoned");
             env.remote_budgets.extend(gate.remote_budget_rows);
             if let Some(w) = gate.dispatch_error_warning {
+                env.warnings.push(w);
+            }
+            if let Some(w) = gate.coverage_warning {
                 env.warnings.push(w);
             }
             if gate.degenerate_reason.is_some() {

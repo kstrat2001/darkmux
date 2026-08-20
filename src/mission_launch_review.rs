@@ -460,6 +460,21 @@ fn with_dispatch_bookends(
             });
             if let Some(reason) = &env.degenerate {
                 payload["degenerate"] = json!(reason);
+            } else if !env.warnings.is_empty() {
+                // (#1876 QA follow-up, MUST FIX 1) A judge-coverage
+                // shortfall (or any other #1260-style non-fatal warning)
+                // sets `env.warnings` without setting `env.degenerate` —
+                // exactly `review_result_to_mission_envelope`'s `Degraded`
+                // condition, one function over. Before #1876 this same
+                // incident shape always went through `degenerate`, which
+                // the arm above already marks; #1876 moved it onto
+                // `warnings` and this bookend never learned to read that
+                // field, so the flow stream recorded an unqualified
+                // `result_class: "ok"` for a run that silently dropped
+                // flags. Mirrors the `"partial"` `result_class` precedent
+                // in `step_kinds::builtins`'s map-step terminal.
+                payload["result_class"] = json!("partial");
+                payload["warnings"] = json!(env.warnings);
             }
             if let Some(member) = env.members.iter().find(|m| m.remote) {
                 let remote_tokens: u64 =
@@ -999,6 +1014,11 @@ fn run_dispatch(
     let crew_name_for_bookends = crew.distinct_profile_names();
     let model_for_bookends = crew_model_summary(&crew);
     let remote_max_tokens_per_execution = darkmux_types::config_access::remote_max_tokens_per_execution();
+    // (#1876/#1877) The judge stage's remote-budget exhaustion policy —
+    // resolved once here, same as the token budget above, and passed
+    // through to both the `--charges-file` (`ReviewInputs`) and the graph
+    // (`ReviewStepContext`) launch shapes below.
+    let judge_exhaustion_strict = darkmux_types::config_access::review_judge_fail_on_any_skip();
 
     // (#1641) `mission_id` starts unset — `--charges-file` never mints a
     // Mission, so it stays `None` on that path. The real-launch branch
@@ -1032,6 +1052,7 @@ fn run_dispatch(
                 "charges_bundles is always Some when input `charges_file` is set (computed above)",
             )),
             remote_max_tokens_per_execution,
+            judge_exhaustion_strict,
             // (#1748) The same `FileSource` bundling used above — lets the
             // mechanical absence-claim backstop check a confirmed finding
             // against the whole file on the `--charges-file` re-judge path
@@ -1126,6 +1147,7 @@ fn run_dispatch(
             judge_system,
             verify_system,
             remote_max_tokens_per_execution,
+            judge_exhaustion_strict,
             timeout_seconds,
             chat_override: None,
             // (#1530) Production dispatch always reconstructs a real
@@ -1633,6 +1655,48 @@ mod tests {
         assert_eq!(terminal.mission_id.as_deref(), Some("review-1700000001-fedcba"));
     }
 
+    /// (#1876 QA follow-up, MUST FIX 1) A judge-coverage shortfall
+    /// (`env.degenerate.is_none()` but `env.warnings` non-empty — exactly
+    /// the #1876 incident shape, 11 of 134 flags unjudged) must NOT read as
+    /// an unqualified `result_class: "ok"` on the flow record. Before
+    /// #1876, that same run set `env.degenerate` and the bookend already
+    /// stamped a marker for it; #1876 moved the incident case off
+    /// `degenerate` and onto `warnings`, and this bookend never learned to
+    /// read the new field — so the flow stream (and everything reading it:
+    /// the viewer, the Redis fleet stream, the hash-chained audit sink)
+    /// recorded a review that silently dropped 11 of 134 flags as a clean
+    /// pass. `result_class` must flip to `"partial"` (matching the
+    /// `"partial"`/`ok_count == results.len()` precedent already used by
+    /// `step_kinds::builtins`'s map-step terminal) and the warning text
+    /// must ride in the payload.
+    #[test]
+    fn with_dispatch_bookends_marks_partial_coverage_on_the_terminal_payload() {
+        let mut emitter = RecordingEmitter::default();
+        let result = with_dispatch_bookends(&mut emitter, "case-1", "test-crew", Some("darkmux:judge-model"), None, json!({}), |em| {
+            em.emit(fake_review_record("step result"));
+            Ok(ReviewEnvelope {
+                warnings: vec!["11 of 134 flags went unjudged on the `judge-pass1` stage".to_string()],
+                ..ReviewEnvelope::default()
+            })
+        });
+        assert!(result.is_ok());
+
+        let terminal = emitter.records.last().unwrap();
+        assert_eq!(terminal.action, "dispatch complete");
+        let payload = terminal.payload.as_ref().unwrap();
+        assert_eq!(
+            payload["result_class"], "partial",
+            "a run with unresolved warnings must not report result_class \"ok\": {payload:?}"
+        );
+        assert_eq!(
+            payload["warnings"][0], "11 of 134 flags went unjudged on the `judge-pass1` stage",
+            "the shortfall reason must ride in the flow record, not just the posted comment: {payload:?}"
+        );
+        // The pre-existing `degenerate` marker is untouched by this case —
+        // this run is NOT degenerate, only partially covered.
+        assert!(payload.get("degenerate").is_none());
+    }
+
     /// The abort/panic path's `on_abort` closure builds its own terminal
     /// record independently of the `Ok`/`Err` match arms above — it needs
     /// its own assertion that `mission_id` survives the `move` closure
@@ -1858,6 +1922,44 @@ mod tests {
         };
         let out = review_result_to_mission_envelope("m-1", &["p-1"], &Ok(env));
         assert_eq!(out.status, crew::envelope::MissionOutcomeStatus::Degenerate);
+    }
+
+    /// (#1876/#1877 QA follow-up) A judge-stage coverage shortfall under
+    /// the DEFAULT (non-strict) policy leaves `env.degenerate` unset but
+    /// pushes a warning into `env.warnings` (`judge_gate_outcome`'s new
+    /// `coverage_warning` field, wired at both call sites in
+    /// `crates/darkmux-lab/src/lab/review.rs`) — exactly so this classifier
+    /// reads it as `Degraded`, not `Clean`. Before that wiring existed, a
+    /// partial-coverage run (real signal, real gap) left BOTH `degenerate`
+    /// and `warnings` empty and read `Clean` here, even though the posted
+    /// PR comment said "Incomplete review — this is not a clean pass" —
+    /// the exact "board and the comment must agree" property this
+    /// function's own doc promises, broken by fixing only the render side.
+    #[test]
+    fn a_partial_coverage_review_is_degraded_not_clean() {
+        let env = ReviewEnvelope {
+            degenerate: None,
+            warnings: vec![
+                "remote judge token budget exhausted — 11 judge call(s) skipped after the \
+                 per-execution allowance (500000 tokens per stage) ran out — the flags that WERE \
+                 judged still render; see the envelope's remote_budgets for the full accounting"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+        let out = review_result_to_mission_envelope("m-1", &["p-1"], &Ok(env));
+        assert_eq!(
+            out.status,
+            crew::envelope::MissionOutcomeStatus::Degraded,
+            "a partial-coverage run must not read Clean on the mission board — `mission launch \
+             review`'s own CLI exit code is unaffected either way (always Ok(0); CI-facing \
+             pass/fail comes from the rendered payload's mode field, per src/cli.rs:552)"
+        );
+        assert!(
+            out.reason.as_deref().unwrap_or_default().contains("remote judge token budget exhausted"),
+            "the WHY is recorded: {:?}",
+            out.reason
+        );
     }
 
     #[test]

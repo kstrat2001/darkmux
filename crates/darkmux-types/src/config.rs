@@ -371,6 +371,20 @@ pub struct ReviewConfig {
     /// chain now that it's being renamed anyway, per `config_access`'s
     /// "every setting resolves in ONE place" contract.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub judge_concurrency: Option<u32>,
+    /// (#1876/#1877) The judge stage's remote-token-budget exhaustion
+    /// policy. `false` (DEFAULT, "partial"): a skipped judge call is a
+    /// COVERAGE fact, not a verdict — the flags that DID get judged still
+    /// render, alongside a loud banner naming the shortfall (never a clean
+    /// pass). `true` ("strict"): restores the pre-#1876 behavior — ANY
+    /// skipped judge call, regardless of how many flags were successfully
+    /// judged, degrades the whole run and discards its findings. An
+    /// operator who genuinely wants "any skip is fatal" sets this; nobody
+    /// else needs to touch it. Named after the incident it fixes: a judge
+    /// that had ruled 123 of 134 flags (7 confirmed, 67 needs-check, both
+    /// complete with evidence) discarded all of it and posted "the review
+    /// produced no signal" because the last 11 calls were skipped when the
+    /// per-execution token bucket ran out.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub judge_fail_on_any_skip: Option<bool>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -569,6 +583,7 @@ impl DarkmuxConfig {
             }),
             review: Some(ReviewConfig {
                 judge_concurrency: Some(1),
+                judge_fail_on_any_skip: Some(false),
                 extras: Default::default(),
             }),
             // (#1698 Packet B2) Written visible with empty (unset) profile
