@@ -221,6 +221,18 @@ use std::time::Instant;
 
 // ─── execution mode ───────────────────────────────────────────────────────
 
+// (#1877, this issue) `ExecMode` and `wave_schedule_to_exec_mode` moved to
+// `darkmux_gestalt::waves` — see their doc comments there for the full
+// argument (deciding sequential-vs-parallel residency cycling is a hardware
+// residency question gestalt already owns; this module used to ask gestalt
+// for a `WaveSchedule` and then re-derive the answer itself). Re-exported
+// under the SAME names so every existing reference in this crate and in
+// `src/mission_launch_review.rs` (the binary crate) keeps resolving
+// unchanged — `pub use` for `ExecMode` since it crosses that crate
+// boundary; a plain `use` for `wave_schedule_to_exec_mode`, which was never
+// `pub` (no caller outside this module ever named it), so this import
+// keeps it at the exact same visibility it had before the move.
+
 /// How probe/judge models are cycled through LMStudio across the review's
 /// dispatches. `Auto` resolves once, up front, to `Sequential` or
 /// `Parallel` (see [`resolve_mode`]) — the resolved choice is what
@@ -234,12 +246,12 @@ use std::time::Instant;
 /// releasing between them (dispatches themselves still run one at a time
 /// through the injected `chat` closure — true concurrent dispatch is a
 /// separate, unaddressed concern).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecMode {
-    Sequential,
-    Parallel,
-    Auto,
-}
+///
+/// (This module's own usage doc — the type itself, `Sequential`/`Parallel`/
+/// `Auto`, now lives in `darkmux_gestalt::waves` since it is genuinely
+/// general, not review-specific; see the `pub use` below.)
+pub use darkmux_gestalt::ExecMode;
+use darkmux_gestalt::wave_schedule_to_exec_mode;
 
 fn mode_label(mode: ExecMode) -> &'static str {
     match mode {
@@ -800,6 +812,42 @@ pub fn review_mission_outcome(env: &ReviewEnvelope) -> RunOutcome {
 // preserves that.
 
 // ─── model cycling ────────────────────────────────────────────────────────
+//
+// (#1877, this issue) `ModelCycler`, `LmsCycler`, and `gather_facts` were
+// candidates to move into `darkmux-gestalt` alongside `ExecMode` above —
+// deciding whether/how a model gets loaded is exactly the residency
+// question gestalt owns. They stay here instead, and this is the honest
+// boundary rather than a forced move:
+//
+// - `gather_facts` takes `&mut LmsHost` and `LmsCycler::ensure_loaded`/
+//   `release` construct one directly — `LmsHost`/`MacProbe` live in
+//   `darkmux_profiles::gestalt_host`, and `darkmux-profiles` already
+//   depends on `darkmux-gestalt` (it implements gestalt's `ModelHost`/
+//   `ResourceProbe` port traits). `darkmux-gestalt` depending back on
+//   `darkmux-profiles` for these would be the exact cycle the #602/#604
+//   port-adapter split exists to prevent — the same shape that already
+//   blocks `resolve_auto_via_waves` below.
+// - `ModelCycler`'s own trait signature (`fn ensure_loaded(&mut self, pm:
+//   &ProfileModel) -> Result<()>`, `Result` = `anyhow::Result`) is the
+//   deeper reason even the TRAIT alone does not move cleanly: every
+//   existing gestalt port trait (`ModelHost`, `ResourceProbe` in
+//   `ports.rs`) deliberately uses gestalt's OWN typed error vocabulary
+//   (`HostError`/`ProbeError`), and `darkmux-gestalt`'s `Cargo.toml` has
+//   no `anyhow` dependency today — that omission is part of the crate's
+//   stated "pure planning core" discipline, not an oversight. Moving
+//   `ModelCycler` as literally written would mean either adding a new
+//   dependency edge to a crate whose own module doc enumerates its
+//   dependency/purity rules (out of scope for a move-only change, and
+//   against this task's own "no new dependencies" constraint), or
+//   retyping it to `HostError`/a new gestalt-native error — a real API
+//   change to every caller, not a move. So `ModelCycler` stays paired
+//   with its one production implementor, `LmsCycler`, which needs the
+//   same host types anyway.
+//
+// None of the three cross a worker-thread boundary that would otherwise
+// impose a `Send`/`Sync` requirement on the trait — `LmsCycler` is used
+// only on the sequential `run_judge_only` path (see `ReviewStepContext`'s
+// doc above: "no `ModelCycler` anywhere in the graph's dispatch path").
 
 /// Load/release one [`ProfileModel`] into/out of LMStudio. Injected so
 /// tests can assert on cycling ORDER via a recording mock without a live
@@ -984,37 +1032,36 @@ fn resolve_seat_max_tokens(s: &ResolvedSeatStaffing, local_default: u32) -> u32 
     }
 }
 
-/// (#1230 Packet 1 cutover) Auto-resolution: `Parallel` iff gestalt's
-/// co-residency wave scheduler ([`darkmux_gestalt::plan_waves`],
-/// `WaveMode::Auto`) packs every distinct LOCAL model (probe seats + judge,
-/// deduped) into ONE wave — i.e. the same arithmetic `plan_acquire`'s
-/// budget/pool-headroom arms use judges them safe to hold resident
-/// together, against REAL facts (a live `MacProbe` pool snapshot, and the
-/// #1243 AI-RAM budget when an operator has configured one). More than one
-/// wave means they don't fit — the same shape `Sequential` always meant,
-/// now DERIVED from live facts instead of a static hardware-tier lookup
-/// table.
-///
-/// Replaces the deleted `resolve_auto` tier table. `darkmux_gestalt::waves`'s
-/// own module doc already claimed the hardware-tier-threshold concept "was
-/// removed end-to-end in #602/#604/#605" — that claim was aspirational until
-/// this function, the review's last holdout, stopped re-deriving one.
-fn wave_schedule_to_exec_mode(schedule: &darkmux_gestalt::WaveSchedule) -> ExecMode {
-    if schedule.waves.len() <= 1 {
-        ExecMode::Parallel
-    } else {
-        ExecMode::Sequential
-    }
-}
+// (#1877, this issue) The old `wave_schedule_to_exec_mode` used to live
+// here: `Parallel` iff gestalt's co-residency wave scheduler
+// ([`darkmux_gestalt::plan_waves`], `WaveMode::Auto`) packs every distinct
+// LOCAL model (probe seats + judge, deduped) into ONE wave — i.e. the same
+// arithmetic `plan_acquire`'s budget/pool-headroom arms use judges them
+// safe to hold resident together, against REAL facts. It moved to
+// `darkmux_gestalt::waves::wave_schedule_to_exec_mode` unchanged (imported
+// above) — this was the pure projection half of the review's last
+// hardware-tier-threshold holdout; `darkmux_gestalt::waves`'s own module
+// doc already claimed that concept "was removed end-to-end in
+// #602/#604/#605," and this move is what makes that claim true rather than
+// aspirational (see that function's doc for the full argument).
 
 /// Gathers real facts and asks gestalt's wave scheduler whether `placements`
 /// fit one wave. Separated from [`wave_schedule_to_exec_mode`] (the pure
-/// projection, directly unit-testable against a scripted `WaveSchedule`) so
+/// projection, now `darkmux_gestalt::waves::wave_schedule_to_exec_mode` —
+/// see its own doc for why it moved and this function did not) so
 /// the I/O — `LmsHost::list_resident` + `MacProbe::pools`, the SAME adapters
 /// [`LmsCycler`] wires — lives in exactly one place. A residency-read
 /// failure degrades to `Sequential` (never guess `Parallel` without knowing
 /// what's already resident) with a loud stderr line, never a silent
 /// downgrade to a riskier mode.
+///
+/// (#1877, this issue) This function itself stays here, unmoved: it opens
+/// its own `LmsHost` and calls [`gather_facts`], both of which need
+/// `darkmux_profiles::gestalt_host` — a crate that already depends on
+/// `darkmux-gestalt` (for the port traits it implements), so `darkmux-
+/// gestalt` depending back on it would be a cycle. Only the pure
+/// wave-count judgment moved; the host-facing glue that gathers the facts
+/// stays with its caller, exactly like [`LmsCycler`]/[`gather_facts`] below.
 fn resolve_auto_via_waves(placements: &[Placement]) -> ExecMode {
     if placements.is_empty() {
         return ExecMode::Parallel;
@@ -1040,6 +1087,22 @@ fn resolve_auto_via_waves(placements: &[Placement]) -> ExecMode {
     }
 }
 
+/// (#1877, this issue) Stays here rather than moving to `darkmux-gestalt`
+/// with the rest of this arc's move — this is the one function of the six
+/// named in the issue that is genuinely review-shaped, not general. Its
+/// signature is `probes: &[ResolvedSeatStaffing], judge: &ResolvedSeatStaffing`:
+/// a specific two-role seat vocabulary (`darkmux_crew::resourcing`'s
+/// review-specific `ResolvedSeatStaffing`, chained as `probes.iter().
+/// chain(once(judge))`) with no general "list of seats" abstraction to
+/// generalize it against yet. Building one now, with a single caller,
+/// would be inventing an abstraction ahead of a second consumer — the same
+/// discipline #1352's StepKind tiering already applies elsewhere in this
+/// codebase. What IS general here — turning a set of local placements into
+/// an `ExecMode` — is exactly [`resolve_auto_via_waves`] and
+/// `darkmux_gestalt::waves::wave_schedule_to_exec_mode`, both already moved
+/// or already gestalt's; this function's own job is purely the review-
+/// specific translation from probe/judge staffing into that generic
+/// `Placement` list.
 fn resolve_mode(mode: ExecMode, probes: &[ResolvedSeatStaffing], judge: &ResolvedSeatStaffing) -> ExecMode {
     match mode {
         ExecMode::Auto => {

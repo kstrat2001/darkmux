@@ -165,6 +165,58 @@ pub struct WaveSchedule {
     pub warnings: Vec<Warning>,
 }
 
+/// How a caller cycles multiple local models through residency across a
+/// sequence of dispatches — `Sequential` (load one, exhaust its work,
+/// release, move on) or `Parallel` (load every distinct model up front,
+/// dispatch each in turn without releasing between them). `Auto` defers the
+/// choice to [`wave_schedule_to_exec_mode`] against a real [`WaveSchedule`].
+///
+/// (#1877, this issue) Moved here, unchanged, from `darkmux_lab::lab::
+/// review` — deciding whether a caller's seats run sequentially or in
+/// parallel is a hardware residency question, the same one [`plan_waves`]
+/// already answers; the review module used to ask this crate for a
+/// [`WaveSchedule`] and then re-derive the answer itself in a private copy.
+/// Re-exported from `review` under this same name so every existing
+/// reference (`review::ExecMode`) keeps resolving unchanged.
+///
+/// Distinct from [`WaveMode`]: `WaveMode` is the INPUT that steers how
+/// [`plan_waves`] packs a schedule (`Auto`/`ForceParallel`/
+/// `ForceSequential`); `ExecMode` is a caller-facing OUTPUT describing how
+/// dispatches should cycle through that schedule's models. The two enums
+/// are related but not interchangeable — `WaveMode::Auto` packs a schedule
+/// from facts, while `ExecMode::Auto` resolves (via
+/// [`wave_schedule_to_exec_mode`]) to `ExecMode::Sequential` or
+/// `ExecMode::Parallel` once that schedule exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecMode {
+    Sequential,
+    Parallel,
+    Auto,
+}
+
+/// Projects a [`WaveSchedule`] onto an [`ExecMode`]: `Parallel` iff every
+/// distinct local model packs into ONE wave (gestalt's co-residency packer
+/// judges them safe to hold resident together against real facts);
+/// `Sequential` when the schedule needed more than one wave, i.e. they don't
+/// fit. Pure projection — no I/O, directly unit-testable against a scripted
+/// `WaveSchedule` with no live LMStudio or `MacProbe` involved.
+///
+/// (#1877, this issue) Moved here, unchanged, from `darkmux_lab::lab::
+/// review::wave_schedule_to_exec_mode` — see [`ExecMode`]'s own doc for why.
+/// The caller-side glue that GATHERS the facts and builds the `WaveSchedule`
+/// (a live `LmsHost`/`MacProbe` read) stays with the caller: this crate's
+/// ports are host-adapter-agnostic by design (`darkmux-profiles::
+/// gestalt_host` implements them, and `darkmux-profiles` already depends on
+/// `darkmux-gestalt` — this crate depending back on a concrete host adapter
+/// would invert that edge into a cycle), so only the pure projection moves.
+pub fn wave_schedule_to_exec_mode(schedule: &WaveSchedule) -> ExecMode {
+    if schedule.waves.len() <= 1 {
+        ExecMode::Parallel
+    } else {
+        ExecMode::Sequential
+    }
+}
+
 /// LOUD whole-schedule refusal of [`WaveMode::ForceParallel`]: the single
 /// wave the operator demanded needs more than the effective limit.
 ///
