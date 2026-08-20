@@ -266,7 +266,17 @@ export function EventLogColumn({
   const q = filters.q.length > 0;
   const qcountText = q
     ? filtered.length
-      ? `${filtered.length} match${filtered.length === 1 ? "" : "es"}${capped ? ` · ${LOG_CAP} shown` : ""}`
+      ? // (#1891) `serverTruncated` applies here too, and for the same
+        // reason the no-search branch below appends it to its own total:
+        // `filtered` is computed over `records`, which is itself a slice of
+        // a server-capped response when `serverTruncated` is true. A search
+        // over that slice can only ever report matches found WITHIN the
+        // slice — matches sitting in the part the server already dropped
+        // are invisible to it. "134 matches" reads as a complete count;
+        // it isn't one. The "+" lands right after the number, same
+        // placement as the no-search branch, so the two chips read as one
+        // consistent convention rather than two different disclosures.
+        `${filtered.length}${serverTruncated ? "+" : ""} match${filtered.length === 1 ? "" : "es"}${capped ? ` · ${LOG_CAP} shown` : ""}`
       : "no match"
     // (operator) "newest 50 of 734" -> "50 of 734". The word carried no
     // information the newest-first ordering does not already show, and this

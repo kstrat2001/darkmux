@@ -2523,6 +2523,60 @@ mod tests {
         drop(guard);
     }
 
+    const MIXED_OUTCOME_CONFIG: &str = r#"{
+        "id": "mixed-outcome-test-mission",
+        "name": "Mixed Outcome Test Mission",
+        "schema_version": "2.3",
+        "phases": [{
+            "id": "p1",
+            "tasks": [
+                {"id": "t-ok", "steps": [{"id": "ok-step", "kind": "procedural.shell", "config": {"command": "true"}}]},
+                {"id": "t-fail", "steps": [{"id": "fail-step", "kind": "procedural.shell", "config": {"command": "exit 1"}}]}
+            ]
+        }]
+    }"#;
+
+    /// (#1893) The generic gate-less launch path's exit code for
+    /// `MissionOutcomeStatus::Degraded` is unpinned: `Clean` and `Error`
+    /// both have coverage (this file's gh-verb tests drive `Error` to exit
+    /// 1 already), but nothing drives `launch()` with a config that mixes a
+    /// completed step and an errored one in the same run — the shape
+    /// `build_envelope` maps to `Degraded`, and the shape every
+    /// operator-authored `gh_verb` panel config (`pr-list`, `pr-info`,
+    /// `pr-approve`, `pr-merge`) actually produces on a partial run. Two
+    /// independent, ungated tasks in one phase — one succeeds, one fails —
+    /// so the scheduler runs both to completion regardless of the other's
+    /// outcome.
+    ///
+    /// Mutating the `Degraded` arm from `=> 0` to `=> 1` in `mission_launch`'s
+    /// exit-code match must fail this test.
+    #[test]
+    #[serial_test::serial]
+    fn launch_a_mixed_complete_and_errored_generic_run_exits_zero_for_degraded() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("mixed-outcome-test-mission", MIXED_OUTCOME_CONFIG);
+
+        let exit = launch("mixed-outcome-test-mission", None, &[], None)
+            .expect("a mixed complete/errored generic run must still return an exit code, not an Err");
+        assert_eq!(
+            exit, 0,
+            "MissionOutcomeStatus::Degraded (some steps completed, some errored) must exit 0 — \
+             a partially-constrained run is not a failed one"
+        );
+
+        let mission_id = single_mission_id();
+        let envelope = crew::lifecycle::load_envelope(&mission_id)
+            .expect("envelope must be readable")
+            .expect("a finalized generic mission must have written an envelope");
+        assert_eq!(
+            envelope.status,
+            crew::envelope::MissionOutcomeStatus::Degraded,
+            "sanity: this config's shape (one completed step + one errored step) must actually \
+             produce Degraded, or this test isn't exercising the arm it claims to"
+        );
+        drop(guard);
+    }
+
     // ── Generic launch path — freeform (no dispatch, no Docker) ────────
 
     /// All mission ids currently minted under the test's isolated crew root
