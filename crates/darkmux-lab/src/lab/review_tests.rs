@@ -2040,6 +2040,15 @@
             "the budget skip must also land a coverage warning, not just the remote_budgets row: {:?}",
             env.warnings
         );
+        // (#1888) Pins the Gate 1 non-strict `coverage_warning`'s allowance
+        // figure against this fixture's real `remote_max_tokens_per_execution`
+        // (100) — a mutation that swaps the interpolated value for a stray
+        // literal must fail here.
+        assert!(
+            env.warnings.iter().any(|w| w.contains("(100 tokens per stage)")),
+            "the coverage warning's allowance must be the fixture's real remote_max_tokens_per_execution: {:?}",
+            env.warnings
+        );
 
         // `review_outcome` (the render-facing predicate) reads this
         // envelope as Partial, naming the real skip/total numbers.
@@ -2049,6 +2058,13 @@
                 assert_eq!(reasons.len(), 1);
                 assert!(reasons[0].contains("1 of 3 flags went unjudged"), "got: {}", reasons[0]);
                 assert!(reasons[0].contains("judge-pass1"), "got: {}", reasons[0]);
+                // (#1888) Same fixture, the OTHER site: `judge_budget_shortfall_reason`'s
+                // allowance figure, pinned against the row's own max_tokens (100).
+                assert!(
+                    reasons[0].contains("100-token allowance"),
+                    "the banner's allowance must be the row's own max_tokens, not a stray literal: {}",
+                    reasons[0]
+                );
             }
             other => panic!("expected Partial, got {other:?}"),
         }
@@ -6394,6 +6410,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             "the exhaustion warning must reach env.warnings: {:?}",
             env.warnings
         );
+        // (#1888 same class, verify stage) The allowance figure is the
+        // real budget passed to `step_ctx_with_chat_and_budget` (100), never
+        // a stray literal.
+        assert!(
+            env.warnings.iter().any(|w| w.contains("allowance of 100 tokens ran out")),
+            "the verify budget warning's allowance must be the real budget passed in: {:?}",
+            env.warnings
+        );
         assert!(
             env.remote_budgets.iter().any(|r| r.stage == "verify"),
             "the verify budget row must reach env.remote_budgets: {:?}",
@@ -7165,6 +7189,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert!(
             recon.warnings.iter().any(|w| w.contains("remote probe token budget exhausted — 1 draw(s) skipped")),
             "exhaustion named: {:?}",
+            recon.warnings
+        );
+        // (#1888 same class, probe stage) The allowance figure is the
+        // caller's real budget (120), never a stray literal.
+        assert!(
+            recon.warnings.iter().any(|w| w.contains("(120 tokens)")),
+            "the probe budget warning's allowance must be the real budget passed in: {:?}",
             recon.warnings
         );
         assert!(recon.all_draws_failed.is_none(), "real signal landed — not the all-failed case");
@@ -8033,6 +8064,14 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 assert!(reasons[0].contains("11 of 134 flags went unjudged"), "got: {}", reasons[0]);
                 assert!(reasons[0].contains("judge-pass1"), "got: {}", reasons[0]);
                 assert!(reasons[0].contains("500497"), "the used-token count is the row's own number: {}", reasons[0]);
+                // (#1888) The allowance figure is the row's own `max_tokens`,
+                // never a stray constant — a mutation that swaps `r.max_tokens`
+                // for a hardcoded literal in the format args must fail here.
+                assert!(
+                    reasons[0].contains("500000-token allowance"),
+                    "the allowance is the row's own max_tokens, not a stray literal: {}",
+                    reasons[0]
+                );
             }
             other => panic!("expected Partial, got {other:?}"),
         }
@@ -8107,6 +8146,13 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
                 );
                 assert!(reasons[0].contains("judge-pass2"), "got: {}", reasons[0]);
                 assert!(reasons[0].contains("500210"), "the used-token count is the row's own number: {}", reasons[0]);
+                // (#1888) Pins the pass-2 arm's allowance figure too — the
+                // same `r.max_tokens` interpolation the pass-1 arm uses.
+                assert!(
+                    reasons[0].contains("500000-token allowance"),
+                    "the allowance is the row's own max_tokens, not a stray literal: {}",
+                    reasons[0]
+                );
                 assert!(
                     !reasons[0].contains("went unjudged"),
                     "a pass-2 skip (already judged, only demoted) must not read like a pass-1 \

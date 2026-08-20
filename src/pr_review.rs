@@ -2389,6 +2389,9 @@ mod tests {
         let body = review["body"].as_str().unwrap();
         assert!(body.contains("Incomplete review"), "the banner is present: {body}");
         assert!(body.contains("11 of 134 flags went unjudged"), "banner names the envelope's real numbers: {body}");
+        // (#1888) The allowance figure is the envelope's own remote_budgets
+        // row (max_tokens: 500_000), never a stray literal.
+        assert!(body.contains("500000-token allowance"), "banner names the envelope's own allowance: {body}");
         assert!(body.contains("confirmed note 0"), "confirmed findings still render: {body}");
         assert!(body.contains("7 confirmed"), "the verdict line still counts confirmed findings: {body}");
         assert!(
@@ -2428,6 +2431,9 @@ mod tests {
         let body = review["body"].as_str().unwrap();
         assert!(body.contains("4 of 9 flags went unjudged"), "{body}");
         assert!(!body.contains("11 of 134"), "must not accidentally carry another fixture's numbers: {body}");
+        // (#1888) This fixture's own allowance (1_000), distinct from the
+        // 500_000 fixture above — pins that the number tracks THIS row.
+        assert!(body.contains("1000-token allowance"), "banner names this fixture's own allowance: {body}");
     }
 
     /// (#1876/#1877 QA follow-up) The zero-confirmed side of `partial` —
@@ -2459,6 +2465,8 @@ mod tests {
         let comment = r.comment.expect("the comment-shape payload is still built");
         assert!(comment.contains("Incomplete review"), "the banner renders in comment mode too: {comment}");
         assert!(comment.contains("2 of 5 flags went unjudged"), "{comment}");
+        // (#1888) Same allowance-pinning discipline in the comment-shape path.
+        assert!(comment.contains("1000-token allowance"), "comment names this fixture's own allowance: {comment}");
         assert!(comment.contains("needs-check note 0"), "the needs-check findings still render: {comment}");
     }
 
