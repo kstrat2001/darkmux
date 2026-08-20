@@ -132,6 +132,17 @@ use serde::{Deserialize, Serialize};
 /// optional field: an older reader degrades the unrecognized value to its
 /// own `Unknown` rather than failing the whole document.
 ///
+/// **This is additive for the PARSE, not for the VERDICT (#1881, QA-caught).**
+/// The first time a real fifth `MissionOutcomeStatus` variant ships, every
+/// OLDER binary still running in the fleet renders every run carrying it as
+/// amber `RunStatus::Unparseable` and raises a `darkmux doctor` warning —
+/// on purpose, the honest degradation this whole fix exists to produce, but
+/// worth knowing up front: adding a variant is safe to DO without breaking
+/// an older reader's parse, but it is NOT free of fleet-wide operator-
+/// visible effect until every machine has upgraded. A future variant-adder
+/// reading only the "safely additive" sentence above should expect that
+/// surprise, not be blindsided by it.
+///
 /// **What stayed true from 1.1, unaffected by this bump:** a document that
 /// fails to parse for a reason NEITHER catch-all can rescue (malformed
 /// JSON, a required field missing or of the wrong type, `outcome` present
@@ -187,22 +198,36 @@ impl MissionOutcomeStatus {
     ///   see `darkmux_lab::lab::review::review_mission_outcome`'s doc.
     /// - [`RunOutcome::Empty`] -> `Degenerate` — no usable signal, the
     ///   "worth retrying" gate.
-    /// - [`RunOutcome::Unknown`] -> `Degraded` (#1881). Unreachable from any
-    ///   real driver today — every caller of `from_outcome` passes a
-    ///   freshly-computed `RunOutcome` it just built, never one round-tripped
-    ///   through deserialize first, and `Unknown` only ever arises from
-    ///   deserializing (see `run_outcome.rs`). Kept exhaustive (not a
-    ///   wildcard) so a future caller that DOES round-trip an outcome
-    ///   through this function gets a deliberate, conservative answer
-    ///   rather than an accidental one: `Degraded`, the same "some real
-    ///   signal, treat with caution" bucket `Partial` uses, rather than
-    ///   assuming either a clean pass or a hard failure it can't back up.
+    /// - [`RunOutcome::Unknown`] -> `Unknown` (#1881, corrected — an earlier
+    ///   version of this mapping used `Degraded` here, reasoned as
+    ///   "conservative." It was the opposite: `Degraded` is the bucket
+    ///   `mission_run_status` (`crates/darkmux-serve/src/runs.rs`) and
+    ///   `mission_launch.rs`'s exit-code match both read as a PASS
+    ///   (`RunStatus::Complete`, exit code zero), and it directly
+    ///   contradicted [`Self::phase_outcome`]'s OWN `Unknown` arm ten lines
+    ///   below, which deliberately chose `Abandoned` because "a status we
+    ///   can't interpret must never be assumed to have completed." Routing
+    ///   through `Degraded` laundered an unrecognized outcome into that
+    ///   assumption before `phase_outcome` ever got a chance to apply its
+    ///   own safety — so the Abandoned guard never actually fired. Mapping
+    ///   to `Unknown` instead keeps every downstream consumer consistent —
+    ///   `phase_outcome` abandons, `mission_run_status` reports
+    ///   `RunStatus::Unparseable`, and `mission_launch.rs`'s exit-code match
+    ///   fails loudly — rather than any of them silently passing.
+    ///   Unreachable from any real driver today either way: every caller of
+    ///   `from_outcome` passes a freshly-computed `RunOutcome` it just
+    ///   built, never one round-tripped through deserialize first, and
+    ///   `Unknown` only ever arises from deserializing (see
+    ///   `run_outcome.rs`) — but exhaustive (not a wildcard) so a future
+    ///   caller that DOES round-trip an outcome through this function gets
+    ///   the same honest "I don't know" every other unrecognized-value path
+    ///   in this fix gets, not an accidental pass.
     pub fn from_outcome(outcome: &RunOutcome) -> Self {
         match outcome {
             RunOutcome::Complete => MissionOutcomeStatus::Clean,
             RunOutcome::Partial { .. } => MissionOutcomeStatus::Degraded,
             RunOutcome::Empty { .. } => MissionOutcomeStatus::Degenerate,
-            RunOutcome::Unknown => MissionOutcomeStatus::Degraded,
+            RunOutcome::Unknown => MissionOutcomeStatus::Unknown,
         }
     }
 
@@ -784,6 +809,27 @@ mod tests {
         assert_eq!(
             MissionOutcomeStatus::from_outcome(&RunOutcome::Empty { reason: "y".to_string() }),
             MissionOutcomeStatus::Degenerate
+        );
+    }
+
+    /// (#1881, QA-caught) `RunOutcome::Unknown` must map to
+    /// `MissionOutcomeStatus::Unknown`, not `Degraded` — an earlier version
+    /// of this mapping used `Degraded`, which `mission_run_status` and
+    /// `mission_launch.rs`'s exit-code match both read as a PASS, directly
+    /// contradicting `phase_outcome`'s own `Unknown -> Abandoned` safety
+    /// choice a few lines below (see `from_outcome`'s doc for the full
+    /// story). This is the ONE place that inconsistency could have entered
+    /// the system — `phase_outcome`/`mission_run_status` are read straight
+    /// off whatever `from_outcome` decided, never re-derived — so pinning
+    /// this mapping directly is what keeps the whole chain honest.
+    #[test]
+    fn from_outcome_maps_unknown_to_unknown_not_degraded() {
+        assert_eq!(MissionOutcomeStatus::from_outcome(&RunOutcome::Unknown), MissionOutcomeStatus::Unknown);
+        // And the consequence that matters: routed through `phase_outcome`,
+        // an unrecognized outcome must abandon, never complete.
+        assert_eq!(
+            MissionOutcomeStatus::from_outcome(&RunOutcome::Unknown).phase_outcome(),
+            PhaseOutcomeKind::Abandoned
         );
     }
 

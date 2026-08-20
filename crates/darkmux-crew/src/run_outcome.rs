@@ -73,6 +73,19 @@
 //! `outcome` therefore still renders per that known status, honestly —
 //! see `MissionOutcomeStatus`'s own forward-compat note in `envelope.rs`
 //! for the field `RunStatus` DOES read leniently.
+//!
+//! **Load-then-save hazard, not yet reachable (#1881, QA-caught).** Because
+//! `Unknown` re-serializes as `{"state":"unknown"}` (the ordinary
+//! `Serialize` derive, unaware anything was discarded on read), a future
+//! code path that LOADS an envelope and then SAVES it back out — a
+//! `mission migrate`-style rewrite, a round-trip through an editing tool —
+//! would silently overwrite a newer machine's real (if unrecognized) value
+//! with this binary's own ignorance of it, permanently losing the original
+//! `state`. No such path exists today: `finalize_mission`
+//! (`crates/darkmux-crew/src/envelope.rs`) is the only `save_envelope`
+//! caller, and every one of its callers hands it a freshly-built
+//! `MissionEnvelope`, never a loaded one. Worth writing down before that
+//! stops being true, rather than after.
 
 use serde::{Deserialize, Serialize};
 

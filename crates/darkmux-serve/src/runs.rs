@@ -773,6 +773,22 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) 
             // binary could NOT read as a completed, green run. This arm is
             // the fix: a genuine parse failure gets its own honest state
             // instead of the happiest available guess.
+            //
+            // (#1881, QA-considered) The error itself is discarded here on
+            // purpose, not by oversight: `build_runs` calls this per
+            // mission on EVERY `/runs` poll, so an unconditional
+            // `eprintln!` here would spam the daemon's stderr once per
+            // request for as long as a broken envelope sits on disk — the
+            // exact kind of unbounded, unstructured noise this project's
+            // observability doctrine argues against. The breadcrumb lives
+            // in `darkmux doctor`'s "mission envelope readability" check
+            // instead (below in this crate's sibling
+            // `crates/darkmux-doctor/src/lib.rs`): on-demand, names the
+            // mission id AND the parse error, and is exactly where an
+            // operator investigating an amber dashboard row is already
+            // pointed. A future rate-limited or once-per-mission log line
+            // here would be a genuine improvement, not ruled out — it just
+            // isn't the cheap fix an unconditional `eprintln!` would be.
             Err(_) => RunStatus::Unparseable,
             // No envelope at all — a pre-#1284 mint, or a mint that never
             // reached finalization's write. Genuinely no data, not a parse
@@ -1840,6 +1856,17 @@ mod tests {
     /// `#[serde(other)]` catch-all so the envelope parses, but an unknown
     /// `status` is precisely the case this binary cannot honestly report a
     /// verdict for — it must still never render as `Complete`.
+    ///
+    /// (#1881, QA-caught) This test used to be mutation-transparent w.r.t.
+    /// the `#[serde(other)]` leniency: with `MissionOutcomeStatus`'s
+    /// catch-all removed, this SAME fixture fails to deserialize entirely
+    /// (`Err`), which the `Err(_) => Unparseable` arm ALSO resolves to
+    /// `RunStatus::Unparseable` — so the final assertion couldn't tell the
+    /// leniency path from the hard-parse-failure path its sibling test
+    /// (`mission_run_status_finalized_envelope_that_fails_to_parse_is_not_complete`)
+    /// already covers. The `load_envelope` call below (matching the
+    /// doctor-side test's own guard) pins that this fixture really does
+    /// parse successfully with `status: Unknown`, not `Err`.
     #[test]
     #[serial_test::serial]
     fn mission_run_status_finalized_unknown_status_variant_is_not_complete() {
@@ -1855,6 +1882,14 @@ mod tests {
             r#"{"mission_id":"m10","schema_version":"1.1","status":"throttled","phases":[]}"#,
         )
         .unwrap();
+
+        let loaded = darkmux_crew::lifecycle::load_envelope("m10");
+        match &loaded {
+            Ok(Some(envelope)) => {
+                assert_eq!(envelope.status, MissionOutcomeStatus::Unknown, "fixture must parse leniently to Unknown status, not some other value")
+            }
+            other => panic!("fixture must exercise the #[serde(other)] leniency path (Ok(Some(_)) with status Unknown), got {other:?}"),
+        }
 
         let status = mission_run_status(&m, &[], now_unix() * 1_000);
         assert_ne!(status, RunStatus::Complete, "an unrecognized status value must never read as a completed, green run");

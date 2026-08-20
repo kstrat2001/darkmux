@@ -75,6 +75,19 @@ describe("RunsBoard", () => {
     expect(rows).toEqual(["m1", "d1", "l1"]); // updated_ts 300 > 200 > 100
   });
 
+  /** (#1881, QA-caught) `RunStatus` gained a sixth value (`unparseable`,
+   *  for an envelope this binary couldn't resolve a verdict for) and
+   *  nothing in this file exercised it — the badge path is fully generic
+   *  (`labbadge ${run.status}`), so the risk was low, but the styling was
+   *  asserted by nothing. */
+  it("renders the unparseable status badge with its own class and text", async () => {
+    mockFetch(true, true, {}, [{ id: "m-broken", kind: "mission", status: "unparseable", tracked: true, updated_ts: 400 }]);
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("m-broken")).toBeInTheDocument());
+    const badge = screen.getByText("unparseable");
+    expect(badge).toHaveClass("labbadge", "unparseable");
+  });
+
   it("shows the kind counts in the filter bar", async () => {
     mockFetch();
     const { container } = renderBoard();
