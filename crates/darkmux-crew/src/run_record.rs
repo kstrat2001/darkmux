@@ -481,6 +481,102 @@ mod tests {
         }
     }
 
+    /// A remote `ProfileModel` whose declared endpoint URL is `url` —
+    /// used by the #1887 credential-strip tests below.
+    fn remote_pm(url: &str) -> ProfileModel {
+        ProfileModel {
+            id: "endpoint-model".to_string(),
+            endpoint: Some(ModelEndpoint { url: Some(url.to_string()), ..Default::default() }),
+            ..Default::default()
+        }
+    }
+
+    /// Same as [`staffing`] but staffed on a remote seat whose endpoint URL
+    /// carries userinfo — used by the #1887 snapshot-level test.
+    fn staffing_remote(name: &str, url: &str) -> ResolvedSeatStaffing {
+        ResolvedSeatStaffing {
+            name: name.to_string(),
+            role_id: Some(format!("review-{name}")),
+            pm: remote_pm(url),
+            k: 1,
+            passes: 2,
+            max_tokens: None,
+            selector: None,
+            provenance: None,
+        }
+    }
+
+    // ─── #1887: seat_endpoint_host must never leak URL userinfo ──────────
+
+    /// `https://tok@proxy.example.com/v1` — the bare-token proxy form
+    /// (LiteLLM and similar proxies document this). The strip must drop
+    /// BOTH the `@` delimiter and the token text itself, not just produce
+    /// *some* string that happens to equal the expected host — a future
+    /// change that returns a different credential-bearing form (e.g.
+    /// leaves the token but drops only the `@`) must still fail this.
+    /// **Proved failing first**: reverting `seat_endpoint_host` to
+    /// `Some(authority.to_string())` (the exact regression #1887
+    /// describes, and the literal diff issue #1887 names) made this test
+    /// fail on the `!host.contains("tok")` assertion — restored before
+    /// committing.
+    #[test]
+    fn seat_endpoint_host_strips_token_userinfo_form() {
+        let pm = remote_pm("https://tok@proxy.example.com/v1");
+        let host = seat_endpoint_host(&pm).expect("a remote pm always yields a host");
+        assert_eq!(host, "proxy.example.com");
+        assert!(!host.contains('@'), "no userinfo delimiter may survive: {host:?}");
+        assert!(!host.contains("tok"), "the token itself must not survive: {host:?}");
+    }
+
+    /// `https://user:pass@host/v1` — the other documented proxy shape
+    /// (basic-auth-style userinfo). Same absence discipline as the
+    /// token-only case above.
+    #[test]
+    fn seat_endpoint_host_strips_user_pass_userinfo_form() {
+        let pm = remote_pm("https://user:pass@proxy.example.com/v1");
+        let host = seat_endpoint_host(&pm).expect("a remote pm always yields a host");
+        assert_eq!(host, "proxy.example.com");
+        assert!(!host.contains('@'), "no userinfo delimiter may survive: {host:?}");
+        assert!(!host.contains("user"), "the username must not survive: {host:?}");
+        assert!(!host.contains("pass"), "the password must not survive: {host:?}");
+    }
+
+    /// A bare host with no userinfo at all is unchanged by the strip — the
+    /// overwhelmingly common case, and the one every existing fixture in
+    /// the tree already exercises indirectly. Pinned directly here so the
+    /// no-`@` fast path stays proven alongside the two stripping cases.
+    #[test]
+    fn seat_endpoint_host_bare_host_is_unchanged() {
+        let pm = remote_pm("https://proxy.example.com/v1");
+        let host = seat_endpoint_host(&pm).expect("a remote pm always yields a host");
+        assert_eq!(host, "proxy.example.com");
+    }
+
+    /// (#1887) `staffing_snapshot`'s `one()` closure stamps
+    /// `SeatStaffingSnapshot.endpoint` by calling `seat_endpoint_host`
+    /// directly (see this file's `staffing_snapshot`, `endpoint:
+    /// seat_endpoint_host(&s.pm)`) — the same helper the three tests above
+    /// pin. Since both producers (`MemberRecord.endpoint` elsewhere in the
+    /// crew dispatch path, and this snapshot) route through the one
+    /// function, one test here confirming the strip survives all the way
+    /// through to the serialized envelope is enough coverage for the
+    /// sibling producer; it is not a second, independent code path that
+    /// needs its own full case matrix.
+    #[test]
+    fn staffing_snapshot_strips_endpoint_userinfo_too() {
+        let judge = staffing_remote("review-judge", "https://tok@proxy.example.com/v1");
+
+        let snap = staffing_snapshot(&[], &judge, None, false);
+
+        let value = serde_json::to_value(&snap).unwrap();
+        let endpoint = value["judge"]["endpoint"]
+            .as_str()
+            .expect("a remote judge seat's snapshot must carry an endpoint host");
+        assert_eq!(endpoint, "proxy.example.com");
+        assert!(!endpoint.contains('@'), "no userinfo delimiter may survive: {endpoint:?}");
+        assert!(!endpoint.contains("tok"), "the token itself must not survive: {endpoint:?}");
+    }
+
     /// [`staffing_snapshot`] end to end: two probe seats + a judge + no
     /// verify seat, asserting the full JSON shape — including that
     /// `verify` and `request_changes` (false) are both absent, per their
