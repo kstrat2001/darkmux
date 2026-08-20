@@ -633,7 +633,12 @@ pub fn synthesize_review(env: &ReviewEnvelope, diff: &str, attribution: Option<&
     // `render_partial_coverage_banner`.
     let partial_reasons: Vec<String> = match outcome {
         RunOutcome::Partial { reasons } => reasons,
-        RunOutcome::Complete | RunOutcome::Empty { .. } => Vec::new(),
+        // (#1881) `outcome` here is `review_outcome`'s OWN freshly-computed
+        // value, never a deserialized one, so `Unknown` (a
+        // deserialize-only forward-compat fallback) is unreachable in
+        // practice — kept exhaustive rather than a wildcard for the same
+        // reason as `mission_launch.rs`'s exit-code match.
+        RunOutcome::Complete | RunOutcome::Empty { .. } | RunOutcome::Unknown => Vec::new(),
     };
     let partial = !partial_reasons.is_empty();
 

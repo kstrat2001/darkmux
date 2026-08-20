@@ -115,6 +115,18 @@ pub(crate) enum RunStatus {
     Complete,
     Error,
     Abandoned,
+    /// (#1881) This binary could not determine the run's real outcome —
+    /// either its `envelope.json` failed to deserialize at all (a newer
+    /// darkmux wrote a shape this reader's `MissionEnvelope`/`RunOutcome`
+    /// don't recognize and doesn't yet have `#[serde(other)]` cover for),
+    /// or it parsed but reported a `status` value this reader's
+    /// `MissionOutcomeStatus` doesn't recognize. Deliberately distinct from
+    /// every other value here: `Complete`/`Error`/`Abandoned` are all
+    /// verdicts this binary is CONFIDENT in; `Unparseable` is the honest
+    /// "I don't know" a viewer must never fold into a green run. See
+    /// `mission_run_status`'s `MissionStatus::Finalized` arm for where this
+    /// is decided.
+    Unparseable,
 }
 
 /// One row of the `/runs` view-model. Lenient-on-read WIRE shape (every
@@ -748,27 +760,60 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) 
         // envelope the run had written before it died, so reading it would let
         // a killed run inherit a success verdict it never earned.
         MissionStatus::Aborted => RunStatus::Abandoned,
-        MissionStatus::Finalized => {
-            let envelope = darkmux_crew::lifecycle::load_envelope(&mission.id)
-                .ok()
-                .flatten();
-            // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
-            // `RunOutcome::Partial` is NOT read here. `RunStatus` has no
-            // partial-coverage value among its states
-            // (`Planned`/`Running`/`Complete`/`Abandoned`/`Error`), and
-            // `status` already collapses
-            // `Partial` into `Degraded` before this match ever runs
-            // (`MissionOutcomeStatus::from_outcome`), so a Partial review's
-            // `Degraded` status falls into the `_ => Complete` arm below —
-            // same as it did before #1877, when Degraded was purely
-            // convention. Widening `RunStatus` to distinguish "complete" from
-            // "complete but constrained" is a real, separate feature (a
-            // dashboard-visible partial badge) this PR does not add.
-            match envelope.map(|e| e.status) {
-                Some(MissionOutcomeStatus::Error) | Some(MissionOutcomeStatus::Degenerate) => RunStatus::Error,
-                _ => RunStatus::Complete,
+        MissionStatus::Finalized => match darkmux_crew::lifecycle::load_envelope(&mission.id) {
+            // (#1881) `load_envelope` failed to deserialize `envelope.json`
+            // — a newer darkmux wrote a `status`/`outcome` shape this
+            // reader's `MissionEnvelope` doesn't recognize (the fleet's
+            // deliberately heterogeneous machines: laptop on a
+            // `cargo install`ed main, Studio on brew/stable — CLAUDE.md's
+            // "cross-system contracts" section). The PREVIOUS version of
+            // this match read the envelope with `.ok().flatten()`, which
+            // discarded this exact `Err` and fell through to the `_ =>
+            // Complete` arm below — silently rendering a record this
+            // binary could NOT read as a completed, green run. This arm is
+            // the fix: a genuine parse failure gets its own honest state
+            // instead of the happiest available guess.
+            Err(_) => RunStatus::Unparseable,
+            // No envelope at all — a pre-#1284 mint, or a mint that never
+            // reached finalization's write. Genuinely no data, not a parse
+            // failure; degrades to `Complete` rather than guessing —
+            // unchanged by #1881, which is about records that EXIST but
+            // can't be read, not records that were never written.
+            Ok(None) => RunStatus::Complete,
+            Ok(Some(envelope)) => {
+                // (#1877 item 4 — stated decision) `envelope.outcome`'s typed
+                // `RunOutcome::Partial` is NOT read here. `RunStatus` has no
+                // partial-coverage value among its states
+                // (`Planned`/`Running`/`Complete`/`Abandoned`/`Error`/
+                // `Unparseable`), and `status` already collapses
+                // `Partial` into `Degraded` before this match ever runs
+                // (`MissionOutcomeStatus::from_outcome`), so a Partial review's
+                // `Degraded` status falls into the `Clean | Degraded => Complete`
+                // arm below — same as it did before #1877, when Degraded was
+                // purely convention. Widening `RunStatus` to distinguish
+                // "complete" from "complete but constrained" is a real,
+                // separate feature (a dashboard-visible partial badge) this
+                // PR does not add.
+                //
+                // (#1881) `outcome`'s own leniency (`RunOutcome::Unknown`,
+                // `run_outcome.rs`) is likewise not read here — unaffected
+                // by this fix, same reasoning as the paragraph above. What
+                // #1881 DOES change: `envelope.status` itself can now be
+                // `MissionOutcomeStatus::Unknown` (a status value this
+                // binary doesn't recognize, degraded via `#[serde(other)]`
+                // rather than failing the whole parse) — and unlike
+                // `outcome`, `status` IS what this match reads. An unknown
+                // status is exactly the "this binary cannot tell you what
+                // happened" case `Unparseable` exists for, so it gets its
+                // own arm rather than falling into the `Clean | Degraded`
+                // wildcard the way a genuinely-known Degraded/Clean does.
+                match envelope.status {
+                    MissionOutcomeStatus::Error | MissionOutcomeStatus::Degenerate => RunStatus::Error,
+                    MissionOutcomeStatus::Unknown => RunStatus::Unparseable,
+                    MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => RunStatus::Complete,
+                }
             }
-        }
+        },
     }
 }
 
@@ -1755,6 +1800,104 @@ mod tests {
         assert_eq!(partial_env.status, MissionOutcomeStatus::Degraded);
         darkmux_crew::envelope::finalize_mission(&partial_env);
         assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Complete);
+    }
+
+    /// (#1881 RED proof) `envelope.json` exists but is not valid JSON at
+    /// all — no leniency, of any kind, can rescue this. Written directly to
+    /// disk (bypassing `save_envelope`/`finalize_mission`, which can only
+    /// ever write something `MissionEnvelope` itself can parse) to simulate
+    /// exactly the scenario the issue names: a NEWER darkmux wrote a record
+    /// this OLDER binary's `serde_json::from_str::<MissionEnvelope>` chokes
+    /// on. Before the fix, `mission_run_status`'s `.ok().flatten()` +
+    /// `_ => RunStatus::Complete` fallback silently renders this as a
+    /// completed, green run — this test's ORIGINAL run (pre-fix) observed
+    /// exactly that: `assert_eq!(.., RunStatus::Complete)` passed, which is
+    /// the bug, not a spec. Fixed: a parse failure gets its own status.
+    #[test]
+    #[serial_test::serial]
+    fn mission_run_status_finalized_envelope_that_fails_to_parse_is_not_complete() {
+        let _g = CrewGuard::new();
+        darkmux_crew::lifecycle::save_mission(&minimal_mission("m9", vec![], None)).unwrap();
+        let mut m = minimal_mission("m9", vec![], None);
+        m.status = MissionStatus::Finalized;
+
+        let path = darkmux_crew::lifecycle::envelope_path("m9");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not valid json at all").unwrap();
+
+        let status = mission_run_status(&m, &[], now_unix() * 1_000);
+        assert_ne!(status, RunStatus::Complete, "a genuinely unparseable envelope must never read as a completed, green run");
+        assert_eq!(status, RunStatus::Unparseable);
+    }
+
+    /// (#1881) The issue's own probe, reproduced: a `status` value this
+    /// binary's `MissionOutcomeStatus` doesn't recognize (`"throttled"`).
+    /// Before ANY fix this fails the WHOLE envelope parse (verified in
+    /// `crates/darkmux-crew/src/envelope.rs`'s own
+    /// `an_unrecognized_status_degrades_to_unknown_and_the_rest_of_the_document_still_parses`
+    /// test), and the old `.ok().flatten()` fallback rendered that as
+    /// `Complete`. After the fix, `MissionOutcomeStatus` gains a
+    /// `#[serde(other)]` catch-all so the envelope parses, but an unknown
+    /// `status` is precisely the case this binary cannot honestly report a
+    /// verdict for — it must still never render as `Complete`.
+    #[test]
+    #[serial_test::serial]
+    fn mission_run_status_finalized_unknown_status_variant_is_not_complete() {
+        let _g = CrewGuard::new();
+        darkmux_crew::lifecycle::save_mission(&minimal_mission("m10", vec![], None)).unwrap();
+        let mut m = minimal_mission("m10", vec![], None);
+        m.status = MissionStatus::Finalized;
+
+        let path = darkmux_crew::lifecycle::envelope_path("m10");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"mission_id":"m10","schema_version":"1.1","status":"throttled","phases":[]}"#,
+        )
+        .unwrap();
+
+        let status = mission_run_status(&m, &[], now_unix() * 1_000);
+        assert_ne!(status, RunStatus::Complete, "an unrecognized status value must never read as a completed, green run");
+        assert_eq!(status, RunStatus::Unparseable);
+    }
+
+    /// (#1881) A `RunOutcome` variant this binary doesn't recognize
+    /// (`outcome.state: "throttled"`), paired with a KNOWN, valid `status`.
+    /// Once `RunOutcome` gains its own `#[serde(other)]` catch-all, this
+    /// envelope parses cleanly — `outcome` is a supplementary, typed detail
+    /// `mission_run_status` has never read (#1877 item 4, unchanged by this
+    /// fix); the `status` field alone is authoritative. So this is the one
+    /// case in the whole issue where the honest answer is NOT
+    /// `Unparseable`: the binary genuinely does understand this run's
+    /// outcome (`status: "degraded"`, a known value that already collapses
+    /// into `Complete`, same as before #1877) even though it can't name
+    /// the docket-coverage DETAIL. Rendering this as `Complete` is correct,
+    /// not a regression of the bug this issue is about — see
+    /// `crates/darkmux-crew/src/envelope.rs`'s leniency test for the proof
+    /// that the REST of the document (status, mission_id, phases) survives
+    /// intact when `outcome` alone is unrecognized.
+    #[test]
+    #[serial_test::serial]
+    fn mission_run_status_finalized_unknown_outcome_variant_with_known_status_still_reads_that_status() {
+        let _g = CrewGuard::new();
+        darkmux_crew::lifecycle::save_mission(&minimal_mission("m11", vec![], None)).unwrap();
+        let mut m = minimal_mission("m11", vec![], None);
+        m.status = MissionStatus::Finalized;
+
+        let path = darkmux_crew::lifecycle::envelope_path("m11");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"mission_id":"m11","schema_version":"1.2","status":"degraded","outcome":{"state":"throttled"},"phases":[]}"#,
+        )
+        .unwrap();
+
+        let status = mission_run_status(&m, &[], now_unix() * 1_000);
+        assert_eq!(
+            status,
+            RunStatus::Complete,
+            "outcome is supplementary and never read for RunStatus — a known status must still be trusted even when outcome's own detail is unrecognized"
+        );
     }
 
     // ── mission_run_status: the staleness gate (#1642, #1633) ───────────

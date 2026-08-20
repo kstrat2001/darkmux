@@ -842,7 +842,13 @@ pub fn launch(
     // with no match arm to add.
     let exit_code = match status {
         MissionOutcomeStatus::Clean | MissionOutcomeStatus::Degraded => 0,
-        MissionOutcomeStatus::Degenerate | MissionOutcomeStatus::Error => 1,
+        // (#1881) `status` here is `build_envelope`'s OWN freshly-computed
+        // value, never a deserialized one, so `Unknown` (a
+        // deserialize-only forward-compat fallback) is unreachable in
+        // practice. Kept exhaustive with a conservative failing exit code
+        // rather than a wildcard, so a future caller that DOES pass a
+        // loaded status here fails loudly instead of silently exiting 0.
+        MissionOutcomeStatus::Degenerate | MissionOutcomeStatus::Error | MissionOutcomeStatus::Unknown => 1,
     };
     // (#1685 QA MUST-FIX 2) This is the branch the documented `pr-list` /
     // `pr-info` / `pr-approve` / `pr-merge` example verbs actually take —

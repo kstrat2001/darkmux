@@ -1111,6 +1111,15 @@ body {
 .labbadge.abandoned {
   color: var(--dim);
 }
+/* (#1881) A run this binary could not read the real outcome of — never
+   styled like `complete` (green) or folded into the dim planned/abandoned
+   look, which would both misreport confidence this reader doesn't have.
+   `--warn` (amber) reads as "pay attention," matching how doctor surfaces
+   the same condition. */
+.labbadge.unparseable {
+  color: var(--warn);
+  border-color: var(--warn);
+}
 .rununtracked {
   font: 600 10px/1 "JetBrains Mono", monospace;
   color: var(--dim);
