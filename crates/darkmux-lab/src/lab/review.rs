@@ -141,10 +141,15 @@
 //!   semantics the scheduler cannot observe from outside the call (see
 //!   `StepRecord::items_in`'s own doc in `run_record.rs`: the scheduler
 //!   always leaves those `None`). This is INNER work, with a breakdown,
-//!   emitted into the flow stream the viewer renders. The scheduler's number
-//!   is OUTER duration — it includes dispatch/reconcile overhead around the
-//!   call and is recorded uniformly for every step of every mission, whether
-//!   or not the kind cooperates. Dropping either loses something real: the
+//!   emitted into the flow stream the viewer renders. The scheduler's
+//!   number is timed strictly around that SAME `run_streaming` call, on
+//!   the step's own worker thread (`scheduler.rs:808`-`:811`) — it
+//!   EXCLUDES queueing behind `remote_cap`, `ensure_wave_loaded`,
+//!   `apply_step_terminal`, and `persist` (see
+//!   `SchedulerReport::step_records`'s own doc in `scheduler.rs` for the
+//!   full list of what a `StepRecord` does and doesn't cover), and it is
+//!   recorded uniformly for every step of every mission, whether or not
+//!   the kind cooperates. Dropping either loses something real: the
 //!   breakdown, or the uniform coverage.
 //!
 //! What the two numbers DO guarantee, because one strictly contains the
