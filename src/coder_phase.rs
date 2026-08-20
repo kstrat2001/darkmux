@@ -1132,15 +1132,27 @@ fn resolve_run_workdir(mission_id: &str, phase_id: &str, root: &Path) -> PathBuf
 /// mission as-is (reconcilable via `darkmux mission finalize`), never fails the
 /// abort.
 ///
-/// (#1877 item 4 — deliberately deferred, NOT this PR) coder-phase does not
-/// construct a `RunOutcome` here or anywhere else in this file. #1877's own
-/// tracking issue names coder-phase as the SECOND consumer `RunOutcome`/
-/// `MissionEnvelope::outcome` exists to serve (a coder's own docket — files
-/// touched, QA findings addressed — is exactly the kind of partitioned work
-/// review's flags already are), but wiring it up is its own acceptance test
-/// and explicitly out of scope for the PR that put the contract on
-/// `MissionEnvelope` in the first place. This function keeps constructing
-/// `status` directly via `MissionEnvelope::new`, same as before.
+/// (#1877 item 4 — deliberately deferred, NOT this PR) This function's only
+/// non-test caller is the narrow single-phase `mission abort --phase`
+/// reconcile below — the whole-mission `mission finalize`/`mission abort`
+/// (`terminate_mission`, this file) don't build a `MissionEnvelope` at all,
+/// and a coder-phase `mission launch` that reaches the operator gate stops
+/// there with no finalize (see `mission_launch.rs::launch`'s own doc).
+/// coder-phase's real MissionEnvelope-touching sites — this function on the
+/// narrow abort path, `reconcile_and_finalize_on_error` on `launch`'s
+/// pre-gate failure path (both hand-construct `status` directly, never a
+/// `RunOutcome`) — are the SECOND consumer #1877's own tracking issue names
+/// for `RunOutcome`/`MissionEnvelope::outcome` (a coder's own docket —
+/// files touched, QA findings addressed — is exactly the kind of
+/// partitioned work review's flags already are). Wiring it up is its own
+/// acceptance test, deferred — but the actual blocker on ALL these sites is
+/// the same one documented next to `mission_launch.rs`'s `build_envelope`:
+/// `MissionOutcomeStatus::from_outcome` (`crates/darkmux-crew/src/
+/// envelope.rs`) has no route to `Error`, so this function's all-abandoned
+/// case (today `Degraded`, honestly `RunOutcome::Empty` then `Degenerate`
+/// once adopted) would be a status change, not a pure refactor. This
+/// function keeps constructing `status` directly via `MissionEnvelope::new`,
+/// same as before.
 fn finalize_mission_if_complete(mission_id: &str) {
     use crew::envelope::{MissionEnvelope, MissionOutcomeStatus, PhaseOutcome, PhaseOutcomeKind};
     use crew::types::PhaseStatus;
