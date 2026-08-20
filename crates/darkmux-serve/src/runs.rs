@@ -1818,6 +1818,65 @@ mod tests {
         assert_eq!(mission_run_status(&m, &[], now_unix() * 1_000), RunStatus::Complete);
     }
 
+    /// (#1892) `MissionStatus` has exactly four variants; no wildcard, so a
+    /// fifth variant fails to compile HERE until a human decides whether it
+    /// is terminal-abandon-shaped or terminal-success-shaped. This is the
+    /// exact shape of bug #1627 fixed once already: `Aborted` used to fall
+    /// through a `_ => Complete` arm and silently inherit `Finalized`'s
+    /// happy mapping. A wildcard in this classifier would let a *new*
+    /// variant repeat that mistake invisibly.
+    fn is_abandon_shaped_terminal(status: MissionStatus) -> bool {
+        match status {
+            MissionStatus::Aborted => true,
+            MissionStatus::Finalized => false,
+            MissionStatus::Active | MissionStatus::Paused => {
+                panic!("not a terminal status; see mission_run_status_active_and_paused_are_running")
+            }
+        }
+    }
+
+    /// (#1892) The gap this closes: nothing in this file ever constructed a
+    /// LOCAL `Mission` with `status: MissionStatus::Aborted` and drove it
+    /// through `mission_run_status` — the only test that touched `Aborted`
+    /// at all (`an_aborted_peer_mission_reads_abandoned_not_complete`) goes
+    /// through the separate fleet/PEER `flow_mission_to_run` path, despite
+    /// its own docstring claiming it exercises "the tracked path". This
+    /// test drives BOTH terminal `MissionStatus` variants — `Aborted` and
+    /// `Finalized` — through a real local `Mission`, so the whole match in
+    /// `mission_run_status` is pinned rather than only the value someone
+    /// happened to audit.
+    ///
+    /// Mutating `MissionStatus::Aborted => RunStatus::Abandoned` to
+    /// `=> RunStatus::Complete` in `mission_run_status` must fail this test.
+    #[test]
+    #[serial_test::serial]
+    fn mission_run_status_pins_every_terminal_mission_status_variant() {
+        let _g = CrewGuard::new();
+        let now_ms = now_unix() * 1_000;
+
+        assert!(is_abandon_shaped_terminal(MissionStatus::Aborted));
+        assert!(!is_abandon_shaped_terminal(MissionStatus::Finalized));
+
+        // Aborted: a torn-down LOCAL mission, never a Finalized one wearing
+        // its clothes. No mission needs to exist on disk — `mission_run_status`
+        // never consults `load_envelope` for this arm.
+        let mut aborted = minimal_mission("m1892-aborted", vec![], None);
+        aborted.status = MissionStatus::Aborted;
+        assert_eq!(
+            mission_run_status(&aborted, &[], now_ms),
+            RunStatus::Abandoned,
+            "an aborted LOCAL mission must read Abandoned, never Complete (#1627, re-pinned by #1892)"
+        );
+
+        // Finalized, no envelope on disk yet: genuinely no data, degrades
+        // to Complete — the OTHER terminal variant, so the classifier
+        // above and the match it mirrors both stay exercised end to end.
+        darkmux_crew::lifecycle::save_mission(&minimal_mission("m1892-finalized", vec![], None)).unwrap();
+        let mut finalized = minimal_mission("m1892-finalized", vec![], None);
+        finalized.status = MissionStatus::Finalized;
+        assert_eq!(mission_run_status(&finalized, &[], now_ms), RunStatus::Complete);
+    }
+
     /// (#1881 RED proof) `envelope.json` exists but is not valid JSON at
     /// all — no leniency, of any kind, can rescue this. Written directly to
     /// disk (bypassing `save_envelope`/`finalize_mission`, which can only
