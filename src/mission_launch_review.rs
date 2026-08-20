@@ -460,6 +460,21 @@ fn with_dispatch_bookends(
             });
             if let Some(reason) = &env.degenerate {
                 payload["degenerate"] = json!(reason);
+            } else if !env.warnings.is_empty() {
+                // (#1876 QA follow-up, MUST FIX 1) A judge-coverage
+                // shortfall (or any other #1260-style non-fatal warning)
+                // sets `env.warnings` without setting `env.degenerate` —
+                // exactly `review_result_to_mission_envelope`'s `Degraded`
+                // condition, one function over. Before #1876 this same
+                // incident shape always went through `degenerate`, which
+                // the arm above already marks; #1876 moved it onto
+                // `warnings` and this bookend never learned to read that
+                // field, so the flow stream recorded an unqualified
+                // `result_class: "ok"` for a run that silently dropped
+                // flags. Mirrors the `"partial"` `result_class` precedent
+                // in `step_kinds::builtins`'s map-step terminal.
+                payload["result_class"] = json!("partial");
+                payload["warnings"] = json!(env.warnings);
             }
             if let Some(member) = env.members.iter().find(|m| m.remote) {
                 let remote_tokens: u64 =
@@ -1638,6 +1653,48 @@ mod tests {
         let terminal = emitter.records.last().unwrap();
         assert_eq!(terminal.action, "dispatch error");
         assert_eq!(terminal.mission_id.as_deref(), Some("review-1700000001-fedcba"));
+    }
+
+    /// (#1876 QA follow-up, MUST FIX 1) A judge-coverage shortfall
+    /// (`env.degenerate.is_none()` but `env.warnings` non-empty — exactly
+    /// the #1876 incident shape, 11 of 134 flags unjudged) must NOT read as
+    /// an unqualified `result_class: "ok"` on the flow record. Before
+    /// #1876, that same run set `env.degenerate` and the bookend already
+    /// stamped a marker for it; #1876 moved the incident case off
+    /// `degenerate` and onto `warnings`, and this bookend never learned to
+    /// read the new field — so the flow stream (and everything reading it:
+    /// the viewer, the Redis fleet stream, the hash-chained audit sink)
+    /// recorded a review that silently dropped 11 of 134 flags as a clean
+    /// pass. `result_class` must flip to `"partial"` (matching the
+    /// `"partial"`/`ok_count == results.len()` precedent already used by
+    /// `step_kinds::builtins`'s map-step terminal) and the warning text
+    /// must ride in the payload.
+    #[test]
+    fn with_dispatch_bookends_marks_partial_coverage_on_the_terminal_payload() {
+        let mut emitter = RecordingEmitter::default();
+        let result = with_dispatch_bookends(&mut emitter, "case-1", "test-crew", Some("darkmux:judge-model"), None, json!({}), |em| {
+            em.emit(fake_review_record("step result"));
+            Ok(ReviewEnvelope {
+                warnings: vec!["11 of 134 flags went unjudged on the `judge-pass1` stage".to_string()],
+                ..ReviewEnvelope::default()
+            })
+        });
+        assert!(result.is_ok());
+
+        let terminal = emitter.records.last().unwrap();
+        assert_eq!(terminal.action, "dispatch complete");
+        let payload = terminal.payload.as_ref().unwrap();
+        assert_eq!(
+            payload["result_class"], "partial",
+            "a run with unresolved warnings must not report result_class \"ok\": {payload:?}"
+        );
+        assert_eq!(
+            payload["warnings"][0], "11 of 134 flags went unjudged on the `judge-pass1` stage",
+            "the shortfall reason must ride in the flow record, not just the posted comment: {payload:?}"
+        );
+        // The pre-existing `degenerate` marker is untouched by this case —
+        // this run is NOT degenerate, only partially covered.
+        assert!(payload.get("degenerate").is_none());
     }
 
     /// The abort/panic path's `on_abort` closure builds its own terminal

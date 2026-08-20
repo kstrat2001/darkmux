@@ -3060,9 +3060,14 @@ fn run_verify_stage(
 /// `coverage_warning` (#1876/#1877 QA follow-up) is the same shape for the
 /// non-strict Gate 1 skip: `env.warnings` is what `review_result_to_mission_
 /// envelope` (`src/mission_launch_review.rs`) reads to classify a run
-/// `Degraded` vs `Clean` for the mission board / CLI exit code / flow
-/// record — those consumers never see `env.remote_budgets` or `env.judged`,
-/// only `degenerate`/`warnings`. Without this, a partial-coverage run (real
+/// `Degraded` vs `Clean` for the mission board, and what
+/// `with_dispatch_bookends` (same file) reads to flip the flow record's
+/// `dispatch complete` `result_class` from `"ok"` to `"partial"` — those two
+/// consumers never see `env.remote_budgets` or `env.judged`, only
+/// `degenerate`/`warnings`. NOT the CLI exit code: `mission launch review`
+/// always returns `Ok(0)` (`src/cli.rs:552` documents why — CI-facing
+/// pass/fail comes from the rendered payload's `mode`, not the process exit
+/// status). Without stamping `env.warnings`, a partial-coverage run (real
 /// signal, real gap) read `Clean` everywhere except the posted PR comment —
 /// exactly the "board and the comment must agree" property this module's
 /// own `review_result_to_mission_envelope` doc already promises, silently
