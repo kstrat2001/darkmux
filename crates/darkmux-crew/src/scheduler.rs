@@ -33,13 +33,14 @@
 //! 3-step chain) never have more than one step ready per wave, so the
 //! classification is correctness/observability, not a measured speedup.
 
+use crate::run_record::StepRecord;
 use crate::step_kinds::StepKindRegistry;
 use crate::types::{NodeStatus, Step, Task};
 use anyhow::{anyhow, Result};
 use darkmux_flow::{Category, FlowRecord, Level, Stage, Tier};
 use darkmux_gestalt::{Facts, FootprintEstimator, ModelHost};
 use std::collections::{BTreeMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ─── Task dependency cycle detection (graph-load-time) (#1341) ────────
 //
@@ -299,6 +300,24 @@ pub struct SchedulerReport {
     pub errored: Vec<String>,
     pub iterations: usize,
     pub warnings: Vec<String>,
+    /// (#1877 item 3) One [`StepRecord`] per step that reached a terminal
+    /// transition through the LIVE `WaveSignal::StepTerminal` path — i.e.
+    /// every completed or errored step, timed with an `Instant` pair taken
+    /// strictly around that step's own `kind.run_streaming(...)` call on
+    /// its own worker thread (see the job closure below), so a sibling's
+    /// duration in here is never inflated by queueing or by a slower wave
+    /// member. `items_in`/`items_out` are always `None` — the scheduler
+    /// observes that a step ran and how long it took, never how many
+    /// items it processed (that is per-kind business semantics; see
+    /// `run_record`'s module doc for the full reconciliation-with-review
+    /// argument). A step whose `StepRunCtx` job PANICKED never streamed a
+    /// terminal, so it gets no entry here (it still lands in `errored`) —
+    /// there is no honest per-step duration to report for it, and this
+    /// module does not report a wave-clock number in its place. This is a
+    /// NEW, additive field: no existing caller of `run_step_graph` is
+    /// required to read it, and none does yet (a mission gets these BY
+    /// CONSTRUCTION but is free to ignore the field entirely).
+    pub step_records: Vec<StepRecord>,
 }
 
 /// Walk `steps` to completion: each iteration computes every currently-
@@ -607,6 +626,9 @@ pub fn run_step_graph(
                             &mut *persist,
                             &id,
                             now_unix(),
+                            // A declined step never dispatched at all —
+                            // nothing to time, so no `StepRecord`.
+                            None,
                             Err(reason),
                             Vec::new(),
                         );
@@ -737,8 +759,20 @@ pub fn run_step_graph(
             let term_tx = tx.clone();
             let job: crate::concurrent_dispatch::DispatchJob<StepJobResult> =
                 Box::new(move || {
+                    // (#1877 item 3) This step's OWN dispatch duration —
+                    // timed strictly around its `run_streaming` call, on
+                    // THIS job's own worker thread. Never derived from
+                    // `step.started_ts` (stamped on the main thread before
+                    // this wave's jobs are even built, so it would include
+                    // any time this job spent queued behind `remote_cap`)
+                    // and never a wall-clock around the whole wave — each
+                    // sibling gets its own `Instant` pair, so a fast step
+                    // sharing a wave with a slow one reports its own real
+                    // duration, not the wave's.
+                    let step_t0 = Instant::now();
                     let result =
                         kind.run_streaming(&step_snapshot, &task_snapshot, &input, &ctx);
+                    let wall_ms = step_t0.elapsed().as_millis() as u64;
                     // That step's OWN finish time — not the wave's flush time.
                     let at = now_unix();
                     match result {
@@ -751,6 +785,7 @@ pub fn run_step_graph(
                             let _ = term_tx.send(crate::step_kinds::WaveSignal::StepTerminal {
                                 index: idx,
                                 at,
+                                wall_ms,
                                 result: Ok(output.clone()),
                                 flow_records: outcome.flow_records,
                             });
@@ -765,6 +800,7 @@ pub fn run_step_graph(
                             let _ = term_tx.send(crate::step_kinds::WaveSignal::StepTerminal {
                                 index: idx,
                                 at,
+                                wall_ms,
                                 result: Err(format!("{e:#}")),
                                 flow_records: Vec::new(),
                             });
@@ -802,7 +838,7 @@ pub fn run_step_graph(
             for sig in rx.iter() {
                 match sig {
                     crate::step_kinds::WaveSignal::Record(rec) => emit(rec),
-                    crate::step_kinds::WaveSignal::StepTerminal { index, at, result, flow_records } => {
+                    crate::step_kinds::WaveSignal::StepTerminal { index, at, wall_ms, result, flow_records } => {
                         apply_step_terminal(
                             steps,
                             &mut report,
@@ -810,6 +846,7 @@ pub fn run_step_graph(
                             &mut *persist,
                             &ready_ids[index],
                             at,
+                            Some(wall_ms),
                             result,
                             flow_records,
                         );
@@ -843,6 +880,11 @@ pub fn run_step_graph(
                 &mut *persist,
                 &id,
                 finished_at,
+                // A panicked job's closure never reached the point where it
+                // would send its own `wall_ms` — no honest duration exists
+                // for it, so no `StepRecord` (see `apply_step_terminal`'s
+                // own doc). It still lands in `report.errored` above.
+                None,
                 result,
                 flow_records,
             );
@@ -857,11 +899,23 @@ pub fn run_step_graph(
 /// (#1483 Bug 3) Apply one step's terminal transition — status flip,
 /// `completed_ts`, batched flow records, the `step complete`/`step error`
 /// lifecycle record, and a durable `persist` — to `steps`/`report`. Shared by
-/// the live per-seat drain (a `WaveSignal::StepTerminal` the moment a job
-/// finishes) and the post-scope reconcile (a panicked job's synthesized
-/// terminal `Err`, #1452), so both paths flip a step identically. `at` is the
+/// three callers: the gate-declined path (a step that never ran at all), the
+/// live per-seat drain (a `WaveSignal::StepTerminal` the moment a job
+/// finishes), and the post-scope reconcile (a panicked job's synthesized
+/// terminal `Err`, #1452) — so all three flip a step identically. `at` is the
 /// step's own completion epoch (seconds); `result` is `Ok(output)` /
 /// `Err(message)`.
+///
+/// (#1877 item 3) `wall_ms` is `Some(duration)` ONLY from the live drain,
+/// where a real per-step `Instant` pair exists (see the job closure above).
+/// It is `None` from the other two callers, honestly: a gate-declined step
+/// never dispatched at all (nothing to time), and a panicked job's job
+/// closure never reached the point where it would have sent its own
+/// `wall_ms` — there is no real duration recoverable for it, and this
+/// function does not substitute a wave-clock number or a `0` in its place.
+/// A [`crate::run_record::StepRecord`] is pushed onto `report.step_records`
+/// only when `wall_ms` is `Some` — so every entry there carries a genuine,
+/// per-step-measured duration, never a fabricated one.
 #[allow(clippy::too_many_arguments)]
 fn apply_step_terminal(
     steps: &mut BTreeMap<String, Step>,
@@ -870,12 +924,25 @@ fn apply_step_terminal(
     persist: &mut dyn FnMut(&Step),
     id: &str,
     at: u64,
+    wall_ms: Option<u64>,
     result: std::result::Result<String, String>,
     flow_records: Vec<FlowRecord>,
 ) {
     let step = steps.get_mut(id).expect("id came from ready_ids itself");
     for record in flow_records {
         emit(record);
+    }
+    if let Some(wall_ms) = wall_ms {
+        report.step_records.push(StepRecord {
+            step_id: step.id.clone(),
+            kind: step.kind.clone(),
+            // (#1877 item 3) The scheduler genuinely does not know how many
+            // items this step consumed/produced — that is per-kind business
+            // semantics. `None`, never a lying `Some(0)`.
+            items_in: None,
+            items_out: None,
+            wall_ms,
+        });
     }
     match result {
         Ok(output) => {
@@ -2316,6 +2383,224 @@ mod tests {
              (barrier preserved) — dep_start={dep_start} slow_done={slow_done} fast_done={fast_done}"
         );
         assert_eq!(steps["c-dep-step"].status, NodeStatus::Complete);
+    }
+
+    // ─── #1877 item 3: the scheduler times and emits StepRecords itself ─
+
+    /// (#1877 item 3) `run_step_graph` produces a real `StepRecord` for a
+    /// step with NO cooperation from its `StepKind` — `procedural.noop` (a
+    /// builtin that knows nothing about `run_record`) reaches this through
+    /// the wave loop alone. **Proved failing first**: before this PR,
+    /// `SchedulerReport` had no `step_records` field at all, so
+    /// `report.step_records` failed to compile
+    /// (`no field \`step_records\` on type \`SchedulerReport\``); this test
+    /// then failed for real once the field existed but nothing populated it
+    /// (`report.step_records` was empty). Both observed directly while
+    /// writing this test, before `apply_step_terminal` grew its push.
+    #[test]
+    fn every_step_kind_gets_a_record_without_opting_in() {
+        let (task_a, step_a) = task_and_step("a", &[]); // default kind: "procedural.noop"
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        let report = run_test_graph(&tasks, &mut steps);
+
+        assert_eq!(report.step_records.len(), 1, "one record for the one step that ran");
+        let rec = &report.step_records[0];
+        assert_eq!(rec.step_id, "a-step");
+        assert_eq!(rec.kind, "procedural.noop", "the scheduler names the step's own registry kind id");
+        assert_eq!(rec.items_in, None, "the scheduler cannot know per-kind item counts");
+        assert_eq!(rec.items_out, None, "same honesty contract on the output side");
+    }
+
+    /// (#1877 item 3) A step's own `StepRecord.wall_ms` is a real,
+    /// non-zero, measured duration for that step's own dispatch — not a
+    /// placeholder. **Proved failing first**: same compile/empty-field
+    /// failures as the test above, observed the same way.
+    #[test]
+    fn step_record_carries_a_real_duration_and_the_right_kind() {
+        let kind = Arc::new(SleepKind);
+        let (ta, sa) = kinded_step("slow", "test.sleep", json!({ "sleep_ms": 60 }), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa)]);
+
+        let kinds = StepKindRegistry::new();
+        kinds.register(kind).unwrap();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(report.step_records.len(), 1);
+        let rec = &report.step_records[0];
+        assert_eq!(rec.step_id, "slow-step");
+        assert_eq!(rec.kind, "test.sleep");
+        assert!(
+            rec.wall_ms >= 50,
+            "a step that slept ~60ms must carry a real, non-zero, roughly-matching \
+             duration, not a placeholder — got {}ms",
+            rec.wall_ms
+        );
+    }
+
+    /// (#1877 item 3) Concurrency correctness, the QUEUEING form — the
+    /// actual reason this has to be timed strictly around
+    /// `kind.run_streaming(...)` inside each job's own closure rather than
+    /// from `step.started_ts` (stamped on the main thread, for every ready
+    /// step, BEFORE that wave's jobs are even built — see the wave loop's
+    /// own comment on why `remote_cap` can force a ready step to wait
+    /// behind a sibling before its closure ever starts). Two independent
+    /// siblings land in the SAME wave with `remote_cap: 1` — only ONE can
+    /// run at a time. `a-slow` sorts first (`BTreeMap` key order) and
+    /// occupies the sole slot for ~250ms; `b-fast` cannot even START until
+    /// `a-slow` finishes, then completes near-instantly itself. A `wall_ms`
+    /// measured from `step.started_ts` (set for BOTH steps before either
+    /// job ran) would show `b-fast` at ~250ms too — its own near-zero
+    /// dispatch plus the ~250ms it spent queued behind its sibling.
+    ///
+    /// **Proved failing first**: temporarily hoisted `step_t0` out of the
+    /// job closure to a single `Instant::now()` shared by every job in the
+    /// wave (captured once, right before the `for (idx, id) in ready_ids...`
+    /// loop that builds them) instead of each closure taking its own,
+    /// leaving the rest of the timing logic untouched, and reran this exact
+    /// test. It failed:
+    /// ```text
+    /// the fast sibling slept 0ms and had to queue behind its sibling under
+    /// remote_cap=1 — its record must reflect ITS OWN near-zero dispatch
+    /// duration, never the ~250ms it spent waiting for the shared slot —
+    /// got 256ms
+    /// ```
+    /// — `b-fast`'s `wall_ms` picked up `a-slow`'s ~250ms queue wait
+    /// exactly as the assertion warns against. Reverted to the real
+    /// per-closure `Instant` (this file's actual code) before committing.
+    #[test]
+    fn concurrent_sibling_steps_each_get_their_own_duration_not_the_waves() {
+        let kind = Arc::new(SleepKind);
+        let (ta, sa) = kinded_step("a-slow", "test.sleep", json!({ "sleep_ms": 250 }), &[]);
+        let (tb, sb) = kinded_step("b-fast", "test.sleep", json!({ "sleep_ms": 0 }), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa), (tb, sb)]);
+
+        let kinds = StepKindRegistry::new();
+        kinds.register(kind).unwrap();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            // (deliberately 1, not 8) — forces `b-fast` to queue behind
+            // `a-slow` instead of running truly in parallel, so a timing
+            // bug that leaks queue wait into `wall_ms` has something real
+            // to leak.
+            1,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(report.step_records.len(), 2, "both siblings of the one wave get their own record");
+        let slow = report
+            .step_records
+            .iter()
+            .find(|r| r.step_id == "a-slow-step")
+            .expect("a-slow's record");
+        let fast = report
+            .step_records
+            .iter()
+            .find(|r| r.step_id == "b-fast-step")
+            .expect("b-fast's record");
+        assert!(
+            slow.wall_ms >= 200,
+            "the slow sibling's own ~250ms sleep must show up in ITS record — got {}ms",
+            slow.wall_ms
+        );
+        assert!(
+            fast.wall_ms < 150,
+            "the fast sibling slept 0ms and had to queue behind its sibling under \
+             remote_cap=1 — its record must reflect ITS OWN near-zero dispatch \
+             duration, never the ~250ms it spent waiting for the shared slot — got {}ms",
+            fast.wall_ms
+        );
+    }
+
+    /// (#1877 item 3) A step that never dispatched at all (its operator-sign-
+    /// off gate declined it before `run_streaming` ever ran) gets NO
+    /// `StepRecord` — there is nothing real to time, and this module never
+    /// substitutes a fabricated duration. It still lands in
+    /// `report.errored`, exactly like any other failed step.
+    #[test]
+    fn gate_declined_step_gets_no_fabricated_record() {
+        let (mut task_a, mut step_a) = task_and_step("a", &[]);
+        step_a.gate = Some(crate::gate::GATE_KIND_OPERATOR.to_string());
+        task_a.description = "gated task".to_string();
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut handler = |_s: &Step, _f: &BTreeMap<String, String>| {
+            crate::gate::GateDecision::Declined { reason: "operator said no".to_string() }
+        };
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            Some(&mut handler),
+            None,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(report.errored, vec!["a-step".to_string()]);
+        assert!(
+            report.step_records.is_empty(),
+            "a declined step never ran — it must not get a StepRecord: {:?}",
+            report.step_records
+        );
+    }
+
+    /// (#1877 item 3) A mission that never reads `SchedulerReport::
+    /// step_records` is unaffected — the field is additive. This is really
+    /// two claims: (a) it compiles and passes unmodified for every one of
+    /// the scheduler's own many pre-existing `run_step_graph` callers in
+    /// this test module, none of which reference `step_records` (that's
+    /// the whole test suite around this test, not just this one function);
+    /// and (b) explicitly, a caller that discards the report entirely
+    /// (`run_graph_with_kind`, used throughout this file) still gets a
+    /// correct run — the records are computed regardless of whether
+    /// anyone looks.
+    #[test]
+    fn a_mission_that_never_reads_step_records_is_unaffected() {
+        let kind = Arc::new(SleepKind);
+        let (ta, sa) = kinded_step("a", "test.sleep", json!({ "sleep_ms": 0 }), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa)]);
+        // `run_graph_with_kind` returns only the emitted flow records,
+        // discarding the `SchedulerReport` (and its `step_records`)
+        // entirely — exactly the "mission ignores the field" shape.
+        let emitted = run_graph_with_kind(kind, &tasks, &mut steps);
+        assert!(emitted.iter().any(|r| r.action == "step complete"));
+        assert_eq!(steps["a-step"].status, NodeStatus::Complete);
     }
 
     /// (#1442 ship-2b, the operator-recorded seam decision on PR #1455) The

@@ -310,6 +310,18 @@ pub enum WaveSignal {
     StepTerminal {
         index: usize,
         at: u64,
+        /// (#1877 item 3) This job's OWN `kind.run_streaming(...)` duration,
+        /// timed with an `Instant` pair taken strictly around that one call
+        /// inside the job closure that produced it — never derived from `at`
+        /// (whole-second epoch, too coarse) and never from the step's
+        /// `started_ts` (set on the MAIN thread before the wave's jobs are
+        /// even built, so it would include queueing time behind
+        /// `remote_cap` when a wave has more ready steps than the
+        /// concurrency cap). This is what makes a per-step
+        /// [`crate::run_record::StepRecord::wall_ms`] correct under
+        /// concurrency: each sibling's duration reflects only its own
+        /// dispatch, not the wave's.
+        wall_ms: u64,
         result: std::result::Result<String, String>,
         flow_records: Vec<FlowRecord>,
     },
