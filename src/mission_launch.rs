@@ -76,6 +76,7 @@ use crate::flow;
 use crate::coder_phase;
 use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::{self, FindingSeverity, LaunchParams, MissionConfig, TaskOverride};
+use crew::run_obs;
 use crew::types::{Mission, MissionSpec, MissionStatus, NodeStatus, Phase, PhaseStatus, Step};
 use darkmux_types::style;
 use std::any::Any;
@@ -268,6 +269,73 @@ fn emit_launch_gh_verb_audit(
     let args = collected.get("args").and_then(|v| v.as_str()).unwrap_or("");
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     crate::acp_panel::emit_gh_verb_audit(verb, args, &cwd, gate_confirmed, success, mission_id);
+}
+
+/// (#1877 — "no blind runs" is now PRESCRIBED for the generic launch path,
+/// not opt-in per config) Build a whole-run `dispatch *` bookend record —
+/// the same coarse liveness edge `mission_launch_review.rs`'s own
+/// `review_bookend_record`/`with_dispatch_bookends` gives `review`
+/// privately, generalized here so every OTHER config `launch` runs gets
+/// it too, unconditionally (see the guard construction in `launch` for
+/// why `review` itself never reaches this — it branches out, and mints no
+/// `mission_id`, before this code is ever reached).
+///
+/// `source = "mission"` — distinct from the per-model-dispatch FROZEN
+/// `"crew_dispatch"` value (`build_dispatch_record_with_payload`'s own
+/// doc — an individual coder/verify/worktree step's OWN dispatch already
+/// carries that) and from review's own `"review"`, so the viewer can tell
+/// a whole-run bookend apart from either: this is not one model call, and
+/// not a review run — it is "did this mission's dispatch work start and
+/// finish."
+///
+/// `pub(crate)` (#1877 QA must-fix 1): `src/acp_panel.rs::run_ephemeral`
+/// reuses this SAME builder for its own whole-run bookend pair — the
+/// `session_id`/`mission_id` param happens to be a minted per-invocation
+/// `correlation_id` there rather than a real mission id, but the shape
+/// (config-id handle, no model, `source: "mission"`) is identical, and a
+/// second hand-rolled copy is exactly the drift #1685 QA MUST-FIX 2
+/// already closed for `emit_gh_verb_audit`.
+pub(crate) fn mission_bookend_record(
+    level: flow::Level,
+    action: &str,
+    config_id: &str,
+    mission_id: &str,
+    payload: serde_json::Value,
+) -> flow::FlowRecord {
+    let mut record = crew::dispatch::build_dispatch_record_with_payload(
+        level,
+        action,
+        config_id,
+        mission_id,
+        None,
+        Some(mission_id),
+        None,
+        Some(payload),
+    );
+    record.source = Some("mission".to_string());
+    record
+}
+
+/// Drain every telemetry sample buffered since the last drain and
+/// backfill `mission_id` onto each — mirrors `run_step_graph`'s own emit
+/// closure's backfill discipline (`record.mission_id.get_or_insert_with`)
+/// below, applied to telemetry the same way `mission_launch_review.rs`'s
+/// `FleetFlowEmitter` backfills it for `review`'s own samples, so a
+/// coder-phase run's telemetry is joinable to its mission in the viewer
+/// exactly like review's already is.
+///
+/// `pub(crate)` (#1877 QA must-fix 1): shared with `acp_panel::
+/// run_ephemeral`'s own telemetry drain — same backfill discipline, keyed
+/// on that path's minted `correlation_id` instead of a real mission id.
+pub(crate) fn drained_telemetry(telemetry: &run_obs::HostTelemetrySampler, mission_id: &str) -> Vec<flow::FlowRecord> {
+    telemetry
+        .try_drain()
+        .into_iter()
+        .map(|mut sample| {
+            sample.mission_id.get_or_insert_with(|| mission_id.to_string());
+            sample
+        })
+        .collect()
 }
 
 pub fn launch(
@@ -614,6 +682,83 @@ pub fn launch(
         None
     };
 
+    // (#1877 "no blind runs" — telemetry + the whole-run dispatch bookend
+    // are PRESCRIBED here, not opt-in) Constructed unconditionally, for
+    // EVERY config that reaches this point — regardless of whether its
+    // graph declares a model-dispatching step kind or is Tier-1-only
+    // procedural/shell work (a `gh_verb` panel config gets telemetry too;
+    // the "was anything actually sampled" question is answered by the
+    // run's real wall-clock against the production cadence below, same as
+    // it already is for `review`). `review` itself NEVER reaches this
+    // line: `config_uses_review_kinds` branches it out, and mints no
+    // `mission_id`, far above (before this function's own `--input`/
+    // `--param` collection even runs) — review builds its own telemetry
+    // sampler and its own `with_dispatch_bookends` privately
+    // (`mission_launch_review.rs` / `darkmux_lab::lab::review::
+    // run_review_graph`), already satisfying the mandate on its own. The
+    // two constructions are mutually exclusive by CONTROL FLOW, not by a
+    // runtime check — there is no code path that reaches both, so no
+    // double-sampling is possible by construction.
+    let telemetry = run_obs::HostTelemetrySampler::start(
+        mission_id.clone(),
+        config_id.to_string(),
+        run_obs::DEFAULT_TELEMETRY_INTERVAL,
+        run_obs::DEFAULT_TELEMETRY_POLL,
+        crew::telemetry_sampler::sample_host,
+        darkmux_profiles::lms::list_loaded,
+    );
+    let mut dispatch_sink = |record: flow::FlowRecord| {
+        let _ = flow::record(record);
+    };
+    let mission_id_for_abort = mission_id.clone();
+    let config_id_for_abort = config_id.to_string();
+    // `BookendGuard`'s Drop fires this `on_abort` closure — building the
+    // "dispatch error" abort record — for any exit between `open()` below
+    // and a matching `close()`: an early `?`-return this function doesn't
+    // already reconcile explicitly, or a genuine panic (contract 2 — RAII-
+    // guarded on all exit paths). Every KNOWN exit point below (the
+    // scheduler error, the coder-phase gate, and the gate-less finish)
+    // calls `bookend.close(...)` explicitly with the real outcome; this is
+    // strictly the backstop for the unexpected case.
+    //
+    // (#1877 QA should-fix, accepted gap — named here, not silently) `on_
+    // abort` builds exactly ONE record; it has no way to also drain and
+    // forward whatever `telemetry` has buffered since the last explicit
+    // drain (`BookendGuard`'s `on_abort` signature is `Fn(&str, &str) ->
+    // FlowRecord`, not `FnMut(&mut dyn BookendSink)`). `RunObs` (used by
+    // review's sequential path) narrows this to "at most one final-tick
+    // sample" because it drains before every record it emits; this bare-
+    // sampler construction only drains at the 3 known exit points, so an
+    // abort via this backstop loses everything buffered since the last of
+    // those — up to one telemetry interval's worth on a run that panics
+    // mid-dispatch. Best-effort telemetry on an already-exceptional path;
+    // the bookend's own liveness record (the actual contract-2 obligation)
+    // is unaffected either way.
+    let mut bookend = flow::BookendGuard::new(&mut dispatch_sink, move |_id, _kind| {
+        mission_bookend_record(
+            flow::Level::Error,
+            "dispatch error",
+            &config_id_for_abort,
+            &mission_id_for_abort,
+            serde_json::json!({
+                "runtime": "mission",
+                "result_class": "error",
+                "error": "mission dispatch terminated before completion (early return or panic)",
+            }),
+        )
+    });
+    bookend.open(
+        "dispatch",
+        "dispatch",
+        mission_bookend_record(
+            flow::Level::Info,
+            "dispatch start",
+            config_id,
+            &mission_id,
+            serde_json::json!({ "runtime": "mission" }),
+        ),
+    );
+
     // (#1503) The #1400 preflight that used to run here — warning that a
     // phase was already terminal-Complete from a prior finalized run — only
     // ever mattered on the reuse/reopen path: a freshly-minted mission's
@@ -723,6 +868,19 @@ pub fn launch(
         // "running" by the other mission's heartbeat.
         &mut |mut record| {
             record.mission_id.get_or_insert_with(|| mission_id.clone());
+            // (#1877) Drain before emit — same interleaving discipline
+            // `run_review_graph`'s own emit closure uses, so telemetry
+            // streams alongside the run's other records rather than
+            // batching at the end (CLAUDE.md's "no blind runs" mandate).
+            // Calls `flow::record` directly here (not `bookend.emit_now`)
+            // because `bookend` isn't reachable from inside this closure
+            // (it's constructed on the outer scope, and this closure is
+            // handed to `run_step_graph` by itself) — same underlying sink
+            // either way (`dispatch_sink` IS `flow::record`), so this is a
+            // borrow-driven split, not two different destinations.
+            for sample in drained_telemetry(&telemetry, &mission_id) {
+                let _ = flow::record(sample);
+            }
             let _ = flow::record(record);
         },
         &mut |step| {
@@ -758,6 +916,26 @@ pub fn launch(
     // mission board just no longer lies about a dead run being active.
     if let Err(e) = graph_result {
         reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e);
+        // (#1877) Explicit close, not the Drop backstop — a scheduler
+        // error is a KNOWN outcome with real error text worth carrying,
+        // same as `with_dispatch_bookends`'s own `Err` arm.
+        for sample in drained_telemetry(&telemetry, &mission_id) {
+            bookend.emit_now(sample);
+        }
+        bookend.close(
+            "dispatch",
+            mission_bookend_record(
+                flow::Level::Error,
+                "dispatch error",
+                config_id,
+                &mission_id,
+                serde_json::json!({
+                    "runtime": "mission",
+                    "result_class": "error",
+                    "error": e.to_string(),
+                }),
+            ),
+        );
         // (#1685 QA MUST-FIX 2) A scheduler-level failure is still "the
         // operator's session tried to act as them" — audit-worthy on its
         // own (see `acp_panel::emit_gh_verb_audit`'s doc on why a failed
@@ -799,6 +977,18 @@ pub fn launch(
         // branches at all — the gate holds regardless of which graph shape
         // a `gh_verb` config happens to declare.
         let success = matches!(&outcome, Ok(code) if *code == 0);
+        // (#1877, QA must-fix; extraction #1877 QA must-fix 3) Explicit
+        // close on the coder branch's early return — a coder-phase run
+        // doing real dispatch work needs a terminal record, not just the
+        // Drop backstop. `success` still gates the gh-verb AUDIT call
+        // below — that one genuinely wants exit-code success, not
+        // gate-reached; see `coder_branch_terminal_bookend`'s own doc for
+        // why the bookend record itself keys on `reached_gate` instead.
+        let (_reached_gate, record) = coder_branch_terminal_bookend(&outcome, config_id, &mission_id);
+        for sample in drained_telemetry(&telemetry, &mission_id) {
+            bookend.emit_now(sample);
+        }
+        bookend.close("dispatch", record);
         emit_launch_gh_verb_audit(config, &collected, &mission_id, gate_confirmed.get(), success);
         return outcome;
     }
@@ -856,6 +1046,25 @@ pub fn launch(
     // graph, so this is where a direct `darkmux mission launch pr-merge`
     // gets its audit record in practice.
     emit_launch_gh_verb_audit(config, &collected, &mission_id, gate_confirmed.get(), exit_code == 0);
+    // (#1877) Explicit close on the gate-less generic finish — the third
+    // and last KNOWN exit this guard covers.
+    for sample in drained_telemetry(&telemetry, &mission_id) {
+        bookend.emit_now(sample);
+    }
+    bookend.close(
+        "dispatch",
+        mission_bookend_record(
+            if exit_code == 0 { flow::Level::Info } else { flow::Level::Error },
+            if exit_code == 0 { "dispatch complete" } else { "dispatch error" },
+            config_id,
+            &mission_id,
+            serde_json::json!({
+                "runtime": "mission",
+                "result_class": if exit_code == 0 { "ok" } else { "error" },
+                "status": format!("{status:?}"),
+            }),
+        ),
+    );
     Ok(exit_code)
 }
 
@@ -1515,6 +1724,53 @@ fn register_coder_phase_kinds(
 /// `Ok(2)` would close the mission under QA-blockers before sign-off).
 fn gate_outcome_reached_no_gate(outcome: &Result<i32>) -> bool {
     matches!(outcome, Err(_) | Ok(1))
+}
+
+/// (#1877 QA must-fix 3) The coder branch's terminal mission-level bookend
+/// record — extracted out of `launch`'s `if let Some(handles) = &coder_
+/// handles` arm so the `reached_gate` decision and the record it produces
+/// are unit-testable directly against a scripted `outcome`, without driving
+/// a real coder-phase dispatch through the scheduler (`launch` hardcodes
+/// `crew::concurrent_dispatch::lms_host_factory` — there is no injectable
+/// mock host on this path, so a full `launch()` integration test can only
+/// ever reach an `Err` outcome here via a cheap, real failure like an
+/// invalid worktree `base`, never `Ok(2)`/`Ok(3)`, which need a real
+/// dispatch to produce).
+///
+/// Returns `(reached_gate, record)` — `launch` still owns EMITTING it
+/// (`bookend.close`, the telemetry drain immediately before, and the
+/// gh-verb audit call after), this function owns only the DECISION: same
+/// split responsibility `mission_bookend_record` itself already has
+/// relative to its callers.
+///
+/// The complete-vs-error split is `reached_gate`
+/// (`!gate_outcome_reached_no_gate(outcome)`), NOT `outcome == Ok(0)` —
+/// see `gate_outcome_reached_no_gate`'s own doc for why: `Ok(2)` (QA found
+/// blockers) and `Ok(3)` (QA unavailable) both leave the mission Active at
+/// the sign-off gate, which is real dispatch work that started and
+/// FINISHED, same as a clean `Ok(0)`. Reading `outcome == Ok(0)` here
+/// instead would mismark `Ok(2)`/`Ok(3)` as `dispatch error`, flipping
+/// those missions to Error on the Runs lens even though they are the
+/// expected "QA has findings, come look" outcome — the exact regression
+/// this function's own tests pin against.
+fn coder_branch_terminal_bookend(
+    outcome: &Result<i32>,
+    config_id: &str,
+    mission_id: &str,
+) -> (bool, flow::FlowRecord) {
+    let reached_gate = !gate_outcome_reached_no_gate(outcome);
+    let record = mission_bookend_record(
+        if reached_gate { flow::Level::Info } else { flow::Level::Error },
+        if reached_gate { "dispatch complete" } else { "dispatch error" },
+        config_id,
+        mission_id,
+        serde_json::json!({
+            "runtime": "mission",
+            "result_class": if reached_gate { "ok" } else { "error" },
+            "gate": "coder-phase",
+        }),
+    );
+    (reached_gate, record)
 }
 
 /// (#1530 Packet 2) Resolve WHICH step in `steps` is the graph's declared
@@ -4271,5 +4527,488 @@ mod tests {
         use crew::envelope::MissionOutcomeStatus;
         let persisted = crew::lifecycle::load_envelope(mid).unwrap().expect("envelope.json persisted");
         assert_eq!(persisted.status, MissionOutcomeStatus::Error, "a hard scheduler Err finalizes to Error status");
+    }
+
+    // ── #1877 — telemetry + the whole-run dispatch bookend, prescribed ──
+
+    #[test]
+    fn mission_bookend_record_stamps_mission_source_session_and_mission_id() {
+        let rec = mission_bookend_record(
+            flow::Level::Info,
+            "dispatch start",
+            "coder-phase",
+            "coder-phase-123-abcdef",
+            serde_json::json!({ "runtime": "mission" }),
+        );
+        assert_eq!(rec.action, "dispatch start");
+        assert_eq!(rec.handle, "coder-phase");
+        assert_eq!(rec.session_id.as_deref(), Some("coder-phase-123-abcdef"));
+        assert_eq!(rec.mission_id.as_deref(), Some("coder-phase-123-abcdef"));
+        // (#1877 requirement 2) `source` must be distinct from BOTH the
+        // per-model-dispatch FROZEN `"crew_dispatch"` value and review's
+        // own `"review"` — otherwise the viewer can't tell a whole-run
+        // bookend apart from an individual model call or a review run.
+        assert_eq!(rec.source.as_deref(), Some("mission"));
+        assert_ne!(rec.source.as_deref(), Some("crew_dispatch"));
+        assert_ne!(rec.source.as_deref(), Some("review"));
+    }
+
+    // ── #1877 QA must-fix 3 — the coder branch's terminal bookend must ──
+    // key on `reached_gate`, not `outcome == Ok(0)`, and the record it
+    // produces must be distinguishable from the `BookendGuard` Drop
+    // backstop's generic abort record.
+    //
+    // RED PROVED (mutation per the QA finding): swapping this function's
+    // `let reached_gate = !gate_outcome_reached_no_gate(outcome);` for
+    // `let reached_gate = matches!(outcome, Ok(0));` (the literal
+    // `reached_gate = success` mutation named in the finding) failed
+    // `coder_branch_terminal_bookend_ok_2_qa_blockers_still_reaches_the_gate`
+    // and `..._ok_3_qa_unavailable_still_reaches_the_gate` below: both
+    // asserted `action == "dispatch complete"` and instead got
+    // `"dispatch error"`.
+
+    #[test]
+    fn coder_branch_terminal_bookend_ok_0_clean_reaches_the_gate() {
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(0), "coder-phase", "m-1");
+        assert!(reached_gate);
+        assert_eq!(rec.action, "dispatch complete");
+        assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
+        assert_eq!(rec.payload.as_ref().unwrap()["result_class"], serde_json::json!("ok"));
+        assert_eq!(rec.payload.as_ref().unwrap()["gate"], serde_json::json!("coder-phase"));
+    }
+
+    #[test]
+    fn coder_branch_terminal_bookend_ok_2_qa_blockers_still_reaches_the_gate() {
+        // `coder_phase_gate_outcome`'s own table: QA found blocker(s)
+        // leaves the phase Running at the sign-off gate — real dispatch
+        // work that started and FINISHED, same as clean. Must close
+        // `dispatch complete`, never `dispatch error`.
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(2), "coder-phase", "m-2");
+        assert!(reached_gate, "Ok(2) (QA blockers) must still reach the gate");
+        assert_eq!(rec.action, "dispatch complete");
+        assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
+    }
+
+    #[test]
+    fn coder_branch_terminal_bookend_ok_3_qa_unavailable_still_reaches_the_gate() {
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(3), "coder-phase", "m-3");
+        assert!(reached_gate, "Ok(3) (QA unavailable) must still reach the gate");
+        assert_eq!(rec.action, "dispatch complete");
+        assert!(matches!(rec.level, flow::Level::Info), "{:?}", rec.level);
+    }
+
+    #[test]
+    fn coder_branch_terminal_bookend_ok_1_coder_dispatch_failure_never_reaches_the_gate() {
+        let (reached_gate, rec) = coder_branch_terminal_bookend(&Ok(1), "coder-phase", "m-4");
+        assert!(!reached_gate);
+        assert_eq!(rec.action, "dispatch error");
+        assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
+        assert_eq!(rec.payload.as_ref().unwrap()["result_class"], serde_json::json!("error"));
+    }
+
+    #[test]
+    fn coder_branch_terminal_bookend_err_worktree_failure_never_reaches_the_gate() {
+        let (reached_gate, rec) =
+            coder_branch_terminal_bookend(&Err(anyhow!("worktree already exists")), "coder-phase", "m-5");
+        assert!(!reached_gate);
+        assert_eq!(rec.action, "dispatch error");
+        assert!(matches!(rec.level, flow::Level::Error), "{:?}", rec.level);
+    }
+
+    /// (#1877 QA must-fix 3) The explicit close's payload always carries
+    /// `gate: "coder-phase"` and NEVER an `error` key — the opposite shape
+    /// from the `BookendGuard` Drop backstop's generic abort record (see
+    /// `launch`'s `bookend` construction: `on_abort` builds a payload with
+    /// `"error": "mission dispatch terminated before completion..."` and no
+    /// `gate` key). Distinguishing the two shapes is what lets
+    /// `launch_coder_phase_worktree_failure_still_closes_the_mission_
+    /// bookend_as_dispatch_error` (below) prove the explicit close actually
+    /// ran, not just that SOME "dispatch error" record landed.
+    #[test]
+    fn coder_branch_terminal_bookend_payload_never_carries_an_error_key() {
+        let (_, rec) = coder_branch_terminal_bookend(&Err(anyhow!("boom")), "coder-phase", "m-6");
+        let payload = rec.payload.as_ref().unwrap();
+        assert!(
+            payload.get("error").is_none(),
+            "the explicit close's payload must not carry the Drop backstop's `error` key: {payload:?}"
+        );
+        assert_eq!(payload["gate"], serde_json::json!("coder-phase"));
+    }
+
+    /// `HostTelemetrySampler` itself never stamps `mission_id` (it doesn't
+    /// know one — see its own doc). `drained_telemetry` is the one place
+    /// that backfill happens for the generic launch path, mirroring
+    /// `mission_launch_review.rs`'s `FleetFlowEmitter`, which does the same
+    /// for `review`'s own samples. Fast injected cadence (5ms) — same
+    /// discipline `crates/darkmux-crew/src/run_obs.rs`'s own tests use — so
+    /// this doesn't race the real ~600-900ms `top`/`vm_stat`/`ioreg` shells
+    /// against the production 2s cadence `launch` itself uses.
+    #[test]
+    fn drained_telemetry_backfills_mission_id_onto_samples_that_lack_one() {
+        fn fake_sample() -> darkmux_crew::telemetry_sampler::HostSample {
+            darkmux_crew::telemetry_sampler::HostSample { cpu: Some(1), mem: Some(2), gpu: Some(3) }
+        }
+        // (#1877 QA nit) A non-empty `Ok(..)` — NOT `Ok(Vec::new())` — so
+        // `lms_diff`'s first (unseeded) call actually reports a load and
+        // the sampler's `telemetry.lms` half (routed through the SAME
+        // `try_drain` channel `telemetry.process` uses) gets covered too,
+        // not just the process-sample half.
+        fn fake_lms() -> anyhow::Result<Vec<darkmux_types::LoadedModel>> {
+            Ok(vec![darkmux_types::LoadedModel {
+                identifier: "darkmux:fake-model".to_string(),
+                model: "fake-model".to_string(),
+                status: "loaded".to_string(),
+                size: "1GB".to_string(),
+                context: 4096,
+            }])
+        }
+        let telemetry = run_obs::HostTelemetrySampler::start(
+            "case".to_string(),
+            "crew".to_string(),
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(2),
+            fake_sample,
+            fake_lms,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let samples = drained_telemetry(&telemetry, "mission-xyz");
+        assert!(!samples.is_empty(), "no sample landed within 200ms (40x the 5ms cadence) — sampler did not run");
+        assert!(
+            samples.iter().any(|s| s.action == "telemetry.process"),
+            "expected at least one `telemetry.process` sample: {samples:#?}"
+        );
+        assert!(
+            samples.iter().any(|s| s.action == "telemetry.lms"),
+            "expected at least one `telemetry.lms` sample (the fake resident model should have \
+             produced a load diff on the first, unseeded call): {samples:#?}"
+        );
+        assert!(
+            samples.iter().all(|s| s.mission_id.as_deref() == Some("mission-xyz")),
+            "every drained sample of EVERY kind must carry the backfilled mission_id: {samples:#?}"
+        );
+        drop(telemetry);
+    }
+
+    /// (#1877 "Bookends fire on a panic") Mirrors `darkmux_flow::bookend`'s
+    /// own `panic_while_armed_still_fires_the_abort_record` test, but
+    /// exercises the EXACT construction `launch` uses (`mission_bookend_
+    /// record` + `BookendGuard::new`'s `on_abort` closure) rather than a
+    /// synthetic fixture — proving THIS integration keeps the RAII
+    /// guarantee, not just the generic mechanism `darkmux-flow`'s own suite
+    /// already covers.
+    #[test]
+    fn mission_bookend_guard_fires_a_dispatch_error_abort_record_on_panic() {
+        let mut records: Vec<flow::FlowRecord> = Vec::new();
+        let mut sink = |r: flow::FlowRecord| records.push(r);
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = flow::BookendGuard::new(&mut sink, move |_id, _kind| {
+                mission_bookend_record(
+                    flow::Level::Error,
+                    "dispatch error",
+                    "panic-test-config",
+                    "panic-test-mission",
+                    serde_json::json!({
+                        "runtime": "mission",
+                        "result_class": "error",
+                        "error": "mission dispatch terminated before completion (early return or panic)",
+                    }),
+                )
+            });
+            guard.open(
+                "dispatch",
+                "dispatch",
+                mission_bookend_record(
+                    flow::Level::Info,
+                    "dispatch start",
+                    "panic-test-config",
+                    "panic-test-mission",
+                    serde_json::json!({ "runtime": "mission" }),
+                ),
+            );
+            panic!("simulated mid-run panic while the guard is armed");
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "the panic must propagate out of catch_unwind");
+        assert_eq!(records.len(), 2, "expected [start, abort]: {records:#?}");
+        assert_eq!(records[0].action, "dispatch start");
+        assert_eq!(records[1].action, "dispatch error");
+        assert_eq!(records[1].source.as_deref(), Some("mission"));
+    }
+
+    /// (#1877 requirement 2 — "review must stop building its own, or you
+    /// get two samplers double-sampling one run") Structural proof of the
+    /// reconciliation this arc chose: NEITHER — `review` never receives
+    /// this guard, and it isn't made nestable either, because the two
+    /// constructions are mutually exclusive by CONTROL FLOW. `launch`
+    /// returns into the dedicated `mission_launch_review::launch` (which
+    /// mints no `mission_id` and builds its own telemetry sampler +
+    /// `with_dispatch_bookends` privately) strictly BEFORE this generic
+    /// path ever reaches `run_obs::HostTelemetrySampler::start` — so
+    /// double-sampling is not a runtime risk to guard against, it is
+    /// unreachable code. This test pins the ORDERING so a future refactor
+    /// that moved the guard construction earlier (or the review branch
+    /// later) would fail loud here instead of silently double-sampling
+    /// review runs in production.
+    #[test]
+    fn review_branch_returns_before_the_mission_telemetry_bookend_guard_is_ever_constructed() {
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mission_launch.rs"));
+        let review_branch = SRC
+            .find("if config_uses_review_kinds(config) {")
+            .expect("the review-kind routing branch must exist in mission_launch.rs");
+        let guard_construction = SRC
+            .find("run_obs::HostTelemetrySampler::start(")
+            .expect("the mission telemetry guard must exist in mission_launch.rs");
+        assert!(
+            review_branch < guard_construction,
+            "the review-kind branch (which returns into mission_launch_review::launch before \
+             minting a mission_id here) must appear BEFORE the telemetry/bookend guard is \
+             constructed — otherwise review's own sampler and this generic one could both run \
+             over the same review dispatch"
+        );
+    }
+
+    /// (#1877 QA should-fix 5) The source-ordering test above pins TEXTUAL
+    /// position, not the actual invariant — a refactor that extracts the
+    /// guard construction into a helper `fn` defined earlier in the file
+    /// (called later) would still fail it while the invariant holds, and
+    /// one that moves the review branch's CALL later while its definition
+    /// stays early would pass it while double-sampling. This test pins the
+    /// invariant BEHAVIORALLY instead: launch a config whose graph uses a
+    /// review kind and assert zero `source: "mission"` records land,
+    /// regardless of how `launch`'s internals are structured.
+    ///
+    /// The config fails fast inside `mission_launch_review::launch` on the
+    /// missing required `diff_file` input (`launch`'s own doc — no
+    /// LMStudio, no worktree, no real work reachable before that `?`) —
+    /// which is fine: the claim under test is "review never reaches the
+    /// generic guard," not "review succeeds," and a review-kind config
+    /// that never even reaches the missing-input bail (a hang, a panic, a
+    /// successful launch) would ALSO be caught here, since any of those
+    /// would either fail this test's `expect_err` or leave the flow
+    /// records inspected below unrepresentative.
+    #[test]
+    #[serial_test::serial]
+    fn review_kind_config_launch_emits_zero_mission_source_records() {
+        let guard = LaunchTestGuard::new();
+        const REVIEW_KIND_CONFIG: &str = r#"{
+            "id": "review-kind-test-mission",
+            "name": "Review Kind Test Mission",
+            "schema_version": "2.3",
+            "phases": [{
+                "id": "p1",
+                "tasks": [{ "id": "t1", "steps": [{ "id": "s1", "kind": "review.judge" }] }]
+            }]
+        }"#;
+        guard.write_config("review-kind-test-mission", REVIEW_KIND_CONFIG);
+
+        let err = launch("review-kind-test-mission", None, &[], None)
+            .expect_err("no `diff_file` input was supplied — the review launcher must bail");
+        assert!(
+            err.to_string().contains("diff_file"),
+            "sanity: this must be review's own missing-input bail, not some other failure: {err}"
+        );
+
+        let records = read_all_flow_records();
+        assert!(
+            records.iter().all(|r| r["source"] != "mission"),
+            "a review-kind config must NEVER reach the generic guard's `source: \"mission\"` \
+             bookend — got {:#?}",
+            records.iter().filter(|r| r["source"] == "mission").collect::<Vec<_>>()
+        );
+        drop(guard);
+    }
+
+    /// (#1877 QA should-fix 6) `read_all_flow_records`-based tests can only
+    /// observe telemetry SAMPLES landing at the real 2s production cadence
+    /// (`run_obs.rs`'s own "sleep first, then sample" design deliberately
+    /// makes that impossible to race in a sub-second test — see this
+    /// module's `drained_telemetry_backfills_...` test, which uses an
+    /// injected fast cadence instead). So nothing in this file's `launch_*`
+    /// tests would notice all four `drained_telemetry(&telemetry, ...)`
+    /// call sites being deleted from `launch` — a real, silent way to lose
+    /// telemetry interleaving without any test going red. Pin the call
+    /// SITE COUNT as a cheap structural backstop: one per exit
+    /// (`run_step_graph`'s own emit closure, the scheduler-error return,
+    /// the coder-gate return, and the gate-less finish).
+    #[test]
+    fn launch_drains_telemetry_at_every_emission_point_and_every_exit() {
+        const SRC: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mission_launch.rs"));
+        // Built via `concat!` (not a plain string literal) so this test's
+        // OWN source line — which necessarily names the exact call shape
+        // it's counting — doesn't self-match and inflate the count by one,
+        // the same idiom `mission_launch_review_and_review_bench_construct_
+        // graphs_through_the_same_launcher`'s `run_needle` uses for the
+        // identical reason.
+        let needle = concat!("drained_telemetry(&telemetry, ", "&mission_id)");
+        let count = SRC.matches(needle).count();
+        assert_eq!(
+            count, 4,
+            "expected exactly 4 call sites of `{needle}` in mission_launch.rs (the run_step_graph \
+             emit closure + the 3 known exit points) — got {count}. If this changed on purpose, \
+             update this count; if not, telemetry interleaving silently regressed somewhere."
+        );
+    }
+
+    /// (#1877 requirement 1 — "no opt-in": a Tier-1-only, no-model-dispatch
+    /// generic config now gets a mission-level `dispatch *` bookend where it
+    /// previously got NONE at all.) Reuses `MIXED_OUTCOME_CONFIG` — one
+    /// completed step, one errored step, `MissionOutcomeStatus::Degraded`,
+    /// exit 0 — because it's the shape every operator-authored `gh_verb`
+    /// panel config actually produces on a partial run, and because a
+    /// Degraded-but-exit-0 run closing as `dispatch complete` (never
+    /// `dispatch error`) is itself worth pinning: the bookend carries
+    /// "did dispatch work happen and finish," not the mission's own
+    /// pass/fail verdict.
+    ///
+    /// RED PROVED: before this arc's `mission_launch.rs` changes, NO
+    /// record with `source == "mission"` was ever emitted on this path —
+    /// `read_all_flow_records()` filtered to `source: "mission"` was
+    /// empty for every generic (non-review) launch, confirmed by running
+    /// this exact assertion against the pre-change tree.
+    #[test]
+    #[serial_test::serial]
+    fn launch_of_a_tier1_generic_config_emits_exactly_one_mission_dispatch_bookend_pair() {
+        let guard = LaunchTestGuard::new();
+        guard.write_config("mixed-outcome-test-mission", MIXED_OUTCOME_CONFIG);
+
+        let exit = launch("mixed-outcome-test-mission", None, &[], None)
+            .expect("a mixed complete/errored generic run must still return an exit code, not an Err");
+        assert_eq!(exit, 0);
+
+        let mission_id = single_mission_id();
+        let records = read_all_flow_records();
+        let mission_records: Vec<&serde_json::Value> =
+            records.iter().filter(|r| r["source"] == "mission").collect();
+        let starts: Vec<&&serde_json::Value> =
+            mission_records.iter().filter(|r| r["action"] == "dispatch start").collect();
+        let completes: Vec<&&serde_json::Value> =
+            mission_records.iter().filter(|r| r["action"] == "dispatch complete").collect();
+        let errors: Vec<&&serde_json::Value> =
+            mission_records.iter().filter(|r| r["action"] == "dispatch error").collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "expected exactly one mission-level `dispatch start`, got {mission_records:#?}"
+        );
+        assert_eq!(
+            completes.len() + errors.len(),
+            1,
+            "expected exactly one mission-level terminal bookend, got {mission_records:#?}"
+        );
+        assert_eq!(
+            completes.len(),
+            1,
+            "a Degraded-but-exit-0 run must close as `dispatch complete`, not `dispatch error`: \
+             {mission_records:#?}"
+        );
+        for r in &starts {
+            assert_eq!(r["mission_id"], serde_json::json!(mission_id));
+            assert_eq!(r["session_id"], serde_json::json!(mission_id));
+        }
+        drop(guard);
+    }
+
+    /// (#1877 requirement 4/5 — "bookends fire on the coder branch's early
+    /// return") `launch`'s coder-phase gate arm (`if let Some(handles) =
+    /// &coder_handles { ... }`) returns EARLY — before `build_envelope`,
+    /// before the gate-less generic finish — on a worktree-creation
+    /// failure (`coder_phase_gate_outcome`'s documented "worktree step
+    /// errored -> hard `Err`" row). An invalid `base` ref makes `git
+    /// worktree add` fail immediately (verified: no worktree or branch is
+    /// ever registered against this repo — see this test's own assertions),
+    /// so this exercises the REAL early-return path, not a mock.
+    ///
+    /// This runs `git worktree add` against THIS repo (`coder_phase::
+    /// repo_root()` resolves from the test process's own cwd), not a
+    /// throwaway tempdir repo — deliberately: an invalid `base` ref is
+    /// already verified to fail before git creates anything, and building
+    /// an isolated fixture repo would mean the test itself mutating
+    /// `std::env::set_current_dir`, which is process-wide and would race
+    /// every OTHER test running concurrently in this binary — a strictly
+    /// worse risk than the one it would avoid.
+    ///
+    /// RED PROVED: before this arc's change, this exact scenario produced
+    /// zero `source: "mission"` records — confirmed by running this
+    /// assertion against the pre-change tree, where the coder branch's
+    /// early return had no bookend to close at all.
+    #[test]
+    #[serial_test::serial]
+    fn launch_coder_phase_worktree_failure_still_closes_the_mission_bookend_as_dispatch_error() {
+        let guard = LaunchTestGuard::new();
+        let tmp = TempDir::new().unwrap();
+        let workdir = tmp.path().join("wt");
+
+        let err = launch(
+            "coder-phase",
+            None,
+            &[
+                format!("workdir={}", workdir.display()),
+                "branch=mission-launch-test-branch".to_string(),
+                "base=mission-launch-tests-definitely-not-a-real-ref".to_string(),
+            ],
+            None,
+        )
+        .expect_err("an invalid `base` ref must fail worktree creation before any dispatch");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("worktree") || msg.contains("git"),
+            "sanity: this must be the worktree-creation failure this test targets, got: {err}"
+        );
+        assert!(!workdir.exists(), "sanity: an invalid base ref must never actually create the worktree dir");
+
+        let mission_id = single_mission_id();
+        let records = read_all_flow_records();
+        let mission_records: Vec<&serde_json::Value> =
+            records.iter().filter(|r| r["source"] == "mission").collect();
+        let starts: Vec<&&serde_json::Value> =
+            mission_records.iter().filter(|r| r["action"] == "dispatch start").collect();
+        let errors: Vec<&&serde_json::Value> =
+            mission_records.iter().filter(|r| r["action"] == "dispatch error").collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "the coder branch's early return must still have opened a mission-level bookend: \
+             {mission_records:#?}"
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "the coder branch's early return must close as `dispatch error`, explicitly — not \
+             rely on the Drop backstop for a KNOWN outcome: {mission_records:#?}"
+        );
+        assert_eq!(errors[0]["mission_id"], serde_json::json!(mission_id));
+        // (#1877 QA must-fix 3) `errors.len() == 1` alone can't tell the
+        // explicit `bookend.close(...)` apart from the `BookendGuard` Drop
+        // backstop — both emit exactly one "dispatch error" record. Only
+        // the PAYLOAD shape distinguishes them: the explicit close stamps
+        // `gate: "coder-phase"` (see `coder_branch_terminal_bookend`) and
+        // carries no `error` key; the Drop backstop's `on_abort` closure
+        // does the opposite (an `error` key naming "terminated before
+        // completion", no `gate` key). Asserting `gate` here is what
+        // proves this test exercises the explicit close this arc added —
+        // not just "some dispatch-error record landed" — which is exactly
+        // what this test's own docstring claims but, before this
+        // assertion, never actually checked.
+        //
+        // RED PROVED: deleting the `bookend.close(...)` call in `launch`'s
+        // coder branch (leaving only the Drop backstop to fire on the
+        // early `return outcome`) still left `starts.len() == 1` and
+        // `errors.len() == 1` passing, but this `payload["gate"]`
+        // assertion failed (`gate` absent) and `payload["error"]` was
+        // present instead.
+        assert_eq!(
+            errors[0]["payload"]["gate"],
+            serde_json::json!("coder-phase"),
+            "must be the explicit coder-branch close, not the Drop backstop's generic abort \
+             record: {mission_records:#?}"
+        );
+        assert!(
+            errors[0]["payload"].get("error").is_none(),
+            "the Drop backstop's abort record carries an `error` key instead of `gate` — seeing \
+             one here means `bookend.close` was never called: {mission_records:#?}"
+        );
+        drop(guard);
     }
 }

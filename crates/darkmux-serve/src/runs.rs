@@ -627,8 +627,59 @@ fn mission_to_run(
             .collect::<Vec<_>>(),
     );
 
-    let role = dispatch_role.or_else(|| representative.and_then(|s| s.role.clone()));
-    let model = representative.and_then(|s| s.model.clone());
+    // (#1877 regression) `representative` (earliest_by_start) is right for
+    // anything that genuinely is about ORDERING — `start_ts` below really
+    // should come from the mission's earliest dispatch. Role and model are
+    // ATTRIBUTE lookups, not ordering, and the #1877 whole-run bookend is
+    // deliberately the mission's earliest record (it opens before any step
+    // dispatches) — so reading role/model only off `representative` shows
+    // a stale-by-construction value whenever the bookend wins the pick.
+    // `sessions` is built from a HashSet (`candidate_ids`), so sorting a
+    // copy by `start_ts` (rather than trusting HashSet iteration order)
+    // keeps "first" deterministic; ISO-8601 sorts correctly as a plain
+    // string, same property `earliest_by_start` itself relies on.
+    //
+    // (#1877 QA must-fix 2) Filter to `start_ts.is_some()` BEFORE the sort,
+    // matching `earliest_by_start`'s own filter — a session with a terminal
+    // record but no `dispatch start` (a start truncated out of the
+    // `RUNS_FLOW_SCAN_WINDOW_DAYS` window, or evicted by Redis's `XADD
+    // MAXLEN ~` while its complete survives) carries `start_ts: None`, and
+    // `Option::cmp` orders `None` BEFORE `Some` — so an unfiltered sort put
+    // that start-less session first and let its `handle`/`model` win both
+    // attributes over every real dispatch session, exactly the corruption
+    // `earliest_by_start` itself is already immune to.
+    let mut sessions_by_start: Vec<&SessionAgg> =
+        sessions.iter().copied().filter(|s| s.start_ts.is_some()).collect();
+    sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
+
+    // Model is simple: the bookend's own record NEVER carries one
+    // (`mission_bookend_record` passes `model: None` unconditionally, one
+    // dispatch bookend spans however many per-step model calls a mission
+    // makes), so a plain "first session that resolved one" — same idiom
+    // as `flow_mission_to_run`'s route/model fallback above — is enough.
+    let model = sessions_by_start.iter().find_map(|s| s.model.clone());
+
+    // Role needs one more step: the bookend's `handle` is the LAUNCHED
+    // CONFIG ID (`mission_bookend_record`'s `role_id` param), which is a
+    // real, non-empty string — so a plain find_map "resolves" it
+    // immediately and never reaches the coder/reviewer/etc. step's actual
+    // role. Prefer the first NON-bookend session (source != "mission")
+    // that resolved a role; only reach for the bookend's own placeholder
+    // if nothing else did — which is the honest outcome for a Tier-1-only
+    // procedural mission that never dispatches a model at all (#1877's own
+    // named gap 2), where the bookend's config-id label is the best
+    // available information, not a display bug.
+    let is_bookend = |s: &&SessionAgg| s.source.as_deref() == Some("mission");
+    let role = dispatch_role
+        .or_else(|| sessions_by_start.iter().filter(|s| !is_bookend(s)).find_map(|s| s.role.clone()))
+        .or_else(|| sessions_by_start.iter().find_map(|s| s.role.clone()));
+
+    // `machine` deliberately stays representative-only, unlike role/model
+    // above: EVERY flow record — the #1877 bookend included — gets
+    // `machine_id` auto-stamped at write time whenever the caller left it
+    // unset (`darkmux_flow::record`'s provenance stamp, CLAUDE.md's
+    // "stamped at record-write time" contract), so the bookend session is
+    // never the one blanking this field the way it blanks role/model.
     let machine = representative.and_then(|s| s.machine.clone());
     let route = remote.and_then(|s| s.endpoint.clone());
     let start_ts_str = representative.and_then(|s| s.start_ts.clone());
@@ -982,6 +1033,14 @@ struct SessionAgg {
     role: Option<String>,
     model: Option<String>,
     machine: Option<String>,
+    /// The record's `source` field (e.g. `"crew_dispatch"`, `"review"`, or
+    /// the #1877 whole-run bookend's `"mission"`) — tracked so
+    /// [`mission_to_run`]'s role/model fallback can tell a real per-step
+    /// dispatch session apart from the mission-level bookend, whose
+    /// `handle` is the launched config id (a real string, never blank),
+    /// not an actual per-step role. Simple presence/absence (`role.is_
+    /// none()`) can't make that distinction — only the source can.
+    source: Option<String>,
     /// From the FIRST non-empty `payload.endpoint` seen on any dispatch
     /// lifecycle record (start, complete, OR error) for this session — the
     /// #1518 lesson applied server-side: the review pipeline stamps
@@ -1081,6 +1140,13 @@ fn build_flow_session_index(
             if let Some(mach) = v.get("machine_id").and_then(|m| m.as_str()) {
                 if !mach.is_empty() {
                     agg.machine = Some(mach.to_string());
+                }
+            }
+        }
+        if agg.source.is_none() {
+            if let Some(src) = v.get("source").and_then(|s| s.as_str()) {
+                if !src.is_empty() {
+                    agg.source = Some(src.to_string());
                 }
             }
         }
@@ -2697,6 +2763,284 @@ mod tests {
         assert_eq!(runs[0].kind, RunKind::Mission);
         assert!(runs[0].tracked);
         assert_eq!(runs[0].model.as_deref(), Some("qwen3.6-35b-a3b"));
+    }
+
+    /// (#1877 regression, fixed here) The whole-run `dispatch start`
+    /// bookend `launch()` now emits unconditionally opens BEFORE any step
+    /// dispatches — so it is always the mission's earliest session, and
+    /// wins `earliest_by_start`'s pick as `representative`. Its record
+    /// carries `handle = <launched config id>` (a real, non-empty string
+    /// — never the actual per-step role) and NO `model` at all
+    /// (`mission_bookend_record` always passes `model: None`; one bookend
+    /// spans however many per-step model calls the mission makes).
+    /// Reading role/model straight off `representative` therefore shows
+    /// the config id as "role" and blanks "model" on the dashboard for
+    /// every mission the new bookend touches — a real, operator-visible
+    /// regression this test pins the fix for.
+    ///
+    /// Red-proved by temporarily reverting `mission_to_run`'s role/model
+    /// lines to `representative.and_then(|s| s.role.clone())` /
+    /// `representative.and_then(|s| s.model.clone())`: role then reported
+    /// `Some("coder-phase")` (the bookend's config-id handle, not the
+    /// coder step's real role) and model reported `None`, both against
+    /// this test's assertions.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_1877_bookend_does_not_blank_a_previously_shown_role_or_model() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mut mission = minimal_mission(
+            "bookend-mission-1",
+            vec!["p-bookend".to_string()],
+            Some(MissionSpec {
+                config_id: "coder-phase".to_string(),
+                inputs_fingerprint: "fpb".to_string(),
+                origin: None,
+            }),
+        );
+        // Unmask `start_ts_str`'s contribution to `Run.started_ts`: with
+        // `mission.started_ts` set (as `minimal_mission` does by default),
+        // the mission record's own field always wins first and the
+        // session-derived fallback this test also pins never gets
+        // exercised. `mission_run_status` maps an Active mission with no
+        // `started_ts` straight to `Planned` (CONSIDER 4) regardless of
+        // sessions, which is why `status` isn't asserted below — that's an
+        // accepted, orthogonal side effect of unmasking the field.
+        mission.started_ts = None;
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase("p-bookend", "bookend-mission-1", vec!["t-bookend".to_string()]);
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task = minimal_task("t-bookend", "p-bookend", vec!["s-bookend".to_string()], Some("coder"));
+        darkmux_crew::lifecycle::save_task("bookend-mission-1", &task).unwrap();
+        let step = minimal_step("s-bookend", "t-bookend", Some("crew-dispatch-coder-bookend"));
+        darkmux_crew::lifecycle::save_step("bookend-mission-1", "p-bookend", &step).unwrap();
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                // The #1877 whole-run bookend — matches `mission_bookend_record`'s
+                // real shape: `handle` = the launched config id, `session_id` =
+                // `mission_id`, `source: "mission"`, no `model`. Earliest ts, so
+                // it wins the `earliest_by_start` pick. `machine_id` present, as
+                // it would be in production (`darkmux_flow::record` auto-stamps
+                // it on every record whose caller left it unset — not something
+                // `mission_bookend_record` itself sets).
+                serde_json::json!({
+                    "ts": "2026-01-01T08:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "bookend-mission-1",
+                    "handle": "coder-phase",
+                    "mission_id": "bookend-mission-1",
+                    "source": "mission",
+                    "machine_id": "studio",
+                }),
+                // The coder step's OWN dispatch — a real role and model,
+                // starting after the bookend. `machine_id` deliberately
+                // DIFFERENT from the bookend's, to pin that `machine` reads
+                // only the representative (earliest) session and does not
+                // borrow a later session's value the way role/model now do.
+                serde_json::json!({
+                    "ts": "2026-01-01T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "crew-dispatch-coder-bookend",
+                    "handle": "coder",
+                    "machine_id": "different-peer",
+                }),
+                serde_json::json!({
+                    "ts": "2026-01-01T09:10:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "crew-dispatch-coder-bookend",
+                    "handle": "coder",
+                    "model": "qwen3.6-35b-a3b",
+                    "machine_id": "different-peer",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None, &[]);
+        assert_eq!(runs.len(), 1, "exactly one Run — the bookend session joins, it doesn't ghost: {runs:?}");
+        assert_eq!(runs[0].id, "bookend-mission-1");
+        assert_eq!(runs[0].kind, RunKind::Mission);
+        assert!(runs[0].tracked);
+
+        // The fix: role/model recover from the coder step's session, not
+        // the bookend's own placeholder handle / absent model.
+        assert_eq!(runs[0].role.as_deref(), Some("coder"), "role must recover the coder step's real role, not the bookend's config-id handle: {runs:?}");
+        assert_eq!(runs[0].model.as_deref(), Some("qwen3.6-35b-a3b"), "model must recover from the coder step's session, not stay blanked by the bookend: {runs:?}");
+
+        // The deliberate machine decision: representative-only, no
+        // fallback — because every record, bookend included, gets
+        // `machine_id` auto-stamped at write time in production, so the
+        // bookend session is never the one blanking it.
+        assert_eq!(runs[0].machine.as_deref(), Some("studio"), "machine must read the representative (earliest/bookend) session's value, not borrow the coder session's: {runs:?}");
+
+        // Ordering is untouched by this fix: start_ts still comes from the
+        // EARLIEST session (the bookend), same as before.
+        assert_eq!(
+            runs[0].started_ts,
+            parse_flow_ts("2026-01-01T08:00:00Z"),
+            "start_ts must still come from the earliest session — only role/model attribution changed: {runs:?}"
+        );
+    }
+
+    /// (#1877 QA must-fix 2) A session with a TERMINAL record but no
+    /// `dispatch start` at all must never win role OR model — reachable via
+    /// `RUNS_FLOW_SCAN_WINDOW_DAYS` truncating the start out of the scan
+    /// window while the complete stays inside it, or a Redis `XADD MAXLEN ~`
+    /// eviction of the oldest (the start) while the complete survives.
+    /// `sessions_by_start`'s sort used to compare `Option<String>` directly
+    /// with no filter, and `Option::cmp` orders `None` before `Some`, so a
+    /// start-less session sorted to the front and its `find_map` lookups
+    /// won both attributes ahead of the mission's real dispatch session.
+    ///
+    /// RED PROVED: against the pre-fix `sessions_by_start.sort_by(|a, b|
+    /// a.start_ts.cmp(&b.start_ts))` (no filter), this test's role/model
+    /// assertions failed with `Some("STALE-ROLE")` / `Some("STALE-MODEL")`
+    /// — exactly the injected startless session's own handle/model, in
+    /// place of the real coder session's `"coder"` / `"qwen3.6-35b-a3b"`.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_1877_startless_session_never_wins_role_or_model() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mut mission = minimal_mission(
+            "bookend-mission-2",
+            vec!["p-bookend2".to_string()],
+            Some(MissionSpec {
+                config_id: "coder-phase".to_string(),
+                inputs_fingerprint: "fpb2".to_string(),
+                origin: None,
+            }),
+        );
+        mission.started_ts = None;
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase("p-bookend2", "bookend-mission-2", vec!["t-bookend2".to_string()]);
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task = minimal_task("t-bookend2", "p-bookend2", vec!["s-bookend2".to_string()], Some("coder"));
+        darkmux_crew::lifecycle::save_task("bookend-mission-2", &task).unwrap();
+        let step = minimal_step("s-bookend2", "t-bookend2", Some("crew-dispatch-coder-bookend2"));
+        darkmux_crew::lifecycle::save_step("bookend-mission-2", "p-bookend2", &step).unwrap();
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                // The #1877 whole-run bookend — earliest ts, wins
+                // `earliest_by_start`'s `representative` pick.
+                serde_json::json!({
+                    "ts": "2026-01-01T08:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "bookend-mission-2",
+                    "handle": "coder-phase",
+                    "mission_id": "bookend-mission-2",
+                    "source": "mission",
+                    "machine_id": "studio",
+                }),
+                // The coder step's OWN dispatch — a real role and model.
+                serde_json::json!({
+                    "ts": "2026-01-01T09:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "crew-dispatch-coder-bookend2",
+                    "handle": "coder",
+                    "machine_id": "different-peer",
+                }),
+                serde_json::json!({
+                    "ts": "2026-01-01T09:10:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "crew-dispatch-coder-bookend2",
+                    "handle": "coder",
+                    "model": "qwen3.6-35b-a3b",
+                    "machine_id": "different-peer",
+                }),
+                // (#1877 QA must-fix 2) A terminal-only record — NO
+                // matching `dispatch start` for this `session_id` anywhere
+                // in this scenario — timestamped LATEST of all three so a
+                // buggy `None`-sorts-first comparison still puts it at the
+                // FRONT of `sessions_by_start` despite the late `ts`.
+                serde_json::json!({
+                    "ts": "2026-01-01T09:20:00Z",
+                    "action": "dispatch complete",
+                    "session_id": "startless-session",
+                    "handle": "STALE-ROLE",
+                    "model": "STALE-MODEL",
+                    "mission_id": "bookend-mission-2",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None, &[]);
+        assert_eq!(runs.len(), 1, "exactly one Run: {runs:?}");
+        assert_eq!(runs[0].id, "bookend-mission-2");
+        assert_eq!(
+            runs[0].role.as_deref(),
+            Some("coder"),
+            "a start-less terminal-only session must never win role: {runs:?}"
+        );
+        assert_eq!(
+            runs[0].model.as_deref(),
+            Some("qwen3.6-35b-a3b"),
+            "a start-less terminal-only session must never win model: {runs:?}"
+        );
+        // `machine` already goes through `earliest_by_start`, which already
+        // filters `start_ts.is_some()` — unaffected by this bug either way,
+        // pinned here so a future regression on THIS sort doesn't silently
+        // also break the field that was never broken.
+        assert_eq!(runs[0].machine.as_deref(), Some("studio"), "{runs:?}");
+    }
+
+    /// A mission with NO other dispatching session at all — a Tier-1-only
+    /// procedural graph (#1877's own named gap 2: no model dispatch,
+    /// bookend-only). The bookend's config-id handle is the ONLY
+    /// information available, so it is legitimately the fallback here —
+    /// this is the "nothing else resolved" arm of the role fallback, not a
+    /// display bug.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_bookend_only_mission_falls_back_to_the_bookends_own_config_id_role() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mission = minimal_mission(
+            "bookend-only-1",
+            vec![],
+            Some(MissionSpec {
+                config_id: "gh-verb-approve".to_string(),
+                inputs_fingerprint: "fpo".to_string(),
+                origin: None,
+            }),
+        );
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-01-01T08:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "bookend-only-1",
+                    "handle": "gh-verb-approve",
+                    "mission_id": "bookend-only-1",
+                    "source": "mission",
+                }),
+                serde_json::json!({
+                    "ts": "2026-01-01T08:00:05Z",
+                    "action": "dispatch complete",
+                    "session_id": "bookend-only-1",
+                    "handle": "gh-verb-approve",
+                    "mission_id": "bookend-only-1",
+                    "source": "mission",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None, &[]);
+        assert_eq!(runs.len(), 1, "exactly one Run for the bookend-only mission: {runs:?}");
+        assert_eq!(runs[0].role.as_deref(), Some("gh-verb-approve"), "with no other session, the bookend's own handle IS the best available role: {runs:?}");
+        assert_eq!(runs[0].model.as_deref(), None, "a procedural-only mission genuinely has no model to show: {runs:?}");
     }
 
     /// Launch path 1/4 (the flagship path): a review-shaped mission whose

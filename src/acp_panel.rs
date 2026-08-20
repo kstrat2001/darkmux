@@ -383,6 +383,69 @@ pub fn run_ephemeral(
     // `<mission_id>/` is ever written).
     let correlation_id = mint_ephemeral_correlation_id(&config.id);
 
+    // (#1877 QA must-fix 1) Telemetry + a whole-run dispatch bookend,
+    // PRESCRIBED here too — not just for `darkmux mission launch`. Before
+    // this, `run_ephemeral` was a second door into `run_step_graph` with
+    // neither: the SAME gh_verb configs `launch()` now covers (`pr-merge`,
+    // `pr-approve`) run through here whenever the ACP panel in Zed invokes
+    // them, so a panel-launched `pr-merge` that hung had none of the
+    // observability its terminal-launched twin gets, and the Runs lens
+    // showed nothing for it. This path is Tier-1-only by construction
+    // (`is_procedural_only` gates routing here at all — see `route_command`),
+    // so no per-step model dispatch ever happens on it; telemetry is the
+    // whole value (host cpu/ram/gpu + lms load/unload deltas alongside a
+    // `procedural.shell` step that shells out to `gh` and might hang), and
+    // the bookend pair is what makes an ephemeral run's liveness visible at
+    // all, the same way `mission_bookend_record`'s own doc explains for
+    // `launch`. Reuses `mission_launch`'s builders (`mission_bookend_record`,
+    // `drained_telemetry`) rather than a second hand-rolled copy of the
+    // record shape — same discipline #1685 QA MUST-FIX 2 already applied to
+    // `emit_gh_verb_audit`. No mission instance is minted either way (rule
+    // D still holds): `mission_id`/`session_id` on every record here is the
+    // per-invocation `correlation_id`, never a real mission id.
+    let telemetry = crate::crew::run_obs::HostTelemetrySampler::start(
+        correlation_id.clone(),
+        config.id.clone(),
+        crate::crew::run_obs::DEFAULT_TELEMETRY_INTERVAL,
+        crate::crew::run_obs::DEFAULT_TELEMETRY_POLL,
+        crate::crew::telemetry_sampler::sample_host,
+        darkmux_profiles::lms::list_loaded,
+    );
+    let mut dispatch_sink = |record: crate::flow::FlowRecord| {
+        let _ = crate::flow::record(record);
+    };
+    let config_id_for_abort = config.id.clone();
+    let correlation_id_for_abort = correlation_id.clone();
+    // `BookendGuard`'s Drop fires this `on_abort` closure for any exit
+    // between `open()` below and a matching `close()` that this function
+    // doesn't already reach explicitly — mirrors `launch`'s own bookend;
+    // see its doc for why this is the accepted backstop for the
+    // unexpected case, not the primary mechanism.
+    let mut bookend = crate::flow::BookendGuard::new(&mut dispatch_sink, move |_id, _kind| {
+        crate::mission_launch::mission_bookend_record(
+            crate::flow::Level::Error,
+            "dispatch error",
+            &config_id_for_abort,
+            &correlation_id_for_abort,
+            serde_json::json!({
+                "runtime": "ephemeral",
+                "result_class": "error",
+                "error": "ephemeral panel dispatch terminated before completion (early return or panic)",
+            }),
+        )
+    });
+    bookend.open(
+        "dispatch",
+        "dispatch",
+        crate::mission_launch::mission_bookend_record(
+            crate::flow::Level::Info,
+            "dispatch start",
+            &config.id,
+            &correlation_id,
+            serde_json::json!({ "runtime": "ephemeral" }),
+        ),
+    );
+
     // (#1685) Track whether an operator sign-off gate was actually
     // CONFIRMED during this run, for the gh-verb audit record emitted
     // below. `Rc<Cell<..>>` (not a plain captured `&mut`) so this closure
@@ -406,7 +469,7 @@ pub fn run_ephemeral(
         }) as BoxedGateHandler<'_>
     });
 
-    let report = crate::crew::scheduler::run_step_graph(
+    let scheduler_result = crate::crew::scheduler::run_step_graph(
         &mut steps,
         &tasks,
         &registry,
@@ -416,6 +479,13 @@ pub fn run_ephemeral(
         &crate::crew::concurrent_dispatch::lms_host_factory,
         &mut |mut record| {
             record.mission_id.get_or_insert_with(|| correlation_id.clone());
+            // (#1877) Drain before emit — same interleaving discipline
+            // `launch`'s own emit closure uses, so telemetry streams
+            // alongside this run's other records rather than batching at
+            // the end (CLAUDE.md's "no blind runs" mandate).
+            for sample in crate::mission_launch::drained_telemetry(&telemetry, &correlation_id) {
+                let _ = crate::flow::record(sample);
+            }
             let _ = crate::flow::record(record);
         },
         &mut |_step: &Step| {
@@ -426,10 +496,77 @@ pub fn run_ephemeral(
         instrumented_gate.as_deref_mut(),
         None,
         &[],
-    )
-    .context("running panel command graph")?;
+    );
 
-    let outcome = render_ephemeral_result(&ordered_tasks, &steps, &report, &interpret_warnings)?;
+    // (#1877 QA must-fix 1) Explicit close on every KNOWN exit — a
+    // scheduler-level error, a `render_ephemeral_result` error, or the
+    // ordinary success finish — same discipline `launch`'s own three
+    // explicit-close sites use; the `BookendGuard` Drop backstop above is
+    // strictly the fallback for the unexpected case (a panic).
+    let report = match scheduler_result {
+        Ok(report) => report,
+        Err(e) => {
+            for sample in crate::mission_launch::drained_telemetry(&telemetry, &correlation_id) {
+                bookend.emit_now(sample);
+            }
+            bookend.close(
+                "dispatch",
+                crate::mission_launch::mission_bookend_record(
+                    crate::flow::Level::Error,
+                    "dispatch error",
+                    &config.id,
+                    &correlation_id,
+                    serde_json::json!({
+                        "runtime": "ephemeral",
+                        "result_class": "error",
+                        "error": e.to_string(),
+                    }),
+                ),
+            );
+            return Err(e.context("running panel command graph"));
+        }
+    };
+
+    let outcome = match render_ephemeral_result(&ordered_tasks, &steps, &report, &interpret_warnings) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            for sample in crate::mission_launch::drained_telemetry(&telemetry, &correlation_id) {
+                bookend.emit_now(sample);
+            }
+            bookend.close(
+                "dispatch",
+                crate::mission_launch::mission_bookend_record(
+                    crate::flow::Level::Error,
+                    "dispatch error",
+                    &config.id,
+                    &correlation_id,
+                    serde_json::json!({
+                        "runtime": "ephemeral",
+                        "result_class": "error",
+                        "error": e.to_string(),
+                    }),
+                ),
+            );
+            return Err(e);
+        }
+    };
+
+    for sample in crate::mission_launch::drained_telemetry(&telemetry, &correlation_id) {
+        bookend.emit_now(sample);
+    }
+    bookend.close(
+        "dispatch",
+        crate::mission_launch::mission_bookend_record(
+            if outcome.success { crate::flow::Level::Info } else { crate::flow::Level::Error },
+            if outcome.success { "dispatch complete" } else { "dispatch error" },
+            &config.id,
+            &correlation_id,
+            serde_json::json!({
+                "runtime": "ephemeral",
+                "result_class": if outcome.success { "ok" } else { "error" },
+            }),
+        ),
+    );
 
     // (#1685) Flow-record audit — ONE record per executed gh-verb command,
     // regardless of outcome: a blocked-by-gate or otherwise-failed attempt
@@ -1059,6 +1196,108 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_CREW_DIR", v),
                 None => std::env::remove_var("DARKMUX_CREW_DIR"),
+            }
+        }
+    }
+
+    // ── #1877 QA must-fix 1 — `run_ephemeral` gets telemetry + the same ──
+    // whole-run `dispatch *` bookend pair `mission_launch::launch` gives
+    // every OTHER config. Before this, a panel-launched `pr-merge` had
+    // neither: identical steps, identical `gh_verb`, zero observability.
+    //
+    // RED PROVED: against the pre-fix `run_ephemeral` (no telemetry/bookend
+    // construction at all), `read_all_flow_records()` in both tests below
+    // returned only the step's own `step result` record — no `source:
+    // "mission"` record of any kind, so the `starts`/`terminals` filters
+    // found nothing and both `assert_eq!(..., 1, ...)` calls failed on `0`.
+
+    #[test]
+    #[serial_test::serial]
+    fn run_ephemeral_emits_a_mission_source_dispatch_bookend_pair_on_success() {
+        let tmp_flows = tempfile::TempDir::new().unwrap();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path()) };
+
+        let cfg = config(
+            "bookend-noop-test",
+            None,
+            vec![phase("p1", vec![task("t1", &[], &[], vec![step("s1", "procedural.noop", serde_json::Value::Null)])])],
+        );
+        let cwd = std::env::temp_dir();
+        let out = run_ephemeral(&cfg, "", &cwd, None).expect("ephemeral run succeeds");
+        assert!(out.success);
+
+        let records = read_all_flow_records();
+        let mission_records: Vec<&serde_json::Value> =
+            records.iter().filter(|r| r["source"] == "mission").collect();
+        let starts: Vec<&&serde_json::Value> =
+            mission_records.iter().filter(|r| r["action"] == "dispatch start").collect();
+        let completes: Vec<&&serde_json::Value> =
+            mission_records.iter().filter(|r| r["action"] == "dispatch complete").collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "an ephemeral run must open exactly one mission-level bookend, matching launch()'s \
+             own pair: {mission_records:#?}"
+        );
+        assert_eq!(
+            completes.len(),
+            1,
+            "a successful ephemeral run must close as `dispatch complete`: {mission_records:#?}"
+        );
+        assert_eq!(starts[0]["handle"], serde_json::json!("bookend-noop-test"));
+        let mission_id = starts[0]["mission_id"].as_str().expect("mission_id present").to_string();
+        assert!(
+            mission_id.starts_with("acp-ephemeral-bookend-noop-test-"),
+            "the bookend's mission_id must be the minted per-invocation correlation id: {mission_id}"
+        );
+        assert_eq!(starts[0]["session_id"], serde_json::json!(mission_id));
+        assert_eq!(completes[0]["mission_id"], serde_json::json!(mission_id));
+        assert_eq!(completes[0]["payload"]["gate"], serde_json::Value::Null, "no coder-phase gate on this path");
+
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_ephemeral_closes_the_bookend_as_dispatch_error_when_the_gate_declines() {
+        let tmp_flows = tempfile::TempDir::new().unwrap();
+        let prev_flows = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe { std::env::set_var("DARKMUX_FLOWS_DIR", tmp_flows.path()) };
+
+        let cfg = gather_then_gated_config();
+        let tmp = std::env::temp_dir();
+        let mut decline = |_s: &Step, _f: &Map<String, String>| crate::crew::gate::GateDecision::Declined {
+            reason: "operator declined".to_string(),
+        };
+        let out = run_ephemeral(&cfg, "", &tmp, Some(&mut decline))
+            .expect("a declined gate still renders a command-failed message, not an Err");
+        assert!(!out.success);
+
+        let records = read_all_flow_records();
+        let mission_records: Vec<&serde_json::Value> =
+            records.iter().filter(|r| r["source"] == "mission").collect();
+        let starts: Vec<&&serde_json::Value> =
+            mission_records.iter().filter(|r| r["action"] == "dispatch start").collect();
+        let errors: Vec<&&serde_json::Value> =
+            mission_records.iter().filter(|r| r["action"] == "dispatch error").collect();
+        assert_eq!(starts.len(), 1, "{mission_records:#?}");
+        assert_eq!(
+            errors.len(),
+            1,
+            "a declined gate is a command FAILURE — the bookend must close as `dispatch error`: \
+             {mission_records:#?}"
+        );
+
+        unsafe {
+            match prev_flows {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
             }
         }
     }
