@@ -287,7 +287,15 @@ fn emit_launch_gh_verb_audit(
 /// a whole-run bookend apart from either: this is not one model call, and
 /// not a review run — it is "did this mission's dispatch work start and
 /// finish."
-fn mission_bookend_record(
+///
+/// `pub(crate)` (#1877 QA must-fix 1): `src/acp_panel.rs::run_ephemeral`
+/// reuses this SAME builder for its own whole-run bookend pair — the
+/// `session_id`/`mission_id` param happens to be a minted per-invocation
+/// `correlation_id` there rather than a real mission id, but the shape
+/// (config-id handle, no model, `source: "mission"`) is identical, and a
+/// second hand-rolled copy is exactly the drift #1685 QA MUST-FIX 2
+/// already closed for `emit_gh_verb_audit`.
+pub(crate) fn mission_bookend_record(
     level: flow::Level,
     action: &str,
     config_id: &str,
@@ -315,7 +323,11 @@ fn mission_bookend_record(
 /// `FleetFlowEmitter` backfills it for `review`'s own samples, so a
 /// coder-phase run's telemetry is joinable to its mission in the viewer
 /// exactly like review's already is.
-fn drained_telemetry(telemetry: &run_obs::HostTelemetrySampler, mission_id: &str) -> Vec<flow::FlowRecord> {
+///
+/// `pub(crate)` (#1877 QA must-fix 1): shared with `acp_panel::
+/// run_ephemeral`'s own telemetry drain — same backfill discipline, keyed
+/// on that path's minted `correlation_id` instead of a real mission id.
+pub(crate) fn drained_telemetry(telemetry: &run_obs::HostTelemetrySampler, mission_id: &str) -> Vec<flow::FlowRecord> {
     telemetry
         .try_drain()
         .into_iter()
