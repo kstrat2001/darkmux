@@ -5,4 +5,4 @@
  * [`mission_run_status`] (missions/dispatches), [`lab_run_status`] (lab
  * runs), [`ghost_runs`] (untracked flow-only sessions).
  */
-export type RunStatus = "planned" | "running" | "complete" | "error" | "abandoned";
+export type RunStatus = "planned" | "running" | "complete" | "error" | "abandoned" | "unparseable";

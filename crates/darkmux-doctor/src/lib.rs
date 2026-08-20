@@ -169,6 +169,7 @@ pub fn run() -> DoctorReport {
         check_beat33_legacy_crew_dir(),
         check_legacy_mission_layout(),
         check_legacy_compaction_extras(),
+        check_mission_envelope_readability(),
     ];
     let checks = [checks, eureka_checks()].concat();
     DoctorReport { checks }
@@ -3744,6 +3745,73 @@ fn check_legacy_mission_layout() -> Check {
     }
 }
 
+/// Name of the mission-envelope readability check (#1881).
+const MISSION_ENVELOPE_READABILITY_CHECK_NAME: &str = "mission envelope readability";
+
+/// (#1881) Every mission dir's `envelope.json`, read the same way
+/// `crates/darkmux-serve/src/runs.rs`'s `mission_run_status` reads it
+/// (`darkmux_crew::lifecycle::load_envelope`), and named LOUDLY when this
+/// binary cannot deserialize one. This is exactly the contract-registry
+/// item 5 obligation ("complaints are LOUD in `darkmux doctor`") applied to
+/// the specific failure `mission_run_status` used to swallow: an envelope a
+/// NEWER darkmux wrote (a `status`/`outcome` value this binary's enums
+/// don't recognize yet) rendered as a silent, completed, green run on the
+/// dashboard instead of surfacing anywhere. Doctor is where schema drift
+/// between fleet machines (CLAUDE.md's "cross-system contracts" — the
+/// laptop on a `cargo install`ed main, the Studio on brew/stable) is
+/// supposed to be named.
+///
+/// Scope: every FINALIZED mission has (or once had) a real envelope to
+/// read; a mission with no `envelope.json` at all (`Ok(None)`) is not
+/// drift — see `load_envelope`'s own doc — and is not reported here.
+fn check_mission_envelope_readability() -> Check {
+    let missions_root = darkmux_crew::loader::missions_dir();
+    let mut unreadable: Vec<String> = Vec::new();
+    let mut readable_count = 0u32;
+    if let Ok(entries) = std::fs::read_dir(&missions_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(mission_id) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match darkmux_crew::lifecycle::load_envelope(mission_id) {
+                Ok(Some(_)) => readable_count += 1,
+                Ok(None) => {}
+                Err(e) => unreadable.push(format!("{mission_id} ({e})")),
+            }
+        }
+    }
+    if unreadable.is_empty() {
+        Check {
+            name: MISSION_ENVELOPE_READABILITY_CHECK_NAME.into(),
+            status: Status::Pass,
+            message: format!("{readable_count} mission envelope(s) parsed cleanly"),
+            hint: None,
+        }
+    } else {
+        Check {
+            name: MISSION_ENVELOPE_READABILITY_CHECK_NAME.into(),
+            status: Status::Warn,
+            message: format!(
+                "{} mission envelope(s) this binary could not parse: {}",
+                unreadable.len(),
+                unreadable.join(", ")
+            ),
+            hint: Some(
+                "Likely schema drift between fleet machines — a newer darkmux wrote a \
+                 status/outcome value this binary's release doesn't recognize yet. Affected runs \
+                 render as \"unparseable\" on the dashboard, never as a false completed/green run. \
+                 Compare `darkmux --version` here against the machine that wrote the envelope, and \
+                 upgrade this machine if it's behind."
+                    .into(),
+            ),
+        }
+    }
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 fn which(cmd: &str) -> Option<PathBuf> {
@@ -4974,11 +5042,12 @@ mod tests {
         // mission-config-registry [#1284] + daemon-freshness +
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + gh-verb-allowlist [#1685] + unpriceable-residents
-        // [#1819] + review-judge-exhaustion-policy [#1876/#1877]) + one per
-        // active eureka rule.
+        // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
+        // mission-envelope-readability [#1881]) + one per active eureka
+        // rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 38 + darkmux_eureka::all_rules().len();
+        let expected = 39 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -6399,4 +6468,86 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1, "exactly one billed call");
     }
 
+    // ─── check_mission_envelope_readability (#1881) ────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn mission_envelope_readability_passes_with_no_missions_dir_at_all() {
+        let _guard = CrewRootGuard::new();
+        let check = check_mission_envelope_readability();
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.hint.is_none());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn mission_envelope_readability_ignores_a_mission_with_no_envelope_written_yet() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("missions").join("m-no-envelope")).unwrap();
+        let check = check_mission_envelope_readability();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn mission_envelope_readability_passes_on_a_well_formed_envelope() {
+        let guard = CrewRootGuard::new();
+        let mission_dir = guard.path().join("missions").join("m-good");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        std::fs::write(
+            mission_dir.join("envelope.json"),
+            r#"{"mission_id":"m-good","status":"clean","phases":[]}"#,
+        )
+        .unwrap();
+        let check = check_mission_envelope_readability();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains('1'), "{}", check.message);
+    }
+
+    /// (#1881 RED proof) A malformed `envelope.json` — no leniency of any
+    /// kind can rescue this, so it is exactly the case `mission_run_status`
+    /// resolves to `RunStatus::Unparseable`. This is the doctor-side half of
+    /// the same fix: the operator must be told WHICH mission, not just see
+    /// a silently-green dashboard row. Proven failing first by temporarily
+    /// treating `Err` the way the pre-#1881 `.ok().flatten()` bug did (fold
+    /// it into "nothing to report") — restored immediately below; see the
+    /// git history on this test for the red run.
+    #[serial_test::serial]
+    #[test]
+    fn mission_envelope_readability_warns_and_names_the_mission_on_a_malformed_envelope() {
+        let guard = CrewRootGuard::new();
+        let mission_dir = guard.path().join("missions").join("m-broken");
+        std::fs::create_dir_all(&mission_dir).unwrap();
+        std::fs::write(mission_dir.join("envelope.json"), "{not valid json at all").unwrap();
+
+        let check = check_mission_envelope_readability();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("m-broken"), "{}", check.message);
+        assert!(check.hint.is_some());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn mission_envelope_readability_names_every_unreadable_mission_alongside_the_readable_ones() {
+        let guard = CrewRootGuard::new();
+        let good_dir = guard.path().join("missions").join("m-good2");
+        std::fs::create_dir_all(&good_dir).unwrap();
+        std::fs::write(
+            good_dir.join("envelope.json"),
+            r#"{"mission_id":"m-good2","status":"clean","phases":[]}"#,
+        )
+        .unwrap();
+        let bad_dir = guard.path().join("missions").join("m-broken2");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join("envelope.json"), "not json").unwrap();
+
+        let check = check_mission_envelope_readability();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("m-broken2"), "{}", check.message);
+        assert!(
+            !check.message.contains("m-good2"),
+            "a readable envelope must not be named among the unreadable ones: {}",
+            check.message
+        );
+    }
 }
