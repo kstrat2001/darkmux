@@ -2633,6 +2633,194 @@ mod tests {
         );
     }
 
+    /// (#1877 item 3 QA) A step that genuinely RAN and then failed (its own
+    /// `run_streaming` call returned `Err`) still gets a real, non-zero
+    /// `StepRecord` — the interesting half of "a step that ran and failed
+    /// is still timed." This is the live per-seat drain path (the job
+    /// closure sends `WaveSignal::StepTerminal` with a real `wall_ms` on
+    /// BOTH the `Ok` and `Err` arms, see the job closure above), not the
+    /// gate-declined or local-wave-load-failure paths, which correctly get
+    /// no record because nothing real ran for them.
+    ///
+    /// **Proved failing first**: temporarily changed `apply_step_terminal`
+    /// to push a `StepRecord` only `if result.is_ok()` (leaving the error
+    /// path's `wall_ms` un-recorded) and reran this exact test. It failed:
+    /// ```text
+    /// assertion `left == right` failed: an errored step that actually
+    /// dispatched must still get a StepRecord
+    ///   left: 0
+    ///  right: 1
+    /// ```
+    /// — confirming the assertion actually distinguishes "ran and failed"
+    /// from "never ran." Reverted the mutation before committing.
+    #[test]
+    fn errored_step_that_actually_ran_still_gets_a_record_with_real_duration() {
+        struct FailingSleepKind;
+        impl StepKind for FailingSleepKind {
+            fn id(&self) -> &'static str {
+                "test.fail-sleep"
+            }
+            fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+                let ms = step.config.get("sleep_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                Err(anyhow!("boom: {}", step.id))
+            }
+        }
+
+        let kind = Arc::new(FailingSleepKind);
+        let (ta, sa) = kinded_step("boom", "test.fail-sleep", json!({ "sleep_ms": 60 }), &[]);
+        let (tasks, mut steps) = graph(vec![(ta, sa)]);
+
+        let kinds = StepKindRegistry::new();
+        kinds.register(kind).unwrap();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |_r| {},
+            &mut |_s| {},
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(report.errored, vec!["boom-step".to_string()]);
+        assert_eq!(
+            report.step_records.len(),
+            1,
+            "an errored step that actually dispatched must still get a StepRecord"
+        );
+        let rec = &report.step_records[0];
+        assert_eq!(rec.step_id, "boom-step");
+        assert_eq!(rec.kind, "test.fail-sleep");
+        assert!(
+            rec.wall_ms >= 50,
+            "the failed step's own ~60ms sleep must show up in its record — got {}ms",
+            rec.wall_ms
+        );
+    }
+
+    /// (#1877 item 3 QA) The other half of the trichotomy: a step whose
+    /// LOCAL wave never even dispatched — `ensure_wave_loaded` fails to
+    /// make its placement resident — gets NO `StepRecord`, exactly like the
+    /// gate-declined and panic cases, even though it reaches `errored`
+    /// through a completely different code path (`run_local_waves`'s
+    /// error-push in `concurrent_dispatch.rs`, reconciled through the SAME
+    /// post-scope `apply_step_terminal(..., None, ...)` call the panic path
+    /// uses — see the scheduler's own field doc). Without this pinned, a
+    /// future refactor that moves the `Instant` outside the `Err` arm (or
+    /// substitutes a wave-clock duration for the reconcile path) could
+    /// silently fabricate a duration for a step that never actually ran,
+    /// and nothing would notice.
+    ///
+    /// **Proved failing first**: temporarily changed the post-scope
+    /// reconcile call's `wall_ms` argument from `None` to `Some(0)`
+    /// (exactly the fabrication this module's docs say never happens) and
+    /// reran this exact test. It failed:
+    /// ```text
+    /// a load-failed step never ran — it must not get a StepRecord:
+    /// [StepRecord { step_id: "needs-model-step", kind:
+    /// "test.local-model", items_in: None, items_out: None, wall_ms: 0 }]
+    /// ```
+    /// — a fabricated `wall_ms: 0` on a step whose `run` never printed.
+    /// Reverted the mutation before committing.
+    #[test]
+    #[serial_test::serial]
+    fn local_wave_load_failure_gets_no_fabricated_record() {
+        /// A kind whose `residency()` always resolves a Local placement for
+        /// a model no test host will ever successfully load — reaches
+        /// `run_local_waves`'s `ensure_wave_loaded` failure path without
+        /// depending on `dispatch.map`'s own collection-shaped residency.
+        struct LocalModelKind;
+        impl StepKind for LocalModelKind {
+            fn id(&self) -> &'static str {
+                "test.local-model"
+            }
+            fn residency(
+                &self,
+                _step: &Step,
+                _task: &Task,
+                _input: &BTreeMap<String, String>,
+                _ctx: &StepRunCtx,
+            ) -> Option<darkmux_gestalt::Placement> {
+                Some(darkmux_gestalt::Placement {
+                    model_key: "unfittable-model".into(),
+                    identifier: "darkmux:unfittable-model".into(),
+                    min_ctx: 8_000,
+                    seat: "step:needs-model".into(),
+                })
+            }
+            fn run(&self, step: &Step, _t: &Task, _i: &BTreeMap<String, String>) -> Result<StepOutcome> {
+                // Never reached — the wave loader must fail before this runs.
+                panic!("run() must not be called for {}: the wave load should have failed first", step.id);
+            }
+        }
+
+        /// A host whose `load` ALWAYS fails with an error `ensure_wave_loaded`
+        /// treats as non-transient (not `InsufficientResources`, so the
+        /// pinned-holder retry branch never applies) — fails the wave on the
+        /// first attempt, deterministically, with no real dispatch ever
+        /// starting.
+        struct FailingLoadHost;
+        impl ModelHost for FailingLoadHost {
+            fn list_resident(&mut self) -> std::result::Result<Vec<darkmux_gestalt::ResidentFact>, darkmux_gestalt::HostError> {
+                Ok(vec![])
+            }
+            fn list_catalog(&mut self) -> std::result::Result<Vec<darkmux_gestalt::CatalogFact>, darkmux_gestalt::HostError> {
+                Ok(vec![])
+            }
+            fn load(
+                &mut self,
+                model_key: &str,
+                _identifier: &str,
+                _min_ctx: u32,
+                _deadline: darkmux_gestalt::Deadline,
+            ) -> std::result::Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError> {
+                Err(darkmux_gestalt::HostError::UnknownModel { model_key: model_key.to_string() })
+            }
+            fn unload(
+                &mut self,
+                _target: &darkmux_gestalt::plan::OwnedTarget,
+                _deadline: darkmux_gestalt::Deadline,
+            ) -> std::result::Result<(), darkmux_gestalt::HostError> {
+                Ok(())
+            }
+        }
+
+        let (t, s) = kinded_step("needs-model", "test.local-model", json!({}), &[]);
+        let (tasks, mut steps) = graph(vec![(t, s)]);
+
+        let kinds = StepKindRegistry::new();
+        kinds.register(Arc::new(LocalModelKind)).unwrap();
+        let facts = Facts {
+            budget: darkmux_gestalt::Budget { max_darkmux_bytes: Some(20_000_000_000) },
+            ..Default::default()
+        };
+        let est = FixedEstimator(BTreeMap::from([("unfittable-model".to_string(), 5_000_000_000)]));
+        let factory = || -> Box<dyn ModelHost> { Box::new(FailingLoadHost) };
+
+        let report = run_step_graph(
+            &mut steps, &tasks, &kinds, &facts, &est, 8, &factory,
+            &mut |_r| {}, &mut |_s| {}, None, None, &[],
+        )
+        .unwrap();
+
+        assert_eq!(report.errored, vec!["needs-model-step".to_string()]);
+        assert!(
+            report.step_records.is_empty(),
+            "a load-failed step never ran — it must not get a StepRecord: {:?}",
+            report.step_records
+        );
+        assert_eq!(steps["needs-model-step"].status, NodeStatus::Error);
+    }
+
     /// (#1877 item 3) A mission that never reads `SchedulerReport::
     /// step_records` is unaffected — the field is additive. This is really
     /// two claims: (a) it compiles and passes unmodified for every one of
