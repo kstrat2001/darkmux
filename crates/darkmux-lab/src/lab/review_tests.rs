@@ -8051,6 +8051,53 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         assert_eq!(review_outcome(&env), RunOutcome::Complete, "non-judge budget skips must not trigger Partial");
     }
 
+    /// (#1876/#1877 QA follow-up, MUST FIX 2) A `judge-pass2` skip means
+    /// something different from a `judge-pass1` skip — the flag WAS judged
+    /// (pass-1 already confirmed it) and only its CONFIRMATION pass was
+    /// skipped, conservatively demoting it to needs-check rather than
+    /// leaving it unjudged. This pins `judge_budget_shortfall_reason`'s
+    /// pass-2 wording end to end through `review_outcome`, since nothing
+    /// else in this module ever constructs a `judge-pass2`
+    /// `RemoteBudgetRecord` — the QA round's own headline correction
+    /// (distinguishing "N went unjudged" from "N conservatively demoted")
+    /// had zero coverage before this test: reintroducing the bug by
+    /// collapsing `judge_budget_shortfall_reason`'s `if r.stage ==
+    /// "judge-pass1"` branch to `if true` left `cargo test --workspace`
+    /// fully green.
+    #[test]
+    fn review_outcome_judge_pass2_skip_reads_as_a_demotion_not_an_unjudged_count() {
+        let env = ReviewEnvelope {
+            degenerate: None,
+            remote_budgets: vec![RemoteBudgetRecord {
+                stage: "judge-pass2".to_string(),
+                max_tokens: 500_000,
+                used_tokens: 500_210,
+                exhausted: true,
+                skipped_calls: 4,
+            }],
+            ..Default::default()
+        };
+        match review_outcome(&env) {
+            RunOutcome::Partial { reasons } => {
+                assert_eq!(reasons.len(), 1);
+                assert!(
+                    reasons[0].contains("4 confirmed finding(s) were conservatively demoted to needs-check"),
+                    "got: {}",
+                    reasons[0]
+                );
+                assert!(reasons[0].contains("judge-pass2"), "got: {}", reasons[0]);
+                assert!(reasons[0].contains("500210"), "the used-token count is the row's own number: {}", reasons[0]);
+                assert!(
+                    !reasons[0].contains("went unjudged"),
+                    "a pass-2 skip (already judged, only demoted) must not read like a pass-1 \
+                     unjudged count: {}",
+                    reasons[0]
+                );
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
     /// A minimal `JudgedFlag` fixture for `review_outcome`'s own unit
     /// tests — distinct from `src/pr_review.rs`'s richer `archived_flag`
     /// (that one is `pub(crate)` to `pr_review`'s own test module, not
