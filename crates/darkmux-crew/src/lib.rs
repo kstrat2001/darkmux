@@ -55,6 +55,10 @@ pub mod mission_config;
 // `dispatch.map` fan-out and `darkmux-lab`'s review pipeline construct.
 pub mod remote_budget;
 pub mod resourcing;
+// (#1877 item 5, motivated by #1876) The generic Complete/Partial/Empty run
+// outcome — see the module doc for why a budget-exhausted-but-mostly-
+// completed run needs a THIRD state, not just a binary degenerate flag.
+pub mod run_outcome;
 pub mod select;
 // (#1230 Packet 2) Generic dependency-graph scheduler over `Step`/`Phase`
 // — see the module doc for the DependencyNode/is_ready/reachable/
