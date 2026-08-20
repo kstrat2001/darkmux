@@ -932,9 +932,20 @@ fn write_temp_diff(case_id: &str, diff: &str) -> Result<PathBuf> {
 /// when dedup found none); `title` folds the judge's `note_for_author`
 /// (author-facing) and `decisive_evidence` (the cited code/claim) together
 /// so both are available to the anchor/title substring matcher. A
-/// degenerate envelope (zero bundles or zero raw flags) maps to
-/// `parsed: false` — scored distinctly from a real pass, same as every
-/// other mode's degenerate case.
+/// degenerate envelope (zero bundles or zero raw flags) OR a PARTIAL one
+/// (#1876/#1877 QA follow-up: the judge stage's remote budget exhausted
+/// before the whole docket was judged) maps to `parsed: false` — scored
+/// distinctly from a real pass, same as every other mode's degenerate
+/// case. Before this, a partial-coverage run's `env.degenerate` was
+/// already `None` (the whole point of #1876's fix — the run isn't a
+/// verdict-level failure), so `parsed: env.degenerate.is_none()` alone
+/// would have scored it as a COMPLETE pass — a case whose judge never
+/// ruled on some of the docket silently deflating recall with no marker
+/// distinguishing "the model missed it" from "the judge never got to
+/// rule on it." `review_outcome(env).is_complete()` is `false` for BOTH
+/// Empty and Partial, matching the old degenerate-only behavior on Empty
+/// and extending the same "don't let an incomplete run masquerade as a
+/// real pass/fail" honesty to Partial.
 fn review_from_funnel(env: &super::review::ReviewEnvelope) -> Review {
     let findings: Vec<Finding> = env
         .judged
@@ -958,7 +969,7 @@ fn review_from_funnel(env: &super::review::ReviewEnvelope) -> Review {
         .collect();
     Review {
         verdict: if findings.is_empty() { "pass".to_string() } else { "flag".to_string() },
-        parsed: env.degenerate.is_none(),
+        parsed: super::review::review_outcome(env).is_complete(),
         findings,
     }
 }

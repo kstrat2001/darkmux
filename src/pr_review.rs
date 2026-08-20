@@ -2425,6 +2425,74 @@ mod tests {
         assert!(!body.contains("11 of 134"), "must not accidentally carry another fixture's numbers: {body}");
     }
 
+    /// (#1876/#1877 QA follow-up) The zero-confirmed side of `partial` —
+    /// needs-check findings only, a judge-pass1 skip row, no confirmed
+    /// findings at all. This is the branch the workflow's `partial)` case
+    /// has to handle differently (`jq -r '.review // "null"'` sees `null`
+    /// and posts a plain comment instead of attempting a formal review),
+    /// and it's exactly what the wording-fix means will actually happen in
+    /// practice: a pass-2 budget exhaustion demotes confirms to
+    /// needs-check, which can easily zero out `confirmed_total` on its own.
+    #[test]
+    fn synthesize_review_partial_with_zero_confirmed_uses_the_comment_shape() {
+        let mut judged: Vec<JudgedFlag> = Vec::new();
+        for i in 0..5 {
+            judged.push(needs_check_flag(&format!("fn{i}@src/y.ts"), None, &format!("needs-check note {i}"), false));
+        }
+        let mut env = healthy_envelope(judged);
+        env.remote_budgets = vec![RemoteBudgetRecord {
+            stage: "judge-pass1".to_string(),
+            max_tokens: 1_000,
+            used_tokens: 900,
+            exhausted: true,
+            skipped_calls: 2,
+        }];
+
+        let r = synthesize_review(&env, DIFF, None);
+        assert_eq!(r.mode, "partial", "a coverage shortfall with zero confirmed findings is still partial");
+        assert!(r.review.is_none(), "no formal review payload without any confirmed findings");
+        let comment = r.comment.expect("the comment-shape payload is still built");
+        assert!(comment.contains("Incomplete review"), "the banner renders in comment mode too: {comment}");
+        assert!(comment.contains("2 of 5 flags went unjudged"), "{comment}");
+        assert!(comment.contains("needs-check note 0"), "the needs-check findings still render: {comment}");
+    }
+
+    /// (#1876/#1877 QA follow-up) `review_outcome`'s Empty case wins over a
+    /// skip row when BOTH are present on the same envelope — e.g. Gate 2
+    /// fired (zero usable rulings) on a run that ALSO carries a
+    /// `remote_budgets` skip row from the same exhausted bucket.
+    /// `synthesize_review` must still route to `"degraded"` and discard,
+    /// never to `"partial"` — a skip row is only evidence for Partial when
+    /// there is no `degenerate` reason set at all.
+    #[test]
+    fn synthesize_review_degenerate_wins_over_a_present_skip_row() {
+        let mut env = ReviewEnvelope {
+            degenerate: Some(
+                "remote judge token budget exhausted — 5 judge call(s) skipped after the \
+                 per-execution allowance (100 tokens per stage) ran out, and none of the flags \
+                 that WERE judged produced a usable ruling — degenerate run, never a silent pass"
+                    .to_string(),
+            ),
+            remote_budgets: vec![RemoteBudgetRecord {
+                stage: "judge-pass1".to_string(),
+                max_tokens: 100,
+                used_tokens: 100,
+                exhausted: true,
+                skipped_calls: 5,
+            }],
+            ..Default::default()
+        };
+        // A degenerate envelope also carries a real skip row on the same
+        // stage — the precedence under test.
+        env.judged = Vec::new();
+
+        let r = synthesize_review(&env, DIFF, None);
+        assert_eq!(r.mode, "degraded", "Empty must win over a present-but-irrelevant skip row");
+        let c = r.comment.unwrap();
+        assert!(c.contains("no signal"), "{c}");
+        assert!(!c.contains("Incomplete review"), "the partial banner must never render alongside a discard: {c}");
+    }
+
     /// (#1260) A REFUTED finding arrives already demoted (tier = Archived,
     /// `demoted_by_verify` recorded in the envelope) — it never renders.
     #[test]

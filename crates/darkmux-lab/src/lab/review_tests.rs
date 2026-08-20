@@ -2007,6 +2007,19 @@
             "the #1329 warning is independent of the exhaustion policy: {:?}",
             env.warnings
         );
+        // (#1876/#1877 QA follow-up) The non-strict Gate 1 skip ALSO lands
+        // a coverage warning in `env.warnings` — this is what
+        // `review_result_to_mission_envelope` (`src/mission_launch_review.rs`)
+        // reads to classify the mission board / CLI exit code `Degraded`
+        // instead of `Clean`. Without this, the fix only reached the
+        // rendered PR comment, not the board — see
+        // `a_partial_coverage_review_is_degraded_not_clean` for the
+        // classifier-side pin.
+        assert!(
+            env.warnings.iter().any(|w| w.contains("remote judge token budget exhausted")),
+            "the budget skip must also land a coverage warning, not just the remote_budgets row: {:?}",
+            env.warnings
+        );
 
         // `review_outcome` (the render-facing predicate) reads this
         // envelope as Partial, naming the real skip/total numbers.
@@ -2019,6 +2032,68 @@
             }
             other => panic!("expected Partial, got {other:?}"),
         }
+    }
+
+    /// (#1876/#1877 QA follow-up) Gate 2's own "no usable ruling" wording
+    /// used to go generic ("all errored/unparsed") whenever the CAUSE was a
+    /// non-strict budget exhaustion, because Gate 1 deliberately leaves
+    /// `degen_reasons` empty in that policy — losing exactly the diagnosis
+    /// an operator most needs (their `remote.max_tokens_per_execution` is
+    /// too low for even one ruling, the single most likely misconfiguration
+    /// shape) at the moment they need it. A budget of `0` refuses every
+    /// call from the first one (`RemoteBudget`'s own doc: "exhausted from
+    /// the FIRST call"), so both flags' pass-1 calls are skipped, `usable`
+    /// stays 0, and Gate 2 fires — this pins that it fires with the
+    /// budget-specific wording, not the generic fallback, regardless of
+    /// the non-strict policy.
+    #[test]
+    fn run_judge_only_total_budget_exhaustion_under_default_policy_still_names_the_budget_in_gate_2() {
+        let crew = crew_with(vec![
+            ("review-probe", vec![staffing("fast", "probe-model", 1)]),
+            ("review-judge", vec![remote_staffing("cloud", "gpt-judge", 1)]),
+        ]);
+        let inputs = ReviewInputs {
+            case_id: "c-judge-only-total-exhaustion".to_string(),
+            roles: &crew,
+            intent_title: "t",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "probe sys",
+            judge_system: "judge sys",
+            verify_system: "verify sys",
+            remote_max_tokens_per_execution: 0, // exhausted from the first call, by construction
+            judge_exhaustion_strict: false,
+            bundles: Some(vec![bundle_input("a.ts"), bundle_input("b.ts")]),
+            source: None,
+        };
+        let flags = vec![
+            flag("a.ts", "member-a", 0, "charge one"),
+            flag("b.ts", "member-a", 0, "charge two"),
+        ];
+        let mut cycler = RecordingCycler::new();
+        let mut chat = |_call: &ChatCall| panic!("a budget of 0 must refuse every call before any dispatch fires");
+        let env = run_judge_only(flags, &inputs, &mut chat, &mut cycler, &mut NullEmitter).expect("runs");
+
+        let p1 = env.remote_budgets.iter().find(|r| r.stage == "judge-pass1").expect("judge-pass1 row");
+        assert_eq!(p1.skipped_calls, 2, "both flags' pass-1 calls were refused");
+
+        let reason = env
+            .degenerate
+            .as_deref()
+            .expect("zero usable rulings must still degrade under the default policy (Gate 2)");
+        assert!(
+            reason.contains("remote judge token budget exhausted"),
+            "Gate 2 must name the budget as the cause, not the generic wording: {reason}"
+        );
+        assert!(
+            reason.contains("none of the flags that WERE judged produced a usable ruling"),
+            "got: {reason}"
+        );
+        assert!(
+            !reason.contains("all errored/unparsed"),
+            "the generic fallback wording must not fire when the cause is known: {reason}"
+        );
     }
 
     // ── ExecMode auto-resolution (#1230 Packet 1: gestalt wave scheduler) ──
@@ -6081,6 +6156,15 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             env.remote_budgets.iter().any(|r| r.stage == "judge-pass1" && r.skipped_calls > 0),
             "the budget row (with its skip) still reaches the envelope: {:?}",
             env.remote_budgets
+        );
+        // (#1876/#1877 QA follow-up) Same coverage-warning check as the
+        // sequential path's counterpart test — this is what makes the
+        // mission board / CLI exit code agree with the posted PR comment
+        // on the graph path too (the actual production entry point).
+        assert!(
+            env.warnings.iter().any(|w| w.contains("remote judge token budget exhausted")),
+            "the budget skip must also land a coverage warning on the graph path: {:?}",
+            env.warnings
         );
         let outcome = review_outcome(&env);
         assert!(outcome.is_partial(), "expected Partial, got {outcome:?}");

@@ -1867,6 +1867,42 @@ mod tests {
         assert_eq!(out.status, crew::envelope::MissionOutcomeStatus::Degenerate);
     }
 
+    /// (#1876/#1877 QA follow-up) A judge-stage coverage shortfall under
+    /// the DEFAULT (non-strict) policy leaves `env.degenerate` unset but
+    /// pushes a warning into `env.warnings` (`judge_gate_outcome`'s new
+    /// `coverage_warning` field, wired at both call sites in
+    /// `crates/darkmux-lab/src/lab/review.rs`) — exactly so this classifier
+    /// reads it as `Degraded`, not `Clean`. Before that wiring existed, a
+    /// partial-coverage run (real signal, real gap) left BOTH `degenerate`
+    /// and `warnings` empty and read `Clean` here, even though the posted
+    /// PR comment said "Incomplete review — this is not a clean pass" —
+    /// the exact "board and the comment must agree" property this
+    /// function's own doc promises, broken by fixing only the render side.
+    #[test]
+    fn a_partial_coverage_review_is_degraded_not_clean() {
+        let env = ReviewEnvelope {
+            degenerate: None,
+            warnings: vec![
+                "remote judge token budget exhausted — 11 judge call(s) skipped after the \
+                 per-execution allowance (500000 tokens per stage) ran out — the flags that WERE \
+                 judged still render; see the envelope's remote_budgets for the full accounting"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+        let out = review_result_to_mission_envelope("m-1", &["p-1"], &Ok(env));
+        assert_eq!(
+            out.status,
+            crew::envelope::MissionOutcomeStatus::Degraded,
+            "a partial-coverage run must not read Clean on the mission board / CLI exit code"
+        );
+        assert!(
+            out.reason.as_deref().unwrap_or_default().contains("remote judge token budget exhausted"),
+            "the WHY is recorded: {:?}",
+            out.reason
+        );
+    }
+
     #[test]
     fn crew_route_label_never_leaks_url_userinfo() {
         // (#1660) A profile url may legitimately carry userinfo — some

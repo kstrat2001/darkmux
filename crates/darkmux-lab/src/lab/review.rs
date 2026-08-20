@@ -977,23 +977,56 @@ pub fn review_outcome(env: &ReviewEnvelope) -> RunOutcome {
     let reasons: Vec<String> = env
         .remote_budgets
         .iter()
-        .filter(|r| r.stage.starts_with("judge") && r.skipped_calls > 0)
-        .map(|r| {
-            format!(
-                "{} of {} flags went unjudged on the `{}` stage — its remote token budget \
-                 exhausted ({} of {} tokens used)",
-                r.skipped_calls,
-                env.judged.len(),
-                r.stage,
-                r.used_tokens,
-                r.max_tokens
-            )
-        })
+        // (#1876/#1877 QA follow-up) Exact stage names, not a `starts_with`
+        // prefix — a future `judge-*` row that ISN'T one of the two real
+        // stages should never silently flip a run to Partial by accident.
+        .filter(|r| matches!(r.stage.as_str(), "judge-pass1" | "judge-pass2") && r.skipped_calls > 0)
+        .map(|r| judge_budget_shortfall_reason(env, r))
         .collect();
     if reasons.is_empty() {
         RunOutcome::Complete
     } else {
         RunOutcome::Partial { reasons }
+    }
+}
+
+/// (#1876/#1877 QA follow-up) `judge-pass1` and `judge-pass2` skips mean
+/// DIFFERENT things and need different wording — conflating them was a
+/// real bug this function's own predecessor had. A pass-1 skip means the
+/// flag NEVER got a ruling at all (`budget_exhausted_outcome` -> `Error` ->
+/// excluded from `usable`, per `judge_gate_outcome`'s own filter) — the
+/// flag is genuinely unjudged. A pass-2 skip means the flag's pass-1
+/// ALREADY ruled it `Confirmed`; only the CONFIRMATION pass was skipped,
+/// which `multi_pass_confirm`'s `PassClass::Reject` arm demotes to
+/// `Tier::NeedsCheck` (`demoted_by_pass2 = true`) — that flag WAS judged
+/// and DOES render, just at a lower tier than a from-scratch double-confirm
+/// would have given it. Reporting a pass-2 skip as "N flags went unjudged"
+/// (the pass-1 wording) would be factually wrong on both halves: the flags
+/// were judged, and `env.judged.len()` is the wrong denominator (pass-2's
+/// docket is pass-1's CONFIRMS, not the whole run).
+fn judge_budget_shortfall_reason(env: &ReviewEnvelope, r: &RemoteBudgetRecord) -> String {
+    // (#1876/#1877 QA follow-up) "{used} of {max} tokens used" reads like a
+    // typo when `used` overshoots `max` — which it routinely does, by
+    // design: the ceiling is SOFT (`RemoteBudget`'s own module doc), so a
+    // grant can land a reply that reports usage slightly above what was
+    // admitted. "exceeded its N-token allowance" states the same fact
+    // without inviting a "did you mean 500000 of 500497?" double-take.
+    if r.stage == "judge-pass1" {
+        format!(
+            "{} of {} flags went unjudged on the `judge-pass1` stage — it exceeded its {}-token \
+             allowance ({} used)",
+            r.skipped_calls,
+            env.judged.len(),
+            r.max_tokens,
+            r.used_tokens
+        )
+    } else {
+        format!(
+            "{} confirmed finding(s) were conservatively demoted to needs-check because their \
+             confirmation pass was skipped on the `judge-pass2` stage — it exceeded its {}-token \
+             allowance ({} used)",
+            r.skipped_calls, r.max_tokens, r.used_tokens
+        )
     }
 }
 
@@ -3024,9 +3057,23 @@ fn run_verify_stage(
 /// #1329). `dispatch_error_warning` is independent and UNCONDITIONAL
 /// (#1329's loud-beats-quiet half) — present whenever a remote judge had
 /// ANY per-flag dispatch failure, whether or not the run also degenerates.
+/// `coverage_warning` (#1876/#1877 QA follow-up) is the same shape for the
+/// non-strict Gate 1 skip: `env.warnings` is what `review_result_to_mission_
+/// envelope` (`src/mission_launch_review.rs`) reads to classify a run
+/// `Degraded` vs `Clean` for the mission board / CLI exit code / flow
+/// record — those consumers never see `env.remote_budgets` or `env.judged`,
+/// only `degenerate`/`warnings`. Without this, a partial-coverage run (real
+/// signal, real gap) read `Clean` everywhere except the posted PR comment —
+/// exactly the "board and the comment must agree" property this module's
+/// own `review_result_to_mission_envelope` doc already promises, silently
+/// broken by the render-only half of this fix. Probe exhaustion
+/// (`review.rs`'s probe stage) and verify exhaustion (`verify_budget_
+/// outcome`) already push their own warning this same way; this closes the
+/// one stage that didn't.
 struct JudgeGateOutcome {
     remote_budget_rows: Vec<RemoteBudgetRecord>,
     dispatch_error_warning: Option<String>,
+    coverage_warning: Option<String>,
     degenerate_reason: Option<String>,
 }
 
@@ -3047,6 +3094,7 @@ fn judge_gate_outcome(
 ) -> JudgeGateOutcome {
     let mut degen_reasons: Vec<String> = Vec::new();
     let mut remote_budget_rows = Vec::new();
+    let mut coverage_warning: Option<String> = None;
 
     // (#1329 fix) A REMOTE judge dispatch failure on a MINORITY of flags is
     // already handled honestly at the per-flag level (archive/demote, never
@@ -3080,6 +3128,7 @@ fn judge_gate_outcome(
     // operator opt-in, `review.judge_fail_on_any_skip`) restores that exact
     // pre-#1876 behavior: ANY skip degrades the whole run, no matter how
     // much was judged.
+    let mut skipped_total: u32 = 0;
     if let Some(b) = budgets {
         if let Some(rec) = b.pass1.record() {
             remote_budget_rows.push(rec);
@@ -3087,23 +3136,45 @@ fn judge_gate_outcome(
         if let Some(rec) = b.pass2.record() {
             remote_budget_rows.push(rec);
         }
-        let skipped = b.pass1.skipped() + b.pass2.skipped();
-        if skipped > 0 && strict {
-            degen_reasons.push(format!(
-                "remote judge token budget exhausted — {skipped} judge call(s) skipped after the \
-                 per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) ran out; \
-                 degenerate run, never a silent pass (review.judge_fail_on_any_skip is set)"
-            ));
+        skipped_total = b.pass1.skipped() + b.pass2.skipped();
+        if skipped_total > 0 {
+            if strict {
+                degen_reasons.push(format!(
+                    "remote judge token budget exhausted — {skipped_total} judge call(s) skipped after \
+                     the per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) \
+                     ran out; degenerate run, never a silent pass (review.judge_fail_on_any_skip is set)"
+                ));
+            } else {
+                coverage_warning = Some(format!(
+                    "remote judge token budget exhausted — {skipped_total} judge call(s) skipped after \
+                     the per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) \
+                     ran out — the flags that WERE judged still render; see the envelope's \
+                     remote_budgets for the full accounting"
+                ));
+            }
         }
     }
 
     // Gate 2: the judge-dead honesty gate — NO flag produced a usable
     // pass-1 ruling, so the whole judge phase produced no signal worth
-    // rendering. Names the specific "remote dispatch failed on N of M"
-    // shape when that's the cause, rather than the generic wording, so the
-    // operator sees WHY the judge went dead, not just THAT it did.
+    // rendering. Names the specific shape that caused it (budget
+    // exhaustion, then a remote dispatch failure) rather than the generic
+    // wording, so the operator sees WHY the judge went dead, not just THAT
+    // it did. (#1876/#1877 QA follow-up) The budget-exhaustion arm fires on
+    // `skipped_total > 0` regardless of `strict` — a NON-strict policy
+    // still reaches this gate when literally nothing was usable (Gate 1
+    // above deliberately left `degen_reasons` empty in that case), and the
+    // operator still deserves the specific diagnosis, not the generic
+    // "all errored/unparsed" wording that used to be the only option here.
     if degen_reasons.is_empty() && judged_len > 0 && usable == 0 {
-        if is_remote && dispatch_errors > 0 {
+        if skipped_total > 0 {
+            degen_reasons.push(format!(
+                "remote judge token budget exhausted — {skipped_total} judge call(s) skipped after the \
+                 per-execution allowance ({remote_max_tokens_per_execution} tokens per stage) ran out, \
+                 and none of the flags that WERE judged produced a usable ruling — degenerate run, \
+                 never a silent pass"
+            ));
+        } else if is_remote && dispatch_errors > 0 {
             degen_reasons.push(format!(
                 "remote judge dispatch failed on {dispatch_errors} of {judged_len} flag(s) after \
                  bounded retries — degraded run, the affected flag(s) carry no adjudication"
@@ -3118,6 +3189,7 @@ fn judge_gate_outcome(
     JudgeGateOutcome {
         remote_budget_rows,
         dispatch_error_warning,
+        coverage_warning,
         degenerate_reason: if degen_reasons.is_empty() { None } else { Some(degen_reasons.join("; ")) },
     }
 }
@@ -3731,6 +3803,9 @@ fn finish_review(
         inputs.judge_exhaustion_strict,
     );
     if let Some(w) = gate.dispatch_error_warning {
+        env.warnings.push(w);
+    }
+    if let Some(w) = gate.coverage_warning {
         env.warnings.push(w);
     }
     env.remote_budgets.extend(gate.remote_budget_rows);
@@ -5691,6 +5766,9 @@ impl StepKind for ReviewJudgeStepKind {
             let mut env = env.lock().expect("shared review envelope mutex poisoned");
             env.remote_budgets.extend(gate.remote_budget_rows);
             if let Some(w) = gate.dispatch_error_warning {
+                env.warnings.push(w);
+            }
+            if let Some(w) = gate.coverage_warning {
                 env.warnings.push(w);
             }
             if gate.degenerate_reason.is_some() {

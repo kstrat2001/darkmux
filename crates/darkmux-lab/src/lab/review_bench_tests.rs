@@ -948,6 +948,32 @@
         assert!(!r.parsed, "a degenerate funnel run must score distinctly from a real pass");
     }
 
+    /// (#1876/#1877 QA follow-up) A PARTIAL-coverage envelope — no
+    /// `degenerate`, but a judge-pass1 `remote_budgets` row with
+    /// `skipped_calls > 0` — must ALSO score `parsed: false`, the same
+    /// distinct-from-a-real-pass treatment the degenerate case above gets.
+    /// Before this, `parsed: env.degenerate.is_none()` alone would have
+    /// scored a run whose judge never ruled on part of its docket as a
+    /// COMPLETE pass, silently deflating recall for cases the model never
+    /// even got a chance to be judged on — a measurement-honesty bug the
+    /// #1876 fix's own "don't let an incomplete run masquerade as
+    /// complete" principle, applied one layer downstream, closes here.
+    #[test]
+    fn review_from_funnel_partial_coverage_envelope_is_not_parsed() {
+        use darkmux_crew::remote_budget::RemoteBudgetRecord;
+        use super::super::review::Tier;
+        let mut env = funnel_env(vec![judged_flag(Some("a real defect"), Tier::Confirmed, "note", "evidence")], None);
+        env.remote_budgets = vec![RemoteBudgetRecord {
+            stage: "judge-pass1".to_string(),
+            max_tokens: 1_000,
+            used_tokens: 900,
+            exhausted: true,
+            skipped_calls: 1,
+        }];
+        let r = review_from_funnel(&env);
+        assert!(!r.parsed, "a partial-coverage funnel run must score distinctly from a real, complete pass");
+    }
+
     #[test]
     fn review_from_funnel_scores_through_the_multi_finding_matcher() {
         use super::super::review::Tier;
