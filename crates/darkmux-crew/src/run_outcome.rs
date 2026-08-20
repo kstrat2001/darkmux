@@ -57,9 +57,10 @@
 //! `#[serde(other)]` on a unit fallback variant fixes this even though the
 //! OTHER variants (`Partial`, `Empty`) carry data: serde buffers the whole
 //! tagged value before dispatching on `state`, so a sibling's fields never
-//! constrain what the fallback arm can accept. Verified directly by
-//! `an_unrecognized_state_degrades_to_unknown_and_the_rest_of_the_document_still_parses`
-//! in `envelope.rs`.
+//! constrain what the fallback arm can accept. Verified directly by this
+//! module's own `an_unrecognized_state_degrades_to_unknown_instead_of_failing_to_parse`
+//! test (below), and again at the whole-`MissionEnvelope` level by
+//! `envelope.rs`'s `an_unrecognized_outcome_variant_degrades_to_unknown_and_the_rest_of_the_document_still_parses`.
 //!
 //! **What this does NOT do:** the original `state` string is discarded
 //! (serde's `other` catch-all buffers-then-drops unmatched content) — a

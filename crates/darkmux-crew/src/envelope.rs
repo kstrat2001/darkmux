@@ -123,8 +123,8 @@ use serde::{Deserialize, Serialize};
 /// document.** Both `RunOutcome` (`outcome`'s tag) and `MissionOutcomeStatus`
 /// (`status` itself) now carry a `#[serde(other)]` catch-all
 /// ([`RunOutcome::Unknown`], [`MissionOutcomeStatus::Unknown`]). Verified
-/// directly: `an_unrecognized_state_degrades_to_unknown_and_the_rest_of_the_document_still_parses`
-/// (below) decodes `{"status":"clean","outcome":{"state":"throttled"}}` and
+/// directly: `an_unrecognized_outcome_variant_degrades_to_unknown_and_the_rest_of_the_document_still_parses`
+/// (below) decodes `{"status":"degraded","outcome":{"state":"throttled"}}` and
 /// gets back a full `MissionEnvelope` with `status`/`mission_id`/`phases`
 /// intact and `outcome: Some(RunOutcome::Unknown)` — not an `Err`. Adding a
 /// new `RunOutcome` variant OR a new `MissionOutcomeStatus` variant is
