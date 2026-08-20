@@ -7997,7 +7997,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
     fn review_outcome_judge_budget_row_with_skips_and_no_degenerate_is_partial() {
         let env = ReviewEnvelope {
             degenerate: None,
-            judged: (0..134).map(|i| archived_flag_for_outcome_test(i)).collect(),
+            judged: (0..134).map(archived_flag_for_outcome_test).collect(),
             remote_budgets: vec![RemoteBudgetRecord {
                 stage: "judge-pass1".to_string(),
                 max_tokens: 500_000,
