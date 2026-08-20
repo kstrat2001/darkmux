@@ -316,6 +316,11 @@ jobs:
               # their pre-#1876 behavior (posted content AND exit code), and
               # this new failure-after-posting behavior stays visibly scoped
               # to the one mode that actually has a coverage gap to report.
+              # KEEP IN SYNC with the `review)` case above: the HEAD_NOW /
+              # REASON / branch-moved / 422-fallback logic is intentionally
+              # duplicated here rather than shared (this file has no
+              # function/include mechanism), so a change to one needs the
+              # same change made to the other by hand.
               if [ "$(jq -r '.review // "null"' "$RUNNER_TEMP/qa/rendered.json")" = "null" ]; then
                 # No confirmed findings this run (needs-check only, or
                 # nothing at all) — no formal review payload, post the
