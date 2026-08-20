@@ -1951,7 +1951,9 @@ mod tests {
         assert_eq!(
             out.status,
             crew::envelope::MissionOutcomeStatus::Degraded,
-            "a partial-coverage run must not read Clean on the mission board / CLI exit code"
+            "a partial-coverage run must not read Clean on the mission board — `mission launch \
+             review`'s own CLI exit code is unaffected either way (always Ok(0); CI-facing \
+             pass/fail comes from the rendered payload's mode field, per src/cli.rs:552)"
         );
         assert!(
             out.reason.as_deref().unwrap_or_default().contains("remote judge token budget exhausted"),

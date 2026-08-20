@@ -73,13 +73,27 @@ darkmux release.
   judged still render (inline comments, the summary fallback, everything),
   with a prominent banner naming the shortfall in the run's own numbers,
   posted as `mode: "partial"` — a CI check that posts and then fails,
-  never a silent clean pass. The mission board, `darkmux mission status`,
-  and the CLI exit code now agree with what the PR comment says (a
-  partial run reads `Degraded`, matching probe/verify exhaustion's
-  existing treatment). An operator who wants the old "any skip is fatal"
-  behavior sets `review.judge_fail_on_any_skip` (env
+  never a silent clean pass. The mission board and `darkmux mission
+  status` now agree with what the PR comment says (a partial run reads
+  `Degraded`, matching probe/verify exhaustion's existing treatment); the
+  flow record's `dispatch complete` payload agrees too, flipping
+  `result_class` from `"ok"` to `"partial"` so the same shortfall reaches
+  the viewer, the Redis fleet stream, and the hash-chained audit sink,
+  not just the posted comment. (The workflow's own CLI exit code was
+  already, and remains, unaffected either way — `mission launch review`
+  always exits `0`; CI-facing pass/fail has always come from the rendered
+  payload's `mode` field, not the process exit status.) An operator who
+  wants the old "any skip is fatal" behavior sets
+  `review.judge_fail_on_any_skip` (env
   `DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_SKIP`), surfaced with provenance by
-  `darkmux doctor`. (#1876, #1877)
+  `darkmux doctor`. Also note: a `judge-pass2`-only exhaustion (every flag
+  WAS judged; some confirms were conservatively demoted to needs-check
+  because their confirmation pass was skipped) now fails the CI check too
+  — previously indistinguishable from a clean run, now correctly `mode:
+  "partial"` like a pass-1 shortfall. That's the safe direction (a
+  demotion-only run is real, postable signal with a real gap, same as a
+  pass-1 shortfall), but it does change when the check goes red on a run
+  where every flag was judged. (#1876, #1877)
 
 - **The machine page's fit projection believed a number it had already
   disproved.** `potential` is the contract "the most this resident will ever
