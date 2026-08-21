@@ -82,6 +82,18 @@ describe("App", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
+        // (#1904) The console's default landing view is now the
+        // client-rendered activity panel (`/runs`-fed), not the
+        // `mission-status` CLI panel — a `/panel/*` mock alone no longer
+        // proves the real console lens mounted, since nothing auto-fetches
+        // it any more. `/runs` needs its own properly-shaped branch (not
+        // the blanket `[]` fallback below, which other endpoints on this
+        // route legitimately want) so the activity view's honest empty
+        // state — real content, not a crash on malformed data — is what
+        // this test observes.
+        if (typeof url === "string" && url.startsWith("/runs")) {
+          return Promise.resolve(new Response(JSON.stringify({ runs: [], generated_at_ms: Date.now() }), { status: 200 }));
+        }
         if (typeof url === "string" && url.startsWith("/panel/")) {
           return Promise.resolve(
             new Response(
@@ -112,7 +124,10 @@ describe("App", () => {
       </QueryClientProvider>,
     );
     expect(screen.queryByText(/lens not ported yet/i)).not.toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText("no missions")).toBeInTheDocument());
+    // (#1904) The default landing content is the activity view's own
+    // honest empty state now, not the `mission-status` CLI panel's output
+    // — "no missions" would never load without an explicit tab click.
+    await waitFor(() => expect(screen.getByText(/no activity recorded yet/i)).toBeInTheDocument());
   });
 
   it("renders the real session run view for #session=<id> (drill-in packet — SessionReplay is no longer a placeholder)", async () => {
@@ -368,6 +383,18 @@ describe("App", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
+        // (#1904) The console's default landing view is now the
+        // client-rendered activity panel (`/runs`-fed), not the
+        // `mission-status` CLI panel — a `/panel/*` mock alone no longer
+        // proves the real console lens mounted, since nothing auto-fetches
+        // it any more. `/runs` needs its own properly-shaped branch (not
+        // the blanket `[]` fallback below, which other endpoints on this
+        // route legitimately want) so the activity view's honest empty
+        // state — real content, not a crash on malformed data — is what
+        // this test observes.
+        if (typeof url === "string" && url.startsWith("/runs")) {
+          return Promise.resolve(new Response(JSON.stringify({ runs: [], generated_at_ms: Date.now() }), { status: 200 }));
+        }
         if (typeof url === "string" && url.startsWith("/panel/")) {
           return Promise.resolve(
             new Response(
@@ -397,7 +424,10 @@ describe("App", () => {
         <App />
       </QueryClientProvider>,
     );
-    await waitFor(() => expect(screen.getByText("no missions")).toBeInTheDocument());
+    // (#1904) The default landing content is the activity view's own
+    // honest empty state now, not the `mission-status` CLI panel's output
+    // — "no missions" would never load without an explicit tab click.
+    await waitFor(() => expect(screen.getByText(/no activity recorded yet/i)).toBeInTheDocument());
     expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
   });
 

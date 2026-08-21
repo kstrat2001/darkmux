@@ -1170,6 +1170,18 @@ body {
   padding: 10px 0;
 }
 
+/* (#1904) The console's default landing view — `ActivityPanel.tsx`, a
+   union over `/runs` shown in place of any CLI panel until the operator
+   explicitly picks one. Reuses `.stagehdr`/`.lablist`/`.labrunrow`/`.none`
+   verbatim (the runs-lens block above) for visual/DOM consistency, plus
+   `.hyblink` (the savings-hero "history →" link, `viewer.html`'s own
+   established anchor styling) for the "→ show every run" escape hatch —
+   so the only new class here is the section's own outer wrapper, purely
+   for spacing against the panel tab bar directly below it. */
+.consoleactivity {
+  margin-bottom: 4px;
+}
+
 /* ── Console lens (Packet 6) — ported from viewer.html's own <style> block
    (search that file for `.panelwrap`/`.panelchrome`/`.panelout`). Same
    load-bearing-CSS caveat as the runs lens block above: `.panelchrome` is
@@ -1573,6 +1585,10 @@ body {
 }
 .hyblink:hover {
   text-decoration: underline;
+}
+.hyblink:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .fleet {

@@ -2,11 +2,23 @@ import { useEffect, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { queryKeys, PANEL_CACHE_MS } from "../../lib/queryKeys";
 import type { PanelId } from "../../lib/route";
-import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols } from "./panels";
+import { PANELS, isManualPanel, panelCols } from "./panels";
 import { fetchPanel } from "./fetchPanel";
 import { panelAgeLabel } from "./format";
 import { AnsiText } from "./ansi";
+import { ActivityPanel } from "./ActivityPanel";
 import type { PanelResponse } from "../../types/handwritten";
+
+/** (#1904) The "all activity" escape hatch's id — mirrors the
+ * `mission-status`/`mission-status-all` pairing already in `PANELS`
+ * (`panels.ts`), but this pair is NOT CLI-backed (no `/panel/activity`
+ * command exists), so it stays out of `PanelId`/`PANEL_IDS` entirely — see
+ * `panels.ts`'s own doc on `PANELS` for why. `ConsoleSelection` below is
+ * this component's own local widening of `PanelId` to cover both
+ * client-only entries: `""` (the activity default, already the sentinel
+ * `parseRoute` produces for "no `panel=` in the URL") and this string. */
+const ACTIVITY_ALL_ID = "activity-all";
+type ConsoleSelection = PanelId | "" | typeof ACTIVITY_ALL_ID;
 
 /**
  * The console lens — `#lens=console&panel=<id>`. Pure port of
@@ -17,13 +29,22 @@ import type { PanelResponse } from "../../types/handwritten";
  * module doc: "twin-drift becomes structurally impossible... a panel cannot
  * diverge from the CLI because it IS the CLI").
  *
+ * (#1904) The one deliberate departure from that pure-CLI-mirror shape: the
+ * console's DEFAULT landing state (`panelId === ""`) and its "all activity"
+ * sibling (`panelId === ACTIVITY_ALL_ID`) are NOT CLI panels — they render
+ * `ActivityPanel`, a client-rendered view over `/runs` (see that module's
+ * own doc for the full origin story and why). Every OTHER `panelId` value
+ * is a real, allowlisted CLI panel and renders exactly as before this
+ * packet, via `CliPanelView` below (extracted from what used to be this
+ * component's own inline body, unchanged in behavior).
+ *
  * DOM/CSS shape is a direct port (`.runsbar`/`.runchip` tabs, `.panelwrap` >
  * `.panelchrome` + a `.panelout`/`.panelerr` body) — see `styles.css`'s own
  * "Console lens (Packet 6)" block for why the flex layout is load-bearing
  * for `innerText` byte-parity, not just visual.
  *
  * Fetch/cache mapping onto TanStack Query (the ONE genuinely non-literal
- * translation this component makes, since legacy hand-rolls its own
+ * translation `CliPanelView` makes, since legacy hand-rolls its own
  * `PANEL_STATE` cache + `loadPanel`):
  * - One `useQuery` keyed by `queryKeys.panel(id)` — switching tabs reuses
  *   Query's own cache exactly the way `PANEL_STATE[id]` reuse worked
@@ -50,7 +71,13 @@ import type { PanelResponse } from "../../types/handwritten";
  *   legacy's `st.body`-gated chrome staying visible-but-stale mid-reload).
  */
 export function ConsolePanel({ initialPanelId }: { initialPanelId: PanelId | "" }) {
-  const [panelId, setPanelId] = useState<PanelId>(initialPanelId || DEFAULT_PANEL_ID);
+  // (#1904) `""` (no `panel=` in the URL, or an unrecognized one — both
+  // already collapse to `""` in `parseRoute`) now means "land on the
+  // activity view", not "fall back to `DEFAULT_PANEL_ID`" — there is no
+  // more `DEFAULT_PANEL_ID` (retired; see `panels.ts`'s own doc). A real
+  // `PanelId`, or `ACTIVITY_ALL_ID`, means the operator (or a deep link)
+  // explicitly picked that tab.
+  const [panelId, setPanelId] = useState<ConsoleSelection>(initialPanelId);
 
   // A fresh deep-link into a DIFFERENT panel while this component is already
   // mounted re-syncs local selection — mirrors `boot()`'s `if(nq)
@@ -60,10 +87,42 @@ export function ConsolePanel({ initialPanelId }: { initialPanelId: PanelId | "" 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPanelId]);
 
-  const manual = isManualPanel(panelId);
+  let body;
+  if (panelId === "") {
+    body = <ActivityPanel capped onShowAll={() => setPanelId(ACTIVITY_ALL_ID)} />;
+  } else if (panelId === ACTIVITY_ALL_ID) {
+    body = <ActivityPanel capped={false} />;
+  } else {
+    body = <CliPanelView id={panelId} onPanelSwitch={setPanelId} />;
+  }
+
+  return (
+    <>
+      <div className="runsbar">
+        <PanelTab id="" label="activity" active={panelId === ""} onSelect={setPanelId} />
+        <PanelTab id={ACTIVITY_ALL_ID} label="all activity" active={panelId === ACTIVITY_ALL_ID} onSelect={setPanelId} />
+        {PANELS.map((p) => (
+          <PanelTab key={p.id} id={p.id} label={p.label} active={p.id === panelId} onSelect={setPanelId} />
+        ))}
+      </div>
+      {body}
+    </>
+  );
+}
+
+/** (#1904) The CLI-panel fetch/chrome/body machinery — the WHOLE of what
+ * `ConsolePanel`'s own return used to inline directly, before "" and
+ * `ACTIVITY_ALL_ID` needed a genuinely different (non-CLI) render branch.
+ * Extracted rather than left inline so those two branches can skip this
+ * entirely (component not mounted = its `useQuery` never fires, cleaner
+ * than an `enabled` flag guarding a query with no valid `PanelId` to key
+ * on) — behavior for every real `PanelId` is byte-for-byte unchanged from
+ * before this packet. */
+function CliPanelView({ id, onPanelSwitch }: { id: PanelId; onPanelSwitch: (id: PanelId) => void }) {
+  const manual = isManualPanel(id);
   const query = useQuery({
-    queryKey: queryKeys.panel(panelId),
-    queryFn: () => fetchPanel(panelId, panelCols(document.querySelector(".panelout"))),
+    queryKey: queryKeys.panel(id),
+    queryFn: () => fetchPanel(id, panelCols(document.querySelector(".panelout"))),
     enabled: !manual,
     staleTime: PANEL_CACHE_MS,
     refetchOnWindowFocus: !manual,
@@ -73,33 +132,26 @@ export function ConsolePanel({ initialPanelId }: { initialPanelId: PanelId | "" 
   const errorMessage = query.data?.ok === false ? query.data.message : null;
 
   return (
-    <>
-      <div className="runsbar">
-        {PANELS.map((p) => (
-          <PanelTab key={p.id} id={p.id} label={p.label} active={p.id === panelId} onSelect={setPanelId} />
-        ))}
+    <div className="panelwrap">
+      <div className="panelchrome">
+        {loadedBody ? (
+          <LoadedChrome body={loadedBody} fetchedAt={query.dataUpdatedAt} onRerun={() => query.refetch()} />
+        ) : (
+          <NotLoadedChrome id={id} loading={query.isFetching} onRun={() => query.refetch()} />
+        )}
       </div>
-      <div className="panelwrap">
-        <div className="panelchrome">
-          {loadedBody ? (
-            <LoadedChrome body={loadedBody} fetchedAt={query.dataUpdatedAt} onRerun={() => query.refetch()} />
-          ) : (
-            <NotLoadedChrome id={panelId} loading={query.isFetching} onRun={() => query.refetch()} />
-          )}
-        </div>
-        <PanelBody
-          loading={query.isFetching}
-          errorMessage={errorMessage}
-          ansiText={loadedBody ? loadedBody.ansi_text || "" : null}
-          onPanelSwitch={setPanelId}
-        />
-      </div>
-    </>
+      <PanelBody
+        loading={query.isFetching}
+        errorMessage={errorMessage}
+        ansiText={loadedBody ? loadedBody.ansi_text || "" : null}
+        onPanelSwitch={onPanelSwitch}
+      />
+    </div>
   );
 }
 
 /** viewer.html: one `.runchip[data-act="setpanel"]` entry of the tab bar. */
-function PanelTab({ id, label, active, onSelect }: { id: PanelId; label: string; active: boolean; onSelect: (id: PanelId) => void }) {
+function PanelTab({ id, label, active, onSelect }: { id: ConsoleSelection; label: string; active: boolean; onSelect: (id: ConsoleSelection) => void }) {
   return (
     <span
       className={`runchip${active ? " on" : ""}`}

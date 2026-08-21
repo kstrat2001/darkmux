@@ -18,6 +18,8 @@ github
 console
 
 === stage ===
+activity
+all activity
 mission status
 all missions
 machine
@@ -26,23 +28,64 @@ roles
 config
 fixtures
 doctor
-$ darkmux mission status
-captured 16:40:57
-· 8ms
-re-run
-mission status — 93 missions
-
-FINALIZED (93)
-  ◆ PR review — kstrat2001/darkmux@8cf07d1c…ep+diff-review+probe-4b+probe-gptoss`)   1d    3/3  ▓▓▓▓
-  ◆ PR review — nbd-sfymfx-bfkdxl-71ns8216 …ep+diff-review+probe-4b+probe-gptoss`)   1d    3/3  ▓▓▓▓
-  ◆ PR review — nbd-sfymfx-bfkdxl-71ns8216 …ep+diff-review+probe-4b+probe-gptoss`)   1d    3/3  ▓▓▓▓
-  ◆ PR review — nbd-sfymfx-bfkdxl-71ns8216 …ep+diff-review+probe-4b+probe-gptoss`)   1d    3/3  ▓▓▓▓
-  • pr-reviewer                                                                      2d    1/1  ▓▓▓▓
-  ◆ PR review — dogfood-2.5.0-pr1671 (crew …ep+diff-review+probe-4b+probe-gptoss`)   2d    3/3  ▓▓▓▓
-  ◆ PR review — kstrat2001/darkmux@42f63390…ep+diff-review+probe-4b+probe-gptoss`)   5d    0/3  ░░░░
-  ◆ PR review — kstrat2001/darkmux@e700d21c…ep+diff-review+probe-4b+probe-gptoss`)   5d    0/3  ░░░░
-  … 85 more (8 of 93 shown)
-  → show every mission
-
-✓ board is clean — every mission's phases are reconciled
+activity — 308 runs
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786199280181417-5
+2h ago
+untracked
+radio-router · qwen3-4b-instruct-2507
+COMPLETE
+DISPATCH
+crew-dispatch-radio-host-1786188712657282-1
+5h ago
+untracked
+radio-host · qwen3.6-35b-a3b-turboquant-mlx
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786188711607472-0
+5h ago
+untracked
+radio-router · qwen3-4b-instruct-2507
+COMPLETE
+DISPATCH
+crew-dispatch-radio-host-1786183040782553-1
+6h ago
+untracked
+radio-host · qwen3.6-35b-a3b-turboquant-mlx
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786183039911693-0
+6h ago
+untracked
+radio-router · qwen3-4b-instruct-2507
+COMPLETE
+DISPATCH
+crew-dispatch-radio-host-1786182435865961-1
+6h ago
+untracked
+radio-host · qwen3.6-35b-a3b-turboquant-mlx
+COMPLETE
+DISPATCH
+crew-dispatch-radio-router-1786182434869757-0
+6h ago
+untracked
+radio-router · qwen3-4b-instruct-2507
+ABANDONED
+MISSION
+acp-ephemeral-pr-ship-1786152707367180000-5
+15h ago
+untracked
+ABANDONED
+MISSION
+acp-ephemeral-pr-comments-list-1786152519941013000-4
+15h ago
+untracked
+ABANDONED
+MISSION
+acp-ephemeral-pr-list-1786152504805583000-3
+15h ago
+untracked
+… 298 more (10 of 308 shown)
+→ show every run
 

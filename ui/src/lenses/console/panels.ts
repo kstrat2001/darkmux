@@ -17,7 +17,19 @@ export interface PanelDef {
   label: string;
 }
 
-/** viewer.html: `const PANELS = [...]`. Order is the tab order. */
+/** viewer.html: `const PANELS = [...]`. Order is the tab order.
+ *
+ * (#1904) These are exactly the CLI-backed panels — the drift guard in
+ * `panels.test.ts` pins `PANELS.map(p => p.id)` to `PANEL_IDS` from
+ * `lib/route.ts`, which is itself the twin of the Rust-side allowlist
+ * (`crates/darkmux-serve/src/panel.rs::PANEL_IDS`, hard-capped at 8 by its
+ * own doctrine assertion). The console lens's DEFAULT landing view (the
+ * "activity" tab, and its "all activity" escape hatch) is NOT one of these
+ * — it is a client-rendered, `/runs`-fed view with no CLI command or argv
+ * behind it, so it deliberately stays OUT of this list and out of
+ * `PanelId`/`PANEL_IDS` entirely. `ConsolePanel.tsx` owns that pair as its
+ * own local `ConsoleSelection` union, widening `PanelId` rather than
+ * pretending a client-only view is a CLI panel. */
 export const PANELS: PanelDef[] = [
   { id: "mission-status", label: "mission status" },
   { id: "mission-status-all", label: "all missions" },
@@ -28,8 +40,6 @@ export const PANELS: PanelDef[] = [
   { id: "lab-fixture-list", label: "fixtures" },
   { id: "doctor", label: "doctor" },
 ];
-
-export const DEFAULT_PANEL_ID: PanelId = "mission-status";
 
 /** viewer.html: `const MANUAL_PANELS = new Set(["doctor"])`. Panels the
  * daemon marks `auto_refresh: false` — they PROBE the machine, so nothing

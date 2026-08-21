@@ -18,6 +18,8 @@ github
 console
 
 === stage ===
+activity
+all activity
 mission status
 all missions
 machine

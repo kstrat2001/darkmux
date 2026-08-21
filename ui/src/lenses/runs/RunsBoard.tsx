@@ -634,8 +634,15 @@ function onActivateKeyDown(onActivate: () => void) {
  * see `activateRun`'s own doc for why `tracked` alone is the wrong gate for
  * "can this be opened" on a `kind: "dispatch"` row. An untracked MISSION
  * row (a peer's mission this daemon has no local session for, #1705) stays
- * flat, matching legacy's original rule for the case where it still holds. */
-function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
+ * flat, matching legacy's original rule for the case where it still holds.
+ *
+ * (#1904) Exported — `ConsoleLiveActivity.tsx` (the console lens's default
+ * "what's running right now" section) reuses this component verbatim for
+ * its own rows, rather than re-deriving the badge/kind-chip/subtitle DOM a
+ * second time. Same row shape, a different `onActivate` (that caller
+ * navigates directly instead of reaching into this file's own
+ * `activateRun`/`rowClickNotice` state). */
+export function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
   const interactive = run.kind === "lab" || run.tracked || run.kind === "dispatch";
   const ago = runsAgo(run);
   const subtitle = runSubtitle(run, showMachine);

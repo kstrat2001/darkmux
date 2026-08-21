@@ -86,18 +86,22 @@ function shot(name) {
 // `ConsolePanel` for `#lens=console` in the meantime, which never carries
 // that data-state, so the click-navigation test hung waiting for a marker
 // that can no longer appear (a twin-drift instance, same class this file's
-// own module doc already names for the frozen-clock interaction). `.panelchrome`
-// is `ConsolePanel`'s own chrome wrapper, rendered UNCONDITIONALLY on mount
-// regardless of loading/error/loaded/manual-not-yet-run state (see that
-// component's own doc) and unique to it — nothing else in this app uses the
-// class — so waiting on it proves the RIGHT lens mounted, matching this
-// test's actual assertions (hash + `.on` class), without needing the
-// content to be FULLY loaded (this test never calls `waitSettled` with a
-// `previousText` check here, so it doesn't need a load-complete marker like
-// `next-parity-console.spec.ts`'s own `re-run`-button marker does).
+// own module doc already names for the frozen-clock interaction). It was
+// then `.panelchrome` (`ConsolePanel`'s CLI-panel chrome wrapper) until
+// #1904: a fresh, un-clicked `#lens=console` now lands on `ActivityPanel`
+// (the client-rendered default over `/runs`, no CLI panel involved at
+// all), which never renders `.panelchrome` — so THAT marker went stale the
+// same way, for the same reason (a real behavior change outrunning a
+// harness assumption). `.consoleactivity` is `ActivityPanel`'s own
+// unconditional wrapper (see that component's own doc — it renders on
+// every branch, including the genuinely-empty one), and this test's own
+// click always lands on the bare default (no `panel=` param), so it's the
+// one marker guaranteed to appear here — matching this test's actual
+// assertions (hash + `.on` class) without needing the content fully
+// loaded, same reasoning as before.
 const TABS = [
   { act: "fleet", hash: "", settle: '[data-state]:not([data-state="pending"])' },
-  { act: "console", hash: "#lens=console", settle: ".panelchrome" },
+  { act: "console", hash: "#lens=console", settle: ".consoleactivity" },
   { act: "runs", hash: "#lens=runs", settle: '[data-state="data"], [data-state="pending"]' },
   { act: "machine", hash: "#lens=machine", settle: '.machine-lens__health[data-state="loaded"]' },
 ];
