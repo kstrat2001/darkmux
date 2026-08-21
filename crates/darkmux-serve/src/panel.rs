@@ -205,11 +205,18 @@ const ALL_OPT: PanelOpt = PanelOpt {
     ],
 };
 
-/// `run list`'s `--kind` filter. Values are deliberately the same strings
-/// as `RunKindArg` (`src/cli.rs`) and `RUNS_KINDS`
-/// (`ui/src/lib/route.ts`) — pinned against the Rust side by
+/// `run list`'s `--kind` filter. Its values are the SAME four strings as
+/// `RunKindArg` (`src/cli.rs`) and `RUNS_KINDS` (`ui/src/lib/route.ts`),
+/// and all three are pinned to each other by
 /// `run_list::run_kind_arg_vocabulary_matches_the_ui_runs_kinds_twin`
-/// (`src/run_list.rs`).
+/// (`src/run_list.rs`), which text-scans THIS constant as its third leg.
+///
+/// The pin is load-bearing, not tidiness. Drop `Lab` from `RunKindArg` and
+/// without it this table keeps offering `--kind lab`; the panel spawns a
+/// flag clap no longer accepts, and the operator gets an empty body with
+/// `exit_code: 2` — a wrong reading with no failing test anywhere. The
+/// reverse (a fifth kind) silently makes that kind unreachable from the
+/// console.
 const RUN_LIST_KIND_OPT: PanelOpt = PanelOpt {
     name: "kind",
     values: &[
@@ -417,6 +424,15 @@ fn opts_json(resolved: &[ResolvedOpt]) -> serde_json::Value {
 /// the `opt.` prefix so [`resolve_opts`] sees bare names. Anything not
 /// prefixed with `opt.` (`cols`, or an unrelated param) is ignored here —
 /// `cols` is read separately by the caller.
+/// The `cols` param, lenient on read (#1911) — see the call site's comment
+/// for why this direction differs from `opt.*`'s fail-closed one. Split
+/// out so the leniency is pinnable by `cols_is_lenient_on_read` without
+/// driving a 200 through the handler, which would spawn `current_exe()`
+/// (the test harness itself, under `cargo test`).
+fn parse_cols(raw: &HashMap<String, String>) -> Option<u16> {
+    raw.get("cols").and_then(|v| v.parse::<u16>().ok())
+}
+
 fn extract_opt_params(raw: &HashMap<String, String>) -> HashMap<String, String> {
     raw.iter().filter_map(|(k, v)| k.strip_prefix("opt.").map(|name| (name.to_string(), v.clone()))).collect()
 }
@@ -523,6 +539,15 @@ pub(crate) async fn panel_handler(
     // LAST so they always win — the alias's whole point is a fixed,
     // non-negotiable selection regardless of what a stray query param says.
     let mut requested = extract_opt_params(&params);
+    // Validate what the CLIENT actually sent BEFORE the alias's forced
+    // overrides mask it (#1911). The module doc's rule is absolute: an
+    // unknown name or value is a 400, never silently ignored. Merging
+    // first made `mission-status-all?opt.all=bogus` a cheerful 200,
+    // because the forced value overwrote the illegal one before anything
+    // looked at it — the one request shape where the doc and the code
+    // disagreed. A non-alias request validates the same map twice, which
+    // is a table walk over at most a handful of entries.
+    resolve_opts(&spec, &requested).map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
     for (name, value) in forced_opts {
         requested.insert((*name).to_string(), (*value).to_string());
     }
@@ -531,7 +556,16 @@ pub(crate) async fn panel_handler(
     let final_argv = compose_argv(&spec, &resolved);
     let key = variant_key(id, &resolved);
 
-    let cols = clamp_cols(params.get("cols").and_then(|v| v.parse::<u16>().ok()));
+    // (#1911) Lenient on read: a malformed `cols` (`abc`, empty, or past
+    // `u16`) resolves to the default width rather than failing the whole
+    // request. The typed `Query<PanelParams>` extractor this replaced
+    // rejected those with a 400 before the handler ran. The change is
+    // deliberate and matches this project's lenient-on-read convention
+    // (and the hash grammar's "invalid params drop silently to default"),
+    // but it IS a behavior change — pinned by `cols_is_lenient_on_read`.
+    // Note the asymmetry with `opt.*` above, which fails CLOSED: a wrong
+    // width is a cosmetic misread, a wrong option is a different command.
+    let cols = clamp_cols(parse_cols(&params));
 
     // Manual-only panels (TTL 0) are floored server-side, keyed by BASE id
     // — see `check_manual_floor`'s own doc for why that must never be the
@@ -757,6 +791,19 @@ mod tests {
                     opt.name,
                     opt.values[0].value
                 );
+                // …and ONLY the default may. A non-default with an empty
+                // fragment produces a second cache entry and a second
+                // spawn for a byte-identical command line, and advertises
+                // a selection the displayed command cannot show.
+                for v in &opt.values[1..] {
+                    assert!(
+                        !v.argv.is_empty(),
+                        "{id}'s opt \"{}\" non-default value \"{}\" carries empty argv — only \
+                         values[0] may, or it is a distinct selection that changes nothing",
+                        opt.name,
+                        v.value
+                    );
+                }
             }
         }
     }
@@ -781,6 +828,27 @@ mod tests {
                         v.value,
                         v.argv
                     );
+                    // A fragment is a flag, optionally followed by ONE
+                    // value for it. Checking only `argv[0]` let a
+                    // positional ride along behind a legal-looking flag
+                    // (`["--kind","mission","extra-positional"]` passed),
+                    // which is weaker than this module's own framing.
+                    assert!(
+                        v.argv.len() <= 2,
+                        "{id}'s opt \"{}\" value \"{}\" has more than a flag and its value: {:?}",
+                        opt.name,
+                        v.value,
+                        v.argv
+                    );
+                    if let Some(tail) = v.argv.get(1) {
+                        assert!(
+                            !tail.starts_with('-'),
+                            "{id}'s opt \"{}\" value \"{}\" packs a second flag into one fragment: {:?}",
+                            opt.name,
+                            v.value,
+                            v.argv
+                        );
+                    }
                 }
             }
         }
@@ -886,16 +954,27 @@ mod tests {
     #[test]
     fn compose_argv_is_declaration_order_never_query_order() {
         let spec = panel_spec("run-list").unwrap();
-        let mut requested = HashMap::new();
-        requested.insert("all".to_string(), "all".to_string());
-        requested.insert("kind".to_string(), "mission".to_string());
-        let resolved = resolve_opts(&spec, &requested).unwrap();
-        let argv = compose_argv(&spec, &resolved);
-        assert_eq!(
-            argv,
-            vec!["run", "list", "--kind", "mission", "--all"],
-            "argv must follow declaration order (kind, then all), not query-string order: {argv:?}"
-        );
+        // Insertion order is not iteration order, and `HashMap`'s is
+        // randomized PER PROCESS — so a single map would let an
+        // implementation that walked `requested` pass roughly half the
+        // time. Both permutations, plus an assertion on the resolved
+        // NAMES, make this deterministic rather than probabilistic.
+        for pairs in [[("all", "all"), ("kind", "mission")], [("kind", "mission"), ("all", "all")]] {
+            let mut requested = HashMap::new();
+            for (k, v) in pairs {
+                requested.insert(k.to_string(), v.to_string());
+            }
+            let resolved = resolve_opts(&spec, &requested).unwrap();
+            let names: Vec<&str> = resolved.iter().map(|r| r.name).collect();
+            let declared: Vec<&str> = spec.opts.iter().map(|o| o.name).collect();
+            assert_eq!(names, declared, "resolved opts must be in DECLARATION order, not query order");
+            let argv = compose_argv(&spec, &resolved);
+            assert_eq!(
+                argv,
+                vec!["run", "list", "--kind", "mission", "--all"],
+                "argv must follow declaration order (kind, then all), not query-string order: {argv:?}"
+            );
+        }
     }
 
     // ── variant_key: cache-key canonicalization (#1911) ───────────────
@@ -1004,6 +1083,184 @@ mod tests {
         assert!(forced.is_empty());
     }
 
+    // ── declaration-table invariants the handler leans on (#1911) ────
+
+    /// `variant_key` builds `id?name=value&name=value`, so a name or value
+    /// containing one of those separators could make two DIFFERENT
+    /// selections produce the SAME key — and for up to the TTL one would
+    /// serve the other's output under the wrong argv. Concretely: an opt
+    /// `x` whose values included the literal `1&y=2`, alongside an opt `y`
+    /// with value `2`, collides with `{x:"1", y:"2"}`.
+    ///
+    /// Unreachable from today's table, which is exactly why it is pinned
+    /// here rather than left to notice later: this module's own standard
+    /// is that only legal combinations can ever become keys.
+    #[test]
+    fn no_opt_name_or_value_contains_a_variant_key_separator() {
+        for id in PANEL_IDS {
+            let spec = panel_spec(id).unwrap();
+            for opt in spec.opts {
+                assert!(
+                    !opt.name.contains(['?', '&', '=']),
+                    "{id}'s opt name {:?} contains a variant-key separator",
+                    opt.name
+                );
+                for v in opt.values {
+                    assert!(
+                        !v.value.contains(['?', '&', '=']),
+                        "{id}'s opt \"{}\" value {:?} contains a variant-key separator — two \
+                         different selections could canonicalize to one cache key",
+                        opt.name,
+                        v.value
+                    );
+                }
+            }
+        }
+    }
+
+    /// "Manual" is spelled two ways — `auto_refresh: false` and a zero
+    /// `cache_ttl` — and two different sites read different ones: the
+    /// floor gate keys off `auto_refresh`, while `last_manual` only
+    /// advances when the TTL is zero. An entry with `auto_refresh: false`
+    /// and a NON-zero TTL would therefore be checked against a clock that
+    /// never ticks, and its floor would silently never fire. Pin them
+    /// equal so that entry cannot be declared.
+    #[test]
+    fn manual_is_spelled_the_same_way_by_both_fields() {
+        for id in PANEL_IDS {
+            let spec = panel_spec(id).unwrap();
+            assert_eq!(
+                spec.auto_refresh,
+                !spec.cache_ttl.is_zero(),
+                "{id} disagrees with itself about being manual: auto_refresh={}, ttl={:?} — the \
+                 floor gate reads auto_refresh and the floor CLOCK reads the ttl, so a mismatch \
+                 means the floor never fires",
+                spec.auto_refresh,
+                spec.cache_ttl
+            );
+        }
+    }
+
+    // ── extract_opt_params: the only place a request string is read ───
+
+    #[test]
+    fn extract_opt_params_takes_only_the_opt_prefixed_params() {
+        let mut raw = HashMap::new();
+        raw.insert("cols".to_string(), "80".to_string());
+        raw.insert("opt.kind".to_string(), "lab".to_string());
+        raw.insert("kind".to_string(), "mission".to_string());
+        let got = extract_opt_params(&raw);
+        assert_eq!(got.len(), 1, "only `opt.`-prefixed params are options: {got:?}");
+        assert_eq!(got.get("kind"), Some(&"lab".to_string()));
+    }
+
+    /// A bare `kind=lab` must NOT be honored — the prefix is what
+    /// separates an option from any other query param the daemon may grow.
+    #[test]
+    fn extract_opt_params_ignores_an_unprefixed_lookalike() {
+        let mut raw = HashMap::new();
+        raw.insert("kind".to_string(), "lab".to_string());
+        assert!(extract_opt_params(&raw).is_empty());
+    }
+
+    #[test]
+    fn extract_opt_params_keeps_an_empty_name_so_it_can_be_rejected() {
+        let mut raw = HashMap::new();
+        raw.insert("opt.".to_string(), "x".to_string());
+        let got = extract_opt_params(&raw);
+        assert_eq!(got.get(""), Some(&"x".to_string()), "an empty name must survive to be 400'd, not vanish");
+    }
+
+    /// The typed extractor this replaced rejected a malformed `cols` with
+    /// a 400 before the handler ran; it now resolves to the default width.
+    /// Deliberate (lenient-on-read), but a real behavior change, so it is
+    /// pinned rather than left as an artifact of a refactor.
+    #[test]
+    fn cols_is_lenient_on_read() {
+        for bad in ["abc", "", "99999", "-1", "80.5"] {
+            let mut raw = HashMap::new();
+            raw.insert("cols".to_string(), bad.to_string());
+            assert_eq!(parse_cols(&raw), None, "{bad:?} should fall back to the default width");
+        }
+        let mut good = HashMap::new();
+        good.insert("cols".to_string(), "80".to_string());
+        assert_eq!(parse_cols(&good), Some(80));
+    }
+
+    // ── handler wiring (#1911) ────────────────────────────────────────
+    //
+    // Every assertion here is on an ERROR path, deliberately. A 200 spawns
+    // `std::env::current_exe()`, which under `cargo test` is the test
+    // harness itself — so the happy path stays a live-daemon check, and
+    // these pin the refusals that must never regress into a spawn.
+
+    async fn panel_get(uri: &str, with_header: bool) -> (StatusCode, String) {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let flows = tempfile::TempDir::new().unwrap();
+        let app = crate::build_router_local(flows.path().to_path_buf());
+        let mut req = Request::builder().uri(uri);
+        if with_header {
+            req = req.header(PANEL_HEADER, "1");
+        }
+        let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), 65536).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[tokio::test]
+    async fn handler_rejects_an_unknown_opt_name_before_spawning() {
+        let (status, body) = panel_get("/panel/run-list?opt.machine=studio", true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("unknown option"), "{body}");
+        assert!(body.contains("machine"), "{body}");
+        assert!(body.contains("kind"), "must name the legal set: {body}");
+    }
+
+    #[tokio::test]
+    async fn handler_rejects_an_unknown_opt_value_before_spawning() {
+        let (status, body) = panel_get("/panel/run-list?opt.kind=bogus", true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("unknown value"), "{body}");
+    }
+
+    /// A bare `kind=lab` is not an option — it must be ignored, not
+    /// honored. If the prefix check were dropped this would compose
+    /// `--kind lab` and return 200 (a spawn) instead of refusing nothing.
+    #[tokio::test]
+    async fn handler_ignores_an_unprefixed_lookalike_param() {
+        let (status, body) = panel_get("/panel/run-list?kind=bogus", true).await;
+        assert_ne!(status, StatusCode::BAD_REQUEST, "a non-`opt.` param must not be read as an option: {body}");
+    }
+
+    /// The alias's forced overrides must not mask an ILLEGAL client value.
+    /// Before this was fixed, merging happened first and this returned a
+    /// cheerful 200 — the one shape where the module doc's "never silently
+    /// ignored" was untrue.
+    #[tokio::test]
+    async fn handler_rejects_an_illegal_value_even_when_the_alias_would_override_it() {
+        let (status, body) = panel_get("/panel/mission-status-all?opt.all=bogus", true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "the alias must not launder an illegal value: {body}");
+        assert!(body.contains("unknown value"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn handler_rejects_an_opt_on_a_panel_that_declares_none() {
+        let (status, body) = panel_get("/panel/flow-status?opt.kind=lab", true).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("(none)"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn handler_still_refuses_an_unknown_id_and_a_missing_header() {
+        let (status, _) = panel_get("/panel/not-a-panel", true).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "the allowlist still closes over ids");
+        let (status, _) = panel_get("/panel/run-list", false).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "the CORS-preflight header gate still applies");
+    }
+
     // ── manual-run floor: keyed by base id, never by variant (#1911) ──
 
     #[tokio::test]
@@ -1029,8 +1286,16 @@ mod tests {
         assert!(check_manual_floor(&panels, "some-other-manual-panel").await.is_ok());
     }
 
-    /// The property #1911 names explicitly: the floor check's own
-    /// signature only ever receives the panel's BASE id (`spec.id`) — see
+    /// Renamed from `manual_floor_cannot_be_defeated_by_cycling_opt_values`
+    /// (#1911 review): it never cycled an opt value, and it CANNOT — the
+    /// parameter does not exist, which is precisely the real guarantee.
+    /// The SIGNATURE is the guard; a test cannot observe the absence of a
+    /// parameter, so claiming that name here read as coverage of a
+    /// property nothing tests. What this does check is the narrower, real
+    /// thing: repeated checks against one base id stay floored.
+    ///
+    /// The floor check's own signature only ever receives the panel's
+    /// BASE id (`spec.id`) — see
     /// `check_manual_floor`'s doc. There is no variant-key parameter for a
     /// caller to pass, structurally, not by convention: cycling any
     /// `opt.*` selection on a (hypothetical, since `doctor` has none today)
@@ -1041,7 +1306,7 @@ mod tests {
     /// have "meant" by a different selection — because no selection ever
     /// reaches this function at all.
     #[tokio::test]
-    async fn manual_floor_cannot_be_defeated_by_cycling_opt_values() {
+    async fn manual_floor_stays_floored_across_repeated_checks_on_one_base_id() {
         let panels = PanelState::default();
         panels.last_manual.lock().await.insert("doctor", Instant::now());
         for _ in 0..3 {

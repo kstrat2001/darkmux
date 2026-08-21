@@ -955,5 +955,42 @@ mod tests {
              ui/src/lib/route.ts's RUNS_KINDS — update BOTH twins together (#1905), the pill \
              row and the CLI flag must show the same vocabulary"
         );
+
+        // (#1911) The THIRD leg. `panel.rs`'s `RUN_LIST_KIND_OPT` declares
+        // the same four values for the console's `--kind` option, and the
+        // panel spawns whatever that table says. Without this leg, dropping
+        // `Lab` from `RunKindArg` keeps the two legs above agreeing while
+        // the panel goes on spawning `run list --kind lab` — clap rejects
+        // it, and the operator sees an empty body with `exit_code: 2`, a
+        // wrong reading with no failing test anywhere. The reverse (a fifth
+        // kind) silently makes it unreachable from the console.
+        //
+        // Text-scanned for the same reason the TS leg is: `panel.rs`'s
+        // module is private to `darkmux-serve`, so there is no binding to
+        // compare against, and a scan that cannot find its anchor fails
+        // loudly rather than passing empty.
+        let panel_rs = include_str!("../crates/darkmux-serve/src/panel.rs");
+        let (_, after) = panel_rs.split_once("const RUN_LIST_KIND_OPT: PanelOpt = PanelOpt {").expect(
+            "RUN_LIST_KIND_OPT not found in crates/darkmux-serve/src/panel.rs — the console \
+             option table this pins against was renamed or removed, so `darkmux run list \
+             --kind` and the panel that spawns it can now drift apart silently (#1911)",
+        );
+        let (body, _) = after.split_once("};").expect(
+            "RUN_LIST_KIND_OPT has no closing `};` in panel.rs — the twin changed shape (#1911)",
+        );
+        let mut panel_kinds: Vec<String> = body
+            .match_indices("value: \"")
+            .filter_map(|(i, _)| {
+                let rest = &body[i + "value: \"".len()..];
+                rest.split_once('"').map(|(v, _)| v.to_string())
+            })
+            .collect();
+        panel_kinds.sort();
+        assert_eq!(
+            rust_kinds, panel_kinds,
+            "darkmux run list --kind's accepted values drifted from the console panel's own \
+             RUN_LIST_KIND_OPT table (crates/darkmux-serve/src/panel.rs) — the panel would \
+             spawn a flag the CLI no longer accepts, or hide one it does (#1911)"
+        );
     }
 }
