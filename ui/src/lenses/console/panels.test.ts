@@ -1,16 +1,19 @@
 import { describe, it, expect } from "vitest";
 import { PANEL_IDS } from "../../lib/route";
-import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols } from "./panels";
+import { PANELS, isManualPanel, panelCols } from "./panels";
 
 describe("PANELS", () => {
   it("covers exactly the routing allowlist, same drift guard as panel.rs's own PANEL_IDS test", () => {
     expect(PANELS.map((p) => p.id).sort()).toEqual([...PANEL_IDS].sort());
   });
 
-  it("mission-status is the default panel, matching viewer.html's state.panelId initial value", () => {
-    expect(DEFAULT_PANEL_ID).toBe("mission-status");
-    expect(PANELS.some((p) => p.id === DEFAULT_PANEL_ID)).toBe(true);
-  });
+  // (#1904) `DEFAULT_PANEL_ID`/"mission-status is the default panel" is
+  // retired along with this test — the console's landing default is no
+  // longer any CLI panel, it's the client-rendered "activity" view
+  // (`ConsolePanel.tsx`'s own `ConsoleSelection` union, outside this
+  // module's PANELS entirely). `ConsolePanel.test.tsx` pins the real landing
+  // behavior now; `mission-status` stays a normal, selectable entry in this
+  // list, covered by the drift-guard test above.
 
   it("only doctor is manual-only", () => {
     expect(isManualPanel("doctor")).toBe(true);

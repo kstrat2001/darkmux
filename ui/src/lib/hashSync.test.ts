@@ -94,14 +94,24 @@ describe("canonicalHash / parseRoute round-trip", () => {
     expect(roundTrip(route)).toEqual(route);
   });
 
-  it("console with mission-status explicitly named round-trips to the SAME hash as the default (both mean 'default')", () => {
+  // (#1904 QA fix) Was: "console with mission-status explicitly named
+  // round-trips to the SAME hash as the default (both mean 'default')" —
+  // that was true under legacy's `pid==="mission-status" ? p.delete("panel")
+  // : ...` collapse, back when "" (no panel param) and "mission-status"
+  // meant the exact same landing state. #1904 broke that premise: "" now
+  // means the ACTIVITY view, a different thing than the `mission-status`
+  // CLI panel. Collapsing the two here made `mission-status` literally
+  // unreachable by URL — a fresh `#lens=console&panel=mission-status` boot
+  // renders the right content once (`ConsolePanel`'s own `initialPanelId`
+  // guard), then this function immediately rewrites the address bar back
+  // to bare `#lens=console`, so a reload/bookmark/copy of that exact URL
+  // silently lands on the activity view instead. `mission-status` now
+  // round-trips like any other explicit panel — there is no more "both mean
+  // default" collapse for ANY panel id.
+  it("console with mission-status explicitly named round-trips to ITSELF, not the default (#1904 — the two are no longer the same view)", () => {
     const route: Route = { kind: "console", panelId: "mission-status" };
-    expect(canonicalHash(route)).toBe("lens=console");
-    // Parsing it back yields the EMPTY-string panelId form, not
-    // "mission-status" literally — this is the same collapse legacy itself
-    // performs (`pid==="mission-status"` deletes the param), so the round
-    // trip lands on the canonical route, not the literal input.
-    expect(roundTrip(route)).toEqual({ kind: "console", panelId: "" });
+    expect(canonicalHash(route)).toBe("lens=console&panel=mission-status");
+    expect(roundTrip(route)).toEqual(route);
   });
 
   it("console with a non-default panel round-trips", () => {

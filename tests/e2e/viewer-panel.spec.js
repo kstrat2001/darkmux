@@ -39,6 +39,22 @@ async function routePanels(page, handler) {
   await page.route('**/panel/**', handler);
 }
 
+// (#1904 CI fix) The console lens's DEFAULT landing view is now
+// `ActivityPanel` (a client-rendered union over `/runs`, no `/panel/*` call
+// at all) rather than the `mission-status` CLI panel — every test below
+// that actually exercises panel rendering, the manual-only contract, or
+// the XSS gate needs a REAL CLI panel on screen to test, so it can no
+// longer get there for free by just clicking the console tab. This
+// explicitly selects `mission-status` (the same panel these tests always
+// meant to exercise — `panelBody()`'s own default `panel: 'mission-status'`
+// names it) after landing on console, which is a BETTER fixture than
+// depending on the console's default happening to be a CLI panel: it
+// keeps working no matter what the lens defaults to next.
+async function selectMissionStatus(page) {
+  await page.click('[data-act="console"]');
+  await page.click('[data-act="setpanel"][data-arg="mission-status"]');
+}
+
 test('the console renders a panel as styled DOM and sends the required header', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (e) => pageErrors.push(String(e)));
@@ -49,7 +65,7 @@ test('the console renders a panel as styled DOM and sends the required header', 
   });
 
   await page.goto('/index-lab.html');
-  await page.click('[data-act="console"]');
+  await selectMissionStatus(page);
   await expect(page.locator('.panelout')).toBeVisible();
 
   // (#1602) The daemon REQUIRES this header — it forces a CORS preflight a
@@ -75,7 +91,7 @@ test('a loopback OSC 8 target is rewritten relative so one link works from the p
     route.fulfill({ contentType: 'application/json', body: JSON.stringify(panelBody(REAL_ANSI)) })
   );
   await page.goto('/index-lab.html');
-  await page.click('[data-act="console"]');
+  await selectMissionStatus(page);
 
   // Packet A bakes ABSOLUTE daemon URLs, and on a standalone machine that
   // means loopback — which tapped from a phone opens the PHONE's localhost.
@@ -97,7 +113,7 @@ test('a manual-only panel never runs until asked', async ({ page }) => {
   });
 
   await page.goto('/index-lab.html');
-  await page.click('[data-act="console"]');
+  await selectMissionStatus(page);
   await expect(page.locator('.panelout')).toBeVisible();
   expect(asked).toEqual(['mission-status']);
 
@@ -121,7 +137,7 @@ test('the daemon\'s own refusal is shown verbatim, not reworded', async ({ page 
     route.fulfill({ status: 429, contentType: 'text/plain', body: 'panel "doctor" is manual-run only and ran 3s ago — floored at 30s\n' })
   );
   await page.goto('/index-lab.html');
-  await page.click('[data-act="console"]');
+  await selectMissionStatus(page);
   // Inventing viewer-side wording for a server rule is the twin-drift this
   // whole packet exists to kill.
   await expect(page.locator('.panelerr')).toContainText('floored at 30s');
@@ -149,7 +165,7 @@ test('the console renders attacker-controlled panel bytes inertly', async ({ pag
     route.fulfill({ contentType: 'application/json', body: JSON.stringify(panelBody(hostile)) })
   );
   await page.goto('/index-lab.html');
-  await page.click('[data-act="console"]');
+  await selectMissionStatus(page);
   await expect(page.locator('.panelout')).toBeVisible();
 
   const fired = await page.evaluate(() => window.__xss);
@@ -190,7 +206,7 @@ test('a panel deep link switches in page instead of navigating', async ({ page }
   });
 
   await page.goto('/index-lab.html');
-  await page.click('[data-act="console"]');
+  await selectMissionStatus(page);
   await expect(page.locator('.panelout')).toContainText('81 more');
 
   const before = page.url();
@@ -221,7 +237,7 @@ test('a manual panel stays unrun across leaving and re-entering the tab', async 
   });
 
   await page.goto('/index-lab.html');
-  await page.click('[data-act="console"]');
+  await selectMissionStatus(page);
   await expect(page.locator('.panelout')).toBeVisible();
   await page.click('[data-act="setpanel"][data-arg="doctor"]');
   await page.waitForTimeout(300);
@@ -266,6 +282,13 @@ test('the console shows no crumb — the picker and the chrome line already say 
   );
   await page.goto('/index-lab.html');
   await page.click('[data-act="console"]');
-  await expect(page.locator('.panelout')).toBeVisible();
+  // (#1904 CI fix) This test's own subject is the CRUMB, which `ConsolePanel`
+  // never touches regardless of which of its own views is showing — it does
+  // not need a CLI panel selected, just the console lens actually mounted.
+  // Was `.panelout` (true only because the default happened to render one);
+  // `.consoleactivity` is what the bare landing view — its default now —
+  // actually renders, so this no longer depends on that default surviving
+  // the next redesign either.
+  await expect(page.locator('.consoleactivity')).toBeVisible();
   expect((await page.locator('#crumb').innerText()).trim()).toBe('');
 });

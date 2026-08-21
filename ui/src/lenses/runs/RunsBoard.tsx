@@ -23,6 +23,8 @@ import {
   labKnobSummary,
   labKnobDiff,
   labCounts,
+  runDestination,
+  MISSION_GRAPH_UNREACHABLE_NOTICE,
   type LabTaskGroup,
 } from "./format";
 
@@ -122,15 +124,13 @@ import {
  * operator-authored posture: a stuck feature gets a visible placeholder,
  * not a silent no-op.
  *
- * The notice used to point at "the classic viewer at /" — `viewer.html` was
- * deleted in #1865 and `/` now serves THIS SAME app, so a daemon-less
- * visitor was being told to go to the page they were already on. There is
- * genuinely nowhere else to send them (a static build has no daemon to
- * reach, full stop), so the fix names the missing capability instead of a
- * bogus destination — matching `onLabRunUnresolvable`'s own
- * `"run detail needs a running daemon — …"` phrasing below. */
-const MISSION_GRAPH_UNREACHABLE_NOTICE =
-  "mission graph needs a running daemon behind this page — this static build has no mission graph data to show.";
+ * The notice text itself (`MISSION_GRAPH_UNREACHABLE_NOTICE`) moved to
+ * `format.ts` (#1904 QA fix) — `ActivityPanel.tsx` can hit the exact same
+ * unreachable case through the shared `runDestination`, and the two
+ * surfaces should say the same thing rather than maintain separate
+ * copies. Matches `onLabRunUnresolvable`'s own `"run detail needs a
+ * running daemon — …"` phrasing below, which stays local since nothing
+ * else needs it. */
 
 export function RunsBoard({
   initialKind,
@@ -266,29 +266,31 @@ export function RunsBoard({
   // sees via the fleet stream): its `id` is a mission id, not a session id,
   // so there is no local `/flow-session/<id>` to open. That row keeps the
   // old "nothing to open" behavior, because for it the premise still holds.
+  // (#1904 QA fix) The four-branch decision itself moved to the shared
+  // `runDestination` (`format.ts`) — this function now only decides what
+  // to DO with each outcome, which for `RunsBoard` differs from
+  // `ActivityPanel.tsx`'s own caller exactly at "lab" (an in-page state
+  // swap here, a cross-lens navigation there).
   function activateRun(run: Run) {
-    if (run.kind === "lab") {
-      openLabRun(run.id);
-      return;
+    const dest = runDestination(run, missionGraphReachable());
+    switch (dest.kind) {
+      case "lab":
+        openLabRun(dest.dir);
+        return;
+      case "hash":
+        // (#1868) In-app navigation (a real `hashchange`, not a
+        // cross-document `location.href` or a silent `history.replaceState`)
+        // so both the session-drill and mission-graph destinations are
+        // normal, back-button-friendly navigations, matching how an
+        // operator reaches every other in-app destination.
+        location.hash = dest.hash;
+        return;
+      case "unreachable":
+        setRowClickNotice(MISSION_GRAPH_UNREACHABLE_NOTICE);
+        return;
+      case "none":
+        return; // a peer mission with no local session: nothing to open here
     }
-    if (run.kind === "dispatch" && !run.tracked) {
-      // No `missionGraphReachable()` gate here — `/flow-session/<id>` is a
-      // plain daemon fetch (`SessionReplay`'s own fetch, same as the
-      // ungated `#session=<sid>` bars `FleetLens.tsx`'s activity timeline
-      // already navigates to), not the mission-graph lens's endpoint.
-      location.hash = `session=${encodeURIComponent(run.id)}`;
-      return;
-    }
-    if (!run.tracked) return; // a peer mission with no local session: nothing to open here
-    if (missionGraphReachable()) {
-      // (#1868) In-app navigation to `MissionGraphLens`, not a cross-document
-      // `location.href` — a real `hashchange` (not `history.replaceState`)
-      // so this is a normal, back-button-friendly navigation, matching how
-      // an operator reaches every other in-app destination.
-      location.hash = `mission=${encodeURIComponent(run.id)}`;
-      return;
-    }
-    setRowClickNotice(MISSION_GRAPH_UNREACHABLE_NOTICE);
   }
 
   // A fresh deep-link into a DIFFERENT kind or run while this component is
@@ -634,8 +636,16 @@ function onActivateKeyDown(onActivate: () => void) {
  * see `activateRun`'s own doc for why `tracked` alone is the wrong gate for
  * "can this be opened" on a `kind: "dispatch"` row. An untracked MISSION
  * row (a peer's mission this daemon has no local session for, #1705) stays
- * flat, matching legacy's original rule for the case where it still holds. */
-function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
+ * flat, matching legacy's original rule for the case where it still holds.
+ *
+ * (#1904) Exported — `ActivityPanel.tsx` (the console lens's default
+ * recent-activity landing view) reuses this component verbatim for its own
+ * rows, rather than re-deriving the badge/kind-chip/subtitle DOM a second
+ * time. Same row shape; `onActivate` differs per caller (both now route
+ * through the shared `runDestination` in `format.ts`, but `ActivityPanel`
+ * has no in-page lab-detail pane to swap to, so its lab case navigates
+ * instead — see that function's own doc). */
+export function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
   const interactive = run.kind === "lab" || run.tracked || run.kind === "dispatch";
   const ago = runsAgo(run);
   const subtitle = runSubtitle(run, showMachine);

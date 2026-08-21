@@ -52,6 +52,37 @@ function machineDrillHash(uid: string, localUid: string | null): string {
   return `lens=machine&uid=${encodeURIComponent(uid)}`;
 }
 
+/** (#1903) The running COUNT's own tap target — distinct from
+ * `machineDrillHash` above (the card BODY's destination, unchanged by this
+ * function or its caller). The count is the thing an operator is actually
+ * reading on the card ("N running"), and it had no destination of its own:
+ * a tap anywhere on the card, count included, fell through to
+ * `machineDrillHash` and landed on the residency room, a machine drill the
+ * operator did not ask for. See #1903's own issue text: "the running count
+ * is the thing the operator is reading, and it has no affordance of its
+ * own."
+ *
+ * `null` (render the plain, non-interactive count, same as before this
+ * packet) when there's nothing running to open — `runningSessionIds` is
+ * only ever non-empty in LIVE mode (see `FleetCard.runningSessionIds`'s own
+ * doc), so this is naturally a no-op in replay, where the count means "the
+ * day's whole session set" rather than "currently running" — a different
+ * question, one the card body's own drill-in already answers honestly.
+ *
+ * Exactly one running session goes straight to that run's own session
+ * drill (`#session=<sid>`, same mechanism the activity-timeline bars below
+ * already use) rather than the runs lens — the single-run case has one
+ * obvious destination, and naming it directly saves a hop. Two or more
+ * goes to the runs lens pinned to this machine (`lens=runs&machine=<uid>`,
+ * the SAME hash `machineDrillHash` already constructs for a confirmed-
+ * remote card body) — a list, not a single run, is the honest surface for
+ * "several things running here". */
+function machineRunsHash(uid: string, runningSessionIds: string[]): string | null {
+  if (runningSessionIds.length === 0) return null;
+  if (runningSessionIds.length === 1) return `session=${encodeURIComponent(runningSessionIds[0])}`;
+  return `lens=runs&machine=${encodeURIComponent(uid)}`;
+}
+
 /** `sc()` — viewer.html:1633. One token-class chip (value over label). */
 function Chip({ value, label, cls }: { value: string | number; label: string; cls?: string }) {
   return (
@@ -436,6 +467,24 @@ export function FleetLens({
             data-arg={card.uid}
             role="button"
             tabIndex={0}
+            // (#1903 QA fix) Explicit, so the card's computed accessible
+            // name is DETERMINISTIC rather than folding in whatever the
+            // nested running-count button's own `aria-label` happens to
+            // say (per ARIA's presentational-children rule, a `button`
+            // descendant's content — including its own name — isn't
+            // exposed separately; without this, the outer card's name
+            // absorbed the inner one's text, e.g. "MacBook-Pro Apple M5
+            // Max dispatch in flight open the 2 running dispatches on
+            // MacBook-Pro"). Nesting one interactive control inside
+            // another is itself an accepted, documented exception here —
+            // not an oversight — because the count needed its own tap
+            // target (#1903) without moving or restructuring the card
+            // body's own destination, which the issue is explicit must
+            // stay unchanged. `stopPropagation` on the inner control (see
+            // the running-count block below) keeps the two handlers from
+            // double-firing; this `aria-label` is the remaining a11y-tree
+            // cleanup that nesting still needs.
+            aria-label={card.name}
             onClick={() => {
               location.hash = machineDrillHash(card.uid, localUid);
             }}
@@ -457,9 +506,53 @@ export function FleetLens({
               <span className="dot" />
               {card.stat}
             </div>
-            <div className="runs">
-              {card.runsCount} {card.runsLabel}
-            </div>
+            {/* (#1903) The running count's own tap target — a SIBLING
+                affordance to the card body's `machineDrillHash` click
+                above, not a replacement for it. `runsHash` is `null`
+                (falls through to the old plain, non-interactive count)
+                whenever there's nothing running to open — see
+                `machineRunsHash`'s own doc. `stopPropagation` on both
+                handlers keeps a click/Enter on the count from ALSO firing
+                the card body's own handler underneath it (this is a
+                nested interactive control by necessity — the issue is
+                explicit that the card body's destination must stay
+                unchanged, which rules out restructuring the card to avoid
+                the nesting). `.runs--live`'s own CSS is what makes it LOOK
+                interactive, matching #1900's lesson in the other
+                direction: a clickable-but-inert-looking control is as
+                dishonest as an inert-looking one that's secretly a broken
+                link. */}
+            {(() => {
+              const runsHash = machineRunsHash(card.uid, card.runningSessionIds);
+              if (!runsHash) {
+                return (
+                  <div className="runs">
+                    {card.runsCount} {card.runsLabel}
+                  </div>
+                );
+              }
+              const activate = (e: { stopPropagation: () => void }) => {
+                e.stopPropagation();
+                location.hash = runsHash;
+              };
+              return (
+                <div
+                  className="runs runs--live"
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`open the ${card.runsCount} running ${card.runsCount === 1 ? "dispatch" : "dispatches"} on ${card.name}`}
+                  onClick={activate}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      activate(e);
+                    }
+                  }}
+                >
+                  {card.runsCount} {card.runsLabel}
+                </div>
+              );
+            })()}
           </div>
         ))}
       </div>

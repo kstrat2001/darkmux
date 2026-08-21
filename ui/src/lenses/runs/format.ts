@@ -148,3 +148,67 @@ export function runsForMachine(runs: Run[], names: Set<string>): Run[] {
   if (names.size === 0) return [];
   return runs.filter((r) => r.machine != null && names.has(r.machine));
 }
+
+/**
+ * (#1904 QA fix) A run's click destination, shared by every caller that
+ * opens a `Run` row — `RunsBoard.tsx`'s `activateRun` and
+ * `ActivityPanel.tsx`'s `activityRunActivate` used to hand-roll the SAME
+ * four-branch decision independently. That duplication is exactly what
+ * let them drift: `ActivityPanel`'s copy dropped the `unreachable` branch
+ * silently (a tracked mission/dispatch row rendered clickable via
+ * `RunRow`'s own `interactive` gate, but clicking it when
+ * `missionGraphReachable()` is false did nothing at all — a dead
+ * affordance, the exact #1900 failure class both callers' own doc
+ * comments invoke). One function, one place the rule lives.
+ *
+ * The LAB branch is deliberately NOT resolved to a navigation here —
+ * `RunsBoard` swaps to an in-page detail pane for a lab run (`openLabRun`,
+ * a `labRunDir` state change plus a hash write), while `ActivityPanel`
+ * isn't the runs lens and has no such state, so it navigates there
+ * instead (`lens=runs&kind=lab&run=<dir>`). Returning the run's `id` (the
+ * lab run's directory) lets each caller build its own destination from
+ * it, rather than this function picking one caller's mechanism as
+ * "correct" for both. */
+export type RunDestination =
+  | { kind: "lab"; dir: string }
+  | { kind: "hash"; hash: string }
+  /** A tracked mission or dispatch (its own mission graph exists), but this
+   * page has no live daemon behind it to fetch `/mission/<id>/graph.json`
+   * from (the daemon-less static demo build). The row is still
+   * INTERACTIVE — clicking it is a real, expected action — it just can't
+   * navigate anywhere useful; callers show `MISSION_GRAPH_UNREACHABLE_NOTICE`
+   * instead of silently doing nothing. */
+  | { kind: "unreachable" }
+  /** An untracked mission (a peer's mission this daemon only knows via the
+   * fleet stream, #1705): its `id` is a mission id, not a session id, so
+   * there is no local record to open. Genuinely nothing to do here —
+   * callers render the row non-interactive, matching `RunRow`'s own
+   * `interactive` gate (`run.kind === "lab" || run.tracked || run.kind ===
+   * "dispatch"`), which already excludes exactly this case. */
+  | { kind: "none" };
+
+export function runDestination(run: Run, graphReachable: boolean): RunDestination {
+  if (run.kind === "lab") return { kind: "lab", dir: run.id };
+  if (run.kind === "dispatch" && !run.tracked) {
+    // No `graphReachable` gate here — `/flow-session/<id>` is a plain
+    // daemon fetch (`SessionReplay`'s own fetch, same as the ungated
+    // `#session=<sid>` bars `FleetLens.tsx`'s activity timeline already
+    // navigates to), not the mission-graph lens's endpoint.
+    return { kind: "hash", hash: `session=${encodeURIComponent(run.id)}` };
+  }
+  if (!run.tracked) return { kind: "none" };
+  if (!graphReachable) return { kind: "unreachable" };
+  return { kind: "hash", hash: `mission=${encodeURIComponent(run.id)}` };
+}
+
+/** The notice used to point at "the classic viewer at /" — `viewer.html`
+ * was deleted in #1865 and `/` now serves THIS SAME app, so a daemon-less
+ * visitor was being told to go to the page they were already on. There is
+ * genuinely nowhere else to send them (a static build has no daemon to
+ * reach, full stop), so the fix names the missing capability instead of a
+ * bogus destination — matching `RunsBoard.tsx`'s own `onLabRunUnresolvable`
+ * `"run detail needs a running daemon — …"` phrasing. Shared (not
+ * redeclared per caller) so the two surfaces that can hit `runDestination`'s
+ * `unreachable` branch say the same thing. */
+export const MISSION_GRAPH_UNREACHABLE_NOTICE =
+  "mission graph needs a running daemon behind this page — this static build has no mission graph data to show.";

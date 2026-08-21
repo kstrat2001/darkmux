@@ -1170,6 +1170,23 @@ body {
   padding: 10px 0;
 }
 
+/* (#1904) The console's default landing view — `ActivityPanel.tsx`, a
+   union over `/runs` shown in place of any CLI panel until the operator
+   explicitly picks one. Reuses `.stagehdr`/`.lablist`/`.labrunrow`/`.none`
+   verbatim (the runs-lens block above) for visual/DOM consistency, plus
+   `.hyblink` (the savings-hero "history →" link, `viewer.html`'s own
+   established anchor styling) for the "→ show every run" escape hatch —
+   so the only new class here is the section's own outer wrapper, purely
+   for spacing against the panel tab bar ABOVE it in DOM order
+   (`ConsolePanel.tsx` renders `.runsbar` first, this second). Matches
+   `.panelwrap`'s own `margin-top: 10px` below — its sibling in that same
+   position — rather than a `margin-bottom` that (a QA review caught) had
+   nothing below it to space against, since this is normally the LAST
+   element `ConsolePanel` renders on the default landing. */
+.consoleactivity {
+  margin-top: 10px;
+}
+
 /* ── Console lens (Packet 6) — ported from viewer.html's own <style> block
    (search that file for `.panelwrap`/`.panelchrome`/`.panelout`). Same
    load-bearing-CSS caveat as the runs lens block above: `.panelchrome` is
@@ -1574,6 +1591,10 @@ body {
 .hyblink:hover {
   text-decoration: underline;
 }
+.hyblink:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 
 .fleet {
   display: flex;
@@ -1637,6 +1658,27 @@ body {
   margin-top: 5px;
   font: 12px "JetBrains Mono", monospace;
   color: var(--fg);
+}
+/* (#1903) The running-count's own tap target — see `FleetLens.tsx`'s
+   `machineRunsHash` doc for why it exists distinct from `.mach` itself.
+   Styled to read as interactive precisely because a plain `.mach .runs`
+   (no running work, the sibling branch above) is NOT clickable — an
+   operator has to be able to tell the two apart at a glance, the same
+   "don't advertise an interaction that silently does nothing, and don't
+   hide one that's real" balance #1900 named for the runs-lens rows. */
+.mach .runs--live {
+  cursor: pointer;
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  width: fit-content;
+}
+.mach .runs--live:hover {
+  color: var(--fg);
+}
+.mach .runs--live:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .mach .dot {
   display: inline-block;

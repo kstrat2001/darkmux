@@ -310,6 +310,105 @@ describe("FleetLens", () => {
   // single repeated instant; the day's whole recorded span stays on
   // screen, with only the playhead marker (and the token hero, and the bar
   // classes) moving.
+  // (#1903) The running COUNT is what the operator actually reads on a
+  // fleet card ("N running"), and until now it carried no tap target of its
+  // own — a click anywhere on the card, count included, fell through to
+  // `machineDrillHash` and landed on the residency room. These three tests
+  // pin the count's own destination, distinct from the card body's, without
+  // touching `machineDrillHash` itself (covered above, unchanged).
+  it("(#1903) tapping the running count with 2 live sessions navigates to the runs lens pinned to the machine; the card body still goes to the residency room", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "coder" },
+      ],
+      machines: [
+        { uid: "u1", name: "MacBook-Pro", last_seen_ms: Date.now() },
+      ],
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("2 running");
+
+    const countEl = card.querySelector(".runs--live")!;
+    expect(countEl).not.toBeNull();
+    fireEvent.click(countEl);
+    expect(window.location.hash).toBe("#lens=runs&machine=u1");
+
+    // The card BODY's own click (anywhere else on the card) is untouched —
+    // this is a LOCAL-confirmed card, so it still goes to the residency
+    // room, not the runs lens the count above just navigated to.
+    window.location.hash = "";
+    fireEvent.click(card.querySelector(".name")!);
+    expect(window.location.hash).toBe("#lens=machine&uid=u1");
+  });
+
+  it("(#1903) tapping the running count with exactly 1 live session opens that run's session drill directly", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      ],
+      machines: [{ uid: "u1", name: "MacBook-Pro", last_seen_ms: Date.now() }],
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("1 running");
+    fireEvent.click(card.querySelector(".runs--live")!);
+    expect(window.location.hash).toBe("#session=s1");
+  });
+
+  it("(#1903) the running count is keyboard operable and carries an accessible name", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      ],
+      machines: [{ uid: "u1", name: "MacBook-Pro", last_seen_ms: Date.now() }],
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const countEl = document.querySelector(".runs--live")!;
+    expect(countEl).toHaveAttribute("role", "button");
+    expect(countEl).toHaveAttribute("tabIndex", "0");
+    expect(countEl.getAttribute("aria-label")).toBeTruthy();
+    fireEvent.keyDown(countEl, { key: "Enter" });
+    expect(window.location.hash).toBe("#session=s1");
+  });
+
+  // (#1903 QA fix) Was: the card body (`role="button"`) had no explicit
+  // `aria-label`, so its computed accessible name absorbed ALL descendant
+  // text — including the nested running-count button's own `aria-label`
+  // ("open the 2 running dispatches on MacBook-Pro"), per ARIA's
+  // presentational-children rule for a `button` descendant. The card
+  // announced as "MacBook-Pro Apple M5 Max dispatch in flight open the 2
+  // running dispatches on MacBook-Pro" instead of just its own name.
+  // Nesting one interactive control inside another is an accepted,
+  // documented exception here (the count needed its own tap target without
+  // moving the card body's destination) — this pins that the OUTER card's
+  // name stays deterministic despite the nesting.
+  it("(#1903 QA fix) the card's own accessible name stays just its machine name, not polluted by the nested running-count button's aria-label", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+        { ts: `${today}T10:00:00.000Z`, machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s2", action: "dispatch.start", handle: "coder" },
+      ],
+      machines: [{ uid: "u1", name: "MacBook-Pro", last_seen_ms: Date.now() }],
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
+    });
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card).toHaveAccessibleName("MacBook-Pro");
+  });
+
   it("a scrubbed playhead moves the hero and the bars, but the activity axis stays the day's whole fixed span", async () => {
     const today = todayUTC();
     const dayTMin = Date.parse(`${today}T10:00:00.000Z`);
