@@ -3879,6 +3879,97 @@
         assert_eq!(json["runs"].as_array().unwrap().len(), 0);
     }
 
+    /// (#1905) Conformance test for `runs.rs`'s own "Two callers, one
+    /// union" contract: `darkmux run list` (`src/run_list.rs`, the root
+    /// binary crate) and this crate's `GET /runs` handler must agree on
+    /// the same on-disk state, because they call the exact same
+    /// `build_runs(flows_dir, lab_dir, fleet)`. There is no separate
+    /// Rust binding across the crate boundary to assert the CALL SITE
+    /// against mechanically (the verb genuinely lives in a different
+    /// crate) -- what this test proves instead, per this issue's own
+    /// fallback instruction, is that `runs_handler`'s HTTP path
+    /// (`spawn_blocking` + JSON envelope) reports EXACTLY what a direct
+    /// `build_runs` call produces: no dropped, reordered, relabeled, or
+    /// additionally-filtered rows on the way out. A future handler change
+    /// that added filtering/transformation before serializing would fail
+    /// THIS test even though `runs.rs`'s own `build_runs` unit tests
+    /// (which never touch the handler) would stay green -- that gap is
+    /// exactly what this test closes.
+    ///
+    /// NOT covered: this doesn't invoke the actual `darkmux run list`
+    /// binary (a root-crate CLI verb can't easily reach into this crate's
+    /// test-only tempdir fixtures) -- but `src/run_list.rs::run` has
+    /// exactly one call site for `build_runs`, with the same three
+    /// arguments shape asserted here, so proving the HANDLER's path
+    /// matches a direct `build_runs` call is the practical proxy for
+    /// proving the VERB's path does too.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn run_list_verb_and_runs_handler_agree_on_the_same_fixture() {
+        let _guard = CrewDirGuard::new();
+        let mission = minimal_mission("conformance-mission", vec![]);
+        save_test_mission(&mission);
+
+        let flows = TempDir::new().unwrap();
+        let lab = TempDir::new().unwrap();
+        write_synthetic_funnel_run(&lab.path().join("case-a/run1"), "demo-case-a", "demo-crew");
+
+        // Path A: exactly what `darkmux run list` calls
+        // (`src/run_list.rs::run`) -- the SAME function, the SAME three
+        // inputs (an empty fleet slice here, matching a standalone,
+        // Redis-off install; `fleet_records_for_runs()` degrades to the
+        // same empty vec in that case).
+        let direct = build_runs(flows.path(), Some(lab.path()), &[]);
+        assert_eq!(direct.len(), 2, "fixture sanity: one mission + one lab run");
+
+        // Path B: the daemon's `GET /runs`.
+        let app = build_router_full_local(
+            flows.path().to_path_buf(),
+            worktrees_base_dir(),
+            Some(lab.path().to_path_buf()),
+        );
+        let response = app
+            .oneshot(Request::builder().uri("/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let handler_runs = json["runs"].as_array().expect("/runs always returns a runs array");
+
+        let mut direct_triples: Vec<(String, String, String)> = direct
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    serde_json::to_value(r.kind).unwrap().as_str().unwrap().to_string(),
+                    serde_json::to_value(r.status).unwrap().as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        direct_triples.sort();
+
+        let mut handler_triples: Vec<(String, String, String)> = handler_runs
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["kind"].as_str().unwrap().to_string(),
+                    r["status"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        handler_triples.sort();
+
+        assert_eq!(
+            direct_triples, handler_triples,
+            "darkmux run list (a direct build_runs call) and GET /runs disagree on the SAME \
+             fixture -- the \"one union\" contract (#1905) is broken: either the handler \
+             transformed the rows on the way out, or one of the two call sites stopped passing \
+             the same inputs"
+        );
+    }
+
     /// (#1868) The standalone mission-graph page and its `/vendor/*` bundle
     /// routes are retired; `/mission/:id/graph` is now a 308 redirect into
     /// the port's own `#mission=<id>` hash route, so an old bookmark or

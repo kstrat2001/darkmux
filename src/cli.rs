@@ -257,6 +257,19 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: MissionCmd,
     },
+    /// Run views (#1905) — the flat cross-kind union `GET /runs` also
+    /// serves: mission, dispatch, and lab runs together, one row per run
+    /// regardless of source. `run list` is the CLI twin of the RUNS lens;
+    /// both call the SAME `darkmux_serve::build_runs` union, so they can
+    /// never disagree about what counts as a run (see that function's own
+    /// doc for the contract). Distinct from `lab run list`, which stays
+    /// lab-directory-scoped and answers a different question (workload /
+    /// profile / wall / ok) — folding the two families together is a real
+    /// option with precedent (#1426) but not this change.
+    Run {
+        #[command(subcommand)]
+        sub: RunFamilyCmd,
+    },
     /// Flow observability — record operator-facing flow events.
     Flow {
         #[command(subcommand)]
@@ -694,6 +707,52 @@ pub(crate) enum MissionCmd {
     Config {
         #[command(subcommand)]
         sub: MissionConfigCmd,
+    },
+}
+
+/// (#1905) `run` kind filter — the CLI twin of the RUNS lens's kind chips
+/// (`ui/src/lib/route.ts::RUNS_KINDS`). clap's default `ValueEnum` rename
+/// (kebab-case of the variant name) happens to equal each of these four
+/// lowercase words unchanged, so no `#[value(rename = ...)]` is needed —
+/// pinned against the TS twin by
+/// `run_list::run_kind_arg_vocabulary_matches_the_ui_runs_kinds_twin`
+/// (`src/run_list.rs`), which reads BOTH sides live rather than trusting
+/// this comment to stay true.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunKindArg {
+    All,
+    Mission,
+    Dispatch,
+    Lab,
+}
+
+/// (#1905) `darkmux run list` — the CLI twin of `GET /runs`. See
+/// `src/run_list.rs` for the implementation and `Cmd::Run`'s own doc for
+/// the contract this shares with the daemon's `/runs` handler.
+#[derive(Subcommand)]
+pub(crate) enum RunFamilyCmd {
+    /// List runs across mission/dispatch/lab kinds — the same union
+    /// `GET /runs` serves. `--limit` caps TOTAL rows, live rows first;
+    /// live (Running) rows are never truncated, so more live runs than
+    /// the limit prints all of them and no history. The footer discloses
+    /// the real total whenever anything was hidden (never reports the cap
+    /// as the total — #1876, #1891).
+    List {
+        /// Filter to one run kind. Defaults to `all`.
+        #[arg(long, value_enum, default_value = "all")]
+        kind: RunKindArg,
+        /// Max rows shown in total, live runs first. Live runs are never
+        /// truncated, so a machine with more running than this prints all
+        /// of them. `0` means no cap. Ignored by `--json`, which is never
+        /// paginated — a machine reader gets every run the kind filter
+        /// selected. Default 10.
+        #[arg(long, default_value = "10")]
+        limit: usize,
+        /// Show every run, ignoring `--limit`.
+        #[arg(long)]
+        all: bool,
+        #[command(flatten)]
+        json: JsonFlag,
     },
 }
 
