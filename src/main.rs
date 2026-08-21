@@ -59,6 +59,7 @@ mod config_cmd;
 mod conventions;
 mod mission_propose;
 mod mission_status;
+mod run_list;
 mod mission_config_cli;
 mod coder_phase;
 mod mission_launch;
@@ -156,6 +157,11 @@ fn run(cmd: Cmd) -> Result<i32> {
         },
         Cmd::Role { sub } => cmd_role(sub),
         Cmd::Mission { sub } => cmd_mission(sub),
+        Cmd::Run { sub } => match sub {
+            cli::RunFamilyCmd::List { kind, limit, all, json } => {
+                run_list::run(kind, limit, all, json.json)
+            }
+        },
         Cmd::Flow { sub } => {
             flow_cli::run(sub)?;
             Ok(0)

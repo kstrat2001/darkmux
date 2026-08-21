@@ -2876,3 +2876,92 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
         "the unverifiable file must still be called out, naming the real code; stdout:\n{stdout}"
     );
 }
+
+/// (#1905) End-to-end conformance for `runs.rs`'s "Two callers, one union"
+/// contract: the `darkmux run list` BINARY and a direct
+/// `darkmux_serve::build_runs` call must report the same runs for the same
+/// on-disk state.
+///
+/// This is the half `crates/darkmux-serve/src/lib_tests.rs`'s
+/// `run_list_verb_and_runs_handler_agree_on_the_same_fixture` explicitly
+/// cannot cover: that test proves the HTTP handler does not transform rows
+/// on the way out, but it never invokes the verb, so it stays green if the
+/// verb stops calling the shared union and starts computing its own. This
+/// test spawns the real binary, so a verb that grew a private aggregation,
+/// a private filter, or a different input triple fails HERE.
+///
+/// Every input is pinned by env so both sides read the SAME state: the
+/// subprocess gets them as env vars, and the in-process side gets them via
+/// `set_var` (hence `#[serial]` — this mutates process-global env).
+/// `DARKMUX_HOME` isolates config.json, and `DARKMUX_REDIS_URL` is removed
+/// on both sides so the fleet input is an empty slice for each.
+#[test]
+#[serial_test::serial]
+fn run_list_binary_agrees_with_the_shared_union_it_calls() {
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+    let lab = TempDir::new().unwrap();
+    let crew = TempDir::new().unwrap();
+
+    // A lab run is any directory carrying one of the three marker files
+    // `scan_lab_runs` matches on (`funnels.json` / `funnel-events.jsonl` /
+    // `scores.json`). One is enough to make the union non-empty, which is
+    // what stops this test from passing vacuously on two empty lists.
+    let run_dir = lab.path().join("case-a/run1");
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::write(run_dir.join("scores.json"), r#"{"cases":[]}"#).unwrap();
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["run", "list", "--json", "--all"])
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_LAB_DIR", lab.path())
+        .env("DARKMUX_CREW_DIR", crew.path())
+        .env_remove("DARKMUX_REDIS_URL")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "run list --json failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("run list --json emitted non-JSON ({e}): {}", String::from_utf8_lossy(&out.stdout)));
+    let mut verb_ids: Vec<String> = json["runs"]
+        .as_array()
+        .expect("run list --json always emits a runs array")
+        .iter()
+        .map(|r| format!("{}/{}/{}", r["kind"].as_str().unwrap(), r["status"].as_str().unwrap(), r["id"].as_str().unwrap()))
+        .collect();
+    verb_ids.sort();
+
+    unsafe {
+        std::env::set_var("DARKMUX_FLOWS_DIR", flows.path());
+        std::env::set_var("DARKMUX_LAB_DIR", lab.path());
+        std::env::set_var("DARKMUX_CREW_DIR", crew.path());
+        std::env::set_var("DARKMUX_HOME", home.path());
+        std::env::remove_var("DARKMUX_REDIS_URL");
+    }
+    let direct = darkmux_serve::build_runs(flows.path(), Some(lab.path()), &[]);
+    let mut direct_ids: Vec<String> = direct
+        .iter()
+        .map(|r| {
+            format!(
+                "{}/{}/{}",
+                serde_json::to_value(r.kind).unwrap().as_str().unwrap(),
+                serde_json::to_value(r.status).unwrap().as_str().unwrap(),
+                r.id
+            )
+        })
+        .collect();
+    direct_ids.sort();
+
+    assert!(
+        !direct_ids.is_empty(),
+        "fixture produced no runs, so this test would pass vacuously — the lab marker file is no longer recognized"
+    );
+    assert_eq!(
+        verb_ids, direct_ids,
+        "`darkmux run list` and darkmux_serve::build_runs disagree on the SAME fixture — the \
+         \"one union\" contract (#1905) is broken: the verb is aggregating, filtering, or \
+         reading different inputs instead of rendering what the shared union returned"
+    );
+}

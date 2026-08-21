@@ -70,6 +70,17 @@
 //! coder-phase/review) — [`mission_to_run`] unions BOTH join keys per
 //! mission, so whichever mechanism actually stamped a session lands the
 //! same Run row exactly once.
+//!
+//! ## Two callers, one union (#1905)
+//!
+//! [`build_runs`] and [`Run`] (with [`RunKind`]/[`RunStatus`]) are `pub` —
+//! this crate's own `runs_handler` (`GET /runs`) AND the root binary's
+//! `darkmux run list` verb both call this SAME function against the SAME
+//! inputs. Neither may compute its own union: a view that needs a field
+//! this module doesn't expose widens the response, it never re-derives
+//! membership/status/identity alongside it (operator direction, #1905's
+//! settled design). See `src/run_list.rs` (root binary crate) for the CLI
+//! side of that contract.
 
 use crate::LabRunSummary;
 use darkmux_crew::envelope::MissionOutcomeStatus;
@@ -96,7 +107,7 @@ use std::path::{Path as StdPath, PathBuf};
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum RunKind {
+pub enum RunKind {
     Mission,
     Dispatch,
     Lab,
@@ -109,7 +120,7 @@ pub(crate) enum RunKind {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum RunStatus {
+pub enum RunStatus {
     Planned,
     Running,
     Complete,
@@ -136,26 +147,26 @@ pub(crate) enum RunStatus {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
-pub(crate) struct Run {
-    pub(crate) id: String,
-    pub(crate) kind: RunKind,
-    pub(crate) status: RunStatus,
+pub struct Run {
+    pub id: String,
+    pub kind: RunKind,
+    pub status: RunStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
-    pub(crate) machine: Option<String>,
+    pub machine: Option<String>,
     /// Endpoint label (e.g. `"azure:host/gpt-4o"`) when any of the run's
     /// dispatches used a hosted endpoint; `None` = local LMStudio (or no
     /// flow session found at all). See the module doc's join-key section
     /// for how this is resolved per `kind`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
-    pub(crate) route: Option<String>,
+    pub route: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
-    pub(crate) role: Option<String>,
+    pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
-    pub(crate) model: Option<String>,
+    pub model: Option<String>,
     // (UI port Packet 1) `#[ts(type = "number")]` overrides ts-rs's default
     // u64 -> bigint mapping. The wire format is plain `JSON.parse` (never
     // serde_json's stringify-large-ints convention), so the browser always
@@ -165,10 +176,10 @@ pub(crate) struct Run {
     // never actually produces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional, type = "number"))]
-    pub(crate) started_ts: Option<u64>,
+    pub started_ts: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional, type = "number"))]
-    pub(crate) completed_ts: Option<u64>,
+    pub completed_ts: Option<u64>,
     /// (#1584) **When this run was last active** — the one field the runs
     /// lens can always order by, across all three sources.
     ///
@@ -185,19 +196,22 @@ pub(crate) struct Run {
     /// arbitrarily-ordered tail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional, type = "number"))]
-    pub(crate) updated_ts: Option<u64>,
+    pub updated_ts: Option<u64>,
     /// `false` = a flow-only ghost with no durable record backing it (see
     /// the module doc's "untracked" synthesis). `true` for every mission
     /// and lab run — both have a durable artifact on disk.
-    pub(crate) tracked: bool,
+    pub tracked: bool,
 }
 
-/// Build the full `/runs` list — the top-level entry point `runs_handler`
-/// calls from a `spawn_blocking` task. Never panics on a missing/malformed
-/// source: `load_missions`/`load_phases` degrade to empty via
-/// `unwrap_or_default` (matching `missions_handler`'s own posture), and
+/// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
+/// (`GET /runs`, from a `spawn_blocking` task) and the root binary's
+/// `darkmux run list` verb (`src/run_list.rs`) call. `pub` since #1905:
+/// neither caller may compute its own union or filter at this layer — see
+/// the module doc's "Two callers, one union" section. Never panics on a
+/// missing/malformed source: `load_missions`/`load_phases` degrade to empty
+/// via `unwrap_or_default` (matching `missions_handler`'s own posture), and
 /// `crate::scan_lab_runs` is already resilient (best-effort scan, #1247).
-pub(crate) fn build_runs(
+pub fn build_runs(
     flows_dir: &StdPath,
     lab_dir: Option<&StdPath>,
     fleet: &[serde_json::Value],
