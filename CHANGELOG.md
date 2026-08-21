@@ -154,6 +154,17 @@ darkmux release.
   a release behind. `MachineTotals.potential_bytes` is now summed as
   `max(potential, current)` per resident: a value change inside an unchanged
   field, and the fix above.
+- `FLOW_SCHEMA_VERSION` **1.19.0 → 1.20.0** (minor, additive): a new
+  `"step timing"` action (#1877's final wiring step). The scheduler now
+  streams one companion flow record per step, live, for every mission that
+  runs through `run_step_graph`, including coder-phase, with no change to
+  its own module. A pre-1.20.0 reader ignores the unknown action entirely;
+  no struct/field change on any existing action. One transient
+  fleet-visible effect: until every machine has upgraded past this build,
+  `darkmux flow status` / `darkmux doctor` on an already-upgraded machine
+  reports `schema_skew_detected` against a peer still writing 1.19.0 (the
+  same live-stream version comparison every prior `FLOW_SCHEMA_VERSION`
+  bump has produced) until the whole fleet catches up.
 
 ### Removed
 

@@ -2111,9 +2111,11 @@ mod tests {
         let actions: Vec<&str> = emitted.iter().map(|r| r.action.as_str()).collect();
         assert!(actions.contains(&"step start"));
         assert!(actions.contains(&"step complete"));
-        // (#1877) The companion timing record fires alongside "step
-        // complete" for every step that streamed a real terminal. See
-        // `step_timing_record`'s own doc.
+        // (#1877) The companion timing record fires for every step that
+        // streamed a real terminal, "step complete" here and "step error"
+        // on a step that ran and failed (see
+        // `errored_step_that_actually_ran_still_gets_a_record_with_real_duration`
+        // below for that case). See `step_timing_record`'s own doc.
         assert_eq!(
             actions.iter().filter(|a| **a == STEP_TIMING_ACTION).count(),
             1,
@@ -2877,6 +2879,7 @@ mod tests {
         kinds.register(kind).unwrap();
         let facts = Facts::default();
         let est = FixedEstimator::default();
+        let mut emitted: Vec<FlowRecord> = Vec::new();
         let report = run_step_graph(
             &mut steps,
             &tasks,
@@ -2885,7 +2888,7 @@ mod tests {
             &est,
             8,
             &mock_host_factory,
-            &mut |_r| {},
+            &mut |r| emitted.push(r),
             &mut |_s| {},
             None,
             None,
@@ -2906,6 +2909,25 @@ mod tests {
             rec.wall_ms >= 50,
             "the failed step's own ~60ms sleep must show up in its record — got {}ms",
             rec.wall_ms
+        );
+
+        // (#1877) The flow-stream companion fires on this path too, not
+        // just the in-memory summary above. This is the "step error" half
+        // of the pairing the sibling test
+        // `step_records_reach_the_flow_stream_live_under_their_own_vocabulary`
+        // (Ok/"step complete" case) exercises above.
+        let timing: Vec<&FlowRecord> = emitted.iter().filter(|r| r.action == STEP_TIMING_ACTION).collect();
+        assert_eq!(
+            timing.len(),
+            1,
+            "expected exactly one \"step timing\" flow record for the failed-but-ran step: {:?}",
+            emitted.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(timing[0].handle, "boom-step");
+        assert_eq!(
+            timing[0].payload.as_ref().and_then(|p| p.get("wall_ms")).and_then(|v| v.as_u64()),
+            Some(rec.wall_ms),
+            "the flow record's wall_ms must match the in-memory StepRecord's exactly"
         );
     }
 
