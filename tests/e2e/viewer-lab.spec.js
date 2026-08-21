@@ -88,10 +88,18 @@ test('runs lens renders every kind in one flat list, newest first', async ({ pag
   // not "live right now". The relative time carries that distinction.
   await expect(page.locator('.labrunrow .labbadge.live')).toHaveCount(0);
 
-  // An untracked ghost has no durable record to open, so its row offers no
-  // drill-down rather than linking to a 404.
+  // (#1900) An untracked DISPATCH row is still openable: `tracked` answers
+  // "does this have a mission graph", which is a different question from
+  // "is there anything to show". The server only ever synthesizes an
+  // untracked dispatch row for a flow session that saw a `dispatch start`,
+  // so there is always a real trajectory behind it — the session drill
+  // (`#session=<id>`) is its destination. The row keeps the honest
+  // `untracked` chip; what changed is that untracked stopped meaning
+  // unopenable, which left an operator unable to open the run that had
+  // just failed.
   const ghost = page.locator('.labrunrow', { hasText: 'ghost-session-abc' });
-  await expect(ghost).toHaveClass(/\bflat\b/);
+  await expect(ghost).not.toHaveClass(/\bflat\b/);
+  await expect(ghost).toHaveAttribute('role', 'button');
   await expect(ghost).toContainText('untracked');
 
   expect(pageErrors, `uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
