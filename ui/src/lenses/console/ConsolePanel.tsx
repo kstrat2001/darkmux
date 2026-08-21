@@ -144,6 +144,8 @@ function CliPanelView({ id, onPanelSwitch }: { id: PanelId; onPanelSwitch: (id: 
         loading={query.isFetching}
         errorMessage={errorMessage}
         ansiText={loadedBody ? loadedBody.ansi_text || "" : null}
+        exitCode={loadedBody ? loadedBody.exit_code : null}
+        stderrTail={loadedBody ? loadedBody.stderr_tail || "" : ""}
         onPanelSwitch={onPanelSwitch}
       />
     </div>
@@ -218,25 +220,82 @@ function NotLoadedChrome({ id, loading, onRun }: { id: PanelId; loading: boolean
 /** viewer.html: `renderConsole()`'s body switch (`.panelout`/`.panelerr`,
  * loading > error > loaded > not-yet-run precedence). The loaded branch is
  * the ONLY one using a real `<pre>` element — see `styles.css`'s module doc
- * for why the tag choice (not just the class) matters. */
+ * for why the tag choice (not just the class) matters.
+ *
+ * (#1908) The loaded branch used to render `ansi_text` (stdout) alone, so a
+ * command that failed with empty stdout was indistinguishable from one that
+ * succeeded with nothing to say — same header, same timing, same empty box.
+ * The daemon already sends `exit_code` and `stderr_tail`
+ * (`crates/darkmux-serve/src/panel.rs`) for exactly this; the viewer just
+ * never read them.
+ *
+ * `failed` treats anything OTHER than a real `0` as not-a-clean-exit — this
+ * covers `null` (`Command::status().code()`'s own signal-killed case) and,
+ * defensively, a malformed/absent field despite the declared `number |
+ * null` type (never leak the literal word "undefined" into the fallback
+ * sentence below). `hasStdout`/`hasStderr` are then independent of
+ * `failed`: a ZERO exit can still have written a warning to stderr, and
+ * that warning is real content, not noise to bury under "no output" (QA
+ * finding on this issue — dropping it would be the same silent-failure
+ * shape #1908 exists to kill, one branch over). So the three regions
+ * compose rather than branch exclusively:
+ *   - `hasStdout` → the ANSI-rendered pre, unchanged from before this
+ *     packet.
+ *   - `hasStderr` (regardless of exit code) → `stderr_tail`, verbatim, in
+ *     the SAME `.panelerr` treatment the HTTP-refusal path already uses
+ *     (`errorMessage` above) — never reworded, per the daemon's own
+ *     "surfaced so a failure isn't silent" comment.
+ *   - `failed && !hasStderr` → a plain sentence naming the exit status
+ *     instead of falling back to a blank box again. This one line isn't
+ *     the daemon's own text (there isn't any to quote), but it still
+ *     describes only what actually happened, never invents what the
+ *     command might have meant.
+ * Only when NONE of the three apply (clean exit, empty stdout, empty
+ * stderr) does the plain "no output" empty state render — distinct
+ * wording from "not run yet" (never fetched) so the two stay
+ * distinguishable. */
 function PanelBody({
   loading,
   errorMessage,
   ansiText,
+  exitCode,
+  stderrTail,
   onPanelSwitch,
 }: {
   loading: boolean;
   errorMessage: string | null;
   ansiText: string | null;
+  exitCode: number | null;
+  stderrTail: string;
   onPanelSwitch: (id: PanelId) => void;
 }) {
   if (loading) return <div className="panelout">running…</div>;
   if (errorMessage) return <div className="panelerr">{errorMessage}</div>;
-  if (ansiText !== null)
+  if (ansiText !== null) {
+    const failed = typeof exitCode !== "number" || exitCode !== 0;
+    const hasStdout = ansiText !== "";
+    const hasStderr = stderrTail !== "";
+
+    if (!failed && !hasStdout && !hasStderr) return <div className="panelout">no output</div>;
+
     return (
-      <pre className="panelout">
-        <AnsiText text={ansiText} onPanelSwitch={onPanelSwitch} />
-      </pre>
+      <>
+        {hasStdout && (
+          <pre className="panelout">
+            <AnsiText text={ansiText} onPanelSwitch={onPanelSwitch} />
+          </pre>
+        )}
+        {(hasStderr || failed) && (
+          <div className="panelerr">
+            {hasStderr
+              ? stderrTail
+              : typeof exitCode === "number"
+                ? `command exited with status ${exitCode} and printed nothing to stderr`
+                : "command did not exit cleanly (killed) and printed nothing to stderr"}
+          </div>
+        )}
+      </>
     );
+  }
   return <div className="panelout">not run yet — this panel probes the machine, so it runs only when you ask.</div>;
 }
