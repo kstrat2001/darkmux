@@ -196,4 +196,131 @@ describe("ConsolePanel", () => {
     await waitFor(() => expect(screen.getByText(/mission status —/)).toBeInTheDocument());
     expect(screen.getByText("mission status", { selector: ".runchip" })).toHaveClass("on");
   });
+
+  // (#1908) A command that fails with empty stdout used to render identically
+  // to a command that succeeded and had nothing to say — header, timing,
+  // empty box either way. The daemon already sends `exit_code` and
+  // `stderr_tail`; the viewer just never read them. These three cover the
+  // fix's own stated shapes: failure-with-stderr, honest-empty-success, and
+  // failure-that-still-produced-stdout. The fourth shape from the issue (the
+  // HTTP-refusal path, `viewer-panel.spec.js:119`) is the existing
+  // "a daemon error response renders the daemon's own message…" test above,
+  // unchanged by this fix.
+  it("(#1908) a failed panel (non-zero exit, empty stdout, non-empty stderr) shows the stderr verbatim and reads as a failure", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(
+        url.startsWith("/runs")
+          ? runsJson()
+          : jsonResponse({
+              ...MISSION_STATUS_BODY,
+              exit_code: 1,
+              ansi_text: "",
+              stderr_tail:
+                "Error: running `lms ps --json`: host command failed: spawning `lms` (ps): No such file or directory (os error 2)",
+            }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText(/host command failed: spawning `lms`/)).toBeInTheDocument());
+    // Verbatim, in the same `.panelerr` treatment the HTTP-refusal path uses
+    // — not reworded, and not the honest-empty-state wording either.
+    expect(document.querySelector(".panelerr")!.textContent).toContain("No such file or directory");
+    expect(screen.queryByText("no output")).not.toBeInTheDocument();
+  });
+
+  it("(#1908) a successful panel (zero exit, empty stdout) renders an honest empty state, not a failure", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(
+        url.startsWith("/runs")
+          ? runsJson()
+          : jsonResponse({ ...MISSION_STATUS_BODY, exit_code: 0, ansi_text: "", stderr_tail: "" }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText("no output")).toBeInTheDocument());
+    expect(document.querySelector(".panelerr")).toBeNull();
+  });
+
+  it("(#1908) a failed panel that DID produce stdout shows both the stdout and the stderr, not one instead of the other", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(
+        url.startsWith("/runs")
+          ? runsJson()
+          : jsonResponse({
+              ...MISSION_STATUS_BODY,
+              exit_code: 2,
+              ansi_text: "partial output before the failure\n",
+              stderr_tail: "boom: something went wrong",
+            }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText(/boom: something went wrong/)).toBeInTheDocument());
+    expect(document.querySelector(".panelout")!.textContent).toContain("partial output before the failure");
+    expect(document.querySelector(".panelerr")!.textContent).toContain("boom: something went wrong");
+  });
+
+  // (#1908 QA fix) A ZERO exit with empty stdout is the "no output" empty
+  // state — but only when stderr is ALSO empty. A command that exits 0 and
+  // still writes a warning to stderr is not silent; dropping that warning
+  // in favor of the same "no output" wording a truly silent success gets
+  // is the same dishonesty #1908 exists to kill, one branch over.
+  it("(#1908) a successful panel that still wrote to stderr shows the stderr, not the 'no output' wording", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(
+        url.startsWith("/runs")
+          ? runsJson()
+          : jsonResponse({
+              ...MISSION_STATUS_BODY,
+              exit_code: 0,
+              ansi_text: "",
+              stderr_tail: "warning: cache dir missing, using defaults",
+            }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText(/warning: cache dir missing/)).toBeInTheDocument());
+    expect(screen.queryByText("no output")).not.toBeInTheDocument();
+  });
+
+  // (#1908 QA fix) The synthesized-fallback branch (a failure that wrote
+  // NOTHING to stderr either) is the one place this component invents its
+  // own words rather than quoting the daemon — exactly the branch most
+  // worth pinning so it can't drift into overclaiming a cause the response
+  // never stated.
+  it("(#1908) a failed panel with no stderr at all still names the failure by exit status, not a blank box", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(
+        url.startsWith("/runs")
+          ? runsJson()
+          : jsonResponse({ ...MISSION_STATUS_BODY, exit_code: 17, ansi_text: "", stderr_tail: "" }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() =>
+      expect(screen.getByText("command exited with status 17 and printed nothing to stderr")).toBeInTheDocument(),
+    );
+  });
+
+  it("(#1908) a signal-killed panel (null exit_code) with no stderr names that instead of a blank box", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(
+        url.startsWith("/runs")
+          ? runsJson()
+          : jsonResponse({ ...MISSION_STATUS_BODY, exit_code: null, ansi_text: "", stderr_tail: "" }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() =>
+      expect(
+        screen.getByText("command did not exit cleanly (killed) and printed nothing to stderr"),
+      ).toBeInTheDocument(),
+    );
+  });
 });
