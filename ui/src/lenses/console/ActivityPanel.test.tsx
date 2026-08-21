@@ -29,7 +29,41 @@ function mockRuns(runs: unknown[]) {
   );
 }
 
-describe("ActivityPanel (#1904)", () => {
+describe("ActivityPanel (#1904 QA fix)", () => {
+  // Blocking finding from code review: `all` defaults to `[]` while the
+  // `/runs` fetch is still in flight (and permanently on a failed fetch),
+  // so `total === 0` and the component asserted the SAME "no activity
+  // recorded yet — nothing has run on this daemon" claim on EVERY entry —
+  // a stated historical fact about the daemon that was simply untrue while
+  // loading, and stuck untrue forever on an error. These two tests pin
+  // real pending/error branches instead.
+  it("while loading, shows a loading state — NOT the 'nothing has run' claim", async () => {
+    let resolveFetch: (r: Response) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveFetch = resolve;
+          }),
+      ),
+    );
+    renderActivity();
+    // Still pending — must NOT claim daemon history is empty.
+    expect(screen.queryByText(/no activity recorded yet/i)).toBeNull();
+    expect(document.querySelector('[data-state="activity-pending"]')).not.toBeNull();
+    resolveFetch!(new Response(JSON.stringify({ runs: [], generated_at_ms: Date.now() }), { status: 200 }));
+    await waitFor(() => expect(screen.getByText(/no activity recorded yet/i)).toBeInTheDocument());
+  });
+
+  it("a failed /runs fetch shows an honest error — NOT the 'nothing has run' claim", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("daemon unreachable", { status: 500 }))));
+    renderActivity();
+    await waitFor(() => expect(document.querySelector('[data-state="activity-error"]')).not.toBeNull());
+    expect(screen.queryByText(/no activity recorded yet/i)).toBeNull();
+    expect(document.querySelector(".panelerr")).not.toBeNull();
+  });
+
   it("genuinely empty state: a daemon with no run of any kind, ever, gets an honest line", async () => {
     mockRuns([]);
     renderActivity();
@@ -80,6 +114,43 @@ describe("ActivityPanel (#1904)", () => {
     expect(screen.getByText("… 4 more (10 of 14 shown)")).toBeInTheDocument();
     fireEvent.click(screen.getByText("→ show every run"));
     expect(onShowAll).toHaveBeenCalledTimes(1);
+  });
+
+  // (#1904 QA fix) Was: the disclosure line was gated on `onShowAll` being
+  // present at all (`{hidden > 0 && onShowAll && (...)}`), so a capped
+  // caller that passed no `onShowAll` got NEITHER the "… N more" line NOR
+  // the link — the cap silently reported as the total, exactly the
+  // #1876/#1891 rule this module's own doc invokes. Only `ConsolePanel.tsx`
+  // happens to always pass `onShowAll` today, so this was latent, not
+  // exercised — the prop is documented as optional and nothing enforced
+  // the pairing.
+  it("discloses the hidden count even when the caller passes no onShowAll (the cap must never silently read as the total)", async () => {
+    const runs = Array.from({ length: 14 }, (_, i) => ({ id: `r${i}`, kind: "mission", status: "complete", tracked: true, updated_ts: i }));
+    mockRuns(runs);
+    renderActivity({ capped: true });
+    await waitFor(() => expect(document.querySelectorAll(".labrunrow").length).toBe(10));
+    expect(screen.getByText("… 4 more (10 of 14 shown)")).toBeInTheDocument();
+    // No link to click through to, since there's nowhere for it to go —
+    // but the COUNT itself must still be honest.
+    expect(screen.queryByText("→ show every run")).toBeNull();
+  });
+
+  // (#1904 QA fix) Was: `activityRunActivate` silently no-op'd for a
+  // tracked mission/dispatch row when `missionGraphReachable()` is false
+  // (the daemon-less static demo) — the row rendered interactive (`RunRow`'s
+  // `interactive` gate has nothing to do with graph reachability) but did
+  // nothing on click, a dead affordance. `RunsBoard.tsx`'s own
+  // `activateRun` shows a notice for the identical case; this pins the
+  // same behavior here via the now-shared `runDestination`.
+  it("a tracked mission click on a daemon-less page shows the SAME unreachable notice RunsBoard shows, instead of doing nothing", async () => {
+    mockRuns([{ id: "mission-1", kind: "mission", status: "complete", tracked: true, updated_ts: 1 }]);
+    // No <meta name="darkmux-mode"> injected — missionGraphReachable() is
+    // false, matching the daemon-less static demo build.
+    renderActivity();
+    await waitFor(() => expect(document.querySelector(".labrunrow")).not.toBeNull());
+    fireEvent.click(document.querySelector(".labrunrow")!);
+    expect(window.location.hash).toBe(""); // no navigation happened
+    expect(screen.getByText(/mission graph needs a running daemon/i)).toBeInTheDocument();
   });
 
   it("the uncapped 'all activity' view renders every run with no disclosure line", async () => {

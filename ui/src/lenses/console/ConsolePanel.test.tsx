@@ -162,9 +162,13 @@ describe("ConsolePanel", () => {
     expect(fetchMock.mock.calls.length).toBe(callsAfterBothVisited);
   });
 
-  // (#1904) The escape hatch, mirroring the `mission-status`/
-  // `mission-status-all` tab pairing already in `PANELS`: both a dedicated
-  // "all activity" tab AND the default view's own inline link reach it.
+  // (#1904 QA fix) Was: only the inline link was ever clicked, despite the
+  // test's own title claiming both paths were exercised — the "all
+  // activity" **tab** itself was never clicked (the comment at the end,
+  // "Direct deep link to the tab reaches the same uncapped state," named
+  // an assertion that was never made). This now genuinely drives both:
+  // the inline link first, back to the capped default, then the "all
+  // activity" tab chip itself.
   it("the 'all activity' tab and the default view's own 'show every run' link both reach the uncapped view", async () => {
     const runs = Array.from({ length: 12 }, (_, i) => ({ id: `r${i}`, kind: "mission", status: "complete", tracked: true, updated_ts: i }));
     vi.stubGlobal("fetch", vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson(runs) : jsonResponse(MISSION_STATUS_BODY))));
@@ -175,8 +179,14 @@ describe("ConsolePanel", () => {
     await waitFor(() => expect(document.querySelectorAll(".consoleactivity .labrunrow").length).toBe(12));
     expect(screen.getByText("all activity", { selector: ".runchip" })).toHaveClass("on");
 
-    // Direct deep link to the tab reaches the same uncapped state.
-    vi.unstubAllGlobals();
+    // Back to the capped default, then the "all activity" TAB itself
+    // (not the inline link) — the second, previously-unexercised path.
+    fireEvent.click(screen.getByText("activity", { selector: ".runchip" }));
+    await waitFor(() => expect(document.querySelectorAll(".consoleactivity .labrunrow").length).toBe(10));
+
+    fireEvent.click(screen.getByText("all activity", { selector: ".runchip" }));
+    await waitFor(() => expect(document.querySelectorAll(".consoleactivity .labrunrow").length).toBe(12));
+    expect(screen.getByText("all activity", { selector: ".runchip" })).toHaveClass("on");
   });
 
   it("mission-status stays selectable and unaffected by the default's change", async () => {

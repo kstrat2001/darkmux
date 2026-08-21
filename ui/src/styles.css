@@ -1177,9 +1177,14 @@ body {
    `.hyblink` (the savings-hero "history →" link, `viewer.html`'s own
    established anchor styling) for the "→ show every run" escape hatch —
    so the only new class here is the section's own outer wrapper, purely
-   for spacing against the panel tab bar directly below it. */
+   for spacing against the panel tab bar ABOVE it in DOM order
+   (`ConsolePanel.tsx` renders `.runsbar` first, this second). Matches
+   `.panelwrap`'s own `margin-top: 10px` below — its sibling in that same
+   position — rather than a `margin-bottom` that (a QA review caught) had
+   nothing below it to space against, since this is normally the LAST
+   element `ConsolePanel` renders on the default landing. */
 .consoleactivity {
-  margin-bottom: 4px;
+  margin-top: 10px;
 }
 
 /* ── Console lens (Packet 6) — ported from viewer.html's own <style> block

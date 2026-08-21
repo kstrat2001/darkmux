@@ -106,9 +106,18 @@ export function canonicalHash(route: Route): string | null {
     case "console": {
       const p = new URLSearchParams();
       p.set("lens", "console");
-      // Legacy: `pid=state.panelId||"mission-status"; if(pid==="mission-status")
-      // p.delete("panel")` — the default panel is never written explicitly.
-      if (route.panelId && route.panelId !== "mission-status") p.set("panel", route.panelId);
+      // (#1904 QA fix) Was `route.panelId && route.panelId !== "mission-status"`
+      // — legacy's own `pid==="mission-status" ? delete("panel") : ...`
+      // collapse, valid back when "" (no panel param) and "mission-status"
+      // were the SAME landing state. #1904 broke that premise: "" now means
+      // the client-rendered activity view, a genuinely different thing from
+      // the `mission-status` CLI panel. Keeping the collapse made
+      // `mission-status` unreachable by URL — this function would silently
+      // rewrite `#lens=console&panel=mission-status` back to bare
+      // `#lens=console` on the very next re-render, so a reload/bookmark of
+      // that exact address landed on the activity view instead. Only the
+      // genuinely-empty case omits the param now.
+      if (route.panelId) p.set("panel", route.panelId);
       return p.toString();
     }
     case "session": {

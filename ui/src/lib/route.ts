@@ -92,13 +92,21 @@ export type Route =
    * doc) rather than needing its own validation here. */
   | { kind: "machine"; uid: string | null }
   /** `panelId` is `""` for "no explicit panel requested" AND for "an
-   * unrecognized id" — both fall back to the console lens's own default
-   * (`mission-status`), matching legacy's `consoleQuery()`:
-   * `PANELS.some(x=>x.id===id) ? id : ""`. The router does the same
-   * allowlist check `consoleQuery` does; the lens component owns applying
-   * the "" -> default fallback (mirroring `state.panelId` starting at
-   * `"mission-status"` and `boot()`'s `if(nq) state.panelId=nq` — a falsy
-   * `nq` leaves the existing default untouched rather than overwriting it). */
+   * unrecognized id" — both parse the same way, matching legacy's
+   * `consoleQuery()`: `PANELS.some(x=>x.id===id) ? id : ""`. The router
+   * does the same allowlist check `consoleQuery` does; the lens component
+   * owns deciding what "" RENDERS as.
+   *
+   * (#1904) That render decision changed, and the premise this doc used to
+   * state no longer holds: "" does NOT fall back to any CLI panel
+   * (`mission-status` included) — it's the console's own client-rendered
+   * activity view (`ActivityPanel`), a genuinely different thing from any
+   * `PanelId`. `mission-status` is an ordinary allowlisted panel now,
+   * addressable by its own explicit `panel=mission-status` like any other
+   * — `hashSync.ts`'s `canonicalHash` used to collapse it back to "",
+   * matching legacy's identical collapse (valid back when the two states
+   * WERE the same thing), which made it unreachable by URL until that
+   * collapse was removed post-#1904. */
   | { kind: "console"; panelId: PanelId | "" }
   | { kind: "session"; sessionId: string }
   /** `#mission=<id>` — the mission-graph lens (#1868). A FULL NAVIGATION in

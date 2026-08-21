@@ -1,9 +1,10 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
 import { resolveRunsSrc } from "../../lib/staticSource";
 import { missionGraphReachable } from "../../lib/injectedMeta";
-import { runActivity, runsMultiMachine } from "../runs/format";
+import { runActivity, runsMultiMachine, runDestination, MISSION_GRAPH_UNREACHABLE_NOTICE } from "../runs/format";
 import { RunRow } from "../runs/RunsBoard";
 import type { RunsResponse } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
@@ -61,37 +62,38 @@ import type { Run } from "../../types/generated/Run";
  */
 const ACTIVITY_ROW_CAP = 10;
 
-/** Row destinations mirror `RunsBoard.tsx`'s own `activateRun` in
- * miniature (see that function's doc for the full reasoning): an untracked
- * dispatch has no mission graph but a real trajectory behind it, so it
- * opens the session drill (`#session=<id>`, #1900); a tracked mission (or
- * a tracked dispatch — the crew-of-one shape, which mints its own mission
- * id) opens the mission-graph lens (`#mission=<id>`); an untracked mission
- * (a peer's mission this daemon only knows via the fleet stream, #1705)
- * stays non-interactive, matching `RunRow`'s own `interactive` gate. A lab
- * run has no session/mission id of its own — it opens the runs lens pinned
- * to `kind=lab` with its own `run=<dir>` deep link, the same canonical hash
- * `RunsBoard`'s `openLabRun` writes.
+/** Row destinations use the SAME `runDestination` decision `RunsBoard.tsx`'s
+ * own `activateRun` does (`format.ts` — see that function's doc for the
+ * full four-branch reasoning); only what happens with each outcome differs
+ * here: `lab` navigates (this component isn't the runs lens, so it has no
+ * in-page detail pane to swap to — `lens=runs&kind=lab&run=<dir>`, the
+ * same canonical hash `RunsBoard`'s `openLabRun` writes), `hash` navigates
+ * directly, and `unreachable` shows `MISSION_GRAPH_UNREACHABLE_NOTICE`
+ * (the SAME text `RunsBoard` shows for the identical case) via
+ * `onUnreachable` rather than silently doing nothing.
  *
- * Deliberately a SMALLER function than `activateRun` — no in-page state
- * swap (this component isn't the runs lens, so lab always navigates rather
- * than swapping to an in-page detail pane) and no `rowClickNotice` banner
- * for the rare daemon-less-demo case where a mission graph is unreachable
- * (that row just renders non-interactive instead, via `RunRow`'s own
- * gate). Kept separate from `activateRun` rather than shared, because the
- * two callers' post-decision behavior genuinely differs. */
-function activityRunActivate(run: Run): void {
-  if (run.kind === "lab") {
-    location.hash = `lens=runs&kind=lab&run=${encodeURIComponent(run.id)}`;
-    return;
-  }
-  if (run.kind === "dispatch" && !run.tracked) {
-    location.hash = `session=${encodeURIComponent(run.id)}`;
-    return;
-  }
-  if (!run.tracked) return; // a peer's mission with no local session: nothing to open here
-  if (missionGraphReachable()) {
-    location.hash = `mission=${encodeURIComponent(run.id)}`;
+ * (#1904 QA fix) This function used to hand-roll its own copy of the
+ * decision tree and dropped the `unreachable` case entirely — a tracked
+ * mission/dispatch row on the daemon-less static demo rendered as
+ * interactive (`RunRow`'s own `interactive` gate has nothing to do with
+ * graph reachability) but did nothing on click: a dead affordance, the
+ * exact #1900 failure class this module's own header doc invokes. Sharing
+ * `runDestination` with `RunsBoard` is what makes that branch impossible
+ * to drop a second time. */
+function activityRunActivate(run: Run, onUnreachable: () => void): void {
+  const dest = runDestination(run, missionGraphReachable());
+  switch (dest.kind) {
+    case "lab":
+      location.hash = `lens=runs&kind=lab&run=${encodeURIComponent(dest.dir)}`;
+      return;
+    case "hash":
+      location.hash = dest.hash;
+      return;
+    case "unreachable":
+      onUnreachable();
+      return;
+    case "none":
+      return; // a peer's mission with no local session: nothing to open here
   }
 }
 
@@ -112,9 +114,10 @@ export function ActivityPanel({
     queryKey: queryKeys.runs(),
     queryFn: () => fetchJson<RunsResponse>(resolveRunsSrc()),
   });
-  const all: Run[] = query.data?.ok && Array.isArray(query.data.data?.runs) ? query.data.data.runs : [];
-  const sorted = [...all].sort((a, b) => runActivity(b) - runActivity(a) || a.id.localeCompare(b.id));
-  const total = sorted.length;
+  // (#1904 QA fix) Same UX `RunsBoard.tsx`'s own `rowClickNotice` gives the
+  // identical `runDestination` "unreachable" outcome — a status line, not
+  // a silent no-op, on the daemon-less static demo.
+  const [rowClickNotice, setRowClickNotice] = useState<string | null>(null);
 
   // `data-state` values here are deliberately NOT the generic "data"/
   // "pending"/"empty" vocabulary several other lenses share (RunsBoard,
@@ -126,6 +129,38 @@ export function ActivityPanel({
   // the wrong tab because BOTH elements briefly satisfied the same
   // selector). Prefixed so this component's states can never collide with
   // any other lens's.
+  //
+  // (#1904 QA fix) These two branches used to be missing — `query.data`
+  // being `undefined` (still loading) or `ok: false` (the fetch failed)
+  // both fell through to `all = []`, `total === 0`, and the EMPTY-daemon
+  // branch below, which asserted "no activity recorded yet — nothing has
+  // run on this daemon" as though that were a verified historical fact.
+  // It flashed on every entry while loading and stuck, permanently wrong,
+  // on any daemon error — since this view IS the console's landing page
+  // now, that is no longer a rare corner. Loading and error get their own
+  // honest states instead, matching the shape `RunsBoard.tsx:390-401`
+  // already uses for the same `/runs` endpoint (pending → "loading…";
+  // `!query.data` there degrades silently only on a settled EMPTY result,
+  // never on a genuine in-flight or error state).
+  if (!query.data) {
+    return (
+      <div className="consoleactivity" data-state="activity-pending" role="status" aria-label="Loading activity">
+        <div className="none">loading…</div>
+      </div>
+    );
+  }
+  if (!query.data.ok) {
+    return (
+      <div className="consoleactivity" data-state="activity-error">
+        <div className="panelerr">{query.data.message}</div>
+      </div>
+    );
+  }
+
+  const all: Run[] = Array.isArray(query.data.data?.runs) ? query.data.data.runs : [];
+  const sorted = [...all].sort((a, b) => runActivity(b) - runActivity(a) || a.id.localeCompare(b.id));
+  const total = sorted.length;
+
   if (total === 0) {
     return (
       <div className="consoleactivity" data-state="activity-empty">
@@ -143,31 +178,49 @@ export function ActivityPanel({
       <div className="stagehdr">
         activity — {total} run{total === 1 ? "" : "s"}
       </div>
+      {rowClickNotice && (
+        <div className="labnotice" role="status">
+          {rowClickNotice}
+        </div>
+      )}
       <div className="lablist">
         {shown.map((r) => (
-          <RunRow key={r.id} run={r} showMachine={showMachine} onActivate={() => activityRunActivate(r)} />
+          <RunRow
+            key={r.id}
+            run={r}
+            showMachine={showMachine}
+            onActivate={() => activityRunActivate(r, () => setRowClickNotice(MISSION_GRAPH_UNREACHABLE_NOTICE))}
+          />
         ))}
       </div>
+      {/* (#1904 QA fix) The disclosure text and the link are now two
+          INDEPENDENT conditions — `hidden > 0` alone decides whether the
+          count renders at all; `onShowAll` only decides whether there's a
+          link to click through with. Was `hidden > 0 && onShowAll && (...)`,
+          which silently dropped the WHOLE disclosure (count included)
+          whenever a caller passed no `onShowAll` — reporting the cap as if
+          it were the total, the exact #1876/#1891 violation this module's
+          own doc names as the rule. */}
+      {hidden > 0 && (
+        <div className="none">
+          … {hidden} more ({shown.length} of {total} shown)
+        </div>
+      )}
       {hidden > 0 && onShowAll && (
-        <>
-          <div className="none">
-            … {hidden} more ({shown.length} of {total} shown)
-          </div>
-          <div
-            className="hyblink"
-            role="button"
-            tabIndex={0}
-            onClick={onShowAll}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onShowAll();
-              }
-            }}
-          >
-            → show every run
-          </div>
-        </>
+        <div
+          className="hyblink"
+          role="button"
+          tabIndex={0}
+          onClick={onShowAll}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              onShowAll();
+            }
+          }}
+        >
+          → show every run
+        </div>
       )}
     </div>
   );

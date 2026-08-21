@@ -351,5 +351,3 @@ test.describe("next-parity: console lens red-prove (harness self-test)", () => {
     expect(await extractStageOnlyText(page)).not.toBe(goldenStageText("console-doctor"));
   });
 });
-
-
