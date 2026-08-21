@@ -2,23 +2,11 @@ import { useEffect, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { queryKeys, PANEL_CACHE_MS } from "../../lib/queryKeys";
 import type { PanelId } from "../../lib/route";
-import { PANELS, isManualPanel, panelCols, panelOptGroups, composeArgv, canonicalOptPairs, type PanelOpt } from "./panels";
+import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols, panelOptGroups, composeArgv, canonicalOptPairs, type PanelOpt } from "./panels";
 import { fetchPanel } from "./fetchPanel";
 import { panelAgeLabel } from "./format";
 import { AnsiText } from "./ansi";
-import { ActivityPanel } from "./ActivityPanel";
 import type { PanelResponse } from "../../types/handwritten";
-
-/** (#1904) The "all activity" escape hatch's id — mirrors the
- * `mission-status`/`mission-status-all` pairing already in `PANELS`
- * (`panels.ts`), but this pair is NOT CLI-backed (no `/panel/activity`
- * command exists), so it stays out of `PanelId`/`PANEL_IDS` entirely — see
- * `panels.ts`'s own doc on `PANELS` for why. `ConsoleSelection` below is
- * this component's own local widening of `PanelId` to cover both
- * client-only entries: `""` (the activity default, already the sentinel
- * `parseRoute` produces for "no `panel=` in the URL") and this string. */
-const ACTIVITY_ALL_ID = "activity-all";
-type ConsoleSelection = PanelId | "" | typeof ACTIVITY_ALL_ID;
 
 /**
  * The console lens — `#lens=console&panel=<id>`. Pure port of
@@ -29,14 +17,18 @@ type ConsoleSelection = PanelId | "" | typeof ACTIVITY_ALL_ID;
  * module doc: "twin-drift becomes structurally impossible... a panel cannot
  * diverge from the CLI because it IS the CLI").
  *
- * (#1904) The one deliberate departure from that pure-CLI-mirror shape: the
- * console's DEFAULT landing state (`panelId === ""`) and its "all activity"
- * sibling (`panelId === ACTIVITY_ALL_ID`) are NOT CLI panels — they render
- * `ActivityPanel`, a client-rendered view over `/runs` (see that module's
- * own doc for the full origin story and why). Every OTHER `panelId` value
- * is a real, allowlisted CLI panel and renders exactly as before this
- * packet, via `CliPanelView` below (extracted from what used to be this
- * component's own inline body, unchanged in behavior).
+ * (#1905 step 3) Every `panelId` this component ever holds is a real,
+ * allowlisted `PanelId` — there is no client-only view left to special-case.
+ * `panelId === ""` (no `panel=` param, or an unrecognized one) resolves to
+ * `DEFAULT_PANEL_ID` (`panels.ts` — `"run-list"`) once, at mount; every
+ * `panelId` renders via `CliPanelView` below, unconditionally. An earlier
+ * shape (#1904) rendered a client-side `ActivityPanel` for `""` and a
+ * second client-only "all activity" pill — ten pills total against an
+ * eight-verb server allowlist, rejected on sight by the operator ("can't
+ * allow main to have this"). `run-list` (#1910/#1905) reads the exact same
+ * `/runs` union that view read, but as captured CLI output — see
+ * `panels.ts`'s own doc on `PANELS` for the full story of why this
+ * supersedes the placeholder rather than merely deleting it.
  *
  * DOM/CSS shape is a direct port (`.runsbar`/`.runchip` tabs, `.panelwrap` >
  * `.panelchrome` + a `.panelout`/`.panelerr` body) — see `styles.css`'s own
@@ -86,13 +78,14 @@ export function ConsolePanel({
    * variant, not just the panel. */
   initialOpts?: Readonly<Record<string, string>>;
 }) {
-  // (#1904) `""` (no `panel=` in the URL, or an unrecognized one — both
-  // already collapse to `""` in `parseRoute`) now means "land on the
-  // activity view", not "fall back to `DEFAULT_PANEL_ID`" — there is no
-  // more `DEFAULT_PANEL_ID` (retired; see `panels.ts`'s own doc). A real
-  // `PanelId`, or `ACTIVITY_ALL_ID`, means the operator (or a deep link)
-  // explicitly picked that tab.
-  const [panelId, setPanelId] = useState<ConsoleSelection>(initialPanelId);
+  // (#1905 step 3) `""` (no `panel=` in the URL, or an unrecognized one —
+  // both already collapse to `""` in `parseRoute`) resolves to
+  // `DEFAULT_PANEL_ID` HERE, once, at the initial state seed — matching
+  // `route.ts`'s own long-standing division of labor: "the router does the
+  // same allowlist check `consoleQuery` does; the lens component owns
+  // deciding what `""` renders as." A real `PanelId` means the operator
+  // (or a deep link) explicitly picked that tab.
+  const [panelId, setPanelId] = useState<PanelId>(initialPanelId || DEFAULT_PANEL_ID);
 
   // (#1911) Per-pill opt selection memory — a `Map` beside `panelId`,
   // deliberately NOT `localStorage` (see the module doc below for why: a
@@ -110,7 +103,11 @@ export function ConsolePanel({
 
   // A fresh deep-link into a DIFFERENT panel while this component is already
   // mounted re-syncs local selection — mirrors `boot()`'s `if(nq)
-  // state.panelId=nq` applying on every fresh console entry.
+  // state.panelId=nq` applying on every fresh console entry. Guarded on a
+  // TRUTHY `initialPanelId` (unchanged from before this packet): a bare
+  // `#lens=console` re-render must not stomp local pill-click navigation
+  // back to the default, since `initialOpts`'s object identity changes on
+  // every hash-driven re-render even when its own panel value stays "".
   useEffect(() => {
     if (!initialPanelId) return;
     setPanelId(initialPanelId);
@@ -124,38 +121,24 @@ export function ConsolePanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPanelId, initialOpts]);
 
-  const isRealPanel = panelId !== "" && panelId !== ACTIVITY_ALL_ID;
-  const activeSelection: Readonly<Record<string, string>> = isRealPanel ? (selections.get(panelId as PanelId) ?? {}) : {};
+  const activeSelection: Readonly<Record<string, string>> = selections.get(panelId) ?? {};
   const setOpt = (name: string, value: string) => {
-    if (!isRealPanel) return;
-    const id = panelId as PanelId;
     setSelections((prev) => {
       const next = new Map(prev);
-      next.set(id, { ...(next.get(id) ?? {}), [name]: value });
+      next.set(panelId, { ...(next.get(panelId) ?? {}), [name]: value });
       return next;
     });
   };
 
-  let body;
-  if (panelId === "") {
-    body = <ActivityPanel capped onShowAll={() => setPanelId(ACTIVITY_ALL_ID)} />;
-  } else if (panelId === ACTIVITY_ALL_ID) {
-    body = <ActivityPanel capped={false} />;
-  } else {
-    body = <CliPanelView id={panelId} opts={activeSelection} onPanelSwitch={setPanelId} />;
-  }
-
   return (
     <>
       <div className="runsbar">
-        <PanelTab id="" label="activity" active={panelId === ""} onSelect={setPanelId} />
-        <PanelTab id={ACTIVITY_ALL_ID} label="all activity" active={panelId === ACTIVITY_ALL_ID} onSelect={setPanelId} />
         {PANELS.map((p) => (
           <PanelTab key={p.id} id={p.id} label={p.label} active={p.id === panelId} onSelect={setPanelId} />
         ))}
       </div>
-      {isRealPanel && <OptsBar id={panelId as PanelId} selection={activeSelection} onChange={setOpt} />}
-      {body}
+      <OptsBar id={panelId} selection={activeSelection} onChange={setOpt} />
+      <CliPanelView id={panelId} opts={activeSelection} onPanelSwitch={setPanelId} />
     </>
   );
 }
@@ -258,14 +241,12 @@ function OptChip({
   );
 }
 
-/** (#1904) The CLI-panel fetch/chrome/body machinery — the WHOLE of what
- * `ConsolePanel`'s own return used to inline directly, before "" and
- * `ACTIVITY_ALL_ID` needed a genuinely different (non-CLI) render branch.
- * Extracted rather than left inline so those two branches can skip this
- * entirely (component not mounted = its `useQuery` never fires, cleaner
- * than an `enabled` flag guarding a query with no valid `PanelId` to key
- * on) — behavior for every real `PanelId` is byte-for-byte unchanged from
- * before this packet. */
+/** The CLI-panel fetch/chrome/body machinery, extracted from `ConsolePanel`'s
+ * own return for readability. (#1905 step 3) This is now the ONLY render
+ * branch `ConsolePanel` ever mounts — an interim shape (#1904) rendered a
+ * client-only `ActivityPanel` here instead for two `panelId` values; see
+ * `panels.ts`'s own doc on `PANELS` for why that branch is gone rather
+ * than kept as a fallback. */
 function CliPanelView({
   id,
   opts,
@@ -315,7 +296,7 @@ function CliPanelView({
 }
 
 /** viewer.html: one `.runchip[data-act="setpanel"]` entry of the tab bar. */
-function PanelTab({ id, label, active, onSelect }: { id: ConsoleSelection; label: string; active: boolean; onSelect: (id: ConsoleSelection) => void }) {
+function PanelTab({ id, label, active, onSelect }: { id: PanelId; label: string; active: boolean; onSelect: (id: PanelId) => void }) {
   return (
     <span
       className={`runchip${active ? " on" : ""}`}

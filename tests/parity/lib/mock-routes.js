@@ -146,6 +146,16 @@ function installCorpusRoutes(page, meta) {
     if (p === "/panel/role-list") return json("panel-role-list.json");
     if (p === "/panel/config-list") return json("panel-config-list.json");
     if (p === "/panel/lab-fixture-list") return json("panel-lab-fixture-list.json");
+    // (#1905 step 3) `run-list` is the console's DEFAULT panel now
+    // (`panels.ts::DEFAULT_PANEL_ID`) — every console golden's bare landing
+    // replays this fixture. Captured for real off a genuinely empty
+    // `DARKMUX_FLOWS_DIR` (`cargo build --bin darkmux`, then
+    // `DARKMUX_FLOWS_DIR=<empty dir> CLICOLOR_FORCE=1 darkmux run list`), not
+    // hand-typed — an honest "nothing has run yet" state, same shape a fresh
+    // install's console actually shows. No richer (populated) run-list
+    // fixture exists yet — a follow-up capture against a real daemon's
+    // history would need its own sanitization pass first.
+    if (p === "/panel/run-list") return json("panel-run-list.json");
     if (p === "/panel/doctor") return json("panel-doctor.json");
     if (p.startsWith("/panel/")) return notFound('unknown panel "' + p.slice("/panel/".length) + '" — panels are a fixed allowlist, not arbitrary commands\n');
 

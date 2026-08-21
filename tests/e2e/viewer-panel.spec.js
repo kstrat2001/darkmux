@@ -39,17 +39,16 @@ async function routePanels(page, handler) {
   await page.route('**/panel/**', handler);
 }
 
-// (#1904 CI fix) The console lens's DEFAULT landing view is now
-// `ActivityPanel` (a client-rendered union over `/runs`, no `/panel/*` call
-// at all) rather than the `mission-status` CLI panel — every test below
-// that actually exercises panel rendering, the manual-only contract, or
-// the XSS gate needs a REAL CLI panel on screen to test, so it can no
-// longer get there for free by just clicking the console tab. This
-// explicitly selects `mission-status` (the same panel these tests always
-// meant to exercise — `panelBody()`'s own default `panel: 'mission-status'`
-// names it) after landing on console, which is a BETTER fixture than
-// depending on the console's default happening to be a CLI panel: it
-// keeps working no matter what the lens defaults to next.
+// The console lens's default landing panel is `run-list` (#1905 step 3;
+// briefly `ActivityPanel`, a client-rendered `/runs` union with no
+// `/panel/*` call at all, under #1904 — deleted, see `panels.ts`'s own doc
+// on `PANELS`). Every test below that exercises panel rendering, the
+// manual-only contract, or the XSS gate wants `mission-status`
+// specifically (`panelBody()`'s own default `panel: 'mission-status'`
+// names it), so this explicitly selects it after landing on console rather
+// than depending on the console's default happening to be the SAME panel
+// these fixtures were written around — a fixture that keeps working no
+// matter what the lens defaults to next.
 async function selectMissionStatus(page) {
   await page.click('[data-act="console"]');
   await page.click('[data-act="setpanel"][data-arg="mission-status"]');
@@ -115,7 +114,10 @@ test('a manual-only panel never runs until asked', async ({ page }) => {
   await page.goto('/index-lab.html');
   await selectMissionStatus(page);
   await expect(page.locator('.panelout')).toBeVisible();
-  expect(asked).toEqual(['mission-status']);
+  // (#1905 step 3) `selectMissionStatus` lands on console FIRST (fetching
+  // `run-list`, the new default panel) before explicitly picking
+  // `mission-status` — `asked` carries both, in that order.
+  expect(asked).toEqual(['run-list', 'mission-status']);
 
   // Selecting `doctor` must NOT fetch: it probes the machine, and running
   // it unasked is the observer joining the observed (#1286). This once
@@ -123,13 +125,13 @@ test('a manual-only panel never runs until asked', async ({ page }) => {
   // worked only on repeat visits, i.e. never when it mattered.
   await page.click('[data-act="setpanel"][data-arg="doctor"]');
   await page.waitForTimeout(400);
-  expect(asked, 'selecting a manual panel must not run it').toEqual(['mission-status']);
+  expect(asked, 'selecting a manual panel must not run it').toEqual(['run-list', 'mission-status']);
   await expect(page.locator('.panelout')).toContainText('not run yet');
 
   // …and an explicit run does.
   await page.click('[data-act="refreshpanel"]');
   await expect(page.locator('.panelchrome')).toContainText('manual-run only');
-  expect(asked).toEqual(['mission-status', 'doctor']);
+  expect(asked).toEqual(['run-list', 'mission-status', 'doctor']);
 });
 
 test('the daemon\'s own refusal is shown verbatim, not reworded', async ({ page }) => {
@@ -313,13 +315,15 @@ test('the console shows no crumb — the picker and the chrome line already say 
   );
   await page.goto('/index-lab.html');
   await page.click('[data-act="console"]');
-  // (#1904 CI fix) This test's own subject is the CRUMB, which `ConsolePanel`
-  // never touches regardless of which of its own views is showing — it does
-  // not need a CLI panel selected, just the console lens actually mounted.
-  // Was `.panelout` (true only because the default happened to render one);
-  // `.consoleactivity` is what the bare landing view — its default now —
-  // actually renders, so this no longer depends on that default surviving
-  // the next redesign either.
-  await expect(page.locator('.consoleactivity')).toBeVisible();
+  // (#1904 CI fix, #1905 step 3) This test's own subject is the CRUMB,
+  // which `ConsolePanel` never touches regardless of which panel is
+  // showing — it does not need a specific CLI panel selected, just the
+  // console lens actually mounted. `.panelwrap` (`CliPanelView`'s own
+  // wrapper) renders unconditionally and immediately for every `panelId`
+  // now that every `panelId` is a real CLI panel (#1905 step 3 deleted the
+  // one client-only view, `ActivityPanel`, that didn't render it) — a
+  // sturdier marker than `.panelout`, which only appears once a fetch
+  // resolves.
+  await expect(page.locator('.panelwrap')).toBeVisible();
   expect((await page.locator('#crumb').innerText()).trim()).toBe('');
 });

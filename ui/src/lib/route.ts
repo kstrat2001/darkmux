@@ -123,18 +123,21 @@ export type Route =
    * unrecognized id" — both parse the same way, matching legacy's
    * `consoleQuery()`: `PANELS.some(x=>x.id===id) ? id : ""`. The router
    * does the same allowlist check `consoleQuery` does; the lens component
-   * owns deciding what "" RENDERS as.
+   * owns deciding what "" RENDERS as — `ConsolePanel.tsx` resolves it to
+   * `panels.ts::DEFAULT_PANEL_ID` (`"run-list"`).
    *
-   * (#1904) That render decision changed, and the premise this doc used to
-   * state no longer holds: "" does NOT fall back to any CLI panel
-   * (`mission-status` included) — it's the console's own client-rendered
-   * activity view (`ActivityPanel`), a genuinely different thing from any
-   * `PanelId`. `mission-status` is an ordinary allowlisted panel now,
-   * addressable by its own explicit `panel=mission-status` like any other
-   * — `hashSync.ts`'s `canonicalHash` used to collapse it back to "",
-   * matching legacy's identical collapse (valid back when the two states
-   * WERE the same thing), which made it unreachable by URL until that
-   * collapse was removed post-#1904.
+   * (#1904/#1905 step 3) A client-rendered `ActivityPanel` briefly stood in
+   * for `""` — a `/runs`-fed view with no CLI command behind it, genuinely
+   * different from any `PanelId`, which meant `mission-status`'s own
+   * address-bar collapse (see below) had to be removed so it stayed
+   * reachable as itself. #1905 step 3 deleted `ActivityPanel` (a THIRD
+   * client-side renderer of `/runs`, the same drift #1905 exists to
+   * prevent) in favor of `run-list` (#1910), a real CLI panel that reads
+   * the identical union — so `""` is back to meaning "the default CLI
+   * panel," the same relationship `mission-status` had pre-#1904. Every
+   * `PanelId` (`run-list` included) stays independently addressable by its
+   * own explicit `panel=<id>` regardless of which one is the default —
+   * `canonicalHash` does not collapse an explicit choice into `""`.
    *
    * `opts` (#1911) — the panel's own resolved `opt.<name>` selections
    * (`{}` when `panelId` is `""`, or a panel declares no options). Only

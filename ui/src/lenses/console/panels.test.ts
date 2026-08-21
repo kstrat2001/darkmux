@@ -8,6 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import {
   PANELS,
   PANEL_OPTS,
+  DEFAULT_PANEL_ID,
   isManualPanel,
   panelCols,
   panelArgv,
@@ -32,6 +33,19 @@ describe("PANELS", () => {
   it("(#1911) run-list joins the pill row; mission-status-all is gone", () => {
     expect(PANELS.map((p) => p.id)).toContain("run-list");
     expect(PANELS.map((p) => p.id)).not.toContain("mission-status-all");
+  });
+
+  // (#1905 step 3) exactly eight pills — the operator's own rejection of a
+  // ten-pill render ("can't allow main to have this") is the reason a
+  // ninth/tenth client-only entry can never come back silently.
+  it("(#1905 step 3) is exactly eight pills, matching panel.rs's own doctrine cap — no client-only entries", () => {
+    expect(PANELS).toHaveLength(8);
+    expect(PANEL_IDS).toHaveLength(8);
+  });
+
+  it("(#1905 step 3) DEFAULT_PANEL_ID is run-list, and is itself one of the eight allowlisted panels", () => {
+    expect(DEFAULT_PANEL_ID).toBe("run-list");
+    expect(PANELS.map((p) => p.id)).toContain(DEFAULT_PANEL_ID);
   });
 
   it("only doctor is manual-only", () => {

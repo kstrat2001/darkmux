@@ -9,6 +9,14 @@
 // script) — NOT picked up by `playwright.config.js`'s `testMatch`, which is
 // scoped to the legacy extractor/red-prove pair on purpose.
 //
+// (#1905 step 3) #1904's client-rendered `ActivityPanel` default (and its
+// own `ACTIVITY`/`.consoleactivity` settle marker this file used to define)
+// is gone — the operator rejected the ten-pill render it produced on sight
+// ("can't allow main to have this"). The bare `#lens=console` landing is
+// `run-list` now, a real CLI panel like any other, so every test below that
+// used to wait on `ACTIVITY` waits on `LOADED` instead — see `panels.ts`'s
+// own doc on `PANELS` for the full story.
+//
 // Same interception + frozen-clock pattern as `extract.spec.ts`, reused
 // verbatim via `lib/extract-next-lens.js` — see that module's doc for the
 // `#stage`-only scoping rationale. Following `next-parity-runs.spec.ts`'s own
@@ -62,17 +70,6 @@ function goldenStageText(label: string): string {
 // module doc above); `.panelerr` is the error branch's own class.
 const LOADED = '.panelchrome button:text-is("re-run")';
 const ERRORED = "#stage .panelerr";
-// (#1904) The console's DEFAULT landing state — `panelId === ""` — is no
-// longer a CLI panel at all, so neither `LOADED` nor `ERRORED` above ever
-// appears there (`ActivityPanel` has no `.panelchrome`/re-run button and no
-// `.panelerr` class of its own; a failed `/runs` fetch degrades to the
-// same honest-empty render as a genuinely quiet daemon — see that
-// component's own module doc for why that's an accepted, precedented
-// simplification, the same one `RunsBoard.tsx`'s own doc names for its
-// identical `/runs` fetch). `.consoleactivity` is this view's own mount
-// marker, corpus-reliable because the recorded corpus has real (if all
-// non-running) `/runs` history to render as rows.
-const ACTIVITY = ".consoleactivity";
 
 /**
  * Wait for `locatorStr` to attach, PUMPING the frozen page clock forward in
@@ -104,20 +101,30 @@ async function waitLoadedUnderFrozenClock(page, locatorStr, timeoutMs = 15000) {
 // (#1904) `mission-status` joins this list — it was previously covered ONLY
 // via the bare default landing (`console.txt`, before this packet WAS its
 // content), never through its own explicit deep link, because the default
-// and this panel used to be the same thing. Now that the default is the
-// activity view, that coverage would silently vanish unless this panel
-// gets the same explicit-deep-link test every other CLI panel already has
-// — `console-mission-status.txt` is its own golden, a copy of the pre-
-// packet `console.txt` body with the same two new tab-bar lines every
-// other golden in this file gets.
-const AUTO_PANELS = ["mission-status", "mission-status-all", "machine-status", "flow-status", "role-list", "config-list", "lab-fixture-list"];
+// and this panel used to be the same thing (#1904's activity view broke
+// that; #1905 step 3 restored it, this time with `run-list` as the
+// default). `console-mission-status.txt` is its own golden regardless, a
+// copy of the pre-packet `console.txt` body with the same two new tab-bar
+// lines every other golden in this file gets.
+//
+// (#1905 step 3) `run-list` joins too — it is the console's DEFAULT panel
+// now (`panels.ts::DEFAULT_PANEL_ID`), so its own explicit-deep-link
+// golden (`console-run-list.txt`) is BYTE-IDENTICAL to `console.txt`'s —
+// same relationship `mission-status`/`console.txt` had pre-#1904, verified
+// directly by the "default boot matches console-run-list.txt too" test
+// below rather than merely asserted in this comment.
+const AUTO_PANELS = ["mission-status", "mission-status-all", "machine-status", "flow-status", "role-list", "config-list", "lab-fixture-list", "run-list"];
 
 test.describe("next-parity: console lens (Packet 6)", () => {
   test.beforeAll(() => {
     mkdirSync(GALLERY_DIR, { recursive: true });
   });
 
-  test("default #lens=console boot (no panel param) matches console.txt's #stage", async ({ page }) => {
+  // (#1905 step 3) The default landing panel is `run-list`, a real CLI
+  // panel — `console.txt`'s golden is BYTE-IDENTICAL to
+  // `console-run-list.txt`'s (see `AUTO_PANELS`'s own comment), verified
+  // directly here rather than merely asserted.
+  test("default #lens=console boot (no panel param) matches console.txt's #stage, which is byte-identical to console-run-list.txt's", async ({ page }) => {
     const meta = loadMeta();
     await installFrozenClock(page, meta.frozen_clock_ms);
     installCorpusRoutes(page, meta);
@@ -125,10 +132,11 @@ test.describe("next-parity: console lens (Packet 6)", () => {
     page.on("pageerror", (e) => pageErrors.push(String(e)));
 
     await page.goto("/index.html#lens=console");
-    await expect(page.locator(ACTIVITY)).toBeAttached({ timeout: 15000 });
+    await expect(page.locator(LOADED)).toBeAttached({ timeout: 15000 });
 
     const got = await extractStageOnlyText(page);
-    expect(got, "console default panel (the activity view) must match the frozen golden byte-for-byte").toBe(goldenStageText("console"));
+    expect(got, "console default panel (run-list) must match the frozen golden byte-for-byte").toBe(goldenStageText("console"));
+    expect(goldenStageText("console"), "console.txt and console-run-list.txt must describe the SAME rendered state").toBe(goldenStageText("console-run-list"));
     expect(pageErrors, `pageerror events: ${pageErrors.join("; ")}`).toHaveLength(0);
 
     await page.screenshot({ path: shot("console-default.png"), fullPage: true });
@@ -140,7 +148,7 @@ test.describe("next-parity: console lens (Packet 6)", () => {
     installCorpusRoutes(page, meta);
 
     await page.goto("/index.html#lens=console&panel=rm-rf-everything");
-    await expect(page.locator(ACTIVITY)).toBeAttached({ timeout: 15000 });
+    await expect(page.locator(LOADED)).toBeAttached({ timeout: 15000 });
     expect(await extractStageOnlyText(page)).toBe(goldenStageText("console"));
   });
 
@@ -186,13 +194,14 @@ test.describe("next-parity: console lens (Packet 6)", () => {
     await page.screenshot({ path: shot("console-doctor.png"), fullPage: true });
   });
 
-  test("clicking through tabs (not just deep-linking) reaches the same content — activity default, role-list, then explicit mission-status", async ({ page }) => {
+  test("clicking through tabs (not just deep-linking) reaches the same content — run-list default, role-list, then explicit mission-status", async ({ page }) => {
     const meta = loadMeta();
     await installFrozenClock(page, meta.frozen_clock_ms);
     installCorpusRoutes(page, meta);
 
     await page.goto("/index.html#lens=console");
-    await expect(page.locator(ACTIVITY)).toBeAttached({ timeout: 15000 });
+    await expect(page.locator(LOADED)).toBeAttached({ timeout: 15000 });
+    expect(await extractStageOnlyText(page)).toBe(goldenStageText("console"));
 
     await page.click('[data-act="setpanel"][data-arg="role-list"]');
     await expect(page.locator('[data-act="setpanel"][data-arg="role-list"].on')).toBeAttached({ timeout: 15000 });
@@ -239,9 +248,9 @@ test.describe("next-parity: console lens (Packet 6)", () => {
     await installFrozenClock(page, meta.frozen_clock_ms);
     installCorpusRoutes(page, meta);
 
-    // (#1904) `mission status`'s own OSC-8 content only renders once that
-    // CLI panel is actually selected — the bare default no longer lands
-    // there (see `ACTIVITY`'s own doc above).
+    // `mission status`'s own OSC-8 content only renders once that CLI
+    // panel is actually selected — the bare default lands on `run-list`
+    // (#1905 step 3), not `mission-status`.
     await page.goto("/index.html#lens=console&panel=mission-status");
     await expect(page.locator(LOADED)).toBeAttached({ timeout: 15000 });
 
@@ -297,15 +306,15 @@ test.describe("next-parity: console lens red-prove (harness self-test)", () => {
     await installFrozenClock(page, Date.UTC(2026, 0, 1));
     installBlankRoutes(page);
 
-    // (#1904) The bare default is `ActivityPanel` now, not a CLI panel —
-    // it has no `.panelerr` class to assert against (a failed `/runs` read
-    // degrades to the SAME honest-empty render as a quiet daemon; see
-    // `ACTIVITY`'s own doc above for why that's accepted here, matching
-    // `RunsBoard.tsx`'s own precedent for the same endpoint). What's still
-    // genuinely provable on the default itself: a blank daemon does NOT
-    // silently reproduce the real `console.txt` golden.
+    // (#1905 step 3) The bare default is `run-list` now, a real CLI panel
+    // like any other — a blank daemon 404s it the same way it 404s every
+    // other panel below, so `.panelerr` is a real, checkable behavior here
+    // too (unlike #1904's `ActivityPanel`, whose failed `/runs` read
+    // degraded to an honest-empty render indistinguishable from a quiet
+    // daemon — that carve-out no longer applies to anything the console
+    // renders).
     await page.goto("/index.html#lens=console");
-    await expect(page.locator(ACTIVITY)).toBeAttached({ timeout: 15000 });
+    await waitLoadedUnderFrozenClock(page, ERRORED);
     expect(await extractStageOnlyText(page), "blank-route extraction must NOT match the real console.txt golden").not.toBe(goldenStageText("console"));
 
     // A genuinely CLI-backed panel is where `.panelerr` visibility is still

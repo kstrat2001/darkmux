@@ -150,25 +150,26 @@ export function runsForMachine(runs: Run[], names: Set<string>): Run[] {
 }
 
 /**
- * (#1904 QA fix) A run's click destination, shared by every caller that
- * opens a `Run` row — `RunsBoard.tsx`'s `activateRun` and
- * `ActivityPanel.tsx`'s `activityRunActivate` used to hand-roll the SAME
- * four-branch decision independently. That duplication is exactly what
- * let them drift: `ActivityPanel`'s copy dropped the `unreachable` branch
- * silently (a tracked mission/dispatch row rendered clickable via
- * `RunRow`'s own `interactive` gate, but clicking it when
- * `missionGraphReachable()` is false did nothing at all — a dead
- * affordance, the exact #1900 failure class both callers' own doc
- * comments invoke). One function, one place the rule lives.
+ * (#1904 QA fix) A run's click destination, extracted from `RunsBoard.tsx`'s
+ * `activateRun` so the four-branch decision lives in exactly one place. It
+ * used to also serve `ActivityPanel.tsx`'s own `activityRunActivate` — a
+ * SECOND hand-rolled copy of the same decision, whose independent drift
+ * (dropping the `unreachable` branch silently: a tracked mission/dispatch
+ * row rendered clickable via `RunRow`'s own `interactive` gate, but
+ * clicking it when `missionGraphReachable()` is false did nothing at all
+ * — the exact #1900 failure class) is why this got pulled out at all.
+ * `ActivityPanel.tsx` is deleted (#1905 step 3 — `run-list`, a real CLI
+ * panel over the same `/runs` union, supersedes it), leaving `RunsBoard`
+ * as this function's one remaining caller; the shared shape stays because
+ * the decision itself — and the drift risk a second caller could someday
+ * reintroduce — is unchanged by having only one caller today.
  *
  * The LAB branch is deliberately NOT resolved to a navigation here —
  * `RunsBoard` swaps to an in-page detail pane for a lab run (`openLabRun`,
- * a `labRunDir` state change plus a hash write), while `ActivityPanel`
- * isn't the runs lens and has no such state, so it navigates there
- * instead (`lens=runs&kind=lab&run=<dir>`). Returning the run's `id` (the
- * lab run's directory) lets each caller build its own destination from
- * it, rather than this function picking one caller's mechanism as
- * "correct" for both. */
+ * a `labRunDir` state change plus a hash write) rather than navigating
+ * anywhere. Returning the run's `id` (the lab run's directory) lets the
+ * caller build its own destination from it, rather than this function
+ * picking a navigation mechanism the caller doesn't use. */
 export type RunDestination =
   | { kind: "lab"; dir: string }
   | { kind: "hash"; hash: string }

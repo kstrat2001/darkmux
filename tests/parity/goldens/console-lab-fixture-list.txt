@@ -18,8 +18,6 @@ github
 console
 
 === stage ===
-activity
-all activity
 mission status
 machine status
 flow status

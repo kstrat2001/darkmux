@@ -204,17 +204,12 @@ export function variantKey(id: PanelId, requested?: Readonly<Record<string, stri
 
 /** viewer.html: `const PANELS = [...]`. Order is the tab order.
  *
- * (#1904) These are exactly the CLI-backed panels — the drift guard in
+ * These are exactly the CLI-backed panels — the drift guard in
  * `panels.test.ts` pins `PANELS.map(p => p.id)` to `PANEL_IDS` from
  * `lib/route.ts`, which is itself the twin of the Rust-side allowlist
  * (`crates/darkmux-serve/src/panel.rs::PANEL_IDS`, hard-capped at 8 by its
- * own doctrine assertion). The console lens's DEFAULT landing view (the
- * "activity" tab, and its "all activity" escape hatch) is NOT one of these
- * — it is a client-rendered, `/runs`-fed view with no CLI command or argv
- * behind it, so it deliberately stays OUT of this list and out of
- * `PanelId`/`PANEL_IDS` entirely. `ConsolePanel.tsx` owns that pair as its
- * own local `ConsoleSelection` union, widening `PanelId` rather than
- * pretending a client-only view is a CLI panel.
+ * own doctrine assertion). Eight pills, full stop — every tab the console
+ * renders is one of these, addressable by its own explicit `panel=<id>`.
  *
  * (#1911) `all missions` is gone (folded into `mission-status`'s own `all`
  * opt — see `PANEL_ALIASES` in `lib/route.ts`), and `run list` joins right
@@ -223,10 +218,56 @@ export function variantKey(id: PanelId, requested?: Readonly<Record<string, stri
  * argv `PANEL_OPTS` carries (`panelArgv(id).join(" ")`) rather than a
  * separately hand-picked string, so "labels read as the command they run"
  * (#1911's own instruction) can't drift from the pending-command preview
- * that uses the exact same argv. */
+ * that uses the exact same argv.
+ *
+ * (#1905 step 3) A NINTH, client-only "activity" pill briefly lived here
+ * (#1904's `ActivityPanel.tsx`, a `/runs`-fed recent-activity view with no
+ * CLI command behind it) plus a TENTH "all activity" escape hatch — ten
+ * pills total, on top of an eight-verb allowlist `panel.rs`'s own doctrine
+ * assertion says is the hard cap. The operator rejected that render on
+ * sight ("can't allow main to have this") — a pill row that visibly
+ * contradicts the doctrine the server half's whole diff exists to enforce
+ * is the first thing anyone opening the console sees. `ActivityPanel.tsx`
+ * is deleted, not demoted: `run list` (#1910's CLI verb, #1905's own
+ * reason for existing) reads the EXACT SAME `/runs` union
+ * `ActivityPanel` read, but as captured CLI output rather than a THIRD
+ * client-side renderer of it — the twin-drift #1905 was opened to prevent
+ * in the first place (`ActivityPanel`'s own hand-rolled row logic HAD
+ * already drifted from `RunsBoard`'s once, per the #1904 QA-fix note on
+ * `runDestination` in `runs/format.ts`). `run-list` supersedes the
+ * placeholder; it does not merely fill the hole left by deleting it. */
 export const PANELS: PanelDef[] = (
   ["mission-status", "machine-status", "flow-status", "role-list", "config-list", "lab-fixture-list", "run-list", "doctor"] as const
 ).map((id) => ({ id, label: panelArgv(id).join(" ") }));
+
+/** (#1905 step 3) The console's landing panel when `panelId === ""` — no
+ * `panel=` in the URL, or an unrecognized one (both already collapse to
+ * `""` in `parseRoute`, per `route.ts`'s own doc on that sentinel).
+ *
+ * A constant with exactly this name and job existed pre-#1904 and was
+ * retired specifically because `""` stopped meaning "the default CLI
+ * panel" and started meaning "the client-rendered activity view" instead
+ * — a genuinely different thing no single `PanelId` could name. That is
+ * the ONLY reason it was retired, and deleting `ActivityPanel.tsx`
+ * (#1905 step 3, see `PANELS`'s own doc above) removes the reason: `""`
+ * goes back to meaning exactly what it meant before #1904 ever
+ * introduced the special case, so restoring the constant is the honest
+ * shape rather than re-deriving a "which panel is the default" answer
+ * inline at `ConsolePanel.tsx`'s own call site.
+ *
+ * `run-list` (#1910/#1905): the same `/runs` union the retired activity
+ * view read, now genuinely CLI-backed, so landing on it by default reads
+ * exactly like landing on `mission status` used to pre-#1904 — an
+ * ordinary allowlisted panel that also happens to be first. `ConsolePanel`
+ * resolves `initialPanelId || DEFAULT_PANEL_ID` once, at mount; it is
+ * deliberately NOT written back into the address bar for the bare `""`
+ * case (`hashSync.ts`'s existing `if (route.panelId)` guard already skips
+ * writing a `panel=` param for a falsy `Route.panelId`, unchanged by this
+ * packet) — an explicit `#lens=console&panel=run-list` deep link stays
+ * distinguishable from, and independently bookmarkable as, the bare
+ * default landing, the same non-collapsing shape `mission-status` earned
+ * post-#1904 (see `hashSync.test.ts`'s own round-trip tests). */
+export const DEFAULT_PANEL_ID: PanelId = "run-list";
 
 /** viewer.html: `const MANUAL_PANELS = new Set(["doctor"])`. Panels the
  * daemon marks `auto_refresh: false` — they PROBE the machine, so nothing

@@ -87,21 +87,17 @@ function shot(name) {
 // that data-state, so the click-navigation test hung waiting for a marker
 // that can no longer appear (a twin-drift instance, same class this file's
 // own module doc already names for the frozen-clock interaction). It was
-// then `.panelchrome` (`ConsolePanel`'s CLI-panel chrome wrapper) until
-// #1904: a fresh, un-clicked `#lens=console` now lands on `ActivityPanel`
-// (the client-rendered default over `/runs`, no CLI panel involved at
-// all), which never renders `.panelchrome` — so THAT marker went stale the
-// same way, for the same reason (a real behavior change outrunning a
-// harness assumption). `.consoleactivity` is `ActivityPanel`'s own
-// unconditional wrapper (see that component's own doc — it renders on
-// every branch, including the genuinely-empty one), and this test's own
-// click always lands on the bare default (no `panel=` param), so it's the
-// one marker guaranteed to appear here — matching this test's actual
-// assertions (hash + `.on` class) without needing the content fully
-// loaded, same reasoning as before.
+// then `.panelchrome` (`ConsolePanel`'s CLI-panel chrome wrapper), briefly
+// went stale AGAIN under #1904's `ActivityPanel` default (which rendered no
+// `.panelchrome` at all), and is `.panelchrome` once more since #1905 step
+// 3 deleted that view — the bare `#lens=console` landing is `run-list`, a
+// real CLI panel, unconditionally rendering `.panelchrome` on first mount
+// (before the fetch even resolves), which is exactly why it's the right
+// settle marker here: this test's own assertions (hash + `.on` class)
+// don't need the content fully loaded, just the right lens mounted.
 const TABS = [
   { act: "fleet", hash: "", settle: '[data-state]:not([data-state="pending"])' },
-  { act: "console", hash: "#lens=console", settle: ".consoleactivity" },
+  { act: "console", hash: "#lens=console", settle: ".panelchrome" },
   { act: "runs", hash: "#lens=runs", settle: '[data-state="data"], [data-state="pending"]' },
   { act: "machine", hash: "#lens=machine", settle: '.machine-lens__health[data-state="loaded"]' },
 ];

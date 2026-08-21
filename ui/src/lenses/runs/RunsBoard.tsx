@@ -125,12 +125,14 @@ import {
  * not a silent no-op.
  *
  * The notice text itself (`MISSION_GRAPH_UNREACHABLE_NOTICE`) moved to
- * `format.ts` (#1904 QA fix) — `ActivityPanel.tsx` can hit the exact same
- * unreachable case through the shared `runDestination`, and the two
- * surfaces should say the same thing rather than maintain separate
- * copies. Matches `onLabRunUnresolvable`'s own `"run detail needs a
- * running daemon — …"` phrasing below, which stays local since nothing
- * else needs it. */
+ * `format.ts` (#1904 QA fix) — shared with `runDestination`'s own
+ * `unreachable` branch so both places that report this case say the same
+ * thing rather than maintaining separate copies (a second caller,
+ * `ActivityPanel.tsx`, used to hit the identical branch; it is deleted,
+ * #1905 step 3, but the shared-text discipline holds regardless of how
+ * many callers there are). Matches `onLabRunUnresolvable`'s own `"run
+ * detail needs a running daemon — …"` phrasing below, which stays local
+ * since nothing else needs it. */
 
 export function RunsBoard({
   initialKind,
@@ -267,10 +269,9 @@ export function RunsBoard({
   // so there is no local `/flow-session/<id>` to open. That row keeps the
   // old "nothing to open" behavior, because for it the premise still holds.
   // (#1904 QA fix) The four-branch decision itself moved to the shared
-  // `runDestination` (`format.ts`) — this function now only decides what
-  // to DO with each outcome, which for `RunsBoard` differs from
-  // `ActivityPanel.tsx`'s own caller exactly at "lab" (an in-page state
-  // swap here, a cross-lens navigation there).
+  // `runDestination` (`format.ts`) — this function only decides what to DO
+  // with each outcome: an in-page state swap for "lab" (`openLabRun`), a
+  // hash navigation for everything else.
   function activateRun(run: Run) {
     const dest = runDestination(run, missionGraphReachable());
     switch (dest.kind) {
@@ -638,14 +639,13 @@ function onActivateKeyDown(onActivate: () => void) {
  * row (a peer's mission this daemon has no local session for, #1705) stays
  * flat, matching legacy's original rule for the case where it still holds.
  *
- * (#1904) Exported — `ActivityPanel.tsx` (the console lens's default
- * recent-activity landing view) reuses this component verbatim for its own
- * rows, rather than re-deriving the badge/kind-chip/subtitle DOM a second
- * time. Same row shape; `onActivate` differs per caller (both now route
- * through the shared `runDestination` in `format.ts`, but `ActivityPanel`
- * has no in-page lab-detail pane to swap to, so its lab case navigates
- * instead — see that function's own doc). */
-export function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
+ * (#1904) Was exported for `ActivityPanel.tsx` (the console lens's then
+ * default recent-activity landing view) to reuse verbatim, rather than
+ * re-deriving the badge/kind-chip/subtitle DOM a second time. That view is
+ * deleted (#1905 step 3 — `run-list`, a real CLI panel, supersedes it),
+ * leaving `RunsBoard` as the only caller; kept module-private now rather
+ * than exported with no consumer. */
+function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
   const interactive = run.kind === "lab" || run.tracked || run.kind === "dispatch";
   const ago = runsAgo(run);
   const subtitle = runSubtitle(run, showMachine);

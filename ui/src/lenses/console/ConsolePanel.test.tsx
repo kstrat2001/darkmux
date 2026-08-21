@@ -36,44 +36,43 @@ afterEach(() => {
   window.location.hash = "";
 });
 
-// (#1904) `/runs` — the ONLY fetch a bare landing (no `panel=`) makes now
-// that the default is the client-rendered activity view, not the
-// `mission-status` CLI panel. Most tests below don't care about its
-// content, so this stands in a well-shaped, empty response wherever a
-// test's own fetch mock doesn't override `/runs` itself.
 function runsJson(runs: unknown[] = []) {
   return jsonResponse({ runs, generated_at_ms: Date.UTC(2026, 0, 1, 12, 0, 0) });
 }
 
-describe("ConsolePanel", () => {
-  // (#1904) Three false starts preceded this shape (documented in
-  // `ActivityPanel.tsx`'s own module doc): a section bolted above the old
-  // default, then a mission-status fallback, before the operator settled on
-  // the console's default being the activity view itself — no panel fetch
-  // at all until the operator explicitly picks a CLI panel tab.
-  it("lands on the activity view by default — fetches ONLY /runs, no /panel/* call, until a CLI tab is explicitly picked", async () => {
-    const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : jsonResponse(MISSION_STATUS_BODY)));
-    vi.stubGlobal("fetch", fetchMock);
-    renderPanel("");
-    await waitFor(() => expect(screen.getByText(/no activity recorded yet/i)).toBeInTheDocument());
-    expect(fetchMock.mock.calls.some(([u]) => String(u).startsWith("/panel/"))).toBe(false);
-    expect(screen.getByText("activity", { selector: ".runchip" })).toHaveClass("on");
-    expect(screen.getByText("mission status", { selector: ".runchip" })).not.toHaveClass("on");
-  });
+const RUN_LIST_DEFAULT_BODY = {
+  panel: "run-list",
+  argv: ["run", "list"],
+  opts: { kind: "all", all: "recent" },
+  captured_ts_ms: Date.UTC(2026, 0, 1, 12, 0, 0),
+  gather_ms: 4,
+  exit_code: 0,
+  ansi_text: "KIND STATUS STARTED DURATION ID",
+  stderr_tail: "",
+  cols: 100,
+  cache_ttl_ms: 3000,
+  age_ms: 0,
+  auto_refresh: true,
+};
 
-  it("a running dispatch is visible on the DEFAULT console view, without picking any panel", async () => {
-    const fetchMock = vi.fn((url: string) =>
-      Promise.resolve(
-        url.startsWith("/runs")
-          ? runsJson([{ id: "d1", kind: "dispatch", status: "running", tracked: false, role: "coder", updated_ts: 1 }])
-          : jsonResponse(MISSION_STATUS_BODY),
-      ),
-    );
+describe("ConsolePanel", () => {
+  // (#1905 step 3) The console's default landing panel is `run-list`
+  // (`panels.ts::DEFAULT_PANEL_ID`) — a real, ordinary CLI panel like any
+  // other, fetched through `/panel/run-list` exactly like an explicit
+  // `panel=run-list` deep link would be. This replaces #1904's
+  // client-rendered `ActivityPanel` default (a THIRD renderer of `/runs`,
+  // deleted along with its own escape-hatch pill — see `panels.ts`'s own
+  // doc on `PANELS` for the full story). No `/runs` fetch happens at all
+  // on a bare landing now; `run-list`'s own daemon endpoint is the ONLY
+  // fetch.
+  it("lands on run-list by default — a real /panel/run-list fetch, the run-list pill active", async () => {
+    const fetchMock = vi.fn((url: string) => (url.startsWith("/panel/run-list") ? Promise.resolve(jsonResponse(RUN_LIST_DEFAULT_BODY)) : Promise.resolve(jsonResponse(MISSION_STATUS_BODY))));
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("");
-    // Same page, no interaction — the running row is already there.
-    await waitFor(() => expect(document.querySelector(".consoleactivity .labrunrow")).not.toBeNull());
-    expect(document.querySelector(".consoleactivity .labrunrow")!.textContent).toContain("d1");
+    await waitFor(() => expect(screen.getByText(/KIND STATUS/)).toBeInTheDocument());
+    expect(fetchMock.mock.calls.some(([u]) => String(u).startsWith("/runs"))).toBe(false);
+    expect(screen.getByText("run list", { selector: ".runchip" })).toHaveClass("on");
+    expect(screen.getByText("mission status", { selector: ".runchip" })).not.toHaveClass("on");
   });
 
   it("selecting doctor (manual-only) does NOT auto-fetch — shows the not-yet-run placeholder", async () => {
@@ -106,22 +105,22 @@ describe("ConsolePanel", () => {
     expect(screen.getByText("· manual-run only")).toBeInTheDocument();
   });
 
-  it("clicking a CLI panel tab fetches it and marks it active, deactivating the activity tab", async () => {
+  it("clicking a CLI panel tab fetches it and marks it active, deactivating the run-list default", async () => {
     const fetchMock = vi.fn((url: string) => {
       if (url.startsWith("/panel/role-list")) {
         return Promise.resolve(jsonResponse({ ...MISSION_STATUS_BODY, panel: "role-list", argv: ["role", "list"], ansi_text: "id description" }));
       }
-      if (url.startsWith("/runs")) return Promise.resolve(runsJson());
+      if (url.startsWith("/panel/run-list")) return Promise.resolve(jsonResponse(RUN_LIST_DEFAULT_BODY));
       return Promise.resolve(jsonResponse(MISSION_STATUS_BODY));
     });
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("");
-    await waitFor(() => expect(screen.getByText(/no activity recorded yet/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/KIND STATUS/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("role list"));
     await waitFor(() => expect(screen.getByText("id description")).toBeInTheDocument());
     expect(screen.getByText("role list").closest(".runchip")).toHaveClass("on");
-    expect(screen.getByText("activity", { selector: ".runchip" })).not.toHaveClass("on");
+    expect(screen.getByText("run list", { selector: ".runchip" })).not.toHaveClass("on");
   });
 
   it("a daemon error response renders the daemon's own message when explicitly selecting mission-status", async () => {
@@ -140,53 +139,26 @@ describe("ConsolePanel", () => {
       if (url.startsWith("/panel/role-list")) {
         return Promise.resolve(jsonResponse({ ...MISSION_STATUS_BODY, ansi_text: "roles here" }));
       }
-      if (url.startsWith("/runs")) return Promise.resolve(runsJson());
+      if (url.startsWith("/panel/run-list")) return Promise.resolve(jsonResponse(RUN_LIST_DEFAULT_BODY));
       return Promise.resolve(jsonResponse(MISSION_STATUS_BODY));
     });
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("");
-    await waitFor(() => expect(screen.getByText(/no activity recorded yet/i)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/KIND STATUS/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("role list"));
     await waitFor(() => expect(screen.getByText("roles here")).toBeInTheDocument());
     fireEvent.click(screen.getByText("mission status"));
     await waitFor(() => expect(screen.getByText(/mission status —/)).toBeInTheDocument());
-    // Both CLI panels have now been fetched once each (plus the one /runs
-    // call from the initial activity landing) — this is the baseline every
-    // further tab switch should reuse rather than add to.
-    const callsAfterBothVisited = fetchMock.mock.calls.length;
+    // Three CLI panels have now been fetched once each (run-list on the
+    // default landing, role-list, mission-status) — this is the baseline
+    // every further tab switch should reuse rather than add to.
+    const callsAfterAllVisited = fetchMock.mock.calls.length;
 
     fireEvent.click(screen.getByText("role list"));
     await waitFor(() => expect(screen.getByText("roles here")).toBeInTheDocument());
 
-    expect(fetchMock.mock.calls.length).toBe(callsAfterBothVisited);
-  });
-
-  // (#1904 QA fix) Was: only the inline link was ever clicked, despite the
-  // test's own title claiming both paths were exercised — the "all
-  // activity" **tab** itself was never clicked (the comment at the end,
-  // "Direct deep link to the tab reaches the same uncapped state," named
-  // an assertion that was never made). This now genuinely drives both:
-  // the inline link first, back to the capped default, then the "all
-  // activity" tab chip itself.
-  it("the 'all activity' tab and the default view's own 'show every run' link both reach the uncapped view", async () => {
-    const runs = Array.from({ length: 12 }, (_, i) => ({ id: `r${i}`, kind: "mission", status: "complete", tracked: true, updated_ts: i }));
-    vi.stubGlobal("fetch", vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson(runs) : jsonResponse(MISSION_STATUS_BODY))));
-    renderPanel("");
-    await waitFor(() => expect(document.querySelectorAll(".consoleactivity .labrunrow").length).toBe(10));
-
-    fireEvent.click(screen.getByText("→ show every run"));
-    await waitFor(() => expect(document.querySelectorAll(".consoleactivity .labrunrow").length).toBe(12));
-    expect(screen.getByText("all activity", { selector: ".runchip" })).toHaveClass("on");
-
-    // Back to the capped default, then the "all activity" TAB itself
-    // (not the inline link) — the second, previously-unexercised path.
-    fireEvent.click(screen.getByText("activity", { selector: ".runchip" }));
-    await waitFor(() => expect(document.querySelectorAll(".consoleactivity .labrunrow").length).toBe(10));
-
-    fireEvent.click(screen.getByText("all activity", { selector: ".runchip" }));
-    await waitFor(() => expect(document.querySelectorAll(".consoleactivity .labrunrow").length).toBe(12));
-    expect(screen.getByText("all activity", { selector: ".runchip" })).toHaveClass("on");
+    expect(fetchMock.mock.calls.length).toBe(callsAfterAllVisited);
   });
 
   it("mission-status stays selectable and unaffected by the default's change", async () => {
