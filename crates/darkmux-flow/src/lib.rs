@@ -2468,7 +2468,12 @@ mod tests {
         //           provenance describing an invocation-scoped fact; nothing ever
         //           read it. Same shape of removal as 1.9.0's `machine_tier`; see
         //           schema.rs's fuller changelog entry.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.19.0");
+        //   1.20.0: new action `"step timing"` (#1877, final wiring step): a
+        //           scheduler-produced `StepRecord` companion record, streamed
+        //           live per step by every mission that runs through
+        //           `run_step_graph`. Minor + additive: older readers ignore
+        //           the unknown action; see schema.rs's fuller changelog entry.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.20.0");
     }
 
     #[test]

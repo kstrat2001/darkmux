@@ -51,13 +51,50 @@
 //! by `review_tests.rs`'s own comment: no graph step kind writes
 //! `env.steps`, so it stays empty end-to-end there, unchanged by this PR).
 //! The two producers are structurally disjoint today — nothing combines
-//! them, so there is no double count to reconcile. Wiring the graph path's
-//! `env.steps` from `SchedulerReport::step_records` (recovering
-//! `items_in`/`items_out` from wherever a mission's own business logic
-//! knows them) is left for a later PR — likely the same one that gives
-//! `coder-phase` its own typed envelope home, since that is the arc's next
-//! item and the natural place to decide how a mission backfills the
-//! scheduler's `None`s.
+//! them, so there is no double count to reconcile.
+//!
+//! **#1877's final wiring step (this arc's own last item, now shipped): the
+//! destination is the flow stream, not `MissionEnvelope`.** Two things
+//! constrained the choice. First, `MissionEnvelope` has no `steps`/
+//! `members`/`staffing` field today, and while adding one would be a
+//! genuinely additive minor bump (the documented rule: a new `Option`
+//! field an older reader safely ignores), it would only ever be POPULATED
+//! by a driver that actually reaches `build_envelope` at the end of its
+//! run. Second, and decisively: `src/mission_launch.rs`'s `coder_handles`
+//! branch, the acceptance test this whole arc measures itself against,
+//! `return`s before `build_envelope` is ever called, on EVERY exit (the
+//! operator gate, a pre-gate failure). An envelope-only destination would
+//! silently exclude the one mission #1877's own issue names as the reason
+//! this substrate needs to exist. The flow stream has neither problem: it
+//! is already durable, already fleet-wide, already what the viewer reads,
+//! and the #1899 bookend machinery already emits there, so `StepRecord`s
+//! reach it the same way regardless of which branch a driver's run takes
+//! afterward, envelope or none.
+//!
+//! Concretely: `crate::scheduler::apply_step_terminal` now streams a
+//! `crate::scheduler::STEP_TIMING_ACTION` ("step timing") flow record for
+//! each `StepRecord` at the moment it is pushed onto `SchedulerReport::
+//! step_records`, see that field's own doc and `step_timing_record`'s doc
+//! in `scheduler.rs`. Every mission that runs through `run_step_graph`
+//! (coder-phase included, with zero changes to `src/coder_phase.rs`) gets
+//! this by construction, live, per step, never batched to the end of the
+//! run.
+//!
+//! **The vocabulary question is resolved by NOT merging.** The scheduler's
+//! own companion record is `action: "step timing"`, deliberately never
+//! `"step result"`, the action a cooperating `StepKind` (`dispatch.map`'s
+//! per-item/aggregate records, review's `review.bundle`/`review.judge`/
+//! etc.) already emits for the steps that know their own `items_in`/
+//! `items_out`. Reusing `"step result"` for the scheduler's own thinner,
+//! uniform-coverage record would put two records under the same action for
+//! the SAME step with non-overlapping payload shapes, genuinely ambiguous
+//! to a consumer that folds by action (`darkmux-serve::mission_graph::
+//! fold_step_finals` is exactly such a consumer, and stays correct here
+//! unchanged: it doesn't recognize `"step timing"`, so it leniently skips
+//! it, same as it would any other action it doesn't fold). A distinct
+//! action is "carry the discriminator" at the cheapest layer available,
+//! the action string itself, so nothing downstream ever has to inspect
+//! `source`/`payload.step_id` to tell the two vocabularies apart.
 
 use crate::resourcing::{ResolvedSeatStaffing, StaffingProvenance};
 use darkmux_profiles::swap;
