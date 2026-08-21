@@ -45,12 +45,24 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
+// (#1904 CI fix) The console lens's DEFAULT landing view is now
+// `ActivityPanel` (a client-rendered union over `/runs`, no `/panel/*` call
+// at all) rather than the `mission-status` CLI panel these three tests
+// actually measure (`.panelout`'s position, its overflow box, the `cols`
+// it asks for). Explicitly selecting the panel is a better fixture than
+// depending on the console's default happening to be a CLI panel — it
+// keeps working no matter what the lens defaults to next.
+async function selectMissionStatus(page) {
+  await page.click('[data-act="console"]');
+  await page.click('[data-act="setpanel"][data-arg="mission-status"]');
+}
+
 // (#1614) Asserted by MEASURED Y position, not by class order in the DOM —
 // `order` changes the visual order without changing the DOM, so a
 // document-order assertion would pass against the bug.
 test('at phone width the chrome reads broadest-scope-first', async ({ page }) => {
   await page.goto('/index-lab.html');
-  await page.click('[data-act="console"]');
+  await selectMissionStatus(page);
   await expect(page.locator('.panelout')).toBeVisible();
 
   // (port note) `.meta`/`.lenstabs` were legacy's own class names for these
@@ -105,7 +117,7 @@ test('the phone never scrolls sideways to read the board', async ({ page }) => {
   });
 
   await page.goto('/index-lab.html');
-  await page.click('[data-act="console"]');
+  await selectMissionStatus(page);
   await expect(page.locator('.panelout')).toBeVisible();
 
   const over = await page.evaluate(() => {
@@ -131,7 +143,7 @@ test('the panel asks for a column count the phone can actually show', async ({ p
   });
 
   await page.goto('/index-lab.html');
-  await page.click('[data-act="console"]');
+  await selectMissionStatus(page);
   await expect(page.locator('.panelout')).toBeVisible();
 
   expect(asked, 'the panel fetch must carry a cols hint').not.toBeNull();
