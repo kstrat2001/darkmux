@@ -26,13 +26,7 @@ config list
 lab fixture list
 run list
 doctor
---kind
-all
-mission
-dispatch
-lab
---all
-$ darkmux run list
+$ darkmux run list --kind all ▾ --all
 captured 20:54:23
 · 4ms
 re-run

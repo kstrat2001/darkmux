@@ -26,7 +26,6 @@ config list
 lab fixture list
 run list
 doctor
---all
 $ darkmux mission status --all
 captured 20:54:23
 · 10ms

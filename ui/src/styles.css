@@ -1170,23 +1170,6 @@ body {
   padding: 10px 0;
 }
 
-/* (#1904) The console's default landing view — `ActivityPanel.tsx`, a
-   union over `/runs` shown in place of any CLI panel until the operator
-   explicitly picks one. Reuses `.stagehdr`/`.lablist`/`.labrunrow`/`.none`
-   verbatim (the runs-lens block above) for visual/DOM consistency, plus
-   `.hyblink` (the savings-hero "history →" link, `viewer.html`'s own
-   established anchor styling) for the "→ show every run" escape hatch —
-   so the only new class here is the section's own outer wrapper, purely
-   for spacing against the panel tab bar ABOVE it in DOM order
-   (`ConsolePanel.tsx` renders `.runsbar` first, this second). Matches
-   `.panelwrap`'s own `margin-top: 10px` below — its sibling in that same
-   position — rather than a `margin-bottom` that (a QA review caught) had
-   nothing below it to space against, since this is normally the LAST
-   element `ConsolePanel` renders on the default landing. */
-.consoleactivity {
-  margin-top: 10px;
-}
-
 /* ── Console lens (Packet 6) — ported from viewer.html's own <style> block
    (search that file for `.panelwrap`/`.panelchrome`/`.panelout`). Same
    load-bearing-CSS caveat as the runs lens block above: `.panelchrome` is
@@ -1202,68 +1185,137 @@ body {
    than reproducing legacy's separate `--bg2`/`--panel`/`--line`/`--muted`/
    `--good`/`--warn`/`--bad`/`--run`/`--accent-dim` tokens verbatim — `
    innerText()` (what parity actually checks) never reads color, so this is a
-   deliberate simplification, not a parity risk. */
-/* (#1911) The generic opts bar — `ConsolePanel.tsx`'s `OptsBar`, rendered
-   between `.runsbar` (the pill row) and `.panelwrap` (the CLI panel's own
-   chrome+body) exactly like the visual mockup in #1911 shows: a second row
-   of controls right under the pills. Absent entirely for 6 of 8 panels
-   (`OptsBar` returns `null` when `panelOptGroups(id)` is empty), so there
-   is no CSS-only "empty bar" to hide — the component itself adds zero
-   pixels. `.optchip`/`.optlabel` reuse `.runchip`'s type scale
-   (11px JetBrains Mono, uppercase-free) so the opts bar reads as a sibling
-   of the pill row, not a different UI language one row down. 40px minimum
-   touch target on every chip (#1911's own accessibility requirement) —
-   `min-height`/`min-width` plus centered flex content rather than relying
-   on padding alone, since the shortest legal chip text ("all") would
-   otherwise fall well under 40px tall at this font size. */
-.optsbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-  margin: 0 0 4px;
-  overflow-x: auto;
-}
-.optgroup {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex: 0 0 auto;
-}
-.optlabel {
-  font: 600 11px/1 "JetBrains Mono", monospace;
-  letter-spacing: 0.04em;
-  color: var(--dim);
-  padding: 0 2px;
-}
-.optchip {
+   deliberate simplification, not a parity risk.
+
+   (#1911, opts-as-command-tokens redesign) An earlier iteration added a
+   SECOND row here (`.optsbar`/`.optgroup`/`.optlabel`/`.optchip`) — a peer
+   pill row for a panel's declared options, reusing `.runchip`'s own type
+   scale "so the opts bar reads as a sibling of the pill row." The operator
+   reviewed it live and rejected exactly that: those controls are not
+   siblings of the panel tabs, they belong to the ACTIVE tab's own command.
+   That whole class family is deleted, not restyled — see `.pc-tok`/
+   `.pc-tok-menu` below, which render the same data INSIDE `.pc-cmd`'s own
+   command line instead (`ConsolePanel.tsx::ChromeCommandLine`). Also
+   deleted: `.consoleactivity{margin-top:10px}`, a rule for
+   `ActivityPanel.tsx` (#1904's client-only console default) that survived
+   in the served bundle after that component was deleted (#1905 step 3) —
+   found still present, unused, on the operator's own live check. */
+
+/* `.pc-tok` — the command-line token, shared by both shapes
+   (`EnumToken`/`BooleanToken`). Same 40px-minimum-touch-target discipline
+   the deleted `.optchip` had, kept here for the same reason: the shortest
+   legal token text ("--all") would otherwise sit well under 40px tall at
+   this font size. Small `border-radius` (6px, not the old chip's pill
+   14px) so a token reads as part of a command line's own punctuation
+   rather than as a pill wearing the pill row's own visual language —
+   exactly the distinction the operator's rejection was about. */
+.pc-tok {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
   min-height: 40px;
   min-width: 40px;
   box-sizing: border-box;
-  font: 600 11px/1 "JetBrains Mono", monospace;
+  font: 600 11px "JetBrains Mono", monospace;
   letter-spacing: 0.02em;
-  padding: 6px 10px;
-  border-radius: 14px;
+  padding: 4px 8px;
+  border-radius: 6px;
   border: 1px solid var(--border);
   background: #131826;
   color: var(--dim);
   cursor: pointer;
 }
-.optchip:hover {
+.pc-tok:hover {
   border-color: var(--accent);
   color: var(--fg);
 }
-.optchip:focus-visible {
+.pc-tok:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
-.optchip.on {
+/* The boolean token's "on" state (`--all` toggled on) — the enum token
+   never carries this class; its OWN state is the value shown in its own
+   text, not a color swap. */
+.pc-tok.on {
   border-color: var(--accent);
   color: var(--accent);
   background: #1c1c22;
+}
+/* `.pc-tok-anchor` is the enum token's positioning context — same
+   anchor-wraps-trigger-and-popup shape `CatalogPanel.tsx`'s own
+   `.catalog-anchor` uses (see that component's doc for the QA history
+   behind choosing an anchor-relative, not page-relative, position).
+   Deliberately NO `display` override (stays a plain inline span) — an
+   earlier draft set `display: inline-flex` here to center the trigger's
+   own content, which BLOCKIFIES every direct flex-item child regardless
+   of that child's own `display` (a real CSS rule, not a quirk): the
+   trigger span was blockified as this anchor's flex item, and Chromium's
+   `innerText` gives a blockified element its own forced line — verified
+   against the real built port, where it split "$ darkmux run list --kind
+   all ▾ --all" across three lines and broke every console golden's
+   byte-parity. `.pc-tok` itself still centers its own text fine via its
+   own `inline-flex` (that one is safe — it is not ALSO a flex-item child
+   of a flex parent). */
+.pc-tok-anchor {
+  position: relative;
+}
+.pc-tok-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  min-width: 120px;
+  /* Never opens off a 390px phone screen: capped narrower than the
+     viewport regardless of where the token sits in the line, plus a
+     scrollable ceiling for `--kind`'s own four short values (and any
+     future opt with more). */
+  max-width: min(80vw, 240px);
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #131826;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+.pc-tok-menu-option {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  box-sizing: border-box;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font: 600 11px "JetBrains Mono", monospace;
+  color: var(--dim);
+  cursor: pointer;
+}
+.pc-tok-menu-option:hover,
+.pc-tok-menu-option:focus-visible {
+  background: #1c1c22;
+  color: var(--fg);
+  outline: none;
+}
+.pc-tok-menu-option[aria-selected="true"] {
+  color: var(--accent);
+}
+/* The argv-drift marker (`ChromeCommandLine`'s own doc: a twin-drift bug
+   between this client's `PANEL_OPTS` table and the server's, surfaced
+   rather than hidden) — reuses `--error`, the same token `.panelerr`
+   already uses, since this names a real bug, not an advisory. */
+.pc-drift {
+  color: var(--error);
+  font-weight: 600;
+}
+/* The stale-output dimming (`PanelBody`'s own `stale` handling): applied
+   to whichever of `.panelout`/`.panelerr` is showing PLACEHOLDER content
+   (`query.isPlaceholderData` — a token flip whose own fetch hasn't landed
+   yet) instead of blanking to "running…". Paired with the `.pc-stale`
+   chrome note (`CapturedInfo`) — this is the visual half of the same
+   signal, not a separate concept. */
+.panelout.pc-body-stale,
+.panelerr.pc-body-stale {
+  opacity: 0.55;
 }
 
 .panelwrap {

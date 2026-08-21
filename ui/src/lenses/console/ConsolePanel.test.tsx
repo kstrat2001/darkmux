@@ -333,23 +333,42 @@ describe("ConsolePanel", () => {
   });
 });
 
-// (#1911) The generic opts bar — driven entirely by `panels.ts`'s
-// `PANEL_OPTS` table, never a switch on panel id.
-describe("ConsolePanel — opts bar (#1911)", () => {
-  const RUN_LIST_BODY = {
-    panel: "run-list",
-    argv: ["run", "list"],
-    opts: { kind: "all", all: "recent" },
-    captured_ts_ms: Date.UTC(2026, 0, 1, 12, 0, 0),
-    gather_ms: 4,
-    exit_code: 0,
-    ansi_text: "KIND STATUS ...",
-    stderr_tail: "",
-    cols: 100,
-    cache_ttl_ms: 3000,
-    age_ms: 0,
-    auto_refresh: true,
-  };
+// (#1911, opts-as-command-tokens redesign) The opts bar (a second pill row)
+// is deleted — the operator rejected it live. A panel's declared options
+// now render as TOKENS inside `.pc-cmd`'s own command line, driven by the
+// same `PANEL_OPTS` table, never a switch on panel id.
+describe("ConsolePanel — command-line tokens (#1911 redesign)", () => {
+  /** The real server response shape for `run-list`'s two declared opts —
+   * `argv` computed the SAME way a real daemon's `resolve_opts`/
+   * `compose_argv` would, so a test asserting "no drift" isn't accidentally
+   * proving it against a fixture that could never have matched in the
+   * first place. Deliberately NOT built by calling this file's own
+   * `composeArgv` import — an independent computation is what makes the
+   * argv-drift test below meaningful. */
+  function runListArgvFor(kind: string, all: string): string[] {
+    const argv = ["run", "list"];
+    if (kind !== "all") argv.push("--kind", kind);
+    if (all === "all") argv.push("--all");
+    return argv;
+  }
+
+  function runListBody(kind: string, all: string, over: Record<string, unknown> = {}) {
+    return {
+      panel: "run-list",
+      argv: runListArgvFor(kind, all),
+      opts: { kind, all },
+      captured_ts_ms: Date.UTC(2026, 0, 1, 12, 0, 0),
+      gather_ms: 4,
+      exit_code: 0,
+      ansi_text: `kind=${kind} all=${all}`,
+      stderr_tail: "",
+      cols: 100,
+      cache_ttl_ms: 3000,
+      age_ms: 0,
+      auto_refresh: true,
+      ...over,
+    };
+  }
 
   function runListFetchMock() {
     return vi.fn((url: string) => {
@@ -357,78 +376,156 @@ describe("ConsolePanel — opts bar (#1911)", () => {
       if (url.startsWith("/panel/run-list")) {
         const u = new URL(url, "http://x");
         const kind = u.searchParams.get("opt.kind") ?? "all";
-        return Promise.resolve(jsonResponse({ ...RUN_LIST_BODY, opts: { kind, all: u.searchParams.get("opt.all") ?? "recent" }, ansi_text: `kind=${kind}` }));
+        const all = u.searchParams.get("opt.all") ?? "recent";
+        return Promise.resolve(jsonResponse(runListBody(kind, all)));
       }
       return Promise.resolve(jsonResponse(MISSION_STATUS_BODY));
     });
   }
 
-  it("a panel with no declared opts (role-list) renders no opts bar at all", async () => {
-    const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : jsonResponse({ ...MISSION_STATUS_BODY, panel: "role-list", argv: ["role", "list"] })));
+  // (bullet 4 — the main regression risk named explicitly in the brief) A
+  // panel with no declared opts renders BYTE-IDENTICAL to before this
+  // whole opts feature existed: one plain, non-interactive `.pc-cmd` span,
+  // no tokens, no `.optsbar`/`.pc-tok`/listbox/switch anywhere in the DOM.
+  it("(byte-identical pin) a panel with no declared opts (role-list) has a plain static command line, no interactive tokens anywhere", async () => {
+    const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/panel/role-list") ? jsonResponse({ ...MISSION_STATUS_BODY, panel: "role-list", argv: ["role", "list"], ansi_text: "id description" }) : jsonResponse(MISSION_STATUS_BODY)));
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("role-list");
-    await waitFor(() => expect(screen.getByText("$ darkmux role list")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("id description")).toBeInTheDocument());
+    const cmd = document.querySelector(".pc-cmd")!;
+    expect(cmd.textContent).toBe("$ darkmux role list");
+    expect(cmd.children.length).toBe(0);
     expect(document.querySelector(".optsbar")).toBeNull();
+    expect(document.querySelector(".pc-tok")).toBeNull();
+    expect(document.querySelector('[role="listbox"]')).toBeNull();
+    expect(document.querySelector('[role="switch"]')).toBeNull();
+    expect(document.querySelector(".pc-drift")).toBeNull();
   });
 
-  it("mission-status declares only the --all toggle: one switch chip, no radiogroup", async () => {
+  it("mission-status declares only the --all boolean token: role=switch, dim when off", async () => {
     const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : jsonResponse(MISSION_STATUS_BODY)));
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("mission-status");
     await waitFor(() => expect(screen.getByText(/mission status —/)).toBeInTheDocument());
-    const bar = document.querySelector(".optsbar")!;
-    expect(bar).not.toBeNull();
     const sw = screen.getByRole("switch", { name: "--all" });
     expect(sw).toHaveAttribute("aria-checked", "false");
-    expect(document.querySelectorAll('[role="radiogroup"]').length).toBe(0);
+    expect(sw).not.toHaveClass("on");
+    expect(document.querySelector('[role="listbox"]')).toBeNull();
+    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux mission status --all");
   });
 
-  it("run-list declares --kind (a radiogroup) AND --all (a switch)", async () => {
+  it("run-list declares --kind (an enum token opening a listbox) AND --all (a switch)", async () => {
     const fetchMock = runListFetchMock();
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("run-list");
     await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
 
-    const kindGroup = screen.getByRole("radiogroup", { name: "--kind" });
-    expect(kindGroup).toBeInTheDocument();
-    const radios = screen.getAllByRole("radio");
-    expect(radios.map((r) => r.textContent)).toEqual(["all", "mission", "dispatch", "lab"]);
-    expect(screen.getByRole("radio", { name: "all" })).toHaveAttribute("aria-checked", "true");
+    const kindToken = screen.getByRole("button", { name: "--kind all ▾" });
+    expect(kindToken).toHaveAttribute("aria-haspopup", "listbox");
+    expect(kindToken).toHaveAttribute("aria-expanded", "false");
     expect(screen.getByRole("switch", { name: "--all" })).toHaveAttribute("aria-checked", "false");
+    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ --all");
   });
 
-  it("clicking a --kind chip on run-list (AUTO panel) triggers a new fetch with the opt applied", async () => {
+  it("activating the --kind token opens a listbox of every legal value, current selection marked", async () => {
     const fetchMock = runListFetchMock();
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("run-list");
     await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole("radio", { name: "lab" }));
+    fireEvent.click(screen.getByRole("button", { name: "--kind all ▾" }));
+    const listbox = screen.getByRole("listbox", { name: "--kind" });
+    expect(listbox).toBeInTheDocument();
+    const options = screen.getAllByRole("option");
+    expect(options.map((o) => o.textContent)).toEqual(["all", "mission", "dispatch", "lab"]);
+    expect(screen.getByRole("option", { name: "all" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("option", { name: "lab" })).toHaveAttribute("aria-selected", "false");
+  });
+
+  it("selecting a listbox option refetches, updates the token text, and closes the menu", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "--kind all ▾" }));
+    fireEvent.click(screen.getByRole("option", { name: "lab" }));
+
     await waitFor(() => expect(screen.getByText(/kind=lab/)).toBeInTheDocument());
-    expect(screen.getByRole("radio", { name: "lab" })).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByRole("radio", { name: "all" })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("button", { name: "--kind lab ▾" })).toBeInTheDocument();
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/panel/run-list") && String(u).includes("opt.kind=lab"))).toBe(true);
   });
 
-  it("the pending-command preview composes from the opts table, not id.replace guesswork — reflects the current selection before any fetch has landed", async () => {
-    const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : new Promise(() => {})));
+  it("clicking the --all switch toggles it on and refetches with --all applied", async () => {
+    const fetchMock = runListFetchMock();
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("run-list");
-    await waitFor(() => expect(screen.getByText("$ darkmux run list")).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole("radio", { name: "dispatch" }));
-    await waitFor(() => expect(screen.getByText("$ darkmux run list --kind dispatch")).toBeInTheDocument());
-  });
-
-  it("clicking the --all switch toggles it on, contributing --all to the composed command", async () => {
-    const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : new Promise(() => {})));
-    vi.stubGlobal("fetch", fetchMock);
-    renderPanel("run-list");
-    await waitFor(() => expect(screen.getByText("$ darkmux run list")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("switch", { name: "--all" }));
-    await waitFor(() => expect(screen.getByText("$ darkmux run list --all")).toBeInTheDocument());
-    expect(screen.getByRole("switch", { name: "--all" })).toHaveAttribute("aria-checked", "true");
+    await waitFor(() => expect(screen.getByRole("switch", { name: "--all" })).toHaveAttribute("aria-checked", "true"));
+    expect(screen.getByRole("switch", { name: "--all" })).toHaveClass("on");
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("opt.all=all"))).toBe(true);
+  });
+
+  it("keyboard: Enter/Space on the --all switch toggles it, same as a click", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.keyDown(screen.getByRole("switch", { name: "--all" }), { key: "Enter" });
+    await waitFor(() => expect(screen.getByRole("switch", { name: "--all" })).toHaveAttribute("aria-checked", "true"));
+
+    fireEvent.keyDown(screen.getByRole("switch", { name: "--all" }), { key: " " });
+    await waitFor(() => expect(screen.getByRole("switch", { name: "--all" })).toHaveAttribute("aria-checked", "false"));
+  });
+
+  it("the command line reflects the current selection even before any fetch has landed (pending preview)", async () => {
+    const fetchMock = vi.fn((url: string) => (url.startsWith("/panel/") ? new Promise(() => {}) : Promise.resolve(runsJson())));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ --all"));
+
+    fireEvent.click(screen.getByRole("button", { name: "--kind all ▾" }));
+    fireEvent.click(screen.getByRole("option", { name: "dispatch" }));
+    await waitFor(() => expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind dispatch ▾ --all"));
+  });
+
+  it("keyboard: Enter opens the menu focused on the current value, ArrowDown moves, Enter selects, focus returns to the token", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    const token = screen.getByRole("button", { name: "--kind all ▾" });
+    token.focus();
+    fireEvent.keyDown(token, { key: "Enter" });
+    await waitFor(() => expect(screen.getByRole("option", { name: "all" })).toHaveFocus());
+
+    fireEvent.keyDown(screen.getByRole("option", { name: "all" }), { key: "ArrowDown" });
+    expect(screen.getByRole("option", { name: "mission" })).toHaveFocus();
+
+    fireEvent.keyDown(screen.getByRole("option", { name: "mission" }), { key: "Enter" });
+    await waitFor(() => expect(screen.getByText(/kind=mission/)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "--kind mission ▾" })).toHaveFocus();
+  });
+
+  it("keyboard: Escape closes the menu without changing the selection and returns focus to the token", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    const token = screen.getByRole("button", { name: "--kind all ▾" });
+    fireEvent.click(token);
+    await waitFor(() => expect(screen.getByRole("option", { name: "all" })).toHaveFocus());
+
+    fireEvent.keyDown(screen.getByRole("option", { name: "all" }), { key: "Escape" });
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "--kind all ▾" })).toHaveFocus();
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("opt.kind="))).toBe(false);
   });
 
   it("(#1911 selection state) flipping run-list -> mission-status -> run-list preserves the --kind selection (per-pill memory, no localStorage)", async () => {
@@ -437,7 +534,8 @@ describe("ConsolePanel — opts bar (#1911)", () => {
     renderPanel("run-list");
     await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole("radio", { name: "lab" }));
+    fireEvent.click(screen.getByRole("button", { name: "--kind all ▾" }));
+    fireEvent.click(screen.getByRole("option", { name: "lab" }));
     await waitFor(() => expect(screen.getByText(/kind=lab/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("mission status"));
@@ -445,25 +543,94 @@ describe("ConsolePanel — opts bar (#1911)", () => {
 
     fireEvent.click(screen.getByText("run list"));
     await waitFor(() => expect(screen.getByText(/kind=lab/)).toBeInTheDocument());
-    expect(screen.getByRole("radio", { name: "lab" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("button", { name: "--kind lab ▾" })).toBeInTheDocument();
     expect(localStorage.length).toBe(0);
   });
 
-  it("keyboard activation (Enter) on a chip selects it, same pattern as the pill tabs", async () => {
-    const fetchMock = runListFetchMock();
-    vi.stubGlobal("fetch", fetchMock);
-    renderPanel("run-list");
-    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
-
-    fireEvent.keyDown(screen.getByRole("radio", { name: "dispatch" }), { key: "Enter" });
-    await waitFor(() => expect(screen.getByText(/kind=dispatch/)).toBeInTheDocument());
-  });
-
-  it("a deep link carrying opts (#1911) renders the chosen chip active and fetches with it applied", async () => {
+  it("a deep link carrying opts (#1911) renders the chosen token and fetches with it applied", async () => {
     const fetchMock = runListFetchMock();
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("run-list", { kind: "dispatch" });
     await waitFor(() => expect(screen.getByText(/kind=dispatch/)).toBeInTheDocument());
-    expect(screen.getByRole("radio", { name: "dispatch" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("button", { name: "--kind dispatch ▾" })).toBeInTheDocument();
+  });
+
+  // ── Staleness: `placeholderData: keepPreviousData` (bullet 3) ──────────
+  it("(stale output treatment) between changing a token and the fetch landing, the old output stays visible, dimmed, with an explicit note — never blanked, never silently current", async () => {
+    let resolveSecond!: (r: Response) => void;
+    const fetchMock = vi.fn((url: string) => {
+      if (url.startsWith("/runs")) return Promise.resolve(runsJson());
+      const u = new URL(url, "http://x");
+      const kind = u.searchParams.get("opt.kind") ?? "all";
+      if (kind === "all") return Promise.resolve(jsonResponse(runListBody("all", "recent")));
+      return new Promise<Response>((resolve) => {
+        resolveSecond = resolve;
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "--kind all ▾" }));
+    fireEvent.click(screen.getByRole("option", { name: "lab" }));
+
+    // The command line already shows the NEW selection — that part is
+    // never stale, it's a pure function of local state.
+    await waitFor(() => expect(screen.getByRole("button", { name: "--kind lab ▾" })).toBeInTheDocument());
+    // The OLD output is still on screen (not blanked to "running…"),
+    // explicitly marked so it can't be read as current.
+    expect(screen.getByText(/kind=all/)).toBeInTheDocument();
+    expect(screen.getByText("· selection changed, refreshing…")).toBeInTheDocument();
+    expect(document.querySelector(".panelout")).toHaveClass("pc-body-stale");
+
+    resolveSecond(jsonResponse(runListBody("lab", "recent")));
+    await waitFor(() => expect(screen.getByText(/kind=lab/)).toBeInTheDocument());
+    expect(screen.queryByText("· selection changed, refreshing…")).not.toBeInTheDocument();
+    expect(document.querySelector(".panelout")).not.toHaveClass("pc-body-stale");
+  });
+
+  it("(byte-identical pin, staleness half) a no-opts panel's output is never marked stale — its query key never changes, so isPlaceholderData can never fire", async () => {
+    const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/panel/role-list") ? jsonResponse({ ...MISSION_STATUS_BODY, panel: "role-list", argv: ["role", "list"], ansi_text: "roles here" }) : jsonResponse(MISSION_STATUS_BODY)));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("role-list");
+    await waitFor(() => expect(screen.getByText("roles here")).toBeInTheDocument());
+    expect(document.querySelector(".panelout")).not.toHaveClass("pc-body-stale");
+    expect(screen.queryByText("· selection changed, refreshing…")).not.toBeInTheDocument();
+  });
+
+  // ── Drift: response.argv disagreeing with the composed argv (bullet 3) ──
+  it("(argv-drift) when the response's own argv does not match what the client composed for the SAME selection, the response wins for display and the mismatch is surfaced, not hidden", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(
+        url.startsWith("/runs")
+          ? runsJson()
+          : // Same `opts` echo as the current (default) selection — NOT
+            // stale — but a DIFFERENT argv than `composeArgv("run-list", {})`
+            // would produce (`["run","list"]`). A real twin-drift shape:
+            // the server resolved the identical selection to different argv
+            // than this client's own table would.
+            jsonResponse(runListBody("all", "recent", { argv: ["run", "list", "--verbose"] })),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --verbose");
+    expect(screen.getByText("⚠ argv mismatch — showing what actually ran")).toBeInTheDocument();
+    // The response won for display — no live tokens rendered while the
+    // client's own composed argv is provably wrong for this data.
+    expect(document.querySelector('[role="listbox"]')).toBeNull();
+    expect(document.querySelector('[role="switch"]')).toBeNull();
+    expect(document.querySelector(".pc-tok")).toBeNull();
+  });
+
+  it("(argv-drift, no false positive) a matching response never shows the drift marker", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+    expect(screen.queryByText(/argv mismatch/)).not.toBeInTheDocument();
+    expect(document.querySelector(".pc-drift")).toBeNull();
   });
 });
