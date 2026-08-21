@@ -43,7 +43,7 @@ use serde::Serialize;
 /// `{"state":"stale","age_ms":41200,"detail":"could not reach Redis"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-pub(crate) enum SourceState {
+pub enum SourceState {
     /// The read succeeded; this response covers the source completely.
     Ok,
     /// The read failed and the last-known-good snapshot is being served in

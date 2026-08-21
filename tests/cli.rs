@@ -2877,6 +2877,37 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
     );
 }
 
+/// Sets a process-global env var and restores its previous value on drop.
+///
+/// Same shape as `crates/darkmux-serve/src/lib_tests.rs`'s `CrewDirGuard`.
+/// Process env is shared by every test in this binary AND inherited by
+/// every `assert_cmd` subprocess it spawns, so a test that sets one
+/// without restoring it is an order-dependent flake waiting for the next
+/// test to be appended below it.
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 /// (#1905) End-to-end conformance for `runs.rs`'s "Two callers, one union"
 /// contract: the `darkmux run list` BINARY and a direct
 /// `darkmux_serve::build_runs` call must report the same runs for the same
@@ -2911,6 +2942,29 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
     fs::create_dir_all(&run_dir).unwrap();
     fs::write(run_dir.join("scores.json"), r#"{"cases":[]}"#).unwrap();
 
+    // A MISSION too, so the fixture spans two kinds. With a single-kind
+    // fixture this comparison discriminates on only one axis: a verb-side
+    // filter that dropped every mission row would leave both sides at the
+    // same lone lab row and pass. `spec.config_id` is deliberately not
+    // `"dispatch"` (which is how a crew-of-one dispatch is distinguished,
+    // #1509), so this lands as `kind: "mission"`.
+    let mission_dir = crew.path().join("missions/conformance-m1");
+    fs::create_dir_all(&mission_dir).unwrap();
+    fs::write(
+        mission_dir.join("mission.json"),
+        r#"{
+            "id": "conformance-m1",
+            "description": "run-list conformance fixture",
+            "status": "finalized",
+            "phase_ids": [],
+            "created_ts": 1700000000,
+            "started_ts": 1700000000,
+            "finalized_ts": 1700000060,
+            "spec": {"config_id": "review", "inputs_fingerprint": "conformance"}
+        }"#,
+    )
+    .unwrap();
+
     let out = Command::cargo_bin("darkmux")
         .unwrap()
         .args(["run", "list", "--json", "--all"])
@@ -2933,13 +2987,25 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
         .collect();
     verb_ids.sort();
 
-    unsafe {
-        std::env::set_var("DARKMUX_FLOWS_DIR", flows.path());
-        std::env::set_var("DARKMUX_LAB_DIR", lab.path());
-        std::env::set_var("DARKMUX_CREW_DIR", crew.path());
-        std::env::set_var("DARKMUX_HOME", home.path());
-        std::env::remove_var("DARKMUX_REDIS_URL");
-    }
+    // Only ONE env var is load-bearing on the in-process side, and it is
+    // restored rather than leaked. `build_runs` takes the flows and lab
+    // paths as ARGUMENTS, so `DARKMUX_FLOWS_DIR`/`DARKMUX_LAB_DIR` would
+    // be inert here; `darkmux-types` is compiled with `test-support` in
+    // this binary, so `config()` is empty and `DARKMUX_HOME` buys nothing;
+    // and the fleet slice is literally `&[]`, so Redis is never consulted.
+    // That leaves `DARKMUX_CREW_DIR`, which `crew_dir_override()` feeds to
+    // `load_missions()` — without it the in-process half would read the
+    // developer's REAL `~/.darkmux` missions and this comparison would be
+    // an accident.
+    //
+    // The restore is not hygiene theater. `assert_cmd::Command` inherits
+    // the parent env, only 15 of this file's ~100 `cargo_bin` call sites
+    // set `DARKMUX_HOME` themselves, and `#[serial]` orders this test
+    // against the file's other `#[serial]` tests only — the rest run
+    // concurrently in this same process. A leaked var pointing at a
+    // `TempDir` that has since been deleted turns green tests red
+    // depending on declaration order.
+    let _crew_guard = EnvVarGuard::set("DARKMUX_CREW_DIR", crew.path());
     let direct = darkmux_serve::build_runs(flows.path(), Some(lab.path()), &[]);
     let mut direct_ids: Vec<String> = direct
         .iter()
@@ -2954,9 +3020,18 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
         .collect();
     direct_ids.sort();
 
+    // Anti-vacuity, on the axis this test actually names: the fixture must
+    // produce BOTH kinds, or a same-kind filter on either side would be
+    // invisible and the comparison would pass by accident.
     assert!(
-        !direct_ids.is_empty(),
-        "fixture produced no runs, so this test would pass vacuously — the lab marker file is no longer recognized"
+        direct_ids.iter().any(|s| s.starts_with("lab/")),
+        "fixture produced no lab run — the marker file is no longer recognized, and this test \
+         would now pass vacuously on the lab axis: {direct_ids:?}"
+    );
+    assert!(
+        direct_ids.iter().any(|s| s.starts_with("mission/")),
+        "fixture produced no mission run — the mission record shape or crew-dir layout changed, \
+         and this test would now pass vacuously on the mission axis: {direct_ids:?}"
     );
     assert_eq!(
         verb_ids, direct_ids,

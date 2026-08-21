@@ -46,7 +46,7 @@ pub mod mission_graph;
 mod panel;
 mod runs;
 pub use runs::{build_runs, Run, RunKind, RunStatus};
-mod source_state;
+pub mod source_state;
 // (#1637) Golden-file generation for the wire types the browser specs consume.
 // Test-only: it exists so a Playwright fixture cannot drift from the shape the
 // server actually emits.
@@ -3271,21 +3271,24 @@ type FleetCache = Option<(std::time::Instant, Vec<serde_json::Value>)>;
 /// see. Returning the pair makes a caller that drops the state do so
 /// visibly, and makes the next aggregation added here confront the question
 /// at compile time rather than by remembering to.
-pub(crate) struct FleetRead {
-    pub(crate) records: Vec<serde_json::Value>,
-    pub(crate) state: source_state::SourceState,
+pub struct FleetRead {
+    pub records: Vec<serde_json::Value>,
+    pub state: source_state::SourceState,
 }
 
-/// (#1905) The fleet-records half of `build_runs`'s three inputs, exposed
-/// `pub` so `darkmux run list` (`src/run_list.rs`, root binary crate) can
-/// assemble the SAME inputs `runs_handler` does before calling the shared
-/// `build_runs` union — a standalone install (no `DARKMUX_REDIS_URL`) gets
-/// an empty vec here (`SourceState::Off`, not an error), same as the
-/// handler. The richer `FleetRead::state` (degraded/stale detail) stays
-/// `pub(crate)` — the CLI verb doesn't need it to render rows, only the
-/// records themselves.
-pub fn fleet_records_for_runs() -> Vec<serde_json::Value> {
-    fleet_flow_records().records
+/// (#1905) The fleet half of `build_runs`'s three inputs, exposed `pub` so
+/// `darkmux run list` (`src/run_list.rs`, root binary crate) can assemble
+/// the SAME inputs `runs_handler` does before calling the shared
+/// `build_runs` union. A standalone install (no `DARKMUX_REDIS_URL`) gets
+/// an empty vec with `SourceState::Off` — correct, not a degradation.
+///
+/// Returns the whole [`FleetRead`], not just `.records`, because dropping
+/// `.state` would make the CLI commit the exact defect `source_state`'s
+/// module doc exists to name: an unreachable hub and a genuinely quiet
+/// fleet would print byte-identical output. `runs_handler` ships the state
+/// as `meta`; the verb has to be able to say the same thing.
+pub fn fleet_records_for_runs() -> FleetRead {
+    fleet_flow_records()
 }
 
 pub(crate) fn fleet_flow_records() -> FleetRead {

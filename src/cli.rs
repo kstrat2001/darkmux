@@ -743,7 +743,9 @@ pub(crate) enum RunFamilyCmd {
         kind: RunKindArg,
         /// Max rows shown in total, live runs first. Live runs are never
         /// truncated, so a machine with more running than this prints all
-        /// of them. `0` means no cap. Default 10.
+        /// of them. `0` means no cap. Ignored by `--json`, which is never
+        /// paginated — a machine reader gets every run the kind filter
+        /// selected. Default 10.
         #[arg(long, default_value = "10")]
         limit: usize,
         /// Show every run, ignoring `--limit`.

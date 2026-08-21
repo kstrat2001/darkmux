@@ -22,16 +22,38 @@ pub(crate) fn run(kind: RunKindArg, limit: usize, all: bool, json: bool) -> Resu
     // /runs` — `fleet_records_for_runs()` degrades to an empty vec on a
     // standalone install (no `DARKMUX_REDIS_URL`), same as the handler.
     let fleet = darkmux_serve::fleet_records_for_runs();
-    let all_rows = darkmux_serve::build_runs(&flows_dir, Some(&lab_dir), &fleet);
+    let all_rows = darkmux_serve::build_runs(&flows_dir, Some(&lab_dir), &fleet.records);
     let filtered = filter_by_kind(all_rows, kind);
 
     if json {
-        return run_json(&filtered, kind);
+        return run_json(&filtered, kind, &fleet.state);
     }
 
     let selection = select_rows(filtered, limit, all);
-    render_text(&selection, kind);
+    render_text(&selection, kind, &fleet.state);
     Ok(0)
+}
+
+/// One line naming an INCOMPLETE fleet read, or `None` when the answer is
+/// whole.
+///
+/// `source_state`'s module doc calls this contract "empty is never
+/// silent": a hub whose Redis just died and a genuinely quiet fleet
+/// produce the same rows, and without this they would produce the same
+/// output too. `Off` is deliberately silent — a standalone install has no
+/// fleet substrate by design, and warning about it would be the bug.
+fn fleet_warning(state: &darkmux_serve::source_state::SourceState) -> Option<String> {
+    use darkmux_serve::source_state::SourceState;
+    match state {
+        SourceState::Ok | SourceState::Off => None,
+        SourceState::Stale { age_ms, .. } => Some(format!(
+            "fleet: could not reach the shared stream; showing a snapshot {} old — runs on other machines may be missing or out of date",
+            format_span(age_ms / 1_000)
+        )),
+        SourceState::Unavailable { .. } => Some(
+            "fleet: could not reach the shared stream and nothing was cached — runs on other machines are missing from this list".to_string(),
+        ),
+    }
 }
 
 fn filter_by_kind(rows: Vec<Run>, kind: RunKindArg) -> Vec<Run> {
@@ -110,13 +132,28 @@ fn select_rows(mut rows: Vec<Run>, limit: usize, all: bool) -> Selection {
 /// directly above it ("showing 9 of 15" under a 10-row table). Only
 /// terminal rows are ever hidden, so the difference between the two
 /// numbers is still exactly the terminal rows that were cut.
-fn footer(sel: &Selection) -> Option<String> {
+fn footer(sel: &Selection, width: Option<usize>) -> Option<String> {
     if sel.shown_terminal >= sel.total_terminal {
         return None;
     }
     let shown = sel.rows.len();
     let hidden = sel.total_terminal - sel.shown_terminal;
-    Some(format!("showing {shown} of {} runs ({hidden} more not shown — `--all` for every run)", shown + hidden))
+    let total = shown + hidden;
+    let full = format!("showing {shown} of {total} runs ({hidden} more not shown — `--all` for every run)");
+    match width {
+        Some(w) if full.chars().count() > w => {
+            // The compact form keeps all three load-bearing facts: what
+            // was shown, the REAL total, and the escape hatch. Only the
+            // "N more" restatement is dropped, and it is pure subtraction
+            // of the two numbers still present — so a narrow pane loses
+            // no disclosure, just a wrapped line it did not need. (The
+            // rows themselves are clamped by `id_width`; a footer that
+            // wrapped while every row fit would be the same overflow bug
+            // one line lower.)
+            Some(format!("showing {shown} of {total} runs · `--all` for every run"))
+        }
+        _ => Some(full),
+    }
 }
 
 fn kind_label(kind: RunKind) -> &'static str {
@@ -227,18 +264,34 @@ fn ellipsize(s: &str, max: usize) -> String {
     format!("{front}…{back}")
 }
 
+/// Strip the `darkmux:` residency namespace off a model id for display —
+/// the Rust twin of `ui/src/lenses/lab/labSeries.ts::shortModel`, which
+/// `runSubtitle` applies before pushing the model.
+///
+/// Not cosmetic. The namespace convention states the prefix is "invisible
+/// at dispatch time" and exists so darkmux can recognize its OWN loaded
+/// instances in `lms ps`; printing it in a run listing leaks bookkeeping
+/// into an operator-facing column. It also costs 8 columns, and under
+/// [`format_row`]'s drop-the-subtitle-whole rule those 8 can be what
+/// pushes a line past the terminal width, costing role, route AND machine
+/// together on a row that would otherwise have fit.
+fn short_model(model: &str) -> &str {
+    model.strip_prefix("darkmux:").unwrap_or(model)
+}
+
 /// `role · model · via route · machine` — same fields, same join, and same
-/// order as `ui/src/lenses/runs/format.ts::runSubtitle` (minus that
-/// function's `showMachine` gate, which exists there to avoid repeating a
-/// machine pin the lens already filtered to; this verb has no such pin, so
-/// machine is always eligible).
+/// order as `ui/src/lenses/runs/format.ts::runSubtitle`, including its
+/// `shortModel` treatment of the model id (see [`short_model`]). The one
+/// difference is that function's `showMachine` gate, which exists there to
+/// avoid repeating a machine pin the lens already filtered to; this verb
+/// has no such pin, so machine is always eligible.
 fn subtitle_for(r: &Run) -> String {
     let mut bits: Vec<String> = Vec::new();
     if let Some(role) = &r.role {
         bits.push(role.clone());
     }
     if let Some(model) = &r.model {
-        bits.push(model.clone());
+        bits.push(short_model(model).to_string());
     }
     if let Some(route) = &r.route {
         bits.push(format!("via {route}"));
@@ -249,13 +302,48 @@ fn subtitle_for(r: &Run) -> String {
     bits.join(" · ")
 }
 
-// KIND(8) + gap(1) + STATUS(10) + gap(1) + STARTED(10) + gap(1) +
-// DURATION(10) + gap(2) = 43. Matches the literal format string in
-// `print_row`/`print_header` below exactly — a change to either must
-// change both, same coupling `mission_status.rs::ROW_FIXED_COLS` documents
-// for its own row shape.
-const FIXED_COLS: usize = 8 + 1 + 10 + 1 + 10 + 1 + 10 + 2;
+/// Column widths. The format strings in [`header_line`]/[`format_row`]
+/// take their widths FROM these consts (`{:<w$}`) rather than repeating
+/// them as literals, so the "change one, change both" coupling that
+/// `mission_status.rs::ROW_FIXED_COLS` documents cannot exist here: there
+/// is one number per column, used by both the budget and the render.
+///
+/// Each width is the longest label its column can hold, pinned by
+/// `every_column_label_fits_its_width` — `status_label` can emit
+/// `unparseable` (11), which a 10-wide column silently renders ONE column
+/// over budget, since `{:<10}` is a minimum and never truncates.
+const INDENT_COLS: usize = 2;
+const KIND_COLS: usize = 8; // "dispatch"
+const STATUS_COLS: usize = 11; // "unparseable"
+const STARTED_COLS: usize = 10;
+const DURATION_COLS: usize = 10;
+/// The two-space gap between DURATION and ID (every other gap is one).
+const ID_GAP_COLS: usize = 2;
+
+/// Everything a row spends before the ID column.
+///
+/// The LEADING INDENT is part of this budget, and forgetting it is the
+/// specific trap `mission_status.rs::ROW_FIXED_COLS` documents having
+/// already sprung twice ("the first draft of this constant said 23"). The
+/// first draft of THIS one omitted the indent AND undersized STATUS, so
+/// `id_width` planned a row two-to-three columns narrower than it rendered
+/// and the clamp branch could not fit at any width. Pinned by
+/// `every_clamped_row_fits_the_width_it_was_planned_for`, which measures
+/// the RENDERED string — a test that recomputed this sum would have agreed
+/// with the wrong constant.
+const FIXED_COLS: usize =
+    INDENT_COLS + KIND_COLS + 1 + STATUS_COLS + 1 + STARTED_COLS + 1 + DURATION_COLS + ID_GAP_COLS;
 const MIN_ID_COLS: usize = 12;
+
+/// The narrowest terminal this row shape can honor. Below it, [`id_width`]
+/// hits its `MIN_ID_COLS` floor and the row is wider than the pane: an id
+/// elided past twelve characters stops identifying anything, so a narrow
+/// pane gets a slightly-too-wide row rather than a useless one. Named so
+/// the guarantee is stateable and testable, rather than being an
+/// unremarked property of two constants. (A narrow render that SHEDS
+/// columns, the way `mission status` sheds its optional ones, is the real
+/// fix when this verb becomes a phone-width console panel — #1905 step 2.)
+const MIN_ROW_COLS: usize = FIXED_COLS + MIN_ID_COLS;
 
 /// The ID column's width for this render: wide enough for the longest id
 /// present, clamped to fit `width` (when known) with the fixed columns
@@ -270,30 +358,61 @@ fn id_width(rows: &[Run], width: Option<usize>) -> usize {
             if max_id + FIXED_COLS <= w {
                 max_id
             } else {
-                w.saturating_sub(FIXED_COLS).max(MIN_ID_COLS)
+                // Clamp to the pane, but never below [`MIN_ROW_COLS`]'s
+                // floor — expressed by raising `w` to the floor rather
+                // than by a second `.max(MIN_ID_COLS)`, so the narrowest
+                // honorable row is stated in ONE place and this branch
+                // cannot drift from it. (`MIN_ROW_COLS > FIXED_COLS` by
+                // construction, so this subtraction cannot underflow.)
+                w.max(MIN_ROW_COLS) - FIXED_COLS
             }
         }
     }
 }
 
-fn print_header(id_w: usize) {
-    println!("  {:<8} {:<10} {:<10} {:<10}  {:<id_w$}", "KIND", "STATUS", "STARTED", "DURATION", "ID");
+fn header_line(id_w: usize) -> String {
+    format!(
+        "{:i$}{:<k$} {:<s$} {:<t$} {:<d$}{:g$}{:<id_w$}",
+        "",
+        "KIND",
+        "STATUS",
+        "STARTED",
+        "DURATION",
+        "",
+        "ID",
+        i = INDENT_COLS,
+        k = KIND_COLS,
+        s = STATUS_COLS,
+        t = STARTED_COLS,
+        d = DURATION_COLS,
+        g = ID_GAP_COLS,
+    )
 }
 
-fn print_row(now: u64, r: &Run, id_w: usize, width: Option<usize>) {
+/// Render one row. Split from the `println!` so a test can MEASURE what
+/// this returns — see [`FIXED_COLS`] for why measuring beats recomputing
+/// the budget.
+fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>) -> String {
     let id_cell = format!("{:<id_w$}", ellipsize(&r.id, id_w));
     let base = format!(
-        "  {:<8} {:<10} {:<10} {:<10}  {}",
+        "{:i$}{:<k$} {:<s$} {:<t$} {:<d$}{:g$}{}",
+        "",
         kind_label(r.kind),
         status_label(r.status),
         started_cell(now, r),
         duration_cell(now, r),
+        "",
         id_cell,
+        i = INDENT_COLS,
+        k = KIND_COLS,
+        s = STATUS_COLS,
+        t = STARTED_COLS,
+        d = DURATION_COLS,
+        g = ID_GAP_COLS,
     );
     let subtitle = subtitle_for(r);
     if subtitle.is_empty() {
-        println!("{base}");
-        return;
+        return base;
     }
     // Only append the subtitle when it demonstrably fits — piped output
     // (width None) always gets it; a real terminal gets it only if the
@@ -303,13 +422,19 @@ fn print_row(now: u64, r: &Run, id_w: usize, width: Option<usize>) {
     // documents for its own overlong lines).
     let full = format!("{base}  {subtitle}");
     match width {
-        None => println!("{full}"),
-        Some(w) if full.chars().count() <= w => println!("{full}"),
-        Some(_) => println!("{base}"),
+        None => full,
+        Some(w) if full.chars().count() <= w => full,
+        Some(_) => base,
     }
 }
 
-fn render_text(sel: &Selection, kind: RunKindArg) {
+fn render_text(sel: &Selection, kind: RunKindArg, fleet: &darkmux_serve::source_state::SourceState) {
+    // Printed BEFORE the table (and before the empty-state line) — an
+    // incomplete answer has to be qualified where the reader meets it, not
+    // in a footnote under rows they have already believed.
+    if let Some(warning) = fleet_warning(fleet) {
+        eprintln!("{}", style::warn(&warning));
+    }
     if sel.rows.is_empty() {
         let msg = if matches!(kind, RunKindArg::All) {
             "no recorded run activity yet".to_string()
@@ -325,16 +450,20 @@ fn render_text(sel: &Selection, kind: RunKindArg) {
     let now = now_unix();
 
     println!("{}", style::header(&format!("runs — {} shown", sel.rows.len())));
-    print_header(id_w);
+    println!("{}", header_line(id_w));
     for r in &sel.rows {
-        print_row(now, r, id_w, width);
+        println!("{}", format_row(now, r, id_w, width));
     }
-    if let Some(line) = footer(sel) {
+    if let Some(line) = footer(sel, width) {
         println!("{}", style::dim(&line));
     }
 }
 
-fn run_json(rows: &[Run], kind: RunKindArg) -> Result<i32> {
+fn run_json(
+    rows: &[Run],
+    kind: RunKindArg,
+    fleet: &darkmux_serve::source_state::SourceState,
+) -> Result<i32> {
     // (#1905, matching `mission status --json`'s posture) NEVER paginated —
     // a machine reader gets every row the kind filter selected;
     // `--limit`/`--all` only shape the human table above.
@@ -344,6 +473,9 @@ fn run_json(rows: &[Run], kind: RunKindArg) -> Result<i32> {
         "kind": kind_arg_label(kind),
         "runs": sorted,
         "total": sorted.len(),
+        // The same honesty `runs_handler` ships as `meta`: a script must be
+        // able to tell an incomplete answer from a quiet fleet.
+        "fleet": fleet,
     });
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(0)
@@ -508,7 +640,7 @@ mod tests {
     #[test]
     fn footer_is_absent_when_nothing_was_truncated() {
         let sel = Selection { rows: vec![], shown_terminal: 5, total_terminal: 5 };
-        assert_eq!(footer(&sel), None);
+        assert_eq!(footer(&sel, None), None);
     }
 
     #[test]
@@ -517,7 +649,7 @@ mod tests {
         let rows: Vec<Run> =
             (0..10u64).map(|i| mk_run(&format!("t{i}"), RunKind::Mission, RunStatus::Complete, i)).collect();
         let sel = Selection { rows, shown_terminal: 10, total_terminal: 47 };
-        let line = footer(&sel).expect("something was hidden, footer must print");
+        let line = footer(&sel, None).expect("something was hidden, footer must print");
         assert!(line.contains("10"), "must name what's shown: {line}");
         assert!(line.contains("47"), "must name the REAL total, not the cap: {line}");
         assert!(line.contains("--all"), "must name the escape hatch: {line}");
@@ -533,9 +665,71 @@ mod tests {
             rows.push(mk_run(&format!("t{i}"), RunKind::Mission, RunStatus::Complete, 1_000 + i));
         }
         let sel = select_rows(rows, 10, false);
-        let line = footer(&sel).expect("6 terminal rows were hidden, footer must print");
+        let line = footer(&sel, None).expect("6 terminal rows were hidden, footer must print");
         assert!(line.contains("showing 10 of 16 runs"), "footer disagreed with the table: {line}");
         assert!(line.contains("6 more"), "must name how many were hidden: {line}");
+    }
+
+    // ── fleet-state disclosure: empty is never silent ────────────────
+
+    /// The load-bearing silence: a standalone install has no fleet
+    /// substrate BY DESIGN, and `source_state`'s own doc says warning
+    /// about it "would be the bug".
+    #[test]
+    fn a_standalone_install_is_never_warned_about_its_missing_fleet() {
+        use darkmux_serve::source_state::SourceState;
+        assert_eq!(fleet_warning(&SourceState::Off), None);
+        assert_eq!(fleet_warning(&SourceState::Ok), None);
+    }
+
+    /// The inverse, and the reason this exists: an unreachable hub and a
+    /// quiet fleet return the same ROWS, so they must not return the same
+    /// OUTPUT.
+    #[test]
+    fn an_incomplete_fleet_read_is_named_rather_than_rendered_as_quiet() {
+        use darkmux_serve::source_state::SourceState;
+        let stale = fleet_warning(&SourceState::Stale { age_ms: 120_000, detail: "could not reach Redis" })
+            .expect("a stale fleet read must be disclosed");
+        assert!(stale.contains("2m"), "must say how old the snapshot is: {stale}");
+        assert!(stale.contains("other machines"), "must say what is affected: {stale}");
+
+        let gone = fleet_warning(&SourceState::Unavailable { detail: "could not reach Redis" })
+            .expect("an unavailable fleet read must be disclosed");
+        assert!(gone.contains("missing"), "must say the list is incomplete: {gone}");
+    }
+
+    /// The warning must never carry the underlying error text — a Redis
+    /// error can embed the connection URL, and the env tier of
+    /// `redis_url()` carries an inline password. `source_state`'s module
+    /// doc makes this rule explicit for the HTTP body; the CLI renders to
+    /// a terminal that gets pasted into issues, so it holds here too.
+    #[test]
+    fn the_fleet_warning_never_echoes_the_source_detail() {
+        use darkmux_serve::source_state::SourceState;
+        let secret = "redis://user:hunter2@hub.example:6379";
+        let line = fleet_warning(&SourceState::Unavailable { detail: secret }).unwrap();
+        assert!(!line.contains("hunter2"), "the warning leaked credential-bearing detail: {line}");
+        assert!(!line.contains("redis://"), "the warning leaked a connection URL: {line}");
+    }
+
+    /// A footer that wrapped while every row fit would be the same
+    /// overflow defect one line lower. The compact form must still carry
+    /// what was shown, the REAL total, and the escape hatch.
+    #[test]
+    fn the_footer_fits_a_narrow_pane_without_losing_disclosure() {
+        let rows: Vec<Run> =
+            (0..3u64).map(|i| mk_run(&format!("t{i}"), RunKind::Mission, RunStatus::Complete, i)).collect();
+        let sel = Selection { rows, shown_terminal: 3, total_terminal: 111 };
+
+        let narrow = footer(&sel, Some(58)).expect("rows were hidden, footer must print");
+        assert!(narrow.chars().count() <= 58, "footer rendered {} cols at width 58: {narrow}", narrow.chars().count());
+        assert!(narrow.contains('3'), "must still name what was shown: {narrow}");
+        assert!(narrow.contains("111"), "must still name the REAL total, not the cap: {narrow}");
+        assert!(narrow.contains("--all"), "must still name the escape hatch: {narrow}");
+
+        // A wide pane keeps the fuller phrasing.
+        let wide = footer(&sel, Some(120)).unwrap();
+        assert!(wide.contains("108 more not shown"), "a wide pane should keep the restatement: {wide}");
     }
 
     // ── run_activity ordering key ────────────────────────────────────
@@ -551,6 +745,163 @@ mod tests {
         assert_eq!(run_activity(&r), 7);
         r.updated_ts = Some(9);
         assert_eq!(run_activity(&r), 9);
+    }
+
+    // ── rendering: measure the RENDERED string, never the budget ─────
+
+    /// The guard [`FIXED_COLS`] earned. For every width `id_width` claims
+    /// it can honor, the rendered header AND row must actually fit. This
+    /// measures the output rather than recomputing the arithmetic, because
+    /// a test that recomputed it would have agreed with the wrong
+    /// constant (the first draft omitted the two-space indent and made the
+    /// clamp branch overflow at every width).
+    #[test]
+    fn every_clamped_row_fits_the_width_it_was_planned_for() {
+        // An id long enough to force the clamp branch at every width below.
+        let mut r = mk_run(
+            "dispatch-code-reviewer-1787054517-1526-0-and-then-some-more",
+            RunKind::Dispatch,
+            RunStatus::Complete,
+            1_000,
+        );
+        r.role = Some("code-reviewer".to_string());
+        r.model = Some("darkmux:qwen3.6-35b-a3b".to_string());
+        r.machine = Some("MacBook-Pro.local".to_string());
+        let rows = vec![r];
+
+        for w in [MIN_ROW_COLS, MIN_ROW_COLS + 1, 70, 80, 100, 120, 200] {
+            let id_w = id_width(&rows, Some(w));
+            let header = header_line(id_w);
+            let row = format_row(2_000, &rows[0], id_w, Some(w));
+            assert!(
+                header.chars().count() <= w,
+                "header rendered {} cols at width {w}: {header:?}",
+                header.chars().count()
+            );
+            assert!(
+                row.chars().count() <= w,
+                "row rendered {} cols at width {w}: {row:?}",
+                row.chars().count()
+            );
+        }
+    }
+
+    /// Every label a column can emit must FIT that column, because
+    /// `{:<w$}` is a minimum width and never truncates: one label over
+    /// budget silently widens every row carrying it. `unparseable` (11)
+    /// is why `STATUS_COLS` is not 10.
+    #[test]
+    fn every_column_label_fits_its_width() {
+        for st in [
+            RunStatus::Planned,
+            RunStatus::Running,
+            RunStatus::Complete,
+            RunStatus::Error,
+            RunStatus::Abandoned,
+            RunStatus::Unparseable,
+        ] {
+            let label = status_label(st);
+            assert!(
+                label.chars().count() <= STATUS_COLS,
+                "status label {label:?} is {} cols, STATUS_COLS is {STATUS_COLS} — every row \
+                 carrying this status renders over budget",
+                label.chars().count()
+            );
+        }
+        for k in [RunKind::Mission, RunKind::Dispatch, RunKind::Lab] {
+            let label = kind_label(k);
+            assert!(label.chars().count() <= KIND_COLS, "kind label {label:?} exceeds KIND_COLS");
+        }
+    }
+
+    /// The floor is a real, stated guarantee: at `MIN_ROW_COLS` the row
+    /// fits, and below it the row is deliberately wider than the pane
+    /// rather than eliding the id into uselessness.
+    #[test]
+    fn below_the_floor_the_id_holds_its_minimum_rather_than_vanishing() {
+        let rows = vec![mk_run(
+            "dispatch-code-reviewer-1787054517-1526-0",
+            RunKind::Dispatch,
+            RunStatus::Unparseable,
+            1,
+        )];
+        assert_eq!(id_width(&rows, Some(MIN_ROW_COLS)), MIN_ID_COLS);
+        assert_eq!(
+            id_width(&rows, Some(MIN_ROW_COLS - 20)),
+            MIN_ID_COLS,
+            "the id column must not shrink past its floor on a very narrow pane"
+        );
+    }
+
+    /// Piped output (`width == None`) is never clamped and never drops the
+    /// subtitle — complete and greppable, matching
+    /// `mission_status.rs::plan_layout`'s same rule.
+    #[test]
+    fn piped_output_keeps_the_full_id_and_subtitle() {
+        let mut r = mk_run("a-very-long-run-identifier-indeed", RunKind::Mission, RunStatus::Complete, 1);
+        r.role = Some("pr-reviewer".to_string());
+        let rows = vec![r];
+        let id_w = id_width(&rows, None);
+        let line = format_row(2, &rows[0], id_w, None);
+        assert!(line.contains("a-very-long-run-identifier-indeed"), "piped id was elided: {line}");
+        assert!(line.contains("pr-reviewer"), "piped subtitle was dropped: {line}");
+    }
+
+    /// The subtitle is dropped WHOLE rather than wrapped or half-printed
+    /// when it cannot fit the known width.
+    #[test]
+    fn an_overlong_subtitle_is_dropped_whole_not_wrapped() {
+        let mut r = mk_run("run-1", RunKind::Mission, RunStatus::Complete, 1);
+        r.role = Some("a-role-name-far-too-long-to-fit-in-this-narrow-pane".to_string());
+        let rows = vec![r];
+        let id_w = id_width(&rows, Some(60));
+        let line = format_row(2, &rows[0], id_w, Some(60));
+        assert!(!line.contains("a-role-name"), "subtitle should have been dropped whole: {line}");
+        assert!(line.chars().count() <= 60);
+        assert_eq!(line.lines().count(), 1, "a dropped subtitle must never become a second line");
+    }
+
+    /// The `darkmux:` residency namespace is bookkeeping, not operator-
+    /// facing text (see [`short_model`]).
+    #[test]
+    fn the_darkmux_namespace_is_stripped_from_the_displayed_model() {
+        let mut r = mk_run("run-1", RunKind::Dispatch, RunStatus::Complete, 1);
+        r.model = Some("darkmux:qwen3.6-35b-a3b".to_string());
+        let sub = subtitle_for(&r);
+        assert_eq!(sub, "qwen3.6-35b-a3b", "the darkmux: prefix leaked into the run listing");
+        // A model that never carried the prefix is untouched.
+        r.model = Some("gpt-4o".to_string());
+        assert_eq!(subtitle_for(&r), "gpt-4o");
+    }
+
+    #[test]
+    fn ellipsize_never_exceeds_its_budget_and_keeps_the_discriminating_tail() {
+        let id = "dispatch-code-reviewer-1787054517-1526-0";
+        for max in 1..=id.chars().count() + 2 {
+            assert!(ellipsize(id, max).chars().count() <= max.max(1), "max={max}");
+        }
+        // The tail is what discriminates darkmux's minted ids, so it must
+        // survive a middle elision.
+        let short = ellipsize(id, 20);
+        assert!(short.ends_with("1526-0"), "the discriminating tail was elided: {short}");
+        // Multibyte safety: char-indexed, never byte-indexed.
+        assert!(ellipsize("ααααααααααββββββββββ", 9).chars().count() <= 9);
+    }
+
+    #[test]
+    fn a_running_row_marks_its_duration_as_still_elapsing() {
+        let mut r = mk_run("live", RunKind::Dispatch, RunStatus::Running, 100);
+        r.completed_ts = None;
+        let cell = duration_cell(160, &r);
+        assert_eq!(cell, "1m+", "a live run's duration must read as at-least, not finished");
+    }
+
+    #[test]
+    fn an_absent_timestamp_renders_a_dash_rather_than_an_inferred_value() {
+        let mut r = mk_run("lab-run", RunKind::Lab, RunStatus::Complete, 100);
+        r.started_ts = None;
+        assert_eq!(started_cell(200, &r), "-");
+        assert_eq!(duration_cell(200, &r), "-");
     }
 
     // ── cross-language kind-vocabulary drift guard ───────────────────
