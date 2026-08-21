@@ -467,6 +467,24 @@ export function FleetLens({
             data-arg={card.uid}
             role="button"
             tabIndex={0}
+            // (#1903 QA fix) Explicit, so the card's computed accessible
+            // name is DETERMINISTIC rather than folding in whatever the
+            // nested running-count button's own `aria-label` happens to
+            // say (per ARIA's presentational-children rule, a `button`
+            // descendant's content — including its own name — isn't
+            // exposed separately; without this, the outer card's name
+            // absorbed the inner one's text, e.g. "MacBook-Pro Apple M5
+            // Max dispatch in flight open the 2 running dispatches on
+            // MacBook-Pro"). Nesting one interactive control inside
+            // another is itself an accepted, documented exception here —
+            // not an oversight — because the count needed its own tap
+            // target (#1903) without moving or restructuring the card
+            // body's own destination, which the issue is explicit must
+            // stay unchanged. `stopPropagation` on the inner control (see
+            // the running-count block below) keeps the two handlers from
+            // double-firing; this `aria-label` is the remaining a11y-tree
+            // cleanup that nesting still needs.
+            aria-label={card.name}
             onClick={() => {
               location.hash = machineDrillHash(card.uid, localUid);
             }}
