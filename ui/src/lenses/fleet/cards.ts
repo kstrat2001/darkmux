@@ -107,6 +107,14 @@ export interface FleetCard {
    * viewer.html:1713. The whole label, not just the noun, so the pluralization
    * rule lives beside the count it describes. */
   runsLabel: string;
+  /** (#1903) The session ids counted into `runsCount`, LIVE MODE ONLY —
+   * always empty in replay, where `runsCount` counts the day's whole
+   * session set rather than currently-running work (see `runsCount`'s own
+   * comment above). Lets `FleetLens.tsx` build the running-count's own tap
+   * target — the session drill directly when there's exactly one, the runs
+   * lens pinned to this machine otherwise — without re-deriving the
+   * running session set from raw flow data a second time. */
+  runningSessionIds: string[];
 }
 
 /** `machPresent()`'s boolean-or-null result, narrowed to "definitely
@@ -133,7 +141,8 @@ export function buildFleetCard(
   // (#691 Slice 2 / viewer.html:1704) Live counts only RUNNING sessions —
   // completed dispatches from earlier today must not read as current crew.
   // A replay counts the whole window: that IS the day's work.
-  const runsCount = liveMode ? all.filter((sid) => liveSet.has(sid)).length : all.length;
+  const runningSessionIds = liveMode ? all.filter((sid) => liveSet.has(sid)) : [];
+  const runsCount = liveMode ? runningSessionIds.length : all.length;
   return {
     uid: m,
     name: nameOf(data, liveMachines, m),
@@ -143,5 +152,6 @@ export function buildFleetCard(
     stat,
     runsCount,
     runsLabel: liveMode ? "running" : `specialist${runsCount === 1 ? "" : "s"}`,
+    runningSessionIds,
   };
 }
