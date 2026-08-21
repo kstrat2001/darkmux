@@ -42,6 +42,9 @@
  * recorded so a lens packet doesn't have to re-derive them from the legacy
  * source.
  */
+import type { PanelId } from "./route";
+import { variantKey } from "../lenses/console/panels";
+
 export const PRESENCE_POLL_MS = 5_000;
 export const RECONCILE_BACKSTOP_MS = 20_000;
 export const MACHINE_RESOURCES_CACHE_MS = 2_000;
@@ -73,7 +76,18 @@ export const queryKeys = {
   labRuns: () => ["lab", "runs"] as const,
   machineSpecs: () => ["machine", "specs"] as const,
   machineResources: () => ["machine", "resources"] as const,
-  panel: (id: string) => ["panel", id] as const,
+  /** `GET /panel/:id` (#1911: `?opt.<name>=<value>` variants). Keyed on the
+   * SAME canonicalization `hashSync.canonicalHash` writes with
+   * (`canonicalOptPairs`, `lenses/console/panels.ts`) — "one
+   * implementation, so the two tiers cannot disagree" (#1911's own
+   * instruction). `panelId` is typed loosely (`PanelId`) at the call site;
+   * kept as `string` here so this file doesn't need to import the console
+   * lens's own routing type for a key-shape function. Distinct variants
+   * (`opt.kind=lab` vs the default) land in DISTINCT cache entries — the
+   * whole point of #1911's per-variant cache on the server side has a
+   * client-side twin here, or two selections of the same panel would
+   * silently share one `useQuery` slot. */
+  panel: (id: PanelId, opts?: Readonly<Record<string, string>>) => ["panel", variantKey(id, opts)] as const,
   flowTail: (date: string) => ["flow", date, "tail"] as const,
   /** `GET /flow/<date>` — the full day's records (distinct from `flowTail`'s
    * SSE stream key above). Consumed by `useFlowWindow` (`hooks/

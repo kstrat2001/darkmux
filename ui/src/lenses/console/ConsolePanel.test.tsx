@@ -4,11 +4,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConsolePanel } from "./ConsolePanel";
 import type { PanelId } from "../../lib/route";
 
-function renderPanel(initialPanelId: PanelId | "" = "") {
+function renderPanel(initialPanelId: PanelId | "" = "", initialOpts?: Readonly<Record<string, string>>) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <ConsolePanel initialPanelId={initialPanelId} />
+      <ConsolePanel initialPanelId={initialPanelId} initialOpts={initialOpts} />
     </QueryClientProvider>,
   );
 }
@@ -118,9 +118,9 @@ describe("ConsolePanel", () => {
     renderPanel("");
     await waitFor(() => expect(screen.getByText(/no activity recorded yet/i)).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText("roles"));
+    fireEvent.click(screen.getByText("role list"));
     await waitFor(() => expect(screen.getByText("id description")).toBeInTheDocument());
-    expect(screen.getByText("roles").closest(".runchip")).toHaveClass("on");
+    expect(screen.getByText("role list").closest(".runchip")).toHaveClass("on");
     expect(screen.getByText("activity", { selector: ".runchip" })).not.toHaveClass("on");
   });
 
@@ -147,7 +147,7 @@ describe("ConsolePanel", () => {
     renderPanel("");
     await waitFor(() => expect(screen.getByText(/no activity recorded yet/i)).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText("roles"));
+    fireEvent.click(screen.getByText("role list"));
     await waitFor(() => expect(screen.getByText("roles here")).toBeInTheDocument());
     fireEvent.click(screen.getByText("mission status"));
     await waitFor(() => expect(screen.getByText(/mission status —/)).toBeInTheDocument());
@@ -156,7 +156,7 @@ describe("ConsolePanel", () => {
     // further tab switch should reuse rather than add to.
     const callsAfterBothVisited = fetchMock.mock.calls.length;
 
-    fireEvent.click(screen.getByText("roles"));
+    fireEvent.click(screen.getByText("role list"));
     await waitFor(() => expect(screen.getByText("roles here")).toBeInTheDocument());
 
     expect(fetchMock.mock.calls.length).toBe(callsAfterBothVisited);
@@ -358,5 +358,140 @@ describe("ConsolePanel", () => {
     // the new command line.
     expect(screen.queryByText("mission status — 0 missions")).not.toBeInTheDocument();
     expect(document.body.textContent).not.toContain("mission status — 0 missions");
+  });
+});
+
+// (#1911) The generic opts bar — driven entirely by `panels.ts`'s
+// `PANEL_OPTS` table, never a switch on panel id.
+describe("ConsolePanel — opts bar (#1911)", () => {
+  const RUN_LIST_BODY = {
+    panel: "run-list",
+    argv: ["run", "list"],
+    opts: { kind: "all", all: "recent" },
+    captured_ts_ms: Date.UTC(2026, 0, 1, 12, 0, 0),
+    gather_ms: 4,
+    exit_code: 0,
+    ansi_text: "KIND STATUS ...",
+    stderr_tail: "",
+    cols: 100,
+    cache_ttl_ms: 3000,
+    age_ms: 0,
+    auto_refresh: true,
+  };
+
+  function runListFetchMock() {
+    return vi.fn((url: string) => {
+      if (url.startsWith("/runs")) return Promise.resolve(runsJson());
+      if (url.startsWith("/panel/run-list")) {
+        const u = new URL(url, "http://x");
+        const kind = u.searchParams.get("opt.kind") ?? "all";
+        return Promise.resolve(jsonResponse({ ...RUN_LIST_BODY, opts: { kind, all: u.searchParams.get("opt.all") ?? "recent" }, ansi_text: `kind=${kind}` }));
+      }
+      return Promise.resolve(jsonResponse(MISSION_STATUS_BODY));
+    });
+  }
+
+  it("a panel with no declared opts (role-list) renders no opts bar at all", async () => {
+    const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : jsonResponse({ ...MISSION_STATUS_BODY, panel: "role-list", argv: ["role", "list"] })));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("role-list");
+    await waitFor(() => expect(screen.getByText("$ darkmux role list")).toBeInTheDocument());
+    expect(document.querySelector(".optsbar")).toBeNull();
+  });
+
+  it("mission-status declares only the --all toggle: one switch chip, no radiogroup", async () => {
+    const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : jsonResponse(MISSION_STATUS_BODY)));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText(/mission status —/)).toBeInTheDocument());
+    const bar = document.querySelector(".optsbar")!;
+    expect(bar).not.toBeNull();
+    const sw = screen.getByRole("switch", { name: "--all" });
+    expect(sw).toHaveAttribute("aria-checked", "false");
+    expect(document.querySelectorAll('[role="radiogroup"]').length).toBe(0);
+  });
+
+  it("run-list declares --kind (a radiogroup) AND --all (a switch)", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    const kindGroup = screen.getByRole("radiogroup", { name: "--kind" });
+    expect(kindGroup).toBeInTheDocument();
+    const radios = screen.getAllByRole("radio");
+    expect(radios.map((r) => r.textContent)).toEqual(["all", "mission", "dispatch", "lab"]);
+    expect(screen.getByRole("radio", { name: "all" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("switch", { name: "--all" })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("clicking a --kind chip on run-list (AUTO panel) triggers a new fetch with the opt applied", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("radio", { name: "lab" }));
+    await waitFor(() => expect(screen.getByText(/kind=lab/)).toBeInTheDocument());
+    expect(screen.getByRole("radio", { name: "lab" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("radio", { name: "all" })).toHaveAttribute("aria-checked", "false");
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/panel/run-list") && String(u).includes("opt.kind=lab"))).toBe(true);
+  });
+
+  it("the pending-command preview composes from the opts table, not id.replace guesswork — reflects the current selection before any fetch has landed", async () => {
+    const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : new Promise(() => {})));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText("$ darkmux run list")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("radio", { name: "dispatch" }));
+    await waitFor(() => expect(screen.getByText("$ darkmux run list --kind dispatch")).toBeInTheDocument());
+  });
+
+  it("clicking the --all switch toggles it on, contributing --all to the composed command", async () => {
+    const fetchMock = vi.fn((url: string) => Promise.resolve(url.startsWith("/runs") ? runsJson() : new Promise(() => {})));
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText("$ darkmux run list")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("switch", { name: "--all" }));
+    await waitFor(() => expect(screen.getByText("$ darkmux run list --all")).toBeInTheDocument());
+    expect(screen.getByRole("switch", { name: "--all" })).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("(#1911 selection state) flipping run-list -> mission-status -> run-list preserves the --kind selection (per-pill memory, no localStorage)", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("radio", { name: "lab" }));
+    await waitFor(() => expect(screen.getByText(/kind=lab/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("mission status"));
+    await waitFor(() => expect(screen.getByText(/mission status —/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("run list"));
+    await waitFor(() => expect(screen.getByText(/kind=lab/)).toBeInTheDocument());
+    expect(screen.getByRole("radio", { name: "lab" })).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.length).toBe(0);
+  });
+
+  it("keyboard activation (Enter) on a chip selects it, same pattern as the pill tabs", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.keyDown(screen.getByRole("radio", { name: "dispatch" }), { key: "Enter" });
+    await waitFor(() => expect(screen.getByText(/kind=dispatch/)).toBeInTheDocument());
+  });
+
+  it("a deep link carrying opts (#1911) renders the chosen chip active and fetches with it applied", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("run-list", { kind: "dispatch" });
+    await waitFor(() => expect(screen.getByText(/kind=dispatch/)).toBeInTheDocument());
+    expect(screen.getByRole("radio", { name: "dispatch" })).toHaveAttribute("aria-checked", "true");
   });
 });

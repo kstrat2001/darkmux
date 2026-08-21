@@ -21,12 +21,12 @@ console
 activity
 all activity
 mission status
-all missions
-machine
-flow
-roles
-config
-fixtures
+machine status
+flow status
+role list
+config list
+lab fixture list
+run list
 doctor
 $ darkmux doctor
 run

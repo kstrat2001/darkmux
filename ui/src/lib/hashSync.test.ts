@@ -89,7 +89,7 @@ describe("canonicalHash / parseRoute round-trip", () => {
   });
 
   it("console with the default panel round-trips WITHOUT a panel param", () => {
-    const route: Route = { kind: "console", panelId: "" };
+    const route: Route = { kind: "console", panelId: "", opts: {} };
     expect(canonicalHash(route)).toBe("lens=console");
     expect(roundTrip(route)).toEqual(route);
   });
@@ -109,15 +109,47 @@ describe("canonicalHash / parseRoute round-trip", () => {
   // round-trips like any other explicit panel — there is no more "both mean
   // default" collapse for ANY panel id.
   it("console with mission-status explicitly named round-trips to ITSELF, not the default (#1904 — the two are no longer the same view)", () => {
-    const route: Route = { kind: "console", panelId: "mission-status" };
+    const route: Route = { kind: "console", panelId: "mission-status", opts: {} };
     expect(canonicalHash(route)).toBe("lens=console&panel=mission-status");
     expect(roundTrip(route)).toEqual(route);
   });
 
   it("console with a non-default panel round-trips", () => {
-    const route: Route = { kind: "console", panelId: "role-list" };
+    const route: Route = { kind: "console", panelId: "role-list", opts: {} };
     expect(canonicalHash(route)).toBe("lens=console&panel=role-list");
     expect(roundTrip(route)).toEqual(route);
+  });
+
+  // ── #1911: opts round-trip ─────────────────────────────────────────
+
+  it("console with a non-default opt round-trips with opt.<name>=<value>", () => {
+    const route: Route = { kind: "console", panelId: "run-list", opts: { kind: "lab" } };
+    expect(canonicalHash(route)).toBe("lens=console&panel=run-list&opt.kind=lab");
+    expect(roundTrip(route)).toEqual(route);
+  });
+
+  it("console with the DEFAULT opt value explicitly picked round-trips WITHOUT the opt param — one canonical hash for one variant", () => {
+    const route: Route = { kind: "console", panelId: "run-list", opts: { kind: "all" } };
+    expect(canonicalHash(route)).toBe("lens=console&panel=run-list");
+  });
+
+  it("multiple non-default opts round-trip sorted by name", () => {
+    const route: Route = { kind: "console", panelId: "run-list", opts: { all: "all", kind: "lab" } };
+    expect(canonicalHash(route)).toBe("lens=console&panel=run-list&opt.all=all&opt.kind=lab");
+    expect(roundTrip(route)).toEqual(route);
+  });
+
+  // ── #1911: the mission-status-all alias upgrade ─────────────────────
+  // Same shape as the pre-existing `#lens=lab` → `#lens=runs&kind=lab`
+  // upgrade above: arriving on the alias already parses to the CANONICAL
+  // route, so writing it back just names it in the address bar.
+
+  it("a panel=mission-status-all deep link upgrades the address bar to panel=mission-status&opt.all=all", () => {
+    window.location.hash = "#lens=console&panel=mission-status-all";
+    const route = parseRoute();
+    expect(route).toEqual({ kind: "console", panelId: "mission-status", opts: { all: "all" } });
+    writeHash(canonicalHash(route));
+    expect(window.location.hash).toBe("#lens=console&panel=mission-status&opt.all=all");
   });
 
   it("session round-trips", () => {

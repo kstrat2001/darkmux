@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import type { Route } from "./route";
+import { canonicalOptPairs } from "../lenses/console/panels";
 
 /**
  * Hash write-back — the `/next` port of legacy's `syncLabHash()`
@@ -118,6 +119,21 @@ export function canonicalHash(route: Route): string | null {
       // that exact address landed on the activity view instead. Only the
       // genuinely-empty case omits the param now.
       if (route.panelId) p.set("panel", route.panelId);
+      // (#1911) Non-default `opt.<name>` selections, sorted by name — the
+      // SAME `canonicalOptPairs` function `queryKeys.panel` keys its cache
+      // on, so the two tiers cannot disagree about what "the current
+      // variant" means. This is also the alias-upgrade path: a
+      // `panel=mission-status-all` deep link already parsed to
+      // `{panelId:"mission-status", opts:{all:"all"}}` (see
+      // `route.ts::PANEL_ALIASES`), so writing it back here rewrites the
+      // address bar to `panel=mission-status&opt.all=all` — the same
+      // `#lens=lab` → `#lens=runs&kind=lab` upgrade this function already
+      // performs for the runs lens.
+      if (route.panelId) {
+        for (const [name, value] of canonicalOptPairs(route.panelId, route.opts)) {
+          p.set(`opt.${name}`, value);
+        }
+      }
       return p.toString();
     }
     case "session": {

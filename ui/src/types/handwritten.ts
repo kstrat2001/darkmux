@@ -241,6 +241,12 @@ export interface LabRunsResponse {
 export interface PanelResponse {
   panel: string;
   argv: string[];
+  /** #1911 — every declared opt's RESOLVED value, including defaults
+   * (`{"kind":"mission","all":"recent"}`), so the artifact stays
+   * self-describing even when nothing was picked explicitly. Empty object
+   * for a panel with no declared opts. Optional here only for fixtures
+   * predating #1911; a real daemon always sends it. */
+  opts?: Record<string, string>;
   captured_ts_ms: number;
   gather_ms: number;
   exit_code: number | null;

@@ -17,6 +17,21 @@ describe("fetchPanel", () => {
     expect(init?.headers).toMatchObject({ "X-Darkmux-Panel": "1" });
   });
 
+  // (#1911) opt.* params
+  it("appends opt.<name>=<value> for every provided selection, sorted by name", async () => {
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) => Promise.resolve(new Response("{}", { status: 200 })));
+    vi.stubGlobal("fetch", fetchMock);
+    await fetchPanel("run-list", 100, { all: "all", kind: "lab" });
+    expect(fetchMock.mock.calls[0][0]).toBe("/panel/run-list?cols=100&opt.all=all&opt.kind=lab");
+  });
+
+  it("sends no opt.* params when none are given (matches the pre-#1911 URL shape exactly)", async () => {
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) => Promise.resolve(new Response("{}", { status: 200 })));
+    vi.stubGlobal("fetch", fetchMock);
+    await fetchPanel("doctor", 100);
+    expect(fetchMock.mock.calls[0][0]).toBe("/panel/doctor?cols=100");
+  });
+
   it("URL-encodes the panel id", async () => {
     const fetchMock = vi.fn((_url: string, _init?: RequestInit) => Promise.resolve(new Response("{}", { status: 200 })));
     vi.stubGlobal("fetch", fetchMock);

@@ -183,22 +183,27 @@ test('the console renders attacker-controlled panel bytes inertly', async ({ pag
   expect(pageErrors, `uncaught: ${pageErrors.join(' | ')}`).toEqual([]);
 });
 
-test('a panel deep link switches in page instead of navigating', async ({ page }) => {
+test('a panel deep link resolves through the real anchor (#1911: the JS in-page switch no longer intercepts a retired alias id)', async ({ page }) => {
   // The verb emits this when it knows it is rendering into a panel (see
   // `panel_deep_link`): "`--all` for every mission" is actionable advice in a
   // terminal and a dead end here, so the flag names itself as a link instead.
+  // The LINK TARGET is unchanged server-side (`panel_deep_link` in
+  // `src/mission_status.rs` still bakes `panel=mission-status-all` — that is
+  // the CLI's own one-release compat posture, #1911).
   const WITH_LINK =
     '\x1b[2m  … 81 more (3 of 84 shown)\x1b[0m\n' +
     '  \x1b]8;;http://127.0.0.1:8765/#lens=console&panel=mission-status-all\x1b\\' +
     '→ show every mission\x1b]8;;\x1b\\\n';
   const asked = [];
   await routePanels(page, (route) => {
-    const id = new URL(route.request().url()).pathname.split('/').pop();
-    asked.push(id);
+    const url = new URL(route.request().url());
+    const id = url.pathname.split('/').pop();
+    const all = url.searchParams.get('opt.all') === 'all';
+    asked.push(all ? `${id}?opt.all=all` : id);
     route.fulfill({
       contentType: 'application/json',
       body: JSON.stringify(
-        id === 'mission-status-all'
+        all
           ? panelBody('\x1b[2m  the whole board\x1b[0m\n', { panel: id, argv: ['mission', 'status', '--all'] })
           : panelBody(WITH_LINK)
       ),
@@ -213,10 +218,30 @@ test('a panel deep link switches in page instead of navigating', async ({ page }
   await page.click('.panelout a:has-text("show every mission")');
   await expect(page.locator('.panelout')).toContainText('the whole board');
 
-  // Switched IN PAGE: the target panel was fetched, and following the href
-  // would have reloaded the viewer to land one tab from where it already was.
-  expect(asked).toContain('mission-status-all');
-  expect(page.url().split('#')[0]).toBe(before.split('#')[0]);
+  // (#1911) `mission-status-all` is no longer a base panel id (see
+  // `PANEL_IDS` in `ui/src/lib/route.ts`) — `panelSwitchId` (`ansi.tsx`)
+  // recognizes a link's raw `panel=` value against that closed set BEFORE
+  // any alias resolution, so this link no longer matches and the JS
+  // in-page-switch shortcut does not fire. The browser instead follows the
+  // anchor's own hash-only `href` natively — a real navigation, which then
+  // reaches `parseRoute`'s alias table (`PANEL_ALIASES`) and resolves to
+  // `mission-status` + `opt.all=all`; the fetch below proves it landed.
+  expect(asked).toContain('mission-status?opt.all=all');
+
+  // Same known harness gap `next-parity-console.spec.ts`'s "the REAL
+  // in-corpus OSC-8 deep link" test already documents for the SAME
+  // recorded link (verbatim comment there): `panel_deep_link` bakes an
+  // ABSOLUTE daemon URL whose pathname is "/" (the console is served at
+  // root in real production, `GET /`). In production the operator is
+  // ALREADY on that same root path, so following the href is a genuine
+  // same-document hash-only change. THIS harness serves the fixture at
+  // `/index-lab.html`, a path the recorded link was never baked against —
+  // a harness artifact, not a production behavior, and the reason this
+  // assertion checks the PATHNAME actually reached (root, matching the
+  // link) rather than asserting it stayed put. Before #1911 this never
+  // surfaced because the JS switch intercepted the click before the real
+  // href was ever followed at all.
+  expect(new URL(page.url()).pathname).toBe('/');
 });
 
 test('a manual panel stays unrun across leaving and re-entering the tab', async ({ page }) => {
@@ -268,12 +293,18 @@ test('a console deep link boots straight into that panel and stays addressable',
 
   await page.goto('/index-lab.html#lens=console&panel=mission-status-all');
   await expect(page.locator('.panelout')).toContainText('the whole board');
-  await expect(page.locator('[data-act="setpanel"][data-arg="mission-status-all"]')).toHaveClass(/\bon\b/);
+  await expect(page.locator('[data-act="setpanel"][data-arg="mission-status"]')).toHaveClass(/\bon\b/);
+  await expect(page.getByRole('switch', { name: '--all' })).toHaveAttribute('aria-checked', 'true');
 
-  // And the address bar still describes what is on screen, so what the
-  // operator copies out of it comes back to the same place.
-  expect(page.url()).toContain('lens=console');
-  expect(page.url()).toContain('panel=mission-status-all');
+  // (#1911) `mission-status-all` folded into `mission-status`'s own `--all`
+  // opt — `parseRoute` resolves the alias synchronously at first parse (see
+  // `route.ts::PANEL_ALIASES`), so the panel renders correctly straight
+  // off this boot with no extra round trip. The address bar then upgrades
+  // to the canonical `opt.*` form — the SAME `#lens=lab` ->
+  // `#lens=runs&kind=lab` upgrade path this app already used, applied here.
+  await expect.poll(() => page.url()).toContain('panel=mission-status&');
+  expect(page.url()).toContain('opt.all=all');
+  expect(page.url()).not.toContain('mission-status-all');
 });
 
 test('the console shows no crumb — the picker and the chrome line already say which panel', async ({ page }) => {

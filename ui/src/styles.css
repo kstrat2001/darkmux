@@ -1203,6 +1203,69 @@ body {
    `--good`/`--warn`/`--bad`/`--run`/`--accent-dim` tokens verbatim — `
    innerText()` (what parity actually checks) never reads color, so this is a
    deliberate simplification, not a parity risk. */
+/* (#1911) The generic opts bar — `ConsolePanel.tsx`'s `OptsBar`, rendered
+   between `.runsbar` (the pill row) and `.panelwrap` (the CLI panel's own
+   chrome+body) exactly like the visual mockup in #1911 shows: a second row
+   of controls right under the pills. Absent entirely for 6 of 8 panels
+   (`OptsBar` returns `null` when `panelOptGroups(id)` is empty), so there
+   is no CSS-only "empty bar" to hide — the component itself adds zero
+   pixels. `.optchip`/`.optlabel` reuse `.runchip`'s type scale
+   (11px JetBrains Mono, uppercase-free) so the opts bar reads as a sibling
+   of the pill row, not a different UI language one row down. 40px minimum
+   touch target on every chip (#1911's own accessibility requirement) —
+   `min-height`/`min-width` plus centered flex content rather than relying
+   on padding alone, since the shortest legal chip text ("all") would
+   otherwise fall well under 40px tall at this font size. */
+.optsbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 4px;
+  overflow-x: auto;
+}
+.optgroup {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.optlabel {
+  font: 600 11px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+  padding: 0 2px;
+}
+.optchip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  min-width: 40px;
+  box-sizing: border-box;
+  font: 600 11px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.02em;
+  padding: 6px 10px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: #131826;
+  color: var(--dim);
+  cursor: pointer;
+}
+.optchip:hover {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.optchip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.optchip.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: #1c1c22;
+}
+
 .panelwrap {
   border: 1px solid var(--border);
   border-radius: 8px;

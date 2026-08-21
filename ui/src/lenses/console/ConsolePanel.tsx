@@ -2,7 +2,7 @@ import { useEffect, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { queryKeys, PANEL_CACHE_MS } from "../../lib/queryKeys";
 import type { PanelId } from "../../lib/route";
-import { PANELS, isManualPanel, panelCols } from "./panels";
+import { PANELS, isManualPanel, panelCols, panelOptGroups, composeArgv, canonicalOptPairs, type PanelOpt } from "./panels";
 import { fetchPanel } from "./fetchPanel";
 import { panelAgeLabel } from "./format";
 import { AnsiText } from "./ansi";
@@ -46,10 +46,14 @@ type ConsoleSelection = PanelId | "" | typeof ACTIVITY_ALL_ID;
  * Fetch/cache mapping onto TanStack Query (the ONE genuinely non-literal
  * translation `CliPanelView` makes, since legacy hand-rolls its own
  * `PANEL_STATE` cache + `loadPanel`):
- * - One `useQuery` keyed by `queryKeys.panel(id)` — switching tabs reuses
- *   Query's own cache exactly the way `PANEL_STATE[id]` reuse worked
- *   (revisiting an already-loaded panel shows the cached body immediately,
- *   no re-fetch), with no hand-rolled state object needed.
+ * - One `useQuery` keyed by `queryKeys.panel(id, opts)` (#1911: `opts` is
+ *   the panel's own current selection, canonicalized into the key the same
+ *   way `hashSync.canonicalHash` canonicalizes it into the address bar —
+ *   `lenses/console/panels.ts::variantKey` is the ONE function both call) —
+ *   switching tabs OR flipping an opts-bar chip reuses Query's own cache
+ *   exactly the way `PANEL_STATE[id]` reuse worked (revisiting an
+ *   already-loaded panel/variant shows the cached body immediately, no
+ *   re-fetch), with no hand-rolled state object needed.
  * - `doctor` (`isManualPanel`) is `enabled: false` PERMANENTLY — selecting
  *   the tab NEVER fetches (matches `MANUAL_PANELS`'s guard on every
  *   auto-fetch call site: `goConsole`/`setPanel`/the visibilitychange
@@ -70,7 +74,18 @@ type ConsoleSelection = PanelId | "" | typeof ACTIVITY_ALL_ID;
  *   CHROME branch below checks the data independently, exactly like
  *   legacy's `st.body`-gated chrome staying visible-but-stale mid-reload).
  */
-export function ConsolePanel({ initialPanelId }: { initialPanelId: PanelId | "" }) {
+export function ConsolePanel({
+  initialPanelId,
+  initialOpts,
+}: {
+  initialPanelId: PanelId | "";
+  /** (#1911) The panel's own opt selections carried in on a deep link
+   * (`route.opts` — `lib/route.ts`), already sanitized against that
+   * panel's own table by `parseRoute`. Seeds this component's per-pill
+   * selection memory (below) so a shared link reproduces panel AND
+   * variant, not just the panel. */
+  initialOpts?: Readonly<Record<string, string>>;
+}) {
   // (#1904) `""` (no `panel=` in the URL, or an unrecognized one — both
   // already collapse to `""` in `parseRoute`) now means "land on the
   // activity view", not "fall back to `DEFAULT_PANEL_ID`" — there is no
@@ -79,13 +94,47 @@ export function ConsolePanel({ initialPanelId }: { initialPanelId: PanelId | "" 
   // explicitly picked that tab.
   const [panelId, setPanelId] = useState<ConsoleSelection>(initialPanelId);
 
+  // (#1911) Per-pill opt selection memory — a `Map` beside `panelId`,
+  // deliberately NOT `localStorage` (see the module doc below for why: a
+  // filter silently restored from last week is a wrong reading that looks
+  // like a quiet system). Session-only: flipping run-list -> flow -> run-list
+  // mid-investigation does not discard a `--kind lab` pick; a fresh mount
+  // (reload) lands on defaults unless the hash itself says otherwise.
+  const [selections, setSelections] = useState<Map<PanelId, Record<string, string>>>(() => {
+    const m = new Map<PanelId, Record<string, string>>();
+    if (initialPanelId && initialOpts && Object.keys(initialOpts).length > 0) {
+      m.set(initialPanelId, { ...initialOpts });
+    }
+    return m;
+  });
+
   // A fresh deep-link into a DIFFERENT panel while this component is already
   // mounted re-syncs local selection — mirrors `boot()`'s `if(nq)
   // state.panelId=nq` applying on every fresh console entry.
   useEffect(() => {
-    if (initialPanelId) setPanelId(initialPanelId);
+    if (!initialPanelId) return;
+    setPanelId(initialPanelId);
+    if (initialOpts && Object.keys(initialOpts).length > 0) {
+      setSelections((prev) => {
+        const next = new Map(prev);
+        next.set(initialPanelId, { ...(next.get(initialPanelId) ?? {}), ...initialOpts });
+        return next;
+      });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialPanelId]);
+  }, [initialPanelId, initialOpts]);
+
+  const isRealPanel = panelId !== "" && panelId !== ACTIVITY_ALL_ID;
+  const activeSelection: Readonly<Record<string, string>> = isRealPanel ? (selections.get(panelId as PanelId) ?? {}) : {};
+  const setOpt = (name: string, value: string) => {
+    if (!isRealPanel) return;
+    const id = panelId as PanelId;
+    setSelections((prev) => {
+      const next = new Map(prev);
+      next.set(id, { ...(next.get(id) ?? {}), [name]: value });
+      return next;
+    });
+  };
 
   let body;
   if (panelId === "") {
@@ -93,7 +142,7 @@ export function ConsolePanel({ initialPanelId }: { initialPanelId: PanelId | "" 
   } else if (panelId === ACTIVITY_ALL_ID) {
     body = <ActivityPanel capped={false} />;
   } else {
-    body = <CliPanelView id={panelId} onPanelSwitch={setPanelId} />;
+    body = <CliPanelView id={panelId} opts={activeSelection} onPanelSwitch={setPanelId} />;
   }
 
   return (
@@ -105,8 +154,107 @@ export function ConsolePanel({ initialPanelId }: { initialPanelId: PanelId | "" 
           <PanelTab key={p.id} id={p.id} label={p.label} active={p.id === panelId} onSelect={setPanelId} />
         ))}
       </div>
+      {isRealPanel && <OptsBar id={panelId as PanelId} selection={activeSelection} onChange={setOpt} />}
       {body}
     </>
+  );
+}
+
+/** (#1911) The generic opts bar — driven ENTIRELY by `panels.ts`'s
+ * `PANEL_OPTS`/`panelOptGroups(id)` data, never a switch on panel id
+ * (the operator's own stated requirement: "dynamically rendered ... not
+ * hard coded on a switch case"). Renders nothing when the active panel
+ * declares no options — 6 of 8 verbs today — zero added pixels there.
+ * Each declared [[PanelOpt]] becomes one group: a dim monospace label
+ * naming the LITERAL flag (`--kind`), then one chip per legal value. A
+ * two-value option whose non-default value is a single flag (`--all`)
+ * collapses to ONE `role="switch"` chip showing the flag itself, rather
+ * than a two-chip radiogroup — see `isBooleanFlagToggle`'s own doc. */
+function OptsBar({
+  id,
+  selection,
+  onChange,
+}: {
+  id: PanelId;
+  selection: Readonly<Record<string, string>>;
+  onChange: (name: string, value: string) => void;
+}) {
+  const groups = panelOptGroups(id);
+  if (groups.length === 0) return null;
+  return (
+    <div className="optsbar">
+      {groups.map((opt) => (
+        <OptGroup key={opt.name} opt={opt} selected={selection[opt.name] ?? opt.values[0].value} onChange={(value) => onChange(opt.name, value)} />
+      ))}
+    </div>
+  );
+}
+
+/** A two-value option whose non-default argv is a single flag (`ALL_OPT`'s
+ * own shape: `[{argv:[]},{argv:["--all"]}]`) — the exact case #1911's own
+ * spec names for the single-toggle-chip collapse. A hypothetical future
+ * two-value opt whose non-default argv is NOT flag-shaped (can't happen
+ * under `panel.rs`'s own `every_opt_value_argv_is_flag_shaped` guard, but
+ * checked here anyway rather than assumed) falls through to the ordinary
+ * radiogroup rendering instead. */
+function isBooleanFlagToggle(opt: PanelOpt): boolean {
+  return opt.values.length === 2 && opt.values[0].argv.length === 0 && opt.values[1].argv.length === 1;
+}
+
+function OptGroup({ opt, selected, onChange }: { opt: PanelOpt; selected: string; onChange: (value: string) => void }) {
+  const flag = `--${opt.name}`;
+  if (isBooleanFlagToggle(opt)) {
+    const on = selected === opt.values[1].value;
+    return (
+      <div className="optgroup">
+        <OptChip role="switch" label={flag} checked={on} onSelect={() => onChange(on ? opt.values[0].value : opt.values[1].value)} />
+      </div>
+    );
+  }
+  return (
+    <div className="optgroup" role="radiogroup" aria-label={flag}>
+      <span className="optlabel">{flag}</span>
+      {opt.values.map((v) => (
+        <OptChip key={v.value} role="radio" label={v.value} checked={v.value === selected} onSelect={() => onChange(v.value)} />
+      ))}
+    </div>
+  );
+}
+
+/** One tappable option chip — the SAME role/tabIndex/Enter-Space keydown
+ * pattern `PanelTab` already uses, so an operator who has learned the pill
+ * row's keyboard behavior gets it here for free. `aria-checked` (not a
+ * plain `aria-pressed`) is what makes `role="radio"`/`role="switch"`
+ * legible to assistive tech — a `<span>` carries no native semantics of
+ * its own, so the ARIA attributes ARE the accessibility tree entry, not a
+ * decoration on top of one. */
+function OptChip({
+  role,
+  label,
+  checked,
+  onSelect,
+}: {
+  role: "radio" | "switch";
+  label: string;
+  checked: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <span
+      className={`optchip${checked ? " on" : ""}`}
+      role={role}
+      aria-checked={checked}
+      tabIndex={0}
+      onClick={onSelect}
+      onKeyDown={(e: KeyboardEvent<HTMLSpanElement>) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect();
+        }
+      }}
+    >
+      {label}
+    </span>
   );
 }
 
@@ -118,11 +266,25 @@ export function ConsolePanel({ initialPanelId }: { initialPanelId: PanelId | "" 
  * than an `enabled` flag guarding a query with no valid `PanelId` to key
  * on) — behavior for every real `PanelId` is byte-for-byte unchanged from
  * before this packet. */
-function CliPanelView({ id, onPanelSwitch }: { id: PanelId; onPanelSwitch: (id: PanelId) => void }) {
+function CliPanelView({
+  id,
+  opts,
+  onPanelSwitch,
+}: {
+  id: PanelId;
+  /** (#1911) The panel's current opt selections — the RAW per-pill map
+   * from `ConsolePanel`'s own state, which may include an explicitly
+   * re-picked default. `queryKeys.panel`/`fetchPanel` both canonicalize
+   * (drop defaults, sort) before this reaches a cache key or the wire, so
+   * "picked the default" and "never touched it" land in the SAME query. */
+  opts: Readonly<Record<string, string>>;
+  onPanelSwitch: (id: PanelId) => void;
+}) {
   const manual = isManualPanel(id);
+  const wireOpts = Object.fromEntries(canonicalOptPairs(id, opts));
   const query = useQuery({
-    queryKey: queryKeys.panel(id),
-    queryFn: () => fetchPanel(id, panelCols(document.querySelector(".panelout"))),
+    queryKey: queryKeys.panel(id, opts),
+    queryFn: () => fetchPanel(id, panelCols(document.querySelector(".panelout")), wireOpts),
     enabled: !manual,
     staleTime: PANEL_CACHE_MS,
     refetchOnWindowFocus: !manual,
@@ -137,7 +299,7 @@ function CliPanelView({ id, onPanelSwitch }: { id: PanelId; onPanelSwitch: (id: 
         {loadedBody ? (
           <LoadedChrome body={loadedBody} fetchedAt={query.dataUpdatedAt} onRerun={() => query.refetch()} />
         ) : (
-          <NotLoadedChrome id={id} loading={query.isFetching} onRun={() => query.refetch()} />
+          <NotLoadedChrome id={id} opts={opts} loading={query.isFetching} onRun={() => query.refetch()} />
         )}
       </div>
       <PanelBody
@@ -204,11 +366,26 @@ function LoadedChrome({
 }
 
 /** viewer.html: `renderConsole()`'s `else` chrome branch (no body yet —
- * manual-never-run, or an auto panel whose fetch failed). */
-function NotLoadedChrome({ id, loading, onRun }: { id: PanelId; loading: boolean; onRun: () => void }) {
+ * manual-never-run, or an auto panel whose fetch failed). (#1911) The
+ * pending-command preview now composes from `panels.ts`'s own opts table
+ * (`composeArgv`) rather than the old `id.replace(/-/g," ")` guess, so it
+ * reflects whatever opts bar chip is currently selected — the receipt line
+ * (`LoadedChrome`, unchanged) always echoes the SERVER's resolved argv once
+ * one lands; this is only the request preview shown before that. */
+function NotLoadedChrome({
+  id,
+  opts,
+  loading,
+  onRun,
+}: {
+  id: PanelId;
+  opts: Readonly<Record<string, string>>;
+  loading: boolean;
+  onRun: () => void;
+}) {
   return (
     <>
-      <span className="pc-cmd">$ darkmux {id.replace(/-/g, " ")}</span>
+      <span className="pc-cmd">$ darkmux {composeArgv(id, opts).join(" ")}</span>
       <span className="pc-spacer"></span>
       <button className="pcbtn" data-act="refreshpanel" disabled={loading} onClick={onRun}>
         run

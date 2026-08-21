@@ -15,9 +15,20 @@ import type { PanelResponse } from "../../types/handwritten";
 
 export type PanelFetchOutcome = { ok: true; data: PanelResponse } | { ok: false; message: string };
 
-export async function fetchPanel(id: string, cols: number): Promise<PanelFetchOutcome> {
+/**
+ * `opts` (#1911) — the panel's own resolved, NON-DEFAULT `(name, value)`
+ * selections (`lenses/console/panels.ts::canonicalOptPairs` is the one
+ * caller-side canonicalizer; this function just serializes whatever it's
+ * handed), appended as `opt.<name>=<value>` query params. The server
+ * validates every pair against its own declared table and 400s on an
+ * unknown name/value — this function does no validation of its own, same
+ * posture as the existing `cols` param.
+ */
+export async function fetchPanel(id: string, cols: number, opts: Readonly<Record<string, string>> = {}): Promise<PanelFetchOutcome> {
   try {
-    const res = await fetch(`/panel/${encodeURIComponent(id)}?cols=${cols}`, {
+    const params = new URLSearchParams({ cols: String(cols) });
+    for (const name of Object.keys(opts).sort()) params.set(`opt.${name}`, opts[name]);
+    const res = await fetch(`/panel/${encodeURIComponent(id)}?${params.toString()}`, {
       headers: { accept: "application/json", "X-Darkmux-Panel": "1" },
     });
     if (!res.ok) {

@@ -462,7 +462,11 @@ function renderRoute(route: Route, onPlaybackPlayheadChange: (t: number | null) 
     case "machine":
       return <MachineLens uid={route.uid} />;
     case "console":
-      return <ConsolePanel initialPanelId={route.panelId} />;
+      // (#1911) `route.opts` — already sanitized against the panel's own
+      // table by `parseRoute` (or forced by `PANEL_ALIASES`) — seeds the
+      // console's per-pill selection memory so a shared link reproduces
+      // panel AND variant.
+      return <ConsolePanel initialPanelId={route.panelId} initialOpts={route.opts} />;
     case "session":
       // Packet 4: a real fetch to /flow-session/<id> — see SessionReplay's
       // own doc for why the RENDER (not the fetch) is still a not-ported
