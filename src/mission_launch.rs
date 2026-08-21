@@ -3073,6 +3073,70 @@ mod tests {
         );
     }
 
+    /// (#1877, final wiring step) A generic Tier-1 mission launched the
+    /// ordinary way (through `launch()` itself, not a hand-rolled
+    /// scheduler call) also reaches the flow stream with a "step timing"
+    /// record, and it carries this run's real `mission_id` the same way
+    /// every other scheduler-authored record does (`get_or_insert`, see
+    /// `launch`'s own `emit` closure). This is the sibling of the
+    /// coder-phase acceptance test above, proving the wiring is generic
+    /// (every mission through `run_step_graph`), not coder-phase-specific.
+    ///
+    /// **Proved failing first**: same mechanism as the coder-phase test.
+    /// With `apply_step_terminal`'s `emit(step_timing_record(...))` call
+    /// removed, `timing` here is empty and the length assertion fails.
+    /// Observed directly while writing this test.
+    #[test]
+    #[serial_test::serial]
+    fn a_generic_tier1_mission_also_gets_step_timing_records_through_launch() {
+        const ONE_STEP_CONFIG: &str = r#"{
+            "id": "step-timing-test-mission",
+            "name": "Step Timing Test Mission",
+            "schema_version": "1.1",
+            "phases": [
+                {
+                    "id": "p1",
+                    "tasks": [
+                        { "id": "t1", "steps": [{ "id": "s1", "kind": "procedural.shell", "config": {"command": "true"} }] }
+                    ]
+                }
+            ]
+        }"#;
+        let guard = LaunchTestGuard::new();
+        guard.write_config("step-timing-test-mission", ONE_STEP_CONFIG);
+
+        let exit = launch("step-timing-test-mission", None, &[], None).expect("launch should succeed");
+        assert_eq!(exit, 0);
+        let mission_id = single_mission_id();
+
+        let records = read_all_flow_records();
+        let timing: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("step timing"))
+            .collect();
+        assert_eq!(
+            timing.len(),
+            1,
+            "expected exactly one \"step timing\" record for the one step that ran, got: {records:#?}"
+        );
+        assert_eq!(timing[0]["source"], serde_json::json!("scheduler"));
+        assert_eq!(timing[0]["mission_id"], serde_json::json!(mission_id));
+        assert_eq!(timing[0]["payload"]["step_id"], serde_json::json!("s1"));
+        assert_eq!(timing[0]["payload"]["kind"], serde_json::json!("procedural.shell"));
+        assert!(
+            timing[0]["payload"].get("wall_ms").and_then(|v| v.as_u64()).is_some(),
+            "the payload must carry a real wall_ms field, got: {:#?}",
+            timing[0]["payload"]
+        );
+        // `procedural.shell` never reports item counts. The honesty
+        // contract (`StepRecord::items_in`/`items_out`, both `Option`)
+        // means they must be ABSENT from the wire shape, not a fabricated
+        // zero.
+        assert!(timing[0]["payload"].get("items_in").is_none());
+        assert!(timing[0]["payload"].get("items_out").is_none());
+        drop(guard);
+    }
+
     #[test]
     #[serial_test::serial]
     fn freeform_relaunch_after_close_mints_a_new_run_never_reopens_the_terminal_one() {
@@ -5009,6 +5073,187 @@ mod tests {
             "the Drop backstop's abort record carries an `error` key instead of `gate` — seeing \
              one here means `bookend.close` was never called: {mission_records:#?}"
         );
+        drop(guard);
+    }
+
+    // ── (#1877, the arc's acceptance test) coder-phase step records reach
+    // the flow stream without touching `src/coder_phase.rs` ─────────────
+
+    /// #1877's own issue: the scheduler produces a `StepRecord` per step for
+    /// every mission (#1886), telemetry/bookends are prescribed for every
+    /// mission (#1899), but nothing reads the records: `src/mission_
+    /// launch.rs:848` binds `graph_result` and only ever inspects it for
+    /// `Err`. This test is the arc's acceptance test named in that issue:
+    /// `coder-phase` must demonstrably receive step records without a
+    /// single line changing in `src/coder_phase.rs`.
+    ///
+    /// Why this can't go through `launch("coder-phase", ...)` the way the
+    /// worktree-FAILURE test above does: a SUCCESSFUL worktree step would
+    /// let the graph continue straight into the `mission.coder` step, which
+    /// dispatches for real (LMStudio/Docker), not appropriate for a fast
+    /// unit test, and not what this test needs to prove. What actually
+    /// needs proving is narrower and mission-agnostic: does the SHARED
+    /// scheduler machinery (`apply_step_terminal`, touched by this arc)
+    /// emit the new record for a coder-phase-shaped step. So this drives
+    /// `crew::scheduler::run_step_graph` directly against a ONE-step graph
+    /// built from `coder_phase::MissionWorktreeStepKind`, the REAL,
+    /// UNEDITED Tier-3 kind `coder_phase.rs` defines (#1352: coder-phase's
+    /// bespoke kinds stay physically co-located with the mission module
+    /// that owns them, never duplicated for a test), exercised against a
+    /// real temp git repo. `git worktree add` genuinely runs; there is no
+    /// mock and no dispatch, because this kind's `residency()` needs
+    /// neither, proven directly by the panicking host factory below. This
+    /// bypasses `launch()`'s own `register_coder_phase_kinds` (which needs
+    /// a full `coder-phase` config plus a resolvable default profile,
+    /// machinery orthogonal to what's under test here) but seeds the SAME
+    /// `CoderPhaseContext` artifact shape production seeds, through the
+    /// SAME `run_step_graph` caller-seed path production uses.
+    ///
+    /// Since the destination is the flow stream and the wiring lives
+    /// entirely in `darkmux-crew`'s scheduler (never in `mission_launch.rs`
+    /// or `coder_phase.rs`), this test proves the actual claim: the
+    /// substrate reaches coder-phase by construction, not because this
+    /// launcher was special-cased for it.
+    ///
+    /// **Proved failing first**: before `apply_step_terminal` called
+    /// `emit(step_timing_record(...))`, the `timing` filter below found
+    /// zero records and `assert_eq!(timing.len(), 1)` failed. Observed
+    /// directly by temporarily reverting the `scheduler.rs` emission call
+    /// and rerunning this exact test.
+    #[test]
+    #[serial_test::serial]
+    fn coder_phase_step_records_reach_the_flow_stream_without_touching_coder_phase_rs() {
+        let guard = LaunchTestGuard::new();
+
+        let repo = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .status()
+                .expect("git must be on PATH for this test");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(repo.path().join("README.md"), "hello\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "initial"]);
+
+        let wt_path = repo.path().join("wt-under-test");
+        let ctx = coder_phase::CoderPhaseContext {
+            repo_root: repo.path().to_path_buf(),
+            wt_path: wt_path.clone(),
+            branch: "coder-phase-step-timing-test".to_string(),
+            base: "HEAD".to_string(),
+            mission_id: "m-test".to_string(),
+            phase_id: "p-test".to_string(),
+            session_id: "s-test".to_string(),
+            role: "coder".to_string(),
+        };
+        let seed_artifacts: Vec<(&'static str, Arc<dyn Any + Send + Sync>)> =
+            vec![(coder_phase::CODER_CONTEXT_ARTIFACT, Arc::new(ctx) as Arc<dyn Any + Send + Sync>)];
+
+        let registry = crew::step_kinds::StepKindRegistry::new();
+        registry.register(Arc::new(coder_phase::MissionWorktreeStepKind)).unwrap();
+
+        let task = crew::types::Task {
+            id: "t1".to_string(),
+            phase_id: "p-test".to_string(),
+            description: "worktree".to_string(),
+            display_name: None,
+            step_ids: vec!["s1".to_string()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let step = Step {
+            id: "s1".to_string(),
+            task_id: "t1".to_string(),
+            gate: None,
+            kind: "mission.worktree".to_string(),
+            status: NodeStatus::Planned,
+            config: serde_json::json!(null),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let mut steps: BTreeMap<String, Step> = [(step.id.clone(), step)].into_iter().collect();
+        let tasks: BTreeMap<String, crew::types::Task> = [(task.id.clone(), task)].into_iter().collect();
+
+        let facts = crew::step_kinds::Facts::default();
+        let est = crew::step_kinds::FixedEstimator::default();
+        let report = crew::scheduler::run_step_graph(
+            &mut steps,
+            &tasks,
+            &registry,
+            &facts,
+            &est,
+            1,
+            &|| {
+                panic!(
+                    "mission.worktree needs no model residency: the host factory must never \
+                     be called"
+                )
+            },
+            &mut |r| {
+                let _ = flow::record(r);
+            },
+            &mut |_step| {},
+            None,
+            None,
+            &seed_artifacts,
+        )
+        .expect("the worktree step must complete against a real git repo");
+
+        assert_eq!(steps["s1"].status, NodeStatus::Complete, "the worktree step must reach Complete");
+        assert!(wt_path.exists(), "sanity: the worktree must actually have been created on disk");
+
+        // The in-memory summary already worked before this arc's final
+        // wiring step (#1886 shipped it).
+        assert_eq!(report.step_records.len(), 1);
+        assert_eq!(report.step_records[0].kind, "mission.worktree");
+
+        // The actual point of this test: the SAME data reached the
+        // durable flow stream, live, under its own vocabulary, with no
+        // change to `src/coder_phase.rs`.
+        let records = read_all_flow_records();
+        let timing: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("step timing"))
+            .collect();
+        assert_eq!(
+            timing.len(),
+            1,
+            "expected exactly one \"step timing\" record for the coder-phase worktree step, \
+             got: {records:#?}"
+        );
+        assert_eq!(timing[0]["payload"]["kind"], serde_json::json!("mission.worktree"));
+        assert_eq!(timing[0]["payload"]["step_id"], serde_json::json!("s1"));
+        assert_eq!(timing[0]["source"], serde_json::json!("scheduler"));
+        let wall_ms = timing[0]["payload"]["wall_ms"].as_u64().expect("a real, present duration");
+        assert!(
+            wall_ms > 0,
+            "a real `git worktree add` subprocess must take a measurable, non-zero amount of \
+             time, got {wall_ms}ms"
+        );
+
+        // The worktree kind's OWN pre-existing `"step result"` companion
+        // (coder_phase.rs's `emit_step_result`, untouched by this arc)
+        // still fires too, proving the two vocabularies coexist for the
+        // SAME step without collision, which is the vocabulary decision
+        // this arc had to make explicit rather than merge silently.
+        let step_result: Vec<&serde_json::Value> = records
+            .iter()
+            .filter(|r| r.get("action").and_then(|v| v.as_str()) == Some("step result"))
+            .collect();
+        assert_eq!(step_result.len(), 1, "the worktree kind's own step-result companion must still fire");
+        assert_eq!(step_result[0]["payload"]["kind"], serde_json::json!("mission.worktree"));
+
         drop(guard);
     }
 }
