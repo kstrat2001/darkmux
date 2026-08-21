@@ -362,6 +362,19 @@ pub struct SchedulerReport {
     /// `run_step_graph` is required to read it, and none does yet (a
     /// mission gets these BY CONSTRUCTION but is free to ignore the field
     /// entirely, subject to the caveats above).
+    ///
+    /// **(#1877, final wiring step) This in-memory summary is no longer the
+    /// only surface.** `apply_step_terminal` also streams a `STEP_TIMING_
+    /// ACTION` ("step timing") flow record for each entry, at the SAME
+    /// moment it is pushed here. See `step_timing_record`'s own doc for
+    /// the shape and `run_record.rs`'s module doc for why the flow stream,
+    /// not `MissionEnvelope`, is the destination. This closes the gap
+    /// point (1) above describes: a scheduler-level `Err` mid-run discards
+    /// the WHOLE in-memory `SchedulerReport` (including earlier waves'
+    /// completed records), but by then every one of those waves' records
+    /// has ALREADY reached the durable flow stream. The live emission
+    /// survives exactly the failure the in-memory summary cannot recover
+    /// from.
     pub step_records: Vec<StepRecord>,
 }
 
@@ -995,7 +1008,7 @@ fn apply_step_terminal(
         emit(record);
     }
     if let Some(wall_ms) = wall_ms {
-        report.step_records.push(StepRecord {
+        let rec = StepRecord {
             step_id: step.id.clone(),
             kind: step.kind.clone(),
             // (#1877 item 3) The scheduler genuinely does not know how many
@@ -1004,7 +1017,12 @@ fn apply_step_terminal(
             items_in: None,
             items_out: None,
             wall_ms,
-        });
+        };
+        // (#1877, final wiring step) Stream the companion "step timing"
+        // record NOW, alongside the in-memory push below, never batched to
+        // the end of `run_step_graph`. See `step_timing_record`'s own doc.
+        emit(step_timing_record(step, &rec));
+        report.step_records.push(rec);
     }
     match result {
         Ok(output) => {
@@ -1134,6 +1152,81 @@ fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
         prev_hash: None,
         hash: None,
         payload: None,
+        work_id: None,
+        attempt: None,
+    }
+}
+
+/// (#1877, final wiring step) The action a scheduler-produced
+/// [`StepRecord`]'s companion flow record carries. See
+/// [`step_timing_record`] and `SchedulerReport::step_records`'s own doc for
+/// what this measures.
+///
+/// **Deliberately its own action, never `"step result"`.** A `StepKind`'s
+/// own business-result record (`dispatch.map`'s per-item/aggregate records,
+/// `darkmux_lab::lab::review`'s `review.bundle`/`review.judge`/etc.) already
+/// emits under `action: "step result"`, `source: "scheduler"` or
+/// `source: "review"`, for the steps that cooperate, and that record
+/// carries real `items_in`/`items_out` this module cannot observe (see
+/// `run_record.rs`'s module doc). Stamping the SAME action here would put
+/// two records for the very same step under the same action string with
+/// different, non-overlapping payload shapes, genuinely ambiguous to any
+/// consumer that counts or folds by `action == "step result"`
+/// (`darkmux-serve`'s `mission_graph::fold_step_finals` is exactly such a
+/// consumer). A distinct action is "carry the discriminator" applied at the
+/// cheapest possible layer: the action string itself, so a reader never has
+/// to inspect `source`/`payload.step_id` to tell the two apart. See
+/// `run_record.rs`'s module doc for the full resolution of this arc's
+/// vocabulary question.
+pub const STEP_TIMING_ACTION: &str = "step timing";
+
+/// One `FlowRecord` per scheduler-produced [`StepRecord`]: the durable,
+/// live-streamed counterpart of the in-memory summary
+/// `SchedulerReport::step_records` collects. #1877's final wiring step:
+/// before this, `StepRecord` existed and every step got one, but nothing
+/// outside a synchronous caller of `run_step_graph` could ever see it. A
+/// coder-phase run's own timing data was produced and immediately dropped
+/// (`src/mission_launch.rs` never read `SchedulerReport::step_records`).
+///
+/// Emitted from [`apply_step_terminal`] at the SAME moment the `StepRecord`
+/// is pushed onto the report: live, per step, never batched to the end of
+/// the run (CLAUDE.md's "No blind runs": "per-event records stream to
+/// durable... files as they happen, never end-of-run-only writes"). Every
+/// mission that runs through [`run_step_graph`] gets this BY CONSTRUCTION,
+/// with no opt-in and no cooperation required from the `StepKind` that ran.
+/// This is the same "free observability" property `step_lifecycle_record`
+/// already gives every step, extended to cover duration.
+///
+/// `payload` is `rec`'s own `serde_json::to_value`: the WIRE shape a
+/// consumer reads here is byte-identical to what a synchronous caller of
+/// `run_step_graph` gets off `SchedulerReport::step_records` directly.
+/// There is exactly one `StepRecord` JSON shape in the tree, never two.
+///
+/// `mission_id: None` for the same reason [`step_lifecycle_record`]
+/// leaves it `None`. See that function's own doc. `session_id` uses the
+/// SAME `session_id::task(&step.task_id)` convention as the lifecycle
+/// records for this step, so a consumer can join "step start"/"step
+/// complete"/"step timing" for one step by `session_id` + `handle`.
+fn step_timing_record(step: &Step, rec: &StepRecord) -> FlowRecord {
+    FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level: Level::Info,
+        category: Category::Work,
+        tier: Tier::Local,
+        stage: Stage::Dispatch,
+        action: STEP_TIMING_ACTION.to_string(),
+        handle: step.id.clone(),
+        phase_id: None,
+        session_id: Some(darkmux_types::session_id::task(&step.task_id)),
+        source: Some("scheduler".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(serde_json::to_value(rec).expect("StepRecord always serializes")),
         work_id: None,
         attempt: None,
     }
@@ -2018,14 +2111,26 @@ mod tests {
         let actions: Vec<&str> = emitted.iter().map(|r| r.action.as_str()).collect();
         assert!(actions.contains(&"step start"));
         assert!(actions.contains(&"step complete"));
-        // (#1399) Every emitted step-lifecycle action must be drawn from
-        // the canonical vocabulary — the SAME constant `darkmux-lab`'s
-        // review-path conformance test asserts against, so the two
-        // producers cannot drift onto competing vocabularies.
+        // (#1877) The companion timing record fires for every step that
+        // streamed a real terminal, "step complete" here and "step error"
+        // on a step that ran and failed (see
+        // `errored_step_that_actually_ran_still_gets_a_record_with_real_duration`
+        // below for that case). See `step_timing_record`'s own doc.
+        assert_eq!(
+            actions.iter().filter(|a| **a == STEP_TIMING_ACTION).count(),
+            1,
+            "expected exactly one \"step timing\" record for the one step that ran: {actions:?}"
+        );
+        // (#1399/#1877) Every emitted step-scoped action must be drawn from
+        // the canonical lifecycle vocabulary OR the documented `step
+        // timing` companion, the SAME constant `darkmux-lab`'s review-path
+        // conformance test asserts against, so the producers cannot drift
+        // onto a competing vocabulary.
         for action in &actions {
             assert!(
-                STEP_LIFECYCLE_ACTIONS.contains(action),
-                "scheduler emitted an action outside the canonical step-lifecycle vocabulary: {action}"
+                STEP_LIFECYCLE_ACTIONS.contains(action) || *action == STEP_TIMING_ACTION,
+                "scheduler emitted an action outside the canonical step-lifecycle vocabulary \
+                 or the documented `step timing` companion: {action}"
             );
         }
     }
@@ -2473,6 +2578,96 @@ mod tests {
         assert_eq!(rec.items_out, None, "same honesty contract on the output side");
     }
 
+    /// (#1877, final wiring step) `SchedulerReport::step_records` used to
+    /// be produced and immediately dropped by every real caller: nothing
+    /// outside a synchronous `run_step_graph` call could ever see it (the
+    /// exact gap #1877's own issue names against `src/mission_launch.rs`).
+    /// This asserts the fix at its root: the record reaches the durable,
+    /// operator-visible flow stream LIVE, as the step completes, not just
+    /// the in-memory summary a caller might or might not read.
+    ///
+    /// **Proved failing first**: before `apply_step_terminal` called
+    /// `emit(step_timing_record(...))`, `emitted` here carried only "step
+    /// start"/"step complete"; filtering for `STEP_TIMING_ACTION` found
+    /// nothing, and this test failed on the `expect` below. Observed
+    /// directly while writing this test.
+    ///
+    /// Also pins the vocabulary decision itself: the flow record's action
+    /// is `STEP_TIMING_ACTION` ("step timing"), never `"step result"`. See
+    /// `step_timing_record`'s own doc for why reusing that action would be
+    /// genuinely ambiguous. Its payload is `StepRecord`'s own
+    /// `serde_json::to_value`, so the wire shape a flow-stream consumer
+    /// reads is byte-identical to what `SchedulerReport::step_records`
+    /// gives a synchronous caller directly. One shape, two surfaces, never
+    /// a lossy second translation.
+    #[test]
+    fn step_records_reach_the_flow_stream_live_under_their_own_vocabulary() {
+        let (task_a, step_a) = task_and_step("a", &[]); // default kind: "procedural.noop"
+        let (tasks, mut steps) = graph(vec![(task_a, step_a)]);
+        let kinds = StepKindRegistry::with_builtins();
+        let facts = Facts::default();
+        let est = FixedEstimator::default();
+        let mut emitted: Vec<FlowRecord> = Vec::new();
+        let report = run_step_graph(
+            &mut steps,
+            &tasks,
+            &kinds,
+            &facts,
+            &est,
+            8,
+            &mock_host_factory,
+            &mut |r| emitted.push(r),
+            &mut |_step| {},
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(report.step_records.len(), 1, "one summary record for the one step that ran");
+
+        let timing: Vec<&FlowRecord> = emitted.iter().filter(|r| r.action == STEP_TIMING_ACTION).collect();
+        assert_eq!(
+            timing.len(),
+            1,
+            "expected exactly one \"step timing\" flow record for the one step that ran, got: {:?}",
+            emitted.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
+        );
+        let rec = timing[0];
+        assert_eq!(rec.source.as_deref(), Some("scheduler"));
+        assert_eq!(rec.handle, "a-step");
+        assert_eq!(
+            rec.payload.as_ref(),
+            Some(&serde_json::to_value(&report.step_records[0]).unwrap()),
+            "the flow record's payload must be the exact same StepRecord shape the summary carries"
+        );
+        // Never the business-result vocabulary. See `step_timing_record`'s
+        // own doc on why the two must stay distinct actions.
+        assert!(
+            !emitted.iter().any(|r| r.action == "step result"),
+            "a procedural.noop step never emits its own \"step result\"; this pins that this \
+             test's \"step timing\" record is not accidentally the OTHER vocabulary"
+        );
+    }
+
+    /// (#1877, final wiring step) The vocabulary decision itself, pinned
+    /// directly: `STEP_TIMING_ACTION` must never collapse onto EITHER of
+    /// the two vocabularies it has to coexist with: the lifecycle
+    /// transitions (`STEP_LIFECYCLE_ACTIONS`) or the business-result
+    /// companion (`"step result"`). A future edit that renamed the
+    /// constant to reuse one of those strings (accidentally "merging the
+    /// two keyings" the issue named as the hazard to avoid) would compile
+    /// fine; this is the test that catches it instead.
+    #[test]
+    fn step_timing_action_is_pinned_distinct_from_every_other_step_vocabulary() {
+        assert_eq!(STEP_TIMING_ACTION, "step timing");
+        assert_ne!(STEP_TIMING_ACTION, "step result");
+        assert!(
+            !STEP_LIFECYCLE_ACTIONS.contains(&STEP_TIMING_ACTION),
+            "STEP_TIMING_ACTION must never collide with a lifecycle transition action"
+        );
+    }
+
     /// (#1877 item 3) A step's own `StepRecord.wall_ms` is a real,
     /// non-zero, measured duration for that step's own dispatch — not a
     /// placeholder. **Proved failing first**: same compile/empty-field
@@ -2684,6 +2879,7 @@ mod tests {
         kinds.register(kind).unwrap();
         let facts = Facts::default();
         let est = FixedEstimator::default();
+        let mut emitted: Vec<FlowRecord> = Vec::new();
         let report = run_step_graph(
             &mut steps,
             &tasks,
@@ -2692,7 +2888,7 @@ mod tests {
             &est,
             8,
             &mock_host_factory,
-            &mut |_r| {},
+            &mut |r| emitted.push(r),
             &mut |_s| {},
             None,
             None,
@@ -2713,6 +2909,25 @@ mod tests {
             rec.wall_ms >= 50,
             "the failed step's own ~60ms sleep must show up in its record — got {}ms",
             rec.wall_ms
+        );
+
+        // (#1877) The flow-stream companion fires on this path too, not
+        // just the in-memory summary above. This is the "step error" half
+        // of the pairing the sibling test
+        // `step_records_reach_the_flow_stream_live_under_their_own_vocabulary`
+        // (Ok/"step complete" case) exercises above.
+        let timing: Vec<&FlowRecord> = emitted.iter().filter(|r| r.action == STEP_TIMING_ACTION).collect();
+        assert_eq!(
+            timing.len(),
+            1,
+            "expected exactly one \"step timing\" flow record for the failed-but-ran step: {:?}",
+            emitted.iter().map(|r| r.action.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(timing[0].handle, "boom-step");
+        assert_eq!(
+            timing[0].payload.as_ref().and_then(|p| p.get("wall_ms")).and_then(|v| v.as_u64()),
+            Some(rec.wall_ms),
+            "the flow record's wall_ms must match the in-memory StepRecord's exactly"
         );
     }
 

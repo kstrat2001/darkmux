@@ -1276,6 +1276,62 @@ mod tests {
         assert!(!out["review-judge-step"].cloud);
     }
 
+    /// (#1877, final wiring step, schema leniency) `darkmux-crew::
+    /// scheduler::STEP_TIMING_ACTION` ("step timing") is a NEW action this
+    /// fold predates. An older/unaware consumer must ignore an action it
+    /// doesn't recognize entirely, never crash, and never fold it into a
+    /// wrongly-zeroed entry (a step with NO entry reads as "nothing folded
+    /// yet"; a step with `tokens: None` from a record this fold chose not
+    /// to read would be indistinguishable from that, but an entry with
+    /// SOME zeroed field would read as "measured as zero," a real lie).
+    /// `fold_step_finals` only folds `"dispatch complete"`/`"step
+    /// result"`, so a correlating "step timing" record, even one with a
+    /// real `wall_ms`, must produce no entry at all.
+    #[test]
+    fn fold_finals_ignores_the_step_timing_action_entirely() {
+        let step_ids = ids(&["s1"]);
+        let rec = serde_json::json!({
+            "action": "step timing",
+            "mission_id": "m-this",
+            "payload": { "step_id": "s1", "kind": "procedural.shell", "wall_ms": 42 }
+        });
+        let out = fold_step_finals(vec![rec], &step_ids, "m-this");
+        assert!(
+            out.is_empty(),
+            "an unrecognized action must be ignored entirely, not folded into a (wrongly \
+             zeroed) entry: {out:?}"
+        );
+    }
+
+    /// Same leniency, but proving the two vocabularies coexist for the
+    /// SAME step without the new "step timing" record disturbing what the
+    /// pre-existing "step result" record already folds. The vocabulary
+    /// decision #1877's own issue asked to be made explicit rather than
+    /// merged silently.
+    #[test]
+    fn fold_finals_step_timing_record_does_not_disturb_a_sibling_step_result_record() {
+        let step_ids = ids(&["s1"]);
+        let recs = vec![
+            serde_json::json!({
+                "action": "step result",
+                "mission_id": "m-this",
+                "payload": { "step_id": "s1", "total_tokens": 4200 }
+            }),
+            serde_json::json!({
+                "action": "step timing",
+                "mission_id": "m-this",
+                "payload": { "step_id": "s1", "kind": "procedural.shell", "wall_ms": 42 }
+            }),
+        ];
+        let out = fold_step_finals(recs, &step_ids, "m-this");
+        assert_eq!(
+            out["s1"].tokens,
+            Some(4200),
+            "the step-result record's folded tokens must survive the sibling step-timing \
+             record unchanged: {out:?}"
+        );
+    }
+
     #[test]
     fn fold_finals_rejects_a_record_stamped_with_a_foreign_mission_id() {
         // (#1641) THE defect, server-side: step ids are config-scoped, so

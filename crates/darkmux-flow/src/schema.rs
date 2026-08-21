@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.19.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.20.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -274,6 +274,23 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.19.0";
 //           (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, …), not from
 //           machine-scoped config — build that when a real consumer
 //           needs it.
+//   1.20.0: new action `"step timing"` (#1877, this arc's final wiring
+//           step): `darkmux-crew::scheduler::apply_step_terminal` now
+//           streams one companion flow record per scheduler-produced
+//           `StepRecord`, live, at the moment it's pushed onto
+//           `SchedulerReport::step_records`. Every mission that runs
+//           through `run_step_graph` gets it by construction (coder-phase
+//           included, with no change to `src/coder_phase.rs`). Payload is
+//           `StepRecord`'s own `serde_json::to_value` (`step_id`/`kind`/
+//           `wall_ms`, `items_in`/`items_out` when known). Deliberately its
+//           own action, never `"step result"`. See `run_record.rs`'s
+//           module doc in `darkmux-crew` for why reusing that action would
+//           put two ambiguous records under one name for the same step.
+//           Minor + additive: a new action value + new payload shape, no
+//           struct/field change; older readers (including `darkmux-serve`'s
+//           `mission_graph::fold_step_finals`) ignore the unknown action.
+//           New records only, prior AuditFileSink chains survive without
+//           rotation.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

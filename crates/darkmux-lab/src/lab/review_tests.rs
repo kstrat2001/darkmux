@@ -2,7 +2,7 @@
     // `NodeStatus` is used only by this test module as of #1284 Packet 3
     // (`build_review_graph` stopped constructing `Step` literals directly
     // once it became a thin `mission_config::interpret` launcher).
-    use darkmux_crew::scheduler::STEP_LIFECYCLE_ACTIONS;
+    use darkmux_crew::scheduler::{STEP_LIFECYCLE_ACTIONS, STEP_TIMING_ACTION};
     // (#1877 item 2) `HostSample` — test-only, same reasoning as
     // `ArtifactBus` below: production review.rs code never names this type
     // directly any more (only passes `sample_host`'s value through), so
@@ -4591,16 +4591,24 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             .filter(|r| r.action == "step complete" || r.action == "step error")
             .count();
         assert_eq!(terminals, steps.len(), "every declared step got a terminal lifecycle record");
-        // (#1399) Every step-lifecycle action this path emits is drawn from
-        // the SAME canonical vocabulary constant the crew scheduler's own
-        // conformance test asserts against — the two execution paths
+        // (#1399/#1877) Every step-lifecycle action this path emits is drawn
+        // from the SAME canonical vocabulary constants the crew scheduler's
+        // own conformance test asserts against. The two execution paths
         // (generic scheduler, review's Tier-3 driver) cannot silently grow
-        // a competing vocabulary.
+        // a competing vocabulary. `STEP_TIMING_ACTION` ("step timing") is
+        // the scheduler's own companion record: `apply_step_terminal`
+        // streams one per `StepRecord` for EVERY graph-driven mission,
+        // review's own graph path included, so this path now emits it
+        // alongside its hand-built `"step result"` records for the SAME
+        // steps without conflict (see `run_record.rs`'s module doc in
+        // `darkmux-crew` for why the two stay distinct actions).
         for record in emitter.records.iter().filter(|r| r.action.starts_with("step ")) {
             assert!(
-                STEP_LIFECYCLE_ACTIONS.contains(&record.action.as_str()) || record.action == "step result",
+                STEP_LIFECYCLE_ACTIONS.contains(&record.action.as_str())
+                    || record.action == "step result"
+                    || record.action == STEP_TIMING_ACTION,
                 "review path emitted a step-scoped action outside the canonical lifecycle \
-                 vocabulary or the documented `step result` companion: {}",
+                 vocabulary or the documented `step result`/`step timing` companions: {}",
                 record.action
             );
         }
