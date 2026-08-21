@@ -58,6 +58,12 @@ function mockFetch(runsOk = true, labRunsOk = true, labSource: Record<string, un
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  // (#1900 QA nit) A shared belt-and-suspenders reset — several tests below
+  // already reset `location.hash` themselves in a `finally`, but this makes
+  // the "hash starts empty" assumption a property of the SUITE rather than
+  // something each new hash-writing test has to remember to arrange for
+  // itself.
+  window.location.hash = "";
 });
 
 describe("RunsBoard", () => {
@@ -121,7 +127,14 @@ describe("RunsBoard", () => {
     await waitFor(() => expect(screen.getByText(/lab series/)).toBeInTheDocument());
   });
 
-  it("an untracked ghost row is rendered as non-interactive with an 'untracked' marker", async () => {
+  it("(#1900) a terminated, untracked dispatch row with flow records is interactive and activating it navigates to #session=<id>", async () => {
+    // "ghost" is `kind: "dispatch", tracked: false` — server-side, EVERY
+    // such row is synthesized only for a flow session that saw a real
+    // `dispatch start` record (`ghost_runs`'s `has_start` gate in
+    // `crates/darkmux-serve/src/runs.rs`), so it always has something to
+    // show via `/flow-session/<id>` even with no mission graph behind it.
+    // The "untracked" chip still shows (it's an honest label — no durable
+    // run record backs this row) but it must no longer mean unopenable.
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -139,10 +152,57 @@ describe("RunsBoard", () => {
         return Promise.resolve(new Response(JSON.stringify({ configured: true, dir: null, exists: null, runs: [] }), { status: 200 }));
       }),
     );
+    try {
+      renderBoard();
+      await waitFor(() => expect(screen.getByText("ghost")).toBeInTheDocument());
+      expect(screen.getByText("untracked")).toBeInTheDocument();
+      const row = screen.getByText("ghost").closest(".labrunrow")!;
+      expect(row).not.toHaveClass("flat");
+      expect(row).toHaveAttribute("role", "button");
+      expect(row).toHaveAttribute("tabIndex", "0");
+
+      fireEvent.click(row);
+      expect(window.location.hash).toBe("#session=ghost");
+      // No mission-graph gate applies here — `/flow-session/<id>` is a
+      // plain daemon fetch, same precedent as `FleetLens.tsx`'s activity-
+      // lane bars, which navigate to `#session=<sid>` ungated.
+      expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("(#1900) a row with genuinely nothing behind it — an untracked mission this daemon doesn't own, with no local session — stays non-interactive", async () => {
+    // `kind: "mission", tracked: false` is `flow_mission_to_run`'s shape
+    // (#1705 — a peer's mission this daemon only sees via the fleet
+    // stream). Its `id` is a mission id, not a session id, so there is no
+    // `/flow-session/<id>` to open here — unlike the dispatch ghost above,
+    // this row really does have nothing local to show.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url === "/runs") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                runs: [{ id: "peer-mission", kind: "mission", status: "running", tracked: false, updated_ts: 1 }],
+                generated_at_ms: 1,
+              }),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response(JSON.stringify({ configured: true, dir: null, exists: null, runs: [] }), { status: 200 }));
+      }),
+    );
     renderBoard();
-    await waitFor(() => expect(screen.getByText("ghost")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("peer-mission")).toBeInTheDocument());
     expect(screen.getByText("untracked")).toBeInTheDocument();
-    expect(screen.getByText("ghost").closest(".labrunrow")).toHaveClass("flat");
+    const row = screen.getByText("peer-mission").closest(".labrunrow")!;
+    expect(row).toHaveClass("flat");
+    expect(row).not.toHaveAttribute("role");
+    fireEvent.click(row);
+    expect(window.location.hash).toBe("");
   });
 
   it("degrades a /runs fetch failure to the empty-runs render (matches legacy's silent catch)", async () => {
@@ -201,7 +261,7 @@ describe("RunsBoard", () => {
     expect(screen.getByText(/needs a running daemon/i)).toBeInTheDocument();
   });
 
-  it("an untracked ghost row has no click affordance and never shows the notice", async () => {
+  it("(#1900) an untracked dispatch ghost row also opens #session=<id> from a keyboard Enter activation, and never shows the mission-graph notice", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -219,10 +279,15 @@ describe("RunsBoard", () => {
         return Promise.resolve(new Response(JSON.stringify({ configured: true, dir: null, exists: null, runs: [] }), { status: 200 }));
       }),
     );
-    renderBoard();
-    await waitFor(() => expect(screen.getByText("ghost2")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("ghost2").closest(".labrunrow")!);
-    expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
+    try {
+      renderBoard();
+      await waitFor(() => expect(screen.getByText("ghost2")).toBeInTheDocument());
+      fireEvent.keyDown(screen.getByText("ghost2").closest(".labrunrow")!, { key: "Enter" });
+      expect(window.location.hash).toBe("#session=ghost2");
+      expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
+    } finally {
+      window.location.hash = "";
+    }
   });
 
   it("switching kind chips clears a lingering row-click notice", async () => {

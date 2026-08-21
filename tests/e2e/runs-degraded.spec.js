@@ -82,12 +82,25 @@ test('a row with no timestamps at all still renders and stays inert', async ({ p
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test('an untracked run is not offered as clickable', async ({ page }) => {
-  // There is no durable record behind a ghost, so a link would open a 404.
+test('an untracked dispatch is openable, and a hostile id survives the hop', async ({ page }) => {
+  // (#1900) This fixture row is a TERMINATED, errored dispatch — the exact
+  // shape an operator most wants to open, since it is the run that just
+  // failed. It used to render inert on the theory that "there is no durable
+  // record behind a ghost", which is false: the server only synthesizes an
+  // untracked dispatch row for a flow session that saw a `dispatch start`,
+  // so a trajectory always exists behind it.
+  //
+  // The id also carries a `/`, so this doubles as the encoding check: the
+  // session hash must be percent-encoded, never split into a second route
+  // segment.
   const errors = await openRuns(page);
   const ghost = page.locator('.labrunrow', { hasText: 'degraded/untracked-ghost' });
-  await expect(ghost).toHaveClass(/flat/);
-  await expect(ghost).not.toHaveAttribute('role', 'button');
+  await expect(ghost).not.toHaveClass(/flat/);
+  await expect(ghost).toHaveAttribute('role', 'button');
+  await ghost.click();
+  await expect
+    .poll(() => page.evaluate(() => location.hash))
+    .toContain(`session=${encodeURIComponent('degraded/untracked-ghost')}`);
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
