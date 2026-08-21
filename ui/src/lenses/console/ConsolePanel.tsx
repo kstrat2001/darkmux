@@ -4,6 +4,7 @@ import { queryKeys, PANEL_CACHE_MS } from "../../lib/queryKeys";
 import type { PanelId } from "../../lib/route";
 import { PANELS, DEFAULT_PANEL_ID, isManualPanel, panelCols, panelArgv, panelOptGroups, composeArgv, canonicalOptPairs, type PanelOpt } from "./panels";
 import { fetchPanel } from "./fetchPanel";
+import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { panelAgeLabel } from "./format";
 import { AnsiText } from "./ansi";
 import type { PanelResponse } from "../../types/handwritten";
@@ -142,11 +143,28 @@ export function ConsolePanel({
 
   const activeSelection: Readonly<Record<string, string>> = selections.get(panelId) ?? {};
   const setOpt = (name: string, value: string) => {
+    const next = { ...activeSelection, [name]: value };
     setSelections((prev) => {
-      const next = new Map(prev);
-      next.set(panelId, { ...(next.get(panelId) ?? {}), [name]: value });
-      return next;
+      const m = new Map(prev);
+      m.set(panelId, next);
+      return m;
     });
+    // (#1911) Write the selection into the URL at the moment it changes.
+    //
+    // This is the same direct-`writeHash` path `RunsBoard.selectKind` uses,
+    // and for the identical reason its own doc gives: a selection lives in
+    // component state, not in `Route`, so no `hashchange` fires and the
+    // route-keyed `useSyncHash` effect never sees it. `canonicalHash`
+    // already knew how to serialize `opt.*`; nothing was calling it.
+    //
+    // Without this, `parseRoute` reads a selection out of a deep link but
+    // nothing ever puts one in: picking `--kind lab` could not be shared,
+    // did not survive a reload, and left no history entry. Verified live
+    // against the daemon before the fix, which is how it was found.
+    //
+    // `writeHash` uses `replaceState`, which does NOT fire `hashchange`,
+    // so this cannot feed back into the effect above as a render loop.
+    writeHash(canonicalHash({ kind: "console", panelId, opts: next }));
   };
 
   return (

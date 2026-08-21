@@ -427,6 +427,45 @@ describe("ConsolePanel — command-line tokens (#1911 redesign)", () => {
     expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ --all");
   });
 
+  /// (#1911) The half that was missing: `parseRoute` could READ a selection
+  /// out of a deep link, but nothing ever WROTE one, so a pick could not be
+  /// shared, did not survive a reload, and left no history entry. Found by
+  /// selecting a value against the live daemon and watching the address bar
+  /// not move. `canonicalHash` already knew how to serialize `opt.*`; the
+  /// call site was absent, exactly the gap `RunsBoard.selectKind` closes for
+  /// its own out-of-route state.
+  it("picking a value writes the selection into the URL", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    window.location.hash = "#lens=console&panel=run-list";
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "--kind all \u25be" }));
+    fireEvent.click(screen.getByRole("option", { name: "lab" }));
+
+    await waitFor(() => expect(window.location.hash).toContain("opt.kind=lab"));
+    expect(window.location.hash).toContain("panel=run-list");
+  });
+
+  /// The default is not written, so the default variant's URL stays
+  /// byte-identical to a bare panel link rather than accumulating noise.
+  it("picking the default value again leaves no opt param behind", async () => {
+    const fetchMock = runListFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    window.location.hash = "#lens=console&panel=run-list";
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "--kind all \u25be" }));
+    fireEvent.click(screen.getByRole("option", { name: "lab" }));
+    await waitFor(() => expect(window.location.hash).toContain("opt.kind=lab"));
+
+    fireEvent.click(screen.getByRole("button", { name: "--kind lab \u25be" }));
+    fireEvent.click(screen.getByRole("option", { name: "all" }));
+    await waitFor(() => expect(window.location.hash).not.toContain("opt.kind"));
+  });
+
   it("activating the --kind token opens a listbox of every legal value, current selection marked", async () => {
     const fetchMock = runListFetchMock();
     vi.stubGlobal("fetch", fetchMock);
