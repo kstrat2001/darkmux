@@ -161,10 +161,18 @@ darkmux release.
   its own module. A pre-1.20.0 reader ignores the unknown action entirely;
   no struct/field change on any existing action. One transient
   fleet-visible effect: until every machine has upgraded past this build,
-  `darkmux flow status` / `darkmux doctor` on an already-upgraded machine
-  reports `schema_skew_detected` against a peer still writing 1.19.0 (the
-  same live-stream version comparison every prior `FLOW_SCHEMA_VERSION`
-  bump has produced) until the whole fleet catches up.
+  `darkmux flow status` / `darkmux doctor` reports `schema_skew_detected`
+  (the same live-stream version comparison every prior
+  `FLOW_SCHEMA_VERSION` bump has produced) until the whole fleet catches
+  up. Note the comparison is symmetric: `live_foreign` is any observed
+  version that differs from the running binary's, in EITHER direction, so
+  the warning appears on the machine that has NOT upgraded too. One
+  upgraded machine writing a single 1.20.0 record to a shared Redis stream
+  is enough to flip a still-on-stable peer's flow-sink health from Pass to
+  Warn. The hint says to upgrade the lagging writer without naming which
+  peer, so from the lagging machine's own seat the message reads as
+  pointing at itself. It is a Warn, never a Fail, and it clears once the
+  fleet is on one version.
 
 ### Removed
 
