@@ -125,6 +125,36 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "mission", missionId: "my-mission" });
   });
 
+  /// (#1920) `opt.*` must resolve search-vs-hash the same way every other
+  /// NAMED param does via `get()` (`search.get(name) || hash.get(name)`).
+  /// It did not: the collection loop let the hash overwrite
+  /// unconditionally, so `opt.kind=` and `panel=` on one page obeyed
+  /// opposite rules.
+  it("opt.* precedence: a non-empty search value wins over the hash, like every other named param", () => {
+    const url = new URL(window.location.href);
+    url.hash = "#lens=console&panel=run-list&opt.kind=lab";
+    url.search = "?opt.kind=mission";
+    window.history.replaceState(null, "", url.toString());
+    const r = parseRoute();
+    expect(r.kind).toBe("console");
+    if (r.kind !== "console") throw new Error("unreachable");
+    expect(r.opts.kind).toBe("mission");
+    window.history.replaceState(null, "", "/");
+  });
+
+  /// The other half of the same rule: an EMPTY search value is not a
+  /// value, so the hash still supplies it, matching `get()`'s own `||`.
+  it("opt.* precedence: an empty search value does not shadow the hash", () => {
+    const url = new URL(window.location.href);
+    url.hash = "#lens=console&panel=run-list&opt.kind=lab";
+    url.search = "?opt.kind=";
+    window.history.replaceState(null, "", url.toString());
+    const r = parseRoute();
+    if (r.kind !== "console") throw new Error("expected console route");
+    expect(r.opts.kind).toBe("lab");
+    window.history.replaceState(null, "", "/");
+  });
+
   it("mission precedence: lens=runs wins over a co-present mission= param", () => {
     setHash("#lens=runs&mission=my-mission");
     expect(parseRoute()).toEqual({ kind: "runs", runsKind: "all", run: null, machine: null });

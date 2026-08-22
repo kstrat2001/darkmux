@@ -304,9 +304,22 @@ export function parseRoute(): Route {
     // OWN table (an id this build doesn't recognize has no table to
     // validate against, so it gets no opts at all — matching "an
     // unrecognized `panel` parses the same as absent").
+    // (#1920) Hash first, then search fills only what the hash did not
+    // set — so a non-empty SEARCH value wins, matching `get()` above
+    // (`search.get(name) || hash.get(name)`) and therefore every other
+    // NAMED param: `lens`, `panel`, `machine`, `uid`, `mission`,
+    // `session`. The first draft appended hash last and let it overwrite
+    // unconditionally, so `opt.kind=` and `panel=` on one page obeyed
+    // opposite rules.
+    //
+    // Note this repo does have a deliberate hash-wins case, pinned by
+    // "an in-hash date wins over a co-present ?date= query param" — but
+    // that is the BARE `#<date>` form, a positional hash shape rather
+    // than a named param, so it is a different rule for a different
+    // thing, not a precedent for this one.
     const rawOpts: Record<string, string> = {};
-    for (const [k, v] of search.entries()) if (k.startsWith("opt.")) rawOpts[k.slice(4)] = v;
     for (const [k, v] of hash.entries()) if (k.startsWith("opt.")) rawOpts[k.slice(4)] = v;
+    for (const [k, v] of search.entries()) if (k.startsWith("opt.") && v !== "") rawOpts[k.slice(4)] = v;
     let opts: Readonly<Record<string, string>> = panelId ? sanitizeOptParams(panelId, rawOpts) : {};
     // The alias's forced selection wins over anything a stray `opt.*`
     // param claimed — mirrors `panel.rs::resolve_alias`'s own doc: "the
