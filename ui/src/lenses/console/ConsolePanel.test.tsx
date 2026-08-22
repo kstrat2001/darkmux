@@ -323,4 +323,40 @@ describe("ConsolePanel", () => {
       ).toBeInTheDocument(),
     );
   });
+
+  // (#1921) A panel switch must never show the OUTGOING panel's body under
+  // the incoming panel's own command line. Today's `CliPanelView` has no
+  // `key` prop and this codebase sets no `placeholderData`/`keepPreviousData`
+  // anywhere (`grep -rn keepPreviousData ui/src` is empty), so a query for a
+  // never-before-fetched id starts with `data: undefined` and the loading
+  // chrome renders — safe by the query library's own default, not by an
+  // explicit guard. That default is exactly the kind of thing a "reuse the
+  // previous panel while the next one loads" enhancement (`placeholderData:
+  // keepPreviousData`, matching `useQuery`'s own naming) could reasonably
+  // add later without anyone noticing it needs a compensating `key={id}` on
+  // `CliPanelView` to keep panels from bleeding into each other. This test
+  // exists to catch exactly that regression, not today's (absent) bug.
+  it("(#1921) switching to a panel whose fetch never resolves does not render the prior panel's body under the new command line", async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.startsWith("/runs")) return Promise.resolve(runsJson());
+      if (url.startsWith("/panel/mission-status")) return Promise.resolve(jsonResponse(MISSION_STATUS_BODY));
+      if (url.startsWith("/panel/machine-status")) return new Promise(() => {}); // never resolves
+      return Promise.resolve(jsonResponse(MISSION_STATUS_BODY));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText("mission status — 0 missions")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("machine", { selector: ".runchip" }));
+    await waitFor(() => expect(screen.getByText("machine", { selector: ".runchip" })).toHaveClass("on"));
+
+    // The command line switched to the new (not-yet-loaded) panel's own
+    // command — `NotLoadedChrome`'s own `.pc-cmd`, distinct from
+    // `LoadedChrome`'s (nothing has resolved for "machine status" yet)...
+    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux machine status");
+    // ...and the OLD panel's body text is gone, not left rendered underneath
+    // the new command line.
+    expect(screen.queryByText("mission status — 0 missions")).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("mission status — 0 missions");
+  });
 });

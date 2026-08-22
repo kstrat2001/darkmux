@@ -2439,6 +2439,7 @@
     /// is integration-tested empirically since it requires a real
     /// docker container.
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_compaction_event_resets_inactivity_deadline() {
         use std::io::Write;
 
@@ -2509,6 +2510,7 @@
     /// tests). Per-mole-hole detectors guard against pathological
     /// tool patterns (cycle / cascade / drift / reasoning-loop).
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_non_progress_events_do_not_reset_inactivity_deadline() {
         use std::io::Write;
 
@@ -2575,6 +2577,7 @@
     /// — see `tailer_failed_tool_completed_does_not_reset_inactivity_deadline`
     /// for the failure case. This test covers the success path (`ok:true`).
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_tool_completed_event_resets_inactivity_deadline() {
         use std::io::Write;
 
@@ -2632,6 +2635,7 @@
     /// detector's consecutive count never trips) can no longer keep the
     /// deadline alive indefinitely.
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_failed_tool_completed_does_not_reset_inactivity_deadline() {
         use std::io::Write;
 
@@ -2672,6 +2676,7 @@
     /// field (pre-#469 trajectory) is treated as success and resets the
     /// deadline, so old data behaves as it did before the field landed.
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_tool_completed_without_ok_field_resets_deadline() {
         use std::io::Write;
 
@@ -2714,6 +2719,7 @@
     /// Compaction + tool.completed in the same poll → deadline ≈
     /// now + inactivity_secs, not stale to whichever fired first.
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_multiple_proof_of_work_events_advance_to_latest() {
         use std::io::Write;
 
@@ -2766,6 +2772,7 @@
     /// compaction reset it. A wedged server delivers no chunks → no events
     /// → true hangs still die.
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); contaminates a #[serial] counting test's DARKMUX_FLOWS_DIR tempdir if run concurrently with it
     fn tailer_model_partial_resets_the_inactivity_deadline() {
         use std::io::Write;
 
@@ -4083,6 +4090,7 @@
     }
 
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record() via poll_and_emit(); found by a direct sweep beyond the issue's own named seven
     fn tailer_state_carries_partial_line_across_polls() {
         // Write the first half of a line, poll, write the second half,
         // poll again — the state's pending buffer must stitch them together
@@ -4173,6 +4181,7 @@
     /// (which the summary DOES track) interleaved with the emoji
     /// line — the turn count proves the second line was parsed.
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record() via poll_and_emit(); found by a direct sweep beyond the issue's own named seven
     fn tailer_state_dispatches_event_after_multibyte_split() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("trajectory.jsonl");
@@ -4229,6 +4238,7 @@
     }
 
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record() via poll_and_emit(); found by a direct sweep beyond the issue's own named seven
     fn tailer_skips_malformed_lines() {
         // A non-JSON line in the trajectory must not crash the tailer or
         // stop later events from being processed.
@@ -4246,6 +4256,7 @@
     // ─── Heartbeat rate limiting ──────────────────────────────────────
 
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record() via poll_and_emit(); found by a direct sweep beyond the issue's own named seven
     fn heartbeat_first_partial_emits() {
         // The very first model.partial should produce a heartbeat (no
         // prior last_heartbeat_at).
@@ -4261,6 +4272,7 @@
     }
 
     #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record() via poll_and_emit(); found by a direct sweep beyond the issue's own named seven
     fn heartbeat_rate_limits_consecutive_partials() {
         // Two model.partial events back-to-back (under the 2s window)
         // should produce exactly one heartbeat.
