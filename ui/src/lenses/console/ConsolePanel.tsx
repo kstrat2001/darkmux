@@ -251,7 +251,7 @@ function CliPanelView({
   return (
     <div className="panelwrap">
       <div className="panelchrome">
-        <ChromeCommandLine id={id} opts={opts} onOptChange={onOptChange} loadedBody={loadedBody} stale={stale} manual={manual} />
+        <ChromeCommandLine id={id} opts={opts} onOptChange={onOptChange} loadedBody={loadedBody} stale={stale} manual={manual} fetchedAt={query.dataUpdatedAt} />
         <span className="pc-spacer"></span>
         {/* (byte-identical-to-today pin) The old `LoadedChrome`/
             `NotLoadedChrome` split had one asymmetry worth preserving
@@ -359,12 +359,16 @@ function ChromeCommandLine({
   loadedBody,
   stale,
   manual,
+  fetchedAt,
 }: {
   id: PanelId;
   opts: Readonly<Record<string, string>>;
   onOptChange: (name: string, value: string) => void;
   loadedBody: PanelResponse | null;
   stale: boolean;
+  /** (#1922 review) `query.dataUpdatedAt` — see `CapturedInfo`'s own doc
+   * for why passing `Date.now()` here silently killed the age-based note. */
+  fetchedAt: number;
   manual: boolean;
 }) {
   const groups = panelOptGroups(id);
@@ -378,7 +382,7 @@ function ChromeCommandLine({
         <span className="pc-drift" title="the composed request did not match what the server actually ran">
           ⚠ argv mismatch — showing what actually ran
         </span>
-        <CapturedInfo body={loadedBody!} stale={false} />
+        <CapturedInfo body={loadedBody!} stale={false} fetchedAt={fetchedAt} />
         {loadedBody!.auto_refresh === false && <span className="pc-manual">· manual-run only</span>}
         <span>· {loadedBody!.gather_ms}ms</span>
       </>
@@ -402,7 +406,7 @@ function ChromeCommandLine({
       </span>
       {loadedBody && (
         <>
-          <CapturedInfo body={loadedBody} stale={stale} />
+          <CapturedInfo body={loadedBody} stale={stale} fetchedAt={fetchedAt} />
           {loadedBody.auto_refresh === false && <span className="pc-manual">· manual-run only</span>}
           <span>· {loadedBody.gather_ms}ms</span>
         </>
@@ -422,8 +426,21 @@ function ChromeCommandLine({
  * (the existing amber-text idiom) since they're the same KIND of signal —
  * only one fires at a time in practice (a placeholder response is always
  * fresher than its own TTL). */
-function CapturedInfo({ body, stale }: { body: PanelResponse; stale: boolean }) {
-  const a = panelAgeLabel(body, Date.now());
+function CapturedInfo({
+  body,
+  stale,
+  fetchedAt,
+}: {
+  body: PanelResponse;
+  stale: boolean;
+  /** (#1922 review) `query.dataUpdatedAt`, NOT `Date.now()`. Passing now
+   * made `panelAgeLabel`'s `age` identically zero, so the age-based
+   * `· stale (Ns)` note could never render — dead code that `format.ts`'s
+   * own unit test kept passing, because it calls `panelAgeLabel` directly
+   * with a synthetic timestamp and never exercises this call site. */
+  fetchedAt: number;
+}) {
+  const a = panelAgeLabel(body, fetchedAt);
   return (
     <>
       <span>
@@ -623,6 +640,12 @@ function BooleanToken({
       tabIndex={0}
       className={`pc-tok${on ? " on" : ""}`}
       aria-checked={on}
+      // (#1922 review) The accessible name is the FLAG, not the rendered
+      // text. Visually an unapplied flag reads `[--all]` (CLI usage
+      // convention for optional), but a screen reader should hear the flag
+      // with `aria-checked` carrying the state, not "left bracket dash
+      // dash all". Also keeps the name stable across the two states.
+      aria-label={flag}
       onClick={toggle}
       onKeyDown={(e: ReactKeyboardEvent<HTMLSpanElement>) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -631,7 +654,17 @@ function BooleanToken({
         }
       }}
     >
-      {flag}
+      {/* (#1922 review) The OFF state must differ in TEXT, not only in
+        * color. Rendering the bare flag either way made `.pc-cmd` read
+        * `$ darkmux mission status --all` above a body saying "8 of 93
+        * shown" — paste that command and you get 93. The two parity
+        * goldens proved it: identical command lines, different bodies.
+        *
+        * Brackets are the CLI usage convention for an optional argument,
+        * so an unapplied flag reads as available-but-not-in-the-command,
+        * which is exactly what it is. It also fixes state-by-color-alone
+        * (WCAG 1.4.1) on a control whose whole job is to be readable. */}
+      {on ? flag : `[${flag}]`}
     </span>
   );
 }

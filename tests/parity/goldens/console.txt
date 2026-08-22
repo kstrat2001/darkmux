@@ -26,7 +26,7 @@ role list
 config list
 lab fixture list
 doctor
-$ darkmux run list --kind all ▾ --all
+$ darkmux run list --kind all ▾ [--all]
 captured 20:54:23
 · 4ms
 re-run

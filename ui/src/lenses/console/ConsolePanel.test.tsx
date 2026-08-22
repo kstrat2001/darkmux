@@ -411,7 +411,60 @@ describe("ConsolePanel — command-line tokens (#1911 redesign)", () => {
     expect(sw).toHaveAttribute("aria-checked", "false");
     expect(sw).not.toHaveClass("on");
     expect(document.querySelector('[role="listbox"]')).toBeNull();
-    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux mission status --all");
+    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux mission status [--all]");
+  });
+
+  /// (#1922 review) The age-based `· stale (Ns)` note was DEAD CODE:
+  /// `panelAgeLabel(body, Date.now())` made `age` identically zero, so the
+  /// branch could never render. `format.ts`'s unit test kept passing
+  /// because it calls `panelAgeLabel` directly with a synthetic timestamp
+  /// and never exercises the call site — nothing asserted the chrome text.
+  it("the chrome reports an aging body once it is past its TTL", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const fetchMock = vi.fn((url: string) =>
+        Promise.resolve(url.startsWith("/runs") ? runsJson() : jsonResponse(MISSION_STATUS_BODY)),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      renderPanel("mission-status");
+      await waitFor(() => expect(document.querySelector(".pc-cmd")).toBeInTheDocument());
+      expect(document.querySelector(".pc-stale")).toBeNull();
+
+      // Past 3x the panel TTL, with no refetch — the body on screen is old
+      // and the receipt has to say so.
+      vi.setSystemTime(Date.now() + 30_000);
+      fireEvent(window, new Event("resize"));
+      await waitFor(() => expect(document.querySelector(".pc-stale")).not.toBeNull());
+      expect(document.querySelector(".pc-stale")!.textContent).toMatch(/stale \(\d+s\)/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /// (#1922 review) The command line must show the command that would
+  /// ACTUALLY run. Rendering the bare flag in both states made `.pc-cmd`
+  /// read `$ darkmux mission status --all` above a body saying "8 of 93
+  /// shown" — paste it and you get 93. The two parity goldens proved it:
+  /// identical command lines, different bodies. State conveyed by colour
+  /// alone was also a WCAG 1.4.1 failure on a control whose entire job is
+  /// to be read.
+  it("a boolean token's command text DIFFERS between off and on", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(url.startsWith("/runs") ? runsJson() : jsonResponse(MISSION_STATUS_BODY)),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText(/mission status —/)).toBeInTheDocument());
+
+    const off = document.querySelector(".pc-cmd")!.textContent;
+    fireEvent.click(screen.getByRole("switch", { name: "--all" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "--all" })).toHaveAttribute("aria-checked", "true"));
+    const on = document.querySelector(".pc-cmd")!.textContent;
+
+    expect(off).not.toBe(on);
+    expect(off).toContain("[--all]");
+    expect(on).toContain("--all");
+    expect(on).not.toContain("[--all]");
   });
 
   it("run-list declares --kind (an enum token opening a listbox) AND --all (a switch)", async () => {
@@ -424,7 +477,7 @@ describe("ConsolePanel — command-line tokens (#1911 redesign)", () => {
     expect(kindToken).toHaveAttribute("aria-haspopup", "listbox");
     expect(kindToken).toHaveAttribute("aria-expanded", "false");
     expect(screen.getByRole("switch", { name: "--all" })).toHaveAttribute("aria-checked", "false");
-    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ --all");
+    expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ [--all]");
   });
 
   /// (#1911) The half that was missing: `parseRoute` could READ a selection
@@ -525,11 +578,11 @@ describe("ConsolePanel — command-line tokens (#1911 redesign)", () => {
     const fetchMock = vi.fn((url: string) => (url.startsWith("/panel/") ? new Promise(() => {}) : Promise.resolve(runsJson())));
     vi.stubGlobal("fetch", fetchMock);
     renderPanel("run-list");
-    await waitFor(() => expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ --all"));
+    await waitFor(() => expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind all ▾ [--all]"));
 
     fireEvent.click(screen.getByRole("button", { name: "--kind all ▾" }));
     fireEvent.click(screen.getByRole("option", { name: "dispatch" }));
-    await waitFor(() => expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind dispatch ▾ --all"));
+    await waitFor(() => expect(document.querySelector(".pc-cmd")!.textContent).toBe("$ darkmux run list --kind dispatch ▾ [--all]"));
   });
 
   it("keyboard: Enter opens the menu focused on the current value, ArrowDown moves, Enter selects, focus returns to the token", async () => {

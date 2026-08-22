@@ -26,7 +26,7 @@ role list
 config list
 lab fixture list
 doctor
-$ darkmux mission status --all
+$ darkmux mission status [--all]
 captured 16:40:57
 · 8ms
 re-run
