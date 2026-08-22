@@ -42,10 +42,12 @@ pub mod mission_graph;
 /// module itself stays private; `build_runs`/`Run`/`RunKind`/`RunStatus`
 /// are re-exported `pub` below (#1905) so the root binary's `darkmux run
 /// list` verb (`src/run_list.rs`) can call the exact same union
-/// `runs_handler` calls, rather than computing its own.
+/// `runs_handler` calls, rather than computing its own. `AbandonReason`
+/// joined the list in #1907, same reasoning: the CLI's own `Abandoned`
+/// rendering needs it too, not just the wire response.
 mod panel;
 mod runs;
-pub use runs::{build_runs, Run, RunKind, RunStatus};
+pub use runs::{build_runs, AbandonReason, Run, RunKind, RunStatus};
 pub mod source_state;
 // (#1637) Golden-file generation for the wire types the browser specs consume.
 // Test-only: it exists so a Playwright fixture cannot drift from the shape the

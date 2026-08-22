@@ -10,7 +10,7 @@
 //! selected; `--limit`/`--all` only shape the human table.
 
 use anyhow::Result;
-use darkmux_serve::{Run, RunKind, RunStatus};
+use darkmux_serve::{AbandonReason, Run, RunKind, RunStatus};
 use darkmux_types::style;
 
 use crate::cli::RunKindArg;
@@ -279,14 +279,34 @@ fn short_model(model: &str) -> &str {
     model.strip_prefix("darkmux:").unwrap_or(model)
 }
 
-/// `role · model · via route · machine` — same fields, same join, and same
-/// order as `ui/src/lenses/runs/format.ts::runSubtitle`, including its
-/// `shortModel` treatment of the model id (see [`short_model`]). The one
-/// difference is that function's `showMachine` gate, which exists there to
-/// avoid repeating a machine pin the lens already filtered to; this verb
-/// has no such pin, so machine is always eligible.
+/// `[reason ·] role · model · via route · machine` — same fields, same
+/// join, and same order as `ui/src/lenses/runs/format.ts::runSubtitle`,
+/// including its `shortModel` treatment of the model id (see
+/// [`short_model`]). The one difference is that function's `showMachine`
+/// gate, which exists there to avoid repeating a machine pin the lens
+/// already filtered to; this verb has no such pin, so machine is always
+/// eligible.
+///
+/// (#1907) `abandoned_reason` leads the line, when present — `STATUS_COLS`
+/// is a fixed-width column pinned to `"unparseable"` (11 chars); widening
+/// it to fit "no ending recorded" would force every row's status column to
+/// carry that width even when the reason is absent. The subtitle line is
+/// already free-width text, so the honest split is here, not there: the
+/// table still reads `abandoned` in the STATUS column (a caller scanning
+/// column-by-column still sees the same six values `status_label` always
+/// emitted), and the reason — "aborted" or "no ending recorded" — is the
+/// first thing on the line right under it.
 fn subtitle_for(r: &Run) -> String {
     let mut bits: Vec<String> = Vec::new();
+    if let Some(reason) = r.abandoned_reason {
+        bits.push(
+            match reason {
+                AbandonReason::Aborted => "aborted",
+                AbandonReason::NoTerminal => "no ending recorded",
+            }
+            .to_string(),
+        );
+    }
     if let Some(role) = &r.role {
         bits.push(role.clone());
     }
@@ -503,6 +523,11 @@ mod tests {
             // sorting, never drill-in — `None` is the honest value for a
             // synthetic row that was never joined to a real flow session.
             session_id: None,
+            // (#1907) None of this module's tests exercise `abandoned_reason`
+            // directly — that behavior is covered in `darkmux-serve`'s own
+            // `runs.rs` tests, where every construction site lives. This
+            // helper's rows are never `Abandoned` in the existing suite.
+            abandoned_reason: None,
         }
     }
 
@@ -876,6 +901,35 @@ mod tests {
         // A model that never carried the prefix is untouched.
         r.model = Some("gpt-4o".to_string());
         assert_eq!(subtitle_for(&r), "gpt-4o");
+    }
+
+    /// (#1907) `abandoned_reason` leads the subtitle line — see that
+    /// field's own doc on `subtitle_for` for why it lives here rather than
+    /// widening the fixed-width STATUS column (`STATUS_COLS` is pinned to
+    /// `"unparseable"`'s width, and "no ending recorded" is longer).
+    #[test]
+    fn subtitle_for_leads_with_the_abandoned_reason_when_present() {
+        let mut r = mk_run("run-1", RunKind::Mission, RunStatus::Abandoned, 1);
+        r.abandoned_reason = Some(AbandonReason::Aborted);
+        assert_eq!(subtitle_for(&r), "aborted");
+
+        r.abandoned_reason = Some(AbandonReason::NoTerminal);
+        assert_eq!(subtitle_for(&r), "no ending recorded");
+
+        r.role = Some("coder".to_string());
+        assert_eq!(
+            subtitle_for(&r),
+            "no ending recorded · coder",
+            "the reason leads; the usual role/model/route/machine bits still follow"
+        );
+    }
+
+    /// A non-abandoned row (or an abandoned row from an older server with
+    /// no `abandoned_reason` on the wire) must not print a phantom reason.
+    #[test]
+    fn subtitle_for_omits_the_reason_when_absent() {
+        let r = mk_run("run-1", RunKind::Mission, RunStatus::Complete, 1);
+        assert_eq!(subtitle_for(&r), "");
     }
 
     #[test]

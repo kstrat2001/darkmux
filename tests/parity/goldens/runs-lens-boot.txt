@@ -65,19 +65,19 @@ crew-dispatch-radio-router-1786182434869757-0
 6h ago
 untracked
 radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 MISSION
 acp-ephemeral-pr-ship-1786152707367180000-5
 15h ago
 untracked
 MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 MISSION
 acp-ephemeral-pr-comments-list-1786152519941013000-4
 15h ago
 untracked
 MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 MISSION
 acp-ephemeral-pr-list-1786152504805583000-3
 15h ago
@@ -95,45 +95,45 @@ crew-dispatch-radio-router-1786151802570362-4
 15h ago
 untracked
 radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 MISSION
 acp-ephemeral-pr-view-1786150088844151000-2
 15h ago
 untracked
 MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 MISSION
 acp-ephemeral-pr-list-1786150055695736000-1
 15h ago
 untracked
 MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 LAB
 review-bench-1786125001194
 22h ago
 MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 LAB
 review-bench-1786123759517
 23h ago
 MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 LAB
 review-bench-1786123489502
 23h ago
 MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 LAB
 review-bench-1786123090473
 23h ago
 MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 MISSION
 acp-ephemeral-pr-list-1786121191309511000-1
 23h ago
 untracked
 MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 MISSION
 acp-ephemeral-pr-list-1786121158195620000-0
 23h ago
@@ -145,7 +145,7 @@ crew-dispatch-radio-router-1786121073895143-0
 23h ago
 untracked
 radio-router · qwen3-4b-instruct-2507 · MacBook-Pro
-ABANDONED
+NO ENDING RECORDED
 MISSION
 acp-ephemeral-pr-list-1786121058517076000-0
 23h ago

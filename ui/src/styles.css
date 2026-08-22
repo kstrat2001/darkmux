@@ -1314,7 +1314,8 @@ body {
    chrome note (`CapturedInfo`) — this is the visual half of the same
    signal, not a separate concept. */
 .panelout.pc-body-stale,
-.panelerr.pc-body-stale {
+.panelerr.pc-body-stale,
+.panelwarn.pc-body-stale {
   opacity: 0.55;
 }
 
@@ -1384,6 +1385,17 @@ body {
   padding: 12px;
   font: 12px/1.5 "JetBrains Mono", monospace;
   color: var(--error);
+  white-space: pre-wrap;
+}
+/* (#1916) stderr on a ZERO exit is a diagnostic, not a failure — see
+   `ConsolePanel.tsx`'s `PanelBody` doc. Same shape as `.panelerr` (same
+   padding, font, wrapping) so only the color reads as different; `--dim`
+   is the same neutral token `.pc-manual`'s badge and the chrome row's own
+   default text color already use, never `--error`. */
+.panelwarn {
+  padding: 12px;
+  font: 12px/1.5 "JetBrains Mono", monospace;
+  color: var(--dim);
   white-space: pre-wrap;
 }
 /* ANSI SGR -> palette. Only what darkmux's own output emits is mapped with

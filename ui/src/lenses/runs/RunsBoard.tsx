@@ -19,6 +19,7 @@ import {
   runsMultiMachine,
   runsAgo,
   runSubtitle,
+  runStatusLabel,
   groupLabRunsByTask,
   labKnobSummary,
   labKnobDiff,
@@ -658,7 +659,13 @@ function onActivateKeyDown(onActivate: () => void) {
  * re-deriving the badge/kind-chip/subtitle DOM a second time. That view is
  * deleted (#1905 step 3 — `run-list`, a real CLI panel, supersedes it),
  * leaving `RunsBoard` as the only caller; kept module-private now rather
- * than exported with no consumer. */
+ * than exported with no consumer.
+ *
+ * (#1907) The badge's CLASS name stays `run.status` verbatim (so
+ * `.labbadge.abandoned` styling — the dim treatment — still applies), but
+ * its TEXT goes through `runStatusLabel`, which reads `abandoned` two
+ * different ways depending on `Run.abandoned_reason`. See that function's
+ * own doc for why "abandoned" alone was the wrong word for this row. */
 function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
   const interactive = runDestination(run, missionGraphReachable()).kind !== "none";
   const ago = runsAgo(run);
@@ -671,7 +678,7 @@ function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boole
         : {})}
     >
       <div className="labrunmain">
-        <span className={`labbadge ${run.status}`}>{run.status}</span>
+        <span className={`labbadge ${run.status}`}>{runStatusLabel(run)}</span>
         <span className={`runkind ${run.kind}`}>{run.kind}</span>
         <span className="labruncrew">{run.id}</span>
         {ago && <span className="labrundir">{ago}</span>}

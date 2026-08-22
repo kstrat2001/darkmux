@@ -199,6 +199,28 @@ describe("App", () => {
     expect(screen.getByText(/lens=totally-bogus/)).toBeInTheDocument();
   });
 
+  // (#1920) The placeholder used to send the operator to "the legacy
+  // viewer at GET /" — a page that stopped existing when viewer.html was
+  // deleted (#1865). `GET /` now serves this SAME app, so that note lied.
+  // The fix names what actually happened and points at a real, on-screen
+  // way out (the nav tabs `NavChrome` always renders above this component).
+  it("names the hash as unrecognized and points at the nav tabs, never the deleted legacy viewer", () => {
+    window.location.hash = "#lens=totally-bogus";
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText(/doesn't recognize that hash/i)).toBeInTheDocument();
+    expect(screen.getByText(/pick a lens from the tabs above/i)).toBeInTheDocument();
+    expect(screen.queryByText(/legacy viewer/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/see.*get \//i)).not.toBeInTheDocument();
+    // The nav tabs really are on screen — the note's claim is true, not
+    // just plausible-sounding.
+    expect(screen.getByRole("link", { name: "fleet" })).toBeInTheDocument();
+  });
+
   // Packet 1.5: nav chrome + hash write-back, wired at the App root.
   //
   // `mockFleetLikeFetch` returns a bare `[]` ONLY for the fleet-shaped
