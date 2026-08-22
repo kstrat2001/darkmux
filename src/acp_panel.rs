@@ -1130,6 +1130,8 @@ mod tests {
 
     // ── run_ephemeral (required test: two-step procedural.shell chain) ──
 
+    #[serial_test::serial]
+
     #[test]
     fn ephemeral_run_chains_two_procedural_shell_steps_via_step_input_env_var() {
         let cfg = config(
@@ -1302,6 +1304,8 @@ mod tests {
         }
     }
 
+    #[serial_test::serial]
+
     #[test]
     fn ephemeral_run_seeds_args_when_a_task_reads_the_synthetic_args_task() {
         // `procedural.shell`'s `sanitize_env_key` uppercases alnum bytes
@@ -1329,6 +1333,8 @@ mod tests {
         let out = run_ephemeral(&cfg, "hello world", &tmp, None).expect("ephemeral run succeeds");
         assert_eq!(out.text.trim(), "arg: hello world");
     }
+
+    #[serial_test::serial]
 
     #[test]
     fn ephemeral_run_with_empty_args_still_resolves_a_task_that_reads_the_reserved_id() {
@@ -1358,6 +1364,8 @@ mod tests {
     }
 
     // ── (#1695 merge-gate finding 1) reserved-id collision ──────────────
+
+    #[serial_test::serial]
 
     #[test]
     fn ephemeral_run_skips_injection_when_the_document_already_declares_the_reserved_task_id() {
@@ -1568,6 +1576,8 @@ mod tests {
         )
     }
 
+    #[serial_test::serial]
+
     #[test]
     fn ephemeral_run_gate_handler_receives_the_gather_tasks_output_and_approving_runs_the_executor() {
         let cfg = gather_then_gated_config();
@@ -1588,6 +1598,8 @@ mod tests {
              dialog-body contract: {received:?}"
         );
     }
+
+    #[serial_test::serial]
 
     #[test]
     fn ephemeral_run_gate_handler_declining_fails_the_command_without_running_the_executor() {

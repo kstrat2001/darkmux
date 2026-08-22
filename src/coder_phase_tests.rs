@@ -1181,6 +1181,7 @@ edit loop detected on src/widget.rs in an earlier dispatch
     /// creation, and the "already exists" bail on a second run for the
     /// same phase (the exact scenario a resumed/un-shipped coder-phase run
     /// hits).
+    #[serial_test::serial]
     #[test]
     fn mission_worktree_step_kind_creates_then_rejects_duplicate() {
         let tmp = tempfile::TempDir::new().unwrap();
