@@ -45,13 +45,15 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
-// (#1904 CI fix) The console lens's DEFAULT landing view is now
-// `ActivityPanel` (a client-rendered union over `/runs`, no `/panel/*` call
-// at all) rather than the `mission-status` CLI panel these three tests
-// actually measure (`.panelout`'s position, its overflow box, the `cols`
-// it asks for). Explicitly selecting the panel is a better fixture than
-// depending on the console's default happening to be a CLI panel — it
-// keeps working no matter what the lens defaults to next.
+// The console lens's default landing panel is `run-list` (#1905 step 3;
+// briefly `ActivityPanel`, a client-rendered `/runs` union with no
+// `/panel/*` call at all, under #1904 — deleted, see `panels.ts`'s own doc
+// on `PANELS`), not `mission-status`, the panel these three tests actually
+// measure (`.panelout`'s position, its overflow box, the `cols` it asks
+// for). Explicitly selecting the panel is a better fixture than depending
+// on the console's default happening to be the SAME panel these fixtures
+// were written around — it keeps working no matter what the lens defaults
+// to next.
 async function selectMissionStatus(page) {
   await page.click('[data-act="console"]');
   await page.click('[data-act="setpanel"][data-arg="mission-status"]');

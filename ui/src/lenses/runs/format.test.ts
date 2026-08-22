@@ -13,6 +13,7 @@ import {
   labKnobSummary,
   labKnobDiff,
   labCounts,
+  runDestination,
 } from "./format";
 import type { Run } from "../../types/generated/Run";
 import type { LabRun } from "../../types/handwritten";
@@ -257,5 +258,72 @@ describe("runsForMachine", () => {
   it("returns nothing for an empty alias set (an unresolvable/stale pin) rather than throwing", () => {
     const a = run({ id: "a", kind: "dispatch", status: "complete", tracked: true, machine: "MacBook-Pro" });
     expect(runsForMachine([a], new Set())).toEqual([]);
+  });
+});
+
+// (#1915) `runDestination` — the single source of truth for what a row
+// click should do, and the actual fix for the untracked-mission-is-inert
+// defect. `RunRow`'s `interactive` gate (`RunsBoard.tsx`) is now just
+// `runDestination(...).kind !== "none"`, so this matrix is also the load-
+// bearing spec for the client-side interactive/inert split.
+describe("runDestination", () => {
+  it("(#1915) an UNTRACKED mission row with a session_id drills to that session — the defect this issue fixed", () => {
+    // Before #1915, `runDestination` only special-cased `kind ===
+    // "dispatch"` for the untracked-but-openable case (#1900); a mission
+    // row in this exact shape read as `{kind: "none"}` even though the
+    // server had a perfectly good representative session for it — 40 of
+    // 104 rows on the reported machine, the entire newest page a person
+    // actually sees.
+    const peerMission = run({
+      id: "review-on-the-hub",
+      kind: "mission",
+      status: "running",
+      tracked: false,
+      session_id: "peer-session-1",
+    });
+    expect(runDestination(peerMission, true)).toEqual({ kind: "hash", hash: "session=peer-session-1" });
+    // `graphReachable` must not matter here — a session drill is never
+    // gated on it, tracked or not.
+    expect(runDestination(peerMission, false)).toEqual({ kind: "hash", hash: "session=peer-session-1" });
+  });
+
+  it("an untracked dispatch ghost row drills to its own id as the session (#1900, still true after the #1915 generalization)", () => {
+    const ghost = run({ id: "ghost-1", kind: "dispatch", status: "abandoned", tracked: false, session_id: "ghost-1" });
+    expect(runDestination(ghost, true)).toEqual({ kind: "hash", hash: "session=ghost-1" });
+  });
+
+  it("(#1915) an untracked row with NO session_id at all has genuinely nowhere to go", () => {
+    // The one shape #1915 leaves inert on purpose: a mission this daemon
+    // knows only from a terminal record, with no dispatch session ever
+    // joined to it (`flow_mission_to_run` can legitimately produce this —
+    // see that function's own doc in `crates/darkmux-serve/src/runs.rs`).
+    const bareUntracked = run({ id: "orphan-mission", kind: "mission", status: "complete", tracked: false });
+    expect(runDestination(bareUntracked, true)).toEqual({ kind: "none" });
+  });
+
+  it("a TRACKED mission still opens its mission graph, never a session — even when it also carries a session_id", () => {
+    // (#1915) The server populates `session_id` uniformly for every
+    // mission row, tracked or not (see `Run.session_id`'s own doc) — this
+    // is the regression `runDestination` must not have: a tracked row
+    // must keep resolving to `#mission=<id>` unconditionally, not fall
+    // into the untracked branch just because the field happens to be set.
+    const tracked = run({
+      id: "tracked-mission-1",
+      kind: "mission",
+      status: "complete",
+      tracked: true,
+      session_id: "some-session-that-must-be-ignored",
+    });
+    expect(runDestination(tracked, true)).toEqual({ kind: "hash", hash: "mission=tracked-mission-1" });
+  });
+
+  it("a tracked row with no reachable daemon reports unreachable, not none", () => {
+    const tracked = run({ id: "tracked-mission-2", kind: "mission", status: "complete", tracked: true });
+    expect(runDestination(tracked, false)).toEqual({ kind: "unreachable" });
+  });
+
+  it("a lab row always opens its own dir, independent of tracked/session_id", () => {
+    const lab = run({ id: "lab-dir-1", kind: "lab", status: "complete", tracked: true });
+    expect(runDestination(lab, true)).toEqual({ kind: "lab", dir: "lab-dir-1" });
   });
 });

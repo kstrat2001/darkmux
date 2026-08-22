@@ -150,53 +150,83 @@ export function runsForMachine(runs: Run[], names: Set<string>): Run[] {
 }
 
 /**
- * (#1904 QA fix) A run's click destination, shared by every caller that
- * opens a `Run` row — `RunsBoard.tsx`'s `activateRun` and
- * `ActivityPanel.tsx`'s `activityRunActivate` used to hand-roll the SAME
- * four-branch decision independently. That duplication is exactly what
- * let them drift: `ActivityPanel`'s copy dropped the `unreachable` branch
- * silently (a tracked mission/dispatch row rendered clickable via
- * `RunRow`'s own `interactive` gate, but clicking it when
- * `missionGraphReachable()` is false did nothing at all — a dead
- * affordance, the exact #1900 failure class both callers' own doc
- * comments invoke). One function, one place the rule lives.
+ * (#1904 QA fix) A run's click destination, extracted from `RunsBoard.tsx`'s
+ * `activateRun` so the four-branch decision lives in exactly one place. It
+ * used to also serve `ActivityPanel.tsx`'s own `activityRunActivate` — a
+ * SECOND hand-rolled copy of the same decision, whose independent drift
+ * (dropping the `unreachable` branch silently: a tracked mission/dispatch
+ * row rendered clickable via `RunRow`'s own `interactive` gate, but
+ * clicking it when `missionGraphReachable()` is false did nothing at all
+ * — the exact #1900 failure class) is why this got pulled out at all.
+ * `ActivityPanel.tsx` is deleted (#1905 step 3 — `run-list`, a real CLI
+ * panel over the same `/runs` union, supersedes it), leaving `RunsBoard`
+ * as this function's one remaining caller; the shared shape stays because
+ * the decision itself — and the drift risk a second caller could someday
+ * reintroduce — is unchanged by having only one caller today.
  *
  * The LAB branch is deliberately NOT resolved to a navigation here —
  * `RunsBoard` swaps to an in-page detail pane for a lab run (`openLabRun`,
- * a `labRunDir` state change plus a hash write), while `ActivityPanel`
- * isn't the runs lens and has no such state, so it navigates there
- * instead (`lens=runs&kind=lab&run=<dir>`). Returning the run's `id` (the
- * lab run's directory) lets each caller build its own destination from
- * it, rather than this function picking one caller's mechanism as
- * "correct" for both. */
+ * a `labRunDir` state change plus a hash write) rather than navigating
+ * anywhere. Returning the run's `id` (the lab run's directory) lets the
+ * caller build its own destination from it, rather than this function
+ * picking a navigation mechanism the caller doesn't use. */
 export type RunDestination =
   | { kind: "lab"; dir: string }
   | { kind: "hash"; hash: string }
-  /** A tracked mission or dispatch (its own mission graph exists), but this
-   * page has no live daemon behind it to fetch `/mission/<id>/graph.json`
-   * from (the daemon-less static demo build). The row is still
-   * INTERACTIVE — clicking it is a real, expected action — it just can't
-   * navigate anywhere useful; callers show `MISSION_GRAPH_UNREACHABLE_NOTICE`
+  /** A tracked mission (its own mission graph exists), but this page has
+   * no live daemon behind it to fetch `/mission/<id>/graph.json` from
+   * (the daemon-less static demo build). The row is still INTERACTIVE —
+   * clicking it is a real, expected action — it just can't navigate
+   * anywhere useful; callers show `MISSION_GRAPH_UNREACHABLE_NOTICE`
    * instead of silently doing nothing. */
   | { kind: "unreachable" }
-  /** An untracked mission (a peer's mission this daemon only knows via the
-   * fleet stream, #1705): its `id` is a mission id, not a session id, so
-   * there is no local record to open. Genuinely nothing to do here —
-   * callers render the row non-interactive, matching `RunRow`'s own
-   * `interactive` gate (`run.kind === "lab" || run.tracked || run.kind ===
-   * "dispatch"`), which already excludes exactly this case. */
+  /** An untracked row with no representative session to drill into either
+   * — genuinely nothing to do here. Callers render the row
+   * non-interactive, matching `RunRow`'s own `interactive` gate ("has a
+   * destination" — see that component's own doc), which already excludes
+   * exactly this case. Rare in practice (every untracked row this build
+   * has actually produced carries a `session_id`, ghost or mission
+   * alike), but not impossible — a mission this daemon knows about
+   * ONLY through a terminal record, with no dispatch session ever
+   * joined to it, is the honest shape that reaches here. */
   | { kind: "none" };
 
+/**
+ * (#1915) Untracked no longer means inert. #1900/#1902 widened this ONLY
+ * for `kind === "dispatch"`, because a dispatch row's `id` happens to BE
+ * its own session id — but `tracked` was never actually the right test;
+ * "does this row carry a session it can be drilled into" is. The server
+ * now carries that pick explicitly (`Run.session_id` —
+ * `crates/darkmux-serve/src/runs.rs`'s `mission_to_run`/
+ * `flow_mission_to_run`/`ghost_runs`, all resolving it the SAME
+ * representative-session rule already used for role/model/route), so ANY
+ * untracked row with one — a ghost dispatch (whose `session_id` equals
+ * its own `id`) or an untracked mission (a peer's, #1705, or a local
+ * ephemeral with no durable record) — drills the same way. On the
+ * reported machine this was 40 of 104 mission rows, the entire newest
+ * page a person actually sees (the board sorts newest-first).
+ *
+ * A tracked mission cannot use this shortcut even when it also carries a
+ * `session_id` (`mission_to_run` populates it uniformly — see that
+ * field's own doc): `/mission/<id>/graph.json` is served from THIS
+ * machine's own durable state, which a tracked row by definition has, so
+ * the richer mission GRAPH is the right destination, not a session. An
+ * UNTRACKED mission structurally cannot make that same claim — there is
+ * no local `Mission`/`Phase`/`Task`/`Step` record for it, on this machine
+ * or (for a peer's mission) on any machine this daemon can query — so its
+ * session is the best this view can ever offer, not a fallback pending a
+ * richer one.
+ */
 export function runDestination(run: Run, graphReachable: boolean): RunDestination {
   if (run.kind === "lab") return { kind: "lab", dir: run.id };
-  if (run.kind === "dispatch" && !run.tracked) {
+  if (!run.tracked) {
     // No `graphReachable` gate here — `/flow-session/<id>` is a plain
     // daemon fetch (`SessionReplay`'s own fetch, same as the ungated
     // `#session=<sid>` bars `FleetLens.tsx`'s activity timeline already
     // navigates to), not the mission-graph lens's endpoint.
-    return { kind: "hash", hash: `session=${encodeURIComponent(run.id)}` };
+    if (run.session_id) return { kind: "hash", hash: `session=${encodeURIComponent(run.session_id)}` };
+    return { kind: "none" };
   }
-  if (!run.tracked) return { kind: "none" };
   if (!graphReachable) return { kind: "unreachable" };
   return { kind: "hash", hash: `mission=${encodeURIComponent(run.id)}` };
 }

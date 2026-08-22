@@ -30,28 +30,56 @@
 
 import { injectedPlaybackDate } from "./injectedMeta";
 import { isStaticBuild } from "./staticSource";
+import { sanitizeOptParams } from "../lenses/console/panels";
 
 export const RUNS_KINDS = ["all", "mission", "dispatch", "lab"] as const;
 export type RunsKind = (typeof RUNS_KINDS)[number];
 
 /** The console lens's panel allowlist — a straight port of `viewer.html`'s
  * `PANELS` id list (`crates/darkmux-serve/src/panel.rs::PANEL_IDS` is the
- * server-side twin). Kept here, next to `RUNS_KINDS`, because both exist for
- * the SAME reason: `parseRoute` needs a closed set to validate a hash param
+ * server-side twin, hard-capped at 8 BASE VERBS by its own doctrine
+ * assertion). Kept here, next to `RUNS_KINDS`, because both exist for the
+ * SAME reason: `parseRoute` needs a closed set to validate a hash param
  * against before trusting it. Console-lens-only concerns (tab labels, which
- * panels are manual-only) stay in `lenses/console/panels.ts` — this list is
- * the routing-grammar's business, not the lens's. */
+ * panels are manual-only, the declared option space) stay in
+ * `lenses/console/panels.ts` — this list is the routing-grammar's business,
+ * not the lens's.
+ *
+ * (#1911) `mission-status-all` dropped out of this list — it is no longer a
+ * base verb, exactly mirroring `panel.rs`'s own layer-2 guard ("flags are
+ * opts, ids are verbs": its old argv `["mission","status","--all"]` bakes a
+ * flag into base argv, which the Rust-side allowlist no longer tolerates as
+ * a direct entry). It survives only as a one-release alias — see
+ * `PANEL_ALIASES` below, the client twin of `panel.rs`'s `resolve_alias`.
+ * `run-list` joins in its place, the CLI twin of the RUNS lens's union
+ * (`src/run_list.rs`). */
 export const PANEL_IDS = [
   "mission-status",
-  "mission-status-all",
-  "machine-status",
-  "flow-status",
   "role-list",
+  "machine-status",
   "config-list",
+  "flow-status",
   "lab-fixture-list",
+  "run-list",
   "doctor",
 ] as const;
 export type PanelId = (typeof PANEL_IDS)[number];
+
+/** One-release compatibility alias (#1911): the client twin of `panel.rs`'s
+ * `resolve_alias`. A `panel=mission-status-all` deep link — the CLI has
+ * printed these (`panel_deep_link` in `src/mission_status.rs`) and an
+ * operator may have bookmarked one — resolves to the BASE id `panelId`
+ * plus the FORCED opt selections that reproduce the old entry's exact
+ * behavior. `parseRoute` applies the forced opts LAST (after any `opt.*`
+ * the hash also carried), matching the server's own "the alias's whole
+ * point is a fixed, non-negotiable selection" ordering. `hashSync`'s
+ * `canonicalHash` then rewrites the address bar to the canonical
+ * `panel=mission-status&opt.all=all` form — the SAME upgrade path
+ * `#lens=lab` → `#lens=runs&kind=lab` already uses. Dropped entirely once
+ * every emitter has migrated, per the pre-1.0 no-compat-baggage posture. */
+export const PANEL_ALIASES: Readonly<Record<string, { panelId: PanelId; opts: Readonly<Record<string, string>> }>> = {
+  "mission-status-all": { panelId: "mission-status", opts: { all: "all" } },
+};
 
 export type Route =
   | { kind: "fleet" }
@@ -95,19 +123,29 @@ export type Route =
    * unrecognized id" — both parse the same way, matching legacy's
    * `consoleQuery()`: `PANELS.some(x=>x.id===id) ? id : ""`. The router
    * does the same allowlist check `consoleQuery` does; the lens component
-   * owns deciding what "" RENDERS as.
+   * owns deciding what "" RENDERS as — `ConsolePanel.tsx` resolves it to
+   * `panels.ts::DEFAULT_PANEL_ID` (`"run-list"`).
    *
-   * (#1904) That render decision changed, and the premise this doc used to
-   * state no longer holds: "" does NOT fall back to any CLI panel
-   * (`mission-status` included) — it's the console's own client-rendered
-   * activity view (`ActivityPanel`), a genuinely different thing from any
-   * `PanelId`. `mission-status` is an ordinary allowlisted panel now,
-   * addressable by its own explicit `panel=mission-status` like any other
-   * — `hashSync.ts`'s `canonicalHash` used to collapse it back to "",
-   * matching legacy's identical collapse (valid back when the two states
-   * WERE the same thing), which made it unreachable by URL until that
-   * collapse was removed post-#1904. */
-  | { kind: "console"; panelId: PanelId | "" }
+   * (#1904/#1905 step 3) A client-rendered `ActivityPanel` briefly stood in
+   * for `""` — a `/runs`-fed view with no CLI command behind it, genuinely
+   * different from any `PanelId`, which meant `mission-status`'s own
+   * address-bar collapse (see below) had to be removed so it stayed
+   * reachable as itself. #1905 step 3 deleted `ActivityPanel` (a THIRD
+   * client-side renderer of `/runs`, the same drift #1905 exists to
+   * prevent) in favor of `run-list` (#1910), a real CLI panel that reads
+   * the identical union — so `""` is back to meaning "the default CLI
+   * panel," the same relationship `mission-status` had pre-#1904. Every
+   * `PanelId` (`run-list` included) stays independently addressable by its
+   * own explicit `panel=<id>` regardless of which one is the default —
+   * `canonicalHash` does not collapse an explicit choice into `""`.
+   *
+   * `opts` (#1911) — the panel's own resolved `opt.<name>` selections
+   * (`{}` when `panelId` is `""`, or a panel declares no options). Only
+   * entries `sanitizeOptParams` recognized for THIS panel ever land here —
+   * see that function's own doc. Always present (never optional) so every
+   * consumer (`ConsolePanel`, `hashSync.canonicalHash`) can read it
+   * unconditionally rather than defaulting to `{}` at every call site. */
+  | { kind: "console"; panelId: PanelId | ""; opts: Readonly<Record<string, string>> }
   | { kind: "session"; sessionId: string }
   /** `#mission=<id>` — the mission-graph lens (#1868). A FULL NAVIGATION in
    * the LEGACY viewer (`location.href = "/mission/<id>/graph"`, a separate
@@ -254,8 +292,40 @@ export function parseRoute(): Route {
 
   if (lens === "console") {
     const rawPanel = get("panel");
-    const panelId = (PANEL_IDS as readonly string[]).includes(rawPanel) ? (rawPanel as PanelId) : "";
-    return { kind: "console", panelId };
+    const alias = PANEL_ALIASES[rawPanel];
+    const panelId: PanelId | "" = alias
+      ? alias.panelId
+      : (PANEL_IDS as readonly string[]).includes(rawPanel)
+        ? (rawPanel as PanelId)
+        : "";
+    // (#1911) `opt.<name>` — read from BOTH the hash and the query string,
+    // same dual-source posture `get()` already gives every other param;
+    // hash wins on a name present in both. Validated against `panelId`'s
+    // OWN table (an id this build doesn't recognize has no table to
+    // validate against, so it gets no opts at all — matching "an
+    // unrecognized `panel` parses the same as absent").
+    // (#1920) Hash first, then search fills only what the hash did not
+    // set — so a non-empty SEARCH value wins, matching `get()` above
+    // (`search.get(name) || hash.get(name)`) and therefore every other
+    // NAMED param: `lens`, `panel`, `machine`, `uid`, `mission`,
+    // `session`. The first draft appended hash last and let it overwrite
+    // unconditionally, so `opt.kind=` and `panel=` on one page obeyed
+    // opposite rules.
+    //
+    // Note this repo does have a deliberate hash-wins case, pinned by
+    // "an in-hash date wins over a co-present ?date= query param" — but
+    // that is the BARE `#<date>` form, a positional hash shape rather
+    // than a named param, so it is a different rule for a different
+    // thing, not a precedent for this one.
+    const rawOpts: Record<string, string> = {};
+    for (const [k, v] of hash.entries()) if (k.startsWith("opt.")) rawOpts[k.slice(4)] = v;
+    for (const [k, v] of search.entries()) if (k.startsWith("opt.") && v !== "") rawOpts[k.slice(4)] = v;
+    let opts: Readonly<Record<string, string>> = panelId ? sanitizeOptParams(panelId, rawOpts) : {};
+    // The alias's forced selection wins over anything a stray `opt.*`
+    // param claimed — mirrors `panel.rs::resolve_alias`'s own doc: "the
+    // alias's whole point is a fixed, non-negotiable selection".
+    if (alias) opts = { ...opts, ...alias.opts };
+    return { kind: "console", panelId, opts };
   }
 
   const mission = get("mission");

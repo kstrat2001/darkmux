@@ -128,7 +128,7 @@ describe("RunsBoard", () => {
     await waitFor(() => expect(screen.getByText(/lab series/)).toBeInTheDocument());
   });
 
-  it("(#1900) a terminated, untracked dispatch row with flow records is interactive and activating it navigates to #session=<id>", async () => {
+  it("(#1900, session_id wiring #1915) a terminated, untracked dispatch row with flow records is interactive and activating it navigates to #session=<id>", async () => {
     // "ghost" is `kind: "dispatch", tracked: false` — server-side, EVERY
     // such row is synthesized only for a flow session that saw a real
     // `dispatch start` record (`ghost_runs`'s `has_start` gate in
@@ -136,6 +136,11 @@ describe("RunsBoard", () => {
     // show via `/flow-session/<id>` even with no mission graph behind it.
     // The "untracked" chip still shows (it's an honest label — no durable
     // run record backs this row) but it must no longer mean unopenable.
+    // `session_id: "ghost"` matches the real wire shape: `ghost_runs`
+    // populates it from the row's OWN id (#1915) — the client no longer
+    // special-cases `kind === "dispatch"`, it reads `run.session_id`
+    // uniformly, so this fixture has to carry it like a real server
+    // response would.
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -143,7 +148,7 @@ describe("RunsBoard", () => {
           return Promise.resolve(
             new Response(
               JSON.stringify({
-                runs: [{ id: "ghost", kind: "dispatch", status: "abandoned", tracked: false, updated_ts: 1 }],
+                runs: [{ id: "ghost", kind: "dispatch", status: "abandoned", tracked: false, session_id: "ghost", updated_ts: 1 }],
                 generated_at_ms: 1,
               }),
               { status: 200 },
@@ -173,12 +178,64 @@ describe("RunsBoard", () => {
     }
   });
 
-  it("(#1900) a row with genuinely nothing behind it — an untracked mission this daemon doesn't own, with no local session — stays non-interactive", async () => {
-    // `kind: "mission", tracked: false` is `flow_mission_to_run`'s shape
-    // (#1705 — a peer's mission this daemon only sees via the fleet
-    // stream). Its `id` is a mission id, not a session id, so there is no
-    // `/flow-session/<id>` to open here — unlike the dispatch ghost above,
-    // this row really does have nothing local to show.
+  it("(#1915) an untracked MISSION row that carries a session_id is interactive and activating it navigates to #session=<id>", async () => {
+    // This is the #1915 defect itself: `kind: "mission", tracked: false`
+    // is `flow_mission_to_run`'s shape (#1705 — a peer's mission this
+    // daemon only sees via the fleet stream), and it USED to always read
+    // as flat because the old `interactive`/`runDestination` logic only
+    // ever special-cased `kind === "dispatch"`. But the server picks a
+    // representative session for a mission row exactly like it does for
+    // role/model/route, so a mission carrying `session_id` has just as
+    // real a destination as the dispatch ghost above — same drill, same
+    // `#session=<id>` hash, no mission-graph gate.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url === "/runs") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                runs: [
+                  {
+                    id: "peer-mission-with-session",
+                    kind: "mission",
+                    status: "running",
+                    tracked: false,
+                    session_id: "peer-session-1",
+                    updated_ts: 1,
+                  },
+                ],
+                generated_at_ms: 1,
+              }),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response(JSON.stringify({ configured: true, dir: null, exists: null, runs: [] }), { status: 200 }));
+      }),
+    );
+    try {
+      renderBoard();
+      await waitFor(() => expect(screen.getByText("peer-mission-with-session")).toBeInTheDocument());
+      expect(screen.getByText("untracked")).toBeInTheDocument();
+      const row = screen.getByText("peer-mission-with-session").closest(".labrunrow")!;
+      expect(row).not.toHaveClass("flat");
+      expect(row).toHaveAttribute("role", "button");
+
+      fireEvent.click(row);
+      expect(window.location.hash).toBe("#session=peer-session-1");
+      expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
+    } finally {
+      window.location.hash = "";
+    }
+  });
+
+  it("(#1915) a row with genuinely nothing behind it — an untracked mission with no session_id at all — stays non-interactive", async () => {
+    // `kind: "mission", tracked: false`, no `session_id`: a mission this
+    // daemon knows only from a terminal record, with no dispatch session
+    // ever joined to it. This is the ONLY untracked shape that still has
+    // truly nothing to open — the case #1900's fix left behind and #1915
+    // fixed everywhere else.
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -262,7 +319,7 @@ describe("RunsBoard", () => {
     expect(screen.getByText(/needs a running daemon/i)).toBeInTheDocument();
   });
 
-  it("(#1900) an untracked dispatch ghost row also opens #session=<id> from a keyboard Enter activation, and never shows the mission-graph notice", async () => {
+  it("(#1900, session_id wiring #1915) an untracked dispatch ghost row also opens #session=<id> from a keyboard Enter activation, and never shows the mission-graph notice", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -270,7 +327,7 @@ describe("RunsBoard", () => {
           return Promise.resolve(
             new Response(
               JSON.stringify({
-                runs: [{ id: "ghost2", kind: "dispatch", status: "abandoned", tracked: false, updated_ts: 1 }],
+                runs: [{ id: "ghost2", kind: "dispatch", status: "abandoned", tracked: false, session_id: "ghost2", updated_ts: 1 }],
                 generated_at_ms: 1,
               }),
               { status: 200 },

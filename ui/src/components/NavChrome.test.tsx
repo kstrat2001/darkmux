@@ -19,7 +19,7 @@ describe("NavChrome", () => {
     [{ kind: "fleet" }, "lens-fleet"],
     [{ kind: "runs", runsKind: "all", run: null, machine: null }, "lens-runs"],
     [{ kind: "machine", uid: null }, "lens-machine"],
-    [{ kind: "console", panelId: "" }, "lens-console"],
+    [{ kind: "console", panelId: "", opts: {} }, "lens-console"],
     // Legacy: `state.level==="subsystem"` (a session drill-in) leaves the
     // fleet tab lit — see `NavChrome.tsx`'s own `isActive` doc.
     [{ kind: "session", sessionId: "abc-123" }, "lens-fleet"],

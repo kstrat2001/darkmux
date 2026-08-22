@@ -51,6 +51,22 @@
       "kind": "dispatch",
       "status": "error",
       "updated_ts": 1893440000,
+      "tracked": false,
+      "session_id": "degraded/untracked-ghost"
+    },
+    {
+      "id": "degraded/untracked-mission-with-session",
+      "kind": "mission",
+      "status": "running",
+      "updated_ts": 1893440000,
+      "tracked": false,
+      "session_id": "degraded/untracked-mission-with-session-sess"
+    },
+    {
+      "id": "degraded/untracked-mission-no-session",
+      "kind": "mission",
+      "status": "running",
+      "updated_ts": 1893440000,
       "tracked": false
     },
     {

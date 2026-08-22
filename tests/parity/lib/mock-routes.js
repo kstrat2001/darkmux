@@ -127,13 +127,35 @@ function installCorpusRoutes(page, meta) {
     if (p === `/flow-mission/${encodeURIComponent(GRAPH_FIXTURE_MISSION_ID)}`) return json("flow-mission-sanity.json");
     if (p.startsWith("/flow-mission/")) return jsonInline({ records: [], count: 0, truncated: false, generated_at_ms: meta.frozen_clock_ms });
 
-    if (p === "/panel/mission-status") return json("panel-mission-status.json");
+    // (#1911) `mission-status` now carries a declared `--all` opt — the
+    // ported client sends `opt.all=all` on the wire (never the retired
+    // `panel=mission-status-all` id, since `parseRoute` resolves that alias
+    // to `{panel:"mission-status", opts:{all:"all"}}` BEFORE any fetch
+    // happens). Branch on the query param, same as a real daemon's
+    // `resolve_opts` would, to replay the "all missions" fixture content.
+    if (p === "/panel/mission-status") {
+      return url.searchParams.get("opt.all") === "all" ? json("panel-mission-status-all.json") : json("panel-mission-status.json");
+    }
+    // Kept for one release (#1911's own compat posture): a stray
+    // `/panel/mission-status-all` request (a pre-#1911 client, or a test
+    // exercising the raw endpoint directly) still replays the same fixture
+    // a real daemon's `resolve_alias` would produce.
     if (p === "/panel/mission-status-all") return json("panel-mission-status-all.json");
     if (p === "/panel/machine-status") return json("panel-machine-status.json");
     if (p === "/panel/flow-status") return json("panel-flow-status.json");
     if (p === "/panel/role-list") return json("panel-role-list.json");
     if (p === "/panel/config-list") return json("panel-config-list.json");
     if (p === "/panel/lab-fixture-list") return json("panel-lab-fixture-list.json");
+    // (#1905 step 3) `run-list` is the console's DEFAULT panel now
+    // (`panels.ts::DEFAULT_PANEL_ID`) — every console golden's bare landing
+    // replays this fixture. Captured for real off a genuinely empty
+    // `DARKMUX_FLOWS_DIR` (`cargo build --bin darkmux`, then
+    // `DARKMUX_FLOWS_DIR=<empty dir> CLICOLOR_FORCE=1 darkmux run list`), not
+    // hand-typed — an honest "nothing has run yet" state, same shape a fresh
+    // install's console actually shows. No richer (populated) run-list
+    // fixture exists yet — a follow-up capture against a real daemon's
+    // history would need its own sanitization pass first.
+    if (p === "/panel/run-list") return json("panel-run-list.json");
     if (p === "/panel/doctor") return json("panel-doctor.json");
     if (p.startsWith("/panel/")) return notFound('unknown panel "' + p.slice("/panel/".length) + '" — panels are a fixed allowlist, not arbitrary commands\n');
 

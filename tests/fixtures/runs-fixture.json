@@ -59,7 +59,8 @@
       "role": "analyst",
       "started_ts": 1893430000,
       "updated_ts": 1893430000,
-      "tracked": false
+      "tracked": false,
+      "session_id": "ghost-session-abc"
     }
   ]
 }

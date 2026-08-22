@@ -1,0 +1,20 @@
+{
+    "panel": "run-list",
+    "argv": [
+        "run",
+        "list"
+    ],
+    "opts": {
+        "kind": "all",
+        "all": "recent"
+    },
+    "captured_ts_ms": 1786222463561,
+    "gather_ms": 4,
+    "exit_code": 0,
+    "ansi_text": "\u001b[2mno recorded run activity yet\u001b[0m\n",
+    "stderr_tail": "",
+    "cols": 100,
+    "cache_ttl_ms": 3000,
+    "age_ms": 0,
+    "auto_refresh": true
+}

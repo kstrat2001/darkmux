@@ -18,15 +18,13 @@ github
 console
 
 === stage ===
-activity
-all activity
+run list
 mission status
-all missions
-machine
-flow
-roles
-config
-fixtures
+machine status
+flow status
+role list
+config list
+lab fixture list
 doctor
 $ darkmux flow status
 captured 20:54:23

@@ -52,17 +52,67 @@ describe("parseRoute", () => {
 
   it("parses #lens=console&panel=<id>", () => {
     setHash("#lens=console&panel=role-list");
-    expect(parseRoute()).toEqual({ kind: "console", panelId: "role-list" });
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "role-list", opts: {} });
   });
 
   it("parses #lens=console with no panel as the default panel", () => {
     setHash("#lens=console");
-    expect(parseRoute()).toEqual({ kind: "console", panelId: "" });
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "", opts: {} });
   });
 
   it("falls back to the default panel for an unrecognized panel id (matching legacy consoleQuery, not a blank page)", () => {
     setHash("#lens=console&panel=rm-rf-everything");
-    expect(parseRoute()).toEqual({ kind: "console", panelId: "" });
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "", opts: {} });
+  });
+
+  // ── #1911: opts on the console route ──────────────────────────────
+
+  it("parses opt.<name>=<value> against the panel's own declared table", () => {
+    setHash("#lens=console&panel=run-list&opt.kind=lab");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "run-list", opts: { kind: "lab" } });
+  });
+
+  it("multiple opts on the same panel compose", () => {
+    setHash("#lens=console&panel=run-list&opt.kind=mission&opt.all=all");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "run-list", opts: { kind: "mission", all: "all" } });
+  });
+
+  it("an unknown opt VALUE for a known name drops silently — never a blank page, never a passthrough", () => {
+    setHash("#lens=console&panel=run-list&opt.kind=bogus");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "run-list", opts: {} });
+  });
+
+  it("an unknown opt NAME for the panel drops silently", () => {
+    setHash("#lens=console&panel=run-list&opt.machine=studio");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "run-list", opts: {} });
+  });
+
+  it("an opt legal on a DIFFERENT panel is irrelevant here and drops", () => {
+    // `kind` is a real opt name — just not one `mission-status` declares.
+    setHash("#lens=console&panel=mission-status&opt.kind=lab");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "mission-status", opts: {} });
+  });
+
+  it("a panel with no declared opts ignores any opt.* param entirely", () => {
+    setHash("#lens=console&panel=doctor&opt.all=all");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "doctor", opts: {} });
+  });
+
+  // ── #1911: the mission-status-all alias ───────────────────────────
+
+  it("panel=mission-status-all resolves to mission-status with all forced", () => {
+    setHash("#lens=console&panel=mission-status-all");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "mission-status", opts: { all: "all" } });
+  });
+
+  it("the alias's forced opt wins over a stray opt.* param claiming otherwise", () => {
+    setHash("#lens=console&panel=mission-status-all&opt.all=recent");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "mission-status", opts: { all: "all" } });
+  });
+
+  it("run-list is a real, addressable panel id", () => {
+    setHash("#lens=console&panel=run-list");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "run-list", opts: {} });
   });
 
   it("parses #session=<id>", () => {
@@ -73,6 +123,36 @@ describe("parseRoute", () => {
   it("parses #mission=<id> as the mission-graph lens route (#1868)", () => {
     setHash("#mission=my-mission");
     expect(parseRoute()).toEqual({ kind: "mission", missionId: "my-mission" });
+  });
+
+  /// (#1920) `opt.*` must resolve search-vs-hash the same way every other
+  /// NAMED param does via `get()` (`search.get(name) || hash.get(name)`).
+  /// It did not: the collection loop let the hash overwrite
+  /// unconditionally, so `opt.kind=` and `panel=` on one page obeyed
+  /// opposite rules.
+  it("opt.* precedence: a non-empty search value wins over the hash, like every other named param", () => {
+    const url = new URL(window.location.href);
+    url.hash = "#lens=console&panel=run-list&opt.kind=lab";
+    url.search = "?opt.kind=mission";
+    window.history.replaceState(null, "", url.toString());
+    const r = parseRoute();
+    expect(r.kind).toBe("console");
+    if (r.kind !== "console") throw new Error("unreachable");
+    expect(r.opts.kind).toBe("mission");
+    window.history.replaceState(null, "", "/");
+  });
+
+  /// The other half of the same rule: an EMPTY search value is not a
+  /// value, so the hash still supplies it, matching `get()`'s own `||`.
+  it("opt.* precedence: an empty search value does not shadow the hash", () => {
+    const url = new URL(window.location.href);
+    url.hash = "#lens=console&panel=run-list&opt.kind=lab";
+    url.search = "?opt.kind=";
+    window.history.replaceState(null, "", url.toString());
+    const r = parseRoute();
+    if (r.kind !== "console") throw new Error("expected console route");
+    expect(r.opts.kind).toBe("lab");
+    window.history.replaceState(null, "", "/");
   });
 
   it("mission precedence: lens=runs wins over a co-present mission= param", () => {
@@ -314,7 +394,7 @@ describe("isLiveRoute — a daemon-less build is never live, on any lens", () =>
     { kind: "fleet" },
     { kind: "runs", runsKind: "all", run: null, machine: null },
     { kind: "machine", uid: null },
-    { kind: "console", panelId: "" },
+    { kind: "console", panelId: "", opts: {} },
     { kind: "unknown", hash: "nonsense" },
   ];
 

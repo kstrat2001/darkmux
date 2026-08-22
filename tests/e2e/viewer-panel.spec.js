@@ -39,17 +39,16 @@ async function routePanels(page, handler) {
   await page.route('**/panel/**', handler);
 }
 
-// (#1904 CI fix) The console lens's DEFAULT landing view is now
-// `ActivityPanel` (a client-rendered union over `/runs`, no `/panel/*` call
-// at all) rather than the `mission-status` CLI panel — every test below
-// that actually exercises panel rendering, the manual-only contract, or
-// the XSS gate needs a REAL CLI panel on screen to test, so it can no
-// longer get there for free by just clicking the console tab. This
-// explicitly selects `mission-status` (the same panel these tests always
-// meant to exercise — `panelBody()`'s own default `panel: 'mission-status'`
-// names it) after landing on console, which is a BETTER fixture than
-// depending on the console's default happening to be a CLI panel: it
-// keeps working no matter what the lens defaults to next.
+// The console lens's default landing panel is `run-list` (#1905 step 3;
+// briefly `ActivityPanel`, a client-rendered `/runs` union with no
+// `/panel/*` call at all, under #1904 — deleted, see `panels.ts`'s own doc
+// on `PANELS`). Every test below that exercises panel rendering, the
+// manual-only contract, or the XSS gate wants `mission-status`
+// specifically (`panelBody()`'s own default `panel: 'mission-status'`
+// names it), so this explicitly selects it after landing on console rather
+// than depending on the console's default happening to be the SAME panel
+// these fixtures were written around — a fixture that keeps working no
+// matter what the lens defaults to next.
 async function selectMissionStatus(page) {
   await page.click('[data-act="console"]');
   await page.click('[data-act="setpanel"][data-arg="mission-status"]');
@@ -115,7 +114,10 @@ test('a manual-only panel never runs until asked', async ({ page }) => {
   await page.goto('/index-lab.html');
   await selectMissionStatus(page);
   await expect(page.locator('.panelout')).toBeVisible();
-  expect(asked).toEqual(['mission-status']);
+  // (#1905 step 3) `selectMissionStatus` lands on console FIRST (fetching
+  // `run-list`, the new default panel) before explicitly picking
+  // `mission-status` — `asked` carries both, in that order.
+  expect(asked).toEqual(['run-list', 'mission-status']);
 
   // Selecting `doctor` must NOT fetch: it probes the machine, and running
   // it unasked is the observer joining the observed (#1286). This once
@@ -123,13 +125,13 @@ test('a manual-only panel never runs until asked', async ({ page }) => {
   // worked only on repeat visits, i.e. never when it mattered.
   await page.click('[data-act="setpanel"][data-arg="doctor"]');
   await page.waitForTimeout(400);
-  expect(asked, 'selecting a manual panel must not run it').toEqual(['mission-status']);
+  expect(asked, 'selecting a manual panel must not run it').toEqual(['run-list', 'mission-status']);
   await expect(page.locator('.panelout')).toContainText('not run yet');
 
   // …and an explicit run does.
   await page.click('[data-act="refreshpanel"]');
   await expect(page.locator('.panelchrome')).toContainText('manual-run only');
-  expect(asked).toEqual(['mission-status', 'doctor']);
+  expect(asked).toEqual(['run-list', 'mission-status', 'doctor']);
 });
 
 test('the daemon\'s own refusal is shown verbatim, not reworded', async ({ page }) => {
@@ -183,22 +185,27 @@ test('the console renders attacker-controlled panel bytes inertly', async ({ pag
   expect(pageErrors, `uncaught: ${pageErrors.join(' | ')}`).toEqual([]);
 });
 
-test('a panel deep link switches in page instead of navigating', async ({ page }) => {
+test('a panel deep link resolves through the real anchor (#1911: the JS in-page switch no longer intercepts a retired alias id)', async ({ page }) => {
   // The verb emits this when it knows it is rendering into a panel (see
   // `panel_deep_link`): "`--all` for every mission" is actionable advice in a
   // terminal and a dead end here, so the flag names itself as a link instead.
+  // The LINK TARGET is unchanged server-side (`panel_deep_link` in
+  // `src/mission_status.rs` still bakes `panel=mission-status-all` — that is
+  // the CLI's own one-release compat posture, #1911).
   const WITH_LINK =
     '\x1b[2m  … 81 more (3 of 84 shown)\x1b[0m\n' +
     '  \x1b]8;;http://127.0.0.1:8765/#lens=console&panel=mission-status-all\x1b\\' +
     '→ show every mission\x1b]8;;\x1b\\\n';
   const asked = [];
   await routePanels(page, (route) => {
-    const id = new URL(route.request().url()).pathname.split('/').pop();
-    asked.push(id);
+    const url = new URL(route.request().url());
+    const id = url.pathname.split('/').pop();
+    const all = url.searchParams.get('opt.all') === 'all';
+    asked.push(all ? `${id}?opt.all=all` : id);
     route.fulfill({
       contentType: 'application/json',
       body: JSON.stringify(
-        id === 'mission-status-all'
+        all
           ? panelBody('\x1b[2m  the whole board\x1b[0m\n', { panel: id, argv: ['mission', 'status', '--all'] })
           : panelBody(WITH_LINK)
       ),
@@ -213,10 +220,30 @@ test('a panel deep link switches in page instead of navigating', async ({ page }
   await page.click('.panelout a:has-text("show every mission")');
   await expect(page.locator('.panelout')).toContainText('the whole board');
 
-  // Switched IN PAGE: the target panel was fetched, and following the href
-  // would have reloaded the viewer to land one tab from where it already was.
-  expect(asked).toContain('mission-status-all');
-  expect(page.url().split('#')[0]).toBe(before.split('#')[0]);
+  // (#1911) `mission-status-all` is no longer a base panel id (see
+  // `PANEL_IDS` in `ui/src/lib/route.ts`) — `panelSwitchId` (`ansi.tsx`)
+  // recognizes a link's raw `panel=` value against that closed set BEFORE
+  // any alias resolution, so this link no longer matches and the JS
+  // in-page-switch shortcut does not fire. The browser instead follows the
+  // anchor's own hash-only `href` natively — a real navigation, which then
+  // reaches `parseRoute`'s alias table (`PANEL_ALIASES`) and resolves to
+  // `mission-status` + `opt.all=all`; the fetch below proves it landed.
+  expect(asked).toContain('mission-status?opt.all=all');
+
+  // Same known harness gap `next-parity-console.spec.ts`'s "the REAL
+  // in-corpus OSC-8 deep link" test already documents for the SAME
+  // recorded link (verbatim comment there): `panel_deep_link` bakes an
+  // ABSOLUTE daemon URL whose pathname is "/" (the console is served at
+  // root in real production, `GET /`). In production the operator is
+  // ALREADY on that same root path, so following the href is a genuine
+  // same-document hash-only change. THIS harness serves the fixture at
+  // `/index-lab.html`, a path the recorded link was never baked against —
+  // a harness artifact, not a production behavior, and the reason this
+  // assertion checks the PATHNAME actually reached (root, matching the
+  // link) rather than asserting it stayed put. Before #1911 this never
+  // surfaced because the JS switch intercepted the click before the real
+  // href was ever followed at all.
+  expect(new URL(page.url()).pathname).toBe('/');
 });
 
 test('a manual panel stays unrun across leaving and re-entering the tab', async ({ page }) => {
@@ -268,12 +295,18 @@ test('a console deep link boots straight into that panel and stays addressable',
 
   await page.goto('/index-lab.html#lens=console&panel=mission-status-all');
   await expect(page.locator('.panelout')).toContainText('the whole board');
-  await expect(page.locator('[data-act="setpanel"][data-arg="mission-status-all"]')).toHaveClass(/\bon\b/);
+  await expect(page.locator('[data-act="setpanel"][data-arg="mission-status"]')).toHaveClass(/\bon\b/);
+  await expect(page.getByRole('switch', { name: '--all' })).toHaveAttribute('aria-checked', 'true');
 
-  // And the address bar still describes what is on screen, so what the
-  // operator copies out of it comes back to the same place.
-  expect(page.url()).toContain('lens=console');
-  expect(page.url()).toContain('panel=mission-status-all');
+  // (#1911) `mission-status-all` folded into `mission-status`'s own `--all`
+  // opt — `parseRoute` resolves the alias synchronously at first parse (see
+  // `route.ts::PANEL_ALIASES`), so the panel renders correctly straight
+  // off this boot with no extra round trip. The address bar then upgrades
+  // to the canonical `opt.*` form — the SAME `#lens=lab` ->
+  // `#lens=runs&kind=lab` upgrade path this app already used, applied here.
+  await expect.poll(() => page.url()).toContain('panel=mission-status&');
+  expect(page.url()).toContain('opt.all=all');
+  expect(page.url()).not.toContain('mission-status-all');
 });
 
 test('the console shows no crumb — the picker and the chrome line already say which panel', async ({ page }) => {
@@ -282,13 +315,15 @@ test('the console shows no crumb — the picker and the chrome line already say 
   );
   await page.goto('/index-lab.html');
   await page.click('[data-act="console"]');
-  // (#1904 CI fix) This test's own subject is the CRUMB, which `ConsolePanel`
-  // never touches regardless of which of its own views is showing — it does
-  // not need a CLI panel selected, just the console lens actually mounted.
-  // Was `.panelout` (true only because the default happened to render one);
-  // `.consoleactivity` is what the bare landing view — its default now —
-  // actually renders, so this no longer depends on that default surviving
-  // the next redesign either.
-  await expect(page.locator('.consoleactivity')).toBeVisible();
+  // (#1904 CI fix, #1905 step 3) This test's own subject is the CRUMB,
+  // which `ConsolePanel` never touches regardless of which panel is
+  // showing — it does not need a specific CLI panel selected, just the
+  // console lens actually mounted. `.panelwrap` (`CliPanelView`'s own
+  // wrapper) renders unconditionally and immediately for every `panelId`
+  // now that every `panelId` is a real CLI panel (#1905 step 3 deleted the
+  // one client-only view, `ActivityPanel`, that didn't render it) — a
+  // sturdier marker than `.panelout`, which only appears once a fetch
+  // resolves.
+  await expect(page.locator('.panelwrap')).toBeVisible();
   expect((await page.locator('#crumb').innerText()).trim()).toBe('');
 });

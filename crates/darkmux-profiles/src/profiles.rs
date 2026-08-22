@@ -750,6 +750,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     /// `default_locations()` is the *fallback* chain only — DARKMUX_PROFILES
     /// short-circuits in `load_registry`, not here. The default chain itself
     /// should not include the env var path.

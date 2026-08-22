@@ -499,6 +499,10 @@ mod tests {
             completed_ts: if status == RunStatus::Running { None } else { Some(updated_ts) },
             updated_ts: Some(updated_ts),
             tracked: true,
+            // (#1915) This CLI-verb test helper only exercises filtering/
+            // sorting, never drill-in — `None` is the honest value for a
+            // synthetic row that was never joined to a real flow session.
+            session_id: None,
         }
     }
 
