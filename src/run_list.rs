@@ -279,23 +279,37 @@ fn short_model(model: &str) -> &str {
     model.strip_prefix("darkmux:").unwrap_or(model)
 }
 
-/// `[reason ·] role · model · via route · machine` — same fields, same
-/// join, and same order as `ui/src/lenses/runs/format.ts::runSubtitle`,
-/// including its `shortModel` treatment of the model id (see
-/// [`short_model`]). The one difference is that function's `showMachine`
-/// gate, which exists there to avoid repeating a machine pin the lens
-/// already filtered to; this verb has no such pin, so machine is always
-/// eligible.
+/// The narrow-pane subtitle: everything [`subtitle_for`] carries, plus the
+/// machine, for when the MACHINE column has been shed (#1929).
+fn subtitle_with_machine(r: &Run) -> String {
+    let base = subtitle_for(r);
+    match (&r.machine, base.is_empty()) {
+        (Some(m), true) => m.clone(),
+        (Some(m), false) => format!("{base} · {m}"),
+        (None, _) => base,
+    }
+}
+
+/// `[reason ·] role · model · via route` — the same fields, join and order
+/// as `ui/src/lenses/runs/format.ts::runSubtitle`, including its
+/// `shortModel` treatment of the model id (see [`short_model`]).
 ///
-/// (#1907) `abandoned_reason` leads the line, when present — `STATUS_COLS`
-/// is a fixed-width column pinned to `"unparseable"` (11 chars); widening
-/// it to fit "no ending recorded" would force every row's status column to
-/// carry that width even when the reason is absent. The subtitle line is
-/// already free-width text, so the honest split is here, not there: the
-/// table still reads `abandoned` in the STATUS column (a caller scanning
-/// column-by-column still sees the same six values `status_label` always
-/// emitted), and the reason — "aborted" or "no ending recorded" — is the
-/// first thing on the line right under it.
+/// (#1907) `abandoned_reason` leads the line when present. `STATUS_COLS` is
+/// fixed-width, pinned to `"unparseable"` (11 chars); widening it to fit
+/// "no ending recorded" would make every row carry that width even when
+/// the reason is absent. The subtitle is already free-width text, so the
+/// honest split is here: the STATUS column still reads `abandoned` (a
+/// caller scanning column-by-column sees the same six values
+/// `status_label` has always emitted) and the reason sits first on the
+/// line under it.
+///
+/// (#1929) Machine is NOT here any more — it is a real headed column. It
+/// used to ride in this subtitle, which reads as prose on a mission row
+/// (`gpt-4o · via azure:… · m1-max-32gb-studio`) but collapses on a lab
+/// row, which has no role, model or route, to a bare machine name under
+/// no header — reading exactly like a column the table forgot to label.
+/// See [`subtitle_with_machine`] for the narrow-pane case where the
+/// column is shed and machine rejoins the line.
 fn subtitle_for(r: &Run) -> String {
     let mut bits: Vec<String> = Vec::new();
     if let Some(reason) = r.abandoned_reason {
@@ -315,9 +329,6 @@ fn subtitle_for(r: &Run) -> String {
     }
     if let Some(route) = &r.route {
         bits.push(format!("via {route}"));
-    }
-    if let Some(machine) = &r.machine {
-        bits.push(machine.clone());
     }
     bits.join(" · ")
 }
@@ -339,6 +350,12 @@ const STARTED_COLS: usize = 10;
 const DURATION_COLS: usize = 10;
 /// The two-space gap between DURATION and ID (every other gap is one).
 const ID_GAP_COLS: usize = 2;
+/// (#1929) MACHINE is a real column, not a subtitle field. It is present on
+/// most rows and is genuinely tabular, and leaving it in the subtitle made
+/// a lab row — which has no role, model or route — render a bare machine
+/// name under no header, reading exactly like a column the table forgot to
+/// label. Widest fleet name today is `m1-max-32gb-studio` (18).
+const MACHINE_COLS: usize = 20;
 
 /// Everything a row spends before the ID column.
 ///
@@ -351,8 +368,39 @@ const ID_GAP_COLS: usize = 2;
 /// `every_clamped_row_fits_the_width_it_was_planned_for`, which measures
 /// the RENDERED string — a test that recomputed this sum would have agreed
 /// with the wrong constant.
-const FIXED_COLS: usize =
-    INDENT_COLS + KIND_COLS + 1 + STATUS_COLS + 1 + STARTED_COLS + 1 + DURATION_COLS + ID_GAP_COLS;
+const FIXED_COLS: usize = INDENT_COLS
+    + KIND_COLS
+    + 1
+    + STATUS_COLS
+    + 1
+    + STARTED_COLS
+    + 1
+    + DURATION_COLS
+    + ID_GAP_COLS;
+
+/// (#1929) What the MACHINE column costs when shown: the column plus its
+/// separating space. Kept OUT of [`FIXED_COLS`] because the column is
+/// SHED on a narrow pane rather than being unconditional -- see
+/// [`show_machine_column`]. Adding it unconditionally raised the narrowest
+/// honorable row from 58 to 79 columns, and the console panel negotiates
+/// as little as 36 on a phone, so a mandatory column would have made the
+/// mobile render worse to fix a desktop one.
+const MACHINE_TOTAL_COLS: usize = MACHINE_COLS + 1;
+
+/// Is there room for the MACHINE column at this width?
+///
+/// Piped output (`None`) always shows it -- complete and greppable, the
+/// same rule `id_width` follows. A known width shows it only if the row
+/// still clears its floor with the column's cost added; otherwise machine
+/// falls back into the subtitle, where it lived before this change, and
+/// the table stays inside the pane. This is the column-shedding
+/// `MIN_ROW_COLS`'s own doc anticipated for the phone-width case.
+fn show_machine_column(width: Option<usize>) -> bool {
+    match width {
+        None => true,
+        Some(w) => w >= MIN_ROW_COLS + MACHINE_TOTAL_COLS,
+    }
+}
 const MIN_ID_COLS: usize = 12;
 
 /// The narrowest terminal this row shape can honor. Below it, [`id_width`]
@@ -371,11 +419,31 @@ const MIN_ROW_COLS: usize = FIXED_COLS + MIN_ID_COLS;
 /// piped output stays complete and greppable, matching
 /// `mission_status.rs::plan_layout`'s same rule for the same reason.
 fn id_width(rows: &[Run], width: Option<usize>) -> usize {
-    let max_id = rows.iter().map(|r| r.id.chars().count()).max().unwrap_or(0);
+    // (#1929) The MACHINE column's cost belongs in this budget whenever the
+    // column is actually shown. Omitting it let a width of 80 pass
+    // `show_machine_column` (floor 79) and then render 101 columns, because
+    // the id was sized as if the column were not there. Caught by
+    // `every_clamped_row_fits_the_width_it_was_planned_for`, which measures
+    // the RENDERED string rather than recomputing the sum.
+    let fixed = FIXED_COLS + if show_machine_column(width) { MACHINE_TOTAL_COLS } else { 0 };
+    // (#1929) The 90th percentile, NOT the max. Measured on a real corpus:
+    // 501 rows, median id 26 chars, widest 83 — a single tempdir-derived
+    // `pr-review--var-folders-...-wt-...` id. Padding to the max made every
+    // one of the other 500 rows carry ~57 columns of whitespace before the
+    // next field, which is what the operator noticed. Ellipsizing one
+    // outlier costs less than spacing out the whole table for it, and
+    // `ellipsize` keeps the discriminating tail.
+    let mut lens: Vec<usize> = rows.iter().map(|r| r.id.chars().count()).collect();
+    lens.sort_unstable();
+    let max_id = if lens.is_empty() {
+        0
+    } else {
+        lens[(lens.len() * 9 / 10).min(lens.len() - 1)]
+    };
     match width {
         None => max_id,
         Some(w) => {
-            if max_id + FIXED_COLS <= w {
+            if max_id + fixed <= w {
                 max_id
             } else {
                 // Clamp to the pane, but never below [`MIN_ROW_COLS`]'s
@@ -384,15 +452,15 @@ fn id_width(rows: &[Run], width: Option<usize>) -> usize {
                 // honorable row is stated in ONE place and this branch
                 // cannot drift from it. (`MIN_ROW_COLS > FIXED_COLS` by
                 // construction, so this subtraction cannot underflow.)
-                w.max(MIN_ROW_COLS) - FIXED_COLS
+                w.max(MIN_ROW_COLS + (fixed - FIXED_COLS)) - fixed
             }
         }
     }
 }
 
-fn header_line(id_w: usize) -> String {
+fn header_line(id_w: usize, machine_col: bool) -> String {
     format!(
-        "{:i$}{:<k$} {:<s$} {:<t$} {:<d$}{:g$}{:<id_w$}",
+        "{:i$}{:<k$} {:<s$} {:<t$} {:<d$}{:g$}{:<id_w$}{}",
         "",
         "KIND",
         "STATUS",
@@ -400,6 +468,7 @@ fn header_line(id_w: usize) -> String {
         "DURATION",
         "",
         "ID",
+        if machine_col { format!(" {:<w$}", "MACHINE", w = MACHINE_COLS) } else { String::new() },
         i = INDENT_COLS,
         k = KIND_COLS,
         s = STATUS_COLS,
@@ -412,10 +481,10 @@ fn header_line(id_w: usize) -> String {
 /// Render one row. Split from the `println!` so a test can MEASURE what
 /// this returns — see [`FIXED_COLS`] for why measuring beats recomputing
 /// the budget.
-fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>) -> String {
+fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>, machine_col: bool) -> String {
     let id_cell = format!("{:<id_w$}", ellipsize(&r.id, id_w));
     let base = format!(
-        "{:i$}{:<k$} {:<s$} {:<t$} {:<d$}{:g$}{}",
+        "{:i$}{:<k$} {:<s$} {:<t$} {:<d$}{:g$}{}{}",
         "",
         kind_label(r.kind),
         status_label(r.status),
@@ -423,6 +492,11 @@ fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>) -> String {
         duration_cell(now, r),
         "",
         id_cell,
+        if machine_col {
+            format!(" {:<w$}", ellipsize(r.machine.as_deref().unwrap_or("-"), MACHINE_COLS), w = MACHINE_COLS)
+        } else {
+            String::new()
+        },
         i = INDENT_COLS,
         k = KIND_COLS,
         s = STATUS_COLS,
@@ -430,7 +504,9 @@ fn format_row(now: u64, r: &Run, id_w: usize, width: Option<usize>) -> String {
         d = DURATION_COLS,
         g = ID_GAP_COLS,
     );
-    let subtitle = subtitle_for(r);
+    // (#1929) When the column is shed, machine rejoins the subtitle so the
+    // information is never simply lost on a narrow pane.
+    let subtitle = if machine_col { subtitle_for(r) } else { subtitle_with_machine(r) };
     if subtitle.is_empty() {
         return base;
     }
@@ -466,13 +542,14 @@ fn render_text(sel: &Selection, kind: RunKindArg, fleet: &darkmux_serve::source_
     }
 
     let width = style::terminal_width();
+    let machine_col = show_machine_column(width);
     let id_w = id_width(&sel.rows, width);
     let now = now_unix();
 
     println!("{}", style::header(&format!("runs — {} shown", sel.rows.len())));
-    println!("{}", header_line(id_w));
+    println!("{}", header_line(id_w, machine_col));
     for r in &sel.rows {
-        println!("{}", format_row(now, r, id_w, width));
+        println!("{}", format_row(now, r, id_w, width, machine_col));
     }
     if let Some(line) = footer(sel, width) {
         println!("{}", style::dim(&line));
@@ -699,6 +776,69 @@ mod tests {
         assert!(line.contains("6 more"), "must name how many were hidden: {line}");
     }
 
+    // ── columns (#1929) ──────────────────────────────────────────────
+
+    /// One outlier id must not widen the table for every other row.
+    /// Measured on the real corpus: 501 rows, median id 26 chars, widest 83
+    /// (a single tempdir-derived id). Padding to the max left ~57 columns
+    /// of whitespace on every other row, which is what the operator saw.
+    #[test]
+    fn one_freakishly_long_id_does_not_pad_every_other_row() {
+        let mut rows: Vec<Run> =
+            (0..20u64).map(|i| mk_run(&format!("short-{i}"), RunKind::Lab, RunStatus::Complete, i)).collect();
+        rows.push(mk_run(&"x".repeat(83), RunKind::Mission, RunStatus::Complete, 99));
+        let w = id_width(&rows, None);
+        assert!(
+            w < 40,
+            "one 83-char id widened the column to {w} — the other 20 rows now carry that padding"
+        );
+    }
+
+    /// MACHINE is a real, HEADED column. It used to ride in the subtitle,
+    /// which reads as prose on a mission row (`gpt-4o · via azure:…`) but
+    /// collapses to a bare machine name on a lab row, where it looks
+    /// exactly like a column the table forgot to label.
+    #[test]
+    fn machine_renders_under_its_own_header_and_not_in_the_subtitle() {
+        let mut r = mk_run("run-1", RunKind::Lab, RunStatus::Complete, 1);
+        r.machine = Some("MacBook-Pro".to_string());
+        assert!(header_line(20, true).contains("MACHINE"), "the column must be labelled");
+        assert!(format_row(2, &r, 20, None, true).contains("MacBook-Pro"));
+        assert_eq!(subtitle_for(&r), "", "machine must no longer be a subtitle field");
+    }
+
+    #[test]
+    fn a_row_with_no_machine_renders_a_dash_under_the_column() {
+        let r = mk_run("run-1", RunKind::Mission, RunStatus::Complete, 1);
+        assert!(format_row(2, &r, 20, None, true).contains('-'));
+    }
+
+    /// The column is SHED on a pane too narrow for it, and machine rejoins
+    /// the subtitle so the information is never simply lost. Adding it
+    /// unconditionally would have raised the narrowest honorable row from
+    /// 58 to 79 columns, and the console panel negotiates as little as 36.
+    #[test]
+    fn the_machine_column_sheds_on_a_narrow_pane_rather_than_overflowing() {
+        assert!(show_machine_column(None), "piped output stays complete");
+        assert!(show_machine_column(Some(200)));
+        assert!(!show_machine_column(Some(54)), "a phone-width pane must shed it");
+
+        let mut r = mk_run("run-1", RunKind::Lab, RunStatus::Complete, 1);
+        r.machine = Some("MacBook-Pro".to_string());
+        assert_eq!(subtitle_with_machine(&r), "MacBook-Pro", "shed means it rejoins the subtitle");
+        r.role = Some("coder".to_string());
+        assert_eq!(subtitle_with_machine(&r), "coder · MacBook-Pro");
+    }
+
+    /// Shedding must not have moved the floor: `MACHINE_TOTAL_COLS` stays
+    /// out of `FIXED_COLS` precisely so a narrow render is no worse than
+    /// before the column existed.
+    #[test]
+    fn adding_the_machine_column_did_not_raise_the_narrow_floor() {
+        assert_eq!(MIN_ROW_COLS, FIXED_COLS + MIN_ID_COLS);
+        assert!(!show_machine_column(Some(MIN_ROW_COLS)), "the floor row has no room for the column");
+    }
+
     // ── fleet-state disclosure: empty is never silent ────────────────
 
     /// The load-bearing silence: a standalone install has no fleet
@@ -800,8 +940,8 @@ mod tests {
 
         for w in [MIN_ROW_COLS, MIN_ROW_COLS + 1, 70, 80, 100, 120, 200] {
             let id_w = id_width(&rows, Some(w));
-            let header = header_line(id_w);
-            let row = format_row(2_000, &rows[0], id_w, Some(w));
+            let header = header_line(id_w, show_machine_column(Some(w)));
+            let row = format_row(2_000, &rows[0], id_w, Some(w), show_machine_column(Some(w)));
             assert!(
                 header.chars().count() <= w,
                 "header rendered {} cols at width {w}: {header:?}",
@@ -871,7 +1011,7 @@ mod tests {
         r.role = Some("pr-reviewer".to_string());
         let rows = vec![r];
         let id_w = id_width(&rows, None);
-        let line = format_row(2, &rows[0], id_w, None);
+        let line = format_row(2, &rows[0], id_w, None, true);
         assert!(line.contains("a-very-long-run-identifier-indeed"), "piped id was elided: {line}");
         assert!(line.contains("pr-reviewer"), "piped subtitle was dropped: {line}");
     }
@@ -884,7 +1024,7 @@ mod tests {
         r.role = Some("a-role-name-far-too-long-to-fit-in-this-narrow-pane".to_string());
         let rows = vec![r];
         let id_w = id_width(&rows, Some(60));
-        let line = format_row(2, &rows[0], id_w, Some(60));
+        let line = format_row(2, &rows[0], id_w, Some(60), show_machine_column(Some(60)));
         assert!(!line.contains("a-role-name"), "subtitle should have been dropped whole: {line}");
         assert!(line.chars().count() <= 60);
         assert_eq!(line.lines().count(), 1, "a dropped subtitle must never become a second line");
