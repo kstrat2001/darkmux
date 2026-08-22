@@ -319,8 +319,8 @@ describe("ConsolePanel", () => {
     renderPanel("mission-status");
     await waitFor(() => expect(screen.getByText("mission status — 0 missions")).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText("machine", { selector: ".runchip" }));
-    await waitFor(() => expect(screen.getByText("machine", { selector: ".runchip" })).toHaveClass("on"));
+    fireEvent.click(screen.getByText("machine status", { selector: ".runchip" }));
+    await waitFor(() => expect(screen.getByText("machine status", { selector: ".runchip" })).toHaveClass("on"));
 
     // The command line switched to the new (not-yet-loaded) panel's own
     // command — `NotLoadedChrome`'s own `.pc-cmd`, distinct from

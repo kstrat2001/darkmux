@@ -298,6 +298,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    #[serial_test::serial]
     fn lms_bin_default_and_overridable() {
         // Combined to avoid env-var race between parallel tests.
         unsafe { std::env::remove_var("DARKMUX_LMS_BIN") };
