@@ -248,6 +248,13 @@ pub(crate) struct PanelSpec {
     /// variants. See the module doc, "Opts: a declared option space, not
     /// an open one".
     pub(crate) opts: &'static [PanelOpt],
+    /// (#1914) Whether this panel's spawn should hand its child a
+    /// fleet-snapshot handoff file (see `crate::write_fleet_snapshot_file`,
+    /// `crate::FLEET_SNAPSHOT_ENV_VAR`) instead of letting it pay its own
+    /// full Redis round trip. `run-list` is the only panel that reads the
+    /// network today (every other entry is a local-disk read) — see the
+    /// module doc's "every panel until now reads local disk only".
+    pub(crate) needs_fleet_snapshot: bool,
 }
 
 /// Every allowlisted BASE panel id (#1911: this counts base verbs, not
@@ -302,7 +309,12 @@ pub(crate) fn panel_spec(id: &str) -> Option<PanelSpec> {
         "doctor" => ("doctor", &["doctor"], false, Duration::ZERO, &[]),
         _ => return None,
     };
-    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts })
+    // (#1914) Derived from the SAME `id` just matched above, not a second
+    // table: `run-list` is the one panel that reads the network today (see
+    // the module doc's "every panel until now reads local disk only" and
+    // `PanelSpec::needs_fleet_snapshot`'s own doc).
+    let needs_fleet_snapshot = id == "run-list";
+    Some(PanelSpec { id, argv, auto_refresh, cache_ttl: ttl, opts, needs_fleet_snapshot })
 }
 
 /// One-release compatibility alias (#1911): the pre-opts client still
@@ -622,6 +634,42 @@ pub(crate) async fn panel_handler(
         return Ok(axum::Json(body));
     }
 
+    // (#1914) When this panel reads the fleet stream, hand the spawned
+    // child the daemon's OWN already-fetched snapshot instead of letting it
+    // pay its own full Redis round trip — that read runs ~650ms+ over a
+    // tailnet at ordinary fleet activity, and a subprocess cannot reach
+    // `fleet_flow_records()`'s in-process 2s cache no matter how warm it is
+    // (see the module doc, "every panel until now reads local disk only").
+    // `spawn_blocking` because `fleet_flow_records` does a synchronous
+    // network call — same reason `runs_handler` wraps it the same way.
+    // Best-effort throughout: ANY failure here (join failure, write
+    // failure) just skips the env var below, and the child falls back to
+    // its own live read (`fleet_records_for_runs`'s own doc) — a snapshot
+    // that couldn't be prepared is never a reason to fail the panel.
+    let fleet_snapshot = if spec.needs_fleet_snapshot {
+        match tokio::task::spawn_blocking(crate::fleet_flow_records).await {
+            Ok(read) => match crate::write_fleet_snapshot_file(&read) {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    eprintln!(
+                        "darkmux serve: panel \"{id}\": could not write the fleet snapshot \
+                         ({e}); the child will read Redis directly"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "darkmux serve: panel \"{id}\": fleet read task failed ({e}); the child \
+                     will read Redis directly"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let started = Instant::now();
     let exe = std::env::current_exe().map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("resolving current_exe: {e}\n"))
@@ -649,6 +697,13 @@ pub(crate) async fn panel_handler(
         // is deliberately inherited — the panel must see the same state the
         // operator's own shell would.
         .kill_on_drop(true);
+
+    if let Some(file) = &fleet_snapshot {
+        // (#1914) Opt-in by the SAME construction as `DARKMUX_PANEL` above:
+        // a bare terminal invocation never has this env var set, so it
+        // takes the exact same live-Redis path it always has.
+        cmd.env(crate::FLEET_SNAPSHOT_ENV_VAR, file.path());
+    }
 
     let output = tokio::time::timeout(PANEL_SPAWN_TIMEOUT, cmd.output())
         .await
@@ -759,6 +814,27 @@ mod tests {
         // `--since <when>`), stop — an open value space is not an
         // allowlist, and that surface is a lens, not a panel.
         assert_eq!(PANEL_IDS.len(), 8, "allowlist growth is a doctrine decision, not a drive-by");
+    }
+
+    /// (#1914) `run-list` is the ONLY panel that reads the network today
+    /// (the module doc: "every panel until now reads local disk only") —
+    /// so it is the only one whose spawn should pay to prepare a fleet
+    /// snapshot handoff file. A future panel added here that also reads
+    /// the fleet stream should flip this to true deliberately, not by
+    /// accident — this guard fails loudly the day that happens to anyone
+    /// who forgets to make the call.
+    #[test]
+    fn only_run_list_needs_a_fleet_snapshot() {
+        for id in PANEL_IDS {
+            let spec = panel_spec(id).unwrap();
+            assert_eq!(
+                spec.needs_fleet_snapshot,
+                *id == "run-list",
+                "{id}.needs_fleet_snapshot should be {} but was {}",
+                *id == "run-list",
+                spec.needs_fleet_snapshot
+            );
+        }
     }
 
     /// Layer 2 of the three-layer guard (#1911): pills are always base
