@@ -65,7 +65,11 @@ test('an abandoned run is visibly not a running one', async ({ page }) => {
   const live = page.locator('.labrunrow', { hasText: 'healthy/live' }).locator('.labbadge');
   const dead = page.locator('.labrunrow', { hasText: 'degraded/abandoned-stale' }).locator('.labbadge');
   await expect(live).toHaveText('running');
-  await expect(dead).toHaveText('abandoned');
+  // (#1907) The badge now names WHICH kind of abandoned. This fixture row
+  // carries no `abandoned_reason`, which is exactly the "no ending was ever
+  // recorded" case — as opposed to a deliberate abort. The test's point is
+  // unchanged: the two states must render distinguishably.
+  await expect(dead).toHaveText('no ending recorded');
   await expect(live).not.toHaveClass(await dead.getAttribute('class'));
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
