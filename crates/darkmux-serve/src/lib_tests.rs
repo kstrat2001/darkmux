@@ -5033,3 +5033,312 @@
         );
         assert!(row.get("turnsFinal").is_none());
     }
+
+    /// (#1914) The fleet-snapshot handoff a spawned `run-list` panel child
+    /// reads INSTEAD of its own Redis round trip (`write_fleet_snapshot_file`
+    /// / `read_fleet_snapshot_file` / `fleet_records_for_runs`'s env-var
+    /// override). A subprocess cannot reach `fleet_flow_records()`'s
+    /// in-process 2s cache no matter how warm it is — this is the plumbing
+    /// that lets it free-ride the daemon's own already-paid read instead.
+    mod fleet_snapshot_handoff {
+        use super::*;
+        use serial_test::serial;
+        use std::io::Write;
+
+        fn sample_records() -> Vec<serde_json::Value> {
+            vec![serde_json::json!({
+                "ts": "2026-08-20T00:00:00Z",
+                "action": "dispatch.turn",
+                "session_id": "snapshot-handoff-selftest-s1",
+            })]
+        }
+
+        /// Round-trip proof for every `SourceState` `fleet_flow_records`
+        /// ever actually constructs: what `write_fleet_snapshot_file`
+        /// writes, `read_fleet_snapshot_file` must read back identically —
+        /// same records, same state (age included for `Stale`). If this
+        /// drifts, a panel spawned while the daemon's OWN last read was
+        /// degraded would silently start reporting a healthier state than
+        /// the truth (or vice versa).
+        #[test]
+        fn snapshot_round_trips_every_source_state() {
+            let cases = vec![
+                FleetRead { records: sample_records(), state: source_state::SourceState::Ok },
+                FleetRead { records: Vec::new(), state: source_state::SourceState::Off },
+                FleetRead {
+                    records: sample_records(),
+                    state: source_state::SourceState::Stale {
+                        age_ms: 4200,
+                        detail: FLEET_READ_ERROR_DETAIL,
+                    },
+                },
+                FleetRead {
+                    records: Vec::new(),
+                    state: source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL },
+                },
+            ];
+            for read in cases {
+                let file = write_fleet_snapshot_file(&read).expect("write snapshot");
+                let back = read_fleet_snapshot_file(file.path()).expect("read snapshot back");
+                assert_eq!(
+                    back.records, read.records,
+                    "records must round-trip for state {:?}",
+                    read.state
+                );
+                assert_eq!(back.state, read.state, "state must round-trip exactly");
+            }
+        }
+
+        /// A missing file is a plumbing failure, not a data answer — the
+        /// reader must say "I couldn't read this" (`None`), never fabricate
+        /// an `Off` or an empty `Ok`.
+        #[test]
+        fn missing_snapshot_file_reads_as_none() {
+            let path = std::path::Path::new(
+                "/nonexistent/darkmux-fleet-snapshot-handoff-selftest-missing.json",
+            );
+            assert!(read_fleet_snapshot_file(path).is_none());
+        }
+
+        /// Malformed JSON: same contract — `None`, never a panic and never
+        /// a fabricated state.
+        #[test]
+        fn malformed_snapshot_file_reads_as_none() {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(b"not json").unwrap();
+            assert!(read_fleet_snapshot_file(file.path()).is_none());
+        }
+
+        /// An unrecognized `kind` (a snapshot a FUTURE binary wrote, with a
+        /// state this one doesn't know about) must also fall back to
+        /// `None` rather than silently mapping onto the wrong
+        /// `SourceState` — lenient-on-read never means "guess".
+        #[test]
+        fn unknown_kind_reads_as_none() {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(br#"{"kind":"from-the-future","age_ms":null,"records":[]}"#).unwrap();
+            assert!(read_fleet_snapshot_file(file.path()).is_none());
+        }
+
+        /// The end-to-end contract `fleet_records_for_runs` promises the
+        /// CLI: when the env var points at a valid snapshot, the live
+        /// Redis path is never taken. Proven with a records payload that
+        /// could NOT have come from the live path — `DARKMUX_REDIS_URL` is
+        /// unset and this crate's test build resolves an empty config tier
+        /// (see the crate's `Cargo.toml` dev-dependency comment on
+        /// `test-support`), so the live path always degrades to `Off` with
+        /// no records; seeing `Ok` with the planted record is only
+        /// possible via the snapshot.
+        #[test]
+        #[serial]
+        fn fleet_records_for_runs_prefers_a_valid_snapshot_over_a_live_read() {
+            unsafe {
+                std::env::remove_var("DARKMUX_REDIS_URL");
+            }
+            let planted =
+                FleetRead { records: sample_records(), state: source_state::SourceState::Ok };
+            let file = write_fleet_snapshot_file(&planted).expect("write snapshot");
+            unsafe {
+                std::env::set_var(FLEET_SNAPSHOT_ENV_VAR, file.path());
+            }
+
+            let read = fleet_records_for_runs();
+
+            unsafe {
+                std::env::remove_var(FLEET_SNAPSHOT_ENV_VAR);
+            }
+
+            assert_eq!(read.state, source_state::SourceState::Ok);
+            assert_eq!(read.records, planted.records);
+        }
+
+        /// The fallback guard: the env var IS set, but the file it names
+        /// is gone (a stale or already-cleaned-up handoff). The CLI must
+        /// fall back to the normal live path — never fail the invocation,
+        /// and never silently claim `Ok` over nothing. With
+        /// `DARKMUX_REDIS_URL` unset, the live path's own honest answer is
+        /// `Off`/empty; seeing exactly that (not an error, not the
+        /// planted-elsewhere data) is the proof the fallback engaged.
+        #[test]
+        #[serial]
+        fn fleet_records_for_runs_falls_back_when_the_snapshot_file_is_missing() {
+            unsafe {
+                std::env::remove_var("DARKMUX_REDIS_URL");
+            }
+            unsafe {
+                std::env::set_var(
+                    FLEET_SNAPSHOT_ENV_VAR,
+                    "/nonexistent/darkmux-fleet-snapshot-handoff-selftest-missing.json",
+                );
+            }
+
+            let read = fleet_records_for_runs();
+
+            unsafe {
+                std::env::remove_var(FLEET_SNAPSHOT_ENV_VAR);
+            }
+
+            assert_eq!(
+                read.state,
+                source_state::SourceState::Off,
+                "must fall back to the live (Off) path, not fabricate a result"
+            );
+            assert!(read.records.is_empty());
+        }
+
+        /// (#1914) On-demand no-rows-lost proof against a LIVE fleet, in the
+        /// same spirit as `presence_roundtrip_against_live_redis`
+        /// (`darkmux-flow/src/presence.rs`): `#[ignore]` so CI without a
+        /// reachable Redis skips it; run with `cargo test -p darkmux-serve
+        /// --lib fleet_snapshot_matches_a_live_read -- --ignored --nocapture`
+        /// while `DARKMUX_REDIS_URL` points at a reachable Redis.
+        ///
+        /// Times a direct live read against the daemon's own path
+        /// (`fleet_flow_records`), snapshots it, then reads the snapshot
+        /// back through the EXACT path a spawned `run-list` child takes
+        /// (`fleet_records_for_runs`'s env-var override) — the same
+        /// function `src/run_list.rs` calls, so this is the real consumer
+        /// contract, not a proxy for it. Asserts byte-for-byte equal
+        /// `.records` and `.state`: not fewer, not more, not reordered —
+        /// the concrete "no row disappears" evidence for the handoff
+        /// mechanism itself.
+        #[test]
+        #[ignore]
+        fn fleet_snapshot_matches_a_live_read() {
+            let Some(_url) =
+                std::env::var("DARKMUX_REDIS_URL").ok().filter(|s| !s.trim().is_empty())
+            else {
+                eprintln!("DARKMUX_REDIS_URL unset — skipping live fleet snapshot proof");
+                return;
+            };
+            let started = std::time::Instant::now();
+            let live = super::fleet_flow_records();
+            let live_elapsed = started.elapsed();
+            eprintln!(
+                "live fleet_flow_records(): {} records, state={:?}, {live_elapsed:?}",
+                live.records.len(),
+                live.state
+            );
+
+            let file = write_fleet_snapshot_file(&live).expect("write snapshot");
+            unsafe {
+                std::env::set_var(FLEET_SNAPSHOT_ENV_VAR, file.path());
+            }
+            let started = std::time::Instant::now();
+            let via_snapshot = fleet_records_for_runs();
+            let snapshot_elapsed = started.elapsed();
+            unsafe {
+                std::env::remove_var(FLEET_SNAPSHOT_ENV_VAR);
+            }
+            eprintln!(
+                "fleet_records_for_runs() via snapshot: {} records, state={:?}, {snapshot_elapsed:?}",
+                via_snapshot.records.len(),
+                via_snapshot.state
+            );
+
+            assert_eq!(
+                via_snapshot.records.len(),
+                live.records.len(),
+                "row count must match exactly — the handoff must not drop or duplicate rows"
+            );
+            assert_eq!(via_snapshot.records, live.records, "records must match byte-for-byte");
+            assert_eq!(via_snapshot.state, live.state, "state must match exactly");
+        }
+
+        /// (#1914) The strongest available proof, run against the REAL
+        /// compiled `darkmux run list --json` binary rather than the
+        /// library function directly: spawns the release binary twice —
+        /// once exactly as a bare terminal invocation always has (no env
+        /// var, its own live Redis read: the ONLY code path a bare
+        /// terminal invocation can ever take, unaffected by this feature),
+        /// once exactly as the daemon's `run-list` panel spawn now does
+        /// (`FLEET_SNAPSHOT_ENV_VAR` pointing at an already-fetched
+        /// snapshot) — and asserts the two invocations' `runs` arrays are
+        /// IDENTICAL in id/kind/status (order too, since both feed the
+        /// same union off the same underlying fleet read). `#[ignore]`:
+        /// needs a live Redis AND a release build at `target/release/
+        /// darkmux` (`cargo build --release --bin darkmux` first). Run with
+        /// `cargo test -p darkmux-serve --lib
+        /// fleet_snapshot_cli_end_to_end -- --ignored --nocapture` while
+        /// `DARKMUX_REDIS_URL` points at a reachable Redis.
+        #[test]
+        #[ignore]
+        fn fleet_snapshot_cli_end_to_end_matches_a_bare_invocation() {
+            let Some(_url) =
+                std::env::var("DARKMUX_REDIS_URL").ok().filter(|s| !s.trim().is_empty())
+            else {
+                eprintln!("DARKMUX_REDIS_URL unset — skipping the CLI end-to-end proof");
+                return;
+            };
+            let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/darkmux");
+            if !bin.exists() {
+                eprintln!(
+                    "no release binary at {} — run `cargo build --release --bin darkmux` first; \
+                     skipping the CLI end-to-end proof",
+                    bin.display()
+                );
+                return;
+            }
+
+            fn run_list_json(
+                bin: &std::path::Path,
+                extra_env: Option<(&str, &std::path::Path)>,
+            ) -> (std::time::Duration, serde_json::Value) {
+                let mut cmd = std::process::Command::new(bin);
+                cmd.args(["run", "list", "--json", "--limit", "10"]);
+                if let Some((k, v)) = extra_env {
+                    cmd.env(k, v);
+                }
+                let started = std::time::Instant::now();
+                let out = cmd.output().expect("spawn darkmux run list --json");
+                let elapsed = started.elapsed();
+                assert!(
+                    out.status.success(),
+                    "darkmux run list --json exited {:?}; stderr: {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let json: serde_json::Value =
+                    serde_json::from_slice(&out.stdout).expect("run list --json must be valid JSON");
+                (elapsed, json)
+            }
+
+            // Bare invocation: no env var. Exactly what a terminal always
+            // does, and exactly what a panel spawn did BEFORE this feature.
+            let (bare_elapsed, bare_json) = run_list_json(&bin, None);
+            eprintln!("bare `run list --json`: {bare_elapsed:?}");
+
+            // Snapshot invocation: exactly what a panel spawn does NOW.
+            let read = super::fleet_flow_records();
+            let file = write_fleet_snapshot_file(&read).expect("write snapshot");
+            let (snapshot_elapsed, snapshot_json) =
+                run_list_json(&bin, Some((FLEET_SNAPSHOT_ENV_VAR, file.path())));
+            eprintln!("snapshot-backed `run list --json`: {snapshot_elapsed:?}");
+
+            let extract_triples = |json: &serde_json::Value| -> Vec<(String, String, String)> {
+                json["runs"]
+                    .as_array()
+                    .expect("run list --json always has a runs array")
+                    .iter()
+                    .map(|r| {
+                        (
+                            r["id"].as_str().unwrap_or_default().to_string(),
+                            r["kind"].as_str().unwrap_or_default().to_string(),
+                            r["status"].as_str().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect()
+            };
+            let bare_triples = extract_triples(&bare_json);
+            let snapshot_triples = extract_triples(&snapshot_json);
+            assert_eq!(
+                snapshot_triples.len(),
+                bare_triples.len(),
+                "row count must match — the snapshot-backed invocation must not drop or add rows"
+            );
+            assert_eq!(
+                snapshot_triples, bare_triples,
+                "id/kind/status, in order, must match exactly between the two invocations"
+            );
+        }
+    }

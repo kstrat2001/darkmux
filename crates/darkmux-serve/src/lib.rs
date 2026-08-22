@@ -3287,8 +3287,124 @@ pub struct FleetRead {
 /// module doc exists to name: an unreachable hub and a genuinely quiet
 /// fleet would print byte-identical output. `runs_handler` ships the state
 /// as `meta`; the verb has to be able to say the same thing.
+///
+/// (#1914) Checks [`FLEET_SNAPSHOT_ENV_VAR`] FIRST. A CLI panel spawn is a
+/// fresh process and cannot reach `fleet_flow_records()`'s in-process 2s
+/// cache no matter how warm it is — every `darkmux run list` invocation
+/// paid its own full Redis round trip. When the daemon spawns the
+/// `run-list` panel it now writes ITS OWN already-fetched [`FleetRead`] to
+/// a temp file and points this env var at it (`panel.rs`'s
+/// `needs_fleet_snapshot`), so the child free-rides the read the daemon
+/// already paid for instead of repeating it. A bare terminal invocation
+/// never has this env var set and takes the exact same live-Redis path as
+/// before — the override is additive, never a change to the verb's default
+/// behavior. Any failure to use the snapshot (unset, missing, unreadable,
+/// malformed) falls back to the live read; it never fails the request or
+/// silently serves an empty fleet over a handoff-plumbing defect.
 pub fn fleet_records_for_runs() -> FleetRead {
+    if let Some(path) = std::env::var_os(FLEET_SNAPSHOT_ENV_VAR) {
+        match read_fleet_snapshot_file(StdPath::new(&path)) {
+            Some(read) => return read,
+            None => {
+                eprintln!(
+                    "darkmux serve: {FLEET_SNAPSHOT_ENV_VAR} was set but the fleet snapshot \
+                     could not be read — falling back to a live fleet read"
+                );
+            }
+        }
+    }
     fleet_flow_records()
+}
+
+/// Env var carrying the path to a fleet-snapshot handoff file (#1914). Set
+/// only by the daemon when it spawns the `run-list` CLI panel; a plain
+/// terminal invocation of `darkmux run list` never sees it.
+pub(crate) const FLEET_SNAPSHOT_ENV_VAR: &str = "DARKMUX_FLEET_SNAPSHOT_FILE";
+
+/// The one literal every degraded-Redis-read arm in this file uses for
+/// `SourceState::Stale`/`Unavailable`'s `detail` (never the real error
+/// text — see `fleet_flow_records`'s own comment: a Redis error can embed
+/// the connection URL). Named once so the snapshot round-trip below can
+/// reconstruct the exact same `&'static str` on the read side without
+/// having to deserialize one (see [`FleetSnapshotFile`]'s doc).
+const FLEET_READ_ERROR_DETAIL: &str = "could not read the fleet stream from Redis";
+
+/// The on-disk shape of a fleet-snapshot handoff file (#1914).
+///
+/// Deliberately NOT `FleetRead`/`SourceState` serialized directly:
+/// `SourceState::Stale`/`Unavailable` carry `detail: &'static str`, which
+/// cannot round-trip through `Deserialize` as an owned value — and every
+/// site in this crate that ever constructs one of those variants already
+/// uses the SAME single literal ([`FLEET_READ_ERROR_DETAIL`]), so there is
+/// nothing to actually preserve there. `kind` + `age_ms` is the whole of
+/// what needs to cross the process boundary; `detail` is reconstructed on
+/// read from the shared constant.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FleetSnapshotFile {
+    kind: String,
+    age_ms: Option<u64>,
+    records: Vec<serde_json::Value>,
+}
+
+impl FleetSnapshotFile {
+    fn from_fleet_read(read: &FleetRead) -> Self {
+        let (kind, age_ms) = match &read.state {
+            source_state::SourceState::Ok => ("ok", None),
+            source_state::SourceState::Stale { age_ms, .. } => ("stale", Some(*age_ms)),
+            source_state::SourceState::Unavailable { .. } => ("unavailable", None),
+            source_state::SourceState::Off => ("off", None),
+        };
+        FleetSnapshotFile { kind: kind.to_string(), age_ms, records: read.records.clone() }
+    }
+
+    /// `None` on an unrecognized `kind` — a snapshot written by a NEWER
+    /// binary than the one reading it (a future state added here) must
+    /// fall back to a live read rather than silently mapping to the wrong
+    /// state (#1269-style leniency: lenient on read, but never wrong).
+    fn into_fleet_read(self) -> Option<FleetRead> {
+        let state = match self.kind.as_str() {
+            "ok" => source_state::SourceState::Ok,
+            "stale" => source_state::SourceState::Stale {
+                age_ms: self.age_ms.unwrap_or(0),
+                detail: FLEET_READ_ERROR_DETAIL,
+            },
+            "unavailable" => {
+                source_state::SourceState::Unavailable { detail: FLEET_READ_ERROR_DETAIL }
+            }
+            "off" => source_state::SourceState::Off,
+            _ => return None,
+        };
+        Some(FleetRead { records: self.records, state })
+    }
+}
+
+/// Write `read` to a fresh, owner-only-readable (`0600`) temp file as JSON
+/// (#1914). The returned [`tempfile::NamedTempFile`] MUST be kept alive by
+/// the caller for as long as the child reading it might still be running —
+/// dropping it deletes the file. These records are real operator flow
+/// data, so the file is scoped to one handoff and never left behind.
+pub(crate) fn write_fleet_snapshot_file(read: &FleetRead) -> std::io::Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new().prefix("darkmux-fleet-snapshot-").tempfile()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    let json = serde_json::to_vec(&FleetSnapshotFile::from_fleet_read(read))?;
+    file.write_all(&json)?;
+    file.flush()?;
+    Ok(file)
+}
+
+/// Read a fleet snapshot file written by [`write_fleet_snapshot_file`].
+/// `None` on ANY failure (missing file, unreadable, malformed JSON, unknown
+/// `kind`) — the caller's job is to fall back to a live read, never to
+/// fail the request over a handoff-plumbing defect.
+fn read_fleet_snapshot_file(path: &StdPath) -> Option<FleetRead> {
+    let bytes = std::fs::read(path).ok()?;
+    let snapshot: FleetSnapshotFile = serde_json::from_slice(&bytes).ok()?;
+    snapshot.into_fleet_read()
 }
 
 pub(crate) fn fleet_flow_records() -> FleetRead {
@@ -3356,7 +3472,10 @@ pub(crate) fn fleet_flow_records() -> FleetRead {
             // embed the connection URL, and the env tier of `redis_url()`
             // carries an inline password. The full error goes to stderr (this
             // process's own log); the wire gets the classification only.
-            const DETAIL: &str = "could not read the fleet stream from Redis";
+            // (#1914) Hoisted to `FLEET_READ_ERROR_DETAIL` — the snapshot
+            // round-trip below needs the SAME literal to reconstruct this
+            // state from a file without deserializing a `&'static str`.
+            const DETAIL: &str = FLEET_READ_ERROR_DETAIL;
             match stale {
                 Some((at, records)) => {
                     eprintln!(

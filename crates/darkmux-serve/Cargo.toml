@@ -30,9 +30,13 @@ tower-http = { version = "0.5", features = ["cors", "timeout"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 redis = { version = "0.27", default-features = false, features = ["streams"] }
+# (#1914) Promoted from dev-only: the fleet-snapshot handoff file a spawned
+# `run-list` panel child reads (`write_fleet_snapshot_file` in lib.rs,
+# `needs_fleet_snapshot` in panel.rs) is production code, not test fixture
+# plumbing.
+tempfile = "3.10"
 
 [dev-dependencies]
-tempfile = "3.10"
 serial_test = "3.1"
 tower = "0.5"
 # (UI port Packet 1) TS-bridge generator for the /runs view-model — dev-only,
