@@ -91,6 +91,13 @@ mod tests {
             completed_ts: None,
             updated_ts: Some(1_785_401_200),
             tracked: true,
+            // (#1915) Populated even though this exemplar is `tracked:
+            // true` (which opens via `#mission=<id>`, not this field) —
+            // "every optional field populated" is the whole point of this
+            // fixture, and a spec author copying it should see the full
+            // wire vocabulary, not infer that `session_id` only ever
+            // shows up on an untracked row.
+            session_id: Some("crew-dispatch-pr-reviewer-1785400940-136e76-0".to_string()),
         };
         golden("runs-row.json", &run);
     }

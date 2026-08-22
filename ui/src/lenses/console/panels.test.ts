@@ -46,6 +46,9 @@ describe("PANELS", () => {
   it("(#1905 step 3) DEFAULT_PANEL_ID is run-list, and is itself one of the eight allowlisted panels", () => {
     expect(DEFAULT_PANEL_ID).toBe("run-list");
     expect(PANELS.map((p) => p.id)).toContain(DEFAULT_PANEL_ID);
+    // (#1911) …and it LEADS the row. A default sitting mid-row reads as an
+    // arbitrary pick rather than the panel you land on.
+    expect(PANELS[0].id).toBe(DEFAULT_PANEL_ID);
   });
 
   it("only doctor is manual-only", () => {

@@ -104,6 +104,46 @@ test('an untracked dispatch is openable, and a hostile id survives the hop', asy
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
+test('(#1915) an untracked MISSION row with a session_id is openable, same as a dispatch ghost', async ({ page }) => {
+  // The #1915 defect itself: `runDestination`/`interactive` used to hard-
+  // code "dispatch" as the one kind allowed to be untracked AND openable,
+  // so an untracked MISSION row read as flat even when the server had a
+  // perfectly good representative session for it (40 of 104 rows on the
+  // reported live fleet — the newest page a person actually sees, since
+  // the board sorts newest-first). The client rule is now kind-agnostic:
+  // "untracked, has a session_id" opens a session, any kind.
+  const errors = await openRuns(page);
+  const row = page.locator('.labrunrow', { hasText: 'degraded/untracked-mission-with-session' });
+  await expect(row).not.toHaveClass(/flat/);
+  await expect(row).toHaveAttribute('role', 'button');
+  await row.click();
+  await expect
+    .poll(() => page.evaluate(() => location.hash))
+    .toContain(`session=${encodeURIComponent('degraded/untracked-mission-with-session-sess')}`);
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});
+
+test('(#1915) an untracked MISSION row with no session_id at all stays correctly inert', async ({ page }) => {
+  // The one shape that still has genuinely nothing to open: a mission this
+  // daemon knows only from a terminal record, with no dispatch session
+  // ever joined to it (`flow_mission_to_run` can legitimately produce
+  // this). Proves the widened rule did not accidentally make EVERY
+  // untracked row openable — only the ones that actually carry a
+  // destination.
+  const errors = await openRuns(page);
+  const row = page.locator('.labrunrow', { hasText: 'degraded/untracked-mission-no-session' });
+  await expect(row).toHaveClass(/flat/);
+  await expect(row).not.toHaveAttribute('role', 'button');
+  // `#lens=runs` is already on the URL from opening this lens (`openRuns`
+  // navigates to `/index-lab.html#lens=runs`) — a non-interactive row's
+  // click must leave that alone, not clear it, so the assertion compares
+  // against the hash AS FOUND rather than assuming it starts empty.
+  const hashBefore = await page.evaluate(() => location.hash);
+  await row.click();
+  await expect(page.evaluate(() => location.hash)).resolves.toBe(hashBefore);
+  expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
+});
+
 test('degraded rows are still rendered inertly, not as markup', async ({ page }) => {
   // `/runs` ids come from run directory names and mission ids, neither of which
   // is guaranteed sanitary. The XSS gate covers the flow-record path; this is

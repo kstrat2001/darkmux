@@ -173,31 +173,60 @@ export function runsForMachine(runs: Run[], names: Set<string>): Run[] {
 export type RunDestination =
   | { kind: "lab"; dir: string }
   | { kind: "hash"; hash: string }
-  /** A tracked mission or dispatch (its own mission graph exists), but this
-   * page has no live daemon behind it to fetch `/mission/<id>/graph.json`
-   * from (the daemon-less static demo build). The row is still
-   * INTERACTIVE — clicking it is a real, expected action — it just can't
-   * navigate anywhere useful; callers show `MISSION_GRAPH_UNREACHABLE_NOTICE`
+  /** A tracked mission (its own mission graph exists), but this page has
+   * no live daemon behind it to fetch `/mission/<id>/graph.json` from
+   * (the daemon-less static demo build). The row is still INTERACTIVE —
+   * clicking it is a real, expected action — it just can't navigate
+   * anywhere useful; callers show `MISSION_GRAPH_UNREACHABLE_NOTICE`
    * instead of silently doing nothing. */
   | { kind: "unreachable" }
-  /** An untracked mission (a peer's mission this daemon only knows via the
-   * fleet stream, #1705): its `id` is a mission id, not a session id, so
-   * there is no local record to open. Genuinely nothing to do here —
-   * callers render the row non-interactive, matching `RunRow`'s own
-   * `interactive` gate (`run.kind === "lab" || run.tracked || run.kind ===
-   * "dispatch"`), which already excludes exactly this case. */
+  /** An untracked row with no representative session to drill into either
+   * — genuinely nothing to do here. Callers render the row
+   * non-interactive, matching `RunRow`'s own `interactive` gate ("has a
+   * destination" — see that component's own doc), which already excludes
+   * exactly this case. Rare in practice (every untracked row this build
+   * has actually produced carries a `session_id`, ghost or mission
+   * alike), but not impossible — a mission this daemon knows about
+   * ONLY through a terminal record, with no dispatch session ever
+   * joined to it, is the honest shape that reaches here. */
   | { kind: "none" };
 
+/**
+ * (#1915) Untracked no longer means inert. #1900/#1902 widened this ONLY
+ * for `kind === "dispatch"`, because a dispatch row's `id` happens to BE
+ * its own session id — but `tracked` was never actually the right test;
+ * "does this row carry a session it can be drilled into" is. The server
+ * now carries that pick explicitly (`Run.session_id` —
+ * `crates/darkmux-serve/src/runs.rs`'s `mission_to_run`/
+ * `flow_mission_to_run`/`ghost_runs`, all resolving it the SAME
+ * representative-session rule already used for role/model/route), so ANY
+ * untracked row with one — a ghost dispatch (whose `session_id` equals
+ * its own `id`) or an untracked mission (a peer's, #1705, or a local
+ * ephemeral with no durable record) — drills the same way. On the
+ * reported machine this was 40 of 104 mission rows, the entire newest
+ * page a person actually sees (the board sorts newest-first).
+ *
+ * A tracked mission cannot use this shortcut even when it also carries a
+ * `session_id` (`mission_to_run` populates it uniformly — see that
+ * field's own doc): `/mission/<id>/graph.json` is served from THIS
+ * machine's own durable state, which a tracked row by definition has, so
+ * the richer mission GRAPH is the right destination, not a session. An
+ * UNTRACKED mission structurally cannot make that same claim — there is
+ * no local `Mission`/`Phase`/`Task`/`Step` record for it, on this machine
+ * or (for a peer's mission) on any machine this daemon can query — so its
+ * session is the best this view can ever offer, not a fallback pending a
+ * richer one.
+ */
 export function runDestination(run: Run, graphReachable: boolean): RunDestination {
   if (run.kind === "lab") return { kind: "lab", dir: run.id };
-  if (run.kind === "dispatch" && !run.tracked) {
+  if (!run.tracked) {
     // No `graphReachable` gate here — `/flow-session/<id>` is a plain
     // daemon fetch (`SessionReplay`'s own fetch, same as the ungated
     // `#session=<sid>` bars `FleetLens.tsx`'s activity timeline already
     // navigates to), not the mission-graph lens's endpoint.
-    return { kind: "hash", hash: `session=${encodeURIComponent(run.id)}` };
+    if (run.session_id) return { kind: "hash", hash: `session=${encodeURIComponent(run.session_id)}` };
+    return { kind: "none" };
   }
-  if (!run.tracked) return { kind: "none" };
   if (!graphReachable) return { kind: "unreachable" };
   return { kind: "hash", hash: `mission=${encodeURIComponent(run.id)}` };
 }

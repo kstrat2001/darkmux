@@ -38,4 +38,32 @@ updated_ts?: number,
  * the module doc's "untracked" synthesis). `true` for every mission
  * and lab run — both have a durable artifact on disk.
  */
-tracked: boolean, };
+tracked: boolean, 
+/**
+ * (#1915) The flow session this row can be drilled into via
+ * `#session=<id>` — the SAME representative-session pick
+ * [`mission_to_run`]/[`flow_mission_to_run`] already make for
+ * role/model/route, now also carried out to the client instead of
+ * being computed and thrown away. Populated for every `Mission` row
+ * (tracked or not) from its representative session, and for a
+ * [`ghost_runs`] dispatch row from the row's OWN id (a ghost's `id`
+ * already IS a session id — see that function's own `Run` literal).
+ * Always `None` for a lab row: a lab run has no flow session backing
+ * it to drill into at all.
+ *
+ * **Why every mission carries this, not just untracked ones:** a
+ * TRACKED mission never actually needs it — `runDestination`
+ * (`ui/src/lenses/runs/format.ts`) resolves a tracked row to
+ * `#mission=<id>` (the mission GRAPH) before this field is ever
+ * consulted, and that stays true: `/mission/<id>/graph.json` is
+ * served from THIS machine's own durable `Mission`/`Phase`/`Task`/
+ * `Step` state, which an untracked row — by definition — does not
+ * have here (it either ran on a peer, #1705, or never got a durable
+ * record at all). An untracked mission can open its representative
+ * SESSION, never its graph; that limit is structural, not a gap this
+ * field closes. Carrying it uniformly means the client's own rule
+ * ("untracked and has a `session_id`" — see `runDestination`'s doc)
+ * never needs a kind-specific carve-out, for missions OR any future
+ * kind that gains the same shape.
+ */
+session_id?: string, };

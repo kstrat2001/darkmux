@@ -8,5 +8,6 @@
   "model": "gpt-oss-120b",
   "started_ts": 1785400940,
   "updated_ts": 1785401200,
-  "tracked": true
+  "tracked": true,
+  "session_id": "crew-dispatch-pr-reviewer-1785400940-136e76-0"
 }

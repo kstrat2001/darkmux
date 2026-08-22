@@ -237,7 +237,14 @@ export function variantKey(id: PanelId, requested?: Readonly<Record<string, stri
  * `runDestination` in `runs/format.ts`). `run-list` supersedes the
  * placeholder; it does not merely fill the hole left by deleting it. */
 export const PANELS: PanelDef[] = (
-  ["mission-status", "machine-status", "flow-status", "role-list", "config-list", "lab-fixture-list", "run-list", "doctor"] as const
+  // (#1911) Tab ORDER, and `run-list` leads it because it IS the landing
+  // panel (`DEFAULT_PANEL_ID` below). A default sitting seventh reads as
+  // an arbitrary pick rather than the one you land on, which is what the
+  // operator caught on the live console. Order here is free: the drift
+  // guard in `panels.test.ts` sorts both sides before comparing, so this
+  // array is presentation only and `PANEL_IDS` stays a closed SET whose
+  // own order carries no meaning.
+  ["run-list", "mission-status", "machine-status", "flow-status", "role-list", "config-list", "lab-fixture-list", "doctor"] as const
 ).map((id) => ({ id, label: panelArgv(id).join(" ") }));
 
 /** (#1905 step 3) The console's landing panel when `panelId === ""` — no

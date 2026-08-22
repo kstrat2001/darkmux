@@ -87,18 +87,22 @@ import {
  *   fallback (`renderMissionStatic()`'s static summary) is genuinely out of
  *   scope — see `MISSION_GRAPH_UNREACHABLE_NOTICE`'s own doc for why a
  *   named notice stands in for it instead.
- * - (#1900) an untracked `kind==="dispatch"` row opens the session drill
- *   instead: `location.hash = "session=<id>"`, straight to `SessionReplay`
- *   (`/flow-session/<id>`) — ungated, no `missionGraphReachable()` check,
- *   same precedent as `FleetLens.tsx`'s activity-lane bars. This used to be
- *   "nothing to open" on the premise that an untracked row is a ghost with
- *   no durable record — false for a dispatch row: server-side, `ghost_runs`
- *   only synthesizes one for a session that actually saw a `dispatch
- *   start`, so there's always a real trajectory behind it even with no
- *   mission ever minted. An untracked `kind==="mission"` row (a peer's
- *   mission this daemon has no local session for, #1705) is the genuinely
- *   different case where the old premise still holds — `interactive` stays
- *   false for it, no click affordance at all.
+ * - (#1900, widened #1915) an untracked row that carries a `session_id`
+ *   opens the session drill instead: `location.hash = "session=<id>"`,
+ *   straight to `SessionReplay` (`/flow-session/<id>`) — ungated, no
+ *   `missionGraphReachable()` check, same precedent as `FleetLens.tsx`'s
+ *   activity-lane bars. This started (#1900) as a `kind==="dispatch"`-only
+ *   carve-out — a ghost dispatch always has a real trajectory behind it
+ *   even with no mission ever minted (`ghost_runs` only synthesizes one for
+ *   a session that actually saw a `dispatch start`) — but that premise
+ *   turned out just as true for an untracked MISSION row (a peer's, #1705,
+ *   or a local ephemeral with no durable record): the server picks the
+ *   same representative session for it that it already computed for role/
+ *   model/route, just never carried out to the client before #1915. The
+ *   rule is now kind-agnostic: "untracked, has a `session_id`" opens a
+ *   session; "untracked, no `session_id`" is the only row with genuinely
+ *   nothing to open (see `runDestination`, `format.ts`, for the full
+ *   reasoning).
  *
  * Hash write-back (Packet 1.5): a kind-chip click changes no `Route` (no
  * `hashchange` fires — this is purely local state), so `App`'s route-keyed
@@ -249,29 +253,30 @@ export function RunsBoard({
   // there is unconditionally a lab row, so there's no kind to dispatch on.
   //
   // (#1900) `tracked` used to gate whether a row could be opened at all —
-  // "an untracked ghost has nothing to open". That premise is false for a
+  // "an untracked ghost has nothing to open". That premise was false for a
   // `kind: "dispatch"` row: server-side, `ghost_runs` (`crates/darkmux-
   // serve/src/runs.rs`) only ever synthesizes an untracked dispatch row for
   // a flow session that saw a real `dispatch start` record (its `has_start`
   // gate), so it always has a real `/flow-session/<id>` behind it — a
-  // trajectory, metrics, per-step records — even with no mission graph. A
-  // terminated `lab run long-agentic` dispatch is exactly this shape: alive
-  // it's `tracked: true` and clickable; the moment it terminates without a
-  // mission ever getting minted for it, `tracked` flips to `false` and the
-  // row went dead, even though the same several-hundred-record session is
-  // still sitting right there. So `kind === "dispatch"` now always has a
-  // destination: `#mission=<id>` when tracked (unchanged), `#session=<id>`
-  // when not.
+  // trajectory, metrics, per-step records — even with no mission graph.
   //
-  // `kind === "mission"` with `tracked: false` is a genuinely different
-  // case (`flow_mission_to_run`, #1705 — a peer's mission this daemon only
-  // sees via the fleet stream): its `id` is a mission id, not a session id,
-  // so there is no local `/flow-session/<id>` to open. That row keeps the
-  // old "nothing to open" behavior, because for it the premise still holds.
-  // (#1904 QA fix) The four-branch decision itself moved to the shared
-  // `runDestination` (`format.ts`) — this function only decides what to DO
-  // with each outcome: an in-page state swap for "lab" (`openLabRun`), a
-  // hash navigation for everything else.
+  // (#1915) The same premise turned out false for an untracked MISSION row
+  // too — 40 of 104 rows on the reported machine, the entire newest page a
+  // person actually sees. The server now carries the SAME representative-
+  // session pick uniformly, as `Run.session_id`, for every kind that has
+  // one; the client-side rule generalized to match: "untracked, but carries
+  // a `session_id`" opens a session, ANY kind, no more per-kind arms. The
+  // one case that still has genuinely nothing to open is an untracked row
+  // with no `session_id` at all — a peer mission this daemon knows only
+  // from a terminal record, with no dispatch session ever joined to it
+  // (`flow_mission_to_run`, #1705). `runDestination`'s own doc (`format.ts`)
+  // has the full reasoning, including why a TRACKED mission never takes
+  // this branch even though it also carries a `session_id`.
+  //
+  // (#1904 QA fix) The decision itself moved to the shared `runDestination`
+  // (`format.ts`) — this function only decides what to DO with each
+  // outcome: an in-page state swap for "lab" (`openLabRun`), a hash
+  // navigation for everything else.
   function activateRun(run: Run) {
     const dest = runDestination(run, missionGraphReachable());
     switch (dest.kind) {
@@ -633,11 +638,20 @@ function onActivateKeyDown(onActivate: () => void) {
  * `tabIndex` affordance for openable rows (see `interactive` below), and
  * `onActivate` is now the REAL per-row action, not a placeholder notice.
  *
- * (#1900) `interactive` widened to also cover an UNTRACKED dispatch row —
- * see `activateRun`'s own doc for why `tracked` alone is the wrong gate for
- * "can this be opened" on a `kind: "dispatch"` row. An untracked MISSION
- * row (a peer's mission this daemon has no local session for, #1705) stays
- * flat, matching legacy's original rule for the case where it still holds.
+ * (#1915) `interactive` is now "has a destination", period — no more
+ * kind-specific arms. It used to read `run.kind === "lab" || run.tracked
+ * || run.kind === "dispatch"`, which is the exact bug #1915 reported: that
+ * expression hard-codes "dispatch" as the one kind allowed to be untracked
+ * AND openable, so an untracked MISSION row — the kind a person actually
+ * browses most, and 40 of 104 rows on the reported machine — read as flat
+ * even when it carried a perfectly good session to open. `runDestination`
+ * is the single source of truth for whether a row has anywhere to go
+ * (`kind !== "none"`); asking it here instead of re-deriving a parallel
+ * rule means a future kind that gains the same shape needs no new arm on
+ * either side. `missionGraphReachable()` deliberately does NOT gate this:
+ * an "unreachable" destination is still a REAL destination (the row shows
+ * `MISSION_GRAPH_UNREACHABLE_NOTICE` on click, not silence), so it must
+ * stay interactive — only `kind === "none"` means truly nothing to open.
  *
  * (#1904) Was exported for `ActivityPanel.tsx` (the console lens's then
  * default recent-activity landing view) to reuse verbatim, rather than
@@ -646,7 +660,7 @@ function onActivateKeyDown(onActivate: () => void) {
  * leaving `RunsBoard` as the only caller; kept module-private now rather
  * than exported with no consumer. */
 function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boolean; onActivate: () => void }) {
-  const interactive = run.kind === "lab" || run.tracked || run.kind === "dispatch";
+  const interactive = runDestination(run, missionGraphReachable()).kind !== "none";
   const ago = runsAgo(run);
   const subtitle = runSubtitle(run, showMachine);
   return (

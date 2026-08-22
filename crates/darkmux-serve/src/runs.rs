@@ -201,6 +201,34 @@ pub struct Run {
     /// the module doc's "untracked" synthesis). `true` for every mission
     /// and lab run — both have a durable artifact on disk.
     pub tracked: bool,
+    /// (#1915) The flow session this row can be drilled into via
+    /// `#session=<id>` — the SAME representative-session pick
+    /// [`mission_to_run`]/[`flow_mission_to_run`] already make for
+    /// role/model/route, now also carried out to the client instead of
+    /// being computed and thrown away. Populated for every `Mission` row
+    /// (tracked or not) from its representative session, and for a
+    /// [`ghost_runs`] dispatch row from the row's OWN id (a ghost's `id`
+    /// already IS a session id — see that function's own `Run` literal).
+    /// Always `None` for a lab row: a lab run has no flow session backing
+    /// it to drill into at all.
+    ///
+    /// **Why every mission carries this, not just untracked ones:** a
+    /// TRACKED mission never actually needs it — `runDestination`
+    /// (`ui/src/lenses/runs/format.ts`) resolves a tracked row to
+    /// `#mission=<id>` (the mission GRAPH) before this field is ever
+    /// consulted, and that stays true: `/mission/<id>/graph.json` is
+    /// served from THIS machine's own durable `Mission`/`Phase`/`Task`/
+    /// `Step` state, which an untracked row — by definition — does not
+    /// have here (it either ran on a peer, #1705, or never got a durable
+    /// record at all). An untracked mission can open its representative
+    /// SESSION, never its graph; that limit is structural, not a gap this
+    /// field closes. Carrying it uniformly means the client's own rule
+    /// ("untracked and has a `session_id`" — see `runDestination`'s doc)
+    /// never needs a kind-specific carve-out, for missions OR any future
+    /// kind that gains the same shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub session_id: Option<String>,
 }
 
 /// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
@@ -441,9 +469,15 @@ fn flow_mission_to_run(
     flow_index: &HashMap<String, SessionAgg>,
     now_ms: u64,
 ) -> Run {
-    let sessions: Vec<&SessionAgg> =
-        agg.session_ids.iter().filter_map(|s| flow_index.get(s)).collect();
-    let any_live = sessions.iter().any(|s| session_is_live(s, now_ms));
+    // (#1915) Pairs, not bare aggs — same reason `mission_to_run` carries
+    // them: `session_id` below needs to know WHICH session won, not just
+    // its fields.
+    let sessions: Vec<(&str, &SessionAgg)> = agg
+        .session_ids
+        .iter()
+        .filter_map(|s| flow_index.get(s.as_str()).map(|a| (s.as_str(), a)))
+        .collect();
+    let any_live = sessions.iter().any(|(_, s)| session_is_live(s, now_ms));
     let status = match (&agg.terminal_ts, agg.terminal_was_abort) {
         // #1627 again: abort is teardown, not success.
         (Some(_), true) => RunStatus::Abandoned,
@@ -454,8 +488,15 @@ fn flow_mission_to_run(
     // Borrow route/model from whichever session first resolved one — a
     // mission-level row has no endpoint of its own, and showing the seat's
     // is more informative than showing nothing.
-    let route = sessions.iter().find_map(|s| s.endpoint.clone());
-    let model = sessions.iter().find_map(|s| s.model.clone());
+    let route = sessions.iter().find_map(|(_, s)| s.endpoint.clone());
+    let model = sessions.iter().find_map(|(_, s)| s.model.clone());
+    // (#1915) This IS the fix: a mission this daemon only sees via the
+    // fleet stream is exactly the row #1915 diagnosed as inert — `tracked:
+    // false` below with no drill target at all. The SAME representative-
+    // session rule `mission_to_run` uses (`earliest_by_start`), so a
+    // mission tracked locally and one only seen remotely pick their
+    // representative session the same way.
+    let session_id = earliest_by_start(&sessions).map(|(sid, _)| sid.to_string());
     Run {
         id: mission_id.to_string(),
         kind: RunKind::Mission,
@@ -478,6 +519,7 @@ fn flow_mission_to_run(
             .or(agg.last_ts.as_deref())
             .and_then(parse_flow_ts),
         tracked: false,
+        session_id,
     }
 }
 
@@ -621,9 +663,14 @@ fn mission_to_run(
     if let Some(ids) = mission_id_index.get(&mission.id) {
         candidate_ids.extend(ids.iter().map(String::as_str));
     }
-    let sessions: Vec<&SessionAgg> = candidate_ids
+    // (#1915) Pairs, not bare aggs — see `earliest_by_start`'s own doc for
+    // why: carrying the id alongside its agg is what lets `representative`
+    // hand its OWN session id to the `Run` (`session_id` below) without a
+    // second, separately-implemented search that could disagree about
+    // which session actually won.
+    let sessions: Vec<(&str, &SessionAgg)> = candidate_ids
         .into_iter()
-        .filter_map(|sid| flow_index.get(sid))
+        .filter_map(|sid| flow_index.get(sid).map(|agg| (sid, agg)))
         .collect();
 
     let representative = earliest_by_start(&sessions);
@@ -637,7 +684,7 @@ fn mission_to_run(
         &sessions
             .iter()
             .copied()
-            .filter(|s| s.endpoint.is_some())
+            .filter(|(_, s)| s.endpoint.is_some())
             .collect::<Vec<_>>(),
     );
 
@@ -663,7 +710,7 @@ fn mission_to_run(
     // attributes over every real dispatch session, exactly the corruption
     // `earliest_by_start` itself is already immune to.
     let mut sessions_by_start: Vec<&SessionAgg> =
-        sessions.iter().copied().filter(|s| s.start_ts.is_some()).collect();
+        sessions.iter().map(|(_, s)| *s).filter(|s| s.start_ts.is_some()).collect();
     sessions_by_start.sort_by(|a, b| a.start_ts.cmp(&b.start_ts));
 
     // Model is simple: the bookend's own record NEVER carries one
@@ -694,10 +741,13 @@ fn mission_to_run(
     // unset (`darkmux_flow::record`'s provenance stamp, CLAUDE.md's
     // "stamped at record-write time" contract), so the bookend session is
     // never the one blanking this field the way it blanks role/model.
-    let machine = representative.and_then(|s| s.machine.clone());
-    let route = remote.and_then(|s| s.endpoint.clone());
-    let start_ts_str = representative.and_then(|s| s.start_ts.clone());
-    let terminal_ts_str = sessions.iter().filter_map(|s| s.terminal_ts.clone()).max();
+    let machine = representative.and_then(|(_, s)| s.machine.clone());
+    let route = remote.and_then(|(_, s)| s.endpoint.clone());
+    let start_ts_str = representative.and_then(|(_, s)| s.start_ts.clone());
+    let terminal_ts_str = sessions.iter().filter_map(|(_, s)| s.terminal_ts.clone()).max();
+    // (#1915) The drill target — see `Run::session_id`'s own doc for why
+    // this is populated for every mission row, tracked or not.
+    let session_id = representative.map(|(sid, _)| sid.to_string());
 
     let started_ts = mission
         .started_ts
@@ -706,10 +756,11 @@ fn mission_to_run(
         .finalized_ts
         .or_else(|| terminal_ts_str.as_deref().and_then(parse_flow_ts));
 
+    let sessions_bare: Vec<&SessionAgg> = sessions.iter().map(|(_, s)| *s).collect();
     Run {
         id: mission.id.clone(),
         kind,
-        status: mission_run_status(mission, &sessions, now_ms),
+        status: mission_run_status(mission, &sessions_bare, now_ms),
         machine,
         route,
         role,
@@ -725,6 +776,7 @@ fn mission_to_run(
         // makes the field's "always populated" contract total for this path.
         updated_ts: completed_ts.or(started_ts).or(Some(mission.created_ts)),
         tracked: true,
+        session_id,
     }
 }
 
@@ -931,6 +983,11 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
         // that never happened; as `updated_ts` it's simply true.
         updated_ts: Some(summary.mtime_ms / 1000),
         tracked: true,
+        // (#1915) A lab run has no flow session backing it — nothing to
+        // drill into via `#session=<id>` — and it already opens its own
+        // in-page detail pane regardless (`RunsBoard.tsx::activateRun`'s
+        // `"lab"` branch), so there's no destination this field could add.
+        session_id: None,
     }
 }
 
@@ -1263,12 +1320,20 @@ fn terminal_status_for_action(action: &str) -> Option<RunStatus> {
 /// plain string). Sessions with no `start_ts` at all are excluded from the
 /// comparison (a `None` `start_ts` must never look "earliest"); falls back
 /// to an arbitrary element only when NONE of the candidates have one.
-fn earliest_by_start<'a>(sessions: &[&'a SessionAgg]) -> Option<&'a SessionAgg> {
+///
+/// (#1915) Operates on `(id, agg)` PAIRS, not bare aggs. Before this, a
+/// caller that also needed to know WHICH session won — not just its
+/// fields — had no way to recover that from the returned `&SessionAgg`
+/// alone (`SessionAgg` doesn't carry its own id; it's the `flow_index`
+/// map's key). The only fix that can't drift is deriving the id from the
+/// SAME comparison that picks the agg, rather than a second, separately
+/// written search for "which id maps to this agg" after the fact.
+fn earliest_by_start<'a>(sessions: &[(&'a str, &'a SessionAgg)]) -> Option<(&'a str, &'a SessionAgg)> {
     sessions
         .iter()
         .copied()
-        .filter(|s| s.start_ts.is_some())
-        .min_by(|a, b| a.start_ts.cmp(&b.start_ts))
+        .filter(|(_, s)| s.start_ts.is_some())
+        .min_by(|(_, a), (_, b)| a.start_ts.cmp(&b.start_ts))
         .or_else(|| sessions.first().copied())
 }
 
@@ -1337,6 +1402,13 @@ fn ghost_runs(
                 .and_then(parse_flow_ts)
                 .or_else(|| agg.start_ts.as_deref().and_then(parse_flow_ts)),
             tracked: false,
+            // (#1915) A ghost row's own `id` (above) already IS a session
+            // id — it's synthesized directly from `flow_index`'s key, one
+            // row per untracked session. Carried here too, redundantly with
+            // `id`, so the CLIENT never needs a kind-specific "for a
+            // dispatch, drill into `id` itself" special case: "untracked
+            // and has a `session_id`" is the one rule every kind obeys.
+            session_id: Some(session_id.clone()),
         });
     }
     out
@@ -2269,6 +2341,51 @@ mod tests {
         assert!(stale_after_ms() >= 600 * 2_000, "and never below the shipped default");
     }
 
+    // ── earliest_by_start: pairs, not bare aggs (#1915) ──────────────────
+
+    /// The core claim the #1915 fix rests on: the returned id genuinely
+    /// belongs to the SAME session whose agg won the comparison, even when
+    /// the winning session isn't the pair listed first. A version that
+    /// derived the id from a SEPARATE search after picking the agg could
+    /// pass a test built any other way and still drift.
+    #[test]
+    fn earliest_by_start_returns_the_id_paired_with_the_winning_agg() {
+        let later = SessionAgg { start_ts: Some("2026-01-01T09:00:00Z".to_string()), ..Default::default() };
+        let earlier = SessionAgg { start_ts: Some("2026-01-01T08:00:00Z".to_string()), ..Default::default() };
+        // Listed with the LATER session first, on purpose — a fallback to
+        // "just take the first pair" would pass this test for the wrong
+        // reason if it happened to also pick the earliest by luck.
+        let pairs = [("later-sess", &later), ("earlier-sess", &earlier)];
+        let (id, agg) = earliest_by_start(&pairs).expect("a session with a start_ts must win");
+        assert_eq!(id, "earlier-sess");
+        assert_eq!(agg.start_ts.as_deref(), Some("2026-01-01T08:00:00Z"));
+    }
+
+    /// A session with no `start_ts` must never look "earliest" — the SAME
+    /// exclusion the bare-agg version already had, still holding after the
+    /// pairing change.
+    #[test]
+    fn earliest_by_start_excludes_a_session_with_no_start_ts_even_when_listed_first() {
+        let no_start = SessionAgg::default();
+        let has_start = SessionAgg { start_ts: Some("2026-01-01T08:00:00Z".to_string()), ..Default::default() };
+        let pairs = [("no-start-sess", &no_start), ("has-start-sess", &has_start)];
+        let (id, _) = earliest_by_start(&pairs).unwrap();
+        assert_eq!(id, "has-start-sess");
+    }
+
+    /// When NONE of the candidates have a `start_ts`, the fallback is an
+    /// arbitrary element — still paired correctly with its own id, not the
+    /// first pair's agg mismatched to a different id.
+    #[test]
+    fn earliest_by_start_falls_back_to_the_first_pair_when_nothing_has_a_start_ts() {
+        let a = SessionAgg { role: Some("coder".to_string()), ..Default::default() };
+        let b = SessionAgg { role: Some("reviewer".to_string()), ..Default::default() };
+        let pairs = [("sess-a", &a), ("sess-b", &b)];
+        let (id, agg) = earliest_by_start(&pairs).unwrap();
+        assert_eq!(id, "sess-a");
+        assert_eq!(agg.role.as_deref(), Some("coder"));
+    }
+
     // ── flow session index + route (#1518 start-OR-complete) ────────────
 
     #[test]
@@ -2535,6 +2652,10 @@ mod tests {
         assert_eq!(g.status, RunStatus::Running);
         assert!(!g.tracked);
         assert_eq!(g.role.as_deref(), Some("coder"));
+        // (#1915) A ghost row's own id already IS its session id — carried
+        // explicitly anyway so the client's drill rule never needs a
+        // dispatch-specific "use `id` itself" carve-out.
+        assert_eq!(g.session_id.as_deref(), Some("orphan-sess"));
     }
 
     #[test]
@@ -2889,6 +3010,14 @@ mod tests {
         // `machine_id` auto-stamped at write time in production, so the
         // bookend session is never the one blanking it.
         assert_eq!(runs[0].machine.as_deref(), Some("studio"), "machine must read the representative (earliest/bookend) session's value, not borrow the coder session's: {runs:?}");
+
+        // (#1915) `session_id` follows the SAME representative-only rule as
+        // `machine` above — the bookend's own id, not the later coder
+        // session's, and not the mission's own id (which happens to be the
+        // same string here by construction, `mission_bookend_record`'s own
+        // shape — pinned as "the representative session's id" rather than
+        // "the mission id" so the two don't get silently conflated).
+        assert_eq!(runs[0].session_id.as_deref(), Some("bookend-mission-1"), "session_id must be the representative (earliest) session's own id: {runs:?}");
 
         // Ordering is untouched by this fix: start_ts still comes from the
         // EARLIEST session (the bookend), same as before.
@@ -3263,6 +3392,29 @@ mod tests {
         assert!(
             !runs.iter().any(|r| r.id == "peer-session-1"),
             "the peer's session is represented by its mission row, not duplicated as a ghost"
+        );
+    }
+
+    /// (#1915) The defect this whole issue is about: an untracked mission
+    /// row used to carry NO way to open it at all — `flow_mission_to_run`
+    /// already computed a representative session for route/model
+    /// attribution and simply never carried its id out. On the reported
+    /// machine 40 of 104 mission rows were exactly this shape, and the
+    /// board sorts newest-first, so this was the first page a person saw.
+    #[test]
+    fn a_peers_untracked_mission_carries_its_representative_session_as_the_drill_target() {
+        let flows = TempDir::new().unwrap();
+        let fleet = vec![
+            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch complete", &darkmux_flow::ts_utc_now()),
+        ];
+        let runs = build_runs(flows.path(), None, &fleet);
+        let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
+        assert!(!row.tracked, "this test's own premise: the row must be untracked");
+        assert_eq!(
+            row.session_id.as_deref(),
+            Some("peer-session-1"),
+            "an untracked mission row must carry its representative session as a drill target, not None: {row:?}"
         );
     }
 

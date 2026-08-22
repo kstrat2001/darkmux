@@ -18,13 +18,13 @@ github
 console
 
 === stage ===
+run list
 mission status
 machine status
 flow status
 role list
 config list
 lab fixture list
-run list
 doctor
 $ darkmux config list
 captured 20:54:23
