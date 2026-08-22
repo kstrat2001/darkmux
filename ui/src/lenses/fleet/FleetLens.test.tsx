@@ -1,11 +1,30 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
-import { todayUTC, prevDateUTC } from "../../lib/flow";
+import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS } from "../../lib/flow";
 import { closeOpenModal } from "../../lib/dialogManager";
 
+// (#1913) Every fixture below anchors its records at "T10:00" of `today`
+// (`todayUTC()`), and liveness (`flowLiveSessions`, `FLOW_LIVE_TTL_MS`) is
+// judged against REAL wall-clock now. Left alone, that means the suite's
+// pass/fail depended on what time of day it happened to run: before 10:00
+// UTC the fixture sits in the future (trivially "fresh"), and after
+// 10:05 UTC it's stale and every "N running" assertion goes red — a test
+// that fails on a schedule, not intermittently. Freezing `Date` to a fixed
+// instant makes the fixture-to-now distance an ASSERTED PARAMETER instead of
+// something inherited from the clock. `toFake: ["Date"]` leaves
+// setTimeout/setInterval alone, so `waitFor()`'s real-timer polling still
+// works.
+const FROZEN_NOW = "2026-06-15T10:02:00.000Z"; // 2 minutes after the T10:00 anchor, well inside FLOW_LIVE_TTL_MS
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date(FROZEN_NOW));
+});
+
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   window.location.hash = "";
   // See EventLogColumn.test.tsx's own comment: dialogManager's open/close
@@ -380,6 +399,50 @@ describe("FleetLens", () => {
     expect(countEl.getAttribute("aria-label")).toBeTruthy();
     fireEvent.keyDown(countEl, { key: "Enter" });
     expect(window.location.hash).toBe("#session=s1");
+  });
+
+  // (#1913) The two tests below pin BOTH sides of the `FLOW_LIVE_TTL_MS`
+  // boundary explicitly, rather than relying on the other tests in this
+  // file happening to sit comfortably inside it. Before this fix neither
+  // direction was asserted: a session's liveness was implicitly "whatever
+  // real wall-clock now happened to be" relative to a `T10:00` fixture.
+  it("(#1913) a session 1s under the FLOW_LIVE_TTL_MS boundary still reads 1 running", async () => {
+    const today = todayUTC();
+    const lastRecordMs = Date.parse(`${today}T10:00:00.000Z`);
+    mockFleetFetch({
+      flowToday: [
+        { ts: new Date(lastRecordMs).toISOString(), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      ],
+      machines: [{ uid: "u1", name: "MacBook-Pro", last_seen_ms: lastRecordMs }],
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
+    });
+    vi.setSystemTime(new Date(lastRecordMs + FLOW_LIVE_TTL_MS - 1000));
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("1 running");
+    expect(card.querySelector(".runs--live")).not.toBeNull();
+  });
+
+  it("(#1913) a session 1s past the FLOW_LIVE_TTL_MS boundary reads 0 running, not stuck live", async () => {
+    const today = todayUTC();
+    const lastRecordMs = Date.parse(`${today}T10:00:00.000Z`);
+    mockFleetFetch({
+      flowToday: [
+        { ts: new Date(lastRecordMs).toISOString(), machine_uid: "u1", machine_id: "MacBook-Pro", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      ],
+      machines: [{ uid: "u1", name: "MacBook-Pro", last_seen_ms: lastRecordMs }],
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "Apple M5 Max" },
+    });
+    vi.setSystemTime(new Date(lastRecordMs + FLOW_LIVE_TTL_MS + 1000));
+    renderFleetLens();
+    await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
+    const card = document.querySelector(".mach")!;
+    expect(card.textContent).toContain("0 running");
+    // No live tap target once nothing is running (`machineRunsHash` returns
+    // null), and the card body itself reads idle, not "dispatch in flight".
+    expect(card.querySelector(".runs--live")).toBeNull();
+    expect(card.textContent).toContain("idle");
   });
 
   // (#1903 QA fix) Was: the card body (`role="button"`) had no explicit

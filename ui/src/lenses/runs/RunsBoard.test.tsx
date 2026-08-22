@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { RunsBoard } from "./RunsBoard";
 import { todayUTC } from "../../lib/flow";
+import { useHashRoute } from "../../lib/useHashRoute";
 
 function renderBoard(
   initialKind: "all" | "mission" | "dispatch" | "lab" = "all",
@@ -671,5 +672,84 @@ describe("RunsBoard — the machine pin (#1809)", () => {
     // l1 is the pinned machine's only lab run and has a recorded corpus
     // (`LAB_RUNS_FIXTURE`) — the series card renders for it.
     expect(container.querySelector(".labtaskcard")).toBeInTheDocument();
+  });
+});
+
+/**
+ * (#1920) A harness that mirrors `App.tsx`'s ACTUAL `RunsBoard` wiring —
+ * `initialKind`/`initialRun`/`initialMachineUid` re-derived from
+ * `useHashRoute()` on every render (`App.tsx`'s `renderRoute`), not fixed
+ * props handed to `RunsBoard` once at construction. Every other test in
+ * this file uses `renderBoard()`, which constructs `RunsBoard` directly
+ * with props that never change after mount — so `suppressResyncRef`'s
+ * guard (in `RunsBoard.tsx`, against the deep-link resync effect's own
+ * echo of `onLabRunUnresolvable`'s `writeHash` call) can never even be
+ * exercised there: the race it guards against only exists when
+ * `initialRun` is genuinely RE-DERIVED from the URL after mount, the way
+ * `App.tsx` does and `renderBoard()` structurally cannot.
+ */
+function AppLikeRunsHarness() {
+  const route = useHashRoute();
+  if (route.kind !== "runs") return null;
+  return <RunsBoard initialKind={route.runsKind} initialRun={route.run} initialMachineUid={route.machine} />;
+}
+
+describe("RunsBoard — deep-link wiring parity with App.tsx (#1920)", () => {
+  afterEach(() => {
+    window.location.hash = "";
+    document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
+    vi.unstubAllGlobals();
+  });
+
+  // (#1920) `RunsBoard.tsx`'s own `onLabRunUnresolvable` sets
+  // `suppressResyncRef.current = true` before clearing `labRunDir`, so the
+  // deep-link resync effect recognizes its OWN echo (the `writeHash` call
+  // inside `onLabRunUnresolvable` changes `location.href` without firing a
+  // real `hashchange`) rather than mistaking it for a fresh external
+  // deep-link and wiping the "couldn't open run" notice back out via its
+  // own `setRowClickNotice(null)`. `RunsBoard.test.tsx`'s direct-construction
+  // tests can't reproduce this — `initialRun` is fixed for the component's
+  // whole lifetime there, so the resync effect's guarded branch never runs
+  // against a genuinely re-derived prop. This test drives a REAL deep link
+  // through `useHashRoute()`, matching `App.tsx`'s own wiring, and forces
+  // the exact re-render `App.tsx` would eventually get from some unrelated
+  // cause (a poll, a refetch) by firing a `hashchange` after the notice
+  // first appears — the same echo the guard exists to recognize.
+  it("a deep link to an unresolvable lab run keeps its notice after the echoed re-render, not wiped back out", async () => {
+    mockFetch(); // /runs, /lab/runs both ok; /lab/run/detail?dir=bad-dir falls through to this mock's 404 default
+    window.location.hash = "#lens=runs&kind=lab&run=bad-dir";
+
+    // No <meta name="darkmux-mode"> is injected by this test harness, so
+    // `missionGraphReachable()` defaults false and the daemon-less-static
+    // notice would render instead — inject it, matching a REAL `darkmux
+    // serve`-served page (same pattern the mission-row test above uses),
+    // so the branch under test is the "couldn't open run" one #1920 names.
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-mode";
+    meta.content = "live";
+    document.head.appendChild(meta);
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <AppLikeRunsHarness />
+      </QueryClientProvider>,
+    );
+
+    const notice = /couldn't open run "bad-dir"/;
+    await waitFor(() => expect(screen.getByText(notice)).toBeInTheDocument());
+
+    // `onLabRunUnresolvable`'s own `writeHash` (a `replaceState`, per
+    // `hashSync.ts`'s own doc) already moved `location.href` to `run=null`
+    // without dispatching `hashchange`. Firing one now is the stand-in for
+    // "the next unrelated App re-render" `RunsBoard.tsx`'s own comment
+    // names as the real-world trigger — it forces `useHashRoute()` to
+    // recompute and hand `RunsBoard` a fresh (now-null) `initialRun`,
+    // which is exactly the echo `suppressResyncRef` exists to recognize.
+    await act(async () => {
+      window.dispatchEvent(new Event("hashchange"));
+    });
+
+    expect(screen.getByText(notice)).toBeInTheDocument();
   });
 });
