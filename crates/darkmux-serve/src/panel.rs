@@ -244,22 +244,7 @@ pub(crate) async fn panel_handler(
     // Manual-only panels (TTL 0) are floored server-side: `auto_refresh:
     // false` is advice to a client the server does not control.
     if !spec.auto_refresh {
-        let last = state.panels.last_manual.lock().await;
-        if let Some(prev) = last.get(id) {
-            let since = prev.elapsed();
-            if since < MANUAL_MIN_INTERVAL {
-                let wait = (MANUAL_MIN_INTERVAL - since).as_secs() + 1;
-                return Err((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    format!(
-                        "panel \"{id}\" is manual-run only and ran {}s ago — it probes the \
-                         machine, so it is floored at {}s between runs. Retry-After: {wait}\n",
-                        since.as_secs(),
-                        MANUAL_MIN_INTERVAL.as_secs()
-                    ),
-                ));
-            }
-        }
+        admit_manual_run(&state.panels, id).await?;
     }
 
     // Serve fresh-enough cache without spawning.
@@ -349,15 +334,58 @@ pub(crate) async fn panel_handler(
         "auto_refresh": spec.auto_refresh,
     });
 
-    if spec.cache_ttl.is_zero() {
-        // Manual panel: nothing cached (an explicit run is a real run), but
-        // the floor's clock advances so the next caller is bounded.
-        state.panels.last_manual.lock().await.insert(id, Instant::now());
-    } else {
+    if !spec.cache_ttl.is_zero() {
         let mut cache = state.panels.cache.lock().await;
         cache.insert(id, CacheEntry { body: body.clone(), captured: Instant::now() });
     }
+    // Manual panels (TTL 0) already advanced the floor's clock at admission
+    // time (`admit_manual_run`, above) — not here. Recording here would
+    // reopen the exact gap #1919 closed: a concurrent racer that passed the
+    // (then read-only) check while this spawn was still in flight would
+    // never have been rejected, because nothing recorded intent until AFTER
+    // the real work finished.
     Ok(axum::Json(body))
+}
+
+/// Atomically check-and-record admission for a MANUAL-ONLY panel run
+/// (`auto_refresh: false`, TTL 0). The check and the record happen under
+/// ONE lock acquisition, so a concurrent racer either sees the just-admitted
+/// timestamp and is rejected, or genuinely arrived after the floor elapsed —
+/// there is no gap between "decided to admit" and "recorded that we did"
+/// for another caller to land in (#1919).
+///
+/// Manual panels have no cache to fall back on (TTL 0, by design — an
+/// explicit re-run must be a real run), so this admission gate is the ONLY
+/// thing standing between a burst of concurrent callers and a burst of real
+/// spawns. It must run before anything else that could yield across an
+/// await point without having already recorded intent.
+async fn admit_manual_run(
+    panels: &PanelState,
+    id: &'static str,
+) -> Result<(), (StatusCode, String)> {
+    let mut last = panels.last_manual.lock().await;
+    if let Some(prev) = last.get(id) {
+        let since = prev.elapsed();
+        if since < MANUAL_MIN_INTERVAL {
+            let wait = (MANUAL_MIN_INTERVAL - since).as_secs() + 1;
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "panel \"{id}\" is manual-run only and ran {}s ago — it probes the \
+                     machine, so it is floored at {}s between runs. Retry-After: {wait}\n",
+                    since.as_secs(),
+                    MANUAL_MIN_INTERVAL.as_secs()
+                ),
+            ));
+        }
+    }
+    // Record intent to run NOW, while still holding the lock — this is the
+    // admission itself, not a side effect of a later successful spawn. A
+    // spawn that subsequently fails or times out still consumed the floor's
+    // window, which is correct: the cost the floor bounds is the spawn
+    // attempt (curl + Keychain + disk probing), not just a successful one.
+    last.insert(id, Instant::now());
+    Ok(())
 }
 
 /// Serve the cached body if it is within `ttl`, with `age_ms` restamped so
@@ -438,5 +466,112 @@ mod tests {
         // narrow screen ended up rendering wider than itself.
         assert_eq!(clamp_cols(Some(52)), 52, "a phone's width is not a floor violation");
         assert_eq!(clamp_cols(Some(46)), 46);
+    }
+
+    /// #1919 part 1: the manual-run floor must be an atomic admission gate,
+    /// not a check followed later by a record. Five concurrent callers race
+    /// `admit_manual_run` on one fresh (empty) `PanelState` for the same id
+    /// — mirroring the issue's own probe ("PROBE real-spawn count among 5
+    /// concurrent racers: 5"). Exactly one may be admitted; the floor exists
+    /// specifically to bound doctor's ~2.2s of probing (curl to GitHub,
+    /// Keychain reads) to once per 30s, and a floor that lets all 5 through
+    /// is no floor at all.
+    ///
+    /// Red-prove (per the Self-QA gate): reverting `admit_manual_run` to the
+    /// old two-step shape — read `last_manual` under one lock acquisition,
+    /// drop it, then insert under a SECOND acquisition after the check —
+    /// reopens the exact gap this closes and this test fails with more than
+    /// one racer admitted. Confirmed by hand; the atomic version (checked
+    /// into this file) is what ships.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admit_manual_run_admits_exactly_one_of_five_concurrent_racers() {
+        let panels = PanelState::default();
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let panels = panels.clone();
+            handles.push(tokio::spawn(async move { admit_manual_run(&panels, "doctor").await }));
+        }
+
+        let mut admitted = 0;
+        let mut rejected = 0;
+        for h in handles {
+            match h.await.expect("task panicked") {
+                Ok(()) => admitted += 1,
+                Err((status, _)) => {
+                    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+                    rejected += 1;
+                }
+            }
+        }
+        assert_eq!(
+            admitted, 1,
+            "exactly one of five concurrent racers should be admitted — the floor bounds \
+             doctor's probing cost to one spawn per 30s regardless of how many callers race it"
+        );
+        assert_eq!(rejected, 4);
+    }
+
+    /// Build a minimal router carrying only `/panel/:id`, backed by a caller-
+    /// supplied `AppState` (so a test can seed `panels` before the request
+    /// lands). Mirrors `crate::build_router_local`'s shape without pulling in
+    /// the full route table, which `panel_handler` doesn't need.
+    async fn panel_get(state: crate::AppState, id: &str) -> (StatusCode, String) {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+
+        let router = axum::Router::new()
+            .route("/panel/:id", axum::routing::get(panel_handler))
+            .with_state(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/panel/{id}"))
+                    .header(PANEL_HEADER, "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// #1919 part 2: nothing proved `panel_handler` actually calls the floor.
+    /// Disabling the call site left 306/306 green (per the issue). This pins
+    /// the floor's *invocation*, end to end through the real handler and
+    /// router — not just `admit_manual_run` in isolation (the test above) —
+    /// by seeding `last_manual` with a fresh timestamp for "doctor" and
+    /// asserting the handler responds 429. A 429 is an error path: the
+    /// handler never reaches `std::env::current_exe()`, so this avoids the
+    /// hazard of the running test binary re-spawning itself as a "panel".
+    ///
+    /// Red-prove: with the call site disabled (`if false &&
+    /// !spec.auto_refresh { ... }`, the exact shape the issue reproduced),
+    /// this test fails — the handler falls through to a real spawn attempt
+    /// instead of returning 429. Confirmed by hand; see the report for the
+    /// exact command and outcome.
+    #[tokio::test]
+    async fn panel_handler_returns_429_when_the_floor_is_already_recorded() {
+        let panels = PanelState {
+            last_manual: Arc::new(tokio::sync::Mutex::new(HashMap::from([("doctor", Instant::now())]))),
+            ..PanelState::default()
+        };
+        let state = crate::AppState {
+            flows_dir: std::path::PathBuf::from("."),
+            worktrees_base: std::path::PathBuf::from("."),
+            sse_open: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            lab_dir: None,
+            panels,
+        };
+
+        let (status, body) = panel_get(state, "doctor").await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            body.contains("manual-run only"),
+            "expected the floor's own message, got: {body}"
+        );
     }
 }

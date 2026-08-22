@@ -2876,20 +2876,40 @@ fn check_mission_config_registry() -> Check {
                         version_drift.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; ");
                     blocking.push(format!("\"{id}\": {joined}"));
                 }
-                // (#1284 review round 2, consider 7) A USER-tier copy whose
-                // schema MINOR trails the binary's is silently missing
-                // additive fields newer launchers rely on — concretely, a
-                // pre-1.4 user copy of "review" has no `reads` field on any
-                // task, so cross-phase data delivery that relies on it (see
-                // schema 1.4's #1619) silently doesn't happen. (#1550 cluster
-                // item 2: the ORIGINAL illustration named the `expand`
-                // primitive, but `expand` was retired in schema 2.0 — a MAJOR
-                // bump, see `MISSION_CONFIG_SCHEMA`'s doc — so pointing at it
-                // here would itself be a stale reference to a field that no
-                // longer exists.) Major drift is `validate()`'s job (either
-                // direction); this minor-trailing check is user-tier-only
-                // because the embedded/on-disk built-ins ship with the binary
-                // and can't trail it.
+                // (#1284 review round 2, consider 7; fixed for #1917) A
+                // USER-tier copy whose schema MINOR trails the binary's MAY
+                // be silently missing an additive field newer launchers rely
+                // on. Two things this finding must get right, both broken
+                // before #1917:
+                //
+                // 1. **The remedy must not assume a fallback exists.** The
+                //    ORIGINAL text unconditionally said "delete it to fall
+                //    back to the embedded tier" — true only when `id` HAS an
+                //    embedded/on-disk counterpart. Every `pr-*` GitHub-verb
+                //    config (and thirteen others, on the reporting
+                //    operator's machine) is user-only: `templates/builtin/
+                //    mission-configs/` holds exactly `coder-phase` and
+                //    `review`. Following the old advice on a user-only
+                //    document deletes it with nothing to fall back to.
+                //    `has_non_user_fallback` is the same user → on-disk →
+                //    embedded resolution `mission launch` uses, so the check
+                //    already KNOWS the answer before it speaks.
+                // 2. **The severity wording must scale with the actual gap.**
+                //    The ORIGINAL text quoted a fixed illustration — a
+                //    pre-1.4 "review" copy losing `reads` (#1619) — on EVERY
+                //    minor-trailing hit, regardless of how far the document
+                //    actually trails. A one-minor additive gap (2.2 → 2.3
+                //    just added the optional `gh_verb`) then reads exactly
+                //    like a data-loss hazard it is not.
+                //
+                // (#1550 cluster item 2: an earlier illustration named the
+                // `expand` primitive, but `expand` was retired in schema
+                // 2.0 — a MAJOR bump, see `MISSION_CONFIG_SCHEMA`'s doc — so
+                // pointing at it here would itself be a stale reference to a
+                // field that no longer exists.) Major drift is `validate()`'s
+                // job (either direction); this minor-trailing check is
+                // user-tier-only because the embedded/on-disk built-ins ship
+                // with the binary and can't trail it.
                 if loaded.source == mission_config::MissionConfigSource::User {
                     if let Some((doc_major, doc_minor)) = loaded
                         .config
@@ -2901,15 +2921,42 @@ fn check_mission_config_registry() -> Check {
                             parse_major_minor(mission_config::MISSION_CONFIG_SCHEMA)
                                 .expect("MISSION_CONFIG_SCHEMA is a valid MAJOR.MINOR constant");
                         if doc_major == bin_major && doc_minor < bin_minor {
+                            let gap = bin_minor - doc_minor;
+                            // Scoped to the actual gap: a one-minor trail is
+                            // advisory by the schema's own versioning rule
+                            // ("a future consumer can safely ignore what it
+                            // can't yet evaluate" — MISSION_CONFIG_SCHEMA's
+                            // doc); a wider trail is where the concrete
+                            // reads/#1619 hazard actually applies.
+                            let severity = if gap <= 1 {
+                                "trailing by one minor is additive by this schema's own \
+                                 versioning rule, so this is likely a no-op — but confirm none \
+                                 of the fields this binary's schema added since your document's \
+                                 version apply to it"
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "trailing by {gap} minors is far enough that the user copy \
+                                     may predate additive fields newer launchers rely on (e.g. a \
+                                     pre-1.4 \"review\" copy has no `reads` field on any task, so \
+                                     cross-phase data delivery that relies on it — see schema \
+                                     1.4's #1619 — silently doesn't happen)"
+                                )
+                            };
+                            let remedy = if mission_config::has_non_user_fallback(id) {
+                                "re-derive it from the current built-in, or delete it to fall \
+                                 back to the on-disk/embedded built-in tier"
+                                    .to_string()
+                            } else {
+                                "this document has no on-disk or embedded counterpart to fall \
+                                 back to — deleting it loses it; update it in place against the \
+                                 current schema instead"
+                                    .to_string()
+                            };
                             blocking.push(format!(
                                 "\"{id}\": user-tier copy declares schema {doc_major}.{doc_minor}, \
-                                 but this binary's mission-config schema is \
-                                 {bin_major}.{bin_minor} — the user copy predates additive \
-                                 fields newer launchers rely on (e.g. a pre-1.4 \"review\" copy \
-                                 has no `reads` field on any task, so cross-phase data delivery \
-                                 that relies on it — see schema 1.4's #1619 — silently doesn't \
-                                 happen); re-derive it from the current built-in or delete it to \
-                                 fall back to the embedded tier"
+                                 but this binary's mission-config schema is {bin_major}.{bin_minor} \
+                                 — {severity}; {remedy}"
                             ));
                         }
                         // (#1648) The MIRROR direction, and the more dangerous
@@ -6152,10 +6199,95 @@ mod tests {
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("declares schema 2.0"), "{}", check.message);
         assert!(
-            check.message.contains("predates additive fields"),
+            // #1917 rescoped this to name the actual gap ("trailing by N
+            // minors") rather than a fixed phrase, since the severity text
+            // now varies with how far the document trails.
+            check.message.contains("predate additive fields"),
             "must name the hazard, not just the version delta: {}",
             check.message
         );
+    }
+
+    /// Pull just one id's finding out of `check_mission_config_registry`'s
+    /// combined message — findings are joined with `" | "` and each starts
+    /// with `"<id>": ...` (see `blocking.join(" | ")`). Lets a test assert
+    /// on ONE finding's text without the other finding's text being able to
+    /// satisfy the assertion by accident.
+    fn finding_for<'a>(message: &'a str, id: &str) -> &'a str {
+        let needle = format!("\"{id}\":");
+        let start = message
+            .find(&needle)
+            .unwrap_or_else(|| panic!("no finding for \"{id}\" in: {message}"));
+        let rest = &message[start..];
+        match rest.find(" | ") {
+            Some(end) => &rest[..end],
+            None => rest,
+        }
+    }
+
+    /// #1917 — the remedy text must differ depending on whether `id` HAS a
+    /// fallback tier. Same one-minor gap on two ids in the SAME check run:
+    /// "review" is embedded (deleting the user copy truly falls back to
+    /// something), "totally-custom-1917" is user-only (deleting it loses
+    /// the document outright — the exact hazard #1917 reported live, on 15
+    /// real configs including every `pr-*` GitHub verb, none of which have
+    /// a built-in counterpart).
+    #[serial_test::serial]
+    #[test]
+    fn check_mission_config_registry_remedy_differs_between_a_fallback_and_a_user_only_config() {
+        let guard = CrewRootGuard::new();
+        std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
+        let (major, minor) =
+            parse_major_minor(darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA).expect("valid constant");
+        let trailing = format!("{major}.{}", minor - 1);
+        std::fs::write(
+            guard.path().join("mission-configs").join("review.json"),
+            format!(r#"{{"id":"review","name":"PR Review (trailing)","schema_version":"{trailing}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            guard.path().join("mission-configs").join("totally-custom-1917.json"),
+            format!(
+                r#"{{"id":"totally-custom-1917","name":"Operator's own verb","schema_version":"{trailing}"}}"#
+            ),
+        )
+        .unwrap();
+
+        let check = check_mission_config_registry();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+
+        let review_finding = finding_for(&check.message, "review");
+        let custom_finding = finding_for(&check.message, "totally-custom-1917");
+
+        assert!(
+            review_finding.contains("delete it"),
+            "review has an embedded fallback — deleting it is a real, safe option: {review_finding}"
+        );
+        assert!(
+            !custom_finding.contains("delete it"),
+            "a user-only config has nothing to fall back to — must never suggest deleting it: {custom_finding}"
+        );
+        assert!(
+            custom_finding.contains("no on-disk or embedded counterpart"),
+            "must say what is actually true for a user-only document: {custom_finding}"
+        );
+
+        // Both fixtures trail by exactly one minor (2.2 vs the binary's
+        // 2.3) — additive, per the schema's own versioning rule. Neither
+        // finding should quote the fixed pre-1.4 "review"/`reads` example;
+        // that hazard belongs to a document trailing far enough for it to
+        // plausibly apply, not to a one-minor additive gap (#1917's second
+        // half — a small gap must not read as data loss).
+        for finding in [review_finding, custom_finding] {
+            assert!(
+                !finding.contains("pre-1.4"),
+                "a one-minor gap must not quote the fixed pre-1.4 example: {finding}"
+            );
+            assert!(
+                finding.contains("one minor"),
+                "the severity text must name the actual (small) gap detected: {finding}"
+            );
+        }
     }
 
     /// (#1648) The MIRROR direction — a user-tier copy on a NEWER minor than
