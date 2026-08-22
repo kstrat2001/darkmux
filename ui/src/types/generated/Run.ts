@@ -65,5 +65,21 @@ tracked: boolean,
  * ("untracked and has a `session_id`" — see `runDestination`'s doc)
  * never needs a kind-specific carve-out, for missions OR any future
  * kind that gains the same shape.
+ *
+ * **`None` also when the representative session is ambiguous
+ * (#1918).** A flow-emitter defect (the scheduler stamps
+ * `session_id` from the TASK id, which carries no per-run identity)
+ * means a "session" can in practice be a bucket several different
+ * missions' records collapsed into — measured live at 49 missions
+ * sharing one session id. `mission_to_run`/`flow_mission_to_run`/
+ * `ghost_runs` each check `SessionAgg::is_ambiguous` before handing
+ * this field a value; when it fires, this stays `None` even though a
+ * representative session technically exists, because that session
+ * cannot be attributed to any one mission. No destination is the
+ * honest answer: an inert row is a smaller failure than a row that
+ * opens a DIFFERENT mission's work while looking like it opened this
+ * one. The root cause (the scheduler's id scheme) is a separate,
+ * deliberately-versioned fix — this field only refuses to act on the
+ * corruption, it does not repair it.
  */
 session_id?: string, };

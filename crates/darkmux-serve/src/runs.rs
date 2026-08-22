@@ -226,6 +226,22 @@ pub struct Run {
     /// ("untracked and has a `session_id`" — see `runDestination`'s doc)
     /// never needs a kind-specific carve-out, for missions OR any future
     /// kind that gains the same shape.
+    ///
+    /// **`None` also when the representative session is ambiguous
+    /// (#1918).** A flow-emitter defect (the scheduler stamps
+    /// `session_id` from the TASK id, which carries no per-run identity)
+    /// means a "session" can in practice be a bucket several different
+    /// missions' records collapsed into — measured live at 49 missions
+    /// sharing one session id. `mission_to_run`/`flow_mission_to_run`/
+    /// `ghost_runs` each check `SessionAgg::is_ambiguous` before handing
+    /// this field a value; when it fires, this stays `None` even though a
+    /// representative session technically exists, because that session
+    /// cannot be attributed to any one mission. No destination is the
+    /// honest answer: an inert row is a smaller failure than a row that
+    /// opens a DIFFERENT mission's work while looking like it opened this
+    /// one. The root cause (the scheduler's id scheme) is a separate,
+    /// deliberately-versioned fix — this field only refuses to act on the
+    /// corruption, it does not repair it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub session_id: Option<String>,
@@ -496,7 +512,15 @@ fn flow_mission_to_run(
     // session rule `mission_to_run` uses (`earliest_by_start`), so a
     // mission tracked locally and one only seen remotely pick their
     // representative session the same way.
-    let session_id = earliest_by_start(&sessions).map(|(sid, _)| sid.to_string());
+    //
+    // (#1918) But only when that session is UNAMBIGUOUS. The scheduler
+    // defect #1918 diagnosed means a session can carry records from
+    // multiple missions — opening it from this row could land on someone
+    // else's work, which is worse than the inert row #1915 fixed. See
+    // `SessionAgg::is_ambiguous`'s own doc.
+    let session_id = earliest_by_start(&sessions)
+        .filter(|(_, agg)| !agg.is_ambiguous())
+        .map(|(sid, _)| sid.to_string());
     Run {
         id: mission_id.to_string(),
         kind: RunKind::Mission,
@@ -747,7 +771,12 @@ fn mission_to_run(
     let terminal_ts_str = sessions.iter().filter_map(|(_, s)| s.terminal_ts.clone()).max();
     // (#1915) The drill target — see `Run::session_id`'s own doc for why
     // this is populated for every mission row, tracked or not.
-    let session_id = representative.map(|(sid, _)| sid.to_string());
+    //
+    // (#1918) Suppressed when the representative session is ambiguous —
+    // same rule and same reasoning as `flow_mission_to_run`'s identical
+    // guard: a session spanning more than one mission is not a valid
+    // drill target for any of them.
+    let session_id = representative.filter(|(_, agg)| !agg.is_ambiguous()).map(|(sid, _)| sid.to_string());
 
     let started_ts = mission
         .started_ts
@@ -1101,6 +1130,28 @@ const RUNS_FLOW_SCAN_WINDOW_DAYS: i64 = 14;
 #[derive(Debug, Default, Clone)]
 struct SessionAgg {
     mission_id: Option<String>,
+    /// (#1918) Every DISTINCT `mission_id` seen on a record folded into
+    /// this session, not just the first (`mission_id` above keeps only
+    /// that). A `HashSet` rather than a running counter: the scheduler
+    /// defect #1918 diagnosed stamps the SAME `session_id` on every step
+    /// of the SAME mission too (many records, one mission), so a naive
+    /// increment-per-record counter would flag an ordinary session as
+    /// ambiguous just for having multiple steps. A set gives "distinct"
+    /// for free — dedup is the data structure, not a comparison a caller
+    /// has to remember to write — and the ambiguity question is then just
+    /// `.len() > 1` (see [`SessionAgg::is_ambiguous`]).
+    ///
+    /// Root cause: the scheduler stamps `session_id` from the TASK id
+    /// (`task-<task_id>`), which carries no per-RUN identity, so every
+    /// mission that happens to run a task with the same id lands in the
+    /// same bucket (98 records / 49 distinct `mission_id` values / 1
+    /// `session_id`, measured live). That is a flow-emitter defect, fixed
+    /// separately (#1918's own "Fix" section) because the id is also the
+    /// flow index's key and appears in `#session=<id>` deep links — a
+    /// data-shape change worth versioning deliberately, not slipped in
+    /// here. This field exists to DETECT the corruption from the read
+    /// side and refuse to act on it, not to repair the write side.
+    mission_ids_seen: HashSet<String>,
     role: Option<String>,
     model: Option<String>,
     machine: Option<String>,
@@ -1139,6 +1190,22 @@ struct SessionAgg {
     /// terminal. Same raw-ISO-string convention as `start_ts`/`terminal_ts`
     /// — parsed via [`parse_flow_ts`] only where a numeric is needed.
     last_activity_ts: Option<String>,
+}
+
+impl SessionAgg {
+    /// (#1918) `true` when this session's records name more than one
+    /// distinct `mission_id` — the read-side detector for the scheduler
+    /// defect (see [`SessionAgg::mission_ids_seen`]'s own doc). Every
+    /// caller that would otherwise hand this session out as a drill target
+    /// (`mission_to_run`, `flow_mission_to_run`, `ghost_runs`) checks this
+    /// FIRST: a session covering more than one mission is not a valid
+    /// drill target for ANY of them, because there is no way to tell,
+    /// from the session alone, which mission a click should actually
+    /// open. No destination is the honest answer — an inert row is a
+    /// smaller failure than a row that opens someone else's work.
+    fn is_ambiguous(&self) -> bool {
+        self.mission_ids_seen.len() > 1
+    }
 }
 
 /// One pass over every flow record within [`RUNS_FLOW_SCAN_WINDOW_DAYS`] —
@@ -1191,6 +1258,19 @@ fn build_flow_session_index(
                 if !mid.is_empty() {
                     agg.mission_id = Some(mid.to_string());
                 }
+            }
+        }
+        // (#1918) Unconditional, unlike `mission_id` above — this tracks
+        // EVERY distinct value this session has ever named, not just the
+        // first, because the ambiguity question ("does this session belong
+        // to more than one mission") can only be answered by seeing them
+        // all. A `HashSet` insert of the same value from the session's own
+        // other steps is a no-op, so an ordinary multi-step mission never
+        // trips this — only a session that genuinely spans more than one
+        // mission grows past one entry.
+        if let Some(mid) = v.get("mission_id").and_then(|m| m.as_str()) {
+            if !mid.is_empty() {
+                agg.mission_ids_seen.insert(mid.to_string());
             }
         }
         if agg.role.is_none() {
@@ -1408,7 +1488,17 @@ fn ghost_runs(
             // `id`, so the CLIENT never needs a kind-specific "for a
             // dispatch, drill into `id` itself" special case: "untracked
             // and has a `session_id`" is the one rule every kind obeys.
-            session_id: Some(session_id.clone()),
+            //
+            // (#1918) Same ambiguity guard as the mission paths, applied
+            // uniformly rather than special-cased away here. A ghost row
+            // is synthesized one-per-session, so by construction it should
+            // never be ambiguous — `has_start` only gates on THIS session
+            // having opened a dispatch, not on how many missions' records
+            // landed in it. If this ever actually fires on a ghost, that
+            // is itself a finding (a session-id COLLISION between an
+            // orphaned dispatch and a real mission), not a nuisance to
+            // silence.
+            session_id: if agg.is_ambiguous() { None } else { Some(session_id.clone()) },
         });
     }
     out
@@ -2386,6 +2476,81 @@ mod tests {
         assert_eq!(agg.role.as_deref(), Some("coder"));
     }
 
+    // ── mission_ids_seen / is_ambiguous (#1918) ──────────────────────────
+    //
+    // Pinning the counting itself, per the coordinator's explicit ask: two
+    // records under the same session_id with DIFFERENT mission_id values
+    // must mark the session ambiguous; two records under the same
+    // session_id with the SAME mission_id (an ordinary multi-step mission
+    // writing several records into its own session) must not.
+
+    #[test]
+    fn build_flow_session_index_two_records_same_session_different_mission_is_ambiguous() {
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-08-07T07:57:43Z",
+                    "action": "step start",
+                    "session_id": "task-__panel_args__",
+                    "mission_id": "acp-ephemeral-pr-view-1786089463406811000-1",
+                    "source": "scheduler",
+                }),
+                serde_json::json!({
+                    "ts": "2026-08-07T07:58:00Z",
+                    "action": "step start",
+                    "session_id": "task-__panel_args__",
+                    "mission_id": "acp-ephemeral-pr-list-1786091297730112000-2",
+                    "source": "scheduler",
+                }),
+            ],
+        );
+        let idx = build_flow_session_index(tmp.path(), &[]);
+        let agg = idx.get("task-__panel_args__").expect("session indexed");
+        assert!(
+            agg.is_ambiguous(),
+            "two DIFFERENT mission_id values under one session_id must mark it ambiguous: {agg:?}"
+        );
+    }
+
+    #[test]
+    fn build_flow_session_index_two_records_same_session_same_mission_is_not_ambiguous() {
+        // The ordinary shape: one mission's own session accumulates several
+        // step records, all naming the SAME mission_id. Without this
+        // inverted case, a naive "grew past one record" counter would pass
+        // the test above for the wrong reason and flag every ordinary
+        // multi-step mission as ambiguous.
+        let tmp = TempDir::new().unwrap();
+        write_day_file(
+            tmp.path(),
+            &today(),
+            &[
+                serde_json::json!({
+                    "ts": "2026-08-07T07:57:43Z",
+                    "action": "step start",
+                    "session_id": "crew-dispatch-coder-1",
+                    "mission_id": "mission-a",
+                    "source": "scheduler",
+                }),
+                serde_json::json!({
+                    "ts": "2026-08-07T07:58:00Z",
+                    "action": "step complete",
+                    "session_id": "crew-dispatch-coder-1",
+                    "mission_id": "mission-a",
+                    "source": "scheduler",
+                }),
+            ],
+        );
+        let idx = build_flow_session_index(tmp.path(), &[]);
+        let agg = idx.get("crew-dispatch-coder-1").expect("session indexed");
+        assert!(
+            !agg.is_ambiguous(),
+            "repeated records naming the SAME mission_id must not be flagged ambiguous: {agg:?}"
+        );
+    }
+
     // ── flow session index + route (#1518 start-OR-complete) ────────────
 
     #[test]
@@ -2656,6 +2821,42 @@ mod tests {
         // explicitly anyway so the client's drill rule never needs a
         // dispatch-specific "use `id` itself" carve-out.
         assert_eq!(g.session_id.as_deref(), Some("orphan-sess"));
+    }
+
+    /// (#1918) By construction a ghost SHOULD never be ambiguous — one row
+    /// per untracked session, and `has_start` only gates on THIS session
+    /// having opened a dispatch, not on how many missions landed in it. But
+    /// the guard is applied uniformly (per the coordinator's explicit ask)
+    /// rather than assumed-safe and skipped here, so this test forces the
+    /// adversarial shape by hand: a session that is BOTH a live ghost
+    /// (unmatched by any known/remote mission) AND carries records from two
+    /// distinct `mission_id`s — the session-id COLLISION #1918's own doc
+    /// names as the finding this would actually represent, not a nuisance
+    /// case. The row still gets synthesized (it IS a real, live dispatch
+    /// session); only its `session_id` drill target goes honest-None.
+    #[test]
+    fn ghost_runs_suppresses_session_id_when_the_session_is_ambiguous() {
+        let mut idx = HashMap::new();
+        let mut collided = SessionAgg {
+            mission_id: None,
+            has_start: true,
+            role: Some("coder".to_string()),
+            start_ts: Some("2026-07-24T10:00:00Z".to_string()),
+            last_activity_ts: Some("2026-07-24T10:00:00Z".to_string()),
+            ..Default::default()
+        };
+        collided.mission_ids_seen.insert("mission-a".to_string());
+        collided.mission_ids_seen.insert("mission-b".to_string());
+        idx.insert("colliding-sess".to_string(), collided);
+        let now_ms = parse_flow_ts("2026-07-24T10:00:00Z").unwrap() * 1_000;
+        let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), now_ms);
+        assert_eq!(ghosts.len(), 1, "the row itself is still real and still emitted: {ghosts:?}");
+        let g = &ghosts[0];
+        assert_eq!(g.id, "colliding-sess");
+        assert_eq!(
+            g.session_id, None,
+            "an ambiguous session must never be handed out as a drill target, ghost or not: {g:?}"
+        );
     }
 
     #[test]
@@ -3025,6 +3226,78 @@ mod tests {
             runs[0].started_ts,
             parse_flow_ts("2026-01-01T08:00:00Z"),
             "start_ts must still come from the earliest session — only role/model attribution changed: {runs:?}"
+        );
+    }
+
+    /// (#1918) The SAME uniform guard applied to the LOCAL tracked-mission
+    /// path, not just the fleet/untracked one above — the coordinator's
+    /// explicit ask was "apply uniformly at every population site," and
+    /// `mission_to_run` is the third. Reuses the bookend fixture above
+    /// almost verbatim; the only change is a second flow record under the
+    /// SAME `session_id` naming a DIFFERENT `mission_id` — the #1918 shape.
+    /// A tracked mission never actually consults `session_id` for its own
+    /// drill (it resolves via `#mission=<id>` first — see `Run::session_id`'s
+    /// doc), so this pins the FIELD's correctness for any other consumer
+    /// (a future doctor check, an operator inspecting `/runs` directly)
+    /// rather than a client-visible behavior change.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_1918_a_tracked_missions_ambiguous_representative_session_gets_no_drill_target() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mut mission = minimal_mission(
+            "collision-mission-1",
+            vec!["p-collision".to_string()],
+            Some(MissionSpec {
+                config_id: "coder-phase".to_string(),
+                inputs_fingerprint: "fpc".to_string(),
+                origin: None,
+            }),
+        );
+        mission.started_ts = None;
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        let phase = minimal_phase("p-collision", "collision-mission-1", vec!["t-collision".to_string()]);
+        darkmux_crew::lifecycle::save_phase(&phase).unwrap();
+        let task = minimal_task("t-collision", "p-collision", vec!["s-collision".to_string()], Some("coder"));
+        darkmux_crew::lifecycle::save_task("collision-mission-1", &task).unwrap();
+        let step = minimal_step("s-collision", "t-collision", Some("collision-mission-1"));
+        darkmux_crew::lifecycle::save_step("collision-mission-1", "p-collision", &step).unwrap();
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                // This mission's own bookend — same shape as the #1877
+                // fixture above.
+                serde_json::json!({
+                    "ts": "2026-01-01T08:00:00Z",
+                    "action": "dispatch start",
+                    "session_id": "collision-mission-1",
+                    "handle": "coder-phase",
+                    "mission_id": "collision-mission-1",
+                    "source": "mission",
+                    "machine_id": "studio",
+                }),
+                // The #1918 collision: a DIFFERENT mission's step landed
+                // under the SAME session_id (the scheduler's task-derived
+                // id scheme colliding across missions).
+                serde_json::json!({
+                    "ts": "2026-01-01T08:30:00Z",
+                    "action": "step start",
+                    "session_id": "collision-mission-1",
+                    "mission_id": "some-other-mission",
+                    "source": "scheduler",
+                }),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "collision-mission-1").expect("row for collision-mission-1");
+        assert!(row.tracked, "this test's own premise: a LOCAL durable mission, tracked: true");
+        assert_eq!(
+            row.session_id, None,
+            "a tracked mission's representative session must ALSO go None when it is ambiguous — the guard is uniform across every population site, not a fleet-only special case: {row:?}"
         );
     }
 
@@ -3415,6 +3688,35 @@ mod tests {
             row.session_id.as_deref(),
             Some("peer-session-1"),
             "an untracked mission row must carry its representative session as a drill target, not None: {row:?}"
+        );
+    }
+
+    /// (#1918) The direction that makes #1915 actually shippable: the SAME
+    /// `peer-session-1` this test's sibling above proves opens cleanly, but
+    /// now a SECOND mission's record also lands under that session_id (the
+    /// scheduler defect's shape — a session bucket collapsing more than one
+    /// mission's records together). The representative pick still succeeds
+    /// mechanically; the ambiguity guard is what has to catch that the pick
+    /// is no longer trustworthy as a drill target.
+    #[test]
+    fn an_untracked_missions_ambiguous_representative_session_gets_no_drill_target() {
+        let flows = TempDir::new().unwrap();
+        let mut collided_record = peer_record("dispatch start", &darkmux_flow::ts_utc_now());
+        collided_record["mission_id"] = serde_json::json!("review-on-a-different-hub");
+        let fleet = vec![
+            peer_record("dispatch start", &darkmux_flow::ts_utc_now()),
+            peer_record("dispatch complete", &darkmux_flow::ts_utc_now()),
+            // Same session_id ("peer-session-1", from `peer_record`), a
+            // DIFFERENT mission_id — the collision.
+            collided_record,
+        ];
+        let runs = build_runs(flows.path(), None, &fleet);
+        let row = runs.iter().find(|r| r.id == "review-on-the-hub").expect("row for review-on-the-hub");
+        assert!(!row.tracked, "this test's own premise: the row must be untracked");
+        assert_eq!(
+            row.session_id, None,
+            "a representative session shared by another mission must never be handed out as a drill target, \
+             even though the mechanical representative-session pick still succeeds: {row:?}"
         );
     }
 
