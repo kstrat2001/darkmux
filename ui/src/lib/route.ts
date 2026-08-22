@@ -8,14 +8,20 @@
  * resolving once `/next` takes over.
  *
  * Precedence when the hash carries multiple intents (same order `boot()`
- * checks them in): `lens=runs`/`lens=lab` > `lens=machine` > `lens=console` >
- * `mission=`/`session=` > a static-build's `darkmux-flow-src` meta (#1801 —
- * see below) > a bare `#<date>` (or `?date=`) playback pin > default fleet.
- * A `lens` value this build doesn't recognize (not
- * `runs`/`lab`/`machine`/`console`, and no bare `mission=`/`session=`/date
- * present either) falls through to `unknown` — a visible "lens not ported
- * yet" placeholder naming the raw hash, never a blank page (the overnight
- * runbook's render-sanity contract).
+ * checks them in): `lens=fleet` > `lens=runs`/`lens=lab` > `lens=machine` >
+ * `lens=console` > `mission=`/`session=` > a static-build's
+ * `darkmux-flow-src` meta (#1801 — see below) > a bare `#<date>` (or
+ * `?date=`) playback pin > default fleet. `lens=fleet` (#1920) is just the
+ * EXPLICIT name for the same default the bottom of this function already
+ * falls back to with no hash at all — naming it here doesn't change what
+ * it resolves to, only whether typing/sharing it dead-ends. `lens` itself
+ * is lowercased before every comparison below (#1920), matching `kind`'s
+ * existing degrade-gracefully behavior. A `lens` value this build doesn't
+ * recognize even after lowercasing (not
+ * `fleet`/`runs`/`lab`/`machine`/`console`, and no bare `mission=`/
+ * `session=`/date present either) falls through to `unknown` — a visible
+ * "lens not ported yet" placeholder naming the raw hash, never a blank
+ * page (the overnight runbook's render-sanity contract).
  *
  * (Packet 4) The bare-date form is `targetDate()`'s convenience in
  * `viewer.html` (type/bookmark `#2026-08-07` directly) — a DIFFERENT
@@ -273,7 +279,29 @@ export function parseRoute(): Route {
   const get = (name: string): string =>
     (search.get(name) || hash.get(name) || "").trim();
 
-  const lens = get("lens");
+  // (#1920) Lowercased the same way `kind` already is below — `lens` is a
+  // closed-set param (`runs`/`lab`/`machine`/`console`/`fleet`) exactly
+  // like `kind` is, and a hand-typed or autocapitalized `#lens=RUNS` used
+  // to compare with strict `===` against every branch, never matching, and
+  // falling all the way to `unknown`. `kind`'s own degrade-gracefully
+  // behavior is the target this brings `lens` in line with, not a new
+  // invention.
+  const lens = get("lens").toLowerCase();
+
+  // (#1920) `fleet` is the bare-root default (no hash at all falls
+  // through to `{kind:"fleet"}` at the bottom of this function) but had no
+  // EXPLICIT `lens=` form of its own — an operator typing or sharing
+  // `#lens=fleet` (a wholly plausible guess: it's the one lens every other
+  // `lens=` value sits beside, and the nav tab's own hash-write for the
+  // fleet tab is `""`, not `"lens=fleet"`, so nothing in this app ever
+  // MINTS that hash, but a person composing one by hand doesn't know
+  // that) hit the `unknown` placeholder instead of the lens that was
+  // already the default. Named explicitly here, same as every other real
+  // lens above and below it, so the fleet lens is addressable by name, not
+  // only by omission.
+  if (lens === "fleet") {
+    return { kind: "fleet" };
+  }
 
   if (lens === "runs" || lens === "lab") {
     const rawKind = (get("kind") || (lens === "lab" ? "lab" : "all")).toLowerCase();

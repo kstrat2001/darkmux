@@ -165,6 +165,44 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "unknown", hash: "lens=bogus-lens" });
   });
 
+  // (#1920) `fleet` is the bare-root default but had no explicit `lens=`
+  // form of its own — a plausible hash to type or share dead-ended at
+  // `unknown` even though the fleet lens is real and already the default.
+  // Named explicitly now, matching every other lens.
+  it("parses #lens=fleet as the fleet route, not unknown", () => {
+    setHash("#lens=fleet");
+    expect(parseRoute()).toEqual({ kind: "fleet" });
+  });
+
+  // (#1920) `lens=` used to compare with strict `===`, so a hand-typed or
+  // autocapitalized value never matched any branch and fell all the way to
+  // `unknown` — where `kind=` already degrades gracefully via its own
+  // `.toLowerCase()`. Each case below is a DIFFERENT real lens, so one test
+  // can't silently pass by exercising the same branch twice.
+  it("lowercases lens= the same way kind= already is, for every real lens", () => {
+    setHash("#lens=RUNS");
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "all", run: null, machine: null });
+
+    setHash("#lens=Lab");
+    expect(parseRoute()).toEqual({ kind: "runs", runsKind: "lab", run: null, machine: null });
+
+    setHash("#lens=MACHINE");
+    expect(parseRoute()).toEqual({ kind: "machine", uid: null });
+
+    setHash("#lens=Console");
+    expect(parseRoute()).toEqual({ kind: "console", panelId: "", opts: {} });
+
+    setHash("#lens=FLEET");
+    expect(parseRoute()).toEqual({ kind: "fleet" });
+  });
+
+  // A genuinely unrecognized value must still degrade to `unknown` after
+  // lowercasing — this isn't a blanket "any string passes now" change.
+  it("a value that is unrecognized even after lowercasing still reports unknown", () => {
+    setHash("#lens=BOGUS-LENS");
+    expect(parseRoute()).toEqual({ kind: "unknown", hash: "lens=BOGUS-LENS" });
+  });
+
   it("parses a bare date hash as a playback route (Packet 4)", () => {
     setHash("#2026-08-09");
     expect(parseRoute()).toEqual({ kind: "playback", date: "2026-08-09" });

@@ -67,6 +67,25 @@ export function runsAgo(r: Run, now: number = Date.now()): string {
   return `${Math.floor(secs / 86400)}d ago`;
 }
 
+/**
+ * (#1907) The status BADGE's display text. `RunStatus::Abandoned` alone
+ * covers two genuinely different situations — a human ran `mission abort`,
+ * or nothing ever wrote an ending (killed/crashed/no terminal record) —
+ * and reading the same word for both is what prompted "i'm not sure what
+ * abandoned means?" on the console's own activity list (this function's
+ * origin issue). `Run.abandoned_reason` is set ONLY alongside `"abandoned"`
+ * (`crates/darkmux-serve/src/runs.rs::Run::abandoned_reason`'s own doc), so
+ * this reads it directly rather than re-deriving the distinction client-
+ * side. Every other status keeps its own plain name, unchanged — this is
+ * the ONE place `RunRow`'s badge text can diverge from `run.status` itself
+ * (the CSS class backing the badge's COLOR stays keyed on `run.status`
+ * verbatim, so `.labbadge.abandoned` styling is untouched by this).
+ */
+export function runStatusLabel(r: Run): string {
+  if (r.status !== "abandoned") return r.status;
+  return r.abandoned_reason === "aborted" ? "aborted" : "no ending recorded";
+}
+
 /** viewer.html: `function runSubtitle(r, showMachine)`. */
 export function runSubtitle(r: Run, showMachine: boolean): string {
   const bits: string[] = [];

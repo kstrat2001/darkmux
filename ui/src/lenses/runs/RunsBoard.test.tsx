@@ -95,6 +95,29 @@ describe("RunsBoard", () => {
     expect(badge).toHaveClass("labbadge", "unparseable");
   });
 
+  /** (#1907) The badge's CLASS stays keyed on `run.status` (so the dim
+   *  `.labbadge.abandoned` styling is unchanged) but its TEXT now reads
+   *  `abandoned_reason` — a deliberate `mission abort` renders "aborted";
+   *  a run with no terminal record ever written (or an older server that
+   *  didn't send the field at all) renders "no ending recorded". Both
+   *  must be real, distinguishable text in the DOM, not the same word. */
+  it("renders an abandoned row's badge text from abandoned_reason, not the bare status word", async () => {
+    mockFetch(true, true, {}, [
+      { id: "aborted-1", kind: "mission", status: "abandoned", tracked: true, updated_ts: 400, abandoned_reason: "aborted" },
+      { id: "stale-1", kind: "dispatch", status: "abandoned", tracked: false, updated_ts: 300 },
+    ]);
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("aborted-1")).toBeInTheDocument());
+
+    const abortedBadge = screen.getByText("aborted");
+    expect(abortedBadge).toHaveClass("labbadge", "abandoned");
+
+    const staleBadge = screen.getByText("no ending recorded");
+    expect(staleBadge).toHaveClass("labbadge", "abandoned");
+
+    expect(screen.queryByText("abandoned", { selector: ".labbadge" })).not.toBeInTheDocument();
+  });
+
   it("shows the kind counts in the filter bar", async () => {
     mockFetch();
     const { container } = renderBoard();

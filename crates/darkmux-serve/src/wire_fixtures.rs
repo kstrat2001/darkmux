@@ -98,6 +98,17 @@ mod tests {
             // wire vocabulary, not infer that `session_id` only ever
             // shows up on an untracked row.
             session_id: Some("crew-dispatch-pr-reviewer-1785400940-136e76-0".to_string()),
+            // (#1907) This exemplar's `status` is `Running`, so `None` here
+            // is the honest value — `abandoned_reason` is only ever `Some`
+            // alongside `RunStatus::Abandoned` (see that field's own doc).
+            // The degraded-shape sibling `runs-degraded-fixture.json` (hand-
+            // written, not generated from this type) already covers an
+            // `abandoned` row with the field entirely ABSENT, which is the
+            // more useful exemplar for this field: it proves an old server
+            // response with no `abandoned_reason` at all still deserializes
+            // leniently, the same "lenient-on-read WIRE shape" this module's
+            // own header doc names for every other optional field.
+            abandoned_reason: None,
         };
         golden("runs-row.json", &run);
     }

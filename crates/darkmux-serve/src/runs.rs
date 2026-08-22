@@ -140,6 +140,31 @@ pub enum RunStatus {
     Unparseable,
 }
 
+/// (#1907) Which of two genuinely different situations produced a
+/// [`RunStatus::Abandoned`] row — see [`Run::abandoned_reason`]'s own doc
+/// for the wire contract and each construction site
+/// (`mission_to_run`/`flow_mission_to_run`/`lab_summary_to_run`/
+/// `ghost_runs`) for how each is decided. Only meaningful when `status ==
+/// RunStatus::Abandoned`; every other status leaves this `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../../../ui/src/types/generated/"))]
+#[serde(rename_all = "lowercase")]
+pub enum AbandonReason {
+    /// A human explicitly tore the run down: a local `mission abort`
+    /// (`MissionStatus::Aborted`), or the remote-mission flow twin of it
+    /// (`FlowMissionAgg::terminal_was_abort`). Deliberate teardown, not a
+    /// run that failed to finish — #1627's own distinction, now carried to
+    /// the wire instead of collapsing into the same word as the case below.
+    Aborted,
+    /// No terminal record was ever written and nothing is live — killed,
+    /// crashed, timed out, or the terminal record simply never landed.
+    /// darkmux does not know how (or whether) this run actually ended; this
+    /// is the honest "no ending recorded" case, never a claim that the run
+    /// gave up on purpose.
+    NoTerminal,
+}
+
 /// One row of the `/runs` view-model. Lenient-on-read WIRE shape (every
 /// field but `id`/`kind`/`status`/`tracked` is optional) — this is NEVER
 /// persisted, so there's no schema-version discipline to carry; a future
@@ -245,6 +270,15 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub session_id: Option<String>,
+    /// (#1907) Set only when `status == RunStatus::Abandoned` — see
+    /// [`AbandonReason`]'s own doc. `RunStatus::Abandoned` alone collapses
+    /// "someone ran `mission abort`" and "no terminal record was ever
+    /// written" into one word; this field carries the distinction the
+    /// server already computes (`terminal_was_abort` / `MissionStatus::Aborted`)
+    /// instead of dropping it on the wire. Absent for every other status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub abandoned_reason: Option<AbandonReason>,
 }
 
 /// Build the full run union — the SAME `Vec<Run>` both `runs_handler`
@@ -501,6 +535,16 @@ fn flow_mission_to_run(
         (None, _) if any_live => RunStatus::Running,
         (None, _) => RunStatus::Abandoned,
     };
+    // (#1907) Both `Abandoned` arms above are already told apart by
+    // `agg.terminal_was_abort` — a real `mission abort` record versus no
+    // terminal record landing at all — so carry that to the wire instead of
+    // re-deriving it from `status` alone (which can't tell the two apart
+    // after the match above has already collapsed them).
+    let abandoned_reason = if status == RunStatus::Abandoned {
+        Some(if agg.terminal_was_abort { AbandonReason::Aborted } else { AbandonReason::NoTerminal })
+    } else {
+        None
+    };
     // Borrow route/model from whichever session first resolved one — a
     // mission-level row has no endpoint of its own, and showing the seat's
     // is more informative than showing nothing.
@@ -544,6 +588,7 @@ fn flow_mission_to_run(
             .and_then(parse_flow_ts),
         tracked: false,
         session_id,
+        abandoned_reason,
     }
 }
 
@@ -786,10 +831,25 @@ fn mission_to_run(
         .or_else(|| terminal_ts_str.as_deref().and_then(parse_flow_ts));
 
     let sessions_bare: Vec<&SessionAgg> = sessions.iter().map(|(_, s)| *s).collect();
+    let status = mission_run_status(mission, &sessions_bare, now_ms);
+    // (#1907) `mission_run_status` has exactly ONE arm that reaches
+    // `Abandoned` via a deliberate teardown — `MissionStatus::Aborted =>
+    // RunStatus::Abandoned` — every other `Abandoned` result it returns
+    // (the staleness gate, or a bubbled-up session `terminal_status ==
+    // Abandoned`) means "no terminal record ever landed", never an abort.
+    // `mission.status` is the mission's own OWN lifecycle field, known here
+    // independent of the match `mission_run_status` already ran, so this
+    // reads it directly rather than re-deriving the same decision from
+    // `status` (which can no longer tell the two apart once collapsed).
+    let abandoned_reason = if status == RunStatus::Abandoned {
+        Some(if mission.status == MissionStatus::Aborted { AbandonReason::Aborted } else { AbandonReason::NoTerminal })
+    } else {
+        None
+    };
     Run {
         id: mission.id.clone(),
         kind,
-        status: mission_run_status(mission, &sessions_bare, now_ms),
+        status,
         machine,
         route,
         role,
@@ -806,6 +866,7 @@ fn mission_to_run(
         updated_ts: completed_ts.or(started_ts).or(Some(mission.created_ts)),
         tracked: true,
         session_id,
+        abandoned_reason,
     }
 }
 
@@ -987,10 +1048,17 @@ fn mission_run_status(mission: &Mission, sessions: &[&SessionAgg], now_ms: u64) 
 /// (#1523 gate CONSIDER 7).
 fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: u64) -> Run {
     let (role, model, route) = lab_staffing_role_model_route(summary.staffing.as_ref());
+    let status = lab_run_status(summary, now_ms);
+    // (#1907) `lab_run_status` has no abort concept at all — its ONLY
+    // `Abandoned` arm is the staleness gate (the run's artifact trail went
+    // quiet past the budget with no `scores.json` ever written), so an
+    // Abandoned lab run always means "no ending recorded", never a
+    // deliberate teardown.
+    let abandoned_reason = (status == RunStatus::Abandoned).then_some(AbandonReason::NoTerminal);
     Run {
         id: summary.dir.clone(),
         kind: RunKind::Lab,
-        status: lab_run_status(summary, now_ms),
+        status,
         machine,
         route,
         role,
@@ -1017,6 +1085,7 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
         // in-page detail pane regardless (`RunsBoard.tsx::activateRun`'s
         // `"lab"` branch), so there's no destination this field could add.
         session_id: None,
+        abandoned_reason,
     }
 }
 
@@ -1457,18 +1526,27 @@ fn ghost_runs(
                 continue;
             }
         }
+        // A terminal status always wins over the liveness gate; only a
+        // session with NO terminal yet falls through to it.
+        let status = agg.terminal_status.unwrap_or_else(|| {
+            if session_is_live(agg, now_ms) {
+                RunStatus::Running
+            } else {
+                RunStatus::Abandoned
+            }
+        });
+        // (#1907) There is no per-dispatch abort action — `mission abort`
+        // is mission-scoped, and a standalone session's only terminals are
+        // `dispatch complete`/`dispatch error`/the presence reconciler's
+        // `session.end` crash-close-edge (see `terminal_status_for_action`'s
+        // own doc) — so an Abandoned ghost always means "no ending
+        // recorded", whether it came from `session.end` or the staleness
+        // gate above.
+        let abandoned_reason = (status == RunStatus::Abandoned).then_some(AbandonReason::NoTerminal);
         out.push(Run {
             id: session_id.clone(),
             kind: RunKind::Dispatch,
-            // A terminal status always wins over the liveness gate; only a
-            // session with NO terminal yet falls through to it.
-            status: agg.terminal_status.unwrap_or_else(|| {
-                if session_is_live(agg, now_ms) {
-                    RunStatus::Running
-                } else {
-                    RunStatus::Abandoned
-                }
-            }),
+            status,
             machine: agg.machine.clone(),
             route: agg.endpoint.clone(),
             role: agg.role.clone(),
@@ -1499,6 +1577,7 @@ fn ghost_runs(
             // orphaned dispatch and a real mission), not a nuisance to
             // silence.
             session_id: if agg.is_ambiguous() { None } else { Some(session_id.clone()) },
+            abandoned_reason,
         });
     }
     out
@@ -2331,6 +2410,23 @@ mod tests {
         assert!(run.tracked);
         assert_eq!(run.completed_ts, Some(1_700_000_000));
         assert_eq!(run.machine.as_deref(), Some("studio"));
+        // (#1907) A Complete row must never carry a leftover reason.
+        assert_eq!(run.abandoned_reason, None);
+    }
+
+    /// (#1907) Lab has no abort concept at all — `lab_run_status`'s only
+    /// `Abandoned` arm is the staleness gate (the artifact trail went quiet
+    /// past the budget with no `scores.json` ever written), so a lab run's
+    /// Abandoned reason must always be the honest "no ending recorded", not
+    /// the deliberate-teardown value.
+    #[test]
+    fn lab_summary_to_run_abandoned_carries_no_terminal_reason() {
+        let summary = minimal_lab_summary("dead/case-1", false, false);
+        // Comfortably past `stale_after_ms()` from `mtime_ms`.
+        let far_future_ms = summary.mtime_ms + stale_after_ms() + 5_000;
+        let run = lab_summary_to_run(&summary, None, far_future_ms);
+        assert_eq!(run.status, RunStatus::Abandoned);
+        assert_eq!(run.abandoned_reason, Some(AbandonReason::NoTerminal));
     }
 
     /// (#1584) The case the `updated_ts` field exists for. An UNFINISHED lab
@@ -2901,6 +2997,10 @@ mod tests {
             RunStatus::Abandoned,
             "a ghost whose session died with no terminal must not read as live forever"
         );
+        // (#1907) A standalone dispatch has no per-session abort action —
+        // `mission abort` is mission-scoped — so an Abandoned ghost from the
+        // staleness gate must always read "no ending recorded".
+        assert_eq!(stale[0].abandoned_reason, Some(AbandonReason::NoTerminal));
     }
 
     #[test]
@@ -2920,6 +3020,10 @@ mod tests {
         let far_future_ms = (now_unix() + 999_999_999) * 1_000;
         let ghosts = ghost_runs(&idx, &HashSet::new(), &HashSet::new(), &HashSet::new(), far_future_ms);
         assert_eq!(ghosts[0].status, RunStatus::Complete, "a terminal verdict must never decay into Abandoned");
+        // (#1907) `abandoned_reason` is ONLY ever set alongside `Abandoned` —
+        // a Complete row must carry `None`, not a stale reason left over
+        // from some other branch.
+        assert_eq!(ghosts[0].abandoned_reason, None);
     }
 
     #[test]
@@ -3564,6 +3668,42 @@ mod tests {
         let runs = build_runs(flows.path(), None, &[]);
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].status, RunStatus::Abandoned, "a crashed session must not read as eternal Running");
+        // (#1907) `mission.json` was never touched again — it stays
+        // `MissionStatus::Active`, never `Aborted` — so this Abandoned row
+        // must carry the honest "no ending recorded" reason, never the
+        // deliberate-teardown one nobody actually asked for.
+        assert_eq!(
+            runs[0].abandoned_reason,
+            Some(AbandonReason::NoTerminal),
+            "a process crash is not a `mission abort` — must not read as a deliberate abort"
+        );
+    }
+
+    /// (#1907) `mission_run_status_pins_every_terminal_mission_status_variant`
+    /// (above) already pins `MissionStatus::Aborted => RunStatus::Abandoned`
+    /// through `mission_run_status` in isolation — but `abandoned_reason` is
+    /// decided at the `mission_to_run` CALL SITE, not inside
+    /// `mission_run_status` itself, so only a full `build_runs` run
+    /// (through `mission_to_run`) can catch a regression in that wiring.
+    /// This is the LOCAL twin of `an_aborted_peer_mission_reads_abandoned_not_complete`.
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_local_aborted_mission_carries_aborted_reason() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mut mission = minimal_mission("m1907-aborted", vec![], None);
+        mission.status = MissionStatus::Aborted;
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "m1907-aborted").unwrap();
+        assert_eq!(row.status, RunStatus::Abandoned);
+        assert_eq!(
+            row.abandoned_reason,
+            Some(AbandonReason::Aborted),
+            "a deliberately torn-down LOCAL mission must carry Aborted, not the generic no-terminal reason"
+        );
     }
 
     #[test]
@@ -3767,6 +3907,10 @@ mod tests {
         let runs = build_runs(flows.path(), None, &fleet);
         let row = runs.iter().find(|r| r.id == "review-on-the-hub").unwrap();
         assert_eq!(row.status, RunStatus::Abandoned);
+        // (#1907) No `mission abort`/`mission close` record ever landed —
+        // this row's Abandoned status came purely from the staleness gate,
+        // so it must read "no ending recorded", not "aborted".
+        assert_eq!(row.abandoned_reason, Some(AbandonReason::NoTerminal));
     }
 
     /// #1627, applied to a mission this machine did not run: a torn-down
@@ -3799,6 +3943,14 @@ mod tests {
         assert!(
             row.completed_ts.is_none(),
             "a torn-down mission never completed, so it carries no completion stamp"
+        );
+        // (#1907) A real `mission abort` record landed — this row's reason
+        // must say so explicitly, not the generic "no ending recorded" the
+        // stale-peer test above pins for the OTHER Abandoned shape.
+        assert_eq!(
+            row.abandoned_reason,
+            Some(AbandonReason::Aborted),
+            "a `mission abort` record must carry the Aborted reason on the wire, not just the collapsed status"
         );
     }
 

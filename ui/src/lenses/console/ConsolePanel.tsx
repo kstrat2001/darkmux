@@ -693,10 +693,20 @@ function BooleanToken({
  * compose rather than branch exclusively:
  *   - `hasStdout` → the ANSI-rendered pre, unchanged from before this
  *     packet.
- *   - `hasStderr` (regardless of exit code) → `stderr_tail`, verbatim, in
- *     the SAME `.panelerr` treatment the HTTP-refusal path already uses
- *     (`errorMessage` above) — never reworded, per the daemon's own
- *     "surfaced so a failure isn't silent" comment.
+ *   - `hasStderr` (regardless of exit code) → `stderr_tail`, verbatim.
+ *     (#1916) The treatment now follows `failed`, not stderr's mere
+ *     presence: `[darkmux-liveness]` traces (#1311) write to stderr
+ *     DELIBERATELY on a clean exit, and three of eight panels
+ *     (`flow-status`, `doctor`, `run-list`) emit them on success —
+ *     painting those lines in `.panelerr` red made a working diagnostic
+ *     look like a failure. `exit_code` is already in the payload, so a
+ *     `0` exit renders stderr in `.panelwarn` (a neutral/dim treatment,
+ *     never `var(--error)`); a non-zero exit keeps the SAME `.panelerr`
+ *     treatment the HTTP-refusal path already uses (`errorMessage`
+ *     above) — never reworded, per the daemon's own "surfaced so a
+ *     failure isn't silent" comment. #1909's own goal survives: a
+ *     failure with empty stdout still reads as a failure (`.panelerr`),
+ *     it just no longer also paints a SUCCESS as one.
  *   - `failed && !hasStderr` → a plain sentence naming the exit status
  *     instead of falling back to a blank box again. This one line isn't
  *     the daemon's own text (there isn't any to quote), but it still
@@ -751,7 +761,7 @@ function PanelBody({
           </pre>
         )}
         {(hasStderr || failed) && (
-          <div className={`panelerr${staleClass}`}>
+          <div className={`${failed ? "panelerr" : "panelwarn"}${staleClass}`}>
             {hasStderr
               ? stderrTail
               : typeof exitCode === "number"

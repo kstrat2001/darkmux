@@ -259,6 +259,55 @@ describe("ConsolePanel", () => {
     expect(screen.queryByText("no output")).not.toBeInTheDocument();
   });
 
+  // (#1916) A `[darkmux-liveness]` trace (#1311) writes to stderr on a
+  // SUCCESSFUL command deliberately — three of eight panels (`flow-status`,
+  // `doctor`, `run-list`) do this on every clean run. Before this fix that
+  // stderr rendered in `.panelerr` (error red), painting a working
+  // diagnostic as a failure. The fix is exit-code-driven: a ZERO exit
+  // renders stderr in `.panelwarn` (neutral/dim), never `.panelerr`.
+  it("(#1916) a successful panel's stderr renders neutral (.panelwarn), never error-red (.panelerr)", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(
+        url.startsWith("/runs")
+          ? runsJson()
+          : jsonResponse({
+              ...MISSION_STATUS_BODY,
+              exit_code: 0,
+              ansi_text: "mission status — 0 missions",
+              stderr_tail: "[darkmux-liveness] 2026-08-22T00:30:11Z +0ms credential-read:darkmux-redis",
+            }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText(/darkmux-liveness/)).toBeInTheDocument());
+    expect(document.querySelector(".panelerr")).toBeNull();
+    expect(document.querySelector(".panelwarn")!.textContent).toContain("darkmux-liveness");
+  });
+
+  // (#1916) The inverse must still hold — a REAL failure's stderr stays in
+  // `.panelerr`, not the new neutral treatment. #1909's original goal (a
+  // failure must not read as a silent success) is untouched by this fix.
+  it("(#1916) a failed panel's stderr still renders error-red (.panelerr), never the neutral .panelwarn", async () => {
+    const fetchMock = vi.fn((url: string) =>
+      Promise.resolve(
+        url.startsWith("/runs")
+          ? runsJson()
+          : jsonResponse({
+              ...MISSION_STATUS_BODY,
+              exit_code: 1,
+              ansi_text: "",
+              stderr_tail: "Error: something real broke",
+            }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderPanel("mission-status");
+    await waitFor(() => expect(screen.getByText(/something real broke/)).toBeInTheDocument());
+    expect(document.querySelector(".panelwarn")).toBeNull();
+    expect(document.querySelector(".panelerr")!.textContent).toContain("something real broke");
+  });
+
   // (#1908 QA fix) The synthesized-fallback branch (a failure that wrote
   // NOTHING to stderr either) is the one place this component invents its
   // own words rather than quoting the daemon — exactly the branch most

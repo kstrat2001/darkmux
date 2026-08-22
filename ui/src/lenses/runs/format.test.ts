@@ -5,6 +5,7 @@ import {
   runActivity,
   runsAgo,
   runSubtitle,
+  runStatusLabel,
   runsMultiMachine,
   runsFiltered,
   runsForMachine,
@@ -103,6 +104,29 @@ describe("runSubtitle", () => {
   });
   it("is empty when nothing applies", () => {
     expect(runSubtitle(run({ id: "a", kind: "mission", status: "complete", tracked: true }), false)).toBe("");
+  });
+});
+
+// (#1907) "abandoned" alone covers two different situations — a deliberate
+// `mission abort` and "no terminal record was ever written" — and reads
+// identically on the row. `runStatusLabel` is what tells them apart.
+describe("runStatusLabel", () => {
+  it("reads a deliberate abort as 'aborted'", () => {
+    const r = run({ id: "a", kind: "mission", status: "abandoned", tracked: true, abandoned_reason: "aborted" });
+    expect(runStatusLabel(r)).toBe("aborted");
+  });
+  it("reads a missing terminal record as 'no ending recorded'", () => {
+    const r = run({ id: "a", kind: "mission", status: "abandoned", tracked: true, abandoned_reason: "noterminal" });
+    expect(runStatusLabel(r)).toBe("no ending recorded");
+  });
+  it("falls back to 'no ending recorded' when abandoned but the reason is absent (an older server)", () => {
+    const r = run({ id: "a", kind: "dispatch", status: "abandoned", tracked: false });
+    expect(runStatusLabel(r)).toBe("no ending recorded");
+  });
+  it("leaves every other status unchanged", () => {
+    for (const status of ["planned", "running", "complete", "error", "unparseable"] as const) {
+      expect(runStatusLabel(run({ id: "a", kind: "mission", status, tracked: true }))).toBe(status);
+    }
   });
 });
 
