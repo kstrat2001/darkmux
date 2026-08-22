@@ -220,6 +220,25 @@ pub fn list_ids() -> Vec<String> {
     set.into_iter().collect()
 }
 
+/// Whether `id` has a NON-user tier to fall back to — an on-disk built-in
+/// template ([`builtin_dirs`]) or a binary-embedded built-in
+/// ([`EMBEDDED_MISSION_CONFIGS`]) — distinct from merely having a user-tier
+/// copy. [`load`] never reports this on its own: it returns whichever tier
+/// WON the search, so a caller that needs "would deleting the user-tier copy
+/// still resolve to something" has to ask separately rather than infer it
+/// from a successful `load`. Built for `darkmux doctor`'s mission-config
+/// drift check (#1917), which was advising "delete it to fall back to the
+/// embedded tier" for documents that have no embedded or on-disk tier at
+/// all — this is the query that check needed and didn't have.
+pub fn has_non_user_fallback(id: &str) -> bool {
+    for d in builtin_dirs() {
+        if find_in_dir(&d, id).is_some() {
+            return true;
+        }
+    }
+    find_embedded(id).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +443,36 @@ mod tests {
             assert_eq!(loaded.config.id, *id);
             assert_eq!(loaded.source, MissionConfigSource::Embedded);
         }
+    }
+
+    /// #1917 — the function `darkmux doctor`'s mission-config drift remedy
+    /// needed and didn't have. "review" resolves to the embedded built-in
+    /// (with no user or on-disk copy present), so a fallback genuinely
+    /// exists.
+    #[test]
+    #[serial_test::serial]
+    fn has_non_user_fallback_true_for_an_embedded_builtin() {
+        let user_tmp = TempDir::new().unwrap();
+        let _crew_guard = CrewDirGuard::new(user_tmp);
+        let empty = TempDir::new().unwrap();
+        let _templates_guard = NoBuiltinTemplatesGuard::new(empty.path());
+        assert!(has_non_user_fallback("review"), "review is embedded — a fallback exists");
+    }
+
+    /// #1917 — an id with no on-disk or embedded counterpart (the shape of
+    /// every `pr-*` GitHub-verb config on the reporting operator's machine)
+    /// reports no fallback. A synthetic id, not a real verb name, so this
+    /// can't collide with a real `~/.darkmux/templates/...` tree on whatever
+    /// machine runs the test.
+    #[test]
+    #[serial_test::serial]
+    fn has_non_user_fallback_false_for_a_user_only_id() {
+        let empty = TempDir::new().unwrap();
+        let _templates_guard = NoBuiltinTemplatesGuard::new(empty.path());
+        assert!(
+            !has_non_user_fallback("definitely-fake-id-1917"),
+            "a made-up id has no built-in counterpart — nothing to fall back to"
+        );
     }
 
     #[test]

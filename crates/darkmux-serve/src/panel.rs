@@ -90,7 +90,7 @@
 //! whole-response; `age_ms` reports how stale a served entry is.
 //!
 //! **The MANUAL-RUN floor (`MANUAL_MIN_INTERVAL`/`last_manual`) stays keyed
-//! by BASE id, never by variant** — see [`check_manual_floor`]'s own doc.
+//! by BASE id, never by variant** — see [`admit_manual_run`]'s own doc.
 //! Otherwise a manual panel that also declared options could be re-run
 //! continuously by cycling `opt.*` values, defeating the floor precisely
 //! where it matters most (a probing panel, not a disk read). `doctor`
@@ -455,9 +455,11 @@ type FlightLock = Arc<tokio::sync::Mutex<()>>;
 pub(crate) struct PanelState {
     cache: Arc<tokio::sync::Mutex<HashMap<String, CacheEntry>>>,
     flights: Arc<tokio::sync::Mutex<HashMap<String, FlightLock>>>,
-    /// Last completed run of each MANUAL-ONLY panel — the floor's clock.
+    /// Last ADMITTED run of each MANUAL-ONLY panel — the floor's clock.
+    /// (#1919) Advances when a run is admitted, not when it completes; see
+    /// `admit_manual_run` for why, and for what that costs.
     /// Keyed by BASE id (`spec.id`), deliberately never by variant — see
-    /// [`check_manual_floor`]. Manual panels are uncached by design, so
+    /// [`admit_manual_run`]. Manual panels are uncached by design, so
     /// this is the only record that one ran at all.
     last_manual: Arc<tokio::sync::Mutex<HashMap<&'static str, Instant>>>,
 }
@@ -481,8 +483,34 @@ fn clamp_cols(cols: Option<u16>) -> u16 {
 /// `MANUAL_MIN_INTERVAL` by construction, not by convention. `doctor`
 /// declares no options today, so no live manual panel exercises the
 /// distinction yet — the signature itself is the guarantee.
-async fn check_manual_floor(panels: &PanelState, id: &'static str) -> Result<(), (StatusCode, String)> {
-    let last = panels.last_manual.lock().await;
+/// Admit one manual run, or refuse it — checking the floor and claiming it
+/// in ONE lock acquisition (#1919).
+///
+/// The previous shape checked, released the lock, and only recorded after
+/// the spawn had finished. Five concurrent racers therefore all saw an
+/// empty clock and all spawned: the cache cannot absorb them either,
+/// because a manual panel has TTL 0 and `cached_if_fresh` short-circuits
+/// before it is consulted. That is the #1286 perturbation this floor
+/// exists to prevent, reached by nothing more exotic than two open
+/// consoles — the laptop browser and the tailnet phone dashboard both
+/// arrive as loopback by design.
+///
+/// The clock now advances at ADMISSION rather than at completion, which
+/// is a deliberate trade with two consequences worth stating:
+///
+/// - A spawn that fails fast (a missing binary, an immediate IO error)
+///   still consumes the window, so the operator waits without having got
+///   a result. Failing closed is the right default for a probe that costs
+///   ~2.2s and touches the Keychain, and the alternative — releasing on
+///   the error arms — is a real option if that proves annoying.
+/// - Completion-to-completion spacing is therefore as low as
+///   `MANUAL_MIN_INTERVAL` minus `PANEL_SPAWN_TIMEOUT` (20s worst case)
+///   rather than a flat 30s. Still far above doctor's own cost.
+///
+/// There is no `.await` between the read and the insert, so a racer
+/// either observes the timestamp or genuinely arrived after the window.
+async fn admit_manual_run(panels: &PanelState, id: &'static str) -> Result<(), (StatusCode, String)> {
+    let mut last = panels.last_manual.lock().await;
     if let Some(prev) = last.get(id) {
         let since = prev.elapsed();
         if since < MANUAL_MIN_INTERVAL {
@@ -490,14 +518,16 @@ async fn check_manual_floor(panels: &PanelState, id: &'static str) -> Result<(),
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
-                    "panel \"{id}\" is manual-run only and ran {}s ago — it probes the \
-                     machine, so it is floored at {}s between runs. Retry-After: {wait}\n",
+                    "panel \"{id}\" is manual-run only and was started {}s ago — it probes \
+                     the machine, so it is floored at {}s between runs. Retry-After: {wait}\n",
                     since.as_secs(),
                     MANUAL_MIN_INTERVAL.as_secs()
                 ),
             ));
         }
     }
+    // Claim the window under the SAME guard that just cleared it.
+    last.insert(id, Instant::now());
     Ok(())
 }
 
@@ -568,10 +598,10 @@ pub(crate) async fn panel_handler(
     let cols = clamp_cols(parse_cols(&params));
 
     // Manual-only panels (TTL 0) are floored server-side, keyed by BASE id
-    // — see `check_manual_floor`'s own doc for why that must never be the
+    // — see `admit_manual_run`'s own doc for why that must never be the
     // variant key.
     if !spec.auto_refresh {
-        check_manual_floor(&state.panels, id).await?;
+        admit_manual_run(&state.panels, id).await?;
     }
 
     // Serve fresh-enough cache without spawning.
@@ -666,8 +696,10 @@ pub(crate) async fn panel_handler(
     if spec.cache_ttl.is_zero() {
         // Manual panel: nothing cached (an explicit run is a real run), but
         // the floor's clock advances so the next caller is bounded. Keyed
-        // by BASE id — see `check_manual_floor`'s own doc.
-        state.panels.last_manual.lock().await.insert(id, Instant::now());
+        // by BASE id — see `admit_manual_run`'s own doc.
+        // (#1919) No record here any more — `admit_manual_run` claimed the
+        // window when it admitted this run. Recording again on completion
+        // would extend the floor by the spawn's own duration.
     } else {
         let mut cache = state.panels.cache.lock().await;
         cache.insert(key, CacheEntry { body: body.clone(), captured: Instant::now() });
@@ -1120,7 +1152,11 @@ mod tests {
 
     /// "Manual" is spelled two ways — `auto_refresh: false` and a zero
     /// `cache_ttl` — and two different sites read different ones: the
-    /// floor gate keys off `auto_refresh`, while `last_manual` only
+    /// floor gate keys off `auto_refresh`. (#1919: the floor CLOCK used to
+    /// key off the ttl instead, which is what made this mismatch reachable;
+    /// admission now advances it, so both read the same field. The pin is
+    /// kept because a spec declaring one without the other is still
+    /// self-contradictory.) Historically `last_manual` only
     /// advances when the TTL is zero. An entry with `auto_refresh: false`
     /// and a NON-zero TTL would therefore be checked against a clock that
     /// never ticks, and its floor would silently never fire. Pin them
@@ -1263,17 +1299,94 @@ mod tests {
 
     // ── manual-run floor: keyed by base id, never by variant (#1911) ──
 
+    /// (#1919) The defect this fix exists for, as an executable case.
+    /// Five racers, one key, a multi-thread runtime: exactly ONE may be
+    /// admitted. Against the previous check-then-record shape all five
+    /// were, because each released the lock before any of them recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admit_manual_run_admits_exactly_one_of_five_concurrent_racers() {
+        let panels = PanelState::default();
+        let admitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let p = panels.clone();
+            let a = admitted.clone();
+            handles.push(tokio::spawn(async move {
+                if admit_manual_run(&p, "doctor").await.is_ok() {
+                    a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(
+            admitted.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the floor admitted more than one concurrent racer — check and claim are not atomic, \
+             so N browser tabs produce N real doctor probes (#1919)"
+        );
+    }
+
+    /// (#1919) And the floor is actually INVOKED. Disabling the call site
+    /// used to leave the whole crate green: the function was tested, its
+    /// invocation was not.
+    ///
+    /// Deliberately asserts the 429, an ERROR path. A 200 spawns
+    /// `current_exe()`, which under `cargo test` is the harness itself.
+    #[tokio::test]
+    async fn panel_handler_returns_429_when_the_floor_is_already_claimed() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::util::ServiceExt;
+        let flows = tempfile::TempDir::new().unwrap();
+        let app = crate::build_router_local(flows.path().to_path_buf());
+        // Claim the window first, then ask the handler for the same panel.
+        // Reaching the state directly is the only way in without spawning.
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/panel/doctor")
+                    .header(PANEL_HEADER, "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The first call either ran (200/500) or was refused for some other
+        // reason; either way it must have CLAIMED the window.
+        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS, "first call must not be floored");
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri("/panel/doctor")
+                    .header(PANEL_HEADER, "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the second immediate request must be floored — if this passes with the call site \
+             disabled, nothing pins that the floor runs at all (#1919)"
+        );
+    }
+
     #[tokio::test]
     async fn manual_floor_is_open_before_any_run_is_recorded() {
         let panels = PanelState::default();
-        assert!(check_manual_floor(&panels, "doctor").await.is_ok());
+        assert!(admit_manual_run(&panels, "doctor").await.is_ok());
     }
 
     #[tokio::test]
     async fn manual_floor_fires_on_the_second_call_within_the_window() {
         let panels = PanelState::default();
         panels.last_manual.lock().await.insert("doctor", Instant::now());
-        let err = check_manual_floor(&panels, "doctor").await.unwrap_err();
+        let err = admit_manual_run(&panels, "doctor").await.unwrap_err();
         assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
         assert!(err.1.contains("floored"), "{}", err.1);
     }
@@ -1283,7 +1396,7 @@ mod tests {
         let panels = PanelState::default();
         panels.last_manual.lock().await.insert("doctor", Instant::now());
         // A DIFFERENT base id must not be floored by doctor's own run.
-        assert!(check_manual_floor(&panels, "some-other-manual-panel").await.is_ok());
+        assert!(admit_manual_run(&panels, "some-other-manual-panel").await.is_ok());
     }
 
     /// Renamed from `manual_floor_cannot_be_defeated_by_cycling_opt_values`
@@ -1296,7 +1409,7 @@ mod tests {
     ///
     /// The floor check's own signature only ever receives the panel's
     /// BASE id (`spec.id`) — see
-    /// `check_manual_floor`'s doc. There is no variant-key parameter for a
+    /// `admit_manual_run`'s doc. There is no variant-key parameter for a
     /// caller to pass, structurally, not by convention: cycling any
     /// `opt.*` selection on a (hypothetical, since `doctor` has none today)
     /// manual panel with options cannot produce a different key to the
@@ -1310,7 +1423,7 @@ mod tests {
         let panels = PanelState::default();
         panels.last_manual.lock().await.insert("doctor", Instant::now());
         for _ in 0..3 {
-            let err = check_manual_floor(&panels, "doctor").await.unwrap_err();
+            let err = admit_manual_run(&panels, "doctor").await.unwrap_err();
             assert_eq!(
                 err.0,
                 StatusCode::TOO_MANY_REQUESTS,

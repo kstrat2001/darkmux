@@ -39,7 +39,7 @@ pub mod interpret;
 pub mod load;
 
 pub use interpret::{interpret, LaunchParams, TaskOverride};
-pub use load::{load, list_ids, LoadedMissionConfig, MissionConfigSource};
+pub use load::{has_non_user_fallback, list_ids, load, LoadedMissionConfig, MissionConfigSource};
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
