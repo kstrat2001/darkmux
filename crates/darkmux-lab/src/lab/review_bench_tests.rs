@@ -1942,6 +1942,11 @@
     ///      operator who configured a lab dir would have bench runs WRITTEN to
     ///      one place and SCANNED for in another — precisely the read/write
     ///      divergence `lab_dir_default`'s own docstring warns about.
+    // `#[serial]` because `lab_dir()` reads `current_dir()` in test builds now,
+    // and this crate's cwd-mutating tests are all serial. Measured before
+    // adding it: 1 disagreement in 346,151 sampled call pairs — rare, real, and
+    // one attribute to close.
+    #[serial_test::serial]
     #[test]
     fn default_scores_path_resolves_through_the_lab_reader_not_the_real_home() {
         let path = super::default_scores_path(1_787_476_055_606);

@@ -103,9 +103,15 @@ pub fn list_runs(limit: Option<usize>) -> Result<Vec<RunSummary>> {
     Ok(summaries)
 }
 
-pub fn format_table(rows: &[RunSummary]) -> String {
+/// `runs_dir` is the root that was actually scanned. It is a parameter rather
+/// than a hardcoded string because the reader is no longer always
+/// `.darkmux/runs` — `lab_dir()` honors `DARKMUX_LAB_DIR` and
+/// `config.dirs.lab`, so naming a directory we may not have looked in is how
+/// an empty list reads as a bug. Same reasoning `lab_runs_handler` applies on
+/// the HTTP side (#1585): report WHY the list is empty, not just that it is.
+pub fn format_table(rows: &[RunSummary], runs_dir: &std::path::Path) -> String {
     if rows.is_empty() {
-        return "(no runs found under .darkmux/runs/)".to_string();
+        return format!("(no runs found under {})\n", runs_dir.display());
     }
     // Compute column widths
     let id_w = rows.iter().map(|r| r.run_id.len()).max().unwrap_or(20).max(20);
@@ -256,7 +262,7 @@ mod tests {
                 run_dir: PathBuf::from("/tmp/def"),
             },
         ];
-        let out = format_table(&rows);
+        let out = format_table(&rows, std::path::Path::new("/tmp/x/runs"));
         assert!(out.contains("RUN ID"));
         assert!(out.contains("abc"));
         assert!(out.contains("def"));
@@ -266,7 +272,7 @@ mod tests {
 
     #[test]
     fn format_table_handles_empty() {
-        let out = format_table(&[]);
+        let out = format_table(&[], std::path::Path::new("/tmp/x/runs"));
         assert!(out.contains("no runs"));
     }
 }
