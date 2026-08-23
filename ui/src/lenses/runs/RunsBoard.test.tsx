@@ -96,7 +96,13 @@ describe("RunsBoard", () => {
    *
    *  The chevron is the fix rather than hover alone, because hover does not
    *  exist on a phone — and hover on every row would promise a destination
-   *  6% of the time there is none. Its PRESENCE is the affordance. */
+   *  6% of the time there is none. Its PRESENCE is the affordance.
+   *
+   *  Asserted via `data-nav` rather than a rendered element: the chevron is a
+   *  CSS `::after` keyed on that attribute, because a text node would land in
+   *  `#stage`'s extracted text and break the frozen parity goldens. CI caught
+   *  exactly that — `next-parity-runs` reddened on two goldens while the
+   *  console suite (the one run locally) stayed green. */
   it("a row that has a destination renders the nav chevron and is interactive", async () => {
     mockFetch(true, true, {}, [
       { id: "m-live", kind: "mission", status: "complete", tracked: true, updated_ts: 400 },
@@ -106,7 +112,7 @@ describe("RunsBoard", () => {
     const row = document.querySelector(".labrunrow")!;
     expect(row).toHaveAttribute("role", "button");
     expect(row).not.toHaveClass("flat");
-    expect(row.querySelector(".runnav")).not.toBeNull();
+    expect(row).toHaveAttribute("data-nav", "1");
   });
 
   it("a row with NO destination renders no chevron and stays inert", async () => {
@@ -119,7 +125,7 @@ describe("RunsBoard", () => {
     const row = document.querySelector(".labrunrow")!;
     expect(row).not.toHaveAttribute("role");
     expect(row).toHaveClass("flat");
-    expect(row.querySelector(".runnav")).toBeNull();
+    expect(row).not.toHaveAttribute("data-nav");
   });
 
   it("renders the unparseable status badge with its own class and text", async () => {

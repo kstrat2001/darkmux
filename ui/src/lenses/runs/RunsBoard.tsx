@@ -673,6 +673,18 @@ function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boole
   return (
     <div
       className={`labrunrow${interactive ? "" : " flat"}`}
+      // The nav chevron is a CSS `::after` keyed on this attribute, NOT a text
+      // node. A text node would land in `#stage`'s extracted text and break
+      // the frozen parity goldens — which is correct of them: a decorative
+      // affordance is not content. It is also `aria-hidden` by construction
+      // (pseudo-elements are), and `role="button"` already tells assistive
+      // tech what the row is.
+      //
+      // Rendered ONLY when the row has a destination, so its PRESENCE is the
+      // affordance. Hover cannot carry this on touch, and 29 of 489 rows on a
+      // real daemon genuinely go nowhere, so a chevron on every row would
+      // promise a destination 6% of the time there is none.
+      {...(interactive ? { "data-nav": "1" } : {})}
       {...(interactive
         ? { role: "button" as const, tabIndex: 0, onClick: onActivate, onKeyDown: onActivateKeyDown(onActivate) }
         : {})}
@@ -683,16 +695,6 @@ function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boole
         <span className="labruncrew">{run.id}</span>
         {ago && <span className="labrundir">{ago}</span>}
         {!run.tracked && <span className="rununtracked">untracked</span>}
-        {/* The nav indicator is rendered ONLY when the row actually has a
-            destination, so its presence is the affordance rather than a
-            decoration. Hover cannot carry this on touch — there is no hover
-            on a phone — and 29 of 489 rows on a real daemon genuinely go
-            nowhere (an untracked mission whose session records have aged out
-            of the flow window), so a chevron on every row would promise a
-            destination six percent of the time it does not have one.
-            `aria-hidden` because `role="button"` already tells assistive
-            tech what this row is; the chevron is for the eye. */}
-        {interactive && <span className="runnav" aria-hidden="true">›</span>}
       </div>
       {subtitle && <div className="labrunmeta dim">{subtitle}</div>}
     </div>
