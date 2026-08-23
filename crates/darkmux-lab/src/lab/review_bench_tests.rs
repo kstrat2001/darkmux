@@ -1925,3 +1925,42 @@
             "no --exec-mode ⇒ Auto, resolved later against local hardware"
         );
     }
+
+    /// A bench run must write where the lab READER scans, and in a test build
+    /// that is the isolated tmp root — never the operator's real
+    /// `~/.darkmux/runs`.
+    ///
+    /// Both halves of this were live defects. `run_review_bench` resolved its
+    /// default artifact path through `paths::resolve(Auto).runs` directly
+    /// instead of `config_access::lab_dir()`, so:
+    ///
+    ///   1. every test that reached this path wrote real run directories into
+    ///      the operator's `~/.darkmux/runs` (observed 2026-08-23: two
+    ///      `review-bench-<ts>` dirs created by `cargo test`, which then
+    ///      rendered as live RUNNING rows in the viewer's runs lens), and
+    ///   2. it silently ignored `DARKMUX_LAB_DIR` / `config.dirs.lab`, so an
+    ///      operator who configured a lab dir would have bench runs WRITTEN to
+    ///      one place and SCANNED for in another — precisely the read/write
+    ///      divergence `lab_dir_default`'s own docstring warns about.
+    #[test]
+    fn default_scores_path_resolves_through_the_lab_reader_not_the_real_home() {
+        let path = super::default_scores_path(1_787_476_055_606);
+
+        let reader_root = darkmux_types::config_access::lab_dir();
+        assert!(
+            path.starts_with(&reader_root),
+            "bench artifacts must land under the same root the lab reader scans\n  \
+             wrote:  {}\n  reader: {}",
+            path.display(),
+            reader_root.display(),
+        );
+
+        if let Some(home) = dirs::home_dir() {
+            let real = home.join(".darkmux").join("runs");
+            assert!(
+                !path.starts_with(&real),
+                "a test build wrote into the operator's real run store: {}",
+                path.display(),
+            );
+        }
+    }

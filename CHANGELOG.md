@@ -1233,7 +1233,7 @@ The production-hardening patch — a ledger correctness fix plus the credential-
 
 ## [1.18.1] - 2026-07-11
 
-The review-output patch — everything a first real production Azure review (finsys-api #396/#397)
+The review-output patch — everything a first real production Azure review (on a private engagement repo)
 surfaced about how the funnel *presents* its findings. No behavior change to what it finds; four
 fixes to how it posts.
 

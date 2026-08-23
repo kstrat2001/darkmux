@@ -320,6 +320,28 @@ pub struct ReviewBenchOpts {
     /// runs when `None`.
     pub bundler_cmd: Option<String>,
 }
+/// Where a bench run's artifacts land when the caller named no `--scores-out`.
+///
+/// Resolves through `config_access::lab_dir()` — the SAME resolver the lab
+/// READER scans — rather than `paths::resolve(Auto).runs` directly. That
+/// distinction is the whole point, and getting it wrong cost two real bugs:
+///
+///   1. `lab_dir()` is `cfg`-isolated in test builds (#994), so an un-isolated
+///      test can no longer write real run directories into the operator's
+///      `~/.darkmux/runs`. Observed 2026-08-23: a `cargo test` created two
+///      `review-bench-<ts>` dirs there, which the viewer's runs lens then
+///      rendered as live RUNNING rows.
+///   2. `lab_dir()` honors `DARKMUX_LAB_DIR` and `config.dirs.lab`; the direct
+///      resolve ignored both. Under a configured lab dir, bench runs were
+///      WRITTEN to one root and SCANNED for in another — exactly the
+///      read/write divergence `lab_dir_default`'s docstring warns about, one
+///      layer down.
+fn default_scores_path(ts_ms: u128) -> PathBuf {
+    darkmux_types::config_access::lab_dir()
+        .join(format!("review-bench-{ts_ms}"))
+        .join("scores.json")
+}
+
 
 pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     let cases = load_cases(&opts.cases_dir)?;
@@ -398,12 +420,7 @@ pub fn run_review_bench(opts: ReviewBenchOpts) -> Result<()> {
     // behavior) keeps that coupling intact while additionally letting the
     // run_id reflect when the run STARTED, not when it finished.
     let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    let scores_path = opts.scores_out.clone().unwrap_or_else(|| {
-        super::paths::resolve(super::paths::ResolveScope::Auto)
-            .runs
-            .join(format!("review-bench-{ts_ms}"))
-            .join("scores.json")
-    });
+    let scores_path = opts.scores_out.clone().unwrap_or_else(|| default_scores_path(ts_ms));
     // (#1247 Part 1) Funnel mode's per-run-local flow-event sink — see
     // `LocalJsonlEmitter`'s doc for why this is NOT the fleet flow stream.
     let mut funnel_emitter = LocalJsonlEmitter::new(scores_path.with_file_name("funnel-events.jsonl"));

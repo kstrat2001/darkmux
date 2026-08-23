@@ -1185,7 +1185,7 @@ pub(crate) fn remote_chat_url(ep: &darkmux_types::ModelEndpoint) -> String {
 }
 
 /// A short human label for the endpoint, for the flow record payload
-/// (e.g. `azure:finherogpt.cognitiveservices.azure.com/gpt-4o`). Host + the
+/// (e.g. `azure:example-aoai.cognitiveservices.azure.com/gpt-4o`). Host + the
 /// model — never the full URL, never any auth. `dispatch_internal` owns
 /// extracting the host from `ModelEndpoint` (`darkmux-flow` — a dependency
 /// LEAF w.r.t. this crate — shouldn't know about that type); the actual
@@ -1229,7 +1229,7 @@ pub(crate) fn remote_auth_header(ep: &darkmux_types::ModelEndpoint) -> Result<Op
     Ok(Some(header))
 }
 
-/// (#1312 — the ROOT fix for the finhub-adonisjs#563 class) Resolve an
+/// (#1312 — the ROOT fix for the locked-keychain class) Resolve an
 /// endpoint's auth secret. Precedence, mirroring darkmux's other secrets
 /// (`redis_url`/`serve_token`): the operator-declared env var (`auth.key_env`)
 /// VERBATIM > per-dispatch in-memory cache > bounded Keychain read
@@ -1237,7 +1237,7 @@ pub(crate) fn remote_auth_header(ep: &darkmux_types::ModelEndpoint) -> Result<Op
 ///
 /// The env tier is the escape hatch a headless runner needs — the operator
 /// names WHICH variable holds the key (any provider: `OPENAI_API_KEY`,
-/// `AZURE_FINHEROGPT_KEY`, …) and the CI job exports it from its secret store;
+/// `AZURE_OPENAI_KEY`, …) and the CI job exports it from its secret store;
 /// with the var present, `security` is NEVER spawned, so there is zero
 /// keychain-read hang risk. The cache collapses the per-call reads (this runs on
 /// every probe draw + judge ruling + verify) to ONE Keychain read per item per
@@ -1308,7 +1308,7 @@ fn resolve_endpoint_secret(auth: &darkmux_types::EndpointAuth) -> Result<String>
         darkmux_flow::KeychainRead::TimedOut => bail!(
             "Keychain read for `{keychain}` timed out after {}s — is the login keychain locked on \
              the runner? A keychain read should be instant; a hang here freezes the dispatch \
-             before any flow record (#1311 / finhub-adonisjs#563). Unlock it \
+             before any flow record (#1311). Unlock it \
              (`security unlock-keychain`), run on an interactive login session, or{env_hint} skip \
              the Keychain entirely (#1312).",
             darkmux_flow::KEYCHAIN_READ_TIMEOUT.as_secs()

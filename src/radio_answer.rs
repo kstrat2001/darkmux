@@ -579,7 +579,7 @@ fn render_mission_deep_artifact(mission_token: &str) -> Option<String> {
 ///
 /// (#1714 gate C-3) The board block belongs in that list too, and since
 /// #1713 it always carries mission ids — which encode repository names and
-/// commit SHAs (`zed-finsys-client-<sha>`, `review-<epoch>-<hash>`) and
+/// commit SHAs (`zed-<repo>-<sha>`, `review-<epoch>-<hash>`) and
 /// ticket-shaped operator names. When the approved-endpoint allowlist
 /// mentioned below gets written, the board must stay withheld (or its ids
 /// redacted) even for an approved endpoint: an allowlist decides WHOSE

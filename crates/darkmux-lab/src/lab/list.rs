@@ -3,7 +3,6 @@
 //! Reads run-dirs under .darkmux/runs/, peeks at each manifest.json for
 //! workload + duration + ok status, and surfaces a compact table.
 
-use crate::lab::paths::{self, ResolveScope};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -25,8 +24,9 @@ pub struct RunSummary {
 }
 
 pub fn list_runs(limit: Option<usize>) -> Result<Vec<RunSummary>> {
-    let paths = paths::resolve(ResolveScope::Auto);
-    let runs_dir = &paths.runs;
+    // The same resolver lab runs are WRITTEN through — see `lab_dir`'s own
+    // docstring on why read and write must not resolve independently.
+    let runs_dir = &darkmux_types::config_access::lab_dir();
     if !runs_dir.exists() {
         return Ok(Vec::new());
     }

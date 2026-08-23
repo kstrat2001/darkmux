@@ -347,11 +347,11 @@ impl std::fmt::Display for RawRedisUrl {
 }
 
 /// (#1311/#1276) Hard bound on every `security find-generic-password` read.
-/// A healthy Keychain read is <100ms; the leading finhub-adonisjs#563
-/// hypothesis is a locked/hung login keychain that froze a dispatch ~19 min
-/// BEFORE any flow record — and the Redis-password read below runs during
-/// flow-sink init, exactly the phase #563 never got past. 15s is generous for a
-/// good read yet fails fast on a wedge.
+/// A healthy Keychain read is <100ms; the leading hypothesis from a private
+/// production incident is a locked/hung login keychain that froze a dispatch
+/// ~19 min BEFORE any flow record — and the Redis-password read below runs
+/// during flow-sink init, exactly the phase that incident never got past. 15s
+/// is generous for a good read yet fails fast on a wedge.
 pub const KEYCHAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Poll cadence for [`run_security_bounded`]'s `try_wait` loop.
@@ -497,8 +497,7 @@ fn read_optional_keychain_secret(item: &str) -> Option<String> {
                 "[darkmux] WARNING: Keychain read for `{item}` timed out after {}s \
                  ({ms}ms elapsed) — is the login keychain locked on this machine? Continuing \
                  WITHOUT it (this optional integration is disabled for this run). Unlock it \
-                 (`security unlock-keychain`) or use the env override. (#1311 / \
-                 finhub-adonisjs#563)",
+                 (`security unlock-keychain`) or use the env override. (#1311)",
                 KEYCHAIN_READ_TIMEOUT.as_secs()
             );
             None

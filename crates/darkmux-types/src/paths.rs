@@ -26,7 +26,14 @@ pub enum Scope {
 #[derive(Debug, Clone)]
 pub struct DarkmuxPaths {
     pub root: PathBuf,
-    pub runs: PathBuf,
+    /// The lab-run root. `pub(crate)` ON PURPOSE (#1882): outside this crate,
+    /// go through `config_access::lab_dir()`, which adds the env/config tiers
+    /// and the test-build isolation (#994) that this raw field has neither of.
+    /// Three call sites resolved this directly and each one wrote lab runs to a
+    /// root the lab reader does not scan; one of them put real run directories
+    /// into the operator's ~/.darkmux/runs from `cargo test`. Making the bypass
+    /// unrepresentable is cheaper than remembering not to take it.
+    pub(crate) runs: PathBuf,
     pub sandboxes: PathBuf,
     pub crew: PathBuf,
     pub notebook: PathBuf,
@@ -48,6 +55,30 @@ pub enum ResolveScope {
     Auto,
     ForceProject,
     ForceUser,
+}
+
+/// Test-only constructor: every darkmux directory under one throwaway root.
+///
+/// Exists because `runs` is `pub(crate)` (#1882), so tests in OTHER crates can
+/// no longer build this struct literally — which is the point: production code
+/// must reach the lab root through `config_access::lab_dir()`. Tests still need
+/// a fully tmp-rooted value, and this gives them one without reopening the
+/// field to the whole workspace.
+#[cfg(any(test, feature = "test-support"))]
+impl DarkmuxPaths {
+    pub fn under_root(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        DarkmuxPaths {
+            runs: root.join("runs"),
+            sandboxes: root.join("sandboxes"),
+            crew: root.join("crew"),
+            notebook: root.join("notebook"),
+            profiles: root.join("profiles.json"),
+            config: root.join("config.json"),
+            scope: Scope::User,
+            root,
+        }
+    }
 }
 
 pub fn resolve(scope: ResolveScope) -> DarkmuxPaths {

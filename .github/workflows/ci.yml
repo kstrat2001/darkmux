@@ -521,6 +521,19 @@ jobs:
         # the allowlist mechanism (`// drift-guard:allow <verb> — <reason>`) live
         # in scripts/rs-drift-guard.py so both halves of the guard can't drift.
         run: python3 scripts/rs-drift-guard.py
+      - name: No engagement-private identifiers (this repo is PUBLIC)
+        # darkmux is public OSS developed alongside private client work, so an
+        # employer name, a private repo, a hosted endpoint or a tracker key can
+        # arrive in a comment or a doc example without anyone noticing — and git
+        # history makes it permanent. Found live on 2026-08-23: a real hosted
+        # endpoint host, a private repo's PR numbers, product names and a live
+        # URL, across 20 files. Every one entered as an ordinary example.
+        #
+        # The sentinel list is NOT duplicated here — the guard reads it from
+        # tests/parity/lib/sanitize.mjs, which already owns it for the parity
+        # scrubber. One list read twice cannot drift; two lists kept in sync by
+        # hand is how the first leak happened.
+        run: python3 scripts/engagement-sentinel-guard.py
       - name: Demo page is in sync with the served viewer
         run: |
           # darkmux.com/demo IS whatever the daemon serves at `/`, in playback

@@ -1,3 +1,0 @@
-src/skills.rs:157:9: delete field source from struct InstallReport expression in install_skills
-src/skills.rs:158:9: delete field targets from struct InstallReport expression in install_skills
-src/skills.rs:301:9: delete field source from struct InstallReport expression in install_from_disk
