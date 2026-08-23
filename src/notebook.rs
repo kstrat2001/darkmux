@@ -68,7 +68,9 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
     let run_dir = if Path::new(&opts.run_id).is_absolute() || opts.run_id.contains('/') {
         PathBuf::from(&opts.run_id)
     } else {
-        paths.runs.join(&opts.run_id)
+        // `lab_dir()` so a notebook draft resolves the run where `lab run`
+        // wrote it, under an operator-configured lab dir too (#1882).
+        darkmux_types::config_access::lab_dir().join(&opts.run_id)
     };
     if !run_dir.exists() {
         bail!("run dir not found: {}", run_dir.display());

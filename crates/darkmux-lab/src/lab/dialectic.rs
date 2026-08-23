@@ -1451,7 +1451,7 @@ mod tests {
             charge: 1,
             stance: Stance::Refute,
             raw_stance: "refute".into(),
-            body: "The wrapper in `[inertia/pages/admin/Show.tsx]` uses \
+            body: "The wrapper in `[app/views/settings/Show.tsx]` uses \
                    `const total = base * rate` which the diff shows."
                 .into(),
             voided: false,

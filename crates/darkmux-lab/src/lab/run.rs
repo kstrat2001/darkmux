@@ -132,7 +132,11 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let run_id = format!("{}-{}-{}-{}", opts.workload_id, profile_name, stamp, i);
-        let run_dir = paths.runs.join(&run_id);
+        // Through `lab_dir()`, not `paths.runs`: the lab READER scans that
+        // root, it honors DARKMUX_LAB_DIR / config.dirs.lab, and it is
+        // cfg-isolated in test builds (#994). Resolving the write root
+        // independently is how a run lands somewhere the reader never looks.
+        let run_dir = darkmux_types::config_access::lab_dir().join(&run_id);
         // (#488 Phase 1 / #490 Phase 3) The workload's *source* sandbox
         // is what gets COW-cloned per run. Phase 3 resolution shape:
         //   1. If workload declares `requires_fixture: <name@version>`,
@@ -533,16 +537,7 @@ mod tests {
         use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec};
         use std::collections::BTreeMap;
         let tmp = TempDir::new().unwrap();
-        let paths = paths::DarkmuxPaths {
-            root: tmp.path().to_path_buf(),
-            runs: tmp.path().join("runs"),
-            sandboxes: tmp.path().join("sandboxes"),
-            crew: tmp.path().join("crew"),
-            notebook: tmp.path().join("notebook"),
-            profiles: tmp.path().join("profiles.json"),
-            config: tmp.path().join("config.json"),
-            scope: paths::Scope::User,
-        };
+        let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
                 workload: WorkloadSpec {
@@ -579,16 +574,7 @@ mod tests {
         use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec};
         use std::collections::BTreeMap;
         let tmp = TempDir::new().unwrap();
-        let paths = paths::DarkmuxPaths {
-            root: tmp.path().to_path_buf(),
-            runs: tmp.path().join("runs"),
-            sandboxes: tmp.path().join("sandboxes"),
-            crew: tmp.path().join("crew"),
-            notebook: tmp.path().join("notebook"),
-            profiles: tmp.path().join("profiles.json"),
-            config: tmp.path().join("config.json"),
-            scope: paths::Scope::User,
-        };
+        let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
                 workload: WorkloadSpec {
@@ -636,16 +622,7 @@ mod tests {
         use std::collections::BTreeMap;
         let tmp = TempDir::new().unwrap();
         // Realistic darkmux home layout — registry lives at root.
-        let paths = paths::DarkmuxPaths {
-            root: tmp.path().to_path_buf(),
-            runs: tmp.path().join("runs"),
-            sandboxes: tmp.path().join("sandboxes"),
-            crew: tmp.path().join("crew"),
-            notebook: tmp.path().join("notebook"),
-            profiles: tmp.path().join("profiles.json"),
-            config: tmp.path().join("config.json"),
-            scope: paths::Scope::User,
-        };
+        let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
         // Create fixture dir with .fixture.json declaring satisfies.
         let fixture_dir = tmp.path().join("my-fx");
         std::fs::create_dir_all(&fixture_dir).unwrap();
@@ -706,16 +683,7 @@ mod tests {
         };
         use std::collections::BTreeMap;
         let tmp = TempDir::new().unwrap();
-        let paths = paths::DarkmuxPaths {
-            root: tmp.path().to_path_buf(),
-            runs: tmp.path().join("runs"),
-            sandboxes: tmp.path().join("sandboxes"),
-            crew: tmp.path().join("crew"),
-            notebook: tmp.path().join("notebook"),
-            profiles: tmp.path().join("profiles.json"),
-            config: tmp.path().join("config.json"),
-            scope: paths::Scope::User,
-        };
+        let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
         let fixture_dir = tmp.path().join("my-fx");
         std::fs::create_dir_all(&fixture_dir).unwrap();
         std::fs::write(
@@ -772,16 +740,7 @@ mod tests {
         use crate::workloads::types::{LoadedWorkload, WorkloadManifest, WorkloadSource, WorkloadSpec};
         use std::collections::BTreeMap;
         let tmp = TempDir::new().unwrap();
-        let paths = paths::DarkmuxPaths {
-            root: tmp.path().to_path_buf(),
-            runs: tmp.path().join("runs"),
-            sandboxes: tmp.path().join("sandboxes"),
-            crew: tmp.path().join("crew"),
-            notebook: tmp.path().join("notebook"),
-            profiles: tmp.path().join("profiles.json"),
-            config: tmp.path().join("config.json"),
-            scope: paths::Scope::User,
-        };
+        let paths = paths::DarkmuxPaths::under_root(tmp.path().to_path_buf());
         let loaded = LoadedWorkload {
             manifest: WorkloadManifest {
                 workload: WorkloadSpec {

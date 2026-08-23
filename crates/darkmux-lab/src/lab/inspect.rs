@@ -117,8 +117,9 @@ fn resolve_run_dir(path: &str) -> PathBuf {
     if path.starts_with('/') || path.starts_with("./") || path.starts_with("../") || path.contains('/') {
         return PathBuf::from(path);
     }
-    let paths = paths::resolve(ResolveScope::Auto);
-    let candidate = paths.runs.join(path);
+    // `lab_dir()`, not a second resolution of the runs root — inspect must look
+    // where `lab run` actually wrote (#1882).
+    let candidate = darkmux_types::config_access::lab_dir().join(path);
     if candidate.exists() {
         return candidate;
     }

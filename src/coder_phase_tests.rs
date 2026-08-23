@@ -43,8 +43,8 @@
         // ticketless → default
         assert_eq!(conventions_branch(&s, &m, Some(&conv)), "darkmux/s1-fix");
         // ticketed → conventioned
-        m.ticket = Some("SAMPLE-2598".into());
-        assert_eq!(conventions_branch(&s, &m, Some(&conv)), "SAMPLE-2598/s1-fix");
+        m.ticket = Some("SAMPLE-4101".into());
+        assert_eq!(conventions_branch(&s, &m, Some(&conv)), "SAMPLE-4101/s1-fix");
         // no conventions at all → default
         assert_eq!(conventions_branch(&s, &m, None), "darkmux/s1-fix");
         // template expanding to an invalid ref → default

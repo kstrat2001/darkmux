@@ -322,7 +322,7 @@ pub struct Mission {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_input: Option<String>,
     /// (#816) Work-item / ticket id this mission realizes (e.g.
-    /// `SAMPLE-2598`), set via `mission propose --ticket`. Referenced as
+    /// `SAMPLE-4101`), set via `mission propose --ticket`. Referenced as
     /// `{ticket}` by the target repo's `.darkmux/conventions.json`
     /// templates for branch names, commit subjects, and PR titles. None
     /// on ticketless missions — templates referencing `{ticket}` then

@@ -629,9 +629,27 @@ fn lab_dir_default() -> std::path::PathBuf {
 
 /// Test builds must never default onto the operator's real `~/.darkmux/runs`
 /// — same isolation discipline as `flows_dir_default` (#994).
+///
+/// But a test that DID isolate itself, by pointing `DARKMUX_HOME` at a
+/// tempdir, means it: honor that exactly as production does. An earlier cut
+/// returned the throwaway path unconditionally, which silently overrode
+/// per-test isolation — `lab run list` then scanned the tmp path while the
+/// test had written under its own `DARKMUX_HOME`, and the two could never
+/// agree. The throwaway is the fallback for tests that isolated NOTHING, not
+/// a replacement for tests that did.
 #[cfg(any(test, feature = "test-support"))]
 fn lab_dir_default() -> std::path::PathBuf {
-    std::path::PathBuf::from("/tmp/darkmux-test-isolated/runs")
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    // Substitute the throwaway ONLY when resolution actually landed on the
+    // operator's real user root — that is the case this guard exists for. Both
+    // documented isolation forms (a `DARKMUX_HOME` tempdir, or a project-local
+    // `./.darkmux` reached via `set_current_dir`) resolve elsewhere and are
+    // honored verbatim, because a test that isolated itself means it.
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/runs");
+    }
+    resolved.runs
 }
 
 /// (#703) Host cache dir for the extracted static `darkmux-runtime` binary,
