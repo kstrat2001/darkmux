@@ -108,10 +108,10 @@ mod tests {
 
     #[test]
     fn expand_fills_all_vars() {
-        let out = expand("{ticket}/{phase}", &vars(Some("SYS-2598"))).unwrap();
-        assert_eq!(out, "SYS-2598/s1-fix");
-        let out = expand("{ticket}: {subject}", &vars(Some("SYS-2598"))).unwrap();
-        assert_eq!(out, "SYS-2598: fix the page copy");
+        let out = expand("{ticket}/{phase}", &vars(Some("SAMPLE-2598"))).unwrap();
+        assert_eq!(out, "SAMPLE-2598/s1-fix");
+        let out = expand("{ticket}: {subject}", &vars(Some("SAMPLE-2598"))).unwrap();
+        assert_eq!(out, "SAMPLE-2598: fix the page copy");
     }
 
     #[test]
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn valid_branch_accepts_and_rejects() {
-        assert!(valid_branch("SYS-2598/s1-fix"));
+        assert!(valid_branch("SAMPLE-2598/s1-fix"));
         assert!(valid_branch("darkmux/s1"));
         assert!(!valid_branch(""));
         assert!(!valid_branch("-rev"));

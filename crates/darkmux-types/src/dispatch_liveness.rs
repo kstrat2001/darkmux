@@ -1,6 +1,6 @@
 //! Dependency-free dispatch liveness FLOOR (#1311, part of #1278).
 //!
-//! `finhub-adonisjs#563` hung 19 minutes on a tiny Azure-only review, machine
+//! a private production review hung 19 minutes on a tiny Azure-only review, machine
 //! awake (no thermal), and emitted ZERO flow records — it froze BEFORE
 //! flow-sink init (before Redis/audit setup), leaving no trace of what phase
 //! it was in. The dispatch bookends (#1272) ride the flow machinery, so they

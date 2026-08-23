@@ -3648,7 +3648,7 @@ mod tests {
                 "name": "Hydration Test",
                 "description": "checks propose-preserved fields land on the mission",
                 "source_input": "the operator's original unabridged words",
-                "ticket": "SYS-4242",
+                "ticket": "SAMPLE-4242",
                 "phases": [{"id": "p1", "description": "only phase"}]
             }"#,
         );
@@ -3667,7 +3667,7 @@ mod tests {
         );
         assert_eq!(
             mission.ticket.as_deref(),
-            Some("SYS-4242"),
+            Some("SAMPLE-4242"),
             "ticket must ride config extras onto the mission record (#816)"
         );
     }

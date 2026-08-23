@@ -79,3 +79,7 @@ ui/playwright-report/
 ui/verify/test-results/
 ui/verify/playwright-report/
 ui/verify/.gallery/
+
+# cargo-mutants run output — local build logs (accidentally committed in #1636)
+mutants.out/
+mutants.out.old/

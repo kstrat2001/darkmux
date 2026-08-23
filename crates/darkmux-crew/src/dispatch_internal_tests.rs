@@ -101,13 +101,13 @@
     fn remote_endpoint_label_names_kind_host_and_model() {
         let az = darkmux_types::ModelEndpoint {
             url: Some(
-                "https://finherogpt.cognitiveservices.azure.com/openai/deployments/gpt-4o".into(),
+                "https://example-aoai.cognitiveservices.azure.com/openai/deployments/gpt-4o".into(),
             ),
             ..Default::default()
         };
         assert_eq!(
             remote_endpoint_label(&az, "gpt-4o"),
-            "azure:finherogpt.cognitiveservices.azure.com/gpt-4o"
+            "azure:example-aoai.cognitiveservices.azure.com/gpt-4o"
         );
         // Non-azure host ⇒ openai kind; label carries host + model, never the path or auth.
         let oai = darkmux_types::ModelEndpoint {

@@ -912,7 +912,7 @@ some epilogue"#;
         let _guard = CrewDirGuard::new(TempDir::new().unwrap());
 
         let proposal = sample_proposal("test-config-shape", &["s1", "s2"]);
-        persist(&proposal, "test input", Some("SYS-1")).expect("persist should succeed");
+        persist(&proposal, "test input", Some("SAMPLE-1")).expect("persist should succeed");
 
         let path = crate::crew::loader::mission_configs_dir().join("test-config-shape.json");
         assert!(path.is_file(), "expected a mission config at {}", path.display());
@@ -926,7 +926,7 @@ some epilogue"#;
         assert_eq!(cfg.phases[1].id, "s2");
         assert!(cfg.phases.iter().all(|p| p.tasks.is_empty()), "compiler proposals are always freeform");
         assert_eq!(cfg.extras.get("source_input"), Some(&serde_json::json!("test input")));
-        assert_eq!(cfg.extras.get("ticket"), Some(&serde_json::json!("SYS-1")));
+        assert_eq!(cfg.extras.get("ticket"), Some(&serde_json::json!("SAMPLE-1")));
         // (contract 7) The document must itself validate cleanly.
         assert!(cfg.is_valid(&[]));
     }

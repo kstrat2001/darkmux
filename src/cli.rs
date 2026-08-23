@@ -518,7 +518,7 @@ pub(crate) enum MissionCmd {
         /// persisted config before launching can omit this flag.
         #[arg(long)]
         start: bool,
-        /// Work-item / ticket id this mission realizes (e.g. `SYS-2598`).
+        /// Work-item / ticket id this mission realizes (e.g. `SAMPLE-2598`).
         /// Stamped into the config draft and, at `mission launch`, onto the
         /// launched mission record; referenced as `{ticket}` by the repo's
         /// `.darkmux/conventions.json` templates (#816) for branch names,

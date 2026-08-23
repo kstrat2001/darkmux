@@ -254,7 +254,7 @@ pub struct EndpointAuth {
     pub keychain: Option<String>,
     /// (#1312) NAME of an environment variable holding this endpoint's API key
     /// — the operator declares WHICH variable (any provider: `OPENAI_API_KEY`,
-    /// `AZURE_FINHEROGPT_KEY`, anything). When set AND present in the env, it is
+    /// `AZURE_OPENAI_KEY`, anything). When set AND present in the env, it is
     /// used VERBATIM and the Keychain is NEVER read — the headless-runner escape
     /// hatch (a CI job exports the var from its secret store; no login keychain
     /// to lock/hang). Resolution: `env(key_env) present > Keychain(keychain)`.
@@ -955,9 +955,9 @@ mod tests {
             "id": "gpt-5.1",
             "n_ctx": 200000,
             "endpoint": {
-                "url": "https://finherogpt.cognitiveservices.azure.com/openai/deployments/gpt-4o",
+                "url": "https://example-aoai.cognitiveservices.azure.com/openai/deployments/gpt-4o",
                 "api_version": "2025-01-01-preview",
-                "auth": { "type": "api-key", "keychain": "darkmux-azure-finherogpt" }
+                "auth": { "type": "api-key", "keychain": "darkmux-azure-example" }
             }
         }"#;
         let m: ProfileModel = serde_json::from_str(json).unwrap();
@@ -965,12 +965,12 @@ mod tests {
         assert!(ep.is_remote());
         assert_eq!(
             ep.base_url(),
-            "https://finherogpt.cognitiveservices.azure.com/openai/deployments/gpt-4o"
+            "https://example-aoai.cognitiveservices.azure.com/openai/deployments/gpt-4o"
         );
         assert_eq!(ep.api_version.as_deref(), Some("2025-01-01-preview"));
         let auth = ep.auth.as_ref().expect("auth parsed");
         assert_eq!(auth.auth_type, Some(EndpointAuthType::ApiKey));
-        assert_eq!(auth.keychain.as_deref(), Some("darkmux-azure-finherogpt"));
+        assert_eq!(auth.keychain.as_deref(), Some("darkmux-azure-example"));
         // full round-trip preserves the endpoint
         let back: ProfileModel =
             serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
@@ -1003,7 +1003,7 @@ mod tests {
     fn endpoint_validate_catches_bad_url_and_authless_keychain() {
         // A URL without a scheme is rejected.
         let bad = ModelEndpoint {
-            url: Some("finherogpt.azure.com".into()),
+            url: Some("example-aoai.azure.com".into()),
             ..Default::default()
         };
         assert!(bad.validate().is_err());

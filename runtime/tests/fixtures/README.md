@@ -29,13 +29,14 @@ are snapshot pins for the compactor request shape, not real-world traces.
 ## Sanitization notes
 
 The harvested traces came from the canonical-tests long-agentic workload
-(operator-confirmed-public). One internal-project ticket prefix `SYS-2359`
+(operator-confirmed-public). One internal-project ticket key
 appeared in the compactor's free-text output and was sanitized to
 `SAMPLE-1234` (preserves structural shape, drops the recognizable internal
 sentinel). Workspace paths use the `/workspace/src/services/refreshToken*`
 form which is generic enough — common across auth codebases worldwide.
 
-If future harvests include sentinels (FinHero / OFAL / DEVOPS-* / etc.),
+If future harvests include engagement sentinels (the set listed in
+`tests/parity/lib/sanitize.mjs`),
 sanitize at extract time before commit. The pre-commit sentinel block in
 de-substack does NOT apply to this repo, but the operator-trust principle
 does: public OSS repo content should not carry internal-project markers.
