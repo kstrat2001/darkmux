@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod fixture;
 pub mod fixture_cli;
 pub mod inspect;
+pub mod lifecycle;
 pub mod list;
 pub mod loop_report;
 pub mod profile_check;
