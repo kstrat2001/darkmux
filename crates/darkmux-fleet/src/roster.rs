@@ -35,7 +35,7 @@ pub struct MachineEntry {
     pub id: String,
 
     /// Tailnet address or DNS name to reach the daemon on. Examples:
-    /// `"100.74.208.36"`, `"studio.tailnet"`, `"127.0.0.1:8765"`. If no
+    /// `"100.64.0.2"`, `"studio.tailnet"`, `"127.0.0.1:8765"`. If no
     /// `:port` suffix is given, `DEFAULT_DAEMON_PORT` (8765) is assumed.
     /// Empty string is rejected at add time.
     pub address: String,
@@ -356,8 +356,8 @@ pub fn probe_reachability(address: &str) -> ReachabilityResult {
 }
 
 /// Parse an `address` string into a `SocketAddr`. Accepts:
-/// - bare IPs: `100.74.208.36` (port defaults to `DEFAULT_DAEMON_PORT`)
-/// - host:port: `100.74.208.36:8765` or `studio.tailnet:9999`
+/// - bare IPs: `100.64.0.2` (port defaults to `DEFAULT_DAEMON_PORT`)
+/// - host:port: `100.64.0.2:8765` or `studio.tailnet:9999`
 /// - DNS names: `studio.tailnet` (resolved via std)
 pub(crate) fn parse_address(address: &str) -> Result<std::net::SocketAddr> {
     let trimmed = address.trim();
@@ -514,9 +514,9 @@ mod parse_address_tests {
     fn bare_ipv4_and_ipv4_with_port_still_work() {
         // Bare v4 previously resolved through the DNS thread; the bare-IP
         // branch answers it directly now. Same result, no resolver.
-        let a = parse_address("100.74.208.36").unwrap();
+        let a = parse_address("100.64.0.2").unwrap();
         assert_eq!(a.port(), DEFAULT_DAEMON_PORT);
-        let b = parse_address("100.74.208.36:8765").unwrap();
+        let b = parse_address("100.64.0.2:8765").unwrap();
         assert_eq!(b.port(), 8765);
     }
 

@@ -152,13 +152,13 @@ mod tests {
     fn add_then_load_round_trips() {
         with_roster_env(|_| {
             let mut r = FleetRoster::default();
-            add_machine(&mut r, "studio", "100.74.208.36", Some("always-on m1 max")).unwrap();
+            add_machine(&mut r, "studio", "100.64.0.2", Some("always-on m1 max")).unwrap();
             save_roster(&r).unwrap();
 
             let loaded = load_roster().unwrap();
             assert_eq!(loaded.machines.len(), 1);
             let entry = loaded.machines.get("studio").unwrap();
-            assert_eq!(entry.address, "100.74.208.36");
+            assert_eq!(entry.address, "100.64.0.2");
             assert_eq!(entry.description.as_deref(), Some("always-on m1 max"));
             assert!(entry.added_unix_ms > 0);
         });
@@ -315,7 +315,7 @@ mod tests {
     fn save_roundtrip_preserves_pretty_json() {
         with_roster_env(|path| {
             let mut r = FleetRoster::default();
-            add_machine(&mut r, "studio", "100.74.208.36:8765", None).unwrap();
+            add_machine(&mut r, "studio", "100.64.0.2:8765", None).unwrap();
             save_roster(&r).unwrap();
             let raw = std::fs::read_to_string(path).unwrap();
             // Pretty-print means newlines + indent — at least one newline.

@@ -382,16 +382,16 @@ mod tests {
     #[test]
     fn normalize_daemon_base_prefixes_host_port_forms() {
         assert_eq!(
-            normalize_daemon_base("100.74.208.36:8765"),
-            "http://100.74.208.36:8765"
+            normalize_daemon_base("100.64.0.2:8765"),
+            "http://100.64.0.2:8765"
         );
     }
 
     #[test]
     fn normalize_daemon_base_appends_default_port_to_bare_hosts() {
         assert_eq!(
-            normalize_daemon_base("100.74.208.36"),
-            format!("http://100.74.208.36:{}", crate::serve::DEFAULT_DAEMON_PORT)
+            normalize_daemon_base("100.64.0.2"),
+            format!("http://100.64.0.2:{}", crate::serve::DEFAULT_DAEMON_PORT)
         );
     }
 

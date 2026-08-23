@@ -1944,7 +1944,7 @@ fn parse_tailnet_viewer_url(json: &str, port: u16) -> Option<String> {
             })
             .unwrap_or(false);
         if proxies_to_us {
-            // `hostport` is like "macbook-pro.taild82cbb.ts.net:80" — split the
+            // `hostport` is like "laptop.tailnet-example.ts.net:80" — split the
             // trailing port to pick the scheme; default to the bare host on no
             // colon (shouldn't happen, but stay total).
             let (host, served_port) = hostport
@@ -5229,10 +5229,10 @@ mod tests {
     #[test]
     fn parse_tailnet_viewer_url_matches_the_proxy_to_our_port() {
         // The real `tailscale serve status --json` shape (captured live).
-        let json = r#"{"TCP":{"80":{"HTTP":true}},"Web":{"macbook-pro.taild82cbb.ts.net:80":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
+        let json = r#"{"TCP":{"80":{"HTTP":true}},"Web":{"laptop.tailnet-example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
         assert_eq!(
             parse_tailnet_viewer_url(json, 8765).as_deref(),
-            Some("http://macbook-pro.taild82cbb.ts.net/")
+            Some("http://laptop.tailnet-example.ts.net/")
         );
         // A different daemon port → not our proxy → None.
         assert_eq!(parse_tailnet_viewer_url(json, 9000), None);

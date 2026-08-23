@@ -104,6 +104,15 @@ const SHA40_RE = /\b[a-f0-9]{40}\b/g;
 // name, since a leaked IP could show up in a URL, a log line, anywhere.
 const IPV4_RE = /\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g;
 
+// A Tailscale MagicDNS name — `<machine>.<tailnet>.ts.net`. Same
+// defense-in-depth reasoning as IPV4_RE above, and added because the IP rule
+// alone was NOT enough: a captured `doctor` golden carried a synthetic IP
+// (this scrubber had rewritten it) sitting directly beside the operator's REAL
+// MagicDNS hostname, which nothing rewrote. The tailnet component is the
+// durable identifier of the two — an address can be reassigned, a tailnet name
+// is the same string everywhere it appears.
+const MAGICDNS_RE = /\b([a-z0-9-]+)\.([a-z0-9-]+)\.ts\.net\b/gi;
+
 function stableHex(input, salt) {
   return createHash("sha256").update(salt + ":" + input).digest("hex");
 }
@@ -161,6 +170,16 @@ function syntheticIpv4(original) {
 
 function scrubIpv4(s) {
   return s.replace(IPV4_RE, (m) => syntheticIpv4(m));
+}
+
+// Both components are rewritten, not just the tailnet: a machine name is often
+// the operator's hardware model, which is identifying on its own.
+function scrubMagicDns(s) {
+  return s.replace(MAGICDNS_RE, (_m, host, tailnet) => {
+    const h = stableHex(host, "magicdns-host").slice(0, 8);
+    const t = stableHex(tailnet, "magicdns-tailnet").slice(0, 10);
+    return `host-${h}.tailnet-${t}.ts.net`;
+  });
 }
 
 // Deterministic placeholder prose: same overall length as the original
@@ -297,6 +316,9 @@ function entityScan(s, matched) {
   const beforeIp = out;
   out = scrubIpv4(out);
   if (out !== beforeIp) matched.ips++;
+  const beforeDns = out;
+  out = scrubMagicDns(out);
+  if (out !== beforeDns) matched.magicdns++;
   return out;
 }
 
@@ -353,7 +375,7 @@ function walk(value, matched, fieldName) {
 export function sanitizeText(text) {
   const parsed = JSON.parse(text);
   const matched = {
-    identifiers: 0, tickets: 0, shas: 0, ips: 0,
+    identifiers: 0, tickets: 0, shas: 0, ips: 0, magicdns: 0,
     prose: 0, paths: 0, uuids: 0, unknown: 0,
     unknownFields: new Set(),
   };

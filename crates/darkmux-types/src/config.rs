@@ -835,12 +835,12 @@ mod tests {
             "lms_bin": "/usr/local/bin/lms",
             "lmstudio_url": "http://localhost:1234",
             "dirs": { "flows": "~/dm/flows", "audit": "~/dm/audit" },
-            "redis": { "host": "100.74.208.36", "port": 6379, "stream": "darkmux:flow", "maxlen": 10000 },
+            "redis": { "host": "100.64.0.2", "port": 6379, "stream": "darkmux:flow", "maxlen": 10000 },
             "runtime": { "inactivity_timeout_seconds": 600, "max_turns": 40, "strict_selection": true, "daemon_auth_enabled": true }
         }"#;
         let cfg: DarkmuxConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.machine_id.as_deref(), Some("studio"));
-        assert_eq!(cfg.redis.as_ref().unwrap().host.as_deref(), Some("100.74.208.36"));
+        assert_eq!(cfg.redis.as_ref().unwrap().host.as_deref(), Some("100.64.0.2"));
         assert_eq!(cfg.redis.as_ref().unwrap().port, Some(6379));
         assert_eq!(cfg.dirs.as_ref().unwrap().flows.as_deref(), Some("~/dm/flows"));
         assert_eq!(cfg.runtime.as_ref().unwrap().max_turns, Some(40));
