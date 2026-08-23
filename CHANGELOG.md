@@ -14,6 +14,28 @@ darkmux release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The lab run root now has one resolver, and a `cargo test` no longer writes
+  into your real run store** (#1882). Five call sites — `lab run`, `lab run
+  list`, `lab run inspect`, `lab notebook draft`, and the review bench —
+  resolved the lab root themselves instead of through
+  `config_access::lab_dir()`. Two consequences, both live: test builds wrote
+  real run directories into `~/.darkmux/runs` (251 had accumulated since July,
+  and recent ones rendered as live `RUNNING` rows in the viewer), and
+  `DARKMUX_LAB_DIR` / `config.dirs.lab` were ignored on the WRITE side while
+  honored on the READ side, so runs landed in a root the reader never scanned.
+  `DarkmuxPaths.runs` is now `pub(crate)`, making the bypass a compile error
+  rather than a convention.
+
+  **Behavior change, if you set `DARKMUX_LAB_DIR` or `config.dirs.lab`:** those
+  verbs now write AND read under the configured root. Runs recorded before this
+  release still live under `~/.darkmux/runs` and will not appear in `lab run
+  list` until moved. Neither setting is written by `darkmux init` and
+  `DARKMUX_LAB_DIR` is undocumented, so most installs are unaffected. The empty
+  list now names the directory it actually scanned instead of always claiming
+  `.darkmux/runs/`.
+
 ### Added
 
 - **`darkmux mission config list` / `show <id>`** — a `role list`/`role show`

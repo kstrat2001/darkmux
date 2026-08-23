@@ -245,7 +245,10 @@ fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
         RunCmd::List { limit, all } => {
             let lim = if all { None } else { Some(limit) };
             let summaries = lab::list::list_runs(lim)?;
-            print!("{}", lab::list::format_table(&summaries));
+            print!(
+                "{}",
+                lab::list::format_table(&summaries, &darkmux_types::config_access::lab_dir())
+            );
             Ok(0)
         }
         RunCmd::Inspect { run, summary } => {
