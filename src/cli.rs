@@ -890,7 +890,7 @@ pub(crate) enum MachineCmd {
         /// Example: `studio`, `laptop`, `mini-1`.
         id: String,
         /// Tailnet address or DNS name to reach the daemon on. Example:
-        /// `100.74.208.36`, `100.74.208.36:8765`, `studio.tailnet`. If
+        /// `100.64.0.2`, `100.64.0.2:8765`, `studio.tailnet`. If
         /// no `:port` suffix, port 8765 is assumed.
         #[arg(long)]
         address: String,

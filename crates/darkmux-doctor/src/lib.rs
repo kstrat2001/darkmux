@@ -1944,7 +1944,7 @@ fn parse_tailnet_viewer_url(json: &str, port: u16) -> Option<String> {
             })
             .unwrap_or(false);
         if proxies_to_us {
-            // `hostport` is like "macbook-pro.taild82cbb.ts.net:80" — split the
+            // `hostport` is like "laptop.tailnet-example.ts.net:80" — split the
             // trailing port to pick the scheme; default to the bare host on no
             // colon (shouldn't happen, but stay total).
             let (host, served_port) = hostport
@@ -5229,19 +5229,19 @@ mod tests {
     #[test]
     fn parse_tailnet_viewer_url_matches_the_proxy_to_our_port() {
         // The real `tailscale serve status --json` shape (captured live).
-        let json = r#"{"TCP":{"80":{"HTTP":true}},"Web":{"macbook-pro.taild82cbb.ts.net:80":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
+        let json = r#"{"TCP":{"80":{"HTTP":true}},"Web":{"laptop.tailnet-example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
         assert_eq!(
             parse_tailnet_viewer_url(json, 8765).as_deref(),
-            Some("http://macbook-pro.taild82cbb.ts.net/")
+            Some("http://laptop.tailnet-example.ts.net/")
         );
         // A different daemon port → not our proxy → None.
         assert_eq!(parse_tailnet_viewer_url(json, 9000), None);
         // Served on 443 → https scheme.
-        let j443 = r#"{"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
-        assert_eq!(parse_tailnet_viewer_url(j443, 8765).as_deref(), Some("https://host.ts.net/"));
+        let j443 = r#"{"Web":{"tailnet-example.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
+        assert_eq!(parse_tailnet_viewer_url(j443, 8765).as_deref(), Some("https://tailnet-example.ts.net/"));
         // localhost proxy target is accepted too.
-        let jlocal = r#"{"Web":{"h.ts.net:80":{"Handlers":{"/":{"Proxy":"http://localhost:8765"}}}}}"#;
-        assert_eq!(parse_tailnet_viewer_url(jlocal, 8765).as_deref(), Some("http://h.ts.net/"));
+        let jlocal = r#"{"Web":{"example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://localhost:8765"}}}}}"#;
+        assert_eq!(parse_tailnet_viewer_url(jlocal, 8765).as_deref(), Some("http://example.ts.net/"));
         // Not serving / empty / garbage → None (best-effort, never an error).
         assert_eq!(parse_tailnet_viewer_url("{}", 8765), None);
         assert_eq!(parse_tailnet_viewer_url("not json", 8765), None);

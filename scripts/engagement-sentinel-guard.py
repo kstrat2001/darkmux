@@ -77,6 +77,39 @@ TICKET_RES = [
 # that silently discarded any short all-caps entry a maintainer might add.
 DELEGATED_TO_TICKET_RE = {"SYS-", "SYS_"}
 
+# ── Network identifiers ────────────────────────────────────────────────────
+#
+# A word scanner cannot see these: an address and a MagicDNS name spell no
+# sentinel. They reached this repo exactly that way — an operator tailnet
+# address in 21 places including `machine add` and `config set` help text, and
+# a MagicDNS hostname in a committed doctor golden, sitting beside an IP the
+# parity scrubber HAD rewritten. Neither is publicly routable and neither is a
+# credential, so this is topology disclosure rather than a breach — but both
+# are durable, correlatable, and permanent once history has them.
+#
+# The example convention this repo already uses, and which these patterns
+# deliberately permit:
+#   * addresses  -> 100.64.x.x  (the first /16 of the CGNAT range)
+#   * MagicDNS   -> a tailnet component listed in EXAMPLE_TAILNETS
+# Anything else inside CGNAT, or any other tailnet name, is presumed real.
+CGNAT_RE = re.compile(
+    r"(?<![\d.])100\.(?:6[5-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?![\d.])"
+)
+EXAMPLE_TAILNETS = {"tailnet", "tailnet-example", "your-tailnet", "example"}
+# The machine label is OPTIONAL, matching `sanitize.mjs`. `tailscale status
+# --json` reports the tailnet as a bare `MagicDNSSuffix`
+# (`<tailnet>.ts.net`), and the tailnet is the durable half — a machine can
+# be renamed, a tailnet name is the same string everywhere it appears.
+# Requiring two labels let exactly that form past this guard.
+MAGICDNS_RE = re.compile(r"\b(?:[a-z0-9-]+\.)?([a-z0-9-]+)\.ts\.net\b", re.I)
+
+
+def network_identifier_hits(line: str) -> bool:
+    """True when the line carries a presumed-real tailnet address or hostname."""
+    if CGNAT_RE.search(line):
+        return True
+    return any(m.group(1).lower() not in EXAMPLE_TAILNETS for m in MAGICDNS_RE.finditer(line))
+
 
 def load_canaries() -> tuple[list[str], list[str]]:
     """Parse the `CANARIES` array out of the scrubber.
@@ -134,7 +167,11 @@ def main() -> int:
         except (UnicodeDecodeError, FileNotFoundError, IsADirectoryError):
             continue  # binary or gone — nothing to read
         for n, line in enumerate(text.splitlines(), 1):
-            if word_re.search(line) or any(r.search(line) for r in TICKET_RES):
+            if (
+                word_re.search(line)
+                or any(r.search(line) for r in TICKET_RES)
+                or network_identifier_hits(line)
+            ):
                 findings.append((rel, n, line.strip()[:120]))
 
     if delegated:

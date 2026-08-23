@@ -36,7 +36,7 @@ darkmux doctor — 38 checks
 ● needs attention — binary vs source: the darkmux you are running was built from 557e1b94, but this source tree's HEAD is 899cf7be — your latest code is NOT in the binary under test
 
   ✓ build                  darkmux 2.5.0 (557e1b94) · flow schema 1.18.0
-  ✓ daemon reachable       reachable · viewer http://100.141.193.1:8765/ · phone http://macbook-pro.taild82cbb.ts.net/
+  ✓ daemon reachable       reachable · viewer http://100.141.193.1:8765/ · phone http://laptop.tailnet-example.ts.net/
   ✓ 31 more checks passed — `-v` for detail
   ⚠ binary vs source       the darkmux you are running was built from 557e1b94, but this source tree's HEAD is 899cf7be — your latest code is NOT in the binary under test
         → rebuild + install it: `cargo install --path .`

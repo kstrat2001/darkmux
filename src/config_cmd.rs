@@ -20,7 +20,7 @@ use std::path::Path;
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
     /// Set a config key (dotted path) to a value, e.g.
-    /// `darkmux config set redis.host 100.74.208.36`,
+    /// `darkmux config set redis.host 100.64.0.2`,
     /// `darkmux config set fleet.mode hub`, or
     /// `darkmux config set role_profiles.review-judge qwen35b` (bind a role to
     /// a profile — #1475). The role id must be a real one (`darkmux role
@@ -443,13 +443,13 @@ mod tests {
         let f = tmp();
         let p = f.path();
         // missing/empty file → starts from {}; string, bool, number, float, fleet.
-        set_at(p, "redis.host", "100.74.208.36").unwrap();
+        set_at(p, "redis.host", "100.64.0.2").unwrap();
         set_at(p, "redis.port", "6380").unwrap();
         set_at(p, "redis.enabled", "true").unwrap();
         set_at(p, "runtime.injected_context_fraction", "0.2").unwrap();
         set_at(p, "fleet.mode", "HUB").unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
-        assert_eq!(v["redis"]["host"], Value::String("100.74.208.36".into()));
+        assert_eq!(v["redis"]["host"], Value::String("100.64.0.2".into()));
         assert_eq!(v["redis"]["port"], serde_json::json!(6380), "coerced to number");
         assert_eq!(v["redis"]["enabled"], Value::Bool(true), "coerced to bool");
         assert_eq!(v["runtime"]["injected_context_fraction"], serde_json::json!(0.2));

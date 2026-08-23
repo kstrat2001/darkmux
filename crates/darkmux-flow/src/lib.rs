@@ -3505,7 +3505,7 @@ mod tests {
         // This test pins the on-the-wire banner format so a future
         // refactor of the eprintln! at the construction site can't
         // silently re-introduce the leak.
-        let url = "redis://:supersecret@100.74.208.36:6379";
+        let url = "redis://:supersecret@100.64.0.2:6379";
         let banner = format!(
             "flow: Redis sink enabled — url={} stream={} max_len={:?} (composed via TeeSink)",
             redact_url_creds(url),
@@ -3553,7 +3553,7 @@ mod tests {
         // HTTP endpoint. The raw URL now lives on `SinkInfo.raw_url`
         // (skip-serialized); `config["url"]` is the redacted display form.
         let sink = RedisSink::new(
-            "redis://:supersecret@100.74.208.36:6379",
+            "redis://:supersecret@100.64.0.2:6379",
             "darkmux:flow",
             Some(10000),
         )
@@ -3563,14 +3563,14 @@ mod tests {
         // In-process path keeps the raw URL.
         assert_eq!(
             info.raw_url.as_deref(),
-            Some("redis://:supersecret@100.74.208.36:6379"),
+            Some("redis://:supersecret@100.64.0.2:6379"),
             "raw_url must round-trip the unredacted URL for the probe path",
         );
 
         // Display path strips it.
         assert_eq!(
             info.config.get("url").map(String::as_str),
-            Some("redis://:***@100.74.208.36:6379"),
+            Some("redis://:***@100.64.0.2:6379"),
             "config[\"url\"] must be redacted",
         );
 
