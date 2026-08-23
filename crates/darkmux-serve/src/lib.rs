@@ -1854,6 +1854,11 @@ pub(crate) struct LabRunSummary {
     /// `scores.json` exists — the run reached its terminal artifact write.
     /// The viewer's live/finished badge keys on this.
     pub(crate) finished: bool,
+    /// (#1930/#1937) The run's own lifecycle status, when it wrote one. `None`
+    /// for runs recorded before this record existed — those keep the old
+    /// artifact-and-staleness inference, so this is additive, not a migration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) lifecycle_status: Option<darkmux_lab::lab::lifecycle::LifecycleStatus>,
     pub(crate) has_funnels: bool,
     pub(crate) has_events: bool,
 }
@@ -1927,7 +1932,13 @@ fn scan_lab_dir_rec(dir: &StdPath, lab_dir: &StdPath, depth: usize, out: &mut Ve
     let has_funnels = dir.join("funnels.json").is_file();
     let has_events = dir.join("funnel-events.jsonl").is_file();
     let has_scores = dir.join("scores.json").is_file();
-    if has_funnels || has_events || has_scores {
+    // (#1937) The lifecycle record is written at run START, so it is the only
+    // marker present while a run is LIVE — the other three are end-of-run
+    // artifacts. Without it the scan cannot see a running lab run at all, and
+    // it falls through to flow synthesis, displaying as an `untracked`
+    // DISPATCH for its entire duration.
+    let has_lifecycle = dir.join(darkmux_lab::lab::lifecycle::LIFECYCLE_FILE).is_file();
+    if has_funnels || has_events || has_scores || has_lifecycle {
         if let Some(summary) = build_lab_run_summary(dir, lab_dir, has_funnels, has_events, has_scores) {
             out.push(summary);
         }
@@ -2080,6 +2091,10 @@ fn build_lab_run_summary(
         archived,
         degenerate,
         finished: has_scores,
+        // Read once here rather than per-consumer: the scan already has the
+        // directory in hand, and a status re-read at display time could
+        // disagree with the one the row was built from.
+        lifecycle_status: darkmux_lab::lab::lifecycle::read(dir).map(|r| r.status),
         has_funnels,
         has_events,
     })

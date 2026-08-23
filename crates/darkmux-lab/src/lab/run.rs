@@ -2,6 +2,7 @@
 
 use crate::lab::artifact_dirs;
 use crate::lab::cow_clone::cow_clone_dir_excluding;
+use crate::lab::lifecycle;
 use crate::lab::paths::{self, ResolveScope};
 use crate::lab::sandbox_hash::hash_sandbox_dir;
 use darkmux_profiles::profiles::{get_profile, load_registry};
@@ -189,6 +190,21 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
 
         fs::create_dir_all(&run_dir).with_context(|| format!("creating {}", run_dir.display()))?;
 
+        // The lifecycle bookend goes here — directly after the directory
+        // exists and BEFORE the first fallible step, so every `?` below is
+        // covered by its RAII terminal guard. Two bugs closed by this one
+        // placement: the scan can now classify a LIVE run as a lab run from
+        // its first moment (#1937, previously it had to wait for end-of-run
+        // artifacts and meanwhile showed as an untracked DISPATCH), and a run
+        // that ERRORS gets a terminal record instead of falling through to an
+        // idle-time guess (#1930).
+        let lifecycle = lifecycle::RunLifecycle::start(
+            &run_dir,
+            &run_id,
+            &opts.workload_id,
+            &profile_name,
+        )?;
+
         // (#488) Phase 1 — materialize the per-run sandbox. If the
         // source exists, COW-clone it (cheap on APFS/btrfs/xfs;
         // fallback to deep copy elsewhere). If not, create an empty
@@ -250,7 +266,10 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         // (#488) Phase 1 — provider operates against the per-run
         // sandbox, not the source. Provider has no awareness of the
         // COW step; it just gets a sandbox dir and works against it.
-        let result = with_provider(&provider_id, |p| {
+        // `Drop` would record this as `interrupted`, which is true but less
+        // useful than the reason. Naming the error explicitly is the whole
+        // point of #1930 — "it errored, and here is why" beats "it stopped".
+        let result = match with_provider(&provider_id, |p| {
             p.setup(&loaded_workload, &run_dir, &per_run_sandbox_dir)?;
             p.run(
                 &loaded_workload,
@@ -261,7 +280,13 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
                 opts.config_path.as_deref(),
                 opts.loop_override.as_ref(),
             )
-        })??;
+        }) {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) | Err(e) => {
+                lifecycle.finish_error(&e);
+                return Err(e);
+            }
+        };
 
         // (#489) Phase 2 — enrich the provider-written manifest.json
         // with fixture provenance (baseline_hash + source_fixture_path).
@@ -301,6 +326,11 @@ pub fn lab_run(opts: RunOpts) -> Result<Vec<RunOutcome>> {
         if !opts.quiet {
             println!("  {}", notes.join(" | "));
         }
+
+        // Reached the end of the run. `result.ok` is the WORK's outcome and is
+        // carried in the outcome/notes; the lifecycle records that the run
+        // itself ran to completion rather than being cut short.
+        lifecycle.finish_complete();
 
         outcomes.push(RunOutcome {
             run_id,

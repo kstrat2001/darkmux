@@ -1097,6 +1097,24 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
 /// step-4 lens can special-case `degenerate` directly off the richer
 /// `/lab/runs` payload if finer granularity turns out to matter).
 fn lab_run_status(summary: &LabRunSummary, now_ms: u64) -> RunStatus {
+    // (#1930) The run's OWN terminal record wins over every inference below.
+    // `finished` only ever meant "scores.json exists", so a run that ERRORED
+    // never set it and fell through to the idle heuristic — reporting
+    // `Running` while fresh and `Abandoned` once stale, neither of which is
+    // what happened. A run that says how it ended is not something to guess at.
+    //
+    // `Running` and `Unknown` deliberately fall THROUGH to the staleness check
+    // below: the first may be a hard-killed run whose `Drop` never ran (the one
+    // gap RAII cannot close), and the second must never be read as a verdict.
+    use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+    match summary.lifecycle_status {
+        Some(Lc::Complete) => {
+            return if summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
+        }
+        Some(Lc::Error) => return RunStatus::Error,
+        Some(Lc::Interrupted) => return RunStatus::Abandoned,
+        _ => {}
+    }
     if summary.finished {
         return if summary.degenerate { RunStatus::Error } else { RunStatus::Complete };
     }
@@ -2371,7 +2389,20 @@ mod tests {
     // ── lab normalization ───────────────────────────────────────────────
 
     fn minimal_lab_summary(dir: &str, finished: bool, degenerate: bool) -> LabRunSummary {
+        lab_summary_with_lifecycle(dir, finished, degenerate, None)
+    }
+
+    /// The same fixture with an explicit lifecycle status — `None` is a run
+    /// recorded BEFORE the lifecycle record existed, which must keep the old
+    /// artifact-and-staleness inference.
+    fn lab_summary_with_lifecycle(
+        dir: &str,
+        finished: bool,
+        degenerate: bool,
+        lifecycle_status: Option<darkmux_lab::lab::lifecycle::LifecycleStatus>,
+    ) -> LabRunSummary {
         LabRunSummary {
+            lifecycle_status,
             dir: dir.to_string(),
             mtime_ms: 1_700_000_000_000,
             case_ids: vec![],
@@ -2389,6 +2420,72 @@ mod tests {
             finished,
             has_funnels: true,
             has_events: true,
+        }
+    }
+
+    /// (#1930) The run's own terminal record outranks every inference.
+    ///
+    /// The bug this pins: `finished` only ever meant "scores.json exists", so
+    /// a run that ERRORED never set it, fell through to the idle heuristic,
+    /// and reported `Running` while its artifacts were fresh — then
+    /// `Abandoned` once they aged. Neither is what happened. A run that says
+    /// how it ended is not something to guess about.
+    #[test]
+    fn a_lifecycle_record_outranks_the_artifact_and_staleness_inference() {
+        use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+        let now = 1_700_000_000_000u64;
+
+        // The exact shape of the bug: unfinished, artifacts still fresh.
+        // Without a record this is `Running` (asserted last, as the control).
+        let errored = lab_summary_with_lifecycle("d", false, false, Some(Lc::Error));
+        assert_eq!(
+            lab_run_status(&errored, now),
+            RunStatus::Error,
+            "an errored run must not read as live just because it died recently"
+        );
+
+        let interrupted = lab_summary_with_lifecycle("d", false, false, Some(Lc::Interrupted));
+        assert_eq!(lab_run_status(&interrupted, now), RunStatus::Abandoned);
+
+        // Complete without `scores.json` — a lab run that finished but whose
+        // bench artifacts were never part of its shape.
+        let done = lab_summary_with_lifecycle("d", false, false, Some(Lc::Complete));
+        assert_eq!(lab_run_status(&done, now), RunStatus::Complete);
+
+        // `degenerate` still downgrades a completed run.
+        let degen = lab_summary_with_lifecycle("d", false, true, Some(Lc::Complete));
+        assert_eq!(lab_run_status(&degen, now), RunStatus::Error);
+
+        // CONTROL — the same summary with no record keeps the old behavior.
+        // Without this the four assertions above could all pass against a
+        // function that ignored the record and happened to agree.
+        let no_record = lab_summary_with_lifecycle("d", false, false, None);
+        assert_eq!(
+            lab_run_status(&no_record, now),
+            RunStatus::Running,
+            "a pre-lifecycle run keeps the artifact-and-staleness inference"
+        );
+    }
+
+    /// `Running` and `Unknown` deliberately DO NOT short-circuit: the first
+    /// may be a hard-killed run whose `Drop` never ran (the one gap RAII
+    /// cannot close), and the second must never be read as a verdict.
+    #[test]
+    fn running_and_unknown_fall_through_to_the_staleness_check() {
+        use darkmux_lab::lab::lifecycle::LifecycleStatus as Lc;
+        let now = 1_700_000_000_000u64;
+        let stale = now + stale_after_ms() + 1;
+
+        for st in [Lc::Running, Lc::Unknown] {
+            let fresh = lab_summary_with_lifecycle("d", false, false, Some(st));
+            assert_eq!(lab_run_status(&fresh, now), RunStatus::Running, "{st:?} fresh");
+
+            let old = lab_summary_with_lifecycle("d", false, false, Some(st));
+            assert_eq!(
+                lab_run_status(&old, stale),
+                RunStatus::Abandoned,
+                "{st:?} whose trail stopped is abandoned, not eternally live"
+            );
         }
     }
 
