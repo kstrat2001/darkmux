@@ -6,6 +6,7 @@ import {
   createFacetSeen,
   defaultFilterState,
   matchesFilters,
+  MODEL_ACTIVITIES,
 } from "./eventFilters";
 import type { FlowRecord } from "../types/handwritten";
 
@@ -112,5 +113,38 @@ describe("absorbNewFacetValues — viewer.html's absorbNewFilterValues()/SEEN (#
     filters = absorbNewFacetValues(filters, facets, seen);
     const again = absorbNewFacetValues(filters, facets, seen);
     expect(again).toBe(filters);
+  });
+});
+
+describe("MODEL_ACTIVITIES — the 'model only' quick filter", () => {
+  /** Measured live on a real `dispatch pr-reviewer`: across twelve minutes the
+   *  session emitted 171 `dispatch.turn.heartbeat`, 94 `telemetry.process` and
+   *  one `dispatch start` — and ZERO reasoning/tool/turn records, because the
+   *  model was still inside its first turn. "model only" therefore rendered an
+   *  empty list while the model was visibly generating, which reads as
+   *  "nothing is happening" at the moment the most is. */
+  it("includes heartbeat, the only model signal during a long first turn", () => {
+    expect(MODEL_ACTIVITIES.has("heartbeat")).toBe(true);
+  });
+
+  it("still includes the per-turn activities it was written for", () => {
+    for (const a of ["reasoning", "tool call", "turn"]) {
+      expect(MODEL_ACTIVITIES.has(a)).toBe(true);
+    }
+  });
+
+  it("excludes activity that is not the model working", () => {
+    // Host telemetry and lifecycle bookends are about the RUN, not the model.
+    for (const a of ["host telemetry", "dispatch start", "dispatch end", "note"]) {
+      expect(MODEL_ACTIVITIES.has(a)).toBe(false);
+    }
+  });
+
+  /** The regression this guards, stated as the real shape: a session whose
+   *  only records are heartbeats must not filter down to nothing. */
+  it("a heartbeat-only session is not empty under the model-only filter", () => {
+    const activities = ["heartbeat", "heartbeat", "host telemetry", "heartbeat"];
+    const kept = activities.filter((a) => MODEL_ACTIVITIES.has(a));
+    expect(kept).toHaveLength(3);
   });
 });

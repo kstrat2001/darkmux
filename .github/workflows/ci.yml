@@ -533,7 +533,9 @@ jobs:
         # tests/parity/lib/sanitize.mjs, which already owns it for the parity
         # scrubber. One list read twice cannot drift; two lists kept in sync by
         # hand is how the first leak happened.
-        run: python3 scripts/engagement-sentinel-guard.py
+        run: |
+          python3 scripts/engagement-sentinel-guard.py --self-test
+          python3 scripts/engagement-sentinel-guard.py
       - name: Demo page is in sync with the served viewer
         run: |
           # darkmux.com/demo IS whatever the daemon serves at `/`, in playback

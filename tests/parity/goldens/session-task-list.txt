@@ -19,7 +19,6 @@ task-list
 
 === stage ===
 RUNNING RUN · FETCH-RENDER (task-list on )
-run
 route
 LMStudio · local · this machine
 timing

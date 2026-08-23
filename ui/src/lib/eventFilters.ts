@@ -70,8 +70,24 @@ export const ACT_ORDER: string[] = [
 ];
 
 /** `ACT_ICON`'s "model only" subset — viewer.html:861's `onlymodel` quick
- * filter (`window.onlyModelActivity`). */
-export const MODEL_ACTIVITIES = new Set(["reasoning", "tool call", "turn"]);
+ * filter (`window.onlyModelActivity`).
+ *
+ * `heartbeat` is in here, and it is the reason this filter works at all during
+ * the window an operator most wants it. Measured live on a real dispatch: over
+ * twelve minutes the session emitted 171 `dispatch.turn.heartbeat` records, 94
+ * `telemetry.process`, and exactly ONE `dispatch start` — and zero
+ * `dispatch.reasoning`, `dispatch.tool` or `dispatch.turn`, because the model
+ * was still inside its first turn. With the original three-element set, "model
+ * only" showed an EMPTY list while the model was visibly generating in
+ * LMStudio, which reads as "nothing is happening" at the exact moment the most
+ * is.
+ *
+ * A heartbeat IS model activity: it is the runtime's proof-of-work signal for a
+ * turn in flight. The original set was written against a multi-turn agentic
+ * shape where turns land every ~30s, so per-turn records were always arriving;
+ * it does not survive a single long reasoning turn, which is the shape a review
+ * or any thinking-family dispatch actually takes. */
+export const MODEL_ACTIVITIES = new Set(["reasoning", "tool call", "turn", "heartbeat"]);
 
 export interface Facets {
   act: string[];
