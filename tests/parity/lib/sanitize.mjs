@@ -51,9 +51,13 @@
 // after re-recording shows real changes, not sanitizer entropy. The
 // original->synthetic mapping is never written to disk.
 //
-// Machine names (MacBook-Pro, m1-max-32gb-studio) are deliberately NOT
-// touched — operator hardware names aren't client-identifying and the plan
-// brief says they may stay. `kstrat2001` (the operator's own public OSS org)
+// STANDALONE machine-name fields (`machine_id: "MacBook-Pro"`,
+// `m1-max-32gb-studio`) are deliberately NOT touched — operator hardware
+// names aren't client-identifying and the plan brief says they may stay.
+// The machine label INSIDE a MagicDNS name is a different case and IS
+// rewritten (see `scrubMagicDns`): there the label is one half of a network
+// identifier, and leaving it while hashing the other half would publish
+// "which machine" alongside a scrubbed "which tailnet". `kstrat2001` (the operator's own public OSS org)
 // is likewise left alone where it appears — it's the operator's own public
 // identity, not client engagement content.
 
@@ -111,7 +115,12 @@ const IPV4_RE = /\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g;
 // MagicDNS hostname, which nothing rewrote. The tailnet component is the
 // durable identifier of the two — an address can be reassigned, a tailnet name
 // is the same string everywhere it appears.
-const MAGICDNS_RE = /\b([a-z0-9-]+)\.([a-z0-9-]+)\.ts\.net\b/gi;
+// The machine label is OPTIONAL: `tailscale status --json` reports the
+// tailnet as a bare `MagicDNSSuffix` (`<tailnet>.ts.net`), and the tailnet
+// is the durable half — a machine can be renamed, a tailnet name is the
+// same string everywhere it appears. Requiring two labels let exactly that
+// form through both this scrubber and the repo guard.
+const MAGICDNS_RE = /\b(?:([a-z0-9-]+)\.)?([a-z0-9-]+)\.ts\.net\b/gi;
 
 function stableHex(input, salt) {
   return createHash("sha256").update(salt + ":" + input).digest("hex");
@@ -162,10 +171,20 @@ function syntheticUuid(original) {
 function syntheticIpv4(original) {
   const digest = stableHex(original, "ip");
   const octet = (i) => 1 + (parseInt(digest.slice(i * 2, i * 2 + 2), 16) % 254);
-  // Kept in the CGNAT-shaped 100.x.x.x range for plausibility (the real
-  // value it replaces is a Tailscale address in that same range) — not load
-  // bearing, just avoids a jarring shape change in the fixture.
-  return `100.${octet(1)}.${octet(2)}.${octet(3)}`;
+  // Second octet forced ABOVE the CGNAT range (100.64–100.127). The shape
+  // stays 100.x.x.x for plausibility — the value it replaces is a Tailscale
+  // address, and a jarring shape change in the fixture helps nobody — but a
+  // synthetic that lands INSIDE CGNAT is indistinguishable from a real
+  // tailnet address to `scripts/engagement-sentinel-guard.py`, which flags
+  // that range on sight.
+  //
+  // Measured before this constraint existed: 255 of 1000 draws (25.5%) fell
+  // in 100.65–100.127, so a corpus re-record carrying two distinct addresses
+  // had a ~44% chance of failing CI on CORRECTLY sanitized content — and the
+  // obvious remedy a maintainer reaches for under a red build is loosening
+  // the guard, which reopens the hole the guard exists to close.
+  const highOctet = 128 + (parseInt(digest.slice(2, 4), 16) % 127); // 128..254
+  return `100.${highOctet}.${octet(2)}.${octet(3)}`;
 }
 
 function scrubIpv4(s) {
@@ -176,8 +195,12 @@ function scrubIpv4(s) {
 // the operator's hardware model, which is identifying on its own.
 function scrubMagicDns(s) {
   return s.replace(MAGICDNS_RE, (_m, host, tailnet) => {
-    const h = stableHex(host, "magicdns-host").slice(0, 8);
-    const t = stableHex(tailnet, "magicdns-tailnet").slice(0, 10);
+    // Lowercased before hashing so `Host.Tailnet.TS.NET` and its lowercase
+    // twin map to the SAME synthetic — otherwise one real machine produces
+    // two different fixtures depending on how a field happened to be cased.
+    const t = stableHex(tailnet.toLowerCase(), "magicdns-tailnet").slice(0, 10);
+    if (host === undefined) return `tailnet-${t}.ts.net`;
+    const h = stableHex(host.toLowerCase(), "magicdns-host").slice(0, 8);
     return `host-${h}.tailnet-${t}.ts.net`;
   });
 }

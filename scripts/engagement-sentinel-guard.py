@@ -96,7 +96,12 @@ CGNAT_RE = re.compile(
     r"(?<![\d.])100\.(?:6[5-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?![\d.])"
 )
 EXAMPLE_TAILNETS = {"tailnet", "tailnet-example", "your-tailnet", "example"}
-MAGICDNS_RE = re.compile(r"\b[a-z0-9-]+\.([a-z0-9-]+)\.ts\.net\b", re.I)
+# The machine label is OPTIONAL, matching `sanitize.mjs`. `tailscale status
+# --json` reports the tailnet as a bare `MagicDNSSuffix`
+# (`<tailnet>.ts.net`), and the tailnet is the durable half — a machine can
+# be renamed, a tailnet name is the same string everywhere it appears.
+# Requiring two labels let exactly that form past this guard.
+MAGICDNS_RE = re.compile(r"\b(?:[a-z0-9-]+\.)?([a-z0-9-]+)\.ts\.net\b", re.I)
 
 
 def network_identifier_hits(line: str) -> bool:

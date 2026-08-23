@@ -5237,11 +5237,11 @@ mod tests {
         // A different daemon port → not our proxy → None.
         assert_eq!(parse_tailnet_viewer_url(json, 9000), None);
         // Served on 443 → https scheme.
-        let j443 = r#"{"Web":{"host.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
-        assert_eq!(parse_tailnet_viewer_url(j443, 8765).as_deref(), Some("https://host.ts.net/"));
+        let j443 = r#"{"Web":{"tailnet-example.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8765"}}}}}"#;
+        assert_eq!(parse_tailnet_viewer_url(j443, 8765).as_deref(), Some("https://tailnet-example.ts.net/"));
         // localhost proxy target is accepted too.
-        let jlocal = r#"{"Web":{"h.ts.net:80":{"Handlers":{"/":{"Proxy":"http://localhost:8765"}}}}}"#;
-        assert_eq!(parse_tailnet_viewer_url(jlocal, 8765).as_deref(), Some("http://h.ts.net/"));
+        let jlocal = r#"{"Web":{"example.ts.net:80":{"Handlers":{"/":{"Proxy":"http://localhost:8765"}}}}}"#;
+        assert_eq!(parse_tailnet_viewer_url(jlocal, 8765).as_deref(), Some("http://example.ts.net/"));
         // Not serving / empty / garbage → None (best-effort, never an error).
         assert_eq!(parse_tailnet_viewer_url("{}", 8765), None);
         assert_eq!(parse_tailnet_viewer_url("not json", 8765), None);

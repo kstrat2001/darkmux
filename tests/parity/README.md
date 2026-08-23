@@ -212,9 +212,11 @@ no field-name policy alone could safely blank without destroying the
 golden's value) stay mostly-real while still catching entity references
 inside it, and it's what scrubs the tailnet IP in `redis_url_redacted`.
 
-Machine names (`MacBook-Pro`, `m1-max-32gb-studio`) are left alone —
-operator hardware names aren't client-identifying and the plan brief says
-they may stay. `kstrat2001` (the operator's own public OSS org/repo
+Standalone machine-name fields (`MacBook-Pro`, `m1-max-32gb-studio`) are
+left alone — operator hardware names aren't client-identifying and the plan
+brief says they may stay. The machine label inside a **MagicDNS name** is a
+different case and is rewritten along with the tailnet, since there it is
+half of a network identifier rather than a hardware label. `kstrat2001` (the operator's own public OSS org/repo
 identity) is likewise left alone where it appears. Every replacement is a
 stable hash of the *original* value (never persisted), so re-recording the
 same real content always produces the same synthetic output — a corpus diff
