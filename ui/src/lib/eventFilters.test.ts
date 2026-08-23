@@ -8,6 +8,7 @@ import {
   matchesFilters,
   MODEL_ACTIVITIES,
 } from "./eventFilters";
+import { onlyModelFacet } from "../components/FiltersDialog";
 import type { FlowRecord } from "../types/handwritten";
 
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
@@ -146,5 +147,45 @@ describe("MODEL_ACTIVITIES — the 'model only' quick filter", () => {
     const activities = ["heartbeat", "heartbeat", "host telemetry", "heartbeat"];
     const kept = activities.filter((a) => MODEL_ACTIVITIES.has(a));
     expect(kept).toHaveLength(3);
+  });
+});
+
+describe("'model only' over the PRODUCTION filter path", () => {
+  // The other MODEL_ACTIVITIES tests assert on the Set object and reimplement
+  // the filter inline, so they exercise `Set.prototype.has` and can never fail
+  // for a production reason. Two mutations that reproduce the exact bug this
+  // fixes both left 967/967 green: gating heartbeat out inside
+  // `onlyModelFacet`, and renaming the label `activityOf` returns so the set
+  // member is dead. This test runs the real chain — activityOf -> computeFacets
+  // -> onlyModelFacet -> matchesFilters — and dies under both.
+  const heartbeat: FlowRecord = {
+    ts: "2026-08-08T12:00:00.000Z",
+    category: "work",
+    action: "dispatch.turn.heartbeat",
+  } as FlowRecord;
+  const hostTelemetry: FlowRecord = {
+    ts: "2026-08-08T12:00:01.000Z",
+    category: "telemetry",
+    source: "process",
+  } as FlowRecord;
+
+  it("a first-turn session shows its heartbeats instead of reading as idle", () => {
+    // The measured shape of a live dispatch still inside turn 1: heartbeats and
+    // host telemetry, and NO reasoning/tool/turn records yet.
+    const records = [heartbeat, hostTelemetry];
+    const facets = computeFacets(records);
+    const filters = { ...defaultFilterState(facets), act: onlyModelFacet(facets) };
+    const shown = records.filter((r) => matchesFilters(r, filters));
+
+    expect(shown).toHaveLength(1);
+    expect(shown[0]).toBe(heartbeat);
+  });
+
+  it("'model only' still excludes host telemetry", () => {
+    const facets = computeFacets([heartbeat, hostTelemetry]);
+    expect(matchesFilters(hostTelemetry, {
+      ...defaultFilterState(facets),
+      act: onlyModelFacet(facets),
+    })).toBe(false);
   });
 });

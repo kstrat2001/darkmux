@@ -3252,16 +3252,31 @@ body {
   font-size: 12px;
   overflow-wrap: anywhere;
 }
-/* A self-describing one-liner (the prompt summary) — neither half of a pair. */
 .session-run .brief-link {
   color: var(--accent);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+/* A self-describing one-liner (the prompt summary) — neither half of a pair. */
 .session-run .brief-note {
   color: var(--dim);
   font-size: 11px;
   margin-top: 8px;
+}
+/* The rule this replaced (`.session-run .track > div:not(:first-child)`) was
+   POSITIONAL, so it dimmed the body lines of every track in the panel — not
+   just the brief. `SessionReplay` renders two more (model, detections) whose
+   body lines lost their styling when it went, which relocated the exact defect
+   this block fixes rather than removing it: `model (lms)` and `no telemetry
+   yet` rendered at identical size and colour, as did `detections` and
+   `✓ clean`. `.lbl` has no rule of its own, so that positional selector was
+   the only thing separating them.
+   Invisible to every test — goldens compare `innerText`, and all seven parity
+   suites passed with it broken. Caught by reading `getComputedStyle` on a real
+   drill-in. */
+.session-run .track > div:not([class^="brief-"]):not(.lbl) {
+  color: var(--dim);
+  font-size: 11px;
 }
 
 .session-run .metrics {

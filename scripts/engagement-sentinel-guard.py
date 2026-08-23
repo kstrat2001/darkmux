@@ -248,6 +248,13 @@ SELF_TEST_CASES = [
     (f"url: somebox.{_INVENTED_TAILNET}.{_TS_SUFFIX}", True, "a real-shaped tailnet"),
     (f"addr: {_INVENTED_CGNAT}", True, "an address inside CGNAT"),
     (f"suffix: {_INVENTED_TAILNET}.{_TS_SUFFIX}", True, "bare MagicDNSSuffix, no machine label"),
+    # The DISCRIMINATOR is the 10-hex, not the `tailnet-` prefix. Without this
+    # case, loosening SYNTHETIC_TAILNET_RE to `^tailnet` (or dropping the `$`)
+    # keeps the suite green — and that is precisely the loosening a maintainer
+    # reaches for under a red build, which is the failure this self-test exists
+    # to prevent. Every other "must be caught" fixture uses a name that does not
+    # begin with `tailnet`, so none of them can tell the two apart.
+    (f"url: box.tailnet-corp.{_TS_SUFFIX}", True, "a real name may begin `tailnet-`; only the 10-hex form is the scrubber's"),
 ]
 
 
