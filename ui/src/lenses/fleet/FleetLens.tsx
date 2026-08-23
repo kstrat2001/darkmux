@@ -5,7 +5,7 @@ import { queryKeys } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useFleetCoverage, useLiveMachines } from "../../hooks/useLiveMachines";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { localMachineUid, machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS, T } from "../../lib/flow";
+import { machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS, T } from "../../lib/flow";
 import type { FlowRecord } from "../../types/handwritten";
 import { fmtN, fmtC } from "../../lib/format";
 import { MachineIcon } from "../../components/MachineIcon";
@@ -23,33 +23,40 @@ import type { MachineSpecs } from "../../types/handwritten";
  * machines render with no icon until /machine/specs/<id> wiring lands"). No
  * text content — contributes nothing to the parity extractor's `innerText`,
  * same as legacy's inline SVG. */
-/** (#1809) A fleet-card click's destination. The runs lens is taken ONLY for
- * a machine positively known to be remote; local and not-yet-known both go
- * to the residency room.
+/** Every machine card drills to the RUNS lens, pinned to that machine.
  *
- * The obvious rule — "local goes to the room, everything else goes to runs"
- * — is wrong in a way that only shows up in the first paint, and it was
- * measured doing exactly that: `localUid` is null until `/machine/specs`
- * resolves, so the LOCAL card was clickable-and-wrong for one frame
- * (`+0ms → lens=runs`, `+100ms → lens=machine`). On loopback that is a
- * blink; over the tailnet phone path it scales with round-trip time, and
- * the wrong destination is SILENT — you land on a populated, plausible runs
- * list rather than anything that says it guessed. `specs` is also gated on
- * `liveMode`, so on a playback route locality never resolves at all and the
- * old rule sent every card, local included, to the runs lens permanently.
+ * One destination, because the alternative is only ever valid for ONE
+ * machine. The residency room reads `/machine/resources`, and that probe
+ * answers for THIS host only — a remote machine's residency is unreadable
+ * from here by construction (`MachineLens.tsx` says so in its own doc, and
+ * gates `resourcesQuery` off accordingly). So the machine lens can never be
+ * a correct destination for a remote card, and making it a CONDITIONAL
+ * destination is what made the navigation inconsistent: the same gesture on
+ * two cards went to two different kinds of page, one of which could not
+ * answer.
  *
- * Inverting the unknown case fixes both, because the two failure modes are
- * not symmetric. A remote machine that lands in the residency room gets an
- * honest dead end — "residency / RAM not reported from here, local-probe
- * only" — which names its own limitation and self-corrects the moment specs
- * confirm locality. A local machine that lands in the runs lens gets a
- * confident, wrong, and unlabeled answer to a question it did not ask. When
- * a guess is unavoidable, guess toward the destination that admits it is
- * guessing. */
-function machineDrillHash(uid: string, localUid: string | null): string {
-  const knownRemote = localUid != null && uid !== localUid;
-  if (knownRemote) return `lens=runs&machine=${encodeURIComponent(uid)}`;
-  return `lens=machine&uid=${encodeURIComponent(uid)}`;
+ * "What is running here" is a question every card can answer, local or
+ * remote, and it is the question the card is already asking on the
+ * operator's behalf — it shows a running count and an activity timeline. So
+ * the runs list pinned to that machine continues what they were reading,
+ * identically for every machine.
+ *
+ * Collapsing the branch also removes a defect it had to work around:
+ * `localUid` is null until `/machine/specs` resolves, so the destination
+ * CHANGED under the operator between first paint and +100ms, and #1809 added
+ * a guess-toward-the-humbler-destination rule purely to make that flicker
+ * harmless. With one destination there is no guess and no wrong frame.
+ *
+ * The residency room is not orphaned — it keeps the MACHINE tab in the nav
+ * chrome, which is a bare `lens=machine` meaning "this machine", the only
+ * machine it can actually report on.
+ *
+ * Operator call, 2026-08-23: "a remote machine's stats can't be read so
+ * clicking that card ... would be an unusable result. The machine tab is
+ * this machine and that makes sense ... Always going to runs would make it
+ * consistent nav regardless of machine." */
+function machineDrillHash(uid: string): string {
+  return `lens=runs&machine=${encodeURIComponent(uid)}`;
 }
 
 /** (#1903) The running COUNT's own tap target — distinct from
@@ -339,19 +346,6 @@ export function FleetLens({
   });
   const specs = liveMode && specsQuery.data?.ok ? specsQuery.data.data : null;
 
-  // (#1809) Which uid IS this daemon — the SAME derivation `App.tsx`/
-  // `MachineLens.tsx` already do off their own copies of `flowWindow`/
-  // `liveMachines`/`specs`, used here for exactly one decision: where a
-  // fleet-card CLICK routes to (see the card below). `null` on a replay
-  // (`specs` is gated off — `localMachineUid(..., null)` returns `null`
-  // unconditionally) and on any daemon-less static build (no
-  // `/machine/specs` to confirm against) — every card reads as "not
-  // confirmed local" in both cases, which is the honest answer: neither has
-  // a live residency probe to claim local identity against.
-  const localUid = useMemo(
-    () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null),
-    [flowWindow.data, liveMachines, specs],
-  );
 
   // (#1869) The token hero + hybrid note are "as of the playhead" — legacy's
   // own `visible()` gate (`DATA.filter(r=>T(r.ts)<=state.t)`), restored at
@@ -450,16 +444,14 @@ export function FleetLens({
           // through (`viewer-lifecycle.spec.js`, `viewer-xss.spec.js`),
           // same contract legacy's markup gave them.
           //
-          // (#1809) The DESTINATION now splits by locality, which legacy
-          // never did (every drill went to the same page). Residency is
-          // local-probe-only by construction (#1286's "observer must not
-          // join the observed" — `/machine/resources` always describes
-          // THIS daemon's own host, never a remote one's), so a remote
-          // machine's page would otherwise be a header plus two
-          // "not reported" notices — the runs lens, pinned to that machine,
-          // is the honest destination instead. The LOCAL card (confirmed
-          // against `localUid`, above) keeps going to the residency room,
-          // same as before this packet.
+          // Every card drills to the runs lens pinned to that machine —
+          // see `machineDrillHash`'s own doc for why there is one
+          // destination and not a locality split. The short version:
+          // residency is local-probe-only by construction (#1286's
+          // "observer must not join the observed" — `/machine/resources`
+          // always describes THIS daemon's own host), so the residency room
+          // can only ever answer for one machine, and a destination valid
+          // for one machine made the same gesture mean two different things.
           <div
             key={card.uid}
             className={`mach${card.active && !card.absent ? " active" : ""}${card.absent ? " absent" : ""}`}
@@ -486,12 +478,12 @@ export function FleetLens({
             // cleanup that nesting still needs.
             aria-label={card.name}
             onClick={() => {
-              location.hash = machineDrillHash(card.uid, localUid);
+              location.hash = machineDrillHash(card.uid);
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                location.hash = machineDrillHash(card.uid, localUid);
+                location.hash = machineDrillHash(card.uid);
               }
             }}
           >

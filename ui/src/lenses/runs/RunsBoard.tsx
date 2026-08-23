@@ -683,6 +683,16 @@ function RunRow({ run, showMachine, onActivate }: { run: Run; showMachine: boole
         <span className="labruncrew">{run.id}</span>
         {ago && <span className="labrundir">{ago}</span>}
         {!run.tracked && <span className="rununtracked">untracked</span>}
+        {/* The nav indicator is rendered ONLY when the row actually has a
+            destination, so its presence is the affordance rather than a
+            decoration. Hover cannot carry this on touch — there is no hover
+            on a phone — and 29 of 489 rows on a real daemon genuinely go
+            nowhere (an untracked mission whose session records have aged out
+            of the flow window), so a chevron on every row would promise a
+            destination six percent of the time it does not have one.
+            `aria-hidden` because `role="button"` already tells assistive
+            tech what this row is; the chevron is for the eye. */}
+        {interactive && <span className="runnav" aria-hidden="true">›</span>}
       </div>
       {subtitle && <div className="labrunmeta dim">{subtitle}</div>}
     </div>

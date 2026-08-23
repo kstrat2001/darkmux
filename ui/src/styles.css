@@ -1036,6 +1036,34 @@ body {
 .labrunrow.flat {
   cursor: default;
 }
+/* Only a row that GOES somewhere reacts. A hover on a dead row would be a
+   promise the click cannot keep. */
+.labrunrow:not(.flat):hover {
+  border-color: var(--accent);
+  background: #172032;
+}
+.labrunrow:not(.flat):hover .runnav {
+  color: var(--accent);
+  transform: translateX(2px);
+}
+/* Pushed to the right edge of the row's first line. `margin-left: auto`
+   rather than a fixed position so it survives the wrap `.labrunmain` does on
+   a narrow viewport. */
+.runnav {
+  margin-left: auto;
+  color: var(--dim, #6b7590);
+  font-size: 15px;
+  line-height: 1;
+  transition: transform 120ms ease, color 120ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .runnav {
+    transition: none;
+  }
+  .labrunrow:not(.flat):hover .runnav {
+    transform: none;
+  }
+}
 .labrunrow:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;

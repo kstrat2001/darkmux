@@ -87,6 +87,41 @@ describe("RunsBoard", () => {
    *  nothing in this file exercised it — the badge path is fully generic
    *  (`labbadge ${run.status}`), so the risk was low, but the styling was
    *  asserted by nothing. */
+  /** The row's nav affordance. Measured on a real daemon: 29 of 489 rows
+   *  (`kind==="mission"`, untracked, no `session_id` — an ACP-ephemeral or an
+   *  aged-out review whose session records have left the flow window) resolve
+   *  to `runDestination`'s `"none"` and swallow the click. Those rows are
+   *  correctly inert already (no `role`, no handler), but they LOOKED
+   *  identical to a live row, so a dead click read as a broken control.
+   *
+   *  The chevron is the fix rather than hover alone, because hover does not
+   *  exist on a phone — and hover on every row would promise a destination
+   *  6% of the time there is none. Its PRESENCE is the affordance. */
+  it("a row that has a destination renders the nav chevron and is interactive", async () => {
+    mockFetch(true, true, {}, [
+      { id: "m-live", kind: "mission", status: "complete", tracked: true, updated_ts: 400 },
+    ]);
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("m-live")).toBeInTheDocument());
+    const row = document.querySelector(".labrunrow")!;
+    expect(row).toHaveAttribute("role", "button");
+    expect(row).not.toHaveClass("flat");
+    expect(row.querySelector(".runnav")).not.toBeNull();
+  });
+
+  it("a row with NO destination renders no chevron and stays inert", async () => {
+    // Untracked mission with no session_id — `runDestination` -> "none".
+    mockFetch(true, true, {}, [
+      { id: "acp-ephemeral-x", kind: "mission", status: "abandoned", tracked: false, updated_ts: 400 },
+    ]);
+    renderBoard();
+    await waitFor(() => expect(screen.getByText("acp-ephemeral-x")).toBeInTheDocument());
+    const row = document.querySelector(".labrunrow")!;
+    expect(row).not.toHaveAttribute("role");
+    expect(row).toHaveClass("flat");
+    expect(row.querySelector(".runnav")).toBeNull();
+  });
+
   it("renders the unparseable status badge with its own class and text", async () => {
     mockFetch(true, true, {}, [{ id: "m-broken", kind: "mission", status: "unparseable", tracked: true, updated_ts: 400 }]);
     renderBoard();
