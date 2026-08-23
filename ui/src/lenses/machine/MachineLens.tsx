@@ -94,12 +94,15 @@ export function lineClass(line: string): string | undefined {
  * link into `#lens=runs&machine=<uid>` (`RunsBoard.tsx`'s machine pin) —
  * see the render below for the link itself.
  *
- * Reached by TWO entry points now, not three: the nav tab / bare
- * `#lens=machine` deep-link (`uid: null` — always "the local machine"), and
- * a LOCAL fleet-card drill (`uid: <uid>`, `FleetLens.tsx`'s locality split —
- * a REMOTE card now routes to the runs lens instead, since a remote
- * machine's residency is unreadable from here by construction: no
- * `/machine/resources` probe exists for a host that isn't this one). The
+ * Reached by ONE minted entry point: the nav tab / bare `#lens=machine`
+ * deep-link (`uid: null` — always "the local machine"). As of 2026-08-23 the
+ * fleet card no longer drills here at all, local or remote: a remote
+ * machine's residency is unreadable from here by construction (no
+ * `/machine/resources` probe exists for a host that isn't this one), so a
+ * destination valid for exactly one machine made the same gesture mean two
+ * different things depending on which card was clicked. Every card now goes
+ * to the runs lens pinned to that machine — see `FleetLens.tsx`'s
+ * `machineDrillHash`. The
  * component itself still resolves an explicit REMOTE uid gracefully
  * (`isLocalMach` below stays real, `resourcesQuery` stays gated off) — a
  * `#lens=machine&uid=<remote>` bookmark minted before this packet, or typed

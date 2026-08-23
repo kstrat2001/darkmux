@@ -1036,6 +1036,43 @@ body {
 .labrunrow.flat {
   cursor: default;
 }
+/* Only a row that GOES somewhere reacts. A hover on a dead row would be a
+   promise the click cannot keep. */
+.labrunrow:not(.flat):hover {
+  border-color: var(--accent);
+  background: #172032;
+}
+.labrunrow[data-nav="1"]:hover::after {
+  color: var(--accent);
+  transform: translateX(2px);
+}
+/* Pushed to the right edge of the row's first line. `margin-left: auto`
+   rather than a fixed position so it survives the wrap `.labrunmain` does on
+   a narrow viewport. */
+/* A pseudo-element, not a text node — see `RunRow`'s own comment: a text
+   chevron lands in the extracted `#stage` text and breaks the frozen parity
+   goldens, which is right to reject it. Decoration is not content. */
+.labrunrow[data-nav="1"]::after {
+  content: "\203A";
+  position: absolute;
+  right: 11px;
+  top: 10px;
+  color: var(--dim, #6b7590);
+  font-size: 15px;
+  line-height: 1;
+  transition: transform 120ms ease, color 120ms ease;
+}
+.labrunrow {
+  position: relative;
+}
+@media (prefers-reduced-motion: reduce) {
+  .labrunrow[data-nav="1"]::after {
+    transition: none;
+  }
+  .labrunrow[data-nav="1"]:hover::after {
+    transform: none;
+  }
+}
 .labrunrow:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;

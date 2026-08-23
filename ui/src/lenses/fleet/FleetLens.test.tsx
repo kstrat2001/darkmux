@@ -211,7 +211,7 @@ describe("FleetLens", () => {
     expect(card.textContent).toContain("MacBook-Pro");
     expect(card).toHaveAttribute("role", "button");
     fireEvent.click(card);
-    expect(window.location.hash).toBe("#lens=machine&uid=u1");
+    expect(window.location.hash).toBe("#lens=runs&machine=u1");
   });
 
   it("Enter/Space also activates the LOCAL fleet-card drill-in (keyboard parity with the click)", async () => {
@@ -230,7 +230,7 @@ describe("FleetLens", () => {
     const card = document.querySelector(".mach")!;
     expect(card.textContent).toContain("MacBook-Pro");
     fireEvent.keyDown(card, { key: "Enter" });
-    expect(window.location.hash).toBe("#lens=machine&uid=u1");
+    expect(window.location.hash).toBe("#lens=runs&machine=u1");
   });
 
   // (#1809, merge-gate fix) The runs lens is for a machine POSITIVELY known
@@ -253,10 +253,11 @@ describe("FleetLens", () => {
     renderFleetLens();
     await waitFor(() => expect(document.querySelector(".mach")).not.toBeNull());
     fireEvent.click(document.querySelector(".mach")!);
-    // The room names its own limitation for a remote machine and
-    // self-corrects once specs land; the runs lens would have answered a
-    // question the operator did not ask, confidently and unlabeled.
-    expect(window.location.hash).toBe("#lens=machine&uid=u1");
+    // The point of the single destination: an UNCONFIRMED card and a
+    // confirmed one now agree, so there is no frame in which this card points
+    // somewhere it will not point once `/machine/specs` resolves. That
+    // flicker is what the old locality branch was working around.
+    expect(window.location.hash).toBe("#lens=runs&machine=u1");
   });
 
   it("a CONFIRMED-REMOTE card goes to the runs lens, pinned to that machine", async () => {
@@ -357,12 +358,14 @@ describe("FleetLens", () => {
     fireEvent.click(countEl);
     expect(window.location.hash).toBe("#lens=runs&machine=u1");
 
-    // The card BODY's own click (anywhere else on the card) is untouched —
-    // this is a LOCAL-confirmed card, so it still goes to the residency
-    // room, not the runs lens the count above just navigated to.
+    // The card BODY now reaches the SAME destination as the count. Before
+    // 2026-08-23 it went to the residency room on a local card; the operator
+    // asked for one destination ("clicking a machine ... should go to the
+    // runs tab with a filter by machine"), which also removed the first-paint
+    // flicker the locality branch existed to make harmless.
     window.location.hash = "";
     fireEvent.click(card.querySelector(".name")!);
-    expect(window.location.hash).toBe("#lens=machine&uid=u1");
+    expect(window.location.hash).toBe("#lens=runs&machine=u1");
   });
 
   it("(#1903) tapping the running count with exactly 1 live session opens that run's session drill directly", async () => {
