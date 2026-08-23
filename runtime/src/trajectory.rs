@@ -275,6 +275,48 @@ impl Trajectory {
     /// (count ≈ MAX_TOKENS_PER_CALL) vs context-overflow-shaped (count
     /// well below cap), and the recovery budget consumption so
     /// repeated stalls in one dispatch are visible at a glance.
+    /// (#1221) The harness checked in on a turn that hit the checkpoint
+    /// interval, and either let it keep thinking or asked it to conclude.
+    ///
+    /// Its own event type on purpose. A checkpoint continuation is the SAME
+    /// logical turn resuming, not a new one — but it IS a new API call, so
+    /// without this the only trace was another `model.completed` and the
+    /// stream read as N turns for what the operator watched as one unbroken
+    /// thought. Twelve continuations of one turn produced twelve "turn"
+    /// records and exactly one `model.reasoning`, because after a prefill the
+    /// provider returns the continued thinking as ordinary `content` and no
+    /// longer tags it as reasoning.
+    ///
+    /// This record says what the HARNESS did, which is a different fact from
+    /// what the model did, and belongs in a different event.
+    pub fn append_checkpoint(
+        &mut self,
+        seq: u32,
+        checkpoint: u32,
+        slice_tokens: Option<u32>,
+        tail_ratio: Option<f32>,
+        verdict: &str,
+    ) {
+        let slice = slice_tokens
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        // `null` rather than a number when the slice was too short to judge —
+        // a 0.0 would read as "maximally repetitive", the exact opposite.
+        let ratio = tail_ratio
+            .and_then(|r| serde_json::Number::from_f64(r as f64))
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null);
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.checkpoint",
+            "seq": seq,
+            "ts": unix_ms(),
+            "checkpoint": checkpoint,
+            "slice_tokens": slice,
+            "tail_ratio": ratio,
+            "verdict": verdict,
+        }));
+    }
+
     pub fn append_intra_turn_stall_recovered(
         &mut self,
         seq: u32,

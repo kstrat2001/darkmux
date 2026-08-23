@@ -21,6 +21,8 @@ export function activityOf(r: FlowRecord): string {
   if (a === "dispatch.tool") return "tool call";
   if (a === "dispatch.turn") return "turn";
   if (a === "dispatch.turn.heartbeat") return "heartbeat";
+  // (#1221) The harness deciding mid-turn whether the model keeps thinking.
+  if (a === "dispatch.checkpoint") return "checkpoint";
   if (a === "dispatch.start" || a === "dispatch start") return "dispatch start";
   if (a === "dispatch.complete" || a === "dispatch complete") return "dispatch end";
   if (a === "dispatch.error" || a === "dispatch error") return "dispatch error";
@@ -47,6 +49,7 @@ export function activityOf(r: FlowRecord): string {
  * lifecycle, then telemetry. */
 export const ACT_ORDER: string[] = [
   "reasoning",
+  "checkpoint",
   "tool call",
   "turn",
   "heartbeat",
@@ -86,8 +89,20 @@ export const ACT_ORDER: string[] = [
  * turn in flight. The original set was written against a multi-turn agentic
  * shape where turns land every ~30s, so per-turn records were always arriving;
  * it does not survive a single long reasoning turn, which is the shape a review
- * or any thinking-family dispatch actually takes. */
-export const MODEL_ACTIVITIES = new Set(["reasoning", "tool call", "turn", "heartbeat"]);
+ * or any thinking-family dispatch actually takes.
+ *
+ * A `checkpoint` is model activity for the same reason, and on the same
+ * shape: it is emitted every time a long reasoning turn hits its check-in
+ * interval, which on a thinking-family dispatch is the ONLY per-turn record
+ * arriving for minutes at a time. (#1221)
+ */
+export const MODEL_ACTIVITIES = new Set([
+  "reasoning",
+  "checkpoint",
+  "tool call",
+  "turn",
+  "heartbeat",
+]);
 
 export interface Facets {
   act: string[];

@@ -416,3 +416,187 @@ mod tests {
         }
     }
 }
+
+// ── intra-turn degeneracy (#1221) ─────────────────────────────────────────
+
+/// Below this, a reasoning slice is treated as looping rather than working.
+///
+/// Deliberately far from BOTH measured clusters. Real productive reasoning —
+/// the 40,608-char pepper-grinder turn, its body alone, a resumed
+/// continuation, and a checkpoint accumulation — all scored **1.000**.
+/// Synthetic loops scored **0.013-0.015**. A threshold anywhere in 0.1-0.8
+/// separates them, so 0.25 sits with enormous margin on both sides.
+///
+/// The asymmetry is the reason to keep it low: a false CLEAN costs one more
+/// checkpoint, while a false DEGENERATE destroys an analysis pass. When in
+/// doubt this must let the model keep working.
+pub const DEGENERATE_TAIL_RATIO: f32 = 0.25;
+
+/// Distinct-window ratio over the TAIL of one reasoning slice.
+///
+/// Tail, not the whole body, because that is where the signature lives: E19
+/// measured a 51K-char turn in which only the final ~200 chars tread water
+/// while everything before was substance. Averaged over the whole slice that
+/// signal vanishes.
+///
+/// Returns `None` for a slice too short to judge — which the caller must treat
+/// as CLEAN, never as degenerate.
+///
+/// **What this does and does not catch.** It detects repetition, not lack of
+/// progress. A model that paraphrases itself in a circle scores well here and
+/// will pass. That is a knowing trade: it catches the cheap pathological case
+/// with a ~70x margin, and what it misses is bounded by the checkpoint ceiling
+/// rather than running forever. Do not read a clean score as "the model is
+/// making progress"; read it as "the model is not repeating itself".
+pub fn tail_repetition_ratio(slice: &str, window: usize, tail: usize) -> Option<f32> {
+    let toks: Vec<&str> = slice.split_whitespace().collect();
+    let start = toks.len().saturating_sub(tail);
+    let t = &toks[start..];
+    if t.len() < window.saturating_mul(3) {
+        return None;
+    }
+    let windows: Vec<String> = t.windows(window).map(|w| w.join(" ")).collect();
+    let distinct: std::collections::HashSet<&String> = windows.iter().collect();
+    Some(distinct.len() as f32 / windows.len() as f32)
+}
+
+/// How many checkpoint intervals of reasoning the gate looks back over.
+///
+/// The sample is DERIVED from the checkpoint interval rather than set beside
+/// it, because the two silently determine the gate's sensitivity together and
+/// setting them independently put it on a knife edge.
+///
+/// A model looping verbatim emits the same slice each interval, so a tail
+/// holding `k` copies scores `1/k` — the floor is `interval / sample`. With the
+/// sample pinned at 4000 and the interval at 1000, that floor was **0.2507**
+/// against a **0.25** threshold: pure verbatim looping asymptotes just ABOVE
+/// the line and never fires. The one live run that did conclude (0.2088) only
+/// got under because its content was repetitive WITHIN each slice as well.
+///
+/// Measured across the grid (verbatim floor / real-source-and-prose ceiling):
+///
+/// | sample | floor | prose |
+/// |--------|-------|-------|
+/// | 4x interval  | 0.2507 | 0.910 |
+/// | 8x interval  | 0.1252 | 0.953 |
+/// | 16x interval | 0.0625 | 0.960 |
+///
+/// 8x puts the threshold at 2x margin above the degenerate floor and ~3.8x
+/// below genuine prose, and — the point of deriving it — those margins hold
+/// whatever the operator sets the interval to.
+pub const TAIL_SAMPLE_INTERVALS: usize = 8;
+
+/// 12-token windows: the size the 1.000-vs-0.015 separation was measured at.
+pub const TAIL_WINDOW_TOKENS: usize = 12;
+
+/// The tail the gate judges, for a given checkpoint interval.
+pub fn tail_sample_tokens(checkpoint_interval: u32) -> usize {
+    (checkpoint_interval as usize).saturating_mul(TAIL_SAMPLE_INTERVALS)
+}
+
+pub fn slice_is_degenerate(slice: &str, checkpoint_interval: u32) -> bool {
+    match tail_repetition_ratio(slice, TAIL_WINDOW_TOKENS, tail_sample_tokens(checkpoint_interval)) {
+        // Too short to judge — the asymmetry says keep working.
+        None => false,
+        Some(r) => r < DEGENERATE_TAIL_RATIO,
+    }
+}
+
+#[cfg(test)]
+mod degeneracy_tests {
+    use super::*;
+
+    #[test]
+    fn an_exact_loop_is_degenerate() {
+        let looping = "I should check the guard. ".repeat(200);
+        assert!(slice_is_degenerate(&looping, 1000));
+    }
+
+    #[test]
+    fn a_two_phrase_cycle_is_degenerate() {
+        let looping = "Check the guard. Verify the path. ".repeat(120);
+        assert!(slice_is_degenerate(&looping, 1000));
+    }
+
+    #[test]
+    fn ordinary_varied_reasoning_is_clean() {
+        // Distinct sentences — the shape all four REAL samples had.
+        let productive: String = (0..300)
+            .map(|i| format!("Step {i}: inspect symbol_{i} in module_{i} and note its guard. "))
+            .collect();
+        assert!(!slice_is_degenerate(&productive, 1000));
+    }
+
+    #[test]
+    fn a_slice_too_short_to_judge_is_treated_as_clean() {
+        // The asymmetry, pinned: uncertainty must never stop a working model.
+        assert_eq!(tail_repetition_ratio("only a few words here", 12, 400), None);
+        assert!(!slice_is_degenerate("only a few words here", 1000));
+    }
+
+    #[test]
+    fn the_threshold_sits_far_from_both_measured_clusters() {
+        let looping = "same phrase again and again ".repeat(150);
+        let productive: String = (0..300)
+            .map(|i| format!("Distinct observation number {i} about a different symbol. "))
+            .collect();
+        let lr = tail_repetition_ratio(&looping, TAIL_WINDOW_TOKENS, tail_sample_tokens(1000)).unwrap();
+        let pr = tail_repetition_ratio(&productive, TAIL_WINDOW_TOKENS, tail_sample_tokens(1000)).unwrap();
+        assert!(lr < DEGENERATE_TAIL_RATIO, "loop {lr} must be below {DEGENERATE_TAIL_RATIO}");
+        assert!(pr > 0.9, "productive {pr} must be near 1.0");
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_gate_sensitivity {
+    use super::*;
+
+    /// (#1221) The gate must actually FIRE on verbatim looping — at every
+    /// checkpoint interval, not just the one it was tuned at.
+    ///
+    /// This is the test that was missing. The sample used to be a constant
+    /// (4000) beside a 1000-token interval, which put the verbatim floor at
+    /// 0.2507 against a 0.25 threshold: a model looping perfectly would
+    /// asymptote just ABOVE the line and never trip. Nothing said so, because
+    /// nothing measured the floor. Deriving the sample from the interval is
+    /// what makes the margin hold at any setting; this pins that it does.
+    #[test]
+    fn verbatim_looping_fires_at_every_interval() {
+        for interval in [250u32, 500, 1000, 2000, 4000] {
+            let slice: String = (0..interval).map(|j| format!("v{j} ")).collect();
+            // Twenty repeats: far more than the tail can hold, so this is the
+            // asymptotic floor, not a transient early value.
+            let looping = slice.repeat(20);
+            let r = tail_repetition_ratio(
+                &looping,
+                TAIL_WINDOW_TOKENS,
+                tail_sample_tokens(interval),
+            )
+            .expect("a 20x repeat is long enough to judge");
+            assert!(
+                r < DEGENERATE_TAIL_RATIO,
+                "verbatim looping at interval={interval} scored {r:.4}, which is NOT \
+                 below the {DEGENERATE_TAIL_RATIO} threshold — the gate cannot fire on \
+                 the exact failure it exists to catch"
+            );
+            assert!(
+                slice_is_degenerate(&looping, interval),
+                "interval={interval}: the gate must call verbatim looping degenerate"
+            );
+        }
+    }
+
+    /// The other side: genuinely varied reasoning must NOT be called degenerate,
+    /// however long it gets. A gate that stops good work is worse than none.
+    #[test]
+    fn novel_reasoning_never_fires_however_long() {
+        for interval in [250u32, 1000, 4000] {
+            // Ten intervals' worth of wholly distinct tokens.
+            let novel: String = (0..interval * 10).map(|j| format!("w{j} ")).collect();
+            assert!(
+                !slice_is_degenerate(&novel, interval),
+                "interval={interval}: novel reasoning must never be called degenerate"
+            );
+        }
+    }
+}

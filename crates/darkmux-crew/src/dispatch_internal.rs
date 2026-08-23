@@ -3644,6 +3644,25 @@ impl TailerState {
                     "to": event.get("tokens_after"),
                 }));
             }
+            "dispatch.checkpoint" => {
+                // (#1221) A checkpoint is the harness deciding, mid-turn,
+                // whether the model keeps thinking. Without its own record the
+                // viewer shows only the `dispatch.turn` each underlying API
+                // call produces, so one long thought reads as a dozen turns
+                // with nothing saying why — which is exactly what an operator
+                // watching a live dispatch reported. `verdict` is the decision
+                // (`continue` / `conclude`) and `tail_ratio` is the measured
+                // repetition of the accumulated reasoning it was made on, so
+                // the surface shows the judgment AND its evidence.
+                let payload = serde_json::json!({
+                    "turn_seq": event.get("seq"),
+                    "checkpoint": event.get("checkpoint"),
+                    "slice_tokens": event.get("slice_tokens"),
+                    "tail_ratio": event.get("tail_ratio"),
+                    "verdict": event.get("verdict"),
+                });
+                self.emit("dispatch.checkpoint", darkmux_flow::Level::Info, payload);
+            }
             "model.reasoning" => {
                 // The runtime emits these when it parses <think>...</think>
                 // blocks from the assistant content (#204). The full
