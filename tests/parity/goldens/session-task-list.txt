@@ -18,7 +18,7 @@ github
 task-list
 
 === stage ===
-RUNNING RUN · FETCH-RENDER (task-list on )
+RUNNING RUN · FETCH-RENDER (task-list on MacBook-Pro)
 route
 LMStudio · local · this machine
 timing

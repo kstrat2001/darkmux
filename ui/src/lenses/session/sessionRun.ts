@@ -338,7 +338,21 @@ export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
   void procs;
 
   return {
-    header: { pillLabel: svLabel.toUpperCase(), pillCls: pillClsFor(svLabel), role, sid, machineName: "" },
+    // (#1221) The machine name was a hardcoded `""`, so the run card header
+    // read `(<sid> on )` with a dangling "on" — while every record in the
+    // stream carried the right `machine_id` and the events list below rendered
+    // it correctly. A stub, not a data gap.
+    //
+    // Prefer the dispatch.start record's machine (the machine that OWNS the
+    // run) and fall back to any record in the session, so a run whose start
+    // record has scrolled out of the window still names its machine.
+    header: {
+      pillLabel: svLabel.toUpperCase(),
+      pillCls: pillClsFor(svLabel),
+      role,
+      sid,
+      machineName: String(d?.machine_id || firstSessRec?.machine_id || ""),
+    },
     briefLines,
     metrics,
     modelTrackLabel,
