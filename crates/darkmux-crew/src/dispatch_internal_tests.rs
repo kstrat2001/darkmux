@@ -3146,6 +3146,65 @@
         assert_eq!(rec["mission_id"], "pre-1.0-compat-sweep");
     }
 
+    /// (#1221) A checkpointed thinking turn is ONE turn on every surface.
+    ///
+    /// The runtime deliberately does not spend a turn on a checkpoint
+    /// continuation, so every `model.completed` from one long thought carries
+    /// the SAME `seq`. The host re-derived its own count by incrementing on
+    /// each event, so a thirteen-checkpoint turn read as thirteen turns on the
+    /// seat-card meter, in `dispatch.complete`'s `total_turns`, and in every
+    /// downstream consumer — the exact "one long thought reads as a dozen
+    /// turns" symptom this feature exists to remove, surviving in the surface
+    /// the operator actually reads. The runtime's own envelope had the right
+    /// number the whole time; only this re-derivation was wrong.
+    #[test]
+    #[serial]
+    fn checkpoint_continuations_count_as_one_turn() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-ckpt".into(),
+            "pr-reviewer".into(),
+            "darkmux:qwen3.8".into(),
+        );
+
+        // One thinking turn, four API calls: seq stays 1 across the
+        // continuations. Then a genuinely new turn at seq 2.
+        for _ in 0..4 {
+            state.handle_event(
+                r#"{"type":"model.completed","seq":1,"finish_reason":"length","tool_calls":null,"usage":{"prompt_tokens":100,"completion_tokens":999}}"#,
+            );
+        }
+        state.handle_event(
+            r#"{"type":"model.completed","seq":2,"finish_reason":"stop","tool_calls":null,"usage":{"prompt_tokens":200,"completion_tokens":50}}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            if let Some(v) = prev_redis {
+                std::env::set_var("DARKMUX_REDIS_URL", v);
+            }
+        }
+
+        assert_eq!(
+            state.summary.turns, 2,
+            "four checkpoint continuations of one thought plus one real turn is \
+             TWO turns, not five — counting API calls inflates every \
+             operator-visible turn count for reasoning-heavy dispatches"
+        );
+    }
+
     #[test]
     #[serial]
     fn handle_event_cycle_emits_telemetry_record() {

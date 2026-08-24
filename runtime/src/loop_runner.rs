@@ -81,23 +81,21 @@ use crate::trajectory::Trajectory;
 /// reasoning is discarded entirely), so reasoning-heavy dispatches raise it
 /// explicitly. No fixed number wins both ways — content-based stopping is
 /// the tracked real fix; this knob is the near-term control.
-/// (#1221) NOT a ceiling — a CHECKPOINT INTERVAL. The model reasons this far,
-/// the runtime inspects the new slice for degeneracy, and unless it is looping
-/// the reasoning is handed straight back and the model continues. The model is
-/// never told a checkpoint happened.
+/// (#1221) The per-call bound for ANSWER output — the model's committed text,
+/// not its scratch work.
 ///
-/// LOWERED from 10000 — the opposite direction to what a ceiling would want,
-/// and correct once it stops being a ceiling. As a limit, 10000 was calibrated
-/// on NON-reasoning coders and became a guillotine on thinking models (43-50%
-/// of review-corpus turns hit it). As an INTERVAL, small is good: it samples
-/// degeneracy finely and stops a loop early, and continuing costs nothing the
-/// model can perceive.
+/// Large on purpose. Chopping a long answer buys no degeneracy signal (an
+/// answer is not a thought) and every continuation re-sends the accumulation,
+/// so the cost of a small value here is quadratic in the number of chops.
 ///
-/// The real cost of a small interval is prefill, not quality — each checkpoint
-/// re-sends the accumulated context, so halving the interval roughly doubles
-/// how often the transcript is re-processed. 1000 is deliberately aggressive
-/// to make the mechanism observable; raise it with
-/// `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` once the behavior is trusted.
+/// The reasoning check-in rate is the SEPARATE constant below. These were one
+/// number until they were split, and the split is what this doc block is
+/// distinguishing: the text that used to sit here described the interval while
+/// being attached to this constant, which is how the two got conflated in the
+/// first place.
+///
+/// Override: `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` env >
+/// `runtime.max_tokens_per_call` config > this default.
 const MAX_TOKENS_PER_CALL: u32 = 10_000;
 
 /// (#1221) How far the model reasons between check-ins — a SAMPLING RATE, not a
@@ -619,6 +617,19 @@ pub fn run(
             }
         }
 
+        // Pick the bound BEFORE building the request that carries it. This
+        // sat after the struct literal, so every request went out with the
+        // PREVIOUS iteration's value — the switch to the answer bound always
+        // lagged one full call. Measured: reasoning=50 / answer=5000 produced
+        // max_tokens 50, 50, 5000, 5000, so a non-reasoning turn was still
+        // checkpointed at the small reasoning interval for one extra call,
+        // which is exactly the case the split exists to prevent.
+        per_call_cap = if in_answer_region {
+            answer_max_tokens
+        } else {
+            reasoning_interval
+        };
+
         let request = ChatRequest {
             model: model.to_string(),
             messages: messages.clone(),
@@ -627,12 +638,6 @@ pub fn run(
             temperature: 0.2,
             max_tokens: Some(per_call_cap),
             response_format: response_format.clone(),
-        };
-
-        per_call_cap = if in_answer_region {
-            answer_max_tokens
-        } else {
-            reasoning_interval
         };
 
         let next_seq = turns + 1;
@@ -901,6 +906,47 @@ pub fn run(
         // needs to see things in. When salvage fired, the content
         // field was cleared above so the truncated reasoning doesn't
         // leak into history.
+        // (#1221) A turn that CONCLUDES after checkpointing returns only the
+        // SUFFIX — a prefill continuation carries just the new text, never the
+        // prefix it continues. Pushing that suffix as a fresh message left the
+        // accumulated body orphaned in the stale prefill one slot earlier, and
+        // `main.rs` takes "the last assistant message" as the deliverable — so
+        // the envelope, the JSON `content` and the operator-visible preview all
+        // got the tail and nothing else.
+        //
+        // That is the MODAL path, not an edge case: most turns conclude rather
+        // than degenerate, and the PR's own measurement is that 43-50% of
+        // review-corpus turns hit the boundary. A feature built to stop
+        // discarding work was discarding it again, one layer up.
+        //
+        // Only on a TERMINAL finish. A `length` finish is still mid-turn: the
+        // checkpoint arm below pops this very message and rewrites the prefill,
+        // so folding here would destroy the accumulation it depends on.
+        if effective_finish_reason != "length" {
+            if let Some(i) = checkpoint_prefill_at {
+                let carried = messages
+                    .get(i)
+                    .and_then(|m| m.content.clone())
+                    .unwrap_or_default();
+                let mut merged = carried;
+                merged.push_str(assistant_message.content.as_deref().unwrap_or(""));
+                // Keep the ANSWER, not the thought. Nothing downstream strips
+                // think blocks, so folding the raw accumulation in would put
+                // scratch work into the committed deliverable — the same
+                // category error this design exists to avoid.
+                let close = crate::budget_request::THINK_CLOSE.trim();
+                let answer = match merged.rfind(close) {
+                    Some(at) => merged[at + close.len()..].trim_start().to_string(),
+                    None => merged,
+                };
+                assistant_message.content = Some(answer);
+                if i < messages.len() {
+                    messages.remove(i);
+                }
+                checkpoint_prefill_at = None;
+            }
+        }
+
         messages.push(assistant_message.clone());
 
         match effective_finish_reason {
@@ -2622,6 +2668,73 @@ mod tests {
             prefill.starts_with("word0"),
             "the answer must be handed back verbatim from its first token, got: {:?}",
             &prefill[..prefill.len().min(60)]
+        );
+    }
+
+
+    /// (#1221) A turn that CONCLUDES after checkpointing must keep its whole
+    /// answer where `main.rs` looks for it.
+    ///
+    /// A prefill continuation returns only the SUFFIX. Pushing that as a fresh
+    /// message left the accumulated body orphaned in the stale prefill one slot
+    /// earlier, and `main.rs` takes "the last assistant message" as the
+    /// deliverable — so the envelope, the JSON content and the operator preview
+    /// got the tail and nothing else. Modal path, not an edge case: most turns
+    /// conclude rather than degenerate.
+    #[test]
+    #[serial_test::serial]
+    fn a_concluding_checkpointed_turn_keeps_its_whole_answer() {
+        let server = MockServer::start();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let _m = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                then.status(200).json_body(chat_response_json(
+                    Some("PARTONE-BODY-THAT-MUST-SURVIVE"), None, "length", 100, 200,
+                ));
+            } else {
+                then.status(200).json_body(chat_response_json(
+                    Some("PARTTWO-CONCLUSION"), None, "stop", 100, 20,
+                ));
+            }
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("ckconclude2").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("t"), Message::user("answer")];
+        let tools: [Tool; 0] = [];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(10), None, Some(200), Some(200), std::collections::BTreeMap::new(), None,
+        )
+        .expect("concluding checkpointed turn returns Ok");
+
+        // Exactly what main.rs does to produce the deliverable.
+        let final_assistant = outcome
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default();
+
+        assert!(
+            final_assistant.contains("PARTONE-BODY-THAT-MUST-SURVIVE"),
+            "the deliverable lost everything before the final continuation — got {final_assistant:?}"
+        );
+        assert!(
+            final_assistant.contains("PARTTWO-CONCLUSION"),
+            "the deliverable must also carry the concluding text — got {final_assistant:?}"
+        );
+        let assistants = outcome.messages.iter().filter(|m| m.role == "assistant").count();
+        assert_eq!(
+            assistants, 1,
+            "the stale prefill must be folded away, not left beside the conclusion"
         );
     }
 

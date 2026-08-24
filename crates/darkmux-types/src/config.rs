@@ -74,7 +74,7 @@ use std::path::Path;
 // the PR-flow guide). darkmux holds no GitHub credential of its own; this
 // block only says which verb NAMES the operator has opted into running.
 // Minor bump, same lenient-read reasoning as every other additive block.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.9";
+pub const CONFIG_SCHEMA_VERSION: &str = "1.10";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent

@@ -3367,6 +3367,17 @@ struct TailerState {
     /// We accumulate bytes here and decode per-line, after the
     /// trailing newline arrives.
     pending: Vec<u8>,
+    /// (#1221) `seq` of the last `model.completed` counted as a TURN.
+    ///
+    /// A checkpointed thinking turn produces many `model.completed` events —
+    /// one per API call — all carrying the SAME `seq`, because the runtime
+    /// deliberately does not spend a turn on a continuation. The host used to
+    /// re-derive its own count by incrementing on every event, so one long
+    /// thought read as a dozen turns on the seat-card meter, in
+    /// `dispatch.complete`'s `total_turns`, and in everything downstream. The
+    /// runtime's own envelope had the right number the whole time; only this
+    /// re-derivation was wrong.
+    last_counted_turn_seq: Option<u64>,
     session_id: String,
     role_id: String,
     model: String,
@@ -3410,6 +3421,7 @@ impl TailerState {
             trajectory_path,
             offset: 0,
             pending: Vec::new(),
+            last_counted_turn_seq: None,
             session_id,
             role_id,
             model,
@@ -3466,6 +3478,7 @@ impl TailerState {
             trajectory_path,
             offset: 0,
             pending: Vec::new(),
+            last_counted_turn_seq: None,
             session_id,
             role_id,
             model,
@@ -3531,7 +3544,14 @@ impl TailerState {
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match event_type {
             "model.completed" => {
-                self.summary.turns += 1;
+                // Count TURNS, not API calls. Same `seq` = the same logical
+                // turn resuming after a checkpoint.
+                let seq = event.get("seq").and_then(|v| v.as_u64());
+                let is_new_turn = seq.is_none() || seq != self.last_counted_turn_seq;
+                if is_new_turn {
+                    self.summary.turns += 1;
+                    self.last_counted_turn_seq = seq;
+                }
                 let payload = serde_json::json!({
                     "turn_seq": event.get("seq"),
                     "finish_reason": cap_json_str(event.get("finish_reason"), MAX_TRAJ_FIELD_BYTES),
