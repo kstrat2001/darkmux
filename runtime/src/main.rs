@@ -224,6 +224,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL`. None = the built-in default
     // (`loop_runner::MAX_TOKENS_PER_CALL` = 10000).
     let mut max_tokens_per_call: Option<u32> = None;
+    let mut reasoning_checkpoint_interval: Option<u32> = None;
 
     // (#457 Step 2) Per-role feedback-template overrides. Dispatcher
     // serializes Role.feedback_templates to JSON; runtime parses into
@@ -472,6 +473,25 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                 } else {
                     eprintln!("--max-turns requires a value");
                     return ExitCode::from(2);
+                }
+            }
+            "--reasoning-checkpoint-interval" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) if n > 0 => {
+                            reasoning_checkpoint_interval = Some(n);
+                            i += 2;
+                        }
+                        _ => {
+                            eprintln!(
+                                "--reasoning-checkpoint-interval requires a positive integer (got: {v})"
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--reasoning-checkpoint-interval requires a value");
+                    std::process::exit(2);
                 }
             }
             "--max-tokens-per-call" => {
@@ -725,6 +745,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         max_turns,
         max_tokens,
         max_tokens_per_call,
+        reasoning_checkpoint_interval,
         feedback_templates,
         response_format,
     );

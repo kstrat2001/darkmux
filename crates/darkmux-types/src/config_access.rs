@@ -278,6 +278,21 @@ pub fn max_tokens_per_call() -> Option<u32> {
     pick_parsed("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", cfg, None)
 }
 
+/// (#1221) How far the model reasons between the runtime's mid-turn check-ins.
+/// `None` = the runtime's built-in `REASONING_CHECKPOINT_INTERVAL` (1000).
+///
+/// Distinct from `max_tokens_per_call` on purpose: that one bounds an ANSWER
+/// and wants to be large, this one samples a THOUGHT and wants to be small.
+/// They were briefly one number, which is wrong for whichever job it is not
+/// tuned for.
+pub fn reasoning_checkpoint_interval_tokens() -> Option<u32> {
+    let cfg = config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.reasoning_checkpoint_interval_tokens);
+    pick_parsed("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", cfg, None)
+}
+
 // ── Remote (hosted-endpoint) dispatch (#1260/#1177) ──
 /// The per-EXECUTION remote token allowance — an execution is one pipeline
 /// stage (the review pipeline's probe pass, each judge pass, the verify pass; a bare

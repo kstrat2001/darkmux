@@ -227,6 +227,7 @@ pub struct RuntimeBehaviorConfig {
     /// E19 measured truncating PRODUCTIVE reasoning on thinking-family
     /// models, so benches raise it explicitly per run.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens_per_call: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub reasoning_checkpoint_interval_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub strict_selection: Option<bool>,
     // (#1311) Verbosity for the diagnostic surfaces. `"info"` (default) emits
     // the informative dispatch-liveness phase markers; `"debug"` additionally
@@ -554,6 +555,7 @@ impl DarkmuxConfig {
                 max_turns: None,
                 max_tokens: None,
                 max_tokens_per_call: None,
+                reasoning_checkpoint_interval_tokens: None,
                 strict_selection: Some(false),
                 log_level: Some("info".to_string()),
                 // (#1548) Now wired end-to-end (config_access accessor +

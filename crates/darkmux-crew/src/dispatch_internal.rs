@@ -390,6 +390,12 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
     if let Some(n) = darkmux_types::config_access::max_tokens_per_call() {
         cmd.arg("--max-tokens-per-call").arg(n.to_string());
     }
+    // (#1221) The reasoning check-in rate — a SEPARATE knob from the answer
+    // bound above, because sampling a thought wants small and bounding an
+    // answer wants large.
+    if let Some(n) = darkmux_types::config_access::reasoning_checkpoint_interval_tokens() {
+        cmd.arg("--reasoning-checkpoint-interval").arg(n.to_string());
+    }
 }
 
 
