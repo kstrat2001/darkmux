@@ -28,8 +28,30 @@ set -euo pipefail
 #
 # Scans the STAGED content, so it sees what is actually about to be committed
 # rather than the working tree.
-if [ -f scripts/engagement-sentinel-guard.py ]; then
-  staged=$(git diff --cached --name-only --diff-filter=ACMR)
+# FAIL CLOSED. This used to be `if [ -f ... ]; then`, which skipped the WHOLE
+# scan when the script was absent — and `git rm scripts/engagement-sentinel-
+# guard.py` removes the working-tree copy BEFORE the hook runs, so one commit
+# could delete the guard and carry a leak past it. An accidental `rm`, a bad
+# merge, or another session touching the shared checkout had the same effect
+# for every subsequent commit.
+if [ ! -f scripts/engagement-sentinel-guard.py ]; then
+  echo "pre-commit: REFUSING — scripts/engagement-sentinel-guard.py is missing," >&2
+  echo "            so staged content cannot be scanned. This repo is PUBLIC." >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "pre-commit: REFUSING — python3 not found, so the leak guard cannot run." >&2
+  exit 1
+fi
+if true; then
+  # -z: NUL-delimited and UNQUOTED. Without it git applies `core.quotePath`
+  # (default true) and returns e.g. "r\303\251sum\303\251-notes.txt" for any
+  # non-ASCII name — accented Latin, CJK, emoji, or a copy-pasted curly quote.
+  # `git show ":$f"` then cannot resolve it, stderr was discarded, `|| continue`
+  # skipped the file, and its content was NEVER SCANNED while the commit
+  # proceeded. Proven by execution 2026-08-24. Also covers embedded newlines,
+  # tabs, quotes and backslashes.
+  staged=$(git diff --cached -z --name-only --diff-filter=ACMR | tr '\0' '\n')
   if [ -n "$staged" ]; then
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
@@ -60,10 +82,21 @@ fi
 #
 # So: print them. Cheap, and it makes an unexpected addition impossible to
 # commit without having seen it scroll past.
-added=$(git diff --cached --name-only --diff-filter=A)
+added=$(git diff --cached -z --name-only --diff-filter=A | tr '\0' '\n')
 if [ -n "$added" ]; then
   echo "pre-commit: this commit ADDS $(echo "$added" | wc -l | tr -d ' ') file(s) to a PUBLIC repo:"
   echo "$added" | sed 's/^/             + /'
+fi
+# MODIFIED files matter too, and were invisible here. The leak that motivated
+# the tailnet scrub was an operator address appearing 21 times inside ALREADY
+# TRACKED files (`machine add` and `config set` help text) — every one of those
+# lands as M, which `--diff-filter=A` never shows. The scan above covers ACMR,
+# but this printout is the only compensating control for content that carries
+# no canary word, and it was blind to the exact shape that already leaked once.
+modified=$(git diff --cached -z --name-only --diff-filter=M | tr '\0' '\n')
+if [ -n "$modified" ]; then
+  echo "pre-commit: and MODIFIES $(echo "$modified" | wc -l | tr -d ' ') tracked file(s):"
+  echo "$modified" | sed 's/^/             ~ /'
 fi
 
 # ── 2. Demo/viewer lockstep ─────────────────────────────────────────────────

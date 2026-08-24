@@ -114,14 +114,46 @@ SYNTHETIC_TAILNET_RE = re.compile(r"^tailnet-[0-9a-f]{10}$")
 # (`<tailnet>.ts.net`), and the tailnet is the durable half — a machine can
 # be renamed, a tailnet name is the same string everywhere it appears.
 # Requiring two labels let exactly that form past this guard.
-MAGICDNS_RE = re.compile(r"\b(?:[a-z0-9-]+\.)?([a-z0-9-]+)\.ts\.net\b", re.I)
+MAGICDNS_RE = re.compile(r"\b(?:([a-z0-9-]+)\.)?([a-z0-9-]+)\.ts\.net\b", re.I)
+
+# Host labels that are self-evidently not an identity. `sanitize.mjs` rewrites
+# the host to `host-<8 hex>`, and the docs use a small set of placeholders.
+SYNTHETIC_HOST_RE = re.compile(r"^host-[0-9a-f]{8}$")
+EXAMPLE_HOSTS = {
+    "laptop", "somebox", "machine", "host", "example", "localhost",
+    "mini", "studio", "peer", "hub", "box",
+}
 
 
 def network_identifier_hits(line: str) -> bool:
     """True when the line carries a presumed-real tailnet address or hostname."""
     if CGNAT_RE.search(line):
         return True
-    return any(not _is_permitted_tailnet(m.group(1)) for m in MAGICDNS_RE.finditer(line))
+    return any(not _is_permitted_magicdns(m) for m in MAGICDNS_RE.finditer(line))
+
+
+def _is_permitted_magicdns(m: "re.Match[str]") -> bool:
+    """BOTH halves must be permitted, not just the tailnet.
+
+    The host used to be a non-capturing group, so `network_identifier_hits`
+    judged the tailnet alone — and a permitted tailnet made the whole match
+    permitted. Proven by execution 2026-08-24:
+    an identifying host label placed in front of a PERMITTED tailnet suffix
+    scanned CLEAN — publishing the identifying half while the sanctioned half
+    vouched for it. (Spelled out only in SELF_TEST_CASES, assembled from
+    fragments: written whole here it would trip this very matcher, which
+    deliberately scans its own source.)
+
+    `sanitize.mjs` rewrites BOTH labels in one replacement; this is the guard
+    catching up to what the scrubber already knew.
+    """
+    host, tailnet = m.group(1), m.group(2)
+    if not _is_permitted_tailnet(tailnet):
+        return False
+    if host is None:
+        return True  # bare `<tailnet>.ts.net`, nothing else to judge
+    h = host.lower()
+    return h in EXAMPLE_HOSTS or SYNTHETIC_HOST_RE.match(h) is not None
 
 
 def _is_permitted_tailnet(tailnet: str) -> bool:
@@ -272,6 +304,9 @@ SELF_TEST_CASES = [
     # to prevent. Every other "must be caught" fixture uses a name that does not
     # begin with `tailnet`, so none of them can tell the two apart.
     (f"url: box.tailnet-corp.{_TS_SUFFIX}", True, "a real name may begin `tailnet-`; only the 10-hex form is the scrubber's"),
+    # BOTH halves are identifying. Judging the tailnet alone published the host.
+    (f"url: acme-client-prod-db.tailnet-example.{_TS_SUFFIX}", True, "an identifying HOST beside a permitted tailnet"),
+    (f"url: host-a1b2c3d4.tailnet-example.{_TS_SUFFIX}", False, "scrubber-shaped host beside a documented tailnet"),
 ]
 
 
