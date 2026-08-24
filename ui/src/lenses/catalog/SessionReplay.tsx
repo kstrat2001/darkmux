@@ -80,8 +80,24 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
 
       {view.briefLines.length > 0 && (
         <div className="track">
-          {view.briefLines.map((line, i) => (
-            <div key={i}>{line}</div>
+          {/* One block element per entry, same order and same text as before —
+              `goldens/session-task-list.txt` pins label and value as separate
+              lines, so the DOM shape is deliberately unchanged. The class is
+              the only addition, and it is what lets a LABEL stop looking like
+              a VALUE. */}
+          {view.briefLines.map((entry, i) => (
+            <div key={i} className={`brief-${entry.kind}`}>
+              {entry.href ? (
+                // A real anchor, so it is keyboard-reachable and middle-clickable
+                // like any other link. Same text either way — the golden reads
+                // `innerText`, which an <a> does not change.
+                <a className="brief-link" href={entry.href}>
+                  {entry.text}
+                </a>
+              ) : (
+                entry.text
+              )}
+            </div>
           ))}
         </div>
       )}

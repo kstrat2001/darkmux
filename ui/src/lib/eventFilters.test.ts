@@ -6,7 +6,9 @@ import {
   createFacetSeen,
   defaultFilterState,
   matchesFilters,
+  MODEL_ACTIVITIES,
 } from "./eventFilters";
+import { onlyModelFacet } from "../components/FiltersDialog";
 import type { FlowRecord } from "../types/handwritten";
 
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
@@ -112,5 +114,78 @@ describe("absorbNewFacetValues — viewer.html's absorbNewFilterValues()/SEEN (#
     filters = absorbNewFacetValues(filters, facets, seen);
     const again = absorbNewFacetValues(filters, facets, seen);
     expect(again).toBe(filters);
+  });
+});
+
+describe("MODEL_ACTIVITIES — the 'model only' quick filter", () => {
+  /** Measured live on a real `dispatch pr-reviewer`: across twelve minutes the
+   *  session emitted 171 `dispatch.turn.heartbeat`, 94 `telemetry.process` and
+   *  one `dispatch start` — and ZERO reasoning/tool/turn records, because the
+   *  model was still inside its first turn. "model only" therefore rendered an
+   *  empty list while the model was visibly generating, which reads as
+   *  "nothing is happening" at the moment the most is. */
+  it("includes heartbeat, the only model signal during a long first turn", () => {
+    expect(MODEL_ACTIVITIES.has("heartbeat")).toBe(true);
+  });
+
+  it("still includes the per-turn activities it was written for", () => {
+    for (const a of ["reasoning", "tool call", "turn"]) {
+      expect(MODEL_ACTIVITIES.has(a)).toBe(true);
+    }
+  });
+
+  it("excludes activity that is not the model working", () => {
+    // Host telemetry and lifecycle bookends are about the RUN, not the model.
+    for (const a of ["host telemetry", "dispatch start", "dispatch end", "note"]) {
+      expect(MODEL_ACTIVITIES.has(a)).toBe(false);
+    }
+  });
+
+  /** The regression this guards, stated as the real shape: a session whose
+   *  only records are heartbeats must not filter down to nothing. */
+  it("a heartbeat-only session is not empty under the model-only filter", () => {
+    const activities = ["heartbeat", "heartbeat", "host telemetry", "heartbeat"];
+    const kept = activities.filter((a) => MODEL_ACTIVITIES.has(a));
+    expect(kept).toHaveLength(3);
+  });
+});
+
+describe("'model only' over the PRODUCTION filter path", () => {
+  // The other MODEL_ACTIVITIES tests assert on the Set object and reimplement
+  // the filter inline, so they exercise `Set.prototype.has` and can never fail
+  // for a production reason. Two mutations that reproduce the exact bug this
+  // fixes both left 967/967 green: gating heartbeat out inside
+  // `onlyModelFacet`, and renaming the label `activityOf` returns so the set
+  // member is dead. This test runs the real chain — activityOf -> computeFacets
+  // -> onlyModelFacet -> matchesFilters — and dies under both.
+  const heartbeat: FlowRecord = {
+    ts: "2026-08-08T12:00:00.000Z",
+    category: "work",
+    action: "dispatch.turn.heartbeat",
+  } as FlowRecord;
+  const hostTelemetry: FlowRecord = {
+    ts: "2026-08-08T12:00:01.000Z",
+    category: "telemetry",
+    source: "process",
+  } as FlowRecord;
+
+  it("a first-turn session shows its heartbeats instead of reading as idle", () => {
+    // The measured shape of a live dispatch still inside turn 1: heartbeats and
+    // host telemetry, and NO reasoning/tool/turn records yet.
+    const records = [heartbeat, hostTelemetry];
+    const facets = computeFacets(records);
+    const filters = { ...defaultFilterState(facets), act: onlyModelFacet(facets) };
+    const shown = records.filter((r) => matchesFilters(r, filters));
+
+    expect(shown).toHaveLength(1);
+    expect(shown[0]).toBe(heartbeat);
+  });
+
+  it("'model only' still excludes host telemetry", () => {
+    const facets = computeFacets([heartbeat, hostTelemetry]);
+    expect(matchesFilters(hostTelemetry, {
+      ...defaultFilterState(facets),
+      act: onlyModelFacet(facets),
+    })).toBe(false);
   });
 });

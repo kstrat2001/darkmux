@@ -3227,17 +3227,54 @@ body {
   margin-bottom: 12px;
   overflow-wrap: anywhere;
 }
-/* `briefLines`' first element is always the "run" label (see
-   `sessionRun.ts`'s own doc) — positionally safe because that array's shape
-   is genuinely fixed. (The machine lens's utility node used to be cited here
-   as the sibling precedent; it is gone — its "fixed" shape was exactly what
-   stopped a live reading and hardcoded copy from being told apart.) */
-.session-run .track:first-of-type > div:first-child {
-  font-weight: 600;
-  color: var(--fg);
-  margin-bottom: 4px;
+/* Keyed on the entry's OWN kind rather than its position. The previous rules
+   styled "first child" as a heading and everything after it identically, so a
+   label and its value were indistinguishable and the whole block read as a
+   flat list. `sessionRun.ts` now tags each entry; position is no longer load
+   bearing, which also retires the fragile "that array's shape is fixed"
+   assumption the old comment leaned on. */
+/* The label is subordinate to its value: smaller, dimmer and letter-spaced so
+   it reads as a field name at a glance.
+   NO `text-transform` — an earlier cut uppercased it, on the assumption that a
+   CSS-only transform would leave the extracted text alone. It does not: the
+   parity harness reads `innerText`, which APPLIES text-transform, so the
+   golden's `route` came back as `ROUTE` and the byte-for-byte comparison
+   failed. Weight, size and colour carry the hierarchy without touching the
+   text a golden pins. */
+.session-run .brief-label {
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  margin-top: 8px;
 }
-.session-run .track > div:not(:first-child) {
+.session-run .brief-value {
+  color: var(--fg);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.session-run .brief-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+/* A self-describing one-liner (the prompt summary) — neither half of a pair. */
+.session-run .brief-note {
+  color: var(--dim);
+  font-size: 11px;
+  margin-top: 8px;
+}
+/* The rule this replaced (`.session-run .track > div:not(:first-child)`) was
+   POSITIONAL, so it dimmed the body lines of every track in the panel — not
+   just the brief. `SessionReplay` renders two more (model, detections) whose
+   body lines lost their styling when it went, which relocated the exact defect
+   this block fixes rather than removing it: `model (lms)` and `no telemetry
+   yet` rendered at identical size and colour, as did `detections` and
+   `✓ clean`. `.lbl` has no rule of its own, so that positional selector was
+   the only thing separating them.
+   Invisible to every test — goldens compare `innerText`, and all seven parity
+   suites passed with it broken. Caught by reading `getComputedStyle` on a real
+   drill-in. */
+.session-run .track > div:not([class^="brief-"]):not(.lbl) {
   color: var(--dim);
   font-size: 11px;
 }

@@ -110,7 +110,7 @@ export interface SessionRunView {
    * there is nothing to show (no route/runtime/image/model/workspace/
    * mission/timing/prompt data at all — doesn't happen in practice since
    * `route`+`timing` are always present, kept for completeness). */
-  briefLines: string[];
+  briefLines: BriefEntry[];
   metrics: Array<{ value: string; label: string }>;
   modelTrackLabel: string;
   modelTrackLines: string[];
@@ -118,8 +118,38 @@ export interface SessionRunView {
   detectionLines: string[];
 }
 
-function pushKv(lines: string[], label: string, value: string | null | undefined) {
-  if (value != null && value !== "") lines.push(label, value);
+/** A run-brief entry, tagged so the renderer can style a LABEL differently
+ *  from a VALUE.
+ *
+ *  It used to be a flat `string[]` with labels and values as adjacent
+ *  elements, which left the renderer no way to tell them apart — so the CSS
+ *  styled "everything after the first line" identically and `route` looked
+ *  exactly like `LMStudio · local · this machine`. The whole block read as an
+ *  undifferentiated list.
+ *
+ *  The TEXT is deliberately unchanged: each entry still renders as its own
+ *  block element, in the same order, so `goldens/session-task-list.txt` — which
+ *  pins label and value as separate lines — keeps passing. Only the class
+ *  differs. */
+export interface BriefEntry {
+  kind: "label" | "value" | "note";
+  text: string;
+  /** When set, the entry renders as an in-app link to this hash.
+   *
+   *  Exists because both drill-in destinations were DEAD ENDS: neither the
+   *  mission lens nor this one had a single outbound navigation, so landing on
+   *  either left the back button as the only exit and no way to reach the
+   *  other view of the same work. The mission id was already displayed here as
+   *  inert text; making it a link costs nothing and is the cheapest half of the
+   *  fix. The text is unchanged, so the golden still matches. */
+  href?: string;
+}
+
+function pushKv(rows: BriefEntry[], label: string, value: string | null | undefined) {
+  if (value != null && value !== "") {
+    rows.push({ kind: "label", text: label });
+    rows.push({ kind: "value", text: value });
+  }
 }
 
 /** `runRegions()` — viewer.html:2064-2285, minus the two SVG chart regions
@@ -214,25 +244,42 @@ export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
       })()
     : "LMStudio · local · this machine";
 
-  const briefRows: string[] = [];
+  const briefRows: BriefEntry[] = [];
   pushKv(briefRows, "route", route);
   pushKv(briefRows, "runtime", sp.runtime ? RUNTIME_LABEL[sp.runtime] ?? sp.runtime : "");
   pushKv(briefRows, "image", sp.image);
   pushKv(briefRows, "model", model);
   pushKv(briefRows, "workspace", sp.workspace);
-  pushKv(briefRows, "mission", d?.mission_id ? `${d.mission_id}${d.phase_id ? ` · phase ${d.phase_id}` : ""}` : "");
+  if (d?.mission_id) {
+    briefRows.push({ kind: "label", text: "mission" });
+    briefRows.push({
+      kind: "value",
+      text: `${d.mission_id}${d.phase_id ? ` · phase ${d.phase_id}` : ""}`,
+      href: `#mission=${encodeURIComponent(d.mission_id)}`,
+    });
+  }
   pushKv(briefRows, "timing", briefTiming);
 
-  const promptLines: string[] = [];
+  const promptLines: BriefEntry[] = [];
   if (sp.prompt) {
     const chars = sp.prompt_chars ?? sp.prompt.length;
     const truncated = sp.prompt_chars != null && sp.prompt.length < sp.prompt_chars ? " · truncated" : "";
-    promptLines.push(`prompt · ${chars} chars${truncated}`);
+    // A self-describing one-liner, not a label/value pair — tagged `note` so it
+    // is not styled as either half of one.
+    promptLines.push({ kind: "note", text: `prompt · ${chars} chars${truncated}` });
   } else if (sp.prompt_chars != null) {
-    promptLines.push("prompt", `${sp.prompt_chars} chars`);
+    promptLines.push({ kind: "label", text: "prompt" });
+    promptLines.push({ kind: "value", text: `${sp.prompt_chars} chars` });
   }
 
-  const briefLines = briefRows.length || promptLines.length ? ["run", ...briefRows, ...promptLines] : [];
+  // No "run" heading inside the block: the region's own `<h2>` directly above
+  // already reads `RUN · <ROLE> (<session> on <machine>)`, so a second bare
+  // "run" was the same word twice, six pixels apart. Legacy printed it and the
+  // golden pinned it; the golden is a spec for catching UNINTENDED drift, not a
+  // veto on removing something redundant, so this is a deliberate hand-edit
+  // there rather than a regression.
+  const briefLines: BriefEntry[] =
+    briefRows.length || promptLines.length ? [...briefRows, ...promptLines] : [];
 
   // ── metrics ────────────────────────────────────────────────────────
   const ctxHeadline = done ? ctxPeak : ctxNow;

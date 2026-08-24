@@ -53,7 +53,7 @@ function stageSectionOf(goldenText: string): string[] {
 function flattenView(view: ReturnType<typeof runRegions>): string[] {
   const lines: string[] = [];
   lines.push(`${view.header.pillLabel} RUN · ${view.header.role} (${view.header.sid} on ${view.header.machineName})`);
-  lines.push(...view.briefLines);
+  lines.push(...view.briefLines.map((e) => e.text));
   for (const m of view.metrics) {
     lines.push(m.value, m.label);
   }
@@ -112,18 +112,18 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.header.pillLabel).toBe("COMPLETE");
     expect(view.header.pillCls).toBe("done");
     expect(view.header.role).toBe("CODER");
-    expect(view.briefLines).toContain("route");
-    expect(view.briefLines).toContain("LMStudio · local · this machine");
-    expect(view.briefLines).toContain("runtime");
-    expect(view.briefLines).toContain("internal container");
-    expect(view.briefLines).toContain("image");
-    expect(view.briefLines).toContain("darkmux-runtime:latest");
-    expect(view.briefLines).toContain("model");
-    expect(view.briefLines).toContain("darkmux:qwen3-coder");
-    expect(view.briefLines).toContain("workspace");
-    expect(view.briefLines).toContain("/tmp/wt");
-    expect(view.briefLines).toContain("prompt");
-    expect(view.briefLines).toContain("500 chars");
+    expect(view.briefLines.map((e) => e.text)).toContain("route");
+    expect(view.briefLines.map((e) => e.text)).toContain("LMStudio · local · this machine");
+    expect(view.briefLines.map((e) => e.text)).toContain("runtime");
+    expect(view.briefLines.map((e) => e.text)).toContain("internal container");
+    expect(view.briefLines.map((e) => e.text)).toContain("image");
+    expect(view.briefLines.map((e) => e.text)).toContain("darkmux-runtime:latest");
+    expect(view.briefLines.map((e) => e.text)).toContain("model");
+    expect(view.briefLines.map((e) => e.text)).toContain("darkmux:qwen3-coder");
+    expect(view.briefLines.map((e) => e.text)).toContain("workspace");
+    expect(view.briefLines.map((e) => e.text)).toContain("/tmp/wt");
+    expect(view.briefLines.map((e) => e.text)).toContain("prompt");
+    expect(view.briefLines.map((e) => e.text)).toContain("500 chars");
     expect(view.metrics.find((m) => m.label === "TURNS")?.value).toBe("3");
     // `fmtC` — the COMPACT formatter (`lib/format.ts`), same as legacy's own
     // `fmtC(tokIn)` on the metric tile (NOT `fmtN`'s comma-grouped form).
@@ -159,7 +159,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    expect(view.briefLines).toContain("Azure OpenAI · my-host/gpt-4o · off-fleet");
+    expect(view.briefLines.map((e) => e.text)).toContain("Azure OpenAI · my-host/gpt-4o · off-fleet");
     expect(view.modelTrackLabel).toBe("model (remote)");
     expect(view.modelTrackLines[0]).toMatch(/served off-fleet — no local model/);
   });
@@ -218,4 +218,47 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(ctx?.label).toBe("CTX PEAK 45K / 100K WINDOW");
     expect(ctx?.value).toBe("45K"); // done -> headline is peak, not the last sample
   });
+
+  // (#1945 review) The mission drill-out was entirely unpinned: deleting the
+  // `href:` line left 967/967 green, and parity cannot reach it either — that
+  // corpus's only start record is `step start`, so `d` is null and the brief
+  // renders route+timing with no mission row at all.
+  it("a dispatch carrying a mission_id gets a clickable drill-out to the mission", () => {
+    const data = [
+      {
+        ts: "2026-01-01T00:00:00Z",
+        session_id: "s2",
+        action: "dispatch.start",
+        mission_id: "m-42",
+        phase_id: "p1",
+        payload: { role: "coder" },
+      },
+    ] as never[];
+    const view = runRegions(flowToRenderModel(data), "s2");
+
+    const label = view.briefLines.find((e) => e.text === "mission");
+    expect(label?.kind).toBe("label");
+
+    const value = view.briefLines.find((e) => e.text.startsWith("m-42"));
+    expect(value?.kind).toBe("value");
+    expect(value?.text).toBe("m-42 · phase p1");
+    // The route the viewer actually understands (`lib/route.ts` -> kind
+    // "mission"), with the id encoded the same way CatalogPanel encodes it.
+    expect(value?.href).toBe("#mission=m-42");
+  });
+
+  it("a dispatch with no mission_id renders no mission row", () => {
+    const data = [
+      {
+        ts: "2026-01-01T00:00:00Z",
+        session_id: "s3",
+        action: "dispatch.start",
+        payload: { role: "coder" },
+      },
+    ] as never[];
+    const view = runRegions(flowToRenderModel(data), "s3");
+    expect(view.briefLines.some((e) => e.text === "mission")).toBe(false);
+    expect(view.briefLines.some((e) => e.href?.startsWith("#mission="))).toBe(false);
+  });
+
 });

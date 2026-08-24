@@ -49,11 +49,12 @@ target-review/
 # ARE committed (they're the recorded spec the React port is graded
 # against); only the build/run scratch below is ignored.
 tests/parity/node_modules/
-tests/parity/.served-next/
-tests/parity/.served-next-chrome/
-tests/parity/.served-next-console/
-tests/parity/.served-next-live/
-tests/parity/.served-next-graph/
+# GLOBBED, not enumerated. The list used to name each suite's served dir, so a
+# new one — `.served-next-probe/`, staged by a review agent instrumenting this
+# tree — was not ignored and got swept into a commit by a `git add -A`,
+# carrying a 152-line copy of the whole viewer bundle. A pattern that has to be
+# extended by hand every time a suite is added will eventually not be.
+tests/parity/.served-next*/
 tests/parity/.gallery/
 tests/parity/corpus.tmp-*/
 tests/parity/test-results/
@@ -79,6 +80,21 @@ ui/playwright-report/
 ui/verify/test-results/
 ui/verify/playwright-report/
 ui/verify/.gallery/
+
+# Playwright scratch at the REPO ROOT. The rules above cover
+# `tests/parity/`, `tests/e2e/`, `tests/flatsat/` and `ui/`, but not the root —
+# so `test-results/.last-run.json` (a stale failed-run marker) sat tracked from
+# 2026-08-04. Root-scoped deliberately; see the `/runs/` note above for what an
+# unqualified pattern does in this tree.
+/test-results/
+
+# Agent + session scratch. `.scratch/` held a commit message, a PR body, two
+# `gh issue view` dumps and a one-off smoke driver — all committed 2026-08-08
+# and referenced by nothing. Scratch belongs in the session scratchpad, not in
+# a public repo's history.
+.scratch/
+*.scratch
+*.scratch.*
 
 # cargo-mutants run output — local build logs (accidentally committed in #1636)
 mutants.out/

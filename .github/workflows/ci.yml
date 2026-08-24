@@ -533,7 +533,27 @@ jobs:
         # tests/parity/lib/sanitize.mjs, which already owns it for the parity
         # scrubber. One list read twice cannot drift; two lists kept in sync by
         # hand is how the first leak happened.
-        run: python3 scripts/engagement-sentinel-guard.py
+        run: |
+          python3 scripts/engagement-sentinel-guard.py --self-test
+          python3 scripts/engagement-sentinel-guard.py
+      - name: No tracked file is one .gitignore says to ignore
+        # Self-maintaining: it needs no list of its own, so it cannot drift
+        # from `.gitignore` the way a second pattern list would. It catches
+        # both directions of the failure that put a commit message, a PR body,
+        # two issue dumps, a stale Playwright marker and a 152-line copy of the
+        # viewer bundle into this public repo — a `git add -A` sweeping scratch
+        # in, and a `.gitignore` rule added later while the file stays tracked
+        # (git keeps honoring the index, so ignoring it afterwards changes
+        # nothing and says nothing).
+        run: |
+          tracked_but_ignored=$(git ls-files -i -c --exclude-standard)
+          if [ -n "$tracked_but_ignored" ]; then
+            echo "::error::These files are tracked but .gitignore says to ignore them:"
+            echo "$tracked_but_ignored"
+            echo "Untrack with: git rm --cached <path>  (keeps the file on disk)"
+            exit 1
+          fi
+          echo "no tracked-but-ignored files"
       - name: Demo page is in sync with the served viewer
         run: |
           # darkmux.com/demo IS whatever the daemon serves at `/`, in playback
