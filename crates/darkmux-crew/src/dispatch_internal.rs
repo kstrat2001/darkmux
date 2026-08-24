@@ -3564,7 +3564,31 @@ impl TailerState {
                     // rather than under-counting from the tail-from-now stream.
                     "turns_so_far": self.summary.turns,
                 });
-                self.emit("dispatch.turn", darkmux_flow::Level::Info, payload);
+                // (#1221) ONE record per LOGICAL turn, emitted when that turn
+                // ENDS. A `length` finish mid-checkpointing is a continuation,
+                // not a turn boundary — the loop uses exactly this test to
+                // decide whether to run its terminal fold.
+                //
+                // This emit used to be unconditional while only the COUNTER was
+                // deduped, so a single long reasoning turn wrote one
+                // `dispatch.turn` record per API call. Observed: 66 turn
+                // records for a run whose `turns` was 1, each correctly stamped
+                // `turn_seq: 1`, rendered by the viewer as 66 separate turns
+                // interleaved with the checkpoints. The summary said 1 and the
+                // stream said 66, and the stream is what the operator reads.
+                //
+                // Continuations are not silent — they emit `dispatch.checkpoint`,
+                // which is the accurate vocabulary for what they are, plus the
+                // per-call `telemetry.tokens` record below (unchanged: billed
+                // usage is genuinely per CALL and the viewer sums it).
+                let finish_is_terminal = event
+                    .get("finish_reason")
+                    .and_then(|v| v.as_str())
+                    .map(|f| f != "length")
+                    .unwrap_or(true);
+                if finish_is_terminal {
+                    self.emit("dispatch.turn", darkmux_flow::Level::Info, payload);
+                }
                 // (#795) Per-turn token telemetry — the live "tokens
                 // off-meter" odometer climbs DURING the dispatch, not just
                 // at complete. Each turn's billed usage is its own
