@@ -12,7 +12,7 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
-## [Unreleased]
+## [2.10.0] - 2026-08-24
 
 ### Fixed
 
@@ -35,6 +35,34 @@ darkmux release.
   `DARKMUX_LAB_DIR` is undocumented, so most installs are unaffected. The empty
   list now names the directory it actually scanned instead of always claiming
   `.darkmux/runs/`.
+
+### Added
+
+- **A thinking model's turn is no longer discarded when it reasons past the
+  per-call bound** (#1221). This is the headline. A model that kept reasoning
+  past `max_tokens_per_call` used to have its ENTIRE turn thrown away — a
+  measured 43-50% of turns on the review corpus, including one 51K-character
+  turn that was tracing real code and naming a real bug when it was cut.
+
+  darkmux now CHECKPOINTS instead: at the bound it hands the model its own
+  accumulated output back as an assistant prefill, so the model RESUMES rather
+  than restarting, and a distinct-12-gram novelty ratio over the accumulation
+  decides whether to hand it back with the think block still OPEN (keep going)
+  or CLOSED (conclude from what you have). Many checkpoints in one thinking turn
+  remain ONE turn, so `runtime.max_turns` keeps meaning what it says.
+
+  The check-in is SILENT — the model is never told a boundary happened. That is
+  not a stylistic choice: a model invited to wrap up wraps up, and measured on a
+  real review it produced a four-point summary with zero findings where the same
+  model uninterrupted found real ones.
+
+- **`runtime.reasoning_checkpoint_interval_tokens`** — how far the model reasons
+  between check-ins (`DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL`, default
+  1000). Deliberately separate from `runtime.max_tokens_per_call`, because the
+  two want opposite values: a checkpoint interval wants to be small so a
+  reasoning loop is caught early, an answer bound wants to be large so a long
+  answer is not chopped. One number serving both is what the split fixed
+  (#1221).
 
 ### Added
 
@@ -83,6 +111,62 @@ darkmux release.
   the retirement lands in the same cycle instead of waiting on one.) (#1868)
 
 ### Fixed
+
+  A note on how these were found, because it is the useful part: the runtime
+  suite was fully green through every one of them. What surfaced them was
+  watching one real 66-call dispatch (which generated 26,181 completion tokens
+  and delivered 1,116 characters, starting mid-sentence) and two review passes
+  briefed to FALSIFY a named claim rather than walk a checklist.
+
+- **A model that closes its own `</think>` no longer strands its answer**
+  (#1221). The region tracker was built on a measured fact — under
+  `response_format` the grammar forbids the model from emitting `</think>` — that
+  turned out to be narrower than assumed: 17 of the 29 built-in roles declare no
+  `output_schema`, and on those (`coder`, `code-reviewer`, `analyst`) the inline
+  qwen-3.x family closes its own block freely. Everything after that delimiter
+  was filed as reasoning and never delivered, and on a terminal turn the trailing
+  scratch plus a dangling `</think>` shipped AS the answer.
+
+- **The deliverable no longer depends on how the run happened to end** (#1221).
+  A turn ending on `stop` and the same turn ending at a token cap produced
+  different content. One rule now serves both: the answer region when the thought
+  was closed (scratch is separable, so it stays out), the accumulation when it
+  never closed (it is not separable, and shipping only the last slice is the
+  discard-the-turn bug this feature exists to end).
+
+- **A repeating answer is bounded, and is never deleted** (#1221). Degeneracy
+  detection was disabled once the thought closed, leaving a post-conclude loop
+  with no gate — measured at 337 checkpoints with no terminal reached, backstopped
+  only by a SIGKILL that produces no envelope at all. Separately, a degenerate
+  verdict used to DELETE the accumulation, and that verdict is wrong for whole
+  classes of legitimate output (an enum-valued JSON array, a block of identical
+  match arms, an ASCII table frame all score as degenerate). Repetition now stops
+  the turn and escalates for handoff with everything banked attached.
+
+- **An empty completion no longer discards the work already banked** (#1221).
+  Losing five productive checkpoints because the sixth call came back blank was
+  the same bug one layer down. This also covers the `finish_reason=tool_calls`
+  with an empty array shape, which popped the message the fold had just written
+  the whole accumulation into.
+
+- **A response with no `usage` object no longer kills the dispatch** (#1221).
+  It made every checkpoint boundary read as a context overflow, which is a hard
+  error — no envelope, no metrics, no deliverable. "Cannot tell" now reads as a
+  cap hit.
+
+- **The event stream shows one turn per turn** (#1949). A single long reasoning
+  turn wrote one `dispatch.turn` record per API call, so the metrics tile read
+  `TURNS 1` while the stream showed 66 — and the stream is what an operator
+  reads. Continuations emit `dispatch.checkpoint`, which is what they are.
+
+- **The run card names its machine again** (#1949). The header rendered
+  `(<session> on )` with a dangling "on" — a hardcoded stub, not a data gap.
+
+- **"Model only" shows model work while it is happening** (#1945). The filter
+  omitted `heartbeat`, so during a long first turn — 171 heartbeats and zero
+  per-turn records — it showed an EMPTY list at the exact moment the most was
+  happening. `checkpoint` joins it for the same reason.
+
 
 - **A judge stage that ruled on most of a review's flags discarded all of
   it and posted "the review produced no signal."** A judge whose remote
@@ -1008,6 +1092,7 @@ schema changes (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`).
   "ready" with no time reference at all, indistinguishable from a fleet that
   had never dispatched.
 
+[2.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.10.0
 [2.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.9.0
 [2.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.8.0
 [2.7.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.7.0
