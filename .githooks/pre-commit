@@ -2,64 +2,88 @@
 #
 # darkmux pre-commit hook.
 #
-# Purpose: keep `docs/demo/index.html` in lockstep with the canonical viewer,
-# WITHOUT relying on anyone remembering to run the generator.
+# THIS REPO IS PUBLIC. Two jobs, in priority order:
 #
-# darkmux.com/demo IS whatever `GET /` currently serves — `assets/next.html`
-# today, derived structurally rather than hardcoded (see `build-demo.sh`'s own
-# doc, #1801 — `assets/viewer.html` was the source before the React port's
-# route flip, #1800; that file is now retired, #1806) — in playback mode,
-# produced by `scripts/build-demo.sh`. CI enforces this (the "docs drift
-# guard" job regenerates and diffs), so a viewer edit committed without the
-# regeneration fails the build AND — until someone notices — ships a stale
-# public demo page.
-#
-# That guard is correct; the manual step in front of it is the problem. It was
-# missed twice in a single session on 2026-07-29/30 (once caught by a frontier
-# code review on #1558, once by CI on #1571). A step that must be remembered is
-# a step that will be forgotten; this makes it structural instead.
+#   1. Refuse to commit engagement-private content.
+#   2. Keep `docs/demo/index.html` in lockstep with the viewer bundle.
 #
 # Install (one-time, per clone):
 #     git config core.hooksPath .githooks
 #
-# Bypass (rare, e.g. committing a deliberate demo-only experiment):
+# Bypass (rare, and never to silence job 1):
 #     git commit --no-verify
 set -euo pipefail
 
+# ── 1. Leak guard ───────────────────────────────────────────────────────────
+#
+# `scripts/engagement-sentinel-guard.py` already scans every tracked file for
+# engagement identifiers, and CI runs it. But CI runs it AFTER the push — so on
+# a public repo the guard reports a leak that is already published. It was
+# firing on the wrong side of the boundary.
+#
+# Discovered 2026-08-24, alongside the finding that this hook had been INERT
+# for weeks: it guarded `assets/viewer.html`, deleted in #1865, so it took its
+# early exit on every commit and did nothing. A guard nobody notices has
+# stopped working is worse than no guard, because it is still trusted.
+#
+# Scans the STAGED content, so it sees what is actually about to be committed
+# rather than the working tree.
+if [ -f scripts/engagement-sentinel-guard.py ]; then
+  staged=$(git diff --cached --name-only --diff-filter=ACMR)
+  if [ -n "$staged" ]; then
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    leaked=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      mkdir -p "$tmp/$(dirname "$f")"
+      git show ":$f" > "$tmp/$f" 2>/dev/null || continue
+    done <<< "$staged"
+    if ! python3 scripts/engagement-sentinel-guard.py --scan-dir "$tmp" 2>/dev/null; then
+      leaked=1
+    fi
+    if [ "$leaked" -ne 0 ]; then
+      echo "" >&2
+      echo "pre-commit: REFUSING — staged content carries an engagement identifier." >&2
+      echo "            This repo is PUBLIC. Fix the content; do NOT --no-verify." >&2
+      exit 1
+    fi
+  fi
+fi
+
+# ── 1b. Surface every NEWLY ADDED file ──────────────────────────────────────
+#
+# The leak guard above knows a vocabulary. It cannot know that a file is simply
+# not yours — a review agent's scratch, another session's work-in-progress, a
+# diff pulled from a private repo. Those have no canary words and are exactly
+# what `git add -A` sweeps in; it has happened twice in one session.
+#
+# So: print them. Cheap, and it makes an unexpected addition impossible to
+# commit without having seen it scroll past.
+added=$(git diff --cached --name-only --diff-filter=A)
+if [ -n "$added" ]; then
+  echo "pre-commit: this commit ADDS $(echo "$added" | wc -l | tr -d ' ') file(s) to a PUBLIC repo:"
+  echo "$added" | sed 's/^/             + /'
+fi
+
+# ── 2. Demo/viewer lockstep ─────────────────────────────────────────────────
+VIEWER="crates/darkmux-serve/assets/next.html"
 DEMO="docs/demo/index.html"
 GEN="scripts/build-demo.sh"
 
-if [ ! -x "$GEN" ] && [ ! -f "$GEN" ]; then
-  # Can't ask which viewer is the source, so can't know whether this commit
-  # needed a regeneration. Stay out of the way; CI's drift guard still catches it.
-  exit 0
-fi
-
-# ASK the generator which file the demo is built from rather than naming one
-# here. This hook used to hardcode `assets/viewer.html`, and the route flip
-# (#1800) moved the demo's source to the React bundle — after which the hook
-# would have sat silently inert on every UI commit, which is the same
-# "two places encode which viewer is real" drift the generator itself was
-# fixed for (#1801). A name that must be kept in sync is a name that won't be.
-VIEWER=$(bash "$GEN" --print-source 2>/dev/null || true)
-if [ -z "$VIEWER" ]; then
-  echo "pre-commit: $GEN could not name the demo's source viewer — skipping the demo check." >&2
-  echo "            CI's docs-drift guard still enforces it." >&2
-  exit 0
-fi
-
-# Nothing to do unless that viewer is part of THIS commit. Keeps the hook free
-# for the overwhelming majority of commits (Rust changes, docs, configs).
 if ! git diff --cached --name-only | grep -qx "$VIEWER"; then
   exit 0
 fi
 
-# CORRECTNESS EDGE CASE, worth the extra check: the generator reads the
-# WORKING TREE copy of the viewer, not the staged one. If those differ (a
-# partial `git add -p`, or an edit made after staging), regenerating would
-# produce a demo built from content that is NOT in this commit — the demo would
-# be wrong AND CI would still fail, which is the worst of both. Refuse instead
-# of silently producing a mismatch.
+if [ ! -f "$GEN" ]; then
+  echo "pre-commit: $VIEWER is staged but $GEN is missing — cannot regenerate the demo." >&2
+  exit 1
+fi
+
+# The generator reads the WORKING TREE copy, not the staged one. If they differ
+# (a partial `git add -p`, or an edit made after staging) regenerating would
+# build the demo from content that is NOT in this commit — wrong demo AND still
+# a red CI. Refuse rather than produce a mismatch.
 if ! git diff --quiet -- "$VIEWER"; then
   echo "pre-commit: $VIEWER has UNSTAGED changes." >&2
   echo "            $GEN reads the working tree, so regenerating now would build the" >&2

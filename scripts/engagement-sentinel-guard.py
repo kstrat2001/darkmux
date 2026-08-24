@@ -170,17 +170,34 @@ def tracked_files() -> list[str]:
     return [p for p in out.stdout.splitlines() if p]
 
 
-def main() -> int:
+def files_under(root: Path) -> list[str]:
+    """Every regular file under `root`, as paths relative to it.
+
+    The pre-commit hook materializes STAGED blobs into a temp dir and scans
+    that, so the guard sees what is actually about to be committed rather than
+    the working tree. `git ls-files` cannot be used there — the temp dir is not
+    a repository.
+    """
+    return [
+        str(p.relative_to(root))
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and ".git/" not in str(p)
+    ]
+
+
+def main(scan_dir: Path | None = None) -> int:
     canaries, delegated = load_canaries()
     if not canaries:
         sys.exit("guard is broken, not the tree: canary list resolved to empty")
     word_re = re.compile("|".join(re.escape(s) for s in canaries), re.I)
 
     findings: list[tuple[str, int, str]] = []
-    for rel in tracked_files():
+    base = scan_dir if scan_dir is not None else ROOT
+    names = files_under(scan_dir) if scan_dir is not None else tracked_files()
+    for rel in names:
         if rel in ALLOWLIST:
             continue
-        path = ROOT / rel
+        path = base / rel
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, FileNotFoundError, IsADirectoryError):
@@ -276,4 +293,12 @@ def self_test() -> int:
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         sys.exit(self_test())
-    sys.exit(main())
+    scan = None
+    if "--scan-dir" in sys.argv:
+        i = sys.argv.index("--scan-dir")
+        if i + 1 >= len(sys.argv):
+            sys.exit("--scan-dir requires a directory")
+        scan = Path(sys.argv[i + 1])
+        if not scan.is_dir():
+            sys.exit(f"--scan-dir: not a directory: {scan}")
+    sys.exit(main(scan))
