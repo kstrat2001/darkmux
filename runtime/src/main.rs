@@ -793,12 +793,21 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     traj.append_dispatch_complete(result_str, wall_ms);
 
     if let Some(o) = &outcome {
+        // (#1221) Prefer the answer the LOOP identified. "Last assistant
+        // message" is the checkpoint prefill on every non-terminal exit, so
+        // re-deriving it here handed the operator the model's raw scratch work
+        // as its answer.
         let final_assistant = o
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant")
-            .and_then(|m| m.content.clone())
+            .final_answer
+            .clone()
+            .filter(|a| !a.trim().is_empty())
+            .or_else(|| {
+                o.messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                    .and_then(|m| m.content.clone())
+            })
             .unwrap_or_else(|| "<empty>".into());
 
         let preview: String = final_assistant.chars().take(400).collect();

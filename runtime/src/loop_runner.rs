@@ -281,6 +281,15 @@ pub struct LoopOutcome {
     /// Total completion tokens summed across all calls.
     pub total_completion_tokens: u32,
 
+    /// (#1221) The turn's ANSWER text when the loop exits with a checkpoint
+    /// prefill still pending.
+    ///
+    /// `main.rs` derives the deliverable as "the last assistant message", which
+    /// is the prefill on every non-terminal exit (escalation, cumulative cap,
+    /// max turns) — so the operator got the model's raw scratch work as its
+    /// answer. The loop knows which region is the answer; nothing downstream
+    /// should have to infer it from message order or delimiters.
+    pub final_answer: Option<String>,
     /// Number of compaction events that fired during the loop.
     /// Phase 6: middle-replace via the companion compactor model.
     pub compactions: u32,
@@ -305,6 +314,36 @@ pub struct LoopOutcome {
 /// (tool dispatch, compaction triggering, finish_reason handling)
 /// doesn't change.
 #[allow(clippy::too_many_arguments)]
+/// The answer region, but only when a checkpoint prefill is still pending —
+/// otherwise the terminal fold has already put the answer in the last message
+/// and there is nothing to override.
+fn pending_answer(prefill_at: Option<usize>, answer: &str, thought: &str) -> Option<String> {
+    prefill_at?;
+    if !answer.trim().is_empty() {
+        return Some(answer.to_string());
+    }
+    // The model produced only scratch work before the run was cut. Handing the
+    // raw prefill over would present `<think>` markup as an answer; handing
+    // over nothing would discard the one thing it did produce, which is the
+    // failure this whole feature exists to end. So: the thought as TEXT, with
+    // the delimiter we (or an inline-think model) opened stripped off.
+    // Strip EVERY delimiter, not just a leading one. A thought accumulated
+    // across checkpoints can carry more than one opener, and the point is that
+    // the deliverable must be text rather than markup — half-stripped markup is
+    // the worst of both.
+    let t = thought
+        .replace(crate::budget_request::THINK_OPEN, "")
+        .replace(crate::budget_request::THINK_OPEN.trim_end(), "")
+        .replace(crate::budget_request::THINK_CLOSE, "")
+        .replace(crate::budget_request::THINK_CLOSE.trim(), "");
+    let t = t.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 pub fn run(
     client: &LmStudioClient,
     // (#1187 audit finding) ALWAYS a local-LMStudio client, never the remote
@@ -371,7 +410,21 @@ pub fn run(
     // truncated copy of the same answer. The model was not resuming a thought;
     // it restarted the same one every call, thirty times, and would have run to
     // context exhaustion without ever concluding.
-    let mut turn_reasoning_accum = String::new();
+    // (#1221) A turn's output has two regions and they must be tracked apart.
+    //
+    // One accumulator plus delimiter-searching produced four separate defects,
+    // all proven: a partial ANSWER arriving beside `reasoning_content` was
+    // discarded entirely (the modal thinking-model shape); an unanchored
+    // `rfind("</think>")` truncated an answer that merely QUOTED the delimiter;
+    // with no close present the raw thought became the deliverable; and the
+    // answer region never engaged when the model closed its own thought.
+    //
+    // Probed live against LMStudio: under `response_format` the model CANNOT
+    // emit `</think>` — the grammar forbids it — so searching for one is
+    // searching for something that will never arrive. We know what we
+    // prefixed, so we track it instead of parsing for it.
+    let mut turn_thought = String::new();
+    let mut turn_answer = String::new();
     let mut checkpoint_prefill_at: Option<usize> = None;
     // (#1221) Whether this turn's `<think>` block has already been closed by a
     // degeneracy verdict. Once closed it STAYS closed: the model is writing its
@@ -579,6 +632,7 @@ pub fn run(
                      returning partial outcome"
                 );
                 return Ok(LoopOutcome {
+                    final_answer: pending_answer(checkpoint_prefill_at, &turn_answer, &turn_thought),
                     terminal_reason: TerminalReason::MaxTurns,
                     messages,
                     turns,
@@ -604,6 +658,7 @@ pub fn run(
                      partial outcome (#423, #457)"
                 );
                 return Ok(LoopOutcome {
+                    final_answer: pending_answer(checkpoint_prefill_at, &turn_answer, &turn_thought),
                     terminal_reason: TerminalReason::EscalationTriggered(
                         EscalationReason::CumulativeTokensExceeded,
                     ),
@@ -661,7 +716,8 @@ pub fn run(
             // turn's accumulation and forget where its prefill lived, so a
             // later checkpoint cannot splice two turns' reasoning together or
             // delete a message belonging to a finished turn.
-            turn_reasoning_accum.clear();
+            turn_thought.clear();
+            turn_answer.clear();
             checkpoint_prefill_at = None;
             turn_think_closed = false;
             turn_is_reasoning = false;
@@ -924,21 +980,15 @@ pub fn run(
         // so folding here would destroy the accumulation it depends on.
         if effective_finish_reason != "length" {
             if let Some(i) = checkpoint_prefill_at {
-                let carried = messages
-                    .get(i)
-                    .and_then(|m| m.content.clone())
-                    .unwrap_or_default();
-                let mut merged = carried;
-                merged.push_str(assistant_message.content.as_deref().unwrap_or(""));
-                // Keep the ANSWER, not the thought. Nothing downstream strips
-                // think blocks, so folding the raw accumulation in would put
-                // scratch work into the committed deliverable — the same
-                // category error this design exists to avoid.
-                let close = crate::budget_request::THINK_CLOSE.trim();
-                let answer = match merged.rfind(close) {
-                    Some(at) => merged[at + close.len()..].trim_start().to_string(),
-                    None => merged,
-                };
+                // The deliverable is the ANSWER region plus whatever this
+                // final call added — assembled, never recovered by searching
+                // for a delimiter. `rfind("</think>")` was wrong twice over: it
+                // truncated an answer that merely QUOTED the delimiter (which
+                // is what a reviewer of this very file writes), and under
+                // `response_format` the model cannot emit one at all, so it
+                // found nothing and handed the raw thought over as the answer.
+                let mut answer = turn_answer.clone();
+                answer.push_str(assistant_message.content.as_deref().unwrap_or(""));
                 assistant_message.content = Some(answer);
                 if i < messages.len() {
                     messages.remove(i);
@@ -952,6 +1002,7 @@ pub fn run(
         match effective_finish_reason {
             "stop" => {
                 return Ok(LoopOutcome {
+                    final_answer: pending_answer(checkpoint_prefill_at, &turn_answer, &turn_thought),
                     terminal_reason: TerminalReason::Stop,
                     messages,
                     turns,
@@ -987,6 +1038,7 @@ pub fn run(
                              pattern. Emitting EscalationTriggered for frontier handoff."
                         );
                         return Ok(LoopOutcome {
+                            final_answer: pending_answer(checkpoint_prefill_at, &turn_answer, &turn_thought),
                             terminal_reason: TerminalReason::EscalationTriggered(
                                 EscalationReason::IntraTurnStallExhausted,
                             ),
@@ -1391,6 +1443,7 @@ pub fn run(
                                  emitting EscalationTriggered terminal for frontier handoff"
                             );
                             return Ok(LoopOutcome {
+                                final_answer: pending_answer(checkpoint_prefill_at, &turn_answer, &turn_thought),
                                 terminal_reason: TerminalReason::EscalationTriggered(
                                     EscalationReason::CompactionLimitReached,
                                 ),
@@ -1475,6 +1528,7 @@ pub fn run(
                          pattern. Emitting EscalationTriggered for frontier handoff."
                     );
                     return Ok(LoopOutcome {
+                        final_answer: pending_answer(checkpoint_prefill_at, &turn_answer, &turn_thought),
                         terminal_reason: TerminalReason::EscalationTriggered(
                             EscalationReason::IntraTurnStallExhausted,
                         ),
@@ -1539,35 +1593,63 @@ pub fn run(
                     turn_is_reasoning = true;
                     accum_carries_its_own_opener = true;
                 }
-                let slice_owned = if cut_inside_inline_think {
-                    content_slice.to_string()
-                } else if per_turn_reasoning.trim().is_empty() {
-                    content_slice.to_string()
-                } else {
-                    // The FIRST checkpoint of a turn is the only honest place to
-                    // decide this: after a prefill the provider stops tagging
-                    // continued thinking as reasoning (darkmux supplied the
-                    // opener), so a later checkpoint of a genuinely reasoning
-                    // turn looks exactly like a non-reasoning one.
+                // Nothing is inserted between slices: the model was cut
+                // mid-sentence and resumes at exactly that character, so any
+                // separator would land inside a word.
+                let reasoning_slice = per_turn_reasoning.trim();
+                if cut_inside_inline_think {
+                    // Inline-think family: the content IS the thought, opener
+                    // and all, and it is not closed yet.
                     turn_is_reasoning = true;
-                    per_turn_reasoning.clone()
-                };
-                // The slice is appended with NO separator: the model was cut
-                // mid-sentence and its next call continues from exactly that
-                // character, so anything inserted here lands inside a word.
-                if !turn_is_reasoning {
-                    // No think block was ever opened, so this turn is writing an
-                    // ANSWER and should not be sampled at the reasoning rate.
-                    in_answer_region = true;
+                    accum_carries_its_own_opener = true;
+                    turn_thought.push_str(content_slice);
+                } else if !reasoning_slice.is_empty() {
+                    turn_is_reasoning = true;
+                    turn_thought.push_str(&per_turn_reasoning);
+                    // BOTH present means the model finished thinking and had
+                    // begun answering when the boundary hit. Discarding
+                    // `content` here silently deleted committed text on the
+                    // most common thinking-model shape.
+                    if !content_slice.is_empty() {
+                        turn_think_closed = true;
+                        in_answer_region = true;
+                        turn_answer.push_str(content_slice);
+                    }
+                } else if turn_think_closed || !turn_is_reasoning {
+                    // Past the thought (or never in one): this is answer text.
+                    if !turn_is_reasoning {
+                        in_answer_region = true;
+                    }
+                    turn_answer.push_str(content_slice);
+                } else {
+                    // Continuing a thought darkmux opened — the provider stops
+                    // tagging it as reasoning once we supplied the opener.
+                    turn_thought.push_str(content_slice);
                 }
-                turn_reasoning_accum.push_str(&slice_owned);
                 // What gets handed back is the WHOLE thought, never one slice.
                 // This is also the scope the degeneracy gate needs: a model
                 // re-treading ground from three checkpoints ago produces slices
                 // that each look locally novel, so judging one slice in
                 // isolation cannot see the cycle it exists to catch.
-                let carried = turn_reasoning_accum.trim();
-                if carried.is_empty() {
+                // Judge the region currently BEING WRITTEN. Judging the
+                // thought unconditionally left a non-reasoning turn measuring an
+                // empty string, so degeneracy could never fire and a repeating
+                // answer spun forever (caught by a hanging test, not by review).
+                let writing_thought = turn_is_reasoning && !turn_think_closed;
+                let carried = if writing_thought {
+                    turn_thought.trim()
+                } else {
+                    turn_answer.trim()
+                };
+                // Emptiness is a property of THIS call, not of the turn. Testing
+                // the accumulation meant that once a turn had checkpointed once
+                // it could never be empty again, so the classic null-emission
+                // runaway could never reach the drop-and-nudge branch a second
+                // time. Measured: 41,383 checkpoints in 20s with
+                // `Recovery budget 0/2` on every line, escalation unreachable.
+                let this_call_produced_nothing =
+                    per_turn_reasoning.trim().is_empty() && content_slice.trim().is_empty();
+                if this_call_produced_nothing || (carried.is_empty() && turn_answer.trim().is_empty()) {
                     // Nothing to hand back — an empty completion at the
                     // boundary. This is the USELESS STALL the intra-turn
                     // recovery has always owned, and it must keep owning it:
@@ -1648,7 +1730,7 @@ pub fn run(
                     // delimiter to close, so it does not get a prefill at all —
                     // it goes back to the recovery path that already owns this
                     // shape.
-                    let fall_through_to_recovery = degenerate && !turn_is_reasoning;
+                    let fall_through_to_recovery = degenerate && !writing_thought;
                     if fall_through_to_recovery {
                         // No think block, so nothing to close. This is the
                         // repeating-at-cap shape the intra-turn stall recovery
@@ -1671,9 +1753,22 @@ pub fn run(
                         // Drop the repeating turn and start the next attempt
                         // from a clean accumulation.
                         messages.pop();
-                        turn_reasoning_accum.clear();
+                        // Remove the PREFILL too. Clearing the index without
+                        // removing the message it pointed at orphaned a raw
+                        // `<think>` block in history — and since the regions
+                        // were cleared in the same breath, nothing could
+                        // reconstruct the answer, so `main.rs` handed that raw
+                        // markup over as the deliverable. Every other path that
+                        // abandons a prefill removes it; this one didn't.
+                        if let Some(i) = checkpoint_prefill_at {
+                            if i < messages.len() {
+                                messages.remove(i);
+                            }
+                        }
+                        turn_thought.clear();
+                        turn_answer.clear();
                         checkpoint_prefill_at = None;
-                    } else if degenerate {
+                    } else if degenerate && writing_thought {
                         eprintln!(
                             "darkmux-runtime: ⏹ checkpoint {checkpoints_used} — the reasoning is \
                              repeating (degeneracy gate); closing the thought so the model \
@@ -1682,7 +1777,6 @@ pub fn run(
                         // The close is written INTO the accumulation, so every
                         // later checkpoint keeps handing back a thought that is
                         // already closed followed by the answer so far.
-                        turn_reasoning_accum.push_str(crate::budget_request::THINK_CLOSE);
                         turn_think_closed = true;
                         // Everything after the closing delimiter is the ANSWER.
                         in_answer_region = true;
@@ -1702,11 +1796,20 @@ pub fn run(
                     // plain-answer turn resumes as itself, with no delimiters
                     // invented around it.
                     if !fall_through_to_recovery {
-                    let body = if turn_is_reasoning && !accum_carries_its_own_opener {
-                        crate::budget_request::continue_thinking_prefill(&turn_reasoning_accum)
-                    } else {
-                        turn_reasoning_accum.clone()
-                    };
+                    // Assembled from the regions, never parsed back out of a
+                    // blob. `accum_carries_its_own_opener` means the thought
+                    // text already begins with the model's own `<think>`.
+                    let mut body = String::new();
+                    if !turn_thought.is_empty() {
+                        if turn_is_reasoning && !accum_carries_its_own_opener {
+                            body.push_str(crate::budget_request::THINK_OPEN);
+                        }
+                        body.push_str(&turn_thought);
+                        if turn_think_closed {
+                            body.push_str(crate::budget_request::THINK_CLOSE);
+                        }
+                    }
+                    body.push_str(&turn_answer);
                     // Drop the truncated raw response...
                     messages.pop();
                     // ...and the prefill this turn put there last time, so the
@@ -2791,36 +2894,35 @@ mod tests {
         )
         .expect("concluding loop returns Ok(outcome)");
 
-        let prefill = outcome
-            .messages
-            .iter()
-            .rev()
-            .find_map(|m| {
-                m.content
-                    .as_deref()
-                    .filter(|c| c.contains("<think>"))
-                    .map(str::to_string)
+        // The gate fired, so the thought was closed and the model answered
+        // from it. What must be true now is about the DELIVERABLE, not about
+        // delimiters left lying in history: the terminal fold removes the
+        // prefill and hands back the answer region, so a concluded turn
+        // correctly leaves no `<think>` behind at all.
+        // Exactly what main.rs does: prefer the answer the loop identified.
+        let final_assistant = outcome
+            .final_answer
+            .clone()
+            .filter(|a| !a.trim().is_empty())
+            .or_else(|| {
+                outcome
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                    .and_then(|m| m.content.clone())
             })
-            .expect("a checkpoint prefill is present");
+            .unwrap_or_default();
 
-        assert_eq!(
-            prefill.matches("</think>").count(),
-            1,
-            "the thought must close exactly ONCE and stay closed; {} closings means \
-             the gate re-fired on an already-concluded thought",
-            prefill.matches("</think>").count()
-        );
-        // The accumulation has to survive the conclude — that is the whole bug.
-        // Post-close continuations append AFTER the closing delimiter.
-        let (thought, answer) = prefill.split_once("</think>").expect("closed thought");
+        // Asserts the deliverable is not raw MARKUP. Not `!contains` — this
+        // mock replays its `<think>` opener on every call, which a real
+        // continuation never does (the model resumes inside the block darkmux
+        // handed back), so interior copies are a fixture artifact rather than a
+        // property of the code.
         assert!(
-            thought.contains("the same clause"),
-            "the reasoning must still be present after the conclude, not wiped"
-        );
-        assert!(
-            !answer.is_empty(),
-            "post-conclude output must land after the closing delimiter, not inside \
-             a re-opened think block"
+            !final_assistant.trim_start().starts_with("<think>"),
+            "the deliverable must be text, not an unopened think block — got {:?}",
+            &final_assistant[..final_assistant.len().min(120)]
         );
         // A conclude is not a turn boundary: many API calls, still one turn.
         assert_eq!(
@@ -4946,20 +5048,21 @@ mod tests {
         // that exhausted the budget and triggered escalation) remains in
         // history — pre-existing #414 escalation semantics: the last stall
         // turn is handoff evidence, the budget check runs before the pop.
-        let kept = outcome
+        // Counts OCCURRENCES, not messages. The original assertion counted
+        // messages, which was right when each truncated turn was appended as
+        // its own message — but replace-not-append means one growing message
+        // now carries the whole accumulation. Three copies of the text still
+        // survive; they just live in one place, which is the point.
+        let kept: usize = outcome
             .messages
             .iter()
-            .filter(|m| {
-                m.content
-                    .as_deref()
-                    .map(|c| c.contains("half my answer"))
-                    .unwrap_or(false)
-            })
-            .count();
+            .filter_map(|m| m.content.as_deref())
+            .map(|c| c.matches("half my answer").count())
+            .sum();
         assert_eq!(
             kept, 3,
-            "every truncated turn must SURVIVE in history — the work is the \
-             point, and discarding it is the bug #1221 measured (got {kept})"
+            "every truncated turn's work must SURVIVE — discarding it is the bug \
+             #1221 measured (found {kept} occurrence(s))"
         );
         // (#1221) The check-in is SILENT. An earlier cut told the model it
         // had "reached the per-call reasoning budget"; measured on a real
