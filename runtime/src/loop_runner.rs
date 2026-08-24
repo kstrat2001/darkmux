@@ -180,16 +180,6 @@ emitted reasoning tokens up to the per-call cap without producing a tool \
 call or a final answer. Please either invoke a tool to make progress, or \
 provide a direct final answer.";
 
-/// (#1221) The nudge for the OTHER non-checkpointable shape: output that is
-/// repeating at the boundary but never opened a thought, so there is no
-/// delimiter to close and nothing to conclude from. The stall nudge above
-/// would be a lie here — the model DID produce content; it produced the same
-/// content over and over.
-const DEGENERATE_NUDGE_MESSAGE: &str = "[darkmux-runtime] Your previous response \
-repeated itself without converging. Change approach: invoke a tool to gather \
-something you do not already have, or give a direct final answer from what you \
-already know.";
-
 /// How the loop terminated. Distinguishes "model said stop" from
 /// "loop hit the safety cap and gave up" — semantically different
 /// outcomes for downstream consumers (a max_turns hit means the
@@ -311,7 +301,15 @@ pub struct LoopOutcome {
 /// continuation never emits.
 fn as_deliverable_text(s: &str) -> String {
     let t = s.trim_start();
-    if !t.starts_with(crate::budget_request::THINK_OPEN.trim()) {
+    let leads_with_markup = t.starts_with(crate::budget_request::THINK_OPEN.trim());
+    // A never-closed thought becomes the deliverable (see `deliverable`), and
+    // an inline-think family's accumulation carries its own opener wherever the
+    // first slice put it. Strip when the text LEADS with markup or when it
+    // carries an UNMATCHED opener — an answer that merely quotes the delimiter
+    // in passing quotes it in balance or not at all, and keeps its text.
+    let unmatched_opener = t.matches(crate::budget_request::THINK_OPEN.trim()).count()
+        > t.matches(crate::budget_request::THINK_CLOSE.trim()).count();
+    if !leads_with_markup && !unmatched_opener {
         return s.to_string();
     }
     // Markup-led: strip EVERY delimiter, not just the leading one. Text
@@ -394,6 +392,42 @@ impl TurnAccum {
         // thought, so a concluded turn never accumulated an answer at all: the
         // gate then read an empty answer region, decided the call had produced
         // nothing, and dropped a turn that had produced plenty.
+        // The model may close the block ITSELF, and on the primary dispatch
+        // surface it is free to. The premise this region machine was built on —
+        // "under `response_format` the model CANNOT emit `</think>`" — is TRUE
+        // and was measured, but it only covers schema-constrained roles:
+        // 17 of the 29 built-in roles declare no `output_schema`, including
+        // `coder`, `code-reviewer` and `analyst`. For those the inline qwen-3.x
+        // family emits its own closer, and nothing here used to watch for it.
+        //
+        // The cost was measured twice, independently. A live 66-call analyst
+        // dispatch generated 26,181 completion tokens and delivered 1,116
+        // characters; a review probe reproduced the same shape and got a
+        // deliverable of `" ANSWER-PART-TWO and that is all."`. In both, the
+        // answer sat in the THOUGHT region because the close that separated
+        // them was read as ordinary thought text.
+        //
+        // This is NOT the `rfind("</think>")` that was removed. That one
+        // searched the whole ACCUMULATION for the LAST occurrence and
+        // TRUNCATED at it, so an answer quoting the delimiter lost its tail.
+        // This splits THIS slice at the FIRST close and keeps BOTH halves —
+        // nothing is discarded, so a quoted delimiter costs a misfiled
+        // sentence rather than a deleted answer.
+        if !self.think_closed {
+            if let Some(at) = content.find(crate::budget_request::THINK_CLOSE.trim()) {
+                let (before, after) = content.split_at(at);
+                let after = &after[crate::budget_request::THINK_CLOSE.trim().len()..];
+                self.is_reasoning = true;
+                if self.thought.is_empty() && before.trim_start().starts_with(crate::budget_request::THINK_OPEN.trim()) {
+                    self.carries_own_opener = true;
+                }
+                self.thought.push_str(reasoning);
+                self.thought.push_str(before);
+                self.think_closed = true;
+                self.answer.push_str(after);
+                return;
+            }
+        }
         if self.think_closed {
             // Reasoning that arrives AFTER the close is still reasoning: it
             // belongs inside the block, not in the deliverable. Appending it to
@@ -551,9 +585,14 @@ impl TurnAccum {
         if self.prefill_at.is_none() {
             return;
         }
-        let mut answer = self.answer.clone();
-        answer.push_str(message.content.as_deref().unwrap_or(""));
-        message.content = Some(as_deliverable_text(&answer));
+        // Route the TERMINAL slice through the same region logic as every other
+        // slice. It used to bypass `absorb` entirely and be appended raw, so a
+        // model that closed its own block on the last call handed its trailing
+        // scratch work AND a dangling `</think>` over as the answer. A terminal
+        // turn is not a different kind of output; it is the last one.
+        let tail = message.content.clone().unwrap_or_default();
+        self.absorb("", &tail);
+        message.content = Some(self.deliverable(""));
         self.remove_prefill(messages);
         self.clear();
     }
@@ -570,26 +609,38 @@ impl TurnAccum {
     /// already the last message and there is nothing to override.
     fn pending_answer(&self) -> Option<String> {
         self.prefill_at?;
-        let answer = as_deliverable_text(&self.answer);
-        if !answer.trim().is_empty() {
-            return Some(answer);
-        }
-        // Only scratch work before the run was cut. Handing the raw prefill
-        // over would present markup as an answer; handing over nothing would
-        // discard the one thing the model did produce, which is the failure
-        // this whole feature exists to end. So: the thought, as text.
-        let thought = self
-            .thought
-            .replace(crate::budget_request::THINK_OPEN, "")
-            .replace(crate::budget_request::THINK_OPEN.trim_end(), "")
-            .replace(crate::budget_request::THINK_CLOSE, "")
-            .replace(crate::budget_request::THINK_CLOSE.trim(), "");
-        let thought = thought.trim();
-        if thought.is_empty() {
+        let d = self.deliverable("");
+        if d.trim().is_empty() {
             None
         } else {
-            Some(thought.to_string())
+            Some(d)
         }
+    }
+
+    /// What this turn hands the operator, given whatever the final call added.
+    ///
+    /// ONE rule, shared by `fold` and `pending_answer`, because they disagreed
+    /// and that meant the SAME run produced a different deliverable depending
+    /// on whether it ended on `stop` or on a cap.
+    ///
+    /// The answer region when the thought was CLOSED — then we can tell scratch
+    /// from answer, and the scratch stays out. When it was NEVER closed we
+    /// cannot, and the accumulation itself is the deliverable. That is not an
+    /// edge case: measured on a live 66-call dispatch, the provider tagged
+    /// reasoning on call 1 only, so every later call arrived as untagged
+    /// content and was classified as more thought. The answer region was empty
+    /// for the whole turn — 26,181 completion tokens generated, 1,116
+    /// characters delivered, starting mid-sentence. Handing over nothing, or
+    /// only the last slice, is the discard-the-turn bug this feature exists to
+    /// end.
+    fn deliverable(&self, tail: &str) -> String {
+        let mut out = String::new();
+        if !self.think_closed && !self.thought.trim().is_empty() {
+            out.push_str(&self.thought);
+        }
+        out.push_str(&self.answer);
+        out.push_str(tail);
+        as_deliverable_text(&out)
     }
 
     /// Whether a prefill is live — i.e. whether this turn has work banked.
@@ -1300,6 +1351,25 @@ pub fn run(
                     // budget, escalating to the frontier when exhausted —
                     // instead of aborting on the first occurrence.
                     if stall_recoveries_used >= MAX_STALL_RECOVERIES {
+                        // (#1221) Drop the empty message before handing off.
+                        // `main.rs` takes the LAST assistant message as the
+                        // deliverable, and this arm pushes a wholly empty one
+                        // every time it fires — so escalating with it still in
+                        // place buries the turn's real work behind a blank
+                        // message and the operator receives nothing. The
+                        // recovery below already drops it; the escalation
+                        // returned before reaching that.
+                        if messages
+                            .last()
+                            .map(|m| {
+                                m.role == "assistant"
+                                    && m.content.as_deref().map(|c| c.trim().is_empty()).unwrap_or(true)
+                                    && m.tool_calls.as_ref().map(|t| t.is_empty()).unwrap_or(true)
+                            })
+                            .unwrap_or(false)
+                        {
+                            messages.pop();
+                        }
                         eprintln!(
                             "darkmux-runtime: escalation_triggered — finish_reason=\
                              tool_calls with no tool_calls, and the intra-turn stall \
@@ -1320,7 +1390,31 @@ pub fn run(
                             failed_to_run: failed_to_run.clone(),
                         });
                     }
-                    messages.pop();
+                    // (#1221) Pop ONLY a genuinely useless message. This arm is
+                    // reached AFTER the terminal fold has written the turn's
+                    // whole accumulation into this very message, so an
+                    // unconditional pop deletes every banked checkpoint — and
+                    // the fold has already cleared the region state, so nothing
+                    // can reconstruct it and `pending_answer` returns None on
+                    // every later exit. Proven by a review probe: a turn that
+                    // banked a 200-item first chunk, then got the wholly-empty
+                    // `tool_calls: []` shape, then concluded, delivered
+                    // `"Done."` and nothing else.
+                    //
+                    // The #1123 shape this recovery was built for is a WHOLLY
+                    // EMPTY message, which pops exactly as before. A message
+                    // carrying real text is not a useless completion; the model
+                    // still gets the budget spent and the nudge, but its work
+                    // stays in history as ordinary assistant text.
+                    let useless = messages
+                        .last()
+                        .map(|m| {
+                            m.content.as_deref().map(|c| c.trim().is_empty()).unwrap_or(true)
+                        })
+                        .unwrap_or(false);
+                    if useless {
+                        messages.pop();
+                    }
                     stall_recoveries_used = stall_recoveries_used.saturating_add(1);
                     trajectory.append_intra_turn_stall_recovered(
                         turns,
@@ -1329,11 +1423,12 @@ pub fn run(
                         MAX_STALL_RECOVERIES,
                     );
                     messages.push(Message::system(STALL_NUDGE_MESSAGE));
+                    let kept = if useless { "Dropped the useless turn" } else { "KEPT the turn's work" };
                     eprintln!(
                         "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} \
-                         returned finish_reason=tool_calls with no tool_calls (empty \
-                         completion). Dropped the useless turn, injected a nudge; \
-                         budget {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#1123)"
+                         returned finish_reason=tool_calls with no tool_calls. {kept}, \
+                         injected a nudge; budget \
+                         {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#1123/#1221)"
                     );
                     continue;
                 }
@@ -1772,8 +1867,27 @@ pub fn run(
                 // cap-1 live, so equality misses by one token and misroutes
                 // a cap hit to the overflow hard error (run-4 killed a
                 // 14-turn prosecution at 29999/30000 exactly this way).
+                // (#1221) An ABSENT `usage` object means "we cannot tell", and
+                // the safe reading of "cannot tell" at a `length` finish is a
+                // CAP HIT, not a context overflow. `is_some_and` returned false
+                // for unknown, which routed straight into the hard `Err` below
+                // — and that `Err` kills the whole dispatch, so `main.rs` emits
+                // `result: "error"` with no envelope, no metrics and no
+                // deliverable. Every banked checkpoint goes with it.
+                //
+                // This matters far more on this branch than before it: the
+                // per-call bound dropped from 10,000 to a 1,000-token
+                // checkpoint interval, so the population reaching this boundary
+                // went from rare to a measured 43-50% of turns. darkmux's own
+                // local path sets `stream_options.include_usage`, so LMStudio
+                // reports it — but a hosted endpoint or proxy that ignores that
+                // flag would make every checkpointed dispatch fatal.
+                //
+                // The overflow diagnosis needs a MEASURED token count below the
+                // cap; without one there is nothing to diagnose from.
                 let cap_cliff = this_turn_completion_tokens
-                    .is_some_and(|t| t.saturating_add(1) >= per_call_cap);
+                    .map(|t| t.saturating_add(1) >= per_call_cap)
+                    .unwrap_or(true);
                 if !is_useless_stall && !cap_cliff {
                     return Err(anyhow!(
                         "model returned finish_reason=length with partial content \
@@ -1905,23 +2019,37 @@ pub fn run(
                     // close the accumulation is reasoning PLUS the answer being
                     // written, and its ratio stays low forever — judging it
                     // would re-fire the verdict on every checkpoint.
-                    let tail_ratio = if turn.think_closed {
-                        None
-                    } else {
-                        crate::reasoning_loop::tail_repetition_ratio(
-                            &carried,
-                            crate::reasoning_loop::TAIL_WINDOW_TOKENS,
-                            crate::reasoning_loop::tail_sample_tokens(reasoning_interval),
-                        )
-                    };
+                    // Judge the region being written, ALWAYS — including after
+                    // the thought is closed.
+                    //
+                    // This used to return `None` once closed, justified by "the
+                    // accumulation is reasoning PLUS the answer, so its ratio
+                    // stays low forever". That was simply false: `carried()`
+                    // returns the ANSWER ALONE once the thought is closed — the
+                    // reasoning is not in the judged slice at all. The
+                    // measurement the gate was disabled to avoid does not
+                    // exist, and disabling it left the post-close answer region
+                    // with no gate whatsoever.
+                    //
+                    // Measured by a review probe: after a forced conclude, a
+                    // model repeating in the answer region ran 337 checkpoints
+                    // with no terminal reached, every line reading `turn 1` and
+                    // `Recovery budget 0/2`. Under default config the only
+                    // backstop is the host's 600s SIGKILL — which produces NO
+                    // envelope, so every banked checkpoint is lost too.
+                    let tail_ratio = crate::reasoning_loop::tail_repetition_ratio(
+                        &carried,
+                        crate::reasoning_loop::TAIL_WINDOW_TOKENS,
+                        crate::reasoning_loop::tail_sample_tokens(reasoning_interval),
+                    );
                     // Degeneracy DETECTION applies to any output; only the
                     // remedy differs. An earlier cut gated the detection itself
                     // on `turn_is_reasoning`, which left repeating plain content
                     // with no gate at all — it checkpointed forever, and the
                     // pre-existing intra-turn stall escalation that used to
                     // bound exactly that shape became unreachable.
-                    let degenerate = !turn.think_closed
-                        && crate::reasoning_loop::slice_is_degenerate(&carried, reasoning_interval);
+                    let degenerate =
+                        crate::reasoning_loop::slice_is_degenerate(&carried, reasoning_interval);
                     // (#1221) EVERY continuation is the same logical turn,
                     // including the one that follows a `conclude`.
                     //
@@ -1977,39 +2105,54 @@ pub fn run(
                     // delimiter to close, so it does not get a prefill at all —
                     // it goes back to the recovery path that already owns this
                     // shape.
-                    let fall_through_to_recovery = degenerate && !writing_thought;
-                    if fall_through_to_recovery {
-                        // No think block, so nothing to close. This is the
-                        // repeating-at-cap shape the intra-turn stall recovery
-                        // already owns (drop + nudge, escalating when its
-                        // budget is spent) — hand it back to that path rather
-                        // than inventing a second remedy here.
+                    // (#1221) The remedy DIFFERS by region, and conflating them
+                    // trades one defect for another.
+                    //
+                    // A degenerate ANSWER after we already forced a conclude is
+                    // a model that will not converge. Bound it — but do NOT
+                    // abandon the accumulation the way the no-thought path
+                    // does. Measured separately: legitimate repetitive ANSWER
+                    // shapes score far below the threshold (an enum-valued JSON
+                    // array, a block of identical match arms, an ASCII table
+                    // frame, a checklist with an invariant line all land near
+                    // 0.003), so deleting on this verdict would destroy real
+                    // work on output that is repetitive by nature rather than
+                    // by pathology. Hand it off instead, with everything banked
+                    // still attached.
+                    if degenerate && !writing_thought {
                         eprintln!(
-                            "darkmux-runtime: ⏹ checkpoint {checkpoints_used} — output is \
-                             repeating and this turn never opened a thought; falling through \
-                             to intra-turn stall recovery. (#1221)"
+                            "darkmux-runtime: ⏹ checkpoint {checkpoints_used} — the ANSWER \
+                             region is repeating and there is no thought left to close. \
+                             Escalating for handoff with everything banked so far ATTACHED. \
+                             (#1221)"
                         );
-                        resuming_after_checkpoint = false;
-                        // The accumulation is PROVEN to be repeating, so it
-                        // goes — message and state together. Handing it back
-                        // would prefill the next call with the very text the
-                        // gate just ruled degenerate, which guarantees more of
-                        // it. This is also why the budget is spent here:
-                        // without it the escalation check at the top of this
-                        // arm can never fire, because the checkpoint path
-                        // replaced the only thing that used to spend it, and a
-                        // model repeating at the boundary would loop until an
-                        // e-stop instead of escalating cleanly for handoff.
-                        turn.abandon(&mut messages);
-                        recover_intra_turn_stall(
-                            &mut messages,
-                            trajectory,
+                        return Ok(LoopOutcome {
+                            final_answer: turn.pending_answer(),
+                            terminal_reason: TerminalReason::EscalationTriggered(
+                                EscalationReason::IntraTurnStallExhausted,
+                            ),
+                            messages,
                             turns,
-                            this_turn_completion_tokens,
-                            &mut stall_recoveries_used,
-                            DEGENERATE_NUDGE_MESSAGE,
-                        );
-                    } else if degenerate && writing_thought {
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                            compactions,
+                            failed_to_run: failed_to_run.clone(),
+                        });
+                    }
+                    // Everything reaching here is either a clean continue or a
+                    // degenerate THOUGHT. The old third branch — abandon the
+                    // accumulation, spend a recovery unit, nudge — is gone: it
+                    // deleted real work on a verdict the metric gets wrong for
+                    // whole classes of legitimate output. Measured on realistic
+                    // answer shapes at the shipped threshold: an enum-valued
+                    // JSON array 0.003, a block of identical match arms 0.003,
+                    // an ASCII table frame 0.003, a checklist with an invariant
+                    // line 0.002 — all "degenerate", none pathological. A
+                    // review probe drove that path with an 11 KB first chunk
+                    // and the operator received "Done."
+                    //
+                    // Repetition is a reason to STOP, never a reason to DELETE.
+                    if degenerate && writing_thought {
                         eprintln!(
                             "darkmux-runtime: ⏹ checkpoint {checkpoints_used} — the reasoning is \
                              repeating (degeneracy gate); closing the thought so the model \
@@ -2038,10 +2181,8 @@ pub fn run(
                     // goes and the prefill REPLACES its predecessor, so the
                     // thread carries ONE growing assistant message rather than
                     // a chain of restarts.
-                    if !fall_through_to_recovery {
-                        messages.pop();
-                        turn.hand_back(&mut messages);
-                    }
+                    messages.pop();
+                    turn.hand_back(&mut messages);
                 }
                 let tokens_str = this_turn_completion_tokens
                     .map(|n| n.to_string())
@@ -2587,6 +2728,71 @@ mod tests {
             turn.thought
         );
         assert!(turn.in_answer_region(), "and the answer bound applies from here");
+    }
+
+    /// (#1221) A turn whose thought was NEVER CLOSED must still deliver its
+    /// work. This is the common case for a thinking model, not an edge case,
+    /// and it was found by a live dispatch rather than by any test here.
+    ///
+    /// Measured, 66 API calls on qwen3.6-35b: the provider tagged reasoning on
+    /// call 1 only (`reasoning_format: separate-field`), so darkmux prefilled
+    /// an OPEN `<think>`. Under `response_format` the model cannot close it,
+    /// and once darkmux supplies the opener the provider stops tagging
+    /// continuations — so all 64 later calls arrived as ordinary content and
+    /// were classified as more thought. The answer region was empty for the
+    /// entire turn. 26,181 completion tokens were generated and 1,116
+    /// characters reached the operator: the last slice, starting mid-sentence.
+    ///
+    /// That is the discard-the-turn bug this feature exists to end, one layer
+    /// further in. `fold` and `pending_answer` also disagreed about it, so the
+    /// SAME run produced a different deliverable depending on whether it ended
+    /// on `stop` or on a cap.
+    #[test]
+    fn a_turn_that_never_closed_its_thought_still_delivers_its_work() {
+        let mut messages = vec![Message::user("u")];
+        let mut turn = TurnAccum::default();
+        // Call 1: the provider tags reasoning. Calls 2..n: plain content that
+        // is really the answer, but is indistinguishable from a continued
+        // thought because the block darkmux opened can never be closed.
+        turn.absorb("EARLY-REASONING ", "");
+        turn.absorb("", "MIDDLE-WORK ");
+        turn.absorb("", "MORE-WORK ");
+        turn.hand_back(&mut messages);
+
+        let mut final_msg = Message::assistant("FINAL-SLICE");
+        turn.fold(&mut messages, &mut final_msg);
+        let delivered = final_msg.content.as_deref().unwrap_or("");
+        assert!(
+            delivered.contains("MIDDLE-WORK") && delivered.contains("MORE-WORK"),
+            "the whole turn's work must reach the operator, not just the last \
+             slice — got {delivered:?}"
+        );
+        assert!(
+            delivered.contains("FINAL-SLICE"),
+            "...including the concluding call — got {delivered:?}"
+        );
+        assert!(
+            !delivered.contains("<think>"),
+            "and it is TEXT, not markup — got {delivered:?}"
+        );
+    }
+
+    /// The other side of the same rule: once the thought IS closed, we can tell
+    /// scratch from answer, so the scratch stays out.
+    #[test]
+    fn a_closed_thought_is_scratch_and_never_reaches_the_deliverable() {
+        let mut messages = vec![Message::user("u")];
+        let mut turn = TurnAccum::default();
+        turn.absorb("PRIVATE-SCRATCH ", "");
+        turn.close_thought();
+        turn.absorb("", "the real answer ");
+        turn.hand_back(&mut messages);
+
+        let mut final_msg = Message::assistant("and its end");
+        turn.fold(&mut messages, &mut final_msg);
+        let delivered = final_msg.content.as_deref().unwrap_or("");
+        assert_eq!(delivered, "the real answer and its end");
+        assert!(!delivered.contains("PRIVATE-SCRATCH"));
     }
 
     /// Reasoning that arrives after the close is kept, but stays out of the
@@ -5559,27 +5765,27 @@ mod tests {
             "budget exhaustion on a repeating cap-cliff must escalate cleanly, got {:?}",
             outcome.terminal_reason
         );
-        // (#1221) What "the work survives" means on a DEGENERATE fixture, and
-        // why this assertion is not the naive one.
+        // (#1221) What "the work survives" means on a DEGENERATE fixture.
         //
         // This mock returns the identical sentence forever, so the turn is
         // degenerate by construction. The loop still does the #1221 thing: it
         // checkpoints, and each checkpoint hands the WHOLE accumulation back in
-        // ONE growing message instead of discarding the truncated call. That is
-        // visible in the trajectory below — six `continue` verdicts before the
-        // gate can see the cycle at all, then `conclude`.
+        // ONE growing message rather than discarding the truncated call — six
+        // `continue` verdicts before the gate can see the cycle at all, then
+        // `conclude`.
         //
-        // What it does NOT do is carry a proven-repeating accumulation forward.
-        // Prefilling the next call with the very text the gate just ruled
-        // degenerate guarantees more of it, so that accumulation is abandoned
-        // and the model is nudged to change approach. Asserting a surviving
-        // copy count here would be asserting the opposite — that darkmux keeps
-        // feeding a model its own loop.
+        // What it must NOT do is DELETE that accumulation. An earlier cut did:
+        // a degenerate verdict on a turn with no open thought abandoned the
+        // prefill, spent a recovery unit, and nudged. Measured against
+        // realistic answer shapes at the shipped threshold, that verdict is
+        // wrong for whole classes of legitimate output — an enum-valued JSON
+        // array scores 0.003, a block of identical match arms 0.003, an ASCII
+        // table frame 0.003, a checklist with an invariant line 0.002. A review
+        // probe drove that path with an 11 KB first chunk and the operator
+        // received "Done."
         //
-        // So: prove the accumulation happened (trajectory), prove the recovery
-        // recovered (nudges), and prove the escalation left the last turn as
-        // handoff evidence (pre-existing #414 semantics — the budget check runs
-        // before the pop).
+        // So repetition now STOPS the turn and hands off with everything
+        // attached. Same terminal as before, reached without destroying data.
         let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
         let traj = std::fs::read_to_string(&traj_file).expect("trajectory written");
         let verdicts: Vec<String> = traj
@@ -5599,36 +5805,26 @@ mod tests {
             verdicts.iter().any(|v| v == "conclude"),
             "the gate must eventually SEE the repetition — verdicts were {verdicts:?}"
         );
-        let kept: usize = outcome
-            .messages
-            .iter()
-            .filter_map(|m| m.content.as_deref())
-            .map(|c| c.matches("half my answer").count())
-            .sum();
-        assert_eq!(
-            kept, 1,
-            "the escalation must hand off the last turn as evidence — not zero \
-             (nothing to hand off) and not the abandoned degenerate accumulation \
-             (found {kept} occurrence(s))"
-        );
-        // The budget was spent ON a recovery, not merely decremented. The
-        // degenerate fall-through used to consume a unit and skip the nudge, so
-        // the model got two silent restarts and then an escalation.
-        let nudges = outcome
-            .messages
-            .iter()
-            .filter(|m| {
-                m.role == "system"
-                    && m.content
-                        .as_deref()
-                        .map(|c| c.contains("repeated itself without converging"))
-                        .unwrap_or(false)
+        // Exactly what main.rs does to produce the deliverable.
+        let delivered = outcome
+            .final_answer
+            .clone()
+            .filter(|a| !a.trim().is_empty())
+            .or_else(|| {
+                outcome
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                    .and_then(|m| m.content.clone())
             })
-            .count();
-        assert_eq!(
-            nudges, 2,
-            "each spent recovery must actually nudge the model to change approach \
-             (found {nudges})"
+            .unwrap_or_default();
+        let kept = delivered.matches("half my answer").count();
+        assert!(
+            kept >= 5,
+            "escalating must carry the accumulation, not delete it — the operator \
+             got {kept} occurrence(s) of the work: {:?}",
+            &delivered[..delivered.len().min(120)]
         );
         // (#1221) The check-in is SILENT. An earlier cut told the model it
         // had "reached the per-call reasoning budget"; measured on a real
@@ -6188,3 +6384,7 @@ mod reasoning_feedback_probe {
 
 
 }
+
+#[cfg(test)]
+#[path = "checkpoint_regression_tests.rs"]
+mod checkpoint_regression_tests;
