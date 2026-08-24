@@ -390,6 +390,12 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
     if let Some(n) = darkmux_types::config_access::max_tokens_per_call() {
         cmd.arg("--max-tokens-per-call").arg(n.to_string());
     }
+    // (#1221) The reasoning check-in rate — a SEPARATE knob from the answer
+    // bound above, because sampling a thought wants small and bounding an
+    // answer wants large.
+    if let Some(n) = darkmux_types::config_access::reasoning_checkpoint_interval_tokens() {
+        cmd.arg("--reasoning-checkpoint-interval").arg(n.to_string());
+    }
 }
 
 
@@ -3361,6 +3367,17 @@ struct TailerState {
     /// We accumulate bytes here and decode per-line, after the
     /// trailing newline arrives.
     pending: Vec<u8>,
+    /// (#1221) `seq` of the last `model.completed` counted as a TURN.
+    ///
+    /// A checkpointed thinking turn produces many `model.completed` events —
+    /// one per API call — all carrying the SAME `seq`, because the runtime
+    /// deliberately does not spend a turn on a continuation. The host used to
+    /// re-derive its own count by incrementing on every event, so one long
+    /// thought read as a dozen turns on the seat-card meter, in
+    /// `dispatch.complete`'s `total_turns`, and in everything downstream. The
+    /// runtime's own envelope had the right number the whole time; only this
+    /// re-derivation was wrong.
+    last_counted_turn_seq: Option<u64>,
     session_id: String,
     role_id: String,
     model: String,
@@ -3404,6 +3421,7 @@ impl TailerState {
             trajectory_path,
             offset: 0,
             pending: Vec::new(),
+            last_counted_turn_seq: None,
             session_id,
             role_id,
             model,
@@ -3460,6 +3478,7 @@ impl TailerState {
             trajectory_path,
             offset: 0,
             pending: Vec::new(),
+            last_counted_turn_seq: None,
             session_id,
             role_id,
             model,
@@ -3525,7 +3544,14 @@ impl TailerState {
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match event_type {
             "model.completed" => {
-                self.summary.turns += 1;
+                // Count TURNS, not API calls. Same `seq` = the same logical
+                // turn resuming after a checkpoint.
+                let seq = event.get("seq").and_then(|v| v.as_u64());
+                let is_new_turn = seq.is_none() || seq != self.last_counted_turn_seq;
+                if is_new_turn {
+                    self.summary.turns += 1;
+                    self.last_counted_turn_seq = seq;
+                }
                 let payload = serde_json::json!({
                     "turn_seq": event.get("seq"),
                     "finish_reason": cap_json_str(event.get("finish_reason"), MAX_TRAJ_FIELD_BYTES),
@@ -3643,6 +3669,25 @@ impl TailerState {
                     "from": event.get("tokens_before"),
                     "to": event.get("tokens_after"),
                 }));
+            }
+            "dispatch.checkpoint" => {
+                // (#1221) A checkpoint is the harness deciding, mid-turn,
+                // whether the model keeps thinking. Without its own record the
+                // viewer shows only the `dispatch.turn` each underlying API
+                // call produces, so one long thought reads as a dozen turns
+                // with nothing saying why — which is exactly what an operator
+                // watching a live dispatch reported. `verdict` is the decision
+                // (`continue` / `conclude`) and `tail_ratio` is the measured
+                // repetition of the accumulated reasoning it was made on, so
+                // the surface shows the judgment AND its evidence.
+                let payload = serde_json::json!({
+                    "turn_seq": event.get("seq"),
+                    "checkpoint": event.get("checkpoint"),
+                    "slice_tokens": event.get("slice_tokens"),
+                    "tail_ratio": event.get("tail_ratio"),
+                    "verdict": event.get("verdict"),
+                });
+                self.emit("dispatch.checkpoint", darkmux_flow::Level::Info, payload);
             }
             "model.reasoning" => {
                 // The runtime emits these when it parses <think>...</think>

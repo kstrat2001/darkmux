@@ -76,6 +76,25 @@ pub struct Message {
 }
 
 impl Message {
+    /// (#1221) An assistant turn meant to be CONTINUED, not read as complete.
+    ///
+    /// Distinguished from a normal assistant message only by intent, but the
+    /// intent is load-bearing: the backend continues a TRAILING assistant
+    /// message rather than starting a fresh turn (verified against LMStudio —
+    /// `"1, 2, 3,"` came back `"4, 5, 6, 7, 8, 9, 10"`). So a prefill must be
+    /// the LAST message; anything appended after it ends the turn and turns a
+    /// continuation back into a restart.
+    pub fn assistant_prefill(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        }
+    }
+
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),

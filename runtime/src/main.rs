@@ -32,6 +32,7 @@ mod json_repair;
 mod lmstudio;
 mod loop_runner;
 mod plain_text_tool_calls;
+mod budget_request;
 mod reasoning_loop;
 mod tool_result_prune;
 mod tools;
@@ -223,6 +224,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL`. None = the built-in default
     // (`loop_runner::MAX_TOKENS_PER_CALL` = 10000).
     let mut max_tokens_per_call: Option<u32> = None;
+    let mut reasoning_checkpoint_interval: Option<u32> = None;
 
     // (#457 Step 2) Per-role feedback-template overrides. Dispatcher
     // serializes Role.feedback_templates to JSON; runtime parses into
@@ -471,6 +473,25 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                 } else {
                     eprintln!("--max-turns requires a value");
                     return ExitCode::from(2);
+                }
+            }
+            "--reasoning-checkpoint-interval" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) if n > 0 => {
+                            reasoning_checkpoint_interval = Some(n);
+                            i += 2;
+                        }
+                        _ => {
+                            eprintln!(
+                                "--reasoning-checkpoint-interval requires a positive integer (got: {v})"
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--reasoning-checkpoint-interval requires a value");
+                    std::process::exit(2);
                 }
             }
             "--max-tokens-per-call" => {
@@ -724,6 +745,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         max_turns,
         max_tokens,
         max_tokens_per_call,
+        reasoning_checkpoint_interval,
         feedback_templates,
         response_format,
     );
@@ -771,12 +793,21 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     traj.append_dispatch_complete(result_str, wall_ms);
 
     if let Some(o) = &outcome {
+        // (#1221) Prefer the answer the LOOP identified. "Last assistant
+        // message" is the checkpoint prefill on every non-terminal exit, so
+        // re-deriving it here handed the operator the model's raw scratch work
+        // as its answer.
         let final_assistant = o
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant")
-            .and_then(|m| m.content.clone())
+            .final_answer
+            .clone()
+            .filter(|a| !a.trim().is_empty())
+            .or_else(|| {
+                o.messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                    .and_then(|m| m.content.clone())
+            })
             .unwrap_or_else(|| "<empty>".into());
 
         let preview: String = final_assistant.chars().take(400).collect();

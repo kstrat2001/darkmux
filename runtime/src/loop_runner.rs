@@ -81,7 +81,40 @@ use crate::trajectory::Trajectory;
 /// reasoning is discarded entirely), so reasoning-heavy dispatches raise it
 /// explicitly. No fixed number wins both ways — content-based stopping is
 /// the tracked real fix; this knob is the near-term control.
-const MAX_TOKENS_PER_CALL: u32 = 10000;
+/// (#1221) The per-call bound for ANSWER output — the model's committed text,
+/// not its scratch work.
+///
+/// Large on purpose. Chopping a long answer buys no degeneracy signal (an
+/// answer is not a thought) and every continuation re-sends the accumulation,
+/// so the cost of a small value here is quadratic in the number of chops.
+///
+/// The reasoning check-in rate is the SEPARATE constant below. These were one
+/// number until they were split, and the split is what this doc block is
+/// distinguishing: the text that used to sit here described the interval while
+/// being attached to this constant, which is how the two got conflated in the
+/// first place.
+///
+/// Override: `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` env >
+/// `runtime.max_tokens_per_call` config > this default.
+const MAX_TOKENS_PER_CALL: u32 = 10_000;
+
+/// (#1221) How far the model reasons between check-ins — a SAMPLING RATE, not a
+/// bound on thinking. A turn may span any number of these.
+///
+/// Deliberately separate from `MAX_TOKENS_PER_CALL` because the two want
+/// opposite values and were briefly the same number, which is a bug waiting to
+/// happen in both directions:
+///
+/// - Sampling a THOUGHT wants SMALL. It catches a loop early, and continuing
+///   costs nothing the model can perceive.
+/// - Bounding an ANSWER wants LARGE. Chopping a 4000-token findings JSON into
+///   four calls buys no degeneracy signal — an answer is not a thought — and
+///   each continuation re-sends the whole accumulation, so the cost is
+///   quadratic in the number of chops.
+///
+/// One number could only ever be wrong for one of them. The loop picks per
+/// call, by which region the turn is in.
+const REASONING_CHECKPOINT_INTERVAL: u32 = 1000;
 
 // (#457) Per-dispatch cumulative-completion-tokens cap — REMOVED as
 // a hardcoded constant. Now passed as `Option<u32>` to `run()` via
@@ -142,25 +175,10 @@ fn update_frozen_prompt_turns(prev: Option<u32>, current: u32, frozen: u32) -> u
     }
 }
 
-/// (#414 PR A) Nudge text injected as a system message when the loop
-/// recovers from a length-finish stall. Names BOTH valid next moves
-/// (tool call OR final answer) so the model has explicit alternatives
-/// to the reasoning-spiral pattern that triggered the stall. The
-/// `[darkmux-runtime]` prefix flags the message as runtime-injected so
-/// the operator + reviewer can recognize it in trajectory replay.
 const STALL_NUDGE_MESSAGE: &str = "[darkmux-runtime] Your previous response \
 emitted reasoning tokens up to the per-call cap without producing a tool \
 call or a final answer. Please either invoke a tool to make progress, or \
 provide a direct final answer.";
-
-/// (#1221) Nudge for the cap-cliff shape: finish_reason=length with PARTIAL
-/// content at the per-call cap. The truncated turn was discarded (leaving it
-/// would anchor the failed pattern); the model is told to spend fewer tokens
-/// this turn. Shares the empty-stall recovery budget.
-const CAP_CLIFF_NUDGE_MESSAGE: &str = "[darkmux-runtime] Your previous response \
-hit the per-call token cap mid-generation and was discarded. Reduce your \
-output this turn: reason briefly, then either invoke one tool call or write \
-your final answer.";
 
 /// How the loop terminated. Distinguishes "model said stop" from
 /// "loop hit the safety cap and gave up" — semantically different
@@ -253,6 +271,15 @@ pub struct LoopOutcome {
     /// Total completion tokens summed across all calls.
     pub total_completion_tokens: u32,
 
+    /// (#1221) The turn's ANSWER text when the loop exits with a checkpoint
+    /// prefill still pending.
+    ///
+    /// `main.rs` derives the deliverable as "the last assistant message", which
+    /// is the prefill on every non-terminal exit (escalation, cumulative cap,
+    /// max turns) — so the operator got the model's raw scratch work as its
+    /// answer. The loop knows which region is the answer; nothing downstream
+    /// should have to infer it from message order or delimiters.
+    pub final_answer: Option<String>,
     /// Number of compaction events that fired during the loop.
     /// Phase 6: middle-replace via the companion compactor model.
     pub compactions: u32,
@@ -260,6 +287,414 @@ pub struct LoopOutcome {
     /// (#799) Bash invocations that FAILED TO RUN (never executed) during the
     /// dispatch — the verifier-fabrication backstop. Empty on an honest run.
     pub failed_to_run: Vec<FailedExec>,
+}
+
+/// (#1221) The deliverable must be TEXT, never markup.
+///
+/// A model handed a closed thought can still re-open one, and that scratch
+/// work must not become the answer. ANCHORED deliberately: this engages only
+/// when the text LEADS with an opener. An answer that merely quotes the
+/// delimiter mid-sentence — which is exactly what a reviewer of this file
+/// writes — is handed over verbatim. The unanchored version of this check is
+/// the same bug class as the `rfind("</think>")` that truncated a quoting
+/// answer, and it is not worth reintroducing to tidy up markup that a real
+/// continuation never emits.
+fn as_deliverable_text(s: &str) -> String {
+    let t = s.trim_start();
+    let leads_with_markup = t.starts_with(crate::budget_request::THINK_OPEN.trim());
+    // A never-closed thought becomes the deliverable (see `deliverable`), and
+    // an inline-think family's accumulation carries its own opener wherever the
+    // first slice put it. Strip when the text LEADS with markup or when it
+    // carries an UNMATCHED opener — an answer that merely quotes the delimiter
+    // in passing quotes it in balance or not at all, and keeps its text.
+    let unmatched_opener = t.matches(crate::budget_request::THINK_OPEN.trim()).count()
+        > t.matches(crate::budget_request::THINK_CLOSE.trim()).count();
+    if !leads_with_markup && !unmatched_opener {
+        return s.to_string();
+    }
+    // Markup-led: strip EVERY delimiter, not just the leading one. Text
+    // accumulated across checkpoints can carry more than one opener, and
+    // half-stripped markup is the worst of both.
+    t.replace(crate::budget_request::THINK_OPEN, "")
+        .replace(crate::budget_request::THINK_OPEN.trim_end(), "")
+        .replace(crate::budget_request::THINK_CLOSE, "")
+        .replace(crate::budget_request::THINK_CLOSE.trim(), "")
+        .trim()
+        .to_string()
+}
+
+/// (#1221) Everything the loop knows about the turn currently in flight: its
+/// two output regions, and the prefill message that carries them back to the
+/// model.
+///
+/// **This type exists because the state machine was written as loose
+/// variables first, and that cost two shipped defects.** Message lifetime and
+/// region lifetime are ONE lifetime, but they were managed by six `let mut`s
+/// mutated at seven sites, so it was possible — and it happened twice — to
+/// clear the index while leaving the message it pointed at. An orphaned
+/// prefill is not a cosmetic mess: nothing downstream can reconstruct the
+/// answer from it, so `main.rs` hands raw `<think>` markup over as the
+/// deliverable.
+///
+/// So every transition that touches the prefill takes `&mut Vec<Message>` and
+/// does both halves. There is no method that clears the state without removing
+/// the message, which is what makes the leak unrepresentable rather than
+/// merely avoided.
+///
+/// The whole lifecycle, and nothing outside these four methods may move it:
+///
+/// ```text
+///   begin()    a new logical turn starts — abandon anything live, reset
+///   absorb()   a slice arrives at the boundary — route it into a region
+///   hand_back()  a checkpoint — replace the prefill with the whole
+///                accumulation so the model RESUMES instead of restarting
+///   fold()     a terminal finish — the answer region becomes the deliverable
+///   abandon()  recovery — the message and the state go together
+/// ```
+#[derive(Default)]
+struct TurnAccum {
+    /// The reasoning region: everything inside this turn's think block.
+    thought: String,
+    /// The answer region: everything the model has committed as its answer.
+    answer: String,
+    /// The thought's closing delimiter has been written into the prefill.
+    /// Once closed it STAYS closed — re-opening a think block around an answer
+    /// tells the model its answer was scratch work.
+    think_closed: bool,
+    /// This turn wrote reasoning at all. A turn that writes a long ANSWER and
+    /// never reasons hits the interval exactly like a thinking turn does, and
+    /// wrapping that answer in `<think>` is the category error prefill
+    /// continuation exists to avoid.
+    is_reasoning: bool,
+    /// The accumulated thought already begins with the model's own `<think>`
+    /// (an inline-think family's raw content), so the prefill must not add a
+    /// second one.
+    carries_own_opener: bool,
+    /// Where this turn's prefill sits in `messages`, while one is live.
+    prefill_at: Option<usize>,
+}
+
+impl TurnAccum {
+    /// A new logical turn. Any prefill still live belonged to the PREVIOUS
+    /// turn and must go with it — this is the transition that used to clear
+    /// the index and leave the message, which is the whole reason this type
+    /// exists.
+    fn begin(&mut self, messages: &mut Vec<Message>) {
+        self.abandon(messages);
+    }
+
+    /// Route a slice into the region it belongs to. The ONLY place the regions
+    /// grow.
+    fn absorb(&mut self, reasoning: &str, content: &str) {
+        // Once the thought is closed, everything that follows is the answer —
+        // INCLUDING text that itself contains `<think>` markup. Testing the
+        // inline delimiters first sent post-close slices back into the
+        // thought, so a concluded turn never accumulated an answer at all: the
+        // gate then read an empty answer region, decided the call had produced
+        // nothing, and dropped a turn that had produced plenty.
+        // The model may close the block ITSELF, and on the primary dispatch
+        // surface it is free to. The premise this region machine was built on —
+        // "under `response_format` the model CANNOT emit `</think>`" — is TRUE
+        // and was measured, but it only covers schema-constrained roles:
+        // 17 of the 29 built-in roles declare no `output_schema`, including
+        // `coder`, `code-reviewer` and `analyst`. For those the inline qwen-3.x
+        // family emits its own closer, and nothing here used to watch for it.
+        //
+        // The cost was measured twice, independently. A live 66-call analyst
+        // dispatch generated 26,181 completion tokens and delivered 1,116
+        // characters; a review probe reproduced the same shape and got a
+        // deliverable of `" ANSWER-PART-TWO and that is all."`. In both, the
+        // answer sat in the THOUGHT region because the close that separated
+        // them was read as ordinary thought text.
+        //
+        // This is NOT the `rfind("</think>")` that was removed. That one
+        // searched the whole ACCUMULATION for the LAST occurrence and
+        // TRUNCATED at it, so an answer quoting the delimiter lost its tail.
+        // This splits THIS slice at the FIRST close and keeps BOTH halves —
+        // nothing is discarded, so a quoted delimiter costs a misfiled
+        // sentence rather than a deleted answer.
+        if !self.think_closed {
+            if let Some(at) = content.find(crate::budget_request::THINK_CLOSE.trim()) {
+                let (before, after) = content.split_at(at);
+                let after = &after[crate::budget_request::THINK_CLOSE.trim().len()..];
+                self.is_reasoning = true;
+                if self.thought.is_empty() && before.trim_start().starts_with(crate::budget_request::THINK_OPEN.trim()) {
+                    self.carries_own_opener = true;
+                }
+                self.thought.push_str(reasoning);
+                self.thought.push_str(before);
+                self.think_closed = true;
+                self.answer.push_str(after);
+                return;
+            }
+        }
+        if self.think_closed {
+            // Reasoning that arrives AFTER the close is still reasoning: it
+            // belongs inside the block, not in the deliverable. Appending it to
+            // the thought keeps it carried back (so the model does not
+            // re-derive it next call) while `prefill_body` still emits the
+            // closing delimiter after it, so the block stays closed. Dropping
+            // it silently — which this did — is the discard-the-work bug in
+            // miniature. Rare in practice: once darkmux supplies the opener the
+            // provider stops tagging continuations as reasoning (measured: 13
+            // API calls, exactly one `model.reasoning` event), so this is the
+            // shape that shows up on a family that keeps tagging.
+            self.thought.push_str(reasoning);
+            self.answer.push_str(content);
+            return;
+        }
+        // An INLINE-think model (the qwen 3.x line) cut mid-reasoning leaves an
+        // UNCLOSED `<think>`, and `extract_think_blocks` deliberately bails on
+        // those — so `reasoning_content` is empty for exactly the shape this
+        // feature exists to handle. Detect it from the delimiters instead.
+        //
+        // Anchored at the START, not counted anywhere in the string. An
+        // unanchored `opens > closes` misclassifies any answer that quotes the
+        // opening delimiter as reasoning; a real inline-think turn LEADS with
+        // it. On a continuation the model resumes inside the block darkmux
+        // handed back and emits no opener at all, which falls through to the
+        // continuing-a-thought branch below.
+        let trimmed = content.trim_start();
+        let opener = crate::budget_request::THINK_OPEN.trim();
+        let closer = crate::budget_request::THINK_CLOSE.trim();
+        if trimmed.starts_with(opener) && trimmed.matches(opener).count() > trimmed.matches(closer).count() {
+            self.is_reasoning = true;
+            // Only the FIRST slice decides whether the accumulation carries its
+            // own opener, because the flag governs whether a `<think>` is
+            // prefixed to the WHOLE thought. Setting it unconditionally let a
+            // later inline slice delete the opener from an accumulation that
+            // began as `reasoning_content` and needed one.
+            if self.thought.is_empty() {
+                self.carries_own_opener = true;
+            }
+            self.thought.push_str(content);
+            return;
+        }
+        if !reasoning.trim().is_empty() {
+            self.is_reasoning = true;
+            self.thought.push_str(reasoning);
+            // BOTH fields present means the model finished thinking and had
+            // begun answering when the boundary hit. Discarding `content` here
+            // silently deleted committed text on the modal thinking-model
+            // shape.
+            if !content.is_empty() {
+                self.think_closed = true;
+                self.answer.push_str(content);
+            }
+            return;
+        }
+        if self.is_reasoning {
+            // Continuing a thought darkmux opened. After a prefill the provider
+            // stops tagging the continuation as reasoning — we supplied the
+            // opener, so it comes back as ordinary content. Measured: 13 API
+            // calls produced exactly ONE `model.reasoning` event.
+            self.thought.push_str(content);
+        } else {
+            self.answer.push_str(content);
+        }
+    }
+
+    /// Which bound the NEXT call carries. A turn starts in the reasoning region
+    /// (we cannot know whether it will think until it answers, and sampling
+    /// finely is the cheap mistake) and moves to the answer region once a
+    /// checkpoint shows the output is plain content, or once a degeneracy
+    /// verdict has closed the thought.
+    fn in_answer_region(&self) -> bool {
+        self.think_closed || (!self.is_reasoning && !self.answer.is_empty())
+    }
+
+    /// Whether the region currently being written is the thought.
+    fn writing_thought(&self) -> bool {
+        self.is_reasoning && !self.think_closed
+    }
+
+    /// The region the degeneracy gate should judge — whichever one is being
+    /// written. Judging the thought unconditionally left a non-reasoning turn
+    /// measuring an empty string, so degeneracy could never fire and a
+    /// repeating answer spun forever.
+    fn carried(&self) -> &str {
+        if self.writing_thought() {
+            self.thought.trim()
+        } else {
+            self.answer.trim()
+        }
+    }
+
+    /// A degeneracy verdict: close the thought so the model answers FROM it
+    /// rather than re-deriving it. Written into the accumulation, so every
+    /// later checkpoint keeps handing back a closed thought plus the answer so
+    /// far.
+    fn close_thought(&mut self) {
+        self.think_closed = true;
+    }
+
+    /// The message that goes back out: the WHOLE accumulation, assembled from
+    /// the regions and never parsed back out of a blob.
+    fn prefill_body(&self) -> String {
+        let mut body = String::new();
+        if !self.thought.is_empty() {
+            // The delimiter contract lives in `budget_request` and is pinned by
+            // its own tests; assembling the same bytes by hand here would be a
+            // second copy that drifts. `carries_own_opener` is the one case
+            // those helpers cannot express: the model's raw content already
+            // OPENS the block, so prefixing a second one nests it.
+            body.push_str(&if self.carries_own_opener {
+                let mut t = self.thought.clone();
+                if self.think_closed {
+                    t.push_str(crate::budget_request::THINK_CLOSE);
+                }
+                t
+            } else if self.think_closed {
+                crate::budget_request::conclude_now_prefill(&self.thought)
+            } else {
+                crate::budget_request::continue_thinking_prefill(&self.thought)
+            });
+        }
+        body.push_str(&self.answer);
+        body
+    }
+
+    /// Hand the turn back as a prefill so the model RESUMES it.
+    ///
+    /// REPLACES the previous prefill rather than appending beside it. A live
+    /// 30-checkpoint dispatch showed the cost of appending: thirty sibling
+    /// assistant messages, each opening its own `<think>` around a truncated
+    /// copy of the same answer. The model was not resuming a thought; it
+    /// restarted the same one every call and could never converge.
+    ///
+    /// The prefill must remain LAST — anything appended after it ends the
+    /// assistant turn and turns a continuation back into a restart.
+    fn hand_back(&mut self, messages: &mut Vec<Message>) {
+        let body = self.prefill_body();
+        self.remove_prefill(messages);
+        messages.push(Message::assistant_prefill(body));
+        self.prefill_at = Some(messages.len() - 1);
+    }
+
+    /// A terminal finish. The deliverable is the ANSWER region plus whatever
+    /// this final call added — assembled, never recovered by searching for a
+    /// delimiter.
+    ///
+    /// A concluding turn returns only the SUFFIX (a continuation carries just
+    /// the new text), so without this fold the accumulated body stays orphaned
+    /// in the prefill one slot earlier and `main.rs` — which takes the last
+    /// assistant message — hands over the tail and nothing else. That is the
+    /// MODAL path, not an edge case: most turns conclude rather than
+    /// degenerate.
+    fn fold(&mut self, messages: &mut Vec<Message>, message: &mut Message) {
+        if self.prefill_at.is_none() {
+            return;
+        }
+        // Route the TERMINAL slice through the same region logic as every other
+        // slice. It used to bypass `absorb` entirely and be appended raw, so a
+        // model that closed its own block on the last call handed its trailing
+        // scratch work AND a dangling `</think>` over as the answer. A terminal
+        // turn is not a different kind of output; it is the last one.
+        let tail = message.content.clone().unwrap_or_default();
+        self.absorb("", &tail);
+        message.content = Some(self.deliverable(""));
+        self.remove_prefill(messages);
+        self.clear();
+    }
+
+    /// Give up on this turn: the message and the state go together. Used by the
+    /// recovery path and by `begin`.
+    fn abandon(&mut self, messages: &mut Vec<Message>) {
+        self.remove_prefill(messages);
+        self.clear();
+    }
+
+    /// The answer this turn would hand over if the run ended right now, and
+    /// only while a prefill is still live — once folded, the deliverable is
+    /// already the last message and there is nothing to override.
+    fn pending_answer(&self) -> Option<String> {
+        self.prefill_at?;
+        let d = self.deliverable("");
+        if d.trim().is_empty() {
+            None
+        } else {
+            Some(d)
+        }
+    }
+
+    /// What this turn hands the operator, given whatever the final call added.
+    ///
+    /// ONE rule, shared by `fold` and `pending_answer`, because they disagreed
+    /// and that meant the SAME run produced a different deliverable depending
+    /// on whether it ended on `stop` or on a cap.
+    ///
+    /// The answer region when the thought was CLOSED — then we can tell scratch
+    /// from answer, and the scratch stays out. When it was NEVER closed we
+    /// cannot, and the accumulation itself is the deliverable. That is not an
+    /// edge case: measured on a live 66-call dispatch, the provider tagged
+    /// reasoning on call 1 only, so every later call arrived as untagged
+    /// content and was classified as more thought. The answer region was empty
+    /// for the whole turn — 26,181 completion tokens generated, 1,116
+    /// characters delivered, starting mid-sentence. Handing over nothing, or
+    /// only the last slice, is the discard-the-turn bug this feature exists to
+    /// end.
+    fn deliverable(&self, tail: &str) -> String {
+        let mut out = String::new();
+        if !self.think_closed && !self.thought.trim().is_empty() {
+            out.push_str(&self.thought);
+        }
+        out.push_str(&self.answer);
+        out.push_str(tail);
+        as_deliverable_text(&out)
+    }
+
+    /// Whether a prefill is live — i.e. whether this turn has work banked.
+    fn has_prefill(&self) -> bool {
+        self.prefill_at.is_some()
+    }
+
+    /// Private: the two halves that must never be done separately.
+    fn remove_prefill(&mut self, messages: &mut Vec<Message>) {
+        if let Some(i) = self.prefill_at.take() {
+            if i < messages.len() {
+                messages.remove(i);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.thought.clear();
+        self.answer.clear();
+        self.think_closed = false;
+        self.is_reasoning = false;
+        self.carries_own_opener = false;
+        self.prefill_at = None;
+    }
+}
+
+
+/// (#1221/#1123) The mechanics both non-checkpointable shapes share: drop the
+/// unusable response, spend one unit of the bounded recovery budget, record it,
+/// and nudge.
+///
+/// What the two callers do NOT share is the accumulation. An EMPTY completion
+/// says nothing about the work already banked, so that path keeps its prefill
+/// and stays on the same turn — discarding five productive checkpoints because
+/// the sixth call came back blank is precisely the bug this feature exists to
+/// end. A DEGENERATE accumulation is different: it is proven to be repeating,
+/// and handing it back guarantees more of it, so that path abandons it first.
+fn recover_intra_turn_stall(
+    messages: &mut Vec<Message>,
+    trajectory: &mut Trajectory,
+    turns: u32,
+    completion_tokens: Option<u32>,
+    stall_recoveries_used: &mut u32,
+    nudge: &str,
+) {
+    messages.pop();
+    *stall_recoveries_used = stall_recoveries_used.saturating_add(1);
+    trajectory.append_intra_turn_stall_recovered(
+        turns,
+        completion_tokens,
+        *stall_recoveries_used,
+        MAX_STALL_RECOVERIES,
+    );
+    messages.push(Message::system(nudge));
 }
 
 /// Run the tool-call loop to completion.
@@ -298,8 +733,13 @@ pub fn run(
     compaction_cfg: &compaction::CompactionConfig,
     max_turns: Option<u32>,
     max_cumulative_tokens: Option<u32>,
-    // (#1221) Per-call completion-token cap; None = MAX_TOKENS_PER_CALL.
+    // (#1221) Per-call completion-token bound for ANSWER output;
+    // None = MAX_TOKENS_PER_CALL.
     max_tokens_per_call: Option<u32>,
+    // (#1221) How far the model reasons between check-ins;
+    // None = REASONING_CHECKPOINT_INTERVAL. A separate knob from the answer
+    // bound above because the two want opposite values — see the constants.
+    reasoning_checkpoint_interval: Option<u32>,
     feedback_templates: std::collections::BTreeMap<String, String>,
     // (#1038) Optional `response_format` envelope (the role's output_schema,
     // wrapped as json_schema). When set, every model turn is grammar-constrained
@@ -310,7 +750,24 @@ pub fn run(
     // (#1221) Resolve the per-call cap once; every use below (the request's
     // max_tokens, cap-salvage detection, the budget snapshot, the length-arm
     // diagnostics) reads this so an override stays consistent end-to-end.
-    let per_call_cap: u32 = max_tokens_per_call.unwrap_or(MAX_TOKENS_PER_CALL);
+    // (#1221) The per-call cap is a CHECKPOINT INTERVAL, not a ceiling — it is
+    // constant, and what changes at each checkpoint is whether the reasoning is
+    // handed back open (continue) or closed (conclude).
+    let answer_max_tokens: u32 = max_tokens_per_call.unwrap_or(MAX_TOKENS_PER_CALL);
+    let reasoning_interval: u32 =
+        reasoning_checkpoint_interval.unwrap_or(REASONING_CHECKPOINT_INTERVAL);
+    // Assigned from the turn's region at the top of every iteration, before
+    // the request that carries it is built; the length arm reads it back.
+    let mut per_call_cap: u32;
+    let mut checkpoints_used: u32 = 0;
+    // Set when the previous iteration handed a turn back as a prefill; read by
+    // the turn counter so the resumed call is not counted as a new turn.
+    let mut resuming_after_checkpoint = false;
+    // (#1221) The turn currently in flight: its two output regions and the
+    // prefill message that carries them back to the model. See `TurnAccum` —
+    // these were six loose `let mut`s mutated at seven sites, and the two
+    // defects that cost were both "cleared the state, left the message".
+    let mut turn = TurnAccum::default();
     let tool_defs: Vec<_> = tools.iter().map(|t| t.to_tool_def()).collect();
     // Set of tool names the model is allowed to call. Drives the
     // plain-text-tool-call promoter (#406): any tool name in the
@@ -501,6 +958,7 @@ pub fn run(
                      returning partial outcome"
                 );
                 return Ok(LoopOutcome {
+                    final_answer: turn.pending_answer(),
                     terminal_reason: TerminalReason::MaxTurns,
                     messages,
                     turns,
@@ -526,6 +984,7 @@ pub fn run(
                      partial outcome (#423, #457)"
                 );
                 return Ok(LoopOutcome {
+                    final_answer: turn.pending_answer(),
                     terminal_reason: TerminalReason::EscalationTriggered(
                         EscalationReason::CumulativeTokensExceeded,
                     ),
@@ -539,6 +998,19 @@ pub fn run(
             }
         }
 
+        // Pick the bound BEFORE building the request that carries it. This
+        // sat after the struct literal, so every request went out with the
+        // PREVIOUS iteration's value — the switch to the answer bound always
+        // lagged one full call. Measured: reasoning=50 / answer=5000 produced
+        // max_tokens 50, 50, 5000, 5000, so a non-reasoning turn was still
+        // checkpointed at the small reasoning interval for one extra call,
+        // which is exactly the case the split exists to prevent.
+        per_call_cap = if turn.in_answer_region() {
+            answer_max_tokens
+        } else {
+            reasoning_interval
+        };
+
         let request = ChatRequest {
             model: model.to_string(),
             messages: messages.clone(),
@@ -549,13 +1021,38 @@ pub fn run(
             response_format: response_format.clone(),
         };
 
-        let next_seq = turns + 1;
+        // (#1221) `turns` has not been incremented yet, so a FRESH turn is
+        // `turns + 1` — but a checkpoint continuation does not increment at
+        // all, and stamping it `turns + 1` gave `model.partial` a sequence one
+        // ahead of the `model.completed` it pairs with. Streaming is the
+        // production default, so that mismatch is what the viewer normally
+        // reads: every continuation's partials filed under a turn that does
+        // not exist yet.
+        let next_seq = if resuming_after_checkpoint { turns } else { turns + 1 };
         let mut response = if streaming {
             run_streaming_turn(client, &request, next_seq, trajectory)?
         } else {
             client.chat(&request)?
         };
-        turns += 1;
+        // (#1221) A checkpoint continuation is the SAME logical turn resuming,
+        // so it must not consume a turn. It is a new API CALL, which is why
+        // this used to increment — but `turns` is what `max_turns` is checked
+        // against, so counting continuations silently divides the operator's
+        // turn budget by the number of checkpoints: with a 1000-token interval,
+        // one long reasoning turn spent thirteen of them. The knob would mean
+        // something different depending on an unrelated interval setting.
+        if resuming_after_checkpoint {
+            resuming_after_checkpoint = false;
+        } else {
+            turns += 1;
+            // (#1221) A new logical turn is a new thought, so the previous
+            // turn's accumulation goes — AND the prefill message that carried
+            // it, which is the half this used to forget. Clearing the index
+            // alone orphaned a raw `<think>` block in history that nothing
+            // could reconstruct an answer from, so `main.rs` handed that markup
+            // over as the deliverable. `begin` does both or neither.
+            turn.begin(&mut messages);
+        }
 
         // (#406) Recover plain-text tool calls the model emitted in
         // `content` or `reasoning_content` instead of the structured
@@ -794,11 +1291,39 @@ pub fn run(
         // needs to see things in. When salvage fired, the content
         // field was cleared above so the truncated reasoning doesn't
         // leak into history.
+        // (#1221) A turn that CONCLUDES after checkpointing returns only the
+        // SUFFIX — a prefill continuation carries just the new text, never the
+        // prefix it continues. Pushing that suffix as a fresh message left the
+        // accumulated body orphaned in the stale prefill one slot earlier, and
+        // `main.rs` takes "the last assistant message" as the deliverable — so
+        // the envelope, the JSON `content` and the operator-visible preview all
+        // got the tail and nothing else.
+        //
+        // That is the MODAL path, not an edge case: most turns conclude rather
+        // than degenerate, and the PR's own measurement is that 43-50% of
+        // review-corpus turns hit the boundary. A feature built to stop
+        // discarding work was discarding it again, one layer up.
+        //
+        // Only on a TERMINAL finish. A `length` finish is still mid-turn: the
+        // checkpoint arm below pops this very message and rewrites the prefill,
+        // so folding here would destroy the accumulation it depends on.
+        //
+        // The deliverable is assembled from the regions, never recovered by
+        // searching for a delimiter. `rfind("</think>")` was wrong twice over:
+        // it truncated an answer that merely QUOTED the delimiter (which is
+        // what a reviewer of this very file writes), and under
+        // `response_format` the model cannot emit one at all, so it found
+        // nothing and handed the raw thought over as the answer.
+        if effective_finish_reason != "length" {
+            turn.fold(&mut messages, &mut assistant_message);
+        }
+
         messages.push(assistant_message.clone());
 
         match effective_finish_reason {
             "stop" => {
                 return Ok(LoopOutcome {
+                    final_answer: turn.pending_answer(),
                     terminal_reason: TerminalReason::Stop,
                     messages,
                     turns,
@@ -826,6 +1351,25 @@ pub fn run(
                     // budget, escalating to the frontier when exhausted —
                     // instead of aborting on the first occurrence.
                     if stall_recoveries_used >= MAX_STALL_RECOVERIES {
+                        // (#1221) Drop the empty message before handing off.
+                        // `main.rs` takes the LAST assistant message as the
+                        // deliverable, and this arm pushes a wholly empty one
+                        // every time it fires — so escalating with it still in
+                        // place buries the turn's real work behind a blank
+                        // message and the operator receives nothing. The
+                        // recovery below already drops it; the escalation
+                        // returned before reaching that.
+                        if messages
+                            .last()
+                            .map(|m| {
+                                m.role == "assistant"
+                                    && m.content.as_deref().map(|c| c.trim().is_empty()).unwrap_or(true)
+                                    && m.tool_calls.as_ref().map(|t| t.is_empty()).unwrap_or(true)
+                            })
+                            .unwrap_or(false)
+                        {
+                            messages.pop();
+                        }
                         eprintln!(
                             "darkmux-runtime: escalation_triggered — finish_reason=\
                              tool_calls with no tool_calls, and the intra-turn stall \
@@ -834,6 +1378,7 @@ pub fn run(
                              pattern. Emitting EscalationTriggered for frontier handoff."
                         );
                         return Ok(LoopOutcome {
+                            final_answer: turn.pending_answer(),
                             terminal_reason: TerminalReason::EscalationTriggered(
                                 EscalationReason::IntraTurnStallExhausted,
                             ),
@@ -845,7 +1390,31 @@ pub fn run(
                             failed_to_run: failed_to_run.clone(),
                         });
                     }
-                    messages.pop();
+                    // (#1221) Pop ONLY a genuinely useless message. This arm is
+                    // reached AFTER the terminal fold has written the turn's
+                    // whole accumulation into this very message, so an
+                    // unconditional pop deletes every banked checkpoint — and
+                    // the fold has already cleared the region state, so nothing
+                    // can reconstruct it and `pending_answer` returns None on
+                    // every later exit. Proven by a review probe: a turn that
+                    // banked a 200-item first chunk, then got the wholly-empty
+                    // `tool_calls: []` shape, then concluded, delivered
+                    // `"Done."` and nothing else.
+                    //
+                    // The #1123 shape this recovery was built for is a WHOLLY
+                    // EMPTY message, which pops exactly as before. A message
+                    // carrying real text is not a useless completion; the model
+                    // still gets the budget spent and the nudge, but its work
+                    // stays in history as ordinary assistant text.
+                    let useless = messages
+                        .last()
+                        .map(|m| {
+                            m.content.as_deref().map(|c| c.trim().is_empty()).unwrap_or(true)
+                        })
+                        .unwrap_or(false);
+                    if useless {
+                        messages.pop();
+                    }
                     stall_recoveries_used = stall_recoveries_used.saturating_add(1);
                     trajectory.append_intra_turn_stall_recovered(
                         turns,
@@ -854,11 +1423,12 @@ pub fn run(
                         MAX_STALL_RECOVERIES,
                     );
                     messages.push(Message::system(STALL_NUDGE_MESSAGE));
+                    let kept = if useless { "Dropped the useless turn" } else { "KEPT the turn's work" };
                     eprintln!(
                         "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} \
-                         returned finish_reason=tool_calls with no tool_calls (empty \
-                         completion). Dropped the useless turn, injected a nudge; \
-                         budget {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#1123)"
+                         returned finish_reason=tool_calls with no tool_calls. {kept}, \
+                         injected a nudge; budget \
+                         {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#1123/#1221)"
                     );
                     continue;
                 }
@@ -1238,6 +1808,7 @@ pub fn run(
                                  emitting EscalationTriggered terminal for frontier handoff"
                             );
                             return Ok(LoopOutcome {
+                                final_answer: turn.pending_answer(),
                                 terminal_reason: TerminalReason::EscalationTriggered(
                                     EscalationReason::CompactionLimitReached,
                                 ),
@@ -1296,8 +1867,27 @@ pub fn run(
                 // cap-1 live, so equality misses by one token and misroutes
                 // a cap hit to the overflow hard error (run-4 killed a
                 // 14-turn prosecution at 29999/30000 exactly this way).
+                // (#1221) An ABSENT `usage` object means "we cannot tell", and
+                // the safe reading of "cannot tell" at a `length` finish is a
+                // CAP HIT, not a context overflow. `is_some_and` returned false
+                // for unknown, which routed straight into the hard `Err` below
+                // — and that `Err` kills the whole dispatch, so `main.rs` emits
+                // `result: "error"` with no envelope, no metrics and no
+                // deliverable. Every banked checkpoint goes with it.
+                //
+                // This matters far more on this branch than before it: the
+                // per-call bound dropped from 10,000 to a 1,000-token
+                // checkpoint interval, so the population reaching this boundary
+                // went from rare to a measured 43-50% of turns. darkmux's own
+                // local path sets `stream_options.include_usage`, so LMStudio
+                // reports it — but a hosted endpoint or proxy that ignores that
+                // flag would make every checkpointed dispatch fatal.
+                //
+                // The overflow diagnosis needs a MEASURED token count below the
+                // cap; without one there is nothing to diagnose from.
                 let cap_cliff = this_turn_completion_tokens
-                    .is_some_and(|t| t.saturating_add(1) >= per_call_cap);
+                    .map(|t| t.saturating_add(1) >= per_call_cap)
+                    .unwrap_or(true);
                 if !is_useless_stall && !cap_cliff {
                     return Err(anyhow!(
                         "model returned finish_reason=length with partial content \
@@ -1322,6 +1912,7 @@ pub fn run(
                          pattern. Emitting EscalationTriggered for frontier handoff."
                     );
                     return Ok(LoopOutcome {
+                        final_answer: turn.pending_answer(),
                         terminal_reason: TerminalReason::EscalationTriggered(
                             EscalationReason::IntraTurnStallExhausted,
                         ),
@@ -1334,38 +1925,281 @@ pub fn run(
                     });
                 }
 
-                // Recover: drop the useless turn from history (it's
-                // pure reasoning noise — leaving it would anchor the
-                // model on the same failed pattern), record a stall-
-                // recovered trajectory event for observability, then
-                // append a system-role nudge naming the two valid
-                // next moves (tool call or final answer). The next
-                // iteration's chat() call will see the augmented
-                // conversation.
-                messages.pop();
-                stall_recoveries_used = stall_recoveries_used.saturating_add(1);
-                trajectory.append_intra_turn_stall_recovered(
-                    turns,
-                    this_turn_completion_tokens,
-                    stall_recoveries_used,
-                    MAX_STALL_RECOVERIES,
-                );
-                // (#1221) Shape-specific nudge: a partial-content cap hit
-                // gets told to spend fewer tokens; the empty runaway keeps
-                // the original tool-or-answer nudge.
-                let (nudge, shape) = if is_useless_stall {
-                    (STALL_NUDGE_MESSAGE, "no content and no tool calls (runaway-reasoning shape)")
+                // (#1221) CHECKPOINT, not a cap. The model's own reasoning
+                // goes back inside the think region so it RESUMES rather than
+                // restarting — measured: a 40,608-char truncated turn prefilled
+                // back resumed mid-sentence and produced 3,999 more tokens.
+                //
+                // The runtime decides, not the model. An earlier cut asked the
+                // model to either conclude or request more budget; measured on
+                // a real review, it FOLDED at the first checkpoint — producing
+                // a four-point summary with zero findings where the same model
+                // uninterrupted had produced a real one. A model invited to
+                // stop will stop. So the check-in is silent: the harness reads
+                // the slice, and the model never learns a boundary existed.
+                //
+                // The closing delimiter is the switch. Clean -> hand it back
+                // OPEN and it keeps thinking. Degenerate or out of checkpoints
+                // -> hand it back CLOSED and it concludes FROM that reasoning
+                // rather than re-deriving it.
+                //
+                // Why not `content`: promoting reasoning there puts scratch
+                // work where the model was trained to read its own committed
+                // answer. Prefill keeps the tokens where they were generated.
+                //
+                // The prefill message must remain LAST — anything appended
+                // after it ends the assistant turn and turns a continuation
+                // back into a restart.
+                // After a prefill the provider stops tagging the continued
+                // thinking as reasoning — darkmux supplied the `<think>` opener
+                // itself, so the model's output comes back as ordinary
+                // `content`. Measured: 13 API calls produced exactly ONE
+                // `model.reasoning` event. Judging only `reasoning_content`
+                // therefore leaves the gate reading an EMPTY slice on every
+                // checkpoint after the first — continuing not because it found
+                // the reasoning clean but because it had nothing to look at.
+                // Post-prefill, content IS the reasoning.
+                let content_slice = assistant_message.content.as_deref().unwrap_or("");
+                // Route the slice into the region it belongs to. Nothing is
+                // inserted between slices: the model was cut mid-sentence and
+                // resumes at exactly that character, so any separator would
+                // land inside a word. See `TurnAccum::absorb` for why the
+                // ordering of the three shapes matters.
+                turn.absorb(&per_turn_reasoning, content_slice);
+                // What gets handed back is the WHOLE accumulation, never one
+                // slice. That is also the scope the degeneracy gate needs: a
+                // model re-treading ground from three checkpoints ago produces
+                // slices that each look locally novel, so judging one slice in
+                // isolation cannot see the cycle it exists to catch.
+                let writing_thought = turn.writing_thought();
+                let carried = turn.carried().to_string();
+                // Emptiness is a property of THIS call, not of the turn. Testing
+                // the accumulation meant that once a turn had checkpointed once
+                // it could never be empty again, so the classic null-emission
+                // runaway could never reach the drop-and-nudge branch a second
+                // time. Measured: 41,383 checkpoints in 20s with
+                // `Recovery budget 0/2` on every line, escalation unreachable.
+                let this_call_produced_nothing =
+                    per_turn_reasoning.trim().is_empty() && content_slice.trim().is_empty();
+                if this_call_produced_nothing {
+                    // Nothing to hand back — an empty completion at the
+                    // boundary. This is the USELESS STALL the intra-turn
+                    // recovery has always owned, and it must keep owning it:
+                    // the checkpoint code replaced the old drop-and-nudge for
+                    // every shape in this arm, which silently took the recovery
+                    // away from the one shape that still needs it. The symptom
+                    // was six tests going from a clean
+                    // `IntraTurnStallExhausted` escalation to `MaxTurns`, with
+                    // `dispatch.intra_turn_stall.recovered` never emitted.
+                    //
+                    // Checkpointing cannot help with THIS call — there is
+                    // nothing in it to resume. But the accumulation from
+                    // earlier checkpoints is untouched work, so it stays: the
+                    // prefill is not abandoned, and the turn does not end.
+                    // Probed live — a system message after a prefill does NOT
+                    // break continuation, so the nudge can sit behind it.
+                    recover_intra_turn_stall(
+                        &mut messages,
+                        trajectory,
+                        turns,
+                        this_turn_completion_tokens,
+                        &mut stall_recoveries_used,
+                        STALL_NUDGE_MESSAGE,
+                    );
+                    // Only a turn with nothing banked is a fresh start; one
+                    // mid-accumulation keeps going, or the empty call would
+                    // cost every checkpoint before it.
+                    resuming_after_checkpoint = turn.has_prefill();
+                    eprintln!(
+                        "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} hit                          the boundary with an EMPTY completion, so there is nothing to                          resume. Dropped the useless turn, injected a nudge; budget                          {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#1123/#1221)"
+                    );
                 } else {
-                    (CAP_CLIFF_NUDGE_MESSAGE, "partial content truncated at the per-call cap (#1221 cap-cliff shape)")
-                };
-                messages.push(Message::system(nudge));
+                    checkpoints_used = checkpoints_used.saturating_add(1);
+                    // Only judge while the thought is still open. After the
+                    // close the accumulation is reasoning PLUS the answer being
+                    // written, and its ratio stays low forever — judging it
+                    // would re-fire the verdict on every checkpoint.
+                    // Judge the region being written, ALWAYS — including after
+                    // the thought is closed.
+                    //
+                    // This used to return `None` once closed, justified by "the
+                    // accumulation is reasoning PLUS the answer, so its ratio
+                    // stays low forever". That was simply false: `carried()`
+                    // returns the ANSWER ALONE once the thought is closed — the
+                    // reasoning is not in the judged slice at all. The
+                    // measurement the gate was disabled to avoid does not
+                    // exist, and disabling it left the post-close answer region
+                    // with no gate whatsoever.
+                    //
+                    // Measured by a review probe: after a forced conclude, a
+                    // model repeating in the answer region ran 337 checkpoints
+                    // with no terminal reached, every line reading `turn 1` and
+                    // `Recovery budget 0/2`. Under default config the only
+                    // backstop is the host's 600s SIGKILL — which produces NO
+                    // envelope, so every banked checkpoint is lost too.
+                    let tail_ratio = crate::reasoning_loop::tail_repetition_ratio(
+                        &carried,
+                        crate::reasoning_loop::TAIL_WINDOW_TOKENS,
+                        crate::reasoning_loop::tail_sample_tokens(reasoning_interval),
+                    );
+                    // Degeneracy DETECTION applies to any output; only the
+                    // remedy differs. An earlier cut gated the detection itself
+                    // on `turn_is_reasoning`, which left repeating plain content
+                    // with no gate at all — it checkpointed forever, and the
+                    // pre-existing intra-turn stall escalation that used to
+                    // bound exactly that shape became unreachable.
+                    let degenerate =
+                        crate::reasoning_loop::slice_is_degenerate(&carried, reasoning_interval);
+                    // (#1221) EVERY continuation is the same logical turn,
+                    // including the one that follows a `conclude`.
+                    //
+                    // This read `!degenerate` first, and a live dispatch showed
+                    // what that costs: a conclude reported itself as not
+                    // resuming, so the next iteration ran the fresh-turn reset,
+                    // wiped the accumulation, and the model regenerated the
+                    // identical thought. The tail ratios of checkpoints 6-10
+                    // reproduced 1-5 to four decimal places, and the run would
+                    // have cycled until context exhaustion. A conclude changes
+                    // the DELIMITER, never the turn.
+                    resuming_after_checkpoint = true;
+                    trajectory.append_checkpoint(
+                        turns,
+                        checkpoints_used,
+                        this_turn_completion_tokens,
+                        tail_ratio,
+                        if degenerate { "conclude" } else { "continue" },
+                    );
+                    // (#1221) The gate does exactly ONE thing: decide whether
+                    // this slice is repeating. It imposes no limit of its own —
+                    // not a checkpoint count (a count times the interval is a
+                    // token ceiling wearing a different name) and not a
+                    // time-based wrap-up. Every stop that is not degeneracy
+                    // belongs to the operator's existing, CONFIGURABLE e-stops.
+                    //
+                    // Which of those actually reach THIS shape, stated
+                    // precisely, because an earlier version of this comment
+                    // named `runtime.max_turns` and that was simply false:
+                    //
+                    //   `runtime.max_turns`  does NOT bound a checkpointing
+                    //       turn. Continuations are the same logical turn by
+                    //       design, so the counter never moves. Naming it here
+                    //       told a reader a bound existed where none did.
+                    //   `runtime.max_tokens` (cumulative) DOES bound it, and is
+                    //       the right knob — checkpointing spends tokens, which
+                    //       is exactly what it meters. It defaults to unset
+                    //       (uncapped), so it bounds this only for an operator
+                    //       who set it.
+                    //   the inactivity budget bounds it only as an absolute
+                    //       600s SIGKILL: a checkpoint is not a proof-of-work
+                    //       signal, so the timer never resets on one. That is a
+                    //       HARD kill — no conclusion, no envelope.
+                    //
+                    // So under default config the only backstop is that hard
+                    // kill. Deliberately left as-is rather than inventing a
+                    // checkpoint ceiling here, which is the thing this change
+                    // exists to remove — but it is a real gap, and the fix
+                    // belongs at the config layer (a default for
+                    // `runtime.max_tokens`), not in this gate. Tracked
+                    // separately.
+                    // A degenerate turn that never opened a thought has no
+                    // delimiter to close, so it does not get a prefill at all —
+                    // it goes back to the recovery path that already owns this
+                    // shape.
+                    // (#1221) The remedy DIFFERS by region, and conflating them
+                    // trades one defect for another.
+                    //
+                    // A degenerate ANSWER after we already forced a conclude is
+                    // a model that will not converge. Bound it — but do NOT
+                    // abandon the accumulation the way the no-thought path
+                    // does. Measured separately: legitimate repetitive ANSWER
+                    // shapes score far below the threshold (an enum-valued JSON
+                    // array, a block of identical match arms, an ASCII table
+                    // frame, a checklist with an invariant line all land near
+                    // 0.003), so deleting on this verdict would destroy real
+                    // work on output that is repetitive by nature rather than
+                    // by pathology. Hand it off instead, with everything banked
+                    // still attached.
+                    if degenerate && !writing_thought {
+                        eprintln!(
+                            "darkmux-runtime: ⏹ checkpoint {checkpoints_used} — the ANSWER \
+                             region is repeating and there is no thought left to close. \
+                             Escalating for handoff with everything banked so far ATTACHED. \
+                             (#1221)"
+                        );
+                        return Ok(LoopOutcome {
+                            final_answer: turn.pending_answer(),
+                            terminal_reason: TerminalReason::EscalationTriggered(
+                                EscalationReason::IntraTurnStallExhausted,
+                            ),
+                            messages,
+                            turns,
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                            compactions,
+                            failed_to_run: failed_to_run.clone(),
+                        });
+                    }
+                    // Everything reaching here is either a clean continue or a
+                    // degenerate THOUGHT. The old third branch — abandon the
+                    // accumulation, spend a recovery unit, nudge — is gone: it
+                    // deleted real work on a verdict the metric gets wrong for
+                    // whole classes of legitimate output. Measured on realistic
+                    // answer shapes at the shipped threshold: an enum-valued
+                    // JSON array 0.003, a block of identical match arms 0.003,
+                    // an ASCII table frame 0.003, a checklist with an invariant
+                    // line 0.002 — all "degenerate", none pathological. A
+                    // review probe drove that path with an 11 KB first chunk
+                    // and the operator received "Done."
+                    //
+                    // Repetition is a reason to STOP, never a reason to DELETE.
+                    if degenerate && writing_thought {
+                        eprintln!(
+                            "darkmux-runtime: ⏹ checkpoint {checkpoints_used} — the reasoning is \
+                             repeating (degeneracy gate); closing the thought so the model \
+                             answers from what it has. (#1221)"
+                        );
+                        // The close is written INTO the accumulation, so every
+                        // later checkpoint keeps handing back a thought that is
+                        // already closed followed by the answer so far, and
+                        // everything after it is the ANSWER region.
+                        turn.close_thought();
+                    } else if turn.think_closed {
+                        eprintln!(
+                            "darkmux-runtime: ⏵ checkpoint {checkpoints_used} — thought already \
+                             closed; handing back the answer so far so the model finishes it. \
+                             (#1221)"
+                        );
+                    } else {
+                        eprintln!(
+                            "darkmux-runtime: ⏵ checkpoint {checkpoints_used} — reasoning is not \
+                             repeating; handing it back OPEN so the model continues. (#1221)"
+                        );
+                    }
+                    // A reasoning turn resumes INSIDE its think block; a
+                    // plain-answer turn resumes as itself, with no delimiters
+                    // invented around it. Either way the truncated raw response
+                    // goes and the prefill REPLACES its predecessor, so the
+                    // thread carries ONE growing assistant message rather than
+                    // a chain of restarts.
+                    messages.pop();
+                    turn.hand_back(&mut messages);
+                }
                 let tokens_str = this_turn_completion_tokens
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "<unknown>".to_string());
+                let shape = if is_useless_stall {
+                    "reasoning-only up to the cap"
+                } else {
+                    "partial content truncated at the cap"
+                };
+                // The per-branch detail (extended / concluded / no-reasoning)
+                // is printed above where the decision is made; this line is the
+                // one-per-hit summary the operator scans for.
                 eprintln!(
-                    "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} \
-                     emitted {tokens_str} completion tokens: {shape}. Dropped \
-                     the turn, injected a nudge; budget {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#414)"
+                    "darkmux-runtime: ⏸ per-call budget reached — turn {turns} \
+                     emitted {tokens_str} completion tokens ({shape}); the turn's \
+                     reasoning was NOT discarded. Recovery budget \
+                     {stall_recoveries_used}/{MAX_STALL_RECOVERIES}. (#1221)"
                 );
                 continue;
             }
@@ -1514,7 +2348,22 @@ fn promote_terminal_reasoning(msg: &mut Message, finish_reason: &str) {
             }
         }
     }
-    msg.reasoning_content = None;
+    // (#1221) EXCEPT on a length finish. The strip exists so a normal turn's
+    // reasoning is not echoed back to the model on the next call — the usual
+    // convention, and correct. But a length turn is the one case that must
+    // carry its reasoning forward: the checkpoint gate hands it back inside the
+    // think region so the model RESUMES instead of restarting, and it cannot do
+    // that with a field this function already emptied.
+    //
+    // Ordering is why this has to live here rather than at the call site:
+    // `promote_terminal_reasoning` runs immediately after the response lands,
+    // while `per_turn_reasoning` — what the gate reads — is assembled much
+    // later. Clearing here made the gate see an empty string and take the
+    // "no reasoning to hand back" fallback on every single checkpoint,
+    // silently reducing the feature to a no-op.
+    if finish_reason != "length" {
+        msg.reasoning_content = None;
+    }
 }
 
 fn assistant_message_has_well_formed_tool_calls(msg: &Message) -> bool {
@@ -1785,6 +2634,286 @@ fn extract_think_blocks(content: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // (#1221) The prefill state machine, tested directly.
+    //
+    // These exist because the loop-level tests could NOT falsify three of
+    // `TurnAccum`'s guards: two deliberate mutations (delete `begin`'s
+    // abandon; check the inline-think delimiters before `think_closed`) left
+    // all 433 loop tests green. That is not evidence the guards are
+    // unnecessary — the whole point of the redesign is that the leaking
+    // states are no longer REACHABLE through the loop, so the loop cannot
+    // reach them to prove anything. A state machine whose invariants are
+    // only observable three layers up is a state machine nobody can check.
+    // ---------------------------------------------------------------
+
+    /// A prefill and its state are created, folded, and abandoned as a UNIT.
+    /// Clearing the index while leaving the message is the leak that produced
+    /// both of this feature's shipped defects: nothing downstream can
+    /// reconstruct an answer from an orphaned prefill, so `main.rs` hands raw
+    /// `<think>` markup over as the deliverable.
+    #[test]
+    fn a_new_turn_takes_the_previous_turns_prefill_with_it() {
+        let mut messages = vec![Message::system("s"), Message::user("u")];
+        let mut turn = TurnAccum::default();
+        turn.absorb("thinking hard", "");
+        turn.hand_back(&mut messages);
+        assert_eq!(messages.len(), 3, "the prefill was pushed");
+        assert!(turn.has_prefill());
+
+        turn.begin(&mut messages);
+        assert!(!turn.has_prefill(), "the index was cleared");
+        assert_eq!(
+            messages.len(),
+            2,
+            "...and so was the MESSAGE — an orphan here becomes the deliverable"
+        );
+        assert!(
+            !messages.iter().any(|m| m
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("thinking hard")),
+            "the previous turn's scratch work must not survive into the next turn"
+        );
+    }
+
+    /// A checkpoint REPLACES its predecessor rather than appending beside it.
+    /// A live 30-checkpoint dispatch showed the cost of appending: thirty
+    /// sibling assistant messages, each opening its own `<think>` around a
+    /// truncated copy of the same answer, so the model restarted every call.
+    #[test]
+    fn each_checkpoint_replaces_the_previous_prefill() {
+        let mut messages = vec![Message::system("s"), Message::user("u")];
+        let mut turn = TurnAccum::default();
+        for slice in ["first ", "second ", "third "] {
+            turn.absorb(slice, "");
+            turn.hand_back(&mut messages);
+        }
+        let assistants: Vec<_> = messages.iter().filter(|m| m.role == "assistant").collect();
+        assert_eq!(assistants.len(), 1, "one growing message, not a chain");
+        let body = assistants[0].content.as_deref().unwrap_or("");
+        assert!(
+            body.contains("first ") && body.contains("second ") && body.contains("third "),
+            "the prefill carries the WHOLE thought, not the newest slice — got {body:?}"
+        );
+        assert_eq!(
+            body.matches(crate::budget_request::THINK_OPEN.trim()).count(),
+            1,
+            "exactly one opener around the accumulation — got {body:?}"
+        );
+    }
+
+    /// Once the thought is closed, EVERYTHING that follows is the answer —
+    /// including text that itself contains `<think>` markup. Testing the
+    /// inline delimiters first sent post-close slices back into the thought,
+    /// so a concluded turn never accumulated an answer at all.
+    #[test]
+    fn a_closed_thought_routes_every_later_slice_to_the_answer() {
+        let mut turn = TurnAccum::default();
+        turn.absorb("", "<think>\nreasoning");
+        assert!(turn.writing_thought(), "an unclosed inline think is the thought");
+        turn.close_thought();
+
+        turn.absorb("", "<think>\nthe model re-opened one");
+        assert!(
+            turn.answer.contains("the model re-opened one"),
+            "post-close text is ANSWER text however it is marked up — answer={:?}",
+            turn.answer
+        );
+        assert!(
+            !turn.thought.contains("the model re-opened one"),
+            "a closed thought must not reopen — thought={:?}",
+            turn.thought
+        );
+        assert!(turn.in_answer_region(), "and the answer bound applies from here");
+    }
+
+    /// (#1221) A turn whose thought was NEVER CLOSED must still deliver its
+    /// work. This is the common case for a thinking model, not an edge case,
+    /// and it was found by a live dispatch rather than by any test here.
+    ///
+    /// Measured, 66 API calls on qwen3.6-35b: the provider tagged reasoning on
+    /// call 1 only (`reasoning_format: separate-field`), so darkmux prefilled
+    /// an OPEN `<think>`. Under `response_format` the model cannot close it,
+    /// and once darkmux supplies the opener the provider stops tagging
+    /// continuations — so all 64 later calls arrived as ordinary content and
+    /// were classified as more thought. The answer region was empty for the
+    /// entire turn. 26,181 completion tokens were generated and 1,116
+    /// characters reached the operator: the last slice, starting mid-sentence.
+    ///
+    /// That is the discard-the-turn bug this feature exists to end, one layer
+    /// further in. `fold` and `pending_answer` also disagreed about it, so the
+    /// SAME run produced a different deliverable depending on whether it ended
+    /// on `stop` or on a cap.
+    #[test]
+    fn a_turn_that_never_closed_its_thought_still_delivers_its_work() {
+        let mut messages = vec![Message::user("u")];
+        let mut turn = TurnAccum::default();
+        // Call 1: the provider tags reasoning. Calls 2..n: plain content that
+        // is really the answer, but is indistinguishable from a continued
+        // thought because the block darkmux opened can never be closed.
+        turn.absorb("EARLY-REASONING ", "");
+        turn.absorb("", "MIDDLE-WORK ");
+        turn.absorb("", "MORE-WORK ");
+        turn.hand_back(&mut messages);
+
+        let mut final_msg = Message::assistant("FINAL-SLICE");
+        turn.fold(&mut messages, &mut final_msg);
+        let delivered = final_msg.content.as_deref().unwrap_or("");
+        assert!(
+            delivered.contains("MIDDLE-WORK") && delivered.contains("MORE-WORK"),
+            "the whole turn's work must reach the operator, not just the last \
+             slice — got {delivered:?}"
+        );
+        assert!(
+            delivered.contains("FINAL-SLICE"),
+            "...including the concluding call — got {delivered:?}"
+        );
+        assert!(
+            !delivered.contains("<think>"),
+            "and it is TEXT, not markup — got {delivered:?}"
+        );
+    }
+
+    /// The other side of the same rule: once the thought IS closed, we can tell
+    /// scratch from answer, so the scratch stays out.
+    #[test]
+    fn a_closed_thought_is_scratch_and_never_reaches_the_deliverable() {
+        let mut messages = vec![Message::user("u")];
+        let mut turn = TurnAccum::default();
+        turn.absorb("PRIVATE-SCRATCH ", "");
+        turn.close_thought();
+        turn.absorb("", "the real answer ");
+        turn.hand_back(&mut messages);
+
+        let mut final_msg = Message::assistant("and its end");
+        turn.fold(&mut messages, &mut final_msg);
+        let delivered = final_msg.content.as_deref().unwrap_or("");
+        assert_eq!(delivered, "the real answer and its end");
+        assert!(!delivered.contains("PRIVATE-SCRATCH"));
+    }
+
+    /// Reasoning that arrives after the close is kept, but stays out of the
+    /// deliverable. Dropping it is the discard-the-work bug in miniature;
+    /// putting it in the answer is the scratch-work-in-the-deliverable bug.
+    /// It belongs inside the block that is already closed.
+    #[test]
+    fn post_close_reasoning_is_carried_back_but_never_delivered() {
+        let mut messages = vec![Message::user("u")];
+        let mut turn = TurnAccum::default();
+        turn.absorb("first thoughts ", "");
+        turn.close_thought();
+        turn.absorb("MORE-SCRATCH ", "the answer");
+
+        assert!(
+            turn.thought.contains("MORE-SCRATCH"),
+            "post-close reasoning must still be carried back — thought={:?}",
+            turn.thought
+        );
+        assert!(
+            !turn.answer.contains("MORE-SCRATCH"),
+            "...but it is NOT the deliverable — answer={:?}",
+            turn.answer
+        );
+        turn.hand_back(&mut messages);
+        let body = messages.last().unwrap().content.as_deref().unwrap_or("");
+        assert!(
+            body.contains("MORE-SCRATCH"),
+            "the prefill carries it so the model does not re-derive it — got {body:?}"
+        );
+        let close = crate::budget_request::THINK_CLOSE.trim();
+        assert!(
+            body.find("MORE-SCRATCH").unwrap() < body.find(close).unwrap(),
+            "and it sits INSIDE the closed block — got {body:?}"
+        );
+    }
+
+    /// The inline-think test is ANCHORED at the start, not counted anywhere in
+    /// the string. An unanchored `opens > closes` misclassifies any answer
+    /// that QUOTES the opening delimiter as reasoning — which is exactly what
+    /// a reviewer of this very file writes. Same bug class as the
+    /// `rfind("</think>")` that truncated a quoting answer.
+    #[test]
+    fn an_answer_that_quotes_the_delimiter_is_not_mistaken_for_reasoning() {
+        let mut turn = TurnAccum::default();
+        turn.absorb(
+            "",
+            "The runtime prefixes `<think>` to the accumulation before handing it back.",
+        );
+        assert!(
+            !turn.is_reasoning,
+            "quoting the delimiter mid-sentence is not thinking — thought={:?}",
+            turn.thought
+        );
+        assert!(
+            turn.answer.contains("prefixes"),
+            "the quoting text is the ANSWER — answer={:?}",
+            turn.answer
+        );
+    }
+
+    /// Only the FIRST slice decides whether the accumulation carries its own
+    /// opener, because the flag governs whether `<think>` is prefixed to the
+    /// WHOLE thought. Setting it on any inline slice let a later one delete
+    /// the opener from an accumulation that began as `reasoning_content`.
+    #[test]
+    fn a_later_inline_slice_cannot_strip_the_openers_from_an_earlier_one() {
+        let mut messages = vec![Message::user("u")];
+        let mut turn = TurnAccum::default();
+        turn.absorb("started in the reasoning field ", "");
+        turn.absorb("", "<think>\nand continued inline");
+        turn.hand_back(&mut messages);
+        let body = messages.last().unwrap().content.as_deref().unwrap_or("");
+        assert!(
+            body.starts_with(crate::budget_request::THINK_OPEN),
+            "an accumulation that began WITHOUT its own opener still needs one — got {body:?}"
+        );
+    }
+
+    /// The deliverable must be TEXT, never markup — but the strip is anchored,
+    /// so an answer that merely quotes the delimiter keeps its text.
+    #[test]
+    fn the_deliverable_is_stripped_only_when_it_leads_with_markup() {
+        assert_eq!(
+            as_deliverable_text("<think>\nscratch work\n</think>\n"),
+            "scratch work"
+        );
+        let quoting = "The opener is `<think>` and the closer is `</think>`.";
+        assert_eq!(
+            as_deliverable_text(quoting),
+            quoting,
+            "a quoting answer is handed over verbatim"
+        );
+    }
+
+    /// An EMPTY completion says nothing about the work already banked. The
+    /// accumulation survives it; only a proven-DEGENERATE one is abandoned.
+    #[test]
+    fn folding_prefers_the_answer_region_and_takes_the_prefill_with_it() {
+        let mut messages = vec![Message::user("u")];
+        let mut turn = TurnAccum::default();
+        turn.absorb("scratch reasoning ", "");
+        turn.close_thought();
+        turn.absorb("", "the answer so far ");
+        turn.hand_back(&mut messages);
+        assert_eq!(messages.len(), 2);
+
+        let mut final_msg = Message::assistant("and its conclusion");
+        turn.fold(&mut messages, &mut final_msg);
+        assert_eq!(
+            final_msg.content.as_deref(),
+            Some("the answer so far and its conclusion"),
+            "the deliverable is the ANSWER region plus this call, never the scratch work"
+        );
+        assert_eq!(messages.len(), 1, "the prefill went with the fold");
+        assert!(!turn.has_prefill());
+        assert!(
+            turn.pending_answer().is_none(),
+            "nothing left to override once folded"
+        );
+    }
     use crate::lmstudio::{FunctionCall, ToolCall};
 
     /// Google's compat layer finishes tool-calling turns with `"stop"` —
@@ -2009,7 +3138,14 @@ mod tests {
     fn promote_terminal_reasoning_skips_on_length_truncation() {
         // (#1050 QA) A length-capped runaway (empty content + reasoning dump, no
         // tool calls) is the #414 stall-recovery shape — do NOT promote, so the
-        // pop+nudge+retry path stays reachable. Reasoning is still stripped.
+        // pop+nudge+retry path stays reachable.
+        //
+        // (#1221) But the reasoning is NO LONGER STRIPPED, and that inversion is
+        // the whole point. Stripping it here is what made the checkpoint gate
+        // read an EMPTY slice on every check-in: `promote_terminal_reasoning`
+        // cleared `reasoning_content` for every finish reason, so the ONE shape
+        // that needs rescuing took the one path that discarded it. Measured
+        // live: 13 API calls produced exactly one `model.reasoning` event.
         let mut msg = Message {
             role: "assistant".into(),
             content: None,
@@ -2023,7 +3159,12 @@ mod tests {
             msg.content, None,
             "must NOT promote on a length-truncated turn (preserves stall recovery)",
         );
-        assert_eq!(msg.reasoning_content, None, "reasoning still stripped (#406)");
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("truncated runaway reasoning..."),
+            "a length-truncated turn must KEEP its reasoning — it is the input the \
+             checkpoint gate reads and the text handed back as the prefill (#1221)"
+        );
     }
 
     #[test]
@@ -2168,7 +3309,7 @@ mod tests {
     /// Build a non-streaming chat-completion response body the way
     /// LMStudio would return it. Tests use this to construct
     /// deterministic turn-by-turn responses.
-    fn chat_response_json(
+    pub(super) fn chat_response_json(
         content: Option<&str>,
         tool_calls: Option<serde_json::Value>,
         finish_reason: &str,
@@ -2212,6 +3353,407 @@ mod tests {
     /// (close to per-call cap). After enough turns, cumulative crosses
     /// MAX_CUMULATIVE_COMPLETION_TOKENS=250000 and the loop should
     /// escalate with `EscalationTriggered(CumulativeTokensExceeded)`
+    /// (#1221) A turn that never reasoned must NOT get its answer wrapped in
+    /// `<think>`.
+    ///
+    /// `max_tokens` bounds every request, so a turn writing a long ANSWER hits
+    /// the checkpoint interval exactly like a thinking turn does. The first cut
+    /// fell back to `content` when no reasoning was present and then wrapped
+    /// that content in a think block — handing the model its own committed
+    /// output back as scratch work. That is the category error the whole
+    /// prefill design exists to avoid, inverted: a `pr-reviewer` emitting a
+    /// large findings JSON would have had that JSON re-presented to it as a
+    /// thought it was still having.
+    #[test]
+    #[serial_test::serial]
+    fn a_non_reasoning_turn_resumes_its_answer_without_think_delimiters() {
+        let server = MockServer::start();
+        // Plain content, no `<think>` anywhere, no `reasoning_content`.
+        let answer: String = (0..200).map(|j| format!("word{j} ")).collect();
+        let body = answer.clone();
+        let _m = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(chat_response_json(Some(&body), None, "length", 100, 200));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("noreason").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("answer")];
+        let tools: [Tool; 0] = [];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), Some(600), Some(200), Some(200), std::collections::BTreeMap::new(), None,
+        )
+        .expect("non-reasoning checkpoint loop returns Ok(outcome)");
+
+        let prefill = outcome
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .and_then(|m| m.content.as_deref())
+            .expect("an assistant prefill is present");
+
+        assert!(
+            !prefill.contains("<think>"),
+            "a turn that never reasoned must resume as ITSELF; wrapping its \
+             answer in a think block tells the model its committed output was \
+             scratch work. Got: {:?}",
+            &prefill[..prefill.len().min(120)]
+        );
+        assert!(
+            prefill.starts_with("word0"),
+            "the answer must be handed back verbatim from its first token, got: {:?}",
+            &prefill[..prefill.len().min(60)]
+        );
+    }
+
+
+    /// (#1221) An EMPTY completion at the boundary says nothing about the work
+    /// already banked.
+    ///
+    /// The intra-turn stall recovery drops the useless call and nudges — that
+    /// is pre-existing #414 behavior and it stays. What it must NOT do is take
+    /// the accumulation with it: discarding five productive checkpoints because
+    /// the sixth call came back blank is precisely the discard-the-turn bug
+    /// this whole feature exists to end, reappearing one layer down.
+    ///
+    /// Two MUTUALLY EXCLUSIVE mocks keyed on the request body — `mock()` takes
+    /// an FnOnce that runs ONCE at registration, so a call counter inside it
+    /// never advances and the mock answers identically forever.
+    #[test]
+    #[serial_test::serial]
+    fn an_empty_call_does_not_discard_the_work_already_banked() {
+        const BANKED: &str = "BANKED-WORK-FROM-AN-EARLIER-CHECKPOINT";
+        let server = MockServer::start();
+        // First call: real content, cut at the boundary.
+        let _first = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                !b.contains(BANKED)
+            });
+            then.status(200)
+                .json_body(chat_response_json(Some(BANKED), None, "length", 100, 200));
+        });
+        // Every later call (the request now carries the prefill): blank.
+        let _blank = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.contains(BANKED)
+            });
+            then.status(200)
+                .json_body(chat_response_json(Some(""), None, "length", 100, 200));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("ckblank").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("t"), Message::user("answer")];
+        let tools: [Tool; 0] = [];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(10), None, Some(200), Some(200), std::collections::BTreeMap::new(), None,
+        )
+        .expect("a blank call after real work returns Ok");
+
+        assert!(
+            matches!(
+                outcome.terminal_reason,
+                TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted)
+            ),
+            "repeated blank calls must still exhaust the recovery budget and escalate, got {:?}",
+            outcome.terminal_reason
+        );
+        // The banked work is reachable EXACTLY as main.rs reaches it.
+        let deliverable = outcome
+            .final_answer
+            .clone()
+            .filter(|a| !a.trim().is_empty())
+            .or_else(|| {
+                outcome
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                    .and_then(|m| m.content.clone())
+            })
+            .unwrap_or_default();
+        assert!(
+            deliverable.contains(BANKED),
+            "the work banked before the blank call must still be the deliverable — got {deliverable:?}"
+        );
+        // And it is still ONE logical turn: a blank call is not a boundary.
+        assert_eq!(
+            outcome.turns, 1,
+            "an empty call mid-accumulation does not start a new turn (turns={})",
+            outcome.turns
+        );
+    }
+
+    /// (#1221) A turn that CONCLUDES after checkpointing must keep its whole
+    /// answer where `main.rs` looks for it.
+    ///
+    /// A prefill continuation returns only the SUFFIX. Pushing that as a fresh
+    /// message left the accumulated body orphaned in the stale prefill one slot
+    /// earlier, and `main.rs` takes "the last assistant message" as the
+    /// deliverable — so the envelope, the JSON content and the operator preview
+    /// got the tail and nothing else. Modal path, not an edge case: most turns
+    /// conclude rather than degenerate.
+    #[test]
+    #[serial_test::serial]
+    fn a_concluding_checkpointed_turn_keeps_its_whole_answer() {
+        let server = MockServer::start();
+        // Two MUTUALLY EXCLUSIVE mocks keyed on the request body. `mock()` takes
+        // an FnOnce that runs ONCE at registration, so a call-counter inside it
+        // is evaluated a single time and the mock answers identically forever —
+        // which made an earlier version of this test spin to 6160 checkpoints
+        // and deadlock every `#[serial]` test behind it.
+        const MARKER: &str = "PARTONE-BODY-THAT-MUST-SURVIVE";
+        let _first = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|req| {
+                    let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                    !b.contains(MARKER)
+                });
+            then.status(200).json_body(chat_response_json(
+                Some(MARKER), None, "length", 100, 200,
+            ));
+        });
+        let _second = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|req| {
+                    let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                    b.contains(MARKER)
+                });
+            then.status(200).json_body(chat_response_json(
+                Some("PARTTWO-CONCLUSION"), None, "stop", 100, 20,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("ckconclude2").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("t"), Message::user("answer")];
+        let tools: [Tool; 0] = [];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(10), None, Some(200), Some(200), std::collections::BTreeMap::new(), None,
+        )
+        .expect("concluding checkpointed turn returns Ok");
+
+        // Exactly what main.rs does to produce the deliverable.
+        let final_assistant = outcome
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default();
+
+        assert!(
+            final_assistant.contains(MARKER),
+            "the deliverable lost everything before the final continuation — got {final_assistant:?}"
+        );
+        assert!(
+            final_assistant.contains("PARTTWO-CONCLUSION"),
+            "the deliverable must also carry the concluding text — got {final_assistant:?}"
+        );
+        let assistants = outcome.messages.iter().filter(|m| m.role == "assistant").count();
+        assert_eq!(
+            assistants, 1,
+            "the stale prefill must be folded away, not left beside the conclusion"
+        );
+    }
+
+    /// (#1221) A `conclude` verdict closes the THOUGHT, not the TURN.
+    ///
+    /// The first cut set `resuming_after_checkpoint = !degenerate`, so a
+    /// conclude reported itself as not-resuming. The next iteration therefore
+    /// ran the fresh-turn reset, wiped the accumulation, and the model
+    /// regenerated the identical thought from scratch. Observed live: the tail
+    /// ratios of checkpoints 6-10 reproduced 1-5 to four decimal places
+    /// (1.0000, 0.5398, 0.3532, 0.2624, 0.2088) and the run would have cycled
+    /// until context exhaustion — the gate ruling correctly and the loop
+    /// discarding the ruling one iteration later.
+    #[test]
+    #[serial_test::serial]
+    fn concluding_closes_the_thought_without_restarting_the_turn() {
+        let server = MockServer::start();
+        // Deliberately degenerate: one clause repeated, so the gate concludes
+        // on the very first checkpoint and every later call is post-close.
+        let repetitive = format!(
+            "<think>\n{}",
+            "the same clause again and again ".repeat(40)
+        );
+        let body = repetitive.clone();
+        let _m = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200)
+                .json_body(chat_response_json(Some(&body), None, "length", 100, 200));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("ckconclude").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("think")];
+        let tools: [Tool; 0] = [];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), Some(1000), Some(200), Some(200), std::collections::BTreeMap::new(), None,
+        )
+        .expect("concluding loop returns Ok(outcome)");
+
+        // The gate fired, so the thought was closed and the model answered
+        // from it. What must be true now is about the DELIVERABLE, not about
+        // delimiters left lying in history: the terminal fold removes the
+        // prefill and hands back the answer region, so a concluded turn
+        // correctly leaves no `<think>` behind at all.
+        // Exactly what main.rs does: prefer the answer the loop identified.
+        let final_assistant = outcome
+            .final_answer
+            .clone()
+            .filter(|a| !a.trim().is_empty())
+            .or_else(|| {
+                outcome
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                    .and_then(|m| m.content.clone())
+            })
+            .unwrap_or_default();
+
+        // Asserts the deliverable is not raw MARKUP. Not `!contains` — this
+        // mock replays its `<think>` opener on every call, which a real
+        // continuation never does (the model resumes inside the block darkmux
+        // handed back), so interior copies are a fixture artifact rather than a
+        // property of the code.
+        assert!(
+            !final_assistant.trim_start().starts_with("<think>"),
+            "the deliverable must be text, not an unopened think block — got {:?}",
+            &final_assistant[..final_assistant.len().min(120)]
+        );
+        // A conclude is not a turn boundary: many API calls, still one turn.
+        assert_eq!(
+            outcome.turns, 1,
+            "a conclude closes the thought, not the turn; turns={} means the loop \
+             treated it as a boundary and restarted the thought",
+            outcome.turns
+        );
+    }
+
+    /// (#1221) The checkpoint prefill must REPLACE the previous one and carry
+    /// the WHOLE thought — the two halves of the same invariant.
+    ///
+    /// Both were wrong in the first implementation, and unit tests did not
+    /// notice because every existing test asserts `terminal_reason` and token
+    /// counts, never the shape of the message thread that goes back out. A live
+    /// 30-checkpoint dispatch was what exposed it: the outgoing request carried
+    /// thirty sibling assistant messages, each opening its own `<think>` with a
+    /// truncated copy of the same answer, so the model restarted rather than
+    /// resumed and could never converge. This test reads the thread.
+    #[test]
+    #[serial_test::serial]
+    fn checkpoint_prefill_replaces_previous_and_carries_accumulated_thought() {
+        let server = MockServer::start();
+        // Distinct tokens so the accumulation is verifiable by inspection and
+        // the degeneracy gate stays on the `continue` branch for this run.
+        // An inline-think model cut mid-thought: an UNCLOSED `<think>`, which is
+        // the shape every truncated reasoning turn actually has.
+        let slice: String = format!(
+            "<think>\n{}",
+            (0..80).map(|i| format!("step{i}")).collect::<Vec<_>>().join(" ")
+        );
+        let slice_body = slice.clone();
+        let _m = server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some(&slice_body),
+                None,
+                // Always truncated at the cap → every call checkpoints.
+                "length",
+                100,
+                200,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("ckprefill").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("think hard")];
+        let tools: [Tool; 0] = [];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        // 200 completion tokens per call against a 600 cumulative cap stops the
+        // run after a handful of checkpoints — enough for stacking to show.
+        let outcome = run(
+            &client,
+            &client,
+            "test-model",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(100),
+            Some(600),
+            Some(200),
+            Some(200),
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("checkpointing loop returns Ok(outcome)");
+
+        let prefills: Vec<&Message> = outcome
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == "assistant"
+                    && m.content.as_deref().is_some_and(|c| c.contains("<think>"))
+            })
+            .collect();
+
+        assert_eq!(
+            prefills.len(),
+            1,
+            "the thread must carry exactly ONE checkpoint prefill; {} of them means \
+             each checkpoint appended beside the last instead of replacing it, which \
+             is what made the model restart its answer every call",
+            prefills.len()
+        );
+
+        let body = prefills[0]
+            .content
+            .as_deref()
+            .expect("prefill message has content");
+        // NOT asserting one `<think>` here: this mock replays its opener on
+        // every call, which a real continuation never does (the model resumes
+        // inside the block darkmux handed back). The invariant that matters —
+        // ONE prefill message rather than a chain of restarts — is asserted
+        // above, and the accumulation is asserted below.
+        // The accumulation: the first slice's opening token must appear once per
+        // checkpoint, not once total.
+        let repeats = body.matches("step0 ").count();
+        assert!(
+            repeats >= 2,
+            "the prefill must hand back the whole thought so far, not just the \
+             newest slice — expected the first slice to still be present after \
+             later checkpoints, found {repeats} occurrence(s)"
+        );
+    }
+
     /// BEFORE hitting MAX_TURNS. Distinguishes from MaxTurns because
     /// the cumulative bail fires earlier in the dispatch lifecycle on
     /// pathological emission patterns.
@@ -2253,7 +3795,7 @@ mod tests {
         // unbounded against a mock that returns infinite identical
         // length-finish responses. 250000 matches the prior hardcoded
         // default value the test was originally written against.
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000), None, None, std::collections::BTreeMap::new(), None)
             .expect("cumulative-budget escalation returns Ok(outcome)");
 
         assert_eq!(
@@ -2305,7 +3847,7 @@ mod tests {
         // (#457) Counter-test to the cap-fire path. Set Some(250_000)
         // for parity with the cap-fire test; the mock returns a stop
         // turn quickly so we never approach it.
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000), None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), Some(250_000), None, None, std::collections::BTreeMap::new(), None)
             .expect("healthy stop should not bail");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
@@ -2351,7 +3893,7 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Test exercises the MaxTurns terminal — needs Some(N)
         // for the cap to fire. 100 matches the prior hardcoded default.
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("MAX_TURNS path returns Ok(outcome), not Err");
 
         assert_eq!(
@@ -2409,7 +3951,7 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Test relies on MaxTurns to terminate the loop — needs
         // Some(100) explicitly now that the cap is operator-opt-in.
-        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("loop completes (MaxTurns)");
 
         // Read the trajectory and find the failure-cascade event.
@@ -2477,7 +4019,7 @@ mod tests {
         // before. (#457) Cap is operator-opt-in now; pass Some(100)
         // explicitly so the loop terminates at the same point this
         // test was originally written against.
-        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("loop completes (MaxTurns)");
 
         // Read the trajectory and count cycle.suspected events.
@@ -2550,7 +4092,7 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
         // (#457) Same MaxTurns-relying pattern as the cycle/cascade
         // tests above; needs Some(100) now that the cap is opt-in.
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("loop completes (MaxTurns)");
 
         // (1) Trajectory contains feedback.injected events — proves
@@ -2660,7 +4202,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("promoted XML tool call should drive the loop, not error");
 
         assert!(
@@ -2790,6 +4332,7 @@ mod tests {
             Some(3),
             None,
             None,
+            None,
             std::collections::BTreeMap::new(),
             None,
         )
@@ -2867,6 +4410,7 @@ mod tests {
             Some(3),
             None,
             Some(5000),
+            None,
             std::collections::BTreeMap::new(),
             None,
         )
@@ -2927,7 +4471,8 @@ mod tests {
             &cfg,
             Some(10),
             None,
-            None,
+            Some(1000),
+            Some(1000),
             std::collections::BTreeMap::new(),
             None,
         )
@@ -2981,7 +4526,8 @@ mod tests {
             &cfg,
             Some(10),
             None,
-            None,
+            Some(10_000),
+            Some(10_000),
             std::collections::BTreeMap::new(),
             None,
         )
@@ -3035,6 +4581,7 @@ mod tests {
             false,
             &cfg,
             Some(3),
+            None,
             None,
             None,
             std::collections::BTreeMap::new(),
@@ -3110,6 +4657,7 @@ mod tests {
             Some(2),
             None,
             None,
+            None,
             std::collections::BTreeMap::new(),
             None,
         )
@@ -3178,7 +4726,8 @@ mod tests {
             &cfg,
             Some(3),
             None,
-            None,
+            Some(1000),
+            Some(1000),
             std::collections::BTreeMap::new(),
             None,
         );
@@ -3241,7 +4790,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("recovered call from length-truncated response should drive the loop");
 
         assert!(
@@ -3296,7 +4845,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("promoted XML tool call from reasoning_content should drive the loop");
 
         assert!(
@@ -3379,7 +4928,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("clean two-turn dispatch");
 
         // The first assistant message in the conversation must have
@@ -3442,7 +4991,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(10_000), Some(10_000), std::collections::BTreeMap::new(), None)
             .expect("clean single-turn dispatch");
 
         captured.assert();
@@ -3481,7 +5030,7 @@ mod tests {
         let tools = [Tool::Read, Tool::Edit, Tool::Bash];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("loop should terminate cleanly on first-turn stop");
 
         stop_mock.assert();
@@ -3617,7 +5166,7 @@ mod tests {
         // tool_calls; will hit MAX_TURNS); we don't care about the
         // outcome's Ok/Err — just whether the compactor was invoked
         // along the way. The result IS the side-effect assertion below.
-        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None);
+        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None);
 
         // Core assertion: compactor was invoked at least once. This is
         // the layer-boundary signal — the runtime's loop translated
@@ -3744,6 +5293,7 @@ mod tests {
             Some(100),
             None,
             None,
+            None,
             std::collections::BTreeMap::new(),
             None,
         );
@@ -3843,7 +5393,7 @@ mod tests {
         // max_turns=6 bounds it to a SINGLE stale episode: the frozen counter
         // climbs 0→1→2→3 across turns 1-4, fires + compacts + resets at turn 4,
         // and the two remaining turns can't reach 3 again.
-        let _outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(6), None, None, std::collections::BTreeMap::new(), None);
+        let _outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(6), None, None, None, std::collections::BTreeMap::new(), None);
 
         // (1) The fix fired a compaction even though the reported count never
         // crossed the threshold — the #854 regression-lock.
@@ -3958,7 +5508,7 @@ mod tests {
         }
         let tools = [Tool::Read];
 
-        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("bail should produce Ok with EscalationTriggered, not Err");
 
         assert_eq!(
@@ -4061,7 +5611,7 @@ mod tests {
         // Loop hits MAX_TURNS (mock loops forever). The key
         // assertion: terminal_reason must be MaxTurns, NOT
         // EscalationTriggered, even though compactions fired.
-        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-primary", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("loop should hit MAX_TURNS, not error");
 
         assert_eq!(
@@ -4127,7 +5677,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(10_000), Some(1000), std::collections::BTreeMap::new(), None)
             .expect("stall recovery should drive the loop to Stop, not Err");
 
         assert_eq!(
@@ -4167,17 +5717,24 @@ mod tests {
         assert!(nudge_present, "nudge system message must be present in final conversation");
     }
 
-    /// (#414 PR A → #1221) The OTHER length shape: content (a partial
-    /// answer) with `finish_reason=length` AT the per-call cap. Pre-#1221
-    /// this bailed ("the partial reply may mislead") — but the bail killed
-    /// the whole dispatch and discarded every prior productive turn
-    /// (dialectic shakedown-2's failure mode), and the mislead concern is
-    /// handled by DROPPING the truncated turn instead. Now recovers via the
-    /// stall path; the mock repeating the shape past the budget ends in a
-    /// clean escalation, and the partial content never survives in history.
+    /// (#414 PR A → #1221) The OTHER length shape: content (a partial answer)
+    /// with `finish_reason=length` AT the per-call cap.
+    ///
+    /// History of this assertion, kept because it is the point. Pre-#1221 this
+    /// BAILED, which killed the whole dispatch and discarded every prior
+    /// productive turn. That was replaced by DROPPING the truncated turn — an
+    /// improvement, but still built on the theory that a capped turn is noise.
+    /// #1221 measured that theory and it is false: 43-50% of turns on the
+    /// review corpus hit this arm, and a scraped 51K-char turn was tracing
+    /// real code and naming a real bug when it was cut.
+    ///
+    /// So the turn is now KEPT and the model is asked to conclude from it. The
+    /// assertion below is inverted rather than deleted: the count that used to
+    /// read 1 ("only the escalation turn survives") now reads 3, because
+    /// nothing is thrown away.
     #[test]
     #[serial_test::serial]
-    fn length_with_content_at_cap_recovers_by_dropping_the_turn() {
+    fn length_with_content_at_cap_keeps_the_turn_and_asks_for_a_conclusion() {
         let server = MockServer::start();
         let _truncated = server.mock(|when, then| {
             when.method(POST).path("/v1/chat/completions");
@@ -4197,7 +5754,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(1000), Some(1000), std::collections::BTreeMap::new(), None)
             .expect("an at-cap truncation must recover, not kill the dispatch (#1221)");
 
         assert!(
@@ -4208,37 +5765,91 @@ mod tests {
             "budget exhaustion on a repeating cap-cliff must escalate cleanly, got {:?}",
             outcome.terminal_reason
         );
-        // The two RECOVERED turns were dropped; only the final turn (the one
-        // that exhausted the budget and triggered escalation) remains in
-        // history — pre-existing #414 escalation semantics: the last stall
-        // turn is handoff evidence, the budget check runs before the pop.
-        let kept = outcome
-            .messages
-            .iter()
-            .filter(|m| {
-                m.content
-                    .as_deref()
-                    .map(|c| c.contains("half my answer"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(
-            kept, 1,
-            "recovered truncated turns must be dropped; only the escalation \
-             turn remains as handoff evidence (got {kept} kept)"
+        // (#1221) What "the work survives" means on a DEGENERATE fixture.
+        //
+        // This mock returns the identical sentence forever, so the turn is
+        // degenerate by construction. The loop still does the #1221 thing: it
+        // checkpoints, and each checkpoint hands the WHOLE accumulation back in
+        // ONE growing message rather than discarding the truncated call — six
+        // `continue` verdicts before the gate can see the cycle at all, then
+        // `conclude`.
+        //
+        // What it must NOT do is DELETE that accumulation. An earlier cut did:
+        // a degenerate verdict on a turn with no open thought abandoned the
+        // prefill, spent a recovery unit, and nudged. Measured against
+        // realistic answer shapes at the shipped threshold, that verdict is
+        // wrong for whole classes of legitimate output — an enum-valued JSON
+        // array scores 0.003, a block of identical match arms 0.003, an ASCII
+        // table frame 0.003, a checklist with an invariant line 0.002. A review
+        // probe drove that path with an 11 KB first chunk and the operator
+        // received "Done."
+        //
+        // So repetition now STOPS the turn and hands off with everything
+        // attached. Same terminal as before, reached without destroying data.
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let traj = std::fs::read_to_string(&traj_file).expect("trajectory written");
+        let verdicts: Vec<String> = traj
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["type"] == "dispatch.checkpoint")
+            .filter_map(|e| e["verdict"].as_str().map(str::to_string))
+            .collect();
+        let continues = verdicts.iter().filter(|v| *v == "continue").count();
+        assert!(
+            continues >= 5,
+            "the truncated calls must ACCUMULATE, not be discarded one by one — \
+             only {continues} `continue` checkpoint(s) in {} verdict(s): {verdicts:?}",
+            verdicts.len()
         );
-        let nudges = outcome
+        assert!(
+            verdicts.iter().any(|v| v == "conclude"),
+            "the gate must eventually SEE the repetition — verdicts were {verdicts:?}"
+        );
+        // Exactly what main.rs does to produce the deliverable.
+        let delivered = outcome
+            .final_answer
+            .clone()
+            .filter(|a| !a.trim().is_empty())
+            .or_else(|| {
+                outcome
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                    .and_then(|m| m.content.clone())
+            })
+            .unwrap_or_default();
+        let kept = delivered.matches("half my answer").count();
+        assert!(
+            kept >= 5,
+            "escalating must carry the accumulation, not delete it — the operator \
+             got {kept} occurrence(s) of the work: {:?}",
+            &delivered[..delivered.len().min(120)]
+        );
+        // (#1221) The check-in is SILENT. An earlier cut told the model it
+        // had "reached the per-call reasoning budget"; measured on a real
+        // review, a model invited to stop STOPS — it produced a four-point
+        // summary with zero findings where the same model uninterrupted found
+        // real ones. So the assertion is inverted rather than deleted: there
+        // must be NO budget message at all. The harness reads the slice and
+        // hands it back; the model never learns a boundary existed.
+        let budget_messages = outcome
             .messages
             .iter()
             .filter(|m| {
                 m.role == "system"
                     && m.content
                         .as_deref()
-                        .map(|c| c.contains("hit the per-call token cap"))
+                        .map(|c| c.contains("budget") || c.contains("reasoning budget"))
                         .unwrap_or(false)
             })
             .count();
-        assert_eq!(nudges, 2, "each recovery must inject the cap-cliff nudge");
+        assert_eq!(
+            budget_messages, 0,
+            "the model must never be told a checkpoint happened — a model invited \
+             to wrap up will wrap up, and that measurably cost real findings \
+             (got {budget_messages} budget message(s))"
+        );
     }
 
     /// (#414 PR A → #1221) Coverage for the `tool_calls: []` empty-array
@@ -4267,7 +5878,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(1000), Some(1000), std::collections::BTreeMap::new(), None)
             .expect("length + content + empty-array tool_calls at cap must recover (#1221)");
         assert!(matches!(
             outcome.terminal_reason,
@@ -4318,7 +5929,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(10_000), Some(1000), std::collections::BTreeMap::new(), None)
             .expect("recovery should drive the loop to Stop");
 
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
@@ -4355,7 +5966,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(10_000), Some(1000), std::collections::BTreeMap::new(), None)
             .expect("budget exhaustion returns Ok(EscalationTriggered)");
 
         assert_eq!(
@@ -4403,7 +6014,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
             .expect("empty finish_reason=tool_calls must recover+escalate, not Err");
 
         assert_eq!(
@@ -4460,7 +6071,7 @@ mod tests {
         let tools = [Tool::Read];
 
         let cfg = compaction::CompactionConfig::never_compact();
-        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, std::collections::BTreeMap::new(), None)
+        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(10_000), Some(1000), std::collections::BTreeMap::new(), None)
             .expect("recovery succeeds");
 
         // Read the trajectory JSONL and assert the event landed.
@@ -4699,3 +6310,81 @@ mod tests {
         assert_eq!(extract_edit_target_path(args), None);
     }
 }
+
+#[cfg(test)]
+mod reasoning_feedback_probe {
+    //! (#1221) Does a truncated turn's REASONING travel back to the model on
+    //! the next call?
+    //!
+    //! This decides whether "keep the turn" preserves anything in the shape
+    //! that matters. A runaway turn is `content: null` with all the substance
+    //! in `reasoning_content`, so if that field is dropped on the way out,
+    //! keeping the message preserves an empty husk and the model genuinely
+    //! does start over.
+    //!
+    //! `Message::reasoning_content` is `skip_serializing_if = "Option::is_none"`
+    //! and its doc claims it is "always None on the request side" — an
+    //! assumption about a code path, not an enforced invariant, so it is
+    //! measured here rather than believed.
+    use super::*;
+    use httpmock::prelude::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn probe_whether_truncated_reasoning_is_echoed_on_the_next_request() {
+        let server = MockServer::start();
+        let first = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions")
+                .matches(|req| {
+                    let body = String::from_utf8_lossy(req.body.as_deref().unwrap_or(&[]));
+                    !body.contains("SUBSTANTIVE_REASONING_MARKER")
+                });
+            let mut body = tests::chat_response_json(None, None, "length", 10, MAX_TOKENS_PER_CALL);
+            body["choices"][0]["message"]["reasoning_content"] =
+                serde_json::json!("SUBSTANTIVE_REASONING_MARKER tracing the write path");
+            then.status(200).json_body(body);
+        });
+        // Fires ONLY if the second request carries the reasoning back.
+        let echoed = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions")
+                .body_contains("SUBSTANTIVE_REASONING_MARKER");
+            then.status(200).json_body(tests::chat_response_json(Some("done"), None, "stop", 10, 5));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("reasoning-echo").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run(
+            &client, &client, "test-model",
+            vec![Message::system("t"), Message::user("go")],
+            &[Tool::Read], &mut traj, false, &cfg, Some(3), None, None,
+            None,
+            std::collections::BTreeMap::new(), None,
+        );
+
+        eprintln!(
+            "PROBE: first-request hits={}, reasoning-echoed hits={}, outcome={:?}",
+            first.hits(),
+            echoed.hits(),
+            outcome.as_ref().map(|o| (&o.terminal_reason, o.turns)).map_err(|e| e.to_string())
+        );
+        if let Ok(o) = &outcome {
+            for (i, m) in o.messages.iter().enumerate() {
+                eprintln!(
+                    "PROBE msg[{i}] role={} content={:?} reasoning={:?}",
+                    m.role,
+                    m.content.as_deref().map(|c| &c[..c.len().min(40)]),
+                    m.reasoning_content.as_deref().map(|c| &c[..c.len().min(40)])
+                );
+            }
+        }
+        assert!(first.hits() >= 1, "the truncated turn must have been produced");
+    }
+
+
+}
+
+#[cfg(test)]
+#[path = "checkpoint_regression_tests.rs"]
+mod checkpoint_regression_tests;

@@ -88,6 +88,7 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.max_turns", Ty::Uint),
     ("runtime.max_tokens", Ty::Uint),
     ("runtime.max_tokens_per_call", Ty::Uint),
+    ("runtime.reasoning_checkpoint_interval_tokens", Ty::Uint),
     ("runtime.strict_selection", Ty::Bool),
     ("runtime.log_level", Ty::Str),
     ("runtime.feedback_injection", Ty::Bool),

@@ -55,6 +55,7 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` (#1276 — bounded host load/unload phase) | `runtime.model_load_timeout_seconds` |
 | `DARKMUX_RUNTIME_MAX_TURNS` / `DARKMUX_RUNTIME_MAX_TOKENS` | `runtime.max_turns` / `runtime.max_tokens` |
 | `DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL` (#1221 — per-CALL completion cap, reasoning + content of one turn; unset = the runtime's built-in 10000, which truncates productive reasoning on thinking-family models) | `runtime.max_tokens_per_call` |
+| `DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL` (#1221 — how far the model REASONS between check-ins; unset = the runtime's built-in 1000. A separate knob from the answer cap above because the two want opposite values: a checkpoint interval wants to be small so a reasoning loop is caught early, an answer bound wants to be large so a long answer is not chopped. Setting one to serve both is what the split fixed.) | `runtime.reasoning_checkpoint_interval_tokens` |
 | `DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION` | `remote.max_tokens_per_execution` (#1260) |
 | `DARKMUX_REVIEW_JUDGE_FAIL_ON_ANY_SKIP` (#1876/#1877 — the judge-stage exhaustion policy) | `review.judge_fail_on_any_skip` |
 | `DARKMUX_RADIO_ROUTER_PROFILE` / `DARKMUX_RADIO_ANSWERER_PROFILE` / `DARKMUX_RADIO_HUMOR` (#1698 — the radio interpreter's two seats + the RADIO persona's humor dial) | `radio.router_profile` / `radio.answerer_profile` / `radio.humor` |

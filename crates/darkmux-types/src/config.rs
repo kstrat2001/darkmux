@@ -74,7 +74,7 @@ use std::path::Path;
 // the PR-flow guide). darkmux holds no GitHub credential of its own; this
 // block only says which verb NAMES the operator has opted into running.
 // Minor bump, same lenient-read reasoning as every other additive block.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.9";
+pub const CONFIG_SCHEMA_VERSION: &str = "1.10";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -227,6 +227,7 @@ pub struct RuntimeBehaviorConfig {
     /// E19 measured truncating PRODUCTIVE reasoning on thinking-family
     /// models, so benches raise it explicitly per run.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens_per_call: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub reasoning_checkpoint_interval_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub strict_selection: Option<bool>,
     // (#1311) Verbosity for the diagnostic surfaces. `"info"` (default) emits
     // the informative dispatch-liveness phase markers; `"debug"` additionally
@@ -554,6 +555,7 @@ impl DarkmuxConfig {
                 max_turns: None,
                 max_tokens: None,
                 max_tokens_per_call: None,
+                reasoning_checkpoint_interval_tokens: None,
                 strict_selection: Some(false),
                 log_level: Some("info".to_string()),
                 // (#1548) Now wired end-to-end (config_access accessor +
