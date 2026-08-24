@@ -2685,20 +2685,33 @@ mod tests {
     #[serial_test::serial]
     fn a_concluding_checkpointed_turn_keeps_its_whole_answer() {
         let server = MockServer::start();
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let c = calls.clone();
-        let _m = server.mock(move |when, then| {
-            when.method(POST).path("/v1/chat/completions");
-            let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if n == 0 {
-                then.status(200).json_body(chat_response_json(
-                    Some("PARTONE-BODY-THAT-MUST-SURVIVE"), None, "length", 100, 200,
-                ));
-            } else {
-                then.status(200).json_body(chat_response_json(
-                    Some("PARTTWO-CONCLUSION"), None, "stop", 100, 20,
-                ));
-            }
+        // Two MUTUALLY EXCLUSIVE mocks keyed on the request body. `mock()` takes
+        // an FnOnce that runs ONCE at registration, so a call-counter inside it
+        // is evaluated a single time and the mock answers identically forever —
+        // which made an earlier version of this test spin to 6160 checkpoints
+        // and deadlock every `#[serial]` test behind it.
+        const MARKER: &str = "PARTONE-BODY-THAT-MUST-SURVIVE";
+        let _first = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|req| {
+                    let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                    !b.contains(MARKER)
+                });
+            then.status(200).json_body(chat_response_json(
+                Some(MARKER), None, "length", 100, 200,
+            ));
+        });
+        let _second = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|req| {
+                    let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                    b.contains(MARKER)
+                });
+            then.status(200).json_body(chat_response_json(
+                Some("PARTTWO-CONCLUSION"), None, "stop", 100, 20,
+            ));
         });
 
         let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
@@ -2724,7 +2737,7 @@ mod tests {
             .unwrap_or_default();
 
         assert!(
-            final_assistant.contains("PARTONE-BODY-THAT-MUST-SURVIVE"),
+            final_assistant.contains(MARKER),
             "the deliverable lost everything before the final continuation — got {final_assistant:?}"
         );
         assert!(
