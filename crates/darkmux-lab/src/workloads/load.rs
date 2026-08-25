@@ -18,6 +18,10 @@ const EMBEDDED_WORKLOADS: &[(&str, &str)] = &[
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/quick-q.json")),
     ),
     (
+        "crawl-error-discard",
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/crawl-error-discard.json")),
+    ),
+    (
         "long-agentic",
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates/builtin/workloads/long-agentic.json")),
     ),

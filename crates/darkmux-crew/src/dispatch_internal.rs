@@ -5134,7 +5134,8 @@ fn probe_loaded_model() -> Result<String> {
 /// AND `unknown_role_vocab_tokens` (typo detection). When the
 /// runtime gains a new tool or roles gain a new capability token,
 /// add it here AND to the match in `role_to_runtime`.
-const KNOWN_ROLE_VOCAB: &[&str] = &["read", "edit", "write", "exec", "process", "update_plan"];
+const KNOWN_ROLE_VOCAB: &[&str] =
+    &["read", "edit", "write", "exec", "process", "update_plan", "report_finding"];
 
 /// Single source of truth for role-vocab → runtime-vocab. Add new
 /// mappings here when the runtime gains a new tool or roles gain
@@ -5147,6 +5148,11 @@ fn role_to_runtime(role_name: &str) -> &'static [&'static str] {
         "edit" => &["edit"],
         "write" => &["write"],
         "exec" => &["bash"],
+        // (#1959) The crawler's output channel. Granted on its own token rather
+        // than folded into `write`, because a role that may RECORD A CLAIM is
+        // categorically different from one that may modify the tree — the
+        // crawler is read-only and must stay that way.
+        "report_finding" => &["report_finding"],
         // Known role-vocab tokens with no runtime equivalent today.
         // NOT typos — silently dropped is correct behavior.
         "process" | "update_plan" => &[],

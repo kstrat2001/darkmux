@@ -668,7 +668,20 @@ fn role_can_modify_files(palette: &darkmux_crew::types::ToolPalette) -> bool {
         palette.allow.iter().any(|a| a == name)
             && !palette.deny.iter().any(|d| d == name)
     };
-    allows("edit") || allows("write")
+    // (#1959) `report_finding` is an EXECUTION surface, not a description.
+    //
+    // This guard's premise (#341) is sound: a coding-task workload paired with
+    // a role that cannot touch files will burn wall-clock narrating a fix it
+    // has no way to apply. But the premise is narrower than the check — it
+    // assumes the only way to PRODUCE something is to edit a file.
+    //
+    // A crawler is deliberately read-only and records each finding through
+    // `report_finding`, which appends to a real artifact the run is measured
+    // by. It is not describing into the void; its output channel simply is not
+    // the filesystem. Denying edit/write is the POINT of that role, so a guard
+    // that reads it as misconfiguration would make read-only workloads
+    // unrepresentable.
+    allows("edit") || allows("write") || allows("report_finding")
 }
 
 /// Reject setupContent keys that would write outside the sandbox dir.
