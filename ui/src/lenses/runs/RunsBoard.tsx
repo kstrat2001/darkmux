@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
-import { queryKeys } from "../../lib/queryKeys";
+import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { missionGraphReachable } from "../../lib/injectedMeta";
 import { isStaticBuild, resolveLabRunsSrc, resolveRunsSrc } from "../../lib/staticSource";
@@ -363,13 +363,32 @@ export function RunsBoard({
   // when the operator backs out, not a blocking dependency (matching
   // legacy: `drillLabRun` never blocks on `loadRuns()`/`loadLabRuns()`
   // either — the two are genuinely independent fetches there too).
+  // Hoisted above the two queries below, which now gate their polling on it
+  // (#1966). It was declared further down, beside `useLiveMachines`.
+  const daemonBacked = !isStaticBuild();
+
+  // (#1966) Both POLL. Neither did, so the board fetched its run list once on
+  // mount and a run that was `running` at load time rendered `running`
+  // forever — reloading the page remounted and refetched, which is why a
+  // refresh "fixed" it. The tell an operator sees is one row disagreeing with
+  // itself: a frozen status badge beside a replay control derived from state
+  // that DOES update.
+  //
+  // Third live view found fetching once (after `useRouteRecords`' session
+  // query, #1960). The shape is a view that describes NOW and fetches ONCE.
+  //
+  // Gated the same way every other live-only poll in this app is: a
+  // daemon-less static build has no daemon to answer, and `resolveRunsSrc()`
+  // there points at a committed file that cannot change.
   const runsQuery = useQuery({
     queryKey: queryKeys.runs(),
     queryFn: () => fetchJson<RunsResponse>(resolveRunsSrc()),
+    refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
   const labRunsQuery = useQuery({
     queryKey: queryKeys.labRuns(),
     queryFn: () => fetchJson<LabRunsResponse>(resolveLabRunsSrc()),
+    refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
 
   // (#1809) Also unconditional, same rules-of-hooks reason as the two
@@ -384,7 +403,6 @@ export function RunsBoard({
   // doc and `MachineLens.tsx`'s identical gate): a daemon-less static build
   // has no `/fleet/machines/live` to poll.
   const nowMs = Date.now();
-  const daemonBacked = !isStaticBuild();
   const flowWindow = useFlowWindow(nowMs);
   const liveMachines = useLiveMachines(daemonBacked);
 
