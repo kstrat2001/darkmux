@@ -396,6 +396,38 @@ pub fn read_keychain_bounded(
 /// `Command::output()` that could deadlock on a full pipe buffer) and NEVER
 /// logged. Takes an already-built `Command` so tests can stand in a `sh -c`
 /// stub for the `security` binary.
+/// (#1965) Decide what a bounded `security` read actually produced.
+///
+/// Split out of `run_security_bounded` so the decision is testable without
+/// spawning a process, because the bug it fixes was invisible from the outside:
+/// success was gated ONLY on the child's exit status, and the stdout drain's
+/// error was discarded via `unwrap_or_default()`. A pipe read that failed
+/// partway — EINTR, EIO, a read racing the child's exit — left a TRUNCATED
+/// secret (or an empty one) that was returned as `Found` and trusted verbatim
+/// by every caller: the Redis password and the serve bearer token both resolve
+/// through here.
+///
+/// A truncated credential presents to its consumer as a WRONG credential, not a
+/// short one, so the resulting auth failure points nowhere near the read. This
+/// operator has already lost time to that exact shape once, through a different
+/// mechanism (a Keychain token truncated by an interactive prompt, producing
+/// silent 401s).
+///
+/// `drained` is `None` when the read failed OR the drain thread panicked. Those
+/// are the same fact — no trustworthy secret — and both must yield
+/// `Unavailable`, which callers already handle, rather than a `Found` nobody
+/// can distinguish from a good read.
+fn keychain_outcome(exit_success: bool, drained: Option<Vec<u8>>) -> KeychainRead {
+    // A non-zero exit means the item is not there; the read outcome is moot.
+    if !exit_success {
+        return KeychainRead::Absent;
+    }
+    match drained {
+        Some(bytes) => KeychainRead::Found(String::from_utf8_lossy(&bytes).into_owned()),
+        None => KeychainRead::Unavailable,
+    }
+}
+
 fn run_security_bounded(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
@@ -410,12 +442,15 @@ fn run_security_bounded(
     };
     let out_pipe = child.stdout.take();
     let err_pipe = child.stderr.take();
-    let out_handle = std::thread::spawn(move || {
+    // (#1965) The read's error is PROPAGATED, not discarded. This buffer is the
+    // secret itself, and a partial read that reaches the caller as a complete
+    // one is the worst outcome available here — see `keychain_outcome`.
+    let out_handle = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
         let mut buf = Vec::new();
         if let Some(mut p) = out_pipe {
-            let _ = p.read_to_end(&mut buf);
+            p.read_to_end(&mut buf)?;
         }
-        buf
+        Ok(buf)
     });
     // stderr captured (not inherited) so an error line can't leak to the
     // terminal; joined + dropped, never logged.
@@ -428,12 +463,12 @@ fn run_security_bounded(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = out_handle.join().unwrap_or_default();
+                // A read error and a panicked drain thread collapse to the same
+                // thing: we do not hold a trustworthy secret. Neither may
+                // become `Found`.
+                let drained = out_handle.join().ok().and_then(|r| r.ok());
                 let _ = err_handle.join();
-                if !status.success() {
-                    return KeychainRead::Absent;
-                }
-                return KeychainRead::Found(String::from_utf8_lossy(&stdout).into_owned());
+                return keychain_outcome(status.success(), drained);
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
@@ -1434,6 +1469,58 @@ mod tests {
     // during flow-sink init), and echo/exit stubs prove the outcome mapping.
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    /// (#1965) The bug: success was gated ONLY on the child's exit status,
+    /// while the stdout drain's error was discarded with `unwrap_or_default()`.
+    /// A pipe read that failed partway therefore returned a TRUNCATED (or
+    /// empty) secret as `Found`, indistinguishable from a good read, and every
+    /// caller trusted it verbatim — the Redis password and the serve bearer
+    /// token both resolve through this path.
+    ///
+    /// These assert the DECISION rather than spawning a process, because a
+    /// genuine mid-read I/O failure is not reproducible on demand — which is
+    /// precisely why the defect survived: no test could reach it from outside.
+    #[test]
+    fn a_failed_stdout_read_is_never_reported_as_a_found_secret() {
+        let out = super::keychain_outcome(true, None);
+        assert!(
+            !matches!(out, KeychainRead::Found(_)),
+            "a partial read must not present as a complete secret, got {out:?}"
+        );
+        assert!(matches!(out, KeychainRead::Unavailable), "got {out:?}");
+    }
+
+    #[test]
+    fn a_panicked_drain_thread_is_also_not_a_found_secret() {
+        // `join()` returning Err collapses to the same `None`: both mean we do
+        // not hold a trustworthy secret.
+        assert!(matches!(
+            super::keychain_outcome(true, None),
+            KeychainRead::Unavailable
+        ));
+    }
+
+    #[test]
+    fn a_clean_read_still_yields_the_secret() {
+        match super::keychain_outcome(true, Some(b"super-secret-value".to_vec())) {
+            KeychainRead::Found(v) => assert_eq!(v, "super-secret-value"),
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_nonzero_exit_is_absent_regardless_of_what_was_read() {
+        // The item is not there; the read outcome is moot and must not turn an
+        // Absent into an Unavailable, which callers treat differently.
+        assert!(matches!(
+            super::keychain_outcome(false, None),
+            KeychainRead::Absent
+        ));
+        assert!(matches!(
+            super::keychain_outcome(false, Some(b"noise".to_vec())),
+            KeychainRead::Absent
+        ));
+    }
 
     #[test]
     fn run_security_bounded_times_out_on_a_hung_read() {
