@@ -3080,7 +3080,8 @@ fn rewrite_container_paths_for_host(stdout: String, host_out: &std::path::Path) 
 /// stderr, only to a trajectory file in a temp dir. A dispatch that tripped a
 /// cycle detector returned an envelope indistinguishable from a clean one.
 ///
-/// Reduced, never streamed: `checkpoints: {total, concluded, last_tail_ratio}`
+/// Reduced, never streamed: `checkpoints: {total, concluded, min_tail_ratio,
+/// mean_tail_ratio}`
 /// replaces 65 individual records, because the caller's next action turns on
 /// "did it converge", not on each ruling. Same test governs every field here —
 /// **would this change what the caller does next?** A field that would not
@@ -3146,7 +3147,8 @@ fn enrich_envelope_with_summary(
             serde_json::json!({
                 "total": summary.checkpoints,
                 "concluded": summary.checkpoints_concluded,
-                "last_tail_ratio": summary.last_tail_ratio,
+                "min_tail_ratio": summary.min_tail_ratio,
+                "mean_tail_ratio": summary.mean_tail_ratio(),
             }),
         );
     }
@@ -3208,11 +3210,61 @@ struct TrajectorySummary {
     // and aggregate it by hand to learn otherwise.
     checkpoints: u32,
     checkpoints_concluded: u32,
-    last_tail_ratio: Option<f64>,
+    /// (#1959) The WORST and the MEAN novelty ratio across the run's
+    /// checkpoints, replacing the LAST one.
+    ///
+    /// `last` was not merely uninformative, it INVERTED the ranking. Measured
+    /// on two real crawls: a run that decayed through fourteen checkpoints to
+    /// 0.193, tripped the gate, and then recovered reported `last = 0.997`,
+    /// while a clean four-checkpoint run reported `0.976`. The degenerate run
+    /// looked HEALTHIER than the healthy one on the field an operator reads
+    /// first.
+    ///
+    /// The two together separate three cases that either alone collapses:
+    /// low min + high mean is one excursion the gate caught and recovered from
+    /// (0.193 / 0.698); low min + low mean is a chronically degenerate run;
+    /// high both is clean (0.976 / 0.985). `min` answers "did this ever
+    /// degenerate", `mean` answers "how much of the run was compromised", and
+    /// the trust decision needs both.
+    ///
+    /// A pure fold over checkpoints the tailer already receives — no extra
+    /// probe, no cost charged to the measured run.
+    min_tail_ratio: Option<f64>,
+    tail_ratio_sum: f64,
+    tail_ratio_count: u32,
     /// `{kind, severity, detail}` per firing, from the same pure
     /// `detector_telemetry_payload` the flow stream uses — one producer, so
     /// the two surfaces cannot drift.
     detections: Vec<serde_json::Value>,
+}
+
+impl TrajectorySummary {
+    /// Fold one checkpoint into the reduction.
+    ///
+    /// Lives here rather than inline in the tailer so a test can drive the
+    /// REAL accumulation. The first version of this change kept the logic in
+    /// `handle_event` and the tests rebuilt it by hand — which made them pass
+    /// against a mutation that replaced the running minimum with the last
+    /// value, the exact regression they were written to catch.
+    fn record_checkpoint(&mut self, tail_ratio: Option<f64>, concluded: bool) {
+        self.checkpoints = self.checkpoints.saturating_add(1);
+        if concluded {
+            self.checkpoints_concluded = self.checkpoints_concluded.saturating_add(1);
+        }
+        if let Some(r) = tail_ratio {
+            self.min_tail_ratio = Some(self.min_tail_ratio.map_or(r, |m: f64| m.min(r)));
+            self.tail_ratio_sum += r;
+            self.tail_ratio_count = self.tail_ratio_count.saturating_add(1);
+        }
+    }
+
+    /// Mean novelty ratio across the run's checkpoints, or `None` when none
+    /// were recorded. Kept as an accessor rather than a stored field so the
+    /// sum and the count cannot drift out of step with each other.
+    fn mean_tail_ratio(&self) -> Option<f64> {
+        (self.tail_ratio_count > 0)
+            .then(|| self.tail_ratio_sum / f64::from(self.tail_ratio_count))
+    }
 }
 
 /// Token totals the runtime records in `metrics.json` at dispatch exit.
@@ -3915,14 +3967,10 @@ impl TailerState {
                 });
                 // (#1955) Reduce as we go: the caller wants "13 checkpoints,
                 // one concluded, final ratio 0.29", never 65 records.
-                self.summary.checkpoints = self.summary.checkpoints.saturating_add(1);
-                if event.get("verdict").and_then(|v| v.as_str()) == Some("conclude") {
-                    self.summary.checkpoints_concluded =
-                        self.summary.checkpoints_concluded.saturating_add(1);
-                }
-                if let Some(r) = event.get("tail_ratio").and_then(|v| v.as_f64()) {
-                    self.summary.last_tail_ratio = Some(r);
-                }
+                self.summary.record_checkpoint(
+                    event.get("tail_ratio").and_then(|v| v.as_f64()),
+                    event.get("verdict").and_then(|v| v.as_str()) == Some("conclude"),
+                );
                 self.emit("dispatch.checkpoint", darkmux_flow::Level::Info, payload);
             }
             "model.reasoning" => {
