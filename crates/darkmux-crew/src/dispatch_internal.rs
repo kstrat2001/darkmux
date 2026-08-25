@@ -2875,7 +2875,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // panicked sampler thread degrades to "no more samples", not a
     // failed dispatch).
     sampler_stop.store(true, Ordering::SeqCst);
-    let _ = sampler_handle.join();
+let host_peaks = sampler_handle.join().unwrap_or_default();
 
     // (#638) The container has exited — the session is no longer running.
     // Stop the liveness heartbeat and DELete its key so the live view drops
@@ -2933,6 +2933,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let trajectory_summary = tailer_handle
         .join()
         .unwrap_or_else(|_| TrajectorySummary::default());
+
+    // (#1955) The envelope is the orchestrator's only surface, so the
+    // reduction lands here — after the tailer has finished and its
+    // observations are final.
+    let stdout = enrich_envelope_with_summary(stdout, &trajectory_summary, &host_peaks);
 
     // (#782) Read the runtime's token totals from metrics.json now the
     // container has exited. Best-effort — zero totals on any read failure
@@ -3068,6 +3073,88 @@ fn rewrite_container_paths_for_host(stdout: String, host_out: &std::path::Path) 
     serde_json::to_string(&v).unwrap_or(stdout)
 }
 
+/// (#1955) Add the observed summary to a JSON envelope.
+///
+/// The orchestrator's ONLY surface is this envelope, and it carried none of
+/// what darkmux detects — the four detectors write nothing to stdout or
+/// stderr, only to a trajectory file in a temp dir. A dispatch that tripped a
+/// cycle detector returned an envelope indistinguishable from a clean one.
+///
+/// Reduced, never streamed: `checkpoints: {total, concluded, last_tail_ratio}`
+/// replaces 65 individual records, because the caller's next action turns on
+/// "did it converge", not on each ruling. Same test governs every field here —
+/// **would this change what the caller does next?** A field that would not
+/// belongs in the trajectory, which `trajectory_path` still points at.
+///
+/// Deliberately does NOT duplicate `metrics`. Those are the RUNTIME's counts
+/// of its own work; these are the HOST tailer's observations. Where the two
+/// could disagree (see #1947) that disagreement is signal, and collapsing them
+/// into one number would hide it.
+fn enrich_envelope_with_summary(
+    stdout: String,
+    summary: &TrajectorySummary,
+    peaks: &HostPeaks,
+) -> String {
+    let trimmed = stdout.trim();
+    if !trimmed.starts_with('{') {
+        return stdout;
+    }
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return stdout;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return stdout;
+    };
+    // Always present, even when empty. An absent field is ambiguous between
+    // "nothing fired" and "this build does not report it"; `[]` is not.
+    obj.insert(
+        "detections".into(),
+        serde_json::Value::Array(summary.detections.clone()),
+    );
+    // Host pressure, reduced. Included only when the sampler actually ran —
+    // an absent block says "not measured", which is honest, where a zeroed
+    // one would read as "measured, and idle".
+    if peaks.samples > 0 {
+        obj.insert(
+            "host".into(),
+            serde_json::json!({
+                "peak_mem_pct": peaks.peak_mem_pct,
+                "peak_cpu_pct": peaks.peak_cpu_pct,
+                "samples": peaks.samples,
+            }),
+        );
+    }
+    if summary.checkpoints > 0 {
+        obj.insert(
+            "checkpoints".into(),
+            serde_json::json!({
+                "total": summary.checkpoints,
+                "concluded": summary.checkpoints_concluded,
+                "last_tail_ratio": summary.last_tail_ratio,
+            }),
+        );
+    }
+    serde_json::to_string(&v).unwrap_or(stdout)
+}
+
+/// (#1955) The host-telemetry reduction the envelope carries.
+///
+/// The sampler already walks cpu/ram/gpu at a fixed cadence and emits each
+/// sample to the flow stream. This is a pure REDUCTION over samples that are
+/// already being taken — it adds no probe, no syscall, and no cost to the
+/// measured run, which is what the observer-must-not-join-the-observed rule
+/// requires of anything on this path.
+///
+/// `samples` is carried deliberately: a peak of 0 and "we never sampled" are
+/// different claims, and an orchestrator reasoning about whether a dispatch
+/// was memory-starved has to be able to tell them apart.
+#[derive(Default, Debug, Clone, Copy)]
+struct HostPeaks {
+    peak_mem_pct: Option<u64>,
+    peak_cpu_pct: Option<u64>,
+    samples: u32,
+}
+
 /// Summary of what the trajectory tailer surfaced. Used to enrich the
 /// dispatch.complete payload with end-of-dispatch counts.
 #[derive(Default, Debug, Clone)]
@@ -3076,6 +3163,21 @@ struct TrajectorySummary {
     tool_calls: u32,
     compactions: u32,
     heartbeats: u32,
+    // (#1955) The two things the orchestrator could not see.
+    //
+    // Both were already COMPUTED here — the tailer forwards checkpoints and
+    // every detector firing into the flow stream — and neither reached the
+    // caller, whose only surface is the envelope. So a dispatch that tripped
+    // a cycle detector returned an envelope indistinguishable from a clean
+    // one, and the operator's orchestrator had to find the trajectory file
+    // and aggregate it by hand to learn otherwise.
+    checkpoints: u32,
+    checkpoints_concluded: u32,
+    last_tail_ratio: Option<f64>,
+    /// `{kind, severity, detail}` per firing, from the same pure
+    /// `detector_telemetry_payload` the flow stream uses — one producer, so
+    /// the two surfaces cannot drift.
+    detections: Vec<serde_json::Value>,
 }
 
 /// Token totals the runtime records in `metrics.json` at dispatch exit.
@@ -3283,7 +3385,8 @@ fn run_telemetry_sampler(
     model: String,
     mission_id: Option<String>,
     phase_id: Option<String>,
-) {
+) -> HostPeaks {
+    let mut peaks = HostPeaks::default();
     let emit = |source: &str, action: &str, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
@@ -3341,6 +3444,17 @@ fn run_telemetry_sampler(
         // `darkmux-lab`'s review driver samples through the same function.
         let sample = crate::telemetry_sampler::sample_host();
         if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
+            // Reduce as we sample. Max, not last: the question an orchestrator
+            // asks afterward is "did this run approach the ceiling", and the
+            // final sample is taken as the container tears down, which is the
+            // least representative moment of the whole run.
+            peaks.samples = peaks.samples.saturating_add(1);
+            if let Some(m) = sample.mem {
+                peaks.peak_mem_pct = Some(peaks.peak_mem_pct.map_or(m, |p| p.max(m)));
+            }
+            if let Some(c) = sample.cpu {
+                peaks.peak_cpu_pct = Some(peaks.peak_cpu_pct.map_or(c, |p| p.max(c)));
+            }
             let mut payload = serde_json::Map::new();
             if let Some(c) = sample.cpu {
                 payload.insert("cpu".into(), c.into());
@@ -3364,13 +3478,16 @@ fn run_telemetry_sampler(
         let mut slept = Duration::ZERO;
         while slept < TELEMETRY_SAMPLE_INTERVAL {
             if stop_flag.load(Ordering::SeqCst) {
-                return;
+                // Teardown mid-interval: return what was observed, never a
+                // default. A killed or short dispatch still has real peaks.
+                return peaks;
             }
             let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
             thread::sleep(nap);
             slept += nap;
         }
     }
+    peaks
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,
@@ -3761,6 +3878,16 @@ impl TailerState {
                     "tail_ratio": event.get("tail_ratio"),
                     "verdict": event.get("verdict"),
                 });
+                // (#1955) Reduce as we go: the caller wants "13 checkpoints,
+                // one concluded, final ratio 0.29", never 65 records.
+                self.summary.checkpoints = self.summary.checkpoints.saturating_add(1);
+                if event.get("verdict").and_then(|v| v.as_str()) == Some("conclude") {
+                    self.summary.checkpoints_concluded =
+                        self.summary.checkpoints_concluded.saturating_add(1);
+                }
+                if let Some(r) = event.get("tail_ratio").and_then(|v| v.as_f64()) {
+                    self.summary.last_tail_ratio = Some(r);
+                }
                 self.emit("dispatch.checkpoint", darkmux_flow::Level::Info, payload);
             }
             "model.reasoning" => {
@@ -3853,6 +3980,10 @@ impl TailerState {
             | "dispatch.intra_turn_stall.recovered"
             | "dispatch.per_turn_cap.salvaged" => {
                 if let Some(payload) = detector_telemetry_payload(event_type, &event) {
+                    // (#1955) Same payload to the envelope. One producer, so
+                    // the viewer and the orchestrator cannot disagree about
+                    // what fired.
+                    self.summary.detections.push(payload.clone());
                     self.emit_telemetry("detector", "telemetry.detector", payload);
                 }
             }

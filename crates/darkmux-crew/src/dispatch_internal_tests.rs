@@ -4694,3 +4694,160 @@ fn an_envelope_without_a_trajectory_path_is_unchanged() {
         "must not invent a field the producer did not emit: {out}"
     );
 }
+
+// ---------------------------------------------------------------
+// (#1955) The envelope carries what darkmux detected.
+//
+// Before this, the four detectors wrote to NO orchestrator-reachable
+// channel — not stdout, not stderr, only a trajectory file in a temp dir.
+// A dispatch that tripped a cycle detector returned an envelope
+// byte-indistinguishable from a clean one.
+// ---------------------------------------------------------------
+
+fn summary_with(detections: Vec<serde_json::Value>) -> super::TrajectorySummary {
+    super::TrajectorySummary {
+        detections,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_detection_reaches_the_envelope() {
+    let det = serde_json::json!({
+        "kind": "cycle",
+        "severity": "warn",
+        "detail": "`read` called 3× in the last 5 tool calls",
+    });
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &summary_with(vec![det.clone()]),
+        &super::HostPeaks::default(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["detections"][0], det, "the firing must reach the caller: {out}");
+    assert_eq!(v["result"], "stop", "existing fields survive");
+}
+
+#[test]
+fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
+    // Absence is ambiguous between "nothing fired" and "this build does not
+    // report detections". `[]` is a positive statement and the caller can
+    // act on it.
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &summary_with(vec![]),
+        &super::HostPeaks::default(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["detections"].is_array(), "must be present: {out}");
+    assert_eq!(v["detections"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn checkpoints_are_reduced_not_streamed() {
+    // 65 records collapse to the three numbers a caller acts on. The full
+    // sequence stays in the trajectory, which `trajectory_path` points at.
+    let s = super::TrajectorySummary {
+        checkpoints: 65,
+        checkpoints_concluded: 1,
+        last_tail_ratio: Some(0.2928),
+        ..Default::default()
+    };
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &s,
+        &super::HostPeaks::default(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["checkpoints"]["total"], 65);
+    assert_eq!(v["checkpoints"]["concluded"], 1);
+    assert!(
+        (v["checkpoints"]["last_tail_ratio"].as_f64().unwrap() - 0.2928).abs() < 1e-9,
+        "the evidence behind the ruling must survive: {out}"
+    );
+}
+
+#[test]
+fn a_dispatch_that_never_checkpointed_omits_the_block() {
+    // Unlike detections, zero checkpoints is not a finding — most dispatches
+    // never hit the boundary. An always-present `{total: 0}` would be noise
+    // on every envelope.
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &super::HostPeaks::default(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v.get("checkpoints").is_none(), "no boundary hit, no block: {out}");
+}
+
+#[test]
+fn enrichment_does_not_duplicate_the_runtime_metrics_block() {
+    // `metrics` is the RUNTIME counting its own work; the summary is the HOST
+    // tailer's observation. Where they disagree (#1947) that is signal, so
+    // enrichment must not overwrite or shadow it.
+    let s = super::TrajectorySummary {
+        turns: 9,
+        checkpoints: 2,
+        ..Default::default()
+    };
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop","metrics":{"turns":1}}"#.to_string(),
+        &s,
+        &super::HostPeaks::default(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["metrics"]["turns"], 1,
+        "the runtime's own count must be left exactly as reported: {out}"
+    );
+}
+
+#[test]
+fn non_envelope_stdout_is_untouched_by_enrichment() {
+    let s = summary_with(vec![serde_json::json!({"kind":"cycle"})]);
+    for raw in ["plain model output", "", "{ not json"] {
+        assert_eq!(
+            super::enrich_envelope_with_summary(raw.to_string(), &s, &super::HostPeaks::default()),
+            raw,
+            "the non-json path must pass through verbatim: {raw:?}"
+        );
+    }
+}
+
+#[test]
+fn host_peaks_reach_the_envelope_when_sampled() {
+    let peaks = super::HostPeaks {
+        peak_mem_pct: Some(78),
+        peak_cpu_pct: Some(412),
+        samples: 46,
+    };
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &peaks,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["host"]["peak_mem_pct"], 78);
+    assert_eq!(v["host"]["peak_cpu_pct"], 412);
+    assert_eq!(
+        v["host"]["samples"], 46,
+        "the sample count distinguishes 'idle' from 'never measured': {out}"
+    );
+}
+
+#[test]
+fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
+    // A dispatch too short to sample, or one where sampling failed, must not
+    // claim it observed an idle machine. Absent means "not measured".
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &super::HostPeaks::default(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v.get("host").is_none(),
+        "unsampled must be absent, never a zeroed block that reads as measured: {out}"
+    );
+}
