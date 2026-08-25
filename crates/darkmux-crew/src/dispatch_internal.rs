@@ -2937,7 +2937,7 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
-    let stdout = enrich_envelope_with_summary(stdout, &trajectory_summary, &host_peaks);
+    let stdout = enrich_envelope_with_summary(stdout, &trajectory_summary, &host_peaks, &host_out);
 
     // (#782) Read the runtime's token totals from metrics.json now the
     // container has exited. Best-effort — zero totals on any read failure
@@ -3094,6 +3094,7 @@ fn enrich_envelope_with_summary(
     stdout: String,
     summary: &TrajectorySummary,
     peaks: &HostPeaks,
+    out_dir: &std::path::Path,
 ) -> String {
     let trimmed = stdout.trim();
     if !trimmed.starts_with('{') {
@@ -3124,6 +3125,21 @@ fn enrich_envelope_with_summary(
             }),
         );
     }
+    // (#1959) What a crawl actually FOUND. The envelope carried a converged
+    // dispatch and no way to tell a run that reported twelve findings from one
+    // that reported none — the difference the caller's next action turns on.
+    //
+    // The block is emitted only when the file exists, and its ABSENCE is
+    // meaningful rather than merely uninformative: the runtime creates this
+    // file on the first successful `report_finding` call, so no file means the
+    // channel was never used. For a role holding that tool, that is precisely
+    // the #1959 failure — the model mis-called the tool, decided it "is not
+    // available in this runtime", and narrated its findings into prose where
+    // nothing could collect them. A count of 0 cannot say that; a missing
+    // block can.
+    if let Some(f) = read_findings_summary(out_dir) {
+        obj.insert("findings".into(), f);
+    }
     if summary.checkpoints > 0 {
         obj.insert(
             "checkpoints".into(),
@@ -3135,6 +3151,25 @@ fn enrich_envelope_with_summary(
         );
     }
     serde_json::to_string(&v).unwrap_or(stdout)
+}
+
+/// (#1959) Count what the crawler recorded, and say where it is.
+///
+/// Deliberately a COUNT plus a PATH rather than the findings themselves: the
+/// envelope is a decision surface, and forty findings inlined into it would
+/// push the thing the caller reads past the point of being read. The path is
+/// host-shaped for the same reason `trajectory_path` is (#1955) — a container
+/// path in an envelope is a path the caller cannot open.
+fn read_findings_summary(out_dir: &std::path::Path) -> Option<serde_json::Value> {
+    let path = out_dir.join(".darkmux-runtime").join("findings.jsonl");
+    let body = std::fs::read_to_string(&path).ok()?;
+    // Count RECORDS, not lines: a trailing newline is not a finding, and a
+    // count that says 4 when the file holds 3 is worse than no count.
+    let count = body.lines().filter(|l| !l.trim().is_empty()).count();
+    Some(serde_json::json!({
+        "count": count,
+        "path": path.display().to_string(),
+    }))
 }
 
 /// (#1955) The host-telemetry reduction the envelope carries.

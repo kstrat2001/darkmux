@@ -16,6 +16,8 @@ import {
   type FilterState,
 } from "../lib/eventFilters";
 import { FiltersDialog, onlyModelFacet } from "./FiltersDialog";
+import { ActivityIcon } from "./ActivityIcon";
+import { recordDetail } from "../lib/recordDetail";
 import { openModalEl } from "../lib/dialogManager";
 
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
@@ -400,6 +402,7 @@ export function EventLogColumn({
           {visibleRecs.length ? (
             visibleRecs.map((r) => {
               const key = recKey(r);
+              const detail = recordDetail(r);
               return (
                 <div
                   key={key}
@@ -421,9 +424,15 @@ export function EventLogColumn({
                   onKeyDown={onActivateKeyDown(() => selectRecord(r))}
                 >
                   <span className="eventlog__rectime">{clk(Date.parse(r.ts))}</span>{" "}
+                  <ActivityIcon act={activityOf(r)} />
                   <span className="eventlog__ractivity">{activityOf(r)}</span>
                   {r.machine_id ? <span className="eventlog__recmachine"> · {r.machine_id}</span> : null}
                   {r.session_id ? <span className="eventlog__recsession"> · {r.session_id}</span> : null}
+                  {/* What the record DID — a tool call's name + arguments +
+                      result size, a turn's finish reason, a reasoning
+                      excerpt. Without it every tool call in the log read
+                      "tool call" and nothing else. */}
+                  {detail ? <span className="preview-text"> · {detail}</span> : null}
                 </div>
               );
             })

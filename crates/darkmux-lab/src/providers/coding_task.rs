@@ -320,9 +320,17 @@ impl WorkloadProvider for CodingTaskProvider {
             // metrics.json. Copying what's there preserves forensic
             // data; missing files just don't copy. Don't "fix" this
             // by aborting when either is absent.
+            // `findings.jsonl` (#1959) is the crawler role's actual PRODUCT,
+            // and it lived only in a temp dir the OS reclaims — so a crawl's
+            // run artifact recorded that a dispatch happened and not what it
+            // found. Same reasoning as the two above, with more at stake:
+            // losing a trajectory costs forensics, losing this costs the
+            // result. Absent for every role that never calls `report_finding`,
+            // which the `exists()` gate below already handles.
             for (name, dst_name) in [
                 ("trajectory.jsonl", "trajectory.jsonl"),
                 ("metrics.json", "metrics.json"),
+                ("findings.jsonl", "findings.jsonl"),
             ] {
                 let src = runtime_dir.join(name);
                 if src.exists() {

@@ -808,6 +808,43 @@ body {
 .eventlog__recsession {
   color: var(--dim);
 }
+/* Row preview + per-activity glyph (viewer.html:621-635). The glyph is the
+   only thing on a log row that says "tool call" vs "reasoning" without
+   reading; the preview is the only thing that says WHAT the call did. Both
+   were absent from the port until the operator noticed — an inline SVG adds
+   no text to `innerText`, so the parity goldens matched with them missing. */
+.preview-text {
+  color: var(--muted);
+  font-style: italic;
+}
+.eventlog__rec.sel .preview-text {
+  color: rgba(232, 230, 227, 0.7);
+}
+.aico {
+  display: inline-flex;
+  vertical-align: -2px;
+  width: 13px;
+  height: 13px;
+  margin-right: 2px;
+  color: var(--muted);
+}
+.aico svg {
+  width: 13px;
+  height: 13px;
+}
+.aico.act-tool-call { color: var(--accent); }
+.aico.act-reasoning { color: #8ab4f8; }
+.aico.act-dispatch-start,
+.aico.act-dispatch-end { color: #4ade80; }
+.aico.act-dispatch-error { color: var(--bad); }
+.aico.act-compaction { color: #c084fc; }
+.aico.act-checkpoint { color: #c084fc; }
+.aico.act-routing { color: #8ab4f8; }
+.aico.act-note { color: var(--accent); }
+.aico.act-feedback { color: #8ab4f8; }
+.aico.act-machine-online,
+.aico.act-machine-offline { color: var(--muted); }
+
 .eventlog__empty {
   color: var(--dim);
   font: 11px ui-monospace, SFMono-Regular, monospace;

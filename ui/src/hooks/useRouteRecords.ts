@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
+import { useLiveSessionIds } from "./useLiveSessionIds";
 import { fetchJson } from "../lib/fetcher";
-import { queryKeys } from "../lib/queryKeys";
+import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
 import type { Route } from "../lib/route";
 import { asRecordArray, fetchStaticFlowRecords, normalizeRecords } from "../lib/flow";
 import { staticFlowSrc } from "../lib/staticSource";
@@ -118,10 +119,29 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
     enabled: flowSrc !== null,
   });
 
+  // A session drill-in is historical ONLY once the session is over. While it
+  // is still running the slice has to keep refetching, or the entire route
+  // freezes at whatever the first fetch happened to catch: no new events, and
+  // with them nothing derived — elapsed time, stage progress, turn counts.
+  // Fleet kept moving throughout (it reads the polled `flowWindow`), which is
+  // what made this read as "the run lens is stuck" rather than "this query
+  // never refetches".
+  //
+  // Liveness comes from presence heartbeats (`useLiveSessionIds`) rather than
+  // from scanning the slice for a terminal bookend: presence is the
+  // fleet-membership source of truth, and a slice-derived guess would call a
+  // session dead the moment its `dispatch.complete` landed even though the
+  // reconciler had not yet closed it. Polled only on a session route — the
+  // `enabled` gate is the same one #1800 P2 added so a replay never asks the
+  // daemon about NOW.
+  const liveSessions = useLiveSessionIds(sessionId !== null && staticFlowSrc() === null);
+  const sessionIsLive = sessionId !== null && liveSessions.has(sessionId);
+
   const sessionQuery = useQuery({
     queryKey: queryKeys.flowSession(sessionId ?? ""),
     queryFn: () => fetchJson<unknown>(`/flow-session/${encodeURIComponent(sessionId ?? "")}`),
     enabled: sessionId !== null,
+    refetchInterval: sessionIsLive ? PRESENCE_POLL_MS : false,
   });
 
   if (flowSrc !== null) {
@@ -160,7 +180,10 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
     return {
       records: recs ?? [],
       loading: sessionQuery.data === undefined,
-      historical: true,
+      // A running session is not a historical slice, and saying so is what
+      // lets the log keep its live affordances (the window label, the
+      // follow-latest tail) instead of presenting a moving feed as a replay.
+      historical: !sessionIsLive,
       error: err ? { status: err.status, message: err.message } : null,
     };
   }
