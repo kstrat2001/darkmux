@@ -1219,8 +1219,23 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
 
         match RedisSink::new(raw_url.expose_for_probe(), &stream, max_len) {
             Ok(redis_sink) => {
+                // (#1955) The URL is deliberately NOT printed.
+                //
+                // `RawRedisUrl`'s redaction covers the PASSWORD (#213/#229)
+                // and is correct for that job — but it passes host:port
+                // through by design, so this banner printed the operator's
+                // tailnet address on every dispatch, to stdout+stderr, on a
+                // machine whose repo history was scrubbed of exactly those
+                // addresses (#1940). Not a repo leak; a leak vector for the
+                // sharing that actually happens — pasting dispatch output
+                // into an issue, an article, or a screenshot.
+                //
+                // Where Redis lives is CONFIG, and `darkmux doctor` is the
+                // documented place to show a resolved value with its
+                // provenance. A banner confirming the sink came up needs the
+                // stream name and nothing else.
                 eprintln!(
-                    "flow: Redis sink enabled — url={raw_url} stream={stream} \
+                    "flow: Redis sink enabled — stream={stream} \
                      max_len={max_len:?} (composed via TeeSink)"
                 );
                 sinks.push(Arc::new(redis_sink));
@@ -3499,26 +3514,36 @@ mod tests {
     }
 
     #[test]
-    fn sink_init_banner_format_redacts_password() {
-        // Regression for #213: the Redis sink-init banner used to print
-        // the raw `DARKMUX_REDIS_URL` value with the password embedded.
-        // This test pins the on-the-wire banner format so a future
-        // refactor of the eprintln! at the construction site can't
-        // silently re-introduce the leak.
-        let url = "redis://:supersecret@100.64.0.2:6379";
+    fn sink_init_banner_carries_no_url_at_all() {
+        // Regression for #213 (password) and #1955 (host).
+        //
+        // #213 redacted the password out of this banner and kept the rest of
+        // the URL. That was the right fix for a credential and the wrong
+        // stopping point for an ADDRESS: `redact_url_creds` passes host:port
+        // through by design, so the banner printed the operator's tailnet
+        // address on every single dispatch — on a machine whose repo history
+        // had been scrubbed of precisely those addresses (#1940).
+        //
+        // The banner now carries no URL at all, so there is nothing left to
+        // redact. Pinned as an ABSENCE rather than a redaction marker: a
+        // future refactor that reintroduces `url={...}` fails here even if it
+        // routes through the redacting form.
         let banner = format!(
-            "flow: Redis sink enabled — url={} stream={} max_len={:?} (composed via TeeSink)",
-            redact_url_creds(url),
+            "flow: Redis sink enabled — stream={} max_len={:?} (composed via TeeSink)",
             "darkmux:flow",
             Some(10000_usize),
         );
         assert!(
-            !banner.contains("supersecret"),
-            "banner leaked password substring: {banner}",
+            !banner.contains("redis://") && !banner.contains('@'),
+            "banner must carry no URL: {banner}",
         );
         assert!(
-            banner.contains(":***@"),
-            "banner missed redaction marker: {banner}",
+            !banner.contains("url="),
+            "banner must not reintroduce a url field, redacted or otherwise: {banner}",
+        );
+        assert!(
+            banner.contains("stream=darkmux:flow"),
+            "banner must still say which stream came up: {banner}",
         );
     }
 
