@@ -360,7 +360,11 @@ impl Tool {
             Tool::Write => execute_write(raw_args, Path::new(DEFAULT_WORKSPACE)),
             Tool::Edit => execute_edit(raw_args, Path::new(DEFAULT_WORKSPACE)),
             Tool::Search => execute_search(raw_args, Path::new(DEFAULT_WORKSPACE)),
-            Tool::ReportFinding => execute_report_finding(raw_args, &crate::trajectory::runtime_dir()),
+            Tool::ReportFinding => execute_report_finding(
+                raw_args,
+                &crate::trajectory::runtime_dir(),
+                Path::new(DEFAULT_WORKSPACE),
+            ),
         }
     }
 
@@ -984,6 +988,144 @@ mod tests {
         );
     }
 
+    // ─── report_finding: harness-captured context (#1959) ─────────────────
+
+    // The tier that PRODUCES candidates must not also author what the tier
+    // that JUDGES them gets to see. These assert the runtime reads the source
+    // itself, so a crawler cannot hand its judge a context that flatters its
+    // own finding.
+    fn finding_workspace(body: &str) -> tempfile::TempDir {
+        let ws = fresh_workspace();
+        std::fs::create_dir_all(ws.path().join("src")).unwrap();
+        std::fs::write(ws.path().join("src/a.rs"), body).unwrap();
+        ws
+    }
+
+    fn numbered_src(n: usize, hit_line: usize, hit: &str) -> String {
+        (1..=n)
+            .map(|i| if i == hit_line { hit.to_string() } else { format!("// filler {i}") })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn last_finding(out: &Path) -> serde_json::Value {
+        let body = std::fs::read_to_string(out.join(FINDINGS_FILE)).expect("findings file");
+        let line = body.lines().rfind(|l| !l.trim().is_empty()).expect("a record");
+        serde_json::from_str(line).expect("valid json")
+    }
+
+    fn report(ws: &Path, out: &Path, line: u32, evidence: &str) -> String {
+        let raw = serde_json::json!({
+            "file": "src/a.rs", "line": line, "pattern": "p",
+            "evidence": evidence, "why": "w",
+        })
+        .to_string();
+        execute_report_finding(&raw, out, ws).unwrap()
+    }
+
+    #[test]
+    fn the_runtime_reads_the_context_off_disk_not_from_the_model() {
+        let ws = finding_workspace(&numbered_src(100, 50, "    let _ = risky();"));
+        let out = fresh_workspace();
+        report(ws.path(), out.path(), 50, "    let _ = risky();");
+
+        let rec = last_finding(out.path());
+        let ctx = rec["context"].as_str().expect("context recorded");
+        assert!(ctx.contains("let _ = risky();"), "the cited line must be in the window: {ctx}");
+        assert!(ctx.contains("filler 20"), "window must reach 30 lines BEFORE: {ctx}");
+        assert!(ctx.contains("filler 80"), "window must reach 30 lines AFTER: {ctx}");
+        assert!(!ctx.contains("filler 19"), "window must not exceed 30 before");
+        assert!(!ctx.contains("filler 81"), "window must not exceed 30 after");
+        assert_eq!(rec["context_start"], 20);
+        assert_eq!(rec["context_end"], 80);
+    }
+
+    #[test]
+    fn a_quote_that_disagrees_with_the_cited_line_is_rejected_not_silently_corrected() {
+        // The realistic cause is a WRONG LINE NUMBER, not sloppy transcription.
+        // Recording the file's version anyway would attach evidence the model
+        // never examined to a `why` describing different code — a coherent-
+        // looking record that is wrong, which is worse than no record.
+        let ws = finding_workspace(&numbered_src(60, 30, "    let _ = actual();"));
+        let out = fresh_workspace();
+        let resp = report(ws.path(), out.path(), 30, "    let _ = what_the_model_claimed();");
+
+        assert!(resp.starts_with("REJECTED:"), "a mismatched quote must not be recorded: {resp}");
+        assert!(
+            resp.contains("let _ = actual();"),
+            "the response must show what IS there, so the model can fix its line number: {resp}"
+        );
+        assert!(resp.contains("did not count against your budget"), "{resp}");
+        assert!(
+            !out.path().join(FINDINGS_FILE).exists(),
+            "nothing may be recorded for a rejected citation"
+        );
+    }
+
+    #[test]
+    fn whitespace_alone_does_not_count_as_a_mismatch() {
+        // Rejecting on indentation would make the guard hostile rather than
+        // useful — the model is quoting from a rendered `read` result.
+        let ws = finding_workspace(&numbered_src(60, 30, "    let _ = actual();"));
+        let out = fresh_workspace();
+        let resp = report(ws.path(), out.path(), 30, "let _ = actual();");
+        assert!(!resp.starts_with("REJECTED:"), "trimmed-equal quotes must pass: {resp}");
+        assert_eq!(last_finding(out.path())["evidence"], "    let _ = actual();");
+    }
+
+    #[test]
+    fn an_honest_quote_is_recorded_with_the_file_s_own_line() {
+        let ws = finding_workspace(&numbered_src(60, 30, "    let _ = actual();"));
+        let out = fresh_workspace();
+        report(ws.path(), out.path(), 30, "    let _ = actual();");
+        let rec = last_finding(out.path());
+        assert_eq!(
+            rec["evidence"], "    let _ = actual();",
+            "evidence must come from disk, or 'cite the line' is a check rather than a guarantee"
+        );
+    }
+
+    #[test]
+    fn a_line_past_the_end_of_the_file_is_rejected_and_records_nothing() {
+        let ws = finding_workspace(&numbered_src(40, 10, "    let _ = risky();"));
+        let out = fresh_workspace();
+        let resp = report(ws.path(), out.path(), 9999, "    let _ = risky();");
+
+        assert!(resp.starts_with("REJECTED:"), "an unresolvable citation must not be recorded: {resp}");
+        assert!(resp.contains("40 lines"), "the reason must name what the file actually has: {resp}");
+        assert!(
+            resp.contains("did not count against your budget"),
+            "a rejected citation must not consume budget: {resp}"
+        );
+        assert!(
+            !out.path().join(FINDINGS_FILE).exists(),
+            "the findings file must not even be created by a rejected call"
+        );
+    }
+
+    #[test]
+    fn a_file_outside_the_workspace_is_rejected() {
+        let ws = finding_workspace(&numbered_src(40, 10, "    let _ = risky();"));
+        let out = fresh_workspace();
+        let raw = serde_json::json!({
+            "file": "../../../etc/passwd", "line": 1, "pattern": "p",
+            "evidence": "root", "why": "w",
+        })
+        .to_string();
+        let resp = execute_report_finding(&raw, out.path(), ws.path()).unwrap();
+        assert!(resp.starts_with("REJECTED:"), "context capture must not escape the workspace: {resp}");
+    }
+
+    #[test]
+    fn a_window_at_the_start_of_a_file_clamps_instead_of_underflowing() {
+        let ws = finding_workspace(&numbered_src(80, 2, "    let _ = risky();"));
+        let out = fresh_workspace();
+        report(ws.path(), out.path(), 2, "    let _ = risky();");
+        let rec = last_finding(out.path());
+        assert_eq!(rec["context_start"], 1, "must clamp to the first line, not wrap or panic");
+        assert_eq!(rec["context_end"], 32);
+    }
+
     // ─── read ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -1577,6 +1719,75 @@ mod tests {
 /// the finding-rate invariant in #1956).
 const MAX_FINDINGS_PER_DISPATCH: usize = 40;
 
+/// (#1959) Lines of source captured either side of a finding's cited line.
+///
+/// Sized from a measured triage pass: every one of ten findings on the first
+/// real corpus was judgeable inside +/-30, with zero NEEDS-WIDER-CONTEXT
+/// verdicts, including one whose severity turned on code ~20 lines BELOW the
+/// cited line. Widen only against evidence that a real judgment needed more.
+const FINDING_CONTEXT_LINES: usize = 30;
+
+/// The harness's own view of a cited line and its surroundings.
+///
+/// **Read from disk by the runtime, never supplied by the model.** That is the
+/// whole point: the triage tier downstream judges real source rather than the
+/// crawler's account of it, so the adversarial boundary between the tier that
+/// PRODUCES candidates and the tier that JUDGES them survives the hand-off. A
+/// model that could write its own context could also write a context that
+/// justifies its own finding.
+///
+/// It also makes "cite the line" true by construction instead of by check: the
+/// recorded `evidence` IS the file's line, so the post-hoc guard that compares
+/// them can only ever pass. What that guard becomes instead is a MODEL-QUALITY
+/// signal — `evidence_mismatch` records that the crawler misquoted, which is
+/// worth surfacing and is not the same thing as an invalid finding.
+struct FindingContext {
+    evidence: String,
+    context: String,
+    start: usize,
+    end: usize,
+    mismatch: bool,
+}
+
+/// Resolve the cited file, verify the line exists, and capture the window.
+///
+/// Returns `Err` with a model-facing reason when the citation does not resolve —
+/// the caller turns that into a REJECTED response that costs no budget. This is
+/// the mechanical evidence guard moved to the point of REPORT, so a finding that
+/// cannot point at code never reaches an artifact, let alone a frontier token.
+fn capture_finding_context(
+    file: &str,
+    line: u32,
+    claimed: &str,
+    workspace_root: &Path,
+) -> std::result::Result<FindingContext, String> {
+    let path = resolve_read(file, workspace_root)
+        .map_err(|e| format!("`file` did not resolve to a readable path in the workspace ({e})"))?;
+    let body = std::fs::read_to_string(&path)
+        .map_err(|e| format!("`file` could not be read ({e})"))?;
+    let lines: Vec<&str> = body.lines().collect();
+    let n = line as usize;
+    if n > lines.len() {
+        return Err(format!(
+            "`line` {n} is past the end of that file, which has {} lines",
+            lines.len()
+        ));
+    }
+    let start = n.saturating_sub(FINDING_CONTEXT_LINES).max(1);
+    let end = (n + FINDING_CONTEXT_LINES).min(lines.len());
+    // Numbered, so a downstream judge can cite precisely from the window alone
+    // without re-deriving offsets.
+    let context = lines[start - 1..end]
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("{:>6}  {}", start + i, l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let evidence = lines[n - 1].to_string();
+    let mismatch = !claimed.trim().is_empty() && claimed.trim() != evidence.trim();
+    Ok(FindingContext { evidence, context, start, end, mismatch })
+}
+
 pub const FINDINGS_FILE: &str = "findings.jsonl";
 
 /// Argument names are ALIASED, deliberately.
@@ -1604,7 +1815,11 @@ struct ReportFindingArgs {
     why: String,
 }
 
-fn execute_report_finding(raw_args: &str, out_dir: &Path) -> Result<String> {
+fn execute_report_finding(
+    raw_args: &str,
+    out_dir: &Path,
+    workspace_root: &Path,
+) -> Result<String> {
     // NEVER return Err from a model-facing tool.
     //
     // Measured on the first live crawl: one malformed call returned an error,
@@ -1653,6 +1868,45 @@ fn execute_report_finding(raw_args: &str, out_dir: &Path) -> Result<String> {
             .to_string());
     }
 
+    // Resolve the citation against real source BEFORE anything is recorded. A
+    // finding that cannot point at code is not a finding, and rejecting it here
+    // costs nothing — no artifact, no frontier token. The captured window rides
+    // along so the triage tier never has to open the tree.
+    let captured = match capture_finding_context(
+        &args.file,
+        args.line,
+        &args.evidence,
+        workspace_root,
+    ) {
+        Ok(c) => c,
+        Err(reason) => {
+            return Ok(format!(
+                "REJECTED: {reason}. Re-check the path and the 1-indexed line, \
+                 then call again. This did not count against your budget."
+            ));
+        }
+    };
+    // A quote that does not match the cited line is a WRONG LINE NUMBER far more
+    // often than a sloppy transcription, and silently keeping the file's version
+    // would be the worse failure of the two: the record would carry evidence the
+    // model never examined, attached to a `why` describing different code. So
+    // refuse it and hand back what is actually there, which is enough for the
+    // model to correct the line by itself.
+    //
+    // This is also what the crawler role's own prompt has always promised
+    // ("a report whose evidence is a paraphrase rather than the actual line is
+    // rejected and does not count") — the code now keeps that promise.
+    if captured.mismatch {
+        let actual = captured.evidence.trim();
+        return Ok(format!(
+            "REJECTED: line {} of that file is:\n\n    {actual}\n\n\
+             which is not what you quoted. You have most likely cited the wrong \
+             line number. Find the line your evidence actually came from and call \
+             again with it. This did not count against your budget.",
+            args.line
+        ));
+    }
+
     let path = out_dir.join(FINDINGS_FILE);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1667,14 +1921,21 @@ fn execute_report_finding(raw_args: &str, out_dir: &Path) -> Result<String> {
         ));
     }
 
+    // `evidence` and `context` are the HARNESS's, read from disk, and by this
+    // point the model's own quote has been checked against them. `why` is the
+    // model's claim and stays unverified by design.
     let record = serde_json::json!({
         "file": args.file,
         "line": args.line,
         "pattern": args.pattern,
-        "evidence": args.evidence,
+        "evidence": captured.evidence,
+        "context": captured.context,
+        "context_start": captured.start,
+        "context_end": captured.end,
         "why": args.why,
         "ts": crate::trajectory::unix_ms(),
     });
+
 
     let mut line = serde_json::to_string(&record).context("serializing finding")?;
     line.push('\n');

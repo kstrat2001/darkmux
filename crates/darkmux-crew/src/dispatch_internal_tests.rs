@@ -4745,28 +4745,93 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
     assert_eq!(v["detections"].as_array().unwrap().len(), 0);
 }
 
-#[test]
-fn checkpoints_are_reduced_not_streamed() {
-    // 65 records collapse to the three numbers a caller acts on. The full
-    // sequence stays in the trajectory, which `trajectory_path` points at.
-    let s = super::TrajectorySummary {
-        checkpoints: 65,
-        checkpoints_concluded: 1,
-        last_tail_ratio: Some(0.2928),
+fn summary_over_ratios(ratios: &[f64], concluded: u32) -> super::TrajectorySummary {
+    let mut s = super::TrajectorySummary {
+        checkpoints_concluded: concluded,
         ..Default::default()
     };
+    for r in ratios {
+        // Drive the REAL accumulator. Rebuilding this fold by hand is what let
+        // an earlier version of these tests pass against a mutation that
+        // replaced the running minimum with the last value.
+        s.record_checkpoint(Some(*r), false);
+    }
+    s
+}
+
+fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
-        &s,
+        s,
         &super::HostPeaks::default(),
         no_findings_dir(),
     );
-    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["checkpoints"]["total"], 65);
-    assert_eq!(v["checkpoints"]["concluded"], 1);
+    serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
+}
+
+#[test]
+fn checkpoints_are_reduced_not_streamed() {
+    // 65 records collapse to the numbers a caller acts on. The full sequence
+    // stays in the trajectory, which `trajectory_path` points at.
+    let v = checkpoint_block(&summary_over_ratios(&[0.9, 0.2928, 0.8], 1));
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["concluded"], 1);
     assert!(
-        (v["checkpoints"]["last_tail_ratio"].as_f64().unwrap() - 0.2928).abs() < 1e-9,
-        "the evidence behind the ruling must survive: {out}"
+        (v["min_tail_ratio"].as_f64().unwrap() - 0.2928).abs() < 1e-9,
+        "the worst moment is the trust gate and must survive: {v}"
+    );
+}
+
+/// (#1959) The regression this replaced. Measured on two real crawls: the
+/// DEGENERATE one reported a higher `last_tail_ratio` (0.997) than the clean
+/// one (0.976), because it decayed to 0.193, tripped the gate, and recovered.
+/// The field an operator reads first ranked the bad run as the healthier one.
+#[test]
+fn a_run_that_degenerated_and_recovered_does_not_look_healthy() {
+    // The real trajectory, abbreviated: decay, gate fires, clean recovery.
+    let bad = summary_over_ratios(
+        &[1.0, 0.98, 0.64, 0.46, 0.36, 0.30, 0.25, 0.193, 0.99, 0.99, 0.95, 1.0],
+        1,
+    );
+    let good = summary_over_ratios(&[0.99, 0.98, 0.99, 0.976], 0);
+
+    let (b, g) = (checkpoint_block(&bad), checkpoint_block(&good));
+    let (bmin, gmin) = (b["min_tail_ratio"].as_f64().unwrap(), g["min_tail_ratio"].as_f64().unwrap());
+    assert!(
+        bmin < gmin,
+        "the degenerate run must not out-rank the clean one: {bmin} vs {gmin}"
+    );
+    assert!(bmin < 0.25, "its worst checkpoint tripped the gate: {bmin}");
+    // Both runs END clean, which is exactly why the last value could not
+    // separate them and the minimum can. The mean separates them too, by a
+    // wide margin — asserted as a RELATIONSHIP rather than a constant so the
+    // test states the property instead of restating the arithmetic.
+    let (bmean, gmean) = (
+        b["mean_tail_ratio"].as_f64().unwrap(),
+        g["mean_tail_ratio"].as_f64().unwrap(),
+    );
+    assert!(
+        bmean < gmean - 0.2,
+        "mean says how MUCH of the run was compromised: {bmean} vs {gmean}"
+    );
+}
+
+/// min alone collapses "one excursion, recovered" into "chronically
+/// degenerate" — both have the same minimum. The mean is what separates them,
+/// which is why both are carried.
+#[test]
+fn mean_separates_a_brief_excursion_from_a_chronically_bad_run() {
+    let brief = checkpoint_block(&summary_over_ratios(&[0.19, 0.99, 0.99, 0.99], 1));
+    let chronic = checkpoint_block(&summary_over_ratios(&[0.19, 0.22, 0.26, 0.21], 1));
+    assert_eq!(
+        brief["min_tail_ratio"].as_f64().unwrap(),
+        chronic["min_tail_ratio"].as_f64().unwrap(),
+        "precondition: identical minima"
+    );
+    assert!(
+        brief["mean_tail_ratio"].as_f64().unwrap()
+            > chronic["mean_tail_ratio"].as_f64().unwrap() + 0.5,
+        "the mean must tell them apart: {brief} vs {chronic}"
     );
 }
 
