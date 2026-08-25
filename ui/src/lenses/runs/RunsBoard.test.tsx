@@ -874,3 +874,46 @@ describe("RunsBoard — deep-link wiring parity with App.tsx (#1920)", () => {
     expect(screen.getByText(notice)).toBeInTheDocument();
   });
 });
+
+/**
+ * (#1966) The board fetched its run list ONCE on mount, so a run that was
+ * `running` at load time rendered `running` forever and only a page reload
+ * corrected it. The operator-visible tell was one row disagreeing with itself:
+ * a frozen status badge beside a replay control derived from state that does
+ * update.
+ *
+ * These assert against a CHANGED server response after the poll interval, not
+ * against the first render. The pre-existing tests all pass with the bug
+ * present because they only ever exercise the initial fetch — which is the one
+ * state that was always correct.
+ */
+describe("RunsBoard — the run list keeps up with the server", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function mockRuns(status: () => string) {
+    return vi.fn(async (url: string) => {
+      const u = String(url);
+      const body = u.includes("lab")
+        ? { runs: [] }
+        : { runs: [{ id: "r-1", kind: "dispatch", status: status(), tracked: true, ts: todayUTC() }] };
+      return { ok: true, status: 200, json: async () => body };
+    });
+  }
+
+  it("re-renders a run as finished once the server says so, with no remount", async () => {
+    let status = "running";
+    vi.stubGlobal("fetch", mockRuns(() => status));
+
+    renderBoard("dispatch");
+    await waitFor(() => expect(screen.getByText(/running/i)).toBeTruthy());
+
+    // The dispatch ends. Nothing about the page changes; only the server does.
+    status = "complete";
+
+    await waitFor(() => expect(screen.queryByText(/running/i)).toBeNull(), { timeout: 15_000 });
+    expect(screen.getByText(/complete/i)).toBeTruthy();
+  }, 20_000);
+});
