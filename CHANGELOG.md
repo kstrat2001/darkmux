@@ -12,6 +12,84 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [2.11.0] - 2026-08-26
+
+### Added
+
+- **`darkmux dispatch` envelopes now report what darkmux OBSERVED, not just
+  what the model said** (#1955, #1958). The four pathology detectors wrote to
+  no orchestrator-reachable channel — not stdout, not stderr, only a trajectory
+  file in a temp dir — so a dispatch that tripped a cycle detector returned an
+  envelope byte-indistinguishable from a clean one. The envelope now carries
+  `detections` (always present, `[]` when nothing fired), `host` peaks, and a
+  `checkpoints` reduction.
+
+- **A `crawler` role and a `report_finding` tool** (#1959). The role scans a
+  bounded scope for ONE named pattern and records each match structurally
+  instead of narrating it in prose. The tool reads the cited line and its ±30
+  surrounding lines **off disk itself** and records them alongside the model's
+  rationale, so a downstream reviewer judges real source rather than the
+  crawler's account of it, and "cite the line" holds by construction rather
+  than by later check. Back-pressure runs on two levels: the return value tells
+  the model how much budget remains, and a hard cap bounds it regardless.
+
+  A citation that does not resolve — a missing file, a line past end-of-file, a
+  quote that disagrees with the line — is REJECTED at report time with the
+  actual line handed back, costs no budget, and never reaches an artifact. The
+  realistic cause of a mismatched quote is a wrong line NUMBER, and silently
+  recording the file's version would attach evidence the model never examined
+  to a rationale describing different code.
+
+  Findings are copied into the lab run directory beside the trajectory, and the
+  envelope reports `findings: {count, path}`. That block's ABSENCE is
+  meaningful: the file is created on the first successful call, so no block
+  means the reporting channel was never used.
+
+### Fixed
+
+- **The per-turn-cap salvage no longer dispatches the tool call it truncated**
+  (#1961). The #479 salvage counted well-formed tool calls but never filtered
+  them. The cap lands mid-serialization, so the last call of a salvaged turn is
+  routinely cut to `arguments: ""` — and all of them were dispatched. The empty
+  call failing was harmless; the damage was that the unparseable argument
+  string stayed in the transcript, and the model host answered the NEXT
+  streaming request with HTTP 500. **A recoverable mid-turn truncation became a
+  total loss of the run**, several turns later, with a 500 as the only symptom.
+  Observed live: a dispatch ended at 67 seconds with no envelope at all.
+
+- **The viewer shows what a tool call actually did again** (#1960). The React
+  port kept the filter that depends on the per-activity icon map and left the
+  icon map behind, and rendered no `tool_name` or arguments at all — so every
+  tool call in the event log read "tool call" and nothing else. Restores the
+  glyphs and the row preview (name, arguments, result size, failure marker),
+  and adds a glyph for reasoning checkpoints, which the legacy map predates.
+
+- **A live session drill-in no longer freezes** (#1960). The session query had
+  no refetch interval and hardcoded itself as historical, so opening a RUNNING
+  session fetched once and never again: no new events, and nothing derived from
+  them could advance, while the fleet view kept moving. Liveness now comes from
+  presence heartbeats.
+
+- **`dispatch --json` no longer reports a container path the caller cannot
+  open**, and the Redis startup banner no longer prints the connection address
+  (#1957).
+
+### Changed
+
+- **`checkpoints.last_tail_ratio` is replaced by `min_tail_ratio` and
+  `mean_tail_ratio`** (#1959). Reporting the LAST measurement did not merely
+  fail to signal, it INVERTED: measured on two real crawls, a run that decayed
+  through fourteen checkpoints to 0.193, tripped the degeneracy gate, and then
+  recovered reported `0.997`, while a clean four-checkpoint run reported
+  `0.976`. The degenerate run looked healthier on the field an operator reads
+  first. `min` answers "did this run ever degenerate"; `mean` answers "how much
+  of it was compromised", and neither substitutes for the other.
+
+  **Breaking, for anything parsing the dispatch envelope:** `last_tail_ratio`
+  is gone rather than deprecated, per the pre-1.0 no-compat-baggage policy. The
+  only consumer is an orchestrator reading the envelope; nothing in the viewer
+  reads it.
+
 ## [2.10.0] - 2026-08-24
 
 ### Fixed
@@ -1092,6 +1170,7 @@ schema changes (FLOW `1.18.0`, CONFIG `1.5`, MISSION_CONFIG `1.3`).
   "ready" with no time reference at all, indistinguishable from a fleet that
   had never dispatched.
 
+[2.11.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.11.0
 [2.10.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.10.0
 [2.9.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.9.0
 [2.8.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.8.0
