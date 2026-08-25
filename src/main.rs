@@ -1430,12 +1430,28 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     // fell through). `--machine` routing (and every other caller of
     // `fleet::dispatch_routed`) is untouched.
     let result = fleet::dispatch_routed_via(opts, crew::dispatch_as_crew_of_one::dispatch_as_crew_of_one)?;
-    // Announce the resolved session id on stderr so operators can correlate
-    // this dispatch with the flow stream — without polluting the --json
-    // envelope on stdout that orchestrators parse.
-    eprintln!("darkmux dispatch: session id `{}`", result.session_id);
+    // (#1955) A `--json` caller receives stdout AND stderr as one payload and
+    // pays context for both. On a run that SUCCEEDED the prose is now pure
+    // overhead: the envelope carries the checkpoint tally, the detections and
+    // the host peaks, so twelve repetitions of `per-call budget reached` cost
+    // tokens to receive and say strictly less than `checkpoints.total`.
+    //
+    // Only on success. A failing dispatch's stderr is the diagnosis — the
+    // docker error, the model load failure, the escalation reason — and
+    // suppressing it to save context would trade a few hundred tokens for the
+    // ability to tell what went wrong. Quiet is for the boring case.
+    //
+    // stderr stays exactly as it is for a human at a terminal, which is the
+    // consumer it was written for and serves well.
+    let quiet = json && result.exit_code == 0;
+    if !quiet {
+        // Announce the resolved session id on stderr so operators can
+        // correlate this dispatch with the flow stream — without polluting the
+        // --json envelope on stdout that orchestrators parse.
+        eprintln!("darkmux dispatch: session id `{}`", result.session_id);
+    }
     print!("{}", result.stdout);
-    if !result.stderr.is_empty() {
+    if !quiet && !result.stderr.is_empty() {
         eprint!("{}", result.stderr);
     }
     Ok(result.exit_code)

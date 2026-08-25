@@ -2875,7 +2875,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // panicked sampler thread degrades to "no more samples", not a
     // failed dispatch).
     sampler_stop.store(true, Ordering::SeqCst);
-    let _ = sampler_handle.join();
+let host_peaks = sampler_handle.join().unwrap_or_default();
 
     // (#638) The container has exited — the session is no longer running.
     // Stop the liveness heartbeat and DELete its key so the live view drops
@@ -2937,7 +2937,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
-    let stdout = enrich_envelope_with_summary(stdout, &trajectory_summary);
+    let stdout = enrich_envelope_with_summary(stdout, &trajectory_summary, &host_peaks);
 
     // (#782) Read the runtime's token totals from metrics.json now the
     // container has exited. Best-effort — zero totals on any read failure
@@ -3090,7 +3090,11 @@ fn rewrite_container_paths_for_host(stdout: String, host_out: &std::path::Path) 
 /// of its own work; these are the HOST tailer's observations. Where the two
 /// could disagree (see #1947) that disagreement is signal, and collapsing them
 /// into one number would hide it.
-fn enrich_envelope_with_summary(stdout: String, summary: &TrajectorySummary) -> String {
+fn enrich_envelope_with_summary(
+    stdout: String,
+    summary: &TrajectorySummary,
+    peaks: &HostPeaks,
+) -> String {
     let trimmed = stdout.trim();
     if !trimmed.starts_with('{') {
         return stdout;
@@ -3107,6 +3111,19 @@ fn enrich_envelope_with_summary(stdout: String, summary: &TrajectorySummary) -> 
         "detections".into(),
         serde_json::Value::Array(summary.detections.clone()),
     );
+    // Host pressure, reduced. Included only when the sampler actually ran —
+    // an absent block says "not measured", which is honest, where a zeroed
+    // one would read as "measured, and idle".
+    if peaks.samples > 0 {
+        obj.insert(
+            "host".into(),
+            serde_json::json!({
+                "peak_mem_pct": peaks.peak_mem_pct,
+                "peak_cpu_pct": peaks.peak_cpu_pct,
+                "samples": peaks.samples,
+            }),
+        );
+    }
     if summary.checkpoints > 0 {
         obj.insert(
             "checkpoints".into(),
@@ -3118,6 +3135,24 @@ fn enrich_envelope_with_summary(stdout: String, summary: &TrajectorySummary) -> 
         );
     }
     serde_json::to_string(&v).unwrap_or(stdout)
+}
+
+/// (#1955) The host-telemetry reduction the envelope carries.
+///
+/// The sampler already walks cpu/ram/gpu at a fixed cadence and emits each
+/// sample to the flow stream. This is a pure REDUCTION over samples that are
+/// already being taken — it adds no probe, no syscall, and no cost to the
+/// measured run, which is what the observer-must-not-join-the-observed rule
+/// requires of anything on this path.
+///
+/// `samples` is carried deliberately: a peak of 0 and "we never sampled" are
+/// different claims, and an orchestrator reasoning about whether a dispatch
+/// was memory-starved has to be able to tell them apart.
+#[derive(Default, Debug, Clone, Copy)]
+struct HostPeaks {
+    peak_mem_pct: Option<u64>,
+    peak_cpu_pct: Option<u64>,
+    samples: u32,
 }
 
 /// Summary of what the trajectory tailer surfaced. Used to enrich the
@@ -3350,7 +3385,8 @@ fn run_telemetry_sampler(
     model: String,
     mission_id: Option<String>,
     phase_id: Option<String>,
-) {
+) -> HostPeaks {
+    let mut peaks = HostPeaks::default();
     let emit = |source: &str, action: &str, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
@@ -3408,6 +3444,17 @@ fn run_telemetry_sampler(
         // `darkmux-lab`'s review driver samples through the same function.
         let sample = crate::telemetry_sampler::sample_host();
         if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
+            // Reduce as we sample. Max, not last: the question an orchestrator
+            // asks afterward is "did this run approach the ceiling", and the
+            // final sample is taken as the container tears down, which is the
+            // least representative moment of the whole run.
+            peaks.samples = peaks.samples.saturating_add(1);
+            if let Some(m) = sample.mem {
+                peaks.peak_mem_pct = Some(peaks.peak_mem_pct.map_or(m, |p| p.max(m)));
+            }
+            if let Some(c) = sample.cpu {
+                peaks.peak_cpu_pct = Some(peaks.peak_cpu_pct.map_or(c, |p| p.max(c)));
+            }
             let mut payload = serde_json::Map::new();
             if let Some(c) = sample.cpu {
                 payload.insert("cpu".into(), c.into());
@@ -3431,13 +3478,16 @@ fn run_telemetry_sampler(
         let mut slept = Duration::ZERO;
         while slept < TELEMETRY_SAMPLE_INTERVAL {
             if stop_flag.load(Ordering::SeqCst) {
-                return;
+                // Teardown mid-interval: return what was observed, never a
+                // default. A killed or short dispatch still has real peaks.
+                return peaks;
             }
             let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
             thread::sleep(nap);
             slept += nap;
         }
     }
+    peaks
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,
