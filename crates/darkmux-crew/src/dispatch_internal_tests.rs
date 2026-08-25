@@ -4615,3 +4615,82 @@ fn normalizing_the_key_does_not_change_the_minted_identifier() {
     assert_eq!(from_bare, from_namespaced);
     assert!(darkmux_profiles::swap::is_darkmux_owned(&from_namespaced));
 }
+
+// ---------------------------------------------------------------
+// (#1955) The host/container seam.
+//
+// These exist because a real dispatch was run and its output was READ
+// rather than EXERCISED. The envelope carried
+// `trajectory_path: "/darkmux-out/.darkmux-runtime/trajectory.jsonl"` —
+// a path-shaped string that looks entirely correct and does not exist on
+// the host. It survived because both sides were individually right: the
+// runtime reports its own view and has a passing test asserting exactly
+// that container path.
+//
+// The rule this encodes: a value that means something different on the
+// other side of a boundary must be resolved FROM THE CONSUMER'S SIDE
+// before it is called verified.
+// ---------------------------------------------------------------
+
+#[test]
+fn envelope_trajectory_path_is_translated_to_the_host_view() {
+    let host_out = std::path::Path::new("/var/folders/xx/T/darkmux-out-analyst-123");
+    let runtime_stdout = r#"{"result":"stop","final_assistant":"hi","trajectory_path":"/darkmux-out/.darkmux-runtime/trajectory.jsonl"}"#;
+
+    let out = super::rewrite_container_paths_for_host(runtime_stdout.to_string(), host_out);
+    let v: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
+
+    assert_eq!(
+        v["trajectory_path"],
+        "/var/folders/xx/T/darkmux-out-analyst-123/.darkmux-runtime/trajectory.jsonl",
+        "the caller must receive a path it can open, not the container's view"
+    );
+    assert_eq!(v["result"], "stop", "unrelated fields are untouched");
+    assert_eq!(v["final_assistant"], "hi");
+}
+
+#[test]
+fn a_host_shaped_path_is_left_alone() {
+    let host_out = std::path::Path::new("/var/folders/xx/T/out");
+    let already = r#"{"trajectory_path":"/var/folders/xx/T/out/.darkmux-runtime/trajectory.jsonl"}"#;
+    let out = super::rewrite_container_paths_for_host(already.to_string(), host_out);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["trajectory_path"],
+        "/var/folders/xx/T/out/.darkmux-runtime/trajectory.jsonl",
+        "translation must be idempotent — only the container prefix is rewritten"
+    );
+}
+
+#[test]
+fn non_json_stdout_passes_through_untouched() {
+    // The non-`--json` path returns bare completion text. Rewriting must be
+    // a no-op there rather than mangling a model's answer that happens to
+    // start with a brace.
+    let host_out = std::path::Path::new("/var/folders/xx/T/out");
+    for raw in [
+        "just some model output",
+        "",
+        "{ not valid json at all",
+    ] {
+        assert_eq!(
+            super::rewrite_container_paths_for_host(raw.to_string(), host_out),
+            raw,
+            "non-envelope stdout must pass through verbatim: {raw:?}"
+        );
+    }
+}
+
+#[test]
+fn an_envelope_without_a_trajectory_path_is_unchanged() {
+    // The remote/single-shot envelopes carry no trajectory_path. Absence is
+    // not an error and must not become a null or an empty string.
+    let host_out = std::path::Path::new("/var/folders/xx/T/out");
+    let remote = r#"{"result":"stop","final_assistant":"hi","metrics":{"turns":1}}"#;
+    let out = super::rewrite_container_paths_for_host(remote.to_string(), host_out);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v.get("trajectory_path").is_none(),
+        "must not invent a field the producer did not emit: {out}"
+    );
+}

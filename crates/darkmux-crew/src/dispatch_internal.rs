@@ -2889,6 +2889,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let wall_ms = dispatch_start_instant.elapsed().as_millis() as u64;
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    // (#1955) Translate container paths to host paths at the seam.
+    //
+    // The runtime reports `trajectory_path` as it sees it —
+    // `/darkmux-out/.darkmux-runtime/trajectory.jsonl` — which is CORRECT
+    // inside the container and meaningless to the caller that receives this
+    // envelope. Nothing translated it, so the envelope's only drill-down
+    // affordance pointed at a path that does not exist on the host. A caller
+    // wanting the trajectory had to scrape the host out-dir out of a prose
+    // stderr line instead, which is exactly what darkmux's own orchestrator
+    // was doing — silently, without reporting the defect.
+    //
+    // Both sides were individually right, which is why unit tests on either
+    // side pass: the runtime's own test asserts the container path and is
+    // correct to. Translation belongs to whoever owns the boundary, and the
+    // host is the only party that knows both views.
+    let stdout = rewrite_container_paths_for_host(stdout, &host_out);
     let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
     // (#363) If the watchdog fired, prepend a structured timeout
@@ -3016,6 +3032,40 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // from the sandbox.
         out_dir: Some(host_out),
     })
+}
+
+/// (#1955) Rewrite the runtime's container-view paths in a JSON envelope to
+/// the host paths the caller can actually open.
+///
+/// Deliberately narrow: it only touches a `trajectory_path` that begins with
+/// the container mount point, and only when stdout parses as a JSON object.
+/// Non-JSON stdout (the non-`--json` text path) is returned untouched, and a
+/// path that is already host-shaped is left alone — so this is a no-op on
+/// every shape except the one that is broken.
+fn rewrite_container_paths_for_host(stdout: String, host_out: &std::path::Path) -> String {
+    const CONTAINER_OUT: &str = "/darkmux-out";
+    let trimmed = stdout.trim();
+    if !trimmed.starts_with('{') {
+        return stdout;
+    }
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return stdout;
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return stdout;
+    };
+    let Some(p) = obj.get("trajectory_path").and_then(|p| p.as_str()) else {
+        return stdout;
+    };
+    let Some(rel) = p.strip_prefix(CONTAINER_OUT) else {
+        return stdout;
+    };
+    let host = host_out.join(rel.trim_start_matches('/'));
+    obj.insert(
+        "trajectory_path".into(),
+        serde_json::Value::String(host.display().to_string()),
+    );
+    serde_json::to_string(&v).unwrap_or(stdout)
 }
 
 /// Summary of what the trajectory tailer surfaced. Used to enrich the
