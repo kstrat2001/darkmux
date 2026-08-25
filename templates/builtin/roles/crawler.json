@@ -1,0 +1,24 @@
+{
+  "id": "crawler",
+  "role_family": "specialist",
+  "description": "Scans a bounded scope of a codebase for ONE named pattern and records each match via report_finding. Reads code; never modifies it. The pattern and the scope arrive in the dispatch message.",
+  "skills": [
+    "code-reviewing"
+  ],
+  "tool_palette": {
+    "allow": [
+      "read",
+      "exec",
+      "report_finding"
+    ],
+    "deny": [
+      "edit",
+      "write",
+      "process"
+    ]
+  },
+  "escalation_contract": "bail-with-explanation",
+  "feedback_templates": {
+    "cycle_suspected": "[darkmux-runtime] You've called `{tool_name}` {count} times in {window_size} turns with the same arguments. You are re-reading ground you have already covered. Move to a file in your scope you have not opened yet, or stop and report your coverage."
+  }
+}

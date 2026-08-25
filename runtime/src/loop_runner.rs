@@ -597,6 +597,25 @@ impl TurnAccum {
         self.clear();
     }
 
+    /// The prefill MESSAGE has been superseded by a real assistant message,
+    /// but the turn is not over — remove the message, keep the accumulation.
+    ///
+    /// The one place message lifetime and region lifetime legitimately part.
+    /// A per-turn-cap salvage produces a genuine assistant message (cleared
+    /// content, recovered tool calls) that is about to be pushed. The prefill
+    /// standing in for it has done its job: it carried the accumulation back to
+    /// the model, and the model has now answered.
+    ///
+    /// Leaving it produces TWO CONSECUTIVE assistant messages, which is an
+    /// invalid conversation shape — measured: the next request returned HTTP
+    /// 500. Folding instead ends the turn early and restores content that
+    /// salvage deliberately cleared. Neither is right; the prefill simply needs
+    /// to go while the regions stay, so the accumulation returns at the next
+    /// checkpoint.
+    fn supersede(&mut self, messages: &mut Vec<Message>) {
+        self.remove_prefill(messages);
+    }
+
     /// Give up on this turn: the message and the state go together. Used by the
     /// recovery path and by `begin`.
     fn abandon(&mut self, messages: &mut Vec<Message>) {
@@ -1010,6 +1029,14 @@ pub fn run(
         } else {
             reasoning_interval
         };
+        // (#1959) Which bound this request carried, captured HERE.
+        //
+        // Consumers downstream cannot re-derive it from `turn`: `absorb` has
+        // not run for this turn yet when the salvage check fires, so the
+        // region state still describes the PREVIOUS turn. A first attempt read
+        // `turn.writing_thought()` at the salvage site and silently never
+        // suppressed anything.
+        let sent_reasoning_bound = !turn.in_answer_region();
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -1251,6 +1278,18 @@ pub fn run(
         // that would exceed). An exact `== per_call_cap` never matches in
         // production, which silently killed both this salvage AND the
         // #1221 cliff recovery below on real dispatches.
+        // (#1959) Compared against what we SENT on this request, deliberately.
+        //
+        // This is not asking "is that a big number." It asks: did WE cut this
+        // turn, or did the context window? A `length` finish BELOW our own cap
+        // means overflow, which is a different and fatal condition. So the
+        // comparison has to be against whatever `max_tokens` this request
+        // actually carried — `per_call_cap`, the region value.
+        //
+        // A first attempt at the bug below keyed this to `answer_max_tokens`
+        // instead. That looked right and was worse: a reasoning turn cut at the
+        // check-in interval stops being recognized as our-cut, and its
+        // well-formed tool calls get dropped rather than dispatched.
         let at_cap = this_turn_completion_tokens
             .is_some_and(|t| t.saturating_add(1) >= per_call_cap);
         let salvaged_per_turn_cap = finish_reason == "length"
@@ -1271,11 +1310,44 @@ pub fn run(
                 per_call_cap,
                 salvaged_count,
             );
-            feedback_injector
-                .queue_per_turn_cap_approach(observed_tokens, per_call_cap);
+            // (#1959) Only when the ANSWER budget was the thing that ran out.
+            //
+            // This nudge tells the model to reduce its per-call reasoning. On a
+            // turn that genuinely blew a 10000-token answer budget that is
+            // useful. Fired on every routine 1000-token reasoning CHECK-IN — as
+            // it was, once #1221 made `per_call_cap` region-dependent — it
+            // breaks the invariant this feature was most careful about: the
+            // model is never told a checkpoint happened.
+            //
+            // That is not a style rule. Measured during #1221: a model invited
+            // to wrap up wraps up, producing a tidy summary with ZERO findings
+            // where the same model uninterrupted found real ones. A nudge to
+            // "reduce your reasoning" arriving every thousand tokens is that
+            // same instruction on a loop.
+            if !sent_reasoning_bound {
+                feedback_injector
+                    .queue_per_turn_cap_approach(observed_tokens, per_call_cap);
+            }
             // Clear truncated content — keep tool_calls. Mirrors the
             // stall-arm's pop reason: anchoring + prompt-token bloat.
             assistant_message.content = None;
+            // (#1959) DROP the tool call the cap cut in half.
+            //
+            // The cap lands mid-serialization, so the LAST call in a salvaged
+            // turn is routinely truncated to `arguments: ""`. Counting the
+            // well-formed ones for the log above is not the same as dispatching
+            // only those, and until this line the message went out whole: the
+            // empty call executed, failed, and — the part that actually hurts —
+            // stayed in the conversation, where `arguments: ""` is not valid
+            // JSON. LMStudio answered the NEXT streaming request with HTTP 500
+            // and the dispatch died outright.
+            //
+            // Observed live: a crawl emitted five `read` calls at the cap, four
+            // with arguments and one with none. It ran 67s and returned no
+            // envelope. A partial call carries no recoverable intent — half a
+            // path is not a narrower path — so dropping it loses nothing the
+            // model cannot simply re-issue on the turn it is about to get.
+            retain_well_formed_tool_calls(&mut assistant_message);
         }
         let effective_finish_reason = resolve_finish_reason(
             finish_reason.as_str(),
@@ -1314,8 +1386,28 @@ pub fn run(
         // what a reviewer of this very file writes), and under
         // `response_format` the model cannot emit one at all, so it found
         // nothing and handed the raw thought over as the answer.
-        if effective_finish_reason != "length" {
+        // (#1959) TERMINAL means the turn is over — not merely that the
+        // finish reason is no longer the string "length".
+        //
+        // A per-turn-cap SALVAGE rewrites the reason to `tool_calls` so the
+        // recovered calls get dispatched, but the turn is still mid-flight: the
+        // model will be called again with the tool results. Folding there is
+        // wrong twice over. It ends the accumulation early, and it writes the
+        // whole accumulated body into `assistant_message.content` — the field
+        // salvage had just deliberately set to `None` to avoid anchoring the
+        // model on truncated output and inflating every later prompt.
+        //
+        // The result reaching the provider was an assistant message carrying a
+        // large content blob AND seven tool calls, followed by seven tool
+        // results. Measured: the next request returned HTTP 500.
+        let turn_is_over = effective_finish_reason != "length" && !salvaged_per_turn_cap;
+        if turn_is_over {
             turn.fold(&mut messages, &mut assistant_message);
+        } else if salvaged_per_turn_cap {
+            // Mid-turn: the prefill is superseded by the message about to be
+            // pushed, but the accumulation lives on. Removing the message
+            // WITHOUT folding is the whole distinction — see `supersede`.
+            turn.supersede(&mut messages);
         }
 
         messages.push(assistant_message.clone());
@@ -2384,6 +2476,24 @@ fn assistant_message_has_well_formed_tool_calls(msg: &Message) -> bool {
 /// count for the trajectory event + operator-visible eprintln. Sharing
 /// the "well-formed" definition between predicate + count keeps the
 /// two in sync if the definition ever evolves.
+/// (#1959) Keep only the tool calls whose arguments actually parse.
+///
+/// The companion to `count_well_formed_tool_calls` — that one reports, this
+/// one enforces, and for most of this feature's life only the reporting half
+/// existed. Applied ONLY on the salvage path: everywhere else a malformed
+/// tool call is the model's own output and belongs in the transcript, where
+/// the failure-rate detector can see it. Here it is an artifact of OUR cut.
+fn retain_well_formed_tool_calls(msg: &mut Message) {
+    if let Some(tcs) = msg.tool_calls.as_mut() {
+        tcs.retain(|tc| serde_json::from_str::<serde_json::Value>(&tc.function.arguments).is_ok());
+        // An empty vector is not the same as no tool calls: `resolve_finish_reason`
+        // asks whether any remain, and a `Some([])` would answer "yes".
+        if tcs.is_empty() {
+            msg.tool_calls = None;
+        }
+    }
+}
+
 fn count_well_formed_tool_calls(msg: &Message) -> usize {
     msg.tool_calls
         .as_ref()
@@ -4221,6 +4331,95 @@ mod tests {
     }
 
     // ─── (#479) per-turn-cap-approach tool-call salvage ─────────────
+
+    /// (#1959) The exact shape a live crawl produced: the per-call cap landed
+    /// mid-serialization of the FIFTH `read`, so four calls carried arguments
+    /// and one carried none. Every one of them was dispatched. The empty call
+    /// failed, stayed in the transcript, and LMStudio answered the next
+    /// streaming request with HTTP 500 — the dispatch ran 67s and returned no
+    /// envelope at all.
+    fn salvage_msg(args: &[&str]) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Some("half a thought".to_string()),
+            reasoning_content: None,
+            tool_calls: Some(
+                args.iter()
+                    .enumerate()
+                    .map(|(i, a)| crate::lmstudio::ToolCall {
+                        id: format!("call_{i}"),
+                        kind: "function".to_string(),
+                        function: crate::lmstudio::FunctionCall {
+                            name: "read".to_string(),
+                            arguments: (*a).to_string(),
+                        },
+                        extra_content: None,
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn a_tool_call_the_cap_cut_in_half_is_dropped_not_dispatched() {
+        let mut msg = salvage_msg(&[
+            r#"{"path":"/workspace/bookend.rs"}"#,
+            r#"{"path":"/workspace/daemon_probe.rs"}"#,
+            r#"{"path":"/workspace/integrity.rs"}"#,
+            r#"{"path":"/workspace/presence.rs"}"#,
+            "", // the cap landed here
+        ]);
+        assert_eq!(count_well_formed_tool_calls(&msg), 4, "precondition");
+
+        retain_well_formed_tool_calls(&mut msg);
+
+        let kept = msg.tool_calls.as_ref().expect("four calls survive");
+        assert_eq!(kept.len(), 4, "the log said 4; the message must agree");
+        assert!(
+            kept.iter()
+                .all(|tc| serde_json::from_str::<serde_json::Value>(&tc.function.arguments).is_ok()),
+            "an unparseable `arguments` reaching the transcript is what 500s the next request"
+        );
+    }
+
+    #[test]
+    fn dropping_every_call_leaves_no_tool_calls_rather_than_an_empty_list() {
+        // `resolve_finish_reason` asks whether any tool calls remain, and
+        // `Some([])` answers "yes" — a turn with nothing to dispatch would be
+        // routed as though it had work to do.
+        let mut msg = salvage_msg(&["", r#"{"path":"#]);
+        retain_well_formed_tool_calls(&mut msg);
+        assert!(
+            msg.tool_calls.is_none(),
+            "an empty vector is not the same as no tool calls"
+        );
+    }
+
+    #[test]
+    fn a_turn_whose_calls_all_parse_is_left_exactly_as_it_was() {
+        let mut msg = salvage_msg(&[
+            r#"{"path":"/workspace/a.rs"}"#,
+            r#"{"path":"/workspace/b.rs"}"#,
+        ]);
+        let before: Vec<String> = msg
+            .tool_calls
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tc| tc.function.arguments.clone())
+            .collect();
+        retain_well_formed_tool_calls(&mut msg);
+        let after: Vec<String> = msg
+            .tool_calls
+            .as_ref()
+            .expect("both calls survive")
+            .iter()
+            .map(|tc| tc.function.arguments.clone())
+            .collect();
+        assert_eq!(after, before, "the common case must be untouched");
+    }
 
     /// Helper-level: assistant_message_has_well_formed_tool_calls returns
     /// true on a message with a single tool call having valid JSON args.

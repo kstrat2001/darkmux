@@ -59,6 +59,7 @@ pub enum Tool {
     Write,
     Edit,
     Search,
+    ReportFinding,
 }
 
 impl Tool {
@@ -70,6 +71,7 @@ impl Tool {
             Tool::Write => "write",
             Tool::Edit => "edit",
             Tool::Search => "search",
+            Tool::ReportFinding => "report_finding",
         }
     }
 
@@ -145,6 +147,18 @@ impl Tool {
                  it is cheaper and the file is written atomically (if \
                  any edit in the batch fails, no write happens). \
                  Arguments: { path: string, edits: [{ old_string: string, new_string: string, replace_all?: bool }] }."
+            }
+            Tool::ReportFinding => {
+                "Records ONE suspected issue you have found, then lets you keep \
+                 working. Call it as soon as you find something rather than \
+                 saving them up for the end — a run that is cut short keeps \
+                 everything already reported. \
+                 Arguments: { file: string, line: integer, pattern: string, \
+                 evidence: string, why: string }. `evidence` MUST be the source \
+                 line copied verbatim from the file, and `line` must be where it \
+                 appears; a report whose evidence does not match that line is \
+                 rejected and does not count. The return value tells you how many \
+                 you have recorded and how many remain in this run's budget."
             }
             Tool::Search => {
                 "FIRST CHOICE for locating text in a file or directory \
@@ -245,6 +259,32 @@ impl Tool {
                 },
                 "required": ["path", "content"]
             }),
+            Tool::ReportFinding => serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Path of the file the issue is in, relative to the workspace root."
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "1-indexed line number where the issue appears."
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "The named pattern you were asked to look for, copied exactly."
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": "The source line at `line`, copied VERBATIM. Not a paraphrase, not a summary."
+                    },
+                    "why": {
+                        "type": "string",
+                        "description": "One or two sentences: why this line matches the pattern, and what it would cost."
+                    }
+                },
+                "required": ["file", "line", "pattern", "evidence", "why"]
+            }),
             Tool::Search => serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -320,6 +360,7 @@ impl Tool {
             Tool::Write => execute_write(raw_args, Path::new(DEFAULT_WORKSPACE)),
             Tool::Edit => execute_edit(raw_args, Path::new(DEFAULT_WORKSPACE)),
             Tool::Search => execute_search(raw_args, Path::new(DEFAULT_WORKSPACE)),
+            Tool::ReportFinding => execute_report_finding(raw_args, &crate::trajectory::runtime_dir()),
         }
     }
 
@@ -331,6 +372,7 @@ impl Tool {
             "write" => Some(Tool::Write),
             "edit" => Some(Tool::Edit),
             "search" => Some(Tool::Search),
+            "report_finding" => Some(Tool::ReportFinding),
             _ => None,
         }
     }
@@ -1509,4 +1551,149 @@ mod tests {
         // schema also included
         assert!(result.contains("EXPECTED argument schema for 'echo'"));
     }
+}
+
+// ─── report_finding ───────────────────────────────────────────────────────
+//
+// (#1959) The crawler's output channel, and a DIFFERENT shape from escalation.
+//
+//   escalation  harness-produced, terminal, "I cannot proceed"      0 or 1
+//   finding     MODEL-produced, mid-run, "here is an artifact"      0..N
+//
+// A finding is a CLAIM, unconfirmed by construction — which is exactly why it
+// needs to be structured rather than narrated. A tool call is structured by
+// construction; prose has to be parsed, and parsing model prose for structure
+// is the same class of mistake as searching for a `</think>` the model may
+// never emit.
+//
+// Findings append to their own file beside the trajectory rather than routing
+// through it. Three things fall out for free: the run's accumulation file IS
+// this file, a killed run keeps every finding already reported, and the tool
+// needs no shared state — the line count IS the count.
+
+/// Hard ceiling per dispatch. A crawler reporting more than this from one
+/// scope is not being thorough, it is pattern-matching noise — so the cap is
+/// also a signal, not just a limit (see the returned `budget_remaining`, and
+/// the finding-rate invariant in #1956).
+const MAX_FINDINGS_PER_DISPATCH: usize = 40;
+
+pub const FINDINGS_FILE: &str = "findings.jsonl";
+
+/// Argument names are ALIASED, deliberately.
+///
+/// Measured on the first live crawl: a model that had just made 13 `read`
+/// calls filled this tool with `read`'s parameter names — `{path, offset}`
+/// instead of `{file, line}`. It pattern-matched the neighbouring tool's
+/// argument shape rather than reading this schema, which is a real
+/// small-model failure mode and not something to prompt away.
+///
+/// Being liberal in what we accept costs one serde attribute and removes an
+/// entire class of failure. The schema still ADVERTISES `file`/`line`; these
+/// aliases just stop a near-miss from being a total loss.
+#[derive(Debug, Deserialize)]
+struct ReportFindingArgs {
+    #[serde(alias = "path", alias = "file_path", alias = "filename")]
+    file: String,
+    #[serde(alias = "offset", alias = "line_number", alias = "lineno")]
+    line: u32,
+    #[serde(default)]
+    pattern: String,
+    #[serde(default, alias = "snippet", alias = "code", alias = "source")]
+    evidence: String,
+    #[serde(default, alias = "reason", alias = "detail", alias = "explanation")]
+    why: String,
+}
+
+fn execute_report_finding(raw_args: &str, out_dir: &Path) -> Result<String> {
+    // NEVER return Err from a model-facing tool.
+    //
+    // Measured on the first live crawl: one malformed call returned an error,
+    // and the model concluded "the report_finding tool is not available in
+    // this runtime" and abandoned the channel entirely for the rest of the
+    // run — falling back to narrating findings in prose, where nothing could
+    // record them. It never retried.
+    //
+    // A tool ERROR reads to a model as "this tool is broken or absent." A tool
+    // RESPONSE reads as "try again, differently." So a malformed call gets a
+    // teaching response showing exactly what a correct call looks like, and
+    // the run continues.
+    let args: ReportFindingArgs = match serde_json::from_str(raw_args) {
+        Ok(a) => a,
+        Err(e) => {
+            return Ok(format!(
+                "NOT RECORDED — I could not read those arguments ({e}). \
+                 This tool takes exactly these five keys:\n\
+                 \n  {{\"file\": \"crates/foo/src/bar.rs\", \"line\": 147, \
+                 \"pattern\": \"<the pattern you were given>\", \
+                 \"evidence\": \"<the source line, copied verbatim>\", \
+                 \"why\": \"<one or two sentences>\"}}\n\
+                 \nThe tool IS available — call it again with those keys. \
+                 Nothing was counted against your budget."
+            ));
+        }
+    };
+    if args.evidence.trim().is_empty() && args.why.trim().is_empty() {
+        return Ok("NOT RECORDED — `evidence` (the source line, copied verbatim) \
+                   and `why` are both required. The tool IS available; call it again \
+                   with those fields filled in. Nothing counted against your budget."
+            .to_string());
+    }
+
+    // "Cite the line", enforced at the tool boundary rather than in triage.
+    // A finding that cannot point at code is not a finding, and rejecting it
+    // here costs nothing — no frontier token is ever spent on it.
+    if args.evidence.trim().is_empty() {
+        return Ok("REJECTED: `evidence` was empty. Copy the source line verbatim \
+                   from the file and call again. This did not count against your budget."
+            .to_string());
+    }
+    if args.line == 0 {
+        return Ok("REJECTED: `line` must be the 1-indexed line where the evidence \
+                   appears. This did not count against your budget."
+            .to_string());
+    }
+
+    let path = out_dir.join(FINDINGS_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let count = existing.lines().filter(|l| !l.trim().is_empty()).count();
+    if count >= MAX_FINDINGS_PER_DISPATCH {
+        return Ok(format!(
+            "REJECTED: this run's finding budget ({MAX_FINDINGS_PER_DISPATCH}) is spent. \
+             Stop reporting and summarize what you covered and what you did not."
+        ));
+    }
+
+    let record = serde_json::json!({
+        "file": args.file,
+        "line": args.line,
+        "pattern": args.pattern,
+        "evidence": args.evidence,
+        "why": args.why,
+        "ts": crate::trajectory::unix_ms(),
+    });
+
+    let mut line = serde_json::to_string(&record).context("serializing finding")?;
+    line.push('\n');
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    use std::io::Write as _;
+    f.write_all(line.as_bytes())
+        .with_context(|| format!("appending to {}", path.display()))?;
+
+    let recorded = count + 1;
+    let remaining = MAX_FINDINGS_PER_DISPATCH.saturating_sub(recorded);
+    // Back-pressure through the return value: the model is TOLD where it stands
+    // so it can self-limit, and the cap above enforces it regardless. Soft
+    // signal plus hard bound, the same shape as the inactivity budget.
+    Ok(format!(
+        "Recorded. {recorded} finding(s) so far, {remaining} remaining in this run's budget. \
+         Continue examining the scope; report the next one when you find it."
+    ))
 }

@@ -185,3 +185,68 @@ describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
     expect(globalThis.fetch).toHaveBeenCalledWith("/flow/2026-08-01", undefined);
   });
 });
+
+/**
+ * A session drill-in that never refetches (the state before this block
+ * existed). The operator's report was "the run lens is stuck — clock frozen,
+ * no events — but fleet is still moving", and the two halves of that sentence
+ * are one bug: the session query fetched once, so nothing derived from those
+ * records could advance, while fleet read the polled live window.
+ *
+ * `historical` is asserted alongside the refetch because they must agree. A
+ * running session presented as a replay is the same lie in the other
+ * direction.
+ */
+function mockFetchLive(opts: { liveIds: string[]; records: () => unknown[] }) {
+  return vi.fn(async (url: string) => {
+    const u = String(url);
+    if (u.startsWith("/fleet/sessions/live")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ sessions: opts.liveIds.map((id) => ({ session_id: id })) }),
+      };
+    }
+    const recs = opts.records();
+    const body = u.startsWith("/flow/") ? recs : { records: recs, count: recs.length, truncated: false, generated_at_ms: 0 };
+    return { ok: true, status: 200, json: async () => body };
+  });
+}
+
+describe("useRouteRecords — a session that is still running", () => {
+  it("is not historical while presence still reports it live", async () => {
+    vi.stubGlobal("fetch", mockFetchLive({ liveIds: ["s-live"], records: () => [{ action: "a" }] }));
+    const route: Route = { kind: "session", sessionId: "s-live" };
+    const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
+
+    await waitFor(() => expect(result.current.historical).toBe(false));
+    // Still that session's OWN records — liveness must not silently swap in
+    // the live window, which is the regression the block above guards.
+    expect(result.current.records).toEqual([{ action: "a" }]);
+  });
+
+  it("stays historical when presence does not list it", async () => {
+    vi.stubGlobal("fetch", mockFetchLive({ liveIds: ["someone-else"], records: () => [{ action: "a" }] }));
+    const route: Route = { kind: "session", sessionId: "s-done" };
+    const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.historical).toBe(true);
+  });
+
+  it("picks up events that arrive after the first fetch — the freeze itself", async () => {
+    let batch = [{ action: "turn-1" }];
+    vi.stubGlobal("fetch", mockFetchLive({ liveIds: ["s-live"], records: () => batch }));
+
+    const route: Route = { kind: "session", sessionId: "s-live" };
+    const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
+
+    await waitFor(() => expect(result.current.records).toEqual([{ action: "turn-1" }]));
+
+    // The dispatch keeps working and emits another turn.
+    batch = [{ action: "turn-1" }, { action: "turn-2" }];
+
+    await waitFor(() => expect(result.current.records).toHaveLength(2), { timeout: 15_000 });
+    expect(result.current.records).toEqual([{ action: "turn-1" }, { action: "turn-2" }]);
+  }, 20_000);
+});

@@ -320,9 +320,17 @@ impl WorkloadProvider for CodingTaskProvider {
             // metrics.json. Copying what's there preserves forensic
             // data; missing files just don't copy. Don't "fix" this
             // by aborting when either is absent.
+            // `findings.jsonl` (#1959) is the crawler role's actual PRODUCT,
+            // and it lived only in a temp dir the OS reclaims — so a crawl's
+            // run artifact recorded that a dispatch happened and not what it
+            // found. Same reasoning as the two above, with more at stake:
+            // losing a trajectory costs forensics, losing this costs the
+            // result. Absent for every role that never calls `report_finding`,
+            // which the `exists()` gate below already handles.
             for (name, dst_name) in [
                 ("trajectory.jsonl", "trajectory.jsonl"),
                 ("metrics.json", "metrics.json"),
+                ("findings.jsonl", "findings.jsonl"),
             ] {
                 let src = runtime_dir.join(name);
                 if src.exists() {
@@ -668,7 +676,20 @@ fn role_can_modify_files(palette: &darkmux_crew::types::ToolPalette) -> bool {
         palette.allow.iter().any(|a| a == name)
             && !palette.deny.iter().any(|d| d == name)
     };
-    allows("edit") || allows("write")
+    // (#1959) `report_finding` is an EXECUTION surface, not a description.
+    //
+    // This guard's premise (#341) is sound: a coding-task workload paired with
+    // a role that cannot touch files will burn wall-clock narrating a fix it
+    // has no way to apply. But the premise is narrower than the check — it
+    // assumes the only way to PRODUCE something is to edit a file.
+    //
+    // A crawler is deliberately read-only and records each finding through
+    // `report_finding`, which appends to a real artifact the run is measured
+    // by. It is not describing into the void; its output channel simply is not
+    // the filesystem. Denying edit/write is the POINT of that role, so a guard
+    // that reads it as misconfiguration would make read-only workloads
+    // unrepresentable.
+    allows("edit") || allows("write") || allows("report_finding")
 }
 
 /// Reject setupContent keys that would write outside the sandbox dir.

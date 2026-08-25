@@ -4722,6 +4722,7 @@ fn a_detection_reaches_the_envelope() {
         r#"{"result":"stop"}"#.to_string(),
         &summary_with(vec![det.clone()]),
         &super::HostPeaks::default(),
+        no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["detections"][0], det, "the firing must reach the caller: {out}");
@@ -4737,6 +4738,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
         r#"{"result":"stop"}"#.to_string(),
         &summary_with(vec![]),
         &super::HostPeaks::default(),
+        no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v["detections"].is_array(), "must be present: {out}");
@@ -4757,6 +4759,7 @@ fn checkpoints_are_reduced_not_streamed() {
         r#"{"result":"stop"}"#.to_string(),
         &s,
         &super::HostPeaks::default(),
+        no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["checkpoints"]["total"], 65);
@@ -4776,6 +4779,7 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
         &super::HostPeaks::default(),
+        no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v.get("checkpoints").is_none(), "no boundary hit, no block: {out}");
@@ -4795,6 +4799,7 @@ fn enrichment_does_not_duplicate_the_runtime_metrics_block() {
         r#"{"result":"stop","metrics":{"turns":1}}"#.to_string(),
         &s,
         &super::HostPeaks::default(),
+        no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
@@ -4808,7 +4813,7 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
     let s = summary_with(vec![serde_json::json!({"kind":"cycle"})]);
     for raw in ["plain model output", "", "{ not json"] {
         assert_eq!(
-            super::enrich_envelope_with_summary(raw.to_string(), &s, &super::HostPeaks::default()),
+            super::enrich_envelope_with_summary(raw.to_string(), &s, &super::HostPeaks::default(), no_findings_dir()),
             raw,
             "the non-json path must pass through verbatim: {raw:?}"
         );
@@ -4826,6 +4831,7 @@ fn host_peaks_reach_the_envelope_when_sampled() {
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
         &peaks,
+        no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["peak_mem_pct"], 78);
@@ -4844,10 +4850,90 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
         &super::HostPeaks::default(),
+        no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(
         v.get("host").is_none(),
         "unsampled must be absent, never a zeroed block that reads as measured: {out}"
+    );
+}
+
+// ---------------------------------------------------------------
+// (#1959) The envelope says what the crawl FOUND.
+//
+// A crawler dispatch converged, wrote its findings to a temp dir, and
+// returned an envelope byte-indistinguishable from one that found nothing.
+// The findings were also never copied into the lab run dir, so the run's
+// durable artifact recorded that work happened and not what it produced.
+// ---------------------------------------------------------------
+
+/// A path with no `findings.jsonl` under it — the shape every non-crawler
+/// dispatch has, and the reason the block must be absent rather than zeroed.
+fn no_findings_dir() -> &'static std::path::Path {
+    std::path::Path::new("/nonexistent/darkmux-out-test")
+}
+
+fn out_dir_with_findings(lines: &[&str]) -> tempfile::TempDir {
+    let td = tempfile::tempdir().expect("tempdir");
+    let rt = td.path().join(".darkmux-runtime");
+    std::fs::create_dir_all(&rt).expect("mkdir");
+    std::fs::write(rt.join("findings.jsonl"), lines.join("\n") + "\n").expect("write");
+    td
+}
+
+#[test]
+fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
+    let td = out_dir_with_findings(&[
+        r#"{"file":"lib.rs","line":147}"#,
+        r#"{"file":"lib.rs","line":416}"#,
+        r#"{"file":"lib.rs","line":424}"#,
+    ]);
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &super::HostPeaks::default(),
+        td.path(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["findings"]["count"], 3, "the caller's next action turns on this: {out}");
+    assert!(
+        v["findings"]["path"].as_str().unwrap().ends_with("findings.jsonl"),
+        "a count with no way to read them is half an answer: {out}"
+    );
+    assert_eq!(v["result"], "stop", "existing fields survive");
+}
+
+#[test]
+fn a_trailing_newline_is_not_a_finding() {
+    // A count that says 2 when the file holds 1 is worse than no count.
+    let td = out_dir_with_findings(&[r#"{"file":"lib.rs","line":147}"#]);
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &super::HostPeaks::default(),
+        td.path(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["findings"]["count"], 1, "records, not lines: {out}");
+}
+
+#[test]
+fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found() {
+    // The distinction is load-bearing and is why this is not a zeroed block:
+    // the runtime creates the file on the first successful `report_finding`,
+    // so for a role HOLDING that tool an absent file is the #1959 failure —
+    // the model decided the tool "is not available in this runtime" and
+    // narrated its findings into prose instead. `count: 0` cannot say that.
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &super::HostPeaks::default(),
+        no_findings_dir(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v.get("findings").is_none(),
+        "absence is the signal; a zeroed block would erase it: {out}"
     );
 }
