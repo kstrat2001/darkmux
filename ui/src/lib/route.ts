@@ -98,7 +98,7 @@ export type Route =
    * null` and renders identically to before this field existed.
    *
    * An open string, same precedent as `machine.uid` below and
-   * `session.sessionId` further down — machine uids are arbitrary
+   * `dispatch.dispatchId` further down — machine uids are arbitrary
    * hardware-derived identifiers with no closed set to validate against
    * here (an unresolvable pin degrades gracefully: `RunsBoard` just shows
    * zero rows for a uid nothing is filed under, same posture `MachineLens`
@@ -121,7 +121,7 @@ export type Route =
    * would silently drop you back to the local machine on reload. `uid` is
    * an open string (not from `PANEL_IDS`/`RUNS_KINDS`'s closed sets) —
    * machine uids are arbitrary hardware-derived identifiers, matching
-   * `session.sessionId`'s existing open-string precedent below. An
+   * `dispatch.dispatchId`'s existing open-string precedent below. An
    * unrecognized/stale uid degrades gracefully (see `MachineLens`'s own
    * doc) rather than needing its own validation here. */
   | { kind: "machine"; uid: string | null }

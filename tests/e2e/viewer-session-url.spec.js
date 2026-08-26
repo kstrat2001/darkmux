@@ -3,7 +3,7 @@
 // This was the ONE level with no URL representation. Drilling in left
 // `location.hash` untouched, so a reload — or a backgrounded PWA relaunch, or
 // a tab reopened from history — silently dropped the operator back to the
-// fleet hero with no error and no explanation. The documented `#session=<id>`
+// fleet hero with no error and no explanation. The documented `#dispatch=<id>`
 // deep link had the mirror problem: `catalogQuery()` parsed it, the daemon
 // returned correctly-scoped records, and `boot()` rendered the fleet hero
 // anyway because only the `mission` kind was ever honored.
@@ -18,10 +18,11 @@
 // port exposes no page globals at all (by design, not oversight — see
 // `App.tsx`'s module doc on operator sovereignty / no hidden state).
 //
-// The port's actual `#session=<id>` MECHANISM is real and independently
-// verified: `route.ts` parses `session=` out of the hash, `App.tsx` renders
+// The port's actual `#dispatch=<id>` MECHANISM is real and independently
+// verified (#1974): `route.ts` parses `dispatch=` (and the one-release
+// `session=` alias) out of the hash, `App.tsx` renders
 // `SessionReplay` for that route kind, and `hashSync.ts`'s `useSyncHash`
-// writes the canonical `session=<id>` form back on every route change — the
+// writes the canonical `dispatch=<id>` form back on every route change — the
 // exact same `location.hash` write every other drill-in in this app uses
 // (`FleetLens`'s machine cards, `NavChrome`'s tabs). Three of the four tests
 // below drive that mechanism directly via a boot-time deep link; the fourth
