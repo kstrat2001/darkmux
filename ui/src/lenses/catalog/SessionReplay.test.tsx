@@ -295,6 +295,90 @@ describe("SessionReplay", () => {
     expect(header).toMatch(/^\S+ RUN · /);
   });
 
+  // ── (#1973 audit) accessibility ────────────────────────────────────
+
+  it("(#1973) the pill and the pulse never tell CONTRADICTORY stories about the same run", async () => {
+    // A run that opened and went silent for weeks has no terminal record, so
+    // the pill says RUNNING — while liveness correctly says it cannot still
+    // be executing. Feeding ONE boolean to both made the pulse announce
+    // "finished" beside a green RUNNING pill: the same run, the same view,
+    // opposite claims, and only a screen-reader user would ever have seen the
+    // contradiction.
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    const records = [
+      { ts: new Date(t0 - 40 * 24 * 3600_000).toISOString(), action: "dispatch.start", session_id: "s-stale", machine_id: "M", payload: { role: "coder" } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-stale");
+    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+    const pill = document.querySelector(".session-run__header .pill")?.textContent ?? "";
+    const pulseLabel = document.querySelector(".pulse")?.getAttribute("aria-label") ?? "";
+    expect(pill).toContain("RUNNING");
+    // The pulse may say "may be abandoned"; it must NOT claim the run finished.
+    expect(pulseLabel).not.toContain("finished");
+    expect(document.querySelector(".pulse")?.getAttribute("data-state")).toBe("stale");
+    vi.useRealTimers();
+  });
+
+  it("(#1973) signal severity is available WITHOUT sight — not only as colour, class and a data attribute", async () => {
+    // The glyph was `aria-hidden`, and the other two carriers (a class and
+    // `data-severity`) are invisible to assistive tech. So the whole
+    // struggle-vs-recovery distinction — the reason this redesign exists —
+    // reached sighted users only.
+    const det = (ts: string, kind: string, severity: string) => ({
+      ts, session_id: "s-sev", category: "telemetry", source: "detector", machine_id: "M",
+      payload: { severity, kind, detail: `${kind} detail` },
+    });
+    const records = [
+      { ts: "2026-01-01T00:00:00Z", action: "dispatch.start", session_id: "s-sev", machine_id: "M", payload: { role: "coder" } },
+      det("2026-01-01T00:00:10Z", "cycle", "warn"),
+      det("2026-01-01T00:00:50Z", "intra-turn-stall", "info"),
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-sev");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+    const glyphs = [...document.querySelectorAll(".signals .signal__glyph")];
+    expect(glyphs.map((g) => g.getAttribute("aria-label"))).toEqual(["warning", "recovered"]);
+    expect(glyphs.every((g) => g.getAttribute("aria-hidden") !== "true")).toBe(true);
+  });
+
+  it("(#1973) the metric panes carry accessible names — their labels are CSS-generated and reach no DOM text node", async () => {
+    // `content: attr(data-scope)` renders MODEL/HARNESS into the box tree
+    // only. It cannot be selected, copied, matched by find-in-page, or seen by
+    // browser translation — and those two words are exactly the information
+    // this redesign exists to convey. The `aria-label` restores the name
+    // without adding text, so the parity goldens (which compare innerText
+    // byte-for-byte) stay green.
+    stubSession();
+    renderReplay("s-disc");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    const model = document.querySelector('.metrics[data-scope="model"]');
+    const harness = document.querySelector('.metrics[data-scope="harness"]');
+    expect(model?.getAttribute("aria-label")).toBe("model metrics");
+    expect(harness?.getAttribute("aria-label")).toBe("harness metrics");
+    expect(model?.getAttribute("role")).toBe("group");
+    // ...and the pane names are still absent from the text, which is what
+    // keeps the goldens passing.
+    expect(model?.textContent).not.toContain("model metrics");
+  });
+
+  it("(#1973) the pulse is NOT an ARIA live region — its state can flap once a second", async () => {
+    // `role="status"` announces on every change, and the quiet threshold is a
+    // bare cutoff with no hysteresis: a dispatch whose turn latency hovers
+    // near it flips label every tick. That is the struggling run an operator
+    // most needs a clean signal about.
+    stubSession();
+    renderReplay("s-disc");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    const pulse = document.querySelector(".pulse");
+    expect(pulse?.getAttribute("role")).toBe("img");
+    expect(pulse?.getAttribute("aria-live")).toBeNull();
+  });
+
   it("renders pending while the fetch is in flight", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     renderReplay("s1");
