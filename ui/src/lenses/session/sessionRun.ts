@@ -286,20 +286,74 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const tMax = computeTMax(data);
   const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
 
-  const sidStarts = data
-    .filter((r) => r.session_id === sid && r.action === "dispatch.start" && T(r.ts) <= nowMs)
+  // (#1988) `T(ts)` is `NaN` for an unparsable timestamp, and EVERY
+  // comparison against `NaN` is false — including `NaN <= nowMs`. So a single
+  // malformed `ts` on the start record used to drop it from `sidStarts`
+  // entirely, leave `startTs` as `NaN`, and make `inAttempt` false for every
+  // record in the session including a perfectly good `dispatch.complete`.
+  // The run then read RUNNING forever AND lost its whole brief — prompt,
+  // runtime, image, workspace, model — because `d` was null.
+  //
+  // Two separate repairs, because the record serves two purposes: it is the
+  // PAYLOAD source (the brief) and the CLOCK source (the attempt window).
+  // A bad clock must not cost the payload.
+  const finiteTs = (r: FlowRecord): number | null => {
+    const t = T(r.ts);
+    return Number.isFinite(t) ? t : null;
+  };
+  const allSidStarts = data.filter((r) => r.session_id === sid && r.action === "dispatch.start");
+  const sidStarts = allSidStarts
+    .filter((r) => {
+      const t = finiteTs(r);
+      return t != null && t <= nowMs;
+    })
     .sort((a, b) => T(a.ts) - T(b.ts));
-  const d = sidStarts.length ? sidStarts[sidStarts.length - 1] : null;
+  // Prefer a start with a usable clock; fall back to ANY start so the brief
+  // survives a malformed timestamp rather than vanishing with it.
+  const d = sidStarts.length ? sidStarts[sidStarts.length - 1] : (allSidStarts[allSidStarts.length - 1] ?? null);
   const firstSessRec = data.find((r) => r.session_id === sid) ?? null;
-  const startTs = d ? T(d.ts) : firstSessRec ? T(firstSessRec.ts) : nowMs;
-  const inAttempt = (r: FlowRecord) => r.session_id === sid && T(r.ts) >= startTs;
+  // `startTs` must be FINITE or it poisons every downstream comparison. Walk
+  // outward for a usable clock: the start record, then the session's first
+  // record, then its earliest parsable one, then `now`.
+  const sessionTimes = data.filter((r) => r.session_id === sid).map(finiteTs).filter((t): t is number => t != null);
+  const startTs =
+    (d ? finiteTs(d) : null) ??
+    (firstSessRec ? finiteTs(firstSessRec) : null) ??
+    (sessionTimes.length ? Math.min(...sessionTimes) : null) ??
+    nowMs;
+  // A record whose own `ts` is unparsable is INCLUDED, not silently dropped.
+  // Excluding it is what hid a legitimate terminal; a malformed record should
+  // be visible and wrong-looking, never invisible.
+  const inAttempt = (r: FlowRecord) => {
+    if (r.session_id !== sid) return false;
+    const t = finiteTs(r);
+    return t == null || t >= startTs;
+  };
 
-  const attemptCloses = data
-    .filter((r) => inAttempt(r) && (r.action === "dispatch.complete" || r.action === "dispatch.error" || r.action === "session.end"))
-    .sort((a, b) => T(a.ts) - T(b.ts));
+  // (#1988) The close edge is selected WITHOUT requiring `ts >= startTs`.
+  //
+  // Requiring it meant a terminal record timestamped before its own start —
+  // ordinary cross-machine clock skew, which this function's own `nowMs`
+  // clamp above already anticipates — was filtered out, so a finished
+  // dispatch reported as perpetually in flight. Guarding the elapsed-time
+  // arithmetic against skew while leaving the terminal SELECTION exposed to
+  // it was the inconsistency.
+  const isTerminal = (r: FlowRecord) =>
+    r.action === "dispatch.complete" || r.action === "dispatch.error" || r.action === "session.end";
+  const sessionTerminals = data.filter((r) => r.session_id === sid && isTerminal(r)).sort((a, b) => T(a.ts) - T(b.ts));
+  const inAttemptCloses = sessionTerminals.filter(inAttempt);
+  // Prefer terminals inside the attempt window; fall back to any terminal on
+  // the session, so a skewed one is honored rather than hidden. `skewedClose`
+  // records that the fallback fired, so the page can SAY so instead of
+  // quietly presenting a reconstructed timeline as fact.
+  const skewedClose = inAttemptCloses.length === 0 && sessionTerminals.length > 0;
+  const attemptCloses = inAttemptCloses.length ? inAttemptCloses : sessionTerminals;
   const close = attemptCloses[0] ?? null;
   const c = attemptCloses.find((r) => r.action !== "session.end") ?? null;
-  const done = !!close && T(close.ts) <= nowMs;
+  // A close with an unparsable `ts` still terminates the run — it is a
+  // terminal record, and `NaN <= nowMs` being false must not resurrect it.
+  const closeTs = close ? finiteTs(close) : null;
+  const done = !!close && (closeTs == null || closeTs <= nowMs);
 
   const visible = data.filter((r) => T(r.ts) <= nowMs);
   const tel = visible.filter((r) => inAttempt(r) && r.category === "telemetry");
@@ -511,6 +565,23 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // like one detected an hour in, which is most of what tells you whether a
   // run was struggling from the start or drifted late.
   const finds: Signal[] = [];
+  if (skewedClose) {
+    // (#1988) The page reconstructed this run's outcome from a terminal
+    // record that precedes its own start. That is honored rather than hidden
+    // — a finished dispatch must not read RUNNING forever — but it is NOT
+    // presented as if the timeline were sound. Saying so is the difference
+    // between a repaired reading and a quietly wrong one, and clock skew is
+    // itself worth an operator's attention on a fleet.
+    finds.push({
+      kind: "clock-skew",
+      severity: "warn",
+      detail:
+        "this run's terminal record is timestamped BEFORE its own start — the outcome is read from it anyway, but elapsed time and signal offsets on this page are unreliable.",
+      fix: "check the clocks on the machines that produced these records.",
+      atMs: null,
+      offsetLabel: "",
+    });
+  }
   if (distinct.length > 1) {
     finds.push({
       kind: "jit-model-swap",
