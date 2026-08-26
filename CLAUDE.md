@@ -230,6 +230,133 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
 7. **Config leniency** — registries and config files are lenient-on-read; semantic validation
    lives at resolution/consumption time and in `darkmux doctor`, never on the hot load path
    (#1269).
+8. **Work-unit vocabulary** — the four operator-visible work nouns each denote ONE grain,
+   and every surface (CLI verb, hash route, wire type, UI label, doc) uses them at that grain
+   (#1974). The containment ladder is **mission > phase > task > step > role execution**:
+
+   - **run** — the UMBRELLA, never a grain: *a top-level unit of work the operator started*.
+     Exactly three kinds (`RunKind`): `mission`, `dispatch`, `lab`. The runs board lists runs;
+     drilling into one opens that kind's own view. `darkmux run list` serves the same union.
+   - **dispatch** — TOP-LEVEL ONLY: the verb `darkmux dispatch <role>`, and the `RunKind` it
+     produces, which means *a run consisting of exactly one role execution*. It is named for
+     its CONTENT, not for the verb. Note `RunKind::Dispatch` is derived FROM a mission by
+     shape (`classify_mission`) — a crew-of-one graph — so it is a shape label on a mission,
+     not a third ontological peer of `Mission`.
+   - **role execution** — the INNER unit: *one role, running until it stops*. Many turns, not
+     one model call (`max_turns`, `turn_seq`). This is deliberately named for the ROLE, not
+     the model, because the model is DERIVED, not declared: `select_model(role, profile)`
+     resolves it at dispatch entry, `DispatchOpts` takes `role_id` as required and
+     `profile_name` as an optional override, and an endpoint-staffed seat has no local model
+     at all. Role is the stable identity across local and remote; the model is a consequence
+     of the profile. (An earlier draft called this a "dispatch", which is what made the word
+     mean both ends of the ladder at once; a later one proposed `model_run`, which named the
+     unit after its output.)
+
+     *Candidates rejected on collision, recorded so they are not re-proposed:* **task** and
+     **job** and **activity** and **assignment** are all TAKEN at other grains — `task` is the
+     parent layer; `job` is the fleet work queue (`fleet::WorkJob`/`ClaimedJob`/`claim_job`,
+     and `WORK_JOB_SCHEMA_VERSION` is a wire schema), where a job is a PHASE claimed by a peer
+     machine; `activity` is the viewer's activity lanes; `assignment` is Task-level resource
+     assignment. Reusing any of them would recreate this exact defect one word over. `shift`
+     and `stint` are genuinely free and were weighed for being more humanized; `execution`
+     won on precision and on composing cleanly for sub-executions.
+   - **phase** / **task** — the two grouping layers between a mission and its steps
+     (`Mission.phase_ids` -> `Phase.task_ids` -> `Task.step_ids`). A `Task` is also where
+     resource ASSIGNMENT lives (role, profile, workdir, image), which is why a step inherits
+     its staffing rather than declaring it.
+   - **step** — a mission-graph node. The step is the NODE; the role execution is what the
+     node DID.
+     **A step contains ZERO OR MORE role executions, and the cardinality is the reason this
+     layer exists.** `procedural.shell`/`procedural.noop` contain zero; `dispatch.internal` and
+     `dispatch.single_shot` contain one; `dispatch.map` contains one per collection item
+     (with per-item error isolation — its own doc contrasts it with "a single-dispatch
+     step"), and the review pipeline's probe and judge steps contain seats x draws. Do NOT
+     insert a further noun between step and role execution to name the N: a 1:1 wrapper earns nothing, and
+     the N already has three domain names that are not synonyms — `dispatch.map`'s **items**
+     (what the work is done to), review's **seats** (which staffed model does it), and
+     **draws** (one invocation, `MemberRecord.draws`). They all bottom out in one model call,
+     which is what `dispatch` already means.
+   - **session** — INTERNAL ONLY: a join key tying a family of flow records together
+     (`darkmux-types/src/session_id.rs`). Never an operator-facing word, because it is also
+     minted for mission lifecycle transitions that are not executions at all
+     (`session_id::mission()`). The `session_id` FIELD keeps its name on disk — renaming it
+     strands every archive, and consumers already treat it opaquely.
+
+   Two consequences that new code inherits:
+
+   - **A role execution has exactly one SPECIALIST role.** Utility invocations inside it
+     (compaction, scribe, estimator) are SUB-EXECUTIONS — themselves role executions, of a
+     utility role — attributed to their OWN role and model, never blended into the primary's
+     metrics. Naming the unit for the role is what makes this compose rather than needing a
+     special case: a sub-execution is the same kind of thing as its parent, one level in. `emit_telemetry` currently violates this — it stamps
+     the specialist's `role_id`/`model` on the compaction record too (#1974).
+   - **A specialist change is an EXECUTION BOUNDARY.** Escalation mints a new role execution;
+     it never puts a second specialist role inside this one. Any predicate that infers a "model swap" from
+     residency alone is wrong: a declared utility role going resident is not a swap (#1934).
+
+   **The WIRE keeps its historical spelling; only the vocabulary is fixed.** The flow-record
+   bookends `dispatch start`/`dispatch complete` are emitted at BOTH grains today — around a
+   whole run (contract 2's liveness requirement, phrased over "any production code path that
+   performs model work", which is granularity-agnostic) and around an inner role execution.
+   Those action strings are NOT being renamed: archives are append-only, four consumers key
+   on them at the session grain (`terminal_status_for_action`
+   `crates/darkmux-serve/src/runs.rs:1476-1478`, the runs board's representative-session
+   pick, `ui/src/lenses/fleet/cards.ts:59`, `ui/src/lib/metaLine.ts:28`), and renaming them
+   would buy a consumer migration for no behavioral gain. Grain is already recoverable from
+   `session_id`/`source`. What entry 8 fixes is the WORD used in code, docs and UI — where
+   `dispatch` had come to mean both ends of the ladder at once. Both contracts stand:
+   contract 2 says liveness must be visible, contract 8 says which noun means which grain.
+
+   Verified by enumerating every completion-endpoint (`chat/completions`) call site — five
+   modules. Two host-side entry points bookend per execution and are correct:
+   `crew::dispatch::dispatch` and `dispatch_local_single_shot`. Everything model-bearing
+   routes through one of them: all three lab providers (`providers/prompt.rs:209`,
+   `coding_task.rs:835`, `tool_bench.rs:1037`), `mission propose`, `lab notebook draft`,
+   coder-phase, and radio (`src/radio.rs:539`). Two things do not:
+
+   - **Compaction is a sub-execution.** `runtime/src/compaction.rs` calls the endpoint with
+     its own `compactor_model` (a 4B utility agent) inside the specialist's role execution,
+     emitting no bookends. That is correct by the sub-execution clause above; the defect is
+     ATTRIBUTION, and it is the `emit_telemetry` violation already named.
+   - **The review pipeline bypasses the dispatch primitive entirely.** Its seats call the
+     raw chat primitive `single_shot_chat` directly (`src/mission_launch_review.rs:1083`),
+     and the launcher wraps the WHOLE multi-model crew mission in ONE
+     `with_dispatch_bookends` pair whose arguments are literally plural —
+     `crew.distinct_profile_names()` and `crew_model_summary(&crew)`, emitted as
+     `crew={names} models={summary}`. So those seat executions have no dispatch identity at
+     all, and the one "dispatch" record on the run denotes a mission.
+
+   **Retiring the run-grain use is a CONSUMER MIGRATION, not a free deletion.** An earlier
+   draft of this entry claimed it "costs nothing in liveness" because the scheduler already
+   emits `step start`/`step complete`/`step error` per step
+   (`crates/darkmux-crew/src/scheduler.rs:715, 1032, 1040`) under a `mission start`. That is
+   true and irrelevant: four consumers key specifically on DISPATCH bookends at the session
+   grain, and step bookends do not feed any of them —
+   `terminal_status_for_action` (`crates/darkmux-serve/src/runs.rs:1476-1478`, which matches
+   only `dispatch complete`/`dispatch error`), the runs board's representative-session pick
+   (`runs.rs:3307`'s regression test records that the whole-run bookend wins that pick, and
+   that losing it already blanked role/model once), fleet card activity
+   (`ui/src/lenses/fleet/cards.ts:59`, filtering `action === "dispatch.start"` with no
+   `source` check), and the status line's last-dispatch (`ui/src/lib/metaLine.ts:28`).
+   Delete the emission first and those surfaces go dark.
+
+   Note also that #1899 PRESCRIBED the whole-run pair for every generic launch three days
+   before this entry was written (`src/mission_launch.rs:~684`: "telemetry + the whole-run
+   dispatch bookend are PRESCRIBED here, not opt-in"). This entry supersedes that
+   deliberately, and the supersession is the point: contract 8 wins on the NOUN, #1899 wins
+   on the MECHANISM. The run grain keeps its bookend and gets its own action vocabulary
+   (`run start`/`run complete`/`run error`), so `dispatch *` can mean one specialist
+   execution. Consumers become bilingual FIRST and stay bilingual permanently — archives are
+   append-only and are never rewritten. That ordering is not optional.
+
+   **"step" is a known-imperfect name, deliberately not being changed (operator, 2026-08-26.)**
+   It implies plurality, so it reads badly for a single-step dispatch — but a task genuinely
+   can hold several, so the name is defensible and the churn is not. The decision was to fix
+   the SEMANTICS and commit to them first; a rename is cheap once the meaning is settled and
+   expensive while it is still moving. Do not reopen this as a naming question without new
+   information about the semantics.
+
+   Conformance: every detail hash route is named for the `RunKind` it opens.
 
 Enforcement is structural, not procedural: every contract gets a conformance test where one
 is expressible (golden files, emission-sequence assertions, boundary tests), and every review
