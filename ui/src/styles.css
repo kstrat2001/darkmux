@@ -3407,10 +3407,16 @@ body {
   padding: 0 6px;
   font-size: 10px;
 }
+/* WRAPS. Without this the row is a single flex line, and a `.signal__fix`
+   that refuses to shrink starves `.signal__detail` — measured at 390px:
+   detail resolved to 0px wide and 2235px TALL, i.e. 146 characters each on
+   their own line, while the fix text overflowed the viewport. Reported from a
+   phone; every desktop check missed it. */
 .session-run .signals .signal__row {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 8px;
+  gap: 4px 8px;
   font-size: 11px;
   color: var(--dim);
   margin-top: 2px;
@@ -3422,14 +3428,33 @@ body {
   color: var(--dim);
   opacity: 0.75;
 }
+/* A real flex-basis, not `auto`. `min-width: 0` correctly permits shrinking,
+   but with nothing to shrink TOWARD the browser is free to resolve this to
+   zero — which is exactly what it did. A basis gives wrapping a threshold to
+   trigger at, so the fix moves to its own line instead of crushing this one.
+   `overflow-wrap: anywhere` handles the unbreakable tokens this text actually
+   carries (`qwen3.6-35b-a3b-turboquant-mlx`), which would otherwise push the
+   page sideways. */
 .session-run .signals .signal__detail {
+  flex: 1 1 240px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* Was `flex: 0 0 auto` — the direct cause. It measured 397px inside a 390px
+   row and took the whole line. It may now shrink AND wrap, and it is the
+   lower-priority half of the pair: the finding matters more than the remedy,
+   so when only one fits on a line, this is the one that moves. */
+.session-run .signals .signal__fix {
   flex: 1 1 auto;
   min-width: 0;
-}
-.session-run .signals .signal__fix {
-  flex: 0 0 auto;
+  overflow-wrap: anywhere;
   color: var(--fg);
   opacity: 0.8;
+}
+/* The run-relative stamp is short and fixed-width; it should never wrap or
+   shrink, so it stays the one genuinely rigid child. */
+.session-run .signals .signal__at {
+  flex: 0 0 auto;
 }
 
 /* (#1973) Payload disclosure — the prompt, reachable rather than summarized
