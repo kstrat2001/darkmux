@@ -230,6 +230,58 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
 7. **Config leniency** — registries and config files are lenient-on-read; semantic validation
    lives at resolution/consumption time and in `darkmux doctor`, never on the hot load path
    (#1269).
+8. **Work-unit vocabulary** — the four operator-visible work nouns each denote ONE grain,
+   and every surface (CLI verb, hash route, wire type, UI label, doc) uses them at that grain
+   (#1974). The containment ladder is **mission > task > step > dispatch**:
+
+   - **run** — the UMBRELLA, never a grain: *a top-level unit of work the operator started*.
+     Exactly three kinds (`RunKind`): `mission`, `dispatch`, `lab`. The runs board lists runs;
+     drilling into one opens that kind's own view. `darkmux run list` serves the same union.
+   - **dispatch** — *one role's one model execution*. Both a run kind (started directly with
+     `darkmux dispatch <role>`) and what a model-bearing step does. A `procedural.shell` step
+     has no dispatch; a model-bearing step has exactly one.
+   - **step** — a mission-graph node. The step is the NODE; the dispatch is what the node DID.
+   - **session** — INTERNAL ONLY: a join key tying a family of flow records together
+     (`darkmux-types/src/session_id.rs`). Never an operator-facing word, because it is also
+     minted for mission lifecycle transitions that are not executions at all
+     (`session_id::mission()`). The `session_id` FIELD keeps its name on disk — renaming it
+     strands every archive, and consumers already treat it opaquely.
+
+   Two consequences that new code inherits:
+
+   - **A dispatch has exactly one SPECIALIST.** Utility invocations inside it (compaction,
+     scribe, estimator) are sub-executions attributed to their OWN role and model, never
+     blended into the primary's metrics. `emit_telemetry` currently violates this — it stamps
+     the specialist's `role_id`/`model` on the compaction record too (#1974).
+   - **A specialist change is a DISPATCH BOUNDARY.** Escalation mints a new dispatch; it never
+     puts a second specialist inside this one. Any predicate that infers a "model swap" from
+     residency alone is wrong: a declared utility role going resident is not a swap (#1934).
+
+   **Every model execution happens inside a dispatch.** Verified by enumerating every
+   completion-endpoint call site (`chat/completions`): five modules, and every host-side
+   entry point routes through `crew::dispatch::dispatch` or `dispatch_local_single_shot`,
+   both of which bookend. That includes `lab run` (`providers/prompt.rs:209`,
+   `providers/coding_task.rs:835`, `providers/tool_bench.rs:1037`), `mission propose`,
+   `lab notebook draft`, `coder-phase`, and `radio` (`src/radio.rs:539`). Two exceptions,
+   both real:
+
+   - **Compaction is a sub-execution, not its own dispatch.** `runtime/src/compaction.rs`
+     calls the endpoint with its own `compactor_model` (a 4B utility agent) inside the
+     specialist's dispatch, emitting no bookends of its own. That is correct by the
+     sub-execution clause above; the defect is ATTRIBUTION, not liveness, and it is the
+     `emit_telemetry` violation already named.
+   - **The review pipeline bookends the whole CREW run, not each execution** — the one
+     place a bookended unit has more than one specialist. `src/mission_launch_review.rs`
+     calls `single_shot_chat` directly and wraps the entire run in ONE
+     `with_dispatch_bookends` pair whose arguments are PLURAL:
+     `crew.distinct_profile_names()` and `crew_model_summary(&crew)`, emitted as
+     `crew={names} models={summary}`. Per-call bookends were removed as duplication of that
+     outer wrap (`crates/darkmux-lab/src/lab/review.rs:6999-7006`). Treat this as a known
+     symptom of the run-substrate arc (#1877) — the review pipeline carries its own parallel
+     telemetry/budget/record substrate — NOT as a standing carve-out. New code does not get
+     to copy it.
+
+   Conformance: every detail hash route is named for the `RunKind` it opens.
 
 Enforcement is structural, not procedural: every contract gets a conformance test where one
 is expressible (golden files, emission-sequence assertions, boundary tests), and every review
