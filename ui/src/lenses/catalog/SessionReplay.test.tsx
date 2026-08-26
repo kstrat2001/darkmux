@@ -275,6 +275,26 @@ describe("SessionReplay", () => {
     vi.useRealTimers();
   });
 
+  it("(#1972) the header keeps EXACTLY one space between the pill and `RUN ·`", async () => {
+    // The parity golden compares `#stage` innerText byte-for-byte, and the
+    // pulse contributes no text of its own — so inserting it is a whitespace
+    // hazard, not a neutral addition. The first attempt shipped
+    // `RUNNING  RUN ·` with two spaces: invisible on screen, unmissable to
+    // the golden, and a full CI round-trip to discover.
+    //
+    // This pins it locally. Parity remains the authority; this is the fast
+    // guard so a whitespace slip costs seconds rather than a CI cycle.
+    stubSession();
+    renderReplay("s-disc");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    const header = document.querySelector(".session-run__header")?.textContent ?? "";
+    // Scoped to the pill -> `RUN ·` boundary, which is the one the pulse sits
+    // in. A whole-header whitespace check would be wrong: an empty role
+    // legitimately leaves `RUN ·  (sid on machine)` doubled, which predates
+    // this change and is not what is being pinned here.
+    expect(header).toMatch(/^\S+ RUN · /);
+  });
+
   it("renders pending while the fetch is in flight", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     renderReplay("s1");

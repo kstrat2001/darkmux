@@ -123,8 +123,15 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
   return (
     <div data-state="data" className="session-run">
       <h2 className="session-run__header">
+        {/* (#1972) Whitespace here is load-bearing: the parity golden compares
+            `#stage` innerText byte-for-byte, and the pulse contributes NO text
+            of its own. So exactly one space separates the pill from `RUN ·` —
+            the `{" "}` below — and there must be none before `RUN`. The first
+            version added a second and CI caught `RUNNING  RUN ·`, which is
+            invisible on screen and unmissable to the golden. */}
         <span className={`pill pill--${view.header.pillCls}`}>{view.header.pillLabel}</span>{" "}
-        <LivenessPulse live={ticking} lastBeatMs={view.lastBeatMs} /> RUN · {view.header.role}{" "}
+        <LivenessPulse live={ticking} lastBeatMs={view.lastBeatMs} />
+        RUN · {view.header.role}{" "}
         <span className="session-run__meta">
           ({view.header.sid} on {view.header.machineName})
         </span>
