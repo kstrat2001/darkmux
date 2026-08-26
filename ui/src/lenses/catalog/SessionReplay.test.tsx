@@ -7,7 +7,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { SessionReplay } from "./SessionReplay";
 
@@ -210,6 +210,69 @@ describe("SessionReplay", () => {
 
     // Run-relative times, newest first inside the group.
     expect([...groups[0].querySelectorAll(".signal__at")].map((e) => e.textContent)).toEqual(["+0:20", "+0:10"]);
+  });
+
+  it("(#1972) a live, recently-active run TICKS its elapsed counter while no records arrive", async () => {
+    // The defect: `runRegions` derived "now" from `computeTMax(data)` — the
+    // newest record's timestamp — so the elapsed counter only advanced when a
+    // record ARRIVED. A dispatch that went quiet showed a frozen clock, which
+    // is exactly when an operator most wants to know how long it has been
+    // quiet. It was not stale; it was structurally incapable of moving.
+    //
+    // The clock is frozen here deliberately (this project's own rule: never
+    // mix a fixed fixture timestamp with a clock-relative assertion), and
+    // advanced explicitly, so the distance between fixture and now is an
+    // asserted parameter rather than inherited from whenever the suite runs.
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    const records = [
+      { ts: new Date(t0 - 30_000).toISOString(), action: "dispatch.start", session_id: "s-live", machine_id: "M", payload: { role: "coder" } },
+      { ts: new Date(t0 - 3_000).toISOString(), action: "dispatch.turn.heartbeat", session_id: "s-live", machine_id: "M", payload: {} },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-live");
+    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+    const readWall = () =>
+      [...document.querySelectorAll('.metrics[data-scope="harness"] .mv')].map((e) => e.textContent).join("");
+    const before = readWall();
+    expect(before).toContain("so far");
+
+    // No new records — only time passing. This is the whole point.
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(readWall()).not.toBe(before);
+    vi.useRealTimers();
+  });
+
+  it("(#1972) a run silent longer than the watchdog's kill timeout does NOT tick — abandonment is not liveness", async () => {
+    // A dispatch that died months ago also has no terminal record. Ticking it
+    // would render `1071:54 so far` and climbing. The host watchdog hard-kills
+    // after `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (600s), so anything quieter
+    // than that cannot still be running — and the recorded parity corpus is
+    // exactly this shape, which is how the rule was found.
+    vi.useFakeTimers();
+    const t0 = 1_800_000_000_000;
+    vi.setSystemTime(t0);
+    const records = [
+      { ts: new Date(t0 - 40 * 24 * 3600_000).toISOString(), action: "dispatch.start", session_id: "s-dead", machine_id: "M", payload: { role: "coder" } },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-dead");
+    await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+    const readWall = () =>
+      [...document.querySelectorAll('.metrics[data-scope="harness"] .mv')].map((e) => e.textContent).join("");
+    const before = readWall();
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(readWall()).toBe(before);
+    // ...and the pulse says quiet rather than beating.
+    expect(document.querySelector(".pulse")?.getAttribute("data-state")).not.toBe("beating");
+    vi.useRealTimers();
   });
 
   it("renders pending while the fetch is in flight", () => {

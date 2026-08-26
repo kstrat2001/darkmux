@@ -138,6 +138,13 @@ export interface SessionRunView {
   metricScope: { model: number[]; harness: number[] };
   modelTrackLabel: string;
   modelTrackLines: string[];
+  /** (#1972) Is this run still going? Drives whether the page subscribes to
+   *  the shared clock at all — a finished run's elapsed time is a fixed fact,
+   *  and re-rendering it once a second is pure waste. */
+  live: boolean;
+  /** (#1972) When the most recent proof-of-life record landed, or `null` if
+   *  none has. The pulse pauses when this goes quiet — see `LivenessPulse`. */
+  lastBeatMs: number | null;
   /** (#1973) Renamed from `detections`. See the signals block in
    *  `runRegions` for why grouping, severity and run-relative times replaced
    *  a flat list of grey strings. */
@@ -237,8 +244,24 @@ function pushKv(rows: BriefEntry[], label: string, value: string | null | undefi
  * session (the `/flow-session/<id>` response, through `flowToRenderModel`
  * — see that function's own doc) — `sid` further scopes every derivation
  * to it, matching legacy's `state.session`. */
-export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
-  const nowMs = computeTMax(data);
+/**
+ * @param nowOverride (#1972) The wall-clock "now" for a LIVE run.
+ *
+ * Without it this derives `now` from `computeTMax(data)` — the newest
+ * record's timestamp — which is correct for a finished run or playback, and
+ * exactly wrong for a live one: the elapsed counter then only advances when a
+ * record ARRIVES, so a dispatch that goes quiet shows a frozen clock. Which
+ * is precisely when the operator most wants to know how long it has been
+ * quiet. The reading was not merely stale; it was structurally incapable of
+ * moving during a stall.
+ *
+ * Passing a real clock here fixes that. It is never allowed to run BACKWARDS
+ * of the records, though: `max(nowOverride, tMax)` keeps a machine whose
+ * clock lags a peer's from rendering a negative elapsed time.
+ */
+export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number): SessionRunView {
+  const tMax = computeTMax(data);
+  const nowMs = nowOverride != null ? Math.max(nowOverride, tMax) : tMax;
 
   const sidStarts = data
     .filter((r) => r.session_id === sid && r.action === "dispatch.start" && T(r.ts) <= nowMs)
@@ -276,6 +299,13 @@ export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
   const nctx = cx.length && Number.isFinite(cx0Max) && cx0Max > 0 ? cx0Max : 0;
   const ctxPeak = cx.length ? Math.max(...cx.map((r) => Number((r.fields as Record<string, unknown>)?.used) || 0)) : 0;
   const ctxNow = cx.length ? Number((cx[cx.length - 1].fields as Record<string, unknown>)?.used) || 0 : 0;
+
+  // (#1972) Proof of life: the newest record belonging to THIS attempt. Not
+  // heartbeats alone — a run emitting turns and tool results is demonstrably
+  // alive whether or not a heartbeat happens to have landed recently, and
+  // keying only on heartbeats would make a busy run look dead.
+  const attemptRecs = visible.filter(inAttempt);
+  const lastBeatMs = attemptRecs.length ? Math.max(...attemptRecs.map((r) => T(r.ts))) : null;
 
   const wallBase = done ? fmtDuration(T(close!.ts) - startTs) : `${fmtDuration(nowMs - startTs)} so far`;
   const exitCode = (c?.payload as DispatchCompletePayload | undefined)?.exit_code;
@@ -509,6 +539,8 @@ export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
     metricScope,
     modelTrackLabel,
     modelTrackLines,
+    live: !done,
+    lastBeatMs,
     signalsLabel,
     signalGroups,
   };

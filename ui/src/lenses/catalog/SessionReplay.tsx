@@ -2,6 +2,17 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
 import { flowToRenderModel } from "../../lib/flow";
+import { useNowMs } from "../../lib/clock";
+import { isStaticBuild } from "../../lib/staticSource";
+import { injectedPlaybackDate } from "../../lib/injectedMeta";
+
+/** (#1972) How long a run may go silent before it is treated as abandoned
+ *  rather than live. Mirrors the host watchdog's own default
+ *  (`DARKMUX_INACTIVITY_TIMEOUT_SECONDS` = 600s): past that point the
+ *  container has been hard-killed, so a still-ticking counter would be
+ *  asserting something the harness has already ruled out. */
+export const STALE_AFTER_MS = 600_000;
+import { LivenessPulse } from "../../components/LivenessPulse";
 import { runRegions } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/handwritten";
 
@@ -33,6 +44,45 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
     queryKey: queryKeys.flowSession(sessionId),
     queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-session/${encodeURIComponent(sessionId)}`),
   });
+
+  // (#1972) HOISTED ABOVE EVERY EARLY RETURN, deliberately. React counts
+  // hooks per render, so calling `useNowMs` after the loading/error/empty
+  // guards below meant the first render called fewer hooks than the second —
+  // "change in the order of Hooks", caught immediately by the existing suite
+  // when this was first written the obvious way.
+  //
+  // `base` is the derivation against record time; `useNowMs` subscribes only
+  // when that says the run is live, and `view` below re-derives against the
+  // ticking clock. Two derivations per second while live, none when not —
+  // `runRegions` is pure over a bounded record set, so the second pass costs
+  // a fraction of a millisecond, and it is what makes the elapsed counter
+  // advance during a STALL rather than freezing at the newest record's
+  // timestamp.
+  const records = query.data?.ok ? query.data.data.records : null;
+  const data = records ? flowToRenderModel(records) : [];
+  const base = records && records.length ? runRegions(data, sessionId) : null;
+  // Gated on PLAYBACK too, not just on the run's own liveness. A recorded
+  // session that never emitted a terminal record still reads as `live`, and
+  // in a static/playback build there is no wall clock it could sensibly
+  // advance against — its elapsed time is a fact about when it was recorded.
+  // Ticking there would also make the parity corpus non-deterministic, which
+  // is this project's own clock rule: no fixture may mix a fixed timestamp
+  // with a clock-relative assertion.
+  // A run with no terminal record is not automatically LIVE. One that died in
+  // January has no `dispatch.complete` either, and ticking its counter up to
+  // now would read `1071:54 so far` and climbing — abandonment rendered as
+  // liveness. The host watchdog hard-kills a dispatch after
+  // `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` (600s by default), so a run that has
+  // emitted nothing for longer than that CANNOT still be running.
+  //
+  // `Date.now()` here is a plain per-render read feeding a boolean, not a
+  // `useSyncExternalStore` snapshot — the value it produces is stable once
+  // past the threshold, so it cannot drive the render loop this file's clock
+  // is careful to avoid.
+  const quietMs = base?.lastBeatMs != null ? Date.now() - base.lastBeatMs : Infinity;
+  const plausiblyRunning = (base?.live ?? false) && quietMs < STALE_AFTER_MS;
+  const ticking = plausiblyRunning && !isStaticBuild() && injectedPlaybackDate() == null;
+  const nowMs = useNowMs(ticking);
 
   if (!query.data) {
     return (
@@ -66,13 +116,15 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
     );
   }
 
-  const data = flowToRenderModel(query.data.data.records);
-  const view = runRegions(data, sessionId);
+
+  // `base` is non-null here: the `count === 0` guard above already returned.
+  const view = ticking ? runRegions(data, sessionId, nowMs) : base!;
 
   return (
     <div data-state="data" className="session-run">
       <h2 className="session-run__header">
-        <span className={`pill pill--${view.header.pillCls}`}>{view.header.pillLabel}</span> RUN · {view.header.role}{" "}
+        <span className={`pill pill--${view.header.pillCls}`}>{view.header.pillLabel}</span>{" "}
+        <LivenessPulse live={ticking} lastBeatMs={view.lastBeatMs} /> RUN · {view.header.role}{" "}
         <span className="session-run__meta">
           ({view.header.sid} on {view.header.machineName})
         </span>
