@@ -417,9 +417,16 @@ describe("SessionReplay", () => {
     expect(screen.getByText("LMStudio · local · this machine")).toBeInTheDocument();
     expect(screen.getByText(/07:36:48 · running/)).toBeInTheDocument();
     expect(screen.getByText("1071:54 so far")).toBeInTheDocument();
-    expect(screen.getByText("TURNS")).toBeInTheDocument();
-    expect(screen.getByText("loaded models")).toBeInTheDocument();
-    expect(screen.getByText(/no telemetry yet/i)).toBeInTheDocument();
+    // Same reason as the track below: this corpus did no model work, so the
+    // MODEL pane is absent and TURNS with it. The HARNESS pane still renders.
+    expect(screen.queryByText("TURNS")).not.toBeInTheDocument();
+    expect(screen.getByText("WALL CLOCK")).toBeInTheDocument();
+    // This corpus is `step start`/`step complete` only — no dispatch, no
+    // model telemetry — so it is a NON-MODEL unit and the loaded-models track
+    // is absent by design (#1973). The golden asserted its presence for years,
+    // which is the golden recording a defect rather than catching one.
+    expect(screen.queryByText("loaded models")).not.toBeInTheDocument();
+    expect(screen.queryByText(/no telemetry yet/i)).not.toBeInTheDocument();
     expect(screen.getByText("signals")).toBeInTheDocument();
     expect(screen.getByText("✓ clean")).toBeInTheDocument();
     expect(screen.getByText(/no behavioral flags/i)).toBeInTheDocument();

@@ -54,10 +54,17 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
   const lines: string[] = [];
   lines.push(`${view.header.pillLabel} ${view.header.role} (${view.header.sid} on ${view.header.machineName})`);
   lines.push(...view.briefLines.map((e) => e.text));
-  for (const m of view.metrics) {
-    lines.push(m.value, m.label);
+  // (#1973) Iterate by SCOPE, not over the flat `metrics` array. The panes
+  // render model-then-harness and the model pane is ABSENT for a unit that
+  // did no model work, so a mirror that walked all six would claim tiles the
+  // page does not show.
+  for (const i of [...view.metricScope.model, ...view.metricScope.harness]) {
+    const m = view.metrics[i];
+    if (m) lines.push(m.value, m.label);
   }
-  lines.push(view.modelTrackLabel, ...view.modelTrackLines);
+  if (view.hasModelWork) {
+    lines.push(view.modelTrackLabel, ...view.modelTrackLines);
+  }
   // (#1973) Mirrors the SIGNALS block's DOM: label, then either the clean
   // pair or, per group, a head line and one line per signal. Note this mirror
   // is NOT enforced against the component (#1978) — the rendered assertions
@@ -197,6 +204,38 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.signalGroups[0].signals[0].atMs).toBeNull();
     expect(view.signalGroups[0].signals[0].offsetLabel).toBe("");
     expect(view.modelTrackLines).toEqual(["a · 10GB", "b · 20GB"]);
+  });
+
+  it("(#1973) a unit that did NO model work has no model pane and no loaded-models track", () => {
+    // A `procedural.shell` step compiles, moves files or runs a command. It
+    // will never have turns, tokens, a context window or a compaction, so
+    // rendering `— TURNS` and `0 COMPACTIONS` is a lie shaped like data: the
+    // zero asserts "this happened, none occurred" when the truth is "this
+    // cannot happen here". The pane split exists to make the model half
+    // ABSENT, and this is what uses it.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "step start", handle: "build" },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "step complete", handle: "build" },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.hasModelWork).toBe(false);
+    expect(view.metricScope.model).toEqual([]);
+    // The harness half still renders — wall clock is a fact about any unit.
+    expect(view.metricScope.harness).toEqual([5]);
+    expect(view.metrics[5].label).toBe("WALL CLOCK");
+  });
+
+  it("(#1973) a dispatch that has STARTED but reported nothing keeps its model pane", () => {
+    // The discriminator is EVIDENCE of model work, not the absence of
+    // numbers. A live dispatch whose first turn has not landed would
+    // otherwise render no model metrics and then GROW a pane mid-run, which
+    // is worse than showing em-dashes that are about to fill in.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.hasModelWork).toBe(true);
+    expect(view.metricScope.model).toEqual([0, 1, 2, 3, 4]);
   });
 
   it("(#1973) marks the PRIMARY loaded model from the dispatch record, and labels the rest honestly", () => {

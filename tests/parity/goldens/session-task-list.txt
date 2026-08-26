@@ -23,20 +23,8 @@ route
 LMStudio · local · this machine
 timing
 07:36:48 · running
-—
-TURNS
-—
-TOKENS IN
-—
-TOKENS OUT
-—
-CONTEXT
-0
-COMPACTIONS
 1071:54 so far
 WALL CLOCK
-loaded models
-no telemetry yet
 signals
 ✓ clean
 no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)

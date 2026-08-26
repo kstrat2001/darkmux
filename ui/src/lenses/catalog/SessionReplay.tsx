@@ -185,6 +185,9 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
         </details>
       ))}
 
+      {/* Absent, not empty, when the unit did no model work — see
+          `hasModelWork`. */}
+      {view.metricScope.model.length > 0 && (
       <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
         {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
           <div className="met" key={i}>
@@ -193,6 +196,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
           </div>
         ))}
       </div>
+      )}
 
       {/* (#1973) The HARNESS pane, ADJACENT to the model pane rather than
           below the model track. Two reasons, and the second is why CI caught
@@ -214,12 +218,14 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
         </div>
       )}
 
-      <div className="track">
-        <div className="lbl">{view.modelTrackLabel}</div>
-        {view.modelTrackLines.map((line, i) => (
-          <div key={i}>{line}</div>
-        ))}
-      </div>
+      {view.hasModelWork && (
+        <div className="track">
+          <div className="lbl">{view.modelTrackLabel}</div>
+          {view.modelTrackLines.map((line, i) => (
+            <div key={i}>{line}</div>
+          ))}
+        </div>
+      )}
 
 
       {/* (#1973) SIGNALS — grouped by kind, severity-coded, run-relative
