@@ -3316,6 +3316,53 @@ body {
   font-size: 11px;
 }
 
+/* (#1972) Liveness pulse. The element is never remounted, so the animation
+   never restarts — beats only move a number, and the dot is PAUSED rather
+   than stopped when a run goes quiet. Stopping and restarting would stutter
+   at whatever irregular cadence records happen to arrive at, which reads as a
+   fault rather than as health. */
+.pulse {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  vertical-align: middle;
+  background: var(--dim);
+  animation: pulse-beat 1.6s ease-in-out infinite;
+  animation-play-state: paused;
+}
+.pulse[data-state="beating"] {
+  background: #4fd18b;
+  animation-play-state: running;
+}
+/* Quiet: still live, but nothing has landed recently. Held still and hollow —
+   distinguishable from "beating" WITHOUT relying on motion or hue alone. */
+.pulse[data-state="quiet"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px #4fd18b;
+}
+.pulse[data-state="done"] {
+  background: var(--border);
+}
+@keyframes pulse-beat {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.78);
+  }
+}
+/* A pulsing dot is decoration for anyone who has asked motion to stop. The
+   state stays legible: filled = beating, hollow = quiet. */
+@media (prefers-reduced-motion: reduce) {
+  .pulse {
+    animation: none;
+  }
+}
+
 /* (#1973) SIGNALS. The block was an undifferentiated grey dump: every entry
    prefixed `⚠`, no times, no grouping, and severity — which the emitter has
    always sent — thrown away, so a successful recovery looked like a doom
