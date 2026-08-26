@@ -73,6 +73,30 @@ describe("SessionReplay", () => {
     expect(disclosure?.querySelector(".disclosure__sum")?.textContent).toContain(`${PROMPT_BODY.length} chars`);
   });
 
+  it("(#1973) prints the prompt summary ONCE — the brief note is gone now that the disclosure carries it", async () => {
+    // The first live render showed `prompt · 467 chars` twice, a few pixels
+    // apart: once in the run brief, once as the expander's summary. Same
+    // duplication the brief's bare "run" heading was removed for.
+    stubSession();
+    renderReplay("s-disc");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    const occurrences = (document.querySelector(".session-run")?.textContent ?? "").match(
+      new RegExp(`prompt · ${PROMPT_BODY.length} chars`, "g"),
+    );
+    expect(occurrences).toHaveLength(1);
+  });
+
+  it("(#1973) still prints a brief prompt line when there is a length but NO text to disclose", async () => {
+    // The one case that keeps the brief line: nothing to expand, so the
+    // summary has nowhere else to live. Guards against the de-duplication
+    // above silently deleting the only report of a prompt's size.
+    stubSession({ prompt: undefined });
+    renderReplay("s-disc");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+    expect(document.querySelector(".session-run")?.textContent).toContain("prompt");
+    expect(document.querySelector('[data-act="disclose-prompt"]')).not.toBeInTheDocument();
+  });
+
   it("(#1973) reports the RECORD's char count when the carried text was truncated, never the surviving length", async () => {
     // A truncated payload must not under-report its real size — the operator
     // is reading this to know how big the brief was, not how much of it

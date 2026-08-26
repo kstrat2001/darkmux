@@ -301,16 +301,19 @@ export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
   if (sp.prompt) {
     const chars = sp.prompt_chars ?? sp.prompt.length;
     const isTrunc = sp.prompt_chars != null && sp.prompt.length < sp.prompt_chars;
-    const truncated = isTrunc ? " · truncated" : "";
-    // A self-describing one-liner, not a label/value pair — tagged `note` so it
-    // is not styled as either half of one.
-    promptLines.push({ kind: "note", text: `prompt · ${chars} chars${truncated}` });
-    // (#1973) ...and the string itself, which this function used to read the
-    // length of and then drop on the floor.
+    // (#1973) The text itself — which this function used to read the length of
+    // and then drop on the floor.
+    //
+    // NO brief note here. The disclosure's own summary already reads
+    // `prompt · <n> chars`, so pushing one would print the same sentence twice,
+    // a few pixels apart — the same duplication the run brief's bare "run"
+    // heading was removed for (see `briefLines` below). The summary IS the
+    // one-liner now, and it is the one that expands.
     disclosures.push({ id: "prompt", label: "prompt", chars, truncated: isTrunc, text: sp.prompt });
   } else if (sp.prompt_chars != null) {
-    // A record that reports a length but carries no text: say so rather than
-    // offering an expander onto nothing.
+    // A record that reports a length but carries no text: say so in the brief,
+    // rather than offering an expander onto nothing. This is the ONLY case
+    // that still produces a brief prompt line.
     promptLines.push({ kind: "label", text: "prompt" });
     promptLines.push({ kind: "value", text: `${sp.prompt_chars} chars` });
   }
