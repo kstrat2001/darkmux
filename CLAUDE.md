@@ -251,6 +251,15 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      of the profile. (An earlier draft called this a "dispatch", which is what made the word
      mean both ends of the ladder at once; a later one proposed `model_run`, which named the
      unit after its output.)
+
+     *Candidates rejected on collision, recorded so they are not re-proposed:* **task** and
+     **job** and **activity** and **assignment** are all TAKEN at other grains — `task` is the
+     parent layer; `job` is the fleet work queue (`fleet::WorkJob`/`ClaimedJob`/`claim_job`,
+     and `WORK_JOB_SCHEMA_VERSION` is a wire schema), where a job is a PHASE claimed by a peer
+     machine; `activity` is the viewer's activity lanes; `assignment` is Task-level resource
+     assignment. Reusing any of them would recreate this exact defect one word over. `shift`
+     and `stint` are genuinely free and were weighed for being more humanized; `execution`
+     won on precision and on composing cleanly for sub-executions.
    - **step** — a mission-graph node. The step is the NODE; the role execution is what the
      node DID.
      **A step contains ZERO OR MORE role executions, and the cardinality is the reason this
