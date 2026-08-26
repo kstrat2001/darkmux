@@ -299,6 +299,57 @@ consequence of the profile. Naming it for the role also makes sub-executions com
 compactor's work inside a specialist's is simply another role execution, one level in, rather
 than a special case needing its own rule.
 
+**The mission metaphor is deliberate, and it has to close.**
+
+darkmux's operator-facing vocabulary commits to the **NASA mission metaphor**. `Mission` and
+`Crew` were canonical from the start; the rest is named to *complete* the metaphor rather than
+to borrow from a software subculture.
+
+Locked terms (decided 2026-06-22):
+
+| Term | What it names |
+|---|---|
+| **Mission** / **Crew** | The work, and who staffs it. |
+| **Debrief** | The post-mission review ceremony (`Stage::Debrief`). |
+| **Lessons** | The durable engagement-context store — previously "knowledge". |
+| **Cautions** | The auto-detected loop pathologies. Already on-theme: spacecraft carry a *Caution & Warning System*. |
+
+And the metaphor closes, which is the point of it: **a mission's runs raise cautions → the
+debrief distills them into lessons → lessons brief the next crew.**
+
+**Why a metaphor rather than accurate jargon.** Metaphors endure because they are *coherent and
+relatable*, not because they are literal. Xerox PARC and early Apple gave us the **Desktop**,
+the **Trash**, **Files** — none of which are literally inside a computer. They lasted because
+the metaphor was complete and drawn from a world people already knew.
+
+Software-tribal terms fracture it, and each carries baggage the metaphor does not: a
+*retrospective* imports Scrum, which not everyone practices and some actively dislike, and which
+means nothing outside engineering; a *post-mortem* imports death. A whole metaphor is something a
+person can hold. Half a metaphor is just inconsistency. We are not sending rockets to the moon,
+but software ships with a rocket emoji, because the metaphor lands.
+
+**How to apply it.** When naming any new operator-facing surface — a verb, a stage, a concept, a
+file — prefer the term that completes the mission metaphor, and check that it *completes* rather
+than merely coexists. Where a real NASA term exists, lean on it: "Lessons Learned" (NASA's LLIS)
+is the authentic version of what dev culture gestures at with "retro notes".
+
+**Reject "it is already there" as a naming argument.** Consistency with an unconsidered
+placeholder is not consistency. `Stage::Retrospect` was renamed to `Stage::Debrief` on exactly
+that basis — it existed, and existing was the only thing it had going for it.
+
+**The boundary.** This governs the OPERATOR-facing surface only. Model-facing text — role
+prompts, skill descriptions, the autonomous-dispatch preamble, feedback-injection templates —
+defaults to AI-convention terminology instead ("the user", "system message", "tool calls"),
+because a local model under clean dispatch context has no darkmux history to ground a metaphor
+against. See the model-facing prompt doctrine in `CLAUDE.md`. The two rules do not compete; they
+apply to different readers.
+
+One consequence worth stating, since it is what put this section here: this doctrine was decided
+and then lived nowhere in the repository for two months. A fresh agent session — the recursive
+success criterion darkmux sets for itself — would have named new surfaces from dev jargon with
+nothing to say it was wrong. A naming rule that exists only in someone's memory is not a rule
+the project has.
+
 **Names that are taken, and by what.** Every humanized word that reads naturally for "one crew
 member's bounded piece of work" turned out to already name a *different* layer of this same
 system — which is itself the finding, because those layers were named with the same instinct:
