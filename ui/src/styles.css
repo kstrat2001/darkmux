@@ -1,5 +1,28 @@
 :root {
   color-scheme: dark;
+  /* ONE mono stack, because there were three and they disagreed (#2001).
+     Measured with CDP on macOS Chrome, what each of the old ones actually
+     rendered:
+       'JetBrains Mono' then generic     -> Courier  (89 rules)
+       ui-monospace/SFMono then generic  -> Courier  (14 rules)
+     Neither `ui-monospace` nor `SFMono-Regular` resolves in Chrome on macOS
+     — SF Mono ships with Xcode/Terminal but is not exposed as a general
+     system font — so BOTH fell through to the generic `monospace`, which
+     Chrome maps to Courier. The viewer rendered in Courier for everyone
+     without JetBrains Mono installed, which is almost everyone: the CSS
+     named that font 89 times and shipped no webfont for it.
+
+     `Menlo` is what actually catches it (present on every macOS install),
+     `Consolas` on Windows, `Liberation Mono`/`DejaVu Sans Mono` on Linux.
+     `ui-monospace` stays first because it costs nothing and wins on the
+     browsers where it DOES resolve.
+
+     `"Apple Color Emoji"` sits AFTER the generic on purpose: fallback is
+     per-glyph, so it is reached only for glyphs the mono faces lack. This
+     is carried over from `.panelout`, the one rule that already had the
+     right shape before this change. */
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", "DejaVu Sans Mono", monospace, "Apple Color Emoji";
   --bg: #0b0e14;
   --fg: #e6e8ee;
   --dim: #8b93a7;
@@ -73,7 +96,7 @@ body {
 
 .nav-tab {
   display: inline-block;
-  font: 600 11px/1 ui-monospace, SFMono-Regular, monospace;
+  font: 600 11px/1 var(--font-mono);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--dim);
@@ -261,7 +284,7 @@ body {
   background: none;
   border: 0;
   padding: 0;
-  font: 11px/1 ui-monospace, SFMono-Regular, monospace;
+  font: 11px/1 var(--font-mono);
   color: var(--dim);
   letter-spacing: 0.02em;
   white-space: nowrap;
@@ -272,7 +295,7 @@ body {
    (`Masthead.tsx`'s own doc: a static demo has no `/flow-days`/
    `/flow-missions` daemon endpoints for the real toggle to fetch). */
 .masthead__srcbadge {
-  font: 600 11px/1 "JetBrains Mono", monospace;
+  font: 600 11px/1 var(--font-mono);
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--bg);
@@ -286,7 +309,7 @@ body {
   color: var(--dim);
   border-radius: 4px;
   cursor: pointer;
-  font: 13px ui-monospace, SFMono-Regular, monospace;
+  font: 13px var(--font-mono);
   padding: 2px 7px;
   line-height: 1.4;
 }
@@ -317,7 +340,7 @@ body {
 .masthead__nav a {
   color: var(--dim);
   text-decoration: none;
-  font: 600 12px ui-monospace, SFMono-Regular, monospace;
+  font: 600 12px var(--font-mono);
   letter-spacing: 0.04em;
 }
 .masthead__nav a:hover {
@@ -582,7 +605,7 @@ body {
   flex: none;
 }
 .eventlog__detailtitle {
-  font: 600 11px ui-monospace, SFMono-Regular, monospace;
+  font: 600 11px var(--font-mono);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--dim);
@@ -595,11 +618,11 @@ body {
 }
 .eventlog__none {
   color: var(--dim);
-  font: 11px ui-monospace, SFMono-Regular, monospace;
+  font: 11px var(--font-mono);
   padding: 8px 0;
 }
 .eventlog__detailcard {
-  font: 11px/1.5 ui-monospace, SFMono-Regular, monospace;
+  font: 11px/1.5 var(--font-mono);
 }
 .eventlog__detailsummary {
   color: var(--accent);
@@ -614,7 +637,7 @@ body {
   color: var(--fg);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font: 11px/1.5 ui-monospace, SFMono-Regular, monospace;
+  font: 11px/1.5 var(--font-mono);
 }
 .eventlog__split {
   height: 7px;
@@ -648,7 +671,7 @@ body {
 }
 .eventlog__head h3 {
   margin: 0;
-  font: 600 11px/1 ui-monospace, SFMono-Regular, monospace;
+  font: 600 11px/1 var(--font-mono);
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--dim);
@@ -731,7 +754,7 @@ body {
      input under 16px; same rationale as legacy's own `.searchbox input`
      rule (viewer.html:341-347). */
   padding: 6px 26px;
-  font: 16px ui-monospace, SFMono-Regular, monospace;
+  font: 16px var(--font-mono);
 }
 /* (Mobile fix pass) Measured 354x32 — width already clears 44, height
    didn't. Mobile-only padding bump; the 16px font (iOS zoom-avoidance
@@ -771,7 +794,7 @@ body {
 }
 .eventlog__qcount {
   flex: none;
-  font: 600 10px/1 ui-monospace, SFMono-Regular, monospace;
+  font: 600 10px/1 var(--font-mono);
   letter-spacing: 0.04em;
   color: var(--dim);
   white-space: nowrap;
@@ -793,7 +816,7 @@ body {
   padding: 6px 12px 8px;
 }
 .eventlog__rec {
-  font: 11px/1.5 ui-monospace, SFMono-Regular, monospace;
+  font: 11px/1.5 var(--font-mono);
   color: var(--dim);
   padding: 5px 6px;
   border-bottom: 1px solid var(--border);
@@ -865,7 +888,7 @@ body {
 
 .eventlog__empty {
   color: var(--dim);
-  font: 11px ui-monospace, SFMono-Regular, monospace;
+  font: 11px var(--font-mono);
   padding: 10px 2px;
 }
 
@@ -971,7 +994,7 @@ body {
 
 .lens-placeholder__hash,
 .lens-placeholder__note {
-  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-family: var(--font-mono);
   font-size: 13px;
   margin: 4px 0;
 }
@@ -1005,12 +1028,12 @@ body {
    header AND change its `innerText`, which moves the parity goldens. Check
    both rules together. */
 .stagehdr {
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--dim);
   margin-bottom: 14px;
 }
 .labnotice {
-  font: 12px/1.5 "JetBrains Mono", monospace;
+  font: 12px/1.5 var(--font-mono);
   color: #ffb86b;
   border: 1px solid #ffb86b;
   border-radius: 6px;
@@ -1026,7 +1049,7 @@ body {
   margin: 10px 0 4px;
 }
 .runchip {
-  font: 600 11px/1 "JetBrains Mono", monospace;
+  font: 600 11px/1 var(--font-mono);
   letter-spacing: 0.04em;
   padding: 6px 10px;
   border-radius: 14px;
@@ -1054,7 +1077,7 @@ body {
 }
 .runkind {
   display: inline-block;
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   letter-spacing: 0.06em;
   text-transform: uppercase;
   padding: 3px 7px;
@@ -1139,16 +1162,16 @@ body {
   gap: 8px;
 }
 .labruncrew {
-  font: 600 12px "JetBrains Mono", monospace;
+  font: 600 12px var(--font-mono);
   color: var(--fg);
 }
 .labrundir {
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--dim);
   overflow-wrap: anywhere;
 }
 .labrunmeta {
-  font: 11px/1.4 "JetBrains Mono", monospace;
+  font: 11px/1.4 var(--font-mono);
   color: var(--fg);
   overflow-wrap: anywhere;
 }
@@ -1160,7 +1183,7 @@ body {
   font-weight: 600;
 }
 .labdiffline {
-  font: 11px/1.4 "JetBrains Mono", monospace;
+  font: 11px/1.4 var(--font-mono);
   color: #5af0a3;
   padding: 2px 0 8px 6px;
   border-left: 2px solid #5af0a3;
@@ -1177,7 +1200,7 @@ body {
 }
 .labbadge {
   display: inline-block;
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   letter-spacing: 0.06em;
   text-transform: uppercase;
   padding: 3px 7px;
@@ -1213,12 +1236,12 @@ body {
   border-color: var(--warn);
 }
 .rununtracked {
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   color: var(--dim);
   letter-spacing: 0.04em;
 }
 .runmore {
-  font: 12px "JetBrains Mono", monospace;
+  font: 12px var(--font-mono);
   color: var(--dim);
   margin-top: 10px;
   cursor: pointer;
@@ -1242,7 +1265,7 @@ body {
   padding: 12px 14px;
 }
 .labtaskhdr {
-  font: 600 13px "JetBrains Mono", monospace;
+  font: 600 13px var(--font-mono);
   color: var(--accent);
   display: flex;
   flex-wrap: wrap;
@@ -1251,14 +1274,14 @@ body {
   margin-bottom: 8px;
 }
 .labtaskcount {
-  font: 600 10px "JetBrains Mono", monospace;
+  font: 600 10px var(--font-mono);
   color: var(--dim);
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 .none {
   color: var(--dim);
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   padding: 10px 0;
 }
 
@@ -1307,7 +1330,7 @@ body {
   min-height: 40px;
   min-width: 40px;
   box-sizing: border-box;
-  font: 600 11px "JetBrains Mono", monospace;
+  font: 600 11px var(--font-mono);
   letter-spacing: 0.02em;
   padding: 4px 8px;
   border-radius: 6px;
@@ -1378,7 +1401,7 @@ body {
   box-sizing: border-box;
   padding: 6px 10px;
   border-radius: 4px;
-  font: 600 11px "JetBrains Mono", monospace;
+  font: 600 11px var(--font-mono);
   color: var(--dim);
   cursor: pointer;
 }
@@ -1426,7 +1449,7 @@ body {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   background: #1c1c22;
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--dim);
 }
 .panelchrome .pc-cmd {
@@ -1443,7 +1466,7 @@ body {
   color: #2a8a96;
 }
 .pcbtn {
-  font: 600 11px "JetBrains Mono", monospace;
+  font: 600 11px var(--font-mono);
   color: var(--dim);
   background: #131826;
   border: 1px solid var(--border);
@@ -1469,13 +1492,12 @@ body {
   overflow-x: auto;
   white-space: pre;
   font:
-    12px/1.5 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace,
-    "Apple Color Emoji";
+    12px/1.5 var(--font-mono);
   color: var(--fg);
 }
 .panelerr {
   padding: 12px;
-  font: 12px/1.5 "JetBrains Mono", monospace;
+  font: 12px/1.5 var(--font-mono);
   color: var(--error);
   white-space: pre-wrap;
 }
@@ -1486,7 +1508,7 @@ body {
    default text color already use, never `--error`. */
 .panelwarn {
   padding: 12px;
-  font: 12px/1.5 "JetBrains Mono", monospace;
+  font: 12px/1.5 var(--font-mono);
   color: var(--dim);
   white-space: pre-wrap;
 }
@@ -1585,7 +1607,7 @@ body {
   margin: 12px 0 0 16px;
 }
 .catalog-toggle {
-  font: 600 11px/1 "JetBrains Mono", monospace;
+  font: 600 11px/1 var(--font-mono);
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--bg);
@@ -1614,7 +1636,7 @@ body {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
 }
 .catpanel .cathdr {
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--dim);
@@ -1709,7 +1731,7 @@ body {
   background: linear-gradient(180deg, rgba(74, 222, 128, 0.06), rgba(74, 222, 128, 0.01));
 }
 .saveyebrow {
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   color: var(--dim);
   text-transform: uppercase;
   letter-spacing: 0.18em;
@@ -1725,7 +1747,7 @@ body {
   flex: 0 0 auto;
 }
 .savnum {
-  font: 700 48px/1 "JetBrains Mono", monospace;
+  font: 700 48px/1 var(--font-mono);
   color: #5af0a3;
   letter-spacing: 0.01em;
 }
@@ -1736,7 +1758,7 @@ body {
   color: var(--dim);
 }
 .savlbl {
-  font: 600 12px/1 "JetBrains Mono", monospace;
+  font: 600 12px/1 var(--font-mono);
   color: var(--fg);
   margin-top: 7px;
   text-transform: uppercase;
@@ -1770,7 +1792,7 @@ body {
   }
 }
 .savc .scv {
-  font: 600 23px/1.1 "JetBrains Mono", monospace;
+  font: 600 23px/1.1 var(--font-mono);
   color: var(--fg);
 }
 .savc.gen .scv {
@@ -1780,7 +1802,7 @@ body {
   color: var(--dim);
 }
 .savc .scl {
-  font: 10px/1.5 "JetBrains Mono", monospace;
+  font: 10px/1.5 var(--font-mono);
   color: var(--dim);
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -1790,7 +1812,7 @@ body {
   margin-top: 9px;
   padding-top: 8px;
   border-top: 1px solid var(--border);
-  font: 12px "JetBrains Mono", monospace;
+  font: 12px var(--font-mono);
   color: #5af0a3;
 }
 .hybnote .hybpre {
@@ -1845,7 +1867,7 @@ body {
   box-shadow: 0 0 0 1px var(--accent);
 }
 .mach .name {
-  font: 600 15px/1 "JetBrains Mono", monospace;
+  font: 600 15px/1 var(--font-mono);
   color: var(--fg);
   display: flex;
   align-items: center;
@@ -1861,7 +1883,7 @@ body {
   display: block;
 }
 .mach .spec {
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--dim);
   margin-top: 3px;
 }
@@ -1871,11 +1893,11 @@ body {
 }
 .mach .stat {
   margin-top: 12px;
-  font: 12px "JetBrains Mono", monospace;
+  font: 12px var(--font-mono);
 }
 .mach .runs {
   margin-top: 5px;
-  font: 12px "JetBrains Mono", monospace;
+  font: 12px var(--font-mono);
   color: var(--fg);
 }
 /* (#1903) The running-count's own tap target — see `FleetLens.tsx`'s
@@ -1954,7 +1976,7 @@ body {
 }
 
 .tlhdr {
-  font: 600 11px/1 "JetBrains Mono", monospace;
+  font: 600 11px/1 var(--font-mono);
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--dim);
@@ -1971,7 +1993,7 @@ body {
   overflow: hidden;
 }
 .twinb {
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   letter-spacing: 0.06em;
   color: var(--dim);
   padding: 4px 8px;
@@ -2037,7 +2059,7 @@ body {
 .lname {
   width: auto;
   margin-bottom: 4px;
-  font: 12px "JetBrains Mono", monospace;
+  font: 12px var(--font-mono);
   color: var(--fg);
   text-align: left;
   white-space: nowrap;
@@ -2099,12 +2121,12 @@ body {
      gutter without its partner is the whole bug; they were one layout. */
   display: flex;
   justify-content: space-between;
-  font: 9px "JetBrains Mono", monospace;
+  font: 9px var(--font-mono);
   color: var(--dim);
   margin-top: 7px;
 }
 .tlempty {
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--dim);
 }
 
@@ -2132,7 +2154,7 @@ body {
   padding: 7px 14px;
   border-radius: 4px;
   cursor: pointer;
-  font: 600 12px "JetBrains Mono", monospace;
+  font: 600 12px var(--font-mono);
 }
 .scrub button:hover {
   border-color: var(--accent);
@@ -2154,7 +2176,7 @@ body {
 }
 .scrub .clock {
   flex: none;
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--dim);
   white-space: nowrap;
 }
@@ -2171,12 +2193,12 @@ body {
 /* (#1729) Fleet-coverage marker on the default view — shown ONLY when the
    presence substrate could not be read (or is stale). An unconfigured fleet
    is not a degradation, so a standalone machine never sees this. */
-.fleetcov{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:9px 14px;border:1px solid var(--warn);border-radius:8px;color:var(--warn);font:600 12px/1.4 'JetBrains Mono',monospace}
+.fleetcov{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:9px 14px;border:1px solid var(--warn);border-radius:8px;color:var(--warn);font:600 12px/1.4 var(--font-mono)}
 .fleetcov__icon{flex:none}
 
 /* ── Record view — a flow record rendered for a person (see RecordView.tsx
    for why this is name/type-driven rather than 26 per-action templates). */
-.rv { font: 12px/1.5 "JetBrains Mono", monospace; }
+.rv { font: 12px/1.5 var(--font-mono); }
 .rv__head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
 .rv__action { font-weight: 700; font-size: 13px; color: var(--accent); }
 .rv__handle { color: var(--fg); }
@@ -2207,7 +2229,7 @@ body {
 .rv__constants { margin-bottom: 8px; }
 .rv__toggle, .rv__more {
   background: none; border: none; padding: 2px 0; color: var(--accent);
-  font: 11px "JetBrains Mono", monospace; cursor: pointer; text-align: left;
+  font: 11px var(--font-mono); cursor: pointer; text-align: left;
 }
 .rv__toggle:hover, .rv__more:hover { text-decoration: underline; }
 .rv__rawtoggle { display: block; margin-top: 4px; }
@@ -2258,12 +2280,12 @@ body {
    note on why it is kept). */
 
 .machine-lens {
-  font: 12px/1.6 "JetBrains Mono", monospace;
+  font: 12px/1.6 var(--font-mono);
   max-width: min(1200px, 92vw);
 }
 
 .machine-lens__hdr {
-  font: 600 13px/1.4 "JetBrains Mono", monospace;
+  font: 600 13px/1.4 var(--font-mono);
   color: var(--fg);
   overflow-wrap: anywhere;
   margin-bottom: 12px;
@@ -2428,7 +2450,7 @@ body {
   display: block;
 }
 .mm-gauge text {
-  font-family: "JetBrains Mono", monospace;
+  font-family: var(--font-mono);
 }
 .mm-gauge-scale-label {
   fill: var(--dim);
@@ -2709,7 +2731,7 @@ body {
 }
 .mm-lamp {
   display: inline-block;
-  font: 600 9.5px/1 "JetBrains Mono", monospace;
+  font: 600 9.5px/1 var(--font-mono);
   letter-spacing: 0.08em;
   padding: 5px 9px;
   border-radius: 4px;
@@ -2784,7 +2806,7 @@ body {
   border: 0;
 }
 .mm-odo-unit {
-  font: 600 11px "JetBrains Mono", monospace;
+  font: 600 11px var(--font-mono);
   color: var(--dim);
   margin-left: 5px;
 }
@@ -2808,7 +2830,7 @@ body {
   height: 14px;
   margin-left: 2px;
   padding: 0;
-  font: 600 9px/1 "JetBrains Mono", monospace;
+  font: 600 9px/1 var(--font-mono);
   color: var(--dim);
   background: transparent;
   border: 1px solid var(--border);
@@ -2875,7 +2897,7 @@ body {
 }
 
 .mm-grouphdr {
-  font: 600 10px/1.4 "JetBrains Mono", monospace;
+  font: 600 10px/1.4 var(--font-mono);
   letter-spacing: 0.1em;
   color: var(--dim);
   margin: 14px 0 6px;
@@ -2961,7 +2983,7 @@ body {
   position: absolute;
   top: 50%;
   transform: translate(6px, -50%);
-  font: 600 10px "JetBrains Mono", monospace;
+  font: 600 10px var(--font-mono);
   color: var(--fg);
   white-space: nowrap;
   text-shadow:
@@ -3061,7 +3083,7 @@ body {
 }
 
 .machine-lens__loosehdr {
-  font: 600 10px/1.4 "JetBrains Mono", monospace;
+  font: 600 10px/1.4 var(--font-mono);
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--dim);
@@ -3082,7 +3104,7 @@ body {
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--accent);
-  font: 11px/1.4 "JetBrains Mono", monospace;
+  font: 11px/1.4 var(--font-mono);
   text-decoration: none;
   position: relative;
 }
@@ -3116,7 +3138,7 @@ body {
 .hint {
   display: block;
   color: var(--dim);
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   margin-top: 10px;
 }
 
@@ -3196,7 +3218,7 @@ body {
   color: var(--dim);
 }
 .labcli code {
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--fg);
 }
 
@@ -3216,7 +3238,7 @@ body {
   gap: 8px;
   padding: 4px 8px;
   border-radius: 4px;
-  font: 11px/1.4 "JetBrains Mono", monospace;
+  font: 11px/1.4 var(--font-mono);
 }
 .labfeedrow:nth-child(odd) {
   background: rgba(255, 255, 255, 0.02);
@@ -3241,11 +3263,11 @@ body {
    new render surface, restyled for this port's own line-array shape
    rather than legacy's flex markup. */
 .session-run {
-  font: 12px/1.6 "JetBrains Mono", monospace;
+  font: 12px/1.6 var(--font-mono);
   max-width: min(1200px, 92vw);
 }
 .session-run__header {
-  font: 600 13px/1.4 "JetBrains Mono", monospace;
+  font: 600 13px/1.4 var(--font-mono);
   color: var(--accent);
   margin-bottom: 10px;
   overflow-wrap: anywhere;
@@ -3667,7 +3689,7 @@ body {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 16px;
-  font: 600 13px/1 "JetBrains Mono", monospace;
+  font: 600 13px/1 var(--font-mono);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--accent);
@@ -3684,7 +3706,7 @@ body {
 }
 .dialog__fgroup h4 {
   margin: 0 0 8px;
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--dim);
@@ -3694,7 +3716,7 @@ body {
   align-items: center;
   gap: 6px;
   margin: 0 14px 7px 0;
-  font: 12px "JetBrains Mono", monospace;
+  font: 12px var(--font-mono);
   color: var(--fg);
   cursor: pointer;
 }
@@ -3716,7 +3738,7 @@ body {
   color: var(--fg);
   border-radius: 4px;
   padding: 8px 10px;
-  font: 14px "JetBrains Mono", monospace;
+  font: 14px var(--font-mono);
 }
 .dialog__clr {
   background: var(--bg);
@@ -3725,12 +3747,12 @@ body {
   border-radius: 4px;
   padding: 8px 12px;
   cursor: pointer;
-  font: 600 12px "JetBrains Mono", monospace;
+  font: 600 12px var(--font-mono);
   white-space: nowrap;
 }
 .dialog__none {
   color: var(--dim);
-  font: 12px "JetBrains Mono", monospace;
+  font: 12px var(--font-mono);
 }
 .dialog__nrow {
   border-bottom: 1px solid var(--border);
@@ -3740,17 +3762,17 @@ body {
   border-bottom: none;
 }
 .dialog__nts {
-  font: 10px "JetBrains Mono", monospace;
+  font: 10px var(--font-mono);
   color: var(--accent-dim);
 }
 .dialog__ntext {
-  font: 12px/1.5 "JetBrains Mono", monospace;
+  font: 12px/1.5 var(--font-mono);
   color: var(--fg);
   margin-top: 3px;
   white-space: pre-wrap;
 }
 .dialog__rrdetail {
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--dim);
 }
 .dialog__kv {
@@ -3820,11 +3842,11 @@ body {
   position: relative;
 }
 .missionlens .midname {
-  font: 600 13px "JetBrains Mono", monospace;
+  font: 600 13px var(--font-mono);
   color: var(--fg);
 }
 .missionlens .mstatus {
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   padding: 3px 7px;
@@ -3845,7 +3867,7 @@ body {
   border-color: var(--warn);
 }
 .missionlens .livepill {
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--dim);
@@ -3876,7 +3898,7 @@ body {
   display: inline-flex;
   align-items: baseline;
   gap: 6px;
-  font: 11px/1 "JetBrains Mono", monospace;
+  font: 11px/1 var(--font-mono);
   color: var(--dim);
   white-space: nowrap;
 }
@@ -3899,7 +3921,7 @@ body {
   display: inline-flex;
   align-items: baseline;
   gap: 8px;
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--dim);
   white-space: nowrap;
 }
@@ -3911,7 +3933,7 @@ body {
   color: var(--ml-run);
 }
 .missionlens .evbtn {
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--dim);
@@ -3934,7 +3956,7 @@ body {
   display: flex;
   gap: 12px;
   align-items: center;
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--dim);
 }
 .missionlens .legend .dot {
@@ -3952,7 +3974,7 @@ body {
    status-legend affordance a phone has once `.legend` hides below. */
 .missionlens .legbtn {
   display: none;
-  font: 600 10px/1 "JetBrains Mono", monospace;
+  font: 600 10px/1 var(--font-mono);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--dim);
@@ -3978,7 +4000,7 @@ body {
   display: none;
   flex-direction: column;
   gap: 6px;
-  font: 11px "JetBrains Mono", monospace;
+  font: 11px var(--font-mono);
   color: var(--dim);
 }
 .missionlens .legendpop.on {
@@ -4029,14 +4051,14 @@ body {
   position: relative;
 }
 .missionlens .mnode .mn-label {
-  font: 600 12px/1.3 "JetBrains Mono", monospace;
+  font: 600 12px/1.3 var(--font-mono);
   color: var(--fg);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .missionlens .mnode .mn-kind {
-  font: 10px/1 "JetBrains Mono", monospace;
+  font: 10px/1 var(--font-mono);
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--dim);
@@ -4128,13 +4150,13 @@ body {
   line-height: 1.1;
 }
 .missionlens .phasegroup .pg-kind {
-  font: 600 9px "JetBrains Mono", monospace;
+  font: 600 9px var(--font-mono);
   letter-spacing: 0.14em;
   color: var(--dim);
   opacity: 0.8;
 }
 .missionlens .phasegroup .pg-name {
-  font: 600 13px "JetBrains Mono", monospace;
+  font: 600 13px var(--font-mono);
   color: var(--fg);
   opacity: 0.85;
 }
@@ -4174,7 +4196,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 5px 0 5px 32px;
-  font: 11px/1.3 "JetBrains Mono", monospace;
+  font: 11px/1.3 var(--font-mono);
   color: var(--dim);
 }
 .missionlens .steprow::before {
@@ -4231,7 +4253,7 @@ body {
 }
 .missionlens .steprow .slead {
   flex: 0 0 auto;
-  font: 600 9px/1 "JetBrains Mono", monospace;
+  font: 600 9px/1 var(--font-mono);
   letter-spacing: 0.09em;
   text-transform: uppercase;
   color: var(--dim);
@@ -4257,7 +4279,7 @@ body {
 .missionlens .steprow .smodel {
   flex: 0 1 auto;
   min-width: 0;
-  font: 9px/1 "JetBrains Mono", monospace;
+  font: 9px/1 var(--font-mono);
   color: var(--accent-dim);
   border: 1px solid var(--border);
   border-radius: 3px;
@@ -4275,7 +4297,7 @@ body {
   flex: 0 0 auto;
   display: inline-flex;
   gap: 6px;
-  font: 10px/1 "JetBrains Mono", monospace;
+  font: 10px/1 var(--font-mono);
   color: var(--dim);
   white-space: nowrap;
 }
@@ -4359,7 +4381,7 @@ body {
   opacity: 0.6;
 }
 .missionlens .tlphase .tlph-hd .tlph-name {
-  font: 600 13px/1.3 "JetBrains Mono", monospace;
+  font: 600 13px/1.3 var(--font-mono);
   color: var(--fg);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4367,7 +4389,7 @@ body {
 }
 .missionlens .tlphase .tlph-hd .tlph-tag {
   margin-left: auto;
-  font: 10px/1 "JetBrains Mono", monospace;
+  font: 10px/1 var(--font-mono);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--dim);
@@ -4423,7 +4445,7 @@ body {
   opacity: 0.6;
 }
 .missionlens .tltask .tlt-name {
-  font: 600 12px/1.3 "JetBrains Mono", monospace;
+  font: 600 12px/1.3 var(--font-mono);
   color: var(--fg);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4431,7 +4453,7 @@ body {
   min-width: 0;
 }
 .missionlens .tltask .tlt-count {
-  font: 10px/1 "JetBrains Mono", monospace;
+  font: 10px/1 var(--font-mono);
   color: var(--dim);
   white-space: nowrap;
 }
@@ -4453,7 +4475,7 @@ body {
 }
 .missionlens .tltask .tlt-waits {
   padding: 0 11px 8px;
-  font: 10px/1.3 "JetBrains Mono", monospace;
+  font: 10px/1.3 var(--font-mono);
   color: var(--dim);
 }
 .missionlens .tltask .tlt-steps {
@@ -4465,7 +4487,7 @@ body {
 }
 .missionlens .tltask .tlt-empty {
   padding: 5px 2px;
-  font: 11px/1.3 "JetBrains Mono", monospace;
+  font: 11px/1.3 var(--font-mono);
   color: var(--dim);
 }
 .missionlens .tlnote {
