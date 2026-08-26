@@ -241,6 +241,16 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      `darkmux dispatch <role>`) and what a model-bearing step does. A `procedural.shell` step
      has no dispatch; a model-bearing step has exactly one.
    - **step** — a mission-graph node. The step is the NODE; the dispatch is what the node DID.
+     **A step contains ZERO OR MORE dispatches, and the cardinality is the reason this layer
+     exists.** `procedural.shell`/`procedural.noop` contain zero; `dispatch.internal` and
+     `dispatch.single_shot` contain one; `dispatch.map` contains one per collection item
+     (with per-item error isolation — its own doc contrasts it with "a single-dispatch
+     step"), and the review pipeline's probe and judge steps contain seats x draws. Do NOT
+     insert a noun between step and dispatch to name the N: a 1:1 wrapper earns nothing, and
+     the N already has three domain names that are not synonyms — `dispatch.map`'s **items**
+     (what the work is done to), review's **seats** (which staffed model does it), and
+     **draws** (one invocation, `MemberRecord.draws`). They all bottom out in one model call,
+     which is what `dispatch` already means.
    - **session** — INTERNAL ONLY: a join key tying a family of flow records together
      (`darkmux-types/src/session_id.rs`). Never an operator-facing word, because it is also
      minted for mission lifecycle transitions that are not executions at all
@@ -306,6 +316,13 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    (`run start`/`run complete`/`run error`), so `dispatch *` can mean one specialist
    execution. Consumers become bilingual FIRST and stay bilingual permanently — archives are
    append-only and are never rewritten. That ordering is not optional.
+
+   **"step" is a known-imperfect name, deliberately not being changed (operator, 2026-08-26.)**
+   It implies plurality, so it reads badly for a single-step dispatch — but a task genuinely
+   can hold several, so the name is defensible and the churn is not. The decision was to fix
+   the SEMANTICS and commit to them first; a rename is cheap once the meaning is settled and
+   expensive while it is still moving. Do not reopen this as a naming question without new
+   information about the semantics.
 
    Conformance: every detail hash route is named for the `RunKind` it opens.
 
