@@ -130,7 +130,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
             version added a second and CI caught `RUNNING  RUN ·`, which is
             invisible on screen and unmissable to the golden. */}
         <span className={`pill pill--${view.header.pillCls}`}>{view.header.pillLabel}</span>{" "}
-        <LivenessPulse live={ticking} lastBeatMs={view.lastBeatMs} />
+        <LivenessPulse done={!view.live} animate={ticking} lastBeatMs={view.lastBeatMs} />
         RUN · {view.header.role}{" "}
         <span className="session-run__meta">
           ({view.header.sid} on {view.header.machineName})
@@ -176,7 +176,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
         </details>
       ))}
 
-      <div className="metrics" data-scope="model">
+      <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
         {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
           <div className="met" key={i}>
             <div className="mv">{m.value}</div>
@@ -195,7 +195,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
           labels are CSS-generated (`::before`) and never enter the text. A
           redesign that can keep its golden should. */}
       {view.metricScope.harness.length > 0 && (
-        <div className="metrics" data-scope="harness">
+        <div className="metrics" data-scope="harness" role="group" aria-label="harness metrics">
           {view.metricScope.harness.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
             <div className="met" key={i}>
               <div className="mv">{m.value}</div>
@@ -227,7 +227,13 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
           view.signalGroups.map((g) => (
             <div className={`signal signal--${g.severity}`} key={g.kind} data-severity={g.severity}>
               <div className="signal__head">
-                <span className="signal__glyph" aria-hidden="true">
+                {/* NOT `aria-hidden`. Severity was carried by this glyph, a
+                    class and a `data-` attribute — the latter two invisible to
+                    assistive tech — so hiding the glyph left a screen-reader
+                    user no way at all to tell a struggle from a recovery,
+                    which is the entire distinction this redesign exists to
+                    draw. */}
+                <span className="signal__glyph" role="img" aria-label={g.severity === "warn" ? "warning" : "recovered"}>
                   {g.severity === "warn" ? "⚠" : "✓"}
                 </span>
                 <span className="signal__kind">{g.kind}</span>

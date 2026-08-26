@@ -23,28 +23,53 @@ import { useNowMs } from "../lib/clock";
 export const PULSE_QUIET_AFTER_MS = 5000;
 
 export interface LivenessPulseProps {
-  /** Whether the run is still going at all. A finished run never pulses. */
-  live: boolean;
+  /** Has the run reached a terminal record? This is the SEMANTIC question —
+   *  what the pill says — and it is deliberately separate from `animate`. */
+  done: boolean;
+  /** Is the run plausibly executing right now (open AND recently active)?
+   *  Drives the animation and the clock subscription only.
+   *
+   *  These were ONE prop, and the two questions disagree for a real case: a
+   *  run that opened and went silent for a month has no terminal record, so
+   *  the pill says RUNNING, while liveness says it cannot still be executing.
+   *  Passing one boolean for both made the pill read `RUNNING` while this
+   *  element announced `finished` — the same run, the same view, opposite
+   *  claims, with only screen-reader users seeing the contradiction. */
+  animate: boolean;
   /** When the newest record for this run landed, or `null` if none has. */
   lastBeatMs: number | null;
 }
 
-export function LivenessPulse({ live, lastBeatMs }: LivenessPulseProps) {
-  // Subscribed only while live — the shared clock's timer is gated on having
-  // an active subscriber, so a finished run drives nothing.
-  const nowMs = useNowMs(live);
-  const quiet = !live || lastBeatMs == null || nowMs - lastBeatMs > PULSE_QUIET_AFTER_MS;
-  const state = !live ? "done" : quiet ? "quiet" : "beating";
+export function LivenessPulse({ done, animate, lastBeatMs }: LivenessPulseProps) {
+  // Subscribed only while animating — the shared clock's timer is gated on
+  // having an active subscriber, so a finished run drives nothing.
+  const nowMs = useNowMs(animate);
+  const quiet = !animate || lastBeatMs == null || nowMs - lastBeatMs > PULSE_QUIET_AFTER_MS;
+  const state = done ? "done" : !animate ? "stale" : quiet ? "quiet" : "beating";
+
+  const label =
+    state === "beating"
+      ? "running"
+      : state === "quiet"
+        ? "running, no activity in the last few seconds"
+        : state === "stale"
+          ? "no recent activity, may be abandoned"
+          : "finished";
 
   return (
     <span
       className="pulse"
       data-state={state}
-      // The state is announced, not just drawn: `beating` vs `quiet` is a real
-      // status distinction and colour/motion alone would not carry it.
-      role="status"
-      aria-label={state === "beating" ? "running" : state === "quiet" ? "running, no recent activity" : "finished"}
-      title={state === "beating" ? "running" : state === "quiet" ? "no activity in the last few seconds" : "finished"}
+      // `role="img"`, NOT `role="status"`. `status` is an ARIA live region, so
+      // every state change is announced — and the boundary here is a bare
+      // threshold with no hysteresis, so a dispatch whose turn latency hovers
+      // near the quiet cutoff flaps between labels once a second. That is
+      // exactly the struggling run an operator most needs a CLEAN signal
+      // about. A pulse is ambient status with a text alternative, read on
+      // demand; it is not an alert.
+      role="img"
+      aria-label={label}
+      title={label}
     />
   );
 }
