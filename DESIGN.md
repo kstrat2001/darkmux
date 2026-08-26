@@ -158,6 +158,107 @@ A local model in an agent loop fails in characteristic ways: re-reading the same
 
 The unifying principle is operator-sovereignty applied to the runtime: every detector is observable in the trajectory, every nudge is attributable to a named signal, every bound is operator-tunable, and nothing silently changes the dispatch without leaving a record of why.
 
+## Execution: one substrate, four identities
+
+> **Status: this section describes the TARGET, and the tree is partway to it.** Each claim
+> below is marked *(holds)* where the code already works this way or *(target)* where it does
+> not yet. That distinction is load-bearing: an architecture document that reads as present
+> tense while describing an intention is how a stated rule becomes something every consumer
+> quietly implements differently. Tracked as [#1979](https://github.com/kstrat2001/darkmux/issues/1979).
+
+Every piece of work darkmux performs — a mission with forty steps, a one-shot `dispatch`, a
+lab run — is the same substrate at a different scale. The reason that has not always been
+visible is that four different identities were doing overlapping jobs with nothing saying
+which answered which question.
+
+### The ladder
+
+**mission › task › step › dispatch.** A *run* is the umbrella, never a grain: one top-level
+unit of work the operator started, in exactly three kinds (mission, dispatch, lab). A *step*
+is a graph node; a *dispatch* is what the node did. A `procedural.shell` step has no
+dispatch; a model-bearing step has exactly one. The full definition, and its consequences for
+attribution and escalation, is contract 8 in [`CLAUDE.md`](CLAUDE.md)'s cross-system contract
+registry. *(holds — the vocabulary is stated and the hash routes are named for their run kind)*
+
+### What each field means
+
+The flow-record schema already carries enough to answer *whose work is this?* The problem was
+never missing data; it was that nothing stated which field answers which question, so every
+consumer picked its own subset.
+
+- **`payload.step_id` — the canonical record-to-step attribution.** Stamped by the producer,
+  not reconstructed by a reader. *(partly holds — `dispatch_internal`'s `stamp_step_id`
+  does this for graph-step dispatches; other step-executing paths are the target)*
+- **`session_id` — a producer-chosen GROUPING key, deliberately not an identity.** Its grain
+  is per kind, and the variation is correct rather than accidental: step-scoped for a solo
+  dispatch, task-scoped for fan-out siblings that must share a join key so a seat's tokens
+  can be tied to its endpoint. It is opaque to consumers, never an operator-facing noun, and
+  never the address of a page. *(holds as behavior; the "not an identity" part is the target
+  — one consumer still addresses a page by it)*
+- **`mission_id` — the authoritative outer scope, filtered first, always.** This is not
+  optional tidiness. A task-scoped `session_id` hashes only the task id, which comes straight
+  out of a mission config, so two concurrent runs of the same config produce colliding
+  session ids and only the `mission_id` backfill tells them apart. *(holds)*
+- **`handle` — a read-side fallback, permanently.** Archives are append-only and never
+  rewritten, so every key that has ever been correct stays supported for reading. *(holds)*
+
+### One resolver
+
+Mapping a record to its step is a three-key chain — `payload.step_id`, then a step-scoped
+`session_id`, then `handle` — with `mission_id` authoritative above all three. That chain is
+correct and already written twice, once per language. What is wrong is that it is not
+universally *used*: a second, ad-hoc resolver matches on step-kind strings with a silent
+catch-all, and the dispatch detail lens scopes by raw session id instead of by step.
+
+The target is one resolver per language, bound by a shared fixture both test suites consume
+so the two implementations cannot drift, and **no kind-keyed registry in any consumer** — a
+consumer that switches on `step.kind` to infer record shape is the snowflake being deleted,
+not a fix for it. Attribution must be inferable from records alone. *(target)*
+
+### Dispatch means one specialist execution
+
+`dispatch start` / `dispatch complete` denotes one role's one model execution, full stop. The
+run grain keeps its own bookend — it is load-bearing for run status, the runs board's
+representative-session pick, fleet card activity, and the status line — but under its own
+vocabulary (`run start` / `run complete` / `run error`) rather than borrowing the dispatch
+one. Consumers become bilingual before the emission changes, and stay bilingual permanently,
+because archives are never rewritten. *(target — today the run grain borrows the dispatch
+vocabulary, and the review pipeline wraps a whole multi-model crew in a single pair)*
+
+Utility work inside a dispatch — compaction above all — is a **sub-execution**, attributed to
+its own role and model rather than blended into the specialist's. Getting this wrong is not
+cosmetic: filing the compactor's residency under the specialist is what makes a healthy run
+report a model swap that never happened. *(target)*
+
+### Where the substrate lives, and why that is the whole lesson
+
+The substrate a serious run needs — host telemetry sampling, per-step records, budget
+accounting, liveness bookends, the resolved-knob snapshot — belongs in the **shared
+control-flow path every run already crosses**: the launcher and the scheduler. Not in an
+importable type that each mission may or may not adopt.
+
+This is not a preference; it is the measured outcome of trying it both ways in the same arc.
+When the telemetry sampler moved into the launcher and per-step records moved into the
+scheduler, every mission gained them with *zero changes in its own module* — a mission
+author cannot forget what they never had to remember. When the same arc left a piece as an
+importable type plus a paragraph of doctrine, it acquired exactly one consumer: the module it
+was extracted from, importing it back under its old name.
+
+**Moving a type one crate over and importing it back is a relocation, not a layering.** The
+test of whether a capability is really shared is not where it is defined; it is whether a
+mission that never mentions it still gets it. *(holds for telemetry, per-step records,
+budgets and outcome; the staffing snapshot is the remaining piece that is still caller
+choice)*
+
+### Lab stays separate, deliberately
+
+Lab runs write per-run-local artifacts and stay off the fleet flow stream. That boundary is a
+measurement-integrity decision, not an inconsistency to be tidied away: the point of a lab
+run is that it is reproducible in isolation, and a bench that quietly enriched the shared
+stream would make its own numbers a function of what else the fleet was doing. Lab's one
+genuine defect is a route naming its drill-in `run=` while `run` is the umbrella everywhere
+else. *(holds)*
+
 ## Composability
 
 darkmux is designed to live BELOW agent frameworks and ABOVE inference engines:
