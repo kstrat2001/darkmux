@@ -373,6 +373,91 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(() => runRegions(flowToRenderModel(data), "s1")).not.toThrow();
   });
 
+  it("(#1988) a malformed start timestamp no longer makes a finished run read RUNNING forever", () => {
+    // `T(ts)` is NaN for an unparsable timestamp, and every comparison
+    // against NaN is false — including `NaN <= nowMs`. One bad string used to
+    // drop the start record, leave `startTs` as NaN, and make `inAttempt`
+    // false for EVERY record including a perfectly good `dispatch.complete`.
+    const data: FlowRecord[] = [
+      { ts: "not-a-real-timestamp", session_id: "s1", action: "dispatch.start", handle: "coder", payload: { prompt: "the brief", workspace: "/tmp/wt" } },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.live).toBe(false);
+  });
+
+  it("(#1988) ...and it keeps its BRIEF, which vanished with the dropped start record", () => {
+    // The record serves two purposes: payload source and clock source. A bad
+    // clock must not cost the payload — losing prompt, runtime, image,
+    // workspace and model is what removed any way to diagnose the run.
+    const data: FlowRecord[] = [
+      { ts: "garbage", session_id: "s1", action: "dispatch.start", handle: "coder", payload: { prompt: "the brief", workspace: "/tmp/wt" } },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.disclosures.map((x) => x.text)).toContain("the brief");
+    expect(view.briefLines.some((e) => e.text === "/tmp/wt")).toBe(true);
+  });
+
+  it("(#1988) a malformed start timestamp does not silently erase the run's telemetry", () => {
+    // The subtler half, and the one the first two tests did NOT cover: even
+    // with the outcome repaired, a `NaN` `startTs` makes `inAttempt` false for
+    // every FINITE-ts record (`t >= NaN` is false), so metrics, signals and
+    // the last-beat all quietly disappear while the page still looks
+    // plausible. Walking outward for a usable clock is what prevents that,
+    // and only an assertion on the CONTENT catches it — the close fallback
+    // masks it from any assertion on `live`.
+    const data: FlowRecord[] = [
+      { ts: "not-a-timestamp", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:00:30Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        fields: { severity: "warn", kind: "cycle", detail: "repeated tool call" },
+      },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.map((g) => g.kind)).toContain("cycle");
+    expect(view.lastBeatMs).not.toBeNull();
+  });
+
+  it("(#1988) a terminal timestamped BEFORE its own start still terminates the run", () => {
+    // Ordinary cross-machine clock skew, which this function's own `nowMs`
+    // clamp already anticipates. Guarding the elapsed-time arithmetic against
+    // skew while leaving the terminal SELECTION exposed to it was the
+    // inconsistency: a finished dispatch reported as perpetually in flight.
+    const data: FlowRecord[] = [
+      { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:09:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.live).toBe(false);
+  });
+
+  it("(#1988) ...and SAYS the timeline is unreliable rather than presenting a repair as fact", () => {
+    // Honoring a skewed terminal is right; pretending the timeline is sound
+    // is not. The reading is repaired AND the repair is disclosed.
+    const data: FlowRecord[] = [
+      { ts: "2026-01-01T00:10:00Z", session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:09:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.map((g) => g.kind)).toContain("clock-skew");
+  });
+
+  it("(#1988) a healthy run raises NO clock-skew signal", () => {
+    // The guard against a warning that fires on every normal run.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups.map((g) => g.kind)).not.toContain("clock-skew");
+    expect(view.live).toBe(false);
+  });
+
   it("(#1973) an `info` signal is NOT rendered as a warning — a recovery is not a struggle", () => {
     // `dispatch_internal` emits `severity: "info"` for `intra-turn-stall`,
     // which reports that a stall RECOVERED. The old viewer dropped severity
