@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
-import { queryKeys } from "../../lib/queryKeys";
+import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
+import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
+import { staticFlowSrc } from "../../lib/staticSource";
 import { flowToRenderModel } from "../../lib/flow";
 import { useNowMs } from "../../lib/clock";
 import { isStaticBuild } from "../../lib/staticSource";
@@ -40,9 +42,25 @@ import type { FlowRecordsResponse } from "../../types/handwritten";
  * unexercised by this corpus).
  */
 export function SessionReplay({ sessionId }: { sessionId: string }) {
+  // (#1972) POLLS while the session is live. Without this the page fetched
+  // its records ONCE, which is the defect a live dogfood run exposed: the
+  // wall clock advanced (it reads the browser clock), while turns, tokens,
+  // signals and `lastBeatMs` all froze at page load — so the pulse went quiet
+  // five seconds in and could never beat, on the one page whose entire
+  // purpose is watching a run happen.
+  //
+  // This is the FOURTH live view found fetching once (#1966 was the third).
+  // Liveness comes from presence rather than from these records: asking the
+  // records whether to keep asking for records is circular, and presence is
+  // already the fleet's source of truth for session membership. The gate also
+  // stops a replay or a finished run polling forever.
+  const liveSessions = useLiveSessionIds(staticFlowSrc() === null);
+  const sessionIsLive = liveSessions.has(sessionId);
+
   const query = useQuery({
     queryKey: queryKeys.flowSession(sessionId),
     queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-session/${encodeURIComponent(sessionId)}`),
+    refetchInterval: sessionIsLive ? PRESENCE_POLL_MS : false,
   });
 
   // (#1972) HOISTED ABOVE EVERY EARLY RETURN, deliberately. React counts

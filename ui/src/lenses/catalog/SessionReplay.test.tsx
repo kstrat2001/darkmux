@@ -385,6 +385,35 @@ describe("SessionReplay", () => {
     expect(pulse?.getAttribute("aria-live")).toBeNull();
   });
 
+  it("(#1972) POLLS a LIVE session's records — the page used to fetch once and freeze", async () => {
+    // Found by a live dogfood run, not by a test. The wall clock advanced
+    // (it reads the browser clock) while turns, tokens, signals and the last
+    // beat all froze at page load — so the pulse went quiet 5s in and could
+    // never beat, on the page whose whole purpose is watching a run.
+    //
+    // Liveness comes from PRESENCE, not from the records: asking the records
+    // whether to keep asking for records is circular.
+    const calls: string[] = [];
+    const fetchMock = vi.fn((url: string) => {
+      calls.push(url);
+      const body = url.startsWith("/fleet/sessions/live")
+        ? // The hook reads presence BEATS and pulls `session_id` off each —
+          // a bare id list parses to an empty set and the page never polls.
+          { sessions: [{ session_id: "s-live" }], meta: {} }
+        : { records: [], count: 0, truncated: false, generated_at_ms: 0 };
+      return Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderReplay("s-live");
+    await waitFor(() => expect(calls.some((u) => u.includes("/flow-session/"))).toBe(true));
+    const firstRound = calls.filter((u) => u.includes("/flow-session/")).length;
+    // The refetch interval is real time; give it one cycle plus slack.
+    await waitFor(
+      () => expect(calls.filter((u) => u.includes("/flow-session/")).length).toBeGreaterThan(firstRound),
+      { timeout: 9000 },
+    );
+  }, 12_000);
+
   it("renders pending while the fetch is in flight", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     renderReplay("s1");
@@ -438,7 +467,11 @@ describe("SessionReplay", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
     renderReplay("a/b c");
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    expect(fetchMock.mock.calls[0][0]).toBe("/flow-session/a%2Fb%20c");
+    // (#1972) Order-independent: the page also queries `/fleet/sessions/live`
+    // to decide whether to POLL, and that request can land first. Asserting
+    // `calls[0]` pinned an incidental ordering rather than the behaviour.
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.map((c) => c[0])).toContain("/flow-session/a%2Fb%20c"),
+    );
   });
 });
