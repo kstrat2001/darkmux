@@ -42,7 +42,9 @@ updated_ts?: number,
 tracked: boolean, 
 /**
  * (#1915) The flow session this row can be drilled into via
- * `#session=<id>` — the SAME representative-session pick
+ * `#dispatch=<id>` (#1974 renamed it from `#session=<id>`; that
+ * spelling survives as a one-release parser alias) — the SAME
+ * representative-session pick
  * [`mission_to_run`]/[`flow_mission_to_run`] already make for
  * role/model/route, now also carried out to the client instead of
  * being computed and thrown away. Populated for every `Mission` row
