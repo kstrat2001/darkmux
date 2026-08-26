@@ -523,16 +523,34 @@ body {
    the correct tool here: it exists to override an inline style, which is
    exactly what this is doing. */
 @media (max-width: 768px) {
+  /* The record card shares this column with the event list, and at 45vh
+     inside a 60vh column it left the list about 15vh — three or four rows,
+     which is not enough to read a stream. The card is a detail of ONE
+     selected record; the list is the thing being scanned, so the card yields
+     first. */
   .eventlog__detail {
     flex-basis: auto !important;
-    max-height: 45vh;
+    max-height: 28vh;
+  }
+  /* A floor in ROWS, not a fraction of the viewport. Roughly ten rows at the
+     ~34px a two-line entry occupies — the point is "enough entries to see a
+     pattern", which does not scale with screen height the way a `vh` does:
+     45vh of a short phone is a handful of rows and 45vh of a tall one is
+     twenty. */
+  .eventlog__list {
+    min-height: 340px;
   }
 }
 
 @media (max-width: 768px) {
   .eventlog {
     width: 100%;
-    height: 60vh;
+    /* Grows with its content up to most of the viewport, rather than being
+       pinned to 60vh regardless of what is in it. Below the stage on a phone
+       the column is a page section, not a sidebar, so a hard height only
+       created a nested scroll area inside an already-scrolling page. */
+    height: auto;
+    max-height: 88vh;
     border-left: none;
     border-top: 1px solid var(--border);
   }
@@ -3256,6 +3274,26 @@ body {
 .session-run .pill--err { color: var(--bad); border-color: var(--bad); }
 .session-run .pill--canceled { color: var(--warn); border-color: var(--warn); }
 
+/* (#1973) The run brief was six label/value pairs stacked vertically —
+   measured 1063x281, using about a quarter of its width and a lot of
+   scrolling. It is a definition list, so it is laid out as one: label above
+   value, flowing into as many columns as fit. `workspace` and `timing` are
+   long, so they get a wider floor than the short fields and the browser packs
+   the rest around them.
+   Layout only — every entry keeps its own block element, its text and its
+   order, so the goldens (innerText, one line per entry) are unaffected. */
+.session-run .track.brief-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  gap: 2px 20px;
+  align-content: start;
+}
+/* A label starts a new pair; keeping it out of the previous cell's flow is
+   what makes the pairs read as pairs rather than as a wall of alternating
+   lines. */
+.session-run .track.brief-grid .brief-label {
+  margin-top: 6px;
+}
 .session-run .track {
   background: rgba(255, 255, 255, 0.025);
   border: 1px solid var(--border);
@@ -3523,13 +3561,43 @@ body {
   overflow-y: auto;
 }
 
+/* (#1973) The two metric panes STACK, each taking a full row.
+   They were briefly laid side by side, on the reasoning that a SYSTEM pane
+   holding one wall-clock tile looked stranded under five model tiles. Adding
+   the host CPU/RAM/GPU peaks removed that reason — system now carries four
+   tiles — and side-by-side then produced a worse artifact: neither pane had
+   room for its tiles in one line, so each orphaned its last tile onto a
+   second row. Two ragged half-rows read worse than two full ones.
+   Full width lets each pane lay its tiles out in a single line at desktop,
+   and reflow cleanly at narrow widths. */
+.session-run .metricbanks {
+  display: block;
+  margin-bottom: 12px;
+}
+
 /* (#1973) The metric panes carry a scope so the operator can tell which
    numbers describe the MODEL's work and which describe the HARNESS around it
    — the question this redesign came from. The label is CSS-generated rather
    than a DOM node so the parity goldens, which read `innerText`, are
    unaffected by it. */
+/* The pane label is ABSOLUTELY POSITIONED, not a grid item — and that is a
+   correctness fix, not a style preference.
+   As a grid item with `grid-column: 1 / -1` it occupied EVERY track, so
+   `auto-fit` had no empty tracks left to collapse: measured at a 1063px
+   container, the grid resolved to TEN 97px tracks for FIVE tiles, leaving
+   the tiles at their 90px minimum and half the row unused. The label that
+   exists to explain the panes was what squashed them.
+   Out of flow, the empty tracks collapse and the tiles expand to fill. It
+   stays CSS-generated so the parity goldens, which compare innerText, are
+   untouched. */
+.session-run .metrics[data-scope] {
+  position: relative;
+  padding-top: 16px;
+}
 .session-run .metrics[data-scope]::before {
-  grid-column: 1 / -1;
+  position: absolute;
+  top: 0;
+  left: 0;
   content: attr(data-scope);
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -3539,7 +3607,9 @@ body {
 
 .session-run .metrics {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  /* `min(150px, 100%)` so a narrow phone still gets ONE full-width column
+     instead of a track wider than the viewport. */
+  grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
   gap: 10px;
   margin-bottom: 12px;
 }
