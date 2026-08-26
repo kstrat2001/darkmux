@@ -4043,19 +4043,119 @@ fn first_line(s: &str) -> &str {
 
 // ─── Result rendering ───────────────────────────────────────────────────
 
-/// Print one check line + its hint lines. Shared by the verbose and
-/// issues-only render paths so they format identically.
-fn print_check_line(c: &Check) {
+/// The width `doctor` renders to (#1995).
+///
+/// `COLUMNS` is what `crates/darkmux-serve/src/panel.rs` sets from the
+/// client's OWN measured panel width, and every other panel verb already
+/// honors it — `run list` went from a 60-char longest line at `COLUMNS=56` to
+/// 159 at `COLUMNS=200` while doctor emitted 2031 characters at both. That is
+/// why doctor was the one panel whose output ran off the screen: not a CSS
+/// problem, a verb that never answered the question it was asked.
+///
+/// Clamped rather than trusted: the band matches the daemon's own
+/// `clamp_cols`, with a 40 floor because this renderer reserves 27 columns
+/// for the marker and the name before the message even starts.
+fn output_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|w| w.clamp(40, 200))
+        .unwrap_or(100)
+}
+
+/// Word-wrap `text` to `width`, indenting every line AFTER the first by
+/// `indent` spaces — a hanging indent, so a wrapped message stays visually
+/// attached to the check that owns it instead of running back to column zero.
+///
+/// Hand-rolled rather than pulling in `textwrap`: the dep set here is
+/// deliberately small (see CLAUDE.md), and this is the whole requirement.
+/// Operates on whitespace-separated words, so it is safe to run on raw text
+/// only — never on a string that already carries ANSI escapes, whose bytes
+/// would count toward the width. Every caller below styles AFTER wrapping.
+///
+/// A word longer than the budget is emitted on its own line and allowed to
+/// exceed it. Breaking mid-token would corrupt the paths, model ids and
+/// commands doctor prints, and dropping it would be worse; the loop must
+/// simply terminate, which it does because each iteration consumes a word.
+fn wrap_hanging(text: &str, width: usize, indent: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+
+    for word in text.split_whitespace() {
+        // The first line is laid out after a prefix the caller has already
+        // accounted for; continuations pay the hanging indent instead.
+        let budget = if out.is_empty() { width } else { width.saturating_sub(indent) };
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= budget {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        return vec![String::new()];
+    }
+
+    let pad = " ".repeat(indent);
+    out.into_iter()
+        .enumerate()
+        .map(|(i, l)| if i == 0 { l } else { format!("{pad}{l}") })
+        .collect()
+}
+
+/// Render one check as the lines that will be printed, wrapped to `width`.
+///
+/// Split out from [`print_check_line`] so the WRAP is testable without
+/// capturing stdout — the behavior under test is the geometry, not the IO.
+fn render_check_block(c: &Check, width: usize) -> Vec<String> {
+    const NAME_COL: usize = 22;
     let marker = match c.status {
         Status::Pass => darkmux_types::style::success("✓"),
         Status::Warn => darkmux_types::style::warn("⚠"),
         Status::Fail => darkmux_types::style::error("✗"),
     };
-    println!("  {} {:<22} {}", marker, c.name, c.message);
+    // "  " + marker + " " + name + " ". Measured from the NAME's real length
+    // so an over-long name pushes the wrap column right rather than silently
+    // overflowing the budget it was never charged for.
+    let head = 2 + 1 + 1 + c.name.chars().count().max(NAME_COL) + 1;
+    let body = width.saturating_sub(head).max(20);
+
+    let mut lines = Vec::new();
+    let msg = wrap_hanging(&c.message, body, 0);
+    lines.push(format!("  {} {:<NAME_COL$} {}", marker, c.name, msg[0]));
+    for cont in &msg[1..] {
+        lines.push(format!("{}{}", " ".repeat(head), cont));
+    }
+
     if let Some(hint) = c.hint.as_ref() {
-        for line in hint.lines() {
-            println!("        → {}", darkmux_types::style::dim(line));
+        // "        → " — 8 spaces, the arrow, a space.
+        const HINT_HEAD: usize = 10;
+        for raw in hint.lines() {
+            let wrapped = wrap_hanging(raw, width.saturating_sub(HINT_HEAD).max(20), 0);
+            lines.push(format!("        → {}", darkmux_types::style::dim(&wrapped[0])));
+            for cont in &wrapped[1..] {
+                lines.push(format!(
+                    "{}{}",
+                    " ".repeat(HINT_HEAD),
+                    darkmux_types::style::dim(cont)
+                ));
+            }
         }
+    }
+    lines
+}
+
+/// Print one check line + its hint lines. Shared by the verbose and
+/// issues-only render paths so they format identically.
+fn print_check_line(c: &Check) {
+    for line in render_check_block(c, output_width()) {
+        println!("{line}");
     }
 }
 
@@ -4067,18 +4167,38 @@ fn print_check_line(c: &Check) {
 /// severity is the shippable L1.) Plain-language verdict words by operator lean
 /// (#932 Q1); the per-check markers stay ✓/⚠/✗.
 fn verdict_banner(r: &DoctorReport) -> String {
+    verdict_banner_at(r, output_width())
+}
+
+/// (#1995) The banner, wrapped to `width`.
+///
+/// The banner quotes the highest-severity check's whole message, so it is the
+/// LONGEST line doctor emits — 276 characters against the real
+/// daemon-freshness finding. Wrapping the per-check lines alone left this one
+/// running off the screen by itself, which is why the width is threaded here
+/// rather than read at the print site.
+///
+/// The text is wrapped BEFORE styling: `style::warn` and friends wrap the
+/// string in ANSI escapes, and those bytes would otherwise be counted against
+/// the width, silently over-wrapping every colored line.
+fn verdict_banner_at(r: &DoctorReport, width: usize) -> String {
     let headline =
         |s: Status| r.checks.iter().find(|c| c.status == s).map(|c| format!("{}: {}", c.name, c.message));
+    // "● " — the marker plus its space, paid by the first line and matched by
+    // the continuation indent so the wrapped text stays under the headline.
+    const MARKER: usize = 2;
+    let body = width.saturating_sub(MARKER).max(20);
+    let render = |text: String| wrap_hanging(&text, body, MARKER).join("\n");
     match r.worst_status() {
         Status::Pass => darkmux_types::style::success("● ok — every check passed"),
-        Status::Warn => darkmux_types::style::warn(&format!(
+        Status::Warn => darkmux_types::style::warn(&render(format!(
             "● needs attention — {}",
             headline(Status::Warn).unwrap_or_else(|| "see the warnings below".into())
-        )),
-        Status::Fail => darkmux_types::style::error(&format!(
+        ))),
+        Status::Fail => darkmux_types::style::error(&render(format!(
             "● broken — {}",
             headline(Status::Fail).unwrap_or_else(|| "see the failures below".into())
-        )),
+        ))),
     }
 }
 
@@ -4159,6 +4279,135 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Visible text only — the marker and hint carry ANSI escapes whose bytes
+    /// must not count toward a width assertion.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    // ── (#1995) Output width ────────────────────────────────────────────
+    //
+    // `doctor` was the only panel verb that ignored the width the caller
+    // asked for. `crates/darkmux-serve/src/panel.rs` sets `COLUMNS` from the
+    // client's own measurement, and `run list`/`flow status`/`config list`
+    // all honor it; doctor emitted a 2031-character line at every width, so
+    // the console panel overflowed its scroller by 533px at a 1440 viewport
+    // and 1419px on a phone. These pin the wrap, not the prose.
+
+    #[test]
+    fn wrap_hanging_leaves_a_short_line_alone() {
+        let out = wrap_hanging("already short", 40, 4);
+        assert_eq!(out, vec!["already short".to_string()]);
+    }
+
+    #[test]
+    fn wrap_hanging_never_exceeds_the_width() {
+        let long = "a darkmux serve daemon is running a DIFFERENT build than this binary \
+                    so anything you verify against it is testing that build, not this one";
+        for width in [40usize, 60, 80, 100, 200] {
+            for line in wrap_hanging(long, width, 8) {
+                assert!(
+                    line.chars().count() <= width,
+                    "width {width}: line of {} chars exceeds it: {line:?}",
+                    line.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_hanging_indents_continuations_but_not_the_first_line() {
+        let out = wrap_hanging("one two three four five six seven eight nine", 20, 6);
+        assert!(out.len() > 1, "expected a wrap at width 20: {out:?}");
+        assert!(!out[0].starts_with(' '), "first line must not be indented: {:?}", out[0]);
+        for cont in &out[1..] {
+            assert!(cont.starts_with("      "), "continuation must carry the indent: {cont:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_hanging_keeps_every_word_and_their_order() {
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
+        let joined = wrap_hanging(text, 24, 3)
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined, text, "wrapping must not drop, duplicate or reorder words");
+    }
+
+    #[test]
+    fn wrap_hanging_emits_an_overlong_word_rather_than_looping() {
+        // A path or model id with no break opportunity must still terminate
+        // and still appear. It may exceed the width; it may not vanish.
+        let word = "darkmux:qwen3.6-35b-a3b-turboquant-mlx-with-a-very-long-suffix";
+        let out = wrap_hanging(&format!("see {word} now"), 20, 2);
+        assert!(out.iter().any(|l| l.contains(word)), "the long word must survive: {out:?}");
+        assert!(out.len() < 12, "must not fragment endlessly: {out:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn output_width_reads_columns_and_clamps_it() {
+        let prev = std::env::var("COLUMNS").ok();
+        std::env::set_var("COLUMNS", "72");
+        assert_eq!(output_width(), 72, "an explicit COLUMNS must be honored");
+        std::env::set_var("COLUMNS", "5");
+        assert!(output_width() >= 40, "a nonsense-narrow COLUMNS must clamp up");
+        std::env::set_var("COLUMNS", "100000");
+        assert!(output_width() <= 200, "a nonsense-wide COLUMNS must clamp down");
+        std::env::set_var("COLUMNS", "not-a-number");
+        assert_eq!(output_width(), 100, "an unparsable COLUMNS falls back to the default");
+        std::env::remove_var("COLUMNS");
+        assert_eq!(output_width(), 100, "no COLUMNS falls back to the default");
+        if let Some(v) = prev {
+            std::env::set_var("COLUMNS", v);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_doctor_message_the_length_of_the_real_one_is_wrapped() {
+        // The regression: the daemon-freshness check's real message. Before
+        // the fix this rendered as ONE line regardless of COLUMNS.
+        let prev = std::env::var("COLUMNS").ok();
+        std::env::set_var("COLUMNS", "100");
+        let c = Check {
+            name: "daemon freshness".into(),
+            status: Status::Warn,
+            message: "a darkmux serve daemon is running a DIFFERENT build (2.11.0) than this \
+                      binary (2.12.0) — it serves its in-memory code until restarted, so \
+                      anything you verify against it is testing that build, not this one"
+                .into(),
+            hint: Some(
+                "restart it: stop the running `darkmux serve` (Ctrl-C in its terminal, or \
+                 `pkill -f 'darkmux serve'`) and start it again"
+                    .into(),
+            ),
+        };
+        for line in render_check_block(&c, output_width()) {
+            let visible = strip_ansi(&line).chars().count();
+            assert!(visible <= 100, "line of {visible} visible chars exceeds COLUMNS=100: {line:?}");
+        }
+        std::env::remove_var("COLUMNS");
+        if let Some(v) = prev {
+            std::env::set_var("COLUMNS", v);
+        }
+    }
+
     use super::*;
 
     // ─── (#1685) check_gh_allowlist — resolved state + provenance ─────────
