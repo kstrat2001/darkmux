@@ -257,29 +257,41 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      puts a second specialist inside this one. Any predicate that infers a "model swap" from
      residency alone is wrong: a declared utility role going resident is not a swap (#1934).
 
-   **Every model execution happens inside a dispatch.** Verified by enumerating every
-   completion-endpoint call site (`chat/completions`): five modules, and every host-side
-   entry point routes through `crew::dispatch::dispatch` or `dispatch_local_single_shot`,
-   both of which bookend. That includes `lab run` (`providers/prompt.rs:209`,
-   `providers/coding_task.rs:835`, `providers/tool_bench.rs:1037`), `mission propose`,
-   `lab notebook draft`, `coder-phase`, and `radio` (`src/radio.rs:539`). Two exceptions,
-   both real:
+   **`dispatch` is currently used at TWO grains, and only one of them is the definition.**
+   The rule above is the definition: one role, one model execution. But the flow-record
+   bookends `dispatch start`/`dispatch complete` are ALSO used as a run-level liveness
+   marker, because contract 2 is phrased as a LIVENESS requirement ("any production code
+   path that performs model work"), which is granularity-agnostic. That phrasing is what
+   licenses the loose usage. Both contracts stand; contract 2 says liveness must be
+   visible, contract 8 says which noun means which grain.
 
-   - **Compaction is a sub-execution, not its own dispatch.** `runtime/src/compaction.rs`
-     calls the endpoint with its own `compactor_model` (a 4B utility agent) inside the
-     specialist's dispatch, emitting no bookends of its own. That is correct by the
-     sub-execution clause above; the defect is ATTRIBUTION, not liveness, and it is the
-     `emit_telemetry` violation already named.
-   - **The review pipeline bookends the whole CREW run, not each execution** — the one
-     place a bookended unit has more than one specialist. `src/mission_launch_review.rs`
-     calls `single_shot_chat` directly and wraps the entire run in ONE
-     `with_dispatch_bookends` pair whose arguments are PLURAL:
+   Verified by enumerating every completion-endpoint (`chat/completions`) call site — five
+   modules. Two host-side entry points bookend per execution and are correct:
+   `crew::dispatch::dispatch` and `dispatch_local_single_shot`. Everything model-bearing
+   routes through one of them: all three lab providers (`providers/prompt.rs:209`,
+   `coding_task.rs:835`, `tool_bench.rs:1037`), `mission propose`, `lab notebook draft`,
+   coder-phase, and radio (`src/radio.rs:539`). Two things do not:
+
+   - **Compaction is a sub-execution.** `runtime/src/compaction.rs` calls the endpoint with
+     its own `compactor_model` (a 4B utility agent) inside the specialist's dispatch,
+     emitting no bookends. That is correct by the sub-execution clause above; the defect is
+     ATTRIBUTION, and it is the `emit_telemetry` violation already named.
+   - **The review pipeline bypasses the dispatch primitive entirely.** Its seats call the
+     raw chat primitive `single_shot_chat` directly (`src/mission_launch_review.rs:1083`),
+     and the launcher wraps the WHOLE multi-model crew mission in ONE
+     `with_dispatch_bookends` pair whose arguments are literally plural —
      `crew.distinct_profile_names()` and `crew_model_summary(&crew)`, emitted as
-     `crew={names} models={summary}`. Per-call bookends were removed as duplication of that
-     outer wrap (`crates/darkmux-lab/src/lab/review.rs:6999-7006`). Treat this as a known
-     symptom of the run-substrate arc (#1877) — the review pipeline carries its own parallel
-     telemetry/budget/record substrate — NOT as a standing carve-out. New code does not get
-     to copy it.
+     `crew={names} models={summary}`. So those seat executions have no dispatch identity at
+     all, and the one "dispatch" record on the run denotes a mission.
+
+   **Retiring the second one costs nothing in liveness, which is why it is a defect and not
+   a carve-out.** The review pipeline runs through the same `run_step_graph` every other
+   scheduler caller uses, so the scheduler ALREADY emits `step start`/`step complete`/`step
+   error` for each of its steps (`crates/darkmux-crew/src/scheduler.rs:715, 1032, 1040`),
+   under a `mission start` above them. Its run-level `dispatch` pair therefore adds no
+   coverage the mission and step bookends do not already give. Tracked as part of the
+   run-substrate arc (#1877): the fix is to give each model-bearing seat a real dispatch,
+   not to license a second meaning. New code does not copy this.
 
    Conformance: every detail hash route is named for the `RunKind` it opens.
 
