@@ -102,8 +102,23 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
         </div>
       )}
 
-      <div className="metrics">
-        {view.metrics.map((m, i) => (
+      {view.disclosures.map((d) => (
+        // (#1973) The payload the brief summarizes, reachable. `<details>`
+        // rather than a JS toggle: it is keyboard-operable and
+        // find-in-page-searchable for free, and the text is in the DOM whether
+        // or not it is open — which is what the golden asserts, since an
+        // assertion on the summary line alone would pass against the very bug
+        // this fixes.
+        <details className="disclosure" key={d.id} data-act={`disclose-${d.id}`}>
+          <summary className="disclosure__sum">
+            {d.label} · {d.chars} chars{d.truncated ? " · truncated" : ""}
+          </summary>
+          <pre className="disclosure__body">{d.text}</pre>
+        </details>
+      ))}
+
+      <div className="metrics" data-scope="model">
+        {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
           <div className="met" key={i}>
             <div className="mv">{m.value}</div>
             <div className="ml">{m.label}</div>
@@ -117,6 +132,22 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
           <div key={i}>{line}</div>
         ))}
       </div>
+
+      {/* (#1973) The HARNESS pane. Separated from the model metrics above
+          because the operator could not tell which numbers described the model
+          and which described darkmux around it — the question that produced
+          this redesign. Rendered only when it has something to say, so a step
+          with no harness metrics shows no empty frame. */}
+      {view.metricScope.harness.length > 0 && (
+        <div className="metrics" data-scope="harness">
+          {view.metricScope.harness.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
+            <div className="met" key={i}>
+              <div className="mv">{m.value}</div>
+              <div className="ml">{m.label}</div>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="track">
         <div className="lbl">{view.detectionsLabel}</div>

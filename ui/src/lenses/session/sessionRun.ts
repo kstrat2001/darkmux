@@ -111,11 +111,47 @@ export interface SessionRunView {
    * mission/timing/prompt data at all — doesn't happen in practice since
    * `route`+`timing` are always present, kept for completeness). */
   briefLines: BriefEntry[];
+  /** (#1973) Payloads the brief SUMMARIZES and previously threw away — the
+   * prompt above all, which `briefLines` renders as `prompt · 1430 chars`
+   * while holding the string itself.
+   *
+   * That is the THIRD instance of one shape in this codebase (tool-call
+   * arguments and session records were the first two, both #1960): a
+   * renderer takes `.length` of a payload it is holding and discards the
+   * payload. So this field is deliberately the full text, and the golden
+   * test asserts it is reachable AFTER expanding — an assertion on the
+   * summary line alone would pass against the very bug it is meant to
+   * catch. */
+  disclosures: Disclosure[];
   metrics: Array<{ value: string; label: string }>;
+  /** (#1973) Which metrics describe the MODEL's work and which describe the
+   * HARNESS around it. `metrics` stays the flat, ordered list every existing
+   * consumer reads; this is the grouping laid over it, by index.
+   *
+   * The split is not cosmetic. It is what lets a step that ran no model
+   * render without holes: a `procedural.shell` step has harness metrics and
+   * NO model metrics, so the model group is absent rather than showing
+   * `0 turns · 0 tokens`, which would be a lie shaped like data. It also
+   * answers the operator question that prompted this — "what does
+   * `model (lms)` mean, and are these numbers about the model or about
+   * darkmux?" */
+  metricScope: { model: number[]; harness: number[] };
   modelTrackLabel: string;
   modelTrackLines: string[];
   detectionsLabel: string;
   detectionLines: string[];
+}
+
+/** (#1973) One payload the brief summarizes, carried in full so the renderer
+ *  can expand it in place. `chars` is the AUTHORITATIVE length from the
+ *  record (`prompt_chars`) when present, so a truncated payload still reports
+ *  its true size rather than the size of what survived. */
+export interface Disclosure {
+  id: string;
+  label: string;
+  chars: number;
+  truncated: boolean;
+  text: string;
 }
 
 /** A run-brief entry, tagged so the renderer can style a LABEL differently
@@ -261,13 +297,20 @@ export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
   pushKv(briefRows, "timing", briefTiming);
 
   const promptLines: BriefEntry[] = [];
+  const disclosures: Disclosure[] = [];
   if (sp.prompt) {
     const chars = sp.prompt_chars ?? sp.prompt.length;
-    const truncated = sp.prompt_chars != null && sp.prompt.length < sp.prompt_chars ? " · truncated" : "";
+    const isTrunc = sp.prompt_chars != null && sp.prompt.length < sp.prompt_chars;
+    const truncated = isTrunc ? " · truncated" : "";
     // A self-describing one-liner, not a label/value pair — tagged `note` so it
     // is not styled as either half of one.
     promptLines.push({ kind: "note", text: `prompt · ${chars} chars${truncated}` });
+    // (#1973) ...and the string itself, which this function used to read the
+    // length of and then drop on the floor.
+    disclosures.push({ id: "prompt", label: "prompt", chars, truncated: isTrunc, text: sp.prompt });
   } else if (sp.prompt_chars != null) {
+    // A record that reports a length but carries no text: say so rather than
+    // offering an expander onto nothing.
     promptLines.push({ kind: "label", text: "prompt" });
     promptLines.push({ kind: "value", text: `${sp.prompt_chars} chars` });
   }
@@ -297,6 +340,14 @@ export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
     { value: String(comps.length), label: "COMPACTIONS" },
     { value: wall, label: "WALL CLOCK" },
   ];
+
+  // (#1973) Indices into `metrics`, not a second copy — one ordered list, one
+  // grouping over it, so the two cannot drift apart. TURNS/TOKENS/CTX/
+  // COMPACTIONS are the model's work; WALL CLOCK is the harness's. Compaction
+  // is a UTILITY role's sub-execution rather than the specialist's own work,
+  // but it is counted here because what the operator is reading is "what
+  // happened to this model's context", which is exactly what a compaction did.
+  const metricScope = { model: [0, 1, 2, 3, 4], harness: [5] };
 
   // ── model track ────────────────────────────────────────────────────
   const modelTrackLabel = ep ? "model (remote)" : "model (lms)";
@@ -354,7 +405,9 @@ export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
       machineName: String(d?.machine_id || firstSessRec?.machine_id || ""),
     },
     briefLines,
+    disclosures,
     metrics,
+    metricScope,
     modelTrackLabel,
     modelTrackLines,
     detectionsLabel,
