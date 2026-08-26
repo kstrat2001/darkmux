@@ -58,7 +58,7 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
   // render model-then-harness and the model pane is ABSENT for a unit that
   // did no model work, so a mirror that walked all six would claim tiles the
   // page does not show.
-  for (const i of [...view.metricScope.model, ...view.metricScope.harness]) {
+  for (const i of [...view.metricScope.model, ...view.metricScope.system]) {
     const m = view.metrics[i];
     if (m) lines.push(m.value, m.label);
   }
@@ -206,6 +206,51 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.modelTrackLines).toEqual(["a · 10GB", "b · 20GB"]);
   });
 
+  it("(#1973) host CPU/RAM/GPU PEAKS land in the system pane", () => {
+    // This telemetry was fetched and discarded (`void procs`) with a comment
+    // parking it for "a future packet". PEAK, not latest: the question a
+    // local-AI operator asks of a finished run is whether it saturated the
+    // machine, and a last sample taken after the model stopped answers
+    // nothing.
+    const proc = (ts: string, cpu: number, mem: number, gpu: number) => ({
+      ts,
+      session_id: "s1",
+      category: "telemetry" as const,
+      source: "process",
+      fields: { cpu, mem, gpu },
+    });
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      proc("2026-01-01T00:00:10Z", 30, 60, 20),
+      proc("2026-01-01T00:00:20Z", 39, 68, 97),
+      // A LATER, lower sample — a "latest" reading would report 12% GPU on a
+      // run that pegged it at 97.
+      proc("2026-01-01T00:00:30Z", 12, 61, 12),
+      { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const byLabel = (l: string) => view.metrics[view.metricScope.system.find((i) => view.metrics[i].label === l) ?? -1]?.value;
+    expect(byLabel("CPU PEAK")).toBe("39%");
+    expect(byLabel("RAM PEAK")).toBe("68%");
+    expect(byLabel("GPU PEAK")).toBe("97%");
+    // ...and they are HARNESS facts, not the model's own work.
+    expect(view.metricScope.model.map((i) => view.metrics[i].label)).not.toContain("GPU PEAK");
+  });
+
+  it("(#1973) a run with no host telemetry shows no host tiles rather than zeros", () => {
+    // Older runs predate the sampler. A `0%` would assert the machine was
+    // idle, which is a different claim from "not measured".
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const labels = view.metricScope.system.map((i) => view.metrics[i].label);
+    // COMPACTIONS is present because this fixture DID dispatch (it just had
+    // no host sampler); the no-model case is covered separately below.
+    expect(labels).toEqual(["WALL CLOCK", "COMPACTIONS"]);
+  });
+
   it("(#1973) a unit that did NO model work has no model pane and no loaded-models track", () => {
     // A `procedural.shell` step compiles, moves files or runs a command. It
     // will never have turns, tokens, a context window or a compaction, so
@@ -221,8 +266,10 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.hasModelWork).toBe(false);
     expect(view.metricScope.model).toEqual([]);
     // The harness half still renders — wall clock is a fact about any unit.
-    expect(view.metricScope.harness).toEqual([5]);
-    expect(view.metrics[5].label).toBe("WALL CLOCK");
+    // No model work -> no COMPACTIONS either: nothing here has a context to
+    // compact, and a `0` would assert the harness declined rather than that
+    // the question does not arise.
+    expect(view.metricScope.system.map((i) => view.metrics[i].label)).toEqual(["WALL CLOCK"]);
   });
 
   it("(#1973) a dispatch that has STARTED but reported nothing keeps its model pane", () => {
@@ -235,7 +282,10 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.hasModelWork).toBe(true);
-    expect(view.metricScope.model).toEqual([0, 1, 2, 3, 4]);
+    const modelLabels = view.metricScope.model.map((i) => view.metrics[i].label);
+    expect(modelLabels.slice(0, 3)).toEqual(["TURNS", "TOKENS IN", "TOKENS OUT"]);
+    expect(modelLabels).toHaveLength(4);
+    expect(modelLabels).not.toContain("COMPACTIONS");
   });
 
   it("(#1973) marks the PRIMARY loaded model from the dispatch record, and labels the rest honestly", () => {

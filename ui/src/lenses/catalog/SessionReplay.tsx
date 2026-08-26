@@ -165,7 +165,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
       </h2>
 
       {view.briefLines.length > 0 && (
-        <div className="track">
+        <div className="track brief-grid">
           {/* One block element per entry, same order and same text as before —
               `goldens/session-task-list.txt` pins label and value as separate
               lines, so the DOM shape is deliberately unchanged. The class is
@@ -203,6 +203,14 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
         </details>
       ))}
 
+      {/* (#1973) Both panes share one row. HARNESS often holds a SINGLE tile
+          (wall clock), and giving it a full-width band of its own made one
+          card look stranded under five. Side by side they read as two groups
+          of one row rather than as a row and an afterthought.
+          A wrapper, not a reordering: MODEL's tiles still precede HARNESS's
+          in the DOM, so innerText order — and the parity goldens — are
+          unchanged. */}
+      <div className="metricbanks">
       {/* Absent, not empty, when the unit did no model work — see
           `hasModelWork`. */}
       {view.metricScope.model.length > 0 && (
@@ -216,7 +224,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
       </div>
       )}
 
-      {/* (#1973) The HARNESS pane, ADJACENT to the model pane rather than
+      {/* (#1973) The SYSTEM pane, ADJACENT to the model pane rather than
           below the model track. Two reasons, and the second is why CI caught
           it: sandwiching `model (lms)` between two metric grids read as a
           mistake on screen, and the split is a GROUPING of one metric row —
@@ -225,9 +233,9 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
           `goldens/session-task-list.txt` still passes byte-for-byte; the pane
           labels are CSS-generated (`::before`) and never enter the text. A
           redesign that can keep its golden should. */}
-      {view.metricScope.harness.length > 0 && (
-        <div className="metrics" data-scope="harness" role="group" aria-label="harness metrics">
-          {view.metricScope.harness.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
+      {view.metricScope.system.length > 0 && (
+        <div className="metrics" data-scope="system" role="group" aria-label="system metrics">
+          {view.metricScope.system.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
             <div className="met" key={i}>
               <div className="mv">{m.value}</div>
               <div className="ml">{m.label}</div>
@@ -235,6 +243,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
           ))}
         </div>
       )}
+      </div>
 
       {view.hasModelWork && (
         <div className="track">

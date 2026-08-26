@@ -118,7 +118,7 @@ describe("SessionReplay", () => {
     expect(document.querySelector('[data-act="disclose-prompt"]')).not.toBeInTheDocument();
   });
 
-  it("(#1973) separates MODEL metrics from HARNESS metrics into distinct panes", async () => {
+  it("(#1973) separates MODEL metrics from SYSTEM metrics into distinct panes", async () => {
     // The operator question that produced this: reading `model (lms)` beside
     // TURNS/TOKENS/WALL CLOCK, it was not knowable which numbers described the
     // model and which described darkmux around it.
@@ -131,16 +131,19 @@ describe("SessionReplay", () => {
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
     const model = document.querySelector('.metrics[data-scope="model"]');
-    const harness = document.querySelector('.metrics[data-scope="harness"]');
+    const system = document.querySelector('.metrics[data-scope="system"]');
     expect(model, "model metric pane").toBeInTheDocument();
-    expect(harness, "harness metric pane").toBeInTheDocument();
+    expect(system, "system metric pane").toBeInTheDocument();
 
     expect(model?.textContent).toContain("TURNS");
     expect(model?.textContent).toContain("TOKENS IN");
-    expect(model?.textContent).toContain("COMPACTIONS");
+    // COMPACTIONS is a HARNESS metric: the harness decides to compact and
+    // performs it via a utility role. The specialist only experiences it.
+    expect(model?.textContent).not.toContain("COMPACTIONS");
+    expect(system?.textContent).toContain("COMPACTIONS");
     // WALL CLOCK is the harness's measure of the run, not the model's work.
     expect(model?.textContent).not.toContain("WALL CLOCK");
-    expect(harness?.textContent).toContain("WALL CLOCK");
+    expect(system?.textContent).toContain("WALL CLOCK");
   });
 
   it("(#1973) keeps the two metric panes ADJACENT, so text order still matches the legacy golden", async () => {
@@ -161,12 +164,12 @@ describe("SessionReplay", () => {
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
     const model = document.querySelector('.metrics[data-scope="model"]');
-    const harness = document.querySelector('.metrics[data-scope="harness"]');
-    expect(model?.nextElementSibling, "HARNESS must directly follow MODEL — nothing between them").toBe(harness);
+    const system = document.querySelector('.metrics[data-scope="system"]');
+    expect(model?.nextElementSibling, "HARNESS must directly follow MODEL — nothing between them").toBe(system);
 
     // And the text order the golden pins: COMPACTIONS ... WALL CLOCK ... model track.
     const txt = document.querySelector(".session-run")?.textContent ?? "";
-    expect(txt.indexOf("COMPACTIONS")).toBeLessThan(txt.indexOf("WALL CLOCK"));
+    expect(txt.indexOf("TOKENS OUT")).toBeLessThan(txt.indexOf("WALL CLOCK"));
     expect(txt.indexOf("WALL CLOCK")).toBeLessThan(txt.indexOf("loaded models"));
   });
 
@@ -235,7 +238,7 @@ describe("SessionReplay", () => {
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
     const readWall = () =>
-      [...document.querySelectorAll('.metrics[data-scope="harness"] .mv')].map((e) => e.textContent).join("");
+      [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
     const before = readWall();
     expect(before).toContain("so far");
 
@@ -264,7 +267,7 @@ describe("SessionReplay", () => {
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
     const readWall = () =>
-      [...document.querySelectorAll('.metrics[data-scope="harness"] .mv')].map((e) => e.textContent).join("");
+      [...document.querySelectorAll('.metrics[data-scope="system"] .mv')].map((e) => e.textContent).join("");
     const before = readWall();
     act(() => {
       vi.advanceTimersByTime(10_000);
@@ -363,9 +366,9 @@ describe("SessionReplay", () => {
     renderReplay("s-disc");
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
     const model = document.querySelector('.metrics[data-scope="model"]');
-    const harness = document.querySelector('.metrics[data-scope="harness"]');
+    const system = document.querySelector('.metrics[data-scope="system"]');
     expect(model?.getAttribute("aria-label")).toBe("model metrics");
-    expect(harness?.getAttribute("aria-label")).toBe("harness metrics");
+    expect(system?.getAttribute("aria-label")).toBe("system metrics");
     expect(model?.getAttribute("role")).toBe("group");
     // ...and the pane names are still absent from the text, which is what
     // keeps the goldens passing.
@@ -447,7 +450,7 @@ describe("SessionReplay", () => {
     expect(screen.getByText(/07:36:48 · running/)).toBeInTheDocument();
     expect(screen.getByText("1071:54 so far")).toBeInTheDocument();
     // Same reason as the track below: this corpus did no model work, so the
-    // MODEL pane is absent and TURNS with it. The HARNESS pane still renders.
+    // MODEL pane is absent and TURNS with it. The SYSTEM pane still renders.
     expect(screen.queryByText("TURNS")).not.toBeInTheDocument();
     expect(screen.getByText("WALL CLOCK")).toBeInTheDocument();
     // This corpus is `step start`/`step complete` only — no dispatch, no

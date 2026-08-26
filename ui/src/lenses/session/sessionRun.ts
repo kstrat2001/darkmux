@@ -128,6 +128,10 @@ export interface SessionRunView {
    * HARNESS around it. `metrics` stays the flat, ordered list every existing
    * consumer reads; this is the grouping laid over it, by index.
    *
+   * The split follows the ACTOR, not the effect: compaction lands in HARNESS
+   * because the harness decides and performs it through a utility role, even
+   * though what it acts on is the model's context.
+   *
    * The split is not cosmetic. It is what lets a step that ran no model
    * render without holes: a `procedural.shell` step has harness metrics and
    * NO model metrics, so the model group is absent rather than showing
@@ -135,7 +139,7 @@ export interface SessionRunView {
    * answers the operator question that prompted this — "what does
    * `model (lms)` mean, and are these numbers about the model or about
    * darkmux?" */
-  metricScope: { model: number[]; harness: number[] };
+  metricScope: { model: number[]; system: number[] };
   modelTrackLabel: string;
   modelTrackLines: string[];
   /** (#1972) Is this run still going? Drives whether the page subscribes to
@@ -486,21 +490,6 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
       ? `CTX PEAK ${(ctxPeak / 1000).toFixed(0)}K / ${nctx / 1000}K WINDOW`
       : `CTX NOW · PEAK ${(ctxPeak / 1000).toFixed(0)}K / ${nctx / 1000}K WINDOW`;
 
-  const metrics = [
-    { value: turnsValue != null ? String(turnsValue) : "—", label: "TURNS" },
-    { value: tokIn != null ? fmtC(tokIn) : "—", label: "TOKENS IN" },
-    { value: tokOut != null ? fmtC(tokOut) : "—", label: "TOKENS OUT" },
-    { value: nctx ? `${(ctxHeadline / 1000).toFixed(0)}K` : "—", label: ctxLabel },
-    { value: String(comps.length), label: "COMPACTIONS" },
-    { value: wall, label: "WALL CLOCK" },
-  ];
-
-  // (#1973) Indices into `metrics`, not a second copy — one ordered list, one
-  // grouping over it, so the two cannot drift apart. TURNS/TOKENS/CTX/
-  // COMPACTIONS are the model's work; WALL CLOCK is the harness's. Compaction
-  // is a UTILITY role's sub-execution rather than the specialist's own work,
-  // but it is counted here because what the operator is reading is "what
-  // happened to this model's context", which is exactly what a compaction did.
   // (#1973) Did this unit do MODEL work at all?
   //
   // The pane split created the ability to omit the model half; this is what
@@ -517,7 +506,71 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const hasModelWork =
     d != null || loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || cx.length > 0 || comps.length > 0;
 
-  const metricScope = { model: hasModelWork ? [0, 1, 2, 3, 4] : [], harness: [5] };
+  // (#1973) Host telemetry — CPU / RAM / GPU — was FETCHED and thrown away:
+  // `const procs = ...` followed by `void procs` to silence the unused
+  // warning, with a comment parking it for "a future packet". That is the
+  // fifth instance of one shape in this lens (tool arguments, session
+  // records, the prompt, and now this): the data is in hand and the renderer
+  // drops it.
+  //
+  // PEAK rather than latest, because the question a local-AI operator asks of
+  // a finished run is "did this saturate the machine" — a last-sample reading
+  // taken after the model stopped answers nothing. `mean` is deliberately not
+  // shown: a run that pegged the GPU for ten seconds inside two minutes is a
+  // very different fact from one that sat at the mean throughout, and only
+  // the peak makes the first visible.
+  const peakOf = (key: string): number | null => {
+    const vals = procs
+      .map((r) => Number((r.fields as Record<string, unknown> | undefined)?.[key]))
+      .filter((n) => Number.isFinite(n));
+    return vals.length ? Math.max(...vals) : null;
+  };
+  const cpuPeak = peakOf("cpu");
+  const ramPeak = peakOf("mem");
+  const gpuPeak = peakOf("gpu");
+
+  // Built as a list with its scope recorded AS EACH TILE IS ADDED, rather
+  // than as a fixed array plus hardcoded indices. The indices are now
+  // conditional (host tiles only exist when host telemetry does), and an
+  // audit already flagged the hardcoded form as a positional contract nothing
+  // enforced — this makes the two unable to drift because there is only one.
+  const metrics: Array<{ value: string; label: string }> = [];
+  const modelIdx: number[] = [];
+  const systemIdx: number[] = [];
+  const push = (into: number[], value: string, label: string) => {
+    into.push(metrics.length);
+    metrics.push({ value, label });
+  };
+  push(modelIdx, turnsValue != null ? String(turnsValue) : "—", "TURNS");
+  push(modelIdx, tokIn != null ? fmtC(tokIn) : "—", "TOKENS IN");
+  push(modelIdx, tokOut != null ? fmtC(tokOut) : "—", "TOKENS OUT");
+  push(modelIdx, nctx ? `${(ctxHeadline / 1000).toFixed(0)}K` : "—", ctxLabel);
+  push(systemIdx, wall, "WALL CLOCK");
+  // (#1973) COMPACTIONS is a HARNESS metric, not a model one — operator call,
+  // and it is the reading contract 8 supports: the harness DECIDES to compact
+  // and performs it through a UTILITY role's sub-execution. The specialist
+  // neither chooses it nor does it; it only experiences the result.
+  // An earlier comment here argued the opposite — that an operator reads it
+  // as "what happened to this model's context" — which describes the EFFECT
+  // rather than the actor, and is exactly the blending the sub-execution rule
+  // exists to stop.
+  // Gated on model work for the same reason the model pane is: a
+  // `procedural.shell` step has no context to compact, so `0 COMPACTIONS`
+  // would assert "the harness compacted nothing" where the truth is "there
+  // was nothing here that could be compacted".
+  if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
+  if (cpuPeak != null) push(systemIdx, `${Math.round(cpuPeak)}%`, "CPU PEAK");
+  if (ramPeak != null) push(systemIdx, `${Math.round(ramPeak)}%`, "RAM PEAK");
+  if (gpuPeak != null) push(systemIdx, `${Math.round(gpuPeak)}%`, "GPU PEAK");
+
+  // (#1973) Indices into `metrics`, not a second copy — one ordered list, one
+  // grouping over it, so the two cannot drift apart. TURNS/TOKENS/CTX/
+  // COMPACTIONS are the model's work; WALL CLOCK is the harness's. Compaction
+  // is a UTILITY role's sub-execution rather than the specialist's own work,
+  // but it is counted here because what the operator is reading is "what
+  // happened to this model's context", which is exactly what a compaction did.
+
+  const metricScope = { model: hasModelWork ? modelIdx : [], system: systemIdx };
 
   // ── model track ────────────────────────────────────────────────────
   // (#1973) Was `model (lms)`, which named the SUBSYSTEM rather than the
@@ -652,10 +705,6 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const signalsLabel = finds.length ? `signals (${finds.length})` : "signals";
 
 
-  // procs (host CPU/RAM/GPU) contributes only to the two skipped SVG
-  // charts — referenced here so the variable isn't flagged unused, and so
-  // a future packet porting those charts has an obvious hook.
-  void procs;
 
   return {
     // (#1221) The machine name was a hardcoded `""`, so the run card header
