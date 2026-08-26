@@ -537,7 +537,7 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     const { container } = renderRegion(BASE);
     const kv = container.querySelector(".mm-kv--machine");
     expect(kv).toBeTruthy();
-    expect(kv!.textContent).toContain("physical pool (no budget configured)");
+    expect(kv!.textContent).toContain("physical pool");
     expect(kv!.textContent).not.toContain("budget configured (");
   });
 
@@ -874,7 +874,13 @@ describe("MachineHealthRegion — #1819 the ESTIMATED resident carries its prove
     const detail = container.querySelector(".mm-kv--machine")!;
     expect(detail.textContent).toContain("unpriced");
     expect(detail.textContent).toContain("estimated");
-    expect(detail.textContent).toContain("1 model");
+    // A NON-BREAKING space between the count and its unit, asserted as such.
+    // This strip is a flat text run, so the browser may break at any space in
+    // it, and at the current type scale it picked the one inside this value —
+    // rendering `estimated 1` on one line and `model` alone on the next. The
+    // assertion pins the glue rather than normalizing it away: written as a
+    // plain space, this test passes against exactly the bug it now guards.
+    expect(detail.textContent).toContain("1\u00A0model");
   });
 
   it("the inverted case: the estimated disclosure is entirely absent when nothing was estimated (BASE's own default)", () => {

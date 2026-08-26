@@ -767,7 +767,20 @@ export function MachineHealthRegion({
         · used <b>{memBytes(b.pool?.used_bytes)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>
         {reclaimableNote(b.pool?.available_bytes, b.pool?.free_bytes)}{" "}
         · unpriced{" "}
-        <b>{Number(b.machine.unpriced_models) || 0} model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}</b>
+        {/* A non-breaking space, not a plain one: this k/v strip is a flat text
+            run with no per-pair element, so the browser may break at ANY space
+            in it — and at the wider type scale it chose the one INSIDE this
+            value, rendering `unpriced 0` on one line and `models` alone on the
+            next. A count severed from its unit is the same defect as a label
+            severed from its value (#2000), just produced by inline wrapping
+            rather than by a grid.
+
+            Scoped to the counts rather than `white-space: nowrap` on every
+            `<b>`: other values in this strip are phrases, not short tokens,
+            and must stay breakable or they overflow a phone. */}
+        <b>
+          {Number(b.machine.unpriced_models) || 0}&nbsp;model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}
+        </b>
         {/* #1819: the same row that already discloses the genuinely-unpriced
             count discloses the ESTIMATED count too — a different fact
             (counted, but via a labeled guess, not a measurement), stated
@@ -781,7 +794,7 @@ export function MachineHealthRegion({
             {" "}
             · estimated{" "}
             <b>
-              {b.machine.estimated_models} model{b.machine.estimated_models === 1 ? "" : "s"}
+              {b.machine.estimated_models}&nbsp;model{b.machine.estimated_models === 1 ? "" : "s"}
             </b>
           </>
         )}
