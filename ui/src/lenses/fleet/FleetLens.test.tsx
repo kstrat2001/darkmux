@@ -382,7 +382,7 @@ describe("FleetLens", () => {
     const card = document.querySelector(".mach")!;
     expect(card.textContent).toContain("1 running");
     fireEvent.click(card.querySelector(".runs--live")!);
-    expect(window.location.hash).toBe("#session=s1");
+    expect(window.location.hash).toBe("#dispatch=s1");
   });
 
   it("(#1903) the running count is keyboard operable and carries an accessible name", async () => {
@@ -401,7 +401,7 @@ describe("FleetLens", () => {
     expect(countEl).toHaveAttribute("tabIndex", "0");
     expect(countEl.getAttribute("aria-label")).toBeTruthy();
     fireEvent.keyDown(countEl, { key: "Enter" });
-    expect(window.location.hash).toBe("#session=s1");
+    expect(window.location.hash).toBe("#dispatch=s1");
   });
 
   // (#1913) The two tests below pin BOTH sides of the `FLOW_LIVE_TTL_MS`

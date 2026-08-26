@@ -45,7 +45,7 @@ type TabAct = (typeof TABS)[number]["act"];
 function isActive(route: Route, tab: TabAct): boolean {
   switch (route.kind) {
     case "fleet":
-    case "session":
+    case "dispatch":
     case "mission":
       return tab === "fleet";
     case "runs":

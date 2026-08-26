@@ -77,7 +77,7 @@ function machineDrillHash(uid: string): string {
  * question, one the card body's own drill-in already answers honestly.
  *
  * Exactly one running session goes straight to that run's own session
- * drill (`#session=<sid>`, same mechanism the activity-timeline bars below
+ * drill (`#dispatch=<sid>`, same mechanism the activity-timeline bars below
  * already use) rather than the runs lens — the single-run case has one
  * obvious destination, and naming it directly saves a hop. Two or more
  * goes to the runs lens pinned to this machine (`lens=runs&machine=<uid>`,
@@ -86,7 +86,7 @@ function machineDrillHash(uid: string): string {
  * "several things running here". */
 function machineRunsHash(uid: string, runningSessionIds: string[]): string | null {
   if (runningSessionIds.length === 0) return null;
-  if (runningSessionIds.length === 1) return `session=${encodeURIComponent(runningSessionIds[0])}`;
+  if (runningSessionIds.length === 1) return `dispatch=${encodeURIComponent(runningSessionIds[0])}`;
   return `lens=runs&machine=${encodeURIComponent(uid)}`;
 }
 
@@ -576,7 +576,7 @@ export function FleetLens({
               </div>
               <div className="tltrack">
                 {/* (#1639, drill-in packet) Session drill — click a bar, land
-                    on `#session=<sid>`. Legacy's OWN `.sbar` bars are inert
+                    on `#dispatch=<sid>`. Legacy's OWN `.sbar` bars are inert
                     (no `data-act`, no click handler anywhere in
                     `viewer.html`'s timeline code); legacy's only session-drill
                     click was `recentRow()`'s "open →" link on the machine
@@ -609,12 +609,12 @@ export function FleetLens({
                     role="button"
                     tabIndex={0}
                     onClick={() => {
-                      location.hash = `session=${encodeURIComponent(bar.sid)}`;
+                      location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
                     }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
-                        location.hash = `session=${encodeURIComponent(bar.sid)}`;
+                        location.hash = `dispatch=${encodeURIComponent(bar.sid)}`;
                       }
                     }}
                   />

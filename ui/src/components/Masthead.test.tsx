@@ -79,7 +79,7 @@ describe("Masthead", () => {
 
   it("hides the refresh control on a replay route (nothing live to refetch)", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
-    renderMasthead({ kind: "session", sessionId: "abc-123" });
+    renderMasthead({ kind: "dispatch", dispatchId: "abc-123" });
     expect(screen.queryByTitle("Refetch now")).not.toBeInTheDocument();
     vi.unstubAllGlobals();
   });

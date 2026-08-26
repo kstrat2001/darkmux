@@ -3,7 +3,7 @@
 // This was the ONE level with no URL representation. Drilling in left
 // `location.hash` untouched, so a reload — or a backgrounded PWA relaunch, or
 // a tab reopened from history — silently dropped the operator back to the
-// fleet hero with no error and no explanation. The documented `#session=<id>`
+// fleet hero with no error and no explanation. The documented `#dispatch=<id>`
 // deep link had the mirror problem: `catalogQuery()` parsed it, the daemon
 // returned correctly-scoped records, and `boot()` rendered the fleet hero
 // anyway because only the `mission` kind was ever honored.
@@ -18,10 +18,11 @@
 // port exposes no page globals at all (by design, not oversight — see
 // `App.tsx`'s module doc on operator sovereignty / no hidden state).
 //
-// The port's actual `#session=<id>` MECHANISM is real and independently
-// verified: `route.ts` parses `session=` out of the hash, `App.tsx` renders
+// The port's actual `#dispatch=<id>` MECHANISM is real and independently
+// verified (#1974): `route.ts` parses `dispatch=` (and the one-release
+// `session=` alias) out of the hash, `App.tsx` renders
 // `SessionReplay` for that route kind, and `hashSync.ts`'s `useSyncHash`
-// writes the canonical `session=<id>` form back on every route change — the
+// writes the canonical `dispatch=<id>` form back on every route change — the
 // exact same `location.hash` write every other drill-in in this app uses
 // (`FleetLens`'s machine cards, `NavChrome`'s tabs). Three of the four tests
 // below drive that mechanism directly via a boot-time deep link; the fourth
@@ -160,18 +161,27 @@ test('drilling into a session writes it to the address bar', async ({ page }) =>
   await bar.click();
 
   await expect(page.locator('.session-run')).toBeVisible();
-  expect(await hash(page), 'clicking the activity-lane bar must write #session=<id>').toContain(`session=${sid}`);
+  expect(await hash(page), 'clicking the activity-lane bar must write #dispatch=<id>').toContain(`dispatch=${sid}`);
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
-test('booting on #session= restores the session view, not the fleet hero', async ({ page }) => {
+test('booting on the LEGACY #session= alias restores the dispatch view AND rewrites the URL to #dispatch= (#1974)', async ({ page }) => {
+  // Deliberately boots on the OLD spelling. This is the browser-level proof
+  // that the one-release alias in `route.ts` actually resolves for a real
+  // bookmark, and that `useSyncHash`'s write-back then rewrites the address
+  // bar to the canonical form — the two halves that together make the alias
+  // temporary rather than permanent. The unit tests cover each half in
+  // isolation (`route.test.ts`, `hashSync.test.ts`); only this one proves
+  // they compose across a real boot.
   await mockSession(page, 'sess-in-flight');
   const errors = await bootLive(page, '#session=sess-in-flight');
   await expect(page.locator('.session-run')).toBeVisible();
   // The fleet hero's own marker must NOT be on the page — booting on a
-  // session must not ALSO render fleet underneath/instead of it.
+  // dispatch must not ALSO render fleet underneath/instead of it.
   await expect(page.locator('.fleet-lens')).toHaveCount(0);
-  expect(await hash(page), 'the URL named a session; boot must honor it').toContain('session=sess-in-flight');
+  await expect
+    .poll(() => hash(page), { message: 'a legacy #session= bookmark must be honored AND rewritten to #dispatch=' })
+    .toContain('dispatch=sess-in-flight');
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
@@ -184,12 +194,12 @@ test('a drill survives a reload — the whole point', async ({ page }) => {
   // one is read back correctly by the other after a real navigation event
   // (not just a same-document hash mutation).
   await mockSession(page, 'sess-reload');
-  const errors = await bootLive(page, '#session=sess-reload');
+  const errors = await bootLive(page, '#dispatch=sess-reload');
   await expect(page.locator('.session-run')).toBeVisible();
 
   await page.reload();
   await expect(page.locator('.session-run')).toBeVisible();
-  expect(await hash(page), 'reload must not silently reset to the fleet hero').toContain('session=sess-reload');
+  expect(await hash(page), 'reload must not silently reset to the fleet hero').toContain('dispatch=sess-reload');
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
@@ -201,9 +211,9 @@ test('navigating up out of a session clears it from the URL', async ({ page }) =
   // route while sitting on a session view: a `NavChrome` tab click — the
   // exact mechanism `useSyncHash`'s write-back is built to react to.
   await mockSession(page, 'sess-leaving');
-  const errors = await bootLive(page, '#session=sess-leaving');
+  const errors = await bootLive(page, '#dispatch=sess-leaving');
   await expect(page.locator('.session-run')).toBeVisible();
-  expect(await hash(page)).toContain('session=sess-leaving');
+  expect(await hash(page)).toContain('dispatch=sess-leaving');
 
   await page.click('#lens-runs');
   await expect.poll(() => hash(page)).not.toContain('sess-leaving');

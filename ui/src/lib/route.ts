@@ -9,7 +9,7 @@
  *
  * Precedence when the hash carries multiple intents (same order `boot()`
  * checks them in): `lens=fleet` > `lens=runs`/`lens=lab` > `lens=machine` >
- * `lens=console` > `mission=`/`session=` > a static-build's
+ * `lens=console` > `mission=`/`dispatch=` (alias `session=`) > a static-build's
  * `darkmux-flow-src` meta (#1801 — see below) > a bare `#<date>` (or
  * `?date=`) playback pin > default fleet. `lens=fleet` (#1920) is just the
  * EXPLICIT name for the same default the bottom of this function already
@@ -19,7 +19,7 @@
  * existing degrade-gracefully behavior. A `lens` value this build doesn't
  * recognize even after lowercasing (not
  * `fleet`/`runs`/`lab`/`machine`/`console`, and no bare `mission=`/
- * `session=`/date present either) falls through to `unknown` — a visible
+ * `dispatch=`/date present either) falls through to `unknown` — a visible
  * "lens not ported yet" placeholder naming the raw hash, never a blank
  * page (the overnight runbook's render-sanity contract).
  *
@@ -98,7 +98,7 @@ export type Route =
    * null` and renders identically to before this field existed.
    *
    * An open string, same precedent as `machine.uid` below and
-   * `session.sessionId` further down — machine uids are arbitrary
+   * `dispatch.dispatchId` further down — machine uids are arbitrary
    * hardware-derived identifiers with no closed set to validate against
    * here (an unresolvable pin degrades gracefully: `RunsBoard` just shows
    * zero rows for a uid nothing is filed under, same posture `MachineLens`
@@ -121,7 +121,7 @@ export type Route =
    * would silently drop you back to the local machine on reload. `uid` is
    * an open string (not from `PANEL_IDS`/`RUNS_KINDS`'s closed sets) —
    * machine uids are arbitrary hardware-derived identifiers, matching
-   * `session.sessionId`'s existing open-string precedent below. An
+   * `dispatch.dispatchId`'s existing open-string precedent below. An
    * unrecognized/stale uid degrades gracefully (see `MachineLens`'s own
    * doc) rather than needing its own validation here. */
   | { kind: "machine"; uid: string | null }
@@ -152,7 +152,21 @@ export type Route =
    * consumer (`ConsolePanel`, `hashSync.canonicalHash`) can read it
    * unconditionally rather than defaulting to `{}` at every call site. */
   | { kind: "console"; panelId: PanelId | ""; opts: Readonly<Record<string, string>> }
-  | { kind: "session"; sessionId: string }
+  /** `#dispatch=<id>` — the detail view for ONE dispatch: one role's one
+   * model execution (`CLAUDE.md` contract 8, the work-unit vocabulary).
+   * Named for the `RunKind` it opens, which is that contract's conformance
+   * rule — every other surface already called this thing a dispatch
+   * (`RUNS_KINDS`, `RunKind::Dispatch`, `darkmux dispatch <role>`); only the
+   * route said "session".
+   *
+   * `session=` is accepted as a ONE-RELEASE ALIAS (see `parseRoute`), the
+   * same shape `PANEL_ALIASES` below uses, because this module's header
+   * requires every bookmark and printed deep link to keep resolving. The
+   * `dispatchId` is still the flow `session_id` on the wire — that FIELD
+   * keeps its name (renaming it strands every archive, and #1974 demotes
+   * "session" to an internal join key rather than deleting it). An open
+   * string, same precedent as `machine.uid` above. */
+  | { kind: "dispatch"; dispatchId: string }
   /** `#mission=<id>` — the mission-graph lens (#1868). A FULL NAVIGATION in
    * the LEGACY viewer (`location.href = "/mission/<id>/graph"`, a separate
    * document with its own vendored React Flow bundle); this port instead
@@ -219,7 +233,7 @@ export function isLiveRoute(route: Route): boolean {
   // — a page asserting there is something to reconnect TO, on a marketing
   // site with no daemon anywhere near it.
   if (isStaticBuild()) return false;
-  return route.kind !== "playback" && route.kind !== "session" && route.kind !== "mission";
+  return route.kind !== "playback" && route.kind !== "dispatch" && route.kind !== "mission";
 }
 
 /** Should the event-log column (`components/EventLogColumn.tsx` — the
@@ -361,9 +375,13 @@ export function parseRoute(): Route {
     return { kind: "mission", missionId: mission };
   }
 
-  const session = get("session");
-  if (session) {
-    return { kind: "session", sessionId: session };
+  // (#1974) `dispatch=` is canonical; `session=` is the one-release alias.
+  // Canonical wins when both are present — a hash carrying both is already
+  // malformed, and preferring the new spelling makes `canonicalHash`'s
+  // rewrite idempotent rather than oscillating.
+  const dispatch = get("dispatch") || get("session");
+  if (dispatch) {
+    return { kind: "dispatch", dispatchId: dispatch };
   }
 
   const raw = (location.hash || "").replace(/^#/, "");

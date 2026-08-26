@@ -261,6 +261,6 @@ function srcbadgeText(route: Route): string {
     const date = route.date ?? todayUTC();
     return date === todayUTC() ? "TODAY" : `FLOW · ${date}`;
   }
-  if (route.kind === "session" || route.kind === "mission") return "REPLAY";
+  if (route.kind === "dispatch" || route.kind === "mission") return "REPLAY";
   return "TODAY";
 }

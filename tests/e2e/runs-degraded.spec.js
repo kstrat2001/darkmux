@@ -104,7 +104,7 @@ test('an untracked dispatch is openable, and a hostile id survives the hop', asy
   await ghost.click();
   await expect
     .poll(() => page.evaluate(() => location.hash))
-    .toContain(`session=${encodeURIComponent('degraded/untracked-ghost')}`);
+    .toContain(`dispatch=${encodeURIComponent('degraded/untracked-ghost')}`);
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
@@ -123,7 +123,7 @@ test('(#1915) an untracked MISSION row with a session_id is openable, same as a 
   await row.click();
   await expect
     .poll(() => page.evaluate(() => location.hash))
-    .toContain(`session=${encodeURIComponent('degraded/untracked-mission-with-session-sess')}`);
+    .toContain(`dispatch=${encodeURIComponent('degraded/untracked-mission-with-session-sess')}`);
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
 
