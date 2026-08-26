@@ -22,7 +22,7 @@ describe("NavChrome", () => {
     [{ kind: "console", panelId: "", opts: {} }, "lens-console"],
     // Legacy: `state.level==="subsystem"` (a session drill-in) leaves the
     // fleet tab lit — see `NavChrome.tsx`'s own `isActive` doc.
-    [{ kind: "session", sessionId: "abc-123" }, "lens-fleet"],
+    [{ kind: "dispatch", dispatchId: "abc-123" }, "lens-fleet"],
     // QA correction (2026-08-09, pre-#1868): the mission route lights
     // fleet, not console — see `NavChrome.tsx`'s own `isActive` doc for the
     // full measurement, and its #1868 note for why this still holds now

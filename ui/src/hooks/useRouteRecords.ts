@@ -89,7 +89,7 @@ function recordsOf(result: { ok: true; data: unknown } | { ok: false } | undefin
 
 export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): RouteRecords {
   const date = route.kind === "playback" ? route.date : null;
-  const sessionId = route.kind === "session" ? route.sessionId : null;
+  const sessionId = route.kind === "dispatch" ? route.dispatchId : null;
   // (#1801) `date` is `null` on a playback route ONLY when `isStaticBuild()`
   // forced it (`route.ts`'s own doc) — so reading `staticFlowSrc()` directly
   // here, rather than re-deriving it from `date === null`, is the "one

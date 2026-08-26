@@ -124,7 +124,7 @@ test('activity lane: drilling a session.end-only session does not throw', async 
   await page.locator('.sbar[title*="sess-ended-via-sessionend"]').click();
 
   await expect(page.locator('.session-run')).toBeVisible();
-  await expect.poll(() => page.evaluate(() => location.hash)).toContain('session=sess-ended-via-sessionend');
+  await expect.poll(() => page.evaluate(() => location.hash)).toContain('dispatch=sess-ended-via-sessionend');
   // The regression gate itself: CANCELED (the fallback for "closed, but not
   // by a clean dispatch.complete"), never COMPLETE.
   await expect(page.locator('.session-run .pill')).toHaveText('CANCELED');

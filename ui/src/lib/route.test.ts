@@ -115,9 +115,19 @@ describe("parseRoute", () => {
     expect(parseRoute()).toEqual({ kind: "console", panelId: "run-list", opts: {} });
   });
 
-  it("parses #session=<id>", () => {
+  it("parses #dispatch=<id> — the canonical spelling (#1974)", () => {
+    setHash("#dispatch=abc-123");
+    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123" });
+  });
+
+  it("(#1974) still parses the legacy #session=<id> alias, so old bookmarks and printed deep links resolve", () => {
     setHash("#session=abc-123");
-    expect(parseRoute()).toEqual({ kind: "session", sessionId: "abc-123" });
+    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "abc-123" });
+  });
+
+  it("(#1974) prefers the canonical dispatch= when a malformed hash carries both, so canonicalHash's rewrite is idempotent rather than oscillating", () => {
+    setHash("#dispatch=canonical&session=legacy");
+    expect(parseRoute()).toEqual({ kind: "dispatch", dispatchId: "canonical" });
   });
 
   it("parses #mission=<id> as the mission-graph lens route (#1868)", () => {
@@ -257,7 +267,7 @@ describe("showsEventLog", () => {
   // its own events pane now (a second EventLogColumn mount, mission-scoped),
   // so the App-level column must not ALSO render for this route.
   const hidden: Route["kind"][] = ["runs", "console", "machine", "mission"];
-  const shown: Route["kind"][] = ["fleet", "session", "playback", "unknown"];
+  const shown: Route["kind"][] = ["fleet", "dispatch", "playback", "unknown"];
 
   it.each(hidden)("hides the event log on %s", (kind) => {
     expect(showsEventLog({ kind } as Route)).toBe(false);
@@ -451,7 +461,7 @@ describe("isLiveRoute — a daemon-less build is never live, on any lens", () =>
 
   it("historical routes are non-live either way — the kind test still stands on its own", () => {
     expect(isLiveRoute({ kind: "playback", date: "2026-08-07" })).toBe(false);
-    expect(isLiveRoute({ kind: "session", sessionId: "s1" })).toBe(false);
+    expect(isLiveRoute({ kind: "dispatch", dispatchId: "s1" })).toBe(false);
     expect(isLiveRoute({ kind: "mission", missionId: "m1" })).toBe(false);
   });
 

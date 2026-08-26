@@ -152,10 +152,18 @@ describe("canonicalHash / parseRoute round-trip", () => {
     expect(window.location.hash).toBe("#lens=console&panel=mission-status&opt.all=all");
   });
 
-  it("session round-trips", () => {
-    const route: Route = { kind: "session", sessionId: "abc-123" };
-    expect(canonicalHash(route)).toBe("session=abc-123");
+  it("dispatch round-trips on the canonical spelling (#1974)", () => {
+    const route: Route = { kind: "dispatch", dispatchId: "abc-123" };
+    expect(canonicalHash(route)).toBe("dispatch=abc-123");
     expect(roundTrip(route)).toEqual(route);
+  });
+
+  it("(#1974) a legacy #session= bookmark is REWRITTEN to the canonical #dispatch= form — which is what makes the alias one-release rather than permanent", () => {
+    window.location.hash = "#session=abc-123";
+    const route = parseRoute();
+    expect(route).toEqual({ kind: "dispatch", dispatchId: "abc-123" });
+    writeHash(canonicalHash(route));
+    expect(window.location.hash).toBe("#dispatch=abc-123");
   });
 
   it("mission is never canonicalized (#1868 — the hash it arrives on already IS canonical, nothing to compress)", () => {

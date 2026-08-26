@@ -136,9 +136,12 @@ export function canonicalHash(route: Route): string | null {
       }
       return p.toString();
     }
-    case "session": {
+    case "dispatch": {
+      // (#1974) Writes the CANONICAL `dispatch=` spelling, which is what
+      // makes the `session=` alias one-release rather than permanent: an
+      // old bookmark parses, then gets rewritten here to the new form.
       const p = new URLSearchParams();
-      p.set("session", route.sessionId);
+      p.set("dispatch", route.dispatchId);
       return p.toString();
     }
     case "mission":

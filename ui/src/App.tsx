@@ -395,10 +395,10 @@ function routeChrome(
   // "uppercase the STRING directly" discipline as the `fleet`/`machine`
   // branches above, just now visibility-aware instead of uniformly assumed
   // visible.
-  if (route.kind === "session") {
+  if (route.kind === "dispatch") {
     // `$("logscope").textContent=sid` (viewer.html:2042,
     // `renderSubsystem()`) — a VISIBLE-log route, so uppercased.
-    return { crumb: "", logscope: route.sessionId };
+    return { crumb: "", logscope: route.dispatchId };
   }
   if (route.kind === "playback") {
     // A bare-date hash never reassigns `state.level` away from its `"fleet"`
@@ -467,11 +467,11 @@ function renderRoute(route: Route, onPlaybackPlayheadChange: (t: number | null) 
       // console's per-pill selection memory so a shared link reproduces
       // panel AND variant.
       return <ConsolePanel initialPanelId={route.panelId} initialOpts={route.opts} />;
-    case "session":
+    case "dispatch":
       // Packet 4: a real fetch to /flow-session/<id> — see SessionReplay's
       // own doc for why the RENDER (not the fetch) is still a not-ported
       // notice.
-      return <SessionReplay sessionId={route.sessionId} />;
+      return <SessionReplay sessionId={route.dispatchId} />;
     case "mission":
       // #1868: the mission-graph lens, folded in-place — see
       // `MissionGraphLens`'s own doc for the data sources and why this

@@ -192,7 +192,7 @@ describe("RunsBoard", () => {
     await waitFor(() => expect(screen.getByText(/lab series/)).toBeInTheDocument());
   });
 
-  it("(#1900, session_id wiring #1915) a terminated, untracked dispatch row with flow records is interactive and activating it navigates to #session=<id>", async () => {
+  it("(#1900, session_id wiring #1915) a terminated, untracked dispatch row with flow records is interactive and activating it navigates to #dispatch=<id>", async () => {
     // "ghost" is `kind: "dispatch", tracked: false` — server-side, EVERY
     // such row is synthesized only for a flow session that saw a real
     // `dispatch start` record (`ghost_runs`'s `has_start` gate in
@@ -232,17 +232,17 @@ describe("RunsBoard", () => {
       expect(row).toHaveAttribute("tabIndex", "0");
 
       fireEvent.click(row);
-      expect(window.location.hash).toBe("#session=ghost");
+      expect(window.location.hash).toBe("#dispatch=ghost");
       // No mission-graph gate applies here — `/flow-session/<id>` is a
       // plain daemon fetch, same precedent as `FleetLens.tsx`'s activity-
-      // lane bars, which navigate to `#session=<sid>` ungated.
+      // lane bars, which navigate to `#dispatch=<sid>` ungated.
       expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
     } finally {
       window.location.hash = "";
     }
   });
 
-  it("(#1915) an untracked MISSION row that carries a session_id is interactive and activating it navigates to #session=<id>", async () => {
+  it("(#1915) an untracked MISSION row that carries a session_id is interactive and activating it navigates to #dispatch=<id>", async () => {
     // This is the #1915 defect itself: `kind: "mission", tracked: false`
     // is `flow_mission_to_run`'s shape (#1705 — a peer's mission this
     // daemon only sees via the fleet stream), and it USED to always read
@@ -251,7 +251,7 @@ describe("RunsBoard", () => {
     // representative session for a mission row exactly like it does for
     // role/model/route, so a mission carrying `session_id` has just as
     // real a destination as the dispatch ghost above — same drill, same
-    // `#session=<id>` hash, no mission-graph gate.
+    // `#dispatch=<id>` hash, no mission-graph gate.
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -287,7 +287,7 @@ describe("RunsBoard", () => {
       expect(row).toHaveAttribute("role", "button");
 
       fireEvent.click(row);
-      expect(window.location.hash).toBe("#session=peer-session-1");
+      expect(window.location.hash).toBe("#dispatch=peer-session-1");
       expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
     } finally {
       window.location.hash = "";
@@ -383,7 +383,7 @@ describe("RunsBoard", () => {
     expect(screen.getByText(/needs a running daemon/i)).toBeInTheDocument();
   });
 
-  it("(#1900, session_id wiring #1915) an untracked dispatch ghost row also opens #session=<id> from a keyboard Enter activation, and never shows the mission-graph notice", async () => {
+  it("(#1900, session_id wiring #1915) an untracked dispatch ghost row also opens #dispatch=<id> from a keyboard Enter activation, and never shows the mission-graph notice", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -405,7 +405,7 @@ describe("RunsBoard", () => {
       renderBoard();
       await waitFor(() => expect(screen.getByText("ghost2")).toBeInTheDocument());
       fireEvent.keyDown(screen.getByText("ghost2").closest(".labrunrow")!, { key: "Enter" });
-      expect(window.location.hash).toBe("#session=ghost2");
+      expect(window.location.hash).toBe("#dispatch=ghost2");
       expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
     } finally {
       window.location.hash = "";

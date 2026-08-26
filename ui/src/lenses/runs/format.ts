@@ -243,7 +243,7 @@ export function runDestination(run: Run, graphReachable: boolean): RunDestinatio
     // daemon fetch (`SessionReplay`'s own fetch, same as the ungated
     // `#session=<sid>` bars `FleetLens.tsx`'s activity timeline already
     // navigates to), not the mission-graph lens's endpoint.
-    if (run.session_id) return { kind: "hash", hash: `session=${encodeURIComponent(run.session_id)}` };
+    if (run.session_id) return { kind: "hash", hash: `dispatch=${encodeURIComponent(run.session_id)}` };
     return { kind: "none" };
   }
   if (!graphReachable) return { kind: "unreachable" };

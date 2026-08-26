@@ -227,7 +227,9 @@ pub struct Run {
     /// and lab run — both have a durable artifact on disk.
     pub tracked: bool,
     /// (#1915) The flow session this row can be drilled into via
-    /// `#session=<id>` — the SAME representative-session pick
+    /// `#dispatch=<id>` (#1974 renamed it from `#session=<id>`; that
+    /// spelling survives as a one-release parser alias) — the SAME
+    /// representative-session pick
     /// [`mission_to_run`]/[`flow_mission_to_run`] already make for
     /// role/model/route, now also carried out to the client instead of
     /// being computed and thrown away. Populated for every `Mission` row
@@ -1081,7 +1083,7 @@ fn lab_summary_to_run(summary: &LabRunSummary, machine: Option<String>, now_ms: 
         updated_ts: Some(summary.mtime_ms / 1000),
         tracked: true,
         // (#1915) A lab run has no flow session backing it — nothing to
-        // drill into via `#session=<id>` — and it already opens its own
+        // drill into via `#dispatch=<id>` — and it already opens its own
         // in-page detail pane regardless (`RunsBoard.tsx::activateRun`'s
         // `"lab"` branch), so there's no destination this field could add.
         session_id: None,
@@ -1234,7 +1236,7 @@ struct SessionAgg {
     /// same bucket (98 records / 49 distinct `mission_id` values / 1
     /// `session_id`, measured live). That is a flow-emitter defect, fixed
     /// separately (#1918's own "Fix" section) because the id is also the
-    /// flow index's key and appears in `#session=<id>` deep links — a
+    /// flow index's key and appears in `#dispatch=<id>` deep links — a
     /// data-shape change worth versioning deliberately, not slipped in
     /// here. This field exists to DETECT the corruption from the read
     /// side and refuse to act on it, not to repair the write side.

@@ -305,15 +305,15 @@ describe("runDestination", () => {
       tracked: false,
       session_id: "peer-session-1",
     });
-    expect(runDestination(peerMission, true)).toEqual({ kind: "hash", hash: "session=peer-session-1" });
+    expect(runDestination(peerMission, true)).toEqual({ kind: "hash", hash: "dispatch=peer-session-1" });
     // `graphReachable` must not matter here — a session drill is never
     // gated on it, tracked or not.
-    expect(runDestination(peerMission, false)).toEqual({ kind: "hash", hash: "session=peer-session-1" });
+    expect(runDestination(peerMission, false)).toEqual({ kind: "hash", hash: "dispatch=peer-session-1" });
   });
 
   it("an untracked dispatch ghost row drills to its own id as the session (#1900, still true after the #1915 generalization)", () => {
     const ghost = run({ id: "ghost-1", kind: "dispatch", status: "abandoned", tracked: false, session_id: "ghost-1" });
-    expect(runDestination(ghost, true)).toEqual({ kind: "hash", hash: "session=ghost-1" });
+    expect(runDestination(ghost, true)).toEqual({ kind: "hash", hash: "dispatch=ghost-1" });
   });
 
   it("(#1915) an untracked row with NO session_id at all has genuinely nowhere to go", () => {
