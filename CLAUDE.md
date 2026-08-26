@@ -237,16 +237,28 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    - **run** — the UMBRELLA, never a grain: *a top-level unit of work the operator started*.
      Exactly three kinds (`RunKind`): `mission`, `dispatch`, `lab`. The runs board lists runs;
      drilling into one opens that kind's own view. `darkmux run list` serves the same union.
-   - **dispatch** — *one role's one model execution*. Both a run kind (started directly with
-     `darkmux dispatch <role>`) and what a model-bearing step does. A `procedural.shell` step
-     has no dispatch; a model-bearing step has exactly one.
-   - **step** — a mission-graph node. The step is the NODE; the dispatch is what the node DID.
-     **A step contains ZERO OR MORE dispatches, and the cardinality is the reason this layer
-     exists.** `procedural.shell`/`procedural.noop` contain zero; `dispatch.internal` and
+   - **dispatch** — TOP-LEVEL ONLY: the verb `darkmux dispatch <role>`, and the `RunKind` it
+     produces, which means *a run consisting of exactly one role execution*. It is named for
+     its CONTENT, not for the verb. Note `RunKind::Dispatch` is derived FROM a mission by
+     shape (`classify_mission`) — a crew-of-one graph — so it is a shape label on a mission,
+     not a third ontological peer of `Mission`.
+   - **role execution** — the INNER unit: *one role, running until it stops*. Many turns, not
+     one model call (`max_turns`, `turn_seq`). This is deliberately named for the ROLE, not
+     the model, because the model is DERIVED, not declared: `select_model(role, profile)`
+     resolves it at dispatch entry, `DispatchOpts` takes `role_id` as required and
+     `profile_name` as an optional override, and an endpoint-staffed seat has no local model
+     at all. Role is the stable identity across local and remote; the model is a consequence
+     of the profile. (An earlier draft called this a "dispatch", which is what made the word
+     mean both ends of the ladder at once; a later one proposed `model_run`, which named the
+     unit after its output.)
+   - **step** — a mission-graph node. The step is the NODE; the role execution is what the
+     node DID.
+     **A step contains ZERO OR MORE role executions, and the cardinality is the reason this
+     layer exists.** `procedural.shell`/`procedural.noop` contain zero; `dispatch.internal` and
      `dispatch.single_shot` contain one; `dispatch.map` contains one per collection item
      (with per-item error isolation — its own doc contrasts it with "a single-dispatch
      step"), and the review pipeline's probe and judge steps contain seats x draws. Do NOT
-     insert a noun between step and dispatch to name the N: a 1:1 wrapper earns nothing, and
+     insert a further noun between step and role execution to name the N: a 1:1 wrapper earns nothing, and
      the N already has three domain names that are not synonyms — `dispatch.map`'s **items**
      (what the work is done to), review's **seats** (which staffed model does it), and
      **draws** (one invocation, `MemberRecord.draws`). They all bottom out in one model call,
@@ -259,21 +271,28 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
 
    Two consequences that new code inherits:
 
-   - **A dispatch has exactly one SPECIALIST.** Utility invocations inside it (compaction,
-     scribe, estimator) are sub-executions attributed to their OWN role and model, never
-     blended into the primary's metrics. `emit_telemetry` currently violates this — it stamps
+   - **A role execution has exactly one SPECIALIST role.** Utility invocations inside it
+     (compaction, scribe, estimator) are SUB-EXECUTIONS — themselves role executions, of a
+     utility role — attributed to their OWN role and model, never blended into the primary's
+     metrics. Naming the unit for the role is what makes this compose rather than needing a
+     special case: a sub-execution is the same kind of thing as its parent, one level in. `emit_telemetry` currently violates this — it stamps
      the specialist's `role_id`/`model` on the compaction record too (#1974).
-   - **A specialist change is a DISPATCH BOUNDARY.** Escalation mints a new dispatch; it never
-     puts a second specialist inside this one. Any predicate that infers a "model swap" from
+   - **A specialist change is an EXECUTION BOUNDARY.** Escalation mints a new role execution;
+     it never puts a second specialist role inside this one. Any predicate that infers a "model swap" from
      residency alone is wrong: a declared utility role going resident is not a swap (#1934).
 
-   **`dispatch` is currently used at TWO grains, and only one of them is the definition.**
-   The rule above is the definition: one role, one model execution. But the flow-record
-   bookends `dispatch start`/`dispatch complete` are ALSO used as a run-level liveness
-   marker, because contract 2 is phrased as a LIVENESS requirement ("any production code
-   path that performs model work"), which is granularity-agnostic. That phrasing is what
-   licenses the loose usage. Both contracts stand; contract 2 says liveness must be
-   visible, contract 8 says which noun means which grain.
+   **The WIRE keeps its historical spelling; only the vocabulary is fixed.** The flow-record
+   bookends `dispatch start`/`dispatch complete` are emitted at BOTH grains today — around a
+   whole run (contract 2's liveness requirement, phrased over "any production code path that
+   performs model work", which is granularity-agnostic) and around an inner role execution.
+   Those action strings are NOT being renamed: archives are append-only, four consumers key
+   on them at the session grain (`terminal_status_for_action`
+   `crates/darkmux-serve/src/runs.rs:1476-1478`, the runs board's representative-session
+   pick, `ui/src/lenses/fleet/cards.ts:59`, `ui/src/lib/metaLine.ts:28`), and renaming them
+   would buy a consumer migration for no behavioral gain. Grain is already recoverable from
+   `session_id`/`source`. What entry 8 fixes is the WORD used in code, docs and UI — where
+   `dispatch` had come to mean both ends of the ladder at once. Both contracts stand:
+   contract 2 says liveness must be visible, contract 8 says which noun means which grain.
 
    Verified by enumerating every completion-endpoint (`chat/completions`) call site — five
    modules. Two host-side entry points bookend per execution and are correct:
@@ -283,7 +302,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    coder-phase, and radio (`src/radio.rs:539`). Two things do not:
 
    - **Compaction is a sub-execution.** `runtime/src/compaction.rs` calls the endpoint with
-     its own `compactor_model` (a 4B utility agent) inside the specialist's dispatch,
+     its own `compactor_model` (a 4B utility agent) inside the specialist's role execution,
      emitting no bookends. That is correct by the sub-execution clause above; the defect is
      ATTRIBUTION, and it is the `emit_telemetry` violation already named.
    - **The review pipeline bypasses the dispatch primitive entirely.** Its seats call the
