@@ -232,7 +232,7 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    (#1269).
 8. **Work-unit vocabulary** — the four operator-visible work nouns each denote ONE grain,
    and every surface (CLI verb, hash route, wire type, UI label, doc) uses them at that grain
-   (#1974). The containment ladder is **mission > task > step > dispatch**:
+   (#1974). The containment ladder is **mission > phase > task > step > role execution**:
 
    - **run** — the UMBRELLA, never a grain: *a top-level unit of work the operator started*.
      Exactly three kinds (`RunKind`): `mission`, `dispatch`, `lab`. The runs board lists runs;
@@ -260,6 +260,10 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      assignment. Reusing any of them would recreate this exact defect one word over. `shift`
      and `stint` are genuinely free and were weighed for being more humanized; `execution`
      won on precision and on composing cleanly for sub-executions.
+   - **phase** / **task** — the two grouping layers between a mission and its steps
+     (`Mission.phase_ids` -> `Phase.task_ids` -> `Task.step_ids`). A `Task` is also where
+     resource ASSIGNMENT lives (role, profile, workdir, image), which is why a step inherits
+     its staffing rather than declaring it.
    - **step** — a mission-graph node. The step is the NODE; the role execution is what the
      node DID.
      **A step contains ZERO OR MORE role executions, and the cardinality is the reason this
