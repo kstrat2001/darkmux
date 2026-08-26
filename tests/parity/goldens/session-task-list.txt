@@ -18,7 +18,7 @@ github
 task-list
 
 === stage ===
-RUNNING RUN · FETCH-RENDER (task-list on MacBook-Pro)
+RUNNING FETCH-RENDER (task-list on MacBook-Pro)
 route
 LMStudio · local · this machine
 timing
@@ -35,7 +35,7 @@ CONTEXT
 COMPACTIONS
 1071:54 so far
 WALL CLOCK
-model (lms)
+loaded models
 no telemetry yet
 signals
 ✓ clean

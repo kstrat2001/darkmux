@@ -427,13 +427,33 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const metricScope = { model: [0, 1, 2, 3, 4], harness: [5] };
 
   // ── model track ────────────────────────────────────────────────────
-  const modelTrackLabel = ep ? "model (remote)" : "model (lms)";
+  // (#1973) Was `model (lms)`, which named the SUBSYSTEM rather than the
+  // content and left an operator asking what it meant — the question that
+  // started this redesign. It is a list of every model LMStudio held during
+  // the run, so it says that.
+  //
+  // Marking the primary needs no new wire field: the `dispatch start` record
+  // carries the resolved model (`FlowRecord.model`), which is ground truth
+  // for what this role actually ran on. Note it is read from `d?.model`
+  // SPECIFICALLY, not from the `model` binding above — that one falls back to
+  // `distinct[0]`, the first-loaded model, which is a heuristic. Marking a
+  // guess as authoritative is precisely the mistake #1934 is about, so when
+  // the record does not name a model, nothing is marked primary.
+  //
+  // The other entries are labelled `also loaded` and NOT "compactor": what a
+  // secondary model was FOR is not knowable until `telemetry.lms` carries the
+  // profile's declared role (#1973 slice 4). Saying "also loaded" is true;
+  // guessing by size or load order would not be.
+  const primaryModel = d?.model ?? null;
+  const modelTrackLabel = ep ? "remote model" : "loaded models";
   const modelTrackLines = ep
     ? [`${model || "unknown"} · served off-fleet — no local model (see route above)`]
     : loads.length
       ? loads.map((r) => {
           const f = r.fields as Record<string, unknown>;
-          return `${f.model} · ${f.gb ?? "?"}GB`;
+          const isPrimary = primaryModel != null && f.model === primaryModel;
+          const tag = primaryModel == null ? "" : isPrimary ? " · primary" : " · also loaded";
+          return `${f.model} · ${f.gb ?? "?"}GB${tag}`;
         })
       : ["no telemetry yet"];
 

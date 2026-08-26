@@ -131,7 +131,16 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
             invisible on screen and unmissable to the golden. */}
         <span className={`pill pill--${view.header.pillCls}`}>{view.header.pillLabel}</span>{" "}
         <LivenessPulse done={!view.live} animate={ticking} lastBeatMs={view.lastBeatMs} />
-        RUN · {view.header.role}{" "}
+        {/* (#1974) No noun. This view's subject is ONE ROLE EXECUTION — one
+            role, one model, its turns, tokens and signals. `RUN` was the one
+            word contract 8 says it definitely is not: `run` is the umbrella
+            over mission/dispatch/lab, never a grain. `STEP` would be wrong
+            too, since a step contains 0..N role executions (a `dispatch.map`
+            step holds one per item). `DISPATCH` names the run KIND, not what
+            is on screen.
+            The role already names the thing, so the noun is dropped rather
+            than replaced with a differently-wrong one. */}
+        {view.header.role}{" "}
         <span className="session-run__meta">
           ({view.header.sid} on {view.header.machineName})
         </span>

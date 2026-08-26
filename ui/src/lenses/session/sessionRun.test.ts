@@ -52,7 +52,7 @@ function stageSectionOf(goldenText: string): string[] {
  * component's own doc for the exact DOM shape this mirrors. */
 function flattenView(view: ReturnType<typeof runRegions>): string[] {
   const lines: string[] = [];
-  lines.push(`${view.header.pillLabel} RUN · ${view.header.role} (${view.header.sid} on ${view.header.machineName})`);
+  lines.push(`${view.header.pillLabel} ${view.header.role} (${view.header.sid} on ${view.header.machineName})`);
   lines.push(...view.briefLines.map((e) => e.text));
   for (const m of view.metrics) {
     lines.push(m.value, m.label);
@@ -174,7 +174,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.briefLines.map((e) => e.text)).toContain("Azure OpenAI · my-host/gpt-4o · off-fleet");
-    expect(view.modelTrackLabel).toBe("model (remote)");
+    expect(view.modelTrackLabel).toBe("remote model");
     expect(view.modelTrackLines[0]).toMatch(/served off-fleet — no local model/);
   });
 
@@ -197,6 +197,43 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.signalGroups[0].signals[0].atMs).toBeNull();
     expect(view.signalGroups[0].signals[0].offsetLabel).toBe("");
     expect(view.modelTrackLines).toEqual(["a · 10GB", "b · 20GB"]);
+  });
+
+  it("(#1973) marks the PRIMARY loaded model from the dispatch record, and labels the rest honestly", () => {
+    // `model (lms)` named the subsystem, not the content, and listed the
+    // specialist beside the compactor with nothing telling them apart — the
+    // operator question that started this redesign.
+    //
+    // The primary needs no new wire field: the `dispatch start` record's own
+    // `model` is ground truth for what this role ran on. The others are
+    // "also loaded" and deliberately NOT named as the compactor — what a
+    // secondary model was FOR is unknowable until `telemetry.lms` carries the
+    // declared role, and guessing by size or load order is exactly the
+    // inference #1934 is about.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "big-specialist" },
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "big-specialist", gb: 18 } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "small-utility", gb: 2 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.modelTrackLabel).toBe("loaded models");
+    expect(view.modelTrackLines).toEqual([
+      "big-specialist · 18GB · primary",
+      "small-utility · 2GB · also loaded",
+    ]);
+  });
+
+  it("(#1973) marks NOTHING primary when the dispatch record names no model — a guess must not be labelled ground truth", () => {
+    // Without `record.model` the only candidate is the FIRST-LOADED model,
+    // which is a heuristic. Marking it "primary" would assert something the
+    // data does not support; the list simply reports what was loaded.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "a", gb: 10 } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "b", gb: 2 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.modelTrackLines).toEqual(["a · 10GB", "b · 2GB"]);
   });
 
   it("a real detector finding carries its severity/kind/detail, without a fix line", () => {

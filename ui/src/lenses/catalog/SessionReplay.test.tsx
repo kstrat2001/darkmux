@@ -167,7 +167,7 @@ describe("SessionReplay", () => {
     // And the text order the golden pins: COMPACTIONS ... WALL CLOCK ... model track.
     const txt = document.querySelector(".session-run")?.textContent ?? "";
     expect(txt.indexOf("COMPACTIONS")).toBeLessThan(txt.indexOf("WALL CLOCK"));
-    expect(txt.indexOf("WALL CLOCK")).toBeLessThan(txt.indexOf("model ("));
+    expect(txt.indexOf("WALL CLOCK")).toBeLessThan(txt.indexOf("loaded models"));
   });
 
   it("(#1973) renders a signal group with its severity, count badge and run-relative time", async () => {
@@ -275,24 +275,30 @@ describe("SessionReplay", () => {
     vi.useRealTimers();
   });
 
-  it("(#1972) the header keeps EXACTLY one space between the pill and `RUN ·`", async () => {
+  it("(#1972) the header keeps EXACTLY one space between the pill and the role", async () => {
     // The parity golden compares `#stage` innerText byte-for-byte, and the
     // pulse contributes no text of its own — so inserting it is a whitespace
-    // hazard, not a neutral addition. The first attempt shipped
-    // `RUNNING  RUN ·` with two spaces: invisible on screen, unmissable to
-    // the golden, and a full CI round-trip to discover.
+    // hazard, not a neutral addition. The first version shipped a doubled
+    // space: invisible on screen, unmissable to the golden, a full CI
+    // round-trip to discover.
     //
-    // This pins it locally. Parity remains the authority; this is the fast
-    // guard so a whitespace slip costs seconds rather than a CI cycle.
-    stubSession();
-    renderReplay("s-disc");
+    // Scoped to the pill -> role boundary, which is where the pulse sits. A
+    // whole-header whitespace check would fail on correct code, because an
+    // empty role legitimately leaves a doubled space before `(sid on
+    // machine)` — that predates this and is not what is guarded here.
+    // Needs a record with a `handle` — the role is read from there, and the
+    // shared fixture leaves it unset, which legitimately renders an empty
+    // role and a doubled space further along the line.
+    const records = [
+      { ts: "2026-01-01T00:00:00Z", action: "dispatch.start", session_id: "s-hdr", machine_id: "M", handle: "coder", payload: {} },
+      { ts: "2026-01-01T00:01:00Z", action: "dispatch.complete", session_id: "s-hdr", machine_id: "M", payload: {} },
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-hdr");
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
     const header = document.querySelector(".session-run__header")?.textContent ?? "";
-    // Scoped to the pill -> `RUN ·` boundary, which is the one the pulse sits
-    // in. A whole-header whitespace check would be wrong: an empty role
-    // legitimately leaves `RUN ·  (sid on machine)` doubled, which predates
-    // this change and is not what is being pinned here.
-    expect(header).toMatch(/^\S+ RUN · /);
+    // Exactly one space between the pill and the role — no noun between them.
+    expect(header).toMatch(/^COMPLETE CODER /);
   });
 
   // ── (#1973 audit) accessibility ────────────────────────────────────
@@ -412,7 +418,7 @@ describe("SessionReplay", () => {
     expect(screen.getByText(/07:36:48 · running/)).toBeInTheDocument();
     expect(screen.getByText("1071:54 so far")).toBeInTheDocument();
     expect(screen.getByText("TURNS")).toBeInTheDocument();
-    expect(screen.getByText("model (lms)")).toBeInTheDocument();
+    expect(screen.getByText("loaded models")).toBeInTheDocument();
     expect(screen.getByText(/no telemetry yet/i)).toBeInTheDocument();
     expect(screen.getByText("signals")).toBeInTheDocument();
     expect(screen.getByText("✓ clean")).toBeInTheDocument();
