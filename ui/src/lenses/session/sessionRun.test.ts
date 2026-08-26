@@ -58,7 +58,21 @@ function flattenView(view: ReturnType<typeof runRegions>): string[] {
     lines.push(m.value, m.label);
   }
   lines.push(view.modelTrackLabel, ...view.modelTrackLines);
-  lines.push(view.detectionsLabel, ...view.detectionLines);
+  // (#1973) Mirrors the SIGNALS block's DOM: label, then either the clean
+  // pair or, per group, a head line and one line per signal. Note this mirror
+  // is NOT enforced against the component (#1978) — the rendered assertions
+  // live in `SessionReplay.test.tsx`. What this pins is the DERIVATION.
+  lines.push(view.signalsLabel);
+  if (view.signalGroups.length === 0) {
+    lines.push("✓ clean", "no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)");
+  } else {
+    for (const g of view.signalGroups) {
+      lines.push(`${g.severity === "warn" ? "⚠" : "✓"}${g.kind}${g.count > 1 ? `×${g.count}` : ""}`);
+      for (const sig of g.signals) {
+        lines.push(`${sig.offsetLabel}${sig.detail}${sig.fix ? `fix: ${sig.fix}` : ""}`);
+      }
+    }
+  }
   return lines;
 }
 
@@ -172,14 +186,20 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:05:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    expect(view.detectionsLabel).toBe("detections (1)");
-    expect(view.detectionLines[0]).toBe("⚠ jit-model-swap");
-    expect(view.detectionLines[1]).toMatch(/2 models loaded in one run \(a → b\)/);
-    expect(view.detectionLines[2]).toMatch(/^fix: pin one model/);
+    expect(view.signalsLabel).toBe("signals (1)");
+    expect(view.signalGroups).toHaveLength(1);
+    expect(view.signalGroups[0].kind).toBe("jit-model-swap");
+    expect(view.signalGroups[0].severity).toBe("warn");
+    expect(view.signalGroups[0].signals[0].detail).toMatch(/2 models loaded in one run \(a → b\)/);
+    expect(view.signalGroups[0].signals[0].fix).toMatch(/^pin one model/);
+    // Synthesized from the load track, so it has no record and no moment —
+    // it must say so rather than borrow one.
+    expect(view.signalGroups[0].signals[0].atMs).toBeNull();
+    expect(view.signalGroups[0].signals[0].offsetLabel).toBe("");
     expect(view.modelTrackLines).toEqual(["a · 10GB", "b · 20GB"]);
   });
 
-  it("a real detector finding renders its severity/kind/detail, without a fix line", () => {
+  it("a real detector finding carries its severity/kind/detail, without a fix line", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
       {
@@ -192,7 +212,89 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
-    expect(view.detectionLines).toEqual(["⚠ cycle", "repeated identical tool call 4x"]);
+    expect(view.signalGroups).toEqual([
+      {
+        kind: "cycle",
+        severity: "warn",
+        count: 1,
+        signals: [
+          {
+            kind: "cycle",
+            severity: "warn",
+            detail: "repeated identical tool call 4x",
+            // 30s after `dispatch.start` — run-relative, because "how far in
+            // did this start" is the question, and a wall-clock stamp makes
+            // the reader compute it.
+            atMs: Date.parse("2026-01-01T00:00:30Z"),
+            offsetLabel: "+0:30",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("(#1973) an `info` signal is NOT rendered as a warning — a recovery is not a struggle", () => {
+    // `dispatch_internal` emits `severity: "info"` for `intra-turn-stall`,
+    // which reports that a stall RECOVERED. The old viewer dropped severity
+    // entirely and prefixed every entry with `⚠`, so a successful recovery
+    // looked exactly like a doom loop.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:00:30Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        fields: { severity: "info", kind: "intra-turn-stall", detail: "stall recovered after 45s" },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups[0].severity).toBe("info");
+  });
+
+  it("(#1973) an UNRECOGNIZED severity degrades to warn, never to info", () => {
+    // A severity this build does not know is more likely to matter than not.
+    // Degrading it to `info` is how a new detector ships invisible.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      {
+        ts: "2026-01-01T00:00:05Z",
+        session_id: "s1",
+        category: "telemetry",
+        source: "detector",
+        fields: { severity: "catastrophic", kind: "future-detector", detail: "something new" },
+      },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups[0].severity).toBe("warn");
+  });
+
+  it("(#1973) groups repeats by kind with a count, and orders warn before info", () => {
+    // Eleven cycle detections should be ONE row that says 11, not eleven rows
+    // that bury everything else — and a recovery must never outrank a
+    // struggle, whatever order the records happen to arrive in.
+    const det = (ts: string, kind: string, severity: string) => ({
+      ts,
+      session_id: "s1",
+      category: "telemetry" as const,
+      source: "detector",
+      fields: { severity, kind, detail: `${kind} at ${ts}` },
+    });
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // The `info` one arrives LAST in time, so recency alone would float it.
+      det("2026-01-01T00:00:10Z", "cycle", "warn"),
+      det("2026-01-01T00:00:20Z", "cycle", "warn"),
+      det("2026-01-01T00:00:50Z", "intra-turn-stall", "info"),
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalsLabel).toBe("signals (3)");
+    expect(view.signalGroups.map((g) => [g.kind, g.count, g.severity])).toEqual([
+      ["cycle", 2, "warn"],
+      ["intra-turn-stall", 1, "info"],
+    ]);
+    // Newest first WITHIN a group.
+    expect(view.signalGroups[0].signals.map((x) => x.offsetLabel)).toEqual(["+0:20", "+0:10"]);
   });
 
   it("no dispatch.start at all falls back to the first record on the session, and reads 'no start'", () => {

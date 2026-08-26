@@ -154,11 +154,37 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
       </div>
 
 
-      <div className="track">
-        <div className="lbl">{view.detectionsLabel}</div>
-        {view.detectionLines.map((line, i) => (
-          <div key={i}>{line}</div>
-        ))}
+      {/* (#1973) SIGNALS — grouped by kind, severity-coded, run-relative
+          times. Was a flat list of grey strings with a `⚠` in front of every
+          entry, including the ones that report a successful RECOVERY. */}
+      <div className="track signals">
+        <div className="lbl">{view.signalsLabel}</div>
+        {view.signalGroups.length === 0 ? (
+          <>
+            <div>✓ clean</div>
+            <div>no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)</div>
+          </>
+        ) : (
+          view.signalGroups.map((g) => (
+            <div className={`signal signal--${g.severity}`} key={g.kind} data-severity={g.severity}>
+              <div className="signal__head">
+                <span className="signal__glyph" aria-hidden="true">
+                  {g.severity === "warn" ? "⚠" : "✓"}
+                </span>
+                <span className="signal__kind">{g.kind}</span>
+                {/* Count only when it IS a count. `×1` is noise on every row. */}
+                {g.count > 1 && <span className="signal__count">×{g.count}</span>}
+              </div>
+              {g.signals.map((sig, i) => (
+                <div className="signal__row" key={i}>
+                  {sig.offsetLabel && <span className="signal__at">{sig.offsetLabel}</span>}
+                  <span className="signal__detail">{sig.detail}</span>
+                  {sig.fix ? <span className="signal__fix">fix: {sig.fix}</span> : null}
+                </div>
+              ))}
+            </div>
+          ))
+        )}
       </div>
     </div>
   );

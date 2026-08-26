@@ -3316,6 +3316,75 @@ body {
   font-size: 11px;
 }
 
+/* (#1973) SIGNALS. The block was an undifferentiated grey dump: every entry
+   prefixed `⚠`, no times, no grouping, and severity — which the emitter has
+   always sent — thrown away, so a successful recovery looked like a doom
+   loop. Colour carries severity, but never ALONE: the glyph (⚠ vs ✓) and the
+   `data-severity` attribute both encode it too, so the distinction survives
+   monochrome and colour-blind viewing. */
+.session-run .signals .signal {
+  border-left: 2px solid var(--border);
+  padding: 4px 0 4px 8px;
+  margin: 6px 0;
+}
+.session-run .signals .signal--warn {
+  border-left-color: #d08b3a;
+}
+.session-run .signals .signal--info {
+  border-left-color: #3a8fd0;
+}
+.session-run .signals .signal__head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11px;
+}
+.session-run .signals .signal--warn .signal__glyph,
+.session-run .signals .signal--warn .signal__kind {
+  color: #e0a45c;
+}
+.session-run .signals .signal--info .signal__glyph,
+.session-run .signals .signal--info .signal__kind {
+  color: #6fb3e8;
+}
+.session-run .signals .signal__kind {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+/* A count badge, shown only when there IS a count — `×1` on every row is
+   noise, not information. */
+.session-run .signals .signal__count {
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+.session-run .signals .signal__row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: 2px;
+}
+/* Run-relative time, tabular so a column of them lines up. */
+.session-run .signals .signal__at {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--dim);
+  opacity: 0.75;
+}
+.session-run .signals .signal__detail {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.session-run .signals .signal__fix {
+  flex: 0 0 auto;
+  color: var(--fg);
+  opacity: 0.8;
+}
+
 /* (#1973) Payload disclosure — the prompt, reachable rather than summarized
    away. `<details>` is used deliberately: keyboard-operable and
    find-in-page-searchable with no JS, and the body is in the DOM whether or

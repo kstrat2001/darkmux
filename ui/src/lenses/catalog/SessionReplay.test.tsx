@@ -170,6 +170,48 @@ describe("SessionReplay", () => {
     expect(txt.indexOf("WALL CLOCK")).toBeLessThan(txt.indexOf("model ("));
   });
 
+  it("(#1973) renders a signal group with its severity, count badge and run-relative time", async () => {
+    // The rendered half of the SIGNALS redesign. `sessionRun.test.ts` pins the
+    // DERIVATION; this pins what an operator actually sees, because that file
+    // compares a hand-written mirror and never renders the component (#1978).
+    const det = (ts: string, kind: string, severity: string) => ({
+      ts,
+      session_id: "s-sig",
+      category: "telemetry",
+      source: "detector",
+      machine_id: "MacBook-Pro",
+      payload: { severity, kind, detail: `${kind} detail` },
+    });
+    const records = [
+      { ts: "2026-01-01T00:00:00Z", action: "dispatch.start", session_id: "s-sig", machine_id: "MacBook-Pro", payload: { role: "coder" } },
+      det("2026-01-01T00:00:10Z", "cycle", "warn"),
+      det("2026-01-01T00:00:20Z", "cycle", "warn"),
+      det("2026-01-01T00:00:50Z", "intra-turn-stall", "info"),
+    ];
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({ records }), { status: 200 }))));
+    renderReplay("s-sig");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+    const groups = [...document.querySelectorAll(".signals .signal")];
+    expect(groups).toHaveLength(2);
+
+    // Severity is encoded THREE ways, so it survives monochrome and
+    // colour-blind viewing: the attribute, the class, and the glyph.
+    expect(groups[0].getAttribute("data-severity")).toBe("warn");
+    expect(groups[0].querySelector(".signal__glyph")?.textContent).toBe("⚠");
+    expect(groups[0].querySelector(".signal__kind")?.textContent).toBe("cycle");
+    expect(groups[0].querySelector(".signal__count")?.textContent).toBe("×2");
+
+    // A recovery is NOT a warning — the defect this redesign fixes.
+    expect(groups[1].getAttribute("data-severity")).toBe("info");
+    expect(groups[1].querySelector(".signal__glyph")?.textContent).toBe("✓");
+    // ...and carries no count badge, because `×1` on every row is noise.
+    expect(groups[1].querySelector(".signal__count")).toBeNull();
+
+    // Run-relative times, newest first inside the group.
+    expect([...groups[0].querySelectorAll(".signal__at")].map((e) => e.textContent)).toEqual(["+0:20", "+0:10"]);
+  });
+
   it("renders pending while the fetch is in flight", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     renderReplay("s1");
@@ -192,7 +234,7 @@ describe("SessionReplay", () => {
     await waitFor(() => expect(screen.getByText(/no records found for session s1/i)).toBeInTheDocument());
   });
 
-  it("renders the real run view — header, brief, metrics, detections — against the recorded corpus fixture", async () => {
+  it("renders the real run view — header, brief, metrics, signals — against the recorded corpus fixture", async () => {
     const raw = JSON.parse(readFileSync(path.join(REPO_ROOT, "tests/parity/corpus/flow-session-task-list.json"), "utf8"));
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify(raw), { status: 200 }))));
     renderReplay("task-list");
@@ -205,7 +247,7 @@ describe("SessionReplay", () => {
     expect(screen.getByText("TURNS")).toBeInTheDocument();
     expect(screen.getByText("model (lms)")).toBeInTheDocument();
     expect(screen.getByText(/no telemetry yet/i)).toBeInTheDocument();
-    expect(screen.getByText("detections")).toBeInTheDocument();
+    expect(screen.getByText("signals")).toBeInTheDocument();
     expect(screen.getByText("✓ clean")).toBeInTheDocument();
     expect(screen.getByText(/no behavioral flags/i)).toBeInTheDocument();
   });
