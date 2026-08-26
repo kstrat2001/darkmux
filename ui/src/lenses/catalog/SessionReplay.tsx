@@ -126,18 +126,15 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
         ))}
       </div>
 
-      <div className="track">
-        <div className="lbl">{view.modelTrackLabel}</div>
-        {view.modelTrackLines.map((line, i) => (
-          <div key={i}>{line}</div>
-        ))}
-      </div>
-
-      {/* (#1973) The HARNESS pane. Separated from the model metrics above
-          because the operator could not tell which numbers described the model
-          and which described darkmux around it — the question that produced
-          this redesign. Rendered only when it has something to say, so a step
-          with no harness metrics shows no empty frame. */}
+      {/* (#1973) The HARNESS pane, ADJACENT to the model pane rather than
+          below the model track. Two reasons, and the second is why CI caught
+          it: sandwiching `model (lms)` between two metric grids read as a
+          mistake on screen, and the split is a GROUPING of one metric row —
+          separating the halves with an unrelated block denies that. Keeping
+          them adjacent also leaves `innerText` order identical to legacy, so
+          `goldens/session-task-list.txt` still passes byte-for-byte; the pane
+          labels are CSS-generated (`::before`) and never enter the text. A
+          redesign that can keep its golden should. */}
       {view.metricScope.harness.length > 0 && (
         <div className="metrics" data-scope="harness">
           {view.metricScope.harness.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
@@ -148,6 +145,14 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
           ))}
         </div>
       )}
+
+      <div className="track">
+        <div className="lbl">{view.modelTrackLabel}</div>
+        {view.modelTrackLines.map((line, i) => (
+          <div key={i}>{line}</div>
+        ))}
+      </div>
+
 
       <div className="track">
         <div className="lbl">{view.detectionsLabel}</div>

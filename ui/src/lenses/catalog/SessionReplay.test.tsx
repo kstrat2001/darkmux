@@ -143,6 +143,33 @@ describe("SessionReplay", () => {
     expect(harness?.textContent).toContain("WALL CLOCK");
   });
 
+  it("(#1973) keeps the two metric panes ADJACENT, so text order still matches the legacy golden", async () => {
+    // CI caught what the screen did not. The first version of the pane split
+    // rendered HARNESS *below* the model track, which sandwiched
+    // `model (lms)` between two metric grids — and, because the parity spec
+    // compares the rendered `#stage` text byte-for-byte against
+    // `goldens/session-task-list.txt`, moved WALL CLOCK after `model (lms)`
+    // and failed it.
+    //
+    // Adjacency is the fix for both: it reads as one grouped metric row, and
+    // `innerText` order stays identical to legacy (the pane labels are
+    // CSS-generated and never enter the text). This asserts it locally,
+    // because the parity suite only runs in CI and a layout regression should
+    // not need a full playwright run to surface.
+    stubSession();
+    renderReplay("s-disc");
+    await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
+
+    const model = document.querySelector('.metrics[data-scope="model"]');
+    const harness = document.querySelector('.metrics[data-scope="harness"]');
+    expect(model?.nextElementSibling, "HARNESS must directly follow MODEL — nothing between them").toBe(harness);
+
+    // And the text order the golden pins: COMPACTIONS ... WALL CLOCK ... model track.
+    const txt = document.querySelector(".session-run")?.textContent ?? "";
+    expect(txt.indexOf("COMPACTIONS")).toBeLessThan(txt.indexOf("WALL CLOCK"));
+    expect(txt.indexOf("WALL CLOCK")).toBeLessThan(txt.indexOf("model ("));
+  });
+
   it("renders pending while the fetch is in flight", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     renderReplay("s1");
