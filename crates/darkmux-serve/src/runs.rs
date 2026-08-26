@@ -84,6 +84,7 @@
 
 use crate::LabRunSummary;
 use darkmux_crew::envelope::MissionOutcomeStatus;
+use darkmux_crew::step_kinds::StepKindRegistry;
 use darkmux_crew::types::{Mission, MissionStatus, Phase, Step, Task};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as StdPath, PathBuf};
@@ -657,12 +658,15 @@ fn crew_of_one_shape(mission: &Mission, phases_by_id: &HashMap<String, Phase>) -
 /// already pay.
 fn collect_mission_step_sessions(mission: &Mission) -> HashSet<String> {
     let mut out = HashSet::new();
+    // Built once per mission, not per step — `with_builtins` allocates five
+    // `Arc`s and a map.
+    let registry = StepKindRegistry::with_builtins();
     for phase_id in &mission.phase_ids {
         let Ok(steps) = darkmux_crew::lifecycle::load_steps_for_phase(&mission.id, phase_id) else {
             continue;
         };
         for step in steps {
-            if let Some(sid) = step_session_id(&step) {
+            if let Some(sid) = step_session_id(&step, &registry) {
                 out.insert(sid);
             }
         }
@@ -670,24 +674,43 @@ fn collect_mission_step_sessions(mission: &Mission) -> HashSet<String> {
     out
 }
 
-/// A `Step`'s dispatch session_id: the explicit `config["session_id"]` when
-/// present, else the default ITS OWN step kind falls back to at dispatch
-/// time (see `crates/darkmux-crew/src/step_kinds/builtins.rs`:
-/// `DispatchInternalStepKind::run` -> `session_id::step(&step.id)` when no
-/// `config.session_id`; `DispatchSingleShotStepKind::run`'s hosted branch ->
-/// `session_id::task(&step.task_id)`). `None` for a step kind with no known
-/// session-id convention (e.g. a purely procedural kind that never
-/// dispatches at all) — nothing to register for those.
-fn step_session_id(step: &Step) -> Option<String> {
-    if let Some(sid) = step.config.get("session_id").and_then(|v| v.as_str()) {
-        if !sid.is_empty() {
-            return Some(sid.to_string());
+/// A `Step`'s dispatch session_id — **asked of the kind, never re-derived
+/// here** (#1979).
+///
+/// This used to be a `match step.kind.as_str()` with a `_ => None` arm, so
+/// the convention lived in two files that nothing kept agreeing.
+///
+/// **Honest scope of the defect** (narrowed by the #1979 QA gate, which
+/// could not reproduce the original claim): an unlisted kind's session went
+/// unclaimed by [`collect_mission_step_sessions`], but that alone does NOT
+/// produce a ghost row. [`ghost_runs`] has a SECOND gate —
+/// `known_mission_ids.contains(agg.mission_id)` — and every production
+/// `run_step_graph` caller backfills `mission_id` (#1641), so a
+/// locally-launched mission's records were already suppressed by mission id.
+/// This is therefore defense-in-depth and a de-duplication of the
+/// convention, not a fix for a reproducible doubled row. Asking the kind is
+/// still right: two files encoding one convention with a silent catch-all is
+/// how the next emitter that skips the `mission_id` backfill becomes a bug
+/// nobody notices.
+///
+/// A kind not in the registry (a Tier 3 kind registered per-launch, e.g.
+/// review's or coder-phase's) falls back to the trait's own default rather
+/// than to `None`, so it is claimed by construction. That is the opposite
+/// of the old catch-all: an unknown kind is now assumed to dispatch under
+/// the documented default, not assumed to be invisible.
+fn step_session_id(step: &Step, registry: &StepKindRegistry) -> Option<String> {
+    match registry.get(&step.kind) {
+        Ok(kind) => kind.dispatch_session_id(step),
+        // Not a built-in. Reproduce the trait default rather than dropping
+        // the step: explicit config wins, else the step-scoped default.
+        Err(_) => {
+            if let Some(sid) = step.config.get("session_id").and_then(|v| v.as_str()) {
+                if !sid.is_empty() {
+                    return Some(sid.to_string());
+                }
+            }
+            Some(darkmux_types::session_id::step(&step.id))
         }
-    }
-    match step.kind.as_str() {
-        "dispatch.internal" => Some(darkmux_types::session_id::step(&step.id)),
-        "dispatch.single_shot" => Some(darkmux_types::session_id::task(&step.task_id)),
-        _ => None,
     }
 }
 
@@ -830,7 +853,22 @@ fn mission_to_run(
         .finalized_ts
         .or_else(|| terminal_ts_str.as_deref().and_then(parse_flow_ts));
 
-    let sessions_bare: Vec<&SessionAgg> = sessions.iter().map(|(_, s)| *s).collect();
+    // (#1979 QA gate) STATUS is computed only over sessions this mission can
+    // legitimately claim. A `session_id` whose records span more than one
+    // mission is corrupt for this purpose — `session_id::task` hashes only
+    // `task_id`, which comes straight out of a mission CONFIG
+    // (`crew::scheduler`'s own doc), so every run of `coder-phase.json`
+    // shares `task-build-coder`. Feeding such an agg into
+    // `mission_run_status` lets one mission read Running off ANOTHER
+    // mission's activity clock: the agg is permanently non-terminal (its
+    // records are `step start`/`step complete`, which
+    // `terminal_status_for_action` maps to `None`), so it both disables the
+    // all-terminal branch and keeps `session_is_live` true. `is_ambiguous`
+    // is the detector that already exists for exactly this corruption.
+    // Membership (`sessions`) deliberately keeps them — claiming the
+    // session still suppresses a ghost row; only STATUS is narrowed.
+    let sessions_bare: Vec<&SessionAgg> =
+        sessions.iter().map(|(_, s)| *s).filter(|s| !s.is_ambiguous()).collect();
     let status = mission_run_status(mission, &sessions_bare, now_ms);
     // (#1907) `mission_run_status` has exactly ONE arm that reaches
     // `Abandoned` via a deliberate teardown — `MissionStatus::Aborted =>
@@ -1996,7 +2034,7 @@ mod tests {
     #[test]
     fn step_session_id_prefers_explicit_config_over_the_kind_default() {
         let step = minimal_step("s1", "t1", Some("explicit-sid"));
-        assert_eq!(step_session_id(&step), Some("explicit-sid".to_string()));
+        assert_eq!(step_session_id(&step, &StepKindRegistry::with_builtins()), Some("explicit-sid".to_string()));
     }
 
     #[test]
@@ -2006,21 +2044,63 @@ mod tests {
         // itself falls back to when `config.session_id` is absent.
         let mut step = minimal_step("s-generic", "t1", None);
         step.kind = "dispatch.internal".to_string();
-        assert_eq!(step_session_id(&step), Some(darkmux_types::session_id::step("s-generic")));
+        assert_eq!(step_session_id(&step, &StepKindRegistry::with_builtins()), Some(darkmux_types::session_id::step("s-generic")));
     }
 
     #[test]
     fn step_session_id_defaults_dispatch_single_shot_to_the_task_scoped_session() {
         let mut step = minimal_step("s-single", "t-owner", None);
         step.kind = "dispatch.single_shot".to_string();
-        assert_eq!(step_session_id(&step), Some(darkmux_types::session_id::task("t-owner")));
+        assert_eq!(step_session_id(&step, &StepKindRegistry::with_builtins()), Some(darkmux_types::session_id::task("t-owner")));
     }
 
     #[test]
-    fn step_session_id_unknown_kind_has_no_default() {
+    fn step_session_id_procedural_kind_opts_out_explicitly() {
+        // (#1979) Renamed from `..._unknown_kind_has_no_default`, which
+        // conflated two different things under one `None`: a kind that
+        // DECLARES it never dispatches, and a kind nobody taught the
+        // resolver about. `procedural.noop` is the first — a registered
+        // kind whose own `dispatch_session_id` returns `None` on purpose.
+        // The second case is now the opposite behavior; see the next test.
         let mut step = minimal_step("s-proc", "t1", None);
         step.kind = "procedural.noop".to_string();
-        assert_eq!(step_session_id(&step), None);
+        assert_eq!(step_session_id(&step, &StepKindRegistry::with_builtins()), None);
+    }
+
+    #[test]
+    fn step_session_id_unregistered_kind_is_claimed_by_the_default_not_dropped() {
+        // (#1979) THE behavior change. The old `match step.kind.as_str()`
+        // ended in `_ => None`, so any kind it had not been taught about —
+        // a Tier 3 kind registered per-launch, or simply a new one — had
+        // its session left unclaimed by `collect_mission_step_sessions`,
+        // and its records then surfaced as a duplicate untracked ghost row
+        // (`ghost_runs`'s `known_session_ids` gate). Nothing failed until
+        // an operator noticed the doubled row.
+        //
+        // An unregistered kind now falls back to the TRAIT DEFAULT, so it
+        // is claimed by construction. Assumed-dispatching is the safe
+        // direction: over-claiming a session that never appears costs
+        // nothing, while under-claiming one that does produces a phantom
+        // run on the board.
+        let mut step = minimal_step("s-tier3", "t1", None);
+        step.kind = "review.judge".to_string();
+        assert_eq!(
+            step_session_id(&step, &StepKindRegistry::with_builtins()),
+            Some(darkmux_types::session_id::step("s-tier3")),
+        );
+    }
+
+    #[test]
+    fn step_session_id_unregistered_kind_still_honors_an_explicit_config_session() {
+        // The fallback must not swallow a caller-named session — review's
+        // and coder-phase's steps DO set one, and claiming the wrong id
+        // would reintroduce the ghost this fixes from the other side.
+        let mut step = minimal_step("s-tier3", "t1", Some("mission-run-m1-p1"));
+        step.kind = "review.judge".to_string();
+        assert_eq!(
+            step_session_id(&step, &StepKindRegistry::with_builtins()),
+            Some("mission-run-m1-p1".to_string()),
+        );
     }
 
     // ── mission_run_status ──────────────────────────────────────────────

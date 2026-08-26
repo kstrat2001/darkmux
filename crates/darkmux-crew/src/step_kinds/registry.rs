@@ -152,6 +152,111 @@ mod tests {
         }
     }
 
+    /// The steps every registered kind is asked about below.
+    fn conformance_step(kind: &str) -> Step {
+        Step {
+            id: "s-conf".to_string(),
+            task_id: "t-conf".to_string(),
+            gate: None,
+            kind: kind.to_string(),
+            status: crate::types::NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        }
+    }
+
+    /// (#1979) The session each registered kind MUST resolve, pinned by
+    /// VALUE. Not `Option::is_some` — see the test below for why that
+    /// distinction is the entire point of this table.
+    ///
+    /// `None` means the kind declares it never dispatches. Landing on that
+    /// requires a deliberate two-sided edit (the override AND this row), so
+    /// it cannot absorb a mistake.
+    fn expected_session(kind_id: &str, step: &Step) -> Option<Option<String>> {
+        Some(match kind_id {
+            // Step-scoped: a solo dispatch owns its own session.
+            "dispatch.internal" => Some(darkmux_types::session_id::step(&step.id)),
+            // Task-scoped: sibling seats fanned out within one task share a
+            // join key so a seat's tokens tie to its endpoint.
+            "dispatch.single_shot" | "dispatch.map" => {
+                Some(darkmux_types::session_id::task(&step.task_id))
+            }
+            // Declared no-dispatch.
+            "procedural.shell" | "procedural.noop" => None,
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn every_registered_kind_resolves_the_session_it_actually_emits_under() {
+        // The structural half of #1979 — and it asserts the VALUE, which an
+        // earlier version of this test did not.
+        //
+        // That earlier version asserted only `resolved.is_some()` for every
+        // dispatching kind. Because `dispatch_session_id` has a trait
+        // DEFAULT, the default answered on behalf of any kind that forgot to
+        // override — with a STEP-scoped id. So a kind whose real convention
+        // is task-scoped could lose its override and the test stayed green:
+        // deleting `DispatchMapStepKind::dispatch_session_id` left 761
+        // darkmux-crew and 331 darkmux-serve tests passing. It caught
+        // "returns nothing" and missed "returns the wrong thing", which is
+        // the failure that actually matters — a wrong session is claimed for
+        // the mission and the real one is not.
+        //
+        // Iterating the REGISTRY is still the point: a sixth kind fails here
+        // the moment it is registered, because `expected_session` will not
+        // have a row for it. That is deliberate — a new kind must state its
+        // convention in BOTH places, and the mismatch is what forces the
+        // author to look at what the kind really emits.
+        let registry = StepKindRegistry::with_builtins();
+        for id in registry.ids() {
+            let kind = registry.get(&id).expect("registry.ids() only yields registered kinds");
+            let step = conformance_step(&id);
+            let expected = expected_session(&id, &step).unwrap_or_else(|| {
+                panic!(
+                    "step kind `{id}` is registered but has no row in `expected_session`. \
+                     Add one naming the session this kind ACTUALLY emits under (check its \
+                     `run`/`run_streaming` in step_kinds::builtins), or `None` if it never \
+                     dispatches. Do not guess from the trait default — the default is \
+                     step-scoped, and a fan-out kind that shares a task-scoped join key \
+                     would silently disagree with its own emission.",
+                )
+            });
+            assert_eq!(
+                kind.dispatch_session_id(&step),
+                expected,
+                "{id} resolves a different session than the one pinned in `expected_session`. \
+                 A forward prediction that disagrees with the real emission claims the wrong \
+                 session for a mission and leaves the real one unclaimed.",
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_config_session_wins_for_every_dispatching_kind() {
+        // The caller-named session (review's seats, coder-phase's
+        // `mission-run-` ids) must survive every kind's own convention —
+        // claiming the wrong id reintroduces the ghost from the other side.
+        let registry = StepKindRegistry::with_builtins();
+        for id in registry.ids() {
+            // Skip the declared no-dispatch kinds — they resolve `None`
+            // whatever the config says, which is their whole contract.
+            if expected_session(&id, &conformance_step(&id)) == Some(None) {
+                continue;
+            }
+            let kind = registry.get(&id).unwrap();
+            let mut step = conformance_step(&id);
+            step.config = serde_json::json!({ "session_id": "caller-named" });
+            assert_eq!(
+                kind.dispatch_session_id(&step),
+                Some("caller-named".to_string()),
+                "{id} ignored an explicit config session_id",
+            );
+        }
+    }
+
     #[test]
     fn register_and_lookup_basic() {
         let registry = StepKindRegistry::new();
