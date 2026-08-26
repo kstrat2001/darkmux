@@ -474,6 +474,55 @@ pub trait StepKind: Send + Sync {
         self.id()
     }
 
+    /// (#1979) The `session_id` this kind's own DISPATCH records land under —
+    /// the FORWARD direction (step -> session), which only the kind can
+    /// answer, because the kind is what chooses it at dispatch time.
+    ///
+    /// **Do not confuse this with attribution.** Mapping a record BACK to its
+    /// step is the reverse direction, and it needs no kind knowledge at all:
+    /// `darkmux-serve`'s `step_for_record` and the viewer's `stepForRecord`
+    /// resolve it from the record alone via `payload.step_id` -> a
+    /// step-scoped `session_id` -> `handle`. A consumer that switches on
+    /// `step.kind` to attribute a record is a bug. This method exists only
+    /// because ghost-suppression must predict a step's session BEFORE any
+    /// record for it exists.
+    ///
+    /// Why it has to be asked rather than matched: `darkmux-serve`'s
+    /// `step_session_id` used to re-derive this with `match
+    /// step.kind.as_str()` and a `_ => None` arm, so the convention lived in
+    /// two files that nothing kept agreeing. A new DISPATCHING kind fell into
+    /// the catch-all, its session went unclaimed, and its records surfaced as
+    /// a duplicate untracked "ghost" row on the runs board — with no test, no
+    /// doctor check and no compile error to say so. The failure needed an
+    /// operator to notice a doubled row.
+    ///
+    /// Defaults to `session_id::step(&step.id)`, matching that helper's own
+    /// documented role as "the step-scoped default dispatch session id", so a
+    /// new dispatching kind is claimed by construction. An explicit
+    /// `config["session_id"]` always wins — a caller that names the session
+    /// owns it.
+    ///
+    /// Return `None` ONLY for a kind that genuinely never dispatches
+    /// (`procedural.*`). That is a deliberate opt-out, not a fallback: the
+    /// registry conformance test in `step_kinds::registry` requires every
+    /// registered kind to either resolve a session or be named on the
+    /// documented no-dispatch list, so "nobody implemented it yet" cannot
+    /// masquerade as "there is nothing here".
+    ///
+    /// This is the kind's OWN dispatch session only. Every step ALSO has its
+    /// scheduler-emitted lifecycle records under
+    /// `session_id::task(&step.task_id)` (`scheduler::step_lifecycle_record`)
+    /// — that is the scheduler's invariant, true for every kind, so a
+    /// consumer adds it once rather than asking each kind about it.
+    fn dispatch_session_id(&self, step: &Step) -> Option<String> {
+        if let Some(sid) = step.config.get("session_id").and_then(|v| v.as_str()) {
+            if !sid.is_empty() {
+                return Some(sid.to_string());
+            }
+        }
+        Some(darkmux_types::session_id::step(&step.id))
+    }
+
     /// (#1230 Packet 3) Which local model, if any, this step needs
     /// resident before it can run — feeds `run_step_graph`'s per-step
     /// `Residency::Local(Placement)` vs `Residency::Remote` classification

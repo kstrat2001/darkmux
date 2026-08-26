@@ -152,6 +152,84 @@ mod tests {
         }
     }
 
+    /// The steps every registered kind is asked about below.
+    fn conformance_step(kind: &str) -> Step {
+        Step {
+            id: "s-conf".to_string(),
+            task_id: "t-conf".to_string(),
+            gate: None,
+            kind: kind.to_string(),
+            status: crate::types::NodeStatus::Planned,
+            config: serde_json::Value::Null,
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        }
+    }
+
+    /// (#1979) Kinds that DECLARE they never dispatch, and so legitimately
+    /// resolve no session. Adding a kind here is a deliberate, reviewable
+    /// act; forgetting to implement `dispatch_session_id` is not, and the
+    /// test below is what tells those two apart.
+    const NO_DISPATCH_KINDS: &[&str] = &["procedural.shell", "procedural.noop"];
+
+    #[test]
+    fn every_registered_kind_resolves_a_dispatch_session_or_declares_it_has_none() {
+        // The structural half of #1979. `darkmux-serve`'s `step_session_id`
+        // used to re-derive this convention with `match step.kind.as_str()`
+        // and a `_ => None` arm — so a kind nobody added to that match had
+        // its session left unclaimed, and its records surfaced as a
+        // duplicate untracked "ghost" row on the runs board with no test,
+        // no doctor check and no compile error to say so.
+        //
+        // Iterating the REGISTRY rather than a hand-written list is the
+        // point: a sixth kind is covered by this test the moment it is
+        // registered, without anyone remembering to extend anything. That
+        // is the difference between a rule that is enforced and a rule
+        // that is written down.
+        let registry = StepKindRegistry::with_builtins();
+        for id in registry.ids() {
+            let kind = registry.get(&id).expect("registry.ids() only yields registered kinds");
+            let resolved = kind.dispatch_session_id(&conformance_step(&id));
+            if NO_DISPATCH_KINDS.contains(&id.as_str()) {
+                assert_eq!(
+                    resolved, None,
+                    "{id} is on NO_DISPATCH_KINDS but resolved a session — either it dispatches now \
+                     (remove it from the list) or the override is wrong",
+                );
+            } else {
+                assert!(
+                    resolved.is_some(),
+                    "{id} resolved NO dispatch session. A dispatching kind whose session is \
+                     unclaimed surfaces as a duplicate ghost row on the runs board. Either \
+                     implement `dispatch_session_id`, or add {id} to NO_DISPATCH_KINDS with a \
+                     reason if it genuinely never dispatches.",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_config_session_wins_for_every_dispatching_kind() {
+        // The caller-named session (review's seats, coder-phase's
+        // `mission-run-` ids) must survive every kind's own convention —
+        // claiming the wrong id reintroduces the ghost from the other side.
+        let registry = StepKindRegistry::with_builtins();
+        for id in registry.ids() {
+            if NO_DISPATCH_KINDS.contains(&id.as_str()) {
+                continue;
+            }
+            let kind = registry.get(&id).unwrap();
+            let mut step = conformance_step(&id);
+            step.config = serde_json::json!({ "session_id": "caller-named" });
+            assert_eq!(
+                kind.dispatch_session_id(&step),
+                Some("caller-named".to_string()),
+                "{id} ignored an explicit config session_id",
+            );
+        }
+    }
+
     #[test]
     fn register_and_lookup_basic() {
         let registry = StepKindRegistry::new();

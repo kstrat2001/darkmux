@@ -553,6 +553,23 @@ impl StepKind for DispatchSingleShotStepKind {
         "Dispatch (single-shot)"
     }
 
+    /// (#1979) Task-scoped, NOT the trait default's step scope. Deliberate:
+    /// sibling seats fanned out within one task share this key so a
+    /// consumer can join a seat's tokens to its endpoint (see the record
+    /// built in this kind's own dispatch path, and `session_id::task`'s
+    /// doc). The step remains individually attributable through
+    /// `payload.step_id` and `handle` — grouping and identity are different
+    /// jobs, and this field is the grouping one.
+    fn dispatch_session_id(&self, step: &Step) -> Option<String> {
+        if let Some(sid) = step.config.get("session_id").and_then(|v| v.as_str()) {
+            if !sid.is_empty() {
+                return Some(sid.to_string());
+            }
+        }
+        Some(darkmux_types::session_id::task(&step.task_id))
+    }
+
+
     fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         use crate::single_shot::{
             single_shot_chat, single_shot_chat_hosted, HostedSingleShotRequest,
@@ -1912,6 +1929,23 @@ impl StepKind for DispatchMapStepKind {
         "Dispatch (map)"
     }
 
+    /// (#1979) Task-scoped, NOT the trait default's step scope. Deliberate:
+    /// sibling seats fanned out within one task share this key so a
+    /// consumer can join a seat's tokens to its endpoint (see the record
+    /// built in this kind's own dispatch path, and `session_id::task`'s
+    /// doc). The step remains individually attributable through
+    /// `payload.step_id` and `handle` — grouping and identity are different
+    /// jobs, and this field is the grouping one.
+    fn dispatch_session_id(&self, step: &Step) -> Option<String> {
+        if let Some(sid) = step.config.get("session_id").and_then(|v| v.as_str()) {
+            if !sid.is_empty() {
+                return Some(sid.to_string());
+            }
+        }
+        Some(darkmux_types::session_id::task(&step.task_id))
+    }
+
+
     fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         // Ctx-free path (unit tests / callers with no scheduler seam): every
         // record batches into `StepOutcome.flow_records`, and the remote
@@ -2004,6 +2038,17 @@ impl StepKind for ProceduralShellStepKind {
         "Shell"
     }
 
+    /// (#1979) `None` — the documented no-dispatch opt-out. This kind
+    /// performs no model work, so it owns no dispatch session; its only
+    /// records are the scheduler's own task-scoped step-lifecycle bookends,
+    /// which every kind gets and which a consumer adds once. Named on the
+    /// no-dispatch list in `step_kinds::registry`'s conformance test, so
+    /// this stays a stated choice rather than an unimplemented default.
+    fn dispatch_session_id(&self, _step: &Step) -> Option<String> {
+        None
+    }
+
+
     fn run(&self, step: &Step, _task: &Task, input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let command = require_config_str(step, self.id(), "command")?;
         let cwd = config_str(step, "cwd");
@@ -2059,6 +2104,17 @@ impl StepKind for ProceduralNoopStepKind {
     fn display_name(&self) -> &'static str {
         "No-op"
     }
+
+    /// (#1979) `None` — the documented no-dispatch opt-out. This kind
+    /// performs no model work, so it owns no dispatch session; its only
+    /// records are the scheduler's own task-scoped step-lifecycle bookends,
+    /// which every kind gets and which a consumer adds once. Named on the
+    /// no-dispatch list in `step_kinds::registry`'s conformance test, so
+    /// this stays a stated choice rather than an unimplemented default.
+    fn dispatch_session_id(&self, _step: &Step) -> Option<String> {
+        None
+    }
+
 
     fn run(&self, step: &Step, _task: &Task, _input: &BTreeMap<String, String>) -> Result<StepOutcome> {
         let output = config_str(step, "output").unwrap_or(&step.id).to_string();
