@@ -12,6 +12,90 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [2.12.0] - 2026-08-26
+
+The run-detail lens, rebuilt around one question the page could not answer:
+which of these numbers describe the model, and which describe darkmux around
+it. Reading `model (lms)` beside TURNS / TOKENS / WALL CLOCK, there was no way
+to tell — and the page was throwing away most of what it had been handed.
+
+Also settles the work-unit vocabulary. `run`, `dispatch`, `step` and `session`
+each denoted a grain and nothing said which, so every consumer picked its own
+reading; `dispatch` in particular named both a top-level run kind and the
+innermost unit. See `CLAUDE.md`'s contract registry entry 8 and `DESIGN.md`.
+
+No schema bump: `FLOW_SCHEMA_VERSION` stays at `1.20.0`. Nothing on the wire
+changed shape.
+
+### Added
+
+- **The prompt is readable.** It was held, measured, and discarded — the page
+  rendered `prompt · 1430 chars` while holding the string. Now an expander,
+  with the record's authoritative length so a truncated brief still reports
+  its real size (#1984).
+- **MODEL and SYSTEM metric panes.** Turns, tokens and context describe the
+  model's work; wall clock, compactions and host load describe the system
+  around it. A step that ran no model — a `procedural.shell` step — shows no
+  model pane at all rather than `0 COMPACTIONS`, which asserts something that
+  cannot happen there (#1984, #1996).
+- **Host CPU / RAM / GPU peaks.** Already in the flow stream, fetched by the
+  page and explicitly discarded. Peaks rather than latest, because the
+  question asked of a finished run is whether it saturated the machine, and
+  absent rather than zero when a run predates the sampler (#1996).
+- **SIGNALS**, replacing `detections`. Grouped by kind with a count,
+  severity-coded, and stamped with run-relative times. The severity was always
+  in the payload and always thrown away, so a recovered stall rendered with
+  the same warning glyph as a doom loop (#1985).
+- **A clock that moves and a pulse that beats.** Elapsed time derived from the
+  newest record's timestamp, so it advanced only when a record arrived and
+  froze during exactly the stalls worth timing. A run silent longer than the
+  watchdog's kill timeout is treated as abandoned rather than live (#1986).
+- **`loaded models`**, naming the primary. The dispatch record already carried
+  the resolved model; secondaries read `also loaded` rather than being guessed
+  at by size or load order (#1991).
+- **`#dispatch=<id>`** replaces `#session=<id>`, with `session=` kept as a
+  one-release parser alias and rewritten to the canonical form on arrival.
+  Every detail route is now named for the `RunKind` it opens (#1977).
+
+### Fixed
+
+- **Runs → Dispatch → a row now reaches the detail view.** A tracked dispatch
+  mints a crew-of-one mission, so it routed to a single-node graph that showed
+  less than the detail page and had no click handler (#1996).
+- **A signal rendered one character per line on mobile.** A non-shrinking
+  sibling starved the detail column to zero width; reported from a phone with
+  1013 tests green (#1987).
+- **Accessibility pass on the same lens.** The pill and the pulse could
+  describe the same run as `RUNNING` and `finished` simultaneously; signal
+  severity reached sighted users only; the metric pane names existed solely as
+  CSS-generated content; a timestamp failed AA contrast; the pulse was a live
+  region that could flap once a second (#1987).
+- **A malformed detector payload is named, not mangled** — `undefined` as a
+  signal heading, `[object Object]` where structured diagnostic data had been
+  (#1992).
+- **A malformed or clock-skewed timestamp no longer strands a finished run.**
+  Either made a completed dispatch read RUNNING forever, and the first also
+  erased the brief that would have explained it. A repaired timeline now says
+  so instead of presenting itself as sound (#1993).
+- **The detail page polls a live session** instead of fetching once, so turns,
+  tokens and signals advance while a run is in flight (#1994).
+- **A `StepKind` is asked for its dispatch session** rather than a consumer
+  re-deriving it from kind strings with a silent fallthrough, and a conformance
+  test pins each kind's answer by value (#1981).
+- The runs board's status no longer reads a mission's liveness off a different
+  mission's activity clock (#1981).
+
+### Changed
+
+- Denser layout throughout: the run brief flows as a definition grid instead of
+  stacking six label/value pairs, and the metric tiles fill their row — a pane
+  label spanning every grid track had prevented `auto-fit` from collapsing the
+  empty ones (#1996).
+- The mobile event list has a floor measured in rows rather than a fraction of
+  the viewport (#1996).
+
+[2.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.12.0
+
 ## [2.11.0] - 2026-08-26
 
 ### Added
