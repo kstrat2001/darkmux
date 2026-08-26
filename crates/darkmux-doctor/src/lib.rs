@@ -2846,7 +2846,9 @@ fn check_mission_config_registry() -> Check {
     let known_kind_refs: Vec<&str> = known_kinds.iter().map(String::as_str).collect();
 
     let mut summary_lines: Vec<String> = Vec::new();
-    let mut blocking: Vec<String> = Vec::new();
+    // (#2003) (id, explanation) pairs, so identical explanations can be
+    // grouped at render time instead of repeated once per document.
+    let mut blocking: Vec<(String, String)> = Vec::new();
     let mut kind_warning_ids: Vec<String> = Vec::new();
 
     for id in &ids {
@@ -2869,12 +2871,12 @@ fn check_mission_config_registry() -> Check {
 
                 if !errors.is_empty() {
                     let joined = errors.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; ");
-                    blocking.push(format!("\"{id}\": {joined}"));
+                    blocking.push((id.clone(), joined));
                 }
                 if !version_drift.is_empty() {
                     let joined =
                         version_drift.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; ");
-                    blocking.push(format!("\"{id}\": {joined}"));
+                    blocking.push((id.clone(), joined));
                 }
                 // (#1284 review round 2, consider 7; fixed for #1917) A
                 // USER-tier copy whose schema MINOR trails the binary's MAY
@@ -2967,10 +2969,13 @@ fn check_mission_config_registry() -> Check {
                                  current schema instead"
                                     .to_string()
                             };
-                            blocking.push(format!(
-                                "\"{id}\": user-tier copy declares schema {doc_major}.{doc_minor}, \
-                                 but this binary's mission-config schema is {bin_major}.{bin_minor} \
-                                 — {severity}; {remedy}"
+                            blocking.push((
+                                id.clone(),
+                                format!(
+                                    "user-tier copy declares schema {doc_major}.{doc_minor}, \
+                                     but this binary's mission-config schema is \
+                                     {bin_major}.{bin_minor} — {severity}; {remedy}"
+                                ),
                             ));
                         }
                         // (#1648) The MIRROR direction, and the more dangerous
@@ -2995,14 +3000,18 @@ fn check_mission_config_registry() -> Check {
                         // window from here forward, which is the only window
                         // a code change can close.
                         if doc_major == bin_major && doc_minor > bin_minor {
-                            blocking.push(format!(
-                                "\"{id}\": user-tier copy declares schema {doc_major}.{doc_minor}, \
-                                 NEWER than this binary's {bin_major}.{bin_minor} — it may declare \
-                                 additive fields this binary silently ignores rather than \
-                                 rejects (a `reads` relation, for one, carries both data and \
-                                 ordering: dropping it can let a stage run early against empty \
-                                 input and finish green with no findings). Upgrade darkmux, or \
-                                 re-author this copy against {bin_major}.{bin_minor}"
+                            blocking.push((
+                                id.clone(),
+                                format!(
+                                    "user-tier copy declares schema {doc_major}.{doc_minor}, \
+                                     NEWER than this binary's {bin_major}.{bin_minor} — it may \
+                                     declare additive fields this binary silently ignores rather \
+                                     than rejects (a `reads` relation, for one, carries both data \
+                                     and ordering: dropping it can let a stage run early against \
+                                     empty input and finish green with no findings). Upgrade \
+                                     darkmux, or re-author this copy against \
+                                     {bin_major}.{bin_minor}"
+                                ),
                             ));
                         }
                     }
@@ -3011,7 +3020,7 @@ fn check_mission_config_registry() -> Check {
                     kind_warning_ids.push(id.clone());
                 }
             }
-            Err(e) => blocking.push(format!("\"{id}\": failed to parse — {e}")),
+            Err(e) => blocking.push((id.clone(), format!("failed to parse — {e}"))),
         }
     }
 
@@ -3040,12 +3049,7 @@ fn check_mission_config_registry() -> Check {
             // (one document can contribute a structural-error entry AND a
             // schema-drift entry), so the count is worded as issues, never
             // as a config count (#1284 review round 1).
-            message: format!(
-                "{} mission config(s) registered, {} issue(s): {}",
-                ids.len(),
-                blocking.len(),
-                blocking.join(" | ")
-            ),
+            message: summarize_findings(ids.len(), &blocking),
             hint: Some(
                 "fix the named document(s) under `~/.darkmux/mission-configs/<id>.json` (or the \
                  checked-out `templates/builtin/mission-configs/<id>.json` for a built-in) — a \
@@ -4043,6 +4047,50 @@ fn first_line(s: &str) -> &str {
 
 // ─── Result rendering ───────────────────────────────────────────────────
 
+/// (#2003) Render the registry's findings, stating each distinct explanation
+/// ONCE and naming every document it applies to.
+///
+/// Measured on a real machine: 15 mission configs each trailing the binary's
+/// schema by one minor produced 15 copies of the same ~600-character
+/// explanation — a 9,726-character check message that wrapped to roughly
+/// sixty lines of near-identical prose. That is one fact about fifteen
+/// documents, not fifteen facts, and rendering it per-document buries the
+/// single thing the operator has to act on.
+///
+/// The issue COUNT stays per-document (a group of five is still five issues),
+/// because that is what the operator is being told to fix; only the prose is
+/// shared. Groups keep first-seen order so the output is stable between runs.
+fn summarize_findings(registered: usize, findings: &[(String, String)]) -> String {
+    let mut order: Vec<&str> = Vec::new();
+    let mut groups: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (id, text) in findings {
+        let entry = groups.entry(text.as_str()).or_insert_with(|| {
+            order.push(text.as_str());
+            Vec::new()
+        });
+        entry.push(id.as_str());
+    }
+
+    let rendered: Vec<String> = order
+        .iter()
+        .map(|text| {
+            let ids = &groups[*text];
+            match ids.len() {
+                // A lone finding reads better as `"id": explanation` — the
+                // shape this check has always used, kept for the common case.
+                1 => format!("\"{}\": {text}", ids[0]),
+                n => format!("{text} — affects {n} config(s): {}", ids.join(", ")),
+            }
+        })
+        .collect();
+
+    format!(
+        "{registered} mission config(s) registered, {} issue(s): {}",
+        findings.len(),
+        rendered.join(" | ")
+    )
+}
+
 /// The width `doctor` renders to (#1995).
 ///
 /// `COLUMNS` is what `crates/darkmux-serve/src/panel.rs` sets from the
@@ -4184,11 +4232,30 @@ fn verdict_banner(r: &DoctorReport) -> String {
 fn verdict_banner_at(r: &DoctorReport, width: usize) -> String {
     let headline =
         |s: Status| r.checks.iter().find(|c| c.status == s).map(|c| format!("{}: {}", c.name, c.message));
-    // "● " — the marker plus its space, paid by the first line and matched by
-    // the continuation indent so the wrapped text stays under the headline.
-    const MARKER: usize = 2;
-    let body = width.saturating_sub(MARKER).max(20);
-    let render = |text: String| wrap_hanging(&text, body, MARKER).join("\n");
+    // ONE LINE, always — a banner is a headline, not a transcript.
+    //
+    // It quotes the worst check's whole message, and those are not bounded:
+    // the real `mission config registry` finding concatenates one full
+    // explanation per affected config, measured at 9,726 characters (the same
+    // ~600-char paragraph 15 times). Wrapping that faithfully filled fifty
+    // lines with a restatement of the check line printed directly below it.
+    // Truncation is not information loss here — the full message is always
+    // rendered in that check's own block.
+    let render = |text: String| {
+        // Collapse any internal newlines first: a multi-line message must not
+        // be able to smuggle a second line past the one-line guarantee.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.chars().count() <= width {
+            return flat;
+        }
+        // Wrap to width-1 and keep the first line, so there is room for the
+        // ellipsis that tells the operator something was cut.
+        let first = wrap_hanging(&flat, width.saturating_sub(1).max(20), 0)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        format!("{first}…")
+    };
     match r.worst_status() {
         Status::Pass => darkmux_types::style::success("● ok — every check passed"),
         Status::Warn => darkmux_types::style::warn(&render(format!(
@@ -4296,6 +4363,111 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn the_verdict_banner_is_one_line_however_long_the_worst_message_is() {
+        // The banner quotes the highest-severity check's message. The real
+        // `mission config registry` finding concatenates one full explanation
+        // per affected config — measured at 9,726 characters, the same ~600
+        // char paragraph 15 times. Wrapping it faithfully filled fifty lines
+        // of the operator's screen with a restatement of what the check line
+        // below already says. A banner is a HEADLINE: one line, always.
+        let huge = std::iter::repeat("some very wordy finding text about a config")
+            .take(200)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let r = DoctorReport {
+            checks: vec![Check {
+                name: "mission config registry".into(),
+                status: Status::Warn,
+                message: huge,
+                hint: None,
+            }],
+        };
+        for width in [56usize, 80, 100, 200] {
+            let banner = strip_ansi(&verdict_banner_at(&r, width));
+            assert_eq!(banner.lines().count(), 1, "width {width}: banner must be ONE line");
+            assert!(
+                banner.chars().count() <= width,
+                "width {width}: banner is {} chars: {banner:?}",
+                banner.chars().count()
+            );
+            assert!(banner.ends_with('…'), "a truncated banner must say so: {banner:?}");
+        }
+    }
+
+    #[test]
+    fn a_short_verdict_banner_is_not_truncated() {
+        let r = DoctorReport {
+            checks: vec![Check {
+                name: "daemon".into(),
+                status: Status::Warn,
+                message: "not reachable".into(),
+                hint: None,
+            }],
+        };
+        let banner = strip_ansi(&verdict_banner_at(&r, 100));
+        assert_eq!(banner, "● needs attention — daemon: not reachable");
+        assert!(!banner.ends_with('…'), "nothing was cut, so nothing may claim it was");
+    }
+
+    // ── (#2003) Grouped registry findings ───────────────────────────────
+
+    #[test]
+    fn identical_findings_state_their_explanation_once() {
+        // Measured on a real machine: 15 configs each trailing the binary's
+        // mission-config schema by one minor produced 15 copies of the SAME
+        // ~600-character explanation — a 9,726-character check message that
+        // wrapped to roughly sixty lines. The finding is one fact about
+        // fifteen documents, not fifteen facts.
+        let text = "user-tier copy declares schema 2.2, but this binary's is 2.3 — \
+                    a long shared explanation that is identical for every document";
+        let findings: Vec<(String, String)> = ["p5-gate-coder", "pr-approve", "pr-list"]
+            .iter()
+            .map(|id| ((*id).to_string(), text.to_string()))
+            .collect();
+        let out = summarize_findings(17, &findings);
+
+        assert_eq!(
+            out.matches("a long shared explanation").count(),
+            1,
+            "the shared explanation must appear exactly once: {out}"
+        );
+        for id in ["p5-gate-coder", "pr-approve", "pr-list"] {
+            assert!(out.contains(id), "every affected id must still be named: {out}");
+        }
+        assert!(out.contains("17 mission config(s) registered"), "{out}");
+        assert!(out.contains("3 issue(s)"), "the issue count is per document, not per group: {out}");
+    }
+
+    #[test]
+    fn distinct_findings_are_each_reported_with_their_own_id() {
+        let findings = vec![
+            ("alpha".to_string(), "a dangling depends_on".to_string()),
+            ("bravo".to_string(), "an empty id".to_string()),
+        ];
+        let out = summarize_findings(2, &findings);
+        assert!(out.contains("alpha") && out.contains("a dangling depends_on"), "{out}");
+        assert!(out.contains("bravo") && out.contains("an empty id"), "{out}");
+        assert!(out.contains("2 issue(s)"), "{out}");
+    }
+
+    #[test]
+    fn grouping_collapses_length_not_information() {
+        let text = "x".repeat(600);
+        let many: Vec<(String, String)> =
+            (0..15).map(|i| (format!("cfg-{i}"), text.clone())).collect();
+        let grouped = summarize_findings(17, &many);
+        let ungrouped: usize = many.iter().map(|(i, t)| i.len() + t.len() + 6).sum();
+        assert!(
+            grouped.len() < ungrouped / 5,
+            "grouping must actually shorten the message: {} vs {ungrouped}",
+            grouped.len()
+        );
+        for i in 0..15 {
+            assert!(grouped.contains(&format!("cfg-{i}")), "id cfg-{i} was lost");
+        }
     }
 
     // ── (#1995) Output width ────────────────────────────────────────────
