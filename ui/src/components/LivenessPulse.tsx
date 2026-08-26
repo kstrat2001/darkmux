@@ -18,9 +18,19 @@
  */
 import { useNowMs } from "../lib/clock";
 
-/** How long without proof of life before the pulse holds still. 2.5x the
- *  emitter's `HEARTBEAT_MIN_INTERVAL` (2s). */
-export const PULSE_QUIET_AFTER_MS = 5000;
+/** How long without proof of life before the pulse holds still.
+ *
+ *  **This must exceed the CLIENT's poll interval, not just the emitter's
+ *  heartbeat cadence.** The pulse measures how fresh the newest RECORD is,
+ *  and the client cannot learn about a beat until it next polls — so record
+ *  freshness is bounded below by `PRESENCE_POLL_MS` (5s) no matter how
+ *  briskly the run emits. At the original 5000 the two were equal, and a
+ *  perfectly healthy run reported quiet for roughly half of every poll cycle:
+ *  the pulse was reporting the CLIENT's polling gap as the RUN's silence.
+ *
+ *  12s = poll (5s) + heartbeat (2s) + margin. A genuinely stuck dispatch
+ *  still stops pulsing well inside the watchdog's own inactivity budget. */
+export const PULSE_QUIET_AFTER_MS = 12_000;
 
 export interface LivenessPulseProps {
   /** Has the run reached a terminal record? This is the SEMANTIC question —
