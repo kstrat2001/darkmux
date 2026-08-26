@@ -290,8 +290,11 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
    error` for each of its steps (`crates/darkmux-crew/src/scheduler.rs:715, 1032, 1040`),
    under a `mission start` above them. Its run-level `dispatch` pair therefore adds no
    coverage the mission and step bookends do not already give. Tracked as part of the
-   run-substrate arc (#1877): the fix is to give each model-bearing seat a real dispatch,
-   not to license a second meaning. New code does not copy this.
+   run-substrate arc's remainder (#1976): the fix is to give each model-bearing seat a real
+   dispatch, not to license a second meaning. Note that `run_obs.rs`'s own doc currently
+   PRESCRIBES the overload ("the caller is expected to already wrap the whole dispatch"),
+   so #1877's extraction hardened it into the shared layer rather than resolving it — that
+   doc is part of the fix. New code does not copy this.
 
    Conformance: every detail hash route is named for the `RunKind` it opens.
 
