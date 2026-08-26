@@ -284,17 +284,28 @@ The contract registry (extend this list when a new cross-cutting invariant is bo
      `crew={names} models={summary}`. So those seat executions have no dispatch identity at
      all, and the one "dispatch" record on the run denotes a mission.
 
-   **Retiring the second one costs nothing in liveness, which is why it is a defect and not
-   a carve-out.** The review pipeline runs through the same `run_step_graph` every other
-   scheduler caller uses, so the scheduler ALREADY emits `step start`/`step complete`/`step
-   error` for each of its steps (`crates/darkmux-crew/src/scheduler.rs:715, 1032, 1040`),
-   under a `mission start` above them. Its run-level `dispatch` pair therefore adds no
-   coverage the mission and step bookends do not already give. Tracked as part of the
-   run-substrate arc's remainder (#1976): the fix is to give each model-bearing seat a real
-   dispatch, not to license a second meaning. Note that `run_obs.rs`'s own doc currently
-   PRESCRIBES the overload ("the caller is expected to already wrap the whole dispatch"),
-   so #1877's extraction hardened it into the shared layer rather than resolving it — that
-   doc is part of the fix. New code does not copy this.
+   **Retiring the run-grain use is a CONSUMER MIGRATION, not a free deletion.** An earlier
+   draft of this entry claimed it "costs nothing in liveness" because the scheduler already
+   emits `step start`/`step complete`/`step error` per step
+   (`crates/darkmux-crew/src/scheduler.rs:715, 1032, 1040`) under a `mission start`. That is
+   true and irrelevant: four consumers key specifically on DISPATCH bookends at the session
+   grain, and step bookends do not feed any of them —
+   `terminal_status_for_action` (`crates/darkmux-serve/src/runs.rs:1476-1478`, which matches
+   only `dispatch complete`/`dispatch error`), the runs board's representative-session pick
+   (`runs.rs:3307`'s regression test records that the whole-run bookend wins that pick, and
+   that losing it already blanked role/model once), fleet card activity
+   (`ui/src/lenses/fleet/cards.ts:59`, filtering `action === "dispatch.start"` with no
+   `source` check), and the status line's last-dispatch (`ui/src/lib/metaLine.ts:28`).
+   Delete the emission first and those surfaces go dark.
+
+   Note also that #1899 PRESCRIBED the whole-run pair for every generic launch three days
+   before this entry was written (`src/mission_launch.rs:~684`: "telemetry + the whole-run
+   dispatch bookend are PRESCRIBED here, not opt-in"). This entry supersedes that
+   deliberately, and the supersession is the point: contract 8 wins on the NOUN, #1899 wins
+   on the MECHANISM. The run grain keeps its bookend and gets its own action vocabulary
+   (`run start`/`run complete`/`run error`), so `dispatch *` can mean one specialist
+   execution. Consumers become bilingual FIRST and stay bilingual permanently — archives are
+   append-only and are never rewritten. That ordering is not optional.
 
    Conformance: every detail hash route is named for the `RunKind` it opens.
 
