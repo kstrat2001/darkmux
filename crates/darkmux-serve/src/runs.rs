@@ -669,13 +669,6 @@ fn collect_mission_step_sessions(mission: &Mission) -> HashSet<String> {
             if let Some(sid) = step_session_id(&step, &registry) {
                 out.insert(sid);
             }
-            // (#1979) The scheduler's own step-lifecycle bookends land under
-            // the TASK session for EVERY kind
-            // (`crew::scheduler::step_lifecycle_record`), independent of
-            // whatever session the kind dispatches under. That is a
-            // scheduler invariant rather than a per-kind choice, so it is
-            // added once here instead of being asked of each kind.
-            out.insert(darkmux_types::session_id::task(&step.task_id));
         }
     }
     out
@@ -685,15 +678,20 @@ fn collect_mission_step_sessions(mission: &Mission) -> HashSet<String> {
 /// here** (#1979).
 ///
 /// This used to be a `match step.kind.as_str()` with a `_ => None` arm, so
-/// the convention lived in two files that nothing kept agreeing. The failure
-/// it caused is specific: a step kind absent from the match resolved `None`,
-/// its session went unclaimed by [`collect_mission_step_sessions`], and its
-/// records surfaced as a duplicate untracked "ghost" row on the runs board
-/// (see [`ghost_runs`]'s `known_session_ids` gate). Nothing failed — no
-/// test, no doctor check, no compile error — until an operator noticed a
-/// doubled row. `procedural.*` kinds never triggered it only because their
-/// records carry no `dispatch start`, so `SessionAgg::has_start` is false
-/// and they are not ghost-eligible; a NEW dispatching kind would have.
+/// the convention lived in two files that nothing kept agreeing.
+///
+/// **Honest scope of the defect** (narrowed by the #1979 QA gate, which
+/// could not reproduce the original claim): an unlisted kind's session went
+/// unclaimed by [`collect_mission_step_sessions`], but that alone does NOT
+/// produce a ghost row. [`ghost_runs`] has a SECOND gate —
+/// `known_mission_ids.contains(agg.mission_id)` — and every production
+/// `run_step_graph` caller backfills `mission_id` (#1641), so a
+/// locally-launched mission's records were already suppressed by mission id.
+/// This is therefore defense-in-depth and a de-duplication of the
+/// convention, not a fix for a reproducible doubled row. Asking the kind is
+/// still right: two files encoding one convention with a silent catch-all is
+/// how the next emitter that skips the `mission_id` backfill becomes a bug
+/// nobody notices.
 ///
 /// A kind not in the registry (a Tier 3 kind registered per-launch, e.g.
 /// review's or coder-phase's) falls back to the trait's own default rather
@@ -855,7 +853,22 @@ fn mission_to_run(
         .finalized_ts
         .or_else(|| terminal_ts_str.as_deref().and_then(parse_flow_ts));
 
-    let sessions_bare: Vec<&SessionAgg> = sessions.iter().map(|(_, s)| *s).collect();
+    // (#1979 QA gate) STATUS is computed only over sessions this mission can
+    // legitimately claim. A `session_id` whose records span more than one
+    // mission is corrupt for this purpose — `session_id::task` hashes only
+    // `task_id`, which comes straight out of a mission CONFIG
+    // (`crew::scheduler`'s own doc), so every run of `coder-phase.json`
+    // shares `task-build-coder`. Feeding such an agg into
+    // `mission_run_status` lets one mission read Running off ANOTHER
+    // mission's activity clock: the agg is permanently non-terminal (its
+    // records are `step start`/`step complete`, which
+    // `terminal_status_for_action` maps to `None`), so it both disables the
+    // all-terminal branch and keeps `session_is_live` true. `is_ambiguous`
+    // is the detector that already exists for exactly this corruption.
+    // Membership (`sessions`) deliberately keeps them — claiming the
+    // session still suppresses a ghost row; only STATUS is narrowed.
+    let sessions_bare: Vec<&SessionAgg> =
+        sessions.iter().map(|(_, s)| *s).filter(|s| !s.is_ambiguous()).collect();
     let status = mission_run_status(mission, &sessions_bare, now_ms);
     // (#1907) `mission_run_status` has exactly ONE arm that reaches
     // `Abandoned` via a deliberate teardown — `MissionStatus::Aborted =>
