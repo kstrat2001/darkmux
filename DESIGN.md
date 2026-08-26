@@ -158,6 +158,180 @@ A local model in an agent loop fails in characteristic ways: re-reading the same
 
 The unifying principle is operator-sovereignty applied to the runtime: every detector is observable in the trajectory, every nudge is attributable to a named signal, every bound is operator-tunable, and nothing silently changes the dispatch without leaving a record of why.
 
+## Execution: one substrate, four identities
+
+> **Status: this section describes the TARGET, and the tree is partway to it.** Each claim
+> below is marked *(holds)* where the code already works this way or *(target)* where it does
+> not yet. That distinction is load-bearing: an architecture document that reads as present
+> tense while describing an intention is how a stated rule becomes something every consumer
+> quietly implements differently. Tracked as [#1979](https://github.com/kstrat2001/darkmux/issues/1979).
+
+Every piece of work darkmux performs — a mission with forty steps, a one-shot `dispatch`, a
+lab run — is the same substrate at a different scale. The reason that has not always been
+visible is that four different identities were doing overlapping jobs with nothing saying
+which answered which question.
+
+### The ladder
+
+**mission › phase › task › step › role execution.** A *run* is the umbrella, never a grain: one
+top-level unit of work the operator started, in exactly three kinds (mission, dispatch, lab).
+A *step* is a graph node; a *role execution* is what the node did. A `procedural.shell` step
+has none; `dispatch.internal` has one; `dispatch.map` has one per collection item, and the
+review pipeline's probe and judge steps have seats × draws. That 0..N cardinality is what
+makes the step layer real rather than a wrapper.
+
+The inner unit is named for the **role**, not the model, because the model is derived rather
+than declared: `select_model(role, profile)` resolves it at dispatch entry, `DispatchOpts`
+takes `role_id` as required and `profile_name` as an optional override, and an
+endpoint-staffed seat has no local model at all. Role is the stable identity across local and
+remote. `dispatch` is then unambiguously TOP-LEVEL — the verb, and the `RunKind` meaning *a
+run consisting of exactly one role execution* — which is what stops one word naming both ends
+of the ladder. The full definition, and its consequences for
+attribution and escalation, is contract 8 in [`CLAUDE.md`](CLAUDE.md)'s cross-system contract
+registry. *(holds — the vocabulary is stated and the hash routes are named for their run kind)*
+
+### What each field means
+
+The flow-record schema already carries enough to answer *whose work is this?* The problem was
+never missing data; it was that nothing stated which field answers which question, so every
+consumer picked its own subset.
+
+- **`payload.step_id` — the canonical record-to-step attribution.** Stamped by the producer,
+  not reconstructed by a reader. *(partly holds — `dispatch_internal`'s `stamp_step_id`
+  does this for graph-step dispatches; other step-executing paths are the target)*
+- **`session_id` — a producer-chosen GROUPING key, deliberately not an identity.** Its grain
+  is per kind, and the variation is correct rather than accidental: step-scoped for a solo
+  dispatch, task-scoped for fan-out siblings that must share a join key so a seat's tokens
+  can be tied to its endpoint. It is opaque to consumers, never an operator-facing noun, and
+  never the address of a page. *(holds as behavior; the "not an identity" part is the target
+  — one consumer still addresses a page by it)*
+- **`mission_id` — the authoritative outer scope, filtered first, always.** This is not
+  optional tidiness. A task-scoped `session_id` hashes only the task id, which comes straight
+  out of a mission config, so two concurrent runs of the same config produce colliding
+  session ids and only the `mission_id` backfill tells them apart. *(holds)*
+- **`handle` — a read-side fallback, permanently.** Archives are append-only and never
+  rewritten, so every key that has ever been correct stays supported for reading. *(holds)*
+
+### One resolver
+
+Mapping a record to its step is a three-key chain — `payload.step_id`, then a step-scoped
+`session_id`, then `handle` — with `mission_id` authoritative above all three. That chain is
+correct and already written twice, once per language. What is wrong is that it is not
+universally *used*: a second, ad-hoc resolver matches on step-kind strings with a silent
+catch-all, and the step detail lens scopes by raw session id instead of by step.
+
+The target is one resolver per language, bound by a shared fixture both test suites consume
+so the two implementations cannot drift, and **no kind-keyed registry in any consumer** — a
+consumer that switches on `step.kind` to infer record shape is the snowflake being deleted,
+not a fix for it. Attribution must be inferable from records alone. *(target)*
+
+### Dispatch names the top of the ladder, not the bottom
+
+`dispatch` names the top of the ladder only: the verb, and the `RunKind` it produces. Naming
+the INNER unit instead — the role execution — is what resolves the overload, and it is the
+cheaper direction by a wide margin: the flow-record bookends `dispatch start` / `dispatch
+complete` keep their historical spelling at both grains, so the four consumers that key on
+them at the session grain (`runs.rs`'s `terminal_status_for_action`, the runs board's
+representative-session pick, `cards.ts`'s fleet activity, `metaLine.ts`'s last-dispatch) are
+untouched. Archives are append-only and grain is already recoverable from `session_id` and
+`source`, so renaming the wire would buy a consumer migration for no behavioral gain. What
+changes is the word used in code, docs and UI. *(holds for the vocabulary; the review
+pipeline still wraps a whole multi-model crew in one pair, which is a separate defect)*
+
+Utility work inside a role execution — compaction above all — is a **sub-execution**:
+itself a role execution, of a utility role, attributed to its own role and model rather than
+blended into the specialist's. Naming the unit for the role is what makes this compose
+instead of needing a special case — a sub-execution is the same kind of thing as its parent,
+one level in. Getting this wrong is not
+cosmetic: filing the compactor's residency under the specialist is what makes a healthy run
+report a model swap that never happened. *(target)*
+
+### Where the substrate lives, and why that is the whole lesson
+
+The substrate a serious run needs — host telemetry sampling, per-step records, budget
+accounting, liveness bookends, the resolved-knob snapshot — belongs in the **shared
+control-flow path every run already crosses**: the launcher and the scheduler. Not in an
+importable type that each mission may or may not adopt.
+
+This is not a preference; it is the measured outcome of trying it both ways in the same arc.
+When the telemetry sampler moved into the launcher and per-step records moved into the
+scheduler, every mission gained them with *zero changes in its own module* — a mission
+author cannot forget what they never had to remember. When the same arc left a piece as an
+importable type plus a paragraph of doctrine, it acquired exactly one consumer: the module it
+was extracted from, importing it back under its old name.
+
+**Moving a type one crate over and importing it back is a relocation, not a layering.** The
+test of whether a capability is really shared is not where it is defined; it is whether a
+mission that never mentions it still gets it. *(holds for telemetry, per-step records,
+budgets and outcome; the staffing snapshot is the remaining piece that is still caller
+choice)*
+
+### The vocabulary, and why each word sits where it does
+
+darkmux names a lot of layers, and the names were not arrived at freely — most of the obvious
+ones were already spoken for. This is the map.
+
+**The containment ladder.** `mission › phase › task › step › role execution`.
+
+| Term | What it is |
+|---|---|
+| **run** | The UMBRELLA: one top-level unit of work the operator started. Never a grain. Three kinds — `mission`, `dispatch`, `lab`. |
+| **mission** | A whole task graph, launched from a config. |
+| **phase** | A grouping of tasks within a mission (`Mission.phase_ids` → `Phase.task_ids`). |
+| **task** | A group of steps — and where resource ASSIGNMENT lives (role, profile, workdir, image), which is why a step inherits staffing rather than declaring it. |
+| **step** | One graph node. Contains **0..N** role executions. |
+| **role execution** | The inner unit: one role, running many turns until it stops. |
+| **dispatch** | TOP-LEVEL ONLY — the verb `darkmux dispatch <role>`, and the `RunKind` meaning *a run consisting of exactly one role execution*. |
+| **crew** / **crew member** / **position** | Who staffs a mission, and where each member sits. |
+| **role** | A stance, a tool palette, and a system prompt. The declared identity of a role execution. |
+| **profile** | The staffing registry entry: which model at what context, local or hosted endpoint. |
+| **seat** | A staffed model position within a run (`MemberRecord`), with a `draws` count. |
+| **draw** | One invocation of a seat. |
+| **item** | One element of a `dispatch.map` collection. |
+| **session** | An INTERNAL join key tying a family of flow records together. Never operator-facing. |
+| **workload** / **fixture** | Lab-only: the thing being run, and the pinned sandbox it runs against. |
+
+**Why the inner unit is named for the ROLE and not the model.** The model is derived, not
+declared: `select_model(role, profile)` resolves it at dispatch entry, `DispatchOpts` takes
+`role_id` as required and `profile_name` as an optional override, and an endpoint-staffed seat
+has no local model at all. Role is the stable identity across local and remote; the model is a
+consequence of the profile. Naming it for the role also makes sub-executions compose — a
+compactor's work inside a specialist's is simply another role execution, one level in, rather
+than a special case needing its own rule.
+
+**Names that are taken, and by what.** Every humanized word that reads naturally for "one crew
+member's bounded piece of work" turned out to already name a *different* layer of this same
+system — which is itself the finding, because those layers were named with the same instinct:
+
+- **task** — the grouping layer above steps.
+- **job** — the FLEET work queue (`fleet::WorkJob`, `ClaimedJob`, `claim_job`), where a job is
+  a PHASE published to Redis and claimed by a peer machine. `WORK_JOB_SCHEMA_VERSION` makes it
+  a wire contract, not just a word.
+- **deployment** — the Azure hosted-model endpoint (`/openai/deployments/<name>`), surfaced in
+  `darkmux doctor`'s own remedy text. Reusing it for the execution would re-fuse the exact
+  thing choosing *role* over *model* was meant to keep apart.
+- **activity** — the viewer's activity lanes.
+- **assignment** — a Task's resource assignment.
+- **turn** — one iteration of the agent loop; a role execution has many.
+- **pass** — the review pipeline's probe/judge/verify passes.
+
+`shift` and `stint` are genuinely unused and were weighed as more humanized alternatives;
+`execution` won on precision and on composing cleanly for sub-executions.
+
+**The rule this leaves behind:** before naming a new layer, check whether the word already
+names a different grain in this system. A word at two grains is the defect that produced this
+whole section — `dispatch` meant both a top-level run kind and the innermost unit, and nothing
+said so, so every consumer picked a meaning and they disagreed.
+
+### Lab stays separate, deliberately
+
+Lab runs write per-run-local artifacts and stay off the fleet flow stream. That boundary is a
+measurement-integrity decision, not an inconsistency to be tidied away: the point of a lab
+run is that it is reproducible in isolation, and a bench that quietly enriched the shared
+stream would make its own numbers a function of what else the fleet was doing. Lab's one
+genuine defect is a route naming its drill-in `run=` while `run` is the umbrella everywhere
+else. *(holds)*
+
 ## Composability
 
 darkmux is designed to live BELOW agent frameworks and ABOVE inference engines:
