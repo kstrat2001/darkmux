@@ -138,8 +138,52 @@ export interface SessionRunView {
   metricScope: { model: number[]; harness: number[] };
   modelTrackLabel: string;
   modelTrackLines: string[];
-  detectionsLabel: string;
-  detectionLines: string[];
+  /** (#1973) Renamed from `detections`. See the signals block in
+   *  `runRegions` for why grouping, severity and run-relative times replaced
+   *  a flat list of grey strings. */
+  signalsLabel: string;
+  signalGroups: SignalGroup[];
+}
+
+/** (#1973) `+m:ss` / `+h:mm:ss` from run start. Sub-minute signals still read
+ *  `+0:07` rather than collapsing to `+0`, because "seven seconds in" and
+ *  "immediately" are different findings. */
+function runOffset(deltaMs: number): string {
+  if (!Number.isFinite(deltaMs) || deltaMs < 0) return "";
+  const total = Math.floor(deltaMs / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const sec = total % 60;
+  const two = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `+${h}:${two(m)}:${two(sec)}` : `+${m}:${two(sec)}`;
+}
+
+/** (#1973) A behavioral signal raised during the run. `severity` comes from
+ *  the emitter — `dispatch_internal`'s detector payload has always carried it
+ *  — and is NOT derived from the record's `level`, which is `Info` for every
+ *  detector record and therefore says nothing. */
+export type SignalSeverity = "warn" | "info";
+
+export interface Signal {
+  kind: string;
+  severity: SignalSeverity;
+  detail: string;
+  fix?: string;
+  /** Absolute time, or `null` for a signal synthesized from other records
+   *  rather than emitted (`jit-model-swap`) — which has no moment of its own
+   *  and must not borrow one. */
+  atMs: number | null;
+  /** Run-relative label (`+2:14`), empty when `atMs` is unknown. Relative
+   *  rather than wall-clock because the question is "how far into the run did
+   *  this start", which an absolute timestamp makes the reader compute. */
+  offsetLabel: string;
+}
+
+export interface SignalGroup {
+  kind: string;
+  severity: SignalSeverity;
+  count: number;
+  signals: Signal[];
 }
 
 /** (#1973) One payload the brief summarizes, carried in full so the renderer
@@ -363,28 +407,80 @@ export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
         })
       : ["no telemetry yet"];
 
-  // ── detections ─────────────────────────────────────────────────────
-  interface Finding {
-    k: string;
-    d: string;
-    f?: string;
-  }
-  const finds: Finding[] = [];
+  // ── signals ────────────────────────────────────────────────────────
+  //
+  // (#1973) Was "detections", rendered as one flat list of grey strings with
+  // a `⚠` in front of every entry and no times at all.
+  //
+  // Two things were wrong with that beyond the styling. First, the emitter
+  // has ALWAYS sent a severity — `dispatch_internal`'s detector payload is
+  // `{kind, severity, detail}` with `warn` for cycle / reasoning-loop /
+  // tool-failure and `info` for `intra-turn-stall`, which is a RECOVERY, not
+  // a problem. The viewer read `kind` and `detail` and dropped `severity`, so
+  // a successful recovery rendered identically to a doom loop. Second, with
+  // no timestamps a cycle detected in the first ten seconds looked exactly
+  // like one detected an hour in, which is most of what tells you whether a
+  // run was struggling from the start or drifted late.
+  const finds: Signal[] = [];
   if (distinct.length > 1) {
     finds.push({
-      k: "jit-model-swap",
-      d: `${distinct.length} models loaded in one run (${distinct.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`,
-      f: "pin one model for the run, or pre-warm the swap target.",
+      kind: "jit-model-swap",
+      // Synthesized from the load track rather than emitted by a detector, so
+      // it has no record of its own and therefore no timestamp — `null` says
+      // so, instead of borrowing one and implying a moment it did not have.
+      severity: "warn",
+      detail: `${distinct.length} models loaded in one run (${distinct.join(" → ")}) — mid-run swap stalls the dispatch while the new model loads.`,
+      fix: "pin one model for the run, or pre-warm the swap target.",
+      atMs: null,
+      offsetLabel: "",
     });
   }
+  const runStartMs = d?.ts ? T(d.ts) : null;
   for (const r of dets) {
     const f = r.fields as Record<string, unknown>;
-    finds.push({ k: String(f.kind), d: String(f.detail) });
+    const atMs = r.ts ? T(r.ts) : null;
+    finds.push({
+      kind: String(f.kind),
+      // Unknown severities degrade to `warn`, never to `info`: a signal this
+      // build does not recognize is more likely to matter than not, and
+      // quietly downgrading it is how a new detector ships invisible.
+      severity: f.severity === "info" ? "info" : "warn",
+      detail: String(f.detail),
+      atMs,
+      offsetLabel: atMs != null && runStartMs != null ? runOffset(atMs - runStartMs) : "",
+    });
   }
-  const detectionsLabel = finds.length ? `detections (${finds.length})` : "detections";
-  const detectionLines = finds.length
-    ? finds.flatMap((f) => [`⚠ ${f.k}`, f.d, ...(f.f ? [`fix: ${f.f}`] : [])])
-    : ["✓ clean", "no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)"];
+
+  // Severity first, then most recent first inside each severity. A run with
+  // twenty signals is read top-down for "what went wrong", and a recovery
+  // never outranks a struggle.
+  const SEV_RANK: Record<SignalSeverity, number> = { warn: 0, info: 1 };
+  finds.sort((a, b) => SEV_RANK[a.severity] - SEV_RANK[b.severity] || (b.atMs ?? 0) - (a.atMs ?? 0));
+
+  // Grouped by kind so eleven cycle detections are one row that says 11,
+  // not eleven rows that bury everything else.
+  const groupOrder: string[] = [];
+  const byKind = new Map<string, Signal[]>();
+  for (const f of finds) {
+    if (!byKind.has(f.kind)) {
+      byKind.set(f.kind, []);
+      groupOrder.push(f.kind);
+    }
+    byKind.get(f.kind)!.push(f);
+  }
+  const signalGroups: SignalGroup[] = groupOrder.map((kind) => {
+    const signals = byKind.get(kind)!;
+    return {
+      kind,
+      // A group takes the highest severity it contains — a kind that fired
+      // once as a recovery and once as a struggle is a struggle.
+      severity: signals.some((x) => x.severity === "warn") ? "warn" : "info",
+      count: signals.length,
+      signals,
+    };
+  });
+  const signalsLabel = finds.length ? `signals (${finds.length})` : "signals";
+
 
   // procs (host CPU/RAM/GPU) contributes only to the two skipped SVG
   // charts — referenced here so the variable isn't flagged unused, and so
@@ -413,7 +509,7 @@ export function runRegions(data: FlowRecord[], sid: string): SessionRunView {
     metricScope,
     modelTrackLabel,
     modelTrackLines,
-    detectionsLabel,
-    detectionLines,
+    signalsLabel,
+    signalGroups,
   };
 }

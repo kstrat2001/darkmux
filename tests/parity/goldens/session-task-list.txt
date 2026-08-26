@@ -37,7 +37,7 @@ COMPACTIONS
 WALL CLOCK
 model (lms)
 no telemetry yet
-detections
+signals
 ✓ clean
 no behavioral flags (cycle, tool-failure, reasoning-loop, edit-drift)
 
