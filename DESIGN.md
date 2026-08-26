@@ -173,7 +173,7 @@ which answered which question.
 
 ### The ladder
 
-**mission › task › step › role execution.** A *run* is the umbrella, never a grain: one
+**mission › phase › task › step › role execution.** A *run* is the umbrella, never a grain: one
 top-level unit of work the operator started, in exactly three kinds (mission, dispatch, lab).
 A *step* is a graph node; a *role execution* is what the node did. A `procedural.shell` step
 has none; `dispatch.internal` has one; `dispatch.map` has one per collection item, and the
@@ -225,7 +225,7 @@ so the two implementations cannot drift, and **no kind-keyed registry in any con
 consumer that switches on `step.kind` to infer record shape is the snowflake being deleted,
 not a fix for it. Attribution must be inferable from records alone. *(target)*
 
-### Dispatch means one specialist execution
+### Dispatch names the top of the ladder, not the bottom
 
 `dispatch` names the top of the ladder only: the verb, and the `RunKind` it produces. Naming
 the INNER unit instead — the role execution — is what resolves the overload, and it is the
@@ -265,6 +265,63 @@ test of whether a capability is really shared is not where it is defined; it is 
 mission that never mentions it still gets it. *(holds for telemetry, per-step records,
 budgets and outcome; the staffing snapshot is the remaining piece that is still caller
 choice)*
+
+### The vocabulary, and why each word sits where it does
+
+darkmux names a lot of layers, and the names were not arrived at freely — most of the obvious
+ones were already spoken for. This is the map.
+
+**The containment ladder.** `mission › phase › task › step › role execution`.
+
+| Term | What it is |
+|---|---|
+| **run** | The UMBRELLA: one top-level unit of work the operator started. Never a grain. Three kinds — `mission`, `dispatch`, `lab`. |
+| **mission** | A whole task graph, launched from a config. |
+| **phase** | A grouping of tasks within a mission (`Mission.phase_ids` → `Phase.task_ids`). |
+| **task** | A group of steps — and where resource ASSIGNMENT lives (role, profile, workdir, image), which is why a step inherits staffing rather than declaring it. |
+| **step** | One graph node. Contains **0..N** role executions. |
+| **role execution** | The inner unit: one role, running many turns until it stops. |
+| **dispatch** | TOP-LEVEL ONLY — the verb `darkmux dispatch <role>`, and the `RunKind` meaning *a run consisting of exactly one role execution*. |
+| **crew** / **crew member** / **position** | Who staffs a mission, and where each member sits. |
+| **role** | A stance, a tool palette, and a system prompt. The declared identity of a role execution. |
+| **profile** | The staffing registry entry: which model at what context, local or hosted endpoint. |
+| **seat** | A staffed model position within a run (`MemberRecord`), with a `draws` count. |
+| **draw** | One invocation of a seat. |
+| **item** | One element of a `dispatch.map` collection. |
+| **session** | An INTERNAL join key tying a family of flow records together. Never operator-facing. |
+| **workload** / **fixture** | Lab-only: the thing being run, and the pinned sandbox it runs against. |
+
+**Why the inner unit is named for the ROLE and not the model.** The model is derived, not
+declared: `select_model(role, profile)` resolves it at dispatch entry, `DispatchOpts` takes
+`role_id` as required and `profile_name` as an optional override, and an endpoint-staffed seat
+has no local model at all. Role is the stable identity across local and remote; the model is a
+consequence of the profile. Naming it for the role also makes sub-executions compose — a
+compactor's work inside a specialist's is simply another role execution, one level in, rather
+than a special case needing its own rule.
+
+**Names that are taken, and by what.** Every humanized word that reads naturally for "one crew
+member's bounded piece of work" turned out to already name a *different* layer of this same
+system — which is itself the finding, because those layers were named with the same instinct:
+
+- **task** — the grouping layer above steps.
+- **job** — the FLEET work queue (`fleet::WorkJob`, `ClaimedJob`, `claim_job`), where a job is
+  a PHASE published to Redis and claimed by a peer machine. `WORK_JOB_SCHEMA_VERSION` makes it
+  a wire contract, not just a word.
+- **deployment** — the Azure hosted-model endpoint (`/openai/deployments/<name>`), surfaced in
+  `darkmux doctor`'s own remedy text. Reusing it for the execution would re-fuse the exact
+  thing choosing *role* over *model* was meant to keep apart.
+- **activity** — the viewer's activity lanes.
+- **assignment** — a Task's resource assignment.
+- **turn** — one iteration of the agent loop; a role execution has many.
+- **pass** — the review pipeline's probe/judge/verify passes.
+
+`shift` and `stint` are genuinely unused and were weighed as more humanized alternatives;
+`execution` won on precision and on composing cleanly for sub-executions.
+
+**The rule this leaves behind:** before naming a new layer, check whether the word already
+names a different grain in this system. A word at two grains is the defect that produced this
+whole section — `dispatch` meant both a top-level run kind and the innermost unit, and nothing
+said so, so every consumer picked a meaning and they disagreed.
 
 ### Lab stays separate, deliberately
 
