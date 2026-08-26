@@ -309,6 +309,70 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ]);
   });
 
+  const detRec = (fields: Record<string, unknown>) => ({
+    ts: "2026-01-01T00:00:30Z",
+    session_id: "s1",
+    category: "telemetry" as const,
+    source: "detector",
+    fields,
+  });
+
+  it("(#1989) a missing `kind` is named, not rendered as the literal string `undefined`", () => {
+    // `String(f.kind)` produced `"undefined"` and it reached the DOM as a
+    // group heading — an operator scanning SIGNALS reads that as a finding
+    // BY THAT NAME. A malformed payload must stay visible and be named
+    // honestly, which is the discipline the severity field already had.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      detRec({ severity: "warn", detail: "something fired" }),
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups[0].kind).toBe("unknown-signal");
+  });
+
+  it("(#1989) an empty-string `kind` is treated as missing, not as a blank heading", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      detRec({ severity: "warn", kind: "", detail: "d" }),
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups[0].kind).toBe("unknown-signal");
+  });
+
+  it("(#1989) a structured `detail` is SERIALIZED, not collapsed to `[object Object]`", () => {
+    // The operator can act on a JSON blob and cannot act on `[object
+    // Object]`. This is the case where a detector carried real diagnostic
+    // data and the viewer threw it away.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      detRec({ severity: "warn", kind: "structured", detail: { tool: "read_file", count: 4 } }),
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    const d = view.signalGroups[0].signals[0].detail;
+    expect(d).not.toContain("[object Object]");
+    expect(d).toContain("read_file");
+    expect(d).toContain("4");
+  });
+
+  it("(#1989) an absent `detail` says so rather than printing `undefined`", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      detRec({ severity: "warn", kind: "no-detail" }),
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.signalGroups[0].signals[0].detail).toBe("(no detail)");
+  });
+
+  it("(#1989) a circular `detail` degrades instead of throwing — a malformed signal must not take the page down", () => {
+    const circular: Record<string, unknown> = { a: 1 };
+    circular.self = circular;
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      detRec({ severity: "warn", kind: "circular", detail: circular }),
+    ];
+    expect(() => runRegions(flowToRenderModel(data), "s1")).not.toThrow();
+  });
+
   it("(#1973) an `info` signal is NOT rendered as a warning — a recovery is not a struggle", () => {
     // `dispatch_internal` emits `severity: "info"` for `intra-turn-stall`,
     // which reports that a stall RECOVERED. The old viewer dropped severity
