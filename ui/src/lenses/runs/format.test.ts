@@ -291,6 +291,48 @@ describe("runsForMachine", () => {
 // `runDestination(...).kind !== "none"`, so this matrix is also the load-
 // bearing spec for the client-side interactive/inert split.
 describe("runDestination", () => {
+  it("(#1973) a TRACKED dispatch row drills to the DETAIL view, not to a one-node graph", () => {
+    // The path an operator actually takes — Runs -> Dispatch -> a row — did
+    // not reach the detail view. A tracked `darkmux dispatch` mints a
+    // crew-of-one mission, so `tracked: true` sent it to `#mission=` and
+    // opened a graph of a SINGLE node, with no click handler on it. That
+    // showed strictly less than the detail view and then dead-ended; the only
+    // ways here were a hand-typed URL or a fleet activity bar.
+    const tracked = run({
+      id: "dispatch-analyst-1787557214-f5a8-0",
+      kind: "dispatch",
+      status: "complete",
+      tracked: true,
+      session_id: "crew-dispatch-analyst-1787557214045728-0",
+    });
+    expect(runDestination(tracked, true)).toEqual({
+      kind: "hash",
+      hash: "dispatch=crew-dispatch-analyst-1787557214045728-0",
+    });
+    // Never gated on the graph being reachable — this route is a plain
+    // `/flow-session/<id>` fetch, not the graph lens's endpoint.
+    expect(runDestination(tracked, false)).toEqual({
+      kind: "hash",
+      hash: "dispatch=crew-dispatch-analyst-1787557214045728-0",
+    });
+  });
+
+  it("(#1973) a tracked dispatch with NO session falls back to the graph rather than linking to nothing", () => {
+    // 36 of 63 tracked dispatch rows on the reporting machine carried no
+    // `session_id` — their flow records had aged out of the scan window. The
+    // detail view is keyed by session, so there is nothing to address; the
+    // graph is the honest destination rather than a dead link.
+    const aged = run({ id: "dispatch-old-1", kind: "dispatch", status: "complete", tracked: true });
+    expect(runDestination(aged, true)).toEqual({ kind: "hash", hash: "mission=dispatch-old-1" });
+  });
+
+  it("(#1973) a tracked MISSION still opens the graph — this change is scoped to dispatch-kind runs", () => {
+    // The graph is the right destination for a real task graph; only the
+    // crew-of-one case was being sent somewhere that showed less.
+    const mission = run({ id: "coder-phase-abc", kind: "mission", status: "complete", tracked: true });
+    expect(runDestination(mission, true)).toEqual({ kind: "hash", hash: "mission=coder-phase-abc" });
+  });
+
   it("(#1915) an UNTRACKED mission row with a session_id drills to that session — the defect this issue fixed", () => {
     // Before #1915, `runDestination` only special-cased `kind ===
     // "dispatch"` for the untracked-but-openable case (#1900); a mission

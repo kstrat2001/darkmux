@@ -141,6 +141,11 @@ export interface SessionRunView {
   /** (#1972) Is this run still going? Drives whether the page subscribes to
    *  the shared clock at all — a finished run's elapsed time is a fixed fact,
    *  and re-rendering it once a second is pure waste. */
+  /** (#1973) Whether this unit did MODEL work. False for a `procedural.*`
+   *  step, whose model pane and loaded-models track are ABSENT rather than
+   *  rendered full of em-dashes and a `0 COMPACTIONS` that asserts something
+   *  impossible. */
+  hasModelWork: boolean;
   live: boolean;
   /** (#1972) When the most recent proof-of-life record landed, or `null` if
    *  none has. The pulse pauses when this goes quiet — see `LivenessPulse`. */
@@ -424,16 +429,52 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // is a UTILITY role's sub-execution rather than the specialist's own work,
   // but it is counted here because what the operator is reading is "what
   // happened to this model's context", which is exactly what a compaction did.
-  const metricScope = { model: [0, 1, 2, 3, 4], harness: [5] };
+  // (#1973) Did this unit do MODEL work at all?
+  //
+  // The pane split created the ability to omit the model half; this is what
+  // uses it. A `procedural.shell` step compiles, moves files or runs a
+  // command — it will never have turns, tokens, a context window or a
+  // compaction. Rendering those as `— TURNS` and, worse, `0 COMPACTIONS` is a
+  // lie shaped like data: a zero asserts "this happened, none occurred", when
+  // the truth is "this cannot happen here".
+  //
+  // The discriminator is EVIDENCE of model work, not the absence of numbers.
+  // A dispatch that has started but reported nothing yet is model work with
+  // no telemetry, and must keep its pane — otherwise a live run would render
+  // no model metrics until its first turn landed, and then grow a pane.
+  const hasModelWork =
+    d != null || loads.length > 0 || turnsValue != null || tokIn != null || tokOut != null || cx.length > 0 || comps.length > 0;
+
+  const metricScope = { model: hasModelWork ? [0, 1, 2, 3, 4] : [], harness: [5] };
 
   // ── model track ────────────────────────────────────────────────────
-  const modelTrackLabel = ep ? "model (remote)" : "model (lms)";
+  // (#1973) Was `model (lms)`, which named the SUBSYSTEM rather than the
+  // content and left an operator asking what it meant — the question that
+  // started this redesign. It is a list of every model LMStudio held during
+  // the run, so it says that.
+  //
+  // Marking the primary needs no new wire field: the `dispatch start` record
+  // carries the resolved model (`FlowRecord.model`), which is ground truth
+  // for what this role actually ran on. Note it is read from `d?.model`
+  // SPECIFICALLY, not from the `model` binding above — that one falls back to
+  // `distinct[0]`, the first-loaded model, which is a heuristic. Marking a
+  // guess as authoritative is precisely the mistake #1934 is about, so when
+  // the record does not name a model, nothing is marked primary.
+  //
+  // The other entries are labelled `also loaded` and NOT "compactor": what a
+  // secondary model was FOR is not knowable until `telemetry.lms` carries the
+  // profile's declared role (#1973 slice 4). Saying "also loaded" is true;
+  // guessing by size or load order would not be.
+  const primaryModel = d?.model ?? null;
+  const modelTrackLabel = ep ? "remote model" : "loaded models";
   const modelTrackLines = ep
     ? [`${model || "unknown"} · served off-fleet — no local model (see route above)`]
     : loads.length
       ? loads.map((r) => {
           const f = r.fields as Record<string, unknown>;
-          return `${f.model} · ${f.gb ?? "?"}GB`;
+          const isPrimary = primaryModel != null && f.model === primaryModel;
+          const tag = primaryModel == null ? "" : isPrimary ? " · primary" : " · also loaded";
+          return `${f.model} · ${f.gb ?? "?"}GB${tag}`;
         })
       : ["no telemetry yet"];
 
@@ -539,6 +580,7 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     metricScope,
     modelTrackLabel,
     modelTrackLines,
+    hasModelWork,
     live: !done,
     lastBeatMs,
     signalsLabel,

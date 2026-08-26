@@ -52,12 +52,19 @@ function stageSectionOf(goldenText: string): string[] {
  * component's own doc for the exact DOM shape this mirrors. */
 function flattenView(view: ReturnType<typeof runRegions>): string[] {
   const lines: string[] = [];
-  lines.push(`${view.header.pillLabel} RUN · ${view.header.role} (${view.header.sid} on ${view.header.machineName})`);
+  lines.push(`${view.header.pillLabel} ${view.header.role} (${view.header.sid} on ${view.header.machineName})`);
   lines.push(...view.briefLines.map((e) => e.text));
-  for (const m of view.metrics) {
-    lines.push(m.value, m.label);
+  // (#1973) Iterate by SCOPE, not over the flat `metrics` array. The panes
+  // render model-then-harness and the model pane is ABSENT for a unit that
+  // did no model work, so a mirror that walked all six would claim tiles the
+  // page does not show.
+  for (const i of [...view.metricScope.model, ...view.metricScope.harness]) {
+    const m = view.metrics[i];
+    if (m) lines.push(m.value, m.label);
   }
-  lines.push(view.modelTrackLabel, ...view.modelTrackLines);
+  if (view.hasModelWork) {
+    lines.push(view.modelTrackLabel, ...view.modelTrackLines);
+  }
   // (#1973) Mirrors the SIGNALS block's DOM: label, then either the clean
   // pair or, per group, a head line and one line per signal. Note this mirror
   // is NOT enforced against the component (#1978) — the rendered assertions
@@ -174,7 +181,7 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     expect(view.briefLines.map((e) => e.text)).toContain("Azure OpenAI · my-host/gpt-4o · off-fleet");
-    expect(view.modelTrackLabel).toBe("model (remote)");
+    expect(view.modelTrackLabel).toBe("remote model");
     expect(view.modelTrackLines[0]).toMatch(/served off-fleet — no local model/);
   });
 
@@ -197,6 +204,75 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.signalGroups[0].signals[0].atMs).toBeNull();
     expect(view.signalGroups[0].signals[0].offsetLabel).toBe("");
     expect(view.modelTrackLines).toEqual(["a · 10GB", "b · 20GB"]);
+  });
+
+  it("(#1973) a unit that did NO model work has no model pane and no loaded-models track", () => {
+    // A `procedural.shell` step compiles, moves files or runs a command. It
+    // will never have turns, tokens, a context window or a compaction, so
+    // rendering `— TURNS` and `0 COMPACTIONS` is a lie shaped like data: the
+    // zero asserts "this happened, none occurred" when the truth is "this
+    // cannot happen here". The pane split exists to make the model half
+    // ABSENT, and this is what uses it.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "step start", handle: "build" },
+      { ts: "2026-01-01T00:00:04Z", session_id: "s1", action: "step complete", handle: "build" },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.hasModelWork).toBe(false);
+    expect(view.metricScope.model).toEqual([]);
+    // The harness half still renders — wall clock is a fact about any unit.
+    expect(view.metricScope.harness).toEqual([5]);
+    expect(view.metrics[5].label).toBe("WALL CLOCK");
+  });
+
+  it("(#1973) a dispatch that has STARTED but reported nothing keeps its model pane", () => {
+    // The discriminator is EVIDENCE of model work, not the absence of
+    // numbers. A live dispatch whose first turn has not landed would
+    // otherwise render no model metrics and then GROW a pane mid-run, which
+    // is worse than showing em-dashes that are about to fill in.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.hasModelWork).toBe(true);
+    expect(view.metricScope.model).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it("(#1973) marks the PRIMARY loaded model from the dispatch record, and labels the rest honestly", () => {
+    // `model (lms)` named the subsystem, not the content, and listed the
+    // specialist beside the compactor with nothing telling them apart — the
+    // operator question that started this redesign.
+    //
+    // The primary needs no new wire field: the `dispatch start` record's own
+    // `model` is ground truth for what this role ran on. The others are
+    // "also loaded" and deliberately NOT named as the compactor — what a
+    // secondary model was FOR is unknowable until `telemetry.lms` carries the
+    // declared role, and guessing by size or load order is exactly the
+    // inference #1934 is about.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder", model: "big-specialist" },
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "big-specialist", gb: 18 } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "small-utility", gb: 2 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.modelTrackLabel).toBe("loaded models");
+    expect(view.modelTrackLines).toEqual([
+      "big-specialist · 18GB · primary",
+      "small-utility · 2GB · also loaded",
+    ]);
+  });
+
+  it("(#1973) marks NOTHING primary when the dispatch record names no model — a guess must not be labelled ground truth", () => {
+    // Without `record.model` the only candidate is the FIRST-LOADED model,
+    // which is a heuristic. Marking it "primary" would assert something the
+    // data does not support; the list simply reports what was loaded.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:00:05Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "a", gb: 10 } },
+      { ts: "2026-01-01T00:00:10Z", session_id: "s1", category: "telemetry", source: "lms", fields: { event: "load", model: "b", gb: 2 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.modelTrackLines).toEqual(["a · 10GB", "b · 2GB"]);
   });
 
   it("a real detector finding carries its severity/kind/detail, without a fix line", () => {

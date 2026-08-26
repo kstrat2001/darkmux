@@ -238,6 +238,23 @@ export type RunDestination =
  */
 export function runDestination(run: Run, graphReachable: boolean): RunDestination {
   if (run.kind === "lab") return { kind: "lab", dir: run.id };
+  // (#1973) A DISPATCH-kind run drills to the DETAIL view, tracked or not.
+  //
+  // Previously only UNTRACKED rows came here; a tracked `darkmux dispatch`
+  // mints a crew-of-one mission, so it fell through to `#mission=` and opened
+  // the graph. That graph is a single node with no click handler — it showed
+  // strictly less than the detail view and then dead-ended, so the path
+  // "Runs -> Dispatch -> detail" did not exist for the rows most likely to be
+  // clicked. The only way here was a hand-typed URL or a fleet activity bar.
+  //
+  // Gated on `session_id` because that is the key this route addresses (a
+  // dispatch-kind run is named for its content but keyed by its session — see
+  // `CLAUDE.md` contract 8). A run whose flow records have aged out of the
+  // window carries none, and falls through to the graph rather than offering
+  // a link to nothing.
+  if (run.kind === "dispatch" && run.session_id) {
+    return { kind: "hash", hash: `dispatch=${encodeURIComponent(run.session_id)}` };
+  }
   if (!run.tracked) {
     // No `graphReachable` gate here — `/flow-session/<id>` is a plain
     // daemon fetch (`SessionReplay`'s own fetch, same as the ungated

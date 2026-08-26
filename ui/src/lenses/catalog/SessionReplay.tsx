@@ -131,7 +131,16 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
             invisible on screen and unmissable to the golden. */}
         <span className={`pill pill--${view.header.pillCls}`}>{view.header.pillLabel}</span>{" "}
         <LivenessPulse done={!view.live} animate={ticking} lastBeatMs={view.lastBeatMs} />
-        RUN · {view.header.role}{" "}
+        {/* (#1974) No noun. This view's subject is ONE ROLE EXECUTION — one
+            role, one model, its turns, tokens and signals. `RUN` was the one
+            word contract 8 says it definitely is not: `run` is the umbrella
+            over mission/dispatch/lab, never a grain. `STEP` would be wrong
+            too, since a step contains 0..N role executions (a `dispatch.map`
+            step holds one per item). `DISPATCH` names the run KIND, not what
+            is on screen.
+            The role already names the thing, so the noun is dropped rather
+            than replaced with a differently-wrong one. */}
+        {view.header.role}{" "}
         <span className="session-run__meta">
           ({view.header.sid} on {view.header.machineName})
         </span>
@@ -176,6 +185,9 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
         </details>
       ))}
 
+      {/* Absent, not empty, when the unit did no model work — see
+          `hasModelWork`. */}
+      {view.metricScope.model.length > 0 && (
       <div className="metrics" data-scope="model" role="group" aria-label="model metrics">
         {view.metricScope.model.map((i) => view.metrics[i]).filter(Boolean).map((m, i) => (
           <div className="met" key={i}>
@@ -184,6 +196,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
           </div>
         ))}
       </div>
+      )}
 
       {/* (#1973) The HARNESS pane, ADJACENT to the model pane rather than
           below the model track. Two reasons, and the second is why CI caught
@@ -205,12 +218,14 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
         </div>
       )}
 
-      <div className="track">
-        <div className="lbl">{view.modelTrackLabel}</div>
-        {view.modelTrackLines.map((line, i) => (
-          <div key={i}>{line}</div>
-        ))}
-      </div>
+      {view.hasModelWork && (
+        <div className="track">
+          <div className="lbl">{view.modelTrackLabel}</div>
+          {view.modelTrackLines.map((line, i) => (
+            <div key={i}>{line}</div>
+          ))}
+        </div>
+      )}
 
 
       {/* (#1973) SIGNALS — grouped by kind, severity-coded, run-relative
