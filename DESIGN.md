@@ -173,10 +173,20 @@ which answered which question.
 
 ### The ladder
 
-**mission › task › step › dispatch.** A *run* is the umbrella, never a grain: one top-level
-unit of work the operator started, in exactly three kinds (mission, dispatch, lab). A *step*
-is a graph node; a *dispatch* is what the node did. A `procedural.shell` step has no
-dispatch; a model-bearing step has exactly one. The full definition, and its consequences for
+**mission › task › step › role execution.** A *run* is the umbrella, never a grain: one
+top-level unit of work the operator started, in exactly three kinds (mission, dispatch, lab).
+A *step* is a graph node; a *role execution* is what the node did. A `procedural.shell` step
+has none; `dispatch.internal` has one; `dispatch.map` has one per collection item, and the
+review pipeline's probe and judge steps have seats × draws. That 0..N cardinality is what
+makes the step layer real rather than a wrapper.
+
+The inner unit is named for the **role**, not the model, because the model is derived rather
+than declared: `select_model(role, profile)` resolves it at dispatch entry, `DispatchOpts`
+takes `role_id` as required and `profile_name` as an optional override, and an
+endpoint-staffed seat has no local model at all. Role is the stable identity across local and
+remote. `dispatch` is then unambiguously TOP-LEVEL — the verb, and the `RunKind` meaning *a
+run consisting of exactly one role execution* — which is what stops one word naming both ends
+of the ladder. The full definition, and its consequences for
 attribution and escalation, is contract 8 in [`CLAUDE.md`](CLAUDE.md)'s cross-system contract
 registry. *(holds — the vocabulary is stated and the hash routes are named for their run kind)*
 
@@ -208,7 +218,7 @@ Mapping a record to its step is a three-key chain — `payload.step_id`, then a 
 `session_id`, then `handle` — with `mission_id` authoritative above all three. That chain is
 correct and already written twice, once per language. What is wrong is that it is not
 universally *used*: a second, ad-hoc resolver matches on step-kind strings with a silent
-catch-all, and the dispatch detail lens scopes by raw session id instead of by step.
+catch-all, and the step detail lens scopes by raw session id instead of by step.
 
 The target is one resolver per language, bound by a shared fixture both test suites consume
 so the two implementations cannot drift, and **no kind-keyed registry in any consumer** — a
@@ -217,16 +227,22 @@ not a fix for it. Attribution must be inferable from records alone. *(target)*
 
 ### Dispatch means one specialist execution
 
-`dispatch start` / `dispatch complete` denotes one role's one model execution, full stop. The
-run grain keeps its own bookend — it is load-bearing for run status, the runs board's
-representative-session pick, fleet card activity, and the status line — but under its own
-vocabulary (`run start` / `run complete` / `run error`) rather than borrowing the dispatch
-one. Consumers become bilingual before the emission changes, and stay bilingual permanently,
-because archives are never rewritten. *(target — today the run grain borrows the dispatch
-vocabulary, and the review pipeline wraps a whole multi-model crew in a single pair)*
+`dispatch` names the top of the ladder only: the verb, and the `RunKind` it produces. Naming
+the INNER unit instead — the role execution — is what resolves the overload, and it is the
+cheaper direction by a wide margin: the flow-record bookends `dispatch start` / `dispatch
+complete` keep their historical spelling at both grains, so the four consumers that key on
+them at the session grain (`runs.rs`'s `terminal_status_for_action`, the runs board's
+representative-session pick, `cards.ts`'s fleet activity, `metaLine.ts`'s last-dispatch) are
+untouched. Archives are append-only and grain is already recoverable from `session_id` and
+`source`, so renaming the wire would buy a consumer migration for no behavioral gain. What
+changes is the word used in code, docs and UI. *(holds for the vocabulary; the review
+pipeline still wraps a whole multi-model crew in one pair, which is a separate defect)*
 
-Utility work inside a dispatch — compaction above all — is a **sub-execution**, attributed to
-its own role and model rather than blended into the specialist's. Getting this wrong is not
+Utility work inside a role execution — compaction above all — is a **sub-execution**:
+itself a role execution, of a utility role, attributed to its own role and model rather than
+blended into the specialist's. Naming the unit for the role is what makes this compose
+instead of needing a special case — a sub-execution is the same kind of thing as its parent,
+one level in. Getting this wrong is not
 cosmetic: filing the compactor's residency under the specialist is what makes a healthy run
 report a model swap that never happened. *(target)*
 
