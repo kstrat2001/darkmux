@@ -3316,6 +3316,75 @@ body {
   font-size: 11px;
 }
 
+/* (#1973) Payload disclosure — the prompt, reachable rather than summarized
+   away. `<details>` is used deliberately: keyboard-operable and
+   find-in-page-searchable with no JS, and the body is in the DOM whether or
+   not it is open, which is what the rendered-DOM test asserts. */
+.session-run .disclosure {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 8px 0 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.session-run .disclosure__sum {
+  cursor: pointer;
+  padding: 6px 10px;
+  color: var(--dim);
+  font-size: 11px;
+  list-style: none;
+}
+.session-run .disclosure__sum::-webkit-details-marker {
+  display: none;
+}
+.session-run .disclosure__sum::before {
+  content: "\25B8";
+  display: inline-block;
+  width: 12px;
+  transition: transform 0.12s ease;
+}
+.session-run .disclosure[open] .disclosure__sum::before {
+  transform: rotate(90deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .session-run .disclosure__sum::before {
+    transition: none;
+  }
+}
+.session-run .disclosure__sum:focus-visible {
+  outline: 2px solid var(--fg);
+  outline-offset: -2px;
+}
+/* The payload itself. `pre-wrap` keeps a brief's own line breaks, which are
+   meaningful, while still wrapping long lines; the container scrolls rather
+   than letting the page scroll sideways. */
+.session-run .disclosure__body {
+  margin: 0;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+/* (#1973) The metric panes carry a scope so the operator can tell which
+   numbers describe the MODEL's work and which describe the HARNESS around it
+   — the question this redesign came from. The label is CSS-generated rather
+   than a DOM node so the parity goldens, which read `innerText`, are
+   unaffected by it. */
+.session-run .metrics[data-scope]::before {
+  grid-column: 1 / -1;
+  content: attr(data-scope);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 10px;
+  color: var(--dim);
+}
+
 .session-run .metrics {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
