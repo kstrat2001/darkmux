@@ -157,6 +157,24 @@ export interface SessionRunView {
   signalGroups: SignalGroup[];
 }
 
+/** (#1989) Render a detector's `detail` without destroying it.
+ *
+ *  `String(value)` collapses every object to `[object Object]`. A detector
+ *  payload carrying structured data is exactly the case where an operator
+ *  most needs to see it, so a non-string is serialized rather than
+ *  stringified. An absent detail says so, instead of printing `undefined`. */
+function signalDetail(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "(no detail)";
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    // Circular or otherwise unserializable — fall back rather than throw,
+    // since a malformed signal must never take the whole page down.
+    return String(value);
+  }
+}
+
 /** (#1973) `+m:ss` / `+h:mm:ss` from run start. Sub-minute signals still read
  *  `+0:07` rather than collapsing to `+0`, because "seven seconds in" and
  *  "immediately" are different findings. */
@@ -511,12 +529,22 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     const f = r.fields as Record<string, unknown>;
     const atMs = r.ts ? T(r.ts) : null;
     finds.push({
-      kind: String(f.kind),
+      // (#1989) `String(f.kind)` turned a missing field into the literal
+      // string `undefined`, rendered verbatim as a group heading — an
+      // operator scanning SIGNALS reads that as a finding named "undefined".
+      // `unknown-signal` says what actually happened instead, and matches the
+      // discipline the severity line below already had: a malformed payload
+      // must stay VISIBLE and be named honestly, never silently mangled.
+      kind: typeof f.kind === "string" && f.kind ? f.kind : "unknown-signal",
       // Unknown severities degrade to `warn`, never to `info`: a signal this
       // build does not recognize is more likely to matter than not, and
       // quietly downgrading it is how a new detector ships invisible.
       severity: f.severity === "info" ? "info" : "warn",
-      detail: String(f.detail),
+      // (#1989) A non-string `detail` used to stringify to `[object Object]`,
+      // destroying real diagnostic content rather than formatting it oddly.
+      // Serializing keeps the data where a human can read it — the operator
+      // can act on a JSON blob and cannot act on `[object Object]`.
+      detail: signalDetail(f.detail),
       atMs,
       offsetLabel: atMs != null && runStartMs != null ? runOffset(atMs - runStartMs) : "",
     });
