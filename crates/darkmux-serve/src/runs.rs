@@ -3706,7 +3706,7 @@ mod tests {
             "bookend-only-1",
             vec![],
             Some(MissionSpec {
-                config_id: "gh-verb-approve".to_string(),
+                config_id: "cmd-gate-approve".to_string(),
                 inputs_fingerprint: "fpo".to_string(),
                 origin: None,
             }),
@@ -3721,7 +3721,7 @@ mod tests {
                     "ts": "2026-01-01T08:00:00Z",
                     "action": "dispatch start",
                     "session_id": "bookend-only-1",
-                    "handle": "gh-verb-approve",
+                    "handle": "cmd-gate-approve",
                     "mission_id": "bookend-only-1",
                     "source": "mission",
                 }),
@@ -3729,7 +3729,7 @@ mod tests {
                     "ts": "2026-01-01T08:00:05Z",
                     "action": "dispatch complete",
                     "session_id": "bookend-only-1",
-                    "handle": "gh-verb-approve",
+                    "handle": "cmd-gate-approve",
                     "mission_id": "bookend-only-1",
                     "source": "mission",
                 }),
@@ -3738,7 +3738,7 @@ mod tests {
 
         let runs = build_runs(flows.path(), None, &[]);
         assert_eq!(runs.len(), 1, "exactly one Run for the bookend-only mission: {runs:?}");
-        assert_eq!(runs[0].role.as_deref(), Some("gh-verb-approve"), "with no other session, the bookend's own handle IS the best available role: {runs:?}");
+        assert_eq!(runs[0].role.as_deref(), Some("cmd-gate-approve"), "with no other session, the bookend's own handle IS the best available role: {runs:?}");
         assert_eq!(runs[0].model.as_deref(), None, "a procedural-only mission genuinely has no model to show: {runs:?}");
     }
 

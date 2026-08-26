@@ -102,7 +102,7 @@ pub(crate) struct ConfigListRow {
     pub phases: Option<usize>,
     pub tasks: Option<usize>,
     pub panel: Option<bool>,
-    pub gh_verb: Option<String>,
+    pub cmd: Option<String>,
     pub error: Option<String>,
 }
 
@@ -126,7 +126,7 @@ pub(crate) fn build_list() -> Vec<ConfigListRow> {
                     phases: Some(loaded.config.phases.len()),
                     tasks: Some(total_tasks),
                     panel: Some(loaded.config.panel.is_some()),
-                    gh_verb: loaded.config.gh_verb.clone(),
+                    cmd: loaded.config.cmd.clone(),
                     error: None,
                 }
             }
@@ -138,7 +138,7 @@ pub(crate) fn build_list() -> Vec<ConfigListRow> {
                 phases: None,
                 tasks: None,
                 panel: None,
-                gh_verb: None,
+                cmd: None,
                 error: Some(format!("{e:#}")),
             },
         })
@@ -164,7 +164,7 @@ fn render_list_text(rows: &[ConfigListRow]) -> String {
         .max(6);
     out.push_str(&format!(
         "{:<id_w$}  {:<name_w$}  {:<src_w$}  {:>6}  {:>5}  {:<5}  {}\n",
-        "id", "name", "source", "phases", "tasks", "panel", "gh_verb"
+        "id", "name", "source", "phases", "tasks", "panel", "cmd"
     ));
     for row in rows {
         if let Some(err) = &row.error {
@@ -180,7 +180,7 @@ fn render_list_text(rows: &[ConfigListRow]) -> String {
             row.phases.unwrap_or(0),
             row.tasks.unwrap_or(0),
             if row.panel.unwrap_or(false) { "yes" } else { "no" },
-            row.gh_verb.as_deref().unwrap_or("-"),
+            row.cmd.as_deref().unwrap_or("-"),
         ));
     }
     out
@@ -305,7 +305,7 @@ pub(crate) struct ConfigShow {
     pub schema_version: Option<String>,
     pub inputs: Vec<InputJson>,
     pub panel: Option<PanelJson>,
-    pub gh_verb: Option<GhVerbJson>,
+    pub cmd: Option<GhVerbJson>,
     pub phases: Vec<PhaseJson>,
     pub registry: RegistryJson,
     pub residency: ResidencyBlockJson,
@@ -537,9 +537,9 @@ pub(crate) fn build_show(
         description: p.description.clone(),
         hint: p.hint.clone(),
     });
-    let gh_verb = config.gh_verb.as_ref().map(|v| GhVerbJson {
+    let cmd = config.cmd.as_ref().map(|v| GhVerbJson {
         verb: v.clone(),
-        allowed: darkmux_types::config_access::gh_verb_allowed(v),
+        allowed: darkmux_types::config_access::cmd_allowed(v),
     });
 
     let registry_json = match profiles {
@@ -575,7 +575,7 @@ pub(crate) fn build_show(
             })
             .collect(),
         panel,
-        gh_verb,
+        cmd,
         phases,
         registry: registry_json,
         residency: residency_json,
@@ -699,13 +699,13 @@ fn render_show_text(show: &ConfigShow) -> String {
         )),
         None => out.push_str("  panel: (not panel-advertised)\n"),
     }
-    match &show.gh_verb {
+    match &show.cmd {
         Some(g) => out.push_str(&format!(
-            "  gh_verb: {} ({})\n",
+            "  cmd: {} ({})\n",
             g.verb,
             if g.allowed { "allowed" } else { "NOT allowed — see darkmux config set gh.*" }
         )),
-        None => out.push_str("  gh_verb: (none)\n"),
+        None => out.push_str("  cmd: (none)\n"),
     }
     out.push_str(&format!(
         "  profiles registry: {}\n",
@@ -965,7 +965,7 @@ mod tests {
             inputs: Vec::new(),
             phases,
             panel: None,
-            gh_verb: None,
+            cmd: None,
             extras: Default::default(),
         }
     }
@@ -1279,11 +1279,11 @@ mod tests {
             phases: None,
             tasks: None,
             panel: None,
-            gh_verb: None,
+            cmd: None,
             error: Some("boom".to_string()),
         };
         let v = serde_json::to_value(&row).unwrap();
-        for key in ["id", "name", "source", "manifest_path", "phases", "tasks", "panel", "gh_verb", "error"] {
+        for key in ["id", "name", "source", "manifest_path", "phases", "tasks", "panel", "cmd", "error"] {
             assert!(v.get(key).is_some(), "missing key {key} in {v}");
         }
         assert!(v["name"].is_null());

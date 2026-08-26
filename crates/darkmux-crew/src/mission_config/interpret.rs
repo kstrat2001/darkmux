@@ -409,13 +409,13 @@ mod tests {
             inputs: Vec::new(),
             phases,
             panel: None,
-            gh_verb: None,
+            cmd: None,
             extras: Map::new(),
         }
     }
 
     #[test]
-    fn fixed_ids_pass_through_verbatim_when_phase_id_differs() {
+    fn fixed_ids_pass_throucmdatim_when_phase_id_differs() {
         // Mirrors review.json's convention — task/step ids never carry the
         // phase-config id as a prefix, so substitution is a no-op even
         // though the launcher supplies a DIFFERENT real phase id.

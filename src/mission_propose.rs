@@ -604,7 +604,7 @@ fn build_mission_config(
         // never panel-advertised by default. The operator opts a proposed
         // config into the panel by hand-editing its saved JSON afterward.
         panel: None,
-        gh_verb: None,
+        cmd: None,
         extras,
     }
 }

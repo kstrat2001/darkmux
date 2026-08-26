@@ -1336,19 +1336,19 @@ fn check_redis_config() -> Check {
 /// default), so an operator wondering "why did `pr-merge` refuse to run"
 /// can see the answer from `darkmux doctor` without reading
 /// `~/.darkmux/config.json` by hand. Never touches GitHub or `gh` itself —
-/// this only reads darkmux's OWN config surface (`GhConfig`'s doc).
+/// this only reads darkmux's OWN config surface (`CmdConfig`'s doc).
 fn check_gh_allowlist() -> Check {
     let name = "gh verb allowlist";
-    let env_enabled = std::env::var("DARKMUX_GH_ENABLED").ok().filter(|s| !s.trim().is_empty()).is_some();
-    let env_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok().filter(|s| !s.trim().is_empty()).is_some();
-    let enabled = darkmux_types::config_access::gh_enabled();
-    let allowed = darkmux_types::config_access::gh_allowed_verbs();
+    let env_enabled = std::env::var("DARKMUX_CMD_ENABLED").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let env_allowed = std::env::var("DARKMUX_CMD_ALLOWED").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let enabled = darkmux_types::config_access::cmd_enabled();
+    let allowed = darkmux_types::config_access::cmd_allowed_verbs();
     let provenance = if env_enabled || env_allowed { "env" } else { "config.json" };
     if !enabled {
         return Check {
             name: name.into(),
             status: Status::Pass,
-            message: format!("disabled ({provenance}) — every gh_verb-declaring panel command refuses to run"),
+            message: format!("disabled ({provenance}) — every cmd-declaring panel command refuses to run"),
             hint: None,
         };
     }
@@ -1356,8 +1356,8 @@ fn check_gh_allowlist() -> Check {
         return Check {
             name: name.into(),
             status: Status::Warn,
-            message: "gh.enabled=true but gh.allowed is empty — every gh_verb-declaring panel command still refuses (a verb absent from the list is blocked even with the gate on)".into(),
-            hint: Some("`darkmux config set gh.allowed <comma-separated-verb-list>` — e.g. pr-list,pr-info,pr-approve,pr-merge — matching each config's own `gh_verb` field.".into()),
+            message: "cmd.enabled=true but cmd.allowed is empty — every cmd-declaring panel command still refuses (a verb absent from the list is blocked even with the gate on)".into(),
+            hint: Some("`darkmux config set cmd.allowed <comma-separated-verb-list>` — e.g. pr-list,pr-info,pr-approve,pr-merge — matching each config's own `cmd` field.".into()),
         };
     }
     Check {
@@ -2899,7 +2899,7 @@ fn check_mission_config_registry() -> Check {
                 //    pre-1.4 "review" copy losing `reads` (#1619) — on EVERY
                 //    minor-trailing hit, regardless of how far the document
                 //    actually trails. A one-minor additive gap (2.2 → 2.3
-                //    just added the optional `gh_verb`) then reads exactly
+                //    just added the optional `cmd`) then reads exactly
                 //    like a data-loss hazard it is not.
                 //
                 // (#1550 cluster item 2: an earlier illustration named the
@@ -2933,7 +2933,7 @@ fn check_mission_config_registry() -> Check {
                                 // no-op". `gap <= 1` measures DISTANCE, not harm, and
                                 // this schema's history refutes the equivalence twice:
                                 // 1.3 -> 1.4 added `reads` (cross-phase delivery
-                                // silently stops) and 2.2 -> 2.3 added `gh_verb` (the
+                                // silently stops) and 2.2 -> 2.3 added `cmd` (the
                                 // allowlist gate stops applying). The only reachable
                                 // gap-1 case on a 2.3 binary today is a 2.2 document,
                                 // which is exactly the `pr-*` configs that mutate
@@ -2945,7 +2945,7 @@ fn check_mission_config_registry() -> Check {
                                  is not the same as harmless. Confirm none of the fields \
                                  this binary's schema added since your document's version \
                                  apply to it: 1.3 -> 1.4 added `reads` (cross-phase data \
-                                 delivery silently stops), 2.2 -> 2.3 added `gh_verb` (a \
+                                 delivery silently stops), 2.2 -> 2.3 added `cmd` (a \
                                  config that mutates GitHub state runs ungated)"
                                     .to_string()
                             } else {
@@ -4166,23 +4166,23 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn check_gh_allowlist_disabled_by_default_is_pass() {
-        let prev_e = std::env::var("DARKMUX_GH_ENABLED").ok();
-        let prev_a = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        let prev_e = std::env::var("DARKMUX_CMD_ENABLED").ok();
+        let prev_a = std::env::var("DARKMUX_CMD_ALLOWED").ok();
         unsafe {
-            std::env::remove_var("DARKMUX_GH_ENABLED");
-            std::env::remove_var("DARKMUX_GH_ALLOWED");
+            std::env::remove_var("DARKMUX_CMD_ENABLED");
+            std::env::remove_var("DARKMUX_CMD_ALLOWED");
         }
         let check = check_gh_allowlist();
         assert_eq!(check.status, Status::Pass, "{}", check.message);
         assert!(check.message.contains("disabled"), "{}", check.message);
         unsafe {
             match prev_e {
-                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ENABLED"),
             }
             match prev_a {
-                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
-                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ALLOWED"),
             }
         }
     }
@@ -4190,11 +4190,11 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn check_gh_allowlist_enabled_with_empty_list_warns() {
-        let prev_e = std::env::var("DARKMUX_GH_ENABLED").ok();
-        let prev_a = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        let prev_e = std::env::var("DARKMUX_CMD_ENABLED").ok();
+        let prev_a = std::env::var("DARKMUX_CMD_ALLOWED").ok();
         unsafe {
-            std::env::set_var("DARKMUX_GH_ENABLED", "true");
-            std::env::remove_var("DARKMUX_GH_ALLOWED");
+            std::env::set_var("DARKMUX_CMD_ENABLED", "true");
+            std::env::remove_var("DARKMUX_CMD_ALLOWED");
         }
         let check = check_gh_allowlist();
         assert_eq!(check.status, Status::Warn, "{}", check.message);
@@ -4202,12 +4202,12 @@ mod tests {
         assert!(check.hint.is_some());
         unsafe {
             match prev_e {
-                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ENABLED"),
             }
             match prev_a {
-                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
-                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ALLOWED"),
             }
         }
     }
@@ -4215,11 +4215,11 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn check_gh_allowlist_enabled_with_verbs_is_pass_and_names_them() {
-        let prev_e = std::env::var("DARKMUX_GH_ENABLED").ok();
-        let prev_a = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        let prev_e = std::env::var("DARKMUX_CMD_ENABLED").ok();
+        let prev_a = std::env::var("DARKMUX_CMD_ALLOWED").ok();
         unsafe {
-            std::env::set_var("DARKMUX_GH_ENABLED", "true");
-            std::env::set_var("DARKMUX_GH_ALLOWED", "pr-list,pr-merge");
+            std::env::set_var("DARKMUX_CMD_ENABLED", "true");
+            std::env::set_var("DARKMUX_CMD_ALLOWED", "pr-list,pr-merge");
         }
         let check = check_gh_allowlist();
         assert_eq!(check.status, Status::Pass, "{}", check.message);
@@ -4228,12 +4228,12 @@ mod tests {
         assert!(check.message.contains("env"), "provenance named: {}", check.message);
         unsafe {
             match prev_e {
-                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ENABLED"),
             }
             match prev_a {
-                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
-                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ALLOWED"),
             }
         }
     }
@@ -5169,7 +5169,7 @@ mod tests {
         // [#934] + binary-split-brain [#934] + crew-validation [#1269] +
         // mission-config-registry [#1284] + daemon-freshness +
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
-        // [#1475] + gh-verb-allowlist [#1685] + unpriceable-residents
+        // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
         // mission-envelope-readability [#1881]) + one per active eureka
         // rule.
@@ -6174,9 +6174,17 @@ mod tests {
         // added this comment's own "once a real 2.1 exists" callout below,
         // and a literal here would have gone stale exactly the way this
         // one did.
+        // (#2004) The MAJOR is derived too. The previous version pinned the
+        // string against the constant but wrote "(major 2)" as a literal —
+        // which is the same staleness the comment above warns about, one
+        // field to the right. It went red on the 3.0 bump.
+        let bin_major = darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA
+            .split('.')
+            .next()
+            .unwrap();
         assert!(
             check.message.contains(&format!(
-                "MISSION_CONFIG_SCHEMA \"{}\" (major 2)",
+                "MISSION_CONFIG_SCHEMA \"{}\" (major {bin_major})",
                 darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA
             )),
             "{}",
@@ -6201,17 +6209,56 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn check_mission_config_registry_blocks_a_user_tier_copy_trailing_the_current_minor() {
+        // (#2004) The fixture is DERIVED from the constant: one minor behind
+        // the binary, within the same major. A literal "2.0" here meant this
+        // test silently changed which BRANCH it exercised when the schema
+        // bumped to 3.0 — 2.0 stopped being "trailing by a minor" and became
+        // "an older major", a different code path with a different message,
+        // so the test failed on an assertion that was no longer even about
+        // the case its name claims.
+        //
+        // At a `.0` schema there is no same-major lower minor, so the case is
+        // genuinely unconstructable and this test asserts the neighbouring
+        // truth instead: a document AT the current schema draws no drift
+        // finding at all. It starts exercising the trailing-minor branch
+        // again, without an edit, the moment a 3.1 exists.
+        let (bin_major, bin_minor) = {
+            let mut it = darkmux_crew::mission_config::MISSION_CONFIG_SCHEMA.split('.');
+            (
+                it.next().unwrap().parse::<u32>().unwrap(),
+                it.next().unwrap_or("0").parse::<u32>().unwrap(),
+            )
+        };
+        let doc_version = format!("{bin_major}.{}", bin_minor.saturating_sub(1));
+
         let guard = CrewRootGuard::new();
         std::fs::create_dir_all(guard.path().join("mission-configs")).unwrap();
         std::fs::write(
             guard.path().join("mission-configs").join("review.json"),
-            r#"{"id":"review","name":"PR Review (pre-panel user copy)","schema_version":"2.0"}"#,
+            format!(
+                r#"{{"id":"review","name":"PR Review (pre-panel user copy)","schema_version":"{doc_version}"}}"#
+            ),
         )
         .unwrap();
 
         let check = check_mission_config_registry();
+
+        if bin_minor == 0 {
+            assert_eq!(
+                check.status,
+                Status::Pass,
+                "a document at the CURRENT schema must draw no drift finding: {}",
+                check.message
+            );
+            return;
+        }
+
         assert_eq!(check.status, Status::Warn, "{}", check.message);
-        assert!(check.message.contains("declares schema 2.0"), "{}", check.message);
+        assert!(
+            check.message.contains(&format!("declares schema {doc_version}")),
+            "{}",
+            check.message
+        );
         assert!(
             // #1917 rescoped this to name the actual gap ("trailing by N
             // minors") rather than a fixed phrase, since the severity text
