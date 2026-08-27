@@ -74,3 +74,94 @@ describe("fetchPanel", () => {
     expect((result as { message: string }).message).toMatch(/could not reach the daemon/);
   });
 });
+
+// ── The static-build path (#2019) ────────────────────────────────────────
+//
+// The regression these exist for: `/panel/:id` on GitHub Pages is answered by
+// PAGES, not a daemon, and this module renders a failed response's BODY as its
+// message by design. The console therefore printed 9,379 bytes of
+// `<!DOCTYPE html>` as command output on darkmux.com/demo.
+//
+// The pair below is the point. It is not enough to stop rendering HTML; the
+// daemon's own text MUST still come through, because that contract is why the
+// body is read at all (a 404 names the allowlist, a 429 explains the floor).
+// Breaking one to fix the other would trade one wrong reading for another.
+
+function meta(name: string, content: string) {
+  const el = document.createElement("meta");
+  el.setAttribute("name", name);
+  el.setAttribute("content", content);
+  document.head.appendChild(el);
+  return el;
+}
+
+describe("fetchPanel — a reply that did not come from a daemon", () => {
+  afterEach(() => {
+    document.head.querySelectorAll("meta[name^='darkmux-']").forEach((e) => e.remove());
+  });
+
+  it("does NOT render an HTML error body as the panel message", async () => {
+    const pagesBody = '<!DOCTYPE html>\n<html><head><title>Page not found &middot; GitHub Pages</title>';
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response(pagesBody, { status: 404, headers: { "content-type": "text/html; charset=utf-8" } }))),
+    );
+    const out = await fetchPanel("run-list", 120);
+    expect(out.ok).toBe(false);
+    if (out.ok) return;
+    expect(out.message).not.toContain("<!DOCTYPE");
+    expect(out.message).not.toContain("Page not found");
+    expect(out.message).toContain("static build");
+  });
+
+  it("STILL renders the daemon's own text/plain error verbatim", async () => {
+    const daemonBody = 'unknown panel "nope" — panels are a fixed allowlist, not arbitrary commands\n';
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response(daemonBody, { status: 404, headers: { "content-type": "text/plain" } }))),
+    );
+    const out = await fetchPanel("nope", 120);
+    expect(out.ok).toBe(false);
+    if (out.ok) return;
+    expect(out.message).toBe(daemonBody.trim());
+  });
+
+  it("treats an absent content-type as the daemon's (its 429 path sets none)", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("rate limited: retry in 30s", { status: 429 }))));
+    const out = await fetchPanel("doctor", 120);
+    expect(out.ok).toBe(false);
+    if (out.ok) return;
+    expect(out.message).toBe("rate limited: retry in 30s");
+  });
+});
+
+describe("fetchPanel — static build reads its committed panel map", () => {
+  afterEach(() => {
+    document.head.querySelectorAll("meta[name^='darkmux-']").forEach((e) => e.remove());
+  });
+
+  it("serves a captured panel and never touches /panel/:id", async () => {
+    meta("darkmux-panels-src", "./demo-panels.json");
+    const captured = { "run-list": { panel: "run-list", ansi_text: "runs — 10 shown", cols: 120 } };
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) =>
+      Promise.resolve(new Response(JSON.stringify(captured), { status: 200 })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const out = await fetchPanel("run-list", 120);
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.data.ansi_text).toBe("runs — 10 shown");
+    expect(fetchMock.mock.calls[0][0]).toBe("./demo-panels.json");
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).startsWith("/panel/"))).toBe(false);
+  });
+
+  it("names a panel the demo did not capture, rather than failing vaguely", async () => {
+    meta("darkmux-panels-src", "./demo-panels.json");
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(JSON.stringify({}), { status: 200 }))));
+    const out = await fetchPanel("doctor", 120);
+    expect(out.ok).toBe(false);
+    if (out.ok) return;
+    expect(out.message).toContain("doctor");
+    expect(out.message).toContain("static build");
+  });
+});

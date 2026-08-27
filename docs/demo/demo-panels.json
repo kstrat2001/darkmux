@@ -1,0 +1,143 @@
+{
+  "config-list": {
+    "age_ms": 0,
+    "ansi_text": "{\n  \"schema_version\": \"1.2\",\n  \"machine_id\": \"m5-ultra-256gb\",\n  \"orchestrator\": \"claude-code\",\n  \"lms_bin\": \"lms\",\n  \"lmstudio_url\": \"http://localhost:1234\",\n  \"redis\": {\n    \"enabled\": false,\n    \"host\": \"127.0.0.1\",\n    \"port\": 6379,\n    \"stream\": \"darkmux:flow\",\n    \"maxlen\": 10000\n  },\n  \"audit\": {\n    \"enabled\": false,\n    \"dir\": \"~/.darkmux/audit\"\n  },\n  \"runtime\": {\n    \"inactivity_timeout_seconds\": 600,\n    \"strict_selection\": false,\n    \"feedback_injection\": true,\n    \"check_updates\": false\n  },\n  \"remote\": {\n    \"max_tokens_per_execution\": 500000\n  },\n  \"fleet\": {\n    \"mode\": \"peer\"\n  }\n}\n",
+    "argv": [
+      "config",
+      "list"
+    ],
+    "auto_refresh": true,
+    "cache_ttl_ms": 3000,
+    "captured_ts_ms": 1787819182911,
+    "cols": 120,
+    "exit_code": 0,
+    "gather_ms": 2,
+    "opts": {},
+    "panel": "config-list",
+    "stderr_tail": ""
+  },
+  "doctor": {
+    "age_ms": 0,
+    "ansi_text": "darkmux doctor \u2014 41 checks\n\n\u25cf needs attention \u2014 binary vs source: the darkmux you are running was built from 42e27c38, but this\u2026\n\n  \u2713 build                  darkmux 3.1.0 (42e27c38\u2731) \u00b7 flow schema 1.22.0\n  \u2713 daemon reachable       reachable \u00b7 viewer http://127.0.0.1:8765/ \u00b7 phone\n                           http://demo-hub.internal/\n  \u2713 35 more checks passed \u2014 `-v` for detail\n  \u26a0 binary vs source       the darkmux you are running was built from 42e27c38, but this source\n                           tree's HEAD is e1833ea7 \u2014 your latest code is NOT in the binary under\n                           test\n        \u2192 rebuild + install it: `cargo install --path .`\n  \u26a0 audit integrity        no audit files under\n                           /home/demo/.darkmux/audit\n        \u2192 AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log\n          whose edits `darkmux flow integrity-check` detects (absent a full re-chain \u2014 the chain is\n          un-anchored), alongside the casual LocalFile sink.\n  \u26a0 legacy compaction extras profile `analyst` has fields not consumed by the internal runtime:\n                             mode; profile `coder` has fields not consumed by the internal runtime:\n                             mode; profile `reviewer` has fields not consumed by the internal\n                             runtime: mode\n        \u2192 Remove `mode` / `maxHistoryShare` / `recentTurnsPreserve` from profile (darkmux's typed\n          schema deliberately doesn't expose these \u2014 see DESIGN.md Schema isolation).\n  \u26a0 darkmux skills freshness darkmux-* skills: 10 up to date; 5 stale (darkmux-add-machine,\n                             darkmux-analyze-run, darkmux-bootstrap, darkmux-enable-audit,\n                             darkmux-qa-review); 1 installed but no longer bundled (darkmux-crawl)\n        \u2192 installed from an older darkmux; run `darkmux init` to refresh (and prune retired skills)\n\n37 pass, 4 warn \u2014 workable but worth a look\n",
+    "argv": [
+      "doctor"
+    ],
+    "auto_refresh": false,
+    "cache_ttl_ms": 3000,
+    "captured_ts_ms": 1787819182952,
+    "cols": 100,
+    "exit_code": 0,
+    "gather_ms": 3,
+    "opts": {},
+    "panel": "doctor",
+    "stderr_tail": ""
+  },
+  "flow-status": {
+    "age_ms": 0,
+    "ansi_text": "darkmux flow status \u2014 \u2713 ok\n  schema:       1.22.0\n  composition:  LocalFile\n\nRedis: not configured (set DARKMUX_REDIS_URL to enable)\n\nDisk\n  flows_dir:    /home/demo/.darkmux/flows\n  exists:       true\n  day_files:    2\n  total_bytes:  5665015\n\nSchema\n  writer:       1.22.0\n  observed:     (none)\n  skew:         false\n",
+    "argv": [
+      "flow",
+      "status"
+    ],
+    "auto_refresh": true,
+    "cache_ttl_ms": 3000,
+    "captured_ts_ms": 1787819182914,
+    "cols": 120,
+    "exit_code": 0,
+    "gather_ms": 2,
+    "opts": {},
+    "panel": "flow-status",
+    "stderr_tail": ""
+  },
+  "lab-fixture-list": {
+    "age_ms": 0,
+    "ansi_text": "No registry at /home/demo/.darkmux/lab-registry.json.\n  To get started:\n    `dm lab fixture register <path-to-fixture>`\n",
+    "argv": [
+      "lab",
+      "fixture",
+      "list"
+    ],
+    "auto_refresh": true,
+    "cache_ttl_ms": 3000,
+    "captured_ts_ms": 1787819182916,
+    "cols": 120,
+    "exit_code": 0,
+    "gather_ms": 1,
+    "opts": {},
+    "panel": "lab-fixture-list",
+    "stderr_tail": ""
+  },
+  "machine-status": {
+    "age_ms": 0,
+    "ansi_text": "\u001b[1;36mloaded models \u2014 darkmux-managed\u001b[0m\n  IDENTIFIER                                    MODEL                              CTX       SIZE\n  darkmux:qwen3.5-122b-a10b                     qwen3.5-122b-a10b                  131072    69.79 GB\n  darkmux:qwen3.6-35b-a3b-turboquant-mlx        qwen3.6-35b-a3b-turboquant-mlx     262144    18.45 GB\n  darkmux:qwen3-coder-next-mlx                  qwen3-coder-next-mlx               131072    32.21 GB\n  darkmux:qwen3-4b-instruct-2507                qwen3-4b-instruct-2507             32768     2.15 GB\n\n\u001b[1;36muser state \u2014 not managed by darkmux\u001b[0m\n  (none)\n\n  pool 256 GB \u00b7 darkmux holds 127.8 GB \u00b7 committed 141.4 GB \u00b7 \u001b[32mGREEN\u001b[0m\n",
+    "argv": [
+      "machine",
+      "status"
+    ],
+    "auto_refresh": true,
+    "cache_ttl_ms": 3000,
+    "captured_ts_ms": 1787819182908,
+    "cols": 120,
+    "exit_code": 0,
+    "gather_ms": 3,
+    "opts": {},
+    "panel": "machine-status",
+    "stderr_tail": ""
+  },
+  "mission-status": {
+    "age_ms": 0,
+    "ansi_text": "\u001b[2m  no missions yet \u2014 propose one with:\u001b[0m\n  \u001b[2m\u2192\u001b[0m darkmux mission propose\n",
+    "argv": [
+      "mission",
+      "status"
+    ],
+    "auto_refresh": true,
+    "cache_ttl_ms": 3000,
+    "captured_ts_ms": 1787819182903,
+    "cols": 120,
+    "exit_code": 0,
+    "gather_ms": 412,
+    "opts": {
+      "all": "recent"
+    },
+    "panel": "mission-status",
+    "stderr_tail": ""
+  },
+  "role-list": {
+    "age_ms": 0,
+    "ansi_text": "id                     description                                                     skills       escalation\nanalyst                Data/system analyst who reads run outputs, logs, metrics,\u2026      1            bail-with-explanation\ncode-reviewer          Senior reviewer who reads PR diffs, identifies issues, le\u2026      1            bail-with-explanation\ncoder                  Implements features described by the user. Reads existing\u2026      2            bail-with-explanation\ncrawler                Scans a bounded scope of a codebase for ONE named pattern\u2026      1            bail-with-explanation\ndesign-reviewer        A senior reviewer who evaluates design proposals (UX, arc\u2026      2            bail-with-explanation\ndialectic-defender     Defense seat of the adversarial (dialectic) PR review (#1\u2026      1            bail-with-explanation\ndialectic-judge        Judge seat of the adversarial (dialectic) PR review (#122\u2026      1            bail-with-explanation\ndialectic-prosecutor   Prosecution seat of the adversarial (dialectic) PR review\u2026      1            bail-with-explanation\nfitness-coach          Fitness-planning thinking partner. Structures training ro\u2026      2            bail-with-explanation\nhealth-research        Health-research thinking partner. Reads symptoms/research\u2026      2            bail-with-explanation\nlab-manager            Manages darkmux lab dispatches end-to-end: runs them, cap\u2026      2            bail-with-explanation\nlegal-research         Legal-research thinking partner. Reads contracts, surface\u2026      2            bail-with-explanation\nlogistics-coordinator  Organizes trip logistics \u2014 booking deadlines, document ti\u2026      2            bail-with-explanation\nmission-compiler       Utility-family role that takes unstructured intent and em\u2026      1            bail-with-explanation\npr-reviewer            Tool-less PR code reviewer for CI: reads a unified diff p\u2026      1            bail-with-explanation\npr-reviewer-agentic    PR reviewer with the repository checked out: reads the di\u2026      1            bail-with-explanation\npr-reviewer-freeform   Tool-less PR code reviewer, aggressive stance: reads a un\u2026      1            bail-with-explanation\nradio-host             Specialist-family ANSWERING seat for the `darkmux radio` \u2026      0            bail-with-explanation\nradio-router           Utility-family ROUTING seat for `darkmux radio` (#1698 Pa\u2026      0            bail-with-explanation\nreview-judge           Judge seat of the review pipeline (#1222 Phase B): invest\u2026      1            bail-with-explanation\nreview-probe           Probe seat of the review pipeline (#1222 Phase B): given \u2026      1            bail-with-explanation\nreview-probe-high      High-tier probe seat of the review pipeline (#1475 packet\u2026      1            bail-with-explanation\nreview-probe-low       Low-tier probe seat of the review pipeline (#1475 packet \u2026      1            bail-with-explanation\nreview-probe-mid       Mid-tier probe seat of the review pipeline (#1475 packet \u2026      1            bail-with-explanation\nreview-verify          Verify (adjudication) seat of the review pipeline (#1260/\u2026      1            bail-with-explanation\nscribe                 Drafts lab notebook entries and prose from run data + use\u2026      1            bail-with-explanation\ntest-designer          Plans test strategies, selects edge cases, and writes tes\u2026      2            bail-with-explanation\ntool-bench             Harness role for the tool-call bench (#1196): retrieves r\u2026      1            bail-with-explanation\ntrip-researcher        Researches destinations, restaurants, transit options, an\u2026      2            bail-with-explanation\nvoice-editor           A senior editor who reads existing drafts and suggests re\u2026      2            bail-with-explanation\n",
+    "argv": [
+      "role",
+      "list"
+    ],
+    "auto_refresh": true,
+    "cache_ttl_ms": 3000,
+    "captured_ts_ms": 1787819182908,
+    "cols": 120,
+    "exit_code": 0,
+    "gather_ms": 3,
+    "opts": {},
+    "panel": "role-list",
+    "stderr_tail": ""
+  },
+  "run-list": {
+    "age_ms": 0,
+    "ansi_text": "\u001b[1;36mruns \u2014 10 shown\u001b[0m\n  KIND     STATUS      STARTED    DURATION    ID                                                MACHINE             \n  dispatch abandoned   1h ago     -           darkmux-crawler-crawl-discarded-locks-2250176547  m5-ultra-256gb      \n  dispatch complete    8h ago     9m          darkmux-crawler-crawl-error-discard-1307487261    m5-ultra-256gb      \n  dispatch complete    9h ago     9m          darkmux-reviewer-review-flow-sinks-987519170      m5-ultra-256gb      \n  dispatch complete    10h ago    9m          darkmux-crawler-crawl-unwrap-paths-4040708454     m5-ultra-256gb      \n  dispatch complete    10h ago    9m          darkmux-scribe-doc-drift-sweep-3918945565         m1-max-32gb-studio  \n  dispatch complete    11h ago    9m          darkmux-reviewer-review-serve-routes-1318381388   m5-ultra-256gb      \n  dispatch complete    12h ago    9m          darkmux-analyst-crawl-lock-ordering-921964300     m5-ultra-256gb      \n  dispatch complete    13h ago    9m          darkmux-estimator-estimate-backlog-4092573714     mac-mini-m4-16gb    \n  dispatch complete    14h ago    9m          darkmux-crawler-crawl-error-discard-2-2301155233  m5-ultra-256gb      \n  dispatch complete    15h ago    9m          darkmux-compactor-compact-trajectories-2619114180 m1-max-32gb-studio  \n",
+    "argv": [
+      "run",
+      "list"
+    ],
+    "auto_refresh": true,
+    "cache_ttl_ms": 3000,
+    "captured_ts_ms": 1787819182951,
+    "cols": 120,
+    "exit_code": 0,
+    "gather_ms": 33,
+    "opts": {
+      "all": "recent",
+      "kind": "all"
+    },
+    "panel": "run-list",
+    "stderr_tail": ""
+  }
+}

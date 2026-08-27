@@ -57,3 +57,28 @@ export function resolveRunsSrc(): string {
 export function resolveLabRunsSrc(): string {
   return injectedMeta("darkmux-lab-runs-src") ?? "/lab/runs";
 }
+
+/** `darkmux-panels-src` — the committed JSON map of `panelId -> PanelResponse`
+ * a daemon-less build serves the console from, in place of `GET /panel/:id`.
+ *
+ * This exists because the console had no static gate at all, and its fetch
+ * DELIBERATELY renders the response body as its error message (the daemon's
+ * own 404 text names the allowlist — see `fetchPanel.ts`'s module doc). That
+ * is right with a daemon behind the page and catastrophic without one: on
+ * GitHub Pages `/panel/:id` is answered by Pages itself, so the console
+ * rendered 9,379 bytes of `<!DOCTYPE html>` as command output. */
+export function staticPanelsSrc(): string | null {
+  return injectedMeta("darkmux-panels-src");
+}
+
+/** `darkmux-machine-src` — the committed `{specs, resources}` a daemon-less
+ * build shows the machine lens from, in place of `/machine/*`.
+ *
+ * The machine lens already gates its QUERIES on `daemonBacked`, so unlike the
+ * console it never issued a bad fetch — it simply rendered an empty shell with
+ * nothing saying why. Host probes (`vm_stat`, `sysctl`, `lms`) can't be
+ * derived from records, so a static build needs a fixture or an explanation;
+ * absent this meta the lens now says so rather than looking dead. */
+export function staticMachineSrc(): string | null {
+  return injectedMeta("darkmux-machine-src");
+}

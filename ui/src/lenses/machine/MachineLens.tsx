@@ -9,7 +9,7 @@ import { specOf } from "../fleet/cards";
 import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
-import { isStaticBuild } from "../../lib/staticSource";
+import { isStaticBuild, staticMachineSrc } from "../../lib/staticSource";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
 /** The health region's state vocabulary, verbatim from `/machine/resources`
@@ -143,6 +143,31 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // so suppressing them changes nothing a consumer can observe.
   const daemonBacked = !isStaticBuild();
 
+  // (#2019) A daemon-less build has no host to probe, so BOTH machine queries
+  // below are gated off — and a disabled react-query sits at `status:
+  // "pending"` forever. That is the exact trap #1770 found for the REMOTE
+  // page (see the `data-state` comment further down: "a marker documented as
+  // a SETTLED signal that never settles"), and its fix added a `"remote"`
+  // branch for the `isLocalMach` gate. `enabled` carries TWO conditions;
+  // only one of them got a branch, so darkmux.com/demo showed `loading…`
+  // indefinitely under a header reading "waiting for a machine".
+  //
+  // A static build can settle two ways: with a captured fixture, or by saying
+  // plainly that there is nothing to probe. Both are settled; neither is
+  // `loading`.
+  const machineSrc = staticMachineSrc();
+  const staticMachineQuery = useQuery({
+    queryKey: queryKeys.staticMachine(machineSrc ?? ""),
+    queryFn: () => fetchJson<{ specs: MachineSpecs; resources: MachineResources }>(machineSrc as string),
+    enabled: machineSrc !== null,
+    staleTime: Infinity,
+  });
+  const staticMachine = staticMachineQuery.data?.ok ? staticMachineQuery.data.data : null;
+  // Settled = we know the answer, even when the answer is "nothing to show".
+  // `!daemonBacked && machineSrc === null` is settled IMMEDIATELY: no fixture
+  // was published, so no fetch will ever resolve it.
+  const staticSettled = !daemonBacked && (machineSrc === null || !staticMachineQuery.isPending);
+
   const flowWindow = useFlowWindow(nowMs);
   const liveMachines = useLiveMachines(daemonBacked);
 
@@ -152,7 +177,7 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
     enabled: daemonBacked,
   });
 
-  const specs = specsQuery.data?.ok ? specsQuery.data.data : null;
+  const specs = staticMachine ? staticMachine.specs : specsQuery.data?.ok ? specsQuery.data.data : null;
 
   const localUid = useMemo(
     () => localMachineUid(flowWindow.data, liveMachines, specs?.machine_id ?? null),
@@ -212,6 +237,16 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // (drives the banner + lamp), independent of what `resources` shows.
   const [lastGoodResources, setLastGoodResources] = useState<MachineResources | null>(null);
   const resources = lastGoodResources;
+
+  // (#2019) A static build's fixture enters through the SAME
+  // `lastGoodResources` slot the live poll writes, rather than being threaded
+  // as a parallel `resources` source. Everything downstream — the residency
+  // state machine, the ledger lines, `data-state="loaded"` — then behaves
+  // identically whether the figures came from a probe or from a capture, and
+  // there is no second code path to keep in step with the first.
+  useEffect(() => {
+    if (staticMachine) setLastGoodResources(staticMachine.resources);
+  }, [staticMachine]);
 
   // The residency state machine (docs/design/machine-lens/proposal.md §8 — ghost/NEW rows) advances
   // on the SAME successful-poll cadence as the payload above: a failed poll
@@ -305,7 +340,20 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
           that never settles. "remote" is that page's own settled value,
           distinct from "loaded"/"error" so a future remote parity test
           waiting on this marker doesn't hang (#1770 merge-gate finding). */}
-      <div className="machine-lens__health" data-state={!isLocalMach ? "remote" : resources ? "loaded" : resourcesErrored ? "error" : "loading"}>
+      <div
+        className="machine-lens__health"
+        data-state={
+          !isLocalMach
+            ? "remote"
+            : resources
+              ? "loaded"
+              : resourcesErrored
+                ? "error"
+                : staticSettled
+                  ? "no-daemon"
+                  : "loading"
+        }
+      >
         <MachineHealthRegion
           isLocalMach={isLocalMach}
           machineName={label}

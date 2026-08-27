@@ -16,6 +16,9 @@ function renderMachine(uid: string | null) {
 afterEach(() => {
   vi.unstubAllGlobals();
   window.location.hash = "";
+  // (#2019) A leaked static-build meta would silently put EVERY later test in
+  // this file into daemon-less mode.
+  document.head.querySelectorAll("meta[name^='darkmux-']").forEach((e) => e.remove());
 });
 
 const RESOURCES = {
@@ -36,12 +39,26 @@ const RESOURCES = {
 /** Routes every endpoint the machine lens reads. `resourcesCalled` records
  * whether `/machine/resources` was EVER requested — the load-bearing
  * assertion for the local-only-probe gate (`enabled: isLocalMach`). */
+/** (#2019) Inject a static-build meta for one test. `isStaticBuild()` and its
+ * siblings read `document.head` live, so this is the real signal, not a
+ * stand-in — see `injectedMeta.ts`'s own doc on why no test harness injects
+ * these by default. Cleared in `afterEach` below. */
+function staticMeta(name: string, content: string) {
+  const el = document.createElement("meta");
+  el.setAttribute("name", name);
+  el.setAttribute("content", content);
+  document.head.appendChild(el);
+}
+
 function mockMachineFetch(opts: {
   specs?: unknown;
   resources?: unknown;
   flowToday?: unknown[];
   flowYesterday?: unknown[];
   liveMachines?: unknown[];
+  /** (#2019) The committed `{specs, resources}` a daemon-less build reads
+   * from `darkmux-machine-src`, served here at that same path. */
+  staticMachine?: unknown;
 } = {}) {
   const today = todayUTC();
   const yesterday = prevDateUTC(today);
@@ -67,6 +84,12 @@ function mockMachineFetch(opts: {
           ),
         );
       }
+      if (path === "./demo-machine.json") {
+        return Promise.resolve(
+          new Response(JSON.stringify(opts.staticMachine ?? {}), { status: opts.staticMachine === undefined ? 404 : 200 }),
+        );
+      }
+      if (path === "./demo-flow.jsonl") return Promise.resolve(new Response("", { status: 200 }));
       if (path === "/fleet/sessions/live") {
         return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
       }
@@ -156,6 +179,48 @@ describe("MachineLens", () => {
     renderMachine(null);
     await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
     expect(document.querySelector(".machine-lens__health")).toHaveAttribute("data-state", "loaded");
+  });
+
+  /**
+   * (#2019) The SAME defect #1770 found for the remote page, on the OTHER
+   * half of the same `enabled`. `resourcesQuery` is gated on
+   * `isLocalMach && daemonBacked`; #1770 gave the first condition a settled
+   * `"remote"` value, and the second never got one — so a daemon-less build
+   * (darkmux.com/demo) left a disabled query at `status: "pending"` and the
+   * lens rendered `loading…` forever, under a header reading "waiting for a
+   * machine". Reported by the operator against the live site.
+   *
+   * Red-proven: reverting the `staticSettled` branch puts both of these back
+   * at "loading".
+   */
+  it("a daemon-less build with NO captured fixture settles, never stuck at \"loading\"", async () => {
+    staticMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    mockMachineFetch({ specs: { machine_id: "demo", cpu_brand: "M5 Ultra" } });
+    renderMachine(null);
+    await waitFor(() =>
+      expect(document.querySelector(".machine-lens__health")).toHaveAttribute("data-state", "no-daemon"),
+    );
+  });
+
+  it("a daemon-less build WITH a captured fixture reaches \"loaded\", same as a live probe", async () => {
+    staticMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    staticMeta("darkmux-machine-src", "./demo-machine.json");
+    mockMachineFetch({
+      specs: { machine_id: "demo", cpu_brand: "M5 Ultra" },
+      // Reuse the file's own realistic payload rather than hand-rolling a
+      // thin one: `MachineHealthRegion` THREW on a minimal object, which is
+      // its own small finding (a hand-edited `demo-machine.json` would crash
+      // the lens rather than degrade) — but a fixture shaped unlike the real
+      // response would be testing the fixture, not the code path.
+      staticMachine: {
+        specs: { machine_id: "m5-ultra-256gb", cpu_brand: "Apple M5 Ultra", ram_total_bytes: 274877906944 },
+        resources: RESOURCES,
+      },
+    });
+    renderMachine(null);
+    await waitFor(() =>
+      expect(document.querySelector(".machine-lens__health")).toHaveAttribute("data-state", "loaded"),
+    );
   });
 
   it("the 'fleet' back-link writes an empty hash", async () => {
