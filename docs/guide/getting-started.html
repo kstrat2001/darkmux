@@ -117,6 +117,11 @@ darkmux init</code></pre>
   <div class="wrap">
     <h2>Verify your setup</h2>
     <p><code>darkmux doctor</code> runs pre-flight checks across the substrate: profile registry, <code>lms</code> binary, models loaded, RAM headroom, power state, role prompt coverage, mission-config registry, daemon reachability, flow-sink health, audit integrity, machine_id resolution, and bundled-skill freshness (it flags any stale <code>darkmux-*</code> skill and points you at <code>darkmux init</code>), plus a battery of empirical rules from the <code>eureka</code> set.</p>
+<figure class="shot">
+  <img src="../media/console-config.png" alt="The darkmux console showing config list: the resolved configuration as JSON, with the redis, audit, runtime, fleet and cmd blocks visible." loading="lazy">
+  <figcaption><code>darkmux config list</code>. Every common knob is written into the file visibly, defaults and all — you tune the file, not the source.</figcaption>
+</figure>
+
     <pre><code>darkmux doctor</code></pre>
     <p>Each check returns Pass, Warn, or Fail. Fail-level lines include actionable hints; the exit code is 0 on all-pass-or-warn, 1 if anything Fails.</p>
 
@@ -170,6 +175,11 @@ darkmux doctor                    <span class="comment"># confirm "profile match
   <div class="wrap">
     <h2>Residency is automatic</h2>
     <p>You never load a profile by hand. A dispatch loads the models the named profile declares, under the resident RAM budget: it brings up what the profile needs and unloads to make room when the budget requires it, and writes nothing outside LMStudio. The <code>swap</code> verb that used to drive this is gone; the internal runtime reads the loaded model directly.</p>
+<figure class="shot">
+  <img src="../media/machine.png" alt="The darkmux machine view: a semicircular gauge reading 164 GiB used of a 256 GB limit, pressure tiles for margin, swap and compressor, and four resident models each with its context, weights, KV cost and current footprint." loading="lazy">
+  <figcaption>The machine view on a 256&nbsp;GB host. Every resident is priced — weights plus KV at its loaded context — so &ldquo;will this fit&rdquo; is arithmetic rather than a guess.</figcaption>
+</figure>
+
 
     <div class="callout good">
       <strong>What happens on dispatch.</strong>

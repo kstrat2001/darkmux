@@ -50,6 +50,11 @@
   <div class="wrap">
     <h2>Crew: roles + dispatch</h2>
     <p>A <strong>role</strong> is a named local-AI capability: a manifest under <code>templates/builtin/roles/&lt;id&gt;.json</code> (or <code>~/.darkmux/roles/&lt;id&gt;.json</code> for operator overrides) paired with a system prompt at the same path with a <code>.md</code> extension. The manifest declares:</p>
+<figure class="shot">
+  <img src="../media/console-roles.png" alt="The darkmux console showing the role list: about thirty roles with descriptions, skill counts and escalation policy, including coder, code-reviewer, crawler, analyst, scribe and the review pipeline seats." loading="lazy">
+  <figcaption>The bundled role library. A role is a stance plus a tool palette plus a system prompt — one dispatch's worth of intent, not a long-lived agent.</figcaption>
+</figure>
+
     <ul>
       <li><code>id</code>, <code>description</code>, <code>skills</code>: the <code>skills</code> list names work-shape descriptors the role is good at. Each skill in turn declares an intrinsic capability profile (<code>code</code>, <code>reasoning</code>, <code>instruction_following</code>, <code>agentic_tool_use</code>) that role-to-model selection scores against.</li>
       <li><code>tool_palette</code>: <code>allow</code> and <code>deny</code> lists of tools (read, exec, edit, etc.)</li>
