@@ -6,11 +6,11 @@
 regex it out with `\\[(.*?)\\]`, which is NON-GREEDY and therefore stops at the
 first `]` inside the array literal — including one inside a comment:
 
-    export const SENTINELS = ["FinHero", ...,
+    export const SENTINELS = ["alpha", "beta",
       // matches sentinel[0] in the tokenizer output
-      "Sisters Inspire"];
+      "gamma"];
 
-That truncates the list silently. Both callers only checked for a COMPLETELY
+...which yields `["alpha", "beta"]`. That truncates the list silently. Both callers only checked for a COMPLETELY
 empty parse, so a partial list sailed through and the guards went half-blind:
 the repo-wide public-leak gate stopped recognizing a real engagement name, and
 the demo scrubber stopped removing it. One natural comment edit disabled both
@@ -33,10 +33,20 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SANITIZE = ROOT / "tests" / "parity" / "lib" / "sanitize.mjs"
 
-# Names whose absence means the parse is wrong, not that the list changed.
-# Deliberately a FLOOR, not a mirror: it is here to catch truncation, so it
-# must not need editing every time a name is legitimately added.
-REQUIRED = {"finhero", "extragalaxies", "sys-"}
+# A FLOOR on how many entries a healthy parse returns.
+#
+# This was a set of REQUIRED NAMES, which is the better check and cannot live
+# here: naming them puts the very identifiers this vocabulary exists to keep
+# out of a public repo INTO a public repo. `engagement-sentinel-guard.py`
+# caught that on the first CI run of the commit that introduced it — the guard
+# catching its own helper reintroducing the bug it was written to fix.
+#
+# A count is weaker (it cannot tell WHICH entry vanished) but it is the
+# strongest check available without restating the list, and it catches the
+# failure that actually happened: a truncating parse returns FEWER entries.
+# Raise it when the owner's list grows; a legitimate shrink below this is a
+# deliberate edit that should require thinking about this line.
+MIN_ENTRIES = 6
 
 
 def _strip_comments(src: str) -> str:
@@ -58,10 +68,11 @@ def sentinels(path: pathlib.Path = SANITIZE) -> list[str]:
     names = re.findall(r'"([^"]+)"', m.group(1))
     if not names:
         sys.exit(f"SENTINELS in {path} parsed EMPTY. Refusing to run.")
-    lowered = {n.lower() for n in names}
-    missing = sorted(r for r in REQUIRED if r not in lowered)
-    if missing:
-        sys.exit(f"SENTINELS in {path} parsed {len(names)} entries but is MISSING "
-                 f"{missing}, which means the parse truncated rather than the list "
-                 f"changing. Refusing to run a half-blind guard. Parsed: {names}")
+    if len(names) < MIN_ENTRIES:
+        # Deliberately does NOT echo `names` — that would print the vocabulary
+        # into CI logs, which are public on a public repo.
+        sys.exit(f"SENTINELS in {path} parsed only {len(names)} entries, below the "
+                 f"floor of {MIN_ENTRIES}. That means the parse truncated rather "
+                 f"than the list legitimately changing. Refusing to run a "
+                 f"half-blind guard.")
     return names
