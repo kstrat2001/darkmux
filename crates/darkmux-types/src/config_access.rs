@@ -968,7 +968,7 @@ mod tests {
     /// so three copies of the number cannot drift apart again.
     #[serial_test::serial]
     #[test]
-    fn radio_humor_default_when_unset_is_low() {
+    fn radio_humor_default_when_unset_is_the_middle_of_the_dial() {
         let prev = std::env::var("DARKMUX_RADIO_HUMOR").ok();
         unsafe { std::env::remove_var("DARKMUX_RADIO_HUMOR"); }
         assert_eq!(u64::from(radio_humor()), RADIO_HUMOR_DEFAULT);
