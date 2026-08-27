@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.21.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.22.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -274,6 +274,41 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.21.0";
 //           (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, …), not from
 //           machine-scoped config — build that when a real consumer
 //           needs it.
+//   1.22.0: additive payload keys `outcome` / `exit_code` / `failure_reason`
+//           on `dispatch.tool` (#2008) — AND a CORRECTION to what the
+//           existing `ok` key means for `bash`. Read this before comparing
+//           records across the boundary.
+//
+//           `ok` was derived from the exit code: anything non-zero was
+//           false. That conflated a command that RAN and reported a result
+//           (a failing test in TDD's red phase, a lint finding, `grep` with
+//           no matches) with one that NEVER RAN (exit 127/126, a spawn
+//           failure, a toolchain that would not load, a timeout). `ok` now
+//           means what every place that specifies it always said it meant —
+//           "the tool call succeeded" — so a red test is `ok: true`.
+//
+//           This is a defect correction, not a semantic redefinition: the
+//           field's contract is stated as tool-success in `trajectory.rs`'s
+//           `append_tool_completed`, in the watchdog comment in
+//           `dispatch_internal.rs` ("ONLY a successful tool call resets the
+//           deadline"), and in the darkmux-analyze-run skill. The classifier
+//           feeding it was wrong; the field's meaning was not. Contract 5's
+//           major triggers (rename, retype, new required field) are not
+//           tripped — same name, same type, same optionality — so this is a
+//           minor bump.
+//
+//           IT IS STILL A BOUNDARY. Records written before 1.22.0 carry the
+//           old meaning and cannot be rewritten; the audit file header
+//           stamps its writer's schema version, so the boundary is locatable
+//           per file. Any series that aggregates `ok: false` across it — the
+//           lab `tool_bench`'s `failed_calls` stat above all — is mixing two
+//           definitions and must be read per-side, not summed.
+//
+//           `outcome` is the three-way discriminator (`"ok"` / `"reported"`
+//           / `"failed"`); `exit_code` accompanies `reported`;
+//           `failure_reason` accompanies `failed`. Flat keys rather than a
+//           nested tagged enum, because every reader here is lenient-on-read
+//           and a flat key is the shape they already tolerate.
 //   1.21.0: additive payload key `result` on the existing `dispatch.tool`
 //           action (#2007). The record already carried `result_chars`; it
 //           now carries the result TEXT beside it, so a failed tool call can

@@ -2580,7 +2580,13 @@ mod tests {
         //           Bounded at 64 KiB here (the container-side trajectory keeps
         //           it in full); truncation is in-band and `result_chars` stays
         //           the true length. Minor + additive; see schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.21.0");
+        //   1.22.0: added `outcome`/`exit_code`/`failure_reason` on
+        //           `dispatch.tool` AND corrected what `ok` means for bash
+        //           (#2008): a command that ran and reported non-zero is now
+        //           `ok: true`. A defect correction — the field always
+        //           documented itself as tool-success — but a boundary for
+        //           any series aggregating `ok` across it. See schema.rs.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.22.0");
     }
 
     #[test]

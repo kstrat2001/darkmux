@@ -67,8 +67,23 @@ export function recordDetail(r: FlowRecord): string {
     // `args` absent on pre-1.16 records — fall back to its size, so an old
     // record degrades to what it can say rather than rendering a bare arrow.
     const args = f.args != null ? prettyArgs(f.args) : `${f.args_chars ?? 0}ch`;
-    const failed = f.ok === false ? " ❌" : "";
-    return `${String(f.tool_name ?? "")} ${args} → ${f.result_chars ?? 0}ch${failed}`;
+    // (#2008) Three outcomes, not two. A command that RAN and reported a
+    // non-zero exit — a red test, a lint finding — is the tool working, and
+    // marking it ❌ told the operator the instrument was broken. It shows its
+    // exit code instead; only a tool that could not run gets the cross.
+    //
+    // `outcome` is absent on pre-1.22 records, where `ok === false` still
+    // carried the old conflated meaning. Those degrade to the cross, which is
+    // what they meant when written — the honest reading of an old record, not
+    // a retroactive reinterpretation of it.
+    let suffix = "";
+    if (typeof f.outcome === "string") {
+      if (f.outcome === "reported") suffix = ` exit ${f.exit_code ?? "?"}`;
+      else if (f.outcome === "failed") suffix = " ❌";
+    } else if (f.ok === false) {
+      suffix = " ❌";
+    }
+    return `${String(f.tool_name ?? "")} ${args} → ${f.result_chars ?? 0}ch${suffix}`;
   }
   if (a === "dispatch.turn" && f) {
     return `turn ${f.turn_seq ?? 0} (${String(f.finish_reason ?? "")})`;

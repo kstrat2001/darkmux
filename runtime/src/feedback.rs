@@ -66,11 +66,13 @@ const DEFAULT_CYCLE_SUSPECTED_TEMPLATE: &str =
 /// (#457 Step 2) Default template for the tool-failure-cascade signal.
 /// Placeholders `{tool_name}`, `{count}` substituted at injection.
 const DEFAULT_TOOL_FAILURE_CASCADE_TEMPLATE: &str =
-    "[darkmux-runtime] `{tool_name}` has failed {count} \
-     times in a row with the same call pattern. Re-read the affected \
-     files or state, then change the inputs. If the tool itself is \
-     wrong for the next step, switch tools. If none of those apply, \
-     stop and summarize what you have so the operator can review.";
+    "[darkmux-runtime] `{tool_name}` could not run {count} times in a \
+     row: {reason}. This is the tool or its environment failing, not the \
+     work you asked it to do. Check the command and the environment — an \
+     interpreter or binary that is missing, a path that does not exist, a \
+     command that never completes. If the tool is wrong for the next step, \
+     switch tools. If none of those apply, stop and summarize what you have \
+     so the operator can review.";
 
 /// (#457 Step 3) Default template for the post-compaction signal —
 /// fires after a successful compaction event. Placeholder `{turn}`
@@ -299,6 +301,7 @@ impl FeedbackInjector {
         &mut self,
         tool_name: &str,
         failure_count: usize,
+        reason: &str,
     ) {
         if !self.enabled {
             return;
@@ -306,7 +309,8 @@ impl FeedbackInjector {
         let template = self.template_for("tool_failure_cascade");
         let message = template
             .replace("{tool_name}", tool_name)
-            .replace("{count}", &failure_count.to_string());
+            .replace("{count}", &failure_count.to_string())
+            .replace("{reason}", reason);
         self.pending.push(message);
         self.pending_kinds.push("tool_failure_cascade");
     }
@@ -482,7 +486,7 @@ mod tests {
     fn queue_tool_failure_cascade_grows_queue() {
         std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
         let mut f = FeedbackInjector::new();
-        f.queue_tool_failure_cascade("edit", 3);
+        f.queue_tool_failure_cascade("edit", 3, "command not found");
         assert_eq!(f.pending_count(), 1);
     }
 
@@ -492,7 +496,7 @@ mod tests {
         std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
         let mut f = FeedbackInjector::new();
         f.queue_cycle_suspected("read", 3, 10);
-        f.queue_tool_failure_cascade("bash", 3);
+        f.queue_tool_failure_cascade("bash", 3, "command not found");
         let msgs = f.drain();
         assert_eq!(msgs.len(), 2);
         assert_eq!(f.pending_count(), 0);
@@ -545,7 +549,7 @@ mod tests {
     fn failure_message_includes_tool_name_and_count() {
         std::env::remove_var("DARKMUX_FEEDBACK_INJECTION");
         let mut f = FeedbackInjector::new();
-        f.queue_tool_failure_cascade("edit", 3);
+        f.queue_tool_failure_cascade("edit", 3, "command not found");
         let msgs = f.drain();
         let content = msgs[0].content.as_ref().expect("system message has content");
         assert!(content.contains("`edit`"), "should name the tool: {content}");
@@ -559,7 +563,7 @@ mod tests {
         let mut f = FeedbackInjector::new();
         assert!(!f.enabled(), "env var `0` must disable");
         f.queue_cycle_suspected("read", 3, 10);
-        f.queue_tool_failure_cascade("edit", 3);
+        f.queue_tool_failure_cascade("edit", 3, "command not found");
         assert_eq!(f.pending_count(), 0, "queuing must be no-op when disabled");
         let msgs = f.drain();
         assert!(msgs.is_empty(), "drain must be empty when disabled");
@@ -610,7 +614,7 @@ mod tests {
         assert!(second.is_empty());
         // After re-queue, drain works again — verifies the queue
         // isn't somehow permanently drained.
-        f.queue_tool_failure_cascade("bash", 3);
+        f.queue_tool_failure_cascade("bash", 3, "command not found");
         let third = f.drain();
         assert_eq!(third.len(), 1);
     }

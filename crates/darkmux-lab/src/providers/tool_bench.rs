@@ -436,6 +436,19 @@ fn analyze_trajectory(text: &str) -> TrajStats {
             "tool.completed" => {
                 s.calls += 1;
                 // Missing `ok` predates #469 and means success.
+                //
+                // (#2008) `ok` no longer counts a command that RAN and
+                // reported a non-zero exit — that is now `outcome:
+                // "reported"` and `ok: true`. Checked against this bench's
+                // own recovery axis before the change landed: both
+                // `planted_failure` tasks plant a MISSING FILE, so their
+                // failure arrives through `Tool::execute`'s `Err` path
+                // (`"tool 'read' returned error: ..."`) and still classifies
+                // as failed. The axis is unaffected.
+                //
+                // What DOES move: a `failed_calls` series that spans the
+                // 1.22.0 flow-schema boundary mixes two definitions of
+                // failure. Compare per-side, never summed across it.
                 if !v.get("ok").and_then(|o| o.as_bool()).unwrap_or(true) {
                     s.failed_calls += 1;
                 }

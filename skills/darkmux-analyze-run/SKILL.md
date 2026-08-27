@@ -127,15 +127,38 @@ Carries FULL reasoning text — can be 5-10× the response size on hard problems
 ### `tool.completed` (1 per tool invocation)
 
 ```
-{ "type": "tool.completed", "seq": <turn>, "tool_seq": <int>, "tool_name": <str>, "args_chars": <int>, "result_chars": <int>, "ok": <bool>, "ts": <unix_ms> }
+{ "type": "tool.completed", "seq": <turn>, "tool_seq": <int>, "tool_name": <str>, "args": <str>, "args_chars": <int>, "result": <str>, "result_chars": <int>, "ok": <bool>, "outcome": <str>, "exit_code": <int|null>, "failure_reason": <str|null>, "ts": <unix_ms> }
 ```
 
-`ok` (added #469) discriminates success from failure: `true` when the tool
-call succeeded (read/edit/write without IO error, `bash` exit 0), `false`
-otherwise. Only a successful tool call counts as proof-of-work for the
-inactivity deadline — a stream of failures no longer keeps a stuck dispatch
-alive. Trajectories predating the field omit it; treat a missing `ok` as
-`true` (success) for backward compatibility.
+`result` (added #2007) is the tool's actual output, in full — the trajectory
+is written inside the container and never crosses a trust boundary, so it is
+uncapped here. `result_chars` is the true length. Before #2007 only the
+length was recorded, which made a failed dispatch undiagnosable after the
+fact; if you are reading an older trajectory, that is why the evidence is
+missing.
+
+`outcome` (added #2008) is the three-way classification and is the field to
+read:
+
+- `"ok"` — ran, reported success.
+- `"reported"` — ran correctly and reported a non-zero result. A failing test
+  in TDD's red phase, a lint finding, `grep` with no matches. `exit_code`
+  accompanies it. **This is the tool working**, so it counts as proof-of-work
+  and never contributes to a tool-failure cascade.
+- `"failed"` — did not run or could not complete: exit 127/126, a spawn or
+  parse failure, a toolchain that would not load, a timeout. `failure_reason`
+  accompanies it. This is the only class that means the instrument is broken.
+
+`ok` (added #469) answers "did the tool call succeed" — `true` for both `ok`
+and `reported`. Only a successful tool call counts as proof-of-work for the
+inactivity deadline, so a stream of genuine failures cannot keep a stuck
+dispatch alive.
+
+**Reading older trajectories.** Before #2008, `ok` was derived from the exit
+code, so a red test recorded `ok: false` and `outcome` is absent. Do not sum
+`ok: false` counts across that boundary — the two sides mean different
+things. Trajectories predating #469 omit `ok` entirely; treat missing as
+`true`.
 
 ### `compaction` (1 per compaction trigger that fires)
 
