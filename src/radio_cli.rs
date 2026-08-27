@@ -69,9 +69,21 @@ pub fn run(text: &str, dry_run: bool) -> Result<i32> {
                     eprintln!("radio: the answering seat failed ({e:#}); falling back to the plain refusal");
                     println!("radio: {reason}");
                     println!("{}", advertised_list_message(&catalog));
-                    Ok(0)
+                    // The model was reached for routing but not for answering:
+                    // the user got a degraded reply, and a script must be able
+                    // to tell.
+                    Ok(1)
                 }
             }
+        }
+        // The routing seat never ran. Nothing downstream can do better with
+        // the same registry / model / server, so: the error once, the fix
+        // is inside it (every producer names its own next step), and a
+        // non-zero exit so `darkmux radio` in a script or CI job fails
+        // instead of printing a command listing and returning 0.
+        RouteDecision::Unavailable { error } => {
+            eprintln!("radio: could not reach a model.\n{error}");
+            Ok(1)
         }
         RouteDecision::Route { command, args } => {
             println!("radio: routing to /{command} — from your text");

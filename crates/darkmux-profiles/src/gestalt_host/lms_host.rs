@@ -393,6 +393,12 @@ fn collect_within(rx: &std::sync::mpsc::Receiver<String>, cap: Duration) -> Stri
 /// load-bearing: a chatty child that fills the OS pipe buffer would
 /// otherwise block forever and read as a timeout. Post-exit collection is
 /// total-bounded per stream by [`PIPE_GRACE`] ([`collect_within`]).
+/// Whether a spawned program is LM Studio's CLI (`lms`, or any path ending
+/// in it, which is what `lms_bin` overrides look like).
+fn is_lms_program(program: &str) -> bool {
+    std::path::Path::new(program).file_name().and_then(|f| f.to_str()) == Some("lms")
+}
+
 pub(crate) fn run_bounded(
     mut cmd: Command,
     phase: &'static str,
@@ -409,9 +415,25 @@ pub(crate) fn run_bounded(
     // runner for non-`lms` probes (vm_stat / sysctl / ps), so a hardcoded
     // "lms" prefix would mislabel those failures.
     let program = cmd.get_program().to_string_lossy().into_owned();
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| HostError::CommandFailed { detail: format!("spawning `{program}` ({phase}): {e}") })?;
+    let mut child = cmd.spawn().map_err(|e| HostError::CommandFailed {
+        detail: if e.kind() == std::io::ErrorKind::NotFound && is_lms_program(&program) {
+            // The first-run shape: LM Studio installed, its CLI never
+            // enabled (or `lms_bin` pointing somewhere wrong). Name the fix
+            // here, at the only place that knows the program was the problem.
+            // Only for `lms`: this runner also spawns the host-telemetry
+            // probes (vm_stat / sysctl / ps), and a missing one of those is
+            // not an LM Studio problem.
+            format!(
+                "`{program}` was not found ({phase}). Install LM Studio and enable its \
+                 command-line tool (`~/.lmstudio/bin/lms bootstrap`), or set `lms_bin` in \
+                 ~/.darkmux/config.json to where `lms` lives."
+            )
+        } else if e.kind() == std::io::ErrorKind::NotFound {
+            format!("`{program}` was not found ({phase})")
+        } else {
+            format!("spawning `{program}` ({phase}): {e}")
+        },
+    })?;
     let stdout_rx = spawn_drain(child.stdout.take());
     let stderr_rx = spawn_drain(child.stderr.take());
     let start = Instant::now();
@@ -1114,4 +1136,27 @@ esac"#,
             }
         }
     }
+
+    #[test]
+    fn a_missing_program_names_the_fix_not_the_errno() {
+        let cmd = Command::new("/nonexistent/darkmux-test/lms");
+        let Err(err) = run_bounded(cmd, "load", Deadline(Duration::from_secs(5)), StdoutMode::Null) else {
+            panic!("a nonexistent program must not spawn")
+        };
+        let HostError::CommandFailed { detail } = err else { panic!("expected CommandFailed, got {err:?}") };
+        assert!(detail.contains("was not found"), "{detail}");
+        assert!(detail.contains("lms bootstrap"), "{detail}");
+        assert!(detail.contains("lms_bin"), "{detail}");
+
+        // The same runner spawns host-telemetry probes; a missing one of
+        // those must not be diagnosed as an LM Studio problem.
+        let cmd = Command::new("/nonexistent/darkmux-test/vm_stat");
+        let Err(err) = run_bounded(cmd, "probe", Deadline(Duration::from_secs(5)), StdoutMode::Null) else {
+            panic!("a nonexistent program must not spawn")
+        };
+        let HostError::CommandFailed { detail } = err else { panic!("expected CommandFailed, got {err:?}") };
+        assert!(detail.contains("was not found"), "{detail}");
+        assert!(!detail.contains("LM Studio"), "{detail}");
+    }
 }
+

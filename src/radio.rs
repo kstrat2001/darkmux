@@ -133,6 +133,13 @@ pub enum RouteDecision {
     /// A short, model- or validator-supplied reason. Never blank —
     /// [`validate_router_output`] and [`route`] always supply one.
     Refuse { reason: String },
+    /// The routing dispatch could not RUN: no profile registry, a
+    /// placeholder or missing model, no `lms`, LM Studio's server down.
+    /// Distinct from [`RouteDecision::Refuse`] on purpose: a refusal is
+    /// the model declining and is worth handing to the answering seat; an
+    /// Unavailable would fail that seat identically, so consumers print
+    /// the error ONCE and exit non-zero (first-run probes, 2026-08-28).
+    Unavailable { error: String },
 }
 
 /// The injectable model-call seam (issue #1698, "the model call is
@@ -162,9 +169,7 @@ pub fn route(text: &str, catalog: &[CatalogEntry], call: &mut ModelCall<'_>) -> 
     let message = build_router_message(text, catalog);
     match call(&message) {
         Ok(raw) => validate_router_output(&raw, catalog),
-        Err(e) => RouteDecision::Refuse {
-            reason: format!("the routing dispatch failed: {e:#}"),
-        },
+        Err(e) => RouteDecision::Unavailable { error: format!("{e:#}") },
     }
 }
 
@@ -246,6 +251,10 @@ fn emit_route_record(text: &str, surface: RadioSurface, decision: &RouteDecision
         RouteDecision::Refuse { reason } => {
             payload["decision"] = serde_json::json!("refuse");
             payload["reason"] = serde_json::json!(reason);
+        }
+        RouteDecision::Unavailable { error } => {
+            payload["decision"] = serde_json::json!("unavailable");
+            payload["error"] = serde_json::json!(error);
         }
     }
     let nanos = std::time::SystemTime::now()
@@ -867,13 +876,19 @@ mod tests {
         assert_eq!(decision, RouteDecision::Route { command: "review".to_string(), args: String::new() });
     }
 
+    /// A routing dispatch that could not run is NOT a refusal. A refusal is
+    /// the model declining; this is the model never being reached (no
+    /// registry, no model, no server). Callers that fall through to the
+    /// answering seat on a refusal would fail identically on an
+    /// Unavailable, so the variant has to be distinct (first-run probes,
+    /// 2026-08-28: every setup error printed twice and exited 0).
     #[test]
-    fn route_turns_a_call_error_into_a_refusal() {
+    fn route_turns_a_call_error_into_unavailable_not_a_refusal() {
         let mut call = |_msg: &str| -> Result<String> { Err(anyhow::anyhow!("dispatch failed: no model loaded")) };
         let decision = route("please review this", &fixture_catalog(), &mut call);
         match decision {
-            RouteDecision::Refuse { reason } => assert!(reason.contains("dispatch failed"), "{reason}"),
-            other => panic!("expected a refusal, got {other:?}"),
+            RouteDecision::Unavailable { error } => assert!(error.contains("dispatch failed"), "{error}"),
+            other => panic!("expected Unavailable, got {other:?}"),
         }
     }
 
