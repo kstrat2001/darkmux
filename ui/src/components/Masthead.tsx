@@ -7,6 +7,22 @@ import { openModalEl } from "../lib/dialogManager";
 import { isLiveRoute, type Route } from "../lib/route";
 import { todayUTC } from "../lib/flow";
 import { injectedMeta } from "../lib/injectedMeta";
+// (#2022) The mark, from the SAME file the site and the icon generator read —
+// one source, so a future change to the identity cannot leave a stale copy
+// behind in the bundle.
+//
+// Imported as a URL, NOT `?raw` + `dangerouslySetInnerHTML`. The first cut
+// did the latter and `no-danger.test.ts` failed it, correctly: that guard is
+// absolute by design, and "my string is trusted" is exactly the argument every
+// XSS bug is made of. Vite inlines an asset under `assetsInlineLimit` as a
+// data URI, so this stays self-contained — no network fetch, and no route the
+// daemon would have to serve — while React keeps its escape-by-construction
+// guarantee intact.
+//
+// The SMALL variant, not the full mark: the masthead sets it near 24px, where
+// the four-channel diagram measured as a smudge when the icon set was built.
+// Two-in/one-out still reads at that size.
+import markUrl from "../brand/mark-trapezoid-out.svg";
 import { isStaticBuild } from "../lib/staticSource";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
 import type { MachineSpecs } from "../types/handwritten";
@@ -140,6 +156,12 @@ export function Masthead({
             so the parity goldens rebaseline from a source that genuinely
             changed rather than being edited to match the port. */}
         <a href="https://darkmux.com/" target="_blank" rel="noopener">
+          {/* `aria-hidden` + no alt text: the wordmark beside it already
+              names the product, so announcing the mark would read the name
+              twice to a screen reader. */}
+          {/* Empty alt, not a description: the wordmark beside it already
+              names the product, so alt text would read the name twice. */}
+          <img className="masthead__mark" src={markUrl} alt="" width="24" height="24" />
           <b>darkmux</b>
         </a>
       </span>

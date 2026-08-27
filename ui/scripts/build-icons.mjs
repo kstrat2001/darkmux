@@ -16,12 +16,21 @@
  *     node ui/scripts/build-icons.mjs
  */
 import { chromium } from "playwright";
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync } from "fs";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const SRC = `${ROOT}/docs/media/icon`;
+// (#2022) The SVGs live under `ui/src/brand/` — inside the build root — so the
+// VIEWER can import them directly (`?raw`) and render the mark inline. Keeping
+// them in `docs/` would have forced a second hand-maintained copy in the
+// bundle, which is the drift this generator exists to prevent.
+//
+// `docs/media/icon/` is now an OUTPUT: the site's <img> tags keep working
+// because the sources are copied there, not because a second original lives
+// there.
+const SRC = `${ROOT}/ui/src/brand`;
+const SITE_SVG = `${ROOT}/docs/media/icon`;
 // (#2022) Two consumers, one generator. `docs/` is the marketing site;
 // `crates/darkmux-serve/assets/` is what the DAEMON embeds and serves as a
 // PWA, and it shipped a different mark entirely — an operator who installed
@@ -60,6 +69,11 @@ const VIEWER_FILES = new Set(["icon-192.png", "icon-512.png", "icon-512-maskable
 const browser = await chromium.launch();
 const page = await browser.newPage();
 mkdirSync(SITE, { recursive: true });
+mkdirSync(SITE_SVG, { recursive: true });
+// Publish the sources the site references by URL.
+for (const f of readdirSync(SRC).filter((n) => n.endsWith(".svg"))) {
+  copyFileSync(`${SRC}/${f}`, `${SITE_SVG}/${f}`);
+}
 mkdirSync(VIEWER, { recursive: true });
 
 for (const t of TARGETS) {

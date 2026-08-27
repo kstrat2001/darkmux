@@ -284,6 +284,26 @@ body {
 .masthead__brand a {
   color: inherit;
   text-decoration: none;
+  /* (#2022) FLEX, not `vertical-align`. The first cut nudged the mark with a
+     `-0.22em` offset, which is a guess dressed as alignment: it happens to
+     look right at one font-size and drifts at every other, and it aligns to
+     the text BASELINE rather than to the optical centre. `align-items:center`
+     is what actually centres two boxes against each other, and it is the same
+     rule the hero lockup and the guide nav already use. */
+  display: inline-flex;
+  align-items: center;
+  gap: 0.34em;
+}
+
+/* Sized in `em` off the brand's own text so the two scale together — two
+   independent sizes drift the moment either is touched.
+
+   `1.5em` because the wordmark is lowercase with nothing rising past `d`/`k`,
+   so a mark matched to its cap height reads noticeably smaller beside it. */
+.masthead__mark {
+  width: 1.5em;
+  height: 1.5em;
+  flex: none;
 }
 .masthead__brand b {
   color: var(--accent);
