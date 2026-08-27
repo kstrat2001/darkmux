@@ -119,9 +119,32 @@ function onActivateKeyDown(onActivate: () => void) {
  * literally "filters", matching its `title`/`aria-label`, so there is no
  * hover-only sentence left to disagree with a touch user's expectation.
  */
-/** (#1066) Session-scoped collapse preference. `dmux.` prefix per the
- * convention in `lenses/mission/timeline.ts`. */
-const COLLAPSE_STORAGE_KEY = "dmux.eventlog.collapsed";
+/** (#1066) Session-scoped collapse preference, keyed by MOUNT SITE.
+ *
+ * This was one global flag, which is wrong because the component has TWO real
+ * mount sites: the App-level mainstay and the one `MissionGraphLens` owns.
+ * An operator who collapsed the mainstay on any route then opened a mission
+ * found the mission's OWN events pane collapsed too — a pane they had never
+ * touched, showing a 28px rail with no explanation.
+ *
+ * That directly contradicted this feature's own framing ("the operator
+ * decided and can undo it"), since here the operator decided nothing about
+ * that pane. Found by a QA agent that navigated between routes rather than
+ * toggling one instance.
+ *
+ * Keyed by MOUNT SITE (`paneId`), deliberately NOT by `scopeLabel`. The
+ * App-level pane's scope label changes with the route — "fleet", "runs",
+ * "console" — so keying on it would reset the choice on every tab switch,
+ * destroying the one property that makes this a MAINSTAY rather than a
+ * per-page toggle. The operator's ask was explicitly "a collapsible mainstay
+ * on all tabs".
+ *
+ * The collision this fixes is between the two SIMULTANEOUS mounts, not
+ * between routes: one `paneId` for the App-level chrome, another for the pane
+ * `MissionGraphLens` owns. `dmux.` prefix per `lenses/mission/timeline.ts`. */
+function collapseKeyFor(pane: string): string {
+  return `dmux.eventlog.collapsed.${pane}`;
+}
 
 export function EventLogColumn({
   records,
@@ -131,9 +154,16 @@ export function EventLogColumn({
   error = null,
   historical = false,
   serverTruncated = false,
+  paneId = "app",
 }: {
   records: FlowRecord[];
   visible: boolean;
+  /** (#1066 QA) Which MOUNT SITE this is — `"app"` for the App-level
+   *  mainstay, something else for a lens that owns its own pane. Keys the
+   *  collapse preference, so two simultaneously-mounted panes cannot
+   *  overwrite each other's choice. Deliberately separate from `scopeLabel`,
+   *  which changes per route and would reset the choice on every tab switch. */
+  paneId?: string;
   /** (#1800 P2) True when `records` is a fetched historical slice rather than
    *  the live rolling window — see the header's own note. */
   historical?: boolean;
@@ -246,7 +276,7 @@ export function EventLogColumn({
   // later in a context that no longer resembles the one it was set in.
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     try {
-      return window.sessionStorage.getItem(COLLAPSE_STORAGE_KEY) === "1";
+      return window.sessionStorage.getItem(collapseKeyFor(paneId)) === "1";
     } catch {
       return false;
     }
@@ -254,7 +284,7 @@ export function EventLogColumn({
   const toggleCollapsed = () => {
     setCollapsed((c) => {
       try {
-        window.sessionStorage.setItem(COLLAPSE_STORAGE_KEY, c ? "0" : "1");
+        window.sessionStorage.setItem(collapseKeyFor(paneId), c ? "0" : "1");
       } catch {
         // ignore — storage unavailable
       }

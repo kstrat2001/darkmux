@@ -701,4 +701,37 @@ describe("App", () => {
     await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1));
     expect(document.getElementById("qcount")?.textContent).toBe("1 events");
   });
+
+  /**
+   * (#1066 QA) The PR's central risk claim — "that would have shipped the
+   * double mount" — was guarded ONLY by a pure-function unit test on
+   * `showsEventLog`. That cannot catch a regression in the WIRING: changing
+   * `visible={showsEventLog(route)}` to `visible={true}` bypasses the
+   * function entirely and left all 1073 tests green.
+   *
+   * Asserts the App-level column is HIDDEN on the mission route, which is
+   * precisely what stops a second visible event log appearing beside the one
+   * `MissionGraphLens` owns.
+   *
+   * Deliberately NOT phrased as "no two visible columns". A first attempt was
+   * written that way and passed vacuously: instrumenting it showed only ONE
+   * column mounts here, because the mission lens's own pane needs graph data
+   * this fixture does not provide — so the assertion could not have failed.
+   * A true-but-unfailable assertion is worse than no test, and that exact
+   * shape is what let an earlier bug through today.
+   *
+   * Red-proven: `visible={true}` in App.tsx fails this.
+   */
+  it("keeps the App-level event log hidden on the mission route, so the lens's own pane stands alone", async () => {
+    vi.stubGlobal("fetch", mockFleetLikeFetch());
+    window.location.hash = "#mission=m1";
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(document.querySelector(".eventlog")).toBeTruthy());
+    expect(document.querySelector(".eventlog")!.className).toMatch(/eventlog--hidden/);
+  });
 });

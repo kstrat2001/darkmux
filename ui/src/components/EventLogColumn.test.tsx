@@ -318,4 +318,33 @@ describe("EventLogColumn", () => {
     fireEvent.click(btn);
     expect(screen.getByRole("button", { name: /expand the event log/i })).toHaveAttribute("aria-expanded", "false");
   });
+
+  it("one pane's collapse choice does not collapse the other mounted pane", () => {
+    // (#2026 QA) Two EventLogColumns are mounted at once on the `mission`
+    // route: the App-level mainstay and the one MissionGraphLens owns. With a
+    // single global key, collapsing the mainstay ANYWHERE silently collapsed
+    // the mission's own pane — which the operator never touched, and which
+    // then showed a 28px rail with no explanation.
+    //
+    // Red-proven: reverting `collapseKeyFor` to one constant fails this.
+    const { unmount } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.click(screen.getByRole("button", { name: /collapse the event log/i }));
+    unmount();
+
+    render(<EventLogColumn paneId="mission" scopeLabel="mission m1" records={[]} visible />);
+    expect(document.querySelector(".eventlog")!.className).not.toMatch(/eventlog--collapsed/);
+  });
+
+  it("the mainstay's collapse choice DOES survive a route change (that is the point)", () => {
+    // The counterpart to the test above, and the reason the key is the MOUNT
+    // SITE rather than the scope label: the App-level pane's label changes
+    // per route ("fleet" -> "runs"), so keying on it would reset the choice on
+    // every tab switch and turn a mainstay back into a per-page toggle.
+    const { unmount } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.click(screen.getByRole("button", { name: /collapse the event log/i }));
+    unmount();
+
+    render(<EventLogColumn scopeLabel="runs" records={[]} visible />);
+    expect(document.querySelector(".eventlog")!.className).toMatch(/eventlog--collapsed/);
+  });
 });
