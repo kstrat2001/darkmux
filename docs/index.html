@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>darkmux — AI-first local-AI orchestrator for Apple Silicon</title>
 <meta name="description" content="AI-first local-AI orchestrator: config-defined missions that run as a live task graph, plus a lab that measures how your hardware runs a workload. Uses local-AI internally to manage your local-AI. Built on real benchmarks.">
-<meta property="og:title" content="Own your AI workforce. Local AI, no API bill.">
-<meta property="og:description" content="Open-source orchestrator for Apple Silicon. Local models handle the routine work so your frontier agent saves its tokens for the hard problems.">
+<meta property="og:title" content="darkmux: the AI runtime built for Apple Silicon">
+<meta property="og:description" content="Automatically manages unified memory, keeps a crew of open models resident, and unifies every Mac you own into a fleet. Open source.">
 <meta property="og:url" content="https://darkmux.com">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="darkmux">
@@ -342,7 +342,11 @@
     font-size: 20px;
     color: var(--text);
     margin: 0 0 32px;
-    max-width: 580px;
+    /* Same measure as the install box and the sections below (#2034 set the
+       wrap to 820). A narrower cap here wrapped the statement a third of the
+       way across and orphaned its last word. `pretty` keeps that from
+       recurring as the copy changes. */
+    text-wrap: pretty;
   }
   .tag .accent { color: var(--accent); }
 
@@ -370,18 +374,30 @@
     border: 1px solid var(--border);
     border-radius: 5px;
     color: var(--muted);
-    font-family: inherit;
-    font-size: 11px;
-    line-height: 1.4;
-    padding: 2px 9px;
+    padding: 5px;
+    display: inline-flex;
     user-select: none;
     transition: color .12s, border-color .12s;
   }
+  /* Clipboard at rest, check after a copy. No failure glyph: when the page
+     cannot write the clipboard, the handler selects the command instead so
+     the user's own Cmd+C works, which is the only fallback that actually
+     helps. State lives in a class so the markup never changes and the
+     button keeps its size. */
+  .copy-btn svg { display: none; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .copy-btn:not(.copied) .copy-btn__copy { display: block; }
+  .copy-btn.copied .copy-btn__ok { display: block; }
   .copy-btn:hover { color: var(--text); border-color: var(--accent); }
   .copy-btn.copied { color: var(--accent); border-color: var(--accent); }
 
   /* buttons */
-  .btns { display: flex; gap: 12px; flex-wrap: wrap; }
+  .btns { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  /* The demo button answers an objection rather than competing with the
+     install line: a reader who glossed past the command is not convinced
+     yet, and this is the page saying so. */
+  .btns__lead { color: var(--muted); font-size: 17px; }
+  .btns__link { color: var(--accent); font-size: 17px; font-weight: 600; text-decoration: none; }
+  .btns__link:hover, .btns__link:focus-visible { text-decoration: underline; text-underline-offset: 3px; }
   .btn {
     display: inline-block;
     padding: 10px 18px;
@@ -508,10 +524,9 @@
            alt="The darkmux mark: four channels converging on a node and leaving as one output — a multiplexer.">
       <h1>darkmux</h1>
     </div>
-    <p class="tag"><strong>Own your AI workforce.</strong> The capable local models your <span class="accent">Apple Silicon</span> already runs, directed by your frontier, no API bill, on your hardware. When a job needs a bigger brain, the same dispatches to the cloud endpoint you choose.</p>
+    <p class="tag"><strong>The AI runtime built for <span class="accent">Apple Silicon</span>.</strong> Designed and built for your Mac by an ex‑Apple software lead: it automatically manages unified memory, keeps a crew of open models resident, and unifies every Mac you own into a fleet.</p>
     <div class="install">
-      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew tap kstrat2001/darkmux</span><button class="copy-btn" data-copy="brew tap kstrat2001/darkmux" aria-label="Copy command">Copy</button></div>
-      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install darkmux</span><button class="copy-btn" data-copy="brew install darkmux" aria-label="Copy command">Copy</button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install kstrat2001/darkmux/darkmux</span><button class="copy-btn" data-copy="brew install kstrat2001/darkmux/darkmux" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
     </div>
     <!-- (#2034) ONE call to action. The guide and the repo live in the nav
          above and are referenced in context further down, so repeating them
@@ -523,7 +538,8 @@
          recorded data. Nothing is running until the visitor installs it, and
          a CTA that says otherwise is a claim the page cannot keep. -->
     <div class="btns">
-      <a class="btn btn-primary" href="demo/">See the demo →</a>
+      <span class="btns__lead">Want to see it in action first?</span>
+      <a class="btns__link" href="demo/">See the demo →</a>
     </div>
   </div>
 </header>
@@ -613,10 +629,9 @@
   <div class="wrap">
     <h2>Get going</h2>
     <div class="install">
-      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew tap kstrat2001/darkmux</span><button class="copy-btn" data-copy="brew tap kstrat2001/darkmux" aria-label="Copy command">Copy</button></div>
-      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install darkmux</span><button class="copy-btn" data-copy="brew install darkmux" aria-label="Copy command">Copy</button></div>
-      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux init</span><button class="copy-btn" data-copy="darkmux init" aria-label="Copy command">Copy</button></div>
-      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux doctor</span><button class="copy-btn" data-copy="darkmux doctor" aria-label="Copy command">Copy</button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install kstrat2001/darkmux/darkmux</span><button class="copy-btn" data-copy="brew install kstrat2001/darkmux/darkmux" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux init</span><button class="copy-btn" data-copy="darkmux init" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux doctor</span><button class="copy-btn" data-copy="darkmux doctor" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
     </div>
     <p class="muted">Prefer source? <code>cargo install --git https://github.com/kstrat2001/darkmux</code> works too. Then edit <code>~/.darkmux/profiles.json</code> to point at your downloaded LMStudio models. The <a href="guide/getting-started.html">getting-started page of the user guide</a> walks through this end-to-end, including verifying with doctor and launching your first mission.</p>
 
@@ -659,21 +674,54 @@
     var btn = e.target.closest(".copy-btn");
     if (!btn) return;
     var cmd = btn.getAttribute("data-copy") || "";
-    var done = function (label, ok) {
-      btn.textContent = label;
-      btn.classList.toggle("copied", ok);
-      setTimeout(function () {
-        btn.textContent = "Copy";
-        btn.classList.remove("copied");
-      }, 1200);
+    var done = function (ok) {
+      if (ok) {
+        btn.classList.add("copied");
+        btn.setAttribute("aria-label", "Copied");
+        setTimeout(function () {
+          btn.classList.remove("copied");
+          btn.setAttribute("aria-label", "Copy command");
+        }, 1200);
+        return;
+      }
+      // The page could not write the clipboard. Select the command so the
+      // user's own copy keystroke does it, and say so on the button.
+      var cmdEl = btn.parentNode.querySelector(".cmd");
+      if (cmdEl && window.getSelection) {
+        var range = document.createRange();
+        range.selectNodeContents(cmdEl);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+      btn.setAttribute("aria-label", "Press Cmd+C to copy");
+      btn.setAttribute("title", "Press Cmd+C to copy");
+    };
+    // `navigator.clipboard` exists only in secure contexts (HTTPS, localhost).
+    // A preview served over plain HTTP on a named host has no such object,
+    // and a copy that silently fails there is the bug the operator reports
+    // against the site. The selection-based copy works everywhere the
+    // async API does not, so it is the fallback rather than a "Failed".
+    var legacyCopy = function () {
+      var ta = document.createElement("textarea");
+      ta.value = cmd;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
+      document.body.removeChild(ta);
+      done(ok);
     };
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(cmd).then(
-        function () { done("Copied", true); },
-        function () { done("Failed", false); }
+        function () { done(true); },
+        legacyCopy
       );
     } else {
-      done("Failed", false);
+      legacyCopy();
     }
   });
 
