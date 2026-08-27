@@ -9,9 +9,14 @@
   <!-- Two inputs, one output: the smallest arrangement that still SAYS
        multiplexer rather than just "a shape". The full mark's four channels
        do not survive this size, but the relation many-in/one-out does, and
-       that relation is the whole idea. -->
-  <path d="M3 25 L14 25" stroke="#38bdf8" stroke-width="4.5" stroke-linecap="round" />
-  <path d="M3 39 L14 39" stroke="#c084fc" stroke-width="4.5" stroke-linecap="round" />
+       that relation is the whole idea.
+
+       Spaced 20 units apart, not 14. Closer together they merged into a
+       double stroke below 32px instead of reading as two channels — and two
+       channels IS the message. 20 also lands symmetric inside the
+       trapezoid's 42-unit left edge (11 units clear above and below). -->
+  <path d="M3 22 L14 22" stroke="#38bdf8" stroke-width="4.5" stroke-linecap="round" />
+  <path d="M3 42 L14 42" stroke="#c084fc" stroke-width="4.5" stroke-linecap="round" />
   <path d="M14 11 L40 23 L40 41 L14 53 Z"
         fill="rgba(129,140,248,0.18)"
         stroke="url(#dm-s2-grad)" stroke-width="5"
