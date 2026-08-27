@@ -13,8 +13,7 @@ import {
   matchesFilters,
   type Facets,
   type FacetSeen,
-  type FilterState,
-} from "../lib/eventFilters";
+  type FilterState, activeFilterCount, restoreFilterState, persistFilterState } from "../lib/eventFilters";
 import { FiltersDialog, onlyModelFacet } from "./FiltersDialog";
 import { ActivityIcon } from "./ActivityIcon";
 import { recordDetail } from "../lib/recordDetail";
@@ -180,7 +179,25 @@ export function EventLogColumn({
   // (`"note"`) was a facet value that had never been seen before and the
   // one-shot reseed had already run.
   const facets = useMemo(() => computeFacets(records), [records]);
-  const [filters, setFilters] = useState<FilterState>(() => defaultFilterState(facets));
+
+  // (#2018) Seeded from `sessionStorage`, reconciled against the facets this
+  // window actually offers. The lazy initializer runs ONCE, which is what
+  // makes this a restore rather than a fight with `absorbNewFacetValues`
+  // below — that effect owns what happens as new facet values arrive, and it
+  // would undo a value re-applied on every render.
+  const [filters, setFilters] = useState<FilterState>(() => restoreFilterState(facets));
+  // (#2018) Derived, never stored: a count held in state would be one more
+  // thing to keep in step with the filters it describes, and would go stale
+  // exactly when new facet values arrive.
+  const activeFilters = useMemo(() => activeFilterCount(filters, facets), [filters, facets]);
+
+  // Persist on change rather than on close: the operator's picks should
+  // survive a refresh taken at any moment, not only one taken after tidily
+  // dismissing the dialog.
+  useEffect(() => {
+    persistFilterState(filters);
+  }, [filters]);
+
   const seenRef = useRef<FacetSeen>(createFacetSeen());
   // The absorb runs in the EFFECT BODY, not inside the `setFilters` updater.
   // `absorbNewFacetValues` mutates the `seen` ledger, and React requires
@@ -352,16 +369,27 @@ export function EventLogColumn({
               >
                 ⏱
               </button>
+              {/* (#2018) The count is the SAFETY property, not decoration.
+                  Without it a pane showing three rows out of four hundred is
+                  indistinguishable from a quiet system — which is the hazard
+                  #1911 names when it refuses to persist a selection ("a
+                  filter silently restored ... looks like a quiet system").
+                  The danger there is silence, not durability, and silence is
+                  already true today with nothing persisted. `aria-label`
+                  carries the count too, so the state is not colour- or
+                  glyph-only. */}
               <button
                 type="button"
                 className="eventlog__fbtn"
                 id="fbtn"
                 data-act="filters"
-                title="filters"
-                aria-label="filters"
+                data-active={activeFilters > 0 ? "1" : undefined}
+                title={activeFilters > 0 ? `${activeFilters} filter${activeFilters === 1 ? "" : "s"} hiding events` : "filters"}
+                aria-label={activeFilters > 0 ? `filters, ${activeFilters} active` : "filters"}
                 onClick={() => openModalEl("modalbg")}
               >
                 filters
+                {activeFilters > 0 ? <span className="eventlog__fcount"> · {activeFilters}</span> : null}
               </button>
             </span>
           </h3>

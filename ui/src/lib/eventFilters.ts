@@ -156,6 +156,35 @@ export function defaultFilterState(facets: Facets): FilterState {
 
 const FACET_KEYS = ["act", "cat", "tier", "src"] as const;
 
+/** (#2018) How many of the operator's filters are currently HIDING something.
+ *
+ * The button reads `filters` whether zero or six are set, so a pane showing
+ * three rows out of four hundred looks exactly like a quiet system. That
+ * invisibility — not durability — is the real hazard #1911 names when it
+ * refuses to persist a selection: "a filter silently restored from last week
+ * is a wrong reading that looks like a quiet system." A filter you can SEE is
+ * not silent, which is why this lands before any persistence does.
+ *
+ * A facet counts as active only when it is a STRICT SUBSET of what is on
+ * offer. Equal-size means every value is selected, which hides nothing — and
+ * a facet whose values have not appeared yet must not read as a filter, or
+ * every fresh page would open claiming filters it never applied.
+ *
+ * The free-text query counts as one, because it hides rows exactly the same
+ * way a facet does.
+ */
+export function activeFilterCount(state: FilterState, facets: Facets): number {
+  let n = 0;
+  for (const k of FACET_KEYS) {
+    const offered = facets[k];
+    const selected = state[k];
+    if (offered.length > 0 && selected.size < offered.length) n += 1;
+  }
+  if (state.q.trim() !== "") n += 1;
+  return n;
+}
+
+
 /** The "have we ever offered this value before" ledger `absorbNewFacetValues`
  * needs — viewer.html's `SEEN` (`SEEN.cat`/`SEEN.tier`/`SEEN.src`/`SEEN.act`,
  * declared alongside `state`). One instance lives for the component's whole
@@ -234,4 +263,87 @@ export function matchesFilters(r: FlowRecord, filters: FilterState): boolean {
     if (q && !JSON.stringify(r).toLowerCase().includes(q)) return false;
   }
   return true;
+}
+
+/** (#2018) `sessionStorage` key for the operator's event-log filter picks.
+ *
+ * The TIER is the whole decision, and it is `session`, not `local`. #1911
+ * refuses `localStorage` for panel selections because "a filter silently
+ * restored from last week is a wrong reading that looks like a quiet system"
+ * — a correctness argument, and one this must not trade away. Session scope
+ * keeps that guarantee (closing the tab clears it) while fixing the actual
+ * complaint, which was that every REFRESH reset the picks.
+ *
+ * Facet sets are stored as arrays and RECONCILED on read against the facets
+ * the current window actually offers: a restored value naming a facet no
+ * longer present would render a filter for something that cannot appear, and
+ * would make `activeFilterCount` report a filter the operator cannot see or
+ * clear. Unknown values are dropped rather than trusted.
+ */
+const FILTERS_STORAGE_KEY = "dmux.eventfilters";
+
+type StoredFilters = { act: string[]; cat: string[]; tier: string[]; src: string[]; q: string };
+
+/** Read persisted picks, reconciled against what this window offers.
+ *
+ * Returns the plain default when nothing is stored, when storage is
+ * unavailable, or when the payload is unrecognizable. Storage access can
+ * THROW outright (private mode, blocked site data), not merely return null,
+ * so every access is wrapped — the pattern `lenses/mission/timeline.ts`
+ * already uses. */
+export function restoreFilterState(
+  facets: Facets,
+  storage: Pick<Storage, "getItem"> | null = typeof window === "undefined" ? null : window.sessionStorage,
+): FilterState {
+  const base = defaultFilterState(facets);
+  if (!storage) return base;
+  let raw: string | null = null;
+  try {
+    raw = storage.getItem(FILTERS_STORAGE_KEY);
+  } catch {
+    return base;
+  }
+  if (!raw) return base;
+  let parsed: Partial<StoredFilters>;
+  try {
+    parsed = JSON.parse(raw) as Partial<StoredFilters>;
+  } catch {
+    return base;
+  }
+  const out = base;
+  for (const k of FACET_KEYS) {
+    const stored = parsed[k];
+    if (!Array.isArray(stored)) continue;
+    const offered = new Set(facets[k]);
+    // Intersect, never union: a stored value the current window does not
+    // offer is dropped. An EMPTY intersection is left as the default (every
+    // value selected) rather than as "nothing selected", because a filter
+    // hiding literally everything is indistinguishable from a broken pane.
+    const keep = stored.filter((v) => offered.has(v));
+    if (keep.length > 0) out[k] = new Set(keep);
+  }
+  if (typeof parsed.q === "string") out.q = parsed.q;
+  return out;
+}
+
+/** Persist the current picks. Silent on failure by design — a filter that
+ * could not be saved is a lost convenience, never a reason to break the
+ * pane. */
+export function persistFilterState(
+  state: FilterState,
+  storage: Pick<Storage, "setItem"> | null = typeof window === "undefined" ? null : window.sessionStorage,
+): void {
+  if (!storage) return;
+  try {
+    const payload: StoredFilters = {
+      act: [...state.act],
+      cat: [...state.cat],
+      tier: [...state.tier],
+      src: [...state.src],
+      q: state.q,
+    };
+    storage.setItem(FILTERS_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore — storage unavailable or full
+  }
 }
