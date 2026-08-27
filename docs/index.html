@@ -24,9 +24,49 @@
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <link rel="manifest" href="/site.webmanifest">
 <meta name="theme-color" content="#0b0e14">
+<link rel="preload" href="media/fonts/jetbrains-mono-700.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  /* JetBrains Mono is SELF-HOSTED, and the wordmark is why.
+     Measured, not assumed: with fonts.gstatic.com blocked on a cold browser,
+     `document.fonts` held ZERO JetBrains Mono faces and the rendered glyphs
+     differed — the h1 silently became a different wordmark. (`document.fonts
+     .check()` reports true in that state, because it answers "can something
+     render this", not "did the webfont load". It is the wrong instrument.)
+
+     It is also the inconsistency worth removing: the VIEWER deliberately ships
+     no webfont at all, using the system mono stack, so the brand mark was the
+     one thing on the whole project hanging off a third-party CDN.
+
+     Latin subset only, the three weights actually used — 92 KB total. Inter
+     still comes from the CDN: body copy degrading to system sans is cosmetic,
+     a logo changing shape is not. */
+  @font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('media/fonts/jetbrains-mono-400.woff2') format('woff2');
+  }
+  @font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 500;
+    font-display: swap;
+    src: url('media/fonts/jetbrains-mono-500.woff2') format('woff2');
+  }
+  @font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 700;
+    /* `block` for the wordmark's weight, not `swap`: a brief invisible h1 is
+       better than the logo visibly changing shape after paint. */
+    font-display: block;
+    src: url('media/fonts/jetbrains-mono-700.woff2') format('woff2');
+  }
+</style>
 <style>
   :root {
     --bg: #0a0a0b;
@@ -72,21 +112,68 @@
   }
   .brand .dot { color: var(--accent); }
   h1 {
-    font-family: 'JetBrains Mono', monospace;
+    /* The wordmark. JetBrains Mono 700 is the choice, and it loads — verified
+       with `document.fonts.check("700 88px 'JetBrains Mono'")`, not assumed.
+
+       The fallbacks are NAMED rather than left as bare `monospace`, which
+       resolves to whatever the OS picked (Menlo here, Consolas on Windows,
+       DejaVu on Linux) — three different wordmarks for one brand. These are
+       ordered by how close they sit to JetBrains Mono's proportions, so a
+       failed webfont degrades to a chosen face instead of an arbitrary one.
+
+       This narrows the failure, it does not remove it: the face still comes
+       from fonts.googleapis.com, so a blocked or slow CDN changes the mark.
+       The real lock is outlining the wordmark to paths (a logo is artwork,
+       not live text) or self-hosting a subset — see #2023. */
+    font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
     font-size: clamp(48px, 9vw, 88px);
     font-weight: 700;
     letter-spacing: -0.02em;
     margin: 0 0 16px;
     line-height: 1.0;
+    /* The name is lowercase always, even sentence-initial. Explicit so no
+       inherited or user-agent transform can capitalize the brand. */
+    text-transform: lowercase;
+    font-synthesis: none;
   }
-  h1 .cursor {
-    display: inline-block;
-    width: 0.6ch;
-    margin-left: 0.1ch;
-    color: var(--accent);
-    animation: blink 1.1s steps(2,end) infinite;
+  /* The mark replaces a blinking `_` that used to trail the wordmark. That
+     cursor said "this is a CLI" the way every terminal-adjacent site says it;
+     the mark says what THIS one does — many channels in, one out. Same job,
+     specific instead of generic, so it is a trade rather than a deletion.
+
+     `clamp` tracks the h1's own `clamp(48px, 9vw, 88px)` so the two scale
+     together instead of drifting apart at the breakpoints. */
+  /* The mark sits ON the wordmark's line, sized in `em` so it tracks the h1
+     rather than being clamped independently — one type scale, not two that
+     drift apart at the breakpoints. `align-items: center` rather than
+     baseline: the mark has no baseline to align to, and its optical centre is
+     mid-glyph on a lowercase wordmark with no ascenders past `d`/`k`. */
+  /* The mark sits ON the wordmark's line rather than above it, and the mark
+     itself is the reason: its output beam points RIGHT, so stacked it exits
+     into empty space, while inline it feeds the `d`. "Many in, one out" then
+     resolves INTO the name instead of gesturing past it.
+
+     Sized in `em`, not its own `clamp` — 1.15x the h1's font-size, so there
+     is ONE type scale rather than two drifting apart at the breakpoints, and
+     mobile needs no separate rule.
+
+     `align-items: center`, not baseline: the mark has no baseline to align
+     to, and `darkmux` is all-lowercase with nothing rising past `d`/`k`, so
+     optical centre is mid-glyph. */
+  .hero-lockup {
+    display: flex;
+    align-items: center;
+    gap: 0.28em;
+    font-size: clamp(48px, 9vw, 88px);
+    margin: 0 0 16px;
   }
-  @keyframes blink { 50% { opacity: 0; } }
+  .hero-lockup h1 { margin: 0; font-size: 1em; }
+  .hero-mark {
+    display: block;
+    width: 1.15em;
+    height: 1.15em;
+    flex: none;
+  }
   .tag {
     font-size: 20px;
     color: var(--text);
@@ -241,7 +328,11 @@
 <header>
   <div class="wrap">
     <div class="brand">darkly energized<span class="dot">·</span>open source</div>
-    <h1>darkmux<span class="cursor">_</span></h1>
+    <div class="hero-lockup">
+      <img class="hero-mark" src="media/icon/mark-full.svg" width="132" height="132"
+           alt="The darkmux mark: four channels converging on a node and leaving as one output — a multiplexer.">
+      <h1>darkmux</h1>
+    </div>
     <p class="tag"><strong>Own your AI workforce.</strong> The capable local models your <span class="accent">Apple Silicon</span> already runs, directed by your frontier, no API bill, on your hardware. When a job needs a bigger brain, the same dispatches to the cloud endpoint you choose.</p>
     <div class="install">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew tap kstrat2001/darkmux</span><button class="copy-btn" data-copy="brew tap kstrat2001/darkmux" aria-label="Copy command">Copy</button></div>
