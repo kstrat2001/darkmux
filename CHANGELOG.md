@@ -12,6 +12,65 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.1.0] - 2026-08-27
+
+Three fixes about darkmux telling the truth about what happened.
+
+3.0.0 shipped a run-detail lens good enough to look at closely, and looking
+closely is what found these. Each one is a place where the system recorded or
+reported something other than what occurred.
+
+### Fixed
+
+- **Tool results are persisted, not just measured** ([#2007](https://github.com/kstrat2001/darkmux/issues/2007)).
+  Every `tool.completed` record carried `result_chars` and threw the result
+  away. A run's trajectory could tell you a tool returned 4,182 characters and
+  not one of them. That is the same shape as the tool-args and session-record
+  findings before it, and it is now the third time this project has discovered
+  it holds a value, takes its length, and drops the value. The result now
+  rides the record, capped at 64 KB.
+
+  The cap **truncates rather than drops**, and it elides from the MIDDLE at a
+  3:1 head:tail ratio. A tool result's two useful ends are the command that ran
+  and how it finished; head-only truncation reliably discards the second one.
+
+- **A red test is not a broken tool** ([#2008](https://github.com/kstrat2001/darkmux/issues/2008)).
+  The failure-cascade detector classified any non-zero exit from `bash` as a
+  tool failure. A model running a test suite under TDD, where a red suite is
+  the expected result, would accumulate cascade signals and get told its tool
+  "could not run" while the tool ran perfectly and reported exactly what it was
+  asked to report.
+
+  `ToolOutcome` replaces the boolean and distinguishes three states: the tool
+  worked (`Ok`), the tool worked and the command it ran reported a non-zero
+  exit (`Reported`), and the tool itself could not run (`Failed`, with a
+  reason). Only the third feeds the cascade detector. The feedback template was
+  rewritten to match: it now names what actually happened rather than asserting
+  a falsehood the model can see is false.
+
+- **A finished run stops running** ([#2011](https://github.com/kstrat2001/darkmux/issues/2011)).
+  Two defects, one root: the run-detail lens had no way to learn a run had
+  ended.
+
+  Its wall clock rendered `close.ts - startTs`, the gap between two flow
+  records as the *viewer* received them, while the run's own recorded `wall_ms`
+  sat unread on the completion payload. The metric was never ticking; only the
+  rendering was.
+
+  And the view stayed RUNNING until a manual reload, because liveness comes
+  from presence heartbeats and the presence key is deleted BEFORE
+  `dispatch complete` is written. The poll that would have fetched the terminal
+  record is exactly the poll that stops. A bounded grace window now holds
+  polling open across that gap.
+
+### Schema
+
+`FLOW_SCHEMA_VERSION` **1.20.0 → 1.22.0** (two minor bumps, both additive).
+`tool.completed` gained `result`, `outcome`, `exit_code`, and
+`failure_reason`. Older readers ignore what they do not know; the viewer
+renders pre-1.22 records the way it always did, since a record written before
+the distinction existed cannot be re-interpreted after the fact.
+
 ## [3.0.0] - 2026-08-27
 
 A major, and the reason is one rename.
@@ -182,6 +241,7 @@ changed shape.
 - The mobile event list has a floor measured in rows rather than a fraction of
   the viewport (#1996).
 
+[3.1.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.1.0
 [3.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.0.0
 [2.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.12.0
 
