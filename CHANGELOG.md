@@ -12,6 +12,116 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.2.0] - 2026-08-28
+
+Radio becomes interactive help, and the front door stops lying.
+
+The home page now promises three lines to a first answer: install, `init`,
+`darkmux radio "do you have a brain?"`. This release is what it took to make
+that promise true on a fresh Mac, plus the page itself. It was measured the
+way a new user would meet it: ten questions a first-day user would type, run
+against radio before and after, graded on one thing, whether the answer names
+a command they can actually run. Before: 3 of 10. After: 9 of 10.
+
+### Added
+
+- **Radio is grounded in the full verb index** ([#2043](https://github.com/kstrat2001/darkmux/pull/2043)).
+  The answering seat was handed top-level `--help` truncated at 1,600
+  characters, so `serve`, `init`, `lab run inspect`, and `mission propose`
+  did not exist as far as it knew, and it invented ids to fill the gap. It is
+  now handed the whole command tree, walked from clap at call time: every
+  runnable verb, its options, one sentence each, 64 lines. Capability is a
+  lookup, not an inference. The index is the last generic section dropped
+  under the bundle's hard cap, because for a help tool "how do I" grounding
+  outlives "what am I working on" grounding.
+
+- **`init` fills in the worker model** ([#2047](https://github.com/kstrat2001/darkmux/pull/2047), closes [#2038](https://github.com/kstrat2001/darkmux/issues/2038)).
+  `init` wrote a registry whose worker profiles named `<your-worker-model-id>`,
+  and nothing filled the blank, so every fresh install failed at its first
+  dispatch with a message that blamed LM Studio. `init` now asks LM Studio
+  what is downloaded and loaded, picks a loaded model if there is one (the
+  operator chose it) or else the largest downloaded model under 60% of RAM,
+  writes it into every placeholder slot, and says which one and where. A
+  registry the operator has already edited is never touched. No `lms`, or
+  nothing downloaded: the placeholder stays and the message names the fix.
+
+- **The home page, rebuilt for the Apple Silicon push**
+  ([#2035](https://github.com/kstrat2001/darkmux/pull/2035), [#2037](https://github.com/kstrat2001/darkmux/pull/2037), [#2039](https://github.com/kstrat2001/darkmux/pull/2039), [#2040](https://github.com/kstrat2001/darkmux/pull/2040), [#2041](https://github.com/kstrat2001/darkmux/pull/2041), [#2046](https://github.com/kstrat2001/darkmux/pull/2046)).
+  "The AI runtime built for Apple Silicon." An origin story instead of a
+  token-rent argument, a six-row comparison against the class of harness
+  built around a frontier API, Get going third instead of last, every command
+  on the page one tap to copy, two-sentence feature sections, and a Get going
+  card that is one real session: two radio answers captured verbatim on an
+  M5 Max, attributed to the model and the setting that produced them.
+  Nothing on the page bounces to Substack; nothing names a competitor.
+
+- **The event log is a collapsible mainstay on every tab**
+  ([#2026](https://github.com/kstrat2001/darkmux/pull/2026), [#2025](https://github.com/kstrat2001/darkmux/pull/2025), [#2024](https://github.com/kstrat2001/darkmux/pull/2024)),
+  with a filter badge that says how many events the filters are hiding and
+  filters that survive a refresh. Console panel selection is in the URL.
+
+- **A mark** ([#2020](https://github.com/kstrat2001/darkmux/pull/2020), [#2023](https://github.com/kstrat2001/darkmux/pull/2023), [#2031](https://github.com/kstrat2001/darkmux/pull/2031), [#2033](https://github.com/kstrat2001/darkmux/pull/2033)):
+  the multiplexer, four channels in and one out, on the site, in the tab, and
+  on the viewer's own masthead.
+
+- **The demo world is committed** ([#2015](https://github.com/kstrat2001/darkmux/pull/2015)),
+  so the screenshots the docs are shot from are reproducible, and the static
+  demo renders its own data on every lens instead of a 404 page
+  ([#2019](https://github.com/kstrat2001/darkmux/pull/2019), [#2021](https://github.com/kstrat2001/darkmux/pull/2021)).
+
+### Changed
+
+- **Radio ships at humor 50** ([#2045](https://github.com/kstrat2001/darkmux/pull/2045)).
+  The default was 65, a value carried over from the author's own persona
+  override, never chosen. Sampled on one question: under about 40 the model
+  reads as plain, 50 is the first setting with a line in it, 100 is the full
+  persona. One constant now, one test, so the number cannot drift across its
+  copies again. `radio.humor` is the dial.
+
+- **The answering seat gets a budget a reasoning model can use** ([#2044](https://github.com/kstrat2001/darkmux/pull/2044)).
+  It was capped at the single-shot path's 4096 tokens, and a 35B thinking
+  model spent exactly that reasoning about a one-line question and returned
+  nothing. The seat now honors `runtime.max_tokens_per_call` and otherwise
+  uses 16,384. An empty answer is a failure that names the budget and the
+  knob, not a blank line and exit 0.
+
+- **Tooling uses the window** ([#2016](https://github.com/kstrat2001/darkmux/pull/2016)):
+  the two lens width caps are gone.
+
+### Fixed
+
+- **First-inference failures say the fix once and exit 1** ([#2042](https://github.com/kstrat2001/darkmux/pull/2042)).
+  Probed with a fresh home for each case: no `init`, the placeholder model, a
+  model not downloaded, the LM Studio server down, no `lms`. Every one printed
+  the same error twice, ended on a command listing, and exited 0. One defect:
+  a routing dispatch that could not run was recast as a model refusal, and
+  the answering seat then failed the same way. `RouteDecision::Unavailable`
+  separates "the model declined" from "the model was never reached." The
+  messages are fixed at their source, so `dispatch` and `lab` get them too:
+  the placeholder is named as a blank `init` left, a missing `lms` names
+  `lms bootstrap` instead of guessing at RAM, a refused connection names the
+  URL and `lms server start`.
+
+- **Six guards that did not guard** ([#2027](https://github.com/kstrat2001/darkmux/pull/2027)),
+  found by a five-agent QA pass briefed to falsify claims rather than walk a
+  checklist: a sentinel-vocabulary parse that failed open on a comment, an
+  isolation test that scanned lines instead of tags, a drift guard that passed
+  vacuously when it could not see what it guarded, and three more. Every one
+  was a check that passed when you planted the thing it existed to catch.
+
+- **The event log collapses to the side** instead of blanking its pane, the
+  collapse button no longer covers content, and the follow toggle shows its
+  state ([#2029](https://github.com/kstrat2001/darkmux/pull/2029)).
+
+- **A machine's label is its most recent name**, not the first one found in
+  the stream ([#2030](https://github.com/kstrat2001/darkmux/pull/2030)).
+
+### Schema
+
+No data-shape changes. `FLOW_SCHEMA_VERSION` stays at 1.22.0 and
+`CONFIG_SCHEMA_VERSION` at 1.11; the radio flow record's `decision` field
+gained the value `unavailable`, which older readers pass through.
+
 ## [3.1.0] - 2026-08-27
 
 Three fixes about darkmux telling the truth about what happened.
@@ -241,6 +351,7 @@ changed shape.
 - The mobile event list has a floor measured in rows rather than a fraction of
   the viewport (#1996).
 
+[3.2.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.2.0
 [3.1.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.1.0
 [3.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.0.0
 [2.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.12.0
