@@ -1,0 +1,135 @@
+{
+  "resources": {
+    "attribution": "per_process",
+    "attribution_note": "4 worker(s) for 4 resident(s) \u2014 per-model footprint (max of rss and phys_footprint), workers rank-matched to models by weights (largest worker <-> largest weights)",
+    "cache_ttl_ms": 2000,
+    "gather_ms": 345,
+    "generated_at_ms": 1787819182953,
+    "limit_bytes": 274877906944,
+    "limit_source": "physical_pool",
+    "machine": {
+      "current_bytes": 127834497549,
+      "estimated_models": 0,
+      "other_used_bytes": 48318382080,
+      "over_price_models": 0,
+      "potential_bytes": 141395856787,
+      "projected_total_bytes": 189714238867,
+      "state": "green",
+      "unpriced_models": 0
+    },
+    "messages": [],
+    "models": [
+      {
+        "current_bytes": 71457518387,
+        "identifier": "darkmux:qwen3.5-122b-a10b",
+        "kv_bytes_at_ctx": 5368709120,
+        "kv_per_token_bytes": 40960,
+        "loaded_ctx": 131072,
+        "model_key": "qwen3.5-122b-a10b",
+        "owner": "darkmux",
+        "potential_bytes": 75161927680,
+        "potential_source": "arch",
+        "state": "green",
+        "weights_bytes": 69793218560
+      },
+      {
+        "current_bytes": 19627792069,
+        "identifier": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+        "kv_bytes_at_ctx": 5368709120,
+        "kv_per_token_bytes": 20480,
+        "loaded_ctx": 262144,
+        "model_key": "qwen3.6-35b-a3b-turboquant-mlx",
+        "owner": "darkmux",
+        "potential_bytes": 23815385183,
+        "potential_source": "arch",
+        "state": "green",
+        "weights_bytes": 18446676063
+      },
+      {
+        "current_bytes": 32663226286,
+        "identifier": "darkmux:qwen3-coder-next-mlx",
+        "kv_bytes_at_ctx": 3221225472,
+        "kv_per_token_bytes": 24576,
+        "loaded_ctx": 131072,
+        "model_key": "qwen3-coder-next-mlx",
+        "owner": "darkmux",
+        "potential_bytes": 35433480192,
+        "potential_source": "arch",
+        "state": "green",
+        "weights_bytes": 32212254720
+      },
+      {
+        "current_bytes": 4085960807,
+        "identifier": "darkmux:qwen3-4b-instruct-2507",
+        "kv_bytes_at_ctx": 4831838208,
+        "kv_per_token_bytes": 147456,
+        "loaded_ctx": 32768,
+        "model_key": "qwen3-4b-instruct-2507",
+        "owner": "darkmux",
+        "potential_bytes": 6985063732,
+        "potential_source": "arch",
+        "state": "green",
+        "weights_bytes": 2153225524
+      }
+    ],
+    "pool": {
+      "available_bytes": 98725027315,
+      "capacity_bytes": 274877906944,
+      "free_bytes": 21719506009,
+      "used_bytes": 176152879629
+    },
+    "pressure": {
+      "compressor_bytes": 3221225472,
+      "margin_percent": 84,
+      "red": false,
+      "swap_used_bytes": 0
+    },
+    "schema_version": "2.1"
+  },
+  "specs": {
+    "cpu_brand": "Apple M5 Ultra",
+    "darkmux_version": "3.1.0",
+    "flow_schema_version": "1.20.0",
+    "generated_at_ms": 1787819182952,
+    "lms_unreachable": false,
+    "loaded_models": [
+      {
+        "context": 131072,
+        "identifier": "darkmux:qwen3.5-122b-a10b",
+        "model": "qwen3.5-122b-a10b",
+        "size": "69.79 GB",
+        "status": "idle"
+      },
+      {
+        "context": 262144,
+        "identifier": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+        "model": "qwen3.6-35b-a3b-turboquant-mlx",
+        "size": "18.45 GB",
+        "status": "idle"
+      },
+      {
+        "context": 131072,
+        "identifier": "darkmux:qwen3-coder-next-mlx",
+        "model": "qwen3-coder-next-mlx",
+        "size": "32.21 GB",
+        "status": "idle"
+      },
+      {
+        "context": 32768,
+        "identifier": "darkmux:qwen3-4b-instruct-2507",
+        "model": "qwen3-4b-instruct-2507",
+        "size": "2.15 GB",
+        "status": "idle"
+      }
+    ],
+    "machine_id": "m5-ultra-256gb",
+    "os": "macos aarch64",
+    "ram_free_for_ai_bytes": 98725027315,
+    "ram_total_bytes": 274877906944,
+    "redis_url_redacted": "redis://demo-hub.internal:6379",
+    "utility_model": {
+      "id": "darkmux:qwen3-4b-instruct-2507",
+      "loaded": true
+    }
+  }
+}

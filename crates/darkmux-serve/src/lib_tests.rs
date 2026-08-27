@@ -5342,3 +5342,44 @@
             );
         }
     }
+
+/// (#2019) The SERVED viewer must never carry a static-source meta.
+///
+/// `isStaticBuild()` is a single signal — the presence of
+/// `<meta name="darkmux-flow-src">` — and everything downstream keys on it:
+/// the console reads a committed panel map instead of `/panel/:id`, the
+/// machine lens reads a fixture instead of probing the host, the runs board
+/// reads a JSON file instead of `/runs`. One stray meta in this asset would
+/// silently turn every operator's live daemon into a replay of the marketing
+/// demo's fictional 256 GB fleet.
+///
+/// The same bundle ships to both surfaces on purpose — `scripts/build-demo.sh`
+/// copies THIS file and injects the metas on the way out, one-directionally.
+/// That direction is the whole isolation guarantee, and nothing but this test
+/// enforces it. Verified by inspection when the demo fixtures landed; a test
+/// is what keeps it verified.
+///
+/// Matches the TAG, not the string: the minified bundle legitimately contains
+/// `"darkmux-flow-src"` as the argument to the reader function.
+#[test]
+fn served_viewer_ships_no_static_source_meta() {
+    for line in NEXT_HTML.lines() {
+        let t = line.trim_start();
+        if !t.starts_with("<meta") {
+            continue;
+        }
+        assert!(
+            !t.contains("darkmux-flow-src")
+                && !t.contains("darkmux-runs-src")
+                && !t.contains("darkmux-lab-runs-src")
+                && !t.contains("darkmux-missions-src")
+                && !t.contains("darkmux-phases-src")
+                && !t.contains("darkmux-panels-src")
+                && !t.contains("darkmux-machine-src"),
+            "assets/next.html ships a static-source meta, which would put every \
+             daemon-served viewer into daemon-less mode:\n  {t}\n\
+             These belong ONLY in the generated docs/demo/index.html, injected \
+             by scripts/build-demo.sh."
+        );
+    }
+}

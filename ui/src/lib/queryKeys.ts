@@ -76,6 +76,10 @@ export const queryKeys = {
   labRuns: () => ["lab", "runs"] as const,
   machineSpecs: () => ["machine", "specs"] as const,
   machineResources: () => ["machine", "resources"] as const,
+  /** (#2019) The committed `{specs, resources}` a daemon-less build reads
+   * instead of probing a host. Keyed by SRC so two static builds served
+   * from one origin cannot share a cache entry. */
+  staticMachine: (src: string) => ["machine", "static", src] as const,
   /** `GET /panel/:id` (#1911: `?opt.<name>=<value>` variants). Keyed on the
    * SAME canonicalization `hashSync.canonicalHash` writes with
    * (`canonicalOptPairs`, `lenses/console/panels.ts`) — "one
