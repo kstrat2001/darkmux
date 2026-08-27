@@ -413,6 +413,46 @@ Three choices shape it:
 
 The schema is lenient on read (every field optional, unknown keys preserved), so a newer config never bricks an older binary and a hand-edited file never panics the CLI. Loud validation is `darkmux doctor`'s job, not the hot load path. Additive schema changes are a minor version bump; the operator's file keeps working across them.
 
+## The command gate: darkmux runs your shell-outs, not its own
+
+Some mission configs exist to run a command that changes something outside darkmux — approve a pull request, merge it, apply a deployment. They are ordinary `procedural.shell` graphs an operator wrote, shelling out to a tool the operator already has installed and signed in, exactly like the `lms` and `zed` shell-outs elsewhere in the binary.
+
+**darkmux holds no credentials of its own.** That is the whole security posture, and it is what makes the gate necessary rather than paranoid: darkmux is borrowing the operator's authenticated tool. A config that can run `gh pr merge` on your behalf is a config that can merge a pull request with your identity, and nothing in darkmux authenticated to earn that.
+
+So a config may declare a `cmd` — a name — and darkmux refuses to run it until that exact name appears in the operator's own allowlist:
+
+```json
+{ "cmd": { "enabled": true, "allowed": ["pr-approve", "pr-merge"] } }
+```
+
+It **fails closed on both counts**: `enabled: false` blocks every declaring config regardless of the list, and a name absent from the list is blocked even when the gate is on. `darkmux init` writes the block visible, disabled, with an empty list — darkmux ships no opinion about which commands exist.
+
+**The gate knows nothing about what it is gating.** It compares one string against a list. It has no model of pull requests, no knowledge of any tool's subcommands, no notion of what "merge" means. That is deliberate: the operator's configs name their own commands, and the operator opts each one in.
+
+This is why the field is `cmd` and not `gh_verb`, which is what it was called until schema 3.0. The mechanism was always neutral, but the *name* was not, and a name is what people build on: a GitLab user was allowlisting `mr-merge` under `gh.allowed`, and a config gating `terraform apply` — which wants this gate exactly as much — had to declare a GitHub-shaped field to get a check that has nothing to do with GitHub. Renaming it cost one schema major and zero migrations, because no document had declared it yet. Waiting would have cost both.
+
+**One asymmetry is worth stating plainly, because it drove the migration's design.** The gate fails *open* for configs that declare nothing: a config with no `cmd` is never blocked, which is correct — most configs dispatch models and touch nothing outside darkmux, and requiring every one of them to declare a name would make the gate noise. But it means a config that *loses* its declaration silently loses its gate. So a document still carrying the old `gh_verb` key is a loud validation **Error**, never a quiet overflow into the forward-compat bag where unknown keys normally land. An unrecognized field is usually harmless; this one would specifically un-protect the thing it was added to protect.
+
+## ACP: darkmux inside the editor
+
+`darkmux acp` speaks the [Agent Client Protocol](https://github.com/agentclientprotocol/agent-client-protocol) over stdio, so an editor like Zed can drive darkmux from its own agent panel — you type `/review` in the editor and a local crew works the PR, with progress rendering in the panel rather than a terminal you have to go find.
+
+**It is still labeled a spike in its own module docs, and that label is honest.** What works, works in Zed today; what is spike-grade is named in `src/acp.rs` rather than papered over. The most fragile piece: review-stage progress is recognized by pattern-matching known substrings out of the review subprocess's stderr, so a wording change in the pipeline's liveness markers silently stops advancing the on-screen plan. The honest reason it survives is that no structured progress channel exists to read instead — teaching the review pipeline one is the real fix, and it is a feature, not a spike's job.
+
+**Commands come from the mission-config registry, not from code.** `session/new` enumerates the same merged registry `darkmux mission launch` uses (built-ins plus `~/.darkmux/mission-configs/`) and advertises every config that declares a `panel` block. Adding a slash command to your editor is writing a JSON file — no rebuild, no registration call, no darkmux release. The panel block's *presence* is the signal; a config without one stays launch-only.
+
+How an invoked command runs is decided **structurally, never by matching an id**:
+
+- a config whose graph uses review-pipeline step kinds takes the bespoke review path
+- a config whose graph dispatches **no models at all** runs as an ephemeral in-process graph — no mission record, no run artifacts, because a command that shells out and prints a result is not a mission and recording it as one would pollute the mission board
+- anything else is a real `mission launch`
+
+The test is the same one `mission launch` itself uses, so the two entry points can't drift into disagreeing about what a config is.
+
+**A long-lived agent process needs a way to stop.** ACP gives an agent no disconnect notification, so a naive implementation leaks a session per editor thread forever. `session/close` is advertised and handled: it aborts anything in flight for that session and drops its state. Because a client may never send it, there is also a process-level backstop — the whole process exits once nothing has been in flight for `runtime.acp_idle_exit_minutes`. `session/cancel` shares the same abort-handle registry, so a cancelled command is genuinely aborted rather than left running with its output discarded.
+
+**`darkmux radio` is the terminal twin.** It routes free text onto exactly one advertised command through a bounded local classification dispatch, then executes it — one routing call, one execution, no loop. It prints the route it chose (`radio: routing to /<id> — from your text`) *before* executing, so the choice is never silent, and text that doesn't map cleanly onto one command **refuses and lists the options** rather than guessing. A router that guesses wrong on a command that mutates external state is exactly the failure the command gate above exists to prevent, so it declines instead.
+
 ## How we decide
 
 darkmux's design decisions are **grounded in data and in published research where it exists**: we'd rather cite a measurement or a paper than assert from intuition. The framing is *convergence, not priority*: independent research and this project keep arriving at the same architecture (fresh-context review, verifiable-check termination, structured compaction), and the citations explain *why* it works. See the roadmap's [*How we decide*](ROADMAP.md#how-we-decide) for the citation-verification discipline (every cited source re-fetched and confirmed; a confident citation under a correctly-recalled label is exactly where fabrication hides).

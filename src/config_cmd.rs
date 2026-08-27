@@ -55,7 +55,7 @@ enum Ty {
     /// A string constrained to the `FleetMode` token set (#933).
     FleetMode,
     /// (#1685) Comma-separated list of non-empty, trimmed strings, coerced
-    /// to a JSON array — `darkmux config set gh.allowed pr-list,pr-merge`.
+    /// to a JSON array — `darkmux config set cmd.allowed pr-list,pr-merge`.
     /// REPLACES the whole array (there is no incremental add); an empty
     /// string clears it to `[]`.
     StrList,
@@ -134,9 +134,9 @@ const KEYS: &[(&str, Ty)] = &[
     // means adding it HERE by hand, or the tier exists in the resolver and is
     // unreachable from `config set`/`get`.
     ("dirs.lab", Ty::Str),
-    // (#1685) The `gh`-verb allowlist gate — see `GhConfig`'s own doc.
-    ("gh.enabled", Ty::Bool),
-    ("gh.allowed", Ty::StrList),
+    // (#1685) The `gh`-verb allowlist gate — see `CmdConfig`'s own doc.
+    ("cmd.enabled", Ty::Bool),
+    ("cmd.allowed", Ty::StrList),
 ];
 
 /// Keys that are deliberately NOT config — a secret that lives in the macOS
@@ -511,30 +511,30 @@ mod tests {
         assert!(set_at(f.path(), "role_profiles.a.b", "x").is_err(), "deeper path rejected");
     }
 
-    /// (#1685) `gh.allowed` round-trips as a JSON array, trims whitespace,
+    /// (#1685) `cmd.allowed` round-trips as a JSON array, trims whitespace,
     /// drops empty entries, and REPLACES (rather than appends to) whatever
     /// was there before.
     #[test]
-    fn gh_allowed_str_list_round_trips_and_replaces() {
+    fn cmd_allowed_str_list_round_trips_and_replaces() {
         let f = tmp();
         let p = f.path();
-        set_at(p, "gh.enabled", "true").unwrap();
-        set_at(p, "gh.allowed", "pr-list, pr-info ,,pr-merge").unwrap();
+        set_at(p, "cmd.enabled", "true").unwrap();
+        set_at(p, "cmd.allowed", "pr-list, pr-info ,,pr-merge").unwrap();
         let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
-        let gh = cfg.gh.unwrap();
-        assert_eq!(gh.enabled, Some(true));
+        let cmd = cfg.cmd.unwrap();
+        assert_eq!(cmd.enabled, Some(true));
         assert_eq!(
-            gh.allowed,
+            cmd.allowed,
             Some(vec!["pr-list".to_string(), "pr-info".to_string(), "pr-merge".to_string()])
         );
         // A second set REPLACES the list, not appends.
-        set_at(p, "gh.allowed", "pr-approve").unwrap();
+        set_at(p, "cmd.allowed", "pr-approve").unwrap();
         let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
-        assert_eq!(cfg.gh.unwrap().allowed, Some(vec!["pr-approve".to_string()]));
+        assert_eq!(cfg.cmd.unwrap().allowed, Some(vec!["pr-approve".to_string()]));
         // An empty value clears the list.
-        set_at(p, "gh.allowed", "").unwrap();
+        set_at(p, "cmd.allowed", "").unwrap();
         let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
-        assert_eq!(cfg.gh.unwrap().allowed, Some(Vec::<String>::new()));
+        assert_eq!(cfg.cmd.unwrap().allowed, Some(Vec::<String>::new()));
     }
 
     #[test]
@@ -649,7 +649,7 @@ mod tests {
             + c.audit.as_ref().map_or(0, |x| x.extras.len())
             + c.runtime.as_ref().map_or(0, |x| x.extras.len())
             + c.fleet.as_ref().map_or(0, |x| x.extras.len())
-            + c.gh.as_ref().map_or(0, |x| x.extras.len())
+            + c.cmd.as_ref().map_or(0, |x| x.extras.len())
     }
 
     #[test]

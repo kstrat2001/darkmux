@@ -47,7 +47,7 @@
 <section>
   <div class="wrap">
     <h2>The three pieces</h2>
-    <h3>1. The allowlist (<code>gh.enabled</code> / <code>gh.allowed</code>)</h3>
+    <h3>1. The allowlist (<code>cmd.enabled</code> / <code>cmd.allowed</code>)</h3>
     <p>darkmux ships an <code>enabled</code>-gated config block, same shape as <code>redis</code>/<code>audit</code>/every other feature block: <code>darkmux init</code> writes it visible and off.</p>
     <pre><code>{
   "gh": {
@@ -55,9 +55,9 @@
     "allowed": []
   }
 }</code></pre>
-    <p>A config opts into the gate by declaring a <code>gh_verb</code> name at its top level (schema 2.3): <code>"gh_verb": "pr-merge"</code>. Before darkmux runs a SINGLE step of that config's graph, on EITHER entry point (a panel slash command, or a bare <code>darkmux mission launch pr-merge</code> from the terminal), it checks <code>gh.enabled == true</code> and that <code>"pr-merge"</code> is listed in <code>gh.allowed</code>. Fails closed on both: the block off refuses everything regardless of the list; a verb absent from the list refuses even with the block on.</p>
-    <pre><code>darkmux config set gh.enabled true
-darkmux config set gh.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
+    <p>A config opts into the gate by declaring a <code>cmd</code> name at its top level (schema 2.3): <code>"cmd": "pr-merge"</code>. Before darkmux runs a SINGLE step of that config's graph, on EITHER entry point (a panel slash command, or a bare <code>darkmux mission launch pr-merge</code> from the terminal), it checks <code>cmd.enabled == true</code> and that <code>"pr-merge"</code> is listed in <code>cmd.allowed</code>. Fails closed on both: the block off refuses everything regardless of the list; a verb absent from the list refuses even with the block on.</p>
+    <pre><code>darkmux config set cmd.enabled true
+darkmux config set cmd.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
     <p>The second command REPLACES the whole list (there is no incremental add today), so name every verb you want live. <code>darkmux doctor</code> shows the resolved state:</p>
     <pre><code>✓ gh verb allowlist      enabled (config.json) — allowed: pr-list, pr-info, pr-approve, pr-merge</code></pre>
   </div>
@@ -91,7 +91,7 @@ darkmux config set gh.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
 <section>
   <div class="wrap">
     <h2>3. The audit record</h2>
-    <p>Every EXECUTED gh-verb command (a config that reached the allowlist gate and actually ran, whatever its outcome) emits one flow record: <code>category: audit</code>, <code>action: "gh.verb.executed"</code>, with the verb name, a best-effort PR number (the first token typed after the slash command), the worktree it ran from, whether the operator confirmed a gate, and success/failure, all in <code>payload</code>. This is the same audit-trail convention <code>darkmux flow note --source adjudication</code> already uses, not a parallel channel; it reads through the ordinary <code>/flow</code> viewer.</p>
+    <p>Every EXECUTED command command (a config that reached the allowlist gate and actually ran, whatever its outcome) emits one flow record: <code>category: audit</code>, <code>action: "gh.verb.executed"</code>, with the verb name, a best-effort PR number (the first token typed after the slash command), the worktree it ran from, whether the operator confirmed a gate, and success/failure, all in <code>payload</code>. This is the same audit-trail convention <code>darkmux flow note --source adjudication</code> already uses, not a parallel channel; it reads through the ordinary <code>/flow</code> viewer.</p>
   </div>
 </section>
 
@@ -112,7 +112,7 @@ darkmux config set gh.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
   "id": "pr-list",
   "name": "PR List",
   "schema_version": "2.3",
-  "gh_verb": "pr-list",
+  "cmd": "pr-list",
   "panel": {
     "description": "List open pull requests in this repo",
     "hint": "(no arguments)"
@@ -143,7 +143,7 @@ darkmux config set gh.allowed pr-list,pr-info,pr-approve,pr-merge</code></pre>
   "id": "pr-info",
   "name": "PR Info",
   "schema_version": "2.3",
-  "gh_verb": "pr-info",
+  "cmd": "pr-info",
   "inputs": [
     { "name": "args", "required": false,
       "description": "The PR number, for a direct CLI launch (--param args=&lt;n&gt;). Omit to use the current branch's PR." }
@@ -210,7 +210,7 @@ url: https://github.com/kstrat2001/darkmux/pull/1749</code></pre>
     }
   }]
 }</code></pre>
-    <p>Both extract the PR number back out of <code>gather</code>'s OWN already-fetched output (a single source of truth: no second <code>gh pr view</code> call, and the number the executor acts on is provably the same one the dialog just showed) rather than re-reading the raw panel args. The full configs (<code>id</code>, <code>schema_version</code>, <code>gh_verb</code>, <code>inputs</code>, <code>panel</code>) wrap around these two tasks the exact same way <code>pr-info.json</code> does above.</p>
+    <p>Both extract the PR number back out of <code>gather</code>'s OWN already-fetched output (a single source of truth: no second <code>gh pr view</code> call, and the number the executor acts on is provably the same one the dialog just showed) rather than re-reading the raw panel args. The full configs (<code>id</code>, <code>schema_version</code>, <code>cmd</code>, <code>inputs</code>, <code>panel</code>) wrap around these two tasks the exact same way <code>pr-info.json</code> does above.</p>
     <p>The <code>[ -n "$PR" ] || exit 1</code> line guards against an empty extraction: <code>gh pr view ""</code> and <code>gh pr merge "" --squash</code> both silently fall back to resolving the CURRENT branch's PR rather than erroring, so if you tune <code>gather</code>'s output format and the <code>grep</code>/<code>sed</code> pattern above stops matching, this line is what stands between "nothing happened" and "the session branch's own PR got merged instead of the one the dialog showed."</p>
   </div>
 </section>
@@ -223,7 +223,7 @@ url: https://github.com/kstrat2001/darkmux/pull/1749</code></pre>
       <li><strong>The demotion rule is fixed prose, not a config.</strong> "Advisory only" vs "custom attribution present" is a simple text match on the posted review's tagline. If your workflow adopts a different higher-tier-confirmation convention, edit the <code>gather</code> step's jq to match it &mdash; darkmux has no opinion here.</li>
       <li><strong>One repo per session.</strong> Nothing aggregates PRs across repos or across concurrent darkmux sessions; that is deliberately the served viewer's job, not this surface's.</li>
       <li><strong><code>gh</code> and <code>jq</code> must be on the operator's <code>PATH</code>.</strong> darkmux never installs, configures, or authenticates either; <code>gh auth status</code> is the pre-flight check.</li>
-      <li><strong>The allowlist gates configs that name themselves, never <code>gh</code> itself.</strong> Only a config that declares its own <code>gh_verb</code> field is checked against <code>gh.allowed</code> at all; a config that shells out to <code>gh</code> without declaring <code>gh_verb</code> runs wherever it would otherwise be allowed to run, ungated by any of this. And <code>gh_verb</code>'s value is a NAME the operator assigns, not a description darkmux verifies: an allowlisted <code>"gh_verb": "pr-list"</code> config is checked by that name only, never by reading what its <code>command</code> string actually does. Author and review your own gh-verb configs with both of those in mind; the gate is "this config may run," not "this config's commands are safe."</li>
+      <li><strong>The allowlist gates configs that name themselves, never <code>gh</code> itself.</strong> Only a config that declares its own <code>cmd</code> field is checked against <code>cmd.allowed</code> at all; a config that shells out to <code>gh</code> without declaring <code>cmd</code> runs wherever it would otherwise be allowed to run, ungated by any of this. And <code>cmd</code>'s value is a NAME the operator assigns, not a description darkmux verifies: an allowlisted <code>"cmd": "pr-list"</code> config is checked by that name only, never by reading what its <code>command</code> string actually does. Author and review your own command configs with both of those in mind; the gate is "this config may run," not "this config's commands are safe."</li>
     </ul>
   </div>
 </section>

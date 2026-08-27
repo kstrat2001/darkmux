@@ -105,19 +105,44 @@ use std::collections::{BTreeMap, BTreeSet};
 /// silently treated as ungated (see `StepConfig::gate`'s own doc on the
 /// fail-closed contract).
 ///
+/// Bumped to **"3.0"** (#2004) — a MAJOR bump: `gh_verb` was RENAMED to
+/// [`MissionConfig::cmd`], and the config block it is checked against
+/// (`darkmux_types::config::GhConfig`) to `CmdConfig` (`cmd.enabled` /
+/// `cmd.allowed`). A rename is a removal plus an addition, and per this
+/// constant's own discipline a removed field is major regardless of whether
+/// anything depended on it — as it happens nothing did: no built-in and no
+/// user document declared `gh_verb`, so this rename migrates zero data.
+///
+/// The old name was a lie about the mechanism. `GhConfig`'s own doc already
+/// stated the design — "GitHub never enters darkmux core ... just a list of
+/// operator-chosen VERB NAMES" — and the mechanism honors it: the gate does
+/// nothing but compare a string a config declares against a list the
+/// operator allowlisted. But naming it `gh_verb` meant a GitLab user
+/// declared `"gh_verb": "mr-merge"`, and a config gating `terraform apply`
+/// or `kubectl delete` — which want this gate just as much — had to declare
+/// a GitHub-shaped field to get it. `cmd` is neutral across forges AND
+/// across domains, which is what the mechanism always was.
+///
+/// A document still declaring `gh_verb` is a loud `Error` at validate time,
+/// NOT a silent overflow into `extras`. That is not merely tidiness: the
+/// gate fails OPEN by design (a config declaring no verb is never blocked,
+/// so an ungated config stays ungated), so a stale `gh_verb` key would make
+/// a config that used to be gated run UNGATED with no signal at all. Same
+/// reasoning as the `expand` removal in 2.0, with a sharper edge.
+///
 /// Bumped to **"2.3"** (#1685) — additive: [`MissionConfig`] gained the
-/// optional `gh_verb` field. Presence names the `gh`-verb allowlist entry
-/// (`darkmux_types::config::GhConfig`) this config requires before it may
+/// optional `cmd` field. Presence names the `gh`-verb allowlist entry
+/// (`darkmux_types::config::CmdConfig`) this config requires before it may
 /// run at ALL, on either entry point (`darkmux acp`'s ephemeral panel route
-/// via `check_gh_verb`, or a direct `darkmux mission launch <id>`) — see
-/// [`MissionConfig::gh_verb`]'s own doc. Absence (every pre-2.3 document,
+/// via `check_cmd`, or a direct `darkmux mission launch <id>`) — see
+/// [`MissionConfig::cmd`]'s own doc. Absence (every pre-2.3 document,
 /// and every config that isn't an operator-authored GitHub-CLI verb) is a
 /// pure no-op.
 ///
 /// Bump discipline (see `CLAUDE.md`'s "Versioning" — same rule, different
 /// data shape): additive field/section → minor; rename/retype/removed
 /// field/new-required-field → major.
-pub const MISSION_CONFIG_SCHEMA: &str = "2.3";
+pub const MISSION_CONFIG_SCHEMA: &str = "3.0";
 
 /// One mission config document — the whole graph SHAPE, as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -158,10 +183,10 @@ pub struct MissionConfig {
     /// operator-authored GitHub-CLI verb) means no allowlist check applies
     /// at all, the ordinary case. `Some(verb)` means darkmux refuses to run
     /// ANY step in this config's graph unless
-    /// `darkmux_types::config_access::gh_verb_allowed(verb)` returns true
-    /// (`config.gh.enabled == true` AND `verb` is named in
-    /// `config.gh.allowed`) — checked ONCE, before `validate`/`interpret`
-    /// ever runs, by [`check_gh_verb`]. All three call sites that can
+    /// `darkmux_types::config_access::cmd_allowed(verb)` returns true
+    /// (`config.cmd.enabled == true` AND `verb` is named in
+    /// `config.cmd.allowed`) — checked ONCE, before `validate`/`interpret`
+    /// ever runs, by [`check_cmd`]. All three call sites that can
     /// execute a config's graph call it: `darkmux acp`'s ephemeral panel
     /// route (`run_ephemeral` in the `darkmux` binary crate), a direct
     /// `darkmux mission launch <id>` (same crate, `mission_launch::launch`),
@@ -171,22 +196,22 @@ pub struct MissionConfig {
     /// with_builtins()`-backed graph) — so the gate holds regardless of
     /// which surface invoked the config. Named independently of the
     /// document's own `id` (conventionally the same string, e.g. a
-    /// `pr-merge.json` config declaring `"gh_verb": "pr-merge"`, but not
+    /// `pr-merge.json` config declaring `"cmd": "pr-merge"`, but not
     /// required to match) so the registry-key concern and the allowlist-name
     /// concern don't silently couple.
     ///
     /// darkmux core holds no opinion about what a "verb" IS — this field
-    /// and `GhConfig.allowed` are both bare strings the OPERATOR chooses;
+    /// and `CmdConfig.allowed` are both bare strings the OPERATOR chooses;
     /// GitHub itself never enters this crate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gh_verb: Option<String>,
+    pub cmd: Option<String>,
     /// Forward-compat overflow — unknown top-level keys land here and
     /// re-serialize flat (a newer document read by an older binary).
     #[serde(flatten)]
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
-/// (#1685) Check `config`'s [`MissionConfig::gh_verb`] (if any) against the
+/// (#1685) Check `config`'s [`MissionConfig::cmd`] (if any) against the
 /// operator's `gh`-verb allowlist. `None` = no verb declared, always
 /// allowed (the ordinary case — most configs never touch this). `Some(reason)`
 /// = blocked; the caller MUST refuse to run any step in the graph rather
@@ -197,17 +222,17 @@ pub struct MissionConfig {
 /// `--funnel` path (#1685 QA CONSIDER 3 — the config it loads is
 /// user-tier-overridable and its graph is `procedural.shell`-capable, same
 /// as the other two).
-pub fn check_gh_verb(config: &MissionConfig) -> Option<String> {
-    let verb = config.gh_verb.as_deref()?;
-    if darkmux_types::config_access::gh_verb_allowed(verb) {
+pub fn check_cmd(config: &MissionConfig) -> Option<String> {
+    let verb = config.cmd.as_deref()?;
+    if darkmux_types::config_access::cmd_allowed(verb) {
         None
     } else {
         Some(format!(
-            "config \"{}\" requires the gh-verb allowlist entry \"{verb}\" — darkmux holds no \
-             GitHub credential of its own and refuses to shell to the operator's own `gh` on \
-             this config's behalf until it is explicitly allowed. Run `darkmux config set \
-             gh.enabled true` and `darkmux config set gh.allowed <comma-separated-list-including-{verb}>` \
-             to allow it (the second command REPLACES the whole list — include every verb you \
+            "config \"{}\" requires the allowlist entry \"{verb}\" — darkmux holds no \
+             credentials of its own and refuses to run this config's shell-out on the \
+             operator's behalf until it is explicitly allowed. Run `darkmux config set \
+             cmd.enabled true` and `darkmux config set cmd.allowed <comma-separated-list-including-{verb}>` \
+             to allow it (the second command REPLACES the whole list — include every command you \
              want allowed).",
             config.id
         ))
@@ -568,6 +593,28 @@ impl MissionConfig {
                 severity: FindingSeverity::Error,
                 path: "id".to_string(),
                 message: "mission config id is empty".to_string(),
+            });
+        }
+
+        // (#2004) `gh_verb` was RENAMED to `cmd` in schema 3.0. Lenient-on-read
+        // means the old key parses cleanly into `extras` and is inert — which
+        // is exactly the danger here, because this gate FAILS OPEN: a config
+        // declaring no verb is never blocked. So a document left on the old
+        // name would silently lose its gate and run UNGATED, with the shell-out
+        // it was protecting proceeding as if the operator had allowlisted it.
+        // Loud at validate/doctor time, never a runtime surprise.
+        if self.extras.contains_key("gh_verb") {
+            findings.push(ValidationFinding {
+                severity: FindingSeverity::Error,
+                path: "gh_verb".to_string(),
+                message: format!(
+                    "config \"{}\" declares `gh_verb`, which was RENAMED to `cmd` in schema 3.0 \
+                     (see MISSION_CONFIG_SCHEMA's doc) — this key now overflows into extras and \
+                     is silently ignored, so this config would run WITHOUT the allowlist gate it \
+                     asked for. Rename the field to `cmd` and set `schema_version` to \"3.0\"; \
+                     the allowlist it is checked against is now `cmd.allowed` (was `gh.allowed`)",
+                    self.id
+                ),
             });
         }
         if self.name.trim().is_empty() {
@@ -951,94 +998,132 @@ mod tests {
             inputs: Vec::new(),
             phases,
             panel: None,
-            gh_verb: None,
+            cmd: None,
             extras: BTreeMap::new(),
         }
     }
 
-    // ── (#1685) check_gh_verb ────────────────────────────────────────
+    // ── (#1685) check_cmd ────────────────────────────────────────
 
     #[test]
-    fn check_gh_verb_is_a_no_op_when_the_config_declares_none() {
+    fn check_cmd_is_a_no_op_when_the_config_declares_none() {
         let cfg = doc(vec![]);
-        assert!(cfg.gh_verb.is_none());
-        assert!(check_gh_verb(&cfg).is_none(), "a config with no gh_verb never gets blocked");
+        assert!(cfg.cmd.is_none());
+        assert!(check_cmd(&cfg).is_none(), "a config with no cmd never gets blocked");
+    }
+
+    #[test]
+    fn a_stale_gh_verb_key_is_a_loud_error_not_a_silent_ungating() {
+        // (#2004) The rename's whole safety property. `gh_verb` overflows into
+        // `extras` and is inert — and this gate FAILS OPEN, so a config left on
+        // the old name loses its allowlist check entirely and the shell-out it
+        // was protecting runs as if the operator had approved it. Validation is
+        // the only thing standing between a rename and a silently ungated
+        // `pr-merge`, so it is asserted here rather than trusted.
+        let mut cfg = doc(vec![]);
+        cfg.id = "pr-merge".into();
+        cfg.extras.insert("gh_verb".into(), serde_json::json!("pr-merge"));
+
+        let findings = cfg.validate(&[]);
+        let hit = findings
+            .iter()
+            .find(|f| f.path == "gh_verb")
+            .expect("a document still declaring gh_verb must be flagged");
+        assert_eq!(
+            hit.severity,
+            FindingSeverity::Error,
+            "a silently-ungated config is an Error, never a Warning"
+        );
+        assert!(hit.message.contains("cmd"), "the finding must name the new field: {}", hit.message);
+        assert!(
+            hit.message.contains("WITHOUT the allowlist gate"),
+            "the finding must state the CONSEQUENCE, not just the rename: {}",
+            hit.message
+        );
+
+        // And the gate itself still reads as ungated — which is exactly why
+        // the validation above has to exist.
+        assert!(
+            check_cmd(&cfg).is_none(),
+            "a stale key must NOT accidentally gate; if this ever passes, the \
+             validation finding is no longer load-bearing and this test is lying"
+        );
     }
 
     #[test]
     #[serial_test::serial]
-    fn check_gh_verb_blocks_when_the_gate_is_off() {
+    fn check_cmd_blocks_when_the_gate_is_off() {
         let mut cfg = doc(vec![]);
-        cfg.gh_verb = Some("pr-merge".to_string());
-        let prev_enabled = std::env::var("DARKMUX_GH_ENABLED").ok();
-        let prev_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        cfg.cmd = Some("pr-merge".to_string());
+        let prev_enabled = std::env::var("DARKMUX_CMD_ENABLED").ok();
+        let prev_allowed = std::env::var("DARKMUX_CMD_ALLOWED").ok();
         // Neither env override set, and the test-support config tier is
         // empty by construction — config_access falls to its built-in
         // `false`/empty defaults.
         unsafe {
-            std::env::remove_var("DARKMUX_GH_ENABLED");
-            std::env::remove_var("DARKMUX_GH_ALLOWED");
+            std::env::remove_var("DARKMUX_CMD_ENABLED");
+            std::env::remove_var("DARKMUX_CMD_ALLOWED");
         }
-        let reason = check_gh_verb(&cfg).expect("must be blocked with the gate off");
+        let reason = check_cmd(&cfg).expect("must be blocked with the gate off");
         assert!(reason.contains("pr-merge"), "{reason}");
-        assert!(reason.contains("gh.enabled"), "{reason}");
+        assert!(reason.contains("cmd.enabled"), "{reason}");
         unsafe {
             match prev_enabled {
-                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ENABLED"),
             }
             match prev_allowed {
-                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
-                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ALLOWED"),
             }
         }
     }
 
     #[test]
     #[serial_test::serial]
-    fn check_gh_verb_allows_when_enabled_and_named() {
+    fn check_cmd_allows_when_enabled_and_named() {
         let mut cfg = doc(vec![]);
-        cfg.gh_verb = Some("pr-merge".to_string());
-        let prev_enabled = std::env::var("DARKMUX_GH_ENABLED").ok();
-        let prev_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        cfg.cmd = Some("pr-merge".to_string());
+        let prev_enabled = std::env::var("DARKMUX_CMD_ENABLED").ok();
+        let prev_allowed = std::env::var("DARKMUX_CMD_ALLOWED").ok();
         unsafe {
-            std::env::set_var("DARKMUX_GH_ENABLED", "true");
-            std::env::set_var("DARKMUX_GH_ALLOWED", "pr-list,pr-merge");
+            std::env::set_var("DARKMUX_CMD_ENABLED", "true");
+            std::env::set_var("DARKMUX_CMD_ALLOWED", "pr-list,pr-merge");
         }
-        assert!(check_gh_verb(&cfg).is_none(), "enabled + named must pass");
+        assert!(check_cmd(&cfg).is_none(), "enabled + named must pass");
         unsafe {
             match prev_enabled {
-                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ENABLED"),
             }
             match prev_allowed {
-                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
-                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ALLOWED"),
             }
         }
     }
 
     #[test]
     #[serial_test::serial]
-    fn check_gh_verb_blocks_a_verb_not_named_even_when_enabled() {
+    fn check_cmd_blocks_a_verb_not_named_even_when_enabled() {
         let mut cfg = doc(vec![]);
-        cfg.gh_verb = Some("pr-merge".to_string());
-        let prev_enabled = std::env::var("DARKMUX_GH_ENABLED").ok();
-        let prev_allowed = std::env::var("DARKMUX_GH_ALLOWED").ok();
+        cfg.cmd = Some("pr-merge".to_string());
+        let prev_enabled = std::env::var("DARKMUX_CMD_ENABLED").ok();
+        let prev_allowed = std::env::var("DARKMUX_CMD_ALLOWED").ok();
         unsafe {
-            std::env::set_var("DARKMUX_GH_ENABLED", "true");
-            std::env::set_var("DARKMUX_GH_ALLOWED", "pr-list,pr-info");
+            std::env::set_var("DARKMUX_CMD_ENABLED", "true");
+            std::env::set_var("DARKMUX_CMD_ALLOWED", "pr-list,pr-info");
         }
-        let reason = check_gh_verb(&cfg).expect("pr-merge is not in the allowlist");
+        let reason = check_cmd(&cfg).expect("pr-merge is not in the allowlist");
         assert!(reason.contains("pr-merge"), "{reason}");
         unsafe {
             match prev_enabled {
-                Some(v) => std::env::set_var("DARKMUX_GH_ENABLED", v),
-                None => std::env::remove_var("DARKMUX_GH_ENABLED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ENABLED"),
             }
             match prev_allowed {
-                Some(v) => std::env::set_var("DARKMUX_GH_ALLOWED", v),
-                None => std::env::remove_var("DARKMUX_GH_ALLOWED"),
+                Some(v) => std::env::set_var("DARKMUX_CMD_ALLOWED", v),
+                None => std::env::remove_var("DARKMUX_CMD_ALLOWED"),
             }
         }
     }
@@ -1670,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_constant_is_2_3() {
+    fn schema_version_constant_is_3_0() {
         // (#1550 cluster item 2) Retired the `expand`/`ExpansionSpec`/
         // `LaunchParams::expansions` primitive — never fed by either
         // production launcher. A field REMOVAL is a MAJOR bump per this
@@ -1685,8 +1770,8 @@ mod tests {
         // gate`), same minor-bump discipline.
         //
         // (#1685) Bumped again to "2.3" — additive (`MissionConfig::
-        // gh_verb`), same minor-bump discipline.
-        assert_eq!(MISSION_CONFIG_SCHEMA, "2.3");
+        // cmd`), same minor-bump discipline.
+        assert_eq!(MISSION_CONFIG_SCHEMA, "3.0");
     }
 
     // ── (#1684) `panel` schema field ─────────────────────────────────────

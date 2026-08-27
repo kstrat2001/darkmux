@@ -770,7 +770,7 @@ pub(crate) enum MissionConfigCmd {
     /// List every registered mission config.
     ///
     /// One row per id: name, source tier, phase/task counts, whether it
-    /// advertises a panel command, and its `gh_verb` (if any), across the
+    /// advertises a panel command, and its `cmd` (if any), across the
     /// same user, on-disk, and embedded tiers `mission launch` searches. A
     /// config that fails to load prints as a row naming the error instead
     /// of being silently dropped, so one broken user-tier override never

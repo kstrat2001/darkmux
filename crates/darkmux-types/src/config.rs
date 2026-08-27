@@ -68,13 +68,14 @@ use std::path::Path;
 // invocation. Nothing ever read it. An older binary's `~/.darkmux/config.json`
 // still carrying the key loads fine — `extras` overflow absorbs the now-
 // unknown top-level key, same lenient-read guarantee as an additive bump.
-// 1.9 (#1685): additive `gh{}` block (`gh.enabled` / `gh.allowed` — the
+// 1.9 (#1685): additive `gh{}` block, RENAMED to `cmd{}` in 1.11 (#2004)
+// (`cmd.enabled` / `cmd.allowed` — the
 // per-verb allowlist gating an operator-authored panel command's shell-out
 // to their OWN `gh` CLI, e.g. the `pr-approve`/`pr-merge` example verbs in
-// the PR-flow guide). darkmux holds no GitHub credential of its own; this
+// the PR-flow guide). darkmux holds no credentials of its own; this
 // block only says which verb NAMES the operator has opted into running.
 // Minor bump, same lenient-read reasoning as every other additive block.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.10";
+pub const CONFIG_SCHEMA_VERSION: &str = "1.11";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -115,9 +116,9 @@ pub struct DarkmuxConfig {
     pub review: Option<ReviewConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radio: Option<RadioConfig>,
-    /// (#1685) The `gh`-verb allowlist — see [`GhConfig`]'s own doc.
+    /// (#1685) The `gh`-verb allowlist — see [`CmdConfig`]'s own doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gh: Option<GhConfig>,
+    pub cmd: Option<CmdConfig>,
 
     /// (#1475 packet 1) The machine-local **role → profile** map — the binding
     /// that welds an abstract role id (e.g. `judge`, `probe-high`) to a
@@ -437,16 +438,30 @@ pub struct RadioConfig {
 
 /// (#1685) The operator's own `gh` CLI credential gate — a **feature block
 /// gated by `enabled`**, same pattern as `RedisConfig`/`AuditConfig`.
-/// darkmux never authenticates to GitHub itself; the PR-flow panel verbs
-/// (`pr-list`/`pr-info`/`pr-approve`/`pr-merge` — see the PR-flow guide)
-/// are operator-authored `procedural.shell` mission configs that shell out
-/// to whatever `gh` the OPERATOR already has signed in, exactly like the
-/// `lms`/`zed` shell-outs elsewhere in this binary. GitHub never enters
-/// darkmux core: this block holds no knowledge of PRs, issues, or the `gh`
-/// binary's own subcommands — just a list of operator-chosen VERB NAMES,
-/// checked against the `gh_verb` an operator's own mission config declares
-/// (`darkmux_crew::mission_config::MissionConfig::gh_verb` /
-/// `check_gh_verb`) before that config is allowed to run at all, on either
+/// The allowlist a mission config's `cmd` field is checked against before
+/// that config may run at all.
+///
+/// (#2004) Named `gh{}` / `gh_verb` until schema 1.11. The mechanism was
+/// always forge-agnostic — this block holds no knowledge of any particular
+/// tool, just a list of operator-chosen COMMAND NAMES — but the NAME said
+/// otherwise, so a GitLab user allowlisted `mr-merge` under `gh.allowed`,
+/// and a config gating `terraform apply` or `kubectl delete` had to declare
+/// a GitHub-shaped field to get a gate that has nothing to do with GitHub.
+/// `cmd` is neutral across forges and across domains, which is what the
+/// mechanism always was. The old name is a loud validation Error, never a
+/// silent overflow — see `MISSION_CONFIG_SCHEMA`'s doc for why that matters
+/// more here than for an ordinary rename.
+///
+/// darkmux never authenticates to anything itself; the PR-flow panel
+/// commands (`pr-list`/`pr-info`/`pr-approve`/`pr-merge` — see the PR-flow
+/// guide) are operator-authored `procedural.shell` mission configs that
+/// shell out to whatever tool the OPERATOR already has signed in, exactly
+/// like the `lms`/`zed` shell-outs elsewhere in this binary. The gated tool
+/// never enters darkmux core: this block is just a list of operator-chosen
+/// COMMAND NAMES,
+/// checked against the `cmd` an operator's own mission config declares
+/// (`darkmux_crew::mission_config::MissionConfig::cmd` /
+/// `check_cmd`) before that config is allowed to run at all, on either
 /// entry point (`darkmux acp`'s ephemeral panel route or a direct `darkmux
 /// mission launch <id>`).
 ///
@@ -457,15 +472,15 @@ pub struct RadioConfig {
 /// counts: `enabled: false` blocks every verb regardless of `allowed`, and
 /// a verb absent from `allowed` is blocked even with `enabled: true`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GhConfig {
+pub struct CmdConfig {
     /// The gate: `true` → the `allowed` list is consulted at all;
-    /// `false`/absent → every `gh_verb`-declaring config is refused,
+    /// `false`/absent → every `cmd`-declaring config is refused,
     /// regardless of `allowed`. Declared first so it reads at the top of
     /// the block.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
     /// The allowlisted verb names — e.g. `["pr-list", "pr-info", "pr-approve",
-    /// "pr-merge"]`, matching each config's own `gh_verb` field verbatim.
-    /// `darkmux config set gh.allowed <comma-separated-list>` replaces the
+    /// "pr-merge"]`, matching each config's own `cmd` field verbatim.
+    /// `darkmux config set cmd.allowed <comma-separated-list>` replaces the
     /// whole list (there is no incremental add today — see the PR-flow guide).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub allowed: Option<Vec<String>>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
@@ -604,10 +619,10 @@ impl DarkmuxConfig {
             // absent) so it shows up in `config list` / the example file.
             role_profiles: Some(BTreeMap::new()),
             // (#1685) Written visible with `enabled: false` and an empty
-            // `allowed` list — see `GhConfig`'s own doc. darkmux ships no
+            // `allowed` list — see `CmdConfig`'s own doc. darkmux ships no
             // opinion about which gh verbs exist; the operator opts each
             // one in by naming it here once they've authored the config.
-            gh: Some(GhConfig {
+            cmd: Some(CmdConfig {
                 enabled: Some(false),
                 allowed: Some(Vec::new()),
                 extras: Default::default(),

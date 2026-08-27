@@ -1863,7 +1863,7 @@
     /// graph built off `StepKindRegistry::with_builtins()` (which includes
     /// `procedural.shell`). Before this fix, a user-tier
     /// `~/.darkmux/mission-configs/review.json` override pairing a
-    /// declared `gh_verb` with a shell step would run through `--funnel`
+    /// declared `cmd` with a shell step would run through `--funnel`
     /// completely unchecked — the allowlist gate only ever covered the
     /// other two entry points. This override is deliberately graph-invalid
     /// (no phases at all): the allowlist check has to fire BEFORE any
@@ -1871,24 +1871,24 @@
     /// config this minimal is enough to prove the gate runs first.
     #[test]
     #[serial_test::serial]
-    fn resolve_funnel_ctx_refuses_a_gh_verb_review_override_when_the_allowlist_gate_is_off() {
+    fn resolve_funnel_ctx_refuses_a_cmd_review_override_when_the_allowlist_gate_is_off() {
         let crew_tmp = tempfile::TempDir::new().unwrap();
         // Restored on Drop, not at the end of the happy path: an assert
         // below that fires would otherwise leave DARKMUX_CREW_DIR pointing
         // at a deleted tempdir for every later test in the process, turning
         // one real failure into a cascade of unrelated ones.
-        let _env = FunnelEnvGuard::capture(&["DARKMUX_CREW_DIR", "DARKMUX_GH_ENABLED", "DARKMUX_GH_ALLOWED"]);
+        let _env = FunnelEnvGuard::capture(&["DARKMUX_CREW_DIR", "DARKMUX_CMD_ENABLED", "DARKMUX_CMD_ALLOWED"]);
         // SAFETY: serialized via #[serial_test::serial]; restored by `_env`.
         unsafe {
             std::env::set_var("DARKMUX_CREW_DIR", crew_tmp.path());
-            std::env::remove_var("DARKMUX_GH_ENABLED");
-            std::env::remove_var("DARKMUX_GH_ALLOWED");
+            std::env::remove_var("DARKMUX_CMD_ENABLED");
+            std::env::remove_var("DARKMUX_CMD_ALLOWED");
         }
         let mission_configs_dir = darkmux_crew::loader::mission_configs_dir();
         fs::create_dir_all(&mission_configs_dir).unwrap();
         fs::write(
             mission_configs_dir.join("review.json"),
-            r#"{"id": "review", "name": "Test Review Override", "schema_version": "2.3", "gh_verb": "pr-merge"}"#,
+            r#"{"id": "review", "name": "Test Review Override", "schema_version": "2.3", "cmd": "pr-merge"}"#,
         )
         .unwrap();
 
@@ -1897,12 +1897,12 @@
         let opts = funnel_ctx_opts(path, "fast", None, None);
 
         let err = match resolve_funnel_ctx(&opts) {
-            Ok(_) => panic!("a gh_verb-declaring review override must be refused with the allowlist gate off"),
+            Ok(_) => panic!("a cmd-declaring review override must be refused with the allowlist gate off"),
             Err(e) => e,
         };
         let msg = format!("{err:#}");
         assert!(msg.contains("pr-merge"), "names the verb: {msg}");
-        assert!(msg.contains("gh.enabled"), "points at the fix: {msg}");
+        assert!(msg.contains("cmd.enabled"), "points at the fix: {msg}");
     }
 
     #[test]
