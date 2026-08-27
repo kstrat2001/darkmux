@@ -78,6 +78,7 @@ mod radio_cli;
 // assembler + artifact shelf + the answering dispatch. See its own module
 // doc.
 mod radio_answer;
+mod radio_index;
 mod role_cli;
 // #515 — serve daemon extracted (final crate; deps doctor/eureka/fleet/crew/
 // flow/profiles all crates). Re-export keeps crate::serve::* resolving for
