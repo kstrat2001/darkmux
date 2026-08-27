@@ -203,13 +203,19 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
   });
 
   it("finds the uid when specs names an alias that is NOT the one nameOf reports", () => {
-    // The regression, exactly: the OLDER alias sorts first, so `nameOf` answers
-    // "MacBook-Pro.local" while `/machine/specs` reports "MacBook-Pro".
-    const data = [rec(UID, "MacBook-Pro.local", "2026-08-13T09:00:00Z"), rec(UID, "MacBook-Pro", "2026-08-13T22:00:00Z")];
+    // The point of this test is `localMachineUid`, and it needs `nameOf` and
+    // specs to DISAGREE — otherwise it passes without exercising anything.
+    //
+    // (#2030) `nameOf` now answers with the most RECENT alias rather than the
+    // first one listed, so the divergence is built the other way round: the
+    // window's newest record says "MacBook-Pro.local" while `/machine/specs`
+    // still reports "MacBook-Pro". Simply flipping the expected string would
+    // have left both sides agreeing and quietly made this vacuous.
+    const data = [rec(UID, "MacBook-Pro", "2026-08-13T09:00:00Z"), rec(UID, "MacBook-Pro.local", "2026-08-13T22:00:00Z")];
     const live = new Map([beat(UID, "MacBook-Pro")]);
     expect(nameOf(data, live, UID)).toBe("MacBook-Pro.local");
+    // specs reports the OTHER alias, and identity still resolves.
     expect(localMachineUid(data, live, "MacBook-Pro")).toBe(UID);
-    // and the other alias resolves to the same machine
     expect(localMachineUid(data, live, "MacBook-Pro.local")).toBe(UID);
   });
 
@@ -224,5 +230,45 @@ describe("machineNames / localMachineUid — identity is the uid, not the label"
     // A freshly booted daemon — the case the `?? machineId` fallback exists for.
     expect(localMachineUid([], new Map(), "MacBook-Pro")).toBe("MacBook-Pro");
     expect(localMachineUid([], new Map(), null)).toBeNull();
+  });
+});
+
+// ── nameOf resolves the CURRENT name, not the first one seen (#2030) ──────
+describe("nameOf recency", () => {
+  const UID = "F9ACF59C-0E8B-5092-A6B4-7C07070737D2";
+  const rec = (ts: string, machine_id: string): FlowRecord =>
+    ({ ts, machine_id, machine_uid: UID, action: "machine.online" }) as unknown as FlowRecord;
+
+  it("a single stale record cannot outvote every later one", () => {
+    // The operator's actual case: one stray record naming a different machine
+    // landed in their flow directory, and their machine page showed that name
+    // from then on. Hundreds of correct records arrived afterwards and none
+    // displaced it, because the lookup took the FIRST match in the window.
+    const data = [
+      rec("2026-08-26T13:42:41Z", "m5-ultra-256gb"), // the stray, listed first
+      rec("2026-08-27T09:00:00Z", "MacBook-Pro"),
+      rec("2026-08-27T21:19:40Z", "MacBook-Pro"),
+    ];
+    expect(nameOf(data, new Map(), UID)).toBe("MacBook-Pro");
+  });
+
+  it("still tracks a genuine rename, in either listing order", () => {
+    // The behaviour the old code was reaching for — a machine really does
+    // change names — must survive. Newest wins regardless of array order.
+    const older = rec("2026-08-01T00:00:00Z", "MacBook-Pro.local");
+    const newer = rec("2026-08-27T00:00:00Z", "MacBook-Pro");
+    expect(nameOf([older, newer], new Map(), UID)).toBe("MacBook-Pro");
+    expect(nameOf([newer, older], new Map(), UID)).toBe("MacBook-Pro");
+  });
+
+  it("falls back to the presence beat, then the uid, when no record names it", () => {
+    expect(nameOf([], new Map([[UID, { display_name: "studio" } as never]]), UID)).toBe("studio");
+    expect(nameOf([], new Map(), UID)).toBe(UID);
+  });
+
+  it("keeps the first match when timestamps are unusable, rather than picking arbitrarily", () => {
+    const a = rec("not-a-date", "first");
+    const b = rec("also-bad", "second");
+    expect(nameOf([a, b], new Map(), UID)).toBe("first");
   });
 });
