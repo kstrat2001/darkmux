@@ -43,6 +43,28 @@ const RESOURCES = {
  * siblings read `document.head` live, so this is the real signal, not a
  * stand-in — see `injectedMeta.ts`'s own doc on why no test harness injects
  * these by default. Cleared in `afterEach` below. */
+/** (#2021) `RESOURCES` carries `models: []`, which is exactly what let the
+ * residency bug through: a lens that never builds a row looks identical to a
+ * lens handed nothing to build one from. The static-fixture test needs a
+ * payload with a REAL resident. */
+const RESOURCES_WITH_RESIDENT = {
+  ...RESOURCES,
+  models: [
+    {
+      identifier: "darkmux:qwen3-4b-instruct-2507",
+      model_key: "qwen3-4b-instruct-2507",
+      owner: "darkmux",
+      loaded_ctx: 120000,
+      weights_bytes: 100,
+      kv_per_token_bytes: 1,
+      kv_bytes_at_ctx: 50,
+      potential_bytes: 200,
+      current_bytes: 150,
+      state: "green",
+    },
+  ],
+};
+
 function staticMeta(name: string, content: string) {
   const el = document.createElement("meta");
   el.setAttribute("name", name);
@@ -214,13 +236,21 @@ describe("MachineLens", () => {
       // response would be testing the fixture, not the code path.
       staticMachine: {
         specs: { machine_id: "m5-ultra-256gb", cpu_brand: "Apple M5 Ultra", ram_total_bytes: 274877906944 },
-        resources: RESOURCES,
+        resources: RESOURCES_WITH_RESIDENT,
       },
     });
     renderMachine(null);
     await waitFor(() =>
       expect(document.querySelector(".machine-lens__health")).toHaveAttribute("data-state", "loaded"),
     );
+
+    // (#2021) `data-state="loaded"` alone did NOT catch the real defect. The
+    // first cut fed the ledger from the fixture but never ran
+    // `advanceResidency`, so the operator saw a correct gauge above a
+    // residency section reading "no models loaded" while the fixture carried
+    // four. Assert the ROWS, not just that the lens settled.
+    await waitFor(() => expect(screen.getByText(/darkmux:qwen3-4b-instruct-2507/)).toBeInTheDocument());
+    expect(screen.queryByText(/no models loaded/i)).not.toBeInTheDocument();
   });
 
   it("the 'fleet' back-link writes an empty hash", async () => {
