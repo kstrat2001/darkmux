@@ -358,11 +358,12 @@ pub fn radio_router_profile() -> Option<String> {
 pub fn radio_answerer_profile() -> Option<String> {
     pick_string("DARKMUX_RADIO_ANSWERER_PROFILE", config().radio.as_ref().and_then(|r| r.answerer_profile.as_deref()), None)
 }
-/// The shipped humor default. Low on purpose: out of the box the answering
-/// seat is objective help, and `radio.humor` is the dial for anyone who
-/// wants the personality. (65 before 2026-08-28: the value carried over
+/// The shipped humor default. The middle of the dial on purpose: sampled on
+/// the same question, anything under about 40 reads as plain, 50 is the
+/// first value with a pulse, and 100 is the full persona. Objective help
+/// with a little voice out of the box; `radio.humor` is the dial. (65 before 2026-08-28: the value carried over
 /// from the operator's own persona override, never chosen as a default.)
-pub const RADIO_HUMOR_DEFAULT: u64 = 30;
+pub const RADIO_HUMOR_DEFAULT: u64 = 50;
 
 /// The RADIO persona's humor dial (0-100). Resolves
 /// `env(DARKMUX_RADIO_HUMOR) > config.radio.humor > RADIO_HUMOR_DEFAULT`, clamped to
@@ -971,7 +972,7 @@ mod tests {
         let prev = std::env::var("DARKMUX_RADIO_HUMOR").ok();
         unsafe { std::env::remove_var("DARKMUX_RADIO_HUMOR"); }
         assert_eq!(u64::from(radio_humor()), RADIO_HUMOR_DEFAULT);
-        assert_eq!(RADIO_HUMOR_DEFAULT, 30);
+        assert_eq!(RADIO_HUMOR_DEFAULT, 50);
         if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_RADIO_HUMOR", v); } }
     }
 

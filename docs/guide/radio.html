@@ -159,7 +159,7 @@ Available commands: `/review`.</code></pre>
   <div class="wrap">
     <h2>Configuration</h2>
     <p>Three knobs, all under the <code>radio</code> config block. <code>darkmux init</code> writes them visible with their defaults, same as every other config surface:</p>
-    <pre><code>"radio": { "router_profile": "", "answerer_profile": "", "humor": 30 }</code></pre>
+    <pre><code>"radio": { "router_profile": "", "answerer_profile": "", "humor": 50 }</code></pre>
     <table>
       <tr><th>Config key</th><th>Env override</th><th>Default</th><th>Effect</th></tr>
       <tr>
@@ -177,7 +177,7 @@ Available commands: `/review`.</code></pre>
       <tr>
         <td><code>radio.humor</code></td>
         <td><code>DARKMUX_RADIO_HUMOR</code></td>
-        <td><code>30</code></td>
+        <td><code>50</code></td>
         <td>0-100 dial substituted into the answering persona's prompt. Values outside that range are accepted by <code>config set</code> but clamped to <code>0..=100</code> when actually read.</td>
       </tr>
     </table>

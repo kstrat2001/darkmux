@@ -42,7 +42,7 @@
   "radio": {
     "router_profile": "",
     "answerer_profile": "",
-    "humor": 30
+    "humor": 50
   },
   "cmd": {
     "enabled": false,
