@@ -605,12 +605,6 @@ export function buildMachineRuns(
   return nodes.sort((a, b) => (b.closeTs ?? b.startTs ?? 0) - (a.closeTs ?? a.startTs ?? 0));
 }
 
-/** Records on `m` with no `session_id` — the "unscoped records" teaser
- * (viewer.html:1977). */
-export function looseRecords(data: FlowRecord[], m: string): FlowRecord[] {
-  return data.filter((r) => uidOf(r) === m && !r.session_id);
-}
-
 /** `lastTs()` — viewer.html:1187. A session's last recorded activity —
  * where an orphan's timeline bar ends when it aged out of presence with no
  * close-edge (so the bar stops at its last sign of life, not at "now"). */

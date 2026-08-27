@@ -4,7 +4,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
-import { localMachineUid, looseRecords, nameOf } from "../../lib/flow";
+import { localMachineUid, nameOf } from "../../lib/flow";
 import { specOf } from "../fleet/cards";
 import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
@@ -267,8 +267,6 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // lens. Adding a second live-only query, and a second thing to gate on
   // `isStaticBuild`, to label a hyperlink would walk that back. A count that
   // cannot drift because it is not there beats a count that is right today.
-  const loose = useMemo(() => (targetUid != null ? looseRecords(flowWindow.data, targetUid) : []), [flowWindow.data, targetUid]);
-
 
   return (
     <div className="machine-lens">
@@ -323,10 +321,12 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
       {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —
           #1508 step 2's own commit named it "deliberately interim". This is
           the replacement: a link into the Runs lens, pinned to this
-          machine. It carries NO count, deliberately — see the block above
-          `loose` for the measured reason (the two sides counted different
-          things over different windows and the link read "0 runs" against a
-          destination listing 282). Rendered
+          machine. It carries NO count, deliberately — the measured reason is
+          the comment block just above this component's `return` (the two
+          sides counted different things over different windows, and the link
+          read "0 runs" against a destination listing 282). That block used to
+          be anchored here as "above `loose`"; the `loose` memo is gone, the
+          block is not. Rendered
           only once a machine is actually resolved (`targetUid != null` —
           mirrors every other `targetUid`-gated region on this page); a page
           that hasn't resolved a target yet has nothing to link to. A real
@@ -348,21 +348,6 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
         </a>
       )}
 
-      {loose.length > 0 && (
-        <div className="machine-lens__loose">
-          <div className="machine-lens__loosehdr">
-            UNSCOPED RECORDS · {loose.length} TODAY
-          </div>
-          <div className="machine-lens__loosenode">
-            <div>unscoped records</div>
-            <div>
-              {loose.length} record{loose.length === 1 ? "" : "s"} without a session
-            </div>
-            <div>flow notes, ambient telemetry, etc.</div>
-            <div>loose</div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

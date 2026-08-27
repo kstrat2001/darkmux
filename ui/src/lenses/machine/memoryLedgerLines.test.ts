@@ -92,7 +92,7 @@ describe("limitDescription", () => {
     expect(limitDescription("budget")).toBe("#1243 budget");
   });
   it("names the physical-pool fallback", () => {
-    expect(limitDescription("physical_pool")).toBe("physical pool (no budget configured)");
+    expect(limitDescription("physical_pool")).toBe("physical pool");
   });
   it("falls back to 'no limit readable' for anything else, including absence", () => {
     expect(limitDescription("something-unrecognized")).toBe("no limit readable");

@@ -304,5 +304,60 @@ export function isManualPanel(id: PanelId): boolean {
  * test-only one. */
 export function panelCols(panelOutEl: Element | null): number {
   const px = panelOutEl ? panelOutEl.clientWidth : window.innerWidth;
-  return Math.max(36, Math.min(200, Math.floor((px - 24) / 7.2)));
+  return Math.max(36, Math.min(200, Math.floor((px - 24) / charAdvance(panelOutEl))));
+}
+
+/** The panel font's real per-character advance, in px.
+ *
+ * This used to be the literal `7.2`, derived once against the 12px mono the
+ * console shipped with. That made the width negotiation a lie the moment the
+ * type scale changed: at 14.16px the advance is 8.53px, so a 1406px panel was
+ * asking the daemon for 191 columns when only 164 fit — and the daemon
+ * answered honestly, producing 246px of overflow. A hardcoded advance cannot
+ * survive a font change, and nothing fails when it goes stale; it just quietly
+ * asks for the wrong width.
+ *
+ * Measured from the element's OWN computed font, so it self-corrects for any
+ * future size, family or zoom change. Cached per font string — the value only
+ * varies with the font, and this runs on every panel fetch.
+ *
+ * Falls back to the historical constant when there is no layout to measure
+ * (jsdom, SSR), which keeps the pure-unit tests meaningful and can only ever
+ * be as wrong as the old behavior was. */
+const advanceCache = new Map<string, number>();
+function charAdvance(el: Element | null): number {
+  const FALLBACK = 7.2;
+  if (!el || typeof getComputedStyle !== "function" || typeof document === "undefined") {
+    return FALLBACK;
+  }
+  // `getComputedStyle` throws on anything that is not a real Element, and
+  // this function's own unit tests pass `{ clientWidth } as Element` on
+  // purpose — the clamp arithmetic is what they exercise, not layout. A
+  // caller that cannot be measured gets the historical constant rather than
+  // an exception on a path that only computes a request parameter.
+  let font = "";
+  try {
+    font = getComputedStyle(el as Element).font;
+  } catch {
+    return FALLBACK;
+  }
+  if (!font) return FALLBACK;
+  const cached = advanceCache.get(font);
+  if (cached) return cached;
+  let advance = FALLBACK;
+  try {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.font = font;
+      // A 100-char run, so per-character rounding cannot dominate the result.
+      const w = ctx.measureText("0".repeat(100)).width / 100;
+      if (Number.isFinite(w) && w > 0) advance = w;
+    }
+  } catch {
+    // A canvas-less or blocked environment keeps the fallback rather than
+    // throwing on a path that only computes a request parameter.
+  }
+  advanceCache.set(font, advance);
+  return advance;
 }

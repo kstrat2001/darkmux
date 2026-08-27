@@ -97,7 +97,11 @@ export function utilityModelId(specs: MachineSpecs | null, isLocalSpecs: boolean
  * row, `MachineHealthRegion.tsx`) has one source of truth for the wording. */
 export function limitDescription(limitSource: string | null | undefined): string {
   if (limitSource === "budget") return "#1243 budget";
-  if (limitSource === "physical_pool") return "physical pool (no budget configured)";
+  // "physical pool" ALREADY means "no budget is configured" — the only other
+  // limit source is `budget` (#1243), which says so in its own name. The
+  // parenthetical restated the absence of the other branch, on a row that is
+  // already six facts long and had begun wrapping at the wider type scale.
+  if (limitSource === "physical_pool") return "physical pool";
   return "no limit readable";
 }
 
