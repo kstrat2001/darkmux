@@ -366,6 +366,13 @@
   .install .cmd { color: var(--accent); }
   .cmd-line { display: flex; align-items: center; gap: 10px; }
   .cmd-line + .cmd-line { margin-top: 6px; }
+  /* Feature-section command lists: the same row the install boxes use, so
+     every command on the page is one tap to copy on a phone. The description
+     sits under its command in the body face, not beside it, so a long command
+     never fights a long description for the width. */
+  .cmds .cmd-desc { font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; font-size: 13px; line-height: 1.5; color: var(--muted); margin: 2px 0 12px 22px; }
+  .cmds .cmd-desc:last-child { margin-bottom: 0; }
+  .cmds .cmd-line + .cmd-line { margin-top: 0; }
   .cmd-line .cmd { flex: 1; white-space: pre; overflow-x: auto; }
   .copy-btn {
     flex: none;
@@ -604,11 +611,14 @@
     <h2>Declare the loadout</h2>
     <h3>The right loaded model, context length, and compaction profile for each task: named, not remembered.</h3>
     <p>You shouldn't have to remember whether your fast bounded-task stack is loaded right now, or whether the deep-agentic profile got unloaded an hour ago when you ran a different test. darkmux makes the loadout an explicit, named thing that a dispatch loads on demand (the founding <code>swap</code> verb is gone; residency is managed for you now).</p>
-    <ul class="plain">
-      <li><code>darkmux profile list</code> — list named stacks (combinations of LMStudio models at specified context lengths)</li>
-      <li><code>darkmux machine status</code> — show what's loaded and which profile (if any) it matches</li>
-      <li><code>darkmux profile scan</code> — discover models in your LMStudio catalog not yet covered by any profile</li>
-    </ul>
+    <div class="install cmds">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux profile list</span><button class="copy-btn" data-copy="darkmux profile list" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">List named stacks: combinations of LM Studio models at set context lengths.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux machine status</span><button class="copy-btn" data-copy="darkmux machine status" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">Show what is loaded right now and which profile, if any, it matches.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux profile scan</span><button class="copy-btn" data-copy="darkmux profile scan" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">Find models in your LM Studio catalog that no profile covers yet.</div>
+    </div>
   </div>
 </section>
 
@@ -617,13 +627,13 @@
     <h2>Watch it work</h2>
     <h3>A daemon + viewer for live observability of dispatches, phases, and verdicts.</h3>
     <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes the flow records written by every dispatch and mission/phase transition. The <a href="demo/">observability viewer</a> renders those records as one drillable view of your fleet: drill fleet → machine → subsystem, with the event stream as a log lens at any level. A <a href="demo/">demo with recorded sample data</a> is published on this site. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
-    <ul class="plain">
-      <li><code>darkmux serve</code> — start the daemon in a separate terminal tab</li>
-      <li><code>darkmux doctor</code> — pre-flight checks including <code>daemon: reachable</code></li>
-      <li><a href="demo/">darkmux.com/demo/</a> — interactive demo, sample fleet data (no install required)</li>
-      <li><code>darkmux dispatch</code> / <code>mission launch review</code> — emit flow records as they run</li>
-    </ul>
-    <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/observability.html">observability section of the user guide</a>.</p>
+    <div class="install cmds">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux serve</span><button class="copy-btn" data-copy="darkmux serve" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">Start the daemon in a separate terminal tab.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux doctor</span><button class="copy-btn" data-copy="darkmux doctor" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">Pre-flight checks, including <code>daemon: reachable</code>.</div>
+    </div>
+    <p class="muted" style="margin-top: 24px;">Every <code>dispatch</code> and every mission emits the records the viewer draws from. No install needed to look: the <a href="demo/">demo</a> is the same viewer on recorded fleet data. Full walkthrough in the <a href="guide/observability.html">observability section of the user guide</a>.</p>
   </div>
 </section>
 
@@ -632,13 +642,18 @@
     <h2>The lab</h2>
     <h3>A measurement harness, not a config tool dressed up as one.</h3>
     <p>Every <code>darkmux lab run</code> writes a manifest, a trajectory, and per-turn timing under <code>.darkmux/runs/&lt;id&gt;/</code>, so wall-clock variance, compaction events, and per-profile behavior are inspectable after the fact. Not in your head. On disk.</p>
-    <ul class="plain">
-      <li><code>lab run quick-q</code> — single-turn smoke prompt against the active profile</li>
-      <li><code>lab run long-agentic</code> — the workload that exercises compaction</li>
-      <li><code>lab run inspect &lt;run&gt;</code> — turns, compactions, mode (fast/slow), notes</li>
-      <li><code>lab tune long-agentic --runs 6</code> — bimodal cluster detection across N dispatches</li>
-      <li><code>lab run compare &lt;A&gt; &lt;B&gt;</code> — diff two runs for variance / regression</li>
-    </ul>
+    <div class="install cmds">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux lab run quick-q</span><button class="copy-btn" data-copy="darkmux lab run quick-q" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">Single-turn smoke prompt against the active profile.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux lab run long-agentic</span><button class="copy-btn" data-copy="darkmux lab run long-agentic" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">The workload that exercises compaction.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux lab run inspect &lt;run-id&gt;</span><button class="copy-btn" data-copy="darkmux lab run inspect &lt;run-id&gt;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">Turns, compactions, mode (fast or slow), notes.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux lab tune long-agentic --runs 6</span><button class="copy-btn" data-copy="darkmux lab tune long-agentic --runs 6" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">Bimodal cluster detection across N dispatches.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux lab run compare &lt;run-a&gt; &lt;run-b&gt;</span><button class="copy-btn" data-copy="darkmux lab run compare &lt;run-a&gt; &lt;run-b&gt;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">Diff two runs for variance or regression.</div>
+    </div>
     <p class="muted" style="margin-top: 24px;">Workloads are pluggable via a <code>WorkloadProvider</code> trait. Two ship out of the box (<code>prompt</code>, <code>coding-task</code>); add your own without forking the repo. Full walkthrough in the <a href="guide/lab.html">lab section of the user guide</a>.</p>
   </div>
 </section>
@@ -648,13 +663,18 @@
     <h2>Missions, phases, and crews</h2>
     <h3>Structured agentic work: the headline of darkmux, driven from your orchestrator.</h3>
     <p>On top of the profile and lab substrate, darkmux runs config-defined <em>missions</em> as a live task graph: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts form a <em>crew</em> that works the mission's <em>phases</em>, every dispatch gated on operator sign-off, tracked as JSON the operator owns. The profile and lab CLI works standalone if that's all you want, but launching a mission and watching the graph is what darkmux is for.</p>
-    <ul class="plain">
-      <li><code>darkmux dispatch coder "..."</code> — invoke a named role; emits flow records</li>
-      <li><code>darkmux mission launch coder-phase</code> — the automated dispatch loop: worktree, coder, QA review, stop at the operator sign-off gate; the frontier ships the git work by hand, then <code>darkmux mission finalize &lt;id&gt;</code> closes it out</li>
-      <li><code>darkmux mission launch review</code> — the review funnel (bundle → probe → dedup → judge → verify → synthesis) against the current branch's diff</li>
-      <li><code>darkmux mission launch/finalize/abort/pause/resume</code> — drive mission lifecycle state (the mission graph derives phase status)</li>
-      <li><code>darkmux mission add-phase --after &lt;s&gt;</code> — insert scope mid-mission without restructuring</li>
-    </ul>
+    <div class="install cmds">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux dispatch coder "&lt;task&gt;"</span><button class="copy-btn" data-copy="darkmux dispatch coder &quot;&lt;task&gt;&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">Hand one task to a named role. Emits flow records as it works.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux mission launch coder-phase</span><button class="copy-btn" data-copy="darkmux mission launch coder-phase" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">The automated loop: worktree, coder, QA review, then a stop at the sign-off gate. You ship the git work; <code>mission finalize</code> closes it out.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux mission launch review</span><button class="copy-btn" data-copy="darkmux mission launch review" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">The review graph (bundle, probe, dedup, judge, verify, synthesis) against the current branch's diff.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux mission status</span><button class="copy-btn" data-copy="darkmux mission status" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">The mission board: every mission by state, phase progress, and the drift that needs attention. <code>finalize</code>, <code>abort</code>, <code>pause</code>, and <code>resume</code> drive the lifecycle.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux mission add-phase --after &lt;phase&gt;</span><button class="copy-btn" data-copy="darkmux mission add-phase --after &lt;phase&gt;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-desc">Insert scope mid-mission without restructuring.</div>
+    </div>
     <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/missions.html">missions section of the user guide</a>.</p>
   </div>
 </section>
