@@ -56,7 +56,7 @@
 
     <pre><code>http://127.0.0.1:8765/</code></pre>
     <p>Because the page is served by your local daemon, it is same-origin with the data it reads: it loads your records directly, with no "connect" step, no account, and nothing uploaded. (The <code>darkmux.com/flow</code> URL from older docs now redirects to the playback <a href="../demo/">demo</a>; for your <em>live</em> data, use the daemon's own address above. Loading a remote page like <code>darkmux.com</code> against your local daemon would be blocked by the daemon's default CORS policy anyway, which is the safe default.)</p>
-    <p>The captures on this page are shot from a fixture fleet, so they show the shape rather than anyone's real machine — and the viewer moves fast, so open it next to a dispatch of your own to see the live version. Each card shows:</p>
+    <p>The captures here come from a demo fleet, not a real machine. Each card shows:</p>
     <ul>
       <li><strong>Tier stripe</strong>: the colored bar on the left. Cyan = operator (manual mission/phase actions), violet = frontier (orchestrator narrative), green = local (model work).</li>
       <li><strong>Action + handle</strong>: what happened ("dispatch start", "dispatch complete", "verdict: clean") and which entity it acted on (the role id, phase id, or mission id).</li>
