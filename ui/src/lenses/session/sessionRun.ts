@@ -388,7 +388,41 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   const attemptRecs = visible.filter(inAttempt);
   const lastBeatMs = attemptRecs.length ? Math.max(...attemptRecs.map((r) => T(r.ts))) : null;
 
-  const wallBase = done ? fmtDuration(T(close!.ts) - startTs) : `${fmtDuration(nowMs - startTs)} so far`;
+  // (#2011) The finished run's DURATION is read from the terminal record's
+  // own `wall_ms` — the runtime's measure, taken between its start and
+  // terminal record writes (`dispatch_internal.rs`'s
+  // `dispatch_complete_payload`) — instead of being recomputed here from two
+  // timestamps. Same shape as #1960/#1973/#2007: a payload in hand, and a
+  // renderer deriving its own answer beside it.
+  //
+  // Why it matters beyond tidiness. The `so far` branch below is driven by
+  // the shared 1s clock (#1972), so a page whose records go STALE keeps
+  // counting: a run left open overnight rendered ~10 hours of elapsed time
+  // for a ten-minute dispatch, with nothing on screen saying it was wrong.
+  // Taking the number from the record that ENDS the run means the worst a
+  // stale page can do is show a stale LABEL — it can no longer invent a
+  // duration. (The staleness itself is fixed separately, in
+  // `hooks/useSessionLiveness.ts`; this is the half that makes the failure
+  // survivable when a fetch is missed anyway.)
+  //
+  // It also removes two arithmetic hazards that are already reachable in
+  // this function: a terminal timestamped BEFORE its own start (the
+  // `skewedClose` case above) subtracts to a negative, and an unparsable
+  // `ts` subtracts to `NaN`.
+  //
+  // Read off `c`, not `close`: a `session.end` close-edge carries no payload
+  // at all (`presence_reconciler.rs`'s `build_session_end_record` sets
+  // `payload: None`), and archived records predate the field — so the
+  // subtraction stays as the fallback rather than being deleted.
+  const recordedWallMs = (c?.payload as DispatchCompletePayload | undefined)?.wall_ms;
+  const runWallMs =
+    typeof recordedWallMs === "number" && Number.isFinite(recordedWallMs)
+      ? recordedWallMs
+      : close
+        ? T(close.ts) - startTs
+        : NaN;
+
+  const wallBase = done ? fmtDuration(runWallMs) : `${fmtDuration(nowMs - startTs)} so far`;
   const exitCode = (c?.payload as DispatchCompletePayload | undefined)?.exit_code;
   const wallLoud =
     done && c && dispatchErrored(c)
@@ -418,7 +452,11 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
     : (dp.completion_tokens ?? null);
 
   // ── brief ──────────────────────────────────────────────────────────
-  const briefTiming = `${clk(startTs)}${done ? ` → ${clk(T(close!.ts))} (${fmtDuration(T(close!.ts) - startTs)})` : " · running"}`;
+  // (#2011) Same `runWallMs` the WALL CLOCK tile shows. The two lines report
+  // one quantity, so they read from one source — deriving it twice is how
+  // they end up disagreeing by a second at a rounding boundary. The two
+  // CLOCK stamps stay record-derived: they are timestamps, not a duration.
+  const briefTiming = `${clk(startTs)}${done ? ` → ${clk(T(close!.ts))} (${fmtDuration(runWallMs)})` : " · running"}`;
   const RUNTIME_LABEL: Record<string, string> = {
     internal: "internal container",
     direct: "direct client (hosted · no container)",
