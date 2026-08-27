@@ -238,15 +238,6 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   const [lastGoodResources, setLastGoodResources] = useState<MachineResources | null>(null);
   const resources = lastGoodResources;
 
-  // (#2019) A static build's fixture enters through the SAME
-  // `lastGoodResources` slot the live poll writes, rather than being threaded
-  // as a parallel `resources` source. Everything downstream — the residency
-  // state machine, the ledger lines, `data-state="loaded"` — then behaves
-  // identically whether the figures came from a probe or from a capture, and
-  // there is no second code path to keep in step with the first.
-  useEffect(() => {
-    if (staticMachine) setLastGoodResources(staticMachine.resources);
-  }, [staticMachine]);
 
   // The residency state machine (docs/design/machine-lens/proposal.md §8 — ghost/NEW rows) advances
   // on the SAME successful-poll cadence as the payload above: a failed poll
@@ -259,21 +250,31 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   const [residencyRows, setResidencyRows] = useState<ResidencyRowView[]>([]);
   const [residencyChanged, setResidencyChanged] = useState(false);
 
+  // (#2021) ONE effect for both sources. The first cut of #2019 set
+  // `lastGoodResources` from the fixture in a separate effect, which fed the
+  // ledger but never ran `advanceResidency` — so the demo rendered its gauge
+  // and its pool figures correctly above a residency section reading "no
+  // models loaded", while the fixture carried four. Its commit message
+  // claimed there was "no second code path to keep in step with the first";
+  // there was, and this is it. A payload reaching the lens by either route
+  // now runs the same body.
+  const incomingResources = staticMachine ? staticMachine.resources : resourcesQuery.data?.ok ? resourcesQuery.data.data : null;
   useEffect(() => {
-    if (!(isLocalMach && resourcesQuery.data?.ok)) return;
-    const data = resourcesQuery.data.data;
+    if (!isLocalMach || !incomingResources) return;
+    const data = incomingResources;
     setLastGoodResources(data);
     const models = Array.isArray(data.models) ? data.models : [];
     const { state, rows } = advanceResidency(residencyRef.current, models, Date.now());
     residencyRef.current = state;
     setResidencyRows(rows);
     setResidencyChanged(residencyChangedThisPoll(rows));
-    // Depends on the query's own settle timestamp, not `resourcesQuery.data`
-    // itself — the object is a fresh reference every render regardless of
-    // whether new data actually arrived, which would re-run this on every
-    // paint rather than once per poll.
+    // Depends on each source's own SETTLE timestamp, never on the payload
+    // object — that is a fresh reference every render whether or not new data
+    // arrived, so depending on it would re-run this on every paint rather than
+    // once per poll. The static fixture settles exactly once
+    // (`staleTime: Infinity`), so its timestamp is stable after the first read.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLocalMach, resourcesQuery.dataUpdatedAt]);
+  }, [isLocalMach, resourcesQuery.dataUpdatedAt, staticMachineQuery.dataUpdatedAt]);
 
   const label = targetUid != null ? nameOf(flowWindow.data, liveMachines, targetUid) : "this machine";
   // `specOf()` (viewer.html:1124-1129, ported in `lenses/fleet/cards.ts` —
