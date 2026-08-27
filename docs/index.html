@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>darkmux — AI-first local-AI orchestrator for Apple Silicon</title>
+<title>darkmux: the AI runtime built for Apple Silicon</title>
 <meta name="description" content="AI-first local-AI orchestrator: config-defined missions that run as a live task graph, plus a lab that measures how your hardware runs a workload. Uses local-AI internally to manage your local-AI. Built on real benchmarks.">
 <meta property="og:title" content="darkmux: the AI runtime built for Apple Silicon">
 <meta property="og:description" content="Automatically manages unified memory, keeps a crew of open models resident, and unifies every Mac you own into a fleet. Open source.">
@@ -13,12 +13,12 @@
 <meta property="og:image" content="https://darkmux.com/media/og-card.png">
 <meta property="og:image:width" content="2400">
 <meta property="og:image:height" content="1260">
-<meta property="og:image:alt" content="The darkmux dashboard, fleet view: a headline counting tokens run locally against tokens sent to the cloud, one card per machine across a three-Mac fleet — an M5 Ultra with a dispatch in flight, an M1 Max and a Mac mini — and a live event stream alongside.">
+<meta property="og:image:alt" content="The darkmux dashboard, fleet view: a headline counting tokens run locally against tokens sent to the cloud, one card per machine across a three-Mac fleet: an M5 Ultra with a dispatch in flight, an M1 Max and a Mac mini: and a live event stream alongside.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:site" content="@ka1n0s">
 <meta name="twitter:creator" content="@ka1n0s">
 <meta name="twitter:image" content="https://darkmux.com/media/og-card.png">
-<meta name="twitter:image:alt" content="The darkmux dashboard, fleet view: a headline counting tokens run locally against tokens sent to the cloud, one card per machine across a three-Mac fleet — an M5 Ultra with a dispatch in flight, an M1 Max and a Mac mini — and a live event stream alongside.">
+<meta name="twitter:image:alt" content="The darkmux dashboard, fleet view: a headline counting tokens run locally against tokens sent to the cloud, one card per machine across a three-Mac fleet: an M5 Ultra with a dispatch in flight, an M1 Max and a Mac mini: and a live event stream alongside.">
 <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
@@ -544,7 +544,7 @@
   <div class="wrap">
     <div class="hero-lockup">
       <img class="hero-mark" src="media/icon/mark-full.svg" width="132" height="132"
-           alt="The darkmux mark: four channels converging on a node and leaving as one output — a multiplexer.">
+           alt="The darkmux mark: four channels converging on a node and leaving as one output: a multiplexer.">
       <h1>darkmux</h1>
     </div>
     <p class="tag"><strong>The AI runtime built for <span class="accent">Apple Silicon</span>.</strong> Designed and built for your Mac by an ex‑Apple software lead: it automatically manages unified memory, keeps a crew of open models resident, and unifies every Mac you own into a fleet.</p>
@@ -609,15 +609,15 @@
 <section>
   <div class="wrap">
     <h2>Declare the loadout</h2>
-    <h3>The right loaded model, context length, and compaction profile for each task: named, not remembered.</h3>
-    <p>You shouldn't have to remember whether your fast bounded-task stack is loaded right now, or whether the deep-agentic profile got unloaded an hour ago when you ran a different test. darkmux makes the loadout an explicit, named thing that a dispatch loads on demand (the founding <code>swap</code> verb is gone; residency is managed for you now).</p>
+    <h3>Name the loadout once. darkmux keeps it resident.</h3>
+    <p>A profile names models at set context lengths, sized to your unified memory. A dispatch declares one; darkmux loads it, keeps it resident, and never touches a model you loaded yourself. MLX and GGUF both work.</p>
     <div class="install cmds">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux profile list</span><button class="copy-btn" data-copy="darkmux profile list" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
-      <div class="cmd-desc">List named stacks: combinations of LM Studio models at set context lengths.</div>
+      <div class="cmd-desc">List named stacks: combinations of models at set context lengths.</div>
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux machine status</span><button class="copy-btn" data-copy="darkmux machine status" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
       <div class="cmd-desc">Show what is loaded right now and which profile, if any, it matches.</div>
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux profile scan</span><button class="copy-btn" data-copy="darkmux profile scan" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
-      <div class="cmd-desc">Find models in your LM Studio catalog that no profile covers yet.</div>
+      <div class="cmd-desc">Find downloaded models that no profile covers yet.</div>
     </div>
   </div>
 </section>
@@ -625,8 +625,8 @@
 <section>
   <div class="wrap">
     <h2>Watch it work</h2>
-    <h3>A daemon + viewer for live observability of dispatches, phases, and verdicts.</h3>
-    <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes the flow records written by every dispatch and mission/phase transition. The <a href="demo/">observability viewer</a> renders those records as one drillable view of your fleet: drill fleet → machine → subsystem, with the event stream as a log lens at any level. A <a href="demo/">demo with recorded sample data</a> is published on this site. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
+    <h3>One live view of the whole fleet, from any device.</h3>
+    <p>A small daemon publishes every dispatch, phase, model, and timing as a flow record. The viewer draws them as one drillable view, fleet to tool call. Put it on your tailnet and watch from your phone.</p>
     <div class="install cmds">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux serve</span><button class="copy-btn" data-copy="darkmux serve" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
       <div class="cmd-desc">Start the daemon in a separate terminal tab.</div>
@@ -640,8 +640,8 @@
 <section>
   <div class="wrap">
     <h2>The lab</h2>
-    <h3>A measurement harness, not a config tool dressed up as one.</h3>
-    <p>Every <code>darkmux lab run</code> writes a manifest, a trajectory, and per-turn timing under <code>.darkmux/runs/&lt;id&gt;/</code>, so wall-clock variance, compaction events, and per-profile behavior are inspectable after the fact. Not in your head. On disk.</p>
+    <h3>Measure a model on your hardware before you staff it.</h3>
+    <p>Every run writes its trajectory and per-turn timing to disk. Baseline, change one variable, measure again: that is how darkmux's defaults were chosen, and how you pick a model for a job.</p>
     <div class="install cmds">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux lab run quick-q</span><button class="copy-btn" data-copy="darkmux lab run quick-q" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
       <div class="cmd-desc">Single-turn smoke prompt against the active profile.</div>
@@ -654,15 +654,15 @@
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux lab run compare &lt;run-a&gt; &lt;run-b&gt;</span><button class="copy-btn" data-copy="darkmux lab run compare &lt;run-a&gt; &lt;run-b&gt;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
       <div class="cmd-desc">Diff two runs for variance or regression.</div>
     </div>
-    <p class="muted" style="margin-top: 24px;">Workloads are pluggable via a <code>WorkloadProvider</code> trait. Two ship out of the box (<code>prompt</code>, <code>coding-task</code>); add your own without forking the repo. Full walkthrough in the <a href="guide/lab.html">lab section of the user guide</a>.</p>
+    <p class="muted" style="margin-top: 24px;">Full walkthrough in the <a href="guide/lab.html">lab section of the user guide</a>.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Missions, phases, and crews</h2>
-    <h3>Structured agentic work: the headline of darkmux, driven from your orchestrator.</h3>
-    <p>On top of the profile and lab substrate, darkmux runs config-defined <em>missions</em> as a live task graph: named local-AI roles (coder, code-reviewer, scribe) with declared tool palettes and system prompts form a <em>crew</em> that works the mission's <em>phases</em>, every dispatch gated on operator sign-off, tracked as JSON the operator owns. The profile and lab CLI works standalone if that's all you want, but launching a mission and watching the graph is what darkmux is for.</p>
+    <h3>Structured work for a crew of local models, driven from wherever you are.</h3>
+    <p>A config-defined task graph worked by a crew of named roles, assembled for the job and dissolved after. Launch from your agent, your editor, the command line, or CI. A coding mission stops at a sign-off gate before anything ships.</p>
     <div class="install cmds">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux dispatch coder "&lt;task&gt;"</span><button class="copy-btn" data-copy="darkmux dispatch coder &quot;&lt;task&gt;&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
       <div class="cmd-desc">Hand one task to a named role. Emits flow records as it works.</div>
