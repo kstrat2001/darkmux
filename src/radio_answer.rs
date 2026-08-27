@@ -800,6 +800,38 @@ pub fn grounding_scope_for(overrides: &AnswererOverrides) -> GroundingScope {
     }
 }
 
+/// The answering seat's per-call completion budget when the operator has
+/// not set `runtime.max_tokens_per_call`. The single-shot path's own
+/// default is 4096, and a 35B thinking model spent exactly that reasoning
+/// about "how do I see what is loaded?" and returned no text (2026-08-28).
+/// 16,384 is the figure the same path already uses when reasoning effort
+/// is set; a thinking model is the radio-host's normal staffing.
+pub const RADIO_ANSWER_TOKEN_CAP: u32 = 16_384;
+
+/// `runtime.max_tokens_per_call` when set (env or config.json), else
+/// [`RADIO_ANSWER_TOKEN_CAP`]. The knob's documented meaning is exactly this
+/// budget (reasoning + content of one call), so radio honors it rather than
+/// growing a knob of its own.
+pub fn answer_token_cap() -> u32 {
+    darkmux_types::config_access::max_tokens_per_call().unwrap_or(RADIO_ANSWER_TOKEN_CAP)
+}
+
+/// The seat's text, or an error when there is none. `single_shot` returns
+/// empty content as `Ok("")` on purpose (it is a transport, not a judge);
+/// radio is the judge, and an answer with no text is a failed answer that
+/// names the likeliest cause and the knob.
+pub fn answer_text(stdout: &str, cap: u32) -> Result<String> {
+    let text = stdout.trim();
+    if text.is_empty() {
+        anyhow::bail!(
+            "the answering seat returned no text. A reasoning model can spend its whole \
+             {cap}-token per-call budget thinking and emit nothing; retry, or raise \
+             `runtime.max_tokens_per_call` (`darkmux config set runtime.max_tokens_per_call N`)."
+        );
+    }
+    Ok(text.to_string())
+}
+
 pub fn dispatch_answerer_call_with(user_message: &str, overrides: &AnswererOverrides) -> Result<String> {
     let persona = crate::crew::loader::role_prompt("radio-host").ok_or_else(|| {
         anyhow::anyhow!("radio-host role has no readable .md persona template — cannot dispatch the answering seat")
@@ -827,14 +859,14 @@ pub fn dispatch_answerer_call_with(user_message: &str, overrides: &AnswererOverr
         profile_name,
         config_path: None,
         force_container: false,
-        max_completion_tokens: None,
+        max_completion_tokens: Some(answer_token_cap()),
         image: None,
         model_base_url_override: None,
         step_id: None,
         system_prompt_override: Some(system_prompt),
     };
     let result = crate::fleet::dispatch_routed_via(opts, crate::crew::dispatch::dispatch_local_single_shot)?;
-    Ok(result.stdout)
+    answer_text(&result.stdout, answer_token_cap())
 }
 
 /// Convenience wrapper: [`answer`] wired to the production call, with
@@ -1559,6 +1591,62 @@ mod tests {
         assert!(bundle.contains("darkmux machine list [") && bundle.contains("--deep"), "{bundle}");
         assert!(bundle.contains("darkmux mission launch"), "{bundle}");
         assert!(!bundle.contains("Top-level darkmux --help"), "the old block is gone: {bundle}");
+    }
+
+    // ── an empty answer is a failure, not an answer (2026-08-28) ─────────
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: caller's test is #[serial_test::serial].
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: caller's test is #[serial_test::serial].
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+
+    /// The answering seat ran a 35B thinking model against a one-line
+    /// question and returned "" after 4095 completion tokens: it reasoned
+    /// its whole 4096 budget away. `single_shot` calls that Ok(""), radio
+    /// printed "radio: " and exited 0. The text must be non-empty to count.
+    #[test]
+    fn an_empty_answer_names_the_budget_and_the_knob() {
+        let err = answer_text("   \n", 4096).unwrap_err().to_string();
+        assert!(err.contains("4096"), "{err}");
+        assert!(err.contains("runtime.max_tokens_per_call"), "{err}");
+        assert!(err.to_lowercase().contains("reason"), "{err}");
+        assert_eq!(answer_text("Run `darkmux machine status`.", 4096).unwrap(), "Run `darkmux machine status`.");
+    }
+
+    /// The seat's per-call budget honors the operator's knob and otherwise
+    /// gives a reasoning model room: the single-shot default of 4096 is what
+    /// produced the empty answer.
+    #[test]
+    #[serial_test::serial]
+    fn answer_token_cap_honors_the_config_knob_and_defaults_above_4096() {
+        let _g = EnvGuard::set("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "12000");
+        assert_eq!(answer_token_cap(), 12000);
+        drop(_g);
+        let _g = EnvGuard::set("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "");
+        assert!(answer_token_cap() > 4096, "{}", answer_token_cap());
+        assert_eq!(answer_token_cap(), RADIO_ANSWER_TOKEN_CAP);
     }
 }
 
