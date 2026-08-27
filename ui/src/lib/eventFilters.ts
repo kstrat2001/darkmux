@@ -282,6 +282,20 @@ export function matchesFilters(r: FlowRecord, filters: FilterState): boolean {
  */
 const FILTERS_STORAGE_KEY = "dmux.eventfilters";
 
+/** (#2027) Per-INSTANCE key. Two `EventLogColumn`s are mounted at once on the
+ * `mission` route — the App-level one (always mounted, CSS-hidden) and the
+ * one `MissionGraphLens` owns, fed mission-scoped records. They shared this
+ * key, so a routine live-poll tick on the HIDDEN pane overwrote the visible
+ * pane's picks, including its search text, and a refresh restored the wrong
+ * pane's filters. Found by a QA agent that mounted both as siblings.
+ *
+ * Scoping by the caller's own label keeps each pane's picks to itself. A
+ * caller that passes nothing gets the original key, so the App-level pane's
+ * existing stored picks survive this change rather than being orphaned. */
+function filtersKeyFor(scope?: string): string {
+  return scope ? `${FILTERS_STORAGE_KEY}.${scope}` : FILTERS_STORAGE_KEY;
+}
+
 type StoredFilters = { act: string[]; cat: string[]; tier: string[]; src: string[]; q: string };
 
 /** Read persisted picks, reconciled against what this window offers.
@@ -294,12 +308,13 @@ type StoredFilters = { act: string[]; cat: string[]; tier: string[]; src: string
 export function restoreFilterState(
   facets: Facets,
   storage: Pick<Storage, "getItem"> | null = typeof window === "undefined" ? null : window.sessionStorage,
+  scope?: string,
 ): FilterState {
   const base = defaultFilterState(facets);
   if (!storage) return base;
   let raw: string | null = null;
   try {
-    raw = storage.getItem(FILTERS_STORAGE_KEY);
+    raw = storage.getItem(filtersKeyFor(scope));
   } catch {
     return base;
   }
@@ -310,6 +325,14 @@ export function restoreFilterState(
   } catch {
     return base;
   }
+  // (#2027) `JSON.parse("null")` SUCCEEDS and yields `null`; so do `"3"` and
+  // `"\"x\""`. The try/catch only covered UNPARSABLE input, so a payload that
+  // parsed to a non-object reached `parsed[k]` and threw a TypeError — inside
+  // a `useState` lazy initializer, which is a render-phase crash, and with no
+  // error boundary in the app at the time, a blank page. The documented
+  // contract already promised "the plain default when the payload is
+  // unrecognizable"; this makes the code match it.
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return base;
   const out = base;
   for (const k of FACET_KEYS) {
     const stored = parsed[k];
@@ -332,6 +355,7 @@ export function restoreFilterState(
 export function persistFilterState(
   state: FilterState,
   storage: Pick<Storage, "setItem"> | null = typeof window === "undefined" ? null : window.sessionStorage,
+  scope?: string,
 ): void {
   if (!storage) return;
   try {
@@ -342,8 +366,76 @@ export function persistFilterState(
       src: [...state.src],
       q: state.q,
     };
-    storage.setItem(FILTERS_STORAGE_KEY, JSON.stringify(payload));
+    storage.setItem(filtersKeyFor(scope), JSON.stringify(payload));
   } catch {
     // ignore — storage unavailable or full
   }
 }
+
+/** (#2027) The stored picks, unreconciled — for a caller that does not yet
+ * know what its facets are.
+ *
+ * `restoreFilterState` intersects against the facets on offer, which is right
+ * once they exist and USELESS at mount: `EventLogColumn` mounts before its
+ * records query resolves, so `computeFacets([])` is empty, every intersection
+ * is empty, and restore returned the plain default. `absorbNewFacetValues`
+ * then treated every arriving value as brand new and selected it. The
+ * operator's pick was discarded on every single load — the feature looked
+ * implemented and did nothing.
+ *
+ * The tests missed it because they seeded facets and records together, which
+ * the real mount order never does. Found by a QA agent that reproduced the
+ * actual App mount sequence.
+ *
+ * Returns null when there is nothing stored, so a caller can distinguish
+ * "operator has no saved picks" from "operator saved everything selected".
+ */
+export function storedFilterPicks(
+  storage: Pick<Storage, "getItem"> | null = typeof window === "undefined" ? null : window.sessionStorage,
+  scope?: string,
+): StoredFilters | null {
+  if (!storage) return null;
+  try {
+    const raw = storage.getItem(filtersKeyFor(scope));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const o = parsed as Partial<StoredFilters>;
+    return {
+      act: Array.isArray(o.act) ? o.act.filter((v) => typeof v === "string") : [],
+      cat: Array.isArray(o.cat) ? o.cat.filter((v) => typeof v === "string") : [],
+      tier: Array.isArray(o.tier) ? o.tier.filter((v) => typeof v === "string") : [],
+      src: Array.isArray(o.src) ? o.src.filter((v) => typeof v === "string") : [],
+      q: typeof o.q === "string" ? o.q : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Apply stored picks to freshly-arrived facets: keep what the operator chose,
+ * and treat a facet they never had an opinion about as fully selected.
+ *
+ * This is the piece `absorbNewFacetValues` cannot do — that function's job is
+ * "a value never offered before becomes selected", which is correct for live
+ * traffic and exactly wrong for a value the operator explicitly DESELECTED in
+ * a previous session. */
+export function applyStoredPicks(picks: StoredFilters, facets: Facets): FilterState {
+  const out = defaultFilterState(facets);
+  for (const k of FACET_KEYS) {
+    const offered = facets[k];
+    if (offered.length === 0) continue;
+    const stored = picks[k];
+    // Nothing stored for this facet: leave it fully selected rather than
+    // reading "absent" as "deselect everything".
+    if (!stored || stored.length === 0) continue;
+    const keep = stored.filter((v) => offered.includes(v));
+    // An empty intersection means the stored picks describe a different world
+    // entirely; a filter hiding every row is indistinguishable from a broken
+    // pane, so fall back to fully selected.
+    if (keep.length > 0) out[k] = new Set(keep);
+  }
+  out.q = picks.q;
+  return out;
+}
+

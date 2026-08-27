@@ -20,7 +20,7 @@ tailnet address or workspace path onto a public page.
 
 Re-run after changing `world.json` or after a panel's output format moves.
 """
-import argparse, json, pathlib, sys, urllib.error, urllib.request
+import argparse, json, pathlib, re, sys, urllib.error, urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -53,10 +53,23 @@ def main():
     a = ap.parse_args()
 
     # Fail loudly if the allowlist moved out from under this list.
+    # An EMPTY parse is a failure, not a pass. The first cut guarded with
+    # `if declared and declared != set(PANEL_IDS)`, so reformatting the Rust
+    # declaration (wrapping `PANEL_IDS: &[&str] = &[` onto two lines) made the
+    # split find nothing, `declared` empty, and the guard silently agree that
+    # a renamed panel was fine. A drift guard that cannot see the thing it
+    # guards must SAY SO, not shrug. Found by a QA agent that reformatted the
+    # declaration rather than reading the parser.
     spec = (ROOT / "crates" / "darkmux-serve" / "src" / "panel.rs").read_text()
-    declared = {ln.strip().strip('",') for ln in spec.split("PANEL_IDS: &[&str] = &[", 1)[-1]
-                .split("];", 1)[0].splitlines() if ln.strip().startswith('"')}
-    if declared and declared != set(PANEL_IDS):
+    m = re.search(r"PANEL_IDS\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\]\s*;", spec, re.S)
+    if not m:
+        sys.exit("cannot find PANEL_IDS in crates/darkmux-serve/src/panel.rs. Refusing to "
+                 "export a demo whose console tabs cannot be checked against the daemon's "
+                 "real allowlist.")
+    declared = set(re.findall(r'"([^"]+)"', m.group(1)))
+    if not declared:
+        sys.exit("PANEL_IDS parsed EMPTY. Refusing to export — see above.")
+    if declared != set(PANEL_IDS):
         sys.exit(f"panel allowlist drifted — panel.rs has {sorted(declared)}, this script has "
                  f"{sorted(PANEL_IDS)}. Update PANEL_IDS (and re-export) rather than shipping a "
                  f"demo whose console is missing a tab.")

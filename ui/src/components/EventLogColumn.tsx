@@ -13,7 +13,7 @@ import {
   matchesFilters,
   type Facets,
   type FacetSeen,
-  type FilterState, activeFilterCount, restoreFilterState, persistFilterState } from "../lib/eventFilters";
+  type FilterState, activeFilterCount, restoreFilterState, persistFilterState, storedFilterPicks, applyStoredPicks } from "../lib/eventFilters";
 import { FiltersDialog, onlyModelFacet } from "./FiltersDialog";
 import { ActivityIcon } from "./ActivityIcon";
 import { recordDetail } from "../lib/recordDetail";
@@ -195,7 +195,7 @@ export function EventLogColumn({
   // survive a refresh taken at any moment, not only one taken after tidily
   // dismissing the dialog.
   useEffect(() => {
-    persistFilterState(filters);
+    persistFilterState(filters, undefined, scopeLabel);
   }, [filters]);
 
   const seenRef = useRef<FacetSeen>(createFacetSeen());
@@ -208,7 +208,29 @@ export function EventLogColumn({
   // returns the stale filters, silently dropping a live-streamed record whose
   // facet value is brand new. Reading `filters` here costs a dependency on it,
   // and the identity guard below keeps that from looping.
+  // (#2027) The operator's STORED picks, held until there are facets to apply
+  // them to. `restoreFilterState` in the initializer above cannot do this: the
+  // component mounts before its records query resolves, so facets are empty,
+  // every intersection is empty, and the picks were silently discarded on
+  // every load. The feature looked implemented and did nothing.
+  const pendingPicksRef = useRef(storedFilterPicks(undefined, scopeLabel));
+
   useEffect(() => {
+    // First arrival of real facets: apply the stored picks INSTEAD of
+    // absorbing. Order matters — `absorbNewFacetValues` selects any value it
+    // has not seen before, which is right for live traffic and exactly wrong
+    // for a value the operator deliberately deselected last session. Applying
+    // first, then letting the ledger mark everything seen, keeps both correct.
+    const pending = pendingPicksRef.current;
+    if (pending && (facets.act.length || facets.cat.length || facets.tier.length || facets.src.length)) {
+      pendingPicksRef.current = null;
+      const restored = applyStoredPicks(pending, facets);
+      for (const k of ["act", "cat", "tier", "src"] as const) {
+        for (const v of facets[k]) seenRef.current[k].add(v);
+      }
+      setFilters(restored);
+      return;
+    }
     const next = absorbNewFacetValues(filters, facets, seenRef.current);
     if (next !== filters) setFilters(next);
   }, [facets, filters]);

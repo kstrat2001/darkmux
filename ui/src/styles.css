@@ -4558,3 +4558,28 @@ body {
     flex-direction: column;
   }
 }
+
+/* (#2027) The lens-crash fallback. Deliberately plain and loud: an operator
+   who can read what broke can file something useful; a blank page cannot be
+   reported at all. */
+.lenscrash {
+  border: 1px solid var(--bad, #e5484d);
+  border-radius: 6px;
+  padding: 16px;
+  max-width: 70ch;
+  font: calc(12px * var(--fs-scale))/1.6 var(--font-mono);
+}
+.lenscrash__title {
+  color: var(--bad, #e5484d);
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.lenscrash__msg {
+  color: var(--fg);
+  overflow-wrap: anywhere;
+  margin-bottom: 10px;
+}
+.lenscrash__hint {
+  color: var(--dim);
+  margin-bottom: 12px;
+}
