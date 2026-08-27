@@ -74,8 +74,21 @@
     --border: #1f1f24;
     --text: #e8e6e3;
     --muted: #8a8a92;
-    --accent: #6df1ff;
-    --accent-dim: #2a8a96;
+    /* (#2022) The VIEWER's accent, adopted verbatim.
+
+    Three accents disagreed: the viewer's #4fd1c5, the site's #6df1ff, and
+    the mark's own #2dd4bf. The first two drifted apart before the mark
+    existed — this is not a regression, it is a pre-existing split the mark
+    made visible.
+
+    The viewer wins because it is the PRODUCT; the site is marketing about
+    it. Repainting the tool every operator uses daily to match a landing
+    page would be the tail wagging the dog, and the mark's teal is already
+    adjacent to this value, so the identity holds either way.
+
+    Operator's call, 2026-08-27. */
+    --accent: #4fd1c5;
+    --accent-dim: #3aa89f;
     --warn: #ffb86b;
   }
   * { box-sizing: border-box; }

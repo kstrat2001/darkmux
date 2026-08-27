@@ -155,6 +155,16 @@ const NEXT_HTML: &str = include_str!("../assets/next.html");
 const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../assets/apple-touch-icon.png");
 const ICON_192_PNG: &[u8] = include_bytes!("../assets/icon-192.png");
 const ICON_512_PNG: &[u8] = include_bytes!("../assets/icon-512.png");
+/// (#2022) The MASKABLE variant, a separate file on purpose.
+///
+/// Android crops a maskable icon to the centre 80%. The mark's endpoint dots
+/// sit at x=6 and x=58 in a 64-unit viewBox — 9.4% and 90.6% — so both fall
+/// outside that window, and they are exactly the parts that make it read as
+/// signals entering and leaving. The manifest previously declared ONE file as
+/// `"any maskable"`, which cannot be both: either the full canvas is wasted
+/// with padding, or the crop eats the dots. `docs/` already split them; this
+/// gives the served PWA the same correctness.
+const ICON_512_MASKABLE_PNG: &[u8] = include_bytes!("../assets/icon-512-maskable.png");
 
 /// (#1403) The web app manifest — `display: standalone` so an installed
 /// shortcut opens chromeless. Served at `GET /manifest.webmanifest`. Static
@@ -399,6 +409,7 @@ pub(crate) fn build_router_full(
         .route("/apple-touch-icon.png", get(apple_touch_icon_handler))
         .route("/icon-192.png", get(icon_192_handler))
         .route("/icon-512.png", get(icon_512_handler))
+        .route("/icon-512-maskable.png", get(icon_512_maskable_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
         .route("/fleet/machines/live", get(fleet_machines_live_handler))
         .route("/lab/runs", get(lab_runs_handler))
@@ -1718,6 +1729,10 @@ async fn icon_192_handler() -> impl IntoResponse {
 /// (#1403) `GET /icon-512.png` — manifest icon (also the maskable source).
 async fn icon_512_handler() -> impl IntoResponse {
     png_response(ICON_512_PNG)
+}
+
+async fn icon_512_maskable_handler() -> impl IntoResponse {
+    png_response(ICON_512_MASKABLE_PNG)
 }
 
 /// Shared PNG response builder for the standalone-shell icons (#1403). A long

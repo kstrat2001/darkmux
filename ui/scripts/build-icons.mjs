@@ -22,7 +22,15 @@ import { fileURLToPath } from "url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const SRC = `${ROOT}/docs/media/icon`;
-const OUT = `${ROOT}/docs`;
+// (#2022) Two consumers, one generator. `docs/` is the marketing site;
+// `crates/darkmux-serve/assets/` is what the DAEMON embeds and serves as a
+// PWA, and it shipped a different mark entirely — an operator who installed
+// the viewer got the old diamond while the website showed the new one.
+//
+// Same sources, same sizes, one script: a future mark change updates both or
+// neither, which is the only way two copies of an identity stay in step.
+const SITE = `${ROOT}/docs`;
+const VIEWER = `${ROOT}/crates/darkmux-serve/assets`;
 const GROUND = "#0b0e14";
 
 // `opaque` matters and is not cosmetic. iOS composites a transparent
@@ -44,9 +52,15 @@ const TARGETS = [
   { file: "favicon-16.png", size: 16, src: "mark-trapezoid.svg", opaque: false },
 ];
 
+// What `crates/darkmux-serve/assets/manifest.webmanifest` actually names,
+// plus the touch icon the served page links. Anything else would be a file
+// the daemon embeds and never serves.
+const VIEWER_FILES = new Set(["icon-192.png", "icon-512.png", "icon-512-maskable.png", "apple-touch-icon.png"]);
+
 const browser = await chromium.launch();
 const page = await browser.newPage();
-mkdirSync(OUT, { recursive: true });
+mkdirSync(SITE, { recursive: true });
+mkdirSync(VIEWER, { recursive: true });
 
 for (const t of TARGETS) {
   const svg = readFileSync(`${SRC}/${t.src}`, "utf8");
@@ -58,12 +72,17 @@ for (const t of TARGETS) {
        display:flex;align-items:center;justify-content:center}
      svg{display:block;width:${inner}px;height:${inner}px}</style>${svg}`,
   );
-  await page.screenshot({ path: `${OUT}/${t.file}`, omitBackground: !t.opaque });
-  console.log(`  ${t.file.padEnd(24)} ${String(t.size).padStart(4)}px  ${t.src}${t.pad ? `  (padded to ${t.pad * 100}%)` : ""}`);
+  await page.screenshot({ path: `${SITE}/${t.file}`, omitBackground: !t.opaque });
+  // The viewer serves a NARROWER set (its manifest only names three), so it
+  // gets the files it actually references rather than every size the site has.
+  if (VIEWER_FILES.has(t.file)) {
+    await page.screenshot({ path: `${VIEWER}/${t.file}`, omitBackground: !t.opaque });
+  }
+  console.log(`  ${t.file.padEnd(24)} ${String(t.size).padStart(4)}px  ${t.src}${t.pad ? `  (padded to ${t.pad * 100}%)` : ""}${VIEWER_FILES.has(t.file) ? "  +viewer" : ""}`);
 }
 
 writeFileSync(
-  `${OUT}/site.webmanifest`,
+  `${SITE}/site.webmanifest`,
   JSON.stringify(
     {
       name: "darkmux",

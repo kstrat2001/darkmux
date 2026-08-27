@@ -94,7 +94,7 @@ Neither bump ever added an endpoint dimension to the token records themselves �
 ```
 // viewer.html:24-26
 --good:#5af0a3;   /* green — currently the hero's "off the meter" color */
---amber:#6df1ff;  /* NOT amber — a cyan, and it's the darkmux BRAND accent */
+--amber:#4fd1c5;  /* NOT amber — a cyan, and it's the darkmux BRAND accent (#2022: was #6df1ff; the site adopted the viewer's value) */
 --warn:#ffb86b; --bad:#ff6b85;  /* reserved for actual problems */
 ```
 

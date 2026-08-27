@@ -5411,3 +5411,40 @@ fn served_viewer_ships_no_static_source_meta() {
         rest = &after[span_end..];
     }
 }
+
+/// (#2022) Every icon the manifest names must actually be servable.
+///
+/// The manifest and the route table are two independent lists, and nothing
+/// made them agree. Adding the maskable variant meant touching three places —
+/// the `include_bytes!`, a handler, a route — and forgetting any one of them
+/// leaves a manifest that promises an icon the daemon 404s. An installed PWA
+/// then silently falls back to a browser default, which is exactly the class
+/// of "looks configured, isn't" failure this file already guards for the
+/// static-source metas.
+#[test]
+fn every_manifest_icon_has_a_route() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(WEB_MANIFEST).expect("manifest.webmanifest must be valid JSON");
+    let icons = manifest["icons"].as_array().expect("manifest declares an icons array");
+    assert!(!icons.is_empty(), "a manifest with no icons is not a PWA");
+
+    for icon in icons {
+        let src = icon["src"].as_str().expect("every icon declares a src");
+        assert!(
+            ROUTED_ICON_PATHS.contains(&src),
+            "manifest.webmanifest names {src}, which has no route in `app()`. Add the \
+             include_bytes!, a handler and a `.route()` — or stop naming it here."
+        );
+    }
+}
+
+/// The icon paths `app()` actually serves. Test-only and INDEPENDENT of the
+/// router on purpose: deriving it from the router would make the check above
+/// compare the route table against itself.
+#[cfg(test)]
+const ROUTED_ICON_PATHS: &[&str] = &[
+    "/icon-192.png",
+    "/icon-512.png",
+    "/icon-512-maskable.png",
+    "/apple-touch-icon.png",
+];

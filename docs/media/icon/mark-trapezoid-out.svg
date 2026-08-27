@@ -6,9 +6,15 @@
       <stop offset="100%" stop-color="#2dd4bf" />
     </linearGradient>
   </defs>
+  <!-- Two inputs, one output: the smallest arrangement that still SAYS
+       multiplexer rather than just "a shape". The full mark's four channels
+       do not survive this size, but the relation many-in/one-out does, and
+       that relation is the whole idea. -->
+  <path d="M3 25 L14 25" stroke="#38bdf8" stroke-width="4.5" stroke-linecap="round" />
+  <path d="M3 39 L14 39" stroke="#c084fc" stroke-width="4.5" stroke-linecap="round" />
   <path d="M14 11 L40 23 L40 41 L14 53 Z"
         fill="rgba(129,140,248,0.18)"
         stroke="url(#dm-s2-grad)" stroke-width="5"
         stroke-linejoin="round" stroke-linecap="round" />
-  <path d="M40 32 L56 32" stroke="#2dd4bf" stroke-width="5" stroke-linecap="round" />
+  <path d="M40 32 L58 32" stroke="#2dd4bf" stroke-width="5" stroke-linecap="round" />
 </svg>
