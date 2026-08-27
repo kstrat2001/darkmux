@@ -2846,7 +2846,9 @@ fn check_mission_config_registry() -> Check {
     let known_kind_refs: Vec<&str> = known_kinds.iter().map(String::as_str).collect();
 
     let mut summary_lines: Vec<String> = Vec::new();
-    let mut blocking: Vec<String> = Vec::new();
+    // (#2003) (id, explanation) pairs, so identical explanations can be
+    // grouped at render time instead of repeated once per document.
+    let mut blocking: Vec<(String, String)> = Vec::new();
     let mut kind_warning_ids: Vec<String> = Vec::new();
 
     for id in &ids {
@@ -2869,12 +2871,12 @@ fn check_mission_config_registry() -> Check {
 
                 if !errors.is_empty() {
                     let joined = errors.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; ");
-                    blocking.push(format!("\"{id}\": {joined}"));
+                    blocking.push((id.clone(), joined));
                 }
                 if !version_drift.is_empty() {
                     let joined =
                         version_drift.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("; ");
-                    blocking.push(format!("\"{id}\": {joined}"));
+                    blocking.push((id.clone(), joined));
                 }
                 // (#1284 review round 2, consider 7; fixed for #1917) A
                 // USER-tier copy whose schema MINOR trails the binary's MAY
@@ -2967,10 +2969,13 @@ fn check_mission_config_registry() -> Check {
                                  current schema instead"
                                     .to_string()
                             };
-                            blocking.push(format!(
-                                "\"{id}\": user-tier copy declares schema {doc_major}.{doc_minor}, \
-                                 but this binary's mission-config schema is {bin_major}.{bin_minor} \
-                                 — {severity}; {remedy}"
+                            blocking.push((
+                                id.clone(),
+                                format!(
+                                    "user-tier copy declares schema {doc_major}.{doc_minor}, \
+                                     but this binary's mission-config schema is \
+                                     {bin_major}.{bin_minor} — {severity}; {remedy}"
+                                ),
                             ));
                         }
                         // (#1648) The MIRROR direction, and the more dangerous
@@ -2995,14 +3000,18 @@ fn check_mission_config_registry() -> Check {
                         // window from here forward, which is the only window
                         // a code change can close.
                         if doc_major == bin_major && doc_minor > bin_minor {
-                            blocking.push(format!(
-                                "\"{id}\": user-tier copy declares schema {doc_major}.{doc_minor}, \
-                                 NEWER than this binary's {bin_major}.{bin_minor} — it may declare \
-                                 additive fields this binary silently ignores rather than \
-                                 rejects (a `reads` relation, for one, carries both data and \
-                                 ordering: dropping it can let a stage run early against empty \
-                                 input and finish green with no findings). Upgrade darkmux, or \
-                                 re-author this copy against {bin_major}.{bin_minor}"
+                            blocking.push((
+                                id.clone(),
+                                format!(
+                                    "user-tier copy declares schema {doc_major}.{doc_minor}, \
+                                     NEWER than this binary's {bin_major}.{bin_minor} — it may \
+                                     declare additive fields this binary silently ignores rather \
+                                     than rejects (a `reads` relation, for one, carries both data \
+                                     and ordering: dropping it can let a stage run early against \
+                                     empty input and finish green with no findings). Upgrade \
+                                     darkmux, or re-author this copy against \
+                                     {bin_major}.{bin_minor}"
+                                ),
                             ));
                         }
                     }
@@ -3011,7 +3020,7 @@ fn check_mission_config_registry() -> Check {
                     kind_warning_ids.push(id.clone());
                 }
             }
-            Err(e) => blocking.push(format!("\"{id}\": failed to parse — {e}")),
+            Err(e) => blocking.push((id.clone(), format!("failed to parse — {e}"))),
         }
     }
 
@@ -3040,12 +3049,7 @@ fn check_mission_config_registry() -> Check {
             // (one document can contribute a structural-error entry AND a
             // schema-drift entry), so the count is worded as issues, never
             // as a config count (#1284 review round 1).
-            message: format!(
-                "{} mission config(s) registered, {} issue(s): {}",
-                ids.len(),
-                blocking.len(),
-                blocking.join(" | ")
-            ),
+            message: summarize_findings(ids.len(), &blocking),
             hint: Some(
                 "fix the named document(s) under `~/.darkmux/mission-configs/<id>.json` (or the \
                  checked-out `templates/builtin/mission-configs/<id>.json` for a built-in) — a \
@@ -4043,19 +4047,163 @@ fn first_line(s: &str) -> &str {
 
 // ─── Result rendering ───────────────────────────────────────────────────
 
-/// Print one check line + its hint lines. Shared by the verbose and
-/// issues-only render paths so they format identically.
-fn print_check_line(c: &Check) {
+/// (#2003) Render the registry's findings, stating each distinct explanation
+/// ONCE and naming every document it applies to.
+///
+/// Measured on a real machine: 15 mission configs each trailing the binary's
+/// schema by one minor produced 15 copies of the same ~600-character
+/// explanation — a 9,726-character check message that wrapped to roughly
+/// sixty lines of near-identical prose. That is one fact about fifteen
+/// documents, not fifteen facts, and rendering it per-document buries the
+/// single thing the operator has to act on.
+///
+/// The issue COUNT stays per-document (a group of five is still five issues),
+/// because that is what the operator is being told to fix; only the prose is
+/// shared. Groups keep first-seen order so the output is stable between runs.
+fn summarize_findings(registered: usize, findings: &[(String, String)]) -> String {
+    let mut order: Vec<&str> = Vec::new();
+    let mut groups: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (id, text) in findings {
+        let entry = groups.entry(text.as_str()).or_insert_with(|| {
+            order.push(text.as_str());
+            Vec::new()
+        });
+        entry.push(id.as_str());
+    }
+
+    let rendered: Vec<String> = order
+        .iter()
+        .map(|text| {
+            let ids = &groups[*text];
+            match ids.len() {
+                // A lone finding reads better as `"id": explanation` — the
+                // shape this check has always used, kept for the common case.
+                1 => format!("\"{}\": {text}", ids[0]),
+                n => format!("{text} — affects {n} config(s): {}", ids.join(", ")),
+            }
+        })
+        .collect();
+
+    format!(
+        "{registered} mission config(s) registered, {} issue(s): {}",
+        findings.len(),
+        rendered.join(" | ")
+    )
+}
+
+/// The width `doctor` renders to (#1995).
+///
+/// `COLUMNS` is what `crates/darkmux-serve/src/panel.rs` sets from the
+/// client's OWN measured panel width, and every other panel verb already
+/// honors it — `run list` went from a 60-char longest line at `COLUMNS=56` to
+/// 159 at `COLUMNS=200` while doctor emitted 2031 characters at both. That is
+/// why doctor was the one panel whose output ran off the screen: not a CSS
+/// problem, a verb that never answered the question it was asked.
+///
+/// Clamped rather than trusted: the band matches the daemon's own
+/// `clamp_cols`, with a 40 floor because this renderer reserves 27 columns
+/// for the marker and the name before the message even starts.
+fn output_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|w| w.clamp(40, 200))
+        .unwrap_or(100)
+}
+
+/// Word-wrap `text` to `width`, indenting every line AFTER the first by
+/// `indent` spaces — a hanging indent, so a wrapped message stays visually
+/// attached to the check that owns it instead of running back to column zero.
+///
+/// Hand-rolled rather than pulling in `textwrap`: the dep set here is
+/// deliberately small (see CLAUDE.md), and this is the whole requirement.
+/// Operates on whitespace-separated words, so it is safe to run on raw text
+/// only — never on a string that already carries ANSI escapes, whose bytes
+/// would count toward the width. Every caller below styles AFTER wrapping.
+///
+/// A word longer than the budget is emitted on its own line and allowed to
+/// exceed it. Breaking mid-token would corrupt the paths, model ids and
+/// commands doctor prints, and dropping it would be worse; the loop must
+/// simply terminate, which it does because each iteration consumes a word.
+fn wrap_hanging(text: &str, width: usize, indent: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+
+    for word in text.split_whitespace() {
+        // The first line is laid out after a prefix the caller has already
+        // accounted for; continuations pay the hanging indent instead.
+        let budget = if out.is_empty() { width } else { width.saturating_sub(indent) };
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= budget {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        return vec![String::new()];
+    }
+
+    let pad = " ".repeat(indent);
+    out.into_iter()
+        .enumerate()
+        .map(|(i, l)| if i == 0 { l } else { format!("{pad}{l}") })
+        .collect()
+}
+
+/// Render one check as the lines that will be printed, wrapped to `width`.
+///
+/// Split out from [`print_check_line`] so the WRAP is testable without
+/// capturing stdout — the behavior under test is the geometry, not the IO.
+fn render_check_block(c: &Check, width: usize) -> Vec<String> {
+    const NAME_COL: usize = 22;
     let marker = match c.status {
         Status::Pass => darkmux_types::style::success("✓"),
         Status::Warn => darkmux_types::style::warn("⚠"),
         Status::Fail => darkmux_types::style::error("✗"),
     };
-    println!("  {} {:<22} {}", marker, c.name, c.message);
+    // "  " + marker + " " + name + " ". Measured from the NAME's real length
+    // so an over-long name pushes the wrap column right rather than silently
+    // overflowing the budget it was never charged for.
+    let head = 2 + 1 + 1 + c.name.chars().count().max(NAME_COL) + 1;
+    let body = width.saturating_sub(head).max(20);
+
+    let mut lines = Vec::new();
+    let msg = wrap_hanging(&c.message, body, 0);
+    lines.push(format!("  {} {:<NAME_COL$} {}", marker, c.name, msg[0]));
+    for cont in &msg[1..] {
+        lines.push(format!("{}{}", " ".repeat(head), cont));
+    }
+
     if let Some(hint) = c.hint.as_ref() {
-        for line in hint.lines() {
-            println!("        → {}", darkmux_types::style::dim(line));
+        // "        → " — 8 spaces, the arrow, a space.
+        const HINT_HEAD: usize = 10;
+        for raw in hint.lines() {
+            let wrapped = wrap_hanging(raw, width.saturating_sub(HINT_HEAD).max(20), 0);
+            lines.push(format!("        → {}", darkmux_types::style::dim(&wrapped[0])));
+            for cont in &wrapped[1..] {
+                lines.push(format!(
+                    "{}{}",
+                    " ".repeat(HINT_HEAD),
+                    darkmux_types::style::dim(cont)
+                ));
+            }
         }
+    }
+    lines
+}
+
+/// Print one check line + its hint lines. Shared by the verbose and
+/// issues-only render paths so they format identically.
+fn print_check_line(c: &Check) {
+    for line in render_check_block(c, output_width()) {
+        println!("{line}");
     }
 }
 
@@ -4067,18 +4215,57 @@ fn print_check_line(c: &Check) {
 /// severity is the shippable L1.) Plain-language verdict words by operator lean
 /// (#932 Q1); the per-check markers stay ✓/⚠/✗.
 fn verdict_banner(r: &DoctorReport) -> String {
+    verdict_banner_at(r, output_width())
+}
+
+/// (#1995) The banner, wrapped to `width`.
+///
+/// The banner quotes the highest-severity check's whole message, so it is the
+/// LONGEST line doctor emits — 276 characters against the real
+/// daemon-freshness finding. Wrapping the per-check lines alone left this one
+/// running off the screen by itself, which is why the width is threaded here
+/// rather than read at the print site.
+///
+/// The text is wrapped BEFORE styling: `style::warn` and friends wrap the
+/// string in ANSI escapes, and those bytes would otherwise be counted against
+/// the width, silently over-wrapping every colored line.
+fn verdict_banner_at(r: &DoctorReport, width: usize) -> String {
     let headline =
         |s: Status| r.checks.iter().find(|c| c.status == s).map(|c| format!("{}: {}", c.name, c.message));
+    // ONE LINE, always — a banner is a headline, not a transcript.
+    //
+    // It quotes the worst check's whole message, and those are not bounded:
+    // the real `mission config registry` finding concatenates one full
+    // explanation per affected config, measured at 9,726 characters (the same
+    // ~600-char paragraph 15 times). Wrapping that faithfully filled fifty
+    // lines with a restatement of the check line printed directly below it.
+    // Truncation is not information loss here — the full message is always
+    // rendered in that check's own block.
+    let render = |text: String| {
+        // Collapse any internal newlines first: a multi-line message must not
+        // be able to smuggle a second line past the one-line guarantee.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.chars().count() <= width {
+            return flat;
+        }
+        // Wrap to width-1 and keep the first line, so there is room for the
+        // ellipsis that tells the operator something was cut.
+        let first = wrap_hanging(&flat, width.saturating_sub(1).max(20), 0)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        format!("{first}…")
+    };
     match r.worst_status() {
         Status::Pass => darkmux_types::style::success("● ok — every check passed"),
-        Status::Warn => darkmux_types::style::warn(&format!(
+        Status::Warn => darkmux_types::style::warn(&render(format!(
             "● needs attention — {}",
             headline(Status::Warn).unwrap_or_else(|| "see the warnings below".into())
-        )),
-        Status::Fail => darkmux_types::style::error(&format!(
+        ))),
+        Status::Fail => darkmux_types::style::error(&render(format!(
             "● broken — {}",
             headline(Status::Fail).unwrap_or_else(|| "see the failures below".into())
-        )),
+        ))),
     }
 }
 
@@ -4159,6 +4346,240 @@ pub fn print_report(r: &DoctorReport, verbose: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Visible text only — the marker and hint carry ANSI escapes whose bytes
+    /// must not count toward a width assertion.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_verdict_banner_is_one_line_however_long_the_worst_message_is() {
+        // The banner quotes the highest-severity check's message. The real
+        // `mission config registry` finding concatenates one full explanation
+        // per affected config — measured at 9,726 characters, the same ~600
+        // char paragraph 15 times. Wrapping it faithfully filled fifty lines
+        // of the operator's screen with a restatement of what the check line
+        // below already says. A banner is a HEADLINE: one line, always.
+        let huge = std::iter::repeat("some very wordy finding text about a config")
+            .take(200)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let r = DoctorReport {
+            checks: vec![Check {
+                name: "mission config registry".into(),
+                status: Status::Warn,
+                message: huge,
+                hint: None,
+            }],
+        };
+        for width in [56usize, 80, 100, 200] {
+            let banner = strip_ansi(&verdict_banner_at(&r, width));
+            assert_eq!(banner.lines().count(), 1, "width {width}: banner must be ONE line");
+            assert!(
+                banner.chars().count() <= width,
+                "width {width}: banner is {} chars: {banner:?}",
+                banner.chars().count()
+            );
+            assert!(banner.ends_with('…'), "a truncated banner must say so: {banner:?}");
+        }
+    }
+
+    #[test]
+    fn a_short_verdict_banner_is_not_truncated() {
+        let r = DoctorReport {
+            checks: vec![Check {
+                name: "daemon".into(),
+                status: Status::Warn,
+                message: "not reachable".into(),
+                hint: None,
+            }],
+        };
+        let banner = strip_ansi(&verdict_banner_at(&r, 100));
+        assert_eq!(banner, "● needs attention — daemon: not reachable");
+        assert!(!banner.ends_with('…'), "nothing was cut, so nothing may claim it was");
+    }
+
+    // ── (#2003) Grouped registry findings ───────────────────────────────
+
+    #[test]
+    fn identical_findings_state_their_explanation_once() {
+        // Measured on a real machine: 15 configs each trailing the binary's
+        // mission-config schema by one minor produced 15 copies of the SAME
+        // ~600-character explanation — a 9,726-character check message that
+        // wrapped to roughly sixty lines. The finding is one fact about
+        // fifteen documents, not fifteen facts.
+        let text = "user-tier copy declares schema 2.2, but this binary's is 2.3 — \
+                    a long shared explanation that is identical for every document";
+        let findings: Vec<(String, String)> = ["p5-gate-coder", "pr-approve", "pr-list"]
+            .iter()
+            .map(|id| ((*id).to_string(), text.to_string()))
+            .collect();
+        let out = summarize_findings(17, &findings);
+
+        assert_eq!(
+            out.matches("a long shared explanation").count(),
+            1,
+            "the shared explanation must appear exactly once: {out}"
+        );
+        for id in ["p5-gate-coder", "pr-approve", "pr-list"] {
+            assert!(out.contains(id), "every affected id must still be named: {out}");
+        }
+        assert!(out.contains("17 mission config(s) registered"), "{out}");
+        assert!(out.contains("3 issue(s)"), "the issue count is per document, not per group: {out}");
+    }
+
+    #[test]
+    fn distinct_findings_are_each_reported_with_their_own_id() {
+        let findings = vec![
+            ("alpha".to_string(), "a dangling depends_on".to_string()),
+            ("bravo".to_string(), "an empty id".to_string()),
+        ];
+        let out = summarize_findings(2, &findings);
+        assert!(out.contains("alpha") && out.contains("a dangling depends_on"), "{out}");
+        assert!(out.contains("bravo") && out.contains("an empty id"), "{out}");
+        assert!(out.contains("2 issue(s)"), "{out}");
+    }
+
+    #[test]
+    fn grouping_collapses_length_not_information() {
+        let text = "x".repeat(600);
+        let many: Vec<(String, String)> =
+            (0..15).map(|i| (format!("cfg-{i}"), text.clone())).collect();
+        let grouped = summarize_findings(17, &many);
+        let ungrouped: usize = many.iter().map(|(i, t)| i.len() + t.len() + 6).sum();
+        assert!(
+            grouped.len() < ungrouped / 5,
+            "grouping must actually shorten the message: {} vs {ungrouped}",
+            grouped.len()
+        );
+        for i in 0..15 {
+            assert!(grouped.contains(&format!("cfg-{i}")), "id cfg-{i} was lost");
+        }
+    }
+
+    // ── (#1995) Output width ────────────────────────────────────────────
+    //
+    // `doctor` was the only panel verb that ignored the width the caller
+    // asked for. `crates/darkmux-serve/src/panel.rs` sets `COLUMNS` from the
+    // client's own measurement, and `run list`/`flow status`/`config list`
+    // all honor it; doctor emitted a 2031-character line at every width, so
+    // the console panel overflowed its scroller by 533px at a 1440 viewport
+    // and 1419px on a phone. These pin the wrap, not the prose.
+
+    #[test]
+    fn wrap_hanging_leaves_a_short_line_alone() {
+        let out = wrap_hanging("already short", 40, 4);
+        assert_eq!(out, vec!["already short".to_string()]);
+    }
+
+    #[test]
+    fn wrap_hanging_never_exceeds_the_width() {
+        let long = "a darkmux serve daemon is running a DIFFERENT build than this binary \
+                    so anything you verify against it is testing that build, not this one";
+        for width in [40usize, 60, 80, 100, 200] {
+            for line in wrap_hanging(long, width, 8) {
+                assert!(
+                    line.chars().count() <= width,
+                    "width {width}: line of {} chars exceeds it: {line:?}",
+                    line.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_hanging_indents_continuations_but_not_the_first_line() {
+        let out = wrap_hanging("one two three four five six seven eight nine", 20, 6);
+        assert!(out.len() > 1, "expected a wrap at width 20: {out:?}");
+        assert!(!out[0].starts_with(' '), "first line must not be indented: {:?}", out[0]);
+        for cont in &out[1..] {
+            assert!(cont.starts_with("      "), "continuation must carry the indent: {cont:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_hanging_keeps_every_word_and_their_order() {
+        let text = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
+        let joined = wrap_hanging(text, 24, 3)
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined, text, "wrapping must not drop, duplicate or reorder words");
+    }
+
+    #[test]
+    fn wrap_hanging_emits_an_overlong_word_rather_than_looping() {
+        // A path or model id with no break opportunity must still terminate
+        // and still appear. It may exceed the width; it may not vanish.
+        let word = "darkmux:qwen3.6-35b-a3b-turboquant-mlx-with-a-very-long-suffix";
+        let out = wrap_hanging(&format!("see {word} now"), 20, 2);
+        assert!(out.iter().any(|l| l.contains(word)), "the long word must survive: {out:?}");
+        assert!(out.len() < 12, "must not fragment endlessly: {out:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn output_width_reads_columns_and_clamps_it() {
+        let prev = std::env::var("COLUMNS").ok();
+        std::env::set_var("COLUMNS", "72");
+        assert_eq!(output_width(), 72, "an explicit COLUMNS must be honored");
+        std::env::set_var("COLUMNS", "5");
+        assert!(output_width() >= 40, "a nonsense-narrow COLUMNS must clamp up");
+        std::env::set_var("COLUMNS", "100000");
+        assert!(output_width() <= 200, "a nonsense-wide COLUMNS must clamp down");
+        std::env::set_var("COLUMNS", "not-a-number");
+        assert_eq!(output_width(), 100, "an unparsable COLUMNS falls back to the default");
+        std::env::remove_var("COLUMNS");
+        assert_eq!(output_width(), 100, "no COLUMNS falls back to the default");
+        if let Some(v) = prev {
+            std::env::set_var("COLUMNS", v);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_doctor_message_the_length_of_the_real_one_is_wrapped() {
+        // The regression: the daemon-freshness check's real message. Before
+        // the fix this rendered as ONE line regardless of COLUMNS.
+        let prev = std::env::var("COLUMNS").ok();
+        std::env::set_var("COLUMNS", "100");
+        let c = Check {
+            name: "daemon freshness".into(),
+            status: Status::Warn,
+            message: "a darkmux serve daemon is running a DIFFERENT build (2.11.0) than this \
+                      binary (2.12.0) — it serves its in-memory code until restarted, so \
+                      anything you verify against it is testing that build, not this one"
+                .into(),
+            hint: Some(
+                "restart it: stop the running `darkmux serve` (Ctrl-C in its terminal, or \
+                 `pkill -f 'darkmux serve'`) and start it again"
+                    .into(),
+            ),
+        };
+        for line in render_check_block(&c, output_width()) {
+            let visible = strip_ansi(&line).chars().count();
+            assert!(visible <= 100, "line of {visible} visible chars exceeds COLUMNS=100: {line:?}");
+        }
+        std::env::remove_var("COLUMNS");
+        if let Some(v) = prev {
+            std::env::set_var("COLUMNS", v);
+        }
+    }
+
     use super::*;
 
     // ─── (#1685) check_gh_allowlist — resolved state + provenance ─────────
