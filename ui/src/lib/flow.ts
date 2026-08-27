@@ -327,8 +327,38 @@ export const uidOf = (r: FlowRecord): string => r.machine_uid || "unknown";
 /** `nameOf()` — viewer.html:1112. */
 export function nameOf(data: FlowRecord[], liveMachines: Map<string, PresenceBeat>, m: string): string {
   if (m === "unknown") return "unknown";
-  const r = data.find((x) => uidOf(x) === m && x.machine_id);
-  if (r) return r.machine_id as string;
+  // (#2030) The MOST RECENT name this uid carried, not the first one found.
+  //
+  // This was `data.find(...)`, whose own doc conceded it "picks the first it
+  // finds. That is fine for a label" — it is not. A machine legitimately
+  // carries several names over time (hostname vs the mDNS `.local` form, or a
+  // deliberate rename), and `find` returns whichever the window happens to
+  // list first. Nothing about that tracks WHICH IS CURRENT.
+  //
+  // The operator hit the sharp end: one stray `machine.online` naming a
+  // different machine landed in their flow directory, and their machine page
+  // showed that name from then on — beside their own correct hardware, which
+  // comes from `/machine/specs` and was never wrong. Hundreds of correct
+  // records arrived afterwards and none of them displaced it.
+  //
+  // That is the real defect. A bad record is a thing that happens; a bad
+  // record that CANNOT BE OUTVOTED is a design choice. Reading the newest
+  // means the next correct record heals the display on its own, with no
+  // intervention and no need to find and delete anything.
+  //
+  // Ties and unparsable timestamps keep the earlier winner, so a window with
+  // no usable `ts` behaves exactly as before rather than picking arbitrarily.
+  let best: FlowRecord | null = null;
+  let bestTs = -Infinity;
+  for (const x of data) {
+    if (uidOf(x) !== m || !x.machine_id) continue;
+    const ts = T(x.ts as string);
+    if (best === null || (Number.isFinite(ts) && ts > bestTs)) {
+      best = x;
+      bestTs = Number.isFinite(ts) ? ts : bestTs;
+    }
+  }
+  if (best) return best.machine_id as string;
   const b = liveMachines.get(m);
   return b?.display_name || m;
 }
@@ -347,8 +377,10 @@ export function machineUids(data: FlowRecord[], liveMachines: Map<string, Presen
  * `machine_uid` accumulates records under both. Renaming a machine, or setting
  * `machine_id` explicitly after running without it, does the same thing.
  *
- * `nameOf` has to answer with ONE name, so it picks the first it finds. That is
- * fine for a label and wrong for an identity test: asking "is the name I show
+ * `nameOf` has to answer with ONE name, so it picks the most recent (#2030 —
+ * it used to pick the first found, which let a single stale record outvote
+ * every later one forever). That is right for a LABEL and still wrong for an
+ * identity test: asking "is the name I show
  * for this uid equal to the name specs reports" fails whenever those two
  * happen to be different aliases of the same machine. Identity questions ask
  * this instead, and get a yes if ANY known alias matches. */
