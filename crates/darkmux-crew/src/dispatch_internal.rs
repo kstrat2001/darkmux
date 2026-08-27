@@ -1508,11 +1508,11 @@ fn remote_chat_attempt(
     let _ = std::fs::remove_file(&cfg_path); // ALWAYS remove the secret-bearing file
     let out = result.map_err(HostedCallError::Other)?;
     if !out.status.success() {
-        return Err(HostedCallError::Other(anyhow!(
-            "hosted dispatch curl failed (exit {}): {}",
+        return Err(HostedCallError::Other(anyhow!(describe_curl_failure(
+            url,
             out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+            &String::from_utf8_lossy(&out.stderr)
+        ))));
     }
     parse_hosted_response(&out.stdout)
 }
@@ -4666,9 +4666,16 @@ fn resolve_dispatch_model_internal(
     use darkmux_profiles::profiles::load_registry;
 
     let loaded = load_registry(config_path).map_err(|e| {
+        // No registry at all is the first-run case and the inner message
+        // already says the fix (`darkmux init`). The "fix the file" wrapper
+        // is for a registry that EXISTS and is broken; wrapping a not-found
+        // in it told a fresh user to fix a file they do not have.
+        if e.to_string().contains("no profile registry found") {
+            return anyhow!("{e:#}");
+        }
         anyhow!(
             "darkmux dispatch: profile registry not loadable ({e}). \
-             Fix the registry file named above — this is a hard stop, not a \
+             Fix the registry file named above. This is a hard stop, not a \
              fallback to whatever LMStudio has loaded, since a broken config \
              can't tell us what you intended to dispatch to. (#1269)"
         )
@@ -4744,6 +4751,14 @@ fn resolve_dispatch_model_internal(
             .collect();
     match select_model(role, profile, |id| skill_index.get(id)) {
         Ok(id) => {
+            // (#2038) Before anything else: a placeholder id would reach
+            // LM Studio and come back as "model not found", which reads as
+            // an LM Studio problem. It is an unfilled blank from
+            // `darkmux init`, and the message has to say so. Unconditional,
+            // so a residency-skipping path cannot carry the placeholder on.
+            if is_placeholder_model_id(&id) {
+                bail!(placeholder_model_error(&active_name, &id, &loaded.path));
+            }
             // (#1135) Load the selected model at the profile's DECLARED n_ctx
             // before dispatch — and before the #408 cross-check below, which
             // then finds it resident. Pre-#1135 the dispatch only resolved the
@@ -5209,6 +5224,43 @@ fn load_at_ctx_bounded(model_key: &str, identifier: &str, n_ctx: u32) -> Result<
 /// `anyhow` result — the RAM-exhaustion case becomes a clear, named error, not a
 /// hang or silent degrade. Pure so the message mapping is unit-testable without
 /// a live host.
+/// `darkmux init` writes `profiles.example.json`, whose worker profiles name
+/// `<your-worker-model-id>` (#2038). A fresh install dispatching that id got
+/// "model `<your-worker-model-id>` was not found by LMStudio", which reads as
+/// an LM Studio problem. It is a fill-in-the-blank the operator has not
+/// filled in yet, and the message has to say so.
+pub(crate) fn is_placeholder_model_id(id: &str) -> bool {
+    id.len() > 2 && id.starts_with('<') && id.ends_with('>')
+}
+
+pub(crate) fn placeholder_model_error(profile: &str, id: &str, registry: &std::path::Path) -> String {
+    format!(
+        "darkmux: profile `{profile}` still names the placeholder `{id}` that `darkmux init` \
+         wrote. Edit {} and replace it with a model id from `lms ls` (a model you have \
+         downloaded in LM Studio), then retry. (#2038)",
+        registry.display()
+    )
+}
+
+/// The curl exit code for "could not connect" (CURLE_COULDNT_CONNECT).
+const CURL_COULDNT_CONNECT: i32 = 7;
+
+/// One sentence a first-run user can act on. The same helper serves LM
+/// Studio (the local single-shot path, `single_shot.rs`) and hosted
+/// endpoints, so it never calls the target "hosted": it names the URL and,
+/// for a refused connection, the server that most likely is not running.
+pub(crate) fn describe_curl_failure(url: &str, exit: i32, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if exit == CURL_COULDNT_CONNECT {
+        format!(
+            "could not connect to {url}: {stderr}. If this is LM Studio, its local server is \
+             not running: start it from the Developer tab, or run `lms server start`, then retry."
+        )
+    } else {
+        format!("chat request to {url} failed (curl exit {exit}): {stderr}")
+    }
+}
+
 fn map_load_result(
     result: Result<darkmux_gestalt::LoadReport, darkmux_gestalt::HostError>,
     model_key: &str,
@@ -5229,8 +5281,16 @@ fn map_load_result(
              the machine is just slow. (#1139/#1276)"
         ),
         Err(HostError::UnknownModel { model_key }) => bail!(
-            "darkmux: model `{model_key}` was not found by LMStudio at load time — check the \
-             id against `lms ls`. (#1139)"
+            "darkmux: model `{model_key}` was not found by LMStudio at load time. Check the id \
+             against `lms ls`; if it is not there, download it in LM Studio or point the \
+             profile at a model you have. (#1139)"
+        ),
+        // A command that failed to run or exited non-zero already carries
+        // its own detail (a missing `lms`, a load error text). Guessing
+        // "insufficient RAM" on top of it sent first-run users after the
+        // wrong problem.
+        Err(HostError::CommandFailed { detail }) => bail!(
+            "darkmux: loading `{model_key}` at n_ctx={n_ctx} failed: {detail} (#1139)"
         ),
         Err(e) => bail!(
             "darkmux: loading `{model_key}` at n_ctx={n_ctx} failed: {e}. Likely insufficient \

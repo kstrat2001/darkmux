@@ -1276,6 +1276,12 @@ async fn run_no_slash_route(
         crate::radio::RouteDecision::Refuse { reason } => {
             answer_no_slash_refusal(session_id, text, &reason, cwd, cx, seat, sessions).await
         }
+        // Not a refusal: the routing seat could not run at all. The answering
+        // seat would fail the same way, so say it once and stop.
+        crate::radio::RouteDecision::Unavailable { error } => {
+            cx.send_notification(agent_chunk(session_id, format!("darkmux: could not reach a model.\n{error}")))?;
+            Ok(())
+        }
         crate::radio::RouteDecision::Route { command, args } => {
             cx.send_notification(agent_chunk(
                 session_id,
@@ -2624,6 +2630,47 @@ mod tests {
             flow_contents.contains("please give me the fixture"),
             "the flow record must carry the source text: {flow_contents}"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_slash_unavailable_prints_once_and_never_reaches_the_answering_seat() {
+        // First-run probes (2026-08-28): with no registry / a placeholder
+        // model / no `lms` / the server down, the routing seat fails, the
+        // failure was recast as a "refusal", the answering seat ran and
+        // failed identically, and the user read the same error twice. The
+        // answerer here PANICS if called: that is the assertion.
+        let crew_tmp = tempfile::TempDir::new().unwrap();
+        let _crew_guard = EnvGuard::set("DARKMUX_CREW_DIR", crew_tmp.path());
+        let flows_tmp = tempfile::TempDir::new().unwrap();
+        let _flows_guard = EnvGuard::set("DARKMUX_FLOWS_DIR", flows_tmp.path());
+        write_echo_fixture(crew_tmp.path(), "echo-fixture", "fixture output");
+
+        let router = |_msg: &str| -> Result<String> {
+            Err(anyhow::anyhow!("darkmux: profile `balanced` still names the placeholder `<your-worker-model-id>`"))
+        };
+        let answerer = |_msg: &str, _overrides: &crate::radio_answer::AnswererOverrides| -> Result<String> {
+            panic!("the answering seat must not run when the routing seat could not reach a model")
+        };
+        let (mut writer, mut reader) = spawn_test_agent(router, answerer);
+        let cwd = std::env::temp_dir();
+        let session_id = handshake(&mut writer, &mut reader, &cwd).await;
+
+        send_prompt(&mut writer, &session_id, "what can you do?").await;
+
+        let reply = recv_json(&mut reader).await;
+        let text = chunk_text(&reply);
+        assert!(text.contains("could not reach a model"), "{text}");
+        assert!(text.contains("<your-worker-model-id>"), "the producer's own fix line must reach the user: {text}");
+        assert_eq!(text.matches("<your-worker-model-id>").count(), 1, "printed once, not per seat: {text}");
+
+        let final_response = recv_json(&mut reader).await;
+        assert_end_turn(&final_response);
+
+        let day = darkmux_flow::day_utc_now();
+        let flow_path = flows_tmp.path().join(format!("{day}.jsonl"));
+        let flow_contents = std::fs::read_to_string(&flow_path).expect("wall 4's flow record file must exist");
+        assert!(flow_contents.contains("\"decision\":\"unavailable\""), "{flow_contents}");
     }
 
     /// (#1698 Packet B2) A router refusal routes to the ANSWERING seat — a

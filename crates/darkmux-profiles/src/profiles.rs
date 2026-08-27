@@ -21,6 +21,18 @@ pub fn default_locations() -> Vec<PathBuf> {
         out.push(home.join(".darkmux").join("profiles.json"));
         out.push(home.join(".config").join("darkmux").join("profiles.json"));
     }
+    // Running from $HOME (the first-run case) makes cwd/.darkmux and
+    // ~/.darkmux the same path; the "Looked in" list should not say it twice.
+    dedupe_paths(out)
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    for p in paths {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
     out
 }
 
@@ -770,4 +782,15 @@ mod tests {
         );
     }
 
+
+    /// Running from $HOME (the first-run case) made cwd/.darkmux and
+    /// ~/.darkmux the same path, so the "Looked in" list printed it twice.
+    #[test]
+    fn candidate_listing_has_no_duplicate_paths() {
+        let a = std::path::PathBuf::from("/h/.darkmux.json");
+        let b = std::path::PathBuf::from("/h/.darkmux/profiles.json");
+        let out = dedupe_paths(vec![a.clone(), b.clone(), b.clone(), a.clone()]);
+        assert_eq!(out, vec![a, b]);
+    }
 }
+

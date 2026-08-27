@@ -5060,3 +5060,60 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         "absence is the signal; a zeroed block would erase it: {out}"
     );
 }
+
+    // ── first-run failure modes (2026-08-28 probes) ──────────────────────
+
+    #[test]
+    fn placeholder_model_ids_are_recognized() {
+        assert!(is_placeholder_model_id("<your-worker-model-id>"));
+        assert!(is_placeholder_model_id("<anything>"));
+        assert!(!is_placeholder_model_id("qwen/qwen3.6-35b-a3b"));
+        assert!(!is_placeholder_model_id("<not-closed"));
+        assert!(!is_placeholder_model_id(""));
+    }
+
+    #[test]
+    fn placeholder_model_error_names_the_profile_the_file_and_the_fix() {
+        let msg = placeholder_model_error("balanced", "<your-worker-model-id>", std::path::Path::new("/home/x/.darkmux/profiles.json"));
+        assert!(msg.contains("`balanced`"), "{msg}");
+        assert!(msg.contains("/home/x/.darkmux/profiles.json"), "{msg}");
+        assert!(msg.contains("lms ls"), "{msg}");
+        assert!(msg.contains("darkmux init"), "{msg}");
+    }
+
+    #[test]
+    fn a_missing_lms_binary_is_not_blamed_on_ram() {
+        use darkmux_gestalt::HostError;
+        let err = map_load_result(
+            Err(HostError::CommandFailed { detail: "`/nonexistent/lms` was not found".into() }),
+            "qwen3-4b",
+            32000,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("was not found"), "{err}");
+        assert!(!err.to_lowercase().contains("insufficient ram"), "a spawn failure is not a RAM problem: {err}");
+    }
+
+    #[test]
+    fn an_unknown_model_error_says_how_to_get_one() {
+        use darkmux_gestalt::HostError;
+        let err = map_load_result(Err(HostError::UnknownModel { model_key: "nobody/7b".into() }), "nobody/7b", 32000)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nobody/7b"), "{err}");
+        assert!(err.contains("lms ls"), "{err}");
+        assert!(err.to_lowercase().contains("download"), "{err}");
+    }
+
+    #[test]
+    fn a_connection_refusal_names_the_url_and_the_server_to_start() {
+        let msg = describe_curl_failure("http://127.0.0.1:1234/v1/chat/completions", 7, "curl: (7) Failed to connect");
+        assert!(msg.contains("http://127.0.0.1:1234"), "{msg}");
+        assert!(msg.contains("LM Studio"), "{msg}");
+        assert!(msg.contains("lms server start"), "{msg}");
+        assert!(!msg.contains("hosted"), "a local URL is not a hosted endpoint: {msg}");
+        let other = describe_curl_failure("https://api.example.com/v1/chat/completions", 22, "curl: (22) 401");
+        assert!(other.contains("exit 22") && other.contains("401"), "{other}");
+        assert!(!other.contains("lms server start"), "an HTTP error is not a connection refusal: {other}");
+    }
