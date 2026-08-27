@@ -310,7 +310,7 @@ Cross-layer telemetry is always-on (#557): no flag, no sidecar file. The interna
 
 View it in the observability viewer the daemon serves: run `darkmux serve` and open `http://localhost:8765/`. The viewer reads live flow records straight from the daemon; there's nothing to drag and drop. A demo instance lives at [darkmux.com/demo](https://darkmux.com/demo).
 
-![The darkmux fleet dashboard: 6,029,666 tokens run locally against zero cloud tokens over 24 hours, broken into 269k generated, 364k fresh input and 5.7M re-read input across 10 dispatches on a three-Mac fleet, with an orchestrator note closing the day.](media/fleet.png)
+![The darkmux dashboard, fleet view: 6,029,666 tokens run locally against zero cloud tokens over 24 hours, broken into 269k generated, 364k fresh input and 5.7M re-read input across 10 dispatches on a three-Mac fleet, with an orchestrator note closing the day.](media/fleet.png)
 
 ## Why this exists: empirical motivation
 
