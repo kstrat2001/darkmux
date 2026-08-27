@@ -1607,7 +1607,7 @@ pub fn run(
                         tool_seq as u32,
                         &call.function.name,
                         &call.function.arguments,
-                        result.len(),
+                        &result,
                         tool_ok,
                     );
                     // (#466/#469) Proof-of-work signal for the inactivity-

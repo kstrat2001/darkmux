@@ -3867,6 +3867,64 @@
 
     // ─── #237: bounding container-written trajectory fields at ingest ──
     #[test]
+    fn the_verdict_at_the_tail_survives_result_truncation() {
+        // (#2007) The whole reason a RESULT elides the MIDDLE rather than the
+        // tail: a test run's verdict is its last line. Head-only truncation
+        // keeps the setup noise and discards the one line a diagnosis needs.
+        let verdict = "Tests: 2 failed, 86 passed, 88 total";
+        let body = format!(
+            "exit: 1\n--- stdout ---\n{}\n{verdict}\n",
+            "PASS tests/services/noise.test.ts\n".repeat(4000)
+        );
+        assert!(body.len() > 4096, "fixture must actually exceed the cap");
+
+        let out = cap_result_middle(&body, 4096);
+        assert!(
+            out.contains(verdict),
+            "the verdict at the TAIL must survive — that is the point of eliding the middle"
+        );
+        assert!(out.contains("exit: 1"), "the head must survive too");
+        assert!(
+            out.contains("middle elided"),
+            "the cut must announce itself in-band, never silently"
+        );
+        assert!(
+            out.contains(&format!("{} chars", body.chars().count())),
+            "the marker must carry the TRUE original size"
+        );
+
+        // The behaviour this replaces — prove it would have lost the verdict,
+        // so this test cannot pass for the wrong reason.
+        assert!(
+            !cap_str(&body, 4096).contains(verdict),
+            "guard: if head-only truncation kept the verdict, this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_result_under_the_cap_is_returned_untouched() {
+        let small = "exit: 0\n--- stdout ---\nok\n";
+        assert_eq!(cap_result_middle(small, 4096), small);
+        let v = serde_json::Value::String(small.to_string());
+        assert_eq!(cap_json_result(Some(&v), 4096), v);
+    }
+
+    #[test]
+    fn result_elision_never_splits_a_codepoint() {
+        // Multibyte throughout, including caps small enough to hit the
+        // degenerate path where head and tail would otherwise overlap.
+        let s = "héllo wörld ".repeat(500);
+        for cap in [32usize, 64, 128, 512, 4096] {
+            let out = cap_result_middle(&s, cap);
+            let v = serde_json::Value::String(out);
+            assert!(
+                serde_json::to_string(&v).is_ok(),
+                "cap {cap} produced text that will not serialize"
+            );
+        }
+    }
+
+    #[test]
     fn cap_json_str_bounds_short_fields() {
         // A container could write a pathologically large tool_name / finish_reason.
         let huge = "z".repeat(MAX_TRAJ_FIELD_BYTES + 5000);

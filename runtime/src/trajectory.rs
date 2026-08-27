@@ -492,20 +492,32 @@ impl Trajectory {
         }));
     }
 
-    /// tool.completed — one per executed tool call. Records the tool name,
-    /// the ARGUMENTS (capped — a search pattern / file path / command, so the
-    /// operator can recall WHAT the model did, not just that it did something),
-    /// and arg/result SIZES. Arguments are the small, high-value input (bounded
-    /// by `MAX_TOOL_ARGS_CHARS`); the result is kept as a size only — a file
-    /// read is large and re-derivable, so persisting it would bloat the
-    /// trajectory for no recall value.
+    /// tool.completed — one per executed tool call. Records the tool name, the
+    /// ARGUMENTS (capped by `MAX_TOOL_ARGS_CHARS`), and the RESULT.
+    ///
+    /// (#2007) The result used to be a size only, on the rationale that "a
+    /// file read is large and re-derivable". That holds for `read` and not for
+    /// `bash`: a test run's output cannot be re-derived later because the state
+    /// it observed has moved on. The cost of that asymmetry was that a failed
+    /// dispatch could not be diagnosed after the fact — the tool-failure
+    /// cascade detector fired on three `bash` failures in the 3.0.0 release
+    /// dogfood and the evidence for WHY was already discarded. Meanwhile
+    /// `model.reasoning` persisted the model's thinking verbatim, so the
+    /// trajectory kept one side of a two-sided conversation.
+    ///
+    /// Stored in FULL, deliberately (operator call): measured across 455 real
+    /// tool calls the median result is 951 chars and the whole day's output is
+    /// 1.2 MB, which is the "record exhaustively, display selectively" trade —
+    /// a consumer can always truncate, and a consumer cannot un-discard.
+    /// `result_chars` remains the TRUE length so that if a cap is ever
+    /// introduced its truncation is visible rather than silent.
     pub fn append_tool_completed(
         &mut self,
         seq: u32,
         tool_seq: u32,
         tool_name: &str,
         args: &str,
-        result_chars: usize,
+        result: &str,
         ok: bool,
     ) {
         // `ok` discriminates success from failure (#469). Additive,
@@ -514,6 +526,11 @@ impl Trajectory {
         // model fast-failing with varying tool calls can't keep the
         // inactivity deadline alive with a stream of failed calls.
         let args_chars = args.chars().count();
+        // The TRUE length, computed from the result itself — never passed in.
+        // A caller-supplied length can drift from the text beside it, and this
+        // field's whole job (#2007) is to make a future cap's truncation
+        // visible rather than silent.
+        let result_chars = result.chars().count();
         self.write_event(&serde_json::json!({
             "type": "tool.completed",
             "seq": seq,
@@ -525,6 +542,7 @@ impl Trajectory {
             "args": cap_chars(args, MAX_TOOL_ARGS_CHARS),
             "args_chars": args_chars,
             "result_chars": result_chars,
+            "result": result,
             "ok": ok,
             "ts": unix_ms(),
         }));
@@ -751,14 +769,51 @@ mod tests {
     }
 
     #[test]
+    fn tool_completed_persists_the_result_not_just_its_length() {
+        // (#2007) The result used to be recorded as a SIZE only. That made a
+        // failed dispatch undiagnosable after the fact: the tool-failure
+        // cascade detector would fire on three `bash` failures and the
+        // evidence for WHY was already gone.
+        //
+        // The original rationale — "a file read is large and re-derivable" —
+        // holds for `read` and not for `bash`: a test run's output cannot be
+        // re-derived later, because the state it observed has moved on.
+        let ws = tempfile::Builder::new().prefix("traj-test-result").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        let failure = "exit: 1\n--- stdout ---\nTests: 2 failed, 86 passed\n--- stderr ---\n";
+        t.append_tool_completed(1, 0, "bash", "{\"command\":\"npm test\"}", failure, false);
+        drop(t);
+
+        let body = fs::read_to_string(
+            ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE),
+        )
+        .unwrap();
+        let line: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+
+        assert_eq!(
+            line["result"], serde_json::json!(failure),
+            "the result text must be persisted verbatim, not summarized"
+        );
+        assert_eq!(
+            line["result_chars"],
+            serde_json::json!(failure.chars().count()),
+            "result_chars stays the TRUE length, so a future cap is visible rather than silent"
+        );
+        assert!(
+            line["result"].as_str().unwrap().contains("2 failed"),
+            "the diagnosis has to survive: {}", line["result"]
+        );
+    }
+
+    #[test]
     fn tool_completed_emits_ok_discriminator() {
         // (#469) tool.completed carries `ok` so the host watchdog can
         // distinguish a successful tool call (proof-of-work, resets the
         // deadline) from a failed one (does not).
         let ws = tempfile::Builder::new().prefix("traj-test-ok").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_tool_completed(1, 0, "bash", "{\"command\":\"ls\"}", 1000, true);
-        t.append_tool_completed(2, 1, "bash", "{\"command\":\"cat x\"}", 80, false);
+        t.append_tool_completed(1, 0, "bash", "{\"command\":\"ls\"}", "a.txt\nb.txt\n", true);
+        t.append_tool_completed(2, 1, "bash", "{\"command\":\"cat x\"}", "exit: 1\n--- stderr ---\nno such file\n", false);
         drop(t);
 
         let body = fs::read_to_string(
@@ -787,7 +842,7 @@ mod tests {
         let ws = tempfile::Builder::new().prefix("traj-test-cap").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         let big = "x".repeat(MAX_TOOL_ARGS_CHARS + 200);
-        t.append_tool_completed(1, 0, "write", &big, 0, true);
+        t.append_tool_completed(1, 0, "write", &big, "", true);
         drop(t);
         let line: serde_json::Value = serde_json::from_str(
             fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE))
