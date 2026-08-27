@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="dm-frame-grad" x1="16" y1="10" x2="48" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#c084fc" />
+      <stop offset="50%" stop-color="#818cf8" />
+      <stop offset="100%" stop-color="#2dd4bf" />
+    </linearGradient>
+    <linearGradient id="dm-line-1" x1="6" y1="18" x2="36" y2="31" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#818cf8" />
+    </linearGradient>
+    <linearGradient id="dm-line-2" x1="6" y1="27" x2="36" y2="32" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2dd4bf" />
+      <stop offset="100%" stop-color="#818cf8" />
+    </linearGradient>
+    <linearGradient id="dm-line-3" x1="6" y1="37" x2="36" y2="32" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#c084fc" />
+      <stop offset="100%" stop-color="#818cf8" />
+    </linearGradient>
+    <linearGradient id="dm-line-4" x1="6" y1="46" x2="36" y2="33" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#e879f9" />
+      <stop offset="100%" stop-color="#818cf8" />
+    </linearGradient>
+    <linearGradient id="dm-out-grad" x1="36" y1="32" x2="58" y2="32" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#818cf8" />
+      <stop offset="100%" stop-color="#2dd4bf" />
+    </linearGradient>
+  </defs>
+
+  <!-- MUX "D" Outer Shell -->
+  <path
+    d="M18 12 L28 12 C40 12 48 20 48 32 C48 44 40 52 28 52 L18 52 Z"
+    fill="rgba(168, 85, 247, 0.12)"
+    stroke="url(#dm-frame-grad)"
+    stroke-width="2.5"
+    stroke-linejoin="round"
+    stroke-linecap="round"
+  />
+
+  <!-- Internal MUX Trapezoid boundary guideline -->
+  <path
+    d="M18 14 L34 22 L34 42 L18 50"
+    fill="rgba(45, 212, 191, 0.06)"
+    stroke="url(#dm-frame-grad)"
+    stroke-width="1.5"
+    stroke-dasharray="2 2"
+    opacity="0.4"
+  />
+
+  <!-- Input Lines (Multiplexer Inputs converging into center output) -->
+  <!-- Channel 1 -->
+  <path d="M6 18 L18 18 L36 31" stroke="url(#dm-line-1)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="6" cy="18" r="1.5" fill="#38bdf8" />
+
+  <!-- Channel 2 -->
+  <path d="M6 27 L18 27 L36 32" stroke="url(#dm-line-2)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="6" cy="27" r="1.5" fill="#2dd4bf" />
+
+  <!-- Channel 3 -->
+  <path d="M6 37 L18 37 L36 32" stroke="url(#dm-line-3)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="6" cy="37" r="1.5" fill="#c084fc" />
+
+  <!-- Channel 4 -->
+  <path d="M6 46 L18 46 L36 33" stroke="url(#dm-line-4)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="6" cy="46" r="1.5" fill="#e879f9" />
+
+  <!-- Convergence Node -->
+  <circle cx="36" cy="32" r="2.5" fill="#2dd4bf" />
+
+  <!-- Single MUX Output Line -->
+  <path d="M36 32 L58 32" stroke="url(#dm-out-grad)" stroke-width="2.5" stroke-linecap="round" />
+  <circle cx="58" cy="32" r="1.5" fill="#2dd4bf" />
+</svg>
