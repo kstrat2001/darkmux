@@ -12,6 +12,94 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.0.0] - 2026-08-27
+
+A major, and the reason is one rename.
+
+The gate that decides whether a mission config may shell out on your behalf was
+named for GitHub. The MECHANISM never was — `GhConfig`'s own doc already said
+"GitHub never enters darkmux core … just a list of operator-chosen VERB NAMES",
+and the check did nothing but compare a string a config declares against a list
+you allowlisted. But the NAME is what people build on: a GitLab user was
+allowlisting `mr-merge` under `gh.allowed`, and a config gating `terraform
+apply` — which wants this gate exactly as much — had to declare a GitHub-shaped
+field to get a check with nothing to do with GitHub.
+
+Renaming it now cost one schema major and **zero migrations**, because no
+built-in and no user document had declared the field yet. The same rename once
+it has users costs a real migration. That is the whole argument for a major
+release with an empirically empty blast radius.
+
+Alongside it: the viewer stopped rendering in Courier for almost everyone, and
+`doctor` stopped running off the side of the screen.
+
+### BREAKING
+
+- **`MissionConfig.gh_verb` is now `cmd`** — mission-config schema `2.3` → `3.0`.
+  A document still declaring `gh_verb` is a loud validation **Error**, never a
+  silent overflow into `extras`. That distinction is load-bearing: this gate
+  fails OPEN for configs that declare nothing (correct — most configs touch
+  nothing outside darkmux), so a document left on the old name would silently
+  lose its gate and run the shell-out it was protecting as if you had approved
+  it. Rename the field and set `schema_version` to `"3.0"`.
+- **`gh.enabled` / `gh.allowed` are now `cmd.enabled` / `cmd.allowed`** — config
+  schema `1.10` → `1.11`. `darkmux config set gh.enabled …` reports
+  `unknown config key` with a suggestion rather than failing obscurely.
+- **`DARKMUX_GH_ENABLED` / `DARKMUX_GH_ALLOWED` are now `DARKMUX_CMD_ENABLED` /
+  `DARKMUX_CMD_ALLOWED`.**
+
+`FLOW_SCHEMA_VERSION` stays at `1.20.0` — nothing on the wire changed shape, so
+a peer on 2.12.0 still reads this machine's records.
+
+### Fixed
+
+- **The viewer rendered in Courier for anyone without JetBrains Mono installed**,
+  which is nearly everyone: the CSS named that font 89 times and shipped no
+  webfont for it. Measured with CDP, the alternate `ui-monospace, SFMono-Regular,
+  monospace` stack resolved to Courier too — neither `ui-monospace` nor
+  `SFMono-Regular` resolves in Chrome on macOS. One `--font-mono` token behind
+  all 107 declarations, landing on Menlo/Consolas/Liberation Mono. No font is
+  packaged; every family is already present on its platform.
+- **The type was too small to read.** 115 of ~167 font declarations were 11px or
+  smaller, against a 16px browser default. One `--fs-scale` knob behind 169
+  declarations, as a uniform multiplier so every existing size relationship is
+  preserved exactly.
+- **`.machine-lens` was never centered** — `max-width` with no `margin-inline`,
+  so every pixel the cap withheld pooled on one side: 16px of gutter left and
+  224px right at 1440.
+- **A count could be severed from its unit.** The limit-source strip is a flat
+  text run, and at the wider type the browser broke *inside* a value, rendering
+  `unpriced 0` on one line and `models` on the next.
+- **The savings headline could overflow a phone.** Its width is data, and a fixed
+  size assumes a digit count — at 320px the 9-digit total ran 31px past the
+  viewport. Now fluid, so it cannot overflow at any total.
+- **`darkmux doctor` ignored the width it was asked for.** `panel.rs` passes the
+  client's measured width as `COLUMNS` and every other panel verb honors it;
+  doctor emitted a 2031-character line at every width, overflowing the console
+  panel by 533px at a 1440 viewport. Now wrapped with a hanging indent — the
+  verdict banner too, which quotes the worst check's whole message and was
+  therefore the single longest line it emitted.
+- **The verdict banner is one line.** It had quoted the worst check's entire
+  message — measured at 9,726 characters across 50 lines.
+- **Identical registry findings state their explanation once.** 15 configs
+  trailing the schema by one minor produced the same ~600-character paragraph
+  fifteen times; it is one fact about fifteen documents, not fifteen facts.
+- **The console asked for the wrong render width.** `panelCols()` divided by a
+  hardcoded 7.2px per character, calibrated against the old 12px mono — at the
+  new size a 1406px panel asked for 191 columns when 164 fit. It measures the
+  element's own font now.
+
+### Added
+
+- **`DESIGN.md` covers the command gate and ACP.** ACP had no coverage at all
+  despite being a shipped surface; the section names what is still spike-grade
+  rather than papering over it.
+- **Real screenshots in the guide**, which had zero images across ten pages, and
+  a social card that is no longer two releases stale. Every capture is shot from
+  a fixture fleet by `scripts/demo-env`, so a public page never carries
+  hostnames, tailnet addresses or workspace paths — and so the whole set can be
+  re-shot after a UI change.
+
 ## [2.12.0] - 2026-08-26
 
 The run-detail lens, rebuilt around one question the page could not answer:
@@ -94,6 +182,7 @@ changed shape.
 - The mobile event list has a floor measured in rows rather than a fraction of
   the viewport (#1996).
 
+[3.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.0.0
 [2.12.0]: https://github.com/kstrat2001/darkmux/releases/tag/v2.12.0
 
 ## [2.11.0] - 2026-08-26
