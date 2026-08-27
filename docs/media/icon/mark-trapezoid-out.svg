@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
   <defs>
-    <linearGradient id="dm-s2-grad" x1="14" y1="10" x2="40" y2="54" gradientUnits="userSpaceOnUse">
+    <linearGradient id="dm-s2-grad" x1="19" y1="10" x2="45" y2="54" gradientUnits="userSpaceOnUse">
       <stop offset="0%" stop-color="#c084fc" />
       <stop offset="50%" stop-color="#818cf8" />
       <stop offset="100%" stop-color="#2dd4bf" />
@@ -11,15 +11,26 @@
        do not survive this size, but the relation many-in/one-out does, and
        that relation is the whole idea.
 
-       Spaced 20 units apart, not 14. Closer together they merged into a
-       double stroke below 32px instead of reading as two channels — and two
-       channels IS the message. 20 also lands symmetric inside the
-       trapezoid's 42-unit left edge (11 units clear above and below). -->
-  <path d="M3 22 L14 22" stroke="#38bdf8" stroke-width="4.5" stroke-linecap="round" />
-  <path d="M3 42 L14 42" stroke="#c084fc" stroke-width="4.5" stroke-linecap="round" />
-  <path d="M14 11 L40 23 L40 41 L14 53 Z"
+       Geometry is symmetric on BOTH axes, which is what lets it sit square in
+       a favicon slot:
+
+         inputs   x  8..19   (11 units)
+         body     x 19..45   (26 units)
+         output   x 45..56   (11 units)   -> span 8..56, centre 32
+
+       The output used to run 18 units against the inputs' 11. That reads as a
+       tail rather than a counterpart, and pushed the whole mark left of the
+       viewBox centre.
+
+       Inputs sit 20 apart, not 14: closer together they merged into a double
+       stroke below 32px instead of reading as two channels, and two channels
+       IS the message. 20 also lands symmetric inside the body's 42-unit left
+       edge — 11 clear above, 11 below. -->
+  <path d="M8 22 L19 22" stroke="#38bdf8" stroke-width="4.5" stroke-linecap="round" />
+  <path d="M8 42 L19 42" stroke="#c084fc" stroke-width="4.5" stroke-linecap="round" />
+  <path d="M19 11 L45 23 L45 41 L19 53 Z"
         fill="rgba(129,140,248,0.18)"
         stroke="url(#dm-s2-grad)" stroke-width="5"
         stroke-linejoin="round" stroke-linecap="round" />
-  <path d="M40 32 L58 32" stroke="#2dd4bf" stroke-width="5" stroke-linecap="round" />
+  <path d="M45 32 L56 32" stroke="#2dd4bf" stroke-width="5" stroke-linecap="round" />
 </svg>
