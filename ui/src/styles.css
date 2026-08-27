@@ -516,51 +516,12 @@ body {
    difference is that this port lets the ROW own the height and the column
    stretch into it, so there is no viewport arithmetic to keep in sync.
    The inner `.loglist` still scrolls. */
-/* (#1066) The collapse control + the collapsed rail.
-
-   COLLAPSED IS NOT HIDDEN. `.eventlog--hidden` is `display:none` — a route
-   decided, and nothing is left to click. Collapsed keeps a rail, so the
-   operator decided and can undo it. That difference is the whole feature.
-
-   The children are hidden with `visibility` rather than unmounted, so the
-   detail pane's scroll position, the drag-resize width and keyboard focus
-   all survive a collapse/expand round trip. */
-.eventlog--collapsed {
-  width: 28px;
-  min-width: 28px;
-}
-.eventlog--collapsed > *:not(.eventlog__collapse) {
-  visibility: hidden;
-  pointer-events: none;
-}
-.eventlog__collapse {
-  position: absolute;
-  top: 6px;
-  left: 4px;
-  z-index: 2;
-  width: 20px;
-  height: 20px;
-  padding: 0;
-  line-height: 1;
-  background: var(--panel, #12141c);
-  color: var(--dim);
-  border: 1px solid var(--line, #232838);
-  border-radius: 4px;
-  cursor: pointer;
-  font: 600 12px/1 var(--font-mono);
-}
-.eventlog__collapse:hover { color: var(--fg); }
-/* Focus must stay visible against both the panel and the collapsed rail. */
-.eventlog__collapse:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 1px;
-}
-/* The column is the positioning context for the absolute rail button. */
-.eventlog { position: relative; }
 
 .eventlog {
   width: 380px;
   flex: none;
+  /* Positioning context for the absolute collapse rail (#1066). */
+  position: relative;
   /* VIEWPORT-bounded and sticky, NOT stretched to the row.
      History, because this has now been wrong twice in opposite directions:
      it shipped as a fixed `70vh`, which left dead space below the column on
@@ -595,6 +556,65 @@ body {
   border-left: 1px solid var(--border);
   background: #10141f;
 }
+
+/* (#1066) The collapse control + the collapsed rail.
+
+   COLLAPSED IS NOT HIDDEN. `.eventlog--hidden` is `display:none` — a route
+   decided, and nothing is left to click. Collapsed keeps a rail, so the
+   operator decided and can undo it. That difference is the whole feature.
+
+   The children are hidden with `visibility` rather than unmounted, so the
+   detail pane's scroll position, the drag-resize width and keyboard focus
+   all survive a collapse/expand round trip. */
+/* (#2029) AFTER `.eventlog`, not before. Both selectors are one class, so
+   they have identical specificity and SOURCE ORDER decides — with this block
+   above `.eventlog`, its `width: 380px` won and the collapsed width never
+   applied. The pane hid its content and kept every pixel, which is the worst
+   of both: no events AND no reclaimed space.
+
+   `!important` would also "work" and is the wrong fix: it wins the argument
+   without resolving it, and leaves the next reader with two rules that
+   disagree. Ordering says which one is the exception. */
+.eventlog--collapsed {
+  width: 28px;
+  min-width: 28px;
+  flex: none;
+}
+.eventlog--collapsed > *:not(.eventlog__collapse) {
+  visibility: hidden;
+  pointer-events: none;
+}
+.eventlog__collapse {
+  /* (#2029) IN FLOW, not absolute. Absolute positioning put it on top of the
+     detail pane's first line — it covered the record headline when expanded
+     and the empty-state sentence when there was nothing selected. A control
+     that obscures the content it controls is worse than no control.
+
+     The column is already `display:flex; flex-direction:column`, so a
+     `flex:none` first child gets its own strip and everything else starts
+     below it. That also makes the collapsed state trivial: the strip is the
+     only child still visible, and it is exactly as wide as the rail. */
+  flex: none;
+  align-self: flex-start;
+  margin: 4px 0 0 4px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  line-height: 1;
+  background: var(--panel, #12141c);
+  color: var(--dim);
+  border: 1px solid var(--line, #232838);
+  border-radius: 4px;
+  cursor: pointer;
+  font: 600 12px/1 var(--font-mono);
+}
+.eventlog__collapse:hover { color: var(--fg); }
+/* Focus must stay visible against both the panel and the collapsed rail. */
+.eventlog__collapse:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* (operator, on the phone) The detail panel's height is an INLINE
    `flex-basis` driven by the split-resizer's state — 38% by default. On
    desktop that is legacy's draggable split and the operator can change it.
@@ -639,6 +659,25 @@ body {
     max-height: 88vh;
     border-left: none;
     border-top: 1px solid var(--border);
+  }
+
+  /* (#2029) Collapse is a no-op where the pane STACKS. At this width the
+     column is a full-width band below the stage, so there is no side to
+     collapse to — a 28px rail would be a 28px-tall sliver of nothing. #1066
+     specified this ("the collapse control should be a no-op / hidden where
+     the pane stacks, so it doesn't fight the responsive layout").
+
+     Hiding the control is also what keeps the cascade honest here: the mobile
+     `.eventlog` rule below sets `width: 100%` and, being later than
+     `.eventlog--collapsed`, would win anyway — so a visible control would
+     hide the content and reclaim nothing, which is the exact bug this packet
+     is fixing on desktop. */
+  .eventlog__collapse {
+    display: none;
+  }
+  .eventlog--collapsed > *:not(.eventlog__collapse) {
+    visibility: visible;
+    pointer-events: auto;
   }
 }
 /* `runs`/`console`/`machine` — port of legacy's `body.runs-mode .log,
@@ -748,19 +787,19 @@ body {
   gap: 6px;
   flex: none;
 }
-.eventlog__follow,
-/* (#2018) The active-filter count. Colour is NOT the only channel — the
-   number itself is the signal, so this still reads with colour vision
-   differences or a forced-colours mode, and `aria-label` carries it for a
-   screen reader. */
-.eventlog__fbtn[data-active="1"] {
-  color: var(--accent);
-  border-color: var(--accent);
-}
-.eventlog__fcount {
-  font-variant-numeric: tabular-nums;
-}
+/* (#2029) `.eventlog__follow` belongs HERE, grouped with `.eventlog__fbtn`
+   for the shared button base. A #2018 edit anchored on the first occurrence
+   of `.eventlog__fbtn` — which was the SECOND LINE of this grouped selector —
+   and spliced a new rule into the middle of it. That orphaned
+   `.eventlog__follow` out of its own base styling and grouped it with the
+   active-filter rule instead, so the follow button lost its padding, border
+   and background AND wore a permanent accent border. Its `.on` class still
+   toggled correctly; nothing about the rendering changed with it, which is
+   why it read as a dead control.
 
+   The lesson is the anchor, not the rule: a bare `find()` on a selector name
+   will happily land inside a grouped selector. */
+.eventlog__follow,
 .eventlog__fbtn {
   display: inline-flex;
   align-items: center;
@@ -773,6 +812,18 @@ body {
   background: none;
   font-size: calc(12px * var(--fs-scale));
   line-height: 1;
+}
+
+/* (#2018) The active-filter count. Colour is NOT the only channel — the
+   number itself is the signal, so this still reads with colour vision
+   differences or a forced-colours mode, and `aria-label` carries it for a
+   screen reader. */
+.eventlog__fbtn[data-active="1"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.eventlog__fcount {
+  font-variant-numeric: tabular-nums;
 }
 .eventlog__follow:hover,
 .eventlog__fbtn:hover {
