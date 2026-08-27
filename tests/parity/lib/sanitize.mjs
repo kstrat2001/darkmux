@@ -67,7 +67,13 @@ import { createHash } from "node:crypto";
 // active-redaction vocabulary. `tripwire.mjs` uses a BROADER, independent
 // canary list (see CANARIES below) for verification; this one drives what
 // sanitizeString actively rewrites.
-export const SENTINELS = ["FinHero", "finhero", "SYS-", "SYS_", "ExtraGalaxies", "finsys", "finhub"];
+export const SENTINELS = ["FinHero", "finhero", "SYS-", "SYS_", "ExtraGalaxies", "finsys", "finhub",
+  // The legal entity behind the engagement. Was scrubbed only by
+  // `scripts/demo-env/import_session.py`'s own hand-written copy of this
+  // list, so it was covered THERE and nowhere else — including this
+  // sanitizer and the repo-wide sentinel guard. Folded in when that
+  // duplicate list was removed in favor of reading this one.
+  "Sisters Inspire"];
 
 // Verification-only canary list (QA finding, post-0a review): broader than
 // SENTINELS on purpose. `tripwire.mjs` scans committed output for these as
