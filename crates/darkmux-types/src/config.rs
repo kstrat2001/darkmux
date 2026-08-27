@@ -417,7 +417,7 @@ pub struct RadioConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub answerer_profile: Option<String>,
     /// The RADIO persona's humor dial (0-100), substituted into the
     /// answering seat's `{{humor}}` template placeholder at assembly time
-    /// (`src/radio_answer.rs`). Default 65 — the value the operator's manual
+    /// (`src/radio_answer.rs`). Default `RADIO_HUMOR_DEFAULT` (50; was 65, the value the operator's manual
     /// TARS-persona override file carried before this config knob existed.
     ///
     /// **Deliberately `u64`, not `u8`** — `config set` coerces every `Uint`
@@ -610,7 +610,7 @@ impl DarkmuxConfig {
             radio: Some(RadioConfig {
                 router_profile: Some(String::new()),
                 answerer_profile: Some(String::new()),
-                humor: Some(65),
+                humor: Some(crate::config_access::RADIO_HUMOR_DEFAULT),
                 extras: Default::default(),
             }),
             // (#1475 packet 1) Written as a visible empty `{}` — the operator
