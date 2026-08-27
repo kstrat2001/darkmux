@@ -256,18 +256,30 @@ describe("parseRoute", () => {
   });
 });
 
-// (Chrome packet) `showsEventLog` — verified against the real legacy source
-// + a live computed-style probe (see the function's own doc for the
-// evidence trail); this is the RED-PROVABLE guard that the verified rule,
-// not the packet brief's wrong claim, is what shipped. Break the function
-// (e.g. revert to `route.kind !== "runs" && route.kind !== "machine"`,
-// dropping the console exclusion) and this test for "console" goes red.
+// `showsEventLog`. The original rule was verified against the real legacy
+// source plus a live computed-style probe (`getComputedStyle('.log').display`
+// per lens), and this stayed the red-provable guard that the VERIFIED rule —
+// not the packet brief's wrong claim — was what shipped.
+//
+// (#1066) `runs`/`console`/`machine` moved from `hidden` to `shown`. Their
+// exclusion was parity with `viewer.html`, which was DELETED in #1865: the
+// rule was matching a viewer that no longer exists, against an operator
+// asking for the events panel as a collapsible mainstay on all tabs. A pane
+// the operator can collapse is strictly more capable than one a route hides
+// for them, and the collapse preference persists per session so a "mainstay"
+// does not mean "reopens on every tab switch".
+//
+// The evidence trail above is kept rather than deleted. It records that the
+// old rule was measured and right for its moment — which is what makes this
+// a deliberate divergence rather than a correction of a mistake.
 describe("showsEventLog", () => {
-  // (#1868) `mission` moved from `shown` to `hidden`: MissionGraphLens owns
-  // its own events pane now (a second EventLogColumn mount, mission-scoped),
-  // so the App-level column must not ALSO render for this route.
-  const hidden: Route["kind"][] = ["runs", "console", "machine", "mission"];
-  const shown: Route["kind"][] = ["fleet", "dispatch", "playback", "unknown"];
+  // (#1868) `mission` is the ONE remaining exclusion, and it is structural
+  // rather than parity: MissionGraphLens mounts its own EventLogColumn with
+  // mission-scoped records, so the App-level column must not also render —
+  // two event logs on one page, disagreeing about scope. This would hold even
+  // if legacy had never existed, which is exactly why it survives #1066.
+  const hidden: Route["kind"][] = ["mission"];
+  const shown: Route["kind"][] = ["fleet", "dispatch", "playback", "unknown", "runs", "console", "machine"];
 
   it.each(hidden)("hides the event log on %s", (kind) => {
     expect(showsEventLog({ kind } as Route)).toBe(false);

@@ -282,4 +282,40 @@ describe("EventLogColumn", () => {
     expect(document.querySelector(".eventlog__recmachine")!.textContent).toContain("MacBook-Pro");
     expect(document.querySelector(".eventlog__recsession")!.textContent).toContain("s-1");
   });
+
+  // ── Collapse (#1066) ───────────────────────────────────────────────────
+  //
+  // Collapsed is NOT hidden, and the distinction is the feature. `visible=
+  // false` is `display:none` with nothing left to click — a route decided.
+  // Collapsed keeps a control, so the operator decided and can undo it.
+  it("collapses and expands from a control that stays clickable in both states", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    const col = () => document.querySelector(".eventlog")!;
+    expect(col().className).not.toMatch(/eventlog--collapsed/);
+
+    const btn = screen.getByRole("button", { name: /collapse the event log/i });
+    fireEvent.click(btn);
+    expect(col().className).toMatch(/eventlog--collapsed/);
+
+    // The control is still THERE — that is what separates this from hidden.
+    fireEvent.click(screen.getByRole("button", { name: /expand the event log/i }));
+    expect(col().className).not.toMatch(/eventlog--collapsed/);
+  });
+
+  it("remembers the collapsed choice across a remount, so a tab switch does not reopen it", () => {
+    const { unmount } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.click(screen.getByRole("button", { name: /collapse the event log/i }));
+    unmount();
+
+    render(<EventLogColumn scopeLabel="runs" records={[]} visible />);
+    expect(document.querySelector(".eventlog")!.className).toMatch(/eventlog--collapsed/);
+  });
+
+  it("reports its state to assistive tech, not by glyph alone", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    const btn = screen.getByRole("button", { name: /collapse the event log/i });
+    expect(btn).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(btn);
+    expect(screen.getByRole("button", { name: /expand the event log/i })).toHaveAttribute("aria-expanded", "false");
+  });
 });

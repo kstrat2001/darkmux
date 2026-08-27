@@ -373,7 +373,25 @@ describe("App", () => {
     expect(document.querySelector(".eventlog")?.className).not.toMatch(/eventlog--hidden/);
   });
 
-  it("mounts the event-log column but HIDDEN (eventlog--hidden) on the machine lens", async () => {
+
+  /* (#1066) These three used to assert `eventlog--hidden` on runs/console/
+     machine. That was PARITY with `viewer.html`'s `runs-mode`/`machine-mode`,
+     measured directly at the time via `getComputedStyle('.log').display` —
+     correct while that viewer still served users. It was deleted in #1865, so
+     the rule was matching a thing that no longer exists, against an operator
+     asking for the opposite: the events panel as a collapsible mainstay on
+     all tabs.
+
+     The assertion is INVERTED rather than deleted, deliberately: the column
+     must still be MOUNTED on every route (legacy keeps `#logscope` in the DOM
+     with real text even when its ancestor is hidden, and the machine-lens
+     byte-parity goldens depend on that), so "not hidden" is a different claim
+     from "absent" and both still need proving.
+
+     `mission` keeps its exclusion and keeps its test — that one is structural,
+     not parity: `MissionGraphLens` mounts its own instance, and two would
+     disagree about scope (#1868). */
+  it("keeps the event-log column VISIBLE on the machine lens (#1066)", async () => {
     window.location.hash = "#lens=machine";
     vi.stubGlobal("fetch", mockFleetLikeFetch());
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -390,10 +408,10 @@ describe("App", () => {
     // mounted and merely unpainted, not unmounted.
     expect(document.getElementById("logscope")).toBeTruthy();
     expect(document.getElementById("logscope")?.hasAttribute("hidden")).toBe(true);
-    expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
+    expect(document.querySelector(".eventlog")?.className).not.toMatch(/eventlog--hidden/);
   });
 
-  it("hides the event-log column (eventlog--hidden) on the console lens (QA correction — the packet brief wrongly claimed console keeps it)", async () => {
+  it("keeps the event-log column VISIBLE on the console lens (#1066)", async () => {
     window.location.hash = "#lens=console";
     vi.stubGlobal(
       "fetch",
@@ -434,10 +452,10 @@ describe("App", () => {
     // (#1905 step 3) The default landing content is `run-list`'s own CLI
     // output now, not a client-rendered activity view's empty state.
     await waitFor(() => expect(screen.getByText("no runs")).toBeInTheDocument());
-    expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
+    expect(document.querySelector(".eventlog")?.className).not.toMatch(/eventlog--hidden/);
   });
 
-  it("hides the event-log column (eventlog--hidden) on the runs lens", async () => {
+  it("keeps the event-log column VISIBLE on the runs lens (#1066)", async () => {
     window.location.hash = "#lens=runs";
     vi.stubGlobal("fetch", mockFleetLikeFetch());
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -447,7 +465,7 @@ describe("App", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(window.location.hash).toBe("#lens=runs"));
-    expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
+    expect(document.querySelector(".eventlog")?.className).not.toMatch(/eventlog--hidden/);
   });
 
   /**

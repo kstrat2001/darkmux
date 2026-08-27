@@ -119,6 +119,10 @@ function onActivateKeyDown(onActivate: () => void) {
  * literally "filters", matching its `title`/`aria-label`, so there is no
  * hover-only sentence left to disagree with a touch user's expectation.
  */
+/** (#1066) Session-scoped collapse preference. `dmux.` prefix per the
+ * convention in `lenses/mission/timeline.ts`. */
+const COLLAPSE_STORAGE_KEY = "dmux.eventlog.collapsed";
+
 export function EventLogColumn({
   records,
   visible,
@@ -235,6 +239,29 @@ export function EventLogColumn({
     if (next !== filters) setFilters(next);
   }, [facets, filters]);
   const [follow, setFollow] = useState(true);
+  // (#1066) Collapsed is the operator's choice and must survive a route
+  // change, or every tab switch reopens it and a "mainstay" becomes an
+  // irritation. Session scope, matching the filters beside it (#2018): a
+  // preference worth keeping across a refresh, not worth resurrecting a week
+  // later in a context that no longer resembles the one it was set in.
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try {
+      return window.sessionStorage.getItem(COLLAPSE_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleCollapsed = () => {
+    setCollapsed((c) => {
+      try {
+        window.sessionStorage.setItem(COLLAPSE_STORAGE_KEY, c ? "0" : "1");
+      } catch {
+        // ignore — storage unavailable
+      }
+      return !c;
+    });
+  };
+
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [detailPct, setDetailPct] = useState(DEFAULT_DETAIL_PCT);
 
@@ -336,7 +363,28 @@ export function EventLogColumn({
       : `${filtered.length}${serverTruncated ? "+" : ""} events`;
 
   return (
-    <div className={`eventlog${visible ? "" : " eventlog--hidden"}`} ref={columnRef}>
+    <div
+      className={`eventlog${visible ? "" : " eventlog--hidden"}${collapsed ? " eventlog--collapsed" : ""}`}
+      ref={columnRef}
+    >
+      {/* (#1066) The rail is the whole reason "collapsed" differs from
+          "hidden". `visible=false` is `display:none` with nothing left to
+          click — a route decides for the operator. Collapsed leaves a
+          control, so the operator decides and can undo it. The button is
+          rendered in BOTH states, never swapped for a different element, so
+          keyboard focus survives the toggle instead of being dropped on the
+          floor when its host unmounts. */}
+      <button
+        type="button"
+        className="eventlog__collapse"
+        data-act="togglelog"
+        aria-expanded={!collapsed}
+        aria-label={collapsed ? "expand the event log" : "collapse the event log"}
+        title={collapsed ? "expand the event log" : "collapse the event log"}
+        onClick={toggleCollapsed}
+      >
+        {collapsed ? "\u2039" : "\u203a"}
+      </button>
       <div className="eventlog__detail" id="detail" style={{ flexBasis: `${detailPct}%` }}>
         {/* (operator) No "selected event" title. It was static chrome
             competing with the record's own headline — `RecordView` already
