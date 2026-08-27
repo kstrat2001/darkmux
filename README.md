@@ -37,7 +37,7 @@ darkmux serve                         # live fleet view at http://localhost:8765
 
 Every mission runs as a live task graph you can watch from any device on your tailnet, including your phone.
 
-![The live savings dashboard: 9.7M tokens kept off the frontier meter over 24 hours across 22 local dispatches on two machines.](docs/media/savings-hero-live.png)
+![The darkmux dashboard, fleet view: 6,029,666 tokens run locally against zero cloud tokens over 24 hours, broken into 269k generated, 364k fresh input and 5.7M re-read input across 10 dispatches on a three-Mac fleet, with an orchestrator note closing the day.](docs/media/fleet.png)
 
 ## What you get
 

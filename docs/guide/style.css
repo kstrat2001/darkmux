@@ -372,3 +372,32 @@ footer a:hover { color: var(--accent); }
 
   footer { padding: 24px 0 36px; }
 }
+
+/* ── Screenshots ────────────────────────────────────────────────────────
+ * Every image on these pages is a real capture of the running viewer, shot
+ * from `scripts/demo-env` against a fixture fleet — not a mockup, and not a
+ * recording of anyone's actual machine. That distinction is why the demo
+ * world exists: a real capture would carry hostnames, tailnet addresses and
+ * workspace paths onto a public page, and could not be re-shot after a UI
+ * change. Re-generate with `node scripts/demo-env/shoot.mjs`.
+ *
+ * Tokens, not literals, so a palette change carries. Matches the homepage's
+ * own inline `.shot` rule (docs/index.html) so the guide doesn't drift into
+ * looking like a different site. */
+.shot { margin: 28px 0 6px; }
+.shot img {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: block;
+  /* The captures are 2x. Without this a browser may smooth them on the way
+     down and the mono text — which is most of what these images ARE — goes
+     soft at exactly the size people read it. */
+  image-rendering: -webkit-optimize-contrast;
+}
+.shot figcaption {
+  font-size: 13px;
+  color: var(--muted);
+  margin-top: 10px;
+  line-height: 1.5;
+}

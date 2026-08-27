@@ -128,6 +128,11 @@ darkmux machine list</code></pre>
   <div class="wrap">
     <h2>The big picture: how the fleet coordinates</h2>
     <p>Three layers, so the commands above make sense:</p>
+<figure class="shot">
+  <img src="../media/console-flow.png" alt="The darkmux console showing flow status: the sink composition, active kinds, and per-day record counts." loading="lazy">
+  <figcaption><code>darkmux flow status</code> in the console. The sink composition is what makes a fleet a fleet — every machine writing into the same stream.</figcaption>
+</figure>
+
     <ul>
       <li><strong>Identity:</strong> each machine declares a logical fleet name (<code>machine_id</code>). That's what flow records carry and what <code>--machine</code> hints reference.</li>
       <li><strong>Coordination:</strong> the hub's Redis carries two stream classes: <code>darkmux:work</code> (the global job queue; workers claim via a shared consumer group) and <code>darkmux:flow</code> (the fleet-wide event log; every machine writes, any daemon's <code>/flow</code> endpoint reads).</li>

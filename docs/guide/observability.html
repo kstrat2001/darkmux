@@ -49,9 +49,14 @@
   <div class="wrap">
     <h2>Open the viewer</h2>
     <p>Point any browser at the daemon's own address:</p>
+<figure class="shot">
+  <img src="../media/fleet.png" alt="The darkmux dashboard, fleet view: a headline of local tokens against zero cloud tokens, three machine cards showing an M5 Ultra, an M1 Max and a Mac mini, and a live event stream on the right." loading="lazy">
+  <figcaption>The fleet view. Local versus cloud tokens at the top, one card per machine, and every flow record streaming on the right as it lands.</figcaption>
+</figure>
+
     <pre><code>http://127.0.0.1:8765/</code></pre>
     <p>Because the page is served by your local daemon, it is same-origin with the data it reads: it loads your records directly, with no "connect" step, no account, and nothing uploaded. (The <code>darkmux.com/flow</code> URL from older docs now redirects to the playback <a href="../demo/">demo</a>; for your <em>live</em> data, use the daemon's own address above. Loading a remote page like <code>darkmux.com</code> against your local daemon would be blocked by the daemon's default CORS policy anyway, which is the safe default.)</p>
-    <p>This guide intentionally ships without static screenshots: the viewer is iterating fast in this phase. Open it next to a real dispatch to see the live shape. Each card shows:</p>
+    <p>The captures here come from a demo fleet, not a real machine. Each card shows:</p>
     <ul>
       <li><strong>Tier stripe</strong>: the colored bar on the left. Cyan = operator (manual mission/phase actions), violet = frontier (orchestrator narrative), green = local (model work).</li>
       <li><strong>Action + handle</strong>: what happened ("dispatch start", "dispatch complete", "verdict: clean") and which entity it acted on (the role id, phase id, or mission id).</li>
@@ -66,6 +71,11 @@
   <div class="wrap">
     <h2>Reading a live dispatch</h2>
     <p>Run something that emits records and watch them land:</p>
+<figure class="shot">
+  <img src="../media/run-detail.png" alt="A running dispatch in the run detail view: a RUNNING pill, the route and model, an expandable prompt, MODEL metrics for turns and tokens, and SYSTEM metrics for wall clock, CPU, RAM and GPU peaks." loading="lazy">
+  <figcaption>One dispatch, still running. MODEL counts what the model did; SYSTEM counts what it cost the machine — the split answers &ldquo;are these numbers about the model, or about darkmux?&rdquo;</figcaption>
+</figure>
+
     <pre><code>darkmux mission launch &lt;your-config&gt;         <span class="comment"># cyan: mission launch record (mints + starts the mission)</span>
 darkmux dispatch coder "..."                <span class="comment"># green: dispatch start + (later) dispatch complete</span>
 darkmux mission finalize &lt;your-mission-id&gt;   <span class="comment"># cyan: mission finalize + duration arc</span></code></pre>
