@@ -130,7 +130,12 @@ const CONFIG_CAP_CHARS: usize = 3_200;
 /// relevant" range).
 const BOARD_CAP_CHARS: usize = 1_600;
 /// Top-level `--help` block cap: ~400 tokens.
-const HELP_CAP_CHARS: usize = 1_600;
+/// (#1784/#1862) The verb index's cap. Sized from the measurement in
+/// `radio_index::tests::rendered_index_fits_its_cap` with headroom; the
+/// whole tree, one line per verb, is what makes "how do I..." a lookup, so
+/// this is the largest section by design and the LAST generic one dropped
+/// under the hard cap (see `enforce_budget`).
+pub const VERB_INDEX_CAP_CHARS: usize = 16_000;
 /// Per-shelf-entry truncation: ~1.5K tokens (issue #1698's own number).
 const SHELF_ENTRY_CAP_CHARS: usize = 6_000;
 /// One named deep artifact: ~1.5K tokens (issue's "1-2K" range, midpoint).
@@ -191,14 +196,18 @@ impl Sections {
     /// matching hard-cap increase — kept live (not deleted) for that reason.
     fn enforce_budget(&mut self) {
         while self.total_chars() > HARD_CAP_CHARS {
-            if self.help.take().is_some() {
-                continue;
-            }
+            // Session history first, then the board, then the verb index:
+            // radio is interactive help, so "how do I" grounding outlives
+            // "what am I working on" grounding. A NAMED artifact still
+            // outlives all three: the user asked about it by name.
             if !self.shelf.is_empty() {
                 self.shelf.remove(0);
                 continue;
             }
             if self.board.take().is_some() {
+                continue;
+            }
+            if self.help.take().is_some() {
                 continue;
             }
             if self.deep_artifact.take().is_some() {
@@ -235,7 +244,10 @@ impl Sections {
             out.push('\n');
         }
         if let Some(h) = &self.help {
-            out.push_str("\nTop-level darkmux --help:\n");
+            out.push_str(
+                "\ndarkmux command index (every runnable verb, its options, one line each; \
+                 when the answer is a command, name it exactly as listed here):\n",
+            );
             out.push_str(h);
             out.push('\n');
         }
@@ -277,10 +289,14 @@ fn render_config_block(cfg_json: &str) -> String {
     truncate_chars(cfg_json, CONFIG_CAP_CHARS)
 }
 
+/// (#1784/#1862) The verb index in place of top-level `--help`: every
+/// runnable verb with its options and one sentence, so a help question is
+/// answered from the tree rather than guessed at (an invented `/machine`
+/// was #1861's first defect; `darkmux machine status` was in the tree).
 fn render_help_block() -> String {
     use clap::CommandFactory;
-    let help = crate::cli::Cli::command().render_help().to_string();
-    truncate_chars(&help, HELP_CAP_CHARS)
+    let index = crate::radio_index::render_verb_index(&crate::radio_index::build_verb_index(&crate::cli::Cli::command()));
+    truncate_chars(&index, VERB_INDEX_CAP_CHARS)
 }
 
 /// How many recent missions the board block names (#1713). Small on
@@ -1514,12 +1530,12 @@ mod tests {
             \n\
             ## What you were handed\n\
             \n\
-            Every call gives you a compiled grounding bundle assembled BEFORE you were dispatched — the command catalog, the current config surface, a short status board, and (when the user's message named something) recent history and one deep artifact. This is the entire truth you have access to. You have no tools, no memory of other exchanges, and no way to look anything up yourself — everything you can honestly say comes from what's in this message.\n\
+            Every call gives you a compiled grounding bundle assembled BEFORE you were dispatched — the command catalog, the darkmux command index (every runnable `darkmux` verb with its options, one line each), the current config surface, a short status board, and (when the user's message named something) recent history and one deep artifact. This is the entire truth you have access to. You have no tools, no memory of other exchanges, and no way to look anything up yourself — everything you can honestly say comes from what's in this message.\n\
             \n\
             ## Your job\n\
             \n\
             1. Answer the user's message using only the grounding you were given. If the grounding doesn't cover it, say so plainly — never guess or pad with generic AI filler.\n\
-            2. If the honest answer points at a command the user could run, name it with its exact slash syntax (e.g. `/pr-list`) so it's unambiguous — never invent a command id that isn't in the catalog you were given.\n\
+            2. If the honest answer points at a command the user could run, name it exactly as it appears in your grounding: a panel command by its slash id from the catalog (e.g. `/pr-list`), any other darkmux verb as the full line from the command index (e.g. `darkmux machine status`), with the option that matters if one does. Never invent a command or an option that is not listed in the grounding you were given.\n\
             3. If a config value is the right lever, tell them the exact invocation to run themselves (e.g. \"run `darkmux config set radio.humor 80`\") — you never execute anything, you only ever say what to run. Suggest, never do.\n\
             4. If the message is genuinely outside what you can ground an answer in — open-ended, off-topic, or asking you to reason about something no grounding source covers — say so honestly and hand it off: \"That's outside what I can answer from here — worth raising with your frontier orchestrator directly.\" Never fake an answer to avoid saying no.\n\
             \n\
@@ -1532,4 +1548,17 @@ mod tests {
              (contract 6) — a deliberate edit updates both this golden and the file together."
         );
     }
+
+    /// (#1784) The bundle carries the verb index, so a "how do I" question
+    /// finds the exact invocation instead of top-level help's verb names.
+    #[test]
+    fn grounding_carries_the_verb_index_with_subverbs_and_options() {
+        let shelf = ArtifactShelf::default();
+        let bundle = assemble_grounding("how do I see what is loaded?", &[], &shelf, Path::new("/tmp"), GroundingScope::Full);
+        assert!(bundle.contains("darkmux machine status"), "{bundle}");
+        assert!(bundle.contains("darkmux machine list [") && bundle.contains("--deep"), "{bundle}");
+        assert!(bundle.contains("darkmux mission launch"), "{bundle}");
+        assert!(!bundle.contains("Top-level darkmux --help"), "the old block is gone: {bundle}");
+    }
 }
+
