@@ -1814,10 +1814,13 @@ fn cmd_init(
         if report.profile_registry_already_present {
             println!("profile registry: already present at {}", p.display());
         } else if report.profile_registry_created {
-            println!(
-                "profile registry: created at {} (edit it to point at your downloaded models — `lms ls`)",
-                p.display()
-            );
+            println!("profile registry: created at {}", p.display());
+        }
+        // (#2038) The worker model: filled from LM Studio, or say why not.
+        if let Some(id) = report.worker_model_filled.as_deref() {
+            println!("worker model: `{id}` (LM Studio has it; every worker profile now names it, edit {} to change)", p.display());
+        } else if let Some(reason) = report.worker_model_unfilled_reason.as_deref() {
+            println!("worker model: not set. {reason}");
         }
     }
     if let Some(p) = report.config_path.as_ref() {
@@ -1897,7 +1900,7 @@ fn cmd_init(
     } else {
         println!();
         println!("Next steps:");
-        if report.profile_registry_created {
+        if report.profile_registry_created && report.worker_model_filled.is_none() {
             println!("  1. Edit ~/.darkmux/profiles.json to point at your downloaded models");
             println!("     (run `lms ls` to see what's available)");
             println!(

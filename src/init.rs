@@ -31,6 +31,11 @@ pub struct InitReport {
     pub profile_registry_path: Option<PathBuf>,
     pub profile_registry_created: bool,
     pub profile_registry_already_present: bool,
+    /// (#2038) The model id `init` wrote into the registry's worker slots in
+    /// place of `<your-worker-model-id>`, chosen from what LM Studio has.
+    pub worker_model_filled: Option<String>,
+    /// (#2038) Why the placeholder was left in place, when it was.
+    pub worker_model_unfilled_reason: Option<String>,
     pub config_path: Option<PathBuf>,
     pub config_created: bool,
     pub config_already_present: bool,
@@ -87,6 +92,19 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
         report.profile_registry_created = true;
     }
 
+    // 1b) (#2038) Fill the placeholder worker model from what LM Studio has.
+    //     Runs on a fresh registry AND on a re-run against one that still holds
+    //     the placeholder (the operator downloaded a model after the first
+    //     init). A registry without the placeholder is never touched, so an
+    //     operator's own edits outrank this every time.
+    if !opts.dry_run && registry_path.exists() {
+        match fill_worker_model(&registry_path) {
+            Ok(Some(id)) => report.worker_model_filled = Some(id),
+            Ok(None) => {}
+            Err(reason) => report.worker_model_unfilled_reason = Some(reason),
+        }
+    }
+
     // 2) Bootstrap the config file (#661). Same never-overwrite discipline as
     //    the profile registry — the operator's config edits outrank a re-run.
     let (config_path, config_created) = bootstrap_config(opts.dry_run)?;
@@ -136,6 +154,87 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
     }
 
     Ok(report)
+}
+
+/// The fill-in-the-blank `profiles.example.json` ships in every worker slot.
+/// `dispatch_internal::is_placeholder_model_id` catches any `<...>` id at
+/// dispatch time; this is the one `init` knows how to fill.
+pub const PLACEHOLDER_MODEL_ID: &str = "<your-worker-model-id>";
+
+/// (#2038) Replace every placeholder worker id in the registry text with
+/// `model_id`. Text-level on purpose: the registry is the operator's file,
+/// and a parse-and-reserialize would reorder keys and drop their formatting.
+/// `None` when the placeholder is absent, so callers can leave the file
+/// byte-identical.
+pub fn fill_placeholder_models(registry_json: &str, model_id: &str) -> Option<String> {
+    if !registry_json.contains(PLACEHOLDER_MODEL_ID) {
+        return None;
+    }
+    Some(registry_json.replace(PLACEHOLDER_MODEL_ID, model_id))
+}
+
+/// The share of RAM a first worker model may occupy on disk-size terms:
+/// the OS, the KV cache at the profile's context, and a utility model all
+/// need room, so the largest model that "fits" is the largest under this.
+pub fn worker_model_budget_bytes(total_ram_gb: u32) -> u64 {
+    u64::from(total_ram_gb) * 1_000_000_000 * 6 / 10
+}
+
+/// (#2038) Pick the worker model: a model LM Studio already has loaded wins
+/// (the operator chose it), else the largest downloaded LLM under the RAM
+/// budget. Embeddings are never workers. `loaded` entries may carry the
+/// `darkmux:` namespace prefix; it is stripped for matching.
+pub fn choose_worker_model(
+    loaded: &[String],
+    available: &[darkmux_profiles::lms::ModelMeta],
+    total_ram_gb: u32,
+) -> Option<String> {
+    let llms: Vec<&darkmux_profiles::lms::ModelMeta> = available.iter().filter(|m| m.model_type == "llm").collect();
+    for id in loaded {
+        let key = id.strip_prefix("darkmux:").unwrap_or(id);
+        if let Some(m) = llms.iter().find(|m| m.model_key == key) {
+            return Some(m.model_key.clone());
+        }
+    }
+    let budget = worker_model_budget_bytes(total_ram_gb);
+    llms.iter()
+        .filter(|m| m.size_bytes <= budget)
+        .max_by_key(|m| m.size_bytes)
+        .map(|m| m.model_key.clone())
+}
+
+/// The IO half: read the registry, ask LM Studio, write the fill. `Ok(None)`
+/// when there was no placeholder; `Err(reason)` when there was one and it
+/// could not be filled (no `lms`, nothing downloaded), with the reason in
+/// operator words.
+fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Option<String>, String> {
+    let text = fs::read_to_string(registry_path).map_err(|e| format!("reading {}: {e}", registry_path.display()))?;
+    if !text.contains(PLACEHOLDER_MODEL_ID) {
+        return Ok(None);
+    }
+    let available = match darkmux_profiles::lms::list_available() {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(format!(
+                "could not ask LM Studio what is downloaded ({e:#}). Install LM Studio and enable its \
+                 command-line tool (`~/.lmstudio/bin/lms bootstrap`), download a model, then re-run \
+                 `darkmux init`."
+            ))
+        }
+    };
+    let loaded: Vec<String> = darkmux_profiles::lms::list_loaded()
+        .map(|v| v.into_iter().map(|m| m.model).collect())
+        .unwrap_or_default();
+    let ram_gb = darkmux_hardware::detect().total_ram_gb;
+    let Some(id) = choose_worker_model(&loaded, &available, ram_gb) else {
+        return Err(format!(
+            "LM Studio has no downloaded LLM that fits in {ram_gb} GB. Download one in LM Studio, then \
+             re-run `darkmux init`."
+        ));
+    };
+    let filled = fill_placeholder_models(&text, &id).expect("placeholder was present");
+    fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+    Ok(Some(id))
 }
 
 fn user_profile_registry_path() -> Result<PathBuf> {
@@ -796,4 +895,55 @@ mod tests {
         let arr = parsed["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(arr.len(), 2); // existing preserved + ours appended
     }
+
+    // ── #2038: init fills the placeholder model from what LM Studio has ──
+
+    fn meta(key: &str, size_gb: u64, kind: &str) -> darkmux_profiles::lms::ModelMeta {
+        darkmux_profiles::lms::ModelMeta {
+            model_key: key.to_string(),
+            display_name: key.to_string(),
+            publisher: String::new(),
+            size_bytes: size_gb * 1_000_000_000,
+            params_string: None,
+            architecture: None,
+            max_context_length: Some(32_768),
+            trained_for_tool_use: true,
+            model_type: kind.to_string(),
+        }
+    }
+
+    #[test]
+    fn fill_replaces_every_placeholder_and_nothing_else() {
+        let reg = r#"{"default_profile":"balanced","profiles":{"fast":{"models":[{"id":"<your-worker-model-id>","n_ctx":32000}]},"gpt":{"models":[{"id":"mlx-community/gpt-oss-120b","n_ctx":100000}]}}}"#;
+        let out = fill_placeholder_models(reg, "qwen/qwen3.6-35b-a3b").expect("placeholder present");
+        assert!(!out.contains(PLACEHOLDER_MODEL_ID), "{out}");
+        assert!(out.contains(r#""id":"qwen/qwen3.6-35b-a3b","n_ctx":32000"#), "{out}");
+        assert!(out.contains("mlx-community/gpt-oss-120b"), "a real id is never touched: {out}");
+        assert_eq!(fill_placeholder_models(&out, "other"), None, "a registry without the placeholder is left alone");
+    }
+
+    #[test]
+    fn choose_prefers_a_loaded_model_then_the_largest_llm_that_fits() {
+        let avail = vec![meta("small-4b", 3, "llm"), meta("big-70b", 45, "llm"), meta("huge-120b", 70, "llm"), meta("embed", 1, "embedding")];
+        // A loaded model wins outright.
+        assert_eq!(choose_worker_model(&["small-4b".to_string()], &avail, 128).as_deref(), Some("small-4b"));
+        // Nothing loaded: the largest LLM that fits the RAM budget.
+        assert_eq!(choose_worker_model(&[], &avail, 128).as_deref(), Some("huge-120b"));
+        assert_eq!(choose_worker_model(&[], &avail, 80).as_deref(), Some("big-70b"));
+        assert_eq!(choose_worker_model(&[], &avail, 16).as_deref(), Some("small-4b"));
+        // Embeddings are never a worker; nothing downloaded is None.
+        assert_eq!(choose_worker_model(&[], &[meta("embed", 1, "embedding")], 128), None);
+        assert_eq!(choose_worker_model(&[], &[], 128), None);
+        // A loaded id that is not in the catalog (a namespaced identifier) still counts.
+        assert_eq!(choose_worker_model(&["darkmux:big-70b".to_string()], &avail, 128).as_deref(), Some("big-70b"));
+    }
+
+    #[test]
+    fn worker_model_budget_leaves_headroom() {
+        // The budget is a fraction of RAM, never all of it: the OS, the KV
+        // cache, and a utility model need room too.
+        assert!(worker_model_budget_bytes(32) < 32 * 1_000_000_000);
+        assert!(worker_model_budget_bytes(32) >= 16 * 1_000_000_000);
+    }
 }
+
