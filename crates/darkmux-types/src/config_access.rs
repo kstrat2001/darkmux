@@ -358,8 +358,14 @@ pub fn radio_router_profile() -> Option<String> {
 pub fn radio_answerer_profile() -> Option<String> {
     pick_string("DARKMUX_RADIO_ANSWERER_PROFILE", config().radio.as_ref().and_then(|r| r.answerer_profile.as_deref()), None)
 }
+/// The shipped humor default. Low on purpose: out of the box the answering
+/// seat is objective help, and `radio.humor` is the dial for anyone who
+/// wants the personality. (65 before 2026-08-28: the value carried over
+/// from the operator's own persona override, never chosen as a default.)
+pub const RADIO_HUMOR_DEFAULT: u64 = 30;
+
 /// The RADIO persona's humor dial (0-100). Resolves
-/// `env(DARKMUX_RADIO_HUMOR) > config.radio.humor > 65`, clamped to
+/// `env(DARKMUX_RADIO_HUMOR) > config.radio.humor > RADIO_HUMOR_DEFAULT`, clamped to
 /// `0..=100` (an out-of-range operator value is clamped rather than
 /// rejected — the persona template only ever renders the number as text,
 /// so an out-of-range value is a cosmetic surprise, not a correctness
@@ -373,7 +379,7 @@ pub fn radio_humor() -> u8 {
     // this value (the persona substitution, the humor picker's presets)
     // only ever needs the already-validated `0..=100` range.
     let cfg = config().radio.as_ref().and_then(|r| r.humor);
-    let n: u64 = pick_parsed("DARKMUX_RADIO_HUMOR", cfg, Some(65)).unwrap();
+    let n: u64 = pick_parsed("DARKMUX_RADIO_HUMOR", cfg, Some(RADIO_HUMOR_DEFAULT)).unwrap();
     n.min(100) as u8
 }
 
@@ -953,6 +959,20 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    /// Ships objective: the RADIO persona's humor is low out of the box and
+    /// the dial is there for anyone who wants the personality (operator,
+    /// 2026-08-28: "65 is too high for default"). One constant, one test,
+    /// so three copies of the number cannot drift apart again.
+    #[serial_test::serial]
+    #[test]
+    fn radio_humor_default_when_unset_is_low() {
+        let prev = std::env::var("DARKMUX_RADIO_HUMOR").ok();
+        unsafe { std::env::remove_var("DARKMUX_RADIO_HUMOR"); }
+        assert_eq!(u64::from(radio_humor()), RADIO_HUMOR_DEFAULT);
+        assert_eq!(RADIO_HUMOR_DEFAULT, 30);
+        if let Some(v) = prev { unsafe { std::env::set_var("DARKMUX_RADIO_HUMOR", v); } }
     }
 
     #[serial_test::serial]

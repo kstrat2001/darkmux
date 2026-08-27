@@ -864,7 +864,7 @@ pub fn available_profile_names() -> Vec<String> {
 /// slider config-option kind — only `select` (dropdown) and `boolean` — so
 /// a continuous 0-100 dial is exposed as a small preset ladder instead. See
 /// this packet's PR body for the schema finding in full.
-pub const HUMOR_PRESETS: &[u8] = &[10, 35, 65, 90];
+pub const HUMOR_PRESETS: &[u8] = &[10, 30, 65, 100];
 
 #[cfg(test)]
 mod tests {
