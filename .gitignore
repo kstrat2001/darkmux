@@ -99,3 +99,9 @@ ui/verify/.gallery/
 # cargo-mutants run output — local build logs (accidentally committed in #1636)
 mutants.out/
 mutants.out.old/
+
+# Demo-env output (scripts/demo-env/) — generated fixtures + the shot PNGs.
+# Root-scoped, per the `/runs/` note above. The INPUTS are committed
+# (world.json, sessions/, the scripts); everything derived from them is not,
+# so a re-shoot never shows up as a diff.
+/screenshots/

@@ -1,0 +1,79 @@
+{
+  "_comment": [
+    "The demo world darkmux.com's screenshots are shot from. Edit this file, re-run",
+    "build.py, and every fixture follows — the generator derives all byte math,",
+    "states and totals from what you declare here, so the numbers stay",
+    "self-consistent no matter what you change (see build.py's `ledger_for`).",
+    "",
+    "This is illustrative data for documentation. It is not a measurement, and",
+    "nothing here should be read as a benchmark result."
+  ],
+
+  "hero_machine": "m5-ultra-256gb",
+
+  "kv_per_token_bytes": {
+    "_comment": "Per-model KV cost. Real observed values where we have them.",
+    "qwen3.5-122b-a10b": 40960,
+    "qwen3.6-35b-a3b-turboquant-mlx": 20480,
+    "qwen3-coder-next-mlx": 24576,
+    "qwen3-4b-instruct-2507": 147456
+  },
+
+  "weights_bytes": {
+    "qwen3.5-122b-a10b": 69793218560,
+    "qwen3.6-35b-a3b-turboquant-mlx": 18446676063,
+    "qwen3-coder-next-mlx": 32212254720,
+    "qwen3-4b-instruct-2507": 2153225524
+  },
+
+  "machines": [
+    {
+      "id": "m5-ultra-256gb",
+      "uid": "DEMO-M5ULTRA-2F4A-11F0-9C3D-A2B1C0D4E5F6",
+      "cpu_brand": "Apple M5 Ultra",
+      "ram_gb": 256,
+      "fleet_mode": "peer",
+      "role_note": "inference workhorse",
+      "other_used_gb": 45,
+      "margin_percent": 84,
+      "swap_used_gb": 0,
+      "compressor_gb": 3,
+      "residents": [
+        { "model": "qwen3.5-122b-a10b",               "ctx": 131072, "kv_used_frac": 0.31, "role": "analyst" },
+        { "model": "qwen3.6-35b-a3b-turboquant-mlx",  "ctx": 262144, "kv_used_frac": 0.22, "role": "coder" },
+        { "model": "qwen3-coder-next-mlx",            "ctx": 131072, "kv_used_frac": 0.14, "role": "reviewer" },
+        { "model": "qwen3-4b-instruct-2507",          "ctx": 32768,  "kv_used_frac": 0.40, "role": "utility", "utility": true }
+      ]
+    },
+    {
+      "id": "m1-max-32gb-studio",
+      "uid": "DEMO-M1MAX-3B7C-11F0-8E21-5D4C3B2A1908",
+      "cpu_brand": "Apple M1 Max",
+      "ram_gb": 32,
+      "fleet_mode": "hub",
+      "role_note": "always-on hub",
+      "other_used_gb": 9,
+      "margin_percent": 52,
+      "swap_used_gb": 1,
+      "compressor_gb": 2,
+      "residents": [
+        { "model": "qwen3-4b-instruct-2507", "ctx": 32768, "kv_used_frac": 0.35, "role": "utility", "utility": true }
+      ]
+    },
+    {
+      "id": "mac-mini-m4-16gb",
+      "uid": "DEMO-MINIM4-5C9D-11F0-A44B-7E6F5A4B3C2D",
+      "cpu_brand": "Apple M4",
+      "ram_gb": 16,
+      "fleet_mode": "peer",
+      "role_note": "edge node",
+      "other_used_gb": 5,
+      "margin_percent": 41,
+      "swap_used_gb": 2,
+      "compressor_gb": 2,
+      "residents": [
+        { "model": "qwen3-4b-instruct-2507", "ctx": 16384, "kv_used_frac": 0.28, "role": "utility", "utility": true }
+      ]
+    }
+  ]
+}
