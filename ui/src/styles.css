@@ -707,6 +707,18 @@ body {
   flex: none;
 }
 .eventlog__follow,
+/* (#2018) The active-filter count. Colour is NOT the only channel — the
+   number itself is the signal, so this still reads with colour vision
+   differences or a forced-colours mode, and `aria-label` carries it for a
+   screen reader. */
+.eventlog__fbtn[data-active="1"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.eventlog__fcount {
+  font-variant-numeric: tabular-nums;
+}
+
 .eventlog__fbtn {
   display: inline-flex;
   align-items: center;

@@ -20,6 +20,10 @@ function rec(overrides: Partial<FlowRecord>): FlowRecord {
 // test that opens the Filters modal and doesn't explicitly close it would
 // leave it open for the NEXT test's freshly-rendered instance too.
 afterEach(() => {
+  // (#2018) Filters now persist to `sessionStorage`, so without this one
+  // test's restrictive picks silently apply to the next — which is how
+  // four unrelated tests started reporting an empty pane.
+  try { window.sessionStorage.clear(); } catch { /* unavailable */ }
   closeOpenModal({ restore: false });
 });
 

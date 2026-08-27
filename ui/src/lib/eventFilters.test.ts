@@ -7,7 +7,11 @@ import {
   defaultFilterState,
   matchesFilters,
   MODEL_ACTIVITIES,
+  activeFilterCount,
+  restoreFilterState,
+  persistFilterState,
 } from "./eventFilters";
+import type { Facets } from "./eventFilters";
 import { onlyModelFacet } from "../components/FiltersDialog";
 import type { FlowRecord } from "../types/handwritten";
 
@@ -187,5 +191,93 @@ describe("'model only' over the PRODUCTION filter path", () => {
       ...defaultFilterState(facets),
       act: onlyModelFacet(facets),
     })).toBe(false);
+  });
+});
+
+// ── Active-filter count + session persistence (#2018) ────────────────────
+describe("activeFilterCount", () => {
+  const facets: Facets = { act: ["a", "b"], cat: ["work"], tier: ["operator"], src: ["cli"] };
+
+  it("counts nothing when every value is selected", () => {
+    expect(activeFilterCount(defaultFilterState(facets), facets)).toBe(0);
+  });
+
+  it("counts a facet only when it is a STRICT subset", () => {
+    const st = defaultFilterState(facets);
+    st.act = new Set(["a"]);
+    expect(activeFilterCount(st, facets)).toBe(1);
+  });
+
+  it("does not count a facet with nothing on offer", () => {
+    // Otherwise a fresh page opens claiming filters it never applied.
+    const empty: Facets = { act: [], cat: [], tier: [], src: [] };
+    expect(activeFilterCount(defaultFilterState(empty), empty)).toBe(0);
+  });
+
+  it("counts the free-text query, which hides rows the same way a facet does", () => {
+    const st = defaultFilterState(facets);
+    st.q = "boom";
+    expect(activeFilterCount(st, facets)).toBe(1);
+    st.q = "   ";
+    expect(activeFilterCount(st, facets)).toBe(0);
+  });
+});
+
+describe("filter session persistence", () => {
+  const facets: Facets = { act: ["a", "b"], cat: ["work"], tier: ["operator"], src: ["cli"] };
+  function mem() {
+    const m = new Map<string, string>();
+    return {
+      getItem: (k: string) => m.get(k) ?? null,
+      setItem: (k: string, v: string) => void m.set(k, v),
+    };
+  }
+
+  it("round-trips a selection", () => {
+    const s = mem();
+    const st = defaultFilterState(facets);
+    st.act = new Set(["a"]);
+    st.q = "err";
+    persistFilterState(st, s);
+    const back = restoreFilterState(facets, s);
+    expect([...back.act]).toEqual(["a"]);
+    expect(back.q).toBe("err");
+  });
+
+  it("drops stored values this window no longer offers", () => {
+    // A restored value naming an absent facet would render a filter for
+    // something that cannot appear, and count toward a badge the operator
+    // can neither see the effect of nor clear.
+    const s = mem();
+    const st = defaultFilterState(facets);
+    st.act = new Set(["a"]);
+    persistFilterState(st, s);
+    const narrower: Facets = { ...facets, act: ["b"] };
+    expect([...restoreFilterState(narrower, s).act]).toEqual(["b"]);
+  });
+
+  it("falls back to the default when the intersection is empty, never to 'nothing selected'", () => {
+    // A filter hiding literally everything is indistinguishable from a
+    // broken pane.
+    const s = mem();
+    const st = defaultFilterState(facets);
+    st.act = new Set(["a"]);
+    persistFilterState(st, s);
+    const disjoint: Facets = { ...facets, act: ["z"] };
+    expect([...restoreFilterState(disjoint, s).act]).toEqual(["z"]);
+  });
+
+  it("returns the default on unparsable stored data rather than throwing", () => {
+    const s = { getItem: () => "{not json", setItem: () => {} };
+    expect([...restoreFilterState(facets, s).act].sort()).toEqual(["a", "b"]);
+  });
+
+  it("survives storage that throws outright, not merely one that returns null", () => {
+    const boom = {
+      getItem: () => { throw new Error("blocked"); },
+      setItem: () => { throw new Error("blocked"); },
+    };
+    expect([...restoreFilterState(facets, boom).act].sort()).toEqual(["a", "b"]);
+    expect(() => persistFilterState(defaultFilterState(facets), boom)).not.toThrow();
   });
 });
