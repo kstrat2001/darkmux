@@ -505,6 +505,7 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
           <MissionCanvas nodes={graph.nodes} edges={graph.edges} metrics={metrics} now={now} note={graph.note} minimapOn={minimapOn} />
         )}
         <EventLogColumn
+          paneId="mission"
           scopeLabel={graph.mission_id}
           records={events}
           visible={evOpen}

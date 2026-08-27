@@ -516,6 +516,48 @@ body {
    difference is that this port lets the ROW own the height and the column
    stretch into it, so there is no viewport arithmetic to keep in sync.
    The inner `.loglist` still scrolls. */
+/* (#1066) The collapse control + the collapsed rail.
+
+   COLLAPSED IS NOT HIDDEN. `.eventlog--hidden` is `display:none` — a route
+   decided, and nothing is left to click. Collapsed keeps a rail, so the
+   operator decided and can undo it. That difference is the whole feature.
+
+   The children are hidden with `visibility` rather than unmounted, so the
+   detail pane's scroll position, the drag-resize width and keyboard focus
+   all survive a collapse/expand round trip. */
+.eventlog--collapsed {
+  width: 28px;
+  min-width: 28px;
+}
+.eventlog--collapsed > *:not(.eventlog__collapse) {
+  visibility: hidden;
+  pointer-events: none;
+}
+.eventlog__collapse {
+  position: absolute;
+  top: 6px;
+  left: 4px;
+  z-index: 2;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  line-height: 1;
+  background: var(--panel, #12141c);
+  color: var(--dim);
+  border: 1px solid var(--line, #232838);
+  border-radius: 4px;
+  cursor: pointer;
+  font: 600 12px/1 var(--font-mono);
+}
+.eventlog__collapse:hover { color: var(--fg); }
+/* Focus must stay visible against both the panel and the collapsed rail. */
+.eventlog__collapse:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+/* The column is the positioning context for the absolute rail button. */
+.eventlog { position: relative; }
+
 .eventlog {
   width: 380px;
   flex: none;

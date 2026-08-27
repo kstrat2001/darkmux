@@ -282,4 +282,69 @@ describe("EventLogColumn", () => {
     expect(document.querySelector(".eventlog__recmachine")!.textContent).toContain("MacBook-Pro");
     expect(document.querySelector(".eventlog__recsession")!.textContent).toContain("s-1");
   });
+
+  // ── Collapse (#1066) ───────────────────────────────────────────────────
+  //
+  // Collapsed is NOT hidden, and the distinction is the feature. `visible=
+  // false` is `display:none` with nothing left to click — a route decided.
+  // Collapsed keeps a control, so the operator decided and can undo it.
+  it("collapses and expands from a control that stays clickable in both states", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    const col = () => document.querySelector(".eventlog")!;
+    expect(col().className).not.toMatch(/eventlog--collapsed/);
+
+    const btn = screen.getByRole("button", { name: /collapse the event log/i });
+    fireEvent.click(btn);
+    expect(col().className).toMatch(/eventlog--collapsed/);
+
+    // The control is still THERE — that is what separates this from hidden.
+    fireEvent.click(screen.getByRole("button", { name: /expand the event log/i }));
+    expect(col().className).not.toMatch(/eventlog--collapsed/);
+  });
+
+  it("remembers the collapsed choice across a remount, so a tab switch does not reopen it", () => {
+    const { unmount } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.click(screen.getByRole("button", { name: /collapse the event log/i }));
+    unmount();
+
+    render(<EventLogColumn scopeLabel="runs" records={[]} visible />);
+    expect(document.querySelector(".eventlog")!.className).toMatch(/eventlog--collapsed/);
+  });
+
+  it("reports its state to assistive tech, not by glyph alone", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    const btn = screen.getByRole("button", { name: /collapse the event log/i });
+    expect(btn).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(btn);
+    expect(screen.getByRole("button", { name: /expand the event log/i })).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("one pane's collapse choice does not collapse the other mounted pane", () => {
+    // (#2026 QA) Two EventLogColumns are mounted at once on the `mission`
+    // route: the App-level mainstay and the one MissionGraphLens owns. With a
+    // single global key, collapsing the mainstay ANYWHERE silently collapsed
+    // the mission's own pane — which the operator never touched, and which
+    // then showed a 28px rail with no explanation.
+    //
+    // Red-proven: reverting `collapseKeyFor` to one constant fails this.
+    const { unmount } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.click(screen.getByRole("button", { name: /collapse the event log/i }));
+    unmount();
+
+    render(<EventLogColumn paneId="mission" scopeLabel="mission m1" records={[]} visible />);
+    expect(document.querySelector(".eventlog")!.className).not.toMatch(/eventlog--collapsed/);
+  });
+
+  it("the mainstay's collapse choice DOES survive a route change (that is the point)", () => {
+    // The counterpart to the test above, and the reason the key is the MOUNT
+    // SITE rather than the scope label: the App-level pane's label changes
+    // per route ("fleet" -> "runs"), so keying on it would reset the choice on
+    // every tab switch and turn a mainstay back into a per-page toggle.
+    const { unmount } = render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    fireEvent.click(screen.getByRole("button", { name: /collapse the event log/i }));
+    unmount();
+
+    render(<EventLogColumn scopeLabel="runs" records={[]} visible />);
+    expect(document.querySelector(".eventlog")!.className).toMatch(/eventlog--collapsed/);
+  });
 });

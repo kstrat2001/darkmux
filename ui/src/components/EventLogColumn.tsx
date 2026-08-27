@@ -119,6 +119,33 @@ function onActivateKeyDown(onActivate: () => void) {
  * literally "filters", matching its `title`/`aria-label`, so there is no
  * hover-only sentence left to disagree with a touch user's expectation.
  */
+/** (#1066) Session-scoped collapse preference, keyed by MOUNT SITE.
+ *
+ * This was one global flag, which is wrong because the component has TWO real
+ * mount sites: the App-level mainstay and the one `MissionGraphLens` owns.
+ * An operator who collapsed the mainstay on any route then opened a mission
+ * found the mission's OWN events pane collapsed too — a pane they had never
+ * touched, showing a 28px rail with no explanation.
+ *
+ * That directly contradicted this feature's own framing ("the operator
+ * decided and can undo it"), since here the operator decided nothing about
+ * that pane. Found by a QA agent that navigated between routes rather than
+ * toggling one instance.
+ *
+ * Keyed by MOUNT SITE (`paneId`), deliberately NOT by `scopeLabel`. The
+ * App-level pane's scope label changes with the route — "fleet", "runs",
+ * "console" — so keying on it would reset the choice on every tab switch,
+ * destroying the one property that makes this a MAINSTAY rather than a
+ * per-page toggle. The operator's ask was explicitly "a collapsible mainstay
+ * on all tabs".
+ *
+ * The collision this fixes is between the two SIMULTANEOUS mounts, not
+ * between routes: one `paneId` for the App-level chrome, another for the pane
+ * `MissionGraphLens` owns. `dmux.` prefix per `lenses/mission/timeline.ts`. */
+function collapseKeyFor(pane: string): string {
+  return `dmux.eventlog.collapsed.${pane}`;
+}
+
 export function EventLogColumn({
   records,
   visible,
@@ -127,9 +154,16 @@ export function EventLogColumn({
   error = null,
   historical = false,
   serverTruncated = false,
+  paneId = "app",
 }: {
   records: FlowRecord[];
   visible: boolean;
+  /** (#1066 QA) Which MOUNT SITE this is — `"app"` for the App-level
+   *  mainstay, something else for a lens that owns its own pane. Keys the
+   *  collapse preference, so two simultaneously-mounted panes cannot
+   *  overwrite each other's choice. Deliberately separate from `scopeLabel`,
+   *  which changes per route and would reset the choice on every tab switch. */
+  paneId?: string;
   /** (#1800 P2) True when `records` is a fetched historical slice rather than
    *  the live rolling window — see the header's own note. */
   historical?: boolean;
@@ -235,6 +269,29 @@ export function EventLogColumn({
     if (next !== filters) setFilters(next);
   }, [facets, filters]);
   const [follow, setFollow] = useState(true);
+  // (#1066) Collapsed is the operator's choice and must survive a route
+  // change, or every tab switch reopens it and a "mainstay" becomes an
+  // irritation. Session scope, matching the filters beside it (#2018): a
+  // preference worth keeping across a refresh, not worth resurrecting a week
+  // later in a context that no longer resembles the one it was set in.
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try {
+      return window.sessionStorage.getItem(collapseKeyFor(paneId)) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleCollapsed = () => {
+    setCollapsed((c) => {
+      try {
+        window.sessionStorage.setItem(collapseKeyFor(paneId), c ? "0" : "1");
+      } catch {
+        // ignore — storage unavailable
+      }
+      return !c;
+    });
+  };
+
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [detailPct, setDetailPct] = useState(DEFAULT_DETAIL_PCT);
 
@@ -336,7 +393,28 @@ export function EventLogColumn({
       : `${filtered.length}${serverTruncated ? "+" : ""} events`;
 
   return (
-    <div className={`eventlog${visible ? "" : " eventlog--hidden"}`} ref={columnRef}>
+    <div
+      className={`eventlog${visible ? "" : " eventlog--hidden"}${collapsed ? " eventlog--collapsed" : ""}`}
+      ref={columnRef}
+    >
+      {/* (#1066) The rail is the whole reason "collapsed" differs from
+          "hidden". `visible=false` is `display:none` with nothing left to
+          click — a route decides for the operator. Collapsed leaves a
+          control, so the operator decides and can undo it. The button is
+          rendered in BOTH states, never swapped for a different element, so
+          keyboard focus survives the toggle instead of being dropped on the
+          floor when its host unmounts. */}
+      <button
+        type="button"
+        className="eventlog__collapse"
+        data-act="togglelog"
+        aria-expanded={!collapsed}
+        aria-label={collapsed ? "expand the event log" : "collapse the event log"}
+        title={collapsed ? "expand the event log" : "collapse the event log"}
+        onClick={toggleCollapsed}
+      >
+        {collapsed ? "\u2039" : "\u203a"}
+      </button>
       <div className="eventlog__detail" id="detail" style={{ flexBasis: `${detailPct}%` }}>
         {/* (operator) No "selected event" title. It was static chrome
             competing with the record's own headline — `RecordView` already

@@ -274,7 +274,21 @@ export function isLiveRoute(route: Route): boolean {
  * ALSO render alongside it; that would be two event logs on one page,
  * disagreeing about scope. */
 export function showsEventLog(route: Route): boolean {
-  return route.kind !== "runs" && route.kind !== "console" && route.kind !== "machine" && route.kind !== "mission";
+  // (#1066) `runs`/`console`/`machine` no longer hide it. Those three were
+  // parity with `viewer.html`'s `runs-mode`/`machine-mode` — measured, and
+  // correct while that viewer still served users. It was DELETED in #1865,
+  // so the rule was matching a thing that no longer exists, against an
+  // operator asking for the opposite: "the events panel being a collapsible
+  // mainstay on all tabs." A pane the operator can collapse is strictly more
+  // capable than one the route hides for them.
+  //
+  // `mission` STAYS excluded, and this is not the same kind of rule.
+  // `MissionGraphLens` mounts its OWN instance of `EventLogColumn`, fed
+  // mission-scoped records; showing the App-level column too would put two
+  // event logs on one page disagreeing about scope (#1868). That is
+  // structural, not parity — it would still hold if legacy had never
+  // existed.
+  return route.kind !== "mission";
 }
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
