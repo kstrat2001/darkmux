@@ -550,6 +550,41 @@ describe("ConsolePanel — command-line tokens (#1911 redesign)", () => {
     expect(window.location.hash).toContain("panel=run-list");
   });
 
+  /// (#2017) The OTHER half of the same pair. #1911 wired opt selection to
+  /// the hash and left panel selection on a bare `useState` setter, so
+  /// `#panel=flow-status&opt.kind=lab` was reachable by hand-typing and
+  /// unreachable by clicking — and a reload dropped you on the default panel
+  /// with someone else's opts still sitting in the URL.
+  it("clicking a panel tab writes it into the URL", async () => {
+    vi.stubGlobal("fetch", runListFetchMock());
+    window.location.hash = "#lens=console&panel=run-list";
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /flow status/i }));
+    await waitFor(() => expect(window.location.hash).toContain("panel=flow-status"));
+  });
+
+  /// A fresh panel serializes ITS OWN opts, not the previous panel's.
+  /// `selections` is keyed per panel, so leaking the outgoing panel's picks
+  /// into the incoming panel's URL would produce a link that resolves to a
+  /// different view than the one on screen — the shape #1911's own
+  /// `sanitizeOptParams` exists to prevent on the way IN.
+  it("switching panels does not carry the previous panel's opts into the URL", async () => {
+    vi.stubGlobal("fetch", runListFetchMock());
+    window.location.hash = "#lens=console&panel=run-list";
+    renderPanel("run-list");
+    await waitFor(() => expect(screen.getByText(/kind=all/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "--kind all \u25be" }));
+    fireEvent.click(screen.getByRole("option", { name: "lab" }));
+    await waitFor(() => expect(window.location.hash).toContain("opt.kind=lab"));
+
+    fireEvent.click(screen.getByRole("button", { name: /flow status/i }));
+    await waitFor(() => expect(window.location.hash).toContain("panel=flow-status"));
+    expect(window.location.hash).not.toContain("opt.kind");
+  });
+
   /// The default is not written, so the default variant's URL stays
   /// byte-identical to a bare panel link rather than accumulating noise.
   it("picking the default value again leaves no opt param behind", async () => {

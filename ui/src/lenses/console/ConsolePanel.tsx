@@ -167,17 +167,36 @@ export function ConsolePanel({
     writeHash(canonicalHash({ kind: "console", panelId, opts: next }));
   };
 
+  // (#2017) Selecting a PANEL writes the hash, the same way selecting an OPT
+  // already does via `setOpt` above. Only half of this pair was wired: an
+  // `opt.*` pick survived a reload and could be shared, while the panel it
+  // applied to could not — so `#panel=flow-status&opt.kind=lab` was reachable
+  // by hand-typing and unreachable by clicking, and a reload dropped you back
+  // on the default panel with someone else's opts still in the URL.
+  //
+  // Carries the CURRENT panel's opts, not the new panel's: `activeSelection`
+  // is per-panel, so a fresh panel's serialized opts are its own (usually
+  // none) rather than the previous panel's leaking across.
+  //
+  // `replaceState` (inside `writeHash`) rather than a push, deliberately —
+  // clicking through five tabs to find the right one should not put five
+  // entries in history for Back to walk out of one at a time.
+  const selectPanel = (next: PanelId) => {
+    setPanelId(next);
+    writeHash(canonicalHash({ kind: "console", panelId: next, opts: selections.get(next) ?? {} }));
+  };
+
   return (
     <>
       <div className="runsbar">
         {PANELS.map((p) => (
-          <PanelTab key={p.id} id={p.id} label={p.label} active={p.id === panelId} onSelect={setPanelId} />
+          <PanelTab key={p.id} id={p.id} label={p.label} active={p.id === panelId} onSelect={selectPanel} />
         ))}
       </div>
       {/* `key={panelId}` — see the module doc's `placeholderData` paragraph
           for why this is load-bearing, not decorative: it is what keeps
           `keepPreviousData` scoped to selection changes WITHIN one panel. */}
-      <CliPanelView key={panelId} id={panelId} opts={activeSelection} onOptChange={setOpt} onPanelSwitch={setPanelId} />
+      <CliPanelView key={panelId} id={panelId} opts={activeSelection} onOptChange={setOpt} onPanelSwitch={selectPanel} />
     </>
   );
 }
