@@ -373,6 +373,9 @@
   .cmds .cmd-desc { font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; font-size: 13px; line-height: 1.5; color: var(--muted); margin: 2px 0 12px 22px; }
   .cmds .cmd-desc:last-child { margin-bottom: 0; }
   .cmds .cmd-line + .cmd-line { margin-top: 0; }
+  .transcript__caption { font-size: 13px; color: #8a8a92; line-height: 1.5; margin: -14px 0 24px; }
+  .session .cmd-out { color: var(--muted); margin: 6px 0 14px 22px; white-space: pre-wrap; font-size: 13px; line-height: 1.55; }
+  .session .cmd-line + .cmd-line { margin-top: 6px; }
   .cmd-line .cmd { flex: 1; white-space: pre; overflow-x: auto; }
   .copy-btn {
     flex: none;
@@ -597,12 +600,23 @@
   <div class="wrap">
     <h2>Get going</h2>
     <h3>Installed to first inference in a few minutes.</h3>
-    <div class="install">
+    <!-- One session, top to bottom. The two radio answers are real,
+         captured 2026-08-28 on the author's M5 Max from the exact commands
+         shown (qwen3.6-35b-a3b answering, qwen3-4b routing), the first at
+         the shipped default (humor 50), the second at 100. Verbatim,
+         including the model's own punctuation. Re-capture when the persona
+         or the default changes; never hand-edit an answer. -->
+    <div class="install cmds session">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install kstrat2001/darkmux/darkmux</span><button class="copy-btn" data-copy="brew install kstrat2001/darkmux/darkmux" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux init</span><button class="copy-btn" data-copy="darkmux init" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
-      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "what can you do?"</span><button class="copy-btn" data-copy="darkmux radio &quot;what can you do?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "do you have a brain?"</span><button class="copy-btn" data-copy="darkmux radio &quot;do you have a brain?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">radio: No biological brain. I'm a local inference engine running on your MacBook-Pro, backed by LMStudio and a handful of quantized models. No synapses, just tensors—processing your inputs on your hardware, not the other way around.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux config set radio.humor 100</span><button class="copy-btn" data-copy="darkmux config set radio.humor 100" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "do you have a brain?"</span><button class="copy-btn" data-copy="darkmux radio &quot;do you have a brain?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">radio: Negative. I'm a local-AI console interface running on your hardware, backed by LMStudio and whatever models you've got loaded. No neurons required—just silicon, a config file, and a healthy respect for thermodynamics. If you need me to route commands or check the flow substrate, I'm on frequency.</div>
     </div>
-    <p>You need <a href="https://lmstudio.ai">LM Studio</a> with a model downloaded. <code>init</code> writes your config. <code>radio</code> is darkmux in plain text: ask what it can do, or say what you want done, and a local model answers from the command catalog and the mission board, or routes you to the right command. The <a href="guide/getting-started.html">getting-started guide</a> takes it from there.</p>
+    <p class="transcript__caption">Verbatim, captured 2026-08-28 on an M5 Max: qwen3.6-35b-a3b answering, qwen3-4b routing, at the shipped default (humor 50) and then at 100.</p>
+    <p>You need <a href="https://lmstudio.ai">LM Studio</a> with a model downloaded. <code>init</code> writes your config. <code>radio</code> is darkmux in plain text: ask it anything about darkmux, or say what you want done, and a local model answers from the command index and the mission board, or routes you to the right command. It ships objective; the humor dial is yours. The <a href="guide/getting-started.html">getting-started guide</a> takes it from there.</p>
   </div>
 </section>
 
