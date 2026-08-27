@@ -461,6 +461,18 @@ export interface FlowRecord {
  * endpoint only on the terminal payload, not on start (see that module's
  * own doc, ported from viewer.html:2131-2135). */
 export interface DispatchCompletePayload {
+  /** (#2011) The RUNTIME's own measure of the execution, in milliseconds —
+   * `dispatch_start_instant.elapsed()` at the moment the terminal record is
+   * built (`crates/darkmux-crew/src/dispatch_internal.rs`'s
+   * `dispatch_complete_payload`). Emitted on every internal, direct and
+   * remote completion, and on the error records too.
+   *
+   * Optional because two real terminals lack it: a `session.end` close-edge
+   * carries NO payload at all (`presence_reconciler.rs`'s
+   * `build_session_end_record` sets `payload: None`), and archived records
+   * predating the field exist. Consumers fall back to subtracting the start
+   * and terminal timestamps — see `lenses/session/sessionRun.ts`. */
+  wall_ms?: number;
   total_turns?: number;
   total_tools?: number;
   total_tokens?: number;

@@ -174,6 +174,41 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("1:00 · killed (timeout)");
   });
 
+  // ── (#2011) the wall clock reads the RECORD, not a subtraction ──────
+  //
+  // `dispatch complete` carries `wall_ms` — the runtime's own measure of the
+  // execution, taken between the start and terminal record writes. The view
+  // recomputed its own from two timestamps instead, which is the same
+  // payload-present-and-unused shape as #1960/#1973/#2007. The fixtures below
+  // make the two disagree by hours, so a test cannot pass on both.
+
+  it("(#2011) takes WALL CLOCK from the terminal record's own wall_ms, not from a timestamp subtraction", () => {
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      // Two hours apart on the clock; the runtime measured 10:15.92 of work.
+      // A subtraction says "120:00" — a plausible, wrong, unfalsifiable number.
+      { ts: "2026-01-01T02:00:00Z", session_id: "s1", action: "dispatch.complete", payload: { wall_ms: 615920 } },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("10:15");
+    // The brief's timing line reports the SAME duration. Two derivations of
+    // one quantity on one page is how they drift apart.
+    expect(view.briefLines.map((e) => e.text).some((t) => t.includes("(10:15)"))).toBe(true);
+  });
+
+  it("(#2011) falls back to the timestamps when the terminal record carries no wall_ms", () => {
+    // A `session.end` close-edge (`presence_reconciler.rs`'s abandoned-run
+    // bracket) has NO payload at all, and older `dispatch complete` records
+    // predate the field. The subtraction is still the best available answer
+    // there — this is the inverted case, and it must keep working.
+    const data: FlowRecord[] = [
+      { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "coder" },
+      { ts: "2026-01-01T00:02:00Z", session_id: "s1", action: "session.end" },
+    ];
+    const view = runRegions(flowToRenderModel(data), "s1");
+    expect(view.metrics.find((m) => m.label === "WALL CLOCK")?.value).toBe("2:00");
+  });
+
   it("a remote (endpoint-served) run names the endpoint and omits the local model track", () => {
     const data: FlowRecord[] = [
       { ts: BASE_TS, session_id: "s1", action: "dispatch.start", handle: "reviewer", payload: { endpoint: "azure:my-host/gpt-4o" } },

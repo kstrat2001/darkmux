@@ -1,8 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
-import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
-import { staticFlowSrc } from "../../lib/staticSource";
+import { useSessionLiveness } from "../../hooks/useSessionLiveness";
 import { flowToRenderModel } from "../../lib/flow";
 import { useNowMs } from "../../lib/clock";
 import { isStaticBuild } from "../../lib/staticSource";
@@ -54,13 +53,19 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
   // records whether to keep asking for records is circular, and presence is
   // already the fleet's source of truth for session membership. The gate also
   // stops a replay or a finished run polling forever.
-  const liveSessions = useLiveSessionIds(staticFlowSrc() === null);
-  const sessionIsLive = liveSessions.has(sessionId);
+  //
+  // (#2011) `shouldPoll` — not bare presence — because a presence-gated
+  // interval that simply switches off at the drop never fetches the terminal
+  // record, and this page then reports `RUNNING` forever with a clock still
+  // counting. `useSessionLiveness` owns that window; it also owns the SAME
+  // query key this component reads, so the event log and the stage cannot
+  // disagree about when the run ended.
+  const { shouldPoll, endedByPresence } = useSessionLiveness(sessionId);
 
   const query = useQuery({
     queryKey: queryKeys.flowSession(sessionId),
     queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-session/${encodeURIComponent(sessionId)}`),
-    refetchInterval: sessionIsLive ? PRESENCE_POLL_MS : false,
+    refetchInterval: shouldPoll ? PRESENCE_POLL_MS : false,
   });
 
   // (#1972) HOISTED ABOVE EVERY EARLY RETURN, deliberately. React counts
@@ -97,8 +102,22 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
   // `useSyncExternalStore` snapshot — the value it produces is stable once
   // past the threshold, so it cannot drive the render loop this file's clock
   // is careful to avoid.
+  //
+  // (#2011) `endedByPresence` is the one signal that OVERRIDES all of this.
+  // The quiet-threshold above is a heuristic standing in for knowledge we
+  // sometimes actually have: presence watching this session disappear is
+  // direct evidence the run stopped, so the counter should not spend a
+  // further ten minutes climbing toward the watchdog timeout before it
+  // admits that. It is deliberately NOT `!sessionIsLive` — a session presence
+  // never listed at all (a replay, a January run, or a machine with Redis
+  // switched off, where `/fleet/sessions/live` returns an empty set for
+  // everything) is not evidence of anything, and gating on mere absence would
+  // freeze the live clock on those machines. Only the observed transition
+  // counts. Note the counter can step BACKWARDS at that moment, from the
+  // ticked value to the last record's own elapsed time; that is the point —
+  // the run's last sign of life is a fact, and the seconds since are not.
   const quietMs = base?.lastBeatMs != null ? Date.now() - base.lastBeatMs : Infinity;
-  const plausiblyRunning = (base?.live ?? false) && quietMs < STALE_AFTER_MS;
+  const plausiblyRunning = (base?.live ?? false) && quietMs < STALE_AFTER_MS && !endedByPresence;
   const ticking = plausiblyRunning && !isStaticBuild() && injectedPlaybackDate() == null;
   const nowMs = useNowMs(ticking);
 

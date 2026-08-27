@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useLiveSessionIds } from "./useLiveSessionIds";
+import { useSessionLiveness } from "./useSessionLiveness";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
 import type { Route } from "../lib/route";
@@ -134,14 +134,20 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
   // reconciler had not yet closed it. Polled only on a session route — the
   // `enabled` gate is the same one #1800 P2 added so a replay never asks the
   // daemon about NOW.
-  const liveSessions = useLiveSessionIds(sessionId !== null && staticFlowSrc() === null);
-  const sessionIsLive = sessionId !== null && liveSessions.has(sessionId);
+  //
+  // (#2011) That reasoning stands and is unchanged. What it left unhandled is
+  // the OPPOSITE race: when presence drops the session the interval goes
+  // `false`, and before `useSessionLiveness` existed nothing fetched again —
+  // so a page whose last live poll predated `dispatch complete` froze on that
+  // snapshot permanently. `shouldPoll` is `isLive` plus a bounded grace window
+  // after the drop; see that hook for why one immediate fetch is not enough.
+  const { isLive: sessionIsLive, shouldPoll } = useSessionLiveness(sessionId);
 
   const sessionQuery = useQuery({
     queryKey: queryKeys.flowSession(sessionId ?? ""),
     queryFn: () => fetchJson<unknown>(`/flow-session/${encodeURIComponent(sessionId ?? "")}`),
     enabled: sessionId !== null,
-    refetchInterval: sessionIsLive ? PRESENCE_POLL_MS : false,
+    refetchInterval: shouldPoll ? PRESENCE_POLL_MS : false,
   });
 
   if (flowSrc !== null) {
