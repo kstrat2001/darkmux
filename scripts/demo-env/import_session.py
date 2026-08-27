@@ -20,16 +20,47 @@ Re-run it to refresh a fixture after a record-vocabulary change.
 """
 import argparse, json, re, sys, pathlib
 
+ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
+
 # Anything matching these never reaches a committed fixture. The scan is a
 # BACKSTOP, not the mechanism: the rewrites below remove the known carriers,
 # and this fails the import loudly if an unknown one survives. A fixture is
 # published to a public docs site, so "probably clean" is not a standard.
+def _engagement_patterns():
+    r"""Engagement-name patterns, built from the ONE file that owns the list.
+
+    `tests/parity/lib/sanitize.mjs` exports `SENTINELS`; this reads the string
+    literals out of that array rather than restating them. A name added there
+    is scrubbed here on the next run with no edit, and this file stays free of
+    the identifiers it exists to remove — which is what lets it live in a
+    public repo without an allowlist exemption.
+
+    Ticket prefixes in that list (`SYS-`, `SYS_`) are skipped: they are handled
+    by the dedicated `\bSYS-\d+\b` rule below, which bounds the digits.
+    """
+    src = ROOT / "tests" / "parity" / "lib" / "sanitize.mjs"
+    m = re.search(r"export const SENTINELS = \[(.*?)\]", src.read_text(), re.S)
+    if not m:
+        sys.exit(f"cannot read SENTINELS from {src} — the scrubber refuses to "
+                 f"run with an unknown vocabulary rather than under-scrubbing.")
+    names = {n.lower() for n in re.findall(r'"([^"]+)"', m.group(1))}
+    names = {n for n in names if not n.endswith(("-", "_"))}
+    if not names:
+        sys.exit(f"SENTINELS in {src} parsed empty — refusing to run.")
+    return [(re.compile(r"(?i)\b" + re.escape(n) + r"\b"), "an engagement name")
+            for n in sorted(names)]
+
+
 FORBIDDEN = [
     (re.compile(r"/Users/[^/\"\s]+"),          "a host home directory"),
     (re.compile(r"\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"), "a tailnet IP"),
-    (re.compile(r"(?i)\bfinhero\b"),           "an engagement name"),
-    (re.compile(r"(?i)\bextragalaxies\b"),     "an engagement name"),
-    (re.compile(r"(?i)sisters inspire"),       "an engagement name"),
+    # Engagement names are NOT spelled here. `tests/parity/lib/sanitize.mjs`
+    # owns that vocabulary (`scripts/engagement-sentinel-guard.py` names it as
+    # the sole owner and allowlists only that file), so re-declaring the
+    # strings would both leak them into a PUBLIC file — the guard fails the
+    # build on exactly that, correctly — and create the second copy that
+    # drifts. Read the owner instead; see `_engagement_patterns()`.
+    *_engagement_patterns(),
     (re.compile(r"\bSYS-\d+\b"),               "an internal ticket key"),
     (re.compile(r"(?i)[\w.+-]+@[\w-]+\.[\w.]+"), "an email address"),
     (re.compile(r"(?i)\b[\w-]+\.ts\.net\b"),   "a MagicDNS name"),

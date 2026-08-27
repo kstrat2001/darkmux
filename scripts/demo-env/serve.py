@@ -151,6 +151,17 @@ def make_handler(inner, fx, hero, demo_uids, home):
             return json.dumps(kept).encode()
 
         def do_GET(self):
+            # The viewer comes from the WORKING TREE, not the installed
+            # binary. The inner daemon serves its own `include_str!`ed copy,
+            # so proxying `/` meant a one-line CSS change could only be seen
+            # after a full `cargo install` — and, worse, that a shot taken
+            # here documented whatever binary happened to be on PATH rather
+            # than the code under review. Reading the built asset makes
+            # `bun run build` + reload the whole loop.
+            if self.path.split("?")[0] in ("/", "/index.html"):
+                asset = ROOT / "crates" / "darkmux-serve" / "assets" / "next.html"
+                if asset.exists():
+                    return self._send(200, asset.read_bytes(), "text/html; charset=utf-8")
             body = self._fixture(self.path)
             if body is not None:
                 return self._send(200, body)
