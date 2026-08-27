@@ -3358,6 +3358,26 @@ const MAX_REASONING_TEXT_BYTES: usize = 256 * 1024;
 /// viewer. Defense-in-depth under the viewer's output encoding (#237).
 const MAX_TRAJ_FIELD_BYTES: usize = 4 * 1024;
 
+/// (#2007) Hard cap on the tool RESULT specifically, which is a different
+/// animal from the fields `MAX_TRAJ_FIELD_BYTES` bounds. Those are short by
+/// nature (a tool name, a finish reason, a one-line detector message); a tool
+/// result is a test run's output or a file's contents, and its whole value is
+/// that it is complete enough to diagnose a failure from.
+///
+/// Sized from measurement, not taste: across 455 real tool calls the median
+/// result is 951 chars, p90 is 5,983 and the LARGEST observed is 52,936 — so
+/// 64 KiB truncates nothing real while still refusing a buggy or adversarial
+/// container that wants to write megabytes into the flow stream, the Redis
+/// stream and the tamper-evident audit chain. The security rationale behind
+/// `MAX_TRAJ_FIELD_BYTES` is unchanged and still applies here; only the
+/// number moves, because the field it guards has a different natural size.
+///
+/// The TRAJECTORY keeps the result in full and uncapped — it is written
+/// inside the container and stays per-run-local, so it never crosses this
+/// trust boundary. `result_chars` is the TRUE length on both surfaces, so a
+/// truncation here is always visible rather than silent.
+const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
+
 /// Acquire the shared inactivity-deadline lock, recovering from a
 /// poisoned mutex instead of panicking. (#890) This deadline is read by
 /// the hard-kill watchdog thread every tick and written by the tailer on
@@ -3911,6 +3931,13 @@ impl TailerState {
                     "args": cap_json_str(event.get("args"), MAX_TRAJ_FIELD_BYTES),
                     "args_chars": event.get("args_chars"),
                     "result_chars": event.get("result_chars"),
+                    // (#2007) The result itself, so a failed tool call can be
+                    // diagnosed from the record instead of only counted. Bound
+                    // is `MAX_TOOL_RESULT_BYTES`, not the 4 KiB used for the
+                    // short fields above — see that constant for why the two
+                    // differ and why `result_chars` above stays the true
+                    // length regardless of what this carries.
+                    "result": cap_json_result(event.get("result"), MAX_TOOL_RESULT_BYTES),
                     "ok": tool_ok,
                 });
                 self.emit("dispatch.tool", darkmux_flow::Level::Info, payload);
@@ -4376,6 +4403,78 @@ fn cap_str(s: &str, max: usize) -> String {
 /// chain, Redis, viewer); bounding them at ingest stops an adversarial or buggy
 /// container from injecting a pathologically large string (#237 defense-in-
 /// depth, layered under the viewer's output encoding).
+/// (#2007) Cap a tool RESULT at `max` bytes by removing the MIDDLE, keeping
+/// both ends.
+///
+/// `cap_str` keeps the head, which is right for the fields it guards (a tool
+/// name, a command, a finish reason — the meaning is at the front). It is
+/// wrong for a tool result: a test run's verdict is the LAST line
+/// (`Tests: 2 failed, 86 passed`), so head-only truncation discards precisely
+/// the diagnostic the record exists to preserve, while keeping the setup
+/// noise. The command echo at the top and the verdict at the bottom are the
+/// two regions that carry meaning; the middle is the part nobody reads.
+///
+/// Deterministic and model-free ON PURPOSE. The obvious alternative — have
+/// the utility model summarize an oversized result — is the pattern CLAUDE.md
+/// names forbidden ("Using the LLM to observe the LLM ... is the forbidden
+/// pattern", #1286, the observer must not join the observed), and it would
+/// turn an evidence artifact into an interpretation: a truncation announces
+/// itself, whereas a summary reads as fact and misleads whoever is diagnosing
+/// if it drops the line that mattered. This record feeds the tamper-evident
+/// audit chain, where derived text has no business.
+///
+/// The elision marker carries the true original size, so the cut is never
+/// silent — the same in-band contract `cap_str` established.
+fn cap_result_middle(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let marker_budget = 96;
+    let keep = max.saturating_sub(marker_budget);
+    // 3:1 head:tail. The head carries the command and the first failures; the
+    // tail carries the verdict. Weighted to the head because a result that is
+    // ONLY long is usually long at the front (a file listing, a build log),
+    // while the tail's value is concentrated in its last few lines.
+    let head_len = keep * 3 / 4;
+    let tail_len = keep - head_len;
+
+    let mut head_cut = head_len.min(s.len());
+    while head_cut > 0 && !s.is_char_boundary(head_cut) {
+        head_cut -= 1;
+    }
+    let mut tail_start = s.len().saturating_sub(tail_len);
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    // Degenerate bounds (a tiny `max`) must not produce overlapping slices.
+    if tail_start <= head_cut {
+        return cap_str(s, max);
+    }
+
+    format!(
+        "{}\n… [middle elided; original {} chars / {} bytes]\n{}",
+        &s[..head_cut],
+        s.chars().count(),
+        s.len(),
+        &s[tail_start..]
+    )
+}
+
+/// Cap a JSON tool-result value by eliding its middle (see
+/// [`cap_result_middle`]). Non-string values pass through; `None` is null.
+fn cap_json_result(value: Option<&serde_json::Value>, max: usize) -> serde_json::Value {
+    let Some(v) = value else {
+        return serde_json::Value::Null;
+    };
+    let Some(s) = v.as_str() else {
+        return v.clone();
+    };
+    if s.len() <= max {
+        return v.clone();
+    }
+    serde_json::Value::String(cap_result_middle(s, max))
+}
+
 fn cap_json_str(value: Option<&serde_json::Value>, max: usize) -> serde_json::Value {
     let Some(v) = value else {
         return serde_json::Value::Null;

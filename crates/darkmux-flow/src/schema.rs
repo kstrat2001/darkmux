@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.20.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.21.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -274,6 +274,25 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.20.0";
 //           (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, …), not from
 //           machine-scoped config — build that when a real consumer
 //           needs it.
+//   1.21.0: additive payload key `result` on the existing `dispatch.tool`
+//           action (#2007). The record already carried `result_chars`; it
+//           now carries the result TEXT beside it, so a failed tool call can
+//           be diagnosed from the record rather than only counted. Motivated
+//           by the 3.0.0 release dogfood, where the tool-failure cascade
+//           detector fired on three `bash` failures and the evidence for WHY
+//           had already been discarded — while `dispatch.reasoning` had been
+//           persisting the model's thinking verbatim the whole time, so the
+//           stream kept one side of a two-sided conversation.
+//           Bounded by `MAX_TOOL_RESULT_BYTES` (64 KiB) rather than the 4 KiB
+//           `MAX_TRAJ_FIELD_BYTES` used for the short fields: a tool result
+//           is a test run's output, and 64 KiB clears the largest observed
+//           across 455 real calls (52,936 chars) while still refusing a
+//           container that wants to write megabytes into the audit chain.
+//           Truncation is in-band and self-describing (`cap_str` appends
+//           `… [truncated; original N chars / M bytes]`), and `result_chars`
+//           remains the TRUE length, so a cut is never silent. Purely
+//           additive: older readers ignore the key, and the container-side
+//           trajectory keeps the result in full and uncapped.
 //   1.20.0: new action `"step timing"` (#1877, this arc's final wiring
 //           step): `darkmux-crew::scheduler::apply_step_terminal` now
 //           streams one companion flow record per scheduler-produced

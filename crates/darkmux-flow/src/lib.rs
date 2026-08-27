@@ -2481,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_schema_version_is_1_16_0() {
+    fn flow_schema_version_is_pinned_so_a_bump_is_deliberate() {
         // Pin the schema version so an accidental rename can't ship silently;
         // any bump beyond this should be a deliberate code change paired with
         // an update to this assertion (and corresponding viewer EXPECTED_*
@@ -2574,7 +2574,13 @@ mod tests {
         //           live per step by every mission that runs through
         //           `run_step_graph`. Minor + additive: older readers ignore
         //           the unknown action; see schema.rs's fuller changelog entry.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.20.0");
+        //   1.21.0: added the `result` payload key on `dispatch.tool` (#2007).
+        //           The record carried `result_chars` and discarded the result,
+        //           so a failed tool call could be counted but not diagnosed.
+        //           Bounded at 64 KiB here (the container-side trajectory keeps
+        //           it in full); truncation is in-band and `result_chars` stays
+        //           the true length. Minor + additive; see schema.rs.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.21.0");
     }
 
     #[test]
