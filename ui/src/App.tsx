@@ -6,6 +6,7 @@ import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
 import { Masthead } from "./components/Masthead";
 import { EventLogColumn } from "./components/EventLogColumn";
+import { LensErrorBoundary } from "./components/LensErrorBoundary";
 import { MachineLens } from "./lenses/machine/MachineLens";
 import { RunsBoard } from "./lenses/runs/RunsBoard";
 import { ConsolePanel } from "./lenses/console/ConsolePanel";
@@ -302,7 +303,20 @@ export function App() {
           row on its own — no separate CSS class needed here. */}
       <div className="app-shell__content">
         <main className="app-shell__stage" id="stage">
-          {renderRoute(route, setPlaybackPlayheadMs)}
+          {/* (#2027) There was no error boundary anywhere in this app, so ANY
+              render throw in ANY lens unmounted the whole tree and left a
+              blank page — every other lens gone with it. Reachable with
+              committed data: the machine lens dereferences
+              `resources.machine.*` unguarded while chaining
+              `resources.pool?.*` beside it, so a trimmed or schema-drifted
+              `demo-machine.json` white-screened darkmux.com/demo entirely.
+
+              Keyed on the route so a crash does not persist across
+              navigation: switching tabs remounts the boundary, which is the
+              recovery an operator will reach for first. */}
+          <LensErrorBoundary key={route.kind} name={route.kind}>
+            {renderRoute(route, setPlaybackPlayheadMs)}
+          </LensErrorBoundary>
         </main>
         <EventLogColumn
           scopeLabel={logscope}

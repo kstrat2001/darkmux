@@ -5356,30 +5356,58 @@
 /// The same bundle ships to both surfaces on purpose — `scripts/build-demo.sh`
 /// copies THIS file and injects the metas on the way out, one-directionally.
 /// That direction is the whole isolation guarantee, and nothing but this test
-/// enforces it. Verified by inspection when the demo fixtures landed; a test
-/// is what keeps it verified.
+/// enforces it.
 ///
-/// Matches the TAG, not the string: the minified bundle legitimately contains
-/// `"darkmux-flow-src"` as the argument to the reader function.
+/// (#2027) Scans TAG SPANS, not lines. The first cut only inspected lines
+/// whose trimmed start was literally `<meta`, so this bypassed it entirely:
+///
+/// ```html
+/// <meta
+///   name="darkmux-flow-src"
+///   content="./demo-flow.jsonl" />
+/// ```
+///
+/// The line carrying the attribute does not start with `<meta`, so it was
+/// never scanned — and a browser parses that identically to the one-line
+/// form. `assets/next.html`'s `<head>` is hand-authored (it flows from
+/// `ui/index.html` through the build unmodified), so an editor soft-wrapping
+/// one long attribute line was enough to disable the only guard there is.
+/// Found by a QA agent that planted the mutation instead of reading the test.
+///
+/// Matching the SPAN also keeps the property the line scan was reaching for:
+/// the minified bundle legitimately contains `"darkmux-flow-src"` as the
+/// reader function's argument, and that is not inside a `<meta ...>` span.
 #[test]
 fn served_viewer_ships_no_static_source_meta() {
-    for line in NEXT_HTML.lines() {
-        let t = line.trim_start();
-        if !t.starts_with("<meta") {
-            continue;
+    const FORBIDDEN: &[&str] = &[
+        "darkmux-flow-src",
+        "darkmux-runs-src",
+        "darkmux-lab-runs-src",
+        "darkmux-missions-src",
+        "darkmux-phases-src",
+        "darkmux-panels-src",
+        "darkmux-machine-src",
+    ];
+
+    let mut rest = NEXT_HTML;
+    while let Some(open) = rest.find("<meta") {
+        let after = &rest[open..];
+        // An unterminated `<meta` is itself a reason to look: scan what is
+        // left rather than silently stopping, so a malformed tag cannot hide
+        // a forbidden name behind a missing `>`.
+        let span_end = after.find('>').map(|i| i + 1).unwrap_or(after.len());
+        let span = &after[..span_end];
+        for name in FORBIDDEN {
+            assert!(
+                !span.contains(name),
+                "assets/next.html ships a static-source meta, which would put every \
+                 daemon-served viewer into daemon-less mode and replay the demo's \
+                 fictional fleet at real operators:\n  {}\n\
+                 These belong ONLY in the generated docs/demo/index.html, injected \
+                 by scripts/build-demo.sh.",
+                span.trim()
+            );
         }
-        assert!(
-            !t.contains("darkmux-flow-src")
-                && !t.contains("darkmux-runs-src")
-                && !t.contains("darkmux-lab-runs-src")
-                && !t.contains("darkmux-missions-src")
-                && !t.contains("darkmux-phases-src")
-                && !t.contains("darkmux-panels-src")
-                && !t.contains("darkmux-machine-src"),
-            "assets/next.html ships a static-source meta, which would put every \
-             daemon-served viewer into daemon-less mode:\n  {t}\n\
-             These belong ONLY in the generated docs/demo/index.html, injected \
-             by scripts/build-demo.sh."
-        );
+        rest = &after[span_end..];
     }
 }

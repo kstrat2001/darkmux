@@ -20,6 +20,9 @@ Re-run it to refresh a fixture after a record-vocabulary change.
 """
 import argparse, json, re, sys, pathlib
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+import lib_vocab as _vocab  # noqa: E402
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 
 # Anything matching these never reaches a committed fixture. The scan is a
@@ -29,24 +32,17 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 def _engagement_patterns():
     r"""Engagement-name patterns, built from the ONE file that owns the list.
 
-    `tests/parity/lib/sanitize.mjs` exports `SENTINELS`; this reads the string
-    literals out of that array rather than restating them. A name added there
-    is scrubbed here on the next run with no edit, and this file stays free of
-    the identifiers it exists to remove — which is what lets it live in a
-    public repo without an allowlist exemption.
+    Delegates the READ to `scripts/lib_vocab.py`, which fails loud on a
+    truncated parse. This used to regex `SENTINELS` here with a non-greedy
+    `\[(.*?)\]`, which stopped at the first `]` in the array literal —
+    including one inside a comment — and silently returned a short list. See
+    that module's doc for the mutation that proved it.
 
-    Ticket prefixes in that list (`SYS-`, `SYS_`) are skipped: they are handled
-    by the dedicated `\bSYS-\d+\b` rule below, which bounds the digits.
+    Ticket prefixes are skipped: the dedicated `\bSYS-\d+\b` rule below bounds
+    the digits.
     """
-    src = ROOT / "tests" / "parity" / "lib" / "sanitize.mjs"
-    m = re.search(r"export const SENTINELS = \[(.*?)\]", src.read_text(), re.S)
-    if not m:
-        sys.exit(f"cannot read SENTINELS from {src} — the scrubber refuses to "
-                 f"run with an unknown vocabulary rather than under-scrubbing.")
-    names = {n.lower() for n in re.findall(r'"([^"]+)"', m.group(1))}
+    names = {n.lower() for n in _vocab.sentinels()}
     names = {n for n in names if not n.endswith(("-", "_"))}
-    if not names:
-        sys.exit(f"SENTINELS in {src} parsed empty — refusing to run.")
     return [(re.compile(r"(?i)\b" + re.escape(n) + r"\b"), "an engagement name")
             for n in sorted(names)]
 
