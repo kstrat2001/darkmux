@@ -9,6 +9,32 @@ function toolRec(payload: Record<string, unknown>): FlowRecord {
   return { ts: "2026-08-25T14:45:41Z", action: "dispatch.tool", fields: payload } as unknown as FlowRecord;
 }
 
+describe("dispatch.tool outcome (#2008)", () => {
+  const rec = (fields: Record<string, unknown>) =>
+    ({ action: "dispatch.tool", fields: { tool_name: "bash", args: "{}", result_chars: 12, ...fields } }) as never;
+
+  it("shows the exit code for a command that RAN and reported non-zero", () => {
+    // A red test is the tool working. Marking it ❌ told the operator the
+    // instrument was broken on exactly the workflow darkmux is built for.
+    const out = recordDetail(rec({ ok: true, outcome: "reported", exit_code: 1 }));
+    expect(out).toContain("exit 1");
+    expect(out).not.toContain("❌");
+  });
+
+  it("keeps the cross for a tool that could not run", () => {
+    const out = recordDetail(rec({ ok: false, outcome: "failed", failure_reason: "command not found" }));
+    expect(out).toContain("❌");
+  });
+
+  it("leaves a pre-1.22 record reading the way it meant when written", () => {
+    // No `outcome` key: `ok:false` carried the old conflated meaning, so the
+    // cross is the honest reading of that record rather than a retroactive
+    // reinterpretation of what the writer knew.
+    const out = recordDetail(rec({ ok: false }));
+    expect(out).toContain("❌");
+  });
+});
+
 describe("prettyArgs", () => {
   it("flattens a tool call's JSON arguments to k=v pairs", () => {
     expect(prettyArgs('{"path":"/workspace/src","pattern":"let _ =","max_results":100}')).toBe(

@@ -518,7 +518,7 @@ impl Trajectory {
         tool_name: &str,
         args: &str,
         result: &str,
-        ok: bool,
+        outcome: &crate::failure_rate::ToolOutcome,
     ) {
         // `ok` discriminates success from failure (#469). Additive,
         // backward-compatible field: consumers predating it treat a
@@ -543,7 +543,27 @@ impl Trajectory {
             "args_chars": args_chars,
             "result_chars": result_chars,
             "result": result,
-            "ok": ok,
+            // (#2008) The three-way outcome beside the boolean. `ok` answers
+            // "did the tool work" (true for a red test); `outcome`
+            // distinguishes a clean run from one that reported non-zero from
+            // one that never ran, which are three different things three
+            // different consumers need to tell apart.
+            "outcome": outcome.as_str(),
+            // Flat additive keys rather than a nested tagged enum: every
+            // reader of this file is lenient-on-read, and a flat key is the
+            // shape they already tolerate. `exit_code` is what lets a viewer
+            // render "exit 1" instead of a bare cross.
+            "exit_code": match outcome {
+                crate::failure_rate::ToolOutcome::Reported { exit_code } => {
+                    serde_json::json!(exit_code)
+                }
+                _ => serde_json::Value::Null,
+            },
+            "failure_reason": match outcome {
+                crate::failure_rate::ToolOutcome::Failed { reason } => serde_json::json!(reason),
+                _ => serde_json::Value::Null,
+            },
+            "ok": outcome.tool_worked(),
             "ts": unix_ms(),
         }));
     }
@@ -732,6 +752,7 @@ pub(crate) fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::failure_rate::ToolOutcome;
 
     #[test]
     fn open_creates_dot_dir_and_file() {
@@ -781,7 +802,7 @@ mod tests {
         let ws = tempfile::Builder::new().prefix("traj-test-result").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         let failure = "exit: 1\n--- stdout ---\nTests: 2 failed, 86 passed\n--- stderr ---\n";
-        t.append_tool_completed(1, 0, "bash", "{\"command\":\"npm test\"}", failure, false);
+        t.append_tool_completed(1, 0, "bash", "{\"command\":\"npm test\"}", failure, &ToolOutcome::Reported { exit_code: 1 });
         drop(t);
 
         let body = fs::read_to_string(
@@ -812,8 +833,8 @@ mod tests {
         // deadline) from a failed one (does not).
         let ws = tempfile::Builder::new().prefix("traj-test-ok").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
-        t.append_tool_completed(1, 0, "bash", "{\"command\":\"ls\"}", "a.txt\nb.txt\n", true);
-        t.append_tool_completed(2, 1, "bash", "{\"command\":\"cat x\"}", "exit: 1\n--- stderr ---\nno such file\n", false);
+        t.append_tool_completed(1, 0, "bash", "{\"command\":\"ls\"}", "a.txt\nb.txt\n", &ToolOutcome::Ok);
+        t.append_tool_completed(2, 1, "bash", "{\"command\":\"cat x\"}", "exit: 1\n--- stderr ---\nno such file\n", &ToolOutcome::Failed { reason: "no such file".into() });
         drop(t);
 
         let body = fs::read_to_string(
@@ -842,7 +863,7 @@ mod tests {
         let ws = tempfile::Builder::new().prefix("traj-test-cap").tempdir().unwrap();
         let mut t = Trajectory::open(ws.path());
         let big = "x".repeat(MAX_TOOL_ARGS_CHARS + 200);
-        t.append_tool_completed(1, 0, "write", &big, "", true);
+        t.append_tool_completed(1, 0, "write", &big, "", &ToolOutcome::Ok);
         drop(t);
         let line: serde_json::Value = serde_json::from_str(
             fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE))

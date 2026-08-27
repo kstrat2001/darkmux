@@ -3939,6 +3939,16 @@ impl TailerState {
                     // length regardless of what this carries.
                     "result": cap_json_result(event.get("result"), MAX_TOOL_RESULT_BYTES),
                     "ok": tool_ok,
+                    // (#2008) The three-way outcome the runtime classified,
+                    // forwarded verbatim. `ok` answers "did the tool work"
+                    // (true for a red test); these say WHICH of the three
+                    // things happened, so the viewer can render "exit 1"
+                    // rather than a bare cross, and so an auditor can tell a
+                    // reported result from a broken instrument.
+                    "outcome": event.get("outcome"),
+                    "exit_code": event.get("exit_code"),
+                    "failure_reason": cap_json_str(
+                        event.get("failure_reason"), MAX_TRAJ_FIELD_BYTES),
                 });
                 self.emit("dispatch.tool", darkmux_flow::Level::Info, payload);
             }

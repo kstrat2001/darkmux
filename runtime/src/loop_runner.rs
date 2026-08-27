@@ -1573,14 +1573,19 @@ pub fn run(
                         );
                     }
                     let result = dispatch(&call.function.name, &call.function.arguments);
-                    // (#469) Classify success/failure with the same
-                    // predicate the failure-rate detector uses, and record
-                    // it on the trajectory event so the host watchdog can
-                    // gate its deadline reset.
-                    let tool_ok = !crate::failure_rate::is_failure_result(
-                        &call.function.name,
-                        &result,
-                    );
+                    // (#469/#2008) Classify with the same function the
+                    // failure-rate detector uses, and record it on the
+                    // trajectory event so the host watchdog can gate its
+                    // deadline reset.
+                    //
+                    // `tool_ok` is TOOL success, which is what the `ok` field
+                    // has always documented itself as meaning — so a command
+                    // that ran and reported non-zero (a red test) is `true`
+                    // here. It did work: the watchdogs should count it, and
+                    // the cascade should not.
+                    let outcome =
+                        crate::failure_rate::classify_outcome(&call.function.name, &result);
+                    let tool_ok = outcome.tool_worked();
                     // (#799) A verifier that never RAN (vs ran-and-failed) is the
                     // trust-critical class — stamp it so a SIGNOFF claiming it
                     // passed can be mechanically contradicted at the gate.
@@ -1608,7 +1613,7 @@ pub fn run(
                         &call.function.name,
                         &call.function.arguments,
                         &result,
-                        tool_ok,
+                        &outcome,
                     );
                     // (#466/#469) Proof-of-work signal for the inactivity-
                     // approach detector. Mirrors the host-side reset
@@ -1668,6 +1673,7 @@ pub fn run(
                     if let Some(FailureCascadeSignal::Suspected {
                         tool_name,
                         failure_count,
+                        reason,
                     }) = failure_rate_detector.record(
                         &call.function.name,
                         &call.function.arguments,
@@ -1701,6 +1707,7 @@ pub fn run(
                         feedback_injector.queue_tool_failure_cascade(
                             &tool_name,
                             failure_count as usize,
+                            &reason,
                         );
                     }
                     messages.push(Message::tool_result(

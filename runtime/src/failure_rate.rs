@@ -49,6 +49,12 @@ pub enum FailureCascadeSignal {
     Suspected {
         tool_name: String,
         failure_count: u32,
+        /// (#2008) WHY it could not run — "command not found", "timed out",
+        /// a toolchain that would not load. The nudge quotes this so the
+        /// model is told what actually broke instead of a bare count, and so
+        /// exit-127 and timeout cases read differently without the template
+        /// needing branches it cannot express.
+        reason: String,
     },
 }
 
@@ -97,15 +103,30 @@ impl FailureRateDetector {
         result: &str,
     ) -> Option<FailureCascadeSignal> {
         let sig = signature(tool_name, raw_args);
-        if is_failure_result(tool_name, result) {
+        // (#2008) Only a genuinely broken instrument cascades. A command that
+        // RAN and reported non-zero — a red test, a lint finding — is the tool
+        // working, and counting it here produced a nudge telling the model its
+        // test runner was broken on exactly the workload darkmux exists to
+        // run. Repetition of a still-failing command is a real pathology, but
+        // it belongs to the cycle detector, which already fires on identical
+        // args regardless of outcome and says something true about it.
+        if !classify_outcome(tool_name, result).tool_worked() {
             let count = self.counters.entry(sig.clone()).or_insert(0);
             *count += 1;
             let count_now = *count;
             if count_now >= self.threshold && !self.warned.contains(&sig) {
                 self.warned.insert(sig);
+                let reason = match classify_outcome(tool_name, result) {
+                    ToolOutcome::Failed { reason } => reason,
+                    // Unreachable: this arm only runs when the outcome was
+                    // Failed. Kept total rather than panicking on a future
+                    // refactor that changes the guard above.
+                    _ => "the tool did not complete".to_string(),
+                };
                 return Some(FailureCascadeSignal::Suspected {
                     tool_name: tool_name.to_string(),
                     failure_count: count_now,
+                    reason,
                 });
             }
             None
@@ -137,46 +158,101 @@ fn signature(tool_name: &str, raw_args: &str) -> String {
     )
 }
 
-/// (#419) Classify a tool-result string as success or failure.
+/// (#2008) What actually happened to a tool call.
 ///
-/// Centralized so the detector doesn't carry per-tool branching
-/// internally. The error-shape contract is owned by
-/// `runtime/src/tools/mod.rs::dispatch` (generic) and the per-tool
-/// `execute_*` functions (specific). When that contract changes,
-/// update this function to match.
+/// Replaces the single boolean the old `is_failure_result` answered, because
+/// one boolean was serving consumers that need different questions answered:
+/// the inactivity watchdogs ask "did work happen?", the cascade detector asks
+/// "is the instrument broken?", and the record asks "what should an operator
+/// see?". A non-zero exit answers none of those — it conflates a command that
+/// RAN and reported a result with one that never ran at all.
 ///
-/// **Tool-surface invariant**: all non-bash tools (read / write /
-/// edit / search) route their failure cases through `Tool::execute`'s
-/// `Err` return, which the dispatcher wraps as `"tool 'NAME' returned
-/// error: ..."`. That's why this function only needs the generic
-/// marker + the bash-specific exit-code parse. Verified against
-/// `runtime/src/tools/mod.rs::execute_{read,write,edit,search}` as
-/// of 2026-05-27. If a future tool returns `Ok(error-shaped-text)`
-/// (i.e., reports failure without using the Err path), add its
-/// pattern here.
-pub fn is_failure_result(tool_name: &str, result: &str) -> bool {
-    // Generic dispatch wrapper for any Err returned by Tool::execute.
-    let generic_marker = format!("tool '{tool_name}' returned error:");
-    if result.starts_with(&generic_marker) {
-        return true;
+/// The distinction is not new: [`classify_failed_to_run`] (#799) already drew
+/// it for the trust-critical sign-off case. This promotes it from one call
+/// site to the type, so every consumer inherits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolOutcome {
+    /// Ran, reported success. `bash` exit 0, or any other tool's `Ok`.
+    Ok,
+    /// Ran correctly and reported a non-zero result. A failing test in TDD's
+    /// red phase, a lint finding, `grep` with no matches. This is WORK — the
+    /// tool did its job — so it is proof-of-work for the watchdogs and must
+    /// never count toward a tool-failure cascade.
+    Reported { exit_code: i32 },
+    /// Did not run, or could not complete. Exit 127/126, a spawn or
+    /// argument-parse failure, a toolchain that could not load, or a timeout.
+    /// This is the only class that means the instrument is broken.
+    Failed { reason: String },
+}
+
+impl ToolOutcome {
+    /// Did the TOOL succeed? True for [`Self::Ok`] and [`Self::Reported`] —
+    /// both mean the tool did its job, which is the question the `ok` field
+    /// has always documented itself as answering (see `trajectory.rs`'s
+    /// `append_tool_completed` and dispatch_internal's watchdog comment).
+    pub fn tool_worked(&self) -> bool {
+        !matches!(self, Self::Failed { .. })
     }
-    // Unknown-tool path from the dispatcher.
-    let unknown_marker = format!("tool '{tool_name}' is not available");
-    if result.starts_with(&unknown_marker) {
-        return true;
-    }
-    // Bash-specific: exit code in the first line. Anything other than
-    // `exit: 0` is a failure (includes timeout exit 124, real
-    // command errors, signals, etc.).
-    if tool_name == "bash" {
-        if let Some(rest) = result.strip_prefix("exit: ") {
-            // `rest` looks like "N\n--- stdout ---..." or "N (TIMED OUT...)...".
-            // `split_whitespace` already handles the trailing newline / parens.
-            let code_token = rest.split_whitespace().next().unwrap_or("");
-            return code_token != "0";
+
+    /// The wire discriminator written into records.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Reported { .. } => "reported",
+            Self::Failed { .. } => "failed",
         }
     }
-    false
+}
+
+/// (#2008) Classify a tool result into [`ToolOutcome`]. Supersedes the old
+/// `is_failure_result`, which was deleted rather than kept: a superseded
+/// classifier left beside its replacement is how the wrong one gets called
+/// again.
+///
+/// **Tool-surface invariant** (carried over from that function): all non-bash
+/// tools route failures through `Tool::execute`'s `Err`, which the dispatcher
+/// wraps as `"tool 'NAME' returned error: ..."`. That is why only the generic
+/// marker plus the bash exit-code parse are needed. Verified against
+/// `runtime/src/tools/mod.rs::execute_{read,write,edit,search}`. A future tool
+/// that returns `Ok(error-shaped-text)` must add its pattern here.
+///
+/// The timeout branch is load-bearing and easy to lose: `classify_failed_to_run`
+/// deliberately returns `None` for exit 124 (it keys on 127/126 and stderr
+/// load-markers), so deriving "failed" from that function alone would silently
+/// reclassify every timeout as [`ToolOutcome::Reported`] — and a command that
+/// keeps timing out is exactly the cascade this detector exists to catch.
+/// The `(TIMED OUT` marker is trustworthy because #905 gates it on the
+/// `timeout` wrapper having actually run, so a user command that genuinely
+/// exits 124 on its own still reads as `Reported`.
+pub fn classify_outcome(tool_name: &str, result: &str) -> ToolOutcome {
+    let generic_marker = format!("tool '{tool_name}' returned error:");
+    if result.starts_with(&generic_marker) {
+        return ToolOutcome::Failed { reason: "the tool returned an error".to_string() };
+    }
+    let unknown_marker = format!("tool '{tool_name}' is not available");
+    if result.starts_with(&unknown_marker) {
+        return ToolOutcome::Failed { reason: "no such tool".to_string() };
+    }
+
+    if tool_name == "bash" {
+        if let Some(rest) = result.strip_prefix("exit: ") {
+            let code_token = rest.split_whitespace().next().unwrap_or("");
+            let code: i32 = code_token.parse().unwrap_or(-1);
+            if code == 0 {
+                return ToolOutcome::Ok;
+            }
+            if result.contains("(TIMED OUT") {
+                return ToolOutcome::Failed {
+                    reason: "the command timed out before completing".to_string(),
+                };
+            }
+            if let Some(reason) = classify_failed_to_run(tool_name, result) {
+                return ToolOutcome::Failed { reason: reason.to_string() };
+            }
+            return ToolOutcome::Reported { exit_code: code };
+        }
+    }
+    ToolOutcome::Ok
 }
 
 /// (#799) Classify whether a bash result means the command **failed to run**
@@ -239,12 +315,12 @@ pub fn classify_failed_to_run(tool_name: &str, result: &str) -> Option<&'static 
 mod tests {
     use super::*;
 
-    // ─── is_failure_result ───────────────────────────────────────────────
+    // ─── classify_outcome ────────────────────────────────────────────────
 
     #[test]
     fn failure_when_generic_dispatch_error() {
         let r = "tool 'read' returned error: path traversal rejected";
-        assert!(is_failure_result("read", r));
+        assert!(!classify_outcome("read", r).tool_worked());
     }
 
     // (#799) classify_failed_to_run — the verifier-fabrication backstop.
@@ -314,37 +390,46 @@ mod tests {
     #[test]
     fn failure_when_unknown_tool_dispatch() {
         let r = "tool 'wibble' is not available in this runtime. known tools: echo, bash, ...";
-        assert!(is_failure_result("wibble", r));
+        assert!(!classify_outcome("wibble", r).tool_worked());
     }
 
     #[test]
-    fn failure_when_bash_exit_nonzero() {
+    fn a_bare_nonzero_exit_is_reported_and_the_tool_still_worked() {
+        // (#2008) This test previously asserted the DEFECT — that any
+        // non-zero exit meant the tool failed. It is inverted deliberately,
+        // not deleted: the case it covers still matters, the expected answer
+        // is what changed. A plain exit 1 with no never-ran marker is a
+        // command that ran and reported a result.
         let r = "exit: 1\n--- stdout ---\nfoo\n--- stderr ---\nbar";
-        assert!(is_failure_result("bash", r));
+        assert_eq!(classify_outcome("bash", r), ToolOutcome::Reported { exit_code: 1 });
+        assert!(
+            classify_outcome("bash", r).tool_worked(),
+            "the tool ran and produced output — that is work"
+        );
     }
 
     #[test]
     fn failure_when_bash_exit_124_timeout() {
         let r = "exit: 124 (TIMED OUT after 30s)\n--- stdout ---\n\n--- stderr ---\n";
-        assert!(is_failure_result("bash", r));
+        assert!(!classify_outcome("bash", r).tool_worked());
     }
 
     #[test]
     fn success_when_bash_exit_zero() {
         let r = "exit: 0\n--- stdout ---\nhello\n--- stderr ---\n";
-        assert!(!is_failure_result("bash", r));
+        assert!(classify_outcome("bash", r).tool_worked());
     }
 
     #[test]
     fn success_when_read_returns_file_content() {
         let r = "     1\tfn main() {\n     2\t    println!(\"hi\");\n     3\t}\n";
-        assert!(!is_failure_result("read", r));
+        assert!(classify_outcome("read", r).tool_worked());
     }
 
     #[test]
     fn success_when_search_returns_matches() {
         let r = "src/main.rs:1:fn main() {\nsrc/main.rs:2:    println!(\"hi\");\n";
-        assert!(!is_failure_result("search", r));
+        assert!(classify_outcome("search", r).tool_worked());
     }
 
     #[test]
@@ -353,7 +438,7 @@ mod tests {
         // and reported no matches. Different from "search command
         // errored out."
         let r = "no matches\n";
-        assert!(!is_failure_result("search", r));
+        assert!(classify_outcome("search", r).tool_worked());
     }
 
     #[test]
@@ -362,7 +447,7 @@ mod tests {
         // that happens to start with "exit: " text from a source file
         // is not a failure signal.
         let r = "exit: 42 — this is fine, just a string in the file";
-        assert!(!is_failure_result("read", r));
+        assert!(classify_outcome("read", r).tool_worked());
     }
 
     // ─── FailureRateDetector behavior ────────────────────────────────────
@@ -402,7 +487,7 @@ mod tests {
         d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         let signal = d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
-        let Some(FailureCascadeSignal::Suspected { tool_name, failure_count }) = signal else {
+        let Some(FailureCascadeSignal::Suspected { tool_name, failure_count, .. }) = signal else {
             panic!("expected Suspected, got {signal:?}");
         };
         assert_eq!(tool_name, "bash");
@@ -492,6 +577,95 @@ mod tests {
         d.record("bash", &bash_args("gcc x.c"), &err_for("bash"));
         // Only 2 consecutive failures since the last success.
         assert!(d.record("bash", &bash_args("gcc x.c"), &ok_for("bash")).is_none(), "intermittent should not trip");
+    }
+
+    #[test]
+    fn red_tests_never_cascade_however_many_times_they_run() {
+        // (#2008) The regression this whole change exists to prevent. Before
+        // it, three `npm test` runs reporting failing tests fired a cascade
+        // whose nudge told the model `bash` had failed and to switch tools.
+        let mut d = FailureRateDetector::with_threshold(3);
+        let red = "exit: 1\n--- stdout ---\nTests: 2 failed, 86 passed\n--- stderr ---\n";
+        for _ in 0..6 {
+            assert!(
+                d.record("bash", &bash_args("npm test"), red).is_none(),
+                "a red test must never cascade — the tool is working"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_failures_still_cascade() {
+        // The other half: the detector's founding case must survive the fix.
+        let mut d = FailureRateDetector::with_threshold(3);
+        let missing = "exit: 127\n--- stdout ---\n--- stderr ---\nbash: gcc: command not found\n";
+        d.record("bash", &bash_args("gcc x.c"), missing);
+        d.record("bash", &bash_args("gcc x.c"), missing);
+        assert!(
+            d.record("bash", &bash_args("gcc x.c"), missing).is_some(),
+            "a command that never ran must still cascade"
+        );
+    }
+
+    #[test]
+    fn a_red_test_is_reported_not_failed() {
+        // (#2008) THE case. A failing test in TDD's red phase is the tool
+        // doing its job. Classifying it as a failure told the model its test
+        // runner was broken and denied the watchdogs their proof-of-work.
+        let red = "exit: 1\n--- stdout ---\nTests: 2 failed, 86 passed\n--- stderr ---\n";
+        assert_eq!(
+            classify_outcome("bash", red),
+            ToolOutcome::Reported { exit_code: 1 },
+            "a command that ran and reported non-zero is Reported, never Failed"
+        );
+        assert!(
+            classify_outcome("bash", red).tool_worked(),
+            "the TOOL worked — this is what the `ok` field has always documented itself as meaning"
+        );
+    }
+
+    #[test]
+    fn a_command_that_never_ran_is_failed() {
+        // Exit 127 — the founding case of this detector (a `gcc` that was not
+        // installed). Must stay Failed, or the cascade loses its real job.
+        let missing = "exit: 127\n--- stdout ---\n--- stderr ---\nbash: gcc: command not found\n";
+        let out = classify_outcome("bash", missing);
+        assert!(matches!(out, ToolOutcome::Failed { .. }), "got {out:?}");
+        assert!(!out.tool_worked());
+    }
+
+    #[test]
+    fn a_timeout_is_failed_not_reported() {
+        // The branch that is easy to lose: `classify_failed_to_run` returns
+        // None for 124, so deriving Failed from it ALONE would silently make
+        // every timeout Reported and drop genuine timeout cascades.
+        let timed_out = "exit: 124 (TIMED OUT after 30s)\n--- stdout ---\n\n--- stderr ---\n";
+        let out = classify_outcome("bash", timed_out);
+        assert!(
+            matches!(out, ToolOutcome::Failed { .. }),
+            "a timed-out command did not complete: {out:?}"
+        );
+        assert!(
+            classify_failed_to_run("bash", timed_out).is_none(),
+            "guard: if classify_failed_to_run ever starts catching 124, this test \
+             stops proving the timeout branch is load-bearing"
+        );
+    }
+
+    #[test]
+    fn a_user_command_exiting_124_on_its_own_is_still_reported() {
+        // #905 gates the marker on the wrapper actually having run, so a
+        // command that genuinely chooses exit 124 is not mislabeled a timeout.
+        let own = "exit: 124\n--- stdout ---\nmy tool uses 124 for 'nothing to do'\n--- stderr ---\n";
+        assert_eq!(classify_outcome("bash", own), ToolOutcome::Reported { exit_code: 124 });
+    }
+
+    #[test]
+    fn a_tool_level_error_is_failed_for_any_tool() {
+        let err = "tool 'edit' returned error: old_string not found";
+        let out = classify_outcome("edit", err);
+        assert!(matches!(out, ToolOutcome::Failed { .. }), "got {out:?}");
+        assert_eq!(classify_outcome("bash", "exit: 0\n--- stdout ---\nok\n"), ToolOutcome::Ok);
     }
 
     #[test]
