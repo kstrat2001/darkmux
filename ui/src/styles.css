@@ -2310,14 +2310,18 @@ body {
 
 .machine-lens {
   font: calc(12px * var(--fs-scale))/1.6 var(--font-mono);
-  max-width: min(1200px, 92vw);
-  /* Centered, so the leftover splits evenly instead of all pooling on the
-     right. Measured before this: 16px of gutter on the left and 224px on the
-     right at 1440 (the 1200px cap), 16/64 at 1000 (the 92vw cap) — the lens
-     hugged the stage's left padding and every pixel the cap withheld landed
-     on one side. This is the only lens with a constraining max-width, so it
-     was also the only one that looked off-center. */
-  margin-inline: auto;
+  /* No max-width. darkmux is TOOLING, and tooling uses the window it was
+     given — `.fleet` and `.rv` already do, flowing to the stage edge.
+
+     This lens capped itself at `min(1200px, 92vw)`, which is why it read as a
+     different product from every other tab: at 2000px it left ~800px of dead
+     space no sibling had. An earlier fix added `margin-inline: auto` so the
+     leftover split evenly rather than pooling 224px on the right at 1440 —
+     that corrected the lopsidedness and left the real question unasked.
+
+     A max-width earns its keep for PROSE, where long measure hurts reading.
+     Nothing here is prose: it is gauges, cards and residency bars, and the
+     bar LENGTH is the datum, so width helps it. */
 }
 
 .machine-lens__hdr {
@@ -3274,7 +3278,14 @@ body {
    rather than legacy's flex markup. */
 .session-run {
   font: calc(12px * var(--fs-scale))/1.6 var(--font-mono);
-  max-width: min(1200px, 92vw);
+  /* No max-width — see `.machine-lens`. These two were the only lenses that
+     capped their own width, and they reached for the same magic number
+     independently, which is usually how a convention announces it wants to
+     exist. It doesn't: tooling uses the window.
+
+     The long-text regions here (prompt disclosure, reasoning) are disclosure
+     panels that set their own measure; capping the whole lens to protect them
+     also shortened every track, pill row and metric strip beside them. */
 }
 .session-run__header {
   font: 600 calc(13px * var(--fs-scale))/1.4 var(--font-mono);
