@@ -104,10 +104,161 @@
   code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace; }
   a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; text-underline-offset: 3px; }
-  .wrap { max-width: 760px; margin: 0 auto; padding: 0 24px; }
+  /* (#2034) 820px, matching `docs/guide/style.css`. These were 760 here and
+     820 there for no reason: two files written months apart, neither carrying
+     a comment, everything around them identical. The visible symptom was the
+     sticky nav shifting 30px horizontally when you moved between home and the
+     guide, since each nav aligned to its own page's column.
+
+     820 wins because ten guide pages already use it and guide prose is dense
+     reference material that benefits from the measure. Changing home is one
+     file; changing the guide would move every guide page. */
+  .wrap { max-width: 820px; margin: 0 auto; padding: 0 24px; }
+  /* (#2034) Figures BREAK OUT of the prose column.
+
+     760px is a good reading measure and the wrong container for a product
+     screenshot. `media/fleet.png` is a 2880px retina asset, roughly 1440
+     logical, and it was rendering at 712px, a 25% scale, while 340px of
+     gutter sat empty on each side. A dense dashboard at quarter size is
+     unreadable, and showing what the tool looks like is that image's entire
+     job.
+
+     `margin-left: 50%` + `translateX(-50%)` centres a wider box inside a
+     narrower parent without needing to know the parent's width, so this
+     keeps working if `.wrap` ever changes. Prose stays at 760. */
+  /* (#2034) The figure sits IN the column. It does not break out.
+
+     Two earlier attempts got this wrong in opposite directions: at column
+     width the 2880px dashboard rendered at 25% and was unreadable, and the
+     fix for that pushed it to 1.7x the column, which the operator called out
+     as swamping the page. Both were trying to solve "you cannot read the
+     detail" with LAYOUT.
+
+     The detail is now on demand: click to open it full screen, click or Esc
+     to close. The page keeps one measure, and the screenshot is legible when
+     someone actually wants to study it. */
   .shot { margin: 28px 0 6px; }
+  .shot img { cursor: zoom-in; display: block; }
+  /* The button is a focus target, not a visual element: it must not change
+     how the figure looks, only make it reachable by keyboard. */
+  .shot-open {
+    display: block;
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: none;
+    cursor: zoom-in;
+  }
+  .shot-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+  /* The lightbox. Deliberately plain: a dark ground, the image fit to the
+     viewport, and a hint. No animation beyond a fade, nothing to learn. */
+  .lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(6, 8, 12, 0.94);
+    cursor: zoom-out;
+  }
+  .lightbox[data-open="1"] { display: flex; }
+  .lightbox img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    border: 1px solid var(--line, #232838);
+    border-radius: 8px;
+  }
+  .lightbox__hint {
+    position: absolute;
+    bottom: 18px;
+    left: 0;
+    right: 0;
+    text-align: center;
+    font-size: 13px;
+    color: #6b7590;
+  }
   .shot img { width: 100%; border: 1px solid #1d2a3a; border-radius: 10px; display: block; }
   .shot figcaption { font-size: 13px; color: #8a8a92; margin-top: 10px; line-height: 1.5; }
+
+  /* (#2034) A sticky nav on HOME.
+     
+     Home is 6.5 screens tall, twice the guide's 3.3, and was the only page
+     with no persistent navigation at all. A visitor five screens down had the
+     footer and nothing else, while the SHORTER page kept a nav pinned the
+     whole way. That is backwards.
+
+     WITH the mark, matching the guide's nav.
+
+     This first shipped without one, reasoning that the hero carries the mark
+     two inches below and showing it twice was noise. That was wrong on both
+     counts, per the operator: they are DIFFERENT VARIANTS: the small
+     two-in/one-out here, the full four-channel diagram in the hero. So it is
+     not the same thing repeated. And leaving it off made home the one page
+     whose nav shows a bare wordmark, which is an inconsistency on the very
+     page that sets the pattern. */
+  /* Values MATCH `docs/guide/style.css`'s `.topnav` exactly: 20px padding,
+     16px wordmark, 22px mark, opaque background. This first shipped with its
+     own numbers (12px padding, 15px, 20px, translucent), so the bar visibly
+     jumped 48px to 67px and changed weight when you moved between home and
+     the guide. The operator caught it immediately.
+
+     The guide's nav is the incumbent on ten pages; home's was twenty minutes
+     old, so home moves. Two navs written separately are two navs that drift,
+     which is exactly what happened. */
+  .homenav {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: var(--bg, #0a0a0b);
+    border-bottom: 1px solid var(--line, #232838);
+    padding: 20px 0;
+  }
+  /* Reuses the page's own `.wrap` rather than declaring a second width.
+     The first cut set 1080px against the page's 760px, so the nav's wordmark
+     sat 160px left of the hero it belongs to. Two containers matched by hand
+     is two containers that drift. */
+  .homenav .wrap {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+  .homenav__brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42em;
+    font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-weight: 700;
+    font-size: 16px;
+    color: var(--text, #e8e9ed);
+    text-decoration: none;
+    text-transform: lowercase;
+    letter-spacing: -0.01em;
+  }
+  /* Sized in `em` off the wordmark, the same rule the guide nav and the
+     masthead use: one type scale rather than three numbers to keep in step. */
+  .homenav__brand img {
+    width: 1.35em;
+    height: 1.35em;
+    flex: none;
+  }
+  .homenav__links {
+    margin-left: auto;
+    display: flex;
+    gap: 18px;
+    font-size: 14px;
+  }
+  .homenav__links a { color: var(--muted, #9aa4bd); text-decoration: none; }
+  .homenav__links a:hover { color: var(--accent); }
+  @media (max-width: 640px) {
+    /* Three links fit beside the wordmark at this width; the fourth
+       (Articles) was removed as off-brand, so nothing needs hiding. */
+    .homenav { padding: 14px 0; }
+    .homenav .wrap { gap: 12px; }
+  }
 
   /* hero */
   header {
@@ -337,10 +488,21 @@
 </style>
 </head>
 <body>
+<span id="top"></span>
+
+<nav class="homenav">
+  <div class="wrap">
+    <a class="homenav__brand" href="#top"><img src="media/icon/mark-trapezoid-out.svg" width="22" height="22" alt="">darkmux</a>
+    <div class="homenav__links">
+      <a href="guide/">Guide</a>
+      <a href="demo/">Demo</a>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a>
+    </div>
+  </div>
+</nav>
 
 <header>
   <div class="wrap">
-    <div class="brand">darkly energized<span class="dot">·</span>open source</div>
     <div class="hero-lockup">
       <img class="hero-mark" src="media/icon/mark-full.svg" width="132" height="132"
            alt="The darkmux mark: four channels converging on a node and leaving as one output — a multiplexer.">
@@ -351,11 +513,17 @@
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew tap kstrat2001/darkmux</span><button class="copy-btn" data-copy="brew tap kstrat2001/darkmux" aria-label="Copy command">Copy</button></div>
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install darkmux</span><button class="copy-btn" data-copy="brew install darkmux" aria-label="Copy command">Copy</button></div>
     </div>
+    <!-- (#2034) ONE call to action. The guide and the repo live in the nav
+         above and are referenced in context further down, so repeating them
+         here only competed with the thing a first-time visitor should
+         actually do: look at the tool. Three buttons of equal weight is not
+         a choice, it is a menu.
+
+         "See the demo", not "See it running". The demo is static playback of
+         recorded data. Nothing is running until the visitor installs it, and
+         a CTA that says otherwise is a claim the page cannot keep. -->
     <div class="btns">
-      <a class="btn btn-primary" href="guide/">User guide →</a>
-      <a class="btn btn-ghost" href="https://github.com/kstrat2001/darkmux">GitHub</a>
-      <a class="btn btn-ghost" href="demo/">Observability demo</a>
-      <a class="btn btn-ghost" href="https://substack.com/@DarklyEnergized">Read the work</a>
+      <a class="btn btn-primary" href="demo/">See the demo →</a>
     </div>
   </div>
 </header>
@@ -366,8 +534,8 @@
     <h3>You don't have to rent every token. The AI workforce is already sitting in your Mac.</h3>
     <p>darkmux started as a lab for testing faster local AI on Apple Silicon. The belief that came out of it: <strong>a frontier model is a brilliant strategist you rent by the token. Burning those tokens on compaction, scaffolding, test runs, and structuring is paying rent for busy work, plus handing your data to someone else's cloud to do it.</strong> The Apple Silicon you already bought runs capable open-source models locally: no cloud account, no per-token meter, nothing leaving your disk. Many Mac owners don't make full use of the hardware they paid for; darkmux gives you the tools to use that silicon.</p>
     <p class="muted">Every default in darkmux comes from a measured result, not a guess. The repo is the evidence locker; the <a href="https://substack.com/@DarklyEnergized">writing</a> is the narrative.</p>
-    <figure class="shot">
-      <img src="media/fleet.png" alt="The darkmux dashboard, fleet view: 6,029,666 tokens run locally against zero cloud tokens over 24 hours, broken into 269k generated, 364k fresh input and 5.7M re-read input across 10 dispatches on a three-Mac fleet, with an orchestrator note closing the day" loading="lazy">
+    <figure class="shot"><button type="button" class="shot-open" aria-label="Enlarge this screenshot">
+      <img src="media/fleet.png" alt="The darkmux dashboard, fleet view: 6,029,666 tokens run locally against zero cloud tokens over 24 hours, broken into 269k generated, 364k fresh input and 5.7M re-read input across 10 dispatches on a three-Mac fleet, with an orchestrator note closing the day" loading="lazy"></button>
       <figcaption>A day on a three-Mac demo fleet: 6M tokens stayed local, none went to a metered API. The breakdown is the lesson — re-read context is about 90% of the input, which is why agent loops burn tokens so fast, and why moving that work off the meter is worth doing.</figcaption>
     </figure>
   </div>
@@ -398,7 +566,7 @@
   <div class="wrap">
     <h2>Watch it work</h2>
     <h3>A daemon + viewer for live observability of dispatches, phases, and verdicts.</h3>
-    <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes the flow records written by every dispatch and mission/phase transition. The <a href="demo/">observability viewer</a> renders those records as one drillable view of your fleet: drill fleet → machine → subsystem, with the event stream as a log lens at any level. A <a href="demo/">live demo with sample data</a> runs on this site. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
+    <p><code>darkmux serve</code> runs a small HTTP daemon (default <code>127.0.0.1:8765</code>) that exposes the flow records written by every dispatch and mission/phase transition. The <a href="demo/">observability viewer</a> renders those records as one drillable view of your fleet: drill fleet → machine → subsystem, with the event stream as a log lens at any level. A <a href="demo/">demo with recorded sample data</a> is published on this site. Wall-clock arcs on dispatch records; <code>model</code> field tells you which LMStudio model ran the work.</p>
     <ul class="plain">
       <li><code>darkmux serve</code> — start the daemon in a separate terminal tab</li>
       <li><code>darkmux doctor</code> — pre-flight checks including <code>daemon: reachable</code></li>
@@ -475,6 +643,14 @@
   </div>
 </footer>
 
+<!-- (#2034) One lightbox for every figure. `aria-hidden` flips with the open
+     state so it is not announced while closed, and the image's alt is copied
+     from the figure that opened it rather than being written twice. -->
+<div class="lightbox" id="lightbox" data-open="0" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Enlarged screenshot">
+  <img alt="">
+  <div class="lightbox__hint">click anywhere, or press Esc, to close</div>
+</div>
+
 <script>
   // Copy-to-clipboard for install commands. One delegated listener (no inline
   // handlers); each `.copy-btn` carries its exact command in `data-copy`. The
@@ -500,6 +676,63 @@
       done("Failed", false);
     }
   });
+
+  // (#2034) Click a figure to see it full screen; click or Esc to close.
+  //
+  // The screenshots are 2880px retina assets shown at roughly a third of that
+  // in the column. Rather than let the figure break out of the page's measure
+  // to make the detail readable, the detail is available on demand.
+  //
+  // Delegated, matching the copy-button listener above. `previouslyFocused`
+  // is restored on close so keyboard users are not dropped at the top of the
+  // document after viewing an image.
+  (function () {
+    var box = document.getElementById("lightbox");
+    if (!box) return;
+    var img = box.querySelector("img");
+    var previouslyFocused = null;
+
+    function open(src, alt) {
+      previouslyFocused = document.activeElement;
+      img.setAttribute("src", src);
+      // Carry the figure's own alt across; the enlarged view describes the
+      // same thing, so writing a second description would let the two drift.
+      img.setAttribute("alt", alt || "");
+      box.setAttribute("data-open", "1");
+      box.setAttribute("aria-hidden", "false");
+      document.body.style.overflow = "hidden";
+      box.focus();
+    }
+
+    function close() {
+      box.setAttribute("data-open", "0");
+      box.setAttribute("aria-hidden", "true");
+      // Drop the src so a large decoded image is not held for a page the
+      // visitor may never reopen.
+      img.removeAttribute("src");
+      document.body.style.overflow = "";
+      if (previouslyFocused && previouslyFocused.focus) previouslyFocused.focus();
+      previouslyFocused = null;
+    }
+
+    document.addEventListener("click", function (e) {
+      if (box.getAttribute("data-open") === "1") { close(); return; }
+      var shot = e.target.closest(".shot img");
+      if (!shot) return;
+      open(shot.getAttribute("src"), shot.getAttribute("alt"));
+    });
+
+    // Keyboard: the figure is reachable and operable without a mouse.
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && box.getAttribute("data-open") === "1") { close(); return; }
+      if (e.key !== "Enter" && e.key !== " ") return;
+      var el = document.activeElement;
+      if (!el || !el.classList || !el.classList.contains("shot-open")) return;
+      e.preventDefault();
+      var i = el.querySelector("img");
+      if (i) open(i.getAttribute("src"), i.getAttribute("alt"));
+    });
+  })();
 </script>
 
 </body>
