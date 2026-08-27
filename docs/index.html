@@ -478,6 +478,12 @@
     margin: 24px 0 0;
   }
   .warn strong { color: var(--warn); }
+  /* Fine print at the foot of the page: same measure and heading as every
+     other section, but the body text steps down to the muted tone so it
+     reads as a footnote, not a fourth feature. */
+  .fineprint { padding-top: 40px; }
+  .fineprint .warn { color: var(--muted); }
+  .fineprint .warn:first-of-type { margin-top: 0; }
 
   /* footer */
   footer {
@@ -582,9 +588,14 @@
 
 <section>
   <div class="wrap">
-    <h2>On-demand crews, not a pyramid</h2>
-    <h3>An AI workforce, not a bureaucracy of bots.</h3>
-    <p>The obvious way to build a multi-agent tool was to copy the company: a boss model delegating to manager models delegating to workers, a pyramid of cloud agents renting tokens to talk to each other. But the org chart exists to route around <em>human</em> limits (span of control, careers, reporting lines), and none of those bind a model that spins up for one job and vanishes. So darkmux has no pyramid. One principal, <strong>you</strong>, leverages an orchestration harness (e.g. Claude Code) that assembles crews on demand for the mission and dissolves them when the work is done. The capable model shapes the work, the local crew does it, <strong>you decide what runs.</strong></p>
+    <h2>Get going</h2>
+    <h3>Installed to first inference in a few minutes.</h3>
+    <div class="install">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install kstrat2001/darkmux/darkmux</span><button class="copy-btn" data-copy="brew install kstrat2001/darkmux/darkmux" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux init</span><button class="copy-btn" data-copy="darkmux init" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "what can you do?"</span><button class="copy-btn" data-copy="darkmux radio &quot;what can you do?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+    </div>
+    <p>You need <a href="https://lmstudio.ai">LM Studio</a> with a model downloaded. <code>init</code> writes your config. <code>radio</code> is darkmux in plain text: ask what it can do, or say what you want done, and a local model answers from the command catalog and the mission board, or routes you to the right command. The <a href="guide/getting-started.html">getting-started guide</a> takes it from there.</p>
   </div>
 </section>
 
@@ -648,16 +659,9 @@
   </div>
 </section>
 
-<section>
+<section class="fineprint">
   <div class="wrap">
-    <h2>Get going</h2>
-    <div class="install">
-      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install kstrat2001/darkmux/darkmux</span><button class="copy-btn" data-copy="brew install kstrat2001/darkmux/darkmux" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
-      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux init</span><button class="copy-btn" data-copy="darkmux init" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
-      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux doctor</span><button class="copy-btn" data-copy="darkmux doctor" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
-    </div>
-    <p class="muted">Prefer source? <code>cargo install --git https://github.com/kstrat2001/darkmux</code> works too. Then edit <code>~/.darkmux/profiles.json</code> to point at your downloaded LMStudio models. The <a href="guide/getting-started.html">getting-started page of the user guide</a> walks through this end-to-end, including verifying with doctor and launching your first mission.</p>
-
+    <h2>Before you run it</h2>
     <div class="warn">
       <strong>Results will vary based on your frontier configuration.</strong> The frontier models you use as the orchestrator (Claude Code, Cursor, etc.) need proper guidance to make the most out of darkmux. The user guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals. See <a href="https://github.com/kstrat2001/darkmux/issues/112">issue #112</a> for the architectural reasoning.
     </div>
@@ -665,6 +669,7 @@
     <div class="warn">
       <strong>Safety note.</strong> darkmux orchestrates AI tools that execute on your machine. It modifies your local config files and, in lab mode, runs AI-generated code in a working directory that is not a security sandbox. Read the <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">DISCLAIMER</a> before running.
     </div>
+  </div>
   </div>
 </section>
 
