@@ -1,8 +1,10 @@
-//! `darkmux acp` — SPIKE (#1388): expose darkmux as an ACP (Agent Client
-//! Protocol) agent over stdio so editors like Zed can drive a
-//! `darkmux mission launch review` from their agent panel.
+//! `darkmux acp`: darkmux as an ACP (Agent Client Protocol) agent over
+//! stdio, so editors like Zed drive the advertised catalog and radio's two
+//! seats from their agent panel. Started as the #1388 spike; shipped through
+//! the #1698 packets. The list below is the spike's original debts, each
+//! marked as it was paid.
 //!
-//! ## This is a spike, not a shipped feature
+//! ## Spike-era notes (historical)
 //!
 //! Optimized for "it works in Zed today", not architectural purity. Things
 //! that are deliberately spike-grade here (a real feature would do these

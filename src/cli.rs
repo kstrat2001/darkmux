@@ -303,9 +303,11 @@ pub(crate) enum Cmd {
         #[arg(long = "lab-dir")]
         lab_dir: Option<std::path::PathBuf>,
     },
-    /// SPIKE (#1388): expose darkmux as an ACP (Agent Client Protocol) agent
-    /// over stdio for editors like Zed. Not a shipped feature yet — see
-    /// `src/acp.rs` module docs for what's spike-grade about it.
+    /// Serve darkmux as an ACP (Agent Client Protocol) agent over stdio, for
+    /// editors like Zed. The advertised command catalog becomes the agent
+    /// panel's slash commands; free text goes through radio's routing and
+    /// answering seats. Wire it in Zed's `agent_servers` with
+    /// `"command": "darkmux", "args": ["acp"]`. Guide: docs/guide/radio.html.
     Acp,
     /// Route free text onto ONE advertised command via a bounded local
     /// classification dispatch, then execute it — the terminal twin of the
