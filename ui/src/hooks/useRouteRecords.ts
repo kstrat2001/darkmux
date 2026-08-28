@@ -94,7 +94,12 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
   // forced it (`route.ts`'s own doc) — so reading `staticFlowSrc()` directly
   // here, rather than re-deriving it from `date === null`, is the "one
   // resolver" this fix keeps to (`lib/staticSource.ts`'s module doc).
-  const flowSrc = route.kind === "playback" ? staticFlowSrc() : null;
+  // (#2065) A DISPATCH route on a static build reads the same committed file
+  // and slices ONE session out of it (`session_id`), instead of asking a
+  // daemon that is not there for `/flow-session/<id>` (a 404 on every
+  // dispatch-row tap of the demo). The file already carries every session
+  // its `demo-runs.json` lists; there is nothing to fetch.
+  const flowSrc = route.kind === "playback" || route.kind === "dispatch" ? staticFlowSrc() : null;
 
   // Deliberately the SAME cache key `useFlowWindow` uses for its two day
   // fetches (`queryKeys.flowDate`). Same endpoint, same response — sharing the
@@ -146,7 +151,7 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
   const sessionQuery = useQuery({
     queryKey: queryKeys.flowSession(sessionId ?? ""),
     queryFn: () => fetchJson<unknown>(`/flow-session/${encodeURIComponent(sessionId ?? "")}`),
-    enabled: sessionId !== null,
+    enabled: sessionId !== null && flowSrc === null,
     refetchInterval: shouldPoll ? PRESENCE_POLL_MS : false,
   });
 
@@ -158,8 +163,9 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
     // has no daemon to report a status FROM. Still shaped through the SAME
     // `normalizeRecords` every other branch here uses (this hook's own
     // module doc explains why that matters).
+    const all = staticQuery.data ? normalizeRecords(staticQuery.data) : [];
     return {
-      records: staticQuery.data ? normalizeRecords(staticQuery.data) : [],
+      records: sessionId !== null ? all.filter((r) => r.session_id === sessionId) : all,
       loading: staticQuery.data === undefined,
       historical: true,
       error: null,

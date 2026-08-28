@@ -375,6 +375,29 @@ describe("RunsBoard", () => {
     expect(notice.textContent).toMatch(/this static build has no mission graph data to show/i);
   });
 
+  it("(#2065) a static build that ships a graphs file opens the mission's MAP lens, not the daemon-less notice", async () => {
+    mockFetch();
+    for (const [name, content] of [
+      ["darkmux-flow-src", "./demo-flow.jsonl"],
+      ["darkmux-graphs-src", "./demo-graphs.json"],
+    ]) {
+      const meta = document.createElement("meta");
+      meta.name = name;
+      meta.content = content;
+      document.head.appendChild(meta);
+    }
+    try {
+      renderBoard();
+      await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+      fireEvent.click(screen.getByText("m1").closest(".labrunrow")!);
+      expect(window.location.hash).toBe("#mission=m1");
+      expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
+    } finally {
+      document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
+      window.location.hash = "";
+    }
+  });
+
   it("the daemon-less notice also fires from a keyboard Enter activation", async () => {
     mockFetch();
     renderBoard();
@@ -836,6 +859,33 @@ describe("RunsBoard — deep-link wiring parity with App.tsx (#1920)", () => {
   // the exact re-render `App.tsx` would eventually get from some unrelated
   // cause (a poll, a refetch) by firing a `hashchange` after the notice
   // first appears — the same echo the guard exists to recognize.
+  it("(#2065) on a static build that ships mission graphs, an unresolvable lab run still gets the daemon-less notice, not a 'removed or stale' claim", async () => {
+    mockFetch(); // /lab/run/detail?dir=bad-dir 404s here exactly as a static host would
+    window.location.hash = "#lens=runs&kind=lab&run=bad-dir";
+    for (const [name, content] of [
+      ["darkmux-flow-src", "./demo-flow.jsonl"],
+      ["darkmux-graphs-src", "./demo-graphs.json"],
+    ]) {
+      const meta = document.createElement("meta");
+      meta.name = name;
+      meta.content = content;
+      document.head.appendChild(meta);
+    }
+    try {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        <QueryClientProvider client={queryClient}>
+          <AppLikeRunsHarness />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(screen.getByText(/needs a running daemon/)).toBeInTheDocument());
+      expect(screen.queryByText(/couldn't open run/)).not.toBeInTheDocument();
+    } finally {
+      document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
+      window.location.hash = "";
+    }
+  });
+
   it("a deep link to an unresolvable lab run keeps its notice after the echoed re-render, not wiped back out", async () => {
     mockFetch(); // /runs, /lab/runs both ok; /lab/run/detail?dir=bad-dir falls through to this mock's 404 default
     window.location.hash = "#lens=runs&kind=lab&run=bad-dir";
