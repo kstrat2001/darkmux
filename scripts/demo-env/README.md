@@ -98,6 +98,91 @@ MagicDNS name, and a first-pass rewrite that matched only the `.ts.net` suffix
 left the host label behind. Treat a refusal as correct and add a rewrite rule;
 do not weaken the scan.
 
+## Refreshing the published demo
+
+`docs/demo/*` and the screenshots feeding `docs/media/*` are GENERATED, never
+hand-edited. Run the four steps in order, from this directory unless noted:
+
+```bash
+./build.py                                            # 1. build the isolated world
+./serve.py --port <free-port> &                       # 2. serve it (real daemon, isolated home)
+./export_static.py --base http://127.0.0.1:<port>     # 3. capture into docs/demo/*
+cd ../.. && bash scripts/build-demo.sh                 # 4. regenerate docs/demo/index.html
+```
+
+What each writes:
+
+1. **`build.py`** — an isolated `DARKMUX_HOME` under `screenshots/demo-home`
+   (flow records, the imported mission(s), config, profiles) plus the
+   machine/panel fixtures under `screenshots/fixtures`. Never touches
+   `~/.darkmux`; safe to run from any checkout, including a worktree.
+2. **`serve.py`** — a REAL `darkmux serve` against that isolated home. Every
+   route the daemon can answer from records is passed through untouched;
+   `/machine/*` and `/panel/doctor`/`/panel/machine-status` are overridden
+   from the fixtures `build.py` wrote (those probe THIS machine, not the
+   demo one); every OTHER passthrough response is scrubbed live before it
+   leaves the process (see `_scrub_passthrough`'s own doc — this is the
+   backstop that catches a probe- or daemon-computed value the import-time
+   scrub never saw, and it now covers every route this handler proxies, not
+   only `/panel/*`).
+3. **`export_static.py`** — `docs/demo/demo-panels.json`, `demo-machine.json`,
+   `demo-missions.json`, `demo-phases.json`, `demo-graphs.json`,
+   `demo-runs.json`, `demo-lab-runs.json`, `demo-flow.jsonl`. Every one of
+   these is CAPTURED from the running daemon's own routes (`/panel/*`,
+   `/machine/*`, `/missions`, `/phases`, `/mission/:id/graph.json`, `/runs`,
+   `/lab/runs`, `/flow-days` + `/flow/:date`) — none is hand-authored, so
+   none can independently go stale the way a hand-edited fixture can.
+4. **`scripts/build-demo.sh`** — `docs/demo/index.html`, generated from
+   whichever built viewer asset the daemon actually serves (never a second
+   hardcoded source — see that script's own doc).
+
+Screenshots (`docs/media/*.png`) come from `node shoot.mjs` (run from this
+directory, against step 2's `serve.py`) for the lens shots it already knows
+about, plus a targeted Playwright capture of `#mission=<id>` for anything
+mission-graph-specific `shoot.mjs`'s generic ready-selector shooter doesn't
+cover (a zoomed crop on one phase, for instance) — same Chrome-channel,
+`deviceScaleFactor: 2`, dark-colorScheme conventions `shoot.mjs` itself uses,
+so a screenshot the harness didn't generate still reads as one that would
+have.
+
+**Before committing, prove — don't assert — each of these:**
+
+- [ ] every `ts` in `demo-flow.jsonl` is within about a day of the moment
+      `build.py` ran (its clock, not whenever the file was last hand-touched):
+      `python3 -c "import json,sys; from datetime import datetime,timezone; recs=[json.loads(l) for l in open('../../docs/demo/demo-flow.jsonl') if l.strip()]; print(min(r['ts'] for r in recs), max(r['ts'] for r in recs))"`
+- [ ] no run in `demo-runs.json` has `"status": "running"` except the one
+      `build.py`'s `REPLAYS` marks `live=True`, and that one's `started_ts` is
+      minutes old, not days
+- [ ] `demo-graphs.json` contains every mission under `missions/`, each with
+      `"mission_status": "finalized"`
+- [ ] `grep -rn "/Users/<you>\|<your-hostname>\|ts\.net" docs/demo/` returns
+      nothing (broaden this per-machine — the four literal patterns are a
+      floor, not the whole scan; a worktree checkout also leaks its own
+      layout unless the repo-root replacement in `canned_doctor`/
+      `_scrub_passthrough` catches it, which is exactly the class of leak
+      that motivated adding it)
+- [ ] any NEW or CHANGED screenshot gets LOOKED AT before committing, not
+      just grepped — an image is opaque to every text-based sentinel guard
+      the repo runs, `scripts/lib_vocab.py` included
+
+Every mission and session in this world is a REAL run of darkmux's own public
+code — imported via `import_session.py`/`import_mission.py`, which strip
+identity and re-anchor timestamps at import time — never a flow record or
+mission JSON typed by hand. That is the whole design principle this file
+opens with ("fixture as little as possible"): a hand-written record can encode
+a shape the daemon could never produce, and the only symptom is a pane that
+renders nothing, which reads as "my selector is wrong" rather than "my
+fixture is wrong." Refreshing the demo is re-running real code against a
+real (if isolated) daemon, never re-typing its output.
+
+**Cadence:** the demo is refreshed at RELEASE, not continuously — the
+`darkmux-point-release` skill runs the four steps above (and their proof
+checklist) as a standard step in every version-bump PR, so darkmux.com/demo
+never reads as more than one release behind main. A demo that rebuilt on
+every commit would recapture screenshots for work nobody has shipped yet;
+release cadence is the point where "what the demo shows" and "what a
+`brew install`ed operator actually gets" are supposed to agree.
+
 ## Known rough edge
 
 `darkmux doctor` reports on the machine it RUNS on, so the canned panel carries
