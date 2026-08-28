@@ -90,6 +90,12 @@ export function specOf(
   // reports the current one. Same identity rule as
   // `lib/flow.ts::localMachineUid`; see `machineNames` for why one machine
   // accumulates several names.
+  // (#2067) Keyed off `liveMachines`, not `specBeats`, on purpose: this
+  // branch answers "is `m` the machine `/machine/specs` describes", a
+  // liveness-side identity question, and `specs` is null on a static build
+  // (the query is live-only) so the branch never runs there. If a static
+  // machine-specs source is ever wired in, this alias lookup must read the
+  // snapshot too.
   if (specs && specs.machine_id && machineNames(data, liveMachines, m).has(specs.machine_id) && specs.cpu_brand) {
     const gb = specs.ram_total_bytes ? ` · ${Math.round(specs.ram_total_bytes / 1073741824)} GB` : "";
     return specs.cpu_brand + gb;

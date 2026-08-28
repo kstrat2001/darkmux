@@ -18,6 +18,10 @@ export function useStaticFleetBeats(): Map<string, PresenceBeat> {
     enabled: src !== null,
     queryKey: queryKeys.staticFleet(src ?? ""),
     queryFn: () => fetchJson<FleetMachinesLiveResponse>(src ?? ""),
+    // A committed file does not change under the page: never stale, so a
+    // remount or tab focus does not re-download it (matches the other
+    // static twins, `MachineLens`/`MissionGraphLens`).
+    staleTime: Infinity,
   });
   return useMemo(() => {
     const map = new Map<string, PresenceBeat>();
