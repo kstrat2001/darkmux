@@ -60,14 +60,16 @@ test('pressing play on the static build actually advances the playhead', async (
   // a fluke.
   await expect.poll(async () => Number(await range.inputValue()), { timeout: 5_000 }).toBeGreaterThan(0);
 
-  // The clock readout moves in lockstep with the range — a second,
-  // independent signal (real DOM text, not the input's own `.value`) that
-  // this is a genuinely advancing playhead, not a range element some other
-  // code nudged in isolation. Compared against its OWN pre-play reading
-  // (captured above) rather than a hardcoded literal, since `clkhm`'s
-  // HH:MM text depends on the runner's local timezone.
-  const clockDuring = await clock.innerText();
-  expect(clockDuring).not.toBe(clockBefore);
+  // Speed is a real multiplier of elapsed time now ("1× doesn't seem 1×",
+  // the #2071 follow-up): at the default 1h/s this 13-second fixture day
+  // plays out inside ONE tick, so sampling the clock mid-flight is a race
+  // against the loop. The advance is proven by the run COMPLETING instead:
+  // the range returns to 100, the play button flips back from "pause", and
+  // the clock (real DOM text, not the input's own `.value`) counts every
+  // record again — three independent signals of a playhead that moved.
+  await expect(range).toHaveValue('100', { timeout: 5_000 });
+  await expect(playBtn).toHaveAttribute('title', 'play');
+  expect(await clock.innerText()).toMatch(new RegExp(`${total}/${total} rec$`));
 
   expect(pageErrors, `pageerror events: ${pageErrors.join('; ')}`).toHaveLength(0);
 });
