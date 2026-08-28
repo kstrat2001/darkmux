@@ -1,61 +1,38 @@
 {
+  "generated_at_ms": 1787886870367,
   "phases": [
     {
-      "id": "demo-scaffold",
-      "mission_id": "demo",
-      "description": "Scaffold the read-only diff route + path containment.",
+      "completed_ts": 1785405556,
+      "created_ts": 1785400940,
+      "description": "double-confirm judge over deduped flags",
+      "display_name": "Adjudicate",
+      "id": "review-1785400940-136e76-adjudicate",
+      "mission_id": "review-1785400940-136e76",
+      "started_ts": 1785402483,
       "status": "complete",
-      "depends_on": [],
-      "created_ts": 1779497400,
-      "completed_ts": 1779497500
+      "task_ids": []
     },
     {
-      "id": "demo-endpoint",
-      "mission_id": "demo",
-      "description": "Compute the running git diff + size-bound + JSON response.",
-      "status": "running",
-      "depends_on": [
-        "demo-scaffold"
-      ],
-      "created_ts": 1779497400,
-      "started_ts": 1779497570
-    },
-    {
-      "id": "demo-tests",
-      "mission_id": "demo",
-      "description": "Integration tests + the malicious-fixture walkthrough.",
-      "status": "planned",
-      "depends_on": [
-        "demo-endpoint"
-      ],
-      "created_ts": 1779497400
-    },
-    {
-      "id": "demo-feature",
-      "mission_id": "demo-shipped",
-      "description": "Emit telemetry.tokens per turn; remove the at-complete aggregate.",
+      "completed_ts": 1785405556,
+      "created_ts": 1785400940,
+      "description": "resolve review bundles from the diff, probe every explicit probe task, dedup",
+      "display_name": "Investigate",
+      "id": "review-1785400940-136e76-investigate",
+      "mission_id": "review-1785400940-136e76",
+      "started_ts": 1785400940,
       "status": "complete",
-      "depends_on": [],
-      "created_ts": 1779410000,
-      "completed_ts": 1779494000
+      "task_ids": []
     },
     {
-      "id": "dispatch-pr-reviewer-1779496200-turn",
-      "mission_id": "dispatch-pr-reviewer-1779496200",
-      "description": "Review PR #612 against its stated intent.",
+      "completed_ts": 1785405556,
+      "created_ts": 1785400940,
+      "description": "verify confirmed findings, synthesize tier counts",
+      "display_name": "Report",
+      "id": "review-1785400940-136e76-report",
+      "mission_id": "review-1785400940-136e76",
+      "started_ts": 1785405346,
       "status": "complete",
-      "depends_on": [],
-      "created_ts": 1779495900,
-      "completed_ts": 1779496200
-    },
-    {
-      "id": "dispatch-analyst-1779492000-turn",
-      "mission_id": "dispatch-analyst-1779492000",
-      "description": "Summarize the week's flow records.",
-      "status": "abandoned",
-      "depends_on": [],
-      "created_ts": 1779491700,
-      "completed_ts": 1779492000
+      "task_ids": []
     }
   ]
 }

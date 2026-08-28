@@ -207,7 +207,7 @@ describe("MissionGraphLens", () => {
     await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(2));
   });
 
-  it("a daemon-less static build shows an honest 'needs a daemon' notice, never attempts a fetch", () => {
+  it("a daemon-less static build with NO published graph fixture shows an honest 'needs a daemon' notice, never attempts a fetch", () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-flow-src";
     meta.content = "./demo-flow.jsonl";
@@ -217,6 +217,84 @@ describe("MissionGraphLens", () => {
     renderLens();
     expect(screen.getByText(/needs a running daemon/i)).toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  describe("static graphs fixture (#2032 packet 2)", () => {
+    function injectStaticMetas() {
+      const flow = document.createElement("meta");
+      flow.name = "darkmux-flow-src";
+      flow.content = "./demo-flow.jsonl";
+      document.head.appendChild(flow);
+      const graphs = document.createElement("meta");
+      graphs.name = "darkmux-graphs-src";
+      graphs.content = "./demo-graphs.json";
+      document.head.appendChild(graphs);
+    }
+
+    /** Stubs `fetch` to answer ONLY the committed graphs-fixture path with
+     *  `map` — anything else (there should be nothing else: every other
+     *  query on this component is `enabled: daemonBacked`, which is false
+     *  for every test in this block) 404s, so an unexpected extra call is
+     *  visible in `calls` rather than silently satisfied. */
+    function mockStaticFetch(map: Record<string, MissionGraph>) {
+      const calls: string[] = [];
+      const fetchMock = vi.fn((url: string) => {
+        calls.push(url);
+        if (url.endsWith("demo-graphs.json")) {
+          return Promise.resolve(new Response(JSON.stringify(map), { status: 200 }));
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      return { fetchMock, calls };
+    }
+
+    it("renders a mission's real task graph from the committed fixture map, with no fetch to the daemon's /mission/:id/graph.json route", async () => {
+      injectStaticMetas();
+      const { fetchMock, calls } = mockStaticFetch({ m1: GRAPH });
+      renderLens("m1");
+      await waitFor(() => expect(document.querySelector(".midname")?.textContent).toBe("m1"));
+      expect(screen.getByText("finalized")).toBeInTheDocument();
+      expect(document.querySelector(".phasegroup")).not.toBeNull();
+      expect(document.querySelector(".mnode.k-task.s-complete")).not.toBeNull();
+      expect(document.querySelector(".steprow.s-complete")).not.toBeNull();
+      // Exactly one network call — the fixture map itself — and NONE of
+      // them named the daemon-only per-mission route.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(calls.some((u) => u.includes("/mission/"))).toBe(false);
+      expect(calls[0]).toContain("demo-graphs.json");
+    });
+
+    it("renders the lens's existing empty/absent state — not an error, not a permanent spinner — when the routed mission isn't in the fixture map", async () => {
+      injectStaticMetas();
+      mockStaticFetch({ "some-other-mission": GRAPH });
+      renderLens("m1");
+      await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+      expect(screen.getByRole("alert").textContent).toMatch(/ephemeral or cleared run/i);
+      // No retry control on the static-absent branch — there is no daemon
+      // behind this page for a retry to reach.
+      expect(screen.queryByTitle("retry — refetch graph")).toBeNull();
+    });
+
+    it("renders a loading state while the fixture map itself is still resolving", () => {
+      injectStaticMetas();
+      vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
+      renderLens("m1");
+      expect(screen.getByRole("status", { name: /loading mission m1/i })).toBeInTheDocument();
+    });
+
+    it("(inverted case) with no darkmux-graphs-src meta, the daemon fetch path is used — the static branch never engages", async () => {
+      // No static metas injected at all — the default daemon-backed
+      // harness every other test in this file exercises.
+      mockFetch();
+      renderLens("m1");
+      await waitFor(() => expect(document.querySelector(".midname")?.textContent).toBe("m1"));
+      // Reaching the rendered graph here is only possible via the daemon's
+      // `/mission/:id/graph.json` route (`mockFetch`'s ONLY 200 responder)
+      // — the static fixture path was never given a `darkmux-graphs-src`
+      // meta to resolve, so `staticGraphsQuery` stayed disabled throughout.
+      expect(document.querySelector(".mnode.k-task.s-complete")).not.toBeNull();
+    });
   });
 
   it("discloses the SERVER's own truncated cap on the events pane when /flow-mission/:id reports truncated:true (proved failing pre-fix: an earlier port discarded this flag entirely)", async () => {

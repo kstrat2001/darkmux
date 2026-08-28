@@ -117,6 +117,12 @@ export const queryKeys = {
    * FLOW RECORD backfill for the same mission id, not the persisted
    * Phase/Task/Step graph structure. */
   missionGraph: (id: string) => ["mission", id, "graph"] as const,
+  /** `staticSource.ts::staticGraphsSrc()`'s committed mission-id -> graph
+   * map (#2032 packet 2) — the static-demo twin of `missionGraph` above,
+   * keyed on the SRC PATH rather than the mission id (one fetch loads
+   * EVERY mission's graph at once, matching `staticMachine`'s own
+   * one-fixture-one-fetch shape, not `missionGraph`'s per-id shape). */
+  staticGraphs: (src: string) => ["mission", "graph", "static", src] as const,
   flowSession: (id: string) => ["flow", "session", id] as const,
   /** `GET /lab/run/detail?dir=` — the lab-run detail view's one-shot fetch
    * (`LabRunDetail.tsx`). The event-feed poll (`/lab/run/events`) is NOT a

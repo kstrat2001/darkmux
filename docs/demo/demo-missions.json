@@ -1,51 +1,22 @@
 {
+  "generated_at_ms": 1787886870366,
   "missions": [
     {
-      "id": "demo",
-      "description": "Add the live-diff endpoint and wire it into the session view.",
-      "status": "active",
+      "created_ts": 1785400940,
+      "description": "PR review \u2014 kstrat2001/darkmux@38031a5af11ac4903a1195c7fda4b7b773e975ec (crew `deep+diff-review+probe-4b+probe-gptoss`)",
+      "finalized_ts": 1785405556,
+      "id": "review-1785400940-136e76",
       "phase_ids": [
-        "demo-scaffold",
-        "demo-endpoint",
-        "demo-tests"
+        "review-1785400940-136e76-investigate",
+        "review-1785400940-136e76-adjudicate",
+        "review-1785400940-136e76-report"
       ],
-      "created_ts": 1779497400,
-      "started_ts": 1779497400,
-      "ticket": null
-    },
-    {
-      "id": "demo-shipped",
-      "description": "Per-turn token telemetry \u2014 the savings odometer.",
-      "status": "finalized",
-      "phase_ids": [
-        "demo-feature"
-      ],
-      "created_ts": 1779410000,
-      "started_ts": 1779410000,
-      "finalized_ts": 1779495000
-    },
-    {
-      "id": "dispatch-pr-reviewer-1779496200",
-      "description": "Review PR #612 against its stated intent.",
-      "status": "finalized",
-      "phase_ids": [
-        "dispatch-pr-reviewer-1779496200-turn"
-      ],
-      "created_ts": 1779495900,
-      "started_ts": 1779495900,
-      "finalized_ts": 1779496200
-    },
-    {
-      "id": "dispatch-analyst-1779492000",
-      "description": "Summarize the week's flow records.",
-      "status": "finalized",
-      "phase_ids": [
-        "dispatch-analyst-1779492000-turn"
-      ],
-      "created_ts": 1779491700,
-      "started_ts": 1779491700,
-      "finalized_ts": 1779492000
+      "spec": {
+        "config_id": "review",
+        "inputs_fingerprint": "172a11e3f2"
+      },
+      "started_ts": 1785400940,
+      "status": "finalized"
     }
-  ],
-  "generated_at_ms": 1779497611000
+  ]
 }

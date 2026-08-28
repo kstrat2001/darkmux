@@ -82,3 +82,19 @@ export function staticPanelsSrc(): string | null {
 export function staticMachineSrc(): string | null {
   return injectedMeta("darkmux-machine-src");
 }
+
+/** `darkmux-graphs-src` (#2032 packet 2) — the committed
+ * `{"<mission-id>": <graph.json payload>, ...}` map a daemon-less build
+ * reads `MissionGraphLens` from, in place of per-mission
+ * `GET /mission/:id/graph.json` calls (`scripts/demo-env/export_static.py`
+ * captures it from a running demo-world daemon — see that script's own
+ * doc). Same shape as `staticMachineSrc`/`staticPanelsSrc` above (a bare
+ * `string | null`, no daemon-default fallback) rather than
+ * `resolveRunsSrc`'s `?? "/runs"` shape: there is no single daemon route
+ * this could fall back to for an ARBITRARY mission id, so a static build
+ * with no fixture published has nothing to default to — the lens's own
+ * "needs a running daemon" notice is what fills that gap, same as it does
+ * today with no fixture at all. */
+export function staticGraphsSrc(): string | null {
+  return injectedMeta("darkmux-graphs-src");
+}

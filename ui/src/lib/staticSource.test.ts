@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { isStaticBuild, staticFlowSrc, resolveRunsSrc, resolveLabRunsSrc } from "./staticSource";
+import { isStaticBuild, staticFlowSrc, resolveRunsSrc, resolveLabRunsSrc, staticGraphsSrc } from "./staticSource";
 
 /**
  * (#1801) The one resolver every static-build consumer (`route.ts`,
@@ -60,5 +60,26 @@ describe("resolveLabRunsSrc", () => {
   it("resolves to the injected src when present (the static demo)", () => {
     injectMeta("darkmux-lab-runs-src", "./demo-lab-runs.json");
     expect(resolveLabRunsSrc()).toBe("./demo-lab-runs.json");
+  });
+});
+
+describe("staticGraphsSrc (#2032 packet 2)", () => {
+  it("is null with no darkmux-graphs-src meta (a real daemon, or a static build with no graph fixture published)", () => {
+    expect(staticGraphsSrc()).toBeNull();
+  });
+
+  it("resolves to the injected src when present (the static demo)", () => {
+    injectMeta("darkmux-graphs-src", "./demo-graphs.json");
+    expect(staticGraphsSrc()).toBe("./demo-graphs.json");
+  });
+
+  it("has no daemon-default fallback — unlike resolveRunsSrc/resolveLabRunsSrc, absence means null, not a route", () => {
+    // There is no single `/mission/*/graph.json`-shaped daemon route to
+    // fall back to for an ARBITRARY mission id — the bare-null return (not
+    // `?? "/some/default"`) is what lets MissionGraphLens tell "no fixture
+    // published" apart from "fixture published, this mission just isn't in
+    // it".
+    expect(staticGraphsSrc()).toBeNull();
+    expect(typeof staticGraphsSrc()).not.toBe("string");
   });
 });
