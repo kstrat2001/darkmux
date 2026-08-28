@@ -88,6 +88,20 @@ fi
 ASSET=$(printf '%s\n' "$ASSET_MATCHES" | grep . | head -1)
 
 SRC="$ROOT/crates/darkmux-serve/assets/$ASSET"
+# (#2072) The first recorded day of the committed flow file — the EARLIEST
+# `ts`, not the first line, because the viewer sorts records before it reads
+# `records[0]` (`firstRecordDate`); file order only happens to agree today.
+# Lets the masthead name the day on every route without downloading the
+# file. The demo world spans more than one day; this is its first.
+# `sed -n 1p`, not `head -1`: `head` closes the pipe after one line, `sort`
+# takes a SIGPIPE, and under `pipefail` this script then exits silently
+# BEFORE writing the page (observed: a rerun printed nothing and left the
+# previous index.html in place).
+FLOW_DATE=$(grep -o '"ts": *"[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' "$ROOT/docs/demo/demo-flow.jsonl" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' | sort | sed -n 1p)
+if [ -z "$FLOW_DATE" ]; then
+  echo "build-demo: could not derive the replayed day from docs/demo/demo-flow.jsonl" >&2
+  exit 1
+fi
 if [ ! -f "$SRC" ]; then
   echo "build-demo: derived source $SRC does not exist" >&2
   exit 1
@@ -141,6 +155,7 @@ fi
 <meta name="darkmux-machine-src" content="./demo-machine.json">
 <meta name="darkmux-graphs-src" content="./demo-graphs.json">
 <meta name="darkmux-fleet-src" content="./demo-fleet.json">
+<meta name="darkmux-flow-date" content="$FLOW_DATE">
 EOF
   sed '1,/<head>/d' "$SRC"
 } > "$OUT"

@@ -23,7 +23,7 @@ import { injectedMeta } from "../lib/injectedMeta";
 // the four-channel diagram measured as a smudge when the icon set was built.
 // Two-in/one-out still reads at that size.
 import markUrl from "../brand/mark-trapezoid-out.svg";
-import { isStaticBuild } from "../lib/staticSource";
+import { isStaticBuild, staticFlowDate } from "../lib/staticSource";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
 import type { MachineSpecs } from "../types/handwritten";
 
@@ -184,7 +184,19 @@ export function Masthead({
         // (#1801) No `<CatalogPanel>` here — see this component's own doc
         // for why a static build gets inert text instead of a button that
         // would 404 on click.
-        <span className="masthead__srcbadge">{srcbadgeText(route)}</span>
+        <span className="masthead__srcbadge" title={srcbadgeText(route).startsWith("FLOW · ") ? "the first recorded day in this replay" : undefined}>
+          {/* (#2073) The `FLOW · ` prefix is its own span so the narrow
+              stylesheet can hide it: brand + chip + mode badge overflowed
+              390px and pushed `▣ PLAYBACK` onto a second masthead line. */}
+          {srcbadgeText(route).startsWith("FLOW · ") ? (
+            <>
+              <span className="masthead__srcpre">FLOW · </span>
+              {srcbadgeText(route).slice("FLOW · ".length)}
+            </>
+          ) : (
+            srcbadgeText(route)
+          )}
+        </span>
       ) : (
         <CatalogPanel label={srcbadgeText(route)} />
       )}
@@ -279,6 +291,17 @@ function srcbadgeText(route: Route): string {
   // and typecheck. Unreachable today because `App.tsx` passes `displayRoute`,
   // whose date is already resolved; this keeps the invariant in the code
   // rather than in that one caller's habits.
+  // (#2072) A static build replays one recorded file on every route; naming
+  // its day only on the playback route left the runs/machine/console tabs
+  // saying `TODAY` and mission/dispatch saying `REPLAY` for the same data.
+  // Checked BEFORE the playback branch on purpose: that branch's date comes
+  // from the fetched records and is unresolved on first paint, so the
+  // landing route flashed `TODAY` (and stayed there if the file was slow)
+  // while every other tab had the date from the meta at once.
+  if (isStaticBuild()) {
+    const date = staticFlowDate();
+    if (date) return `FLOW · ${date}`;
+  }
   if (route.kind === "playback") {
     const date = route.date ?? todayUTC();
     return date === todayUTC() ? "TODAY" : `FLOW · ${date}`;

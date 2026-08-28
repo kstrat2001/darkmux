@@ -42,7 +42,7 @@ export function LiveStatusBadge({ status }: { status: LiveTailStatus }) {
  * not-ported notice describes nothing. Now that the stage is a real
  * historical render, its absence was the difference between a page that says
  * what it is showing and one that leaves you to infer it —
- * `goldens/playback-date.txt`'s topbar carries `▣ PLAYBACK`.
+ * `goldens/playback-date.txt`'s topbar carries `▶ PLAYBACK` (operator, 2026-08-28: "why is the playback icon a square?" — ▣ was legacy's glyph; ▶ says playback).
  *
  * `.pb` with neither `.live` nor `.stale`, matching legacy's own
  * `classList.toggle("live", live)` leaving the class off in this arm.
@@ -50,7 +50,7 @@ export function LiveStatusBadge({ status }: { status: LiveTailStatus }) {
 export function PlaybackModeBadge() {
   return (
     <span id="modebadge" className="pb" data-state="playback">
-      <span className="pbdot">▣</span>
+      <span className="pbdot">▶</span>
       {" playback"}
     </span>
   );

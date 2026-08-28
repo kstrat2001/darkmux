@@ -1,7 +1,7 @@
 === topbar ===
 darkmux
 FLOW · 2026-08-07
-▣ PLAYBACK
+▶ PLAYBACK
 home
 guide
 articles

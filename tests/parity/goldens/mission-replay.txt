@@ -1,7 +1,7 @@
 === topbar ===
 darkmux
 NO RECORDS · 2026-08-08
-▣ PLAYBACK
+▶ PLAYBACK
 home
 guide
 articles
