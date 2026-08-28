@@ -244,33 +244,11 @@ export function Masthead({
   );
 }
 
-/** `setBadges()`'s `sb.textContent` assignment — viewer.html:3432/3439.
- * Legacy's full mode matrix is `live`/`play`/`empty`/`no-daemon`; this app
- * only ever occupies the `live` (rolling window) shape for `fleet`/`runs`/
- * `machine`/`console`/`unknown` (`isLiveRoute`'s own doc), so those all
- * collapse to legacy's `dl` — `"today"` whenever the live window's date is
- * today, which for a rolling live window is always (there's no code path
- * in this app that keeps `useLiveTail` running against a non-today date —
- * see `useLiveTail.ts`'s own rollover handling). `playback` has a REAL date
- * (`route.date`) to show, matching legacy's `mode==="play"` branch's date
- * component (dropping the "Flow · " prefix — not byte-tested for this
- * route and this app has no real playback data pipeline behind it yet, see
- * `PlaybackLens`'s own doc, so a literal date reads more honestly than a
- * borrowed live-mode phrase). `session`/`mission` have no natural
- * "source date" in THIS badge (no historical fetch pipeline backs `session`
- * either) — "REPLAY" names what they are without inventing a fake date.
- * `mission` (#1868) keeps this same "REPLAY" label deliberately, even
- * though `MissionGraphLens` is now a genuinely live-tailing view: this
- * outer masthead badge describes the App-level FLEET flow window's data
- * source, which this route doesn't use (see `route.ts`'s `isLiveRoute` doc)
- * — the lens's OWN header renders its real live/reconnecting status. A
- * mismatch between this outer badge and the lens's inner status is a known,
- * narrow rough edge (this badge is chrome ABOVE a self-contained region, not
- * a claim about that region's own liveness); revisit if it proves
- * confusing in practice. Pre-uppercased (see this component's own module
- * doc for why: matches
- * `App.tsx`'s `routeChrome` precedent for the fleet `#logscope` value)
- * except the literal ISO date, which has no case to begin with. */
+/** The masthead's source chip, per route. A live route reads `TODAY`; a
+ * playback names its day; a dispatch or mission page names the day the
+ * shell derived from its records (`replayDate`) and reads `RESULT` until
+ * that is known — a finished run is a result, and the date is what the
+ * demo shows on the same routes. */
 function srcbadgeText(route: Route, replayDate: string | null = null): string {
   // (#1800) `"Flow · "+date` verbatim from legacy's `play` arm, pre-uppercased
   // per this component's own module doc. The previous version rendered a bare

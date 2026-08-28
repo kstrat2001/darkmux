@@ -168,10 +168,12 @@ export function App() {
   const replayDate = useMemo(() => {
     if (route.kind === "playback") return route.date;
     if (source.kind !== "daemon") return null;
-    if (route.kind === "dispatch") return earliestDate(routeRecords.records);
+    // A dispatch that is still RUNNING is a live view, not a replay: no day,
+    // no badge, no transport over a frozen snapshot (review finding).
+    if (route.kind === "dispatch") return routeRecords.historical ? earliestDate(routeRecords.records) : null;
     if (route.kind === "mission") return missionRecordsQuery.data?.ok ? earliestDate(asRecordArray(missionRecordsQuery.data.data)) : null;
     return null;
-  }, [route, source.kind, routeRecords.records, missionRecordsQuery.data]);
+  }, [route, source.kind, routeRecords.records, routeRecords.historical, missionRecordsQuery.data]);
   const day = useDay(replayDate);
   const dayRecords = day.records;
   const transport = usePlaybackTransport(dayRecords);
@@ -184,7 +186,10 @@ export function App() {
   // which can sit before the end of a run that crossed midnight, and the
   // default render must be the whole run (measured: a session page lost
   // half its elapsed time to the cut before this guard).
-  const playhead = transport.active && transport.scrubbed ? transport.t : null;
+  // `t < tMax`, not just `scrubbed`: after a play-through the playhead rests
+  // at the loaded day's end with `scrubbed` still true, and the cut would
+  // return by the transport's own primary gesture (review finding).
+  const playhead = transport.active && transport.scrubbed && transport.t < transport.tMax ? transport.t : null;
   const eventLogRecords = useMemo(() => {
     if (playhead === null) return routeRecords.records;
     // A static build's runs/machine/console routes have no slice of their

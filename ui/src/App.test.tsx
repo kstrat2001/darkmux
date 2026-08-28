@@ -829,6 +829,27 @@ describe("App", () => {
     await screen.findByRole("group", { name: "playback transport" });
   });
 
+  it("a dispatch that is still running is a live view: no date, no playback badge, no transport", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        const recs = [{ ts: "2026-08-07T09:00:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-live" }];
+        if (path === "/flow-session/s-live") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 1, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        if (path === "/fleet/sessions/live") return Promise.resolve(new Response(JSON.stringify({ sessions: [{ session_id: "s-live", machine_uid: "m1", beat_ts_ms: Date.now() }], meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }));
+        if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "ok" } }, complete: true } }), { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response(JSON.stringify(recs), { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    window.location.hash = "#dispatch=s-live";
+    renderApp();
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBeGreaterThan(0));
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("RESULT"));
+    expect(document.querySelector("#modebadge")).toBeNull();
+    expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
+  });
+
   it("a daemon mission page names its day in the chip with the playback badge, and (for now) no transport", async () => {
     mockDaemonReplay();
     window.location.hash = "#mission=m-one";
@@ -968,6 +989,9 @@ describe("App", () => {
       await vi.advanceTimersByTimeAsync(15000);
       await waitFor(() => expect(screen.getByRole("slider")).toHaveValue("100"));
       expect(screen.getByRole("button", { name: /^play$/i })).toBeInTheDocument();
+      // At the end nothing is cut: the whole day's log is back (a run that
+      // crossed the loaded day's end must render whole after a play-through).
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(DAY_FOR_TRANSPORT.length));
     } finally {
       meta.remove();
       vi.useRealTimers();
