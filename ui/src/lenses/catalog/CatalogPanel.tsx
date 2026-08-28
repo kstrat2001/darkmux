@@ -142,7 +142,7 @@ export function CatalogPanel({ label }: { label?: string } = {}) {
     <div className="catalog-anchor" ref={anchorRef}>
       <button
         type="button"
-        className="catalog-toggle"
+        className="chip catalog-toggle"
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
         aria-controls="catpanel"

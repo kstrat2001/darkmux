@@ -23,7 +23,7 @@ import { injectedMeta } from "../lib/injectedMeta";
 // the four-channel diagram measured as a smudge when the icon set was built.
 // Two-in/one-out still reads at that size.
 import markUrl from "../brand/mark-trapezoid-out.svg";
-import { isStaticBuild, staticFlowDate } from "../lib/staticSource";
+import { getSource } from "../lib/source";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
 import type { MachineSpecs } from "../types/handwritten";
 
@@ -77,7 +77,7 @@ import type { MachineSpecs } from "../types/handwritten";
  * `CatalogPanel.test.tsx`'s own accessible-name-based queries, which never
  * render through this component and so never see the override.
  *
- * **On a static build (#1801, `isStaticBuild()`), the badge is TEXT, not a
+ * **On a static build (#1801, `getSource().kind === "static"`), the badge is TEXT, not a
  * `<CatalogPanel>`.** Legacy's own gate is `if(!flowSrc && mode!=="no-daemon"){
  * sb.dataset.act="catalog"; ... }` (viewer.html:3936) — `#srcbadge` becomes
  * the history-browser trigger ONLY when a real daemon is behind the page;
@@ -180,11 +180,11 @@ export function Masthead({
         <span className="masthead__ver" id="verbadge" />
       )}
       <AboutDialog route={route} liveStatus={liveStatus} specs={specs} />
-      {isStaticBuild() ? (
+      {getSource().kind === "static" ? (
         // (#1801) No `<CatalogPanel>` here — see this component's own doc
         // for why a static build gets inert text instead of a button that
         // would 404 on click.
-        <span className="masthead__srcbadge" title={/^\d{4}-\d{2}-\d{2}$/.test(srcbadgeText(route)) ? "the first recorded day in this replay" : undefined}>
+        <span className="chip masthead__srcbadge" title={/^\d{4}-\d{2}-\d{2}$/.test(srcbadgeText(route)) ? "the first recorded day in this replay" : undefined}>
           {srcbadgeText(route)}
         </span>
       ) : (
@@ -199,7 +199,7 @@ export function Masthead({
           badge on every lens, mode being global there. */}
       {live ? (
         <LiveStatusBadge status={liveStatus} />
-      ) : isStaticBuild() || route.kind === "playback" ? (
+      ) : getSource().kind === "static" || route.kind === "playback" ? (
         <PlaybackModeBadge />
       ) : null}
       {/* (operator: "a reload button next to 'live' is absurd") — and it is:
@@ -291,10 +291,8 @@ function srcbadgeText(route: Route): string {
   // (operator, 2026-08-28) The chip is the bare date on every width: the
   // `FLOW · ` prefix read as noise on desktop and was already hidden on
   // phones, so dropping it is also what makes the two consistent.
-  if (isStaticBuild()) {
-    const date = staticFlowDate();
-    if (date) return date;
-  }
+  const source = getSource();
+  if (source.kind === "static" && source.date) return source.date;
   if (route.kind === "playback") {
     const date = route.date ?? todayUTC();
     // (operator, 2026-08-28) A playback names its day even when that day

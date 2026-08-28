@@ -50,7 +50,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
-import { isStaticBuild, staticGraphsSrc } from "../../lib/staticSource";
+import { getSource } from "../../lib/source";
 import { useLiveTail } from "../../hooks/useLiveTail";
 import { asRecordArray, bodyTruncated, todayUTC } from "../../lib/flow";
 import { EventLogColumn } from "../../components/EventLogColumn";
@@ -257,7 +257,8 @@ function MeterEl({ tot }: { tot: ReturnType<typeof missionTotals> }) {
 
 export function MissionGraphLens({ missionId }: { missionId: string }) {
   const queryClient = useQueryClient();
-  const daemonBacked = !isStaticBuild();
+  const source = getSource();
+  const daemonBacked = source.kind === "daemon";
   const today = todayUTC();
 
   // (#1628 lineage) `refetchInterval` — the safety-net reconcile poll for a
@@ -285,7 +286,7 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
   // `staticMachineQuery`'s own `enabled: machineSrc !== null` precedent in
   // `MachineLens.tsx` — a disabled query with no fixture is a KNOWN answer
   // ("nothing published"), not a pending one.
-  const graphsSrc = staticGraphsSrc();
+  const graphsSrc = source.graphs;
   const staticGraphsQuery = useQuery({
     queryKey: queryKeys.staticGraphs(graphsSrc ?? ""),
     queryFn: () => fetchJson<Record<string, MissionGraph>>(graphsSrc as string),

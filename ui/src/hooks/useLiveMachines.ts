@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
 import type { CoverageMeta, FleetMachinesLiveResponse, PresenceBeat } from "../types/handwritten";
-import { staticFleetSrc } from "../lib/staticSource";
+import { getSource } from "../lib/source";
 
 /** (#2067) The committed fleet snapshot a daemon-less build ships
  * (`darkmux-fleet-src`), as the same uid-keyed map `useLiveMachines`
@@ -13,7 +13,8 @@ import { staticFleetSrc } from "../lib/staticSource";
  * build gets an empty map. Feed this to the SPEC lookup only, never to
  * presence: a snapshot says what the hardware is, not who is online now. */
 export function useStaticFleetBeats(): Map<string, PresenceBeat> {
-  const src = staticFleetSrc();
+  const source = getSource();
+  const src = source.fleet;
   const query = useQuery({
     enabled: src !== null,
     queryKey: queryKeys.staticFleet(src ?? ""),

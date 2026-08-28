@@ -414,13 +414,13 @@ body {
    `/flow-missions` daemon endpoints for the real toggle to fetch). Since
    #2072 it is also drawn as an outlined label rather than the toggle's
    filled box, so it no longer reads as tappable. */
-.masthead__srcbadge {
+/* (#2086) ONE chip: the static build's inert date badge and the daemon
+   build's catalog toggle share every visual property here, so they cannot
+   drift apart again (they did: filled slab vs outlined label, #2072). */
+.chip {
   font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  /* (#2072) A LABEL, not a filled slab: the filled accent box is the
-     daemon build's `.catalog-toggle` button, and painting the inert span
-     the same way made it read as tappable (operator, on the phone). */
   color: var(--accent);
   background: transparent;
   border: 1px solid var(--accent);
@@ -1889,14 +1889,7 @@ body {
    `.masthead__srcbadge`, so a daemon page and the demo show one chip; the
    caret is what says this one opens the catalog. */
 .catalog-toggle {
-  font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--accent);
-  background: transparent;
-  padding: 4px 8px;
-  border: 1px solid var(--accent);
-  border-radius: 3px;
+  /* Look: `.chip`. Only what makes it a control lives here. */
   cursor: pointer;
 }
 .catalog-toggle::after {

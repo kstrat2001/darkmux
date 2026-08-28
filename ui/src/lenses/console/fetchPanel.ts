@@ -12,7 +12,7 @@
  * reusing the shared wrapper and losing it.
  */
 import type { PanelResponse } from "../../types/handwritten";
-import { staticPanelsSrc } from "../../lib/staticSource";
+import { getSource } from "../../lib/source";
 
 export type PanelFetchOutcome = { ok: true; data: PanelResponse } | { ok: false; message: string };
 
@@ -56,7 +56,8 @@ async function fetchStaticPanel(src: string, id: string): Promise<PanelFetchOutc
 }
 
 export async function fetchPanel(id: string, cols: number, opts: Readonly<Record<string, string>> = {}): Promise<PanelFetchOutcome> {
-  const staticSrc = staticPanelsSrc();
+  const source = getSource();
+  const staticSrc = source.panels;
   if (staticSrc !== null) return fetchStaticPanel(staticSrc, id);
   try {
     const params = new URLSearchParams({ cols: String(cols) });

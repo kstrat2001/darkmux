@@ -4,11 +4,12 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { missionGraphReachable } from "../../lib/injectedMeta";
-import { isStaticBuild, resolveLabRunsSrc, resolveRunsSrc, staticFlowSrc } from "../../lib/staticSource";
+import { getSource, labRunsSrc, runsSrc } from "../../lib/source";
+import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
-import { fetchStaticFlowRecords, machineNames, nameOf } from "../../lib/flow";
+import { machineNames, nameOf } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse, LabRunsResponse, LabRun } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
@@ -235,7 +236,7 @@ export function RunsBoard({
     // Reusing it here would turn the honest daemon-less notice into a false
     // "it may have been removed" claim about the operator's data.
     setRowClickNotice(
-      isStaticBuild()
+      getSource().kind === "static"
         ? "run detail needs a running daemon — this static build lists runs without their per-run pipeline and event feed."
         : `couldn't open run "${dir}" — it may have been removed, or the link is stale. Showing the run list.`,
     );
@@ -370,7 +371,7 @@ export function RunsBoard({
   // either — the two are genuinely independent fetches there too).
   // Hoisted above the two queries below, which now gate their polling on it
   // (#1966). It was declared further down, beside `useLiveMachines`.
-  const daemonBacked = !isStaticBuild();
+  const daemonBacked = getSource().kind === "daemon";
 
   // (#1966) Both POLL. Neither did, so the board fetched its run list once on
   // mount and a run that was `running` at load time rendered `running`
@@ -387,12 +388,12 @@ export function RunsBoard({
   // there points at a committed file that cannot change.
   const runsQuery = useQuery({
     queryKey: queryKeys.runs(),
-    queryFn: () => fetchJson<RunsResponse>(resolveRunsSrc()),
+    queryFn: () => fetchJson<RunsResponse>(runsSrc()),
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
   const labRunsQuery = useQuery({
     queryKey: queryKeys.labRuns(),
-    queryFn: () => fetchJson<LabRunsResponse>(resolveLabRunsSrc()),
+    queryFn: () => fetchJson<LabRunsResponse>(labRunsSrc()),
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
 
@@ -426,23 +427,15 @@ export function RunsBoard({
   // export time — it would resolve on deploy day and decay empty after.
   // The alias set is not time-scoped; the whole file is the source.
   //
-  // Read RAW (no `normalizeRecords`) on purpose: only `machine_uid` /
-  // `machine_id` are consulted, and the schema-header line the normalizer
-  // drops carries neither. Fetched only while a pin needs it — the demo's
-  // file is megabytes, and an unpinned board never reads a record of it.
-  const flowSrc = daemonBacked ? null : staticFlowSrc();
-  const staticPinFetch = flowSrc !== null && machineUid !== null;
-  const staticFlowQuery = useQuery({
-    queryKey: queryKeys.staticFlowSrc(flowSrc ?? ""),
-    queryFn: () => fetchStaticFlowRecords(flowSrc ?? ""),
-    enabled: staticPinFetch,
-  });
-  const pinRecords = daemonBacked ? flowWindow.data : (staticFlowQuery.data ?? []);
-  // Loading is not "empty": until the file lands, an empty alias set would
-  // render the pre-#2063 symptom as a flash ("no runs recorded yet" under a
-  // raw-uid chip) for as long as the download takes. Folded into the
-  // pending branch below.
-  const staticPinPending = staticPinFetch && staticFlowQuery.data === undefined;
+  // (#2086) The static day comes from the one resolver (`useDay`); the shell
+  // already holds it for the transport on every route, so this is cache
+  // reuse, not a download of its own. Loading is not "empty": until the file
+  // lands, an empty alias set would render the pre-#2063 symptom as a flash
+  // ("no runs recorded yet" under a raw-uid chip); folded into the pending
+  // branch below.
+  const day = useDay(null);
+  const pinRecords = daemonBacked ? flowWindow.data : (day.records ?? []);
+  const staticPinPending = !daemonBacked && machineUid !== null && day.loading;
 
   // The lab-run detail pane is its own top-level render, reached without
   // waiting on the two queries above and independent of `kind` (see

@@ -1,3 +1,4 @@
+import { getSource } from "./source";
 /**
  * `injectedMeta()` — viewer.html:3808-3811. Both `GET /` and `GET /next`
  * inject `darkmux-version`/`darkmux-flow-schema`/`darkmux-mode`/
@@ -44,8 +45,9 @@ export function missionGraphReachable(): boolean {
   // rather than the daemon-less notice. A mission absent from the file
   // still gets the lens's own honest notice, so this predicate need not
   // know which ids it holds.
-  if (injectedMeta("darkmux-graphs-src") !== null) return true;
-  return !!injectedMeta("darkmux-mode") && !injectedMeta("darkmux-flow-src");
+  const s = getSource();
+  if (s.graphs !== null) return true;
+  return !!injectedMeta("darkmux-mode") && s.kind === "daemon";
 }
 
 /** `/play/<date>`'s injected date, when the server actually served a PLAYBACK

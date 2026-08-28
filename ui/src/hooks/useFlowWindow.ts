@@ -3,7 +3,7 @@ import { skipToken, useQueries, useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { DATE_ROLLOVER_CHECK_MS, queryKeys } from "../lib/queryKeys";
 import { asRecordArray, buildFlowWindow, computeTMax, prevDateUTC, todayUTC } from "../lib/flow";
-import { isStaticBuild } from "../lib/staticSource";
+import { getSource } from "../lib/source";
 import type { FlowRecord } from "../types/handwritten";
 
 export interface FlowWindowResult {
@@ -75,7 +75,7 @@ export function useFlowWindow(nowMs: number): FlowWindowResult {
   // already paid for twice. On a static build the fetch could only ever fail,
   // so suppressing it changes nothing a consumer can observe. The broader
   // question of route-gating this window is tracked separately as #1805.
-  const daemonBacked = !isStaticBuild();
+  const daemonBacked = getSource().kind === "daemon";
 
   const results = useQueries({
     queries: [

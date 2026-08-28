@@ -9,7 +9,7 @@ import { specOf } from "../fleet/cards";
 import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
-import { isStaticBuild, staticMachineSrc } from "../../lib/staticSource";
+import { getSource } from "../../lib/source";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
 /** The health region's state vocabulary, verbatim from `/machine/resources`
@@ -141,7 +141,8 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // Gated on the BUILD rather than the route, for the same reason
   // `useFlowWindow` is: on a static build these fetches could only ever fail,
   // so suppressing them changes nothing a consumer can observe.
-  const daemonBacked = !isStaticBuild();
+  const source = getSource();
+  const daemonBacked = source.kind === "daemon";
 
   // (#2019) A daemon-less build has no host to probe, so BOTH machine queries
   // below are gated off — and a disabled react-query sits at `status:
@@ -155,7 +156,7 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // A static build can settle two ways: with a captured fixture, or by saying
   // plainly that there is nothing to probe. Both are settled; neither is
   // `loading`.
-  const machineSrc = staticMachineSrc();
+  const machineSrc = source.machine;
   const staticMachineQuery = useQuery({
     queryKey: queryKeys.staticMachine(machineSrc ?? ""),
     queryFn: () => fetchJson<{ specs: MachineSpecs; resources: MachineResources }>(machineSrc as string),
