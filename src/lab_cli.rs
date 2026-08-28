@@ -256,6 +256,21 @@ fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
             println!("run:         {}", report.run_id);
             println!("workload:    {}", report.workload_id);
             println!("wall:        {}s", report.walltime_ms / 1000);
+            // (#2094 finding 7) Shown next to wall — a rested run's wall
+            // clock must never be misread as a slow model. Milliseconds,
+            // not truncated-to-integer-seconds: `rest_ms` is small enough
+            // relative to typical dispatch walltimes that a seconds
+            // display can round a real, knob-driven rest down to "0s" and
+            // read as if no rest happened at all. `0` when the run
+            // predates the feature or took no rests; not gated on
+            // verify/mode outcome — a failed or Slow-classified run shows
+            // its rest exactly the same as a clean Fast one whenever it's
+            // known (populated straight off `report.rest_ms`, which
+            // `CodingTaskProvider::inspect` fills best-effort regardless
+            // of the run's own verdict).
+            if report.rest_ms > 0 {
+                println!("rest:        {}ms", report.rest_ms);
+            }
             println!("turns:       {}", report.turns);
             println!("compactions: {}", report.compactions);
             if !report.tokens_before.is_empty() {

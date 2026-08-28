@@ -581,6 +581,302 @@
         assert_eq!(t.total(), u32::MAX);
     }
 
+    // ─── (#2094) read_rest_totals — mirrors read_token_totals exactly ────
+
+    #[test]
+    fn read_rest_totals_parses_metrics_json() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 1000, "rests": 2}"#).unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!(r.rest_ms, 1000);
+        assert_eq!(r.rests, 2);
+    }
+
+    #[test]
+    fn read_rest_totals_degrades_to_zero_on_missing_or_malformed() {
+        // (#2094 finding 5) Both cases now also fall back to
+        // trajectory.jsonl — but neither temp dir has one, so the
+        // fallback itself degrades to zero too, same end result as before
+        // the fallback existed.
+        let missing = TempDir::new().unwrap();
+        let r = read_rest_totals(missing.path());
+        assert_eq!((r.rest_ms, r.rests), (0, 0), "missing metrics.json + no trajectory → zero");
+
+        let bad = TempDir::new().unwrap();
+        let rt = bad.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), "{not valid json").unwrap();
+        let r = read_rest_totals(bad.path());
+        assert_eq!((r.rest_ms, r.rests), (0, 0), "malformed metrics.json + no trajectory → zero");
+    }
+
+    #[test]
+    fn read_rest_totals_absent_fields_falls_back_to_trajectory_or_zero() {
+        // A metrics.json from BEFORE #2094 (or a build without the feature)
+        // has no rest_ms/rests keys at all. With no trajectory.jsonl either,
+        // this must still degrade to zero, not error.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"total_prompt_tokens": 100}"#).unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!((r.rest_ms, r.rests), (0, 0));
+    }
+
+    // ─── #2094 finding 5: rest_ms on the error path ──────────────────────
+
+    #[test]
+    fn read_rest_totals_falls_back_to_trajectory_when_metrics_json_is_absent() {
+        // No metrics.json at all — e.g. the runtime was SIGKILLed before
+        // its exit-time write ran. The runtime.rest events are durably
+        // streamed to trajectory.jsonl as they happen, so summing them
+        // recovers the totals metrics.json never got the chance to write.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":500}\n\
+             {\"type\":\"model.completed\",\"seq\":1}\n\
+             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":300}\n",
+        )
+        .unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!(r.rest_ms, 800, "sum of both runtime.rest ms fields");
+        assert_eq!(r.rests, 2, "count of runtime.rest events, ignoring other event types");
+    }
+
+    #[test]
+    fn read_rest_totals_falls_back_to_trajectory_when_metrics_lacks_rest_ms() {
+        // metrics.json IS present and valid JSON, but (pre-#2094 shape, or
+        // a runtime build without the feature) carries no rest_ms key —
+        // must still reach for the trajectory fallback rather than
+        // treating a present-but-incomplete file as authoritative zero.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"total_prompt_tokens": 100}"#).unwrap();
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":250}\n",
+        )
+        .unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!(r.rest_ms, 250);
+        assert_eq!(r.rests, 1);
+    }
+
+    #[test]
+    fn read_rest_totals_prefers_metrics_json_over_trajectory_when_both_present() {
+        // metrics.json carrying rest_ms is authoritative — the trajectory
+        // fallback only kicks in when metrics.json can't answer at all.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 1000, "rests": 2}"#).unwrap();
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":9999}\n",
+        )
+        .unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!(r.rest_ms, 1000, "metrics.json wins, not the trajectory sum");
+        assert_eq!(r.rests, 2);
+    }
+
+    #[test]
+    fn read_rest_totals_skips_malformed_trajectory_lines() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "not even json\n\
+             {\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":500}\n",
+        )
+        .unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!(r.rest_ms, 500, "the malformed line is skipped, not fatal to the sum");
+        assert_eq!(r.rests, 1);
+    }
+
+    // ─── #2094 second round, finding 1: rest_ms max(metrics, tailer) ─────
+
+    #[test]
+    fn reconcile_rest_totals_prefers_the_larger_of_metrics_and_tailer() {
+        let from_metrics = RestTotals { rest_ms: 0, rests: 0 };
+        let from_tailer = RestTotals { rest_ms: 1000, rests: 2 };
+        let merged = reconcile_rest_totals(from_metrics, from_tailer);
+        assert_eq!(merged.rest_ms, 1000);
+        assert_eq!(merged.rests, 2);
+    }
+
+    #[test]
+    fn reconcile_rest_totals_keeps_metrics_when_it_reports_more_than_the_tailer() {
+        // The live tailer's view can be the SMALLER one too (its last poll
+        // landed a beat before the runtime's clean-exit flush) — metrics.json
+        // is the fuller picture in that direction, so this isn't a blind
+        // "trajectory always wins," it's a genuine per-field max.
+        let from_metrics = RestTotals { rest_ms: 1000, rests: 2 };
+        let from_tailer = RestTotals { rest_ms: 400, rests: 1 };
+        let merged = reconcile_rest_totals(from_metrics, from_tailer);
+        assert_eq!(merged.rest_ms, 1000);
+        assert_eq!(merged.rests, 2);
+    }
+
+    #[test]
+    fn dispatch_error_terminal_recovers_rest_totals_from_the_live_tailer_when_metrics_json_is_zeroed(
+    ) {
+        // (#2094 second round, finding 1) Reproduces the exact failure this
+        // finding names: the runtime crashed (SIGKILL, hard error) after
+        // writing a zeroed metrics.json, but AFTER two real rests had
+        // already streamed to trajectory.jsonl and been seen live by the
+        // tailer. `read_rest_totals` alone gates its own trajectory
+        // fallback on metrics.json KEY PRESENCE, not value — so it trusts
+        // the zeroed-but-present `rest_ms`/`rests` and never reaches
+        // `sum_rest_totals_from_trajectory` itself. The payload must still
+        // surface the real totals by reconciling against what the live
+        // tailer (`TrajectorySummary`) actually observed as the events
+        // streamed, independent of the post-hoc metrics.json read.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 0, "rests": 0}"#).unwrap();
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":400}\n\
+             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":600}\n",
+        )
+        .unwrap();
+
+        // Confirms the gap this finding names: read_rest_totals alone
+        // trusts the zeroed-but-present metrics.json and never falls
+        // through to the trajectory sum.
+        let from_metrics = read_rest_totals(out.path());
+        assert_eq!((from_metrics.rest_ms, from_metrics.rests), (0, 0));
+
+        // What the live tailer accumulated processing the same two events
+        // as they streamed — TrajectorySummary's own running total, kept
+        // independently of the post-hoc metrics.json read.
+        let from_tailer = RestTotals { rest_ms: 1000, rests: 2 };
+
+        let merged = reconcile_rest_totals(from_metrics, from_tailer);
+        assert_eq!(merged.rest_ms, 1000, "payload must carry the tailer-observed total");
+        assert_eq!(merged.rests, 2);
+    }
+
+    // ─── #2094 finding 8: turn_delay_effective_ms ─────────────────────────
+
+    #[test]
+    fn read_turn_delay_effective_ms_prefers_the_metrics_json_field() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(
+            rt.join("metrics.json"),
+            r#"{"rest_ms": 1000, "rests": 2, "turn_delay_effective_ms": 500}"#,
+        )
+        .unwrap();
+        let rest = read_rest_totals(out.path());
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, Some(500), "the exact resolved constant, not the 1000/2 average");
+    }
+
+    #[test]
+    fn read_turn_delay_effective_ms_falls_back_to_rest_average_when_metrics_json_absent() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        // No metrics.json at all — trajectory carries two rests of 500ms
+        // and 300ms, summing 800ms over 2 rests.
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":500}\n\
+             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":300}\n",
+        )
+        .unwrap();
+        let rest = read_rest_totals(out.path());
+        assert_eq!((rest.rest_ms, rest.rests), (800, 2));
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, Some(400), "800ms / 2 rests = 400ms average, the derived fallback");
+    }
+
+    #[test]
+    fn read_turn_delay_effective_ms_falls_back_when_metrics_json_lacks_the_field() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        // metrics.json present (pre-finding-8 shape) but has no
+        // turn_delay_effective_ms key — must still reach for the average.
+        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 600, "rests": 3}"#).unwrap();
+        let rest = RestTotals { rest_ms: 600, rests: 3 };
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, Some(200));
+    }
+
+    #[test]
+    fn read_turn_delay_effective_ms_is_none_when_nothing_is_knowable() {
+        let out = TempDir::new().unwrap();
+        // No metrics.json, no trajectory.jsonl, zero rests — genuinely
+        // unknowable, not a misleading 0.
+        let rest = RestTotals::default();
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, None);
+    }
+
+    #[test]
+    fn read_turn_delay_effective_ms_zero_field_does_not_short_circuit_the_derived_average_when_rests_positive(
+    ) {
+        // (#2094 second round, finding 1) Same shape of bug as rest_ms: a
+        // metrics.json written with `turn_delay_effective_ms: 0` (the
+        // exit-time write raced a crash and only got a zeroed struct out)
+        // must not be trusted as "the resolved cadence was genuinely
+        // zero" when `rest` says this dispatch actually rested. Fall
+        // through to the derived average instead.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"turn_delay_effective_ms": 0}"#).unwrap();
+        let rest = RestTotals { rest_ms: 1000, rests: 2 };
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, Some(500), "falls through to 1000/2 = 500, not the zeroed field");
+    }
+
+    #[test]
+    fn read_turn_delay_effective_ms_zero_field_is_honored_when_there_were_genuinely_no_rests() {
+        // A single-turn dispatch that never rested legitimately has
+        // turn_delay_effective_ms=0 with rests=0 — that zero IS the truth,
+        // not a raced write, and must still be returned as Some(0) rather
+        // than falling to None.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"turn_delay_effective_ms": 0}"#).unwrap();
+        let rest = RestTotals::default();
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, Some(0));
+    }
+
+    // ─── #2094 finding 4: never rest an agentic-REMOTE dispatch ──────────
+
+    #[test]
+    fn effective_turn_delay_ms_forces_zero_for_agentic_remote_regardless_of_config() {
+        // A remote-agentic dispatch's "brain" is a hosted endpoint, not
+        // local LMStudio — there is no local GPU on this host to rest, so
+        // the configured rest must never reach it even at a large nonzero
+        // value.
+        assert_eq!(effective_turn_delay_ms(3000, true), 0);
+        assert_eq!(effective_turn_delay_ms(0, true), 0);
+    }
+
+    #[test]
+    fn effective_turn_delay_ms_passes_through_unchanged_for_local() {
+        assert_eq!(effective_turn_delay_ms(3000, false), 3000);
+        assert_eq!(effective_turn_delay_ms(0, false), 0);
+    }
+
     #[test]
     #[serial]
     fn config_path_reaches_dispatch_resolvers_not_just_env() {
@@ -1147,6 +1443,13 @@
             // two tests together pin BOTH string forms the container's
             // falsy-set reader must distinguish.
             feedback_injection: true,
+            // (#2094) Nonzero here so the complete-vector assertion below
+            // pins the forwarded `-e DARKMUX_TURN_DELAY_MS=<n>` pair too.
+            turn_delay_ms: 3000,
+            // (#2094 finding 1) A distinct, non-default value so the
+            // complete-vector assertion below pins the forwarded
+            // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` pair too.
+            inactivity_timeout_seconds: 900,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1209,65 +1512,82 @@
         assert_eq!(argv[21], "-e");
         assert_eq!(argv[22], "DARKMUX_FEEDBACK_INJECTION=true");
 
+        // 5c. (#2094) Verify the turn-delay env var is forwarded — ALWAYS,
+        // including at nonzero values (`config.turn_delay_ms: 3000` in this
+        // test's config → `DARKMUX_TURN_DELAY_MS=3000` on argv).
+        assert_eq!(argv[23], "-e");
+        assert_eq!(argv[24], "DARKMUX_TURN_DELAY_MS=3000");
+
+        // 5d. (#2094 finding 1) Verify the inactivity-timeout env var is
+        // forwarded too (`config.inactivity_timeout_seconds: 900` in this
+        // test's config → `DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900` on argv)
+        // — the piece #2094's original cut left unforwarded, so the
+        // runtime's soft-warning detector silently used its own 600s
+        // literal default instead of the operator's configured budget.
+        assert_eq!(argv[25], "-e");
+        assert_eq!(argv[26], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900");
+
         // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[23], "-v");
+        assert_eq!(argv[27], "-v");
         assert_eq!(
-            argv[24],
+            argv[28],
             "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
         );
-        assert_eq!(argv[25], "--entrypoint");
-        assert_eq!(argv[26], "/darkmux-runtime");
+        assert_eq!(argv[29], "--entrypoint");
+        assert_eq!(argv[30], "/darkmux-runtime");
 
         // 7. Verify `--` + image + runtime CLI args
-        assert_eq!(argv[27], "--");
-        assert_eq!(argv[28], "rust:slim"); // image
-        assert_eq!(argv[29], "run"); // runtime subcommand
-        assert_eq!(argv[30], "--model");
-        assert_eq!(argv[31], "llama3-8b");
-        assert_eq!(argv[32], "--system");
-        assert_eq!(argv[33], "You are a coding assistant.");
+        assert_eq!(argv[31], "--");
+        assert_eq!(argv[32], "rust:slim"); // image
+        assert_eq!(argv[33], "run"); // runtime subcommand
+        assert_eq!(argv[34], "--model");
+        assert_eq!(argv[35], "llama3-8b");
+        assert_eq!(argv[36], "--system");
+        assert_eq!(argv[37], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[34], "--prompt-file");
-        assert_eq!(argv[35], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[38], "--prompt-file");
+        assert_eq!(argv[39], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[36], "--json");
+        assert_eq!(argv[40], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[37], "--allowed-tools");
-        assert_eq!(argv[38], "exec,edit");
+        assert_eq!(argv[41], "--allowed-tools");
+        assert_eq!(argv[42], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[39], "--compact-threshold-tokens");
-        assert_eq!(argv[40], "4096");
-        assert_eq!(argv[41], "--compactor-model");
-        assert_eq!(argv[42], "util-model");
-        assert_eq!(argv[43], "--compact-threshold-ratio");
-        assert_eq!(argv[44], "0.75");
-        assert_eq!(argv[45], "--context-window");
-        assert_eq!(argv[46], "32000");
-        assert_eq!(argv[47], "--compact-strategy");
-        assert_eq!(argv[48], "structured-slot");
-        assert_eq!(argv[49], "--bail-after-compactions");
-        assert_eq!(argv[50], "10");
-        assert_eq!(argv[51], "--compactor-custom-instructions");
-        assert_eq!(argv[52], "Be terse.");
+        assert_eq!(argv[43], "--compact-threshold-tokens");
+        assert_eq!(argv[44], "4096");
+        assert_eq!(argv[45], "--compactor-model");
+        assert_eq!(argv[46], "util-model");
+        assert_eq!(argv[47], "--compact-threshold-ratio");
+        assert_eq!(argv[48], "0.75");
+        assert_eq!(argv[49], "--context-window");
+        assert_eq!(argv[50], "32000");
+        assert_eq!(argv[51], "--compact-strategy");
+        assert_eq!(argv[52], "structured-slot");
+        assert_eq!(argv[53], "--bail-after-compactions");
+        assert_eq!(argv[54], "10");
+        assert_eq!(argv[55], "--compactor-custom-instructions");
+        assert_eq!(argv[56], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[53], "--feedback-templates-json");
+        assert_eq!(argv[57], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[54].contains("error"));
-        assert!(argv[54].contains("An error occurred"));
+        assert!(argv[58].contains("error"));
+        assert!(argv[58].contains("An error occurred"));
 
-        // Total arg count: 55 (0..=54) — 53 pre-#1548, +2 for the new
-        // `-e DARKMUX_FEEDBACK_INJECTION=<v>` pair.
-        assert_eq!(argv.len(), 55);
+        // Total arg count: 59 (0..=58) — 53 pre-#1548, +2 for
+        // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
+        // `-e DARKMUX_TURN_DELAY_MS=<ms>` (#2094), +2 for
+        // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` (#2094 finding 1).
+        assert_eq!(argv.len(), 59);
     }
 
     #[test]
@@ -1308,6 +1628,8 @@
             // caught it, which is exactly why the sibling test's claim to
             // cover "both string forms" mattered.
             feedback_injection: false,
+            turn_delay_ms: 0,
+            inactivity_timeout_seconds: 600,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1323,6 +1645,23 @@
             argv.contains(&"DARKMUX_FEEDBACK_INJECTION=false".to_string()),
             "the OFF state must be forwarded verbatim — the runtime only honors \
              `0|off|false|no`, so any other rendering silently re-enables it: {argv:?}"
+        );
+
+        // (#2094) The turn-delay env var is ALWAYS forwarded too, including
+        // at its unconfigured `0` value — never an absent var the container
+        // has to interpret as "not configured."
+        assert!(
+            argv.contains(&"DARKMUX_TURN_DELAY_MS=0".to_string()),
+            "the unconfigured (0) turn-delay must still be forwarded verbatim: {argv:?}"
+        );
+
+        // (#2094 finding 1) The inactivity-timeout env var is ALWAYS
+        // forwarded too — a minimal dispatch still needs the runtime's
+        // soft-warning detector to see the operator's real budget, not
+        // silently fall back to its own 600s literal default.
+        assert!(
+            argv.contains(&"DARKMUX_INACTIVITY_TIMEOUT_SECONDS=600".to_string()),
+            "the resolved inactivity timeout must be forwarded verbatim: {argv:?}"
         );
 
         // Should NOT contain optional flags
@@ -1401,6 +1740,8 @@
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
             feedback_injection: true,
+            turn_delay_ms: 0,
+            inactivity_timeout_seconds: 600,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1448,6 +1789,8 @@
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
             feedback_injection: true,
+            turn_delay_ms: 0,
+            inactivity_timeout_seconds: 600,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1699,6 +2042,8 @@
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
             feedback_injection: true,
+            turn_delay_ms: 0,
+            inactivity_timeout_seconds: 600,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -2859,6 +3204,122 @@
             "a streamed chunk (model.partial) must reset the inactivity \
              deadline — an actively generating model is not a hung dispatch"
         );
+    }
+
+    // ─── #2094 finding 2: a rest is host-side proof-of-work too ─────────
+
+    /// A `runtime.rest` trajectory event must reset the host-side
+    /// `inactivity_deadline` exactly like `tool.completed`/`compaction` do
+    /// — the runtime deliberately sleeps between turns (GPU thermal/power
+    /// relief), and without this the host-side hard-kill watchdog would
+    /// tick the deadline down toward a kill during time the dispatch was
+    /// idle BY DESIGN, not stalled.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record()
+    fn tailer_runtime_rest_event_resets_inactivity_deadline() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+
+        let inactivity_secs = 600u64;
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            inactivity_secs,
+        );
+
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(f, r#"{{"type":"runtime.rest","seq":2,"ts":1234567890,"ms":500}}"#).unwrap();
+        drop(f);
+
+        let before_reset = Instant::now();
+        state.poll_and_emit();
+
+        let new_deadline = *shared.lock().unwrap();
+        let expected_min =
+            before_reset + Duration::from_secs(inactivity_secs) - Duration::from_millis(50);
+        assert!(
+            new_deadline >= expected_min,
+            "a runtime.rest event must reset the inactivity deadline — a \
+             deliberate inter-turn rest is not a stalled dispatch"
+        );
+        assert!(
+            new_deadline > original_deadline,
+            "reset must overwrite the prior stale deadline"
+        );
+    }
+
+    /// Each `runtime.rest` trajectory event must emit exactly one
+    /// `dispatch.rest` flow record, carrying this rest's own `ms` + `turn`
+    /// alongside the RUNNING cumulative `rest_ms`/`rests` totals — so a
+    /// rested run is visible on the live flow stream turn-by-turn, not
+    /// only summarized at `dispatch.complete`.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn handle_event_runtime_rest_emits_dispatch_rest_with_cumulative_totals() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-rest".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(r#"{"type":"runtime.rest","seq":1,"ts":1,"ms":500}"#);
+        state.handle_event(r#"{"type":"runtime.rest","seq":2,"ts":2,"ms":500}"#);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["session_id"] == "sess-rest" && v["action"] == "dispatch.rest")
+            .collect();
+
+        assert_eq!(records.len(), 2, "one dispatch.rest record per runtime.rest event");
+
+        assert_eq!(records[0]["payload"]["ms"], 500);
+        assert_eq!(records[0]["payload"]["turn"], 1);
+        assert_eq!(records[0]["payload"]["rest_ms"], 500, "first rest: running total = 500");
+        assert_eq!(records[0]["payload"]["rests"], 1);
+
+        assert_eq!(records[1]["payload"]["ms"], 500);
+        assert_eq!(records[1]["payload"]["turn"], 2);
+        assert_eq!(records[1]["payload"]["rest_ms"], 1000, "second rest: running total = 1000");
+        assert_eq!(records[1]["payload"]["rests"], 2);
     }
 
     // ─── #557 slice 2 detector telemetry ──────────────────────────────

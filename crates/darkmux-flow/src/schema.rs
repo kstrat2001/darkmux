@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.24.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.25.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -394,6 +394,33 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.24.0";
 //           above landed via merge-gate review on the same branch that
 //           introduced 1.24.0, before this schema version ever shipped —
 //           amending this entry in place, not a further version bump.)
+//   1.25.0 (#2094): additive payload fields for the global inter-turn
+//           rest — `turn_delay_ms` (the resolved knob) on `dispatch.start`,
+//           and `rest_ms` / `rests` (sum + count of the rests this
+//           dispatch took) on `dispatch.complete`, surfaced beside the
+//           existing `wall_ms` (which INCLUDES rest time; a consumer
+//           wanting model-only time subtracts `rest_ms`). No struct/field
+//           change — same `payload` blob every other richer action
+//           already uses. Older readers ignore the new keys; new records
+//           only, prior AuditFileSink chains survive without rotation.
+//           This branch took 1.25.0 directly (skipping the two RESERVED
+//           slots above) so the eventual three-way merge is a one-line
+//           reconcile: whichever branch lands last just renumbers its own
+//           bump past whatever the other two already claimed.
+//           (finding 2, same 1.25.0) Also added the `dispatch.rest` action
+//           itself — one per `runtime.rest` trajectory event, live on the
+//           flow stream (not just summarized at `dispatch.complete`).
+//           Payload: `ms` (this rest's duration), `turn`, and the running
+//           `rest_ms` / `rests` totals so far. A new action value under the
+//           same additive rule this whole version already documents; older
+//           readers that don't recognize `dispatch.rest` ignore it exactly
+//           like they ignore any other unfamiliar action.
+//           (finding 8, same 1.25.0) Also added `turn_delay_effective_ms`
+//           to `dispatch.complete` — the POST-CLAMP cadence the runtime
+//           actually applied, distinct from `rest_ms`/`rests` (what
+//           happened) and from the operator's raw configured value
+//           (`dispatch.start`'s `turn_delay_ms`). `null` when unknowable.
+//           Additive payload field, same rule as the rest of this version.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

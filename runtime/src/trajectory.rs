@@ -92,6 +92,19 @@ pub struct Metrics {
     pub total_completion_tokens: u32,
     pub total_messages: usize,
     pub max_turns_reached: bool,
+    /// (#2094) Sum of every inter-turn rest this dispatch took, in
+    /// milliseconds — the AFTER-clamp duration actually slept. `wall_ms`
+    /// above INCLUDES this time (wall stays wall); a caller wanting
+    /// model-only time subtracts `rest_ms` from `wall_ms` itself.
+    pub rest_ms: u64,
+    /// (#2094) How many inter-turn rests fired during this dispatch.
+    pub rests: u32,
+    /// (#2094 finding 8) The POST-CLAMP `turn_delay_ms` cadence this
+    /// dispatch actually applied (`resolve_turn_delay_ms`'s output) — the
+    /// effective knob, known even on a dispatch that took zero rests.
+    /// Read back host-side (`dispatch_internal.rs`) and surfaced on the
+    /// `dispatch.complete` flow payload as `turn_delay_effective_ms`.
+    pub turn_delay_effective_ms: u64,
     /// First 400 chars of the final assistant message (for at-a-glance
     /// "what did the agent end up saying"). Truncated to keep
     /// metrics.json human-readable in a terminal.
@@ -340,6 +353,20 @@ impl Trajectory {
             "completion_tokens": completion_tokens_value,
             "recoveries_used": recoveries_used,
             "recoveries_budget": recoveries_budget,
+        }));
+    }
+
+    /// (#2094) One event per turn-delay rest the loop took — harness-owned
+    /// idle time between inference turns, never a stall. `ms` is the actual
+    /// sleep duration AFTER clamping (see `loop_runner.rs`'s clamp logic),
+    /// so a consumer summing `ms` across every `runtime.rest` event gets
+    /// exactly `Metrics.rest_ms`.
+    pub fn append_rest(&mut self, seq: u32, ms: u64) {
+        self.write_event(&serde_json::json!({
+            "type": "runtime.rest",
+            "seq": seq,
+            "ts": unix_ms(),
+            "ms": ms,
         }));
     }
 
@@ -790,6 +817,27 @@ mod tests {
     }
 
     #[test]
+    fn append_rest_writes_runtime_rest_event_with_ms() {
+        // (#2094) One event per turn-delay rest; `ms` is the actual
+        // (post-clamp) sleep duration.
+        let ws = tempfile::Builder::new().prefix("traj-rest").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_rest(1, 500);
+        t.append_rest(2, 500);
+        drop(t);
+
+        let traj_file = ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE);
+        let body = fs::read_to_string(&traj_file).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "one runtime.rest event per rest");
+        for line in &lines {
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed["type"], "runtime.rest");
+            assert_eq!(parsed["ms"], 500);
+        }
+    }
+
+    #[test]
     fn tool_completed_persists_the_result_not_just_its_length() {
         // (#2007) The result used to be recorded as a SIZE only. That made a
         // failed dispatch undiagnosable after the fact: the tool-failure
@@ -922,6 +970,44 @@ mod tests {
         assert!(line["max"].is_null(), "None max must serialize as JSON null");
     }
 
+    /// (#2094 finding 8) The runtime writes `turn_delay_effective_ms` into
+    /// metrics.json under exactly that key — the host-side
+    /// `read_turn_delay_effective_ms` (`dispatch_internal.rs`) reads it
+    /// back by this literal name, so a rename here silently breaks that
+    /// reader without either side's own compiler catching it.
+    #[test]
+    fn save_metrics_writes_turn_delay_effective_ms_under_its_own_key() {
+        let ws = tempfile::Builder::new().prefix("traj-metrics-tdem").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        let m = Metrics {
+            runtime: "darkmux-runtime",
+            version: "0.1.0",
+            model: "test".into(),
+            started_at_unix_ms: 0,
+            wall_ms: 3000,
+            result: "stop".into(),
+            turns: 3,
+            compactions: 0,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_messages: 0,
+            max_turns_reached: false,
+            rest_ms: 1000,
+            rests: 2,
+            turn_delay_effective_ms: 500,
+            final_assistant_preview: "".into(),
+        };
+        t.save_metrics(&m).unwrap();
+        drop(t);
+
+        let body = fs::read_to_string(ws.path().join(TRAJECTORY_SUBDIR).join(METRICS_FILE))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["turn_delay_effective_ms"], 500);
+        assert_eq!(parsed["rest_ms"], 1000);
+        assert_eq!(parsed["rests"], 2);
+    }
+
     #[test]
     fn open_no_op_when_dir_unwritable() {
         // Point at a path under root that we can't create (assuming
@@ -944,6 +1030,9 @@ mod tests {
             total_completion_tokens: 0,
             total_messages: 0,
             max_turns_reached: false,
+            rest_ms: 0,
+            rests: 0,
+            turn_delay_effective_ms: 0,
             final_assistant_preview: "".into(),
         };
         t.save_metrics(&m).unwrap();

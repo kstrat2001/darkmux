@@ -460,6 +460,34 @@ pub struct DockerRunConfig {
     /// never received, so the container always saw it unset and injection was
     /// unconditionally on regardless of `config.json` or a host-side export.
     pub feedback_injection: bool,
+    /// (#2094) The resolved `runtime.turn_delay_ms` setting
+    /// (`darkmux_types::config_access::turn_delay_ms()`), forwarded into the
+    /// container as `-e DARKMUX_TURN_DELAY_MS=<ms>` — the SAME #1548 pattern
+    /// `feedback_injection` above uses (the runtime crate can't depend on
+    /// `config_access`; the host does the tier resolution and always
+    /// forwards its result, even at `0`). The remote single-shot path
+    /// never sets this at all — it never builds a `DockerRunConfig`. An
+    /// agentic-REMOTE dispatch (a tool-granting role on an endpoint
+    /// profile, `remote_chat_url.is_some()` below) DOES build one and run
+    /// the same container `loop_runner.rs` local dispatches use, so
+    /// leaving this at the operator's configured value there would
+    /// actually sleep between turns against an endpoint with no local GPU
+    /// to rest — the call site force-overrides this field to `0` whenever
+    /// the dispatch is agentic-remote, regardless of config (#2094 finding 4).
+    pub turn_delay_ms: u64,
+    /// (#2094 finding 1) The resolved `runtime.inactivity_timeout_seconds`
+    /// setting (`darkmux_types::config_access::inactivity_timeout_seconds()`),
+    /// forwarded into the container as
+    /// `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` — the SAME #1548 pattern
+    /// `feedback_injection` and `turn_delay_ms` above use. Before this field
+    /// existed, the runtime's own soft-warning reader
+    /// (`runtime/src/loop_runner.rs`) fell back to its unconditional 600s
+    /// literal default on EVERY dispatch, silently diverging from an
+    /// operator override the host-side watchdog (which reads the same
+    /// config accessor directly, not through `docker run`) already honored
+    /// — the runtime and the host disagreed about when "inactivity" starts.
+    /// Always forwarded, matching the host's hard-kill value exactly.
+    pub inactivity_timeout_seconds: u64,
     /// (#1187) When Some, this dispatch's "brain" is a remote OpenAI-compatible
     /// endpoint rather than local LMStudio — passed to the container as
     /// `--chat-url`. Set for a role whose tool_palette grants at least one
@@ -552,6 +580,27 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // resolved value on every dispatch, not just when the operator overrides.
     args.push("-e".to_string());
     args.push(format!("DARKMUX_FEEDBACK_INJECTION={}", config.feedback_injection));
+
+    // (#2094) Forward the resolved `turn_delay_ms` setting into the
+    // container — the SAME #1548 pattern as `feedback_injection` above.
+    // Always emitted, including at `0` (no rest, the pre-existing
+    // behavior), so the container's reader never has to guess whether an
+    // absent var means "not configured" or "the host forgot to forward it."
+    args.push("-e".to_string());
+    args.push(format!("DARKMUX_TURN_DELAY_MS={}", config.turn_delay_ms));
+
+    // (#2094 finding 1) Forward the resolved `inactivity_timeout_seconds`
+    // setting — the SAME #1548 pattern as `feedback_injection` and
+    // `turn_delay_ms` above. Always emitted so the runtime's soft-warning
+    // detector (`runtime/src/loop_runner.rs`) reads the SAME budget the
+    // host-side hard-kill watchdog uses, instead of silently falling back
+    // to its own unconditional 600s literal on every dispatch regardless
+    // of an operator override.
+    args.push("-e".to_string());
+    args.push(format!(
+        "DARKMUX_INACTIVITY_TIMEOUT_SECONDS={}",
+        config.inactivity_timeout_seconds
+    ));
 
     // Runtime binary injection (non-default images only)
     if config.inject {
@@ -2447,6 +2496,18 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "prompt": crate::dispatch::capped_prompt(&opts.message),
         "system_chars": system_prompt.chars().count(),
         "workspace": workspace.display().to_string(),
+        // (#2094) The resolved inter-turn rest this dispatch forwards into
+        // the container — recorded up front so a rested run's wall clock
+        // is never misread as a slow model without the knob that caused it.
+        // (#2094 finding 4) Stamped `0` for an agentic-REMOTE dispatch
+        // (`agentic_pm.is_some()`) via `effective_turn_delay_ms` — mirrors
+        // the same forced override on `DockerRunConfig.turn_delay_ms`
+        // below, so the flow record never claims a rest a remote endpoint
+        // never actually takes.
+        "turn_delay_ms": effective_turn_delay_ms(
+            darkmux_types::config_access::turn_delay_ms(),
+            agentic_pm.is_some(),
+        ),
     });
     // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
@@ -2627,6 +2688,21 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         feedback_templates: feedback_json,
         cache_dir: cache_dir.clone(),
         feedback_injection: darkmux_types::config_access::feedback_injection(),
+        // (#2094 finding 4) Never rest an agentic-REMOTE dispatch
+        // (`agentic_pm.is_some()`, i.e. this container's brain is a hosted
+        // endpoint, not local LMStudio). The rest exists for GPU thermal /
+        // power relief between LOCAL inference bursts; an endpoint has no
+        // GPU on this host to rest, and the per-execution remote allowance
+        // (`DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`) should not pay
+        // latency for a knob that does nothing for it. Forced to `0`
+        // regardless of the operator's configured `turn_delay_ms` — see
+        // the matching `dispatch_start_payload["turn_delay_ms"]` stamp
+        // above, which mirrors this same override via `effective_turn_delay_ms`.
+        turn_delay_ms: effective_turn_delay_ms(
+            darkmux_types::config_access::turn_delay_ms(),
+            agentic_pm.is_some(),
+        ),
+        inactivity_timeout_seconds: darkmux_types::config_access::inactivity_timeout_seconds(),
         remote_chat_url: agentic_pm
             .as_ref()
             .and_then(|pm| pm.endpoint.as_ref())
@@ -2962,11 +3038,40 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     // container has exited. Best-effort — zero totals on any read failure
     // (this is observability enrichment, never a dispatch-failing path).
     let tokens = read_token_totals(&host_out);
+    // (#2094) Same best-effort read, same source file — the sum of every
+    // inter-turn rest this dispatch took + how many. `wall_ms` above
+    // INCLUDES this time (wall stays wall); a caller wanting model-only
+    // time subtracts `rest_ms` from `wall_ms` itself.
+    let rest_from_metrics = read_rest_totals(&host_out);
+    // (#2094 second round, finding 1) Reconcile against the live tailer's
+    // OWN running total (`trajectory_summary`, already accumulated above
+    // from every `runtime.rest` event AS IT STREAMED — the same mechanism
+    // `total_turns` below already trusts) rather than trusting
+    // `read_rest_totals`'s file read alone. See `reconcile_rest_totals`'s
+    // doc for why: a metrics.json that raced a crash and landed a zeroed
+    // struct on disk must not undercut a real, live-observed rest total.
+    let rest = reconcile_rest_totals(
+        rest_from_metrics,
+        RestTotals { rest_ms: trajectory_summary.rest_ms, rests: trajectory_summary.rests },
+    );
+    // (#2094 finding 8) Best-effort read of the post-clamp cadence this
+    // dispatch actually applied — see read_turn_delay_effective_ms's own
+    // doc for the metrics.json-then-derived-average fallback chain. Fed
+    // the RECONCILED `rest` above so the derived-average fallback uses
+    // the best available rest data too.
+    let turn_delay_effective_ms = read_turn_delay_effective_ms(&host_out, rest);
 
     // 8. Emit dispatch.complete flow record with summary metadata.
     let mut dispatch_complete_payload = serde_json::json!({
         "runtime": "internal",
         "wall_ms": wall_ms,
+        // (#2094) Surfaced NEXT TO wall_ms per the issue's own framing — a
+        // rested run's wall clock must never be misread as a slow model.
+        "rest_ms": rest.rest_ms,
+        "rests": rest.rests,
+        // (#2094 finding 8) null when unknowable (no metrics.json field
+        // AND zero rests) rather than a misleading 0.
+        "turn_delay_effective_ms": turn_delay_effective_ms,
         "stdout_chars": stdout.chars().count(),
         "stderr_chars": stderr.chars().count(),
         // (#1042) On the error path, carry a bounded stderr TAIL so a failed
@@ -3219,6 +3324,15 @@ struct TrajectorySummary {
     tool_calls: u32,
     compactions: u32,
     heartbeats: u32,
+    /// (#2094 finding 2) Live running sum/count of the `runtime.rest`
+    /// events this dispatch has taken so far — mirrors the runtime's own
+    /// `rest_ms`/`rests` accumulators (`runtime/src/loop_runner.rs`), kept
+    /// host-side too so each `dispatch.rest` flow record can carry the
+    /// cumulative totals alongside its own `ms`, the same "live running
+    /// total" shape `turns_so_far`/`tool_calls_so_far` already give the
+    /// mission-graph viewer's seat-card meter.
+    rest_ms: u64,
+    rests: u32,
     // (#1955) The two things the orchestrator could not see.
     //
     // Both were already COMPUTED here — the tailer forwards checkpoints and
@@ -3328,6 +3442,153 @@ pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
     TokenTotals {
         prompt: v.get("total_prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
         completion: v.get("total_completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+    }
+}
+
+/// (#2094) Sum + count of the inter-turn rests the runtime took during
+/// this dispatch. Read primarily from `metrics.json`, same as
+/// [`TokenTotals`] — but see [`read_rest_totals`]'s own doc for the
+/// `trajectory.jsonl` fallback (finding 5) that source alone doesn't
+/// have. Best-effort degrade-to-zero when neither source is available
+/// (observability enrichment, never a dispatch failure).
+#[derive(Default, Debug, Clone, Copy)]
+pub struct RestTotals {
+    pub rest_ms: u64,
+    pub rests: u32,
+}
+
+/// Read `rest_ms` / `rests` from the runtime's `metrics.json` under
+/// `<out_dir>/.darkmux-runtime/`, the same way [`read_token_totals`] does.
+///
+/// (#2094 finding 5) Unlike token totals, rest totals have a second
+/// source: when `metrics.json` is absent, unparseable, or simply carries
+/// no `rest_ms` key at all (predates #2094; or the runtime never reached
+/// its own exit-time write — SIGKILL, Ctrl-C, a hard crash before the
+/// clean-exit path runs), fall back to SUMMING the `runtime.rest` events
+/// straight out of `trajectory.jsonl`. Those events are durably streamed
+/// to disk as each rest happens (`Trajectory::append_rest`), so this
+/// fallback covers exactly the case `metrics.json` structurally cannot: a
+/// dispatch that never got to write its own totals file. Both sources
+/// degrade to `RestTotals::default()` when neither is available —
+/// observability enrichment, never a dispatch failure.
+pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
+    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
+    let from_metrics = fs::read_to_string(&metrics_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.get("rest_ms").is_some());
+    if let Some(v) = from_metrics {
+        return RestTotals {
+            rest_ms: v.get("rest_ms").and_then(|n| n.as_u64()).unwrap_or(0),
+            rests: v.get("rests").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+        };
+    }
+    sum_rest_totals_from_trajectory(out_dir)
+}
+
+/// (#2094 finding 5) The fallback source `read_rest_totals` reaches for
+/// when `metrics.json` can't answer: sum every `runtime.rest` event's
+/// `ms` out of `<out_dir>/.darkmux-runtime/trajectory.jsonl`. Malformed
+/// or unreadable lines are skipped rather than aborting the whole sum —
+/// the same lenient-on-read posture the live tailer uses on this file.
+fn sum_rest_totals_from_trajectory(out_dir: &Path) -> RestTotals {
+    let traj_path = out_dir.join(".darkmux-runtime").join("trajectory.jsonl");
+    let Ok(raw) = fs::read_to_string(&traj_path) else {
+        return RestTotals::default();
+    };
+    let mut totals = RestTotals::default();
+    for line in raw.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(|t| t.as_str()) != Some("runtime.rest") {
+            continue;
+        }
+        let ms = event.get("ms").and_then(|n| n.as_u64()).unwrap_or(0);
+        totals.rest_ms = totals.rest_ms.saturating_add(ms);
+        totals.rests = totals.rests.saturating_add(1);
+    }
+    totals
+}
+
+/// (#2094 second round, finding 1) Merge the post-hoc `metrics.json` read
+/// ([`read_rest_totals`]) with the live tailer's own running accumulation
+/// (`TrajectorySummary::rest_ms`/`rests`, kept independently as each
+/// `runtime.rest` event streams in — see the doc at that field), taking
+/// the per-field MAX of the two.
+///
+/// `read_rest_totals` gates its own trajectory fallback on metrics.json
+/// KEY PRESENCE, not value — a `metrics.json` written with `rest_ms: 0`
+/// (an exit-time write that raced a SIGKILL or a hard crash, landing a
+/// zeroed struct on disk moments before the process died) reads as an
+/// authoritative zero and never reaches `sum_rest_totals_from_trajectory`
+/// at all, even though the tailer watched real rests happen live. The
+/// live tailer's total is the second, independent witness this case
+/// needs: max rather than "prefer one or the other" because either source
+/// can legitimately be the fuller one (metrics.json's clean-exit write
+/// can also capture a beat the tailer's last poll missed).
+pub(crate) fn reconcile_rest_totals(from_metrics: RestTotals, from_tailer: RestTotals) -> RestTotals {
+    RestTotals {
+        rest_ms: from_metrics.rest_ms.max(from_tailer.rest_ms),
+        rests: from_metrics.rests.max(from_tailer.rests),
+    }
+}
+
+/// (#2094 finding 8) The POST-CLAMP `turn_delay_ms` cadence this dispatch
+/// actually applied — `resolve_turn_delay_ms`'s output
+/// (`runtime/src/loop_runner.rs`), written by the runtime into
+/// `metrics.json` as `turn_delay_effective_ms` because only the runtime
+/// knows the clamped value. Preferred source: the metrics.json field
+/// itself, when present. Fallback (metrics.json absent, or present but
+/// missing this field — predates finding 8, or the runtime never reached
+/// its clean-exit write): `rest.rest_ms / rest.rests` when `rest.rests >
+/// 0` — a derived AVERAGE cadence, not the exact resolved constant, but
+/// the cheapest available approximation from data that already exists
+/// (`RestTotals`, itself already trajectory-fallback-covered by
+/// [`read_rest_totals`]). `None` when nothing is knowable at all (no
+/// metrics.json field AND zero rests — could mean turn_delay_ms was never
+/// configured, or the dispatch never reached a second turn).
+///
+/// (#2094 second round, finding 1) A metrics.json field of exactly `0`
+/// must NOT short-circuit the derived-average fallback when `rest.rests
+/// > 0` — same failure shape as `reconcile_rest_totals` guards against: a
+/// clean-exit write that raced a crash can land a zeroed struct on disk
+/// even though the dispatch genuinely rested. Only trust the metrics
+/// field's zero when there were also zero rests to derive an average
+/// from (a single-turn dispatch's honest `0`); otherwise fall through.
+pub fn read_turn_delay_effective_ms(out_dir: &Path, rest: RestTotals) -> Option<u64> {
+    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
+    let from_metrics = fs::read_to_string(&metrics_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("turn_delay_effective_ms").and_then(|n| n.as_u64()));
+    if let Some(v) = from_metrics {
+        if v != 0 || rest.rests == 0 {
+            return Some(v);
+        }
+    }
+    if rest.rests > 0 {
+        Some(rest.rest_ms / u64::from(rest.rests))
+    } else {
+        None
+    }
+}
+
+/// (#2094 finding 4) Whether the operator's configured `turn_delay_ms`
+/// should reach this dispatch's container. Never for an agentic-REMOTE
+/// dispatch (`is_agentic_remote` = `agentic_pm.is_some()` at the call
+/// site) — that dispatch's "brain" is a hosted endpoint, not local
+/// LMStudio, so there is no local GPU on THIS host to rest, and honoring
+/// the configured rest there would only add real latency the
+/// per-execution remote token allowance pays for nothing. Pure so the
+/// call site's two consumers (`DockerRunConfig.turn_delay_ms` and the
+/// `dispatch.start` payload's `turn_delay_ms` field) can't drift from
+/// each other or be tested only through a live container spawn.
+pub(crate) fn effective_turn_delay_ms(configured_ms: u64, is_agentic_remote: bool) -> u64 {
+    if is_agentic_remote {
+        0
+    } else {
+        configured_ms
     }
 }
 
@@ -4138,6 +4399,37 @@ impl TailerState {
                     "max": event.get("max"),
                     "threshold": self.compaction_threshold,
                 }));
+            }
+            // (#2094 finding 2) A rest IS host-side proof-of-work — the
+            // runtime deliberately sleeps between turns (GPU thermal/power
+            // relief), and this catch-all previously dropped that event on
+            // the floor entirely. Two consequences, both fixed here:
+            //
+            // (a) The host-side hard-kill watchdog's `inactivity_deadline`
+            //     never saw the rest as activity, so a long enough
+            //     `turn_delay_ms` could tick the deadline down toward the
+            //     hard kill during time the dispatch was deliberately idle
+            //     BY DESIGN, not stalled. Reset it exactly the way
+            //     `tool.completed`/`compaction` do — same signal class.
+            // (b) The rest was invisible on the flow stream entirely — no
+            //     `dispatch.rest` record, so a rested run's live view gave
+            //     no indication anything was happening between turns.
+            "runtime.rest" => {
+                let ms = event.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.summary.rest_ms = self.summary.rest_ms.saturating_add(ms);
+                self.summary.rests = self.summary.rests.saturating_add(1);
+                if let Some(deadline) = &self.inactivity_deadline {
+                    let new_deadline =
+                        Instant::now() + Duration::from_secs(self.inactivity_secs);
+                    *lock_deadline(deadline) = new_deadline;
+                }
+                let payload = serde_json::json!({
+                    "ms": ms,
+                    "turn": event.get("seq"),
+                    "rest_ms": self.summary.rest_ms,
+                    "rests": self.summary.rests,
+                });
+                self.emit("dispatch.rest", darkmux_flow::Level::Info, payload);
             }
             _ => {
                 // Other event types (dispatch.start/complete from the

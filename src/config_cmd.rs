@@ -99,6 +99,9 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.injected_context_fraction", Ty::Float),
     // (#1698 Packet B2) The `darkmux acp` process's idle self-exit budget.
     ("runtime.acp_idle_exit_minutes", Ty::Uint),
+    // (#2094) The global inter-turn rest, in milliseconds, the internal
+    // runtime sleeps between inference turns on every LOCAL dispatch.
+    ("runtime.turn_delay_ms", Ty::Uint),
     ("fleet.mode", Ty::FleetMode),
     // (#1260) The per-execution remote token allowance for endpoint-staffed
     // crew seats (one pipeline stage = one execution). Tokens, never currency.
@@ -449,15 +452,34 @@ mod tests {
         set_at(p, "redis.enabled", "true").unwrap();
         set_at(p, "runtime.injected_context_fraction", "0.2").unwrap();
         set_at(p, "fleet.mode", "HUB").unwrap();
+        set_at(p, "runtime.turn_delay_ms", "3000").unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         assert_eq!(v["redis"]["host"], Value::String("100.64.0.2".into()));
         assert_eq!(v["redis"]["port"], serde_json::json!(6380), "coerced to number");
         assert_eq!(v["redis"]["enabled"], Value::Bool(true), "coerced to bool");
         assert_eq!(v["runtime"]["injected_context_fraction"], serde_json::json!(0.2));
         assert_eq!(v["fleet"]["mode"], Value::String("hub".into()), "fleet.mode normalized to canonical token");
+        assert_eq!(v["runtime"]["turn_delay_ms"], serde_json::json!(3000));
         // The written file still parses as a DarkmuxConfig.
         let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
         assert_eq!(cfg.redis.unwrap().port, Some(6380));
+        assert_eq!(cfg.runtime.unwrap().turn_delay_ms, Some(3000));
+    }
+
+    /// (#2094) `runtime.turn_delay_ms` rejects a non-integer value the same
+    /// way every other `Ty::Uint` key does, and `config get` reports the
+    /// stored value verbatim.
+    #[test]
+    fn turn_delay_ms_rejects_bad_value_and_get_round_trips() {
+        let f = tmp();
+        let p = f.path();
+        let err = set_at(p, "runtime.turn_delay_ms", "abc").unwrap_err();
+        assert!(
+            format!("{err}").contains("runtime.turn_delay_ms"),
+            "error names the key: {err}"
+        );
+        set_at(p, "runtime.turn_delay_ms", "500").unwrap();
+        assert_eq!(get_at(p, "runtime.turn_delay_ms").unwrap(), "500");
     }
 
     /// (#1475 packet 1) `role_profiles.<role>` is a dynamic settable key — it

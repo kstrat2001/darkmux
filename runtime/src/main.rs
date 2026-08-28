@@ -826,6 +826,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             total_completion_tokens: o.total_completion_tokens,
             total_messages: o.messages.len(),
             max_turns_reached,
+            rest_ms: o.rest_ms,
+            rests: o.rests,
+            turn_delay_effective_ms: o.turn_delay_effective_ms,
             final_assistant_preview: preview,
         };
         let _ = traj.save_metrics(&metrics);
@@ -842,6 +845,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                 o.total_prompt_tokens,
                 o.total_completion_tokens,
                 o.messages.len(),
+                o.rest_ms,
+                o.rests,
+                o.turn_delay_effective_ms,
             );
             // (#799) Stamp the verifier-fabrication backstop: the bash commands
             // that FAILED TO RUN this dispatch. The gate cross-checks a SIGNOFF's
@@ -887,6 +893,23 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             // the #325 three-way result discrimination that downstream
             // consumers branch on.
             max_turns_reached: false,
+            // (#2094) No `LoopOutcome` survives an `Err` return — any rests
+            // taken before the failure aren't recoverable HERE without
+            // threading rest counters through the error path too (the same
+            // reason turns/compactions above are hardcoded 0, not a new
+            // gap). This IS recoverable on the HOST side, though: every
+            // `runtime.rest` this dispatch took before the crash was
+            // already durably streamed to `trajectory.jsonl` as it
+            // happened (`Trajectory::append_rest`), independent of this
+            // (now-zeroed) `metrics.json` write. The host's
+            // `dispatch_internal.rs` reconciles this zeroed metrics.json
+            // against its own live tailer's accumulation
+            // (`reconcile_rest_totals`, #2094 second round finding 1)
+            // precisely so a dispatch.error terminal still reports the
+            // real totals rather than these hardcoded zeros.
+            rest_ms: 0,
+            rests: 0,
+            turn_delay_effective_ms: 0,
             final_assistant_preview: String::new(),
         };
         let _ = traj.save_metrics(&metrics);
@@ -895,6 +918,12 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             let envelope = build_json_envelope(
                 "error", None, &model, started_at_unix_ms, wall_ms,
                 0, 0, 0, 0, 0,
+                // (#2094) Same "no LoopOutcome survives an Err return"
+                // limit as the `trajectory::Metrics` write above — the
+                // host reconciles the real totals from the trajectory,
+                // this envelope's own rest fields stay 0 like every
+                // other counter on this path.
+                0, 0, 0,
             );
             println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
         } else {
@@ -928,6 +957,13 @@ fn run_dispatch(args: &[String]) -> ExitCode {
 ///
 /// Arg types mirror the source types in `trajectory::Metrics` +
 /// `loop_runner::Outcome` so callers don't need casts.
+///
+/// (#2094 second round, finding 3 CONSIDER) `rest_ms`/`rests`/
+/// `turn_delay_effective_ms` join the metrics block so a `--json`
+/// consumer reading `wall_ms` sees the rest right there in the same
+/// object, instead of having to cross-reference `metrics.json` /
+/// `trajectory.jsonl` separately the way the host's own enrichment
+/// (`dispatch_internal.rs`'s `dispatch.complete` payload) already does.
 #[allow(clippy::too_many_arguments)]
 fn build_json_envelope(
     result: &str,
@@ -940,6 +976,9 @@ fn build_json_envelope(
     prompt_tokens: u32,
     completion_tokens: u32,
     total_messages: usize,
+    rest_ms: u64,
+    rests: u32,
+    turn_delay_effective_ms: u64,
 ) -> serde_json::Value {
     serde_json::json!({
         "result": result,
@@ -960,6 +999,13 @@ fn build_json_envelope(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_messages": total_messages,
+            // (#2094) Surfaced NEXT TO wall_ms, same framing as the host's
+            // dispatch.complete payload — a rested run's wall clock must
+            // never be misread as a slow model. `wall_ms` above INCLUDES
+            // this time (wall stays wall).
+            "rest_ms": rest_ms,
+            "rests": rests,
+            "turn_delay_effective_ms": turn_delay_effective_ms,
         },
         // Container-internal path where the runtime's own bookkeeping
         // landed — now the out-dir (SEPARATE from /workspace) per the
@@ -1131,6 +1177,9 @@ mod tests {
             2970,
             112,
             3,
+            1000,
+            2,
+            500,
         );
         // Top-level contract — qa-review + lab adapter parse these.
         assert_eq!(env["result"], "stop");
@@ -1145,6 +1194,11 @@ mod tests {
         assert_eq!(env["metrics"]["prompt_tokens"], 2970);
         assert_eq!(env["metrics"]["completion_tokens"], 112);
         assert_eq!(env["metrics"]["total_messages"], 3);
+        // (#2094 second round, finding 3 CONSIDER) The rest fields live
+        // right next to wall_ms in the same metrics object.
+        assert_eq!(env["metrics"]["rest_ms"], 1000);
+        assert_eq!(env["metrics"]["rests"], 2);
+        assert_eq!(env["metrics"]["turn_delay_effective_ms"], 500);
     }
 
     #[test]
@@ -1152,20 +1206,23 @@ mod tests {
         // Failure path emits same envelope shape so consumers can parse
         // uniformly without branching on success/error.
         let env = build_json_envelope(
-            "error", None, "darkmux:foo", 1700000000000, 500, 0, 0, 0, 0, 0,
+            "error", None, "darkmux:foo", 1700000000000, 500, 0, 0, 0, 0, 0, 0, 0, 0,
         );
         assert_eq!(env["result"], "error");
         assert!(env["final_assistant"].is_null(), "error envelope must have null final_assistant");
         assert_eq!(env["metrics"]["model"], "darkmux:foo");
         assert_eq!(env["metrics"]["wall_ms"], 500);
         assert_eq!(env["metrics"]["turns"], 0);
+        assert_eq!(env["metrics"]["rest_ms"], 0);
+        assert_eq!(env["metrics"]["rests"], 0);
+        assert_eq!(env["metrics"]["turn_delay_effective_ms"], 0);
     }
 
     #[test]
     fn json_envelope_serializes_as_single_line() {
         // qa-review parses with `jq -c` — verify the serialized form is
         // single-line + valid JSON. (No surprise whitespace, etc.)
-        let env = build_json_envelope("stop", Some("x"), "m", 0, 0, 0, 0, 0, 0, 0);
+        let env = build_json_envelope("stop", Some("x"), "m", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         let s = serde_json::to_string(&env).unwrap();
         assert!(!s.contains('\n'), "envelope must serialize on one line; got: {s}");
         // Round-trip must produce identical structure.
@@ -1180,7 +1237,7 @@ mod tests {
         // stays parseable. Regression guard for "naive println escaping"
         // mistakes that would tempt a future refactor.
         let tricky = "line1\nline2\twith \"quotes\" and \\backslash";
-        let env = build_json_envelope("stop", Some(tricky), "m", 0, 0, 0, 0, 0, 0, 0);
+        let env = build_json_envelope("stop", Some(tricky), "m", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         let s = serde_json::to_string(&env).unwrap();
         let back: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(back["final_assistant"], tricky);

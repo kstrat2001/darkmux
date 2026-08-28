@@ -539,7 +539,32 @@ impl WorkloadProvider for CodingTaskProvider {
         }
 
         let walltime_ms = meta.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
-        let mode = classify_mode(walltime_ms, loaded);
+        // (#2094 finding 7) Computed once here — used both for the
+        // classification below and the report's own `rest_ms` field /
+        // notes line, so all three readings agree.
+        //
+        // (#2094 second round, finding 5 CONSIDER) `max()` against the
+        // trajectory-derived sum, the same reconcile shape `turns`/
+        // `compactions` already get via `reconcile_count` — a
+        // zeroed-but-present metrics.json (the exit-time write raced a
+        // crash, same shape `darkmux-crew`'s `reconcile_rest_totals`
+        // fixes host-side) must not undercut a trajectory that actually
+        // recorded rests.
+        let rest_ms: u64 = runtime_metrics
+            .as_ref()
+            .map(|m| m.rest_ms)
+            .unwrap_or(0)
+            .max(sum_rest_ms_from_events(&events));
+        // Classify on MODEL time, not raw wall clock. Fast/Slow is a claim
+        // about the MODEL's speed; a rested run's wall clock includes real
+        // idle time (GPU thermal/power relief between turns, #2094) that
+        // has nothing to do with how fast the model itself ran. Without
+        // this, a heavily-rested run can misclassify as Slow purely
+        // because of the pacing knob, not the model. The DISPLAYED
+        // walltime stays the raw wall clock (below) — only the
+        // classification input changes.
+        let model_time_ms = walltime_ms.saturating_sub(u128::from(rest_ms));
+        let mode = classify_mode(model_time_ms, loaded);
 
         // Prefer runtime metrics when present (internal-runtime path);
         // fall back to trajectory-derived counts (openclaw shell-out
@@ -570,6 +595,13 @@ impl WorkloadProvider for CodingTaskProvider {
             format!("compactions={}", compactions),
             format!("walltime={}s", walltime_ms / 1000),
         ];
+        // (#2094 finding 7) Only when non-zero — a clean unrested run's
+        // summary line stays exactly as it read before this feature
+        // existed, and a rested run's summary makes the pacing knob's
+        // cost visible right next to the walltime it inflated.
+        if rest_ms > 0 {
+            notes.push(format!("rest={rest_ms}ms"));
+        }
         if let Some(m) = mode {
             notes.push(format!(
                 "mode={}",
@@ -607,6 +639,13 @@ impl WorkloadProvider for CodingTaskProvider {
             walltime_ms,
             turns,
             compactions,
+            // (#2094) Taken directly from metrics.json — unlike turns/
+            // compactions there's no trajectory-derived series to
+            // reconcile against; `0` means "no rests" or "no metrics.json"
+            // and either reading is correct (the runtime's own default).
+            // (#2094 finding 7) Same variable the classification above and
+            // the notes line use — can't drift from either.
+            rest_ms,
             tokens_before,
             summary_chars,
             mode,
@@ -1184,6 +1223,15 @@ fn classify_mode(walltime_ms: u128, loaded: &LoadedWorkload) -> Option<RunMode> 
 struct InternalRuntimeMetrics {
     turns: Option<u32>,
     compactions: Option<u32>,
+    /// (#2094) Sum of inter-turn rests, in milliseconds — `0` (not
+    /// `None`) when absent. (#2094 second round, finding 5 CONSIDER:
+    /// this field DOES now have a trajectory-derived fallback to
+    /// reconcile against, the same shape `turns`/`compactions` have via
+    /// `reconcile_count` — see the call site in `inspect`, which takes
+    /// `max(this field, sum_rest_ms_from_events(&events))` so a
+    /// zeroed-but-present metrics.json can't undercut a trajectory that
+    /// actually recorded rests.)
+    rest_ms: u64,
 }
 
 /// Read a runtime-emitted `metrics.json` from a specific path.
@@ -1215,6 +1263,22 @@ fn reconcile_count(metric: Option<u32>, trajectory: u32) -> u32 {
     metric.unwrap_or(0).max(trajectory)
 }
 
+/// (#2094 second round, finding 5 CONSIDER) Sum every `runtime.rest`
+/// event's `ms` out of an already-parsed trajectory. Mirrors
+/// `darkmux_crew::dispatch_internal::sum_rest_totals_from_trajectory`
+/// (cited here rather than called directly: that helper re-reads
+/// `trajectory.jsonl` from disk given a directory, but `inspect` already
+/// has the events parsed into memory as `events` by the time `rest_ms`
+/// is computed — re-reading the file here would be a redundant disk pass
+/// over identical data).
+fn sum_rest_ms_from_events(events: &[serde_json::Value]) -> u64 {
+    events
+        .iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("runtime.rest"))
+        .map(|e| e.get("ms").and_then(|n| n.as_u64()).unwrap_or(0))
+        .fold(0u64, u64::saturating_add)
+}
+
 fn read_metrics_json(path: &Path) -> Option<InternalRuntimeMetrics> {
     let raw = fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -1224,6 +1288,7 @@ fn read_metrics_json(path: &Path) -> Option<InternalRuntimeMetrics> {
             .get("compactions")
             .and_then(|x| x.as_u64())
             .map(|n| n as u32),
+        rest_ms: v.get("rest_ms").and_then(|x| x.as_u64()).unwrap_or(0),
     })
 }
 
@@ -1988,6 +2053,130 @@ not-valid-json
         // Pre-fix: turns=0, compactions=0. Post-fix: runtime values flow through.
         assert_eq!(report.turns, 10);
         assert_eq!(report.compactions, 2);
+        // (#2094) No rest_ms key in this fixture's metrics.json — absent
+        // means zero, not an error.
+        assert_eq!(report.rest_ms, 0);
+    }
+
+    /// (#2094) `rest_ms` flows through from metrics.json exactly like
+    /// `turns`/`compactions` — same fixture shape, one more key.
+    #[test]
+    fn inspect_surfaces_rest_ms_from_runtime_metrics() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox = tmp.path().join("sandbox");
+        let runtime_dir = sandbox.join(".darkmux-runtime");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(
+            run_dir.join("manifest.json"),
+            format!(
+                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
+                sandbox.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            runtime_dir.join("metrics.json"),
+            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":3,"compactions":0,"rest_ms":1000,"rests":2}"#,
+        )
+        .unwrap();
+        fs::write(run_dir.join("trajectory.jsonl"), "").unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        assert_eq!(report.rest_ms, 1000);
+    }
+
+    /// (#2094 finding 7) `classify_mode` must judge MODEL time
+    /// (walltime - rest), not raw wall clock — Fast/Slow is a claim about
+    /// the model. A run whose raw walltime crosses into the Slow cluster
+    /// ONLY because it took a long rest (GPU thermal/power pacing, not
+    /// the model actually being slow) must still classify Fast once the
+    /// rest is subtracted out. The DISPLAYED walltime note stays the raw
+    /// wall clock — only the classification input changes.
+    #[test]
+    fn inspect_classifies_fast_when_rest_ms_pulls_model_time_below_slow_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox = tmp.path().join("sandbox");
+        let runtime_dir = sandbox.join(".darkmux-runtime");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        // Raw walltime (700s) lands inside slow_cluster_seconds (600,950)
+        // below — a naive raw-wall classification would read Slow.
+        fs::write(
+            run_dir.join("manifest.json"),
+            format!(
+                r#"{{"session_id":"sess","duration_ms":700000,"sandbox":"{}"}}"#,
+                sandbox.display()
+            ),
+        )
+        .unwrap();
+        // 450s of that 700s was rest, not inference — model time is
+        // 250s, squarely inside fast_cluster_seconds (197,280).
+        fs::write(
+            runtime_dir.join("metrics.json"),
+            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":3,"compactions":0,"rest_ms":450000,"rests":5}"#,
+        )
+        .unwrap();
+        fs::write(run_dir.join("trajectory.jsonl"), "").unwrap();
+
+        let mut spec = basic_spec();
+        spec.expected = Some(ExpectedSpec {
+            fast_cluster_seconds: Some((197, 280)),
+            slow_cluster_seconds: Some((600, 950)),
+            ..Default::default()
+        });
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+
+        assert_eq!(report.mode, Some(RunMode::Fast), "model time (250s) is Fast, not raw wall (700s)");
+        assert_eq!(report.walltime_ms, 700_000, "the DISPLAYED walltime stays the raw wall clock");
+        assert_eq!(report.rest_ms, 450_000);
+        assert!(
+            report.notes.iter().any(|n| n == "rest=450000ms"),
+            "notes must surface the rest that explains the wall/model-time gap: {:?}",
+            report.notes
+        );
+    }
+
+    /// (#2094 second round, finding 5 CONSIDER) The same "zeroed-but-present
+    /// metrics.json" gap `darkmux-crew`'s `reconcile_rest_totals` fixes on
+    /// the host side, reproduced here: `rest_ms: 0` in metrics.json must
+    /// not be trusted as an authoritative zero when the trajectory
+    /// recorded real `runtime.rest` events — fall back to summing them.
+    #[test]
+    fn inspect_falls_back_to_trajectory_rest_when_metrics_rest_ms_is_zero() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox = tmp.path().join("sandbox");
+        let runtime_dir = sandbox.join(".darkmux-runtime");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(
+            run_dir.join("manifest.json"),
+            format!(
+                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
+                sandbox.display()
+            ),
+        )
+        .unwrap();
+        // metrics.json IS present with the key, but zeroed — the same
+        // "exit-time write raced a crash" shape as the host-side finding.
+        fs::write(
+            runtime_dir.join("metrics.json"),
+            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":3,"compactions":0,"rest_ms":0,"rests":0}"#,
+        )
+        .unwrap();
+        fs::write(
+            run_dir.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":400}\n\
+             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":600}\n",
+        )
+        .unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        assert_eq!(report.rest_ms, 1000, "sum of both runtime.rest ms fields from the trajectory");
     }
 
     // ─── #364: inspect prefers run_dir/metrics.json over sandbox ──
