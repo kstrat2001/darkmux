@@ -356,24 +356,44 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.24.0";
 //           manifest / rules / read-only source worktrees / `darkmux crawl
 //           plan` machinery with no flow-record vocabulary of its own).
 //           `crawl.mission.started` / `crawl.mission.completed` bookend
-//           the whole sequential unit loop (payload: corpus, units
-//           planned/completed/errored/skipped, tokens, wall_ms,
-//           tokens_per_hour, stopped_by); `crawl.unit.started` /
-//           `crawl.unit.completed` bookend each unit (payload: corpus,
-//           unit, source, sha, rule, kind, result, findings, tokens);
-//           `crawl.finding` carries one recorded finding (payload: corpus,
-//           unit, source, sha, rule, plus the finding record's own fields
-//           verbatim — `file` rewritten from the container path to a
-//           source-relative path, with the original kept as `file_raw`).
-//           The launcher's own PER-UNIT model dispatch already satisfies
-//           the dispatch-liveness contract (registry entry 2) via the
-//           ordinary `dispatch start`/`dispatch complete`/`dispatch error`
-//           bookends `crew::dispatch::dispatch` always emits — this new
-//           family is descriptive scaffolding around that, not a
-//           replacement for it. Minor + additive: five new action values,
-//           same `payload` blob shape every other richer action already
-//           uses; older readers ignore the unknown actions. New records
-//           only, prior AuditFileSink chains survive without rotation.
+//           the whole sequential unit loop (payload: corpus, units_in_
+//           plan/units_selected/units_not_run — plan-level: a unit
+//           excluded by `--param units=`, cut by `--param limit=`, or
+//           never reached because the loop stopped early all land in
+//           `units_not_run`, one number for every reason (merge-gate
+//           finding 2, renamed from the original `units_planned`);
+//           units_completed/errored/skipped, tokens, wall_ms,
+//           tokens_per_hour, stopped_by — `done`/`limit` reach a real
+//           `phase complete`; a kill file, SIGINT, or an early error/
+//           panic reach `phase abandon` instead (finding 3, so the phase
+//           record itself, not just this payload, tells a deliberate
+//           stop apart from a completion); `model`/`profile`/
+//           `timeout_secs`/`limit`/`plan_path`/`units_filter` self-
+//           describe the run's own config (finding 8)); `crawl.unit.
+//           started` / `crawl.unit.completed` bookend each unit (payload:
+//           corpus, unit, source, sha, rule, kind, result — `stop`/
+//           `error`/`timeout`/`interrupted` — findings, tokens, model;
+//           both records now share the UNIT's own session id rather than
+//           `started` carrying the mission id, finding 5); `crawl.finding`
+//           carries one recorded finding (payload: corpus, unit, source,
+//           sha, rule, plus the finding record's own fields verbatim —
+//           `file` rewritten from the container path to a source-relative
+//           path, with the original kept as `file_raw`). Every record in
+//           the family now stamps `FlowRecord.model` when the unit's
+//           envelope reported one (previously hardcoded `None`, finding
+//           8). The launcher's own PER-UNIT model dispatch already
+//           satisfies the dispatch-liveness contract (registry entry 2)
+//           via the ordinary `dispatch start`/`dispatch complete`/
+//           `dispatch error` bookends `crew::dispatch::dispatch` always
+//           emits — this family is descriptive scaffolding around that,
+//           not a replacement for it. Minor + additive: five new action
+//           values, same `payload` blob shape every other richer action
+//           already uses; older readers ignore the unknown actions and
+//           unknown payload fields. New records only, prior AuditFileSink
+//           chains survive without rotation. (The field rename/additions
+//           above landed via merge-gate review on the same branch that
+//           introduced 1.24.0, before this schema version ever shipped —
+//           amending this entry in place, not a further version bump.)
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

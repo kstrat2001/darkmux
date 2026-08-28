@@ -601,7 +601,15 @@ pub(crate) enum MissionCmd {
     /// any produced output (Clean/Degraded/Degenerate alike — CI-facing
     /// pass/fail comes from the rendered payload's `mode` field, not this
     /// code), propagating a hard failure for anything that fails before an
-    /// envelope was ever produced.
+    /// envelope was ever produced. `crawl` (#1959 packet 2 — the crawl
+    /// LAUNCHER, `src/crawl_launch.rs`) exits `0` on a clean finish
+    /// (every selected unit attempted, or `--param limit=` cut the
+    /// selection short by design — both read as an honest completion);
+    /// `1` an error before or during the per-unit loop (a pre-mint
+    /// validation bail, or the RAII finalize guard catching an early
+    /// return/panic mid-loop); `3` the operator dropped a `STOP` kill file
+    /// in the corpus root — honored BETWEEN units, never mid-dispatch;
+    /// `130` SIGINT, same between-units timing as the kill file.
     Launch {
         /// Mission config id to launch — a built-in (e.g. `coder-phase`)
         /// or a `darkmux mission propose`-drafted user-tier config.
@@ -619,7 +627,9 @@ pub(crate) enum MissionCmd {
         /// coder-phase (and gate-less generic graphs) default 600;
         /// `review` defaults 3600 — the retired `pr-review run`'s own
         /// per-call default, preserved so a long judge pass doesn't newly
-        /// time out (#1284 Packet 4b review gate, must-fix 1).
+        /// time out (#1284 Packet 4b review gate, must-fix 1); `crawl`
+        /// defaults 600 (per-unit dispatch timeout — the same 600s every
+        /// other config-less-graph default uses).
         #[arg(long)]
         timeout: Option<u32>,
     },
@@ -811,6 +821,16 @@ pub(crate) enum MissionConfigCmd {
     /// config that fails to load prints as a row naming the error instead
     /// of being silently dropped, so one broken user-tier override never
     /// hides every other registered config. Read-only.
+    ///
+    /// `crawl` (`darkmux mission launch crawl`, #1959 packet 2) does NOT
+    /// appear here — this list enumerates `templates/builtin/mission-
+    /// configs/*.json` documents (plus the user tier), and crawl has no
+    /// such document: its Task/Step graph is computed at RUN TIME from a
+    /// resolved corpus plan, not declared ahead of time (see `src/crawl_
+    /// launch.rs`'s module doc for the full reasoning). It is routed by
+    /// literal config id in `mission_launch::launch`, checked BEFORE this
+    /// registry is consulted at all. This is absence by design, not a gap
+    /// in the list.
     List {
         #[command(flatten)]
         json: JsonFlag,

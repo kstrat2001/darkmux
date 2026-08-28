@@ -760,3 +760,469 @@ fn mission_and_task_structure_is_the_shape_mission_status_reads() {
         assert_eq!(s.status, crew::types::NodeStatus::Complete, "{s:#?}");
     }
 }
+
+// ── #1959 merge-gate findings ───────────────────────────────────────────
+
+/// A synthetic plan with `n` `Unit::Site` entries, all bound to
+/// `swallowed-error` against source `app1` (present in `two_source_
+/// fixture`'s manifest) — used where a test needs a plan LARGER than the
+/// fixture's own 2-unit corpus (finding 2's "70 in plan, 1 selected"
+/// shape) without spinning up 70 real git repos. `sources` is left empty
+/// deliberately: with no `PlanSource` entries, the sha/tree reconcile
+/// loop in `run()` has nothing to check, so this plan is valid to load
+/// regardless of what `sources::resolve` returns for the real fixture.
+fn synthetic_plan_with_n_units(corpus_name: &str, n: usize) -> Plan {
+    let units: Vec<Unit> = (1..=n)
+        .map(|i| Unit::Site {
+            id: format!("u-{i:04}"),
+            rule: "swallowed-error".to_string(),
+            source: "app1".to_string(),
+            sites: vec![Site { file: "x.ts".to_string(), line: 5, start: 1, end: 6, hits: vec![5] }],
+            est_tokens: 10,
+        })
+        .collect();
+    Plan {
+        schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
+        corpus: corpus_name.to_string(),
+        planned_at: "2026-01-01T00:00:00Z".to_string(),
+        sources: Vec::new(),
+        units,
+        totals: plan::Totals::default(),
+    }
+}
+
+/// Whole-word (case-insensitive) substring check — `str::contains` alone
+/// would false-positive on e.g. "corpuscular", and finding 4's vocabulary
+/// guard is specifically about a darkmux-internal TERM leaking into
+/// model-facing prose, not any substring collision.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    let lower = haystack.to_lowercase();
+    let word = word.to_lowercase();
+    lower.split(|c: char| !c.is_alphanumeric()).any(|tok| tok == word)
+}
+
+// ── finding 1a: pre-mint rule validation ────────────────────────────────
+
+#[test]
+#[serial_test::serial]
+fn plan_naming_a_rule_the_manifest_no_longer_declares_bails_before_any_mint() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (rules_vec, _) = rules::resolve_default(&manifest.rules).unwrap();
+    let resolved = sources::resolve(&manifest, true).unwrap();
+    let mut stale_plan = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
+    match &mut stale_plan.units[0] {
+        Unit::Site { rule, .. } => *rule = "ghost-rule".to_string(),
+        other => panic!("fixture expected to produce Unit::Site units, got {other:?}"),
+    }
+    let plan_path = fx.root.path().join("ghost-rule-plan.json");
+    std::fs::write(&plan_path, serde_json::to_string(&stale_plan).unwrap()).unwrap();
+
+    let mut params = params_for(&fx);
+    params.insert("plan".to_string(), Value::String(plan_path.to_string_lossy().to_string()));
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let err = run(&params, None, &mut dispatch).unwrap_err();
+    assert!(err.to_string().contains("ghost-rule"), "{err}");
+    assert!(calls.borrow().clone().is_empty(), "no dispatch before the pre-mint bail");
+
+    let records = read_all_flow_records();
+    assert!(
+        records.iter().all(|r| r["action"] != "crawl.mission.started"),
+        "a pre-mint bail must never emit crawl.mission.started — no mission was minted: {records:#?}"
+    );
+}
+
+// ── finding 1b: the RAII finalize guard ─────────────────────────────────
+
+/// A panic injected through the `dispatch_fn` seam mid-loop (the task's
+/// own suggested injection point) must still leave a matching `crawl.
+/// mission.completed` record, a written envelope, and a non-`Active`
+/// mission behind — the guard's whole reason to exist.
+#[test]
+#[serial_test::serial]
+fn a_panic_mid_loop_still_finalizes_via_the_raii_guard() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+
+    let mut dispatch = |opts: DispatchOpts| -> Result<DispatchResult> {
+        let session_id = opts.session_id.clone().unwrap_or_default();
+        let unit_id = unit_id_from_session(&session_id);
+        emit_scripted_bookend(darkmux_flow::DISPATCH_START, &opts, &session_id, None);
+        if unit_id == "u-0001" {
+            panic!("simulated mid-dispatch panic for {unit_id}");
+        }
+        let script = ScriptedUnit::default();
+        let result = scripted_ok_result(&unit_id, &script, session_id.clone());
+        emit_scripted_bookend(darkmux_flow::DISPATCH_COMPLETE, &opts, &session_id, Some(script.model));
+        Ok(result)
+    };
+
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&params_for(&fx), None, &mut dispatch)));
+    std::panic::set_hook(prev_hook);
+    assert!(outcome.is_err(), "expected the injected panic to propagate out of run()");
+
+    let records = read_all_flow_records();
+    let mission_id = mission_id_from_records(&records);
+    let completed = records
+        .iter()
+        .find(|r| r["action"] == "crawl.mission.completed")
+        .expect("the RAII guard must still emit crawl.mission.completed on a panic");
+    assert_eq!(completed["payload"]["stopped_by"], "error");
+    assert_eq!(completed["payload"]["units_completed"], 0);
+
+    let runs_dir = fx.root.path().join("runs").join(&mission_id);
+    assert!(runs_dir.join("envelope.json").exists(), "the envelope must still be written on the abort path");
+    let envelope: Value = serde_json::from_str(&std::fs::read_to_string(runs_dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(envelope["stopped_by"], "error");
+
+    let mission_json = std::fs::read_to_string(crew::lifecycle::mission_path(&mission_id)).unwrap();
+    let mission: crew::types::Mission = serde_json::from_str(&mission_json).unwrap();
+    assert_ne!(
+        mission.status,
+        crew::types::MissionStatus::Active,
+        "the mission must never be left stuck Active after an abort — {mission:#?}"
+    );
+
+    let phase_id = format!("{mission_id}-crawl");
+    let phase_json = std::fs::read_to_string(crew::lifecycle::phase_path(&mission_id, &phase_id)).unwrap();
+    let phase: crew::types::Phase = serde_json::from_str(&phase_json).unwrap();
+    assert_eq!(phase.status, crew::types::PhaseStatus::Abandoned, "an aborted crawl abandons its phase, not completes it");
+}
+
+// ── finding 2: plan-size accounting ─────────────────────────────────────
+
+#[test]
+#[serial_test::serial]
+fn seventy_in_plan_one_selected_reports_units_not_run_everywhere() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let synthetic = synthetic_plan_with_n_units(&manifest.name, 70);
+    let plan_path = fx.root.path().join("big-plan.json");
+    std::fs::write(&plan_path, serde_json::to_string(&synthetic).unwrap()).unwrap();
+
+    let mut params = params_for(&fx);
+    params.insert("plan".to_string(), Value::String(plan_path.to_string_lossy().to_string()));
+    params.insert("limit".to_string(), Value::String("1".to_string()));
+
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string()], "only the selected unit is ever dispatched");
+
+    let records = read_all_flow_records();
+    let started = records.iter().find(|r| r["action"] == "crawl.mission.started").unwrap();
+    assert_eq!(started["payload"]["units_in_plan"], 70);
+    assert_eq!(started["payload"]["units_selected"], 1);
+
+    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    assert_eq!(completed["payload"]["units_in_plan"], 70);
+    assert_eq!(completed["payload"]["units_selected"], 1);
+    assert_eq!(completed["payload"]["units_not_run"], 69);
+
+    let mission_id = mission_id_from_records(&records);
+    let runs_dir = fx.root.path().join("runs").join(&mission_id);
+    let envelope: Value = serde_json::from_str(&std::fs::read_to_string(runs_dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(envelope["units_in_plan"], 70);
+    assert_eq!(envelope["units_selected"], 1);
+    assert_eq!(envelope["units_not_run"], 69);
+}
+
+// ── finding 3: a deliberate stop is not a completion ────────────────────
+
+#[test]
+#[serial_test::serial]
+fn kill_file_stop_abandons_the_phase_not_completes_it() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let root_path = fx.root.path().to_path_buf();
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    scripts.insert("u-0002".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, move |unit_id| {
+        if unit_id == "u-0001" {
+            std::fs::write(root_path.join("STOP"), "").unwrap();
+        }
+    });
+
+    let code = run(&params_for(&fx), None, &mut dispatch).unwrap();
+    assert_eq!(code, 3);
+
+    let records = read_all_flow_records();
+    let mission_id = mission_id_from_records(&records);
+    let phase_id = format!("{mission_id}-crawl");
+    let phase_json = std::fs::read_to_string(crew::lifecycle::phase_path(&mission_id, &phase_id)).unwrap();
+    let phase: crew::types::Phase = serde_json::from_str(&phase_json).unwrap();
+    assert_eq!(
+        phase.status,
+        crew::types::PhaseStatus::Abandoned,
+        "a kill-file stop is not a completion (#1959 merge-gate finding 3)"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn done_stop_leaves_the_phase_complete() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    scripts.insert("u-0002".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    run(&params_for(&fx), None, &mut dispatch).unwrap();
+
+    let records = read_all_flow_records();
+    let mission_id = mission_id_from_records(&records);
+    let phase_id = format!("{mission_id}-crawl");
+    let phase_json = std::fs::read_to_string(crew::lifecycle::phase_path(&mission_id, &phase_id)).unwrap();
+    let phase: crew::types::Phase = serde_json::from_str(&phase_json).unwrap();
+    assert_eq!(phase.status, crew::types::PhaseStatus::Complete, "a clean `done` stop IS a completion");
+}
+
+// ── finding 4: shipped rule prose vs the vocabulary guard ───────────────
+
+/// Every EMBEDDED rule (not just a synthetic test rule) run through the
+/// exact resolution path `run()` itself uses, checked against the full
+/// darkmux-internal vocabulary list — this is what caught
+/// `stale-consumer.json`'s "this unit" in its `no_match` field, which the
+/// pre-existing `message_builder_never_uses_darkmux_internal_vocabulary`
+/// test above could not: that test only ever exercises a synthetic
+/// `test_rule`, never the shipped rule files.
+#[test]
+fn every_shipped_rule_avoids_darkmux_internal_vocabulary() {
+    let (embedded, load_warnings) = rules::load_all(None);
+    assert!(load_warnings.is_empty(), "{load_warnings:?}");
+    let all_ids: Vec<String> = embedded.keys().cloned().collect();
+    assert!(all_ids.len() >= 3, "expected at least the 3 known built-in rules: {all_ids:?}");
+
+    let (resolved, resolve_warnings) = rules::resolve_default(&all_ids).unwrap();
+    assert!(resolve_warnings.is_empty(), "{resolve_warnings:?}");
+    assert_eq!(resolved.len(), all_ids.len());
+
+    for rule in &resolved {
+        let rendered = pattern_block(rule);
+        for banned in ["unit", "ledger", "corpus", "packet", "darkmux"] {
+            assert!(
+                !contains_word(&rendered, banned),
+                "rule `{}` renders the darkmux-internal word `{banned}` into model-facing prose: {rendered}",
+                rule.id
+            );
+        }
+    }
+}
+
+// ── finding 5: crawl.unit.started carries the UNIT session id ───────────
+
+#[test]
+#[serial_test::serial]
+fn unit_started_and_completed_share_the_same_session_id() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    scripts.insert("u-0002".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+    run(&params_for(&fx), None, &mut dispatch).unwrap();
+
+    let records = read_all_flow_records();
+    for r in records.iter().filter(|r| r["action"] == "crawl.unit.started") {
+        let sid = r["session_id"].as_str().expect("crawl.unit.started must carry a session_id");
+        assert!(sid.starts_with("crawl-"), "{r:#?}");
+        assert_ne!(sid, r["mission_id"].as_str().unwrap(), "must be the UNIT session, not the mission id");
+    }
+
+    let started_sessions: Vec<&str> =
+        records.iter().filter(|r| r["action"] == "crawl.unit.started").map(|r| r["session_id"].as_str().unwrap()).collect();
+    let completed_sessions: Vec<&str> = records
+        .iter()
+        .filter(|r| r["action"] == "crawl.unit.completed")
+        .map(|r| r["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        started_sessions, completed_sessions,
+        "each unit's started/completed records must carry the SAME session id (#1959 merge-gate finding 5)"
+    );
+}
+
+// ── finding 6: plan reload validation ───────────────────────────────────
+
+#[test]
+#[serial_test::serial]
+fn plan_corpus_mismatch_bails_loud() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (rules_vec, _) = rules::resolve_default(&manifest.rules).unwrap();
+    let resolved = sources::resolve(&manifest, true).unwrap();
+    let mut plan_wrong_corpus = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
+    plan_wrong_corpus.corpus = "some-other-corpus".to_string();
+    let plan_path = fx.root.path().join("wrong-corpus-plan.json");
+    std::fs::write(&plan_path, serde_json::to_string(&plan_wrong_corpus).unwrap()).unwrap();
+
+    let mut params = params_for(&fx);
+    params.insert("plan".to_string(), Value::String(plan_path.to_string_lossy().to_string()));
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let err = run(&params, None, &mut dispatch).unwrap_err();
+    assert!(err.to_string().contains("some-other-corpus"), "{err}");
+    assert!(calls.borrow().clone().is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn plan_source_tree_mismatch_bails_loud() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (rules_vec, _) = rules::resolve_default(&manifest.rules).unwrap();
+    let resolved = sources::resolve(&manifest, true).unwrap();
+    let mut plan_wrong_tree = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
+    plan_wrong_tree.sources[0].tree = PathBuf::from("/nonexistent/relocated/tree");
+    let plan_path = fx.root.path().join("wrong-tree-plan.json");
+    std::fs::write(&plan_path, serde_json::to_string(&plan_wrong_tree).unwrap()).unwrap();
+
+    let mut params = params_for(&fx);
+    params.insert("plan".to_string(), Value::String(plan_path.to_string_lossy().to_string()));
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let err = run(&params, None, &mut dispatch).unwrap_err();
+    assert!(err.to_string().contains("different tree"), "{err}");
+    assert!(calls.borrow().clone().is_empty());
+}
+
+#[test]
+fn schema_major_mismatch_warns_only_on_a_real_major_difference() {
+    assert!(plan_schema_major_mismatch_warning("2.0", "1.0").is_some());
+    assert!(plan_schema_major_mismatch_warning("1.0", "1.0").is_none());
+    assert!(plan_schema_major_mismatch_warning("1.9", "1.0").is_none(), "a minor bump is not a major mismatch");
+}
+
+// ── finding 7: `--param units=` parsing to zero ids bails loudly ───────
+
+#[test]
+#[serial_test::serial]
+fn units_param_parsing_to_zero_ids_bails_loud() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut params = params_for(&fx);
+    params.insert("units".to_string(), Value::String(",, ".to_string()));
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let err = run(&params, None, &mut dispatch).unwrap_err();
+    assert!(err.to_string().contains("named no unit ids"), "{err}");
+    assert!(calls.borrow().clone().is_empty());
+}
+
+// ── finding 8: self-describing envelope ─────────────────────────────────
+
+#[test]
+#[serial_test::serial]
+fn envelope_is_self_describing() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut params = params_for(&fx);
+    params.insert("limit".to_string(), Value::String("1".to_string()));
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit { model: "darkmux:test-model", ..Default::default() });
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    run(&params, Some(120), &mut dispatch).unwrap();
+
+    let records = read_all_flow_records();
+    let mission_id = mission_id_from_records(&records);
+    let runs_dir = fx.root.path().join("runs").join(&mission_id);
+    let envelope: Value = serde_json::from_str(&std::fs::read_to_string(runs_dir.join("envelope.json")).unwrap()).unwrap();
+
+    assert_eq!(envelope["model"], "darkmux:test-model");
+    assert_eq!(envelope["timeout_secs"], 120);
+    assert_eq!(envelope["limit"], 1);
+    assert_eq!(envelope["plan_path"], "planned in-process");
+    assert!(envelope["units_filter"].is_null());
+    assert_eq!(envelope["units"][0]["model"], "darkmux:test-model");
+
+    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    assert_eq!(completed["model"], "darkmux:test-model", "the mission-level record's own FlowRecord.model field");
+}
+
+// ── finding 9: watchdog timeout detection ───────────────────────────────
+
+#[test]
+fn watchdog_timeout_marker_is_detected_in_stderr() {
+    assert!(watchdog_timeout_fired(&format!(
+        "{} — no proof-of-work signal in 600s",
+        crew::dispatch_internal::INACTIVITY_TIMEOUT_MARKER
+    )));
+    assert!(!watchdog_timeout_fired("some other stderr, nothing to do with a timeout"));
+}
+
+#[test]
+fn interpret_dispatch_result_reports_timeout_when_the_watchdog_marker_is_present() {
+    let res = DispatchResult {
+        exit_code: 137,
+        stdout: String::new(),
+        stderr: format!("{} — no proof-of-work signal in 600s", crew::dispatch_internal::INACTIVITY_TIMEOUT_MARKER),
+        session_id: "sess".to_string(),
+        out_dir: None,
+    };
+    let (result_label, ..) = interpret_dispatch_result("u-0001", &res);
+    assert_eq!(result_label, "timeout");
+}
+
+#[test]
+fn interpret_dispatch_result_handles_non_json_stdout_via_exit_code() {
+    let ok = DispatchResult {
+        exit_code: 0,
+        stdout: "not json, plain prose the model printed instead of the --json envelope".to_string(),
+        stderr: String::new(),
+        session_id: "s".to_string(),
+        out_dir: None,
+    };
+    let (result_label, ..) = interpret_dispatch_result("u-0001", &ok);
+    assert_eq!(result_label, "stop", "a zero exit with unparseable stdout still reads as a clean stop");
+
+    let bad = DispatchResult {
+        exit_code: 1,
+        stdout: "not json, plain prose".to_string(),
+        stderr: String::new(),
+        session_id: "s".to_string(),
+        out_dir: None,
+    };
+    let (result_label2, ..) = interpret_dispatch_result("u-0001", &bad);
+    assert_eq!(result_label2, "error");
+}
+
+// ── finding 12: quiet zero-unit crawl still finalizes correctly ────────
+
+#[test]
+#[serial_test::serial]
+fn limit_zero_selects_nothing_and_completes_cleanly() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut params = params_for(&fx);
+    params.insert("limit".to_string(), Value::String("0".to_string()));
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    assert!(calls.borrow().clone().is_empty(), "zero selected units means zero dispatches");
+
+    let records = read_all_flow_records();
+    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    assert_eq!(completed["payload"]["units_selected"], 0);
+    assert_eq!(completed["payload"]["units_completed"], 0);
+    assert_eq!(completed["payload"]["stopped_by"], "limit");
+}

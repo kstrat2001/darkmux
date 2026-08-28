@@ -53,6 +53,13 @@
 //! interrupt / error handling, the envelope) without spawning Docker or
 //! touching LMStudio — live verification against a real dispatch is the
 //! orchestrator's job after this ships (per this task's own instruction).
+//!
+//! **The kill file is honored BETWEEN units, not mid-unit.** The loop
+//! checks `STOP` before dispatching each unit; a unit already dispatched
+//! runs to its own completion or its own `--timeout`, never torn down
+//! partway through — there is no mechanism here that could interrupt a
+//! live container mid-dispatch, and this launcher doesn't try to build
+//! one. Same shape for SIGINT.
 
 use crate::crew;
 use crate::mission_launch;
@@ -67,6 +74,7 @@ use darkmux_lab::crawl::rules::{self, Rule};
 use darkmux_lab::crawl::sources;
 use darkmux_types::style;
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -156,6 +164,25 @@ fn group_key(u: &Unit) -> (String, String) {
     (unit_source(u).to_string(), rule_ids.join("+"))
 }
 
+/// `Some(<warning text>)` when `loaded`'s major version component differs
+/// from `expected`'s — a pure function (no I/O, no `eprintln!`) so the
+/// decision is directly unit-testable; the call site is the only thing
+/// that prints. `None` for any non-major difference (a minor/patch bump is
+/// additive, per this project's own semver discipline) or a malformed
+/// version string on the `expected` side (defensive; `expected` is always
+/// `plan::PLAN_SCHEMA_VERSION` in production).
+fn plan_schema_major_mismatch_warning(loaded: &str, expected: &str) -> Option<String> {
+    let loaded_major = loaded.split('.').next().unwrap_or(loaded);
+    let expected_major = expected.split('.').next().unwrap_or(expected);
+    if loaded_major == expected_major {
+        return None;
+    }
+    Some(format!(
+        "schema_version {loaded} (this darkmux understands {expected}) — a MAJOR version \
+         difference may mean fields this launcher relies on are missing or shaped differently"
+    ))
+}
+
 // ── unit selection ──────────────────────────────────────────────────────
 
 /// Select units from the plan: an explicit `--param units=<csv>` filters by
@@ -167,6 +194,19 @@ fn group_key(u: &Unit) -> (String, String) {
 fn select_units<'a>(the_plan: &'a Plan, units_filter: Option<&str>, limit: Option<usize>) -> Result<(Vec<&'a Unit>, bool)> {
     let mut selected: Vec<&Unit> = if let Some(csv) = units_filter {
         let ids: Vec<&str> = csv.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if ids.is_empty() {
+            // (#1959 merge-gate finding 7) `--param units=` naming no ids
+            // after parsing (e.g. an empty string, or all-commas) used to
+            // fall straight through to the `.filter(...)` below and select
+            // NOTHING — silently. A crawl that dispatches zero units and
+            // reports success is a worse failure mode than a loud bail.
+            bail!(
+                "darkmux mission launch crawl: --param units=`{csv}` named no unit ids after \
+                 parsing — pass a comma-separated list of unit ids (e.g. \
+                 `--param units=u-0001,u-0002`), or drop --param units to select every unit in \
+                 the plan"
+            );
+        }
         for id in &ids {
             if !the_plan.units.iter().any(|u| u.id() == *id) {
                 let known: Vec<&str> = the_plan.units.iter().map(|u| u.id()).collect();
@@ -248,9 +288,12 @@ fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<St
     let mut out = String::new();
     match unit {
         Unit::Site { rule, sites, source, .. } => {
-            let r = rules_by_id
-                .get(rule)
-                .ok_or_else(|| anyhow!("crawl launcher: no rule resolved for id `{rule}` (this is a bug — every unit's rule id comes from the same resolved rule set the plan was built from)"))?;
+            let r = rules_by_id.get(rule).ok_or_else(|| {
+                anyhow!(
+                    "crawl launcher: no rule resolved for id `{rule}` — re-run `darkmux crawl plan` \
+                     for this manifest, or drop `--param plan=`"
+                )
+            })?;
             out.push_str(&pattern_block(r));
             out.push_str(&format!(
                 "Your scope is these sites in `/workspace/{source}`. For each, read lines noted below and decide whether the cited line matches the pattern. Sites:\n{}\n",
@@ -259,9 +302,12 @@ fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<St
         }
         Unit::Read { rules: rule_ids, files, source, .. } => {
             for rid in rule_ids {
-                let r = rules_by_id
-                    .get(rid)
-                    .ok_or_else(|| anyhow!("crawl launcher: no rule resolved for id `{rid}` (this is a bug)"))?;
+                let r = rules_by_id.get(rid).ok_or_else(|| {
+                    anyhow!(
+                        "crawl launcher: no rule resolved for id `{rid}` — re-run `darkmux crawl plan` \
+                         for this manifest, or drop `--param plan=`"
+                    )
+                })?;
                 out.push_str(&pattern_block(r));
             }
             out.push_str(&format!(
@@ -280,9 +326,12 @@ fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<St
             library_surface,
             ..
         } => {
-            let r = rules_by_id
-                .get(rule)
-                .ok_or_else(|| anyhow!("crawl launcher: no rule resolved for id `{rule}` (this is a bug)"))?;
+            let r = rules_by_id.get(rule).ok_or_else(|| {
+                anyhow!(
+                    "crawl launcher: no rule resolved for id `{rule}` — re-run `darkmux crawl plan` \
+                     for this manifest, or drop `--param plan=`"
+                )
+            })?;
             out.push_str(&pattern_block(r));
             out.push_str(&format!(
                 "Your scope is these import sites in `/workspace/{source}`:\n{}\n\n",
@@ -298,21 +347,48 @@ fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<St
     Ok(out)
 }
 
+/// Whether `stderr` carries the host watchdog's structured inactivity-
+/// timeout marker (`darkmux_crew::dispatch_internal::INACTIVITY_TIMEOUT_
+/// MARKER`, #363) — the one reliable `DispatchResult`-level signal that a
+/// non-clean exit was specifically the watchdog hard-killing the
+/// container, rather than any other failure shape (#1959 merge-gate
+/// finding 9).
+fn watchdog_timeout_fired(stderr: &str) -> bool {
+    stderr.contains(crew::dispatch_internal::INACTIVITY_TIMEOUT_MARKER)
+}
+
 /// Pull `(result, wall_ms, prompt_tokens, completion_tokens, model,
 /// detections)` out of a dispatch's `--json` envelope (`res.stdout`).
-/// `result` collapses to `"stop"` on a clean finish and `"error"` on
-/// anything else (a hard-to-parse envelope, `max_turns`, an escalation
-/// variant, or a bare non-zero exit with no envelope at all) — see this
-/// function's call site for why the tri-state `stop|error|timeout` this
-/// launcher's spec names isn't implemented: there is no reliable
-/// `DispatchResult`-level signal today for "the host watchdog hard-killed
-/// this container" versus any other non-clean exit.
-fn interpret_dispatch_result(res: &DispatchResult) -> (String, u64, u64, u64, Option<String>, Option<Value>) {
-    let envelope: Option<Value> =
-        if res.stdout.trim().starts_with('{') { serde_json::from_str(&res.stdout).ok() } else { None };
+/// `result` is `"stop"` on a clean finish, `"timeout"` when `stderr`
+/// carries the host watchdog's marker (see [`watchdog_timeout_fired`]),
+/// else `"error"` (a hard-to-parse envelope, `max_turns`, an escalation
+/// variant, or a bare non-zero exit with neither signal). When `stdout`
+/// is non-empty but doesn't parse as the expected JSON envelope, this
+/// prints a warning naming the unit and the first 120 chars — silent
+/// swallowing here previously meant a model that broke the `--json`
+/// contract read as an ordinary clean "stop" whenever `exit_code == 0`.
+fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> (String, u64, u64, u64, Option<String>, Option<Value>) {
+    let envelope: Option<Value> = if res.stdout.trim().starts_with('{') {
+        serde_json::from_str(&res.stdout).ok()
+    } else {
+        None
+    };
+    if envelope.is_none() && !res.stdout.trim().is_empty() {
+        let excerpt: String = res.stdout.chars().take(120).collect();
+        eprintln!(
+            "{}",
+            style::warn(&format!(
+                "darkmux mission launch crawl: unit `{unit_id}` produced non-JSON stdout \
+                 (expected a `--json` envelope) — first 120 chars: {excerpt:?}"
+            ))
+        );
+    }
+    let timed_out = watchdog_timeout_fired(&res.stderr);
     let result_label = match envelope.as_ref().and_then(|e| e.get("result")).and_then(Value::as_str) {
         Some("stop") => "stop".to_string(),
+        Some(_) if timed_out => "timeout".to_string(),
         Some(_) => "error".to_string(),
+        None if timed_out => "timeout".to_string(),
         None => if res.exit_code == 0 { "stop".to_string() } else { "error".to_string() },
     };
     let model = envelope.as_ref().and_then(|e| e.pointer("/metrics/model")).and_then(Value::as_str).map(String::from);
@@ -326,7 +402,13 @@ fn interpret_dispatch_result(res: &DispatchResult) -> (String, u64, u64, u64, Op
 
 // ── flow records ─────────────────────────────────────────────────────────
 
-fn crawl_record(action: &str, mission_id: &str, session_id: Option<&str>, payload: Value) -> darkmux_flow::FlowRecord {
+fn crawl_record(
+    action: &str,
+    mission_id: &str,
+    session_id: Option<&str>,
+    payload: Value,
+    model: Option<&str>,
+) -> darkmux_flow::FlowRecord {
     darkmux_flow::FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: darkmux_flow::Level::Info,
@@ -338,7 +420,7 @@ fn crawl_record(action: &str, mission_id: &str, session_id: Option<&str>, payloa
         phase_id: None,
         session_id: session_id.map(String::from),
         source: Some("crawl".to_string()),
-        model: None,
+        model: model.map(String::from),
         reasoning: None,
         mission_id: Some(mission_id.to_string()),
         machine_id: None,
@@ -391,6 +473,189 @@ struct TaskGroup {
     unit_indices: Vec<usize>,
 }
 
+// ── finalize guard (#1959 merge-gate finding 1b) ────────────────────────
+
+/// Mutable accumulators for one crawl run, shared between the per-unit
+/// loop and [`CrawlFinalizeGuard`] via a `RefCell` — the guard needs to
+/// read them from a `Drop` context that can't hold a scoped `&mut` across
+/// the whole loop. Everything here is single-threaded, single-function
+/// state; a `RefCell` is the plain tool for that, not a concurrency
+/// primitive doing double duty.
+struct CrawlStats {
+    stopped_by: &'static str,
+    units_completed: usize,
+    units_errored: usize,
+    units_skipped: usize,
+    findings_total: usize,
+    prompt_tokens_total: u64,
+    completion_tokens_total: u64,
+    wall_ms_total: u64,
+    per_unit_rows: Vec<Value>,
+    /// The first non-`None` model any unit's envelope reported, in unit
+    /// order — the envelope header's `model` field (finding 8).
+    first_model: Option<String>,
+}
+
+/// Everything [`finalize_crawl`] needs that doesn't change once the loop
+/// starts — split out from [`CrawlStats`] so the guard can hold it by
+/// value alongside a `&RefCell<CrawlStats>` without the two fighting the
+/// borrow checker.
+struct FinalizeCtx {
+    mission_id: String,
+    phase_id: String,
+    corpus_name: String,
+    units_in_plan: usize,
+    units_selected: usize,
+    runs_dir: PathBuf,
+    ledger_path: PathBuf,
+    timeout_secs: u32,
+    limit: Option<usize>,
+    plan_path: Option<PathBuf>,
+    units_filter: Option<String>,
+}
+
+/// RAII guard mirroring `darkmux-crew`'s `DispatchBookendGuard`: armed for
+/// the duration of the per-unit loop, so an early `?`-return (today, only
+/// `build_message`'s rule lookup — see finding 1a for why that's
+/// unreachable in production, and this module's tests for a panic-
+/// injection proof of the same safety net) or a panic still leaves a
+/// matching `crawl.mission.completed` record, a written envelope, and a
+/// non-`Active` mission behind — never a mission stuck `Active` with the
+/// counts accumulated so far silently lost. `close()` (the normal
+/// end-of-loop path) disarms the guard so `Drop` never double-finalizes.
+struct CrawlFinalizeGuard<'a> {
+    armed: bool,
+    stats: &'a RefCell<CrawlStats>,
+    ctx: FinalizeCtx,
+}
+
+impl<'a> CrawlFinalizeGuard<'a> {
+    fn new(stats: &'a RefCell<CrawlStats>, ctx: FinalizeCtx) -> Self {
+        Self { armed: true, stats, ctx }
+    }
+
+    /// The normal end-of-loop path.
+    fn close(&mut self) -> Result<i32> {
+        self.armed = false;
+        finalize_crawl(self.stats, &self.ctx)
+    }
+}
+
+impl Drop for CrawlFinalizeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.stats.borrow_mut().stopped_by = "error";
+        // Best-effort, same as every other lifecycle call in this module
+        // (`let _ = ...`): a `Drop` can't propagate a `Result`, and this
+        // guard IS the last-resort finalize — there's nowhere further to
+        // report a failure to.
+        let _ = finalize_crawl(self.stats, &self.ctx);
+    }
+}
+
+/// Shared finalize logic for both the normal end-of-loop path
+/// ([`CrawlFinalizeGuard::close`]) and the abort path
+/// ([`CrawlFinalizeGuard`]'s `Drop`): transitions the phase to its correct
+/// terminal (finding 3), closes the mission, emits `crawl.mission.
+/// completed`, writes the envelope, and prints the summary table.
+fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32> {
+    let s = stats.borrow();
+
+    // (finding 3) A deliberate stop is not a completion. `done`/`limit`
+    // are honest completions of the SELECTED work; a kill file, an
+    // interrupt, or an early error/panic mean the phase's own work was
+    // cut short, not finished — abandon it, don't complete it.
+    if matches!(s.stopped_by, "done" | "limit") {
+        let _ = crew::lifecycle::phase_complete(&ctx.phase_id);
+    } else {
+        let _ = crew::lifecycle::phase_abandon(&ctx.phase_id);
+    }
+    let _ = crew::lifecycle::mission_close_with_reasoning(
+        &ctx.mission_id,
+        Some(&format!("crawl stopped_by={}", s.stopped_by)),
+    );
+
+    let total_tokens = s.prompt_tokens_total + s.completion_tokens_total;
+    let wall_hours = (s.wall_ms_total as f64) / 1000.0 / 3600.0;
+    let tokens_per_hour = if wall_hours > 0.0 { (total_tokens as f64 / wall_hours).round() as u64 } else { 0 };
+    // (finding 2) Plan-level, not selection-level: covers a unit excluded
+    // by `--param units=`, cut by `--param limit=`, AND a selected unit
+    // never reached because the loop stopped early — every reason a
+    // plan's unit could go un-attempted, in one number.
+    let units_not_run = ctx.units_in_plan.saturating_sub(s.units_completed + s.units_errored);
+
+    let summary = json!({
+        "mission_id": ctx.mission_id,
+        "corpus": ctx.corpus_name,
+        "units_in_plan": ctx.units_in_plan,
+        "units_selected": ctx.units_selected,
+        "units_not_run": units_not_run,
+        "units_completed": s.units_completed,
+        "units_errored": s.units_errored,
+        "units_skipped": s.units_skipped,
+        "findings": s.findings_total,
+        "prompt_tokens": s.prompt_tokens_total,
+        "completion_tokens": s.completion_tokens_total,
+        "wall_ms": s.wall_ms_total,
+        "tokens_per_hour": tokens_per_hour,
+        "stopped_by": s.stopped_by,
+        // (finding 8) Self-describing envelope header.
+        "model": s.first_model,
+        // Not resolvable from this launcher's DispatchOpts today — crawl
+        // always dispatches with `profile_name: None` (default routing),
+        // so there is no profile name to report. Present (not omitted) so
+        // a reader can tell "checked, and there isn't one" apart from
+        // "this launcher never learned to report it."
+        "profile": Value::Null,
+        "timeout_secs": ctx.timeout_secs,
+        "limit": ctx.limit,
+        "plan_path": ctx
+            .plan_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "planned in-process".to_string()),
+        "units_filter": ctx.units_filter,
+    });
+    let _ = darkmux_flow::record(crawl_record(
+        "crawl.mission.completed",
+        &ctx.mission_id,
+        Some(&ctx.mission_id),
+        summary.clone(),
+        s.first_model.as_deref(),
+    ));
+
+    let mut envelope = summary.clone();
+    if let Some(obj) = envelope.as_object_mut() {
+        obj.insert("units".to_string(), json!(s.per_unit_rows));
+    }
+    let envelope_path = ctx.runs_dir.join("envelope.json");
+    std::fs::write(&envelope_path, serde_json::to_string_pretty(&envelope)?)
+        .with_context(|| format!("writing {}", envelope_path.display()))?;
+
+    print_summary_table(
+        &ctx.mission_id,
+        &ctx.corpus_name,
+        s.units_completed,
+        s.units_errored,
+        s.units_skipped,
+        units_not_run,
+        s.findings_total,
+        total_tokens,
+        s.wall_ms_total,
+        s.stopped_by,
+        &ctx.ledger_path,
+    );
+
+    Ok(match s.stopped_by {
+        "kill_file" => 3,
+        "interrupted" => 130,
+        "error" => 1,
+        _ => 0,
+    })
+}
+
 // ── the launcher itself ─────────────────────────────────────────────────
 
 /// The testable core. `dispatch_fn` is `crew::dispatch::dispatch` in
@@ -429,6 +694,30 @@ pub(crate) fn run(
             let text = std::fs::read_to_string(pp).with_context(|| format!("reading plan {}", pp.display()))?;
             let loaded_plan: Plan =
                 serde_json::from_str(&text).with_context(|| format!("parsing plan {} as JSON", pp.display()))?;
+
+            // (#1959 merge-gate finding 6a) A plan carries `corpus` (the
+            // manifest name it was planned from) — bail loudly rather than
+            // let a plan minted for a DIFFERENT manifest silently drive
+            // this crawl.
+            if loaded_plan.corpus != manifest.name {
+                bail!(
+                    "darkmux mission launch crawl: plan {} was planned from corpus '{}', not \
+                     '{}' — pass the plan that matches --param corpus=, or omit --param plan to \
+                     plan fresh",
+                    pp.display(),
+                    loaded_plan.corpus,
+                    manifest.name
+                );
+            }
+            // (#1959 merge-gate finding 6b) A schema MAJOR mismatch means
+            // this binary's `Plan`/`Unit` shape may not agree with what the
+            // file actually holds — non-fatal (lenient-on-read, per
+            // CLAUDE.md's config-leniency contract), but the operator
+            // should know before trusting the run.
+            if let Some(w) = plan_schema_major_mismatch_warning(&loaded_plan.schema_version, plan::PLAN_SCHEMA_VERSION) {
+                eprintln!("{}", style::warn(&format!("darkmux mission launch crawl: plan {} — {w}", pp.display())));
+            }
+
             for ps in &loaded_plan.sources {
                 let Some(rs) = resolved_sources.iter().find(|r| r.id == ps.id) else {
                     bail!(
@@ -450,6 +739,21 @@ pub(crate) fn run(
                         rs.sha
                     );
                 }
+                // (#1959 merge-gate finding 6c) Same tree the sha already
+                // vouches for, checked directly — a sha match with a
+                // relocated tree path would still dispatch against the
+                // wrong on-disk directory.
+                if rs.tree != ps.tree {
+                    bail!(
+                        "darkmux mission launch crawl: source '{}' resolves to a different tree \
+                         than plan {} recorded ({} vs {}) — re-run `darkmux crawl plan` and pass \
+                         the fresh plan.json, or omit --param plan to plan fresh",
+                        ps.id,
+                        pp.display(),
+                        ps.tree.display(),
+                        rs.tree.display()
+                    );
+                }
             }
             loaded_plan
         }
@@ -458,6 +762,43 @@ pub(crate) fn run(
     };
 
     let (selected, truncated) = select_units(&the_plan, units_filter.as_deref(), limit)?;
+
+    // ── validate every selected unit's rule ids resolve BEFORE minting a
+    //    mission (#1959 merge-gate finding 1a). A stale `--param plan=`
+    //    file can name a rule id the CURRENT `--param corpus=` manifest no
+    //    longer declares (renamed/removed since the plan was written) —
+    //    the sha check above catches a moved SOURCE tree, but says nothing
+    //    about the manifest's `rules` list drifting. Bailing here, before
+    //    any Mission/Phase/Task/Step record exists, means an operator who
+    //    hits this never has a stranded mission to clean up.
+    for u in &selected {
+        for rule_id in unit_rules(u) {
+            if !rules_by_id.contains_key(&rule_id) {
+                bail!(
+                    "darkmux mission launch crawl: unit `{}` names rule `{rule_id}`, which the \
+                     current corpus manifest's resolved rule set does not declare — re-run \
+                     `darkmux crawl plan` for this manifest, or drop `--param plan=` to plan \
+                     fresh",
+                    u.id()
+                );
+            }
+        }
+    }
+
+    // (#1959 merge-gate finding 12) A zero-unit selection is easy to
+    // produce by accident (a `--param units=` typo that happens to still
+    // parse, an over-narrow filter) and easy to miss buried in a summary
+    // table nobody scrolled to — say it loudly, up front.
+    if selected.is_empty() {
+        eprintln!(
+            "{}",
+            style::warn(&format!(
+                "darkmux mission launch crawl: 0 units selected for corpus '{}' — nothing to \
+                 crawl (check --param units=/--param limit= against the resolved plan)",
+                manifest.name
+            ))
+        );
+    }
 
     // ── mint the mission ─────────────────────────────────────────────
     let mission_id = mission_launch::mint_run_id("crawl")?;
@@ -571,16 +912,24 @@ pub(crate) fn run(
 
     let sources_summary: Vec<Value> = the_plan.sources.iter().map(|s| json!({"id": s.id, "sha": s.sha})).collect();
     let est_tokens_total: usize = selected.iter().map(|u| u.est_tokens()).sum();
+    // (#1959 merge-gate finding 2) `units_planned` renamed to
+    // `units_selected` (the plan may hold more units than were actually
+    // selected for THIS run — `units_in_plan` is that pre-selection
+    // count). No `units_not_run` here yet — nothing has run at start.
+    let units_in_plan = the_plan.units.len();
+    let units_selected = selected.len();
     let _ = darkmux_flow::record(crawl_record(
         "crawl.mission.started",
         &mission_id,
         Some(&mission_id),
         json!({
             "corpus": manifest.name,
-            "units_planned": selected.len(),
+            "units_in_plan": units_in_plan,
+            "units_selected": units_selected,
             "est_tokens": est_tokens_total,
             "sources": sources_summary,
         }),
+        None,
     ));
 
     // ── kill file / per-run artifacts ──────────────────────────────────
@@ -593,26 +942,49 @@ pub(crate) fn run(
     #[cfg(unix)]
     darkmux_types::interrupt::install();
 
-    let mut stopped_by: &'static str = if truncated { "limit" } else { "done" };
-    let mut units_completed = 0usize;
-    let mut units_errored = 0usize;
-    let mut units_skipped = 0usize;
-    let mut findings_total = 0usize;
-    let mut prompt_tokens_total: u64 = 0;
-    let mut completion_tokens_total: u64 = 0;
-    let mut wall_ms_total: u64 = 0;
-    let mut per_unit_rows: Vec<Value> = Vec::new();
+    let stats = RefCell::new(CrawlStats {
+        stopped_by: if truncated { "limit" } else { "done" },
+        units_completed: 0,
+        units_errored: 0,
+        units_skipped: 0,
+        findings_total: 0,
+        prompt_tokens_total: 0,
+        completion_tokens_total: 0,
+        wall_ms_total: 0,
+        per_unit_rows: Vec::new(),
+        first_model: None,
+    });
+    // (finding 1b) Armed here, before the loop starts — see the guard's
+    // own doc for what "armed" guarantees on an early return or panic.
+    let mut guard = CrawlFinalizeGuard::new(
+        &stats,
+        FinalizeCtx {
+            mission_id: mission_id.clone(),
+            phase_id: phase_id.clone(),
+            corpus_name: manifest.name.clone(),
+            units_in_plan,
+            units_selected,
+            runs_dir: runs_dir.clone(),
+            ledger_path: ledger_path.clone(),
+            timeout_secs: timeout,
+            limit,
+            plan_path: plan_path.clone(),
+            units_filter: units_filter.clone(),
+        },
+    );
 
     for (i, unit) in selected.iter().enumerate() {
         if kill_file.exists() {
-            stopped_by = "kill_file";
-            units_skipped = selected.len() - i;
+            let mut s = stats.borrow_mut();
+            s.stopped_by = "kill_file";
+            s.units_skipped = selected.len() - i;
             break;
         }
         #[cfg(unix)]
         if darkmux_types::interrupt::is_set() {
-            stopped_by = "interrupted";
-            units_skipped = selected.len() - i;
+            let mut s = stats.borrow_mut();
+            s.stopped_by = "interrupted";
+            s.units_skipped = selected.len() - i;
             break;
         }
 
@@ -628,6 +1000,15 @@ pub(crate) fn run(
             let _ = crew::lifecycle::save_step(&mission_id, &phase_id, &step);
         }
 
+        // (#1959 merge-gate finding 5) Computed BEFORE `crawl.unit.started`
+        // is emitted, so that record's `session_id` carries the UNIT's own
+        // session — it used to carry the mission id (the same value every
+        // OTHER `crawl.*` record for this mission already carries), which
+        // made `crawl.unit.started` the one record in this family you
+        // couldn't correlate to its matching `crawl.unit.completed` by
+        // session id alone.
+        let session_id = format!("crawl-{mission_id}-{}", unit.id());
+
         let started_payload = match unit {
             Unit::Site { sites, .. } => json!({
                 "corpus": manifest.name, "unit": unit.id(), "source": source, "sha": sha,
@@ -642,10 +1023,15 @@ pub(crate) fn run(
                 "rule": rule_ids, "kind": kind, "est_tokens": unit.est_tokens(), "sites": sites.len(),
             }),
         };
-        let _ = darkmux_flow::record(crawl_record("crawl.unit.started", &mission_id, Some(&mission_id), started_payload));
+        let _ = darkmux_flow::record(crawl_record(
+            "crawl.unit.started",
+            &mission_id,
+            Some(&session_id),
+            started_payload,
+            None,
+        ));
 
         let message = build_message(&rules_by_id, unit)?;
-        let session_id = format!("crawl-{mission_id}-{}", unit.id());
         let opts = DispatchOpts {
             role_id: "crawler".to_string(),
             message,
@@ -671,10 +1057,32 @@ pub(crate) fn run(
 
         let dispatch_outcome = dispatch_fn(opts);
 
-        let (result_label, wall_ms, prompt_tok, completion_tok, model, detections) = match &dispatch_outcome {
+        let (mut result_label, wall_ms, prompt_tok, completion_tok, model, detections) = match &dispatch_outcome {
             Err(_) => ("error".to_string(), 0u64, 0u64, 0u64, None, None),
-            Ok(res) => interpret_dispatch_result(res),
+            Ok(res) => interpret_dispatch_result(unit.id(), res),
         };
+        // (#1959 merge-gate finding 13) SIGINT may have arrived WHILE this
+        // unit's dispatch was in flight — the container often comes back
+        // as a non-clean exit in that case, which would otherwise read as
+        // an ordinary per-unit "error". Read at THIS point (right after
+        // the dispatch returns, before the next unit's own kill-file/
+        // interrupt check), so it names this exact unit's own outcome.
+        // Checked here, not in `is_error` alone, because the payload/step
+        // output text itself needs to say "interrupted", not "error".
+        #[cfg(unix)]
+        let interrupted_at_readback = darkmux_types::interrupt::is_set();
+        #[cfg(not(unix))]
+        let interrupted_at_readback = false;
+        if interrupted_at_readback {
+            result_label = "interrupted".to_string();
+        }
+
+        if let Some(m) = &model {
+            let mut s = stats.borrow_mut();
+            if s.first_model.is_none() {
+                s.first_model = Some(m.clone());
+            }
+        }
 
         let mut findings_n = 0usize;
         if let Ok(res) = &dispatch_outcome {
@@ -703,7 +1111,13 @@ pub(crate) fn run(
                         let line_out = serde_json::to_string(&rec).unwrap_or_default();
                         ledger_buf.push_str(&line_out);
                         ledger_buf.push('\n');
-                        let _ = darkmux_flow::record(crawl_record("crawl.finding", &mission_id, Some(&session_id), rec));
+                        let _ = darkmux_flow::record(crawl_record(
+                            "crawl.finding",
+                            &mission_id,
+                            Some(&session_id),
+                            rec,
+                            model.as_deref(),
+                        ));
                     }
                     if !ledger_buf.is_empty() {
                         let _ = append_file(&ledger_path, &ledger_buf);
@@ -713,19 +1127,37 @@ pub(crate) fn run(
             }
         }
 
-        let is_error = dispatch_outcome.is_err() || result_label == "error";
-        if is_error {
-            units_errored += 1;
-        } else {
-            units_completed += 1;
+        // (#1959 merge-gate finding 9) "timeout" is also a failure for
+        // accounting purposes — anything other than a clean "stop" means
+        // this unit did not complete cleanly. (finding 13) An interrupted
+        // unit is neither a completion nor a per-unit failure — it's
+        // counted in neither bucket, which means it flows into `units_
+        // not_run` (finding 2's `units_in_plan - completed - errored`)
+        // automatically rather than needing a THIRD counter.
+        let is_error = !interrupted_at_readback && (dispatch_outcome.is_err() || result_label != "stop");
+        {
+            let mut s = stats.borrow_mut();
+            if interrupted_at_readback {
+                // neither bucket — see the comment above.
+            } else if is_error {
+                s.units_errored += 1;
+            } else {
+                s.units_completed += 1;
+            }
+            s.findings_total += findings_n;
+            s.prompt_tokens_total += prompt_tok;
+            s.completion_tokens_total += completion_tok;
+            s.wall_ms_total += wall_ms;
         }
-        findings_total += findings_n;
-        prompt_tokens_total += prompt_tok;
-        completion_tokens_total += completion_tok;
-        wall_ms_total += wall_ms;
 
         if let Ok(mut step) = crew::lifecycle::load_step(&mission_id, &phase_id, &step_id) {
-            step.status = if is_error { NodeStatus::Error } else { NodeStatus::Complete };
+            step.status = if interrupted_at_readback {
+                NodeStatus::Abandoned
+            } else if is_error {
+                NodeStatus::Error
+            } else {
+                NodeStatus::Complete
+            };
             step.completed_ts = Some(now_unix());
             step.output = Some(result_label.clone());
             let _ = crew::lifecycle::save_step(&mission_id, &phase_id, &step);
@@ -746,10 +1178,15 @@ pub(crate) fn run(
         if let Some(d) = &detections {
             completed_payload["detections"] = d.clone();
         }
-        let _ =
-            darkmux_flow::record(crawl_record("crawl.unit.completed", &mission_id, Some(&session_id), completed_payload));
+        let _ = darkmux_flow::record(crawl_record(
+            "crawl.unit.completed",
+            &mission_id,
+            Some(&session_id),
+            completed_payload,
+            model.as_deref(),
+        ));
 
-        per_unit_rows.push(json!({
+        stats.borrow_mut().per_unit_rows.push(json!({
             "unit": unit.id(),
             "source": source,
             "rule": rule_ids,
@@ -758,54 +1195,20 @@ pub(crate) fn run(
             "prompt_tokens": prompt_tok,
             "completion_tokens": completion_tok,
             "wall_ms": wall_ms,
+            "model": model,
         }));
 
         #[cfg(unix)]
         if darkmux_types::interrupt::is_set() {
-            stopped_by = "interrupted";
-            units_skipped = selected.len() - (i + 1);
+            let mut s = stats.borrow_mut();
+            s.stopped_by = "interrupted";
+            s.units_skipped = selected.len() - (i + 1);
             break;
         }
     }
 
-    // ── finalize ──────────────────────────────────────────────────────
-    let _ = crew::lifecycle::phase_complete(&phase_id);
-    let _ = crew::lifecycle::mission_close_with_reasoning(&mission_id, Some(&format!("crawl stopped_by={stopped_by}")));
-
-    let total_tokens = prompt_tokens_total + completion_tokens_total;
-    let wall_hours = (wall_ms_total as f64) / 1000.0 / 3600.0;
-    let tokens_per_hour = if wall_hours > 0.0 { (total_tokens as f64 / wall_hours).round() as u64 } else { 0 };
-
-    let summary = json!({
-        "mission_id": mission_id,
-        "corpus": manifest.name,
-        "units_completed": units_completed,
-        "units_errored": units_errored,
-        "units_skipped": units_skipped,
-        "findings": findings_total,
-        "prompt_tokens": prompt_tokens_total,
-        "completion_tokens": completion_tokens_total,
-        "wall_ms": wall_ms_total,
-        "tokens_per_hour": tokens_per_hour,
-        "stopped_by": stopped_by,
-    });
-    let _ = darkmux_flow::record(crawl_record("crawl.mission.completed", &mission_id, Some(&mission_id), summary.clone()));
-
-    let mut envelope = summary.clone();
-    if let Some(obj) = envelope.as_object_mut() {
-        obj.insert("units".to_string(), json!(per_unit_rows));
-    }
-    let envelope_path = runs_dir.join("envelope.json");
-    std::fs::write(&envelope_path, serde_json::to_string_pretty(&envelope)?)
-        .with_context(|| format!("writing {}", envelope_path.display()))?;
-
-    print_summary_table(&mission_id, &manifest.name, units_completed, units_errored, units_skipped, findings_total, total_tokens, wall_ms_total, stopped_by, &ledger_path);
-
-    Ok(match stopped_by {
-        "kill_file" => 3,
-        "interrupted" => 130,
-        _ => 0,
-    })
+    // ── finalize (normal path) — disarms the guard ──────────────────────
+    guard.close()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -815,6 +1218,7 @@ fn print_summary_table(
     units_completed: usize,
     units_errored: usize,
     units_skipped: usize,
+    units_not_run: usize,
     findings: usize,
     total_tokens: u64,
     wall_ms: u64,
@@ -823,12 +1227,18 @@ fn print_summary_table(
 ) {
     println!("{}", style::header(&format!("darkmux mission launch crawl — {corpus} ({mission_id})")));
     println!(
-        "  units: {units_completed} completed, {units_errored} errored, {units_skipped} skipped"
+        "  units: {units_completed} completed, {units_errored} errored, {units_skipped} skipped, \
+         {units_not_run} not run"
     );
     println!("  findings: {findings}");
     println!("  tokens: {total_tokens}   wall: {wall_ms}ms");
     println!("  stopped_by: {stopped_by}");
-    println!("  ledger: {}", ledger_path.display());
+    // (#1959 merge-gate finding 12) No point pointing at a ledger file
+    // that was never written — a run with zero findings never appends to
+    // it, so the path would just dangle.
+    if findings > 0 {
+        println!("  ledger: {}", ledger_path.display());
+    }
 }
 
 #[cfg(test)]
