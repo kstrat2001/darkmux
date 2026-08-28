@@ -81,16 +81,34 @@ export function replayDataSource(date: string): string {
  * the presence map, and a second implementation here would be free to drift
  * from the one the fleet cards are built from. On a replay the presence map
  * is empty, so this is just the record uids. */
-export function replayMetaLines(data: FlowRecord[], date: string): string[] {
+/** (#2073) The meta line's parts. `replayMetaLines` composes them, and the
+ * app shell renders `source`/`span` in their own element so a phone can drop
+ * them: the chip already names the day and the activity timeline already
+ * states the span, leaving the mission and the census as the information
+ * this line alone carries. */
+export interface ReplayMetaParts {
+  head: string;
+  source: string;
+  span: string;
+  census: string;
+}
+
+export function replayMetaParts(data: FlowRecord[], date: string): ReplayMetaParts {
   const ts = data.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
   const tMin = ts.length ? Math.min(...ts) : Date.now();
   const tMax = ts.length ? Math.max(...ts) : Date.now();
   const machineCount = new Set(data.map(uidOf)).size;
-  // The literal space before the clock range is legacy's own: the template
-  // ends `${lday(tMin)} ` and the next line begins `${clk(tMin)}`.
-  const head = `◆ ${replayMissionLabel(data)}`;
-  return [
-    `${head} · ${replayDataSource(date)} · ${lday(tMin)} ${clk(tMin)}–${clk(tMax)}`,
-    `${data.length} records · ${machineCount} machines`,
-  ];
+  return {
+    head: `◆ ${replayMissionLabel(data)}`,
+    source: replayDataSource(date),
+    // The literal space before the clock range is legacy's own: the template
+    // ends `${lday(tMin)} ` and the next line begins `${clk(tMin)}`.
+    span: `${lday(tMin)} ${clk(tMin)}–${clk(tMax)}`,
+    census: `${data.length} records · ${machineCount} machines`,
+  };
+}
+
+export function replayMetaLines(data: FlowRecord[], date: string): string[] {
+  const p = replayMetaParts(data, date);
+  return [`${p.head} · ${p.source} · ${p.span}`, p.census];
 }

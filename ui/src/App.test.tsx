@@ -634,7 +634,7 @@ describe("App", () => {
     // mode this is. Both were absent/wrong — the chip showed a bare date and
     // no mode badge rendered at all on a replay.
     expect(document.querySelector(".catalog-toggle")?.textContent).toContain("FLOW · 2026-08-07");
-    expect(document.getElementById("modebadge")?.textContent).toBe("▣ playback");
+    expect(document.getElementById("modebadge")?.textContent).toBe("▶ playback");
 
     // crumb: `◆ <primaryMission()>`. Non-empty precisely BECAUSE a replay is
     // not presence-scoped — the live arm filters to missions with a running

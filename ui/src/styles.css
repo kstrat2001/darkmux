@@ -276,6 +276,12 @@ body {
   .app-shell__crumb.is-replay {
     display: none;
   }
+  /* (#2073) "It seems so busy with text" (operator): the source label and
+     the day span repeat the chip and the activity timeline's header. A
+     phone keeps the mission and the census. */
+  .app-shell__metasrc {
+    display: none;
+  }
 }
 
 .app-shell__stage {

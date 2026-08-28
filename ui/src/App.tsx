@@ -19,7 +19,7 @@ import { useRouteRecords } from "./hooks/useRouteRecords";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
-import { primaryReplayMission, replayMetaLines } from "./lib/replayMeta";
+import { primaryReplayMission, replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
 import { T, firstRecordDate, localMachineUid, nameOf, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
@@ -260,6 +260,10 @@ export function App() {
   // values are lowercase now for the same reason — CSS `text-transform`
   // never applies to text that is not rendered, so legacy's raw text is what
   // both sides must match. All of this dies with legacy at the flip.
+  const replayParts = useMemo(
+    () => (replayMeta ? replayMetaParts(replayMeta, displayRoute.kind === "playback" ? (displayRoute.date ?? "") : "") : null),
+    [replayMeta, displayRoute],
+  );
   const { crumb, logscope } = routeChrome(route, targetMachineName, replayMeta);
 
   useSyncHash(route);
@@ -292,6 +296,14 @@ export function App() {
               icon-boundary quirk with a real (empty) element. */}
           {ready && !staticIdle ? (
             <div><ReadyHeadline n={ready.n} ago={ready.ago} /></div>
+          ) : replayParts ? (
+            /* (#2073) Same text as `metaLines[0]`; the source + span sit in
+               their own span so the narrow stylesheet can drop what the chip
+               and the activity timeline already say. */
+            <div className="app-shell__metaline">
+              {replayParts.head}
+              <span className="app-shell__metasrc">{` · ${replayParts.source} · ${replayParts.span}`}</span>
+            </div>
           ) : (
             <div className="app-shell__metaline">{metaLines[0]}</div>
           )}

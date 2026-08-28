@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { primaryReplayMission, replayMissionLabel, replayMetaLines, replayDataSource } from "./replayMeta";
+import { primaryReplayMission, replayMissionLabel, replayMetaLines, replayMetaParts, replayDataSource } from "./replayMeta";
 import { normalizeRecords } from "./flow";
 import { clk, lday } from "./format";
 import type { FlowRecord } from "../types/handwritten";
@@ -133,5 +133,24 @@ describe("normalizeRecords — the per-session runtime aggregate", () => {
     expect(ts).toEqual([...ts].sort((a, b) => a - b));
     // The event log reverses this set and follow-latest takes the topmost row,
     // so both assume temporal order; an unsorted append breaks both quietly.
+  });
+});
+
+/** (#2073) The meta line's PARTS, so a phone can show only what no other
+ * chrome carries (the mission and the census) while desktop keeps the full
+ * line. The lines must stay the composition of the parts, or the two
+ * viewports would disagree about the day. */
+describe("replayMetaParts", () => {
+  it("composes to exactly the two lines replayMetaLines renders", () => {
+    const data = [
+      { ts: "2026-08-26T01:00:00Z", machine_uid: "u1", mission_id: "m-one" },
+      { ts: "2026-08-26T02:00:00Z", machine_uid: "u2", mission_id: "m-one" },
+    ] as never[];
+    const parts = replayMetaParts(data, "2026-08-26");
+    expect(parts.head).toBe("◆ m-one");
+    expect(parts.census).toBe("2 records · 2 machines");
+    expect(parts.source).toBe("flow · 2026-08-26");
+    expect(`${parts.head} · ${parts.source} · ${parts.span}`).toBe(replayMetaLines(data, "2026-08-26")[0]);
+    expect(parts.census).toBe(replayMetaLines(data, "2026-08-26")[1]);
   });
 });
