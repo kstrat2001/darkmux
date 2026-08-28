@@ -1150,18 +1150,40 @@ mod tests {
         assert_eq!(delivered["action"], "crawl.finding");
 
         assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)));
-        let fired = capture.0.lock().unwrap();
-        let fired = fired.iter().find(|r| r.action == "hook.fired").unwrap();
-        assert_eq!(fired.payload.as_ref().unwrap()["delivered_action"], "crawl.finding");
+        {
+            let guard = capture.0.lock().unwrap();
+            let fired = guard.iter().find(|r| r.action == "hook.fired").unwrap();
+            assert_eq!(fired.payload.as_ref().unwrap()["delivered_action"], "crawl.finding");
+        }
+
+        // The cursor must have ADVANCED past the delivered line: without
+        // that, the drainer treats it as still-pending and redelivers it on
+        // every poll. Give it several poll cycles' worth of time and assert
+        // the request count never grows past 1 — this is what actually
+        // proves the cursor advanced (a plain "== 1 eventually" check would
+        // pass instantaneously and race right past a redelivery loop).
+        std::thread::sleep(POLL_INTERVAL * 10);
+        assert_eq!(receiver.request_count(), 1, "cursor must advance so the delivered line is never resent");
+        assert_eq!(read_cursor(&sink.rules[0].rule.cursor_path), std::fs::read_to_string(&sink.rules[0].rule.outbox_path).unwrap().len() as u64);
     }
 
     #[test]
     fn down_receiver_does_not_block_write() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // A port nothing is listening on.
+        // A "black hole" receiver: bound (the TCP handshake completes via
+        // the kernel's own listen backlog) but never `.accept()`'d, so
+        // nothing ever reads the request or answers it. This — not a
+        // REFUSED port — is what actually proves write() doesn't block on
+        // the network: a refused connection fails near-instantly
+        // regardless of whether the caller is sync or async, so it would
+        // let a synchronous-POST-on-write() mutation slip through
+        // undetected. Kept alive for the whole test (never accepted, never
+        // dropped early) so the connect+write phases genuinely hang.
+        let black_hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = black_hole.local_addr().unwrap();
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
-            http: Some("http://127.0.0.1:1/unreachable".to_string()),
+            http: Some(format!("http://{addr}/unreachable")),
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
