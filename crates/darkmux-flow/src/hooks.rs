@@ -29,9 +29,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use darkmux_types::config::{HookMatch, HookRule};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write as _};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -542,18 +542,39 @@ fn write_cursor(cursor_path: &Path, offset: u64) -> Result<()> {
 /// offset just past it — or `None` when nothing is pending, INCLUDING a
 /// partially-written line still missing its trailing newline (never
 /// delivered half a record; the next poll picks it up once complete).
+/// (#2093 merge-gate finding 5) Reads via a `BufReader::read_until` from
+/// `cursor`, stopping at the FIRST newline, rather than `read_to_string`-
+/// ing the entire remaining tail into memory on every call. The old shape
+/// was O(remaining outbox size) PER delivered line — with N pending lines
+/// each call re-read everything after `cursor`, so draining N lines did
+/// O(N × average-remaining-size) total work. `read_until` still only
+/// returns once it finds `\n` (or hits EOF), so this call is O(this one
+/// line's length), not O(everything left in the file).
 fn next_pending_line(outbox_path: &Path, cursor: u64) -> Option<(String, u64)> {
     let mut file = fs::File::open(outbox_path).ok()?;
     file.seek(SeekFrom::Start(cursor)).ok()?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).ok()?;
-    let nl = buf.find('\n')?;
-    Some((buf[..nl].to_string(), cursor + nl as u64 + 1))
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    let n = reader.read_until(b'\n', &mut buf).ok()?;
+    if n == 0 || buf.last() != Some(&b'\n') {
+        // EOF with nothing pending, OR a partial/torn tail with no
+        // trailing newline yet — never delivered half a record.
+        return None;
+    }
+    buf.pop(); // drop the trailing '\n' itself
+    let line = String::from_utf8(buf).ok()?;
+    Some((line, cursor + n as u64))
 }
 
 /// Count of fully-committed (newline-terminated) lines at or after
 /// `cursor` — the "undelivered" count `darkmux doctor` / `flow hooks
 /// status` report.
+///
+/// (#2093 merge-gate finding 5) Streams through a `BufReader` in fixed-
+/// size chunks rather than `read_to_string`-ing the whole tail into one
+/// `String` — bounded memory regardless of how large the undelivered tail
+/// has grown, which matters most on exactly the unhealthy-receiver path
+/// this count is meant to report on.
 pub fn undelivered_line_count(outbox_path: &Path, cursor: u64) -> usize {
     let Ok(mut file) = fs::File::open(outbox_path) else {
         return 0;
@@ -561,11 +582,94 @@ pub fn undelivered_line_count(outbox_path: &Path, cursor: u64) -> usize {
     if file.seek(SeekFrom::Start(cursor)).is_err() {
         return 0;
     }
-    let mut buf = String::new();
-    if file.read_to_string(&mut buf).is_err() {
-        return 0;
+    let mut reader = BufReader::new(file);
+    let mut chunk = [0u8; 8192];
+    let mut count = 0usize;
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => count += chunk[..n].iter().filter(|&&b| b == b'\n').count(),
+            Err(_) => break,
+        }
     }
-    buf.matches('\n').count()
+    count
+}
+
+/// (#2093 merge-gate finding 5) Bytes at or after `cursor` — the
+/// UNDELIVERED size, what the hard cap and compaction threshold both
+/// compare against. `0` when the file is missing or unreadable (matches
+/// `undelivered_line_count`'s fail-open-to-zero shape).
+fn undelivered_byte_len(outbox_path: &Path, cursor: u64) -> u64 {
+    fs::metadata(outbox_path).map(|m| m.len()).unwrap_or(0).saturating_sub(cursor)
+}
+
+/// (#2093 merge-gate finding 5) True when a rule's CURRENT undelivered
+/// bytes already exceed `max_outbox_mb`. The write path checks this
+/// BEFORE appending — so a single write whose own body is larger than the
+/// cap still lands once (current undelivered was under the cap before
+/// it), and only a write landing AFTER the outbox is already over cap is
+/// dropped. `max_outbox_mb` of `0` means "no cap" (never over).
+fn rule_over_cap(outbox_path: &Path, cursor: u64, max_outbox_mb: u64) -> bool {
+    if max_outbox_mb == 0 {
+        return false;
+    }
+    undelivered_byte_len(outbox_path, cursor) > max_outbox_mb.saturating_mul(1024 * 1024)
+}
+
+/// (#2093 merge-gate finding 5) The compaction threshold: once a rule's
+/// CURSOR (not undelivered size — a mostly-delivered outbox with a huge
+/// already-consumed prefix wastes disk exactly the same way) crosses
+/// this many bytes, rewrite the file down to just its undelivered tail
+/// and reset the cursor to 0. 8 MiB by default; a real caller passes
+/// `DEFAULT_COMPACTION_THRESHOLD_BYTES`, tests pass a small value so the
+/// behavior is exercised without writing megabytes.
+const DEFAULT_COMPACTION_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+
+/// (#2093 merge-gate finding 5) Rewrite `outbox_path` down to just its
+/// undelivered tail (from `cursor` onward) and reset the cursor to 0,
+/// when the cursor has crossed `threshold_bytes` — an already-delivered
+/// prefix a healthy receiver has long since consumed otherwise grows
+/// forever. Takes the outbox file's OWN append lock (in addition to
+/// whatever drain lock the caller already holds) so an appender can never
+/// interleave with the rewrite: write undelivered bytes to a sibling temp
+/// file, `rename` it atomically over the real outbox path (so a reader
+/// mid-open sees either the whole old file or the whole new one, never a
+/// partial rewrite), THEN reset the cursor — in that order, so a crash
+/// between the rename and the cursor reset is recovered by
+/// `undelivered_line_count`/`next_pending_line` simply reading from the
+/// (still-correct, non-zero) old cursor against the ALREADY-repacked
+/// file, which is a safe, if not immediately obvious, no-op: the
+/// undelivered tail is now at offset 0, so the stale cursor briefly
+/// overshoots and reports 0 pending until the next successful cycle
+/// re-derives it — never data loss, worst case a temporary stall.
+fn maybe_compact_outbox(outbox_path: &Path, cursor_path: &Path, threshold_bytes: u64) {
+    let cursor = read_cursor(cursor_path);
+    if cursor < threshold_bytes {
+        return;
+    }
+    let result: Result<()> = (|| {
+        let mut guard = darkmux_types::flock::lock_exclusive(outbox_path)?;
+        // Re-check under the lock — another compaction (or a delivery
+        // that hadn't landed yet when we read `cursor` above) may have
+        // already moved the cursor since the caller's unlocked read.
+        let cursor = read_cursor(cursor_path);
+        if cursor < threshold_bytes {
+            return Ok(());
+        }
+        let file = guard.file();
+        file.seek(SeekFrom::Start(cursor)).with_context(|| format!("seeking {}", outbox_path.display()))?;
+        let mut remaining = Vec::new();
+        file.read_to_end(&mut remaining).with_context(|| format!("reading tail of {}", outbox_path.display()))?;
+        let tmp_path = PathBuf::from(format!("{}.compact.tmp", outbox_path.display()));
+        fs::write(&tmp_path, &remaining).with_context(|| format!("writing {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, outbox_path)
+            .with_context(|| format!("renaming {} to {}", tmp_path.display(), outbox_path.display()))?;
+        drop(guard);
+        write_cursor(cursor_path, 0)
+    })();
+    if let Err(e) = result {
+        eprintln!("flow::HookSink: outbox compaction failed for {}: {e:#}", outbox_path.display());
+    }
 }
 
 // ─── Delivery ───────────────────────────────────────────────────────────
@@ -658,6 +762,19 @@ struct RuleRuntime {
     /// then one 400 has seen 3 total attempts but only ONE client error,
     /// and must not be abandoned after that single 4xx.
     client_error_count: Mutex<u32>,
+    /// (#2093 merge-gate finding 5, doubles as finding 9's write-failure
+    /// counter) Appends refused for this rule — either because its
+    /// undelivered bytes were already over `hooks.max_outbox_mb` (finding
+    /// 5), or because the outbox append itself failed (finding 9, e.g. an
+    /// unwritable/full disk). Surfaced by `flow hooks status` and
+    /// `doctor`; never reset — a monotonically growing count across the
+    /// process lifetime is the honest shape for "how much did we lose."
+    dropped_appends: AtomicU64,
+    /// (#2093 merge-gate finding 5) Rate-limits the `hook.failed` emitted
+    /// when the hard cap is active, to at most once per minute — a
+    /// receiver that's been down for hours must not turn into one
+    /// `hook.failed` record per dropped write.
+    last_drop_warning: Mutex<Option<Instant>>,
 }
 
 fn apply_backoff(rt: &RuleRuntime) {
@@ -703,13 +820,64 @@ fn emit_hook_record(
         payload["error"] = serde_json::Value::String(e.to_string());
     }
 
+    let action = if success { "hook.fired" } else { "hook.failed" };
     let rec = FlowRecord {
         ts: schema::ts_utc_now(),
         level: if success { Level::Info } else { Level::Error },
         category: Category::Machinery,
         tier: Tier::Local,
         stage: Stage::Ship,
-        action: if success { "hook.fired".to_string() } else { "hook.failed".to_string() },
+        action: action.to_string(),
+        handle: host,
+        phase_id: None,
+        session_id: None,
+        source: Some("hook".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        // (#2093 merge-gate finding 12) Left `None` here on purpose —
+        // `crate::record_to` below is the SAME stamping path every other
+        // producer's `flow::record()` call goes through, and it only
+        // fills a field the caller left absent.
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(payload),
+        work_id: None,
+        attempt: None,
+    };
+    if let Err(e) = crate::record_to(report_sink, rec) {
+        eprintln!("flow::HookSink: failed to emit {action}: {e:#}");
+    }
+}
+
+/// (#2093 merge-gate finding 5) Emit a rate-limited `hook.failed` naming
+/// the total drop count for this rule — at most once per minute, so a
+/// receiver that's been down for hours doesn't turn every dropped write
+/// into its own flow record.
+fn maybe_warn_dropped(rt: &RuleRuntime, report_sink: &dyn FlowSink, max_outbox_mb: u64, dropped_count: u64) {
+    const WARNING_INTERVAL: Duration = Duration::from_secs(60);
+    let now = Instant::now();
+    {
+        let mut last = rt.last_drop_warning.lock().unwrap();
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < WARNING_INTERVAL {
+                return;
+            }
+        }
+        *last = Some(now);
+    }
+    let reason =
+        format!("outbox over the {max_outbox_mb} MiB cap — {dropped_count} write(s) dropped for this rule so far");
+    let host = extract_host_port(&rt.rule.url).unwrap_or("").to_string();
+    let rec = FlowRecord {
+        ts: schema::ts_utc_now(),
+        level: Level::Error,
+        category: Category::Machinery,
+        tier: Tier::Local,
+        stage: Stage::Ship,
+        action: "hook.failed".to_string(),
         handle: host,
         phase_id: None,
         session_id: None,
@@ -721,12 +889,17 @@ fn emit_hook_record(
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: Some(payload),
+        payload: Some(serde_json::json!({
+            "rule_index": rt.rule.index,
+            "target_host": extract_host_port(&rt.rule.url).unwrap_or(""),
+            "error": reason,
+            "dropped_count": dropped_count,
+        })),
         work_id: None,
         attempt: None,
     };
-    if let Err(e) = report_sink.write(&rec) {
-        eprintln!("flow::HookSink: failed to emit {}: {e:#}", rec.action);
+    if let Err(e) = crate::record_to(report_sink, rec) {
+        eprintln!("flow::HookSink: failed to emit hook.failed (dropped-append warning): {e:#}");
     }
 }
 
@@ -758,6 +931,10 @@ fn drainer_loop(
             let Ok(Some(_drain_lock)) = darkmux_types::flock::try_lock_exclusive(&rt.rule.drain_lock_path) else {
                 continue;
             };
+            // (#2093 merge-gate finding 5) Compaction runs under the SAME
+            // drain lock this iteration already holds — checked (and, at
+            // most, performed) once per poll cycle per rule.
+            maybe_compact_outbox(&rt.rule.outbox_path, &rt.rule.cursor_path, DEFAULT_COMPACTION_THRESHOLD_BYTES);
             let cursor = read_cursor(&rt.rule.cursor_path);
             let Some((line, new_cursor)) = next_pending_line(&rt.rule.outbox_path, cursor) else {
                 continue;
@@ -865,6 +1042,16 @@ pub struct HookSink {
     stop: Arc<AtomicBool>,
     nudge: Arc<(Mutex<bool>, Condvar)>,
     drainer: Mutex<Option<JoinHandle<()>>>,
+    /// (#2093 merge-gate finding 5) The hard cap, read ONCE (live) at
+    /// construction — `write()` checks every matching rule's current
+    /// undelivered bytes against it before appending. `0` = no cap.
+    max_outbox_mb: u64,
+    /// (#2093 merge-gate finding 5) A second handle to the same sink the
+    /// drainer thread's copy points at — `write()` needs its OWN copy to
+    /// emit a rate-limited `hook.failed` when the hard cap drops an
+    /// append, since that decision happens on the CALLER's thread, not
+    /// the drainer's.
+    report_sink: Arc<dyn FlowSink>,
 }
 
 impl HookSink {
@@ -896,22 +1083,38 @@ impl HookSink {
                     next_attempt: Mutex::new(now),
                     attempt_count: Mutex::new(0),
                     client_error_count: Mutex::new(0),
+                    dropped_appends: AtomicU64::new(0),
+                    last_drop_warning: Mutex::new(None),
                 })
             })
             .collect();
 
         let stop = Arc::new(AtomicBool::new(false));
         let nudge = Arc::new((Mutex::new(false), Condvar::new()));
+        // (#2093 merge-gate finding 5) Read live, once, at construction —
+        // matches every other config accessor's "env wins live" contract
+        // at the one point this sink consults it; a running sink doesn't
+        // re-poll config on every write.
+        let max_outbox_mb = darkmux_types::config_access::hooks_max_outbox_mb();
 
         let thread_rules = rule_runtimes.clone();
         let thread_stop = stop.clone();
         let thread_nudge = nudge.clone();
+        let thread_report_sink = report_sink.clone();
         let handle = std::thread::Builder::new()
             .name("hook-drainer".to_string())
-            .spawn(move || drainer_loop(thread_rules, thread_stop, thread_nudge, report_sink))
+            .spawn(move || drainer_loop(thread_rules, thread_stop, thread_nudge, thread_report_sink))
             .context("spawning hook drainer thread")?;
 
-        Ok(Self { outbox_dir, rules: rule_runtimes, stop, nudge, drainer: Mutex::new(Some(handle)) })
+        Ok(Self {
+            outbox_dir,
+            rules: rule_runtimes,
+            stop,
+            nudge,
+            drainer: Mutex::new(Some(handle)),
+            max_outbox_mb,
+            report_sink,
+        })
     }
 
     pub fn outbox_dir(&self) -> &Path {
@@ -929,10 +1132,26 @@ impl FlowSink for HookSink {
         let mut any = false;
         for rt in &self.rules {
             if hook_match(&rt.rule.match_, record) {
+                // (#2093 merge-gate finding 5) Checked BEFORE appending —
+                // a write landing while undelivered bytes are already
+                // over the cap is dropped outright, never touching the
+                // outbox file. `rule_over_cap` reads current on-disk size
+                // fresh each time (cheap — one `stat`), so this stays
+                // correct across compaction shrinking the file back down.
+                let cursor = read_cursor(&rt.rule.cursor_path);
+                if rule_over_cap(&rt.rule.outbox_path, cursor, self.max_outbox_mb) {
+                    let dropped = rt.dropped_appends.fetch_add(1, Ordering::Relaxed) + 1;
+                    maybe_warn_dropped(rt, self.report_sink.as_ref(), self.max_outbox_mb, dropped);
+                    continue;
+                }
                 if let Err(e) = append_outbox_line(&rt.rule.outbox_path, &line) {
+                    // (#2093 merge-gate finding 9) An append failure is
+                    // counted the SAME way a cap-drop is — both are "this
+                    // record never reached the outbox for this rule."
+                    let dropped = rt.dropped_appends.fetch_add(1, Ordering::Relaxed) + 1;
                     eprintln!(
                         "flow::HookSink: rule #{} outbox append failed: {e:#} (this write is lost \
-                         for that rule; other rules + other sinks are unaffected)",
+                         for that rule; other rules + other sinks are unaffected; {dropped} dropped so far)",
                         rt.rule.index
                     );
                 } else {
@@ -1711,6 +1930,136 @@ mod tests {
             "307 must also be refused as a permanent failure"
         );
         assert_never_contacted(&attacker);
+    }
+
+    // ─── (#2093 merge-gate finding 12) hook.fired/failed carry machine provenance ─
+
+    #[test]
+    fn emitted_hook_records_carry_machine_id_and_uid_like_every_other_producer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("dispatch start")).unwrap();
+
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)));
+        let guard = capture.0.lock().unwrap();
+        let fired = guard.iter().find(|r| r.action == "hook.fired").unwrap();
+        assert!(
+            fired.machine_id.is_some(),
+            "hook.fired must go through the same stamping path every other producer uses (machine_id present)"
+        );
+    }
+
+    // ─── (#2093 merge-gate finding 5) bounded outbox ──────────────────────
+
+    #[test]
+    fn maybe_compact_outbox_rewrites_undelivered_tail_and_resets_cursor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outbox_path = tmp.path().join("0-x.outbox.jsonl");
+        let cursor_path = tmp.path().join("0-x.cursor");
+
+        // 5 delivered lines (before the cursor) + 3 undelivered lines
+        // (after it). A small injectable threshold — well under the real
+        // 8 MiB default — makes this test fast and deterministic.
+        let delivered = "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n{\"n\":4}\n";
+        let undelivered = "{\"n\":5}\n{\"n\":6}\n{\"n\":7}\n";
+        std::fs::write(&outbox_path, format!("{delivered}{undelivered}")).unwrap();
+        write_cursor(&cursor_path, delivered.len() as u64).unwrap();
+
+        maybe_compact_outbox(&outbox_path, &cursor_path, 10); // threshold: 10 bytes
+
+        assert_eq!(read_cursor(&cursor_path), 0, "cursor resets to 0 — the compacted file starts fresh");
+        let content = std::fs::read_to_string(&outbox_path).unwrap();
+        assert_eq!(content, undelivered, "only the undelivered tail survives compaction");
+        assert_eq!(undelivered_line_count(&outbox_path, 0), 3, "same 3 pending lines, just repacked into a smaller file");
+    }
+
+    #[test]
+    fn maybe_compact_outbox_is_a_noop_below_threshold() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outbox_path = tmp.path().join("0-x.outbox.jsonl");
+        let cursor_path = tmp.path().join("0-x.cursor");
+        std::fs::write(&outbox_path, "{\"n\":0}\n{\"n\":1}\n").unwrap();
+        write_cursor(&cursor_path, 8).unwrap();
+
+        maybe_compact_outbox(&outbox_path, &cursor_path, 10_000_000); // way above cursor
+
+        assert_eq!(read_cursor(&cursor_path), 8, "cursor untouched below threshold");
+        assert_eq!(std::fs::read_to_string(&outbox_path).unwrap(), "{\"n\":0}\n{\"n\":1}\n", "file untouched below threshold");
+    }
+
+    #[test]
+    fn rule_over_cap_compares_undelivered_bytes_against_the_mib_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outbox_path = tmp.path().join("0-x.outbox.jsonl");
+        let over_cap_body = "x".repeat(2 * 1024 * 1024); // 2 MiB of undelivered bytes
+        std::fs::write(&outbox_path, format!("{{\"a\":\"{over_cap_body}\"}}\n")).unwrap();
+        assert!(rule_over_cap(&outbox_path, 0, 1), "2 MiB of undelivered bytes must be over a 1 MiB cap");
+        assert!(!rule_over_cap(&outbox_path, 0, 100), "must NOT be over a 100 MiB cap");
+    }
+
+    #[test]
+    fn hook_write_drops_appends_past_the_cap_and_counts_them() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A "black hole" target: bound but never accepted, so nothing is
+        // ever delivered — every write stays undelivered, letting the
+        // outbox grow past the cap deterministically.
+        let black_hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = black_hole.local_addr().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(format!("http://{addr}/unreachable")),
+            extras: Default::default(),
+        }];
+
+        let prev = std::env::var("DARKMUX_HOOKS_MAX_OUTBOX_MB").ok();
+        // `HookSink::new` reads the cap ONCE, live, at construction —
+        // matches `config_access`'s general "env read live per access"
+        // rule, applied at the one place this sink reads it.
+        unsafe {
+            std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", "1");
+        }
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_MAX_OUTBOX_MB"),
+            }
+        }
+
+        // The cap check reads CURRENT undelivered bytes BEFORE this
+        // write, so the first write that itself pushes the outbox over
+        // the cap still lands (current undelivered was 0, under the
+        // cap) — only a write that lands AFTER the outbox is already
+        // over cap is dropped. Write one big (2 MiB) record first (goes
+        // through, pushes undelivered to ~2 MiB), then one small record
+        // (must be dropped, since undelivered is now already over the 1
+        // MiB cap).
+        let big_reasoning = "x".repeat(2 * 1024 * 1024);
+        let mut big = record("work.big");
+        big.reasoning = Some(big_reasoning);
+        sink.write(&big).unwrap();
+        assert_eq!(
+            undelivered_line_count(&sink.rules[0].rule.outbox_path, 0),
+            1,
+            "the first (over-cap-pushing) write lands — the check is against bytes BEFORE this write"
+        );
+
+        sink.write(&record("work.small")).unwrap();
+        assert_eq!(
+            undelivered_line_count(&sink.rules[0].rule.outbox_path, 0),
+            1,
+            "the second write must be DROPPED — undelivered bytes are already over the 1 MiB cap"
+        );
+        assert_eq!(sink.rules[0].dropped_appends.load(Ordering::Relaxed), 1, "the drop must be counted");
     }
 
     // ─── (#2093 merge-gate finding 4) torn-line safety ───────────────────

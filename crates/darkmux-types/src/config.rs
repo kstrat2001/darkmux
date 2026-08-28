@@ -567,6 +567,16 @@ pub struct HooksConfig {
     /// whose `action` starts with `hook.` (the sink's own firing/failure
     /// records) never match any rule — loop prevention.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub rules: Option<Vec<HookRule>>,
+    /// (#2093 merge-gate finding 5) Hard cap, in MiB, on UNDELIVERED bytes
+    /// a single rule's outbox may hold before appends for that rule stop.
+    /// A down/unreachable receiver never blocks `write()` (the outbox
+    /// exists precisely so it doesn't have to), but without a ceiling an
+    /// indefinitely-down receiver turns "buffer while down" into
+    /// "consume disk without bound." Past this cap, new records for that
+    /// rule are dropped (counted, surfaced in `flow hooks status` and
+    /// `doctor`, and named in a rate-limited `hook.failed`) rather than
+    /// grown further — other rules and every other sink are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub max_outbox_mb: Option<u64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -773,6 +783,7 @@ impl DarkmuxConfig {
                 enabled: Some(false),
                 outbox_dir: Some("~/.darkmux/hooks".to_string()),
                 rules: Some(Vec::new()),
+                max_outbox_mb: Some(256),
                 extras: Default::default(),
             }),
             extras: Default::default(),
@@ -977,6 +988,10 @@ mod tests {
         assert_eq!(hooks.enabled, Some(false));
         assert_eq!(hooks.outbox_dir.as_deref(), Some("~/.darkmux/hooks"));
         assert_eq!(hooks.rules.as_ref().map(|r| r.is_empty()), Some(true));
+        // (#2093 merge-gate finding 5) the hard outbox cap is visible too —
+        // an operator tuning it shouldn't have to know the field exists
+        // before they can find it in their own config.json.
+        assert_eq!(hooks.max_outbox_mb, Some(256), "default hard cap is visible in the written config");
 
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         assert!(json.contains("\"hooks\""), "hooks block visible in serialized config");
