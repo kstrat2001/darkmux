@@ -12,6 +12,95 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.3.0] - 2026-08-28
+
+The demo plays a real mission, and playback rides on every route.
+
+[darkmux.com/demo](https://darkmux.com/demo) now replays a real review mission,
+the crew reviewing a merged darkmux PR, with the mission graph, the runs, the
+fleet, and the event log all reading from one committed day. The playback
+transport sits on a sticky row with the tabs on every route, its speed is an
+honest multiplier, and a daemon page for a finished dispatch gets the same
+day chip, badge, and transport the demo has. Most of this release was found
+by tapping through the demo on a phone: a fleet card that landed on an empty
+runs lens, run rows that errored, a playback view that jumped as events
+streamed in, a top chrome that was mostly text. Each of those is fixed below.
+
+### Added
+
+- **The demo replays a real review mission** ([#2062](https://github.com/kstrat2001/darkmux/pull/2062), closes [#2032](https://github.com/kstrat2001/darkmux/issues/2032)).
+  `scripts/demo-env/import_mission.py` imports a finished mission from a
+  real `~/.darkmux`, scrubs identity once at import (machine ids, host paths,
+  hostnames, tailnet names, absolute timestamps; a scrub miss fails the
+  import, and CI's public-leak guard fails the PR), and the static build
+  captures each mission graph into `docs/demo/demo-graphs.json`. The subject
+  is always darkmux's own public code, never an engagement's, so a missed
+  scrub still exposes nothing foreign.
+
+- **Sticky tabs and a playback transport on every route** ([#2080](https://github.com/kstrat2001/darkmux/pull/2080), closes [#2071](https://github.com/kstrat2001/darkmux/issues/2071)).
+  The shell owns the playhead, so a run's detail page, the fleet, and the
+  runs board all follow the same clock; the tabs and the transport stay
+  pinned while the page scrolls. A run rewound to before it started says so
+  instead of rendering a header for nothing.
+
+- **A daemon dispatch or mission page names its day** ([#2089](https://github.com/kstrat2001/darkmux/pull/2089)).
+  The chip shows the day the run started, the `▶ PLAYBACK` badge says which
+  mode the page is in, and a finished dispatch gets the transport. A run
+  that is still going stays a live view. When no date resolves the chip
+  reads `RESULT`.
+
+- **`init` verifies the worker model against LM Studio** ([#2054](https://github.com/kstrat2001/darkmux/pull/2054), closes [#2053](https://github.com/kstrat2001/darkmux/issues/2053)).
+  The shipped default is written only when LM Studio actually has it; the
+  next-steps text no longer says `docker build`.
+
+### Changed
+
+- **Playback speed is a real multiplier** ([#2081](https://github.com/kstrat2001/darkmux/pull/2081)).
+  The transport advanced a fixed fraction of the day per tick, so every
+  recording played in twelve seconds and "1×" was thousands of times real
+  time. It now advances recorded time by the measured wall-clock delta times
+  the speed, labeled as recorded time per second: `1h/s` (default), `10m/s`,
+  `1m/s`.
+
+- **One date chip on every build** ([#2085](https://github.com/kstrat2001/darkmux/pull/2085), [#2074](https://github.com/kstrat2001/darkmux/pull/2074), closes [#2072](https://github.com/kstrat2001/darkmux/issues/2072), [#2073](https://github.com/kstrat2001/darkmux/issues/2073)).
+  Demo and daemon render the same outlined pill with the bare date (the
+  `FLOW ·` prefix was noise), and the phone chrome drops from 203 to 153
+  pixels: the meta line keeps the mission and the census, the idle line is
+  gone from the static build, the masthead packs the chip and badge to the
+  right on phones only.
+
+- **Uniform tabs, matching transport controls** ([#2082](https://github.com/kstrat2001/darkmux/pull/2082), [#2084](https://github.com/kstrat2001/darkmux/pull/2084)).
+  Tab cells share a width on every screen and fill the row on portrait
+  phones; the transport marks are SVG paths in identically sized buttons,
+  and play is outlined like the rest.
+
+- **One source resolver, one day hook** ([#2087](https://github.com/kstrat2001/darkmux/pull/2087), closes [#2086](https://github.com/kstrat2001/darkmux/issues/2086)).
+  `lib/source.ts` is the only place the viewer decides whether it is a
+  static page or a daemon page; `hooks/useDay.ts` is the only loader for a
+  day of records. The build-type branch left the lenses.
+
+- **Guide front door and radio page** ([#2056](https://github.com/kstrat2001/darkmux/pull/2056), [#2051](https://github.com/kstrat2001/darkmux/pull/2051), [#2052](https://github.com/kstrat2001/darkmux/pull/2052)).
+  The guide index and getting-started page are one captured session on a
+  fresh home, with no frontier-orchestrator assumption; the radio page is
+  distilled to what works, with verbatim captures; `acp --help` stops
+  calling a shipped feature a spike.
+
+### Fixed
+
+- A fleet card tap on the demo lands on the machine's runs instead of an
+  empty board ([#2064](https://github.com/kstrat2001/darkmux/pull/2064), closes [#2063](https://github.com/kstrat2001/darkmux/issues/2063)).
+- Every run row on the demo opens ([#2066](https://github.com/kstrat2001/darkmux/pull/2066), closes [#2065](https://github.com/kstrat2001/darkmux/issues/2065)): mission rows
+  gate on the captured graph, dispatch rows slice their session out of the
+  committed day.
+- The mobile playback view no longer jumps and flickers as events stream in
+  ([#2069](https://github.com/kstrat2001/darkmux/pull/2069), closes [#2068](https://github.com/kstrat2001/darkmux/issues/2068)): the hero row wrapped by the digit width of one
+  tile, the inspector resized on every followed record. Cumulative layout
+  shift on a full replay went from 1.21 to 0.21.
+- Fleet cards on the demo read their hardware from a committed snapshot
+  instead of saying it was not reported ([#2070](https://github.com/kstrat2001/darkmux/pull/2070), closes [#2067](https://github.com/kstrat2001/darkmux/issues/2067)).
+- Mission graph siblings no longer overlap, phase bands share a width, and
+  the canvas fits its viewport ([#2059](https://github.com/kstrat2001/darkmux/pull/2059)).
+
 ## [3.2.0] - 2026-08-28
 
 Radio becomes interactive help, and the front door stops lying.
@@ -351,6 +440,7 @@ changed shape.
 - The mobile event list has a floor measured in rows rather than a fraction of
   the viewport (#1996).
 
+[3.3.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.3.0
 [3.2.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.2.0
 [3.1.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.1.0
 [3.0.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.0.0
