@@ -141,9 +141,37 @@ pub fn load_all(user_dir: Option<&Path>) -> (BTreeMap<String, Rule>, Vec<String>
                     continue;
                 }
                 match fs::read_to_string(&path) {
-                    Ok(text) => match serde_json::from_str::<Rule>(&text) {
-                        Ok(r) => {
-                            map.insert(r.id.clone(), r);
+                    Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(override_value) => {
+                            let Some(id) = override_value.get("id").and_then(|v| v.as_str()) else {
+                                warnings.push(format!(
+                                    "user crawl rule {} has no `id` field — skipped",
+                                    path.display()
+                                ));
+                                continue;
+                            };
+                            let id = id.to_string();
+                            // A user file sharing an existing id MERGES over
+                            // it — only the fields the override names
+                            // change; everything else (e.g. an embedded
+                            // rule's `applies_to`/`prefilter`) survives from
+                            // the rule already in the map (#1959 finding 2).
+                            // An id the map doesn't know yet gets an empty
+                            // base, i.e. the override defines the whole rule.
+                            let base = map
+                                .get(&id)
+                                .and_then(|r| serde_json::to_value(r).ok())
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            let merged = merge_json_object_shallow(base, override_value);
+                            match serde_json::from_value::<Rule>(merged) {
+                                Ok(r) => {
+                                    map.insert(id, r);
+                                }
+                                Err(e) => warnings.push(format!(
+                                    "user crawl rule {} failed to parse ({e}) — skipped",
+                                    path.display()
+                                )),
+                            }
                         }
                         Err(e) => warnings.push(format!(
                             "user crawl rule {} failed to parse ({e}) — skipped",
@@ -162,11 +190,55 @@ pub fn load_all(user_dir: Option<&Path>) -> (BTreeMap<String, Rule>, Vec<String>
     (map, warnings)
 }
 
+/// Shallow top-level JSON-object merge: every key `patch` names overwrites
+/// `base`'s value at that key WHOLESALE (an array field, e.g. `applies_to`,
+/// REPLACES rather than concatenates — there is no recursive merge into
+/// nested structures) — any key `patch` doesn't name survives from `base`
+/// untouched (#1959 finding 2). `patch` wins entirely when either side
+/// isn't a JSON object (a malformed base/override falls through to
+/// `Rule`'s own deserialize error rather than merging nonsense).
+fn merge_json_object_shallow(base: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+    match (base, patch) {
+        (serde_json::Value::Object(mut base_map), serde_json::Value::Object(patch_map)) => {
+            for (k, v) in patch_map {
+                base_map.insert(k, v);
+            }
+            serde_json::Value::Object(base_map)
+        }
+        (_, patch) => patch,
+    }
+}
+
+/// Warn (never fail — this is advisory, not validation) when a resolved
+/// `site`/`read` rule has an empty `applies_to` (it will never match any
+/// file) or a `site` rule has an empty `prefilter` (`plan.rs`'s
+/// `collect_site_units` early-returns with zero units for exactly this
+/// case, silently before this fix — #1959 finding 2). Runs only over the
+/// rules a manifest actually RESOLVED for use — not every rule sitting in
+/// the registry — so an unrelated user-authored rule id never generates
+/// noise for a manifest that doesn't reference it.
+fn warn_on_thin_rules(resolved: &[Rule], warnings: &mut Vec<String>) {
+    for rule in resolved {
+        if matches!(rule.kind, RuleKind::Site | RuleKind::Read) && rule.applies_to.is_empty() {
+            warnings.push(format!(
+                "crawl rule '{}' has an empty `applies_to` — it will never match any file",
+                rule.id
+            ));
+        }
+        if rule.kind == RuleKind::Site && rule.prefilter.is_empty() {
+            warnings.push(format!(
+                "crawl rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
+                rule.id
+            ));
+        }
+    }
+}
+
 /// Resolve a manifest's `rules: [ids...]` against the registry. Errors
 /// loudly on an unknown id, listing every known id — never silently drops
 /// an unresolvable rule.
 pub fn resolve(ids: &[String], user_dir: Option<&Path>) -> Result<(Vec<Rule>, Vec<String>)> {
-    let (map, warnings) = load_all(user_dir);
+    let (map, mut warnings) = load_all(user_dir);
     let mut out = Vec::new();
     for id in ids {
         match map.get(id) {
@@ -185,6 +257,7 @@ pub fn resolve(ids: &[String], user_dir: Option<&Path>) -> Result<(Vec<Rule>, Ve
             }
         }
     }
+    warn_on_thin_rules(&out, &mut warnings);
     Ok((out, warnings))
 }
 
@@ -241,8 +314,15 @@ mod tests {
         assert!(msg.contains("stale-consumer"), "{msg}");
     }
 
+    /// #1959 finding 2: a user-tier override file only names the fields it
+    /// wants to change. Before this fix, `load_all` REPLACED the embedded
+    /// rule wholesale on a matching id (`map.insert(r.id.clone(), r)` with
+    /// `r` being the freshly-parsed override alone) — every field the
+    /// override didn't name (here, `applies_to`/`prefilter`) silently
+    /// dropped to its serde default (an empty vec) instead of surviving
+    /// from the embedded rule underneath.
     #[test]
-    fn user_tier_overrides_embedded_rule_by_id() {
+    fn user_tier_override_merges_named_fields_over_the_embedded_rule() {
         let dir = TempDir::new().unwrap();
         let override_json = serde_json::json!({
             "id": "swallowed-error",
@@ -258,11 +338,38 @@ mod tests {
 
         let (map, warnings) = load_all(Some(dir.path()));
         assert!(warnings.is_empty(), "{warnings:?}");
+        let merged = &map["swallowed-error"];
+        // The override's own fields won.
+        assert_eq!(merged.title.as_deref(), Some("operator override"));
+        assert_eq!(merged.window, Some(5));
+        // Everything the override didn't name survived from the embedded
+        // rule underneath — this is the actual bug this test guards.
+        let (embedded, _) = load_all(None);
+        assert_eq!(merged.applies_to, embedded["swallowed-error"].applies_to);
+        assert!(!merged.prefilter.is_empty(), "{merged:?}");
+        assert_eq!(merged.prefilter, embedded["swallowed-error"].prefilter);
+    }
+
+    #[test]
+    fn user_tier_override_array_field_replaces_rather_than_concatenates() {
+        let dir = TempDir::new().unwrap();
+        let override_json = serde_json::json!({
+            "id": "swallowed-error",
+            "kind": "site",
+            "applies_to": ["**/*.custom"]
+        });
+        fs::write(
+            dir.path().join("swallowed-error.json"),
+            override_json.to_string(),
+        )
+        .unwrap();
+
+        let (map, _) = load_all(Some(dir.path()));
+        // Replaced, not appended to the embedded rule's own applies_to.
         assert_eq!(
-            map["swallowed-error"].title.as_deref(),
-            Some("operator override")
+            map["swallowed-error"].applies_to,
+            vec!["**/*.custom".to_string()]
         );
-        assert_eq!(map["swallowed-error"].window, Some(5));
     }
 
     #[test]
@@ -275,6 +382,44 @@ mod tests {
         assert_eq!(map.len(), 3);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("broken.json"), "{warnings:?}");
+    }
+
+    #[test]
+    fn resolve_warns_on_empty_applies_to_and_empty_site_prefilter() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("thin-site.json"),
+            serde_json::json!({"id": "thin-site", "kind": "site"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("thin-read.json"),
+            serde_json::json!({"id": "thin-read", "kind": "read", "applies_to": ["**/*.ts"]})
+                .to_string(),
+        )
+        .unwrap();
+
+        let (rules, warnings) = resolve(
+            &["thin-site".to_string(), "thin-read".to_string()],
+            Some(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(rules.len(), 2);
+
+        // thin-site: empty applies_to AND empty prefilter -> two warnings.
+        assert!(
+            warnings.iter().any(|w| w.contains("thin-site") && w.contains("applies_to")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("thin-site") && w.contains("prefilter")),
+            "{warnings:?}"
+        );
+        // thin-read: applies_to is populated, so no applies_to warning for it.
+        assert!(
+            !warnings.iter().any(|w| w.contains("thin-read")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
