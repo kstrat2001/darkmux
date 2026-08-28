@@ -8,7 +8,7 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1787889648446,
+    "captured_ts_ms": 1787892244648,
     "cols": 120,
     "exit_code": 0,
     "gather_ms": 2,
@@ -18,13 +18,13 @@
   },
   "doctor": {
     "age_ms": 0,
-    "ansi_text": "darkmux doctor \u2014 41 checks\n\n\u25cf needs attention \u2014 daemon freshness: a darkmux serve daemon is running a DIFFERENT build (3.2.0\u2026\n\n  \u2713 build                  darkmux 3.2.0 (460e309f\u2731) \u00b7 flow schema 1.22.0\n  \u2713 daemon reachable       reachable \u00b7 viewer http://127.0.0.1:8765/ \u00b7 phone\n                           http://demo-hub.internal/\n  \u2713 34 more checks passed \u2014 `-v` for detail\n  \u26a0 daemon freshness       a darkmux serve daemon is running a DIFFERENT build (3.2.0 (d57b7b66))\n                           than this binary (3.2.0 (460e309f\u2731)) \u2014 it serves its in-memory code until\n                           restarted, so anything you verify against it is testing that build, not\n                           this one\n        \u2192 restart it: stop the running `darkmux serve` (Ctrl-C in its terminal, or `pkill -f\n          'darkmux serve'`) and start it again\n  \u26a0 audit integrity        no audit files under\n                           /home/demo/.darkmux/audit\n        \u2192 AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log\n          whose edits `darkmux flow integrity-check` detects (absent a full re-chain \u2014 the chain is\n          un-anchored), alongside the casual LocalFile sink.\n  \u26a0 utility model          utility model `qwen3-4b-instruct-2507` registered but NOT loaded\n        \u2192 No verb needs this loaded first \u2014 the binding's only job is to name the compactor, and\n          every dispatch path self-loads it at its declared `n_ctx` under the `darkmux:` namespace\n          (#1616). Loading it by hand just pays that cost now instead of during the first dispatch;\n          if you do, keep the namespace and the context \u2014 `lms load <id> --context-length <n>\n          --identifier darkmux:<id>` \u2014 since a bare `lms load` creates a resident darkmux won't\n          reuse and `machine eject` can't reclaim. (#590, #1616, #1675)\n  \u26a0 legacy compaction extras profile `analyst` has fields not consumed by the internal runtime:\n                             mode; profile `coder` has fields not consumed by the internal runtime:\n                             mode; profile `reviewer` has fields not consumed by the internal\n                             runtime: mode\n        \u2192 Remove `mode` / `maxHistoryShare` / `recentTurnsPreserve` from profile (darkmux's typed\n          schema deliberately doesn't expose these \u2014 see DESIGN.md Schema isolation).\n  \u26a0 darkmux skills freshness darkmux-* skills: 10 up to date; 5 stale (darkmux-add-machine,\n                             darkmux-analyze-run, darkmux-bootstrap, darkmux-enable-audit,\n                             darkmux-qa-review); 1 installed but no longer bundled (darkmux-crawl)\n        \u2192 installed from an older darkmux; run `darkmux init` to refresh (and prune retired skills)\n\n36 pass, 5 warn \u2014 workable but worth a look\n",
+    "ansi_text": "darkmux doctor \u2014 41 checks\n\n\u25cf needs attention \u2014 daemon freshness: a darkmux serve daemon is running a DIFFERENT build (3.2.0\u2026\n\n  \u2713 build                  darkmux 3.2.0 (460e309f\u2731) \u00b7 flow schema 1.22.0\n  \u2713 daemon reachable       reachable \u00b7 viewer http://127.0.0.1:8765/ \u00b7 phone\n                           http://demo-hub.internal/\n  \u2713 33 more checks passed \u2014 `-v` for detail\n  \u26a0 daemon freshness       a darkmux serve daemon is running a DIFFERENT build (3.2.0 (d57b7b66))\n                           than this binary (3.2.0 (460e309f\u2731)) \u2014 it serves its in-memory code until\n                           restarted, so anything you verify against it is testing that build, not\n                           this one\n        \u2192 restart it: stop the running `darkmux serve` (Ctrl-C in its terminal, or `pkill -f\n          'darkmux serve'`) and start it again\n  \u26a0 binary vs source       the darkmux you are running was built from 460e309f, but this source\n                           tree's HEAD is 8e906ab1 \u2014 your latest code is NOT in the binary under\n                           test\n        \u2192 rebuild + install it: `cargo install --path .`\n  \u26a0 audit integrity        no audit files under\n                           /home/demo/.darkmux/audit\n        \u2192 AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log\n          whose edits `darkmux flow integrity-check` detects (absent a full re-chain \u2014 the chain is\n          un-anchored), alongside the casual LocalFile sink.\n  \u26a0 utility model          utility model `qwen3-4b-instruct-2507` registered but NOT loaded\n        \u2192 No verb needs this loaded first \u2014 the binding's only job is to name the compactor, and\n          every dispatch path self-loads it at its declared `n_ctx` under the `darkmux:` namespace\n          (#1616). Loading it by hand just pays that cost now instead of during the first dispatch;\n          if you do, keep the namespace and the context \u2014 `lms load <id> --context-length <n>\n          --identifier darkmux:<id>` \u2014 since a bare `lms load` creates a resident darkmux won't\n          reuse and `machine eject` can't reclaim. (#590, #1616, #1675)\n  \u26a0 legacy compaction extras profile `analyst` has fields not consumed by the internal runtime:\n                             mode; profile `coder` has fields not consumed by the internal runtime:\n                             mode; profile `reviewer` has fields not consumed by the internal\n                             runtime: mode\n        \u2192 Remove `mode` / `maxHistoryShare` / `recentTurnsPreserve` from profile (darkmux's typed\n          schema deliberately doesn't expose these \u2014 see DESIGN.md Schema isolation).\n  \u26a0 darkmux skills freshness darkmux-* skills: 10 up to date; 5 stale (darkmux-add-machine,\n                             darkmux-analyze-run, darkmux-bootstrap, darkmux-enable-audit,\n                             darkmux-qa-review); 1 installed but no longer bundled (darkmux-crawl)\n        \u2192 installed from an older darkmux; run `darkmux init` to refresh (and prune retired skills)\n\n35 pass, 6 warn \u2014 workable but worth a look\n",
     "argv": [
       "doctor"
     ],
     "auto_refresh": false,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1787889648474,
+    "captured_ts_ms": 1787892244697,
     "cols": 100,
     "exit_code": 0,
     "gather_ms": 3,
@@ -34,24 +34,24 @@
   },
   "flow-status": {
     "age_ms": 0,
-    "ansi_text": "darkmux flow status \u2014 \u2713 ok\n  schema:       1.22.0\n  composition:  LocalFile\n\nRedis: not configured (set DARKMUX_REDIS_URL to enable)\n\nDisk\n  flows_dir:    /home/demo/.darkmux/flows\n  exists:       true\n  day_files:    2\n  total_bytes:  3177927\n\nSchema\n  writer:       1.22.0\n  observed:     (none)\n  skew:         false\n",
+    "ansi_text": "darkmux flow status \u2014 \u2713 ok\n  schema:       1.22.0\n  composition:  LocalFile\n\nRedis: not configured (set DARKMUX_REDIS_URL to enable)\n\nDisk\n  flows_dir:    /home/demo/.darkmux/flows\n  exists:       true\n  day_files:    3\n  total_bytes:  5923009\n\nSchema\n  writer:       1.22.0\n  observed:     (none)\n  skew:         false\n",
     "argv": [
       "flow",
       "status"
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1787889648449,
+    "captured_ts_ms": 1787892244652,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 2,
+    "gather_ms": 3,
     "opts": {},
     "panel": "flow-status",
     "stderr_tail": ""
   },
   "lab-fixture-list": {
     "age_ms": 0,
-    "ansi_text": "Lab registry: /home/demo/.darkmux/lab-registry.json (1 fixture)\n\n  demo-tiny-py\n    path:       /home/demo/darkmux/templates/builtin/lab-fixtures/demo-tiny-py\n    version:    1.0\n    satisfies:  tiny-python-suite@1.0\n    hash:       blake3:3b3e906155a4a66055be7fd39b4a855fca549f23f0e4fff34060c93c75f61e49\n    hashed_at:  2026-08-28T03:55:19Z\n\n",
+    "ansi_text": "Lab registry: /home/demo/.darkmux/lab-registry.json (1 fixture)\n\n  demo-tiny-py\n    path:       /home/demo/darkmux/templates/builtin/lab-fixtures/demo-tiny-py\n    version:    1.0\n    satisfies:  tiny-python-suite@1.0\n    hash:       blake3:3b3e906155a4a66055be7fd39b4a855fca549f23f0e4fff34060c93c75f61e49\n    hashed_at:  2026-08-28T04:32:01Z\n\n",
     "argv": [
       "lab",
       "fixture",
@@ -59,10 +59,10 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1787889648452,
+    "captured_ts_ms": 1787892244656,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 2,
+    "gather_ms": 3,
     "opts": {},
     "panel": "lab-fixture-list",
     "stderr_tail": ""
@@ -76,7 +76,7 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1787889648443,
+    "captured_ts_ms": 1787892244645,
     "cols": 120,
     "exit_code": 0,
     "gather_ms": 3,
@@ -86,17 +86,17 @@
   },
   "mission-status": {
     "age_ms": 0,
-    "ansi_text": "\u001b[1;36mmission status \u2014 1 mission\u001b[0m\n\n\u001b[2mFINALIZED (1)\u001b[0m\n  \u25c6 \u001b]8;;http://demo-hub.internal/mission/demo-review-nameof-recency/graph\u001b\\PR review \u2014 demo-review-nameof-recency (crew `deep+diff-review+probe-4b+probe-qwen38`)\u001b]8;;\u001b\\  \u001b[2m43m\u001b[0m    3/3  \u2593\u2593\u2593\u2593  \u001b[2m3 complete\u001b[0m\n\n\u001b[32m\u2713 board is clean \u2014 every mission's phases are reconciled\u001b[0m\n",
+    "ansi_text": "\u001b[1;36mmission status \u2014 1 mission\u001b[0m\n\n\u001b[2mFINALIZED (1)\u001b[0m\n  \u25c6 \u001b]8;;http://demo-hub.internal/mission/demo-review-nameof-recency/graph\u001b\\PR review \u2014 demo-review-nameof-recency (crew `deep+diff-review+probe-4b+probe-qwen38`)\u001b]8;;\u001b\\  \u001b[2m50m\u001b[0m    3/3  \u2593\u2593\u2593\u2593  \u001b[2m3 complete\u001b[0m\n\n\u001b[32m\u2713 board is clean \u2014 every mission's phases are reconciled\u001b[0m\n",
     "argv": [
       "mission",
       "status"
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1787889648438,
+    "captured_ts_ms": 1787892244636,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 73,
+    "gather_ms": 67,
     "opts": {
       "all": "recent"
     },
@@ -112,27 +112,27 @@
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1787889648442,
+    "captured_ts_ms": 1787892244644,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 3,
+    "gather_ms": 5,
     "opts": {},
     "panel": "role-list",
     "stderr_tail": ""
   },
   "run-list": {
     "age_ms": 0,
-    "ansi_text": "\u001b[1;36mruns \u2014 10 shown\u001b[0m\n  KIND     STATUS      STARTED    DURATION    ID                                               MACHINE             \n  dispatch running     11m ago    11m+        darkmux-crawler-crawl-discarded-locks-2250176547 m5-ultra-256gb      \n  dispatch complete    28m ago    9m          darkmux-crawler-crawl-error-discard-1307487261   m5-ultra-256gb      \n  mission  complete    1h ago     32m         demo-review-nameof-recency                       m5-ultra-256gb      \n  dispatch complete    1h ago     9m          darkmux-reviewer-review-flow-sinks-987519170     m5-ultra-256gb      \n  dispatch complete    1h ago     9m          darkmux-crawler-crawl-unwrap-paths-4040708454    m5-ultra-256gb      \n  dispatch complete    2h ago     9m          darkmux-scribe-doc-drift-sweep-3918945565        m1-max-32gb-studio  \n  dispatch complete    3h ago     9m          darkmux-reviewer-review-serve-routes-1318381388  m5-ultra-256gb      \n  dispatch complete    4h ago     9m          darkmux-analyst-crawl-lock-ordering-921964300    m5-ultra-256gb      \n  dispatch complete    5h ago     9m          darkmux-estimator-estimate-backlog-4092573714    mac-mini-m4-16gb    \n  dispatch complete    6h ago     9m          darkmux-crawler-crawl-error-discard-2-2301155233 m5-ultra-256gb      \n\u001b[2mshowing 10 of 11 runs (1 more not shown \u2014 `--all` for every run)\u001b[0m\n",
+    "ansi_text": "\u001b[1;36mruns \u2014 10 shown\u001b[0m\n  KIND     STATUS      STARTED    DURATION    ID                                               MACHINE             \n  dispatch running     18m ago    18m+        darkmux-crawler-crawl-discarded-locks-2250176547 m5-ultra-256gb      \n  mission  complete    1h ago     32m         demo-review-nameof-recency                       m5-ultra-256gb      \n  dispatch complete    1d ago     9m          darkmux-crawler-crawl-error-discard-1307487261   m5-ultra-256gb      \n  dispatch complete    1d ago     9m          darkmux-reviewer-review-flow-sinks-987519170     m5-ultra-256gb      \n  dispatch complete    1d ago     9m          darkmux-crawler-crawl-unwrap-paths-4040708454    m5-ultra-256gb      \n  dispatch complete    1d ago     9m          darkmux-scribe-doc-drift-sweep-3918945565        m1-max-32gb-studio  \n  dispatch complete    1d ago     9m          darkmux-reviewer-review-serve-routes-1318381388  m5-ultra-256gb      \n  dispatch complete    1d ago     9m          darkmux-analyst-crawl-lock-ordering-921964300    m5-ultra-256gb      \n  dispatch complete    1d ago     9m          darkmux-estimator-estimate-backlog-4092573714    mac-mini-m4-16gb    \n  dispatch complete    1d ago     9m          darkmux-crawler-crawl-error-discard-2-2301155233 m5-ultra-256gb      \n\u001b[2mshowing 10 of 11 runs (1 more not shown \u2014 `--all` for every run)\u001b[0m\n",
     "argv": [
       "run",
       "list"
     ],
     "auto_refresh": true,
     "cache_ttl_ms": 3000,
-    "captured_ts_ms": 1787889648473,
+    "captured_ts_ms": 1787892244696,
     "cols": 120,
     "exit_code": 0,
-    "gather_ms": 20,
+    "gather_ms": 37,
     "opts": {
       "all": "recent",
       "kind": "all"

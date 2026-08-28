@@ -5,7 +5,7 @@
     "diff_file": "/tmp/demo-scratch",
     "source": {
       "kind": "worktree",
-      "path": "/home/demo/de-projects/dm-crawl"
+      "path": "/home/demo/workspace"
     }
   },
   "id": "review-bundle-step",

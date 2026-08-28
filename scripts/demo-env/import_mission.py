@@ -271,9 +271,15 @@ def self_test():
           renamed["nested"]["not_a_ts"] == original["nested"]["not_a_ts"])
 
     # ---- the scrub backstop still refuses a planted leak --------------------
-    leaked = {"note": "nobody@example.com leaked", "path": "/Users/nobody/proj"}
-    scrubbed = scrub(leaked)
-    check("scrub() rewrites the host path", "/Users/nobody" not in scrubbed["path"])
+    leaked = {"note": "nobody@example.com leaked"}
+    paths = scrub({"a": "/Users/nobody/proj", "b": "/Users/nobody/de-things/some-checkout/src",
+                   "c": "/Users/nobody/.darkmux/flows", "d": "/home/demo/darkmux/templates/x"})
+    check("scrub() rewrites the host path", "/Users/nobody" not in paths["a"])
+    check("scrub() collapses the path tail after the username (a project root, "
+          "a checkout name are identity too)",
+          paths["b"] == "/home/demo/workspace" and paths["a"] == "/home/demo/workspace")
+    check("scrub() keeps the demo home and the rewritten repo root",
+          paths["c"] == "/home/demo/.darkmux/flows" and paths["d"] == "/home/demo/darkmux/templates/x")
     caught = False
     try:
         scan_or_die(json.dumps(leaked), "self-test")

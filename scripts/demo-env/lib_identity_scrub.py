@@ -77,6 +77,14 @@ def scrub(obj):
         # detail lens renders it, and an empty workspace row reads as a bug.
         s = re.sub(r"/Users/[^/\"\s]+/\.darkmux", "/home/demo/.darkmux", obj)
         s = re.sub(r"/Users/[^/\"\s]+", "/home/demo", s)
+        # The username rule leaves the rest of a home path intact, and the
+        # rest is identity too: a personal project root, a checkout name, a
+        # worktree hash (#2032 review: `/home/demo/de-projects/dm-crawl`
+        # reached a committed fixture). Everything under /home/demo that is
+        # not the demo's own `.darkmux` or the repo's rewritten `darkmux`
+        # root collapses to one placeholder. Nothing downstream reads a
+        # workspace path for content.
+        s = re.sub(r"/home/demo/(?!\.darkmux(?:/|\b)|darkmux(?:/|\b))[^\"\s]+", "/home/demo/workspace", s)
         # A frontier orchestrator's OWN scratchpad path
         # (`/private/tmp/claude-<uid>/...`) can end up quoted inside a
         # review's findings when the reviewed diff was staged from one (a

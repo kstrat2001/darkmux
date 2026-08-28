@@ -65,11 +65,11 @@ whatever `build.py --now` (default: real now) just anchored the world to; and
 marked `live=True` reads as running, because that is the only session missing
 its terminal `dispatch complete`/`dispatch error` record (the same bookend
 contract 2 states). `demo-lab-runs.json` mirrors `/lab/runs` for the same
-"stop hand-authoring what a real route already answers" reason; the demo
-world configures no lab dir, so it is expected to keep coming back
-`configured: false` — captured rather than assumed, so a future world that DID
-configure one would change this file the same way it changes every other
-fixture, with no second edit required.
+"stop hand-authoring what a real route already answers" reason. Since #2032
+packet 1 the world registers a real lab fixture (`demo-tiny-py`), so this
+comes back `configured: true` with an empty run list until a lab run is
+seeded (#2061 item 1); captured rather than assumed, so seeding one changes
+this file the same way it changes every other fixture, with no second edit.
 
 Re-run after changing `world.json` or after a panel's output format moves —
 or simply run `./build.py && ./serve.py & ./export_static.py` any time before

@@ -171,21 +171,30 @@ def make_handler(inner, fx, hero, demo_uids, home):
                     # means blanking `ansi_text`/`stderr_tail` IN that shape,
                     # not swapping in an unrelated object the pane cannot
                     # render at all.
+                    # Only a PANEL payload has a body to blank. Every other
+                    # route (/runs, /missions, /mission/:id/graph.json, ...)
+                    # is a data shape the exporter writes to docs/demo
+                    # verbatim, so the only safe answer is to refuse: the
+                    # exception becomes a 502 in do_GET, export_static's
+                    # urlopen raises on it, and the export stops instead of
+                    # publishing the leak (review of #2032: the blanking
+                    # branch used to ANNOTATE such a dict and forward it,
+                    # leak included, while logging that it withheld it).
                     try:
                         payload = json.loads(text)
+                    except (json.JSONDecodeError, TypeError):
+                        payload = None
+                    if isinstance(payload, dict) and "ansi_text" in payload:
                         payload["ansi_text"] = (
                             "panel content withheld: identity scrub could not "
                             "clear it for the demo world"
                         )
                         payload["stderr_tail"] = ""
                         return json.dumps(payload).encode()
-                    except (json.JSONDecodeError, TypeError):
-                        return json.dumps({
-                            "panel": "unknown", "argv": [], "opts": {},
-                            "ansi_text": "panel content withheld: identity scrub "
-                                         "could not clear it for the demo world",
-                            "stderr_tail": "", "exit_code": 1,
-                        }).encode()
+                    raise RuntimeError(
+                        f"withheld: passthrough response still carries {what} "
+                        f"after the identity scrub; refusing to serve it"
+                    )
             return text.encode()
 
         def _filter_flow(self, data):
@@ -341,5 +350,33 @@ def main():
         daemon.terminate()
 
 
+def self_test():
+    """The three payload shapes the scrub backstop must get right."""
+    Handler = make_handler("http://127.0.0.1:1", {}, "demo", set(), pathlib.Path("/nonexistent"))
+    scrubber = Handler._scrub_passthrough
+    leak = "someone@example.com"
+    panel = json.dumps({"panel": "x", "ansi_text": f"hi {leak}", "stderr_tail": ""}).encode()
+    out = json.loads(scrubber(None, panel))
+    assert leak not in json.dumps(out) and "withheld" in out["ansi_text"], "panel payload must be blanked"
+    dict_route = json.dumps({"runs": [{"id": "r1", "dir": f"/x/{leak}"}]}).encode()
+    try:
+        scrubber(None, dict_route)
+        raise AssertionError("a non-panel payload carrying a sentinel must be refused, not forwarded")
+    except RuntimeError as e:
+        assert "withheld" in str(e)
+    list_route = json.dumps([{"note": leak}]).encode()
+    try:
+        scrubber(None, list_route)
+        raise AssertionError("a list payload carrying a sentinel must be refused")
+    except RuntimeError:
+        pass
+    clean = json.dumps({"runs": [{"id": "r1", "dir": "/home/demo/darkmux"}]}).encode()
+    assert json.loads(scrubber(None, clean)) == json.loads(clean), "a clean payload passes through unchanged"
+    print("serve.py self-test: all checks passed")
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        self_test()
+        sys.exit(0)
     main()

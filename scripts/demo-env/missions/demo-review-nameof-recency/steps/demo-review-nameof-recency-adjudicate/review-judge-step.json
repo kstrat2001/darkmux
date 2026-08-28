@@ -11,7 +11,7 @@
     "passes": 2,
     "source": {
       "kind": "worktree",
-      "path": "/home/demo/de-projects/dm-crawl"
+      "path": "/home/demo/workspace"
     }
   },
   "id": "review-judge-step",
