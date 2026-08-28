@@ -702,6 +702,71 @@
         assert_eq!(r.rests, 1);
     }
 
+    // ─── #2094 second round, finding 1: rest_ms max(metrics, tailer) ─────
+
+    #[test]
+    fn reconcile_rest_totals_prefers_the_larger_of_metrics_and_tailer() {
+        let from_metrics = RestTotals { rest_ms: 0, rests: 0 };
+        let from_tailer = RestTotals { rest_ms: 1000, rests: 2 };
+        let merged = reconcile_rest_totals(from_metrics, from_tailer);
+        assert_eq!(merged.rest_ms, 1000);
+        assert_eq!(merged.rests, 2);
+    }
+
+    #[test]
+    fn reconcile_rest_totals_keeps_metrics_when_it_reports_more_than_the_tailer() {
+        // The live tailer's view can be the SMALLER one too (its last poll
+        // landed a beat before the runtime's clean-exit flush) — metrics.json
+        // is the fuller picture in that direction, so this isn't a blind
+        // "trajectory always wins," it's a genuine per-field max.
+        let from_metrics = RestTotals { rest_ms: 1000, rests: 2 };
+        let from_tailer = RestTotals { rest_ms: 400, rests: 1 };
+        let merged = reconcile_rest_totals(from_metrics, from_tailer);
+        assert_eq!(merged.rest_ms, 1000);
+        assert_eq!(merged.rests, 2);
+    }
+
+    #[test]
+    fn dispatch_error_terminal_recovers_rest_totals_from_the_live_tailer_when_metrics_json_is_zeroed(
+    ) {
+        // (#2094 second round, finding 1) Reproduces the exact failure this
+        // finding names: the runtime crashed (SIGKILL, hard error) after
+        // writing a zeroed metrics.json, but AFTER two real rests had
+        // already streamed to trajectory.jsonl and been seen live by the
+        // tailer. `read_rest_totals` alone gates its own trajectory
+        // fallback on metrics.json KEY PRESENCE, not value — so it trusts
+        // the zeroed-but-present `rest_ms`/`rests` and never reaches
+        // `sum_rest_totals_from_trajectory` itself. The payload must still
+        // surface the real totals by reconciling against what the live
+        // tailer (`TrajectorySummary`) actually observed as the events
+        // streamed, independent of the post-hoc metrics.json read.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 0, "rests": 0}"#).unwrap();
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":400}\n\
+             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":600}\n",
+        )
+        .unwrap();
+
+        // Confirms the gap this finding names: read_rest_totals alone
+        // trusts the zeroed-but-present metrics.json and never falls
+        // through to the trajectory sum.
+        let from_metrics = read_rest_totals(out.path());
+        assert_eq!((from_metrics.rest_ms, from_metrics.rests), (0, 0));
+
+        // What the live tailer accumulated processing the same two events
+        // as they streamed — TrajectorySummary's own running total, kept
+        // independently of the post-hoc metrics.json read.
+        let from_tailer = RestTotals { rest_ms: 1000, rests: 2 };
+
+        let merged = reconcile_rest_totals(from_metrics, from_tailer);
+        assert_eq!(merged.rest_ms, 1000, "payload must carry the tailer-observed total");
+        assert_eq!(merged.rests, 2);
+    }
+
     // ─── #2094 finding 8: turn_delay_effective_ms ─────────────────────────
 
     #[test]
@@ -759,6 +824,39 @@
         let rest = RestTotals::default();
         let effective = read_turn_delay_effective_ms(out.path(), rest);
         assert_eq!(effective, None);
+    }
+
+    #[test]
+    fn read_turn_delay_effective_ms_zero_field_does_not_short_circuit_the_derived_average_when_rests_positive(
+    ) {
+        // (#2094 second round, finding 1) Same shape of bug as rest_ms: a
+        // metrics.json written with `turn_delay_effective_ms: 0` (the
+        // exit-time write raced a crash and only got a zeroed struct out)
+        // must not be trusted as "the resolved cadence was genuinely
+        // zero" when `rest` says this dispatch actually rested. Fall
+        // through to the derived average instead.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"turn_delay_effective_ms": 0}"#).unwrap();
+        let rest = RestTotals { rest_ms: 1000, rests: 2 };
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, Some(500), "falls through to 1000/2 = 500, not the zeroed field");
+    }
+
+    #[test]
+    fn read_turn_delay_effective_ms_zero_field_is_honored_when_there_were_genuinely_no_rests() {
+        // A single-turn dispatch that never rested legitimately has
+        // turn_delay_effective_ms=0 with rests=0 — that zero IS the truth,
+        // not a raced write, and must still be returned as Some(0) rather
+        // than falling to None.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"turn_delay_effective_ms": 0}"#).unwrap();
+        let rest = RestTotals::default();
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, Some(0));
     }
 
     // ─── #2094 finding 4: never rest an agentic-REMOTE dispatch ──────────

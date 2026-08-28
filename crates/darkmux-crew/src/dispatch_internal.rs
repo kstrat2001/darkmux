@@ -3042,10 +3042,23 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     // inter-turn rest this dispatch took + how many. `wall_ms` above
     // INCLUDES this time (wall stays wall); a caller wanting model-only
     // time subtracts `rest_ms` from `wall_ms` itself.
-    let rest = read_rest_totals(&host_out);
+    let rest_from_metrics = read_rest_totals(&host_out);
+    // (#2094 second round, finding 1) Reconcile against the live tailer's
+    // OWN running total (`trajectory_summary`, already accumulated above
+    // from every `runtime.rest` event AS IT STREAMED — the same mechanism
+    // `total_turns` below already trusts) rather than trusting
+    // `read_rest_totals`'s file read alone. See `reconcile_rest_totals`'s
+    // doc for why: a metrics.json that raced a crash and landed a zeroed
+    // struct on disk must not undercut a real, live-observed rest total.
+    let rest = reconcile_rest_totals(
+        rest_from_metrics,
+        RestTotals { rest_ms: trajectory_summary.rest_ms, rests: trajectory_summary.rests },
+    );
     // (#2094 finding 8) Best-effort read of the post-clamp cadence this
     // dispatch actually applied — see read_turn_delay_effective_ms's own
-    // doc for the metrics.json-then-derived-average fallback chain.
+    // doc for the metrics.json-then-derived-average fallback chain. Fed
+    // the RECONCILED `rest` above so the derived-average fallback uses
+    // the best available rest data too.
     let turn_delay_effective_ms = read_turn_delay_effective_ms(&host_out, rest);
 
     // 8. Emit dispatch.complete flow record with summary metadata.
@@ -3498,6 +3511,29 @@ fn sum_rest_totals_from_trajectory(out_dir: &Path) -> RestTotals {
     totals
 }
 
+/// (#2094 second round, finding 1) Merge the post-hoc `metrics.json` read
+/// ([`read_rest_totals`]) with the live tailer's own running accumulation
+/// (`TrajectorySummary::rest_ms`/`rests`, kept independently as each
+/// `runtime.rest` event streams in — see the doc at that field), taking
+/// the per-field MAX of the two.
+///
+/// `read_rest_totals` gates its own trajectory fallback on metrics.json
+/// KEY PRESENCE, not value — a `metrics.json` written with `rest_ms: 0`
+/// (an exit-time write that raced a SIGKILL or a hard crash, landing a
+/// zeroed struct on disk moments before the process died) reads as an
+/// authoritative zero and never reaches `sum_rest_totals_from_trajectory`
+/// at all, even though the tailer watched real rests happen live. The
+/// live tailer's total is the second, independent witness this case
+/// needs: max rather than "prefer one or the other" because either source
+/// can legitimately be the fuller one (metrics.json's clean-exit write
+/// can also capture a beat the tailer's last poll missed).
+pub(crate) fn reconcile_rest_totals(from_metrics: RestTotals, from_tailer: RestTotals) -> RestTotals {
+    RestTotals {
+        rest_ms: from_metrics.rest_ms.max(from_tailer.rest_ms),
+        rests: from_metrics.rests.max(from_tailer.rests),
+    }
+}
+
 /// (#2094 finding 8) The POST-CLAMP `turn_delay_ms` cadence this dispatch
 /// actually applied — `resolve_turn_delay_ms`'s output
 /// (`runtime/src/loop_runner.rs`), written by the runtime into
@@ -3512,14 +3548,24 @@ fn sum_rest_totals_from_trajectory(out_dir: &Path) -> RestTotals {
 /// [`read_rest_totals`]). `None` when nothing is knowable at all (no
 /// metrics.json field AND zero rests — could mean turn_delay_ms was never
 /// configured, or the dispatch never reached a second turn).
+///
+/// (#2094 second round, finding 1) A metrics.json field of exactly `0`
+/// must NOT short-circuit the derived-average fallback when `rest.rests
+/// > 0` — same failure shape as `reconcile_rest_totals` guards against: a
+/// clean-exit write that raced a crash can land a zeroed struct on disk
+/// even though the dispatch genuinely rested. Only trust the metrics
+/// field's zero when there were also zero rests to derive an average
+/// from (a single-turn dispatch's honest `0`); otherwise fall through.
 pub fn read_turn_delay_effective_ms(out_dir: &Path, rest: RestTotals) -> Option<u64> {
     let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
     let from_metrics = fs::read_to_string(&metrics_path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|v| v.get("turn_delay_effective_ms").and_then(|n| n.as_u64()));
-    if from_metrics.is_some() {
-        return from_metrics;
+    if let Some(v) = from_metrics {
+        if v != 0 || rest.rests == 0 {
+            return Some(v);
+        }
     }
     if rest.rests > 0 {
         Some(rest.rest_ms / u64::from(rest.rests))

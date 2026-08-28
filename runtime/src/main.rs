@@ -891,9 +891,19 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             // consumers branch on.
             max_turns_reached: false,
             // (#2094) No `LoopOutcome` survives an `Err` return — any rests
-            // taken before the failure aren't recoverable here without
+            // taken before the failure aren't recoverable HERE without
             // threading rest counters through the error path too (the same
-            // reason turns/compactions above are hardcoded 0, not a new gap).
+            // reason turns/compactions above are hardcoded 0, not a new
+            // gap). This IS recoverable on the HOST side, though: every
+            // `runtime.rest` this dispatch took before the crash was
+            // already durably streamed to `trajectory.jsonl` as it
+            // happened (`Trajectory::append_rest`), independent of this
+            // (now-zeroed) `metrics.json` write. The host's
+            // `dispatch_internal.rs` reconciles this zeroed metrics.json
+            // against its own live tailer's accumulation
+            // (`reconcile_rest_totals`, #2094 second round finding 1)
+            // precisely so a dispatch.error terminal still reports the
+            // real totals rather than these hardcoded zeros.
             rest_ms: 0,
             rests: 0,
             turn_delay_effective_ms: 0,
