@@ -89,13 +89,28 @@ fn level_wire(l: Level) -> String {
         .unwrap_or_default()
 }
 
-/// True when `record` satisfies `m`. Records whose `action` starts with
-/// `hook.` NEVER match, regardless of `m` — the loop guard, checked first
-/// and unconditionally. An all-`None` match matches nothing (`m.is_empty()`
+/// (#2093 merge-gate finding 11) True when `action` is the sink's OWN
+/// vocabulary (or close enough to it that letting it through would risk
+/// a loop) — checked case-insensitively, and covering more than the
+/// literal `hook.fired`/`hook.failed` strings: the bare word `hook` (no
+/// dot), and the PLURAL `hooks.` prefix (a record naming the FEATURE,
+/// which an operator's own rule could plausibly emit under, e.g.
+/// `hooks.debug`) are refused too. A case-sensitive, singular-only
+/// `starts_with("hook.")` check would let `HOOK.FIRED` or a bare `hook`
+/// action straight through the guard it exists to be.
+fn is_hook_own_action(action: &str) -> bool {
+    let lower = action.to_ascii_lowercase();
+    lower == "hook" || lower.starts_with("hook.") || lower.starts_with("hooks.")
+}
+
+/// True when `record` satisfies `m`. Records whose `action` is the
+/// sink's own vocabulary (see `is_hook_own_action`) NEVER match,
+/// regardless of `m` — the loop guard, checked first and
+/// unconditionally. An all-`None` match matches nothing (`m.is_empty()`
 /// short-circuits false) — an empty match is a rule an operator forgot to
 /// fill in, not an accidental catch-all.
 pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
-    if record.action.starts_with("hook.") {
+    if is_hook_own_action(&record.action) {
         return false;
     }
     if m.is_empty() {
@@ -1124,8 +1139,9 @@ impl HookSink {
 
 impl FlowSink for HookSink {
     fn write(&self, record: &FlowRecord) -> Result<()> {
-        // Loop guard — never even considered against any rule.
-        if record.action.starts_with("hook.") {
+        // Loop guard — never even considered against any rule. See
+        // `is_hook_own_action`'s doc (#2093 merge-gate finding 11).
+        if is_hook_own_action(&record.action) {
             return Ok(());
         }
         let line = serde_json::to_string(record).context("serializing record for hook outbox")?;
@@ -1509,6 +1525,23 @@ mod tests {
         assert!(!hook_match(&HookMatch { action: Some("*".to_string()), ..Default::default() }, &r));
         let r = record("hook.failed");
         assert!(!hook_match(&HookMatch { action: Some("*".to_string()), ..Default::default() }, &r));
+    }
+
+    /// (#2093 merge-gate finding 11) The loop guard must catch case
+    /// variants and near-miss spellings a naive `starts_with("hook.")`
+    /// lets through: an upper/mixed-case `HOOK.FIRED`, the bare word
+    /// `hook` with no dot at all, and the PLURAL `hooks.` prefix (a
+    /// record naming the feature, not the sink's own vocabulary).
+    #[test]
+    fn hook_actions_never_match_case_insensitively_or_bare_or_plural_prefix() {
+        let vectors = ["HOOK.FIRED", "Hook.Failed", "hook", "hooks.status"];
+        for action in vectors {
+            let r = record(action);
+            assert!(
+                !hook_match(&HookMatch { action: Some("*".to_string()), ..Default::default() }, &r),
+                "must be excluded by the loop guard: {action}"
+            );
+        }
     }
 
     // ─── URL policy ─────────────────────────────────────────────────────
