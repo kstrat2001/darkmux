@@ -271,9 +271,9 @@ def self_test():
           renamed["nested"]["not_a_ts"] == original["nested"]["not_a_ts"])
 
     # ---- the scrub backstop still refuses a planted leak --------------------
-    leaked = {"note": "kain@finhero.asia leaked", "path": "/Users/kain/proj"}
+    leaked = {"note": "nobody@example.com leaked", "path": "/Users/nobody/proj"}
     scrubbed = scrub(leaked)
-    check("scrub() rewrites the host path", "/Users/kain" not in scrubbed["path"])
+    check("scrub() rewrites the host path", "/Users/nobody" not in scrubbed["path"])
     caught = False
     try:
         scan_or_die(json.dumps(leaked), "self-test")
