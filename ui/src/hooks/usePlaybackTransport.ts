@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { T, computeTMax, computeTMin } from "../lib/flow";
 import type { FlowRecord } from "../types/handwritten";
 
@@ -11,12 +11,29 @@ import type { FlowRecord } from "../types/handwritten";
  * `dayRecords` is the loaded day (`null` when nothing is loaded: a live
  * daemon route has nothing to scrub). The playhead resets whenever the day
  * itself changes (its span or size), matching the lens's old `[date]`
- * reset. The tick loop advances `t` by a fixed fraction of the day's span
- * per tick so a day of any length plays out in the same wall-clock time. */
-export const SPEEDS = [0.5, 1, 2, 4] as const;
+ * reset. The tick loop advances `t` by the MEASURED elapsed wall clock
+ * since the previous tick times the speed, so the labeled rate holds on a
+ * day of any length, and holds when the browser throttles the interval
+ * (a background tab runs `setInterval` once a second; a nominal step would
+ * then replay at a tenth of the label). */
+/** Speed is a REAL multiplier of elapsed time: at `3600` one second of
+ * wall clock replays one recorded hour. It used to be a fraction of the
+ * day per tick (`PLAY_SPAN_DIVISOR = 120`: any recording, however long,
+ * played out in 12 seconds), which made the "1×" label a lie — a 13-hour
+ * demo day ran at ~3,900× real time under it (operator: "1× doesn't seem
+ * 1×"). Labeled as recorded time per second (`speedLabel`) because a bare
+ * multiplier is meaningless to a reader: `1h/s` is. Cycle order steps
+ * DOWN from the default (1h/s → 10m/s → 1m/s) and wraps. */
+export const SPEEDS = [3600, 600, 60] as const;
 export type Speed = (typeof SPEEDS)[number];
+export const DEFAULT_SPEED: Speed = 3600;
 export const PLAY_TICK_MS = 100;
-export const PLAY_SPAN_DIVISOR = 120;
+
+export function speedLabel(speed: number): string {
+  if (speed % 3600 === 0) return `${speed / 3600}h/s`;
+  if (speed % 60 === 0) return `${speed / 60}m/s`;
+  return `${speed}s/s`;
+}
 
 export interface PlaybackTransport {
   /** A day is loaded and non-empty: the transport renders and the lenses
@@ -45,22 +62,35 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null): PlaybackT
 
   const [t, setT] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
-  const [speed, setSpeed] = useState<Speed>(1);
+  const [speed, setSpeed] = useState<Speed>(DEFAULT_SPEED);
   useEffect(() => {
     setT(null);
     setPlaying(false);
-    setSpeed(1);
+    setSpeed(DEFAULT_SPEED);
   }, [dayKey]);
 
   const playheadT = t ?? tMax;
 
   // Keyed on the day (`dayKey`), not on the records array: a daemon
   // playback route rebuilds that array per render, and an effect keyed on it
-  // would clear and restart the interval on every render.
+  // would clear and restart the interval on every render. The step is
+  // recorded time per tick, so a day of any length plays at the labeled
+  // rate rather than in a fixed number of ticks.
+  // `lastTick` survives an effect restart (a speed change re-arms the
+  // interval), so the partial tick in flight at that moment is not lost —
+  // it lands on the next tick at the new speed.
+  const lastTick = useRef<number | null>(null);
   useEffect(() => {
-    if (!playing || !dayKey) return;
-    const step = ((tMax - tMin) / PLAY_SPAN_DIVISOR) * speed;
+    if (!playing || !dayKey) {
+      lastTick.current = null;
+      return;
+    }
+    if (lastTick.current === null) lastTick.current = performance.now();
     const id = setInterval(() => {
+      const now = performance.now();
+      const dt = now - (lastTick.current ?? now);
+      lastTick.current = now;
+      const step = dt * speed; // recorded ms this tick
       setT((prev) => Math.min((prev ?? tMax) + step, tMax));
     }, PLAY_TICK_MS);
     return () => clearInterval(id);
