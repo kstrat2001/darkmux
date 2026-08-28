@@ -155,6 +155,30 @@ describe("FleetLens", () => {
     expect(container.querySelector('[data-act="notes"]')).not.toBeInTheDocument();
   });
 
+  it("(#2068) the unattributed tile is ALWAYS in the hero, dimmed at zero, so a dispatch starting or finishing never re-flows the page", async () => {
+    const today = todayUTC();
+    mockFleetFetch({
+      flowToday: [
+        {
+          ts: `${today}T10:00:05.000Z`,
+          machine_uid: "u1",
+          session_id: "s-local",
+          action: "dispatch.start",
+          category: "work",
+          source: "crew",
+          payload: { role: "coder", endpoint: "local" },
+        },
+      ],
+    });
+    renderFleetLens();
+    await waitFor(() => expect(screen.getByText("local tokens")).toBeInTheDocument());
+    const label = screen.getByText("unattributed");
+    const tile = label.closest(".savlead")!;
+    expect(tile.className).toMatch(/\bunknown\b/);
+    expect(tile.className).toMatch(/\bzero\b/);
+    expect(tile.querySelector(".savnum")!.textContent).toBe("0");
+  });
+
   it("honesty about incomplete data: a session with no dispatch bookend renders as 'unattributed', not silently local", async () => {
     const today = todayUTC();
     mockFleetFetch({
@@ -170,8 +194,11 @@ describe("FleetLens", () => {
       ],
     });
     renderFleetLens();
-    await waitFor(() => expect(screen.getByText("unattributed")).toBeInTheDocument());
-    expect(screen.getByText("1,000")).toBeInTheDocument(); // the unattributed figure
+    // (#2068) The label is always mounted now; the FIGURE is what proves the
+    // tokens landed as unattributed rather than local.
+    await waitFor(() => expect(screen.getByText("1,000")).toBeInTheDocument());
+    expect(screen.getByText("1,000").parentElement!.className).toMatch(/\bunknown\b/);
+    expect(screen.getByText("1,000").parentElement!.className).not.toMatch(/\bzero\b/);
     // Local tokens must NOT have absorbed it — it's excluded, not credited.
     const localBlock = screen.getByText("local tokens").previousSibling;
     expect(localBlock?.textContent).toBe("0");

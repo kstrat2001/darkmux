@@ -242,7 +242,10 @@ describe("PlaybackLens — the playback transport (#1869)", () => {
     // the bar reads "done".
     await waitFor(() => expect(screen.getByText("local tokens").previousSibling?.textContent).toBe("600"));
     expect(document.querySelector(".sbar")).toHaveClass("done");
-    expect(screen.queryByText("unattributed")).not.toBeInTheDocument();
+    // (#2068) The unattributed tile is always mounted; at the true max the
+    // session is attributed, so the FIGURE is 0 and the tile reads `zero`.
+    expect(screen.getByText("unattributed").previousSibling?.textContent).toBe("0");
+    expect(screen.getByText("unattributed").parentElement!.className).toMatch(/\bzero\b/);
 
     // Scrub to the midpoint — after the token telemetry, before the
     // session's close edge.

@@ -658,6 +658,12 @@ body {
     flex-basis: auto !important;
     max-height: 28vh;
   }
+  /* (#2068) While the pane follows the newest record its content changes on
+     every event; a content-sized box then moves the whole list under it. Pin
+     the height for that mode only — a hand-picked record is not streaming. */
+  .eventlog__detail.following {
+    height: 28vh;
+  }
   /* A floor in ROWS, not a fraction of the viewport. Roughly ten rows at the
      ~34px a two-line entry occupies — the point is "enough entries to see a
      pattern", which does not scale with screen height the way a `vh` does:
@@ -1915,6 +1921,44 @@ body {
 }
 .savlead.unknown .savnum {
   color: var(--dim);
+}
+/* (#2068) The tile is always mounted (see `FleetLens.tsx`); at zero it reads
+   as a quiet placeholder rather than a figure worth a glance. */
+.savlead.unknown.zero {
+  opacity: 0.45;
+}
+/* (#2068) On a phone the hero's tiles wrap by the WIDTH of their figures: a
+   narrow "0" shared a row with the cloud tile and a five-digit figure took a
+   row of its own, so the hero grew 85px whenever a dispatch went in flight
+   and shrank when it finished — on every event during playback. A fixed
+   grid makes the row count a property of the layout, not of the digits.
+   Placed AFTER the base `.savrow` rule above on purpose: same specificity,
+   so source order is what lets it win. */
+@media (max-width: 768px) {
+  .savrow {
+    display: grid;
+    /* `minmax(0, 1fr)`, not `1fr`: a bare `1fr` track cannot shrink below
+       its content's min-content width, so a nine-digit local figure pushed
+       the second column past the viewport (measured: cloud tile's right
+       edge at 395px in a 320px viewport). */
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: start;
+  }
+  .savlead {
+    min-width: 0;
+  }
+  .savclasses {
+    grid-column: 1 / -1;
+  }
+}
+/* Phones: one tile per row. Two columns cannot hold the fluid figure
+   (`min(48px, 13vw)` was measured against the FULL row width at 320px) and
+   a smaller figure would undercut the number the hero exists to show. The
+   row count is still fixed — four rows, whatever the digits. */
+@media (max-width: 560px) {
+  .savrow {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 .savlbl {
   font: 600 calc(12px * var(--fs-scale))/1 var(--font-mono);
