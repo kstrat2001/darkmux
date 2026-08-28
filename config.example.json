@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.11",
+  "schema_version": "1.13",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -23,7 +23,8 @@
     "check_updates": true,
     "daemon_auth_enabled": false,
     "injected_context_fraction": 0.15,
-    "acp_idle_exit_minutes": 30
+    "acp_idle_exit_minutes": 30,
+    "turn_delay_ms": 0
   },
   "fleet": {
     "mode": "standalone"
