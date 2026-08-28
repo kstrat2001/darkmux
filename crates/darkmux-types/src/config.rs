@@ -75,7 +75,16 @@ use std::path::Path;
 // the PR-flow guide). darkmux holds no credentials of its own; this
 // block only says which verb NAMES the operator has opted into running.
 // Minor bump, same lenient-read reasoning as every other additive block.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.11";
+// 1.12 is RESERVED for a sibling branch's additive `hooks{}` block — not
+// present in this tree yet. This branch (#2094) takes 1.13 directly rather
+// than colliding on 1.12, so the eventual merge is a one-line reconcile
+// (whichever branch lands second just bumps its own number by one) instead
+// of a real conflict over the same version string.
+// 1.13 (#2094): additive `runtime.turn_delay_ms` (a global rest, in
+// milliseconds, the internal runtime sleeps between inference turns on
+// every LOCAL dispatch — GPU thermal/power relief for sustained runs, see
+// that field's own doc). Minor bump, same lenient-read reasoning.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.13";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -270,6 +279,22 @@ pub struct RuntimeBehaviorConfig {
     /// 30 (documented in the issue's session-hygiene addendum: "most swaps
     /// find no process running").
     #[serde(default, skip_serializing_if = "Option::is_none")] pub acp_idle_exit_minutes: Option<u64>,
+    /// (#2094) A global rest, in milliseconds, the internal runtime sleeps
+    /// between inference turns on EVERY local dispatch — not a per-workload
+    /// "duty cycle" (that shape was proposed for the crawler, #1959, and
+    /// rejected by the operator as both too narrow and the wrong grain: heat
+    /// is about sustained load, and the right rest is after each inference
+    /// burst, on every dispatch). Resolved HOST-side via
+    /// `config_access::turn_delay_ms()` and forwarded into the container as
+    /// `-e DARKMUX_TURN_DELAY_MS=<n>` — the #1548 pattern (the runtime crate
+    /// can't depend on `config_access`; the host does the tier resolution
+    /// and always forwards its result). Default `0` (no rest — the pre-
+    /// existing behavior). Applied in `runtime/src/loop_runner.rs` between
+    /// turns, never before the first turn; clamped below the inactivity
+    /// timeout with a loud warning if configured at or above it. Local
+    /// dispatches only — the remote single-shot path and endpoint-staffed
+    /// seats have nothing to rest, so the forwarded value is inert there.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub turn_delay_ms: Option<u64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -583,6 +608,9 @@ impl DarkmuxConfig {
                 daemon_auth_enabled: Some(false),
                 injected_context_fraction: Some(0.15),
                 acp_idle_exit_minutes: Some(30),
+                // (#2094) Visible `0` — the pre-existing no-rest behavior,
+                // discoverable + one edit from a thermal-friendly value.
+                turn_delay_ms: Some(0),
                 extras: Default::default(),
             }),
             fleet: Some(FleetConfig {
@@ -711,6 +739,22 @@ mod tests {
             Some("PROJECT-SHADOW-MUST-NOT-LOAD"),
             "#1323: load_resolved must ignore a project-local .darkmux/config.json"
         );
+    }
+
+    /// (#2094) `turn_delay_ms` is written visible at `0` (no-rest, the
+    /// pre-existing behavior) and round-trips a populated value losslessly.
+    #[test]
+    fn turn_delay_ms_visible_default_and_round_trips() {
+        let cfg = DarkmuxConfig::with_defaults();
+        assert_eq!(cfg.runtime.as_ref().unwrap().turn_delay_ms, Some(0));
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"turn_delay_ms\":0"), "visible in the serialized default: {json}");
+
+        let populated = r#"{ "runtime": { "turn_delay_ms": 3000 } }"#;
+        let cfg: DarkmuxConfig = serde_json::from_str(populated).unwrap();
+        assert_eq!(cfg.runtime.as_ref().unwrap().turn_delay_ms, Some(3000));
+        let back: DarkmuxConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.runtime.unwrap().turn_delay_ms, Some(3000), "lossless round-trip");
     }
 
     /// `with_defaults()` is the full, self-documenting config `init` writes:

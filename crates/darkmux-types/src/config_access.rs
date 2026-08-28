@@ -558,6 +558,18 @@ pub fn feedback_injection() -> bool {
     config().runtime.as_ref().and_then(|r| r.feedback_injection).unwrap_or(true)
 }
 
+/// (#2094) The global inter-turn rest, in milliseconds, the internal
+/// runtime sleeps between inference turns on every LOCAL dispatch. Resolves
+/// `env(DARKMUX_TURN_DELAY_MS) > config.runtime.turn_delay_ms > 0` —
+/// mirrors `inactivity_timeout_seconds`'s wiring exactly. `0` (the default)
+/// means no rest, the pre-existing behavior; the runtime clamps a
+/// configured value at or above the inactivity timeout rather than
+/// honoring it verbatim (see `runtime/src/loop_runner.rs`).
+pub fn turn_delay_ms() -> u64 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.turn_delay_ms);
+    pick_parsed("DARKMUX_TURN_DELAY_MS", cfg, Some(0)).unwrap()
+}
+
 // ── Mission board (#1230 Packet 5) ──
 /// How many days an Active mission may sit with zero `Complete` phases
 /// before `darkmux mission status`'s drift detector flags it as stale.
@@ -954,6 +966,29 @@ mod tests {
         // An unparseable env value falls through (here, to the default).
         unsafe { std::env::set_var(k, "not-a-number") };
         assert_eq!(model_load_timeout_seconds(), 600);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── turn_delay_ms (#2094): env > config > 0 default, mirroring
+    //    model_load_timeout_seconds' resolution exactly ──
+    #[serial_test::serial]
+    #[test]
+    fn turn_delay_ms_env_overrides_then_default() {
+        let k = "DARKMUX_TURN_DELAY_MS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        // No env + the empty test config (#811) → the built-in 0 default (no rest).
+        assert_eq!(turn_delay_ms(), 0);
+        unsafe { std::env::set_var(k, "3000") };
+        assert_eq!(turn_delay_ms(), 3000, "env wins live");
+        // An unparseable env value falls through (here, to the default).
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(turn_delay_ms(), 0);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),
