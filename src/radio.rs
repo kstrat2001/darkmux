@@ -497,6 +497,7 @@ fn extract_fenced_json_block(raw: &str) -> Option<String> {
 /// operator-tunable.
 pub fn dispatch_router_call(message: &str) -> Result<String> {
     let opts = crate::crew::dispatch::DispatchOpts {
+        workspace_read_only: false,
         role_id: "radio-router".to_string(),
         message: message.to_string(),
         session_id: None,

@@ -247,6 +247,7 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
     let compile_start_instant = std::time::Instant::now();
 
     let opts = crate::crew::dispatch::DispatchOpts {
+        workspace_read_only: false,
         role_id: "mission-compiler".to_string(),
         message,
         session_id: None,

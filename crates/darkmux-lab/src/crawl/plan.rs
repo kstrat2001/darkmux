@@ -136,7 +136,7 @@ impl Unit {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct PlanSource {
     pub id: String,
     pub sha: String,
@@ -148,7 +148,7 @@ pub struct PlanSource {
     pub files_walked: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct SkippedEntry {
     pub reason: String,
     pub file: String,
@@ -159,7 +159,7 @@ pub struct SkippedEntry {
 /// Every manifest edge this plan attempted, whether or not it produced a
 /// unit — the ledger that shows an edge WAS checked even when its range
 /// admits the library version (or the check was inconclusive).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct EdgeLedgerEntry {
     pub consumer: String,
     pub library: String,
@@ -175,7 +175,7 @@ pub struct EdgeLedgerEntry {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, Default)]
 pub struct RuleTotal {
     pub units: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -194,7 +194,7 @@ pub struct RuleTotal {
     pub est_tokens: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, Default)]
 pub struct Totals {
     pub units: usize,
     pub est_tokens: usize,
@@ -203,7 +203,14 @@ pub struct Totals {
     pub edges: Vec<EdgeLedgerEntry>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `Deserialize` added in #1959 packet 2 (this struct and every type it
+/// contains — `PlanSource`/`SkippedEntry`/`EdgeLedgerEntry`/`RuleTotal`/
+/// `Totals`) for `darkmux mission launch crawl --param plan=<plan.json>`:
+/// the launcher loads a plan a prior `darkmux crawl plan` run already
+/// wrote, rather than re-planning, and verifies each source's `sha` still
+/// matches the resolved tree before dispatching anything. No wire-format
+/// change — every field this crate already writes reads back unchanged.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Plan {
     pub schema_version: String,
     pub corpus: String,

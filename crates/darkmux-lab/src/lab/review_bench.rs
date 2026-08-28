@@ -751,6 +751,7 @@ fn dispatch_case(
             .to_string(),
     );
     let d = DispatchOpts {
+        workspace_read_only: false,
         role_id: role_id.to_string(),
         message: prompt.to_string(),
         session_id: Some(session_id),

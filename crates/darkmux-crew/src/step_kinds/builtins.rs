@@ -384,6 +384,7 @@ impl StepKind for DispatchInternalStepKind {
             .unwrap_or(false);
 
         let opts = DispatchOpts {
+            workspace_read_only: false,
             role_id,
             message,
             session_id: Some(session_id),

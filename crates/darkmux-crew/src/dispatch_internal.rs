@@ -27,6 +27,15 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// The host watchdog's structured-timeout marker prefix (#363), prepended
+/// to `stderr` when the inactivity timer fires. A public constant (rather
+/// than a literal duplicated at each detection call site) so any other
+/// consumer of a `DispatchResult` — `src/crawl_launch.rs`'s
+/// `interpret_dispatch_result` is the first (#1959 merge-gate finding 9) —
+/// can detect the same event without re-deriving or hand-copying this
+/// string.
+pub const INACTIVITY_TIMEOUT_MARKER: &str = "darkmux dispatch: INACTIVITY TIMEOUT";
+
 /// Local Docker image tag for the internal runtime, built from
 /// `runtime/Dockerfile` by a source checkout (`docker build -t darkmux-runtime
 /// runtime/`). Preferred when present — it's the dev workflow.
@@ -133,9 +142,13 @@ fn ensure_darkmux_image_present() -> Result<String> {
 /// Extracted from the docker-spawn site so the mount-translation rule is
 /// unit-testable without spawning a container (same rationale as
 /// `apply_compaction_flags`).
-pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host_out: &Path) {
+/// `read_only` appends `:ro` to the workspace bind (#1959 packet 2) — the
+/// out-dir mount is NEVER read-only regardless of `read_only`, since the
+/// runtime writes its own bookkeeping (trajectory, findings) there.
+pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host_out: &Path, read_only: bool) {
     args.push("-v".to_string());
-    args.push(format!("{}:/workspace", workspace.display()));
+    let suffix = if read_only { ":ro" } else { "" };
+    args.push(format!("{}:/workspace{suffix}", workspace.display()));
     args.push("-v".to_string());
     args.push(format!("{}:/darkmux-out", host_out.display()));
 }
@@ -478,6 +491,11 @@ pub struct DockerRunConfig {
     /// (see `runtime/src/main.rs`'s client construction). Carries no secret
     /// material — safe on argv/`ps`, same as `--model`.
     pub base_url_override: Option<String>,
+    /// (#1959 packet 2) Mount `/workspace` `:ro` instead of read-write —
+    /// see `DispatchOpts::workspace_read_only`'s doc for why. `false`
+    /// preserves the existing read-write mount for every caller that
+    /// doesn't set it.
+    pub workspace_read_only: bool,
 }
 
 /// (#842) Build the complete `docker` command from a prepared config: the
@@ -514,7 +532,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     }
 
     // Workspace + out-dir volume mounts
-    apply_volume_mounts(&mut args, &config.workspace, &config.host_out);
+    apply_volume_mounts(&mut args, &config.workspace, &config.host_out, config.workspace_read_only);
 
     // Shared toolchain cache mount (always applied). The host dir is
     // resolved + created at the call site (see DockerRunConfig.cache_dir);
@@ -2615,6 +2633,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .map(remote_chat_url),
         remote_needs_auth,
         base_url_override: opts.model_base_url_override.clone(),
+        workspace_read_only: opts.workspace_read_only,
     };
 
     // (#907) Validate the image ref before it reaches docker as a positional
@@ -2914,7 +2933,7 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     // diagnostic detail about why.
     if timeout_fired.load(Ordering::SeqCst) {
         stderr = format!(
-            "darkmux dispatch: INACTIVITY TIMEOUT — no proof-of-work signal in {inactivity_secs}s — \
+            "{INACTIVITY_TIMEOUT_MARKER} — no proof-of-work signal in {inactivity_secs}s — \
              container `{container_name}` was killed by the watchdog. The inactivity timer \
              resets on each successful tool call (read / bash / edit / write) and on each \
              compaction event. Genuine thinking-mode hangs and total stalls trigger this; \

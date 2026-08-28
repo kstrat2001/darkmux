@@ -65,6 +65,11 @@ mod mission_status;
 mod run_list;
 mod mission_config_cli;
 mod coder_phase;
+// `darkmux mission launch crawl` (#1959 packet 2) — the crawl launcher,
+// a dedicated launcher alongside mission_launch_review for the same
+// reason: it needs execution shape the generic mission_config::interpret
+// + scheduler path has no seam for. See its own module doc.
+mod crawl_launch;
 mod mission_launch;
 mod mission_launch_review;
 mod notebook;
@@ -1387,6 +1392,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         }
     };
     let opts = crew::dispatch::DispatchOpts {
+        workspace_read_only: false,
         role_id: role,
         message,
         session_id,

@@ -2586,7 +2586,12 @@ mod tests {
         //           `ok: true`. A defect correction — the field always
         //           documented itself as tool-success — but a boundary for
         //           any series aggregating `ok` across it. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.22.0");
+        //   1.23.0: RESERVED for `hook.*` (#2093), landing on a sibling
+        //           branch — see schema.rs's version history for the merge
+        //           note.
+        //   1.24.0: new `crawl.*` action family for `darkmux mission
+        //           launch crawl` (#1959 packet 2). See schema.rs.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.24.0");
     }
 
     #[test]

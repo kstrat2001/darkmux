@@ -1013,6 +1013,7 @@
             &mut args,
             Path::new("/host/workspace"),
             Path::new("/host/out"),
+            false,
         );
         assert_eq!(
             args,
@@ -1031,6 +1032,33 @@
                 .iter()
                 .any(|a| a.ends_with(":/workspace") && a.contains("/host/out")),
             "out-dir must not be mounted at /workspace"
+        );
+    }
+
+    /// (#1959 packet 2) `read_only=true` appends `:ro` to the WORKSPACE
+    /// bind only — the out-dir mount stays read-write regardless, since the
+    /// runtime always writes its own bookkeeping (trajectory, findings)
+    /// there. The crawl launcher sets `DispatchOpts::workspace_read_only`
+    /// so a role holding only `read`/`exec`/`report_finding` can't write
+    /// into the corpus tree even via a shell escape.
+    #[test]
+    fn apply_volume_mounts_appends_ro_to_workspace_bind_when_read_only() {
+        let mut args: Vec<String> = Vec::new();
+        apply_volume_mounts(
+            &mut args,
+            Path::new("/host/workspace"),
+            Path::new("/host/out"),
+            true,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-v",
+                "/host/workspace:/workspace:ro",
+                "-v",
+                "/host/out:/darkmux-out",
+            ],
+            "workspace bind gains :ro; out-dir bind is unaffected"
         );
     }
 
@@ -1122,6 +1150,7 @@
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
+            workspace_read_only: false,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -1282,6 +1311,7 @@
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
+            workspace_read_only: false,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -1374,6 +1404,7 @@
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
+            workspace_read_only: false,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -1420,7 +1451,23 @@
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
+            workspace_read_only: false,
         }
+    }
+
+    /// (#1959 packet 2) The full-argv wiring: `workspace_read_only: true`
+    /// on `DockerRunConfig` must reach the actual `docker run` argv as
+    /// `-v /tmp/ws:/workspace:ro`, not just be asserted at the
+    /// `apply_volume_mounts` unit level above.
+    #[test]
+    fn build_docker_run_argv_appends_ro_to_workspace_mount_when_read_only() {
+        let mut config = base_argv_config();
+        config.workspace_read_only = true;
+        let argv = build_docker_run_argv(&config);
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-v" && w[1] == "/tmp/ws:/workspace:ro"),
+            "expected -v /tmp/ws:/workspace:ro in argv: {argv:?}"
+        );
     }
 
     // ─── #1187: agentic-remote argv emission ─────────────────────
@@ -1655,6 +1702,7 @@
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
+            workspace_read_only: false,
         };
         let argv = build_docker_run_argv(&config);
         let cmd = docker_command_from_argv(&argv);

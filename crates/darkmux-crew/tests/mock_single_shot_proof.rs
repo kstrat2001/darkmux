@@ -98,6 +98,7 @@ fn container_free_single_shot_dispatch_round_trips_through_a_real_http_mock_serv
 
     let session_id = format!("mock-single-shot-proof-{}", std::process::id());
     let opts = DispatchOpts {
+        workspace_read_only: false,
         // `radio-router` is the packet's own real caller (#1698) — a
         // BUILT-IN role (`crates/darkmux-crew/src/loader.rs`'s
         // `BUILTIN_ROLES`/`BUILTIN_ROLE_PROMPTS`), so no on-disk role

@@ -8,7 +8,7 @@
   "exclude": ["**/node_modules/**", "**/dist/**", "**/build/**", "**/*.d.ts", "**/*.test.*", "**/*.spec.*"],
   "window": 20,
   "match": "The consumer's declared range for the library EXCLUDES the library version being examined (a lower major, or a caret/tilde range that cannot reach it), AND a symbol the consumer imports from that library has, in the library version being examined, a different signature, a different return shape, a changed default, or no longer exists. Report each consumer import line of such a symbol.",
-  "no_match": "The range already admits the library's current version. The imported symbol is unchanged between the pinned version and the library version being examined, as far as the library files provided with this unit show. A comment at the consumer says the pin is deliberate and why.",
+  "no_match": "The range already admits the library's current version. The imported symbol is unchanged between the pinned version and the library version being examined, as far as the library files listed above show. A comment at the consumer says the pin is deliberate and why.",
   "evidence": "The consumer's import line, copied verbatim. `line` is where it appears.",
   "why_hint": "Name the symbol, the consumer's pinned range, the library version being examined, and what changed; quote the line from the provided library files that shows the change. A version gap alone, with no changed symbol, is context, not a finding."
 }

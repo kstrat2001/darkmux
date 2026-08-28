@@ -440,6 +440,7 @@ mod tests {
 
     fn test_opts(role: &str, message: &str) -> DispatchOpts {
         DispatchOpts {
+            workspace_read_only: false,
             role_id: role.to_string(),
             message: message.to_string(),
             session_id: None,
