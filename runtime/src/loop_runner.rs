@@ -335,20 +335,30 @@ impl TurnSleeper for RealSleeper {
 /// honored verbatim — rather than silently letting the operator's own
 /// pacing knob become the thing that kills their dispatch.
 ///
+/// (#2094 second round, finding 4) The band was widened from "clamp at
+/// the full timeout" to "clamp at HALF the timeout"
+/// (`configured_ms * 2 >= budget_ms`) — a rest at, say, 60% of the
+/// timeout was previously honored verbatim, but a real turn's own
+/// latency plus the trajectory tailer's 250ms poll overhead sit on top of
+/// it, so an unclamped rest could still leave only a sliver of headroom
+/// before the deadline. Clamping at half guarantees at least half the
+/// budget remains for everything else.
+///
 /// `budget_ms == 0` is a degenerate operator setting (an effectively
 /// disabled watchdog) — never clamp against it: half of zero is zero,
 /// which would silently erase an intentional rest rather than protect
 /// anything. Pure + testable.
 fn resolve_turn_delay_ms(configured_ms: u64, budget_secs: u64) -> (u64, Option<String>) {
     let budget_ms = budget_secs.saturating_mul(1000);
-    if budget_ms == 0 || configured_ms < budget_ms {
+    if budget_ms == 0 || configured_ms.saturating_mul(2) < budget_ms {
         return (configured_ms, None);
     }
     let clamped = budget_ms / 2;
     let warning = format!(
-        "darkmux-runtime: ⚠ turn_delay_ms={configured_ms} is at or above the inactivity \
+        "darkmux-runtime: ⚠ turn_delay_ms={configured_ms} is at or above half the inactivity \
          timeout ({budget_ms}ms) — clamping to {clamped}ms (half the timeout) so the \
-         configured rest can never itself trip the watchdog. (#2094)"
+         configured rest, plus the tailer's own polling overhead, can never approach the \
+         watchdog's deadline. (#2094)"
     );
     (clamped, Some(warning))
 }
@@ -2994,6 +3004,38 @@ mod tests {
         // silently erase an intentional rest (half of zero is zero).
         let (ms, warning) = resolve_turn_delay_ms(5_000, 0);
         assert_eq!(ms, 5_000);
+        assert!(warning.is_none());
+    }
+
+    // ─── #2094 second round, finding 4: widen the clamp band to half ─────
+
+    #[test]
+    fn resolve_turn_delay_ms_at_half_the_timeout_now_clamps_though_well_below_the_full_timeout() {
+        // 10s budget = 10000ms. A configured 6000ms is well BELOW the full
+        // timeout (the old band's threshold) but AT/ABOVE half of it — the
+        // widened band clamps it, because 6000ms plus a real turn's
+        // latency plus the tailer's own 250ms poll overhead can still
+        // approach a 10000ms deadline in practice.
+        let (ms, warning) = resolve_turn_delay_ms(6_000, 10);
+        assert_eq!(ms, 5_000, "clamped to half the timeout");
+        let w = warning.expect("must warn when clamping");
+        assert!(w.contains("6000"), "names the configured value: {w}");
+        assert!(w.contains("5000"), "names the clamped value: {w}");
+    }
+
+    #[test]
+    fn resolve_turn_delay_ms_exactly_at_half_the_timeout_clamps() {
+        // Boundary: configured_ms * 2 == budget_ms clamps (>=, not >).
+        let (ms, warning) = resolve_turn_delay_ms(5_000, 10);
+        assert_eq!(ms, 5_000);
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn resolve_turn_delay_ms_just_below_half_the_timeout_passes_through_unclamped() {
+        // One ms under the boundary must NOT clamp.
+        let (ms, warning) = resolve_turn_delay_ms(4_999, 10);
+        assert_eq!(ms, 4_999);
         assert!(warning.is_none());
     }
 

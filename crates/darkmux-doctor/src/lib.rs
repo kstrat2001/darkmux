@@ -1414,11 +1414,15 @@ fn check_review_judge_exhaustion_policy() -> Check {
 /// the inactivity timeout.
 ///
 /// Warns (advice, never a gate — operator sovereignty #44) when the
-/// configured value is AT OR ABOVE the inactivity timeout: the runtime
-/// clamps it to half the timeout rather than honoring it verbatim (see
-/// `runtime/src/loop_runner.rs`), so a value the operator actually meant
-/// would otherwise silently become a different number with nothing here
-/// to say so before the first dispatch discovers it via a stderr line.
+/// configured value is AT OR ABOVE HALF the inactivity timeout (#2094
+/// second round, finding 4 — the runtime's own clamp band, widened from
+/// "at the full timeout" so a rest plus a real turn's latency plus the
+/// tailer's polling overhead can never approach the deadline): the
+/// runtime clamps it to half the timeout rather than honoring it verbatim
+/// (see `runtime/src/loop_runner.rs`), so a value the operator actually
+/// meant would otherwise silently become a different number with nothing
+/// here to say so before the first dispatch discovers it via a stderr
+/// line.
 ///
 /// No laptop-class hardware signal exists in `darkmux-hardware` today (only
 /// `Platform` + `RamTier`, no chassis/battery detection) — the issue's
@@ -1479,13 +1483,13 @@ fn check_turn_delay() -> Check {
             hint: None,
         };
     }
-    if ms >= timeout_ms {
+    if ms.saturating_mul(2) >= timeout_ms {
         let clamped = timeout_ms / 2;
         return Check {
             name: name.into(),
             status: Status::Warn,
             message: format!(
-                "{ms}ms ({provenance}) is at or above the inactivity timeout ({timeout_ms}ms) — \
+                "{ms}ms ({provenance}) is at or above half the inactivity timeout ({timeout_ms}ms) — \
                  the runtime clamps it to {clamped}ms (half the timeout) rather than honoring it verbatim"
             ),
             hint: Some(
@@ -4850,6 +4854,39 @@ mod tests {
         let check = check_turn_delay();
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(check.message.contains("10000ms"), "{}", check.message);
+        assert!(check.message.contains("5000ms"), "names the clamped half: {}", check.message);
+        assert!(check.hint.is_some());
+        unsafe {
+            match prev_d {
+                Some(v) => std::env::set_var("DARKMUX_TURN_DELAY_MS", v),
+                None => std::env::remove_var("DARKMUX_TURN_DELAY_MS"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
+    /// (#2094 second round, finding 4) The runtime's clamp band widened
+    /// from "at or above the full timeout" to "at or above HALF the
+    /// timeout" — doctor's own gate must track the same band, or it tells
+    /// the operator a value is fine when the runtime is actually about to
+    /// clamp it.
+    #[serial_test::serial]
+    #[test]
+    fn check_turn_delay_at_half_the_timeout_warns_though_well_below_the_full_timeout() {
+        let prev_d = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
+        let prev_t = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe {
+            // 10s timeout (10000ms); a 6000ms delay is well BELOW the full
+            // timeout but AT/ABOVE half of it — the widened band warns.
+            std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "10");
+            std::env::set_var("DARKMUX_TURN_DELAY_MS", "6000");
+        }
+        let check = check_turn_delay();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("6000ms"), "{}", check.message);
         assert!(check.message.contains("5000ms"), "names the clamped half: {}", check.message);
         assert!(check.hint.is_some());
         unsafe {
