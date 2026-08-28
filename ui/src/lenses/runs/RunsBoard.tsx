@@ -229,8 +229,13 @@ export function RunsBoard({
     const dir = labRunDir;
     suppressResyncRef.current = true;
     setLabRunDir(null);
+    // (#2065) Branched on the build, not on `missionGraphReachable()`: that
+    // predicate now also answers true on a static build that ships mission
+    // graphs, while lab-run detail (`/lab/run/detail`) still needs a daemon.
+    // Reusing it here would turn the honest daemon-less notice into a false
+    // "it may have been removed" claim about the operator's data.
     setRowClickNotice(
-      !missionGraphReachable()
+      isStaticBuild()
         ? "run detail needs a running daemon — this static build lists runs without their per-run pipeline and event feed."
         : `couldn't open run "${dir}" — it may have been removed, or the link is stale. Showing the run list.`,
     );

@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
-import { fetchStaticFlowRecords, flowToRenderModel, normalizeRecords } from "../../lib/flow";
+import { fetchStaticFlowRecords, flowToRenderModel } from "../../lib/flow";
 import { useNowMs } from "../../lib/clock";
 import { isStaticBuild, staticFlowSrc } from "../../lib/staticSource";
 import { injectedPlaybackDate } from "../../lib/injectedMeta";
@@ -67,7 +67,12 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
   // dispatch-row tap 404'd here. Read the committed file instead (the same
   // `queryKeys.staticFlowSrc` slot the playback lens and `useRouteRecords`
   // fill, so this is cache reuse) and slice this session out of it, shaped
-  // exactly like the daemon's response so nothing below has to know.
+  // like the daemon's response so nothing below has to know. RAW records,
+  // not `normalizeRecords`: `/flow-session` hands back raw records too, and
+  // `flowToRenderModel` synthesizes the per-session runtime telemetry row
+  // itself — normalizing here would add a second copy the daemon path never
+  // has. The file's schema-header line carries no `session_id`, so the
+  // slice drops it on its own.
   const flowSrc = staticFlowSrc();
   const query = useQuery({
     queryKey: queryKeys.flowSession(sessionId),
@@ -82,7 +87,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
   });
   const staticSlice: FlowRecordsResponse | null = useMemo(() => {
     if (flowSrc === null || staticQuery.data === undefined) return null;
-    const recs = normalizeRecords(staticQuery.data).filter((r) => r.session_id === sessionId);
+    const recs = staticQuery.data.filter((r) => r.session_id === sessionId);
     return { records: recs, count: recs.length, truncated: false, generated_at_ms: 0 };
   }, [flowSrc, staticQuery.data, sessionId]);
   const session: FetchResult<FlowRecordsResponse> | undefined =
