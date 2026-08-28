@@ -3,8 +3,9 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
-import { fetchStaticFlowRecords, flowToRenderModel } from "../../lib/flow";
+import { T, fetchStaticFlowRecords, flowToRenderModel } from "../../lib/flow";
 import { useNowMs } from "../../lib/clock";
+import { clkhm } from "../../lib/format";
 import { isStaticBuild, staticFlowSrc } from "../../lib/staticSource";
 import { injectedPlaybackDate } from "../../lib/injectedMeta";
 
@@ -41,7 +42,7 @@ import type { FlowRecordsResponse } from "../../types/handwritten";
  * exercises the populated branch — the empty branch is honest but
  * unexercised by this corpus).
  */
-export function SessionReplay({ sessionId }: { sessionId: string }) {
+export function SessionReplay({ sessionId, playhead = null }: { sessionId: string; playhead?: number | null }) {
   // (#1972) POLLS while the session is live. Without this the page fetched
   // its records ONCE, which is the defect a live dogfood run exposed: the
   // wall clock advanced (it reads the browser clock), while turns, tokens,
@@ -106,7 +107,13 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
   // a fraction of a millisecond, and it is what makes the elapsed counter
   // advance during a STALL rather than freezing at the newest record's
   // timestamp.
-  const records = session?.ok ? session.data.records : null;
+  // (#2071) The shell's transport hands this lens the playhead it renders
+  // at: the run's turns, tokens and status derive from the records up to
+  // that instant, so scrubbing a run detail replays the run rather than
+  // narrowing only the event log beside a finished stage. `null` (a live
+  // daemon route, no transport) renders the whole slice as before.
+  const all = session?.ok ? session.data.records : null;
+  const records = all && playhead !== null ? all.filter((r) => !(T(r.ts) > playhead)) : all;
   const data = records ? flowToRenderModel(records) : [];
   const base = records && records.length ? runRegions(data, sessionId) : null;
   // Gated on PLAYBACK too, not just on the run's own liveness. A recorded
@@ -180,7 +187,22 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
 
 
   // `base` is non-null here: the `count === 0` guard above already returned.
-  const view = ticking ? runRegions(data, sessionId, nowMs) : base!;
+  // (#2071) The playhead can sit BEFORE this run's first record (rewind on
+  // a day the run started partway into): the cut slice is empty, `base` is
+  // null, and the header below would dereference it — measured as "the
+  // dispatch lens stopped rendering" through the error boundary. Say what
+  // is true instead: at this instant the run has not started.
+  if (!base) {
+    return (
+      <div data-state="before-start" role="status" aria-label={`Session ${sessionId} not started yet`}>
+        <div className="stagehdr">session replay</div>
+        <div className="none">
+          {sessionId} has not started yet at this point of the day{playhead !== null ? ` (${clkhm(playhead)})` : ""}. Scrub forward to see it.
+        </div>
+      </div>
+    );
+  }
+  const view = ticking ? runRegions(data, sessionId, nowMs) : base;
 
   return (
     <div data-state="data" className="session-run">

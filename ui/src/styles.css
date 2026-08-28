@@ -73,15 +73,20 @@ html,
 body {
   margin: 0;
   padding: 0;
-  /* No horizontal document scroll at any width, including 390px phone
-     viewports — the overnight runbook's render-sanity contract.
-     (#2071) `clip`, not `hidden`: any `overflow` other than `visible` on
-     `body` makes it a scroll container, and `position: sticky` descendants
-     then stick to a box that never scrolls — measured: the sticky block's
-     top went to -1360px after a 1500px scroll. `clip` clips without
-     creating a scroll container, so the block sticks to the viewport. */
-  overflow-x: clip;
   max-width: 100%;
+}
+/* No horizontal document scroll at any width, including 390px phone
+   viewports — the overnight runbook's render-sanity contract. On `html`
+   ONLY (#2071): `overflow-x: hidden` on `body` too made body a scroll
+   container, and `position: sticky` descendants then stuck to a box that
+   never scrolls (measured: the sticky block's top at -1360px after a 1500px
+   scroll). With body left `visible`, the block sticks to the viewport AND
+   `document.body.scrollWidth` keeps reporting overflowing content, which
+   is what every "no horizontal scroll" guard in tests/parity reads (they
+   moved off `documentElement.scrollWidth` precisely because the root clamps
+   it). `clip` on body would have kept sticky but clamped that too. */
+html {
+  overflow-x: hidden;
 }
 
 body {
@@ -759,11 +764,11 @@ body {
   .scrub button::after {
     content: "";
     position: absolute;
-    left: 0;
-    right: 0;
+    left: 50%;
     top: 50%;
+    width: max(100%, 44px);
     height: 44px;
-    transform: translateY(-50%);
+    transform: translate(-50%, -50%);
   }
   .eventlog {
     width: 100%;

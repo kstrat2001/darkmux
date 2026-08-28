@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, fireEvent, cleanup } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
 
@@ -852,6 +852,56 @@ describe("App", () => {
       await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(3)); // s1's three, never s2's
       fireEvent.change(screen.getByRole("slider"), { target: { value: "0" } });
       await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1));
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it("(#2071) on a static dispatch route the run detail itself replays at the playhead: scrubbed to the start it is RUNNING", async () => {
+    const meta = mockStaticDay();
+    window.location.hash = "#dispatch=s1";
+    try {
+      renderApp();
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(3));
+      const pillAtEnd = document.querySelector(".session-run__header .pill")!.textContent;
+      expect(pillAtEnd).not.toMatch(/running/i);
+      fireEvent.change(screen.getByRole("slider"), { target: { value: "0" } });
+      await waitFor(() => expect(document.querySelector(".session-run__header .pill")!.textContent).toMatch(/running/i));
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it("(#2071) the mission route shows no transport — nothing there answers it", async () => {
+    const meta = mockStaticDay();
+    window.location.hash = "#lens=runs";
+    try {
+      renderApp();
+      // First prove the day is loaded: the transport is up on the runs route.
+      await screen.findByRole("group", { name: "playback transport" });
+      // Then the route gate, on the same loaded day: switching to a mission
+      // takes the transport down (a vacuous "never appeared" would pass
+      // before the day loaded, which is why the order matters).
+      await act(async () => {
+        window.location.hash = "#mission=m1";
+        window.dispatchEvent(new HashChangeEvent("hashchange"));
+      });
+      await waitFor(() => expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument());
+      expect(document.querySelector(".app-shell__sticky .app-shell__navtabs")).toBeTruthy();
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it("(#2071) a dispatch route scrubbed to BEFORE its run's first record says so, instead of crashing the lens", async () => {
+    const meta = mockStaticDay();
+    window.location.hash = "#dispatch=s2"; // s2 starts at 00:45, the day at 00:00
+    try {
+      renderApp();
+      await waitFor(() => expect(document.querySelector(".session-run__header .pill")).toBeTruthy());
+      fireEvent.change(screen.getByRole("slider"), { target: { value: "0" } });
+      await waitFor(() => expect(screen.getByRole("status", { name: /not started yet/i })).toBeInTheDocument());
+      expect(document.body.textContent).not.toMatch(/stopped rendering/i);
     } finally {
       meta.remove();
     }

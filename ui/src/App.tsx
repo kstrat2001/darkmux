@@ -160,6 +160,10 @@ export function App() {
   const staticDay = useMemo(() => (staticDayQuery.data ? normalizeRecords(staticDayQuery.data) : null), [staticDayQuery.data]);
   const dayRecords = staticSrc !== null ? staticDay : route.kind === "playback" && !routeRecords.loading ? routeRecords.records : null;
   const transport = usePlaybackTransport(dayRecords);
+  // (#2071 review) Show the transport only where something on screen
+  // answers it. The mission lens takes no playhead and mounts its own log
+  // (`showsEventLog` excludes it), so play/pause there would move nothing.
+  const transportShown = transport.active && route.kind !== "mission";
   const eventLogRecords = useMemo(() => {
     if (!transport.active) return routeRecords.records;
     // A static build's runs/machine/console routes have no slice of their
@@ -168,7 +172,9 @@ export function App() {
     // routes keep their own slice, scoped the same way.
     const own = route.kind === "playback" || route.kind === "dispatch" || staticSrc === null;
     const base = own ? routeRecords.records : (dayRecords ?? []);
-    return base.filter((r) => T(r.ts) <= transport.t);
+    // `!(ts > t)`, not `ts <= t`: a record with an unparseable `ts` stays
+    // in the log, as it did before the transport scoped every route.
+    return base.filter((r) => !(T(r.ts) > transport.t));
   }, [transport.active, transport.t, route.kind, routeRecords.records, staticSrc, dayRecords]);
   // (#2071) The sticky block's measured height feeds `--chrome-h`, the
   // offset the event log column sticks under on desktop. It used to be a
@@ -322,7 +328,7 @@ export function App() {
           which is what stopped the 32px tab-strip jump between routes. */}
       <div className="app-shell__sticky" ref={stickyRef}>
         <NavChrome route={route} />
-        {transport.active ? (
+        {transportShown ? (
           <Scrubber
             t={transport.t}
             tMin={transport.tMin}
@@ -567,7 +573,7 @@ function renderRoute(route: Route, playhead: number | null) {
       // Packet 4: a real fetch to /flow-session/<id> — see SessionReplay's
       // own doc for why the RENDER (not the fetch) is still a not-ported
       // notice.
-      return <SessionReplay sessionId={route.dispatchId} />;
+      return <SessionReplay sessionId={route.dispatchId} playhead={playhead} />;
     case "mission":
       // #1868: the mission-graph lens, folded in-place — see
       // `MissionGraphLens`'s own doc for the data sources and why this

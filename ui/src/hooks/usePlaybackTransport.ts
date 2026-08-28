@@ -54,14 +54,17 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null): PlaybackT
 
   const playheadT = t ?? tMax;
 
+  // Keyed on the day (`dayKey`), not on the records array: a daemon
+  // playback route rebuilds that array per render, and an effect keyed on it
+  // would clear and restart the interval on every render.
   useEffect(() => {
-    if (!playing || !records) return;
+    if (!playing || !dayKey) return;
     const step = ((tMax - tMin) / PLAY_SPAN_DIVISOR) * speed;
     const id = setInterval(() => {
       setT((prev) => Math.min((prev ?? tMax) + step, tMax));
     }, PLAY_TICK_MS);
     return () => clearInterval(id);
-  }, [playing, records, tMin, tMax, speed]);
+  }, [playing, dayKey, tMin, tMax, speed]);
   useEffect(() => {
     if (playing && playheadT >= tMax) setPlaying(false);
   }, [playing, playheadT, tMax]);
@@ -69,16 +72,19 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null): PlaybackT
   const scrub = useCallback((next: number) => setT(next), []);
   const rewind = useCallback(() => setT(tMin), [tMin]);
   const togglePlay = useCallback(() => {
-    setPlaying((was) => {
-      if (was) return false;
-      // Pressing play at the end starts over, same as the lens did.
-      setT((prev) => ((prev ?? tMax) >= tMax ? tMin : prev));
-      return true;
-    });
-  }, [tMin, tMax]);
+    if (playing) {
+      setPlaying(false);
+      return;
+    }
+    // Pressing play at the end starts over, same as the lens did. Two plain
+    // setters, not a setter inside another's updater (updaters must stay
+    // pure; React may invoke them twice).
+    if (playheadT >= tMax) setT(tMin);
+    setPlaying(true);
+  }, [playing, playheadT, tMin, tMax]);
   const cycleSpeed = useCallback(() => setSpeed((s) => SPEEDS[(SPEEDS.indexOf(s) + 1) % SPEEDS.length]), []);
 
-  const visibleCount = useMemo(() => (records ? records.filter((r) => T(r.ts) <= playheadT).length : 0), [records, playheadT]);
+  const visibleCount = useMemo(() => (records ? records.filter((r) => !(T(r.ts) > playheadT)).length : 0), [records, playheadT]);
 
   return {
     active: records !== null,
