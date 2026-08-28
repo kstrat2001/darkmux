@@ -829,6 +829,40 @@ describe("App", () => {
     await screen.findByRole("group", { name: "playback transport" });
   });
 
+  it("a run that crossed the loaded day's end renders whole at rest AND after a play-through; only a moved playhead cuts it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const session = [
+      { ts: "2026-08-07T23:30:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-mid" },
+      { ts: "2026-08-07T23:50:00.000Z", category: "dispatch", action: "dispatch.reasoning", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-mid" },
+      { ts: "2026-08-08T00:20:00.000Z", category: "dispatch", action: "dispatch.complete", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s-mid" },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "/flow-session/s-mid") return Promise.resolve(new Response(JSON.stringify({ records: session, count: 3, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        // The daemon's day file holds only Aug 7: the run's last record is on Aug 8.
+        if (path === "/flow/2026-08-07") return Promise.resolve(new Response(JSON.stringify(session.slice(0, 2)), { status: 200 }));
+        if (path === "/fleet/sessions/live") return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    window.location.hash = "#dispatch=s-mid";
+    try {
+      renderApp();
+      await screen.findByRole("group", { name: "playback transport" });
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(3)); // whole, at rest
+      fireEvent.click(screen.getByRole("button", { name: /^play$/i }));
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1)); // rewound: cut
+      await vi.advanceTimersByTimeAsync(15000);
+      await waitFor(() => expect(screen.getByRole("button", { name: /^play$/i })).toBeInTheDocument());
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(3)); // played through: whole again, Aug 8 record included
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a dispatch that is still running is a live view: no date, no playback badge, no transport", async () => {
     vi.stubGlobal(
       "fetch",
