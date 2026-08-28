@@ -917,3 +917,78 @@ describe("RunsBoard — the run list keeps up with the server", () => {
     expect(screen.getByText(/complete/i)).toBeTruthy();
   }, 20_000);
 });
+
+/**
+ * (#2063) The machine pin on a DAEMON-LESS static build (darkmux.com/demo).
+ * There is no `/flow/<date>` and no `/fleet/machines/live` to resolve a uid
+ * through — `useFlowWindow`/`useLiveMachines` are gated off on purpose
+ * (#1801) — so the pin's alias set has to come from the committed flow file
+ * (`darkmux-flow-src`), the same records the playback lens already reads.
+ * Before this test, the fleet card's drill-in landed on "no runs recorded
+ * yet" for every machine on the demo while the unpinned board listed them.
+ */
+describe("RunsBoard — the machine pin on a static build (#2063)", () => {
+  function injectMeta(name: string, content: string) {
+    const el = document.createElement("meta");
+    el.setAttribute("name", name);
+    el.setAttribute("content", content);
+    document.head.appendChild(el);
+  }
+  afterEach(() => {
+    window.location.hash = "";
+    document.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
+  });
+
+  const STATIC_RUNS = [
+    { id: "m1", kind: "mission", status: "complete", tracked: true, updated_ts: 300, machine: "m5-ultra-256gb" },
+    { id: "d1", kind: "dispatch", status: "running", tracked: true, role: "coder", updated_ts: 200, machine: "m5-ultra-256gb" },
+    // Another machine — must stay out of the u1 pin.
+    { id: "m2", kind: "mission", status: "complete", tracked: true, updated_ts: 250, machine: "m1-max-32gb-studio" },
+  ];
+  // The committed flow file, as the demo's export writes it: uid + name on
+  // every record, spread across DAYS (a static fixture's timestamps are
+  // frozen at export time — a viewer-clock window must not be what resolves
+  // the pin, or it decays empty as the deploy ages).
+  const STATIC_FLOW = [
+    { ts: "2026-08-26T01:00:00Z", machine_uid: "u1", machine_id: "m5-ultra-256gb" },
+    { ts: "2026-08-27T01:00:00Z", machine_uid: "u2", machine_id: "m1-max-32gb-studio" },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join("\n");
+
+  function mockStaticFetch() {
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        seen.push(path);
+        if (path === "/runs") {
+          return Promise.resolve(new Response(JSON.stringify({ runs: STATIC_RUNS, generated_at_ms: 1 }), { status: 200 }));
+        }
+        if (path === "/lab/runs") {
+          return Promise.resolve(new Response(JSON.stringify({ configured: false, dir: null, exists: false, runs: [] }), { status: 200 }));
+        }
+        if (path === "./demo-flow.jsonl") {
+          return Promise.resolve(new Response(STATIC_FLOW, { status: 200 }));
+        }
+        // A static host has NO daemon routes: `/flow/<date>`,
+        // `/fleet/machines/live` and everything else 404, as on darkmux.com.
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    return seen;
+  }
+
+  it("resolves the pin's alias set from the committed flow file, never from a daemon route", async () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    const seen = mockStaticFetch();
+    renderBoard("all", null, "u1");
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    expect(screen.getByText("d1")).toBeInTheDocument();
+    expect(screen.queryByText("m2")).not.toBeInTheDocument();
+    // The chip names the machine, not the raw uid.
+    expect(screen.getByText(/m5-ultra-256gb/)).toBeInTheDocument();
+    expect(seen.filter((p) => p.startsWith("/flow/") || p === "/fleet/machines/live")).toEqual([]);
+  });
+});
