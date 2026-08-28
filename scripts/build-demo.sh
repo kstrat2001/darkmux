@@ -140,6 +140,7 @@ fi
 <meta name="darkmux-panels-src" content="./demo-panels.json">
 <meta name="darkmux-machine-src" content="./demo-machine.json">
 <meta name="darkmux-graphs-src" content="./demo-graphs.json">
+<meta name="darkmux-fleet-src" content="./demo-fleet.json">
 EOF
   sed '1,/<head>/d' "$SRC"
 } > "$OUT"

@@ -1,0 +1,48 @@
+{
+  "machines": [
+    {
+      "beat_ts_ms": 1787897595281,
+      "darkmux_version": "3.2.0",
+      "display_name": "m5-ultra-256gb",
+      "loaded_models": [
+        "darkmux:qwen3.5-122b-a10b",
+        "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+        "darkmux:qwen3-coder-next-mlx",
+        "darkmux:qwen3-4b-instruct-2507"
+      ],
+      "machine_uid": "DEMO-M5ULTRA-2F4A-11F0-9C3D-A2B1C0D4E5F6",
+      "schema_version": "1.20.0",
+      "specs": "Apple M5 Ultra \u00b7 256 GB"
+    },
+    {
+      "beat_ts_ms": 1787897595281,
+      "darkmux_version": "3.2.0",
+      "display_name": "m1-max-32gb-studio",
+      "loaded_models": [
+        "darkmux:qwen3-4b-instruct-2507"
+      ],
+      "machine_uid": "DEMO-M1MAX-3B7C-11F0-8E21-5D4C3B2A1908",
+      "schema_version": "1.20.0",
+      "specs": "Apple M1 Max \u00b7 32 GB"
+    },
+    {
+      "beat_ts_ms": 1787897595281,
+      "darkmux_version": "3.2.0",
+      "display_name": "mac-mini-m4-16gb",
+      "loaded_models": [
+        "darkmux:qwen3-4b-instruct-2507"
+      ],
+      "machine_uid": "DEMO-MINIM4-5C9D-11F0-A44B-7E6F5A4B3C2D",
+      "schema_version": "1.20.0",
+      "specs": "Apple M4 \u00b7 16 GB"
+    }
+  ],
+  "meta": {
+    "complete": true,
+    "sources": {
+      "fleet": {
+        "state": "ok"
+      }
+    }
+  }
+}

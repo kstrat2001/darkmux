@@ -98,3 +98,15 @@ export function staticMachineSrc(): string | null {
 export function staticGraphsSrc(): string | null {
   return injectedMeta("darkmux-graphs-src");
 }
+
+/** `darkmux-fleet-src` (#2067) — the committed `/fleet/machines/live`
+ * snapshot a daemon-less build reads the fleet cards' HARDWARE line from.
+ * A static build cannot poll presence, and without a beat every card read
+ * "hardware not reported" under a machine named `m5-ultra-256gb`. Only the
+ * spec string is consumed from it (`cards.ts::specOf`): hardware is a fact
+ * about the machine, presence at a playhead is not, so the snapshot never
+ * stands in for liveness. Same bare `string | null` shape as
+ * `staticGraphsSrc` above. */
+export function staticFleetSrc(): string | null {
+  return injectedMeta("darkmux-fleet-src");
+}

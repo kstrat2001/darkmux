@@ -123,6 +123,10 @@ export const queryKeys = {
    * EVERY mission's graph at once, matching `staticMachine`'s own
    * one-fixture-one-fetch shape, not `missionGraph`'s per-id shape). */
   staticGraphs: (src: string) => ["mission", "graph", "static", src] as const,
+  /** `staticSource.ts::staticFleetSrc()`'s committed `/fleet/machines/live`
+   * snapshot (#2067) — the fleet cards' hardware line on a static build.
+   * Keyed by SRC like every other static twin here. */
+  staticFleet: (src: string) => ["fleet", "machines", "static", src] as const,
   flowSession: (id: string) => ["flow", "session", id] as const,
   /** `GET /lab/run/detail?dir=` — the lab-run detail view's one-shot fetch
    * (`LabRunDetail.tsx`). The event-feed poll (`/lab/run/events`) is NOT a

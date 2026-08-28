@@ -53,22 +53,22 @@ describe("hybridNote", () => {
 
   it("all-local runs get the local-only template", () => {
     const note = hybridNote([], { ...ZERO_TOKENS, runs: 4, cloudRuns: 0 });
-    expect(note.text).toBe("4 local dispatches — the hybrid loop is humming. keep it up.");
+    expect(note.text).toBe("4 local dispatches. The hybrid loop is humming, keep it up.");
   });
 
   it("all-cloud runs get the cloud-only template", () => {
     const note = hybridNote([], { ...ZERO_TOKENS, runs: 3, cloudRuns: 3 });
-    expect(note.text).toBe("3 dispatches via cloud — the right brain for the job. keep it up.");
+    expect(note.text).toBe("3 dispatches via cloud. The right brain for the job, keep it up.");
   });
 
   it("a mix of local and cloud runs gets the combined template", () => {
     const note = hybridNote([], { ...ZERO_TOKENS, runs: 5, cloudRuns: 2 });
-    expect(note.text).toBe("3 dispatches local + 2 via cloud — the hybrid loop is humming. keep it up.");
+    expect(note.text).toBe("3 dispatches local + 2 via cloud. The hybrid loop is humming, keep it up.");
   });
 
   it("singular dispatch wording at exactly one run", () => {
     const note = hybridNote([], { ...ZERO_TOKENS, runs: 1, cloudRuns: 0 });
-    expect(note.text).toBe("1 local dispatch — the hybrid loop is humming. keep it up.");
+    expect(note.text).toBe("1 local dispatch. The hybrid loop is humming, keep it up.");
   });
 
   it("zero runs and no notes/missions gets the invitation", () => {
