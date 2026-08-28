@@ -85,14 +85,18 @@ darkmux does **not** ship a catalog of per-language images. Instead it **injects
 
 ## Environment variables
 
-The runtime reads only two env vars directly. Everything else — model, context
+The runtime reads three env vars directly. Everything else — model, context
 window, compaction tuning, turn/token bounds — arrives as explicit **CLI flags**
-from the host dispatcher.
+from the host dispatcher. All three below arrive **host-forwarded**: the host
+resolves each config-tier setting and always writes it into the container as
+an explicit `-e VAR=<value>` on the `docker run` (#1548's pattern) — a
+host-side `export` alone never reaches the container.
 
 | Variable | Default | Effect |
 |---|---|---|
 | `DARKMUX_INACTIVITY_TIMEOUT_SECONDS` | 600 | Per-dispatch inactivity budget. The runtime-side detector soft-warns at 75%; the host watchdog hard-kills the container at 100%. Both reset on any proof-of-work signal. |
 | `DARKMUX_FEEDBACK_INJECTION` | on | Toggles the struggle-detector feedback-injection channel (cycle / tool-failure / reasoning-loop nudges). Set to `0`/`off`/`false`/`no` to disable. |
+| `DARKMUX_TURN_DELAY_MS` | 0 | (#2094) Global inter-turn rest — the runtime sleeps this many milliseconds **between turns only** (never before the first turn, never after the last). Recorded as `rest_ms`/`rests`, summed alongside an **unchanged** `wall_ms` (wall stays wall). Clamped against `DARKMUX_INACTIVITY_TIMEOUT_SECONDS`: a value at or above half the inactivity timeout is clamped to half the timeout, with a loud warning naming the clamp — a rest can never itself approach the watchdog's deadline. Never applied on an agentic-remote dispatch (no local GPU on this host to rest). |
 
 **Compaction config is NOT read from the environment** (since #368/#482). The host
 derives it from `profile.runtime.compaction.*` and passes it as CLI flags —
