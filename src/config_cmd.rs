@@ -157,6 +157,9 @@ const KEYS: &[(&str, Ty)] = &[
     ("hooks.enabled", Ty::Bool),
     ("hooks.outbox_dir", Ty::Str),
     ("hooks.rules", Ty::Json),
+    // (#2093 merge-gate finding 5) The hard cap on undelivered bytes per
+    // rule, in MiB — see `HooksConfig::max_outbox_mb`'s own doc.
+    ("hooks.max_outbox_mb", Ty::Uint),
 ];
 
 /// Keys that are deliberately NOT config — a secret that lives in the macOS

@@ -251,28 +251,46 @@ fn extract_host_port(raw: &str) -> Option<&str> {
     raw.strip_prefix("http://").map(|rest| rest.split('/').next().unwrap_or(""))
 }
 
-/// Filesystem-safe form of a `host[:port]` string for an outbox filename.
+/// Filesystem-safe form of a `host[:port]` string — folded into
+/// `rule_key`'s output for readability (an operator `ls`-ing the outbox
+/// dir can eyeball which host a file targets without decoding the hash).
 fn sanitize_host_port(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '-' })
         .collect()
 }
 
-fn outbox_paths(outbox_dir: &Path, index: usize, url: &str) -> (PathBuf, PathBuf) {
+/// (#2093 merge-gate finding 15) A rule's stable filename KEY, derived
+/// from its own content (`match` + `http`) rather than its ARRAY INDEX
+/// in `hooks.rules`. Index-based naming has a real correctness bug, not
+/// just a hygiene one: reordering (not even removing) a rule in config —
+/// an operator inserting a new rule at the front, say — silently
+/// reassigns rule A's outbox/cursor/counters to whatever rule now
+/// occupies index A's OLD slot. A content hash ties the files to the
+/// RULE'S IDENTITY, immune to reordering; two rules with genuinely
+/// identical `match`+`http` collide on purpose (they'd be redundant
+/// duplicates sharing one outbox, not two independent ones). BLAKE3
+/// (already a `darkmux-flow` dependency for `AuditFileSink`'s hash
+/// chain) truncated to 16 hex chars (64 bits) — filename-length, not a
+/// security boundary, so this collision space is more than sufficient
+/// for the number of rules an operator hand-writes.
+pub fn rule_key(m: &HookMatch, url: &str) -> String {
+    let canonical = serde_json::to_string(m).unwrap_or_default();
+    let hash = blake3::hash(format!("{canonical}\u{0}{url}").as_bytes());
     let host_port = extract_host_port(url).unwrap_or("unknown");
-    let sanitized = sanitize_host_port(host_port);
-    let base = format!("{index}-{sanitized}");
-    (outbox_dir.join(format!("{base}.outbox.jsonl")), outbox_dir.join(format!("{base}.cursor")))
+    format!("{}-{}", sanitize_host_port(host_port), &hash.to_hex()[..16])
+}
+
+fn outbox_paths(outbox_dir: &Path, key: &str) -> (PathBuf, PathBuf) {
+    (outbox_dir.join(format!("{key}.outbox.jsonl")), outbox_dir.join(format!("{key}.cursor")))
 }
 
 /// Sibling of `outbox_paths`' pair — where the rule's last-terminal-outcome
 /// (success or give-up; never an ordinary retry) is recorded, for `darkmux
 /// doctor` and `darkmux flow hooks status`'s "last delivery ts / last
 /// error" columns. Same naming scheme, different suffix.
-fn last_status_path(outbox_dir: &Path, index: usize, url: &str) -> PathBuf {
-    let host_port = extract_host_port(url).unwrap_or("unknown");
-    let sanitized = sanitize_host_port(host_port);
-    outbox_dir.join(format!("{index}-{sanitized}.last"))
+fn last_status_path(outbox_dir: &Path, key: &str) -> PathBuf {
+    outbox_dir.join(format!("{key}.last"))
 }
 
 /// (#2093 merge-gate finding 3) Sibling of `outbox_paths`' pair — a
@@ -283,10 +301,8 @@ fn last_status_path(outbox_dir: &Path, index: usize, url: &str) -> PathBuf {
 /// `POST_TIMEOUT` (5s), and an appender taking the SAME lock the drainer
 /// holds during a POST would block `write()` for that long — the one
 /// thing this sink promises never to do.
-fn drain_lock_path(outbox_dir: &Path, index: usize, url: &str) -> PathBuf {
-    let host_port = extract_host_port(url).unwrap_or("unknown");
-    let sanitized = sanitize_host_port(host_port);
-    outbox_dir.join(format!("{index}-{sanitized}.drain.lock"))
+fn drain_lock_path(outbox_dir: &Path, key: &str) -> PathBuf {
+    outbox_dir.join(format!("{key}.drain.lock"))
 }
 
 /// (#2093 merge-gate finding 9) Sibling of `outbox_paths`' pair — where
@@ -294,10 +310,8 @@ fn drain_lock_path(outbox_dir: &Path, index: usize, url: &str) -> PathBuf {
 /// invocation (`darkmux doctor`, `darkmux flow hooks status`) can see
 /// drops a currently- or previously-running dispatch process counted
 /// in-memory. Plain text, same shape as the `.cursor` file.
-fn dropped_appends_path(outbox_dir: &Path, index: usize, url: &str) -> PathBuf {
-    let host_port = extract_host_port(url).unwrap_or("unknown");
-    let sanitized = sanitize_host_port(host_port);
-    outbox_dir.join(format!("{index}-{sanitized}.dropped"))
+fn dropped_appends_path(outbox_dir: &Path, key: &str) -> PathBuf {
+    outbox_dir.join(format!("{key}.dropped"))
 }
 
 fn read_dropped_appends(path: &Path) -> u64 {
@@ -369,13 +383,15 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("hook rule #{index} has no `http` target"))?;
         validate_loopback_http_url(&url).with_context(|| format!("hook rule #{index}"))?;
-        let (outbox_path, cursor_path) = outbox_paths(outbox_dir, index, &url);
-        let last_status_path = last_status_path(outbox_dir, index, &url);
-        let drain_lock_path = drain_lock_path(outbox_dir, index, &url);
-        let dropped_appends_path = dropped_appends_path(outbox_dir, index, &url);
+        let match_ = r.r#match.clone().unwrap_or_default();
+        let key = rule_key(&match_, &url);
+        let (outbox_path, cursor_path) = outbox_paths(outbox_dir, &key);
+        let last_status_path = last_status_path(outbox_dir, &key);
+        let drain_lock_path = drain_lock_path(outbox_dir, &key);
+        let dropped_appends_path = dropped_appends_path(outbox_dir, &key);
         out.push(ResolvedRule {
             index,
-            match_: r.r#match.clone().unwrap_or_default(),
+            match_,
             url,
             outbox_path,
             cursor_path,
@@ -414,6 +430,13 @@ pub struct HookRuleSummary {
     /// is visible from a separate `darkmux doctor` / `flow hooks status`
     /// process invocation, not just a live in-process `HookSink`.
     pub dropped_appends: u64,
+    /// (#2093 merge-gate finding 15) This rule's stable filename key —
+    /// see `rule_key`'s doc. Exposed so a caller (`darkmux doctor`) can
+    /// diff the set of CURRENT rules' keys against what's actually on
+    /// disk in `outbox_dir` and name any `*.outbox.jsonl` file that
+    /// belongs to no current rule (a rule since removed from config, or
+    /// — before this fix — the artifact of an index-based reassignment).
+    pub key: String,
 }
 
 fn describe_match(m: &HookMatch) -> String {
@@ -455,11 +478,12 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
             let m = r.r#match.clone().unwrap_or_default();
             let url = r.http.clone().unwrap_or_default();
             let is_loopback = validate_loopback_http_url(&url).is_ok();
-            let (outbox_path, cursor_path) = outbox_paths(outbox_dir, index, &url);
+            let key = rule_key(&m, &url);
+            let (outbox_path, cursor_path) = outbox_paths(outbox_dir, &key);
             let cursor = read_cursor(&cursor_path);
             let undelivered = undelivered_line_count(&outbox_path, cursor);
-            let last = read_last_status(&last_status_path(outbox_dir, index, &url));
-            let dropped_appends = read_dropped_appends(&dropped_appends_path(outbox_dir, index, &url));
+            let last = read_last_status(&last_status_path(outbox_dir, &key));
+            let dropped_appends = read_dropped_appends(&dropped_appends_path(outbox_dir, &key));
             HookRuleSummary {
                 index,
                 match_desc: describe_match(&m),
@@ -472,6 +496,7 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
                 last_delivery_ts: last.as_ref().map(|s| s.ts.clone()),
                 last_error: last.and_then(|s| s.error),
                 dropped_appends,
+                key,
             }
         })
         .collect()
@@ -2226,7 +2251,8 @@ mod tests {
             http: Some(receiver.url("/events")),
             extras: Default::default(),
         }];
-        let (outbox_path, _cursor_path) = outbox_paths(tmp.path(), 0, &rules[0].http.clone().unwrap());
+        let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
+        let (outbox_path, _cursor_path) = outbox_paths(tmp.path(), &key);
 
         // Phase A — simulate a crash mid-write: a truncated JSON fragment
         // with NO trailing newline, written directly (not through
@@ -2397,7 +2423,8 @@ mod tests {
             http: Some(receiver.url("/events")),
             extras: Default::default(),
         }];
-        let (_outbox_path, cursor_path) = outbox_paths(tmp.path(), 0, &rules[0].http.clone().unwrap());
+        let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
+        let (_outbox_path, cursor_path) = outbox_paths(tmp.path(), &key);
 
         // Monitor the cursor file concurrently with the run — proves it
         // never regresses, not just that its FINAL value is sane.
@@ -2474,7 +2501,8 @@ mod tests {
         }
 
         // The outbox line must still be there (never delivered, never lost).
-        let (outbox_path, cursor_path) = outbox_paths(tmp.path(), 0, &rules[0].http.clone().unwrap());
+        let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
+        let (outbox_path, cursor_path) = outbox_paths(tmp.path(), &key);
         assert_eq!(undelivered_line_count(&outbox_path, read_cursor(&cursor_path)), 1);
 
         // Rebind a receiver on the SAME address and construct a NEW sink —
@@ -2487,14 +2515,77 @@ mod tests {
         drop(sink2);
     }
 
-    // ─── Naming ─────────────────────────────────────────────────────────
+    // ─── Naming (#2093 merge-gate finding 15) ────────────────────────────
 
     #[test]
-    fn outbox_and_cursor_paths_named_by_index_and_host_port() {
+    fn outbox_and_cursor_paths_named_by_content_hash_not_index() {
         let dir = PathBuf::from("/tmp/x");
-        let (outbox, cursor) = outbox_paths(&dir, 2, "http://127.0.0.1:8790/events");
-        assert_eq!(outbox, dir.join("2-127.0.0.1-8790.outbox.jsonl"));
-        assert_eq!(cursor, dir.join("2-127.0.0.1-8790.cursor"));
+        let m = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let key = rule_key(&m, "http://127.0.0.1:8790/events");
+        let (outbox, cursor) = outbox_paths(&dir, &key);
+        // Readable host prefix + a stable hash suffix, NOT an array index.
+        assert!(outbox.to_string_lossy().starts_with("/tmp/x/127.0.0.1-8790-"), "{outbox:?}");
+        assert!(outbox.to_string_lossy().ends_with(".outbox.jsonl"), "{outbox:?}");
+        assert_eq!(cursor, PathBuf::from(outbox.to_string_lossy().replace(".outbox.jsonl", ".cursor")));
+
+        // Deterministic — the SAME rule content always yields the SAME key.
+        assert_eq!(rule_key(&m, "http://127.0.0.1:8790/events"), key);
+        // A DIFFERENT match yields a DIFFERENT key, even at the same host.
+        let m2 = HookMatch { action: Some("crawl.other".to_string()), ..Default::default() };
+        assert_ne!(rule_key(&m2, "http://127.0.0.1:8790/events"), key);
+    }
+
+    /// (#2093 merge-gate finding 15) The bug index-based naming actually
+    /// had: reordering rules in config (not removing — REORDERING)
+    /// silently reassigns one rule's outbox/cursor/counters to whatever
+    /// rule now sits at that array index. Content-hash keying is immune
+    /// to this because the key is derived from the rule itself, not its
+    /// position.
+    #[test]
+    fn rule_key_is_immune_to_reordering_unlike_the_old_index_scheme() {
+        let rule_a = HookMatch { action: Some("crawl.*".to_string()), ..Default::default() };
+        let rule_b = HookMatch { action: Some("dispatch.*".to_string()), ..Default::default() };
+        let url = "http://127.0.0.1:8790/events";
+
+        // Rule A first, rule B second — then reordered: B first, A second.
+        let key_a_before = rule_key(&rule_a, url);
+        let key_b_before = rule_key(&rule_b, url);
+        let key_b_after = rule_key(&rule_b, url); // same rule, new position
+        let key_a_after = rule_key(&rule_a, url);
+
+        // The KEY (unlike the old `{index}-{host}` scheme) doesn't move —
+        // it's derived from the rule, not the array position the caller
+        // happens to iterate it at.
+        assert_eq!(key_a_before, key_a_after, "rule A's key is stable across reordering");
+        assert_eq!(key_b_before, key_b_after, "rule B's key is stable across reordering");
+        assert_ne!(key_a_before, key_b_before, "distinct rules never collide");
+    }
+
+    /// (#2093 merge-gate finding 15) `resolve_rules` — which is what
+    /// `HookSink::new` actually calls — derives the SAME key regardless
+    /// of a rule's index in the array, end to end.
+    #[test]
+    fn resolve_rules_paths_are_stable_across_reordering() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rule_a = HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:8790/a".to_string()),
+            extras: Default::default(),
+        };
+        let rule_b = HookRule {
+            r#match: Some(HookMatch { action: Some("dispatch.*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:8790/b".to_string()),
+            extras: Default::default(),
+        };
+        let a_first = resolve_rules(&[rule_a.clone(), rule_b.clone()], tmp.path()).unwrap();
+        let b_first = resolve_rules(&[rule_b, rule_a], tmp.path()).unwrap();
+
+        let a_outbox_when_first = &a_first[0].outbox_path;
+        let a_outbox_when_second = &b_first[1].outbox_path;
+        assert_eq!(
+            a_outbox_when_first, a_outbox_when_second,
+            "rule A's outbox path must be the SAME file regardless of which index it's resolved at"
+        );
     }
 
     /// (#2093 Self-QA gate — cost check) `write()` latency with hooks

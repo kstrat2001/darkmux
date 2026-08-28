@@ -52,7 +52,8 @@
   "hooks": {
     "enabled": false,
     "outbox_dir": "~/.darkmux/hooks",
-    "rules": []
+    "rules": [],
+    "max_outbox_mb": 256
   },
   "role_profiles": {}
 }

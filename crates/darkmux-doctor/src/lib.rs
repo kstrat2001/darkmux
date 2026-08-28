@@ -1412,6 +1412,43 @@ fn hooks_match_risks_observing_the_observer(match_desc: &str) -> bool {
     match_desc.contains("category=telemetry") || match_desc.contains("action=telemetry.") || match_desc == "action=*"
 }
 
+/// (#2093 merge-gate finding 15) `*.outbox.jsonl` files in `outbox_dir`
+/// whose key (the content-hash `rule_key` — see `darkmux_flow::hooks`'
+/// own doc) matches no CURRENTLY-configured rule. Belongs to a rule
+/// since removed from config (or edited enough to change its
+/// `match`/`http`) — the outbox still holds whatever was undelivered
+/// when that happened, and nothing will ever drain it again unless the
+/// rule comes back verbatim.
+fn stray_outbox_files(
+    rules: &[darkmux_types::config::HookRule],
+    outbox_dir: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let current_keys: std::collections::HashSet<String> = rules
+        .iter()
+        .map(|r| {
+            let m = r.r#match.clone().unwrap_or_default();
+            let url = r.http.clone().unwrap_or_default();
+            darkmux_flow::hooks::rule_key(&m, &url)
+        })
+        .collect();
+    let Ok(entries) = std::fs::read_dir(outbox_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                return false;
+            };
+            let Some(key) = name.strip_suffix(".outbox.jsonl") else {
+                return false;
+            };
+            !current_keys.contains(key)
+        })
+        .collect()
+}
+
 /// The pure rollup `check_hooks()` delegates to — split out so it's testable
 /// against synthetic rules without the global config/env tier (#811 empties
 /// `config()` in test builds, so there's no way to inject `hooks.rules`
@@ -1513,6 +1550,29 @@ fn build_hooks_check(
     };
     let mut out = vec![overview];
     out.extend(rule_checks);
+
+    // (#2093 merge-gate finding 15) A file that belongs to no CURRENT
+    // rule — named so, rather than silently taking up disk forever.
+    let stray = stray_outbox_files(rules, outbox_dir);
+    if !stray.is_empty() {
+        let names: Vec<String> =
+            stray.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+        out.push(Check {
+            name: "hooks.stray".into(),
+            status: Status::Warn,
+            message: format!(
+                "{} outbox file(s) belong to no currently-configured rule: {}",
+                names.len(),
+                names.join(", ")
+            ),
+            hint: Some(
+                "A rule was removed or edited since these were written. Safe to delete once you've \
+                 confirmed nothing important is still undelivered in them."
+                    .into(),
+            ),
+        });
+    }
+
     out
 }
 
@@ -5001,6 +5061,42 @@ mod tests {
         let bare_star = checks.iter().find(|c| c.name == "hooks.rule.1").unwrap();
         assert_eq!(bare_star.status, Status::Warn, "{}", bare_star.message);
         assert!(bare_star.message.contains("observer must not join the observed"), "{}", bare_star.message);
+    }
+
+    /// (#2093 merge-gate finding 15) A `*.outbox.jsonl` file that belongs
+    /// to no CURRENTLY-configured rule — the artifact of a rule since
+    /// removed (or, before content-hash keying, silently reassigned by a
+    /// reorder) — is named, not silently ignored.
+    #[test]
+    fn hooks_check_warns_on_stray_outbox_file() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:8790/events".to_string()),
+            extras: Default::default(),
+        }];
+        // A stray file belonging to a rule that's since been removed from
+        // config — its key can't match any CURRENT rule's `rule_key`.
+        std::fs::write(tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.outbox.jsonl"), "").unwrap();
+
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
+        let stray = checks.iter().find(|c| c.name == "hooks.stray").expect("a stray-file check must be present");
+        assert_eq!(stray.status, Status::Warn, "{}", stray.message);
+        assert!(stray.message.contains("127.0.0.1-9999-deadbeefdeadbeef"), "{}", stray.message);
+    }
+
+    #[test]
+    fn hooks_check_no_stray_file_check_when_nothing_stray() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:8790/events".to_string()),
+            extras: Default::default(),
+        }];
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
+        assert!(checks.iter().all(|c| c.name != "hooks.stray"), "no stray files → no stray check emitted");
     }
 
     #[serial_test::serial]

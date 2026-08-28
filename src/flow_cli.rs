@@ -879,6 +879,7 @@ mod tests {
             last_delivery_ts: Some("2026-08-29T00:00:00Z".to_string()),
             last_error: None,
             dropped_appends: 0,
+            key: format!("127.0.0.1-8790-{index}"),
         }
     }
 
