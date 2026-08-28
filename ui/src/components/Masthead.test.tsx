@@ -208,6 +208,14 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     vi.unstubAllGlobals();
   });
 
+  it("a daemon playback of TODAY names the day, not TODAY — that word belongs to the live view", () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const today = new Date().toISOString().slice(0, 10);
+    const { container } = renderMasthead({ kind: "playback", date: today } as never);
+    expect(container.querySelector(".catalog-toggle")?.textContent).toBe(today);
+    vi.unstubAllGlobals();
+  });
+
   it("renders plain text, not the catalog-toggle button, when darkmux-flow-src is injected", () => {
     injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));

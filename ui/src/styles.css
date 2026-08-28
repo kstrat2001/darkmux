@@ -1885,16 +1885,23 @@ body {
   align-self: flex-start;
   margin: 12px 0 0 16px;
 }
+/* (operator, 2026-08-28) The SAME outlined pill as the static build's
+   `.masthead__srcbadge`, so a daemon page and the demo show one chip; the
+   caret is what says this one opens the catalog. */
 .catalog-toggle {
   font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--bg);
-  background: var(--accent);
-  padding: 5px 9px;
-  border: 0;
+  color: var(--accent);
+  background: transparent;
+  padding: 4px 8px;
+  border: 1px solid var(--accent);
   border-radius: 3px;
   cursor: pointer;
+}
+.catalog-toggle::after {
+  content: " ▾";
+  letter-spacing: 0;
 }
 .catalog-toggle:hover {
   box-shadow: 0 0 0 2px rgba(79, 209, 197, 0.35);
