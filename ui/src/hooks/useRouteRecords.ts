@@ -3,8 +3,9 @@ import { useSessionLiveness } from "./useSessionLiveness";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
 import type { Route } from "../lib/route";
-import { asRecordArray, fetchStaticFlowRecords, normalizeRecords } from "../lib/flow";
-import { staticFlowSrc } from "../lib/staticSource";
+import { asRecordArray, normalizeRecords } from "../lib/flow";
+import { getSource } from "../lib/source";
+import { useDay } from "./useDay";
 import type { FlowRecord } from "../types/handwritten";
 import type { FlowWindowResult } from "./useFlowWindow";
 
@@ -90,39 +91,20 @@ function recordsOf(result: { ok: true; data: unknown } | { ok: false } | undefin
 export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): RouteRecords {
   const date = route.kind === "playback" ? route.date : null;
   const sessionId = route.kind === "dispatch" ? route.dispatchId : null;
-  // (#1801) `date` is `null` on a playback route ONLY when `isStaticBuild()`
-  // forced it (`route.ts`'s own doc) — so reading `staticFlowSrc()` directly
+  // (#1801) `date` is `null` on a playback route ONLY when a static build
+  // forced it (`route.ts`'s own doc) — so reading the source's flow file directly
   // here, rather than re-deriving it from `date === null`, is the "one
-  // resolver" this fix keeps to (`lib/staticSource.ts`'s module doc).
+  // resolver" this fix keeps to (`lib/source.ts`, the one place the build type is decided).
   // (#2065) A DISPATCH route on a static build reads the same committed file
   // and slices ONE session out of it (`session_id`), instead of asking a
   // daemon that is not there for `/flow-session/<id>` (a 404 on every
   // dispatch-row tap of the demo). The file already carries every session
   // its `demo-runs.json` lists; there is nothing to fetch.
-  const flowSrc = route.kind === "playback" || route.kind === "dispatch" ? staticFlowSrc() : null;
-
-  // Deliberately the SAME cache key `useFlowWindow` uses for its two day
-  // fetches (`queryKeys.flowDate`). Same endpoint, same response — sharing the
-  // slot means a playback route for today reuses the window's already-fetched
-  // day instead of issuing a second identical request. It also means the two
-  // can never disagree about what `/flow/<date>` returned.
-  const dayQuery = useQuery({
-    queryKey: queryKeys.flowDate(date ?? ""),
-    queryFn: () => fetchJson<unknown>(`/flow/${encodeURIComponent(date ?? "")}`),
-    enabled: date !== null,
-  });
-
-  // (#1801) The static-demo twin of `dayQuery` above — same cache slot
-  // `PlaybackLens` reads for the stage, so the event log and the stage can
-  // never disagree about the committed file's contents (`queryKeys.ts`'s own
-  // doc on `staticFlowSrc`). `date` is always `null` whenever `flowSrc` is
-  // non-null (see the doc above), so this and `dayQuery` are mutually
-  // exclusive by construction, not by an extra guard.
-  const staticQuery = useQuery({
-    queryKey: queryKeys.staticFlowSrc(flowSrc ?? ""),
-    queryFn: () => fetchStaticFlowRecords(flowSrc ?? ""),
-    enabled: flowSrc !== null,
-  });
+  const source = getSource();
+  const flowSrc = route.kind === "playback" || route.kind === "dispatch" ? source.flow : null;
+  // (#2086) The loaded day comes from ONE hook now; on a static build this
+  // is the committed file (any route), on a daemon playback `/flow/<date>`.
+  const day = useDay(route.kind === "playback" ? route.date : null);
 
   // A session drill-in is historical ONLY once the session is over. While it
   // is still running the slice has to keep refetching, or the entire route
@@ -159,31 +141,26 @@ export function useRouteRecords(route: Route, flowWindow: FlowWindowResult): Rou
     // `fetchStaticFlowRecords` already collapses a network failure, a 404,
     // or an empty file to `[]` (matching legacy's own silent catch — see
     // that function's own doc), so there is no distinct HTTP-status error to
-    // surface here the way `dayQuery`'s branch below does: a static build
+    // surface here the way the daemon playback branch below does: a static build
     // has no daemon to report a status FROM. Still shaped through the SAME
     // `normalizeRecords` every other branch here uses (this hook's own
     // module doc explains why that matters).
-    const all = staticQuery.data ? normalizeRecords(staticQuery.data) : [];
+    const all = day.records ?? [];
     return {
       records: sessionId !== null ? all.filter((r) => r.session_id === sessionId) : all,
-      loading: staticQuery.data === undefined,
+      loading: day.loading,
       historical: true,
       error: null,
     };
   }
 
   if (date !== null) {
-    const recs = recordsOf(dayQuery.data);
-    const err = dayQuery.data && !dayQuery.data.ok ? dayQuery.data : null;
     // A FAILED fetch yields [] rather than the live window: showing live
     // traffic under a "playback for <date>" heading is the exact confusion
-    // this hook exists to remove. Empty is honest; wrong is not.
-    return {
-      records: recs ?? [],
-      loading: dayQuery.data === undefined,
-      historical: true,
-      error: err ? { status: err.status, message: err.message } : null,
-    };
+    // this hook exists to remove. Empty is honest; wrong is not. `useDay`
+    // fetches `/flow/<date>` on the same `queryKeys.flowDate` slot
+    // `useFlowWindow` uses, so a playback of today reuses the window's day.
+    return { records: day.records ?? [], loading: day.loading, historical: true, error: day.error };
   }
 
   if (sessionId !== null) {

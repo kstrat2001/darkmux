@@ -4,7 +4,7 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useFleetCoverage, useLiveMachines, useStaticFleetBeats } from "../../hooks/useLiveMachines";
-import { isStaticBuild } from "../../lib/staticSource";
+import { getSource } from "../../lib/source";
 import { useLiveSessionIds } from "../../hooks/useLiveSessionIds";
 import { machineUids, machPresent, liveSessionSet, LIVE_WINDOW_MS, T } from "../../lib/flow";
 import type { FlowRecord } from "../../types/handwritten";
@@ -336,7 +336,7 @@ export function FleetLens({
   // comes from the committed fleet snapshot instead — spec lookup ONLY;
   // presence at the playhead still derives from the records.
   const staticBeats = useStaticFleetBeats();
-  const specBeats = isStaticBuild() ? staticBeats : liveMachines;
+  const specBeats = getSource().kind === "static" ? staticBeats : liveMachines;
   // `/machine/specs` is the THIRD live-only endpoint on this screen, and the
   // one that got away in the first pass. It describes the hardware of the
   // machine serving the page RIGHT NOW — `pollMachineSpecs` is the live-only

@@ -1,9 +1,9 @@
 import { useMemo, useRef, useEffect } from "react";
 import { useHashRoute } from "./lib/useHashRoute";
-import { isStaticBuild, staticFlowSrc } from "./lib/staticSource";
+import { getSource } from "./lib/source";
+import { useDay } from "./hooks/useDay";
 import { usePlaybackTransport } from "./hooks/usePlaybackTransport";
 import { Scrubber } from "./lenses/catalog/Scrubber";
-import { fetchStaticFlowRecords, normalizeRecords } from "./lib/flow";
 import { useSyncHash } from "./lib/hashSync";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
@@ -150,15 +150,11 @@ export function App() {
   // the sticky block on every tab and the run-detail and mission lenses
   // replay against the same clock. A daemon build has a day only on its
   // `/play/<date>` route; live routes have nothing to scrub.
-  const staticSrc = isStaticBuild() ? staticFlowSrc() : null;
-  const staticDayQuery = useQuery({
-    queryKey: queryKeys.staticFlowSrc(staticSrc ?? ""),
-    queryFn: () => fetchStaticFlowRecords(staticSrc ?? ""),
-    enabled: staticSrc !== null,
-    staleTime: Infinity,
-  });
-  const staticDay = useMemo(() => (staticDayQuery.data ? normalizeRecords(staticDayQuery.data) : null), [staticDayQuery.data]);
-  const dayRecords = staticSrc !== null ? staticDay : route.kind === "playback" && !routeRecords.loading ? routeRecords.records : null;
+  // (#2086) One resolver for the loaded day — static file on every route,
+  // `/flow/<date>` on a daemon playback, nothing on a live route.
+  const source = getSource();
+  const day = useDay(route.kind === "playback" ? route.date : null);
+  const dayRecords = day.records;
   const transport = usePlaybackTransport(dayRecords);
   // (#2071 review) Show the transport only where something on screen
   // answers it. The mission lens takes no playhead and mounts its own log
@@ -170,12 +166,12 @@ export function App() {
     // own (the live window is empty there); the day's log, scoped to the
     // playhead, is what the transport is scrubbing. Playback and dispatch
     // routes keep their own slice, scoped the same way.
-    const own = route.kind === "playback" || route.kind === "dispatch" || staticSrc === null;
+    const own = route.kind === "playback" || route.kind === "dispatch" || source.kind === "daemon";
     const base = own ? routeRecords.records : (dayRecords ?? []);
     // `!(ts > t)`, not `ts <= t`: a record with an unparseable `ts` stays
     // in the log, as it did before the transport scoped every route.
     return base.filter((r) => !(T(r.ts) > transport.t));
-  }, [transport.active, transport.t, route.kind, routeRecords.records, staticSrc, dayRecords]);
+  }, [transport.active, transport.t, route.kind, routeRecords.records, source.kind, dayRecords]);
   // (#2071) The sticky block's measured height feeds `--chrome-h`, the
   // offset the event log column sticks under on desktop. It used to be a
   // 97px constant that assumed the masthead + one chrome row.
@@ -250,7 +246,7 @@ export function App() {
   // a machine", "N machines · last dispatch …"); a static build has no
   // daemon, so a non-playback route there gets no meta line rather than a
   // live-only phrase about a machine that will never arrive.
-  const staticIdle = isStaticBuild() && !replayMeta;
+  const staticIdle = source.kind === "static" && !replayMeta;
 
   // (#1801) A static-build playback route carries `date: null` at parse time
   // (`route.ts`'s own doc on the widened variant) — the real date is only

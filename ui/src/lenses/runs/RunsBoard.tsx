@@ -3,12 +3,13 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
-import { missionGraphReachable } from "../../lib/injectedMeta";
-import { isStaticBuild, resolveLabRunsSrc, resolveRunsSrc, staticFlowSrc } from "../../lib/staticSource";
+import { missionGraphReachable } from "../../lib/source";
+import { getSource, labRunsSrc, runsSrc } from "../../lib/source";
+import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
-import { fetchStaticFlowRecords, machineNames, nameOf } from "../../lib/flow";
+import { machineNames, nameOf } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse, LabRunsResponse, LabRun } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
@@ -39,8 +40,8 @@ import {
  *
  * Data: `GET /runs` (the flat cross-source view-model, every kind) and
  * `GET /lab/runs` (the lab-only staffing/bundle extras), fetched TOGETHER on
- * every mount — via `staticSource.ts`'s `resolveRunsSrc()`/
- * `resolveLabRunsSrc()` rather than the two literal paths directly, so a
+ * every mount — via `source.ts`'s `runsSrc()`/
+ * `labRunsSrc()` rather than the two literal paths directly, so a
  * static build (`darkmux-runs-src`/`darkmux-lab-runs-src` metas — #1801,
  * viewer.html:4077/4027) reads its committed fixture files instead of
  * hitting a daemon that isn't there. A daemon-served page is unaffected:
@@ -235,7 +236,7 @@ export function RunsBoard({
     // Reusing it here would turn the honest daemon-less notice into a false
     // "it may have been removed" claim about the operator's data.
     setRowClickNotice(
-      isStaticBuild()
+      getSource().kind === "static"
         ? "run detail needs a running daemon — this static build lists runs without their per-run pipeline and event feed."
         : `couldn't open run "${dir}" — it may have been removed, or the link is stale. Showing the run list.`,
     );
@@ -370,7 +371,7 @@ export function RunsBoard({
   // either — the two are genuinely independent fetches there too).
   // Hoisted above the two queries below, which now gate their polling on it
   // (#1966). It was declared further down, beside `useLiveMachines`.
-  const daemonBacked = !isStaticBuild();
+  const daemonBacked = getSource().kind === "daemon";
 
   // (#1966) Both POLL. Neither did, so the board fetched its run list once on
   // mount and a run that was `running` at load time rendered `running`
@@ -383,16 +384,16 @@ export function RunsBoard({
   // query, #1960). The shape is a view that describes NOW and fetches ONCE.
   //
   // Gated the same way every other live-only poll in this app is: a
-  // daemon-less static build has no daemon to answer, and `resolveRunsSrc()`
+  // daemon-less static build has no daemon to answer, and `runsSrc()`
   // there points at a committed file that cannot change.
   const runsQuery = useQuery({
     queryKey: queryKeys.runs(),
-    queryFn: () => fetchJson<RunsResponse>(resolveRunsSrc()),
+    queryFn: () => fetchJson<RunsResponse>(runsSrc()),
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
   const labRunsQuery = useQuery({
     queryKey: queryKeys.labRuns(),
-    queryFn: () => fetchJson<LabRunsResponse>(resolveLabRunsSrc()),
+    queryFn: () => fetchJson<LabRunsResponse>(labRunsSrc()),
     refetchInterval: daemonBacked ? PRESENCE_POLL_MS : false,
   });
 
@@ -404,7 +405,7 @@ export function RunsBoard({
   // `#meta` and the machine-lens crumb) — same "cache reuse, not a second
   // network round trip" TanStack dedup App.tsx's own module doc names for
   // `MachineLens`. `useLiveMachines` is gated the same way every OTHER
-  // live-only poll in this app is (`isStaticBuild()` — see that hook's own
+  // live-only poll in this app is (a static build (`getSource().kind`) — see that hook's own
   // doc and `MachineLens.tsx`'s identical gate): a daemon-less static build
   // has no `/fleet/machines/live` to poll.
   const nowMs = Date.now();
@@ -426,23 +427,18 @@ export function RunsBoard({
   // export time — it would resolve on deploy day and decay empty after.
   // The alias set is not time-scoped; the whole file is the source.
   //
-  // Read RAW (no `normalizeRecords`) on purpose: only `machine_uid` /
-  // `machine_id` are consulted, and the schema-header line the normalizer
-  // drops carries neither. Fetched only while a pin needs it — the demo's
-  // file is megabytes, and an unpinned board never reads a record of it.
-  const flowSrc = daemonBacked ? null : staticFlowSrc();
-  const staticPinFetch = flowSrc !== null && machineUid !== null;
-  const staticFlowQuery = useQuery({
-    queryKey: queryKeys.staticFlowSrc(flowSrc ?? ""),
-    queryFn: () => fetchStaticFlowRecords(flowSrc ?? ""),
-    enabled: staticPinFetch,
-  });
-  const pinRecords = daemonBacked ? flowWindow.data : (staticFlowQuery.data ?? []);
-  // Loading is not "empty": until the file lands, an empty alias set would
-  // render the pre-#2063 symptom as a flash ("no runs recorded yet" under a
-  // raw-uid chip) for as long as the download takes. Folded into the
-  // pending branch below.
-  const staticPinPending = staticPinFetch && staticFlowQuery.data === undefined;
+  // (#2086) The static day comes from the one resolver (`useDay`); the shell
+  // (`App.tsx`) calls it on EVERY static route for the transport, so this
+  // read is cache reuse. That is a dependency, not a coincidence: if the
+  // shell's call is ever route-gated, this board becomes the one that
+  // downloads the multi-megabyte file on the runs route, and it would then
+  // want its own `machineUid !== null` gate back. Loading is not "empty": until the file
+  // lands, an empty alias set would render the pre-#2063 symptom as a flash
+  // ("no runs recorded yet" under a raw-uid chip); folded into the pending
+  // branch below.
+  const day = useDay(null);
+  const pinRecords = daemonBacked ? flowWindow.data : (day.raw ?? []); // identity fields only; raw as before
+  const staticPinPending = !daemonBacked && machineUid !== null && day.loading;
 
   // The lab-run detail pane is its own top-level render, reached without
   // waiting on the two queries above and independent of `kind` (see

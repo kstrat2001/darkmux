@@ -142,7 +142,7 @@ export function CatalogPanel({ label }: { label?: string } = {}) {
     <div className="catalog-anchor" ref={anchorRef}>
       <button
         type="button"
-        className="catalog-toggle"
+        className="chip catalog-toggle"
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
         aria-controls="catpanel"
@@ -165,6 +165,7 @@ export function CatalogPanel({ label }: { label?: string } = {}) {
         aria-label="browse history"
       >
         {label ?? "browse history"}
+        <span className="chip__caret" aria-hidden="true" />
       </button>
       {open && (
         <div className="catpanel" id="catpanel">

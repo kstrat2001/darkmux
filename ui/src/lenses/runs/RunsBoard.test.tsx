@@ -1069,12 +1069,8 @@ describe("RunsBoard — the machine pin on a static build (#2063)", () => {
     expect(screen.queryByText(/no runs recorded yet/)).not.toBeInTheDocument();
   });
 
-  it("never downloads the flow file for an unpinned board", async () => {
-    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
-    const seen = mockStaticFetch();
-    renderBoard("all", null, null);
-    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
-    expect(screen.getByText("m2")).toBeInTheDocument();
-    expect(seen).not.toContain("./demo-flow.jsonl");
-  });
+  // (#2086) "never downloads the flow file for an unpinned board" retired:
+  // the shell loads the day on every static route for the transport, and
+  // this board reads that same cache slot, so the file is one download the
+  // board neither triggers nor avoids.
 });

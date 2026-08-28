@@ -13,13 +13,13 @@
  * - `GET /mission/:id/graph.json` — the initial node/edge snapshot. New
  *   query key (`queryKeys.missionGraph`), nothing else in this app reads it.
  *   **Daemon-backed builds only** (`daemonBacked`, below). On a static build
- *   (#2032 packet 2) this is replaced entirely by `staticGraphsSrc()`'s
+ *   (#2032 packet 2) this is replaced entirely by `getSource().graphs`'s
  *   committed `{"<mission-id>": <graph>, ...}` fixture
  *   (`queryKeys.staticGraphs`) — one fetch for every mission this build
  *   knows about, this mission's own entry looked up client-side. No flow
  *   backfill, no live tail, no SSE: a static build renders exactly the
  *   snapshot the fixture captured, same as `MachineLens.tsx`'s
- *   `staticMachineSrc()` precedent.
+ *   `getSource().machine` precedent.
  * - `GET /flow-mission/:id` — the mission's cross-day flow-record backfill.
  *   SAME `queryKeys.flowMission` key `MissionReplay` used to fetch before
  *   this lens replaced it (retired this packet).
@@ -50,7 +50,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
-import { isStaticBuild, staticGraphsSrc } from "../../lib/staticSource";
+import { getSource } from "../../lib/source";
 import { useLiveTail } from "../../hooks/useLiveTail";
 import { asRecordArray, bodyTruncated, todayUTC } from "../../lib/flow";
 import { EventLogColumn } from "../../components/EventLogColumn";
@@ -257,7 +257,8 @@ function MeterEl({ tot }: { tot: ReturnType<typeof missionTotals> }) {
 
 export function MissionGraphLens({ missionId }: { missionId: string }) {
   const queryClient = useQueryClient();
-  const daemonBacked = !isStaticBuild();
+  const source = getSource();
+  const daemonBacked = source.kind === "daemon";
   const today = todayUTC();
 
   // (#1628 lineage) `refetchInterval` — the safety-net reconcile poll for a
@@ -285,7 +286,7 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
   // `staticMachineQuery`'s own `enabled: machineSrc !== null` precedent in
   // `MachineLens.tsx` — a disabled query with no fixture is a KNOWN answer
   // ("nothing published"), not a pending one.
-  const graphsSrc = staticGraphsSrc();
+  const graphsSrc = source.graphs;
   const staticGraphsQuery = useQuery({
     queryKey: queryKeys.staticGraphs(graphsSrc ?? ""),
     queryFn: () => fetchJson<Record<string, MissionGraph>>(graphsSrc as string),

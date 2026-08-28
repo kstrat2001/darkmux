@@ -3,10 +3,11 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
-import { T, fetchStaticFlowRecords, flowToRenderModel } from "../../lib/flow";
+import { T, flowToRenderModel } from "../../lib/flow";
 import { useNowMs } from "../../lib/clock";
 import { clkhm } from "../../lib/format";
-import { isStaticBuild, staticFlowSrc } from "../../lib/staticSource";
+import { getSource } from "../../lib/source";
+import { useDay } from "../../hooks/useDay";
 import { injectedPlaybackDate } from "../../lib/injectedMeta";
 
 /** (#1972) How long a run may go silent before it is treated as abandoned
@@ -74,23 +75,25 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // itself — normalizing here would add a second copy the daemon path never
   // has. The file's schema-header line carries no `session_id`, so the
   // slice drops it on its own.
-  const flowSrc = staticFlowSrc();
+  const source = getSource();
+  const flowSrc = source.flow;
   const query = useQuery({
     queryKey: queryKeys.flowSession(sessionId),
     queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-session/${encodeURIComponent(sessionId)}`),
     enabled: flowSrc === null,
     refetchInterval: shouldPoll ? PRESENCE_POLL_MS : false,
   });
-  const staticQuery = useQuery({
-    queryKey: queryKeys.staticFlowSrc(flowSrc ?? ""),
-    queryFn: () => fetchStaticFlowRecords(flowSrc ?? ""),
-    enabled: flowSrc !== null,
-  });
+  // (#2086) The static day comes from the one resolver (the shell already
+  // holds it for the transport; same cache slot, no second download).
+  const day = useDay(null);
   const staticSlice: FlowRecordsResponse | null = useMemo(() => {
-    if (flowSrc === null || staticQuery.data === undefined) return null;
-    const recs = staticQuery.data.filter((r) => r.session_id === sessionId);
+    // RAW, not `day.records`: `/flow-session` hands back raw records and
+    // `flowToRenderModel` synthesizes the runtime row itself; the normalized
+    // day already carries one, so slicing it would double the row.
+    if (flowSrc === null || day.raw === null) return null;
+    const recs = day.raw.filter((r) => r.session_id === sessionId);
     return { records: recs, count: recs.length, truncated: false, generated_at_ms: 0 };
-  }, [flowSrc, staticQuery.data, sessionId]);
+  }, [flowSrc, day.raw, sessionId]);
   const session: FetchResult<FlowRecordsResponse> | undefined =
     flowSrc === null ? query.data : staticSlice === null ? undefined : { ok: true, data: staticSlice };
 
@@ -150,7 +153,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // the run's last sign of life is a fact, and the seconds since are not.
   const quietMs = base?.lastBeatMs != null ? Date.now() - base.lastBeatMs : Infinity;
   const plausiblyRunning = (base?.live ?? false) && quietMs < STALE_AFTER_MS && !endedByPresence;
-  const ticking = plausiblyRunning && !isStaticBuild() && injectedPlaybackDate() == null;
+  const ticking = plausiblyRunning && source.kind !== "static" && injectedPlaybackDate() == null;
   const nowMs = useNowMs(ticking);
 
   if (!session) {

@@ -35,7 +35,7 @@
  */
 
 import { injectedPlaybackDate } from "./injectedMeta";
-import { isStaticBuild } from "./staticSource";
+import { getSource } from "./source";
 import { sanitizeOptParams } from "../lenses/console/panels";
 
 export const RUNS_KINDS = ["all", "mission", "dispatch", "lab"] as const;
@@ -184,7 +184,7 @@ export type Route =
    * the same one. See `route.ts`'s own module doc for the precedence this
    * sits at (lowest, below every `lens=`/`mission=`/`session=` form).
    *
-   * (#1801) `date` is `string | null` — `null` ONLY when `isStaticBuild()`
+   * (#1801) `date` is `string | null` — `null` ONLY when a static build (`getSource().kind`)
    * forced this route (see below): a static demo build has no server-
    * assigned date the way `/play/<date>`'s injected meta does, and no daemon
    * to ask `/flow/<date>` for one either. Legacy's own flowSrc branch has the
@@ -232,7 +232,7 @@ export function isLiveRoute(route: Route): boolean {
   // polled every 5s indefinitely, and the mode badge reading `◌ RECONNECTING`
   // — a page asserting there is something to reconnect TO, on a marketing
   // site with no daemon anywhere near it.
-  if (isStaticBuild()) return false;
+  if (getSource().kind === "static") return false;
   return route.kind !== "playback" && route.kind !== "dispatch" && route.kind !== "mission";
 }
 
@@ -422,7 +422,7 @@ export function parseRoute(): Route {
   // legacy's stricter `cq` suppression of mission/session under flowSrc
   // (`(flowSrc||lq||mq||nq!=null) ? null : catalogQuery()`) is NOT ported —
   // narrower scope, named here rather than silently dropped.
-  if (isStaticBuild()) {
+  if (getSource().kind === "static") {
     return { kind: "playback", date: null };
   }
 

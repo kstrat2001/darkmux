@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useLiveSessionIds } from "./useLiveSessionIds";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
-import { staticFlowSrc } from "../lib/staticSource";
+import { getSource } from "../lib/source";
 
 /**
  * (#2011) Is THIS session running, and should its slice keep being fetched?
@@ -77,7 +77,7 @@ export function useSessionLiveness(sessionId: string | null): SessionLiveness {
   // The `enabled` gate #1800 P2 added: a replay must not poll live presence.
   // Passing the result away is not enough — the query still fires and still
   // describes NOW.
-  const liveSessions = useLiveSessionIds(sessionId !== null && staticFlowSrc() === null);
+  const liveSessions = useLiveSessionIds(sessionId !== null && getSource().kind === "daemon");
   const isLive = sessionId !== null && liveSessions.has(sessionId);
 
   const queryClient = useQueryClient();
