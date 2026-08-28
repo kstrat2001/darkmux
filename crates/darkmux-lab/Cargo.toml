@@ -26,6 +26,15 @@ serde_json = "1.0"
 dirs = "5.0"
 # BLAKE3 — content hashing for sandbox baseline/final hashes (#487).
 blake3 = "1.5"
+# (#1959 packet 1) The crawl `site`/`edge` rule prefilters use real regex
+# syntax (`\bcatch\s*(\(|\{)`, alternation, anchors) that the inline glob
+# matcher (crawl/glob.rs — no glob crate exists anywhere in this workspace,
+# so that one IS hand-rolled) cannot express. `regex` was already present in
+# Cargo.lock as a transitive DEV-dependency (via assert_cmd/predicates,
+# `cargo tree -i regex` confirmed no direct/normal dependency anywhere);
+# this promotes it to a real dependency of the one crate that needs it at
+# runtime rather than widening the workspace's already-locked version.
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3.10"

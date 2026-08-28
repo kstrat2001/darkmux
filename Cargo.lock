@@ -838,6 +838,7 @@ dependencies = [
  "darkmux-profiles",
  "darkmux-types",
  "dirs",
+ "regex",
  "serde",
  "serde_json",
  "serial_test",

@@ -275,6 +275,14 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: crate::flow_cli::FlowCmd,
     },
+    /// The agentic bug crawler (#1959). Packet 1: `crawl plan` turns a
+    /// corpus manifest into a deterministic, token-estimated work-unit
+    /// plan — mechanical only, no model dispatch. Later packets add the
+    /// dispatch loop this plan feeds.
+    Crawl {
+        #[command(subcommand)]
+        sub: CrawlCmd,
+    },
     /// Read/write `~/.darkmux/config.json` settings (#937). `set` validates the
     /// key + coerces the value; secrets stay in the Keychain. Distinct from
     /// `profile` (the profiles registry).
@@ -367,6 +375,32 @@ pub(crate) enum RoleCmd {
         id: String,
         #[command(flatten)]
         json: JsonFlag,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CrawlCmd {
+    /// Load a corpus manifest, resolve its rules + sources (git mirrors ->
+    /// read-only worktrees), and write a token-estimated work-unit plan.
+    /// Mechanical only — no model dispatch (#1959 packet 1).
+    Plan {
+        /// Path to the corpus manifest JSON.
+        manifest: std::path::PathBuf,
+        /// Where to write the plan JSON (default: `<corpus root>/plan.json`).
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Resolve sources against the mirror as-is, without `git fetch`ing
+        /// first — fully offline against whatever's already mirrored. A
+        /// `git` source with no mirror yet REFUSES instead of cloning (a
+        /// first clone needs the network, which this flag promises not to
+        /// use) — rerun once without `--no-fetch` to populate it. A `path`
+        /// source's first clone is local-filesystem-only, so it's exempt
+        /// and still populates on the first run.
+        #[arg(long)]
+        no_fetch: bool,
+        /// Print the plan JSON to stdout instead of the human table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
