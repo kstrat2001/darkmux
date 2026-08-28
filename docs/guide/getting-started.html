@@ -32,242 +32,175 @@
   <div class="wrap">
     <div class="label">01 <span class="dot">·</span> foundation</div>
     <h1>Getting started</h1>
-    <p class="lede">Install darkmux, verify the setup, declare your first profile, dispatch a role, and launch your first mission. Everything else in the guide assumes you've done this.</p>
+    <p class="lede">Install, <code>init</code>, first inference. Then the checks, a first dispatch, and the viewer. Every output below is a capture from a fresh machine, so what you see should match.</p>
   </div>
 </header>
 
 <section>
   <div class="wrap">
     <h2>Prerequisites</h2>
+    <p>Two things, and a third only for dispatch.</p>
     <table>
-      <tr><th>Required</th><th>Why</th><th>Install</th></tr>
-      <tr>
-        <td><a href="https://brew.sh">Homebrew</a></td>
-        <td>How darkmux installs (the tap + formula below).</td>
-        <td>One-line install at <a href="https://brew.sh">brew.sh</a>.</td>
-      </tr>
-      <tr>
-        <td><a href="https://lmstudio.ai/">LMStudio</a></td>
-        <td>darkmux drives LMStudio via the <code>lms</code> CLI for load/unload.</td>
-        <td>macOS / Windows / Linux installer.</td>
-      </tr>
-      <tr>
-        <td>At least one model in LMStudio</td>
-        <td>Nothing for a dispatch to load without one.</td>
-        <td>Download via the LMStudio UI; verify with <code>lms ls</code>.</td>
-      </tr>
+      <thead><tr><th>Required</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><a href="https://brew.sh">Homebrew</a></td><td>How darkmux installs.</td></tr>
+        <tr><td><a href="https://lmstudio.ai">LM Studio</a>, with at least one model downloaded and its command-line tool enabled (<code>~/.lmstudio/bin/lms bootstrap</code>)</td><td>darkmux loads and unloads models through <code>lms</code>. <code>init</code> picks your first worker model from what you have downloaded.</td></tr>
+        <tr><td>Docker, running</td><td>Only for <code>dispatch</code>, <code>lab run</code>, and missions: each dispatch runs in a small <code>darkmux-runtime</code> container, pulled on first use. <code>radio</code>, <code>doctor</code>, and the viewer need no Docker.</td></tr>
+      </tbody>
     </table>
-    <p class="muted"><code>brew install</code> needs no toolchain: Homebrew handles the build, and bottled binaries (once published) ship precompiled.</p>
-    <p class="muted">darkmux is developed and tested on Apple Silicon. Linux should work; Intel Mac is untested.</p>
-
-    <h3>For the dispatch + lab path</h3>
-    <p class="muted">The <code>profile</code> / <code>machine</code> core needs only LMStudio. Docker is required for <code>dispatch</code> / <code>lab run</code> (the only dispatch path).</p>
-    <table>
-      <tr><th>Tool</th><th>When you need it</th></tr>
-      <tr>
-        <td><a href="https://www.docker.com/products/docker-desktop">Docker</a></td>
-        <td><strong>Required for <code>darkmux dispatch</code> / <code>lab run</code></strong>. The dispatch runs in a per-invocation <code>darkmux-runtime</code> container; the image is pulled from GHCR on first use, so you just need Docker running.</td>
-      </tr>
-      <tr>
-        <td><a href="https://claude.com/claude-code">Claude Code</a> (or any frontier orchestrator)</td>
-        <td><strong>Recommended.</strong> darkmux is designed to be <em>driven</em> by a frontier orchestrator. <code>darkmux init</code> installs agent skills (including the <code>/darkmux-bootstrap</code> setup skill) and dispatches agentic work through one. The bare CLI works without it, but the orchestrator is the intended path; see <a href="#orchestrator">Recommended: let your orchestrator set it up</a> below.</td>
-      </tr>
-    </table>
+    <p>darkmux is developed and tested on Apple Silicon. Everything below was run on one.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Install + bootstrap</h2>
+    <h2>Install and init</h2>
+    <p>One line installs; <code>init</code> writes your config and profile registry, picks a worker model from what LM Studio has, and installs the agent skills.</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew install kstrat2001/darkmux/darkmux</span><button class="copy-btn" data-copy="brew install kstrat2001/darkmux/darkmux" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux init</span><button class="copy-btn" data-copy="darkmux init" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">profile registry: created at ~/.darkmux/profiles.json
+worker model: <code>qwen3.6-35b-a3b-turboquant-mlx</code> (LM Studio has it; every worker profile now names it, edit ~/.darkmux/profiles.json to change)
+utility model: <code>qwen3-4b-instruct-2507</code> (the registry named one LM Studio does not have; this is the closest downloaded match, edit ~/.darkmux/profiles.json to change)
+config: created at ~/.darkmux/config.json (machine_id seeded — edit to set Redis, dirs, runtime knobs)
+skills targets: ~/.claude/skills
+  installed (15): darkmux-bootstrap, darkmux-mission-debrief, darkmux-enable-audit, darkmux-add-machine, darkmux-status, darkmux-list-stacks, darkmux-list-workloads, darkmux-lab-run, darkmux-list-runs, darkmux-analyze-run, darkmux-compare-runs, darkmux-design-profile, darkmux-scan-and-suggest, darkmux-qa-review, darkmux-escalation-handler
 
-    <p>From a fresh macOS machine that has LMStudio installed:</p>
-    <pre><code><span class="comment"># 1. Tap + install</span>
-brew tap kstrat2001/darkmux
-brew install darkmux                <span class="comment"># stable release (or --HEAD for latest main)</span>
-
-<span class="comment"># 2. Bootstrap config + agent skills</span>
-darkmux init</code></pre>
-    <div class="callout">If <code>brew install</code> refuses with an <strong>"untrusted tap"</strong> error, newer Homebrew gates third-party taps behind a one-time trust step: run <code>brew trust kstrat2001/darkmux</code>, then re-run the install. (Older Homebrew won't prompt for this.)</div>
-    <p>The tap is at <a href="https://github.com/kstrat2001/homebrew-darkmux">kstrat2001/homebrew-darkmux</a>. The formula installs the <code>darkmux</code> CLI, the <code>serve</code> daemon, and the bundled agent skills. <strong>Updating</strong> later is <code>brew upgrade darkmux</code> (plus <code>brew services restart darkmux</code> to pick up the new daemon).</p>
-    <p>That's the whole install. Local dispatch works too: the <code>darkmux-runtime</code> Docker image is pulled from GHCR on first use, so you just need Docker running.</p>
-    <p class="muted">Contributing to darkmux, or building from source? See <a href="https://github.com/kstrat2001/darkmux/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> on GitHub.</p>
-  </div>
-</section>
-
-<section id="orchestrator">
-  <div class="wrap">
-    <h2>Recommended: let your orchestrator set it up</h2>
-    <p>darkmux is built to be <em>driven</em> by a frontier orchestrator: a <a href="https://claude.com/claude-code">Claude Code</a>, Gemini, Antigravity, Cursor, Codex, or Copilot session that runs the loop, reads the project docs, and proposes the commands. <code>darkmux init</code> installs the agent skills + guidance for exactly this. <strong>The recommended way to finish setup (and to operate darkmux day to day) is from inside an orchestrator session, not by hand.</strong></p>
-
-    <p><strong>Whichever frontier model you prefer, the first move is the same: have it read the project docs.</strong> They're written for any agent and carry darkmux's operating doctrine:</p>
-    <ul>
-      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/README.md"><code>README.md</code></a>: what darkmux is for (the north-star) + the quick start.</li>
-      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/CLAUDE.md"><code>CLAUDE.md</code></a> / <a href="https://github.com/kstrat2001/darkmux/blob/main/AGENTS.md"><code>AGENTS.md</code></a>: the agent-facing operating doctrine. Claude Code auto-loads <code>CLAUDE.md</code>; Antigravity / Gemini / Codex / Cursor auto-load <code>AGENTS.md</code>. Same doctrine, both conventions shipped.</li>
-      <li><a href="https://github.com/kstrat2001/darkmux/blob/main/DESIGN.md"><code>DESIGN.md</code></a>: the implementation reasoning, for when the agent needs the "why."</li>
-      <li>This guide: the operator-facing walkthrough the agent can follow step by step.</li>
-    </ul>
-
-    <p><strong>Claude Code</strong> gets a head start: open a session in your working directory and run the guided setup skill (installed by <code>darkmux init</code>):</p>
-    <pre><code>/darkmux-bootstrap</code></pre>
-    <p>It walks the whole setup interactively: detecting your hardware tier, downloading the recommended models, registering profiles, and validating the end state with <code>darkmux doctor</code>. The skill <strong>reads and proposes; you run the commands</strong>, so you stay in the loop with provenance on every step. On any other frontier, point the session at the docs above and ask it to do the same; the steps below are exactly what it follows.</p>
-
-    <div class="callout good">
-      <strong>Why orchestrator-first?</strong>
-      <p style="margin: 6px 0 0;">darkmux's reason for existing is local-AI orchestration: the frontier model is the strategist that drives your local models, and setup is the first place that shows up. Everything from here down documents the <em>same steps by hand</em>: read it to understand what the orchestrator does for you, or follow it directly if you're running darkmux as a bare CLI.</p>
+Next steps:
+  1. First answer, no Docker needed: <code>darkmux radio "do you have a brain?"</code>
+  2. Check the setup: <code>darkmux doctor</code>
+  3. With Docker running, a first dispatch: <code>darkmux dispatch code-reviewer "What do you do?"</code> (the runtime image is pulled on first use)</div>
     </div>
+    <p class="session-caption">Verbatim, captured 2026-08-28 on an M5 Max from a home directory with no <code>~/.darkmux</code>, LM Studio installed with a few models downloaded.</p>
+    <p>If Homebrew refuses the tap as untrusted, run <code>brew trust kstrat2001/darkmux</code> once and install again. Update later with <code>brew upgrade darkmux</code>. <code>init</code> is safe to re-run: it refreshes the skills and never overwrites a registry or config you have edited.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Verify your setup</h2>
-    <p><code>darkmux doctor</code> runs pre-flight checks across the substrate: profile registry, <code>lms</code> binary, models loaded, RAM headroom, power state, role prompt coverage, mission-config registry, daemon reachability, flow-sink health, audit integrity, machine_id resolution, and bundled-skill freshness (it flags any stale <code>darkmux-*</code> skill and points you at <code>darkmux init</code>), plus a battery of empirical rules from the <code>eureka</code> set.</p>
-<figure class="shot">
-  <img src="../media/console-config.png" alt="The darkmux console showing config list: the resolved configuration as JSON, with the redis, audit, runtime, fleet and cmd blocks visible." loading="lazy">
-  <figcaption><code>darkmux config list</code>. Every common knob is written into the file visibly, defaults and all — you tune the file, not the source.</figcaption>
-</figure>
-
-    <pre><code>darkmux doctor</code></pre>
-    <p>Each check returns Pass, Warn, or Fail. Fail-level lines include actionable hints; the exit code is 0 on all-pass-or-warn, 1 if anything Fails.</p>
-
-    <p>Output is one line per check, color-coded: <code>✓</code> for Pass, <code>!</code> for Warn, <code>✗</code> for Fail. Run it yourself on a fresh setup. That's the canonical reference for what it looks like.</p>
-
-    <p>Common first-run warnings:</p>
-    <ul>
-      <li><strong><code>daemon: reachable</code> Warn</strong>: the daemon isn't running yet. That's fine; you start it in <a href="#see-it-work">See it work</a> below (one command on Homebrew). Non-fatal: it only affects live viewing.</li>
-      <li><strong><code>profile match</code> Warn</strong>: your <code>~/.darkmux/profiles.json</code> doesn't yet reference what's loaded in LMStudio. That's also fine; we fix it next.</li>
-    </ul>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <h2>Configure your first profile <span class="muted" style="font-weight:400">(or let <code>/darkmux-bootstrap</code> do it)</span></h2>
-    <p class="muted">This is the manual version of what the <a href="#orchestrator"><code>/darkmux-bootstrap</code></a> skill does for you. Follow it to understand the moving parts, or if you're running darkmux without an orchestrator.</p>
-    <p>A profile is a named loadout: which model(s) to keep resident in LMStudio at which context length. Profiles live in <code>~/.darkmux/profiles.json</code> (created by <code>darkmux init</code>).</p>
-    <h3>Inspect what's already there</h3>
-    <pre><code>darkmux profile list              <span class="comment"># list configured profiles</span>
-cat ~/.darkmux/profiles.json      <span class="comment"># see the actual JSON</span></code></pre>
-    <p>The bootstrap config ships with four reference profiles in increasing capacity: <code>fast</code> (32K), <code>balanced</code> (100K), <code>deep</code> (200K), and a <code>gpt-oss</code> preset (the 120B MXFP4 build for Apple Silicon, at 100K). <code>fast</code>/<code>balanced</code>/<code>deep</code> carry a placeholder worker id, <code>&lt;your-worker-model-id&gt;</code>, for you to fill in; <code>gpt-oss</code> ships a concrete id (<code>mlx-community/gpt-oss-120b-MXFP4-Q8</code>). The <strong>default profile is <code>balanced</code></strong>, not the 120B preset.</p>
-
-    <h3>Point a profile at a real model</h3>
-    <p>The quickest way: <code>darkmux profile scan</code> lists the models LMStudio has downloaded that aren't yet in any profile, with a suggestion for each, so you can see what's available to slot in without hand-matching ids. Want a whole starter profile written for you? <code>darkmux profile draft --model &lt;model-id&gt; &lt;profile-name&gt;</code> prints a ready-to-paste profile JSON for a given model and task class (<code>--task-class fast|mid|long</code>).</p>
-    <pre><code><span class="comment"># Downloaded models not yet in a profile, with suggestions</span>
-darkmux profile scan
-
-<span class="comment"># Or emit a starter profile for a specific model (prints to stdout)</span>
-darkmux profile draft --model &lt;model-id&gt; my-fast --task-class fast</code></pre>
-    <p>Then replace a placeholder in <code>profiles.json</code> with a real id (<code>lms ls</code> shows the raw list if you prefer). Pick one to start, whatever you've been using day-to-day:</p>
-    <pre><code><span class="comment"># See what's available (raw)</span>
-lms ls
-
-<span class="comment"># Edit the file (use whatever editor)</span>
-${EDITOR:-vim} ~/.darkmux/profiles.json</code></pre>
-    <p>Each profile model has two fields that matter:</p>
-    <ul>
-      <li><code>id</code>: the LMStudio model id from <code>lms ls</code> output (e.g. <code>qwen3.6-35b-a3b</code>).</li>
-      <li><code>n_ctx</code>: context length to load at. Defaults are usually fine; <code>32768</code> is a safe starter for any model.</li>
-    </ul>
-    <p>Profile models are <strong>worker</strong> models; there's no per-model <code>role</code> field. The standing utility/compactor model is declared once for the machine in the top-level <code>internal.utility</code> binding, not per profile. If a profile lists more than one worker, an optional <code>default_model</code> names which one is the default.</p>
-
-    <h3>Verify the edits</h3>
-    <pre><code>darkmux profile list              <span class="comment"># the profile should now list your model</span>
-darkmux doctor                    <span class="comment"># confirm "profile match" is green or close</span></code></pre>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <h2>Residency is automatic</h2>
-    <p>You never load a profile by hand. A dispatch loads the models the named profile declares, under the resident RAM budget: it brings up what the profile needs and unloads to make room when the budget requires it, and writes nothing outside LMStudio. The <code>swap</code> verb that used to drive this is gone; the internal runtime reads the loaded model directly.</p>
-<figure class="shot">
-  <img src="../media/machine.png" alt="The darkmux machine view: a semicircular gauge reading 164 GiB used of a 256 GB limit, pressure tiles for margin, swap and compressor, and four resident models each with its context, weights, KV cost and current footprint." loading="lazy">
-  <figcaption>The machine view on a 256&nbsp;GB host. Every resident is priced — weights plus KV at its loaded context — so &ldquo;will this fit&rdquo; is arithmetic rather than a guess.</figcaption>
-</figure>
-
-
-    <div class="callout good">
-      <strong>What happens on dispatch.</strong>
-      <p style="margin: 6px 0 0;">When a dispatch needs your profile's models, darkmux issues <code>lms load</code> for each with a <code>darkmux:</code> namespace prefix (so darkmux can recognize its own loads later), sets the context length, and reports success. Nothing outside LMStudio is modified.</p>
+    <h2>First inference</h2>
+    <p>No Docker, no setup beyond the model: <code>radio</code> is darkmux in plain text, and it is the fastest proof the install works. Ask it anything about darkmux; it answers from the command tree and your machine’s state.</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "do you have a brain?"</span><button class="copy-btn" data-copy="darkmux radio &quot;do you have a brain?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">radio: No biological hardware. I run on local silicon, routed through your LM Studio instance at <code>localhost:1234</code>. I process text, match it against darkmux commands, and execute what's configured. If you want to see what models are actually loaded on your machine, run <code>darkmux machine status</code>. Otherwise, I'm just a well-wired console with a calibrated humor dial and zero pulse.</div>
     </div>
-
-    <p>If a dispatch reports a warning about RAM headroom or a model not found in <code>lms ls</code>, that's doctor-style feedback at load time, usually fixable by either trimming context length or downloading the model first via the LMStudio UI.</p>
+    <p class="session-caption">The <a href="radio.html">radio page</a> has the rest: the humor dial, the editor integration, and how to advertise your own commands.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Your first dispatch</h2>
-    <p>A dispatch is the task-grain execution entry point: hand one local-AI role a single message and let it run in the container-bounded runtime. The message is positional, so nothing but the role and the text is required:</p>
-    <pre><code>darkmux dispatch code-reviewer "Summarize the risk in this change." <span class="comment"># role + message, positional</span>
-git diff | darkmux dispatch pr-reviewer                             <span class="comment"># or pipe the message in on stdin</span></code></pre>
-    <p>darkmux loads the profile's model if it isn't resident, runs the role's tool loop, and prints the result. Every dispatch emits a flow record you can watch live in the viewer (below).</p>
-    <div class="callout">
-      <strong>Verified at release rehearsal.</strong>
-      <p style="margin: 6px 0 0;">This step calls a real model, so its output depends on your hardware and loaded model and isn't reproduced here. It is exercised live against a loaded model as part of the pre-release dogfood, per darkmux's release gate. Run it yourself once a model is loaded; that is the canonical reference for what your setup produces.</p>
+    <h2>Check the setup</h2>
+    <p><code>doctor</code> asks "is my setup correct": registry, models, RAM, daemon, flow sinks, skills. Pass, warn, or fail per check, with the fix under each warning; exit 1 only on a fail. <code>machine status</code> asks the other question, "what is loaded right now".</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux doctor</span><button class="copy-btn" data-copy="darkmux doctor" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">darkmux doctor — 41 checks
+
+● needs attention — flow sink health: LocalFile · warnings: flows_dir_absent
+
+  ✓ build                  darkmux 3.2.0 (6a7cd3fd) · flow schema 1.22.0
+  ✓ daemon reachable       reachable · viewer http://127.0.0.1:8765/ · phone
+                           http://&lt;tailnet-hostname&gt;/
+  ✓ 36 more checks passed — <code>-v</code> for detail
+  ⚠ flow sink health       LocalFile · warnings: flows_dir_absent
+        → Run <code>darkmux flow status</code> for full detail. Common fixes: start Redis (`brew services start
+          redis<code>) if </code>redis_unreachable<code>; raise </code>DARKMUX_REDIS_MAXLEN` if
+          <code>redis_stream_near_maxlen</code>; upgrade the lagging writer in the fleet if
+          <code>schema_skew_detected</code>.
+  ⚠ audit integrity        no audit files under ~/.darkmux/audit
+        → AuditFileSink is opt-in: set DARKMUX_AUDIT_DIR to enable a BLAKE3 hash-chained audit log
+          whose edits <code>darkmux flow integrity-check</code> detects (absent a full re-chain — the chain is
+          un-anchored), alongside the casual LocalFile sink.
+  ⚠ utility model          utility model <code>qwen3-4b-instruct-2507</code> registered but NOT loaded
+        → No verb needs this loaded first — the binding's only job is to name the compactor, and
+          every dispatch path self-loads it at its declared <code>n_ctx</code> under the <code>darkmux:</code> namespace
+          (#1616). Loading it by hand just pays that cost now instead of during the first dispatch;
+          if you do, keep the namespace and the context — `lms load &lt;id&gt; --context-length &lt;n&gt;
+          --identifier darkmux:&lt;id&gt;<code> — since a bare </code>lms load` creates a resident darkmux won't
+          reuse and <code>machine eject</code> can't reclaim. (#590, #1616, #1675)
+
+38 pass, 3 warn — workable but worth a look</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux machine status</span><button class="copy-btn" data-copy="darkmux machine status" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">registry: ~/.darkmux/profiles.json
+
+darkmux-managed (1):
+  darkmux:qwen3.6-35b-a3b-turboquant-mlx         ctx=262144   18.45 GB   idle
+
+user state (0):
+  (none — LMStudio is exclusively darkmux's right now)
+
+matches no registered profile</div>
     </div>
+    <p class="session-caption">Three warnings on a fresh install are normal: no flow files yet, the audit log is opt-in, and the utility model loads itself on the first dispatch. One thing is redacted: the machine’s tailnet hostname on the daemon line.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Launch your first mission <span class="muted" style="font-weight:400">(the centerpiece)</span></h2>
-    <p>A dispatch runs one role once. A <strong>mission</strong> runs a whole task graph: a crew of roles works the phases, and the graph is live in your browser as it goes. The built-in <code>coder-phase</code> config is the dispatch-to-PR loop, a worktree, a coder, a QA review, then a stop at an operator sign-off gate.</p>
-    <pre><code><span class="comment"># start the daemon first so you can watch the graph (the "See it work" section below has the details)</span>
-brew services start darkmux
-
-<span class="comment"># launch the built-in coder-phase mission; --param supplies its declared inputs</span>
-darkmux mission launch coder-phase \
-  --param workdir=/tmp/darkmux-first-mission \
-  --param base=main \
-  --param branch=darkmux/first-mission \
-  --param mission_id=first-mission</code></pre>
-    <p class="muted">Those four <code>--param</code> values are <code>coder-phase</code>'s declared inputs (worktree path, base branch, new branch name, mission id); launch bails with a copy-pasteable example if one is missing. In practice your frontier orchestrator fills these in for you. This is what it runs under the hood.</p>
-    <p>Open <code>http://127.0.0.1:8765/</code> and you see the mission graph come alive: phases light up as the crew works them, each dispatch streaming its tokens and detectors into the timeline. The run stops at the sign-off gate; from there your frontier orchestrator ships the git work by hand (commit, push, <code>gh pr create</code>, <code>gh pr merge</code>), then <code>darkmux mission finalize &lt;id&gt;</code> closes out the darkmux-side state, or <code>darkmux mission abort &lt;id&gt;</code> tears the worktree down. <strong>Watching that graph is the first-wow moment: this is what darkmux is for.</strong></p>
-    <div class="callout">
-      <strong>Verified at release rehearsal.</strong>
-      <p style="margin: 6px 0 0;">A mission launch drives real model dispatches, so its trajectory and timing depend on your hardware and loaded model and aren't reproduced here. The <code>coder-phase</code> gate-held loop is exercised live before every release per darkmux's release gate (a real gate-held dogfood on the pepper-grinder fixture). Run it against a repo of your own to see your graph.</p>
+    <h2>Profiles</h2>
+    <p>A profile is a named loadout: which model at which context length. <code>init</code> wrote three worker profiles around the model it picked (<code>fast</code> at 32K, <code>balanced</code> at 100K, the default, and <code>deep</code> at 200K) plus a few reference profiles for the review pipeline. Nothing loads by hand: a dispatch loads what its profile declares, under the RAM budget, and never touches a model you loaded yourself.</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux profile list</span><button class="copy-btn" data-copy="darkmux profile list" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux profile scan</span><button class="copy-btn" data-copy="darkmux profile scan" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
     </div>
+    <p class="session-caption">To change the worker, edit <code>~/.darkmux/profiles.json</code>; <code>profile scan</code> lists downloaded models no profile covers yet. Profile models are workers. The utility model that compacts context for them is declared once, in <code>internal.utility</code>.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>The health duo: machine + doctor</h2>
-    <p>Two read-only checks answer two different questions. <code>darkmux doctor</code> asks <em>is my setup correct</em> (preflight, config, pass/warn/fail, run earlier in this guide). <code>darkmux machine</code> asks <em>is my host healthy right now</em> (live residents, RAM truth). Bare <code>darkmux machine</code> routes to <code>machine status</code>:</p>
-    <pre><code>darkmux machine status            <span class="comment"># what's loaded right now; which profile (if any) matches</span>
-darkmux machine resources         <span class="comment"># live per-model RAM commitment vs footprint + machine pressure</span></code></pre>
-    <p><code>machine status</code> groups loaded models by ownership: darkmux-managed (under the <code>darkmux:</code> namespace) vs your own user state, which darkmux never touches. <code>machine resources</code> is the live memory ledger, kernel counters and <code>lms</code> metadata only, zero model dispatches. To release darkmux's own RAM footprint without disturbing anything you loaded yourself: <code>darkmux machine eject</code>.</p>
+    <h2>First dispatch</h2>
+    <p>A dispatch hands one role one message and lets it work with real tools. This is what Docker is for: each dispatch runs in a fresh <code>darkmux-runtime</code> container with only its workspace mounted, so the model can read, write, and run things in that directory and reach nothing else on your Mac, and the container is gone when the dispatch ends. The workspace itself is the model’s to change, which is why coding missions stop at a sign-off gate before anything ships. The first dispatch pulls the image; after that it is seconds. <code>darkmux lab run quick-q</code> runs the same path as a recorded, timed run.</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux dispatch code-reviewer "In two sentences, what do you do and what do you never do?"</span><button class="copy-btn" data-copy="darkmux dispatch code-reviewer &quot;In two sentences, what do you do and what do you never do?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">dispatching to model: qwen3.6-35b-a3b-turboquant-mlx
 
-    <h3>The smoke test</h3>
-    <pre><code>darkmux lab run quick-q           <span class="comment"># single-turn smoke prompt against the active profile</span>
-darkmux lab run inspect &lt;run-id&gt;      <span class="comment"># quick look at what happened</span></code></pre>
-    <p>This runs through darkmux's internal Docker-bounded runtime. The runtime image is pulled from GHCR on first use, so you just need Docker running. No Docker yet? Skip this step and come back after the <a href="lab.html">lab</a> section. (Like a dispatch, this calls a real model, so its numbers are yours to generate.)</p>
-  </div>
-</section>
+--- final assistant message ---
 
-<section id="see-it-work">
-  <div class="wrap">
-    <h2>See it work: start the daemon</h2>
-    <p>darkmux records everything it does as flow records, and the daemon serves them to a live viewer in your browser. Starting it is one command.</p>
-    <p>The daemon runs as a managed background service. It starts now, and again at every login:</p>
-    <pre><code>brew services start darkmux</code></pre>
-    <p>Open the viewer at the daemon's own address:</p>
-    <pre><code>open http://127.0.0.1:8765/        <span class="comment"># or just visit it in any browser</span></code></pre>
-    <p>The page is served by your local daemon, so it loads your own records directly: no account, nothing uploaded. It's empty until darkmux does some work; if you ran the smoke test above with the daemon up, that dispatch is already on the timeline. Want to see the shape before installing anything? The <a href="../demo/">playback demo at darkmux.com/demo</a> renders a recorded session.</p>
-    <p>That's the whole live-viewer setup. The <a href="observability.html">next section</a> is the deeper tour: how to read the timeline, manage the daemon, and the HTTP endpoints it exposes.</p>
+
+I analyze diffs to identify correctness, security, and testing issues while reporting findings classified as MUST FIX or CONSIDER. I never modify implementation code, create commits or PRs, run remote git operations, or attempt to install project toolchains.
+
+--- metrics ---
+turns:             1
+compactions:       0
+prompt tokens:     3527
+completion tokens: 277
+total messages:    3
+wall:              2933ms
+darkmux-runtime: trajectory → /darkmux-out/.darkmux-runtime/trajectory.jsonl
+darkmux-runtime: metrics → /darkmux-out/.darkmux-runtime/metrics.json</div>
+    </div>
+    <p class="session-caption">Every dispatch writes a flow record and a trajectory. The message is positional; <code>git diff | darkmux dispatch pr-reviewer</code> pipes one in. With no <code>--workdir</code>, the workspace is a fresh temporary directory, as above.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>What's next</h2>
-    <p>If you set up via <a href="#orchestrator"><code>/darkmux-bootstrap</code></a> (or had your orchestrator follow the steps above), your profiles and models are already in place. Pick a direction:</p>
-    <ul>
-      <li>For the deeper tour of the live viewer (reading the timeline, managing the daemon, the HTTP endpoints): <a href="observability.html">Observability: daemon + viewer</a>.</li>
-      <li>If you want to benchmark / characterize your hardware against a workload: <a href="lab.html">The lab harness</a>.</li>
-      <li>If you're integrating with an orchestrator for agentic work: <a href="missions.html">Missions, phases, and dispatch</a>.</li>
-    </ul>
+    <h2>Watch it work</h2>
+    <p>The daemon serves your flow records to a viewer in your browser: one drillable view, fleet to machine to run to tool call. It runs as a Homebrew service and comes back at login.</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">brew services start darkmux</span><button class="copy-btn" data-copy="brew services start darkmux" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">open http://127.0.0.1:8765/</span><button class="copy-btn" data-copy="open http://127.0.0.1:8765/" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+    </div>
+    <p class="session-caption">Nothing leaves the machine; the page is served by your own daemon. If the smoke test above ran with the daemon up, it is already on the timeline. The <a href="../demo/">demo</a> is the same viewer on recorded data, and <a href="observability.html">Observability</a> is the deeper tour.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Your first mission</h2>
+    <p>A dispatch runs one role once. A mission runs a task graph: a crew of roles works the phases and the graph is live in the viewer as it goes. The built-in <code>coder-phase</code> is the dispatch-to-PR loop: a worktree, a coder, a QA review, then a stop at a sign-off gate before anything ships.</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux mission launch coder-phase --param workdir=/tmp/darkmux-first-mission --param base=main --param branch=darkmux/first-mission --param mission_id=first-mission</span><button class="copy-btn" data-copy="darkmux mission launch coder-phase --param workdir=/tmp/darkmux-first-mission --param base=main --param branch=darkmux/first-mission --param mission_id=first-mission" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+    </div>
+    <p class="session-caption">A mission drives real dispatches for minutes, so its output is yours to generate; run it against a repo of your own and watch the graph. From the gate, you (or your agent) ship the git work, then <code>darkmux mission finalize &lt;id&gt;</code> closes it out. The whole model is in <a href="missions.html">Missions, phases, and dispatch</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>From an agent</h2>
+    <p><code>init</code> installed skills for Claude Code and a <code>CLAUDE.md</code>/<code>AGENTS.md</code>-reading harness. In Claude Code, <code>/darkmux-bootstrap</code> walks this same setup interactively, proposing each command for you to run. In Zed, <code>darkmux acp</code> is an agent server; the <a href="radio.html#editor">radio page</a> shows the wiring. Nothing on this page needs an agent; everything on it works from one.</p>
   </div>
 </section>
 
