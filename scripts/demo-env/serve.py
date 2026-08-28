@@ -112,7 +112,7 @@ def make_handler(inner, fx, hero, demo_uids, home):
 
             The canned panels go through the importer's scrub at build time,
             but a passthrough panel is rendered LIVE by the daemon on THIS
-            machine and never saw it. Two real leaks were caught this way,
+            machine and never saw it. Three real leaks were caught this way,
             not by inspection: `lab fixture list` printed the demo home's
             real absolute path (`/Users/<you>/de-projects/.../screenshots/
             demo-home`) into a frame headed for a public docs page; once a
@@ -120,11 +120,17 @@ def make_handler(inner, fx, hero, demo_uids, home):
             Packet 1), it rendered a deep-link URL through
             `darkmux_doctor::viewer_link_base` — this MACHINE's real
             Tailscale MagicDNS hostname (`http://macbook-pro.taild<...>.
-            ts.net/mission/.../graph`), not the demo's fictional one. Same
-            failure shape as the first leak (a probe-derived value, not
-            fixture content), so it gets the same fix: scrub every
-            passthrough, not just the one route that happened to be caught
-            first.
+            ts.net/mission/.../graph`), not the demo's fictional one; and
+            (#2032 packet 3) `GET /lab/runs`, captured for the first time by
+            `export_static.py`, answered `dir` with the demo home's real
+            absolute filesystem path — a live daemon computation, never a
+            flow-record field, so nothing upstream had ever scrubbed it. All
+            three are the same failure shape (a probe- or daemon-computed
+            value, not fixture content), so they get the same fix: scrub
+            EVERY passthrough response (every route this handler proxies
+            except `/flow/*`, which is scrubbed at import time and only
+            needs the presence filter below), not just the one route that
+            happened to be caught first.
 
             Reuses `lib_identity_scrub.scrub()` — the SAME rewrite
             `import_session.py`/`import_mission.py` run at build time —
@@ -139,10 +145,19 @@ def make_handler(inner, fx, hero, demo_uids, home):
                 text = data.decode()
             except UnicodeDecodeError:
                 return data
-            if str(home) not in text and "/Users/" not in text \
+            if str(home) not in text and str(ROOT) not in text and "/Users/" not in text \
                     and not any(p.search(text) for p, _ in FORBIDDEN):
                 return data
             text = text.replace(str(home), "/home/demo/.darkmux")
+            # Same repo-checkout-path leak `build.py::canned_doctor` guards
+            # against, live here: `lab fixture list` names the built-in
+            # fixture's real path under `ROOT` (`templates/builtin/lab-
+            # fixtures/...`), which the generic scrub below does not fully
+            # clean — it strips the `/Users/<name>` segment but leaves
+            # whatever comes after, including a worktree's session-scoped
+            # directory name. `home` is replaced first because it nests
+            # under `ROOT`; replacing `ROOT` first would corrupt that match.
+            text = text.replace(str(ROOT), "/home/demo/darkmux")
             text = _identity_scrub(text)
             for pat, what in FORBIDDEN:
                 m = pat.search(text)
@@ -225,7 +240,10 @@ def make_handler(inner, fx, hero, demo_uids, home):
                     base = self.path.split("?")[0]
                     if base.startswith("/flow/"):
                         data = self._filter_flow(data)
-                    elif base.startswith("/panel/"):
+                    else:
+                        # Every OTHER passthrough route gets the same scrub —
+                        # see `_scrub_passthrough`'s own doc for why this
+                        # cannot be scoped to `/panel/*` alone any more.
                         data = self._scrub_passthrough(data)
                     return self._send(r.status, data, ctype)
             except urllib.error.HTTPError as e:

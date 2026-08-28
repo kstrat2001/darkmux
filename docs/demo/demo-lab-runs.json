@@ -1,6 +1,6 @@
 {
-  "configured": false,
-  "dir": null,
-  "exists": false,
+  "configured": true,
+  "dir": "/home/demo/.darkmux/runs",
+  "exists": true,
   "runs": []
 }

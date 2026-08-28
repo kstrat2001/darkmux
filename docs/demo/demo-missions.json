@@ -1,21 +1,22 @@
 {
-  "generated_at_ms": 1787886870366,
+  "generated_at_ms": 1787889648476,
   "missions": [
     {
-      "created_ts": 1785400940,
-      "description": "PR review \u2014 kstrat2001/darkmux@38031a5af11ac4903a1195c7fda4b7b773e975ec (crew `deep+diff-review+probe-4b+probe-gptoss`)",
-      "finalized_ts": 1785405556,
-      "id": "review-1785400940-136e76",
+      "created_ts": 1787885107,
+      "description": "PR review \u2014 demo-review-nameof-recency (crew `deep+diff-review+probe-4b+probe-qwen38`)",
+      "finalized_ts": 1787887039,
+      "id": "demo-review-nameof-recency",
       "phase_ids": [
-        "review-1785400940-136e76-investigate",
-        "review-1785400940-136e76-adjudicate",
-        "review-1785400940-136e76-report"
+        "demo-review-nameof-recency-investigate",
+        "demo-review-nameof-recency-adjudicate",
+        "demo-review-nameof-recency-report"
       ],
       "spec": {
         "config_id": "review",
-        "inputs_fingerprint": "172a11e3f2"
+        "inputs_fingerprint": "0866ce12d4",
+        "origin": "builtin"
       },
-      "started_ts": 1785400940,
+      "started_ts": 1787885107,
       "status": "finalized"
     }
   ]

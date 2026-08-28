@@ -18,7 +18,8 @@ This reads them from a RUNNING `serve.py` and writes what it got:
     ./serve.py &            # the demo world
     ./export_static.py      # -> docs/demo/demo-panels.json, demo-machine.json,
                              #    demo-missions.json, demo-phases.json,
-                             #    demo-graphs.json
+                             #    demo-graphs.json, demo-flow.jsonl,
+                             #    demo-runs.json, demo-lab-runs.json
 
 Capturing from the demo world rather than a real daemon is the point. That
 world is fictional by construction (a 256 GB M5 Ultra that exists nowhere) and
@@ -49,7 +50,31 @@ reader; `MissionGraphLens.tsx` looks its routed mission up in the map instead
 of fetching `/mission/:id/graph.json` (which no daemon behind `docs/demo`
 could ever answer).
 
-Re-run after changing `world.json` or after a panel's output format moves.
+`demo-flow.jsonl`/`demo-runs.json`/`demo-lab-runs.json` (#2032 packet 3) were,
+before this packet, hand-authored fixtures with no capture script behind them
+either — `demo-flow.jsonl` was frozen at a single day in 2026-05, so every
+published demo aged in place: the "last active" reading grew stale by exactly
+however long it had been since a human last remembered to hand-edit the file,
+and the one `running` row in `demo-runs.json` stayed `running` forever,
+because nothing ever re-derived it from `build.py`'s actual `live=True`
+replay. Re-exporting from the demo world's own daemon fixes both: `/flow-days`
++ `/flow/<date>` (passthrough — see `serve.py`'s own module doc) give the
+REAL days the current build wrote, so the committed `.jsonl` always covers
+whatever `build.py --now` (default: real now) just anchored the world to; and
+`/runs` gives the REAL run list, where exactly the ONE replay `build.py`
+marked `live=True` reads as running, because that is the only session missing
+its terminal `dispatch complete`/`dispatch error` record (the same bookend
+contract 2 states). `demo-lab-runs.json` mirrors `/lab/runs` for the same
+"stop hand-authoring what a real route already answers" reason; the demo
+world configures no lab dir, so it is expected to keep coming back
+`configured: false` — captured rather than assumed, so a future world that DID
+configure one would change this file the same way it changes every other
+fixture, with no second edit required.
+
+Re-run after changing `world.json` or after a panel's output format moves —
+or simply run `./build.py && ./serve.py & ./export_static.py` any time before
+a release, since every fixture's "how long ago" reads relative to the moment
+`build.py` ran, not to when the fixture was last hand-touched.
 """
 import argparse, json, pathlib, re, sys, urllib.error, urllib.request
 
@@ -149,6 +174,31 @@ def main():
             g = get_optional(a.base, f"/mission/{mid}/graph.json")
             if g is not None:
                 graphs[mid] = g
+        # (#2032 packet 3) `/runs` and `/lab/runs` are both in `serve.py`'s
+        # passthrough set too — real aggregation, same "capture, don't
+        # hand-author" discipline as missions/phases/graphs above.
+        runs_resp = get(a.base, "/runs")
+        lab_runs_resp = get(a.base, "/lab/runs")
+        # `/flow-days` names every day the current build actually wrote
+        # (never a hardcoded date — a rebuild anchored to a different `--now`
+        # or spanning a day boundary changes what this lists, and the export
+        # follows without a second edit). `/flow/<date>` returns that day's
+        # records as a bare JSON array (`flow_handler`,
+        # `crates/darkmux-serve/src/lib.rs`); concatenating every day and
+        # sorting by `ts` reproduces exactly what the daemon would serve
+        # across the whole (short, demo-world) history, in the chronological
+        # order `parseFlowJsonl`/`firstRecordDate` (`ui/src/lib/flow.ts`)
+        # expect — the static reader derives the playback date from
+        # `records[0].ts`, so an unsorted write would silently misdate the
+        # demo.
+        days_resp = get(a.base, "/flow-days")
+        flow_records = []
+        for day in days_resp.get("days", []):
+            date = day.get("date") if isinstance(day, dict) else day
+            if not date:
+                continue
+            flow_records.extend(get(a.base, f"/flow/{date}"))
+        flow_records.sort(key=lambda r: r.get("ts") or "")
     except urllib.error.URLError as e:
         sys.exit(f"cannot reach {a.base} ({e}). Start the demo world first: ./serve.py")
 
@@ -158,6 +208,14 @@ def main():
     (OUT / "demo-missions.json").write_text(json.dumps(missions_resp, indent=2, sort_keys=True) + "\n")
     (OUT / "demo-phases.json").write_text(json.dumps(phases_resp, indent=2, sort_keys=True) + "\n")
     (OUT / "demo-graphs.json").write_text(json.dumps(graphs, indent=2, sort_keys=True) + "\n")
+    (OUT / "demo-runs.json").write_text(json.dumps(runs_resp, indent=2, sort_keys=True) + "\n")
+    (OUT / "demo-lab-runs.json").write_text(json.dumps(lab_runs_resp, indent=2, sort_keys=True) + "\n")
+    # NOT `sort_keys`/indented JSON: this is JSONL, one compact record object
+    # per line, matching exactly what a real `<date>.jsonl` day file on disk
+    # looks like and what `parseFlowJsonl` (`ui/src/lib/flow.ts`) parses —
+    # line-oriented, not a pretty-printed array.
+    (OUT / "demo-flow.jsonl").write_text(
+        "\n".join(json.dumps(r, sort_keys=True) for r in flow_records) + "\n")
 
     print(f"wrote {OUT / 'demo-panels.json'} ({len(panels)} panels)")
     for pid in PANEL_IDS:
@@ -170,6 +228,11 @@ def main():
     print(f"wrote {OUT / 'demo-phases.json'} ({len(phases_resp.get('phases', []))} phases)")
     print(f"wrote {OUT / 'demo-graphs.json'} ({len(graphs)} of "
           f"{len(missions_resp.get('missions', []))} missions' graphs captured)")
+    print(f"wrote {OUT / 'demo-runs.json'} ({len(runs_resp.get('runs', []))} runs, "
+          f"{sum(1 for r in runs_resp.get('runs', []) if r.get('status') == 'running')} running)")
+    print(f"wrote {OUT / 'demo-lab-runs.json'} (configured={lab_runs_resp.get('configured')})")
+    print(f"wrote {OUT / 'demo-flow.jsonl'} ({len(flow_records)} records across "
+          f"{len(days_resp.get('days', []))} day(s))")
 
 
 if __name__ == "__main__":

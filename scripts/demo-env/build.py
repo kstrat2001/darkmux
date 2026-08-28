@@ -430,6 +430,21 @@ def canned_doctor(home, cols=120):
     # shorter (an unbreakable path token is the one thing wrapping cannot
     # help) and honest about what the reader would see on their own machine.
     text = text.replace(str(home), "/home/demo/.darkmux")
+    # The repo CHECKOUT's own path (distinct from `home` above, which is
+    # scrubbed first because it nests under `ROOT` and would otherwise be
+    # corrupted by this replacement running first). A panel that names a
+    # repo-relative path (`lab fixture list`'s built-in fixture, registered
+    # from `templates/builtin/lab-fixtures/...` under `ROOT`) still carries
+    # whatever directory this build happened to run from — including, when
+    # built from a git worktree (this project's own documented working
+    # pattern — see `CLAUDE.md`'s "the main checkout is shared" section), a
+    # session-scoped worktree name like `.claude/worktrees/agent-<hash>`.
+    # `scrub()`'s generic `/Users/[^/]+` rule only strips the username
+    # segment and leaves the rest of the path — including that worktree
+    # hash — intact, so it survives as a real, if not hostname-shaped,
+    # identity carrier. Caught the same way `home` is: rewrite to a stable
+    # placeholder before the generic scrub runs.
+    text = text.replace(str(ROOT), "/home/demo/darkmux")
     text = scrub(text)
     for pat, what in FORBIDDEN:
         m = pat.search(text)
