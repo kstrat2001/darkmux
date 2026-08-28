@@ -27,6 +27,15 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// The host watchdog's structured-timeout marker prefix (#363), prepended
+/// to `stderr` when the inactivity timer fires. A public constant (rather
+/// than a literal duplicated at each detection call site) so any other
+/// consumer of a `DispatchResult` — `src/crawl_launch.rs`'s
+/// `interpret_dispatch_result` is the first (#1959 merge-gate finding 9) —
+/// can detect the same event without re-deriving or hand-copying this
+/// string.
+pub const INACTIVITY_TIMEOUT_MARKER: &str = "darkmux dispatch: INACTIVITY TIMEOUT";
+
 /// Local Docker image tag for the internal runtime, built from
 /// `runtime/Dockerfile` by a source checkout (`docker build -t darkmux-runtime
 /// runtime/`). Preferred when present — it's the dev workflow.
@@ -2924,7 +2933,7 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     // diagnostic detail about why.
     if timeout_fired.load(Ordering::SeqCst) {
         stderr = format!(
-            "darkmux dispatch: INACTIVITY TIMEOUT — no proof-of-work signal in {inactivity_secs}s — \
+            "{INACTIVITY_TIMEOUT_MARKER} — no proof-of-work signal in {inactivity_secs}s — \
              container `{container_name}` was killed by the watchdog. The inactivity timer \
              resets on each successful tool call (read / bash / edit / write) and on each \
              compaction event. Genuine thinking-mode hangs and total stalls trigger this; \
