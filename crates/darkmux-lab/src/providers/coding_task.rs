@@ -607,6 +607,11 @@ impl WorkloadProvider for CodingTaskProvider {
             walltime_ms,
             turns,
             compactions,
+            // (#2094) Taken directly from metrics.json — unlike turns/
+            // compactions there's no trajectory-derived series to
+            // reconcile against; `0` means "no rests" or "no metrics.json"
+            // and either reading is correct (the runtime's own default).
+            rest_ms: runtime_metrics.as_ref().map(|m| m.rest_ms).unwrap_or(0),
             tokens_before,
             summary_chars,
             mode,
@@ -1184,6 +1189,11 @@ fn classify_mode(walltime_ms: u128, loaded: &LoadedWorkload) -> Option<RunMode> 
 struct InternalRuntimeMetrics {
     turns: Option<u32>,
     compactions: Option<u32>,
+    /// (#2094) Sum of inter-turn rests, in milliseconds — `0` (not
+    /// `None`) when absent, since there's no trajectory-derived fallback
+    /// to reconcile against the way `turns`/`compactions` have (unlike
+    /// those, an absent value here has nothing to be "lower than").
+    rest_ms: u64,
 }
 
 /// Read a runtime-emitted `metrics.json` from a specific path.
@@ -1224,6 +1234,7 @@ fn read_metrics_json(path: &Path) -> Option<InternalRuntimeMetrics> {
             .get("compactions")
             .and_then(|x| x.as_u64())
             .map(|n| n as u32),
+        rest_ms: v.get("rest_ms").and_then(|x| x.as_u64()).unwrap_or(0),
     })
 }
 
@@ -1988,6 +1999,38 @@ not-valid-json
         // Pre-fix: turns=0, compactions=0. Post-fix: runtime values flow through.
         assert_eq!(report.turns, 10);
         assert_eq!(report.compactions, 2);
+        // (#2094) No rest_ms key in this fixture's metrics.json — absent
+        // means zero, not an error.
+        assert_eq!(report.rest_ms, 0);
+    }
+
+    /// (#2094) `rest_ms` flows through from metrics.json exactly like
+    /// `turns`/`compactions` — same fixture shape, one more key.
+    #[test]
+    fn inspect_surfaces_rest_ms_from_runtime_metrics() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox = tmp.path().join("sandbox");
+        let runtime_dir = sandbox.join(".darkmux-runtime");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(
+            run_dir.join("manifest.json"),
+            format!(
+                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
+                sandbox.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            runtime_dir.join("metrics.json"),
+            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":3,"compactions":0,"rest_ms":1000,"rests":2}"#,
+        )
+        .unwrap();
+        fs::write(run_dir.join("trajectory.jsonl"), "").unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        assert_eq!(report.rest_ms, 1000);
     }
 
     // ─── #364: inspect prefers run_dir/metrics.json over sandbox ──

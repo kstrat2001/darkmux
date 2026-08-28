@@ -256,6 +256,12 @@ fn cmd_lab_run_sub(sub: RunCmd) -> Result<i32> {
             println!("run:         {}", report.run_id);
             println!("workload:    {}", report.workload_id);
             println!("wall:        {}s", report.walltime_ms / 1000);
+            // (#2094) Shown next to wall — a rested run's wall clock must
+            // never be misread as a slow model. `0` when the run predates
+            // the feature or took no rests; no separate "unknown" state.
+            if report.rest_ms > 0 {
+                println!("rest:        {}s", report.rest_ms / 1000);
+            }
             println!("turns:       {}", report.turns);
             println!("compactions: {}", report.compactions);
             if !report.tokens_before.is_empty() {

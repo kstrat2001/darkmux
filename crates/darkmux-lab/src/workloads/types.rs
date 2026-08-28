@@ -203,6 +203,11 @@ pub struct InspectionReport {
     pub walltime_ms: u128,
     pub turns: u32,
     pub compactions: u32,
+    /// (#2094) Sum of the internal runtime's inter-turn rests for this run,
+    /// read from `metrics.json` alongside `turns`/`compactions`. `0` when
+    /// the run predates the feature or `metrics.json` is absent — the
+    /// runtime's own default-off behavior, not a read failure.
+    pub rest_ms: u64,
     pub tokens_before: Vec<u64>,
     pub summary_chars: Vec<u64>,
     pub mode: Option<RunMode>,

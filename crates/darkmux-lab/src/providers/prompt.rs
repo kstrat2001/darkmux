@@ -145,6 +145,9 @@ impl WorkloadProvider for PromptProvider {
             walltime_ms: meta.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128,
             turns: 1,
             compactions: 0,
+            // (#2094) A single-turn provider never rests (nothing to rest
+            // BETWEEN); not read from metrics.json here.
+            rest_ms: 0,
             tokens_before: vec![],
             summary_chars: vec![],
             mode: None,
