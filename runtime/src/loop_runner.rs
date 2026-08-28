@@ -284,9 +284,75 @@ pub struct LoopOutcome {
     /// Phase 6: middle-replace via the companion compactor model.
     pub compactions: u32,
 
+    /// (#2094) Sum of every inter-turn rest this dispatch took, in
+    /// milliseconds — the AFTER-clamp duration actually slept. `wall_ms`
+    /// (computed by the caller from `trajectory.elapsed_ms()`) INCLUDES
+    /// this time; a caller wanting model-only time subtracts `rest_ms`.
+    pub rest_ms: u64,
+    /// (#2094) How many inter-turn rests fired during this dispatch.
+    pub rests: u32,
+
     /// (#799) Bash invocations that FAILED TO RUN (never executed) during the
     /// dispatch — the verifier-fabrication backstop. Empty on an honest run.
     pub failed_to_run: Vec<FailedExec>,
+}
+
+/// (#2094) Injectable sleep abstraction for the global inter-turn rest.
+/// `run()` uses [`RealSleeper`] in production; tests inject a recording
+/// sleeper so the exact call count + duration can be asserted without
+/// waiting in real time (the "no test sleeps for real longer than 10ms"
+/// discipline this project holds tests to).
+pub trait TurnSleeper {
+    fn sleep(&self, ms: u64);
+}
+
+/// The production [`TurnSleeper`] — an actual `std::thread::sleep`. `ms ==
+/// 0` is a true no-op (no syscall at all), so the unconfigured (default)
+/// path costs nothing beyond the branch that decides to skip it.
+pub struct RealSleeper;
+
+impl TurnSleeper for RealSleeper {
+    fn sleep(&self, ms: u64) {
+        if ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+    }
+}
+
+/// (#2094) Clamp an operator-configured `turn_delay_ms` below the
+/// inactivity timeout, and produce the loud warning to log when it does.
+/// A rest AT OR ABOVE the full timeout could by itself exhaust the
+/// deadline before the loop ever reaches its next proof-of-work signal, so
+/// anything at or above the timeout is clamped to HALF of it — never
+/// honored verbatim — rather than silently letting the operator's own
+/// pacing knob become the thing that kills their dispatch.
+///
+/// `budget_ms == 0` is a degenerate operator setting (an effectively
+/// disabled watchdog) — never clamp against it: half of zero is zero,
+/// which would silently erase an intentional rest rather than protect
+/// anything. Pure + testable.
+fn resolve_turn_delay_ms(configured_ms: u64, budget_secs: u64) -> (u64, Option<String>) {
+    let budget_ms = budget_secs.saturating_mul(1000);
+    if budget_ms == 0 || configured_ms < budget_ms {
+        return (configured_ms, None);
+    }
+    let clamped = budget_ms / 2;
+    let warning = format!(
+        "darkmux-runtime: ⚠ turn_delay_ms={configured_ms} is at or above the inactivity \
+         timeout ({budget_ms}ms) — clamping to {clamped}ms (half the timeout) so the \
+         configured rest can never itself trip the watchdog. (#2094)"
+    );
+    (clamped, Some(warning))
+}
+
+/// (#2094) Extend `deadline` forward by `rest_ms` — the runtime-side
+/// soft-inactivity clock is EXTENDED by a harness-owned rest, never reset
+/// to "just now" (that would grant more headroom than the rest actually
+/// cost) and never left untouched (that would let the rest silently
+/// consume inactivity budget as if the dispatch had gone quiet). Pure +
+/// testable; mirrors `resolve_turn_delay_ms`'s shape.
+fn extend_deadline_by_rest(deadline: std::time::Instant, rest_ms: u64) -> std::time::Instant {
+    deadline + std::time::Duration::from_millis(rest_ms)
 }
 
 /// (#1221) The deliverable must be TEXT, never markup.
@@ -730,8 +796,50 @@ fn recover_intra_turn_stall(
 /// final response is identical either way; the rest of the loop
 /// (tool dispatch, compaction triggering, finish_reason handling)
 /// doesn't change.
+/// (#2094) Thin production wrapper over [`run_with_sleeper`] — constructs
+/// the real [`RealSleeper`] so every existing call site (35+ call sites at
+/// the time this landed, tests included) keeps this exact signature and
+/// needs no change. Tests that want to assert the turn-delay rest's exact
+/// call count/duration call [`run_with_sleeper`] directly with a recording
+/// sleeper instead.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
+    client: &LmStudioClient,
+    compactor_client: &LmStudioClient,
+    model: &str,
+    initial_messages: Vec<Message>,
+    tools: &[Tool],
+    trajectory: &mut Trajectory,
+    streaming: bool,
+    compaction_cfg: &compaction::CompactionConfig,
+    max_turns: Option<u32>,
+    max_cumulative_tokens: Option<u32>,
+    max_tokens_per_call: Option<u32>,
+    reasoning_checkpoint_interval: Option<u32>,
+    feedback_templates: std::collections::BTreeMap<String, String>,
+    response_format: Option<serde_json::Value>,
+) -> Result<LoopOutcome> {
+    run_with_sleeper(
+        client,
+        compactor_client,
+        model,
+        initial_messages,
+        tools,
+        trajectory,
+        streaming,
+        compaction_cfg,
+        max_turns,
+        max_cumulative_tokens,
+        max_tokens_per_call,
+        reasoning_checkpoint_interval,
+        feedback_templates,
+        response_format,
+        &RealSleeper,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_sleeper(
     client: &LmStudioClient,
     // (#1187 audit finding) ALWAYS a local-LMStudio client, never the remote
     // brain — even when `client` is configured with a `chat_url`/auth header
@@ -764,6 +872,8 @@ pub fn run(
     // wrapped as json_schema). When set, every model turn is grammar-constrained
     // to that shape — local-model JSON malformation becomes impossible.
     response_format: Option<serde_json::Value>,
+    // (#2094) Injectable rest sleeper — see [`TurnSleeper`]'s own doc.
+    sleeper: &dyn TurnSleeper,
 ) -> Result<LoopOutcome> {
     let mut messages = initial_messages;
     // (#1221) Resolve the per-call cap once; every use below (the request's
@@ -799,6 +909,9 @@ pub fn run(
     let mut total_prompt_tokens: u32 = 0;
     let mut total_completion_tokens: u32 = 0;
     let mut compactions: u32 = 0;
+    // (#2094) Sum + count of the inter-turn rests taken this dispatch.
+    let mut rest_ms: u64 = 0;
+    let mut rests: u32 = 0;
     let mut latest_prompt_tokens: u32 = 0;
     // (#854) Endpoint stale-token detection state. `prev_prompt_tokens` is the
     // prior turn's reported count; `frozen_prompt_turns` counts consecutive
@@ -885,6 +998,22 @@ pub fn run(
         .unwrap_or(600);
     let mut last_proof_of_work = std::time::Instant::now();
     let mut inactivity_soft_warning_fired_in_window = false;
+
+    // (#2094) Global inter-turn rest — read once at startup, same pattern
+    // as `inactivity_budget_secs` above (both are host-forwarded env vars
+    // the container reads exactly once). Clamped below the inactivity
+    // timeout so the operator's own pacing knob can never become the thing
+    // that trips the watchdog; a clamp fires a loud warning naming both
+    // numbers.
+    let turn_delay_ms: u64 = std::env::var("DARKMUX_TURN_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let (turn_delay_ms, turn_delay_warning) =
+        resolve_turn_delay_ms(turn_delay_ms, inactivity_budget_secs);
+    if let Some(w) = &turn_delay_warning {
+        eprintln!("{w}");
+    }
 
     // (#465) Test-cadence-drift detector — REDESIGNED from #457's
     // edits-since-last-bash counter. The prior shape mis-fired on
@@ -984,6 +1113,8 @@ pub fn run(
                     total_prompt_tokens,
                     total_completion_tokens,
                     compactions,
+                    rest_ms,
+                    rests,
                     failed_to_run: failed_to_run.clone(),
                 });
             }
@@ -1012,9 +1143,39 @@ pub fn run(
                     total_prompt_tokens,
                     total_completion_tokens,
                     compactions,
+                    rest_ms,
+                    rests,
                     failed_to_run: failed_to_run.clone(),
                 });
             }
+        }
+
+        // (#2094) Global inter-turn rest — GPU thermal/power relief between
+        // inference bursts. Fires here: AFTER this turn's tool results were
+        // appended (or after the terminal-return checks above bailed, in
+        // which case this line never runs at all — no rest on a dispatch
+        // that's about to end) and BEFORE the next chat request is built.
+        //
+        // Two guards, both load-bearing:
+        // - `turns > 0` — never rest before the FIRST request; there is no
+        //   prior turn to have rested "between."
+        // - `!resuming_after_checkpoint` — a checkpoint continuation is the
+        //   SAME logical turn resuming (see `resuming_after_checkpoint`'s
+        //   own doc above), not a turn boundary; the model is still
+        //   actively mid-thought and this is not "between turns."
+        if turns > 0 && !resuming_after_checkpoint && turn_delay_ms > 0 {
+            sleeper.sleep(turn_delay_ms);
+            rest_ms = rest_ms.saturating_add(turn_delay_ms);
+            rests = rests.saturating_add(1);
+            trajectory.append_rest(turns, turn_delay_ms);
+            // Harness-owned time, not a stall: EXTEND (never reset to "now")
+            // the soft-inactivity clock by exactly the rest duration, and
+            // clear the edge-trigger flag so a fresh rest buys a fresh
+            // chance before the next soft warning — mirrors the
+            // tool.completed/compaction proof-of-work resets elsewhere in
+            // this loop.
+            last_proof_of_work = extend_deadline_by_rest(last_proof_of_work, turn_delay_ms);
+            inactivity_soft_warning_fired_in_window = false;
         }
 
         // Pick the bound BEFORE building the request that carries it. This
@@ -1422,6 +1583,8 @@ pub fn run(
                     total_prompt_tokens,
                     total_completion_tokens,
                     compactions,
+                    rest_ms,
+                    rests,
                     failed_to_run: failed_to_run.clone(),
                 });
             }
@@ -1479,6 +1642,8 @@ pub fn run(
                             total_prompt_tokens,
                             total_completion_tokens,
                             compactions,
+                            rest_ms,
+                            rests,
                             failed_to_run: failed_to_run.clone(),
                         });
                     }
@@ -1916,6 +2081,8 @@ pub fn run(
                                 total_prompt_tokens,
                                 total_completion_tokens,
                                 compactions,
+                                rest_ms,
+                                rests,
                                 failed_to_run: failed_to_run.clone(),
                             });
                         }
@@ -2020,6 +2187,8 @@ pub fn run(
                         total_prompt_tokens,
                         total_completion_tokens,
                         compactions,
+                        rest_ms,
+                        rests,
                         failed_to_run: failed_to_run.clone(),
                     });
                 }
@@ -2235,6 +2404,8 @@ pub fn run(
                             total_prompt_tokens,
                             total_completion_tokens,
                             compactions,
+                            rest_ms,
+                            rests,
                             failed_to_run: failed_to_run.clone(),
                         });
                     }
@@ -2751,6 +2922,263 @@ fn extract_think_blocks(content: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------
+    // (#2094) turn_delay_ms: the pure clamp + deadline-extension arithmetic,
+    // tested in isolation. The full loop is scripted-mock-server-driven
+    // below; these two functions are the piece that's cheapest to falsify
+    // directly per-guard.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn resolve_turn_delay_ms_below_timeout_passes_through_unclamped() {
+        let (ms, warning) = resolve_turn_delay_ms(3000, 600);
+        assert_eq!(ms, 3000);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_turn_delay_ms_at_or_above_timeout_clamps_to_half_and_warns() {
+        // 10s budget = 10000ms; a configured 10000ms is AT the timeout.
+        let (ms, warning) = resolve_turn_delay_ms(10_000, 10);
+        assert_eq!(ms, 5_000, "clamped to half the timeout");
+        let w = warning.expect("must warn when clamping");
+        assert!(w.contains("10000"), "names the configured value: {w}");
+        assert!(w.contains("5000"), "names the clamped value: {w}");
+
+        // Strictly above the timeout clamps identically.
+        let (ms, warning) = resolve_turn_delay_ms(999_999, 10);
+        assert_eq!(ms, 5_000);
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn resolve_turn_delay_ms_zero_budget_never_clamps() {
+        // A 0-second inactivity timeout is a degenerate operator setting
+        // (an effectively disabled watchdog) — clamping against it would
+        // silently erase an intentional rest (half of zero is zero).
+        let (ms, warning) = resolve_turn_delay_ms(5_000, 0);
+        assert_eq!(ms, 5_000);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn extend_deadline_by_rest_moves_the_deadline_forward_by_exactly_the_rest() {
+        let now = std::time::Instant::now();
+        let extended = extend_deadline_by_rest(now, 500);
+        assert_eq!(extended, now + std::time::Duration::from_millis(500));
+        assert!(extended > now, "the deadline must move strictly forward");
+    }
+
+    #[test]
+    fn extend_deadline_by_rest_zero_is_a_true_no_op() {
+        let now = std::time::Instant::now();
+        assert_eq!(extend_deadline_by_rest(now, 0), now);
+    }
+
+    /// (#2094 boundary case) The soft-inactivity check in the loop is
+    /// `last_proof_of_work.elapsed() >= threshold_secs`. Extending the
+    /// deadline pushes `last_proof_of_work` FORWARD — potentially past
+    /// `Instant::now()` in a fast test, since the injected sleeper never
+    /// actually blocks (no real wall-clock time passes during a "rest").
+    /// `Instant::elapsed()` on a reference point in the future must
+    /// saturate to ZERO, not panic or underflow — which is exactly why a
+    /// rest can never itself read as having crossed the soft-warning
+    /// threshold: after an extension, `elapsed()` can only report LESS
+    /// time-toward-threshold, never more. This is the actual mechanism
+    /// that makes "the rest cannot trip the deadline" true.
+    #[test]
+    fn extending_the_deadline_into_the_future_makes_elapsed_read_as_zero_not_negative() {
+        let now = std::time::Instant::now();
+        let extended = extend_deadline_by_rest(now, 5_000);
+        assert_eq!(
+            extended.elapsed(),
+            std::time::Duration::ZERO,
+            "a deadline extended into the future must never report negative/underflowed elapsed time"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // (#2094) The inter-turn rest, driven through a real scripted loop —
+    // proves the wiring (guard placement, sleeper injection, trajectory +
+    // outcome accounting), not just the arithmetic tested in isolation
+    // above.
+    // ---------------------------------------------------------------
+
+    /// Records every sleep call without blocking — the harness never
+    /// actually waits (the "no test sleeps for real longer than 10ms"
+    /// discipline this project holds tests to).
+    #[derive(Default)]
+    struct RecordingSleeper {
+        calls: std::cell::RefCell<Vec<u64>>,
+    }
+    impl TurnSleeper for RecordingSleeper {
+        fn sleep(&self, ms: u64) {
+            self.calls.borrow_mut().push(ms);
+        }
+    }
+
+    /// Register a 3-response script on `server`: two `tool_calls` turns
+    /// followed by a `stop`. Mocks are mutually exclusive on how many
+    /// `"role":"tool"` substrings the accumulating request body carries —
+    /// the same keyed-mock trick
+    /// `an_empty_call_does_not_discard_the_work_already_banked` uses,
+    /// generalized to 3 states. Reuses the exact tool/args
+    /// `assistant_messages_in_history_never_carry_reasoning_content` does
+    /// (a `read` call on `/workspace/x.txt`), known to round-trip cleanly
+    /// with no Docker/real LMStudio involved.
+    fn register_three_turn_tool_then_stop_script(server: &httpmock::MockServer) {
+        use httpmock::prelude::*;
+        let tool_calls = serde_json::json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}" },
+        }]);
+        let tc1 = tool_calls.clone();
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(None, Some(tc1.clone()), "tool_calls", 100, 20));
+        });
+        let tc2 = tool_calls.clone();
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 1
+            });
+            then.status(200).json_body(chat_response_json(None, Some(tc2.clone()), "tool_calls", 120, 20));
+        });
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() >= 2
+            });
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 140, 5));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_three_turn_dispatch_rests_exactly_twice_between_turns() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+        use httpmock::prelude::*;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::set_var("DARKMUX_TURN_DELAY_MS", "500");
+
+        let server = MockServer::start();
+        register_three_turn_tool_then_stop_script(&server);
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("turn-delay-3").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let sleeper = RecordingSleeper::default();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, &sleeper,
+        )
+        .expect("3-turn scripted dispatch returns Ok");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        assert_eq!(outcome.turns, 3, "sanity: three logical turns");
+        assert_eq!(
+            sleeper.calls.borrow().as_slice(),
+            [500, 500],
+            "rests fire BETWEEN turns only — 2 rests for 3 turns, never before the first"
+        );
+        assert_eq!(outcome.rest_ms, 1000, "LoopOutcome carries the same sum the sleeper saw");
+        assert_eq!(outcome.rests, 2);
+
+        drop(traj);
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let body = std::fs::read_to_string(&traj_file).unwrap();
+        let rest_events = body.lines().filter(|l| l.contains("\"type\":\"runtime.rest\"")).count();
+        assert_eq!(rest_events, 2, "one runtime.rest trajectory event per rest");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_three_turn_dispatch_never_rests_when_turn_delay_is_zero() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+        use httpmock::prelude::*;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS"); // unset → 0 default
+
+        let server = MockServer::start();
+        register_three_turn_tool_then_stop_script(&server);
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("turn-delay-0").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let sleeper = RecordingSleeper::default();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, &sleeper,
+        )
+        .expect("3-turn scripted dispatch returns Ok");
+
+        assert_eq!(outcome.turns, 3, "sanity: still three turns");
+        assert!(sleeper.calls.borrow().is_empty(), "delay=0 must never sleep");
+        assert_eq!(outcome.rest_ms, 0);
+        assert_eq!(outcome.rests, 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_one_turn_dispatch_never_rests() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+        use httpmock::prelude::*;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::set_var("DARKMUX_TURN_DELAY_MS", "500");
+
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 50, 5));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("turn-delay-1turn").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("hi")];
+        let tools: [Tool; 0] = [];
+        let cfg = compaction::CompactionConfig::never_compact();
+        let sleeper = RecordingSleeper::default();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, &sleeper,
+        )
+        .expect("single-turn dispatch returns Ok");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        assert_eq!(outcome.turns, 1);
+        assert!(
+            sleeper.calls.borrow().is_empty(),
+            "a single turn has no prior turn to rest AFTER — never before the first request"
+        );
+        assert_eq!(outcome.rest_ms, 0);
+        assert_eq!(outcome.rests, 0);
+    }
 
     // ---------------------------------------------------------------
     // (#1221) The prefill state machine, tested directly.

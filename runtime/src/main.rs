@@ -826,6 +826,8 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             total_completion_tokens: o.total_completion_tokens,
             total_messages: o.messages.len(),
             max_turns_reached,
+            rest_ms: o.rest_ms,
+            rests: o.rests,
             final_assistant_preview: preview,
         };
         let _ = traj.save_metrics(&metrics);
@@ -887,6 +889,12 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             // the #325 three-way result discrimination that downstream
             // consumers branch on.
             max_turns_reached: false,
+            // (#2094) No `LoopOutcome` survives an `Err` return — any rests
+            // taken before the failure aren't recoverable here without
+            // threading rest counters through the error path too (the same
+            // reason turns/compactions above are hardcoded 0, not a new gap).
+            rest_ms: 0,
+            rests: 0,
             final_assistant_preview: String::new(),
         };
         let _ = traj.save_metrics(&metrics);
