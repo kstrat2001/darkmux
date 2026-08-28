@@ -155,6 +155,7 @@ pub fn run() -> DoctorReport {
         check_openai_base_url_conflict(),
         check_redis_config(),
         check_gh_allowlist(),
+        check_hooks(),
         check_review_judge_exhaustion_policy(),
         check_turn_delay(),
         check_remote_endpoint_credentials(),
@@ -1366,6 +1367,86 @@ fn check_gh_allowlist() -> Check {
         status: Status::Pass,
         message: format!("enabled ({provenance}) — allowed: {}", allowed.join(", ")),
         hint: None,
+    }
+}
+
+/// (#2093) Surface the flow-record hook sink's resolved state: whether it's
+/// enabled (with provenance), and — when it is — every configured rule's
+/// match + URL + undelivered-line count, flagging a rule whose match is
+/// empty (Warn — matches nothing, likely an operator forgot to fill it in)
+/// or whose URL isn't loopback (Fail — `HookSink::new` refuses the whole
+/// sink over this, so it's a hard block, not a suggestion).
+fn check_hooks() -> Check {
+    let env_set = std::env::var("DARKMUX_HOOKS_ENABLED").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let provenance = if env_set { "env" } else { "config.json" };
+    let enabled = darkmux_types::config_access::hooks_enabled();
+    let rules = darkmux_types::config_access::hooks_rules();
+    let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
+    build_hooks_check(enabled, provenance, &rules, &outbox_dir)
+}
+
+/// The pure rollup `check_hooks()` delegates to — split out so it's testable
+/// against synthetic rules without the global config/env tier (#811 empties
+/// `config()` in test builds, so there's no way to inject `hooks.rules`
+/// through the real accessor path in a unit test).
+fn build_hooks_check(
+    enabled: bool,
+    provenance: &str,
+    rules: &[darkmux_types::config::HookRule],
+    outbox_dir: &std::path::Path,
+) -> Check {
+    let name = "hooks";
+    if !enabled {
+        return Check { name: name.into(), status: Status::Pass, message: format!("disabled ({provenance})"), hint: None };
+    }
+    if rules.is_empty() {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!("enabled ({provenance}) but no rules configured — outbox_dir={}", outbox_dir.display()),
+            hint: Some(
+                "Add a rule to config.json's `hooks.rules`, e.g. `darkmux config set hooks.rules \
+                 '[{\"match\":{\"action\":\"crawl.*\"},\"http\":\"http://127.0.0.1:8790/events\"}]'`."
+                    .into(),
+            ),
+        };
+    }
+
+    let summaries = darkmux_flow::hooks::summarize_configured_rules(rules, outbox_dir);
+    let mut worst = Status::Pass;
+    let mut lines = Vec::with_capacity(summaries.len());
+    for s in &summaries {
+        let mut flags = Vec::new();
+        if s.is_empty_match {
+            flags.push("EMPTY MATCH — matches nothing".to_string());
+            if worst == Status::Pass {
+                worst = Status::Warn;
+            }
+        }
+        if !s.is_loopback {
+            flags.push("NON-LOOPBACK URL — refused at load".to_string());
+            worst = Status::Fail;
+        }
+        let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
+        lines.push(format!(
+            "  #{}: {} -> {} (undelivered: {}){flag_str}",
+            s.index, s.match_desc, s.url, s.undelivered
+        ));
+    }
+    Check {
+        name: name.into(),
+        status: worst,
+        message: format!(
+            "enabled ({provenance}) — {} rule(s), outbox_dir={}\n{}",
+            summaries.len(),
+            outbox_dir.display(),
+            lines.join("\n")
+        ),
+        hint: if worst != Status::Pass {
+            Some("Fix the flagged rule(s) in ~/.darkmux/config.json (or `darkmux config set hooks.rules ...`).".into())
+        } else {
+            None
+        },
     }
 }
 
@@ -4735,6 +4816,81 @@ mod tests {
         }
     }
 
+    // ─── (#2093) check_hooks — flow-record hooks ───────────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn check_hooks_disabled_by_default_is_pass() {
+        let prev = std::env::var("DARKMUX_HOOKS_ENABLED").ok();
+        unsafe { std::env::remove_var("DARKMUX_HOOKS_ENABLED"); }
+        let check = check_hooks();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("disabled"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_ENABLED"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_hooks_enabled_with_no_rules_warns() {
+        let prev = std::env::var("DARKMUX_HOOKS_ENABLED").ok();
+        unsafe { std::env::set_var("DARKMUX_HOOKS_ENABLED", "true"); }
+        let check = check_hooks();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("no rules"), "{}", check.message);
+        assert!(check.hint.is_some());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_ENABLED"),
+            }
+        }
+    }
+
+    /// The rule-level rollup (empty match → Warn, non-loopback URL → Fail,
+    /// undelivered count + per-rule detail in the message) is exercised
+    /// against `build_hooks_check` directly with synthetic rules, since the
+    /// global `config()` tier is empty by construction in test builds (#811)
+    /// — there is no way to inject a populated `hooks.rules` through
+    /// `check_hooks()`'s normal env/config path.
+    #[test]
+    fn hooks_check_rollup_flags_empty_match_and_non_loopback() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![
+            HookRule {
+                r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+                http: Some("http://127.0.0.1:8790/events".to_string()),
+                extras: Default::default(),
+            },
+            HookRule { r#match: None, http: Some("http://127.0.0.1:9000/x".to_string()), extras: Default::default() },
+            HookRule {
+                r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+                http: Some("http://10.0.0.5:8790/x".to_string()),
+                extras: Default::default(),
+            },
+        ];
+        let check = build_hooks_check(true, "config.json", &rules, tmp.path());
+        assert_eq!(check.status, Status::Fail, "a non-loopback rule is a hard block: {}", check.message);
+        assert!(check.message.contains("EMPTY MATCH"), "{}", check.message);
+        assert!(check.message.contains("NON-LOOPBACK"), "{}", check.message);
+        assert!(check.message.contains("crawl.*"), "healthy rule still named: {}", check.message);
+        assert!(check.message.contains("undelivered"), "{}", check.message);
+
+        // A single empty-match rule with an otherwise-fine URL is Warn only.
+        let warn_only = vec![HookRule {
+            r#match: None,
+            http: Some("http://127.0.0.1:8790/events".to_string()),
+            extras: Default::default(),
+        }];
+        let check = build_hooks_check(true, "config.json", &warn_only, tmp.path());
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+    }
+
     #[serial_test::serial]
     #[test]
     fn check_gh_allowlist_enabled_with_verbs_is_pass_and_names_them() {
@@ -5834,8 +5990,8 @@ mod tests {
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
-        // turn-delay [#2094] + mission-envelope-readability [#1881]) + one
-        // per active eureka rule.
+        // turn-delay [#2094] + mission-envelope-readability [#1881] + hooks
+        // [#2093]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
         let expected = 40 + darkmux_eureka::all_rules().len();
