@@ -3040,3 +3040,224 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
          reading different inputs instead of rendering what the shared union returned"
     );
 }
+
+// ── crawl plan (#1959 packet 1) ──
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("running git {args:?} in {}: {e}", dir.display()));
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn init_repo(dir: &std::path::Path) {
+    fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "-q", "-b", "main"]);
+    git(dir, &["config", "user.email", "test@example.com"]);
+    git(dir, &["config", "user.name", "test"]);
+}
+
+fn commit_all(dir: &std::path::Path, message: &str) {
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", message]);
+}
+
+/// Build the `app` consumer repo: a `.ts` file with two well-separated
+/// `catch` blocks (so their windows don't merge into one site — the
+/// prefilter is mechanical and must find both), a `package.json` pinning
+/// `@org/lib` to `pin_range`, and a `src/uses-lib.ts` that imports it.
+fn write_app_repo(dir: &std::path::Path, pin_range: &str) {
+    init_repo(dir);
+    fs::write(
+        dir.join("package.json"),
+        serde_json::json!({"name": "app", "dependencies": {"@org/lib": pin_range}}).to_string(),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    // Two catch sites separated by far more than 2x the built-in rule's
+    // window (30 lines each side), so they land as two DISTINCT sites
+    // rather than merging into one span.
+    let mut lines = vec!["function a() {".to_string(), "  try { risky(); }".to_string(), "  catch (e) { console.error(e); }".to_string(), "}".to_string()];
+    for _ in 0..80 {
+        lines.push(String::new());
+    }
+    lines.push("function b() {".to_string());
+    lines.push("  try { risky(); }".to_string());
+    lines.push("  catch (e) { }".to_string()); // the bare swallow the model would flag
+    lines.push("}".to_string());
+    fs::write(dir.join("src/x.ts"), lines.join("\n")).unwrap();
+
+    fs::write(
+        dir.join("src/uses-lib.ts"),
+        "import { thing } from '@org/lib';\nthing();\n",
+    )
+    .unwrap();
+
+    commit_all(dir, "app: initial");
+}
+
+fn write_lib_repo(dir: &std::path::Path, version: &str) {
+    init_repo(dir);
+    fs::write(
+        dir.join("package.json"),
+        serde_json::json!({"name": "@org/lib", "version": version}).to_string(),
+    )
+    .unwrap();
+    commit_all(dir, "lib: initial");
+}
+
+fn write_manifest(path: &std::path::Path, root: &std::path::Path, app: &std::path::Path, lib: &std::path::Path) {
+    let manifest = serde_json::json!({
+        "schema_version": "1.0",
+        "name": "test-corpus",
+        "root": root.to_string_lossy(),
+        "sources": [
+            {"id": "app", "path": app.to_string_lossy(), "ref": "main"},
+            {"id": "lib", "path": lib.to_string_lossy(), "ref": "main"}
+        ],
+        "edges": [{"consumer": "app", "library": "lib", "package": "@org/lib"}],
+        "rules": ["swallowed-error", "doc-contradicts-code", "stale-consumer"]
+    });
+    fs::write(path, manifest.to_string()).unwrap();
+}
+
+#[test]
+fn crawl_plan_produces_one_site_one_read_one_stale_edge_unit() {
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let lib = workdir.path().join("lib");
+    write_app_repo(&app, "^5.5.0");
+    write_lib_repo(&lib, "8.1.1");
+
+    let manifest_path = workdir.path().join("corpus.json");
+    let root = workdir.path().join("croot");
+    write_manifest(&manifest_path, &root, &app, &lib);
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["crawl", "plan", "--no-fetch", "--json"])
+        .arg(&manifest_path)
+        .output()
+        .expect("crawl plan runs");
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid plan JSON");
+
+    let units = plan["units"].as_array().expect("units array");
+    let site_units: Vec<&serde_json::Value> =
+        units.iter().filter(|u| u["kind"] == "site").collect();
+    let read_units: Vec<&serde_json::Value> =
+        units.iter().filter(|u| u["kind"] == "read").collect();
+    let edge_units: Vec<&serde_json::Value> =
+        units.iter().filter(|u| u["kind"] == "edge").collect();
+
+    assert_eq!(site_units.len(), 1, "units: {units:#?}");
+    assert_eq!(
+        site_units[0]["sites"].as_array().unwrap().len(),
+        2,
+        "site unit: {:#?}",
+        site_units[0]
+    );
+
+    assert_eq!(read_units.len(), 1, "units: {units:#?}");
+
+    assert_eq!(edge_units.len(), 1, "units: {units:#?}");
+    assert_eq!(edge_units[0]["range_admits"], serde_json::json!(false));
+    assert_eq!(edge_units[0]["sites"].as_array().unwrap().len(), 1);
+    assert_eq!(edge_units[0]["pinned"], serde_json::json!("^5.5.0"));
+    assert_eq!(edge_units[0]["library_version"], serde_json::json!("8.1.1"));
+
+    let edge_ledger = plan["totals"]["edges"].as_array().expect("edges ledger");
+    assert_eq!(edge_ledger.len(), 1);
+    assert_eq!(edge_ledger[0]["range_admits"], serde_json::json!(false));
+
+    // "0 units" must never look like nothing printed — the text-table path,
+    // exercised separately below, is the loud-zero guarantee; this asserts
+    // the same run isn't silently vacuous on the JSON side either.
+    assert!(plan["totals"]["units"].as_u64().unwrap() >= 3);
+}
+
+#[test]
+fn crawl_plan_admitted_range_produces_no_edge_unit_but_is_ledgered() {
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let lib = workdir.path().join("lib");
+    // Pinned range now ADMITS the library's version — no unit should fire.
+    write_app_repo(&app, "^8.0.0");
+    write_lib_repo(&lib, "8.1.1");
+
+    let manifest_path = workdir.path().join("corpus.json");
+    let root = workdir.path().join("croot");
+    write_manifest(&manifest_path, &root, &app, &lib);
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["crawl", "plan", "--no-fetch", "--json"])
+        .arg(&manifest_path)
+        .output()
+        .expect("crawl plan runs");
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid plan JSON");
+
+    let units = plan["units"].as_array().expect("units array");
+    let edge_units: Vec<&serde_json::Value> =
+        units.iter().filter(|u| u["kind"] == "edge").collect();
+    assert!(edge_units.is_empty(), "units: {units:#?}");
+
+    let edge_ledger = plan["totals"]["edges"].as_array().expect("edges ledger");
+    assert_eq!(edge_ledger.len(), 1, "{edge_ledger:#?}");
+    assert_eq!(edge_ledger[0]["range_admits"], serde_json::json!(true));
+}
+
+#[test]
+fn crawl_plan_zero_units_says_so_loudly_in_the_text_table() {
+    // A corpus with no rules matches nothing — the table must say "0
+    // units", never print an empty section that reads as silent success.
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let lib = workdir.path().join("lib");
+    write_app_repo(&app, "^5.5.0");
+    write_lib_repo(&lib, "8.1.1");
+
+    let manifest = serde_json::json!({
+        "schema_version": "1.0",
+        "name": "empty-corpus",
+        "root": workdir.path().join("croot").to_string_lossy(),
+        "sources": [
+            {"id": "app", "path": app.to_string_lossy(), "ref": "main"},
+            {"id": "lib", "path": lib.to_string_lossy(), "ref": "main"}
+        ],
+        "rules": []
+    });
+    let manifest_path = workdir.path().join("corpus.json");
+    fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["crawl", "plan", "--no-fetch"])
+        .arg(&manifest_path)
+        .output()
+        .expect("crawl plan runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("0 units"), "got:\n{stdout}");
+}
