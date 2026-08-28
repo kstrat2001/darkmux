@@ -211,20 +211,23 @@ fn pattern_block(rule: &Rule) -> String {
     )
 }
 
-fn render_sites(sites: &[Site]) -> String {
+fn render_sites(source: &str, sites: &[Site]) -> String {
+    // Full container paths: the workspace root is the CORPUS tree, so a path
+    // relative to the source (`ui/src/x.ts`) does not resolve and the tool
+    // boundary rejects it (observed on the first live mission, #1959).
     sites
         .iter()
-        .map(|s| format!("- {}:{} (read lines {}-{})", s.file, s.line, s.start, s.end))
+        .map(|s| format!("- /workspace/{source}/{}:{} (read lines {}-{})", s.file, s.line, s.start, s.end))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn render_files(files: &[ReadFileEntry]) -> String {
+fn render_files(source: &str, files: &[ReadFileEntry]) -> String {
     files
         .iter()
         .map(|f| match f {
-            ReadFileEntry::Whole(path) => format!("- {path}"),
-            ReadFileEntry::Range { file, start, end } => format!("- {file} (lines {start}-{end})"),
+            ReadFileEntry::Whole(path) => format!("- /workspace/{source}/{path}"),
+            ReadFileEntry::Range { file, start, end } => format!("- /workspace/{source}/{file} (lines {start}-{end})"),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -236,7 +239,7 @@ fn render_files(files: &[ReadFileEntry]) -> String {
 /// load-bearing sentences (the tool's exact five keys; the coverage
 /// request), so a model already tuned against that workload sees familiar
 /// phrasing here.
-const REPORT_FINDING_INSTRUCTIONS: &str = "\nFor each match, call `report_finding` with these five keys exactly: `file`, `line`, `pattern`, `evidence`, `why`. `evidence` must be the source line copied verbatim, and `line` must be where it appears.\n\nWhen you are done, say which files or sites you examined, which you did not get to, and whether you covered the whole scope.\n";
+const REPORT_FINDING_INSTRUCTIONS: &str = "\nFor each match, call `report_finding` with these five keys exactly: `file`, `line`, `pattern`, `evidence`, `why`. `file` must be the full path exactly as listed above, starting with `/workspace/`. `evidence` must be the source line copied verbatim, and `line` must be where it appears.\n\nWhen you are done, say which files or sites you examined, which you did not get to, and whether you covered the whole scope.\n";
 
 /// Build the dispatch message for one unit. Model-facing (AI-convention
 /// terms; the words `unit`/`ledger`/`corpus`/`packet` never appear —
@@ -251,7 +254,7 @@ fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<St
             out.push_str(&pattern_block(r));
             out.push_str(&format!(
                 "Your scope is these sites in `/workspace/{source}`. For each, read lines noted below and decide whether the cited line matches the pattern. Sites:\n{}\n",
-                render_sites(sites)
+                render_sites(source, sites)
             ));
         }
         Unit::Read { rules: rule_ids, files, source, .. } => {
@@ -263,7 +266,7 @@ fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<St
             }
             out.push_str(&format!(
                 "Your scope is these files in `/workspace/{source}`. Read each one in full and apply every pattern above:\n{}\n",
-                render_files(files)
+                render_files(source, files)
             ));
         }
         Unit::Edge {
@@ -283,7 +286,7 @@ fn build_message(rules_by_id: &BTreeMap<String, Rule>, unit: &Unit) -> Result<St
             out.push_str(&pattern_block(r));
             out.push_str(&format!(
                 "Your scope is these import sites in `/workspace/{source}`:\n{}\n\n",
-                render_sites(sites)
+                render_sites(source, sites)
             ));
             out.push_str(&format!(
                 "The library `{package}` at the version being examined is at `/workspace/{library}`; its entry files and changelog are: {}. The consumer pins `{pinned}`; the library version is `{library_version}`.\n",

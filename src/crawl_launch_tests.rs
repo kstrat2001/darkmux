@@ -586,7 +586,8 @@ fn message_builder_site_shape_has_scope_and_pattern_prose() {
     assert!(msg.contains("EVIDENCE for r1"), "{msg}");
     assert!(msg.contains("WHY for r1"), "{msg}");
     assert!(msg.contains("/workspace/app1"), "{msg}");
-    assert!(msg.contains("- x.ts:3 (read lines 1-6)"), "{msg}");
+    assert!(msg.contains("- /workspace/app1/x.ts:3 (read lines 1-6)"), "{msg}");
+    assert!(!msg.contains("- x.ts:3"), "sites must be full container paths, not source-relative: {msg}");
     assert!(msg.contains("report_finding"), "{msg}");
 }
 
@@ -609,8 +610,8 @@ fn message_builder_read_shape_lists_files_and_every_bound_rule() {
     let msg = build_message(&rules_by_id, &unit).unwrap();
     assert!(msg.contains("MATCH ONE"), "{msg}");
     assert!(msg.contains("MATCH TWO"), "{msg}");
-    assert!(msg.contains("- a.ts"), "{msg}");
-    assert!(msg.contains("- b.ts (lines 1-10)"), "{msg}");
+    assert!(msg.contains("- /workspace/app1/a.ts"), "{msg}");
+    assert!(msg.contains("- /workspace/app1/b.ts (lines 1-10)"), "{msg}");
     assert!(msg.contains("/workspace/app1"), "{msg}");
 }
 
@@ -640,7 +641,8 @@ fn message_builder_edge_shape_includes_library_surface_and_versions() {
     assert!(msg.contains("8.1.1"), "{msg}");
     assert!(msg.contains("index.js"), "{msg}");
     assert!(msg.contains("CHANGELOG.md"), "{msg}");
-    assert!(msg.contains("- uses.ts:1"), "{msg}");
+    assert!(msg.contains("- /workspace/app1/uses.ts:1"), "{msg}");
+    assert!(msg.contains("starting with `/workspace/`"), "{msg}");
 }
 
 #[test]
