@@ -297,7 +297,10 @@ function srcbadgeText(route: Route): string {
   }
   if (route.kind === "playback") {
     const date = route.date ?? todayUTC();
-    return date === todayUTC() ? "TODAY" : date;
+    // (operator, 2026-08-28) A playback names its day even when that day
+    // is today: `TODAY` beside `▶ PLAYBACK` read as a different chip from
+    // the demo's dated one. `TODAY` is the LIVE view's word.
+    return date;
   }
   if (route.kind === "dispatch" || route.kind === "mission") return "REPLAY";
   return "TODAY";
