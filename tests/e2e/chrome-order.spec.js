@@ -84,10 +84,14 @@ test('at phone width the chrome reads broadest-scope-first', async ({ page }) =>
   // The regression: machine-scope status ("coder on MacBook-Pro") wrapped to
   // BELOW the tab strip and one line above the panel, where it read as the
   // selected tab's first line of content.
+  // (#2071) The tab strip is the top of the sticky block now (tabs +
+  // transport, operator decision), and the status line sits directly under
+  // it, above the panel. Before #2071 the order was status, tabs, panel.
   expect(
-    meta.y,
-    'global machine status must sit ABOVE the tab selector, not between it and the panel'
-  ).toBeLessThan(tabs.y);
+    tabs.y,
+    'the tab selector is the top of the sticky block; the status line sits under it'
+  ).toBeLessThan(meta.y);
+  expect(meta.y, 'the status line sits above the panel').toBeLessThan((await page.locator('.panelout').boundingBox()).y);
 
   // ...and the tab strip ends up directly above the panel it selects, which is
   // the association a tab bar exists to carry.

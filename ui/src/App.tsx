@@ -1,6 +1,9 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useEffect } from "react";
 import { useHashRoute } from "./lib/useHashRoute";
-import { isStaticBuild } from "./lib/staticSource";
+import { isStaticBuild, staticFlowSrc } from "./lib/staticSource";
+import { usePlaybackTransport } from "./hooks/usePlaybackTransport";
+import { Scrubber } from "./lenses/catalog/Scrubber";
+import { fetchStaticFlowRecords, normalizeRecords } from "./lib/flow";
 import { useSyncHash } from "./lib/hashSync";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
@@ -141,11 +144,45 @@ export function App() {
   // so no filtering — matches `PlaybackLens`'s own `t ?? tMax` convention.
   // Guarded on `route.kind === "playback"` so a stale value left over from
   // a previous playback visit can never leak into a live route's log.
-  const [playbackPlayheadMs, setPlaybackPlayheadMs] = useState<number | null>(null);
+  // (#2071) The loaded day the shell's transport scrubs. A static build has
+  // ONE committed file and loads it on every route (one cached download; the
+  // landing route fetches it anyway), so play/pause and the scrubber sit in
+  // the sticky block on every tab and the run-detail and mission lenses
+  // replay against the same clock. A daemon build has a day only on its
+  // `/play/<date>` route; live routes have nothing to scrub.
+  const staticSrc = isStaticBuild() ? staticFlowSrc() : null;
+  const staticDayQuery = useQuery({
+    queryKey: queryKeys.staticFlowSrc(staticSrc ?? ""),
+    queryFn: () => fetchStaticFlowRecords(staticSrc ?? ""),
+    enabled: staticSrc !== null,
+    staleTime: Infinity,
+  });
+  const staticDay = useMemo(() => (staticDayQuery.data ? normalizeRecords(staticDayQuery.data) : null), [staticDayQuery.data]);
+  const dayRecords = staticSrc !== null ? staticDay : route.kind === "playback" && !routeRecords.loading ? routeRecords.records : null;
+  const transport = usePlaybackTransport(dayRecords);
   const eventLogRecords = useMemo(() => {
-    if (route.kind !== "playback" || playbackPlayheadMs === null) return routeRecords.records;
-    return routeRecords.records.filter((r) => T(r.ts) <= playbackPlayheadMs);
-  }, [route.kind, playbackPlayheadMs, routeRecords.records]);
+    if (!transport.active) return routeRecords.records;
+    // A static build's runs/machine/console routes have no slice of their
+    // own (the live window is empty there); the day's log, scoped to the
+    // playhead, is what the transport is scrubbing. Playback and dispatch
+    // routes keep their own slice, scoped the same way.
+    const own = route.kind === "playback" || route.kind === "dispatch" || staticSrc === null;
+    const base = own ? routeRecords.records : (dayRecords ?? []);
+    return base.filter((r) => T(r.ts) <= transport.t);
+  }, [transport.active, transport.t, route.kind, routeRecords.records, staticSrc, dayRecords]);
+  // (#2071) The sticky block's measured height feeds `--chrome-h`, the
+  // offset the event log column sticks under on desktop. It used to be a
+  // 97px constant that assumed the masthead + one chrome row.
+  const stickyRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = stickyRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const apply = () => el.parentElement?.style.setProperty("--chrome-h", `${Math.round(el.getBoundingClientRect().height)}px`);
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   // (#1800 P2, QA gate) Route-gated for the same reason `useLiveTail` above
   // is, and the gate is load-bearing in a way that is easy to get wrong:
   // `FleetLens` already passed `enabled: false` on a replay, but a DISABLED
@@ -278,8 +315,30 @@ export function App() {
           `.app-shell__crumbbar`, matching legacy's DOM order (`.top` before
           `.crumbbar`). */}
       <Masthead route={displayRoute} liveStatus={liveStatus} specs={specs} />
-      <div className="app-shell__crumbbar">
+      {/* (#2071) The sticky block: the tab strip plus, while a day is loaded,
+          the playback transport. Operator decision: sticky row, tabs
+          included; the masthead, crumb and meta line scroll away. Its height
+          is route-independent by construction (the meta line is NOT in it),
+          which is what stopped the 32px tab-strip jump between routes. */}
+      <div className="app-shell__sticky" ref={stickyRef}>
         <NavChrome route={route} />
+        {transport.active ? (
+          <Scrubber
+            t={transport.t}
+            tMin={transport.tMin}
+            tMax={transport.tMax}
+            playing={transport.playing}
+            speed={transport.speed}
+            onScrub={transport.scrub}
+            onRewind={transport.rewind}
+            onTogglePlay={transport.togglePlay}
+            onCycleSpeed={transport.cycleSpeed}
+            visibleCount={transport.visibleCount}
+            totalCount={transport.totalCount}
+          />
+        ) : null}
+      </div>
+      <div className="app-shell__crumbbar">
         {/* (#2073) `is-replay`: on a playback route the crumb repeats the
             meta line's own lead (`◆ <mission>`); the narrow stylesheet drops
             this copy, where a phone has no room for the same name twice. */}
@@ -338,7 +397,7 @@ export function App() {
               navigation: switching tabs remounts the boundary, which is the
               recovery an operator will reach for first. */}
           <LensErrorBoundary key={route.kind} name={route.kind}>
-            {renderRoute(route, setPlaybackPlayheadMs)}
+            {renderRoute(route, transport.active ? transport.t : null)}
           </LensErrorBoundary>
         </main>
         <EventLogColumn
@@ -490,7 +549,7 @@ function routeChrome(
  * calls it) know this parameter exists. See `App`'s own
  * `playbackPlayheadMs`/`eventLogRecords` doc for why the event log needs it.
  */
-function renderRoute(route: Route, onPlaybackPlayheadChange: (t: number | null) => void) {
+function renderRoute(route: Route, playhead: number | null) {
   switch (route.kind) {
     case "fleet":
       return <FleetLens />;
@@ -518,7 +577,7 @@ function renderRoute(route: Route, onPlaybackPlayheadChange: (t: number | null) 
       // (#1800 P2) A bare #<date> hash — a REAL historical render now: the
       // fleet hero over that day's records, with every one of legacy's
       // replay-mode branches taken. See PlaybackLens's own doc.
-      return <PlaybackLens date={route.date} onPlayheadChange={onPlaybackPlayheadChange} />;
+      return <PlaybackLens date={route.date} playhead={playhead} />;
     case "unknown":
       return <LensPlaceholder label="unrecognized" hash={route.hash} />;
   }
