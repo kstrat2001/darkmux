@@ -438,3 +438,40 @@ footer a:hover { color: var(--accent); }
   margin-top: 10px;
   line-height: 1.5;
 }
+
+/* ── Session cards (ported from the home page's Get going, 2026-08-28) ──
+   One card that reads as a terminal session: copyable command rows, verbatim
+   output rows under the command that produced them, an attribution caption.
+   `.session .copy-btn` is the icon button; `.code-wrap .copy-btn` (the text
+   button copy.js adds to every <pre>) is untouched. */
+.session {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin: 16px 0 12px;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  color: var(--text);
+  overflow-x: auto;
+}
+.session .cmd-line { display: flex; align-items: center; gap: 10px; }
+.session .cmd-line + .cmd-line { margin-top: 6px; }
+.session .cmd-line .prompt { color: var(--muted); user-select: none; }
+.session .cmd-line .cmd { flex: 1; color: var(--accent); white-space: pre; overflow-x: auto; }
+.session .cmd-out { color: var(--muted); margin: 6px 0 14px 22px; white-space: pre-wrap; line-height: 1.55; }
+.session .cmd-out:last-child { margin-bottom: 0; }
+.session .cmd-out code { color: var(--text); font-family: inherit; background: none; padding: 0; }
+.session .cmd-desc { font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; color: var(--muted); margin: 2px 0 12px 22px; line-height: 1.5; }
+.session .copy-btn {
+  flex: none; cursor: pointer; background: transparent; border: 1px solid var(--border);
+  border-radius: 5px; color: var(--muted); padding: 5px; display: inline-flex; user-select: none;
+  transition: color .12s, border-color .12s;
+}
+.session .copy-btn svg { display: none; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.session .copy-btn:not(.copied) .copy-btn__copy { display: block; }
+.session .copy-btn.copied .copy-btn__ok { display: block; }
+.session .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+.session .copy-btn.copied { color: var(--accent); border-color: var(--accent); }
+.session-caption { font-size: 13px; color: var(--muted); line-height: 1.5; margin: 0 0 24px; }
+
