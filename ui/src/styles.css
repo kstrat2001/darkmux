@@ -439,14 +439,6 @@ body {
     margin-right: auto;
   }
 }
-@media (max-width: 560px) {
-  /* (#2073) Brand + `FLOW · <date>` + `▣ PLAYBACK` overflowed 390px and
-     wrapped the mode badge onto its own masthead line; the date alone is
-     the information. Same breakpoint as the masthead's other phone rules. */
-  .masthead__srcpre {
-    display: none;
-  }
-}
 .masthead__refresh {
   background: none;
   border: 1px solid var(--border);

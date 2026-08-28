@@ -202,7 +202,7 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     for (const route of [{ kind: "playback", date: null }, { kind: "runs", runsKind: "all", run: null, machine: null }, { kind: "fleet" }, { kind: "mission", missionId: "m1" }] as const) {
       const { container, unmount } = renderMasthead(route as never);
       const badge = container.querySelector(".masthead__srcbadge");
-      expect(badge?.textContent).toBe("FLOW · 2026-08-26");
+      expect(badge?.textContent).toBe("2026-08-26");
       unmount();
     }
     vi.unstubAllGlobals();

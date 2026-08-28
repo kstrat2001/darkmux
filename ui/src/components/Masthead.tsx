@@ -184,18 +184,8 @@ export function Masthead({
         // (#1801) No `<CatalogPanel>` here — see this component's own doc
         // for why a static build gets inert text instead of a button that
         // would 404 on click.
-        <span className="masthead__srcbadge" title={srcbadgeText(route).startsWith("FLOW · ") ? "the first recorded day in this replay" : undefined}>
-          {/* (#2073) The `FLOW · ` prefix is its own span so the narrow
-              stylesheet can hide it: brand + chip + mode badge overflowed
-              390px and pushed `▣ PLAYBACK` onto a second masthead line. */}
-          {srcbadgeText(route).startsWith("FLOW · ") ? (
-            <>
-              <span className="masthead__srcpre">FLOW · </span>
-              {srcbadgeText(route).slice("FLOW · ".length)}
-            </>
-          ) : (
-            srcbadgeText(route)
-          )}
+        <span className="masthead__srcbadge" title={/^\d{4}-\d{2}-\d{2}$/.test(srcbadgeText(route)) ? "the first recorded day in this replay" : undefined}>
+          {srcbadgeText(route)}
         </span>
       ) : (
         <CatalogPanel label={srcbadgeText(route)} />
@@ -298,13 +288,16 @@ function srcbadgeText(route: Route): string {
   // from the fetched records and is unresolved on first paint, so the
   // landing route flashed `TODAY` (and stayed there if the file was slow)
   // while every other tab had the date from the meta at once.
+  // (operator, 2026-08-28) The chip is the bare date on every width: the
+  // `FLOW · ` prefix read as noise on desktop and was already hidden on
+  // phones, so dropping it is also what makes the two consistent.
   if (isStaticBuild()) {
     const date = staticFlowDate();
-    if (date) return `FLOW · ${date}`;
+    if (date) return date;
   }
   if (route.kind === "playback") {
     const date = route.date ?? todayUTC();
-    return date === todayUTC() ? "TODAY" : `FLOW · ${date}`;
+    return date === todayUTC() ? "TODAY" : date;
   }
   if (route.kind === "dispatch" || route.kind === "mission") return "REPLAY";
   return "TODAY";
