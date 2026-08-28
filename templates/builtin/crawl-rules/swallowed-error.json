@@ -8,7 +8,7 @@
   "prefilter": ["\\bcatch\\s*(\\(|\\{)", "\\.catch\\s*\\(", "^\\s*void\\s+[A-Za-z_$][\\w$.]*\\s*\\("],
   "window": 30,
   "match": "The site is a `catch` clause, a `.catch(...)` handler, or a `void somePromise()` statement, AND the failure that reaches it is neither rethrown, nor returned as an error value the caller checks, nor logged, nor counted, nor recorded anywhere the surrounding lines show. The operation looks like it succeeded to everything downstream.",
-  "no_match": "The handler rethrows or wraps and throws. The handler logs (any logger call, `console.*`, a metrics call, an error reporter). The handler returns or resolves a value that plainly encodes the failure (`null`/`undefined`/`false`/an error object) AND the immediate caller visibly checks it. A comment in the window says why ignoring this failure is safe. Test code, generated code, or a `.d.ts`.",
+  "no_match": "The handler rethrows or wraps and throws. The handler logs (any logger call, `console.*`, a metrics call, an error reporter). The handler returns or resolves a value that plainly encodes the failure (`null`/`undefined`/`false`/an error object) AND the immediate caller visibly checks it. A comment in the surrounding lines you were given says why ignoring this failure is safe. Test code, generated code, or a `.d.ts`.",
   "evidence": "The `catch`/`.catch`/`void` line, copied verbatim. `line` is where it appears.",
-  "why_hint": "Say what operation failed silently and what downstream code assumes about it. Do not speculate past what the window shows; if the consequence is outside the window, say 'consequence not visible in window'."
+  "why_hint": "Say what operation failed silently and what downstream code assumes about it. Do not speculate past what the surrounding lines you were given show; if the consequence is outside them, say 'consequence not visible in the surrounding lines you were given'."
 }

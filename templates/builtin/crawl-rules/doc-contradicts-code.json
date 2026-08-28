@@ -6,7 +6,7 @@
   "applies_to": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.mjs", "**/README.md", "**/docs/**/*.md"],
   "exclude": ["**/node_modules/**", "**/dist/**", "**/build/**", "**/coverage/**", "**/*.d.ts", "**/CHANGELOG*.md"],
   "chunk_tokens": 12000,
-  "match": "A JSDoc/TSDoc block, a leading line comment, or a README/doc sentence makes a checkable claim about the code it sits next to (what it returns, what it validates, what it throws, what it defaults to, what it never does, which order things happen in), and the code in the same chunk visibly does something else. The claim and the code must BOTH be in the chunk you were given.",
+  "match": "A JSDoc/TSDoc block, a leading line comment, or a README/doc sentence makes a checkable claim about the code it sits next to (what it returns, what it validates, what it throws, what it defaults to, what it never does, which order things happen in), and the code visibly does something else. The claim and the code must BOTH be in the text you were given.",
   "no_match": "The comment is vague or aspirational (a TODO, a 'should', a design note). The claim is about behavior that lives in another file you cannot see. The comment is merely stale in wording (a renamed parameter) without changing what a reader would expect the code to do. Commented-out code. Generated files.",
   "evidence": "The line carrying the CLAIM, copied verbatim. `line` is that line. Put the contradicting code line in `why`, quoted.",
   "why_hint": "Quote the claim, quote the code line that contradicts it, and state the difference in one sentence. If you cannot quote both, it is not a finding."

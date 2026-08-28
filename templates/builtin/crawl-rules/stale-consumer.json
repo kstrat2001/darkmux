@@ -1,5 +1,5 @@
 {
-  "_comment": "(#1959) Edge-shaped rule: fires on a dependency EDGE the corpus manifest declares (consumer -> library, both in the corpus). The prefilter is fully mechanical and costs no tokens: the consumer's pinned range for the library vs the library's version at its crawled ref, and the consumer's import sites of that library. The model reads only those sites plus the library's public surface, and reports the sites whose meaning would change.",
+  "_comment": "(#1959) Edge-shaped rule: fires on a dependency EDGE the corpus manifest declares (consumer -> library, both in the corpus). The prefilter is fully mechanical and costs no tokens: the consumer's pinned range for the library vs. the library version being examined, and the consumer's import sites of that library. The model reads the consumer's import sites plus the library entry files and changelog listed with the unit, and reports the sites whose meaning would change.",
   "id": "stale-consumer",
   "kind": "edge",
   "title": "A consumer pins a library version its range cannot advance to, and imports symbols that changed",
@@ -7,8 +7,8 @@
   "applies_to": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.mjs"],
   "exclude": ["**/node_modules/**", "**/dist/**", "**/build/**", "**/*.d.ts", "**/*.test.*", "**/*.spec.*"],
   "window": 20,
-  "match": "The consumer's declared range for the library EXCLUDES the library's version at the crawled ref (a lower major, or a caret/tilde range that cannot reach it), AND a symbol the consumer imports from that library has, at the crawled ref, a different signature, a different return shape, a changed default, or no longer exists. Report each consumer call site of such a symbol.",
-  "no_match": "The range already admits the library's current version. The imported symbol is unchanged between the pinned major and the crawled ref as far as the library's exports and changelog show. A comment or lockfile note at the consumer says the pin is deliberate and why.",
+  "match": "The consumer's declared range for the library EXCLUDES the library version being examined (a lower major, or a caret/tilde range that cannot reach it), AND a symbol the consumer imports from that library has, in the library version being examined, a different signature, a different return shape, a changed default, or no longer exists. Report each consumer call site of such a symbol.",
+  "no_match": "The range already admits the library's current version. The imported symbol is unchanged between the pinned version and the library version being examined, as far as the library files provided with this unit show. A comment or lockfile note at the consumer says the pin is deliberate and why.",
   "evidence": "The consumer's import line or call line, copied verbatim. `line` is where it appears.",
-  "why_hint": "Name the symbol, the consumer's pinned range, the library's version at the crawled ref, and what changed (quote the library's export or changelog line). A version gap alone, with no changed symbol, is context for the ledger, not a finding."
+  "why_hint": "Name the symbol, the consumer's pinned range, the library version being examined, and what changed; quote the line from the provided library files that shows the change. A version gap alone, with no changed symbol, is context, not a finding."
 }
