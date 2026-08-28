@@ -633,7 +633,7 @@ describe("App", () => {
     // topbar: the source chip names the day, and the mode badge says what
     // mode this is. Both were absent/wrong — the chip showed a bare date and
     // no mode badge rendered at all on a replay.
-    expect(document.querySelector(".catalog-toggle")?.textContent).toContain("FLOW · 2026-08-07");
+    expect(document.querySelector(".catalog-toggle")?.textContent).toContain("2026-08-07");
     expect(document.getElementById("modebadge")?.textContent).toBe("▶ playback");
 
     // crumb: `◆ <primaryMission()>`. Non-empty precisely BECAUSE a replay is

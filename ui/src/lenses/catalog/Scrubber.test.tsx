@@ -76,7 +76,7 @@ describe("Scrubber", () => {
 
   // (#1067) The glyph carries visual state; title/aria-label carry meaning —
   // and must flip TOGETHER with the glyph, not drift from it.
-  it("the play/pause button's glyph and its name flip together", () => {
+  it("the play/pause button's icon and its name flip together", () => {
     const { rerender } = render(
       <Scrubber
         t={TMIN}
@@ -93,7 +93,7 @@ describe("Scrubber", () => {
       />,
     );
     const playBtn = screen.getByRole("button", { name: "play" });
-    expect(playBtn.textContent).toBe("▶");
+    expect(playBtn.querySelector("svg path")?.getAttribute("d")).toBe("M4 2l10 6-10 6z"); // the play triangle
 
     rerender(
       <Scrubber
@@ -111,7 +111,7 @@ describe("Scrubber", () => {
       />,
     );
     const pauseBtn = screen.getByRole("button", { name: "pause" });
-    expect(pauseBtn.textContent).toBe("⏸");
+    expect(pauseBtn.querySelector("svg path")?.getAttribute("d")).toBe("M3 2h4v12H3zM9 2h4v12H9z"); // the pause bars
     expect(screen.queryByRole("button", { name: "play" })).not.toBeInTheDocument();
   });
 

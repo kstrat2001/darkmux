@@ -142,7 +142,13 @@ body {
 }
 
 .app-shell__navtabs {
-  display: inline-flex;
+  /* (operator, 2026-08-28) Uniform cells on every width: `grid-auto-columns:
+     1fr` sizes every tab to the widest label (MACHINE) instead of its own,
+     so RUNS is no longer the slim one. On desktop the strip stays compact
+     beside the transport; the phone rule below stretches it to the row. */
+  display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
   flex: none;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -151,6 +157,7 @@ body {
 
 .nav-tab {
   display: inline-block;
+  text-align: center;
   font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -292,6 +299,17 @@ body {
   }
   .app-shell__navtabs {
     order: 0;
+    /* (operator, on the phone, 2026-08-28) Uniform-width tabs filling the
+       row: sized by their labels, RUNS was the slim one and the strip sat
+       ragged against the full-width transport under it. Equal cells line
+       up with the content edges, center by construction, and widen each
+       tap target from ~70px to a quarter of the row. */
+    display: grid;
+    width: 100%;
+  }
+  .app-shell__navtabs .nav-tab {
+    justify-content: center;
+    text-align: center;
   }
   .app-shell__crumb {
     order: 1;
@@ -419,14 +437,6 @@ body {
      so its own auto margin does not compete with this one. */
   .masthead__brand {
     margin-right: auto;
-  }
-}
-@media (max-width: 560px) {
-  /* (#2073) Brand + `FLOW · <date>` + `▣ PLAYBACK` overflowed 390px and
-     wrapped the mode badge onto its own masthead line; the date alone is
-     the information. Same breakpoint as the masthead's other phone rules. */
-  .masthead__srcpre {
-    display: none;
   }
 }
 .masthead__refresh {
@@ -2497,6 +2507,21 @@ body {
   background: var(--accent);
   color: var(--bg);
   border-color: var(--accent);
+}
+/* The icon buttons are fixed squares with the path flex-centered, so the
+   rewind and play/pause controls are the same size and their marks sit in
+   the same place (see `Scrubber.tsx` for why text glyphs could not). */
+.scrub button.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 34px;
+  padding: 0;
+  line-height: 0;
+}
+.scrub button.icon svg {
+  display: block;
 }
 .scrub input[type="range"] {
   flex: 1;
