@@ -100,7 +100,7 @@ Next steps:
 
   ✓ build                  darkmux 3.2.0 (6a7cd3fd) · flow schema 1.22.0
   ✓ daemon reachable       reachable · viewer http://127.0.0.1:8765/ · phone
-                           http://macbook-pro.taild82cbb.ts.net/
+                           http://&lt;tailnet-hostname&gt;/
   ✓ 36 more checks passed — <code>-v</code> for detail
   ⚠ flow sink health       LocalFile · warnings: flows_dir_absent
         → Run <code>darkmux flow status</code> for full detail. Common fixes: start Redis (`brew services start
@@ -131,7 +131,7 @@ user state (0):
 
 matches no registered profile</div>
     </div>
-    <p class="session-caption">Three warnings on a fresh install are normal: no flow files yet, the audit log is opt-in, and the utility model loads itself on the first dispatch.</p>
+    <p class="session-caption">Three warnings on a fresh install are normal: no flow files yet, the audit log is opt-in, and the utility model loads itself on the first dispatch. One thing is redacted: the machine’s tailnet hostname on the daemon line.</p>
   </div>
 </section>
 
