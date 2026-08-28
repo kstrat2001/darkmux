@@ -116,6 +116,17 @@ fi
 # moment anyone opened the runs lens. An empty, well-formed body renders the
 # same "lab not configured" state a real daemon without a lab dir shows —
 # honest, and one request quieter.
+#
+# `-graphs-src` (#2032 packet 2) names `docs/demo/demo-graphs.json` — a
+# committed `{"<mission-id>": <graph.json payload>, ...}` map, captured by
+# `scripts/demo-env/export_static.py` from a running demo-world daemon (see
+# that script's own doc). `MissionGraphLens.tsx` looks its routed mission up
+# in this map on a static build instead of fetching
+# `/mission/:id/graph.json`, which nothing behind `docs/demo` could ever
+# answer. A mission absent from the map (this demo's world never ran it, or
+# the fixture predates it) renders the lens's existing "graph data isn't
+# available" state — not a permanent loading spinner and not a raw fetch
+# error.
 {
   sed '/<head>/q' "$SRC"
   cat <<EOF
@@ -128,6 +139,7 @@ fi
 <meta name="darkmux-lab-runs-src" content="./demo-lab-runs.json">
 <meta name="darkmux-panels-src" content="./demo-panels.json">
 <meta name="darkmux-machine-src" content="./demo-machine.json">
+<meta name="darkmux-graphs-src" content="./demo-graphs.json">
 EOF
   sed '1,/<head>/d' "$SRC"
 } > "$OUT"

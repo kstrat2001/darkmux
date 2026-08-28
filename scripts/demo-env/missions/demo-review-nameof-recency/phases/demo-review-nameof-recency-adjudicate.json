@@ -1,0 +1,11 @@
+{
+  "completed_ts_rel": 1929,
+  "created_ts_rel": 0,
+  "description": "double-confirm judge over deduped flags",
+  "display_name": "Adjudicate",
+  "id": "demo-review-nameof-recency-adjudicate",
+  "mission_id": "demo-review-nameof-recency",
+  "started_ts_rel": 1760,
+  "status": "complete",
+  "task_ids": []
+}

@@ -385,6 +385,15 @@ darkmux mission launch review-lean --param diff_file=...  <span class="comment">
     <p>Output is structured JSON with the full findings list. Gate CI or pre-commit scripts on the verdict bucket when you need to require clean reviews.</p>
 
     <p>The review emits its own flow records (Review category, frontier-tier for the orchestrator narrative, local-tier for the actual reviewer dispatch). Watch the viewer during a review-funnel run to see the full cascade.</p>
+
+<figure class="shot">
+  <img src="../media/mission-graph.png" alt="The darkmux mission graph lens showing a finalized review mission: three phases arranged top to bottom — Investigate with Bundle, Probe high, Probe low, Probe mid and Dedup tasks; Adjudicate with a Judge task; and Report with Verify and Synthesis tasks — alongside an event log and payload detail panel, pan/zoom controls, and a minimap." loading="lazy">
+  <figcaption>The review funnel's task graph, live in the viewer. Every box is one <code>Task</code>; the rows inside are its <code>Step</code>s, the same bundle → probe → dedup → judge → verify → synthesis stages described above, rendered from the actual scheduler run rather than drawn by hand.</figcaption>
+</figure>
+<figure class="shot">
+  <img src="../media/mission-graph-detail.png" alt="A zoomed view of the Investigate phase: Bundle feeding three parallel Probe tasks (high, low, mid), each showing its dispatch-map step with a truncated model identifier and token count, converging on a Dedup task." loading="lazy">
+  <figcaption>Zoomed on Investigate: the bundle step fans out into the probe tasks, one per configured seat, each dispatching to its own model at its own token budget before dedup collapses the overlapping findings.</figcaption>
+</figure>
   </div>
 </section>
 

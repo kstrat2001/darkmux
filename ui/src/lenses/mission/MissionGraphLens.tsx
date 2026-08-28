@@ -12,6 +12,14 @@
  *
  * - `GET /mission/:id/graph.json` — the initial node/edge snapshot. New
  *   query key (`queryKeys.missionGraph`), nothing else in this app reads it.
+ *   **Daemon-backed builds only** (`daemonBacked`, below). On a static build
+ *   (#2032 packet 2) this is replaced entirely by `staticGraphsSrc()`'s
+ *   committed `{"<mission-id>": <graph>, ...}` fixture
+ *   (`queryKeys.staticGraphs`) — one fetch for every mission this build
+ *   knows about, this mission's own entry looked up client-side. No flow
+ *   backfill, no live tail, no SSE: a static build renders exactly the
+ *   snapshot the fixture captured, same as `MachineLens.tsx`'s
+ *   `staticMachineSrc()` precedent.
  * - `GET /flow-mission/:id` — the mission's cross-day flow-record backfill.
  *   SAME `queryKeys.flowMission` key `MissionReplay` used to fetch before
  *   this lens replaced it (retired this packet).
@@ -42,7 +50,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient, skipToken } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
-import { isStaticBuild } from "../../lib/staticSource";
+import { isStaticBuild, staticGraphsSrc } from "../../lib/staticSource";
 import { useLiveTail } from "../../hooks/useLiveTail";
 import { asRecordArray, bodyTruncated, todayUTC } from "../../lib/flow";
 import { EventLogColumn } from "../../components/EventLogColumn";
@@ -268,6 +276,23 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
     enabled: daemonBacked,
     refetchInterval: daemonBacked ? RECONCILE_BACKSTOP_MS : false,
   });
+
+  // (#2032 packet 2) The static-build twin of `graphQuery` above — one
+  // fetch of the WHOLE committed mission-id -> graph map, this mission's
+  // entry read out of it below. `enabled` on BOTH `!daemonBacked` and a
+  // published fixture: with no `darkmux-graphs-src` meta at all (no fixture
+  // was ever exported for this build) there is nothing to fetch, matching
+  // `staticMachineQuery`'s own `enabled: machineSrc !== null` precedent in
+  // `MachineLens.tsx` — a disabled query with no fixture is a KNOWN answer
+  // ("nothing published"), not a pending one.
+  const graphsSrc = staticGraphsSrc();
+  const staticGraphsQuery = useQuery({
+    queryKey: queryKeys.staticGraphs(graphsSrc ?? ""),
+    queryFn: () => fetchJson<Record<string, MissionGraph>>(graphsSrc as string),
+    enabled: !daemonBacked && graphsSrc !== null,
+    staleTime: Infinity,
+  });
+
   const flowMissionQuery = useQuery({
     queryKey: queryKeys.flowMission(missionId),
     queryFn: () => fetchJson<unknown>(`/flow-mission/${encodeURIComponent(missionId)}`),
@@ -322,7 +347,14 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
       return next;
     });
 
-  const baseGraph = graphQuery.data?.ok ? graphQuery.data.data : null;
+  // (#2032 packet 2) `staticGraph` — this mission's entry in the committed
+  // fixture map, or `null` when the map hasn't resolved yet / doesn't carry
+  // this mission. `baseGraph` picks ONE source by build kind, never both:
+  // a daemon-backed build never reads the static map (it has no meta to
+  // resolve one from), and a static build never reads `graphQuery` (it's
+  // `enabled: false`, so `graphQuery.data` stays `undefined` forever).
+  const staticGraph = staticGraphsQuery.data?.ok ? (staticGraphsQuery.data.data[missionId] ?? null) : null;
+  const baseGraph = daemonBacked ? (graphQuery.data?.ok ? graphQuery.data.data : null) : staticGraph;
 
   // All three record sources, deduped — see this module's own doc.
   const allRecords = useMemo(() => {
@@ -413,54 +445,93 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
     void queryClient.invalidateQueries({ queryKey: queryKeys.flowDate(today) });
   }
 
-  if (!daemonBacked) {
-    return (
-      <div className="missionlens" data-state="no-daemon">
-        <div className="stagehdr">mission graph</div>
-        <div className="none">
-          mission graph needs a running daemon behind this page — this static build has no mission graph data to show.
+  if (daemonBacked) {
+    if (!graphQuery.data) {
+      return (
+        <div className="missionlens" data-state="loading">
+          <div className="stagehdr">mission graph</div>
+          <div className="none" role="status" aria-label={`Loading mission ${missionId}`}>
+            loading mission graph…
+          </div>
         </div>
-      </div>
-    );
+      );
+    }
+
+    if (!graphQuery.data.ok) {
+      const notFound = graphQuery.data.status === 404;
+      const msg = notFound
+        ? ownedBy
+          ? `This mission ran on \`${ownedBy}\`, not on this machine. Its graph is built from local mission data, so open darkmux on \`${ownedBy}\` to see it.`
+          : "This mission's graph data isn't available — it may have been an ephemeral or cleared run."
+        : `darkmux mission graph: ${graphQuery.data.message}`;
+      return (
+        <div className="missionlens" data-state="error">
+          <div className="stagehdr">mission graph</div>
+          <div className="msg none" role="alert">
+            {msg}
+          </div>
+          <button type="button" className="evbtn" title="retry — refetch graph" onClick={refresh}>
+            ↻
+          </button>
+        </div>
+      );
+    }
+  } else {
+    // (#2032 packet 2) `graphQuery` never runs on a static build (`enabled:
+    // daemonBacked`, above), so these three states — no fixture published
+    // at all, the published fixture still resolving, this mission absent
+    // from a resolved fixture — are decided from `graphsSrc`/
+    // `staticGraphsQuery` instead of `graphQuery.data`.
+    if (graphsSrc === null) {
+      return (
+        <div className="missionlens" data-state="no-daemon">
+          <div className="stagehdr">mission graph</div>
+          <div className="none">
+            mission graph needs a running daemon behind this page — this static build has no mission graph data to show.
+          </div>
+        </div>
+      );
+    }
+
+    if (staticGraphsQuery.isPending) {
+      return (
+        <div className="missionlens" data-state="loading">
+          <div className="stagehdr">mission graph</div>
+          <div className="none" role="status" aria-label={`Loading mission ${missionId}`}>
+            loading mission graph…
+          </div>
+        </div>
+      );
+    }
+
+    if (!staticGraph) {
+      // A mission absent from the fixture map — never captured in this
+      // demo world, or the fixture predates it. Reuses the SAME wording and
+      // `data-state="error"`/`role="alert"` shape as the daemon-backed 404
+      // branch above — the lens's existing empty/absent state, not a new
+      // one and not a raw fetch-failure render. No retry button: there is
+      // no daemon behind this page for a retry to reach.
+      return (
+        <div className="missionlens" data-state="error">
+          <div className="stagehdr">mission graph</div>
+          <div className="msg none" role="alert">
+            This mission's graph data isn't available — it may have been an ephemeral or cleared run.
+          </div>
+        </div>
+      );
+    }
   }
 
-  if (!graphQuery.data) {
-    return (
-      <div className="missionlens" data-state="loading">
-        <div className="stagehdr">mission graph</div>
-        <div className="none" role="status" aria-label={`Loading mission ${missionId}`}>
-          loading mission graph…
-        </div>
-      </div>
-    );
-  }
-
-  if (!graphQuery.data.ok) {
-    const notFound = graphQuery.data.status === 404;
-    const msg = notFound
-      ? ownedBy
-        ? `This mission ran on \`${ownedBy}\`, not on this machine. Its graph is built from local mission data, so open darkmux on \`${ownedBy}\` to see it.`
-        : "This mission's graph data isn't available — it may have been an ephemeral or cleared run."
-      : `darkmux mission graph: ${graphQuery.data.message}`;
-    return (
-      <div className="missionlens" data-state="error">
-        <div className="stagehdr">mission graph</div>
-        <div className="msg none" role="alert">
-          {msg}
-        </div>
-        <button type="button" className="evbtn" title="retry — refetch graph" onClick={refresh}>
-          ↻
-        </button>
-      </div>
-    );
-  }
-
-  if (!graph) return null; // graph/idx derive from baseGraph, which is set once graphQuery.data.ok — defensive only
+  if (!graph) return null; // graph/idx derive from baseGraph, which is set once the active data source resolved successfully — defensive only
 
   const useTimeline = timelineActive(viewMode, isMobile);
   const tot = missionTotals(metrics);
   const status = normalizeMissionStatus(graph.mission_status);
-  const showLivePill = !(liveStatus === "live" && statusRank(status) >= 2);
+  // Static builds never show the live pill. `useLiveTail(false)` never opens
+  // a connection and its status stays at its `useState` INITIAL value —
+  // `"live"`, forever (see that hook's own doc) — which would otherwise
+  // render a confident "● live" on a page with no daemon anywhere near it.
+  const showLivePill = daemonBacked && !(liveStatus === "live" && statusRank(status) >= 2);
 
   return (
     <div className="missionlens">
@@ -474,9 +545,15 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
         ) : null}
         <MeterEl tot={tot} />
         <ProcEl proc={proc} />
-        <button type="button" className="evbtn" title="refresh — refetch graph + events" onClick={refresh}>
-          ↻
-        </button>
+        {/* (#2032 packet 2) No daemon behind a static build to refetch
+            against — `refresh()` would only invalidate queries that are
+            `enabled: false` and never re-run. Hidden rather than left as a
+            dead click. */}
+        {daemonBacked ? (
+          <button type="button" className="evbtn" title="refresh — refetch graph + events" onClick={refresh}>
+            ↻
+          </button>
+        ) : null}
         <button type="button" className="evbtn" title="switch renderer" onClick={() => setViewMode(useTimeline ? "canvas" : "timeline")}>
           {useTimeline ? "graph" : "list"}
         </button>

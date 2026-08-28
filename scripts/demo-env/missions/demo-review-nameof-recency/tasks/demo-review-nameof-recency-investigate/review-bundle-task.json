@@ -1,0 +1,10 @@
+{
+  "depends_on": [],
+  "description": "resolve review bundles from the diff",
+  "display_name": "Bundle",
+  "id": "review-bundle-task",
+  "phase_id": "demo-review-nameof-recency-investigate",
+  "step_ids": [
+    "review-bundle-step"
+  ]
+}

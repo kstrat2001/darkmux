@@ -1,0 +1,312 @@
+{
+  "description": "Transcribed as data (#1284 Packet 1) from build_review_graph (crates/darkmux-lab/src/lab/review.rs), the Task/Step graph `darkmux mission launch review` builds (retired the `pr-review run` verb in Packet 4b): investigate (resolve bundles from the diff, probe every explicit one-role probe task (#1512 -- no `expand` template, no crew-level probe-role enumeration), dedup the flags with domain reconstruction at the dedup boundary) -> adjudicate (double-confirm judge over the deduped flags) -> report (verify confirmed findings, synthesize tier counts). As of #1512, the probe stage is three EXPLICIT tasks (`review-probe-high-task`/`-mid-task`/`-low-task`), each carrying its own `role_id` and depending only on `review-bundle-task` -- parallelism is emergent from `depends_on` (all three share one dependency, none depend on each other, so `review-dedup-task`'s three-way `depends_on` is a real fan-in). Changing the probe COUNT is a config edit (add/remove a probe task with its own `role_id`), never a Rust change -- as of #1513's review dissolution, roles are discovered by `darkmux_crew::resourcing::resolve_review_roles`, which classifies EVERY role-bearing task in this document STRUCTURALLY by its step kind (a `review.judge` step names the judge task; a `review.verify-render` step names the verify task; anything else carrying a `role_id` is a probe), never by enumerating role names in Rust and never by reading `review-dedup-task`'s `depends_on` (that list is `build_review_graph`'s CLAIM/PRUNE boundary only -- a resolved staffing claims its declared task by role_id, and any declared task nobody claims gets pruned, loudly, with a warning). This document is the EXECUTABLE source of truth -- build_review_graph is a thin launcher that loads this config and calls mission_config::interpret. `src/mission_launch_review.rs` is the operator-facing CALLER of that launcher (`--param key=value` inputs below), not a second graph builder.",
+  "id": "review",
+  "inputs": [
+    {
+      "description": "Path to the unified diff file under review. `mission_launch_review::launch` reads it into ReviewStepContext.diff and feeds it to every probe/judge/verify dispatch. Required unconditionally -- even a `from_envelope` synthesis-only launch needs it, to resolve each finding's quoted anchor back to a diff line.",
+      "name": "diff_file",
+      "required": true
+    },
+    {
+      "description": "Unique id for this review run (ReviewStepContext.case_id) -- correlates flow records and the review envelope, and seeds the minted mission's instance id. LAUNCHER-DERIVED when absent: `owner/repo@head_sha` for a GitHub source, the worktree path, or `local` -- an explicit value always wins. Never asked of the operator by the generic missing-inputs gate (mirrors `coder-phase`'s `mission_id` input).",
+      "name": "case_id",
+      "required": false
+    },
+    {
+      "description": "Local checkout directory to bundle from. Alternative to `github` + `head_sha` (mutually exclusive; exactly one source is required unless `from_envelope`).",
+      "name": "worktree",
+      "required": false
+    },
+    {
+      "description": "GitHub source `owner/repo` -- bundles via the GitHub API, no local checkout. Requires `head_sha`.",
+      "name": "github",
+      "required": false
+    },
+    {
+      "description": "Commit SHA to read file content at (GitHub source only).",
+      "name": "head_sha",
+      "required": false
+    },
+    {
+      "description": "Path to a file carrying the author's stated intent for the change (PR title + description, one blob), fed into the JUDGE prompt only (ReviewStepContext.intent_body; intent_title stays empty -- matches the retired CLI). Absent -> \"(no description provided)\".",
+      "name": "intent_file",
+      "required": false
+    },
+    {
+      "description": "(#1475 packet 3) Per-run role->profile OVERRIDE for the high-recall probe seat (`--param review-probe-high=<profile>`). The named profile must exist in the registry; its default model staffs the seat for this run only. Precedence: this override > the machine-local `role_profiles` map in config.json > `default_profile`. Absent -> the map (else the fresh-user default_profile floor).",
+      "name": "review-probe-high",
+      "required": false
+    },
+    {
+      "description": "(#1475 packet 3) Per-run role->profile OVERRIDE for the mid-recall probe seat (`--param review-probe-mid=<profile>`). Same precedence + semantics as `review-probe-high`.",
+      "name": "review-probe-mid",
+      "required": false
+    },
+    {
+      "description": "(#1475 packet 3) Per-run role->profile OVERRIDE for the low-recall probe seat (`--param review-probe-low=<profile>`). Same precedence + semantics as `review-probe-high`.",
+      "name": "review-probe-low",
+      "required": false
+    },
+    {
+      "description": "(#1475 packet 3) Per-run role->profile OVERRIDE for the judge seat (`--param review-judge=<profile>`). Same precedence + semantics as `review-probe-high` -- override the machine's `role_profiles` binding for one run without editing config.json (e.g. escalate the judge to a denser profile).",
+      "name": "review-judge",
+      "required": false
+    },
+    {
+      "description": "(#1475 packet 3) Per-run role->profile OVERRIDE for the verify seat (`--param review-verify=<profile>`). Same precedence + semantics as `review-probe-high`.",
+      "name": "review-verify",
+      "required": false
+    },
+    {
+      "description": "(#1426 ship-2) When truthy (`true`/`1`/`yes`/`on`), confirmed findings render as a blocking REQUEST_CHANGES review; else (default) an advisory COMMENT. Replaces the retired crew's `request_changes` field.",
+      "name": "request_changes",
+      "required": false
+    },
+    {
+      "description": "Execution mode: sequential | parallel | auto (default auto). `auto` lets the gestalt wave planner decide co-residency from the resolved seats; the value is resolved via `resolve_mode` and recorded on the envelope as `mode` provenance, not a behavioral switch the operator normally sets.",
+      "name": "mode",
+      "required": false
+    },
+    {
+      "description": "(#1266) The judge seat's consensus DEPTH (passes) \u2014 1 single / 2 double-confirm / N unanimous. Governs the JUDGE seat only (the sole consumer; the probe/verify seats ignore it). Absent -> the resolver's default (2, double-confirm). Validated `>= 1` at resolution time (a zero-pass judge makes no ruling); lenient on read otherwise (contract 7). Threaded to the already-parameterized `multi_pass_confirm` pass count via `ResolvedSeatStaffing.passes`.",
+      "name": "passes",
+      "required": false
+    },
+    {
+      "description": "Path to write the full review envelope (pretty JSON).",
+      "name": "envelope_out",
+      "required": false
+    },
+    {
+      "description": "Path to write the rendered `{mode, review, comment}` payload. `-` (or omitted) writes to stdout -- a CONTRACT the CI workflow parses byte-for-byte, so `mission launch` prints no decorative banner ahead of it for this config.",
+      "name": "emit",
+      "required": false
+    },
+    {
+      "description": "Override path for profiles.json (else DARKMUX_PROFILES / the default resolution).",
+      "name": "profiles",
+      "required": false
+    },
+    {
+      "description": "Attribution text for the posted footer (#1113) -- the default derives \"where the model ran\" from the envelope's own member records.",
+      "name": "attribution",
+      "required": false
+    },
+    {
+      "description": "External bundler command (`<cmd> --worktree <dir> --diff <file>`), standing in for the built-in bundler.",
+      "name": "bundler",
+      "required": false
+    },
+    {
+      "description": "Re-judge a previously-recorded flag list without re-running the probe (run_judge_only) -- the bundler still runs, since the judge needs the code each flag's bundle_id refers to. Mints NO mission (same as the retired CLI).",
+      "name": "charges_file",
+      "required": false
+    },
+    {
+      "description": "Synthesis-only: read a previously-written envelope_out and emit the rendered payload -- zero model calls, zero bundling, zero mission minted. The CI-testable path.",
+      "name": "from_envelope",
+      "required": false
+    },
+    {
+      "description": "INTERNALLY DERIVED, never operator-supplied -- `mission_launch_review::run_dispatch` always passes an empty string (matches the retired CLI's own RunOpts shape, which carried one intent blob with no separate title field). ReviewStepContext.intent_title.",
+      "name": "intent_title",
+      "required": false
+    },
+    {
+      "description": "Resolved probe/judge/verify seat staffing (StaffingSnapshot / ResolvedSeatStaffing), computed by `mission_launch_review::run_dispatch` from `darkmux_crew::resourcing::resolve_review_roles` (#1475, #1512, #1513 review -- each review role resolves via launch override > role_profiles map > default_profile), never a literal CLI input. The probe roles themselves are read directly off this document -- every task classified structurally by its STEP KIND (a `review.judge` step is the judge task; a `review.verify-render` step is the verify task; anything else carrying a `role_id` is a probe, e.g. the three explicit `review-probe-high-task`/`-mid-task`/`-low-task`); there is no Rust-side enumeration of probe role ids and no dependence on `review-dedup-task.depends_on` for discovery (that list is the SEPARATE claim/prune boundary `build_review_graph` uses).",
+      "name": "staffing",
+      "required": false
+    },
+    {
+      "description": "The judge step's real config.concurrency, resolved by the launcher from darkmux_types::config_access::review_judge_concurrency() (env > config.review.judge_concurrency > 1) -- never a literal CLI input. ALWAYS supplied by the launcher as a step_config_override on review-judge-step -- the static `config.concurrency: 1` below is a documented DEFAULT for a human reading this file, never load-bearing at launch.",
+      "name": "judge_concurrency",
+      "required": false
+    }
+  ],
+  "name": "PR Review",
+  "panel": {
+    "description": "Review the working-tree diff with darkmux's local-model review crew",
+    "hint": "(no arguments)"
+  },
+  "phases": [
+    {
+      "description": "resolve review bundles from the diff, probe every explicit probe task, dedup",
+      "display_name": "Investigate",
+      "id": "investigate",
+      "tasks": [
+        {
+          "description": "resolve review bundles from the diff",
+          "display_name": "Bundle",
+          "id": "review-bundle-task",
+          "steps": [
+            {
+              "config": null,
+              "id": "review-bundle-step",
+              "kind": "review.bundle"
+            }
+          ]
+        },
+        {
+          "depends_on": [
+            "review-bundle-task"
+          ],
+          "description": "probe role `review-probe-high` \u2014 one role, one task (#1512); parallelism with the other two probe tasks is emergent from all three depending only on review-bundle-task",
+          "display_name": "Probe high",
+          "id": "review-probe-high-task",
+          "notes": [
+            "always two steps (#1530 follow-on, Packet A1), mirroring the verify task's render/dispatch.map split: the render step (review.probe-render) reads this seat's selector + role id from its OWN config (stamped by build_review_graph_from_config) and this run's bundles off the ArtifactBus, renders the probe_user_message collection AT RUN TIME, and the dispatch.map step resolves that collection from the render step's output via resolve_map_collection's single-dependency fallback (config.collection is no longer stamped)."
+          ],
+          "role_id": "review-probe-high",
+          "steps": [
+            {
+              "config": null,
+              "id": "review-probe-high-render-step",
+              "kind": "review.probe-render"
+            },
+            {
+              "config": null,
+              "id": "review-probe-high-step",
+              "kind": "dispatch.map"
+            }
+          ]
+        },
+        {
+          "depends_on": [
+            "review-bundle-task"
+          ],
+          "description": "probe role `review-probe-mid` \u2014 one role, one task (#1512)",
+          "display_name": "Probe mid",
+          "id": "review-probe-mid-task",
+          "role_id": "review-probe-mid",
+          "steps": [
+            {
+              "config": null,
+              "id": "review-probe-mid-render-step",
+              "kind": "review.probe-render"
+            },
+            {
+              "config": null,
+              "id": "review-probe-mid-step",
+              "kind": "dispatch.map"
+            }
+          ]
+        },
+        {
+          "depends_on": [
+            "review-bundle-task"
+          ],
+          "description": "probe role `review-probe-low` \u2014 one role, one task (#1512)",
+          "display_name": "Probe low",
+          "id": "review-probe-low-task",
+          "role_id": "review-probe-low",
+          "steps": [
+            {
+              "config": null,
+              "id": "review-probe-low-render-step",
+              "kind": "review.probe-render"
+            },
+            {
+              "config": null,
+              "id": "review-probe-low-step",
+              "kind": "dispatch.map"
+            }
+          ]
+        },
+        {
+          "depends_on": [
+            "review-probe-high-task",
+            "review-probe-mid-task",
+            "review-probe-low-task"
+          ],
+          "description": "dedup probe flags \u2014 mechanism-family keying + anchor matching. (#1512, #1513 review) `depends_on` below is build_review_graph's CLAIM/PRUNE boundary, NOT the probe role registry: a resolved staffing claims its declared task by role_id, and any declared task nobody claims is pruned (loudly, with a warning). Probe roles are discovered separately, by resolve_review_roles walking every task in this document and classifying each by its step kind. Adding/removing a probe task here (with its own role_id, and its entry in this depends_on list) still changes the probe count with zero Rust changes.",
+          "display_name": "Dedup",
+          "id": "review-dedup-task",
+          "steps": [
+            {
+              "config": null,
+              "id": "review-dedup-step",
+              "kind": "review.dedup"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "description": "double-confirm judge over deduped flags",
+      "display_name": "Adjudicate",
+      "id": "adjudicate",
+      "tasks": [
+        {
+          "description": "double-confirm judge \u2014 internal pass1/pass2 loop over deduped flags",
+          "display_name": "Judge",
+          "id": "review-judge-task",
+          "reads": [
+            "review-dedup-task"
+          ],
+          "role_id": "review-judge",
+          "steps": [
+            {
+              "config": {
+                "concurrency": 1
+              },
+              "id": "review-judge-step",
+              "kind": "review.judge"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "description": "verify confirmed findings, synthesize tier counts",
+      "display_name": "Report",
+      "id": "report",
+      "tasks": [
+        {
+          "description": "verify \u2014 render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
+          "display_name": "Verify",
+          "id": "review-verify-task",
+          "notes": [
+            "always present in the graph even when no verify seat is staffed -- the render step (review.verify-render) emits an EMPTY collection in that case (and on a judge-doomed run, and on a zero-confirmed docket), which makes the dispatch.map step a completed no-op with residency None: zero model loads, zero dispatches (#1442, the generic port of the empty-docket short-circuit).",
+            "the render step consumes the judge task's output and emits one frozen verify_prompt per CONFIRMED finding (byte parity with the #1256 golden by construction); build_review_graph stamps the map step's dispatch config (model/system/max_tokens/bucket_budget/...) only when a verify seat is staffed. The verify-APPLY boundary (state machine, member accounting, budget row) lives in the synthesis step."
+          ],
+          "reads": [
+            "review-judge-task"
+          ],
+          "role_id": "review-verify",
+          "steps": [
+            {
+              "config": null,
+              "id": "review-verify-render-step",
+              "kind": "review.verify-render"
+            },
+            {
+              "config": null,
+              "id": "review-verify-step",
+              "kind": "dispatch.map"
+            }
+          ]
+        },
+        {
+          "depends_on": [
+            "review-verify-task"
+          ],
+          "description": "synthesis \u2014 apply verify adjudications, finalize tier counts + needs-check clustering",
+          "display_name": "Synthesis",
+          "id": "review-synthesis-task",
+          "reads": [
+            "review-dedup-task",
+            "review-judge-task"
+          ],
+          "steps": [
+            {
+              "config": null,
+              "id": "review-synthesis-step",
+              "kind": "review.synthesis"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "schema_version": "3.0"
+}

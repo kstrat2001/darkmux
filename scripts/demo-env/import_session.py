@@ -18,81 +18,17 @@ the replay to any wall-clock instant.
 
 Re-run it to refresh a fixture after a record-vocabulary change.
 """
-import argparse, json, re, sys, pathlib
+import argparse, json, sys, pathlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-import lib_vocab as _vocab  # noqa: E402
+
+# `FORBIDDEN` + `scrub()` moved to `lib_identity_scrub.py` (#2032 Packet 1)
+# so `import_mission.py` can reuse the SAME patterns instead of a second
+# copy that drifts. Re-exported here so `from import_session import scrub,
+# FORBIDDEN` (used by `build.py::canned_doctor`) keeps working unchanged.
+from lib_identity_scrub import scrub, FORBIDDEN, scan_or_die, ts_to_ms  # noqa: F401
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
-
-# Anything matching these never reaches a committed fixture. The scan is a
-# BACKSTOP, not the mechanism: the rewrites below remove the known carriers,
-# and this fails the import loudly if an unknown one survives. A fixture is
-# published to a public docs site, so "probably clean" is not a standard.
-def _engagement_patterns():
-    r"""Engagement-name patterns, built from the ONE file that owns the list.
-
-    Delegates the READ to `scripts/lib_vocab.py`, which fails loud on a
-    truncated parse. This used to regex `SENTINELS` here with a non-greedy
-    `\[(.*?)\]`, which stopped at the first `]` in the array literal —
-    including one inside a comment — and silently returned a short list. See
-    that module's doc for the mutation that proved it.
-
-    Ticket prefixes are skipped: the dedicated `\bSYS-\d+\b` rule below bounds
-    the digits.
-    """
-    names = {n.lower() for n in _vocab.sentinels()}
-    names = {n for n in names if not n.endswith(("-", "_"))}
-    return [(re.compile(r"(?i)\b" + re.escape(n) + r"\b"), "an engagement name")
-            for n in sorted(names)]
-
-
-FORBIDDEN = [
-    (re.compile(r"/Users/[^/\"\s]+"),          "a host home directory"),
-    (re.compile(r"\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"), "a tailnet IP"),
-    # Engagement names are NOT spelled here. `tests/parity/lib/sanitize.mjs`
-    # owns that vocabulary (`scripts/engagement-sentinel-guard.py` names it as
-    # the sole owner and allowlists only that file), so re-declaring the
-    # strings would both leak them into a PUBLIC file — the guard fails the
-    # build on exactly that, correctly — and create the second copy that
-    # drifts. Read the owner instead; see `_engagement_patterns()`.
-    *_engagement_patterns(),
-    (re.compile(r"\bSYS-\d+\b"),               "an internal ticket key"),
-    (re.compile(r"(?i)[\w.+-]+@[\w-]+\.[\w.]+"), "an email address"),
-    (re.compile(r"(?i)\b[\w-]+\.ts\.net\b"),   "a MagicDNS name"),
-    # The host's own name. It survives rewrites aimed at the DOMAIN (it is the
-    # left-most label), and it is the single most identifying string a
-    # `doctor` or `flow status` capture carries.
-    (re.compile(r"(?i)\b(?:macbook-pro|kains?-mac(?:book|-studio)?|mac-studio)\b"),
-     "the operator's hostname"),
-]
-
-def scrub(obj):
-    """Rewrite the KNOWN identity carriers. Anything left is caught below."""
-    if isinstance(obj, dict):
-        return {k: scrub(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [scrub(v) for v in obj]
-    if isinstance(obj, str):
-        # A sandbox path is real content (the run's workspace), so it is
-        # rewritten to an equivalent demo path rather than blanked — the run
-        # detail lens renders it, and an empty workspace row reads as a bug.
-        s = re.sub(r"/Users/[^/\"\s]+/\.darkmux", "/home/demo/.darkmux", obj)
-        s = re.sub(r"/Users/[^/\"\s]+", "/home/demo", s)
-        # Network identity. Both carriers name the operator's private tailnet,
-        # and both show up in output that otherwise belongs in the docs
-        # (`darkmux doctor` prints the daemon's bind host). Rewritten to a
-        # demo-domain equivalent rather than blanked, so the surrounding line
-        # still reads as the real check output it is.
-        # Consume the WHOLE FQDN, host label included. Matching only the
-        # `<tailnet>.ts.net` suffix left the host label behind, so
-        # `macbook-pro.taild<...>.ts.net` scrubbed to
-        # `macbook-pro.demo-hub.internal` — still the operator's real machine
-        # name, in a string that goes on a public docs page.
-        s = re.sub(r"\b[\w-]+(?:\.[\w-]+)*\.ts\.net\b", "demo-hub.internal", s)
-        s = re.sub(r"\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "10.0.0.21", s)
-        return s
-    return obj
 
 def main():
     ap = argparse.ArgumentParser()
@@ -113,27 +49,21 @@ def main():
     # Normalize time to an offset from the session's first record so the
     # replay can be anchored anywhere. Kept as `t_ms` rather than a rewritten
     # `ts`, so a fixture can never be mistaken for a real dated log.
-    def ms(r):
-        from datetime import datetime
-        return int(datetime.strptime(r["ts"], "%Y-%m-%dT%H:%M:%SZ").timestamp() * 1000)
-    base = min(ms(r) for r in recs)
-    recs.sort(key=ms)
+    base = min(ts_to_ms(r["ts"]) for r in recs)
+    recs.sort(key=lambda r: ts_to_ms(r["ts"]))
 
     out = []
     for r in recs:
+        t_ms = ts_to_ms(r["ts"]) - base
         r = scrub(r)
-        r["t_ms"] = ms(r) - base
+        r["t_ms"] = t_ms
         # Identity is assigned at build time from world.json, never inherited.
         for k in ("ts", "machine_id", "machine_uid"):
             r.pop(k, None)
         out.append(r)
 
     blob = "\n".join(json.dumps(r, sort_keys=True) for r in out)
-    for pat, what in FORBIDDEN:
-        m = pat.search(blob)
-        if m:
-            sys.exit(f"REFUSING to write {a.out}: found {what} ({m.group(0)!r}).\n"
-                     f"Add a rewrite rule to scrub() — do not weaken the scan.")
+    scan_or_die(blob, a.out)
 
     p = pathlib.Path(a.out); p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(blob + "\n")

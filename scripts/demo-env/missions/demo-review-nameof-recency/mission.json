@@ -1,0 +1,18 @@
+{
+  "created_ts_rel": 0,
+  "description": "PR review \u2014 demo-review-nameof-recency (crew `deep+diff-review+probe-4b+probe-qwen38`)",
+  "finalized_ts_rel": 1932,
+  "id": "demo-review-nameof-recency",
+  "phase_ids": [
+    "demo-review-nameof-recency-investigate",
+    "demo-review-nameof-recency-adjudicate",
+    "demo-review-nameof-recency-report"
+  ],
+  "spec": {
+    "config_id": "review",
+    "inputs_fingerprint": "0866ce12d4",
+    "origin": "builtin"
+  },
+  "started_ts_rel": 0,
+  "status": "finalized"
+}

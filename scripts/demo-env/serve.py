@@ -20,6 +20,8 @@ import argparse, http.server, json, os, pathlib, re, signal, socket, subprocess,
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
+sys.path.insert(0, str(HERE))
+from lib_identity_scrub import scrub as _identity_scrub, FORBIDDEN  # noqa: E402
 
 MACHINE_ROUTES = {"/machine/specs": "specs", "/machine/resources": "resources",
                   "/machine/status": "status"}
@@ -106,25 +108,93 @@ def make_handler(inner, fx, hero, demo_uids, home):
             return None
 
         def _scrub_passthrough(self, data):
-            """Rewrite host paths in a PASSTHROUGH response.
+            """Rewrite identity carriers in a PASSTHROUGH response.
 
             The canned panels go through the importer's scrub at build time,
-            but a passthrough panel is rendered live by the daemon and never
-            saw it — `lab fixture list` printed the demo home's real absolute
-            path (`/Users/<you>/de-projects/.../screenshots/demo-home`) into a
-            frame headed for a public docs page. Scrubbing HERE covers every
-            passthrough panel, including ones added later, rather than
-            requiring each to be remembered.
+            but a passthrough panel is rendered LIVE by the daemon on THIS
+            machine and never saw it. Three real leaks were caught this way,
+            not by inspection: `lab fixture list` printed the demo home's
+            real absolute path (`/Users/<you>/de-projects/.../screenshots/
+            demo-home`) into a frame headed for a public docs page; once a
+            real mission existed for `mission-status` to link to (#2032
+            Packet 1), it rendered a deep-link URL through
+            `darkmux_doctor::viewer_link_base` — this MACHINE's real
+            Tailscale MagicDNS hostname (`http://macbook-pro.taild<...>.
+            ts.net/mission/.../graph`), not the demo's fictional one; and
+            (#2032 packet 3) `GET /lab/runs`, captured for the first time by
+            `export_static.py`, answered `dir` with the demo home's real
+            absolute filesystem path — a live daemon computation, never a
+            flow-record field, so nothing upstream had ever scrubbed it. All
+            three are the same failure shape (a probe- or daemon-computed
+            value, not fixture content), so they get the same fix: scrub
+            EVERY passthrough response (every route this handler proxies
+            except `/flow/*`, which is scrubbed at import time and only
+            needs the presence filter below), not just the one route that
+            happened to be caught first.
+
+            Reuses `lib_identity_scrub.scrub()` — the SAME rewrite
+            `import_session.py`/`import_mission.py` run at build time —
+            rather than a second hand-rolled pattern set that could drift
+            from it. `FORBIDDEN` is the live backstop: if a scrubbed panel
+            STILL carries a known identity pattern, the panel is replaced
+            with a placeholder rather than shipped dirty, mirroring
+            `build.py::canned_doctor`'s "omit rather than ship" rule for the
+            live path.
             """
             try:
                 text = data.decode()
             except UnicodeDecodeError:
                 return data
-            if str(home) not in text and "/Users/" not in text:
+            if str(home) not in text and str(ROOT) not in text and "/Users/" not in text \
+                    and not any(p.search(text) for p, _ in FORBIDDEN):
                 return data
             text = text.replace(str(home), "/home/demo/.darkmux")
-            # Backstop for any other host path the daemon may print.
-            text = re.sub(r"/Users/[^/\"\s\\]+", "/home/demo", text)
+            # Same repo-checkout-path leak `build.py::canned_doctor` guards
+            # against, live here: `lab fixture list` names the built-in
+            # fixture's real path under `ROOT` (`templates/builtin/lab-
+            # fixtures/...`), which the generic scrub below does not fully
+            # clean — it strips the `/Users/<name>` segment but leaves
+            # whatever comes after, including a worktree's session-scoped
+            # directory name. `home` is replaced first because it nests
+            # under `ROOT`; replacing `ROOT` first would corrupt that match.
+            text = text.replace(str(ROOT), "/home/demo/darkmux")
+            text = _identity_scrub(text)
+            for pat, what in FORBIDDEN:
+                m = pat.search(text)
+                if m:
+                    print(f"  ! passthrough panel still carries {what} "
+                          f"({m.group(0)!r}) after scrub; panel body replaced "
+                          f"rather than shipped dirty", file=sys.stderr)
+                    # Every `/panel/*` response is `panel_payload`-shaped
+                    # (`panel`, `argv`, `ansi_text`, …) — the console pane
+                    # reads those fields directly, so withholding the panel
+                    # means blanking `ansi_text`/`stderr_tail` IN that shape,
+                    # not swapping in an unrelated object the pane cannot
+                    # render at all.
+                    # Only a PANEL payload has a body to blank. Every other
+                    # route (/runs, /missions, /mission/:id/graph.json, ...)
+                    # is a data shape the exporter writes to docs/demo
+                    # verbatim, so the only safe answer is to refuse: the
+                    # exception becomes a 502 in do_GET, export_static's
+                    # urlopen raises on it, and the export stops instead of
+                    # publishing the leak (review of #2032: the blanking
+                    # branch used to ANNOTATE such a dict and forward it,
+                    # leak included, while logging that it withheld it).
+                    try:
+                        payload = json.loads(text)
+                    except (json.JSONDecodeError, TypeError):
+                        payload = None
+                    if isinstance(payload, dict) and "ansi_text" in payload:
+                        payload["ansi_text"] = (
+                            "panel content withheld: identity scrub could not "
+                            "clear it for the demo world"
+                        )
+                        payload["stderr_tail"] = ""
+                        return json.dumps(payload).encode()
+                    raise RuntimeError(
+                        f"withheld: passthrough response still carries {what} "
+                        f"after the identity scrub; refusing to serve it"
+                    )
             return text.encode()
 
         def _filter_flow(self, data):
@@ -179,7 +249,10 @@ def make_handler(inner, fx, hero, demo_uids, home):
                     base = self.path.split("?")[0]
                     if base.startswith("/flow/"):
                         data = self._filter_flow(data)
-                    elif base.startswith("/panel/"):
+                    else:
+                        # Every OTHER passthrough route gets the same scrub —
+                        # see `_scrub_passthrough`'s own doc for why this
+                        # cannot be scoped to `/panel/*` alone any more.
                         data = self._scrub_passthrough(data)
                     return self._send(r.status, data, ctype)
             except urllib.error.HTTPError as e:
@@ -277,5 +350,33 @@ def main():
         daemon.terminate()
 
 
+def self_test():
+    """The three payload shapes the scrub backstop must get right."""
+    Handler = make_handler("http://127.0.0.1:1", {}, "demo", set(), pathlib.Path("/nonexistent"))
+    scrubber = Handler._scrub_passthrough
+    leak = "someone@example.com"
+    panel = json.dumps({"panel": "x", "ansi_text": f"hi {leak}", "stderr_tail": ""}).encode()
+    out = json.loads(scrubber(None, panel))
+    assert leak not in json.dumps(out) and "withheld" in out["ansi_text"], "panel payload must be blanked"
+    dict_route = json.dumps({"runs": [{"id": "r1", "dir": f"/x/{leak}"}]}).encode()
+    try:
+        scrubber(None, dict_route)
+        raise AssertionError("a non-panel payload carrying a sentinel must be refused, not forwarded")
+    except RuntimeError as e:
+        assert "withheld" in str(e)
+    list_route = json.dumps([{"note": leak}]).encode()
+    try:
+        scrubber(None, list_route)
+        raise AssertionError("a list payload carrying a sentinel must be refused")
+    except RuntimeError:
+        pass
+    clean = json.dumps({"runs": [{"id": "r1", "dir": "/home/demo/darkmux"}]}).encode()
+    assert json.loads(scrubber(None, clean)) == json.loads(clean), "a clean payload passes through unchanged"
+    print("serve.py self-test: all checks passed")
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        self_test()
+        sys.exit(0)
     main()

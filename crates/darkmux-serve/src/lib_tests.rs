@@ -170,17 +170,29 @@
             recs.push(r);
         }
         assert!(!recs.is_empty(), "demo dataset is empty");
-        // The demo flare is data-driven: the mission is named `demo`, so the
-        // viewer's crumb reads `◆ demo` with zero viewer special-casing.
-        assert!(
-            recs.iter().any(|r| r.mission_id.as_deref() == Some("demo")),
-            "demo dataset must carry mission_id=demo (the data-driven demo flare)"
-        );
-        assert!(
-            recs.iter()
-                .all(|r| r.mission_id.as_deref().map_or(true, |m| m == "demo")),
-            "every mission-scoped demo record must be mission=demo"
-        );
+        // The demo flare is data-driven: the viewer's mission crumb and the
+        // `#mission=<id>` MAP lens resolve through the missions the world
+        // publishes (#2032 replays a REAL finalized mission, no hand-authored
+        // `demo` mission any more), so every mission-scoped flow record must
+        // name a mission `docs/demo/demo-missions.json` lists — an orphan id
+        // would render a crumb that leads nowhere.
+        let flow_missions: std::collections::BTreeSet<_> =
+            recs.iter().filter_map(|r| r.mission_id.as_deref()).collect();
+        assert!(!flow_missions.is_empty(), "demo dataset must carry mission-scoped records (the demo flare)");
+        let missions_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/demo/demo-missions.json");
+        let missions: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(missions_path).unwrap_or_else(|e| panic!("reading {missions_path}: {e}")),
+        )
+        .expect("demo-missions.json is JSON");
+        let listed: std::collections::BTreeSet<_> = missions["missions"]
+            .as_array()
+            .expect("demo-missions.json carries a `missions` array")
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        for m in &flow_missions {
+            assert!(listed.contains(m), "flow record mission `{m}` is not a mission demo-missions.json lists ({listed:?})");
+        }
         let machines: std::collections::BTreeSet<_> =
             recs.iter().filter_map(|r| r.machine_id.as_deref()).collect();
         assert!(

@@ -1,0 +1,344 @@
+{
+  "demo-review-nameof-recency": {
+    "edges": [
+      {
+        "id": "contains:demo-review-nameof-recency-investigate:review-bundle-task",
+        "kind": "contains",
+        "source": "demo-review-nameof-recency-investigate",
+        "target": "review-bundle-task"
+      },
+      {
+        "id": "contains:demo-review-nameof-recency-investigate:review-dedup-task",
+        "kind": "contains",
+        "source": "demo-review-nameof-recency-investigate",
+        "target": "review-dedup-task"
+      },
+      {
+        "id": "depends_on:review-probe-high-task:review-dedup-task",
+        "kind": "depends_on",
+        "source": "review-probe-high-task",
+        "target": "review-dedup-task"
+      },
+      {
+        "id": "depends_on:review-probe-mid-task:review-dedup-task",
+        "kind": "depends_on",
+        "source": "review-probe-mid-task",
+        "target": "review-dedup-task"
+      },
+      {
+        "id": "depends_on:review-probe-low-task:review-dedup-task",
+        "kind": "depends_on",
+        "source": "review-probe-low-task",
+        "target": "review-dedup-task"
+      },
+      {
+        "id": "contains:demo-review-nameof-recency-investigate:review-probe-high-task",
+        "kind": "contains",
+        "source": "demo-review-nameof-recency-investigate",
+        "target": "review-probe-high-task"
+      },
+      {
+        "id": "depends_on:review-bundle-task:review-probe-high-task",
+        "kind": "depends_on",
+        "source": "review-bundle-task",
+        "target": "review-probe-high-task"
+      },
+      {
+        "id": "contains:demo-review-nameof-recency-investigate:review-probe-low-task",
+        "kind": "contains",
+        "source": "demo-review-nameof-recency-investigate",
+        "target": "review-probe-low-task"
+      },
+      {
+        "id": "depends_on:review-bundle-task:review-probe-low-task",
+        "kind": "depends_on",
+        "source": "review-bundle-task",
+        "target": "review-probe-low-task"
+      },
+      {
+        "id": "contains:demo-review-nameof-recency-investigate:review-probe-mid-task",
+        "kind": "contains",
+        "source": "demo-review-nameof-recency-investigate",
+        "target": "review-probe-mid-task"
+      },
+      {
+        "id": "depends_on:review-bundle-task:review-probe-mid-task",
+        "kind": "depends_on",
+        "source": "review-bundle-task",
+        "target": "review-probe-mid-task"
+      },
+      {
+        "id": "contains:demo-review-nameof-recency-adjudicate:review-judge-task",
+        "kind": "contains",
+        "source": "demo-review-nameof-recency-adjudicate",
+        "target": "review-judge-task"
+      },
+      {
+        "id": "contains:demo-review-nameof-recency-report:review-synthesis-task",
+        "kind": "contains",
+        "source": "demo-review-nameof-recency-report",
+        "target": "review-synthesis-task"
+      },
+      {
+        "id": "depends_on:review-verify-task:review-synthesis-task",
+        "kind": "depends_on",
+        "source": "review-verify-task",
+        "target": "review-synthesis-task"
+      },
+      {
+        "id": "contains:demo-review-nameof-recency-report:review-verify-task",
+        "kind": "contains",
+        "source": "demo-review-nameof-recency-report",
+        "target": "review-verify-task"
+      }
+    ],
+    "generated_at_ms": 1787892244711,
+    "legacy": false,
+    "mission_id": "demo-review-nameof-recency",
+    "mission_status": "finalized",
+    "nodes": [
+      {
+        "completedTs": 1787889069,
+        "depth": 0,
+        "description": "resolve review bundles from the diff, probe every explicit probe task, dedup",
+        "id": "demo-review-nameof-recency-investigate",
+        "kind": "phase",
+        "label": "Investigate",
+        "startedTs": 1787887310,
+        "status": "complete"
+      },
+      {
+        "completedTs": 1787887315,
+        "depth": 0,
+        "description": "resolve review bundles from the diff",
+        "id": "review-bundle-task",
+        "kind": "task",
+        "label": "Bundle",
+        "parentId": "demo-review-nameof-recency-investigate",
+        "startedTs": 1787887310,
+        "status": "complete",
+        "steps": [
+          {
+            "completedTs": 1787887315,
+            "id": "review-bundle-step",
+            "kind": "review.bundle",
+            "label": "Bundle",
+            "startedTs": 1787887310,
+            "status": "complete"
+          }
+        ]
+      },
+      {
+        "completedTs": 1787889069,
+        "depth": 2,
+        "description": "dedup probe flags \u2014 mechanism-family keying + anchor matching. (#1512, #1513 review) `depends_on` below is build_review_graph's CLAIM/PRUNE boundary, NOT the probe role registry: a resolved staffing claims its declared task by role_id, and any declared task nobody claims is pruned (loudly, with a warning). Probe roles are discovered separately, by resolve_review_roles walking every task in this document and classifying each by its step kind. Adding/removing a probe task here (with its own role_id, and its entry in this depends_on list) still changes the probe count with zero Rust changes.",
+        "id": "review-dedup-task",
+        "kind": "task",
+        "label": "Dedup",
+        "parentId": "demo-review-nameof-recency-investigate",
+        "startedTs": 1787889069,
+        "status": "complete",
+        "steps": [
+          {
+            "completedTs": 1787889069,
+            "id": "review-dedup-step",
+            "kind": "review.dedup",
+            "label": "Dedup",
+            "startedTs": 1787889069,
+            "status": "complete"
+          }
+        ]
+      },
+      {
+        "completedTs": 1787889061,
+        "depth": 1,
+        "description": "probe role `review-probe-high` \u2014 one role, one task (#1512); parallelism with the other two probe tasks is emergent from all three depending only on review-bundle-task",
+        "id": "review-probe-high-task",
+        "kind": "task",
+        "label": "Probe high",
+        "parentId": "demo-review-nameof-recency-investigate",
+        "startedTs": 1787887316,
+        "status": "complete",
+        "steps": [
+          {
+            "completedTs": 1787887316,
+            "id": "review-probe-high-render-step",
+            "kind": "review.probe-render",
+            "label": "Probe prompts",
+            "startedTs": 1787887316,
+            "status": "complete"
+          },
+          {
+            "completedTs": 1787889061,
+            "id": "review-probe-high-step",
+            "kind": "dispatch.map",
+            "label": "Dispatch (map)",
+            "localOk": true,
+            "model": "darkmux:qwen/qwen3.8-27b",
+            "startedTs": 1787887317,
+            "status": "complete",
+            "tokensFinal": 40356
+          }
+        ]
+      },
+      {
+        "completedTs": 1787887574,
+        "depth": 1,
+        "description": "probe role `review-probe-low` \u2014 one role, one task (#1512)",
+        "id": "review-probe-low-task",
+        "kind": "task",
+        "label": "Probe low",
+        "parentId": "demo-review-nameof-recency-investigate",
+        "startedTs": 1787887316,
+        "status": "complete",
+        "steps": [
+          {
+            "completedTs": 1787887316,
+            "id": "review-probe-low-render-step",
+            "kind": "review.probe-render",
+            "label": "Probe prompts",
+            "startedTs": 1787887316,
+            "status": "complete"
+          },
+          {
+            "completedTs": 1787887574,
+            "id": "review-probe-low-step",
+            "kind": "dispatch.map",
+            "label": "Dispatch (map)",
+            "localOk": true,
+            "model": "darkmux:qwen3-4b-instruct-2507",
+            "startedTs": 1787887317,
+            "status": "complete",
+            "tokensFinal": 9975
+          }
+        ]
+      },
+      {
+        "completedTs": 1787887547,
+        "depth": 1,
+        "description": "probe role `review-probe-mid` \u2014 one role, one task (#1512)",
+        "id": "review-probe-mid-task",
+        "kind": "task",
+        "label": "Probe mid",
+        "parentId": "demo-review-nameof-recency-investigate",
+        "startedTs": 1787887316,
+        "status": "complete",
+        "steps": [
+          {
+            "completedTs": 1787887316,
+            "id": "review-probe-mid-render-step",
+            "kind": "review.probe-render",
+            "label": "Probe prompts",
+            "startedTs": 1787887316,
+            "status": "complete"
+          },
+          {
+            "completedTs": 1787887547,
+            "id": "review-probe-mid-step",
+            "kind": "dispatch.map",
+            "label": "Dispatch (map)",
+            "localOk": true,
+            "model": "darkmux:mistralai/devstral-small-2-2512",
+            "startedTs": 1787887317,
+            "status": "complete",
+            "tokensFinal": 8087
+          }
+        ]
+      },
+      {
+        "completedTs": 1787889238,
+        "depth": 1,
+        "description": "double-confirm judge over deduped flags",
+        "id": "demo-review-nameof-recency-adjudicate",
+        "kind": "phase",
+        "label": "Adjudicate",
+        "startedTs": 1787889069,
+        "status": "complete"
+      },
+      {
+        "completedTs": 1787889234,
+        "depth": 0,
+        "description": "double-confirm judge \u2014 internal pass1/pass2 loop over deduped flags",
+        "id": "review-judge-task",
+        "kind": "task",
+        "label": "Judge",
+        "parentId": "demo-review-nameof-recency-adjudicate",
+        "startedTs": 1787889069,
+        "status": "complete",
+        "steps": [
+          {
+            "completedTs": 1787889234,
+            "id": "review-judge-step",
+            "kind": "review.judge",
+            "label": "Judge",
+            "model": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+            "startedTs": 1787889069,
+            "status": "complete",
+            "tokensFinal": 25199
+          }
+        ]
+      },
+      {
+        "completedTs": 1787889241,
+        "depth": 2,
+        "description": "verify confirmed findings, synthesize tier counts",
+        "id": "demo-review-nameof-recency-report",
+        "kind": "phase",
+        "label": "Report",
+        "startedTs": 1787889238,
+        "status": "complete"
+      },
+      {
+        "completedTs": 1787889239,
+        "depth": 1,
+        "description": "synthesis \u2014 apply verify adjudications, finalize tier counts + needs-check clustering",
+        "id": "review-synthesis-task",
+        "kind": "task",
+        "label": "Synthesis",
+        "parentId": "demo-review-nameof-recency-report",
+        "startedTs": 1787889239,
+        "status": "complete",
+        "steps": [
+          {
+            "completedTs": 1787889239,
+            "id": "review-synthesis-step",
+            "kind": "review.synthesis",
+            "label": "Synthesis",
+            "startedTs": 1787889239,
+            "status": "complete"
+          }
+        ]
+      },
+      {
+        "completedTs": 1787889239,
+        "depth": 0,
+        "description": "verify \u2014 render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
+        "id": "review-verify-task",
+        "kind": "task",
+        "label": "Verify",
+        "parentId": "demo-review-nameof-recency-report",
+        "startedTs": 1787889238,
+        "status": "complete",
+        "steps": [
+          {
+            "completedTs": 1787889238,
+            "id": "review-verify-render-step",
+            "kind": "review.verify-render",
+            "label": "Verify prompts",
+            "startedTs": 1787889238,
+            "status": "complete"
+          },
+          {
+            "completedTs": 1787889239,
+            "id": "review-verify-step",
+            "kind": "dispatch.map",
+            "label": "Dispatch (map)",
+            "model": "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
+            "startedTs": 1787889239,
+            "status": "complete"
+          }
+        ]
+      }
+    ]
+  }
+}

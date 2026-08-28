@@ -1,0 +1,12 @@
+{
+  "completed_ts_rel": 1929,
+  "config": {
+    "verify_seat_staffed": true
+  },
+  "id": "review-verify-render-step",
+  "kind": "review.verify-render",
+  "output": "[]",
+  "started_ts_rel": 1929,
+  "status": "complete",
+  "task_id": "review-verify-task"
+}

@@ -1,0 +1,14 @@
+{
+  "depends_on": [],
+  "description": "double-confirm judge \u2014 internal pass1/pass2 loop over deduped flags",
+  "display_name": "Judge",
+  "id": "review-judge-task",
+  "phase_id": "demo-review-nameof-recency-adjudicate",
+  "reads": [
+    "review-dedup-task"
+  ],
+  "role_id": "review-judge",
+  "step_ids": [
+    "review-judge-step"
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "completed_ts_rel": 1760,
+  "created_ts_rel": 0,
+  "description": "resolve review bundles from the diff, probe every explicit probe task, dedup",
+  "display_name": "Investigate",
+  "id": "demo-review-nameof-recency-investigate",
+  "mission_id": "demo-review-nameof-recency",
+  "started_ts_rel": 1,
+  "status": "complete",
+  "task_ids": []
+}

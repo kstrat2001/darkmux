@@ -1,0 +1,24 @@
+{
+  "completed_ts_rel": 1752,
+  "config": {
+    "bucket_budget": 500000,
+    "bucket_group": "probe",
+    "identifier": "darkmux:qwen/qwen3.8-27b",
+    "max_tokens": 4000,
+    "model": "darkmux:qwen/qwen3.8-27b",
+    "model_key": "qwen/qwen3.8-27b",
+    "n_ctx": 50000,
+    "retry_on_empty": 1,
+    "retry_on_error": 1,
+    "system": "",
+    "temperature": 0.20000000298023224,
+    "timeout_seconds": 3600,
+    "user_template": "{item}"
+  },
+  "id": "review-probe-high-step",
+  "kind": "dispatch.map",
+  "output": "[{\"index\":0,\"ok\":true,\"content\":\"\",\"total_tokens\":10712,\"prompt_tokens\":2714,\"completion_tokens\":7998,\"wall_ms\":554964},{\"index\":1,\"ok\":true,\"content\":\"\",\"total_tokens\":10602,\"prompt_tokens\":2604,\"completion_tokens\":7998,\"wall_ms\":410077},{\"index\":2,\"ok\":true,\"content\":\"\",\"total_tokens\":10610,\"prompt_tokens\":2612,\"completion_tokens\":7998,\"wall_ms\":394329},{\"index\":3,\"ok\":true,\"content\":\"\",\"total_tokens\":8432,\"prompt_tokens\":434,\"completion_tokens\":7998,\"wall_ms\":370679}]",
+  "started_ts_rel": 8,
+  "status": "complete",
+  "task_id": "review-probe-high-task"
+}

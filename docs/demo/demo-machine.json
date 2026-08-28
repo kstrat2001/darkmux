@@ -4,7 +4,7 @@
     "attribution_note": "4 worker(s) for 4 resident(s) \u2014 per-model footprint (max of rss and phys_footprint), workers rank-matched to models by weights (largest worker <-> largest weights)",
     "cache_ttl_ms": 2000,
     "gather_ms": 345,
-    "generated_at_ms": 1787819182953,
+    "generated_at_ms": 1787892244698,
     "limit_bytes": 274877906944,
     "limit_source": "physical_pool",
     "machine": {
@@ -88,9 +88,9 @@
   },
   "specs": {
     "cpu_brand": "Apple M5 Ultra",
-    "darkmux_version": "3.1.0",
+    "darkmux_version": "3.2.0",
     "flow_schema_version": "1.20.0",
-    "generated_at_ms": 1787819182952,
+    "generated_at_ms": 1787892244698,
     "lms_unreachable": false,
     "loaded_models": [
       {
