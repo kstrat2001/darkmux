@@ -591,6 +591,16 @@ pub struct HookRule {
     /// Refused at config load (the whole hooks sink degrades, loudly) when
     /// the host isn't `127.0.0.1` / `::1` / `localhost` — a token-bearing
     /// remote hook is a later packet (#2093's own "out of scope").
+    ///
+    /// **Delivery is AT-LEAST-ONCE, not exactly-once** (#2093 merge-gate
+    /// finding 13): the cursor advances only AFTER a successful POST, so
+    /// a crash (or process kill) between the receiver returning 2xx and
+    /// that cursor write redelivers the same record on the next restart.
+    /// This receiver MUST be idempotent — in practice, that means keying
+    /// on the record's own identity rather than treating arrival as the
+    /// event. The tracker's finding-identity key already does this by
+    /// construction, so a redelivered `hook.fired`/matched record is a
+    /// safe no-op for it, not a duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub http: Option<String>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
