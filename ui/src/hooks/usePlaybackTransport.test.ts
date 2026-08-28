@@ -64,8 +64,12 @@ describe("usePlaybackTransport", () => {
       vi.advanceTimersByTime(1000);
     });
     expect(result.current.t - result.current.tMin).toBe(3600_000);
+    // The step is MEASURED: a throttled interval (one late tick standing in
+    // for ten) still replays the labeled amount of recorded time.
     act(() => result.current.rewind());
-    act(() => result.current.cycleSpeed()); // 1h/s -> 1m/s
+    act(() => result.current.cycleSpeed()); // 1h/s -> 10m/s
+    expect(result.current.speed).toBe(600);
+    act(() => result.current.cycleSpeed()); // 10m/s -> 1m/s
     expect(result.current.speed).toBe(60);
     act(() => {
       vi.advanceTimersByTime(1000);
@@ -79,7 +83,7 @@ describe("usePlaybackTransport", () => {
       result.current.rewind();
       result.current.cycleSpeed();
     });
-    expect(result.current.speed).toBe(60);
+    expect(result.current.speed).toBe(600);
     const other = [{ ts: "2026-08-09T00:00:00.000Z", action: "dispatch.start" }, { ts: "2026-08-09T02:00:00.000Z", action: "dispatch.complete" }] as unknown as FlowRecord[];
     rerender({ d: other });
     expect(result.current.t).toBe(Date.parse("2026-08-09T02:00:00.000Z"));

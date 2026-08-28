@@ -36,30 +36,37 @@ test('pressing play on the static build actually advances the playhead', async (
   // fixture (shared with `viewer-xss.spec.js`) grows or shrinks a record.
   const total = clockBefore.match(/\/(\d+) rec$/)[1];
 
+  // The 13-second fixture day plays inside ONE 100 ms tick at the default
+  // 1h/s, so asserting the "rewound and playing" state from the test side
+  // is a race against the loop. Record the transitions from INSIDE the page
+  // instead: a requestAnimationFrame sampler (~16 ms, finer than the tick)
+  // captures every distinct (range value, button title, clock) state the
+  // transport passes through; the assertions read that record once the run
+  // has completed. Pressing play while pinned at the end restarts from the
+  // beginning (`togglePlay`'s "restart if at the end" rule, ported from
+  // legacy's `if(state.t>=tMax)state.t=tMin;`), so the first state seen
+  // must be the range at 0 with the button reading "pause" and the clock's
+  // NUMERATOR below the day's total — the denominator is invariant across
+  // the test, so it alone could never prove the playhead moved.
+  await page.evaluate(() => {
+    const range = document.querySelector('.scrub input[type="range"]');
+    const btn = document.querySelector('.scrub button.primary');
+    const clockEl = document.querySelector('[data-testid="scrubber-clock"]');
+    window.__transport = [];
+    const sample = () => {
+      const state = `${range.value}|${btn.title}|${clockEl.textContent}`;
+      if (state !== window.__transport[window.__transport.length - 1]) window.__transport.push(state);
+      window.__transportRaf = requestAnimationFrame(sample);
+    };
+    sample();
+  });
   await playBtn.click();
-
-  // Pressing play while pinned at the end restarts from the beginning
-  // (`onTogglePlay`'s own "restart if at the end" rule, ported from
-  // legacy's `if(state.t>=tMax)state.t=tMin;`) — so the FIRST observable
-  // effect is the range dropping to 0, before it climbs again.
-  await expect(range).toHaveValue('0');
-  await expect(playBtn).toHaveAttribute('title', 'pause');
-  // The record count half of the clock readout drops too — rewound to the
-  // start, only the record(s) at-or-before tMin remain visible. Asserting
-  // the NUMERATOR here, not the denominator: `total` (the day's whole
-  // count) is invariant across the entire test, so a denominator-only
-  // assertion would pass even if the numerator never moved at all.
-  const clockAfterRewind = await clock.innerText();
-  const numeratorAfterRewind = Number(clockAfterRewind.match(/(\d+)\/\d+ rec$/)[1]);
-  expect(numeratorAfterRewind).toBeLessThan(Number(total));
 
   // Real wall-clock, real `setInterval` — poll until the playhead has
   // measurably moved off zero. The fixture's ~13s span at 1x advances the
   // full range in ~12s (legacy's own `(tMax-tMin)/120` step every 100ms),
   // so any nonzero value within a few real seconds is genuine motion, not
   // a fluke.
-  await expect.poll(async () => Number(await range.inputValue()), { timeout: 5_000 }).toBeGreaterThan(0);
-
   // Speed is a real multiplier of elapsed time now ("1× doesn't seem 1×",
   // the #2071 follow-up): at the default 1h/s this 13-second fixture day
   // plays out inside ONE tick, so sampling the clock mid-flight is a race
@@ -70,6 +77,14 @@ test('pressing play on the static build actually advances the playhead', async (
   await expect(range).toHaveValue('100', { timeout: 5_000 });
   await expect(playBtn).toHaveAttribute('title', 'play');
   expect(await clock.innerText()).toMatch(new RegExp(`${total}/${total} rec$`));
+  const transitions = await page.evaluate(() => {
+    cancelAnimationFrame(window.__transportRaf);
+    return window.__transport;
+  });
+  const rewound = transitions.find((st) => st.startsWith('0|pause|'));
+  expect(rewound, `transitions seen: ${transitions.join(' → ')}`).toBeTruthy();
+  expect(Number(rewound.match(/(\d+)\/\d+ rec$/)[1])).toBeLessThan(Number(total));
+  expect(transitions[transitions.length - 1]).toMatch(new RegExp(`^100\\|play\\|.*${total}/${total} rec$`));
 
   expect(pageErrors, `pageerror events: ${pageErrors.join('; ')}`).toHaveLength(0);
 });
