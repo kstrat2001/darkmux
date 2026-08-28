@@ -7,7 +7,7 @@
 use crate::crawl::glob;
 use crate::crawl::manifest::CorpusManifest;
 use crate::crawl::rules::{Rule, RuleKind};
-use crate::crawl::semver::range_admits;
+use crate::crawl::semver::{prerelease_tag, range_admits};
 use crate::crawl::sources::ResolvedSource;
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -47,6 +47,14 @@ pub struct Site {
     pub line: usize,
     pub start: usize,
     pub end: usize,
+    /// Every 1-indexed hit line that merged into this span, in ascending
+    /// order — `line` is always `hits[0]`. Overlapping/adjacent windows
+    /// merge into one site (see `merge_windows`), which used to discard
+    /// every hit but the first; a reviewer (or the model) reading `sites`
+    /// alone had no way to tell "one hit, wide window" from "several hits,
+    /// merged span" (#1959 finding 9). Additive field — every existing
+    /// reader of `line`/`start`/`end` is unaffected.
+    pub hits: Vec<usize>,
 }
 
 /// A read unit's file list entry: a whole file (serializes as a bare
@@ -90,6 +98,25 @@ pub enum Unit {
         library_version: String,
         range_admits: bool,
         sites: Vec<Site>,
+        /// The library source's tree root the surface below was resolved
+        /// against — lets a downstream dispatch open the exact files
+        /// `library_surface` names without re-deriving the path (#1959
+        /// finding 4).
+        library_tree: PathBuf,
+        /// The library's package.json entry points (`main`, `module`,
+        /// `types`/`typings`, every string reachable under `exports`) plus
+        /// any top-level `CHANGELOG*` file, relative to `library_tree`,
+        /// filtered to paths that actually exist and deduplicated. This —
+        /// not the library's whole tree — is what the model is asked to
+        /// read alongside the consumer's import sites; see the
+        /// `stale-consumer` rule prose for why the `no_match`/`why_hint`
+        /// wording is scoped to exactly these files.
+        library_surface: Vec<String>,
+        /// Set when `library_surface` came back empty — names why, so an
+        /// operator reading the plan doesn't mistake "found nothing" for
+        /// "didn't look".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
         est_tokens: usize,
     },
 }
@@ -155,6 +182,15 @@ pub struct RuleTotal {
     pub sites: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<usize>,
+    /// True when at least one of this rule's `read` units is SHARED with
+    /// another active read rule (the single combined read pass groups
+    /// files by their exact ruleset — see `collect_read_units` — so two
+    /// rules matching the same file share its unit, and thus its
+    /// `est_tokens`). Surfaced so the CLI table's per-rule sums don't read
+    /// as double-counting the plan's own `totals.est_tokens` (#1959
+    /// finding 17). Always `false` for `site`/`edge` rules.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared: bool,
     pub est_tokens: usize,
 }
 
@@ -189,9 +225,9 @@ struct SourceFiles {
 }
 
 impl SourceFiles {
-    fn new(tree: &Path) -> Result<Self> {
+    fn new(tree: &Path, source_id: &str, skipped: &mut Vec<SkippedEntry>) -> Result<Self> {
         let mut all = Vec::new();
-        walk_relative(tree, tree, &mut all)?;
+        walk_relative(tree, tree, &mut all, source_id, skipped)?;
         all.sort();
         Ok(Self {
             tree: tree.to_path_buf(),
@@ -257,7 +293,13 @@ impl SourceFiles {
     }
 }
 
-fn walk_relative(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+fn walk_relative(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<String>,
+    source_id: &str,
+    skipped: &mut Vec<SkippedEntry>,
+) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
@@ -265,33 +307,54 @@ fn walk_relative(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
             continue;
         }
         let ft = entry.file_type()?;
-        if ft.is_dir() {
-            walk_relative(root, &path, out)?;
-        } else if ft.is_file() {
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            out.push(rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"));
+        let rel = || {
+            path.strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        };
+        if ft.is_symlink() {
+            // Never followed — `file_type()` reports a symlink's own type
+            // without resolving it, so neither the `is_dir`/`is_file` arm
+            // below ever fires for one. Before this fix that meant a
+            // symlink simply vanished from the walk with no record; now
+            // it's recorded so a plan's totals account for every entry the
+            // walker actually met (#1959 finding 6).
+            skipped.push(SkippedEntry {
+                reason: "symlink".to_string(),
+                file: rel(),
+                source: Some(source_id.to_string()),
+            });
+            continue;
         }
-        // symlinks: skipped (neither a plain file to read nor a dir to walk).
+        if ft.is_dir() {
+            walk_relative(root, &path, out, source_id, skipped)?;
+        } else if ft.is_file() {
+            out.push(rel());
+        }
     }
     Ok(())
 }
 
-/// Merge 1-indexed hit line numbers into `(start, end, first_hit_line)`
-/// spans using `window` lines of context on each side, clamped to
-/// `[1, total_lines]`. `hits` must be sorted ascending (callers build it
-/// that way via a single forward line scan). Overlapping/adjacent spans
-/// merge into one — "overlapping windows in the same file count once".
-fn merge_windows(hits: &[usize], window: usize, total_lines: usize) -> Vec<(usize, usize, usize)> {
+/// Merge 1-indexed hit line numbers into `(start, end, first_hit_line,
+/// every_hit_line)` spans using `window` lines of context on each side,
+/// clamped to `[1, total_lines]`. `hits` must be sorted ascending (callers
+/// build it that way via a single forward line scan). Overlapping/adjacent
+/// spans merge into one — "overlapping windows in the same file count
+/// once" — and every hit line that merged into a span is carried forward
+/// (`Site::hits`, #1959 finding 9) rather than only the first.
+fn merge_windows(hits: &[usize], window: usize, total_lines: usize) -> Vec<(usize, usize, usize, Vec<usize>)> {
     let clamp_end = total_lines.max(1);
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    let mut spans: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
     for &h in hits {
         let s = h.saturating_sub(window).max(1);
         let e = (h + window).min(clamp_end);
         match spans.last_mut() {
             Some(last) if s <= last.1 + 1 => {
                 last.1 = last.1.max(e);
+                last.3.push(h);
             }
-            _ => spans.push((s, e, h)),
+            _ => spans.push((s, e, h, vec![h])),
         }
     }
     spans
@@ -312,12 +375,12 @@ fn next_unit_id(seq: &mut usize) -> String {
 /// fixed pass order (every `site` rule, then the combined `read` pass per
 /// source, then every `edge` rule).
 pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource]) -> Result<Plan> {
+    let mut skipped: Vec<SkippedEntry> = Vec::new();
     let mut files_by_id: BTreeMap<String, SourceFiles> = BTreeMap::new();
     for s in sources {
-        files_by_id.insert(s.id.clone(), SourceFiles::new(&s.tree)?);
+        files_by_id.insert(s.id.clone(), SourceFiles::new(&s.tree, &s.id, &mut skipped)?);
     }
 
-    let mut skipped: Vec<SkippedEntry> = Vec::new();
     let mut units: Vec<Unit> = Vec::new();
     let mut unit_seq: usize = 1;
 
@@ -365,7 +428,7 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
                     library_version: None,
                     range_admits: None,
                     note: Some(format!(
-                        "ecosystem '{ecosystem}' not supported by rule '{}' — packet 1 supports npm only",
+                        "ecosystem '{ecosystem}' not supported by rule '{}' — only the npm ecosystem is supported",
                         rule.id
                     )),
                 });
@@ -377,7 +440,7 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
             let pinned = consumer_pkg.as_ref().ok().and_then(|v| pinned_range(v, &edge.package));
             let lib_version = library_pkg.as_ref().ok().and_then(package_version);
 
-            let (admits, note) = match (&pinned, &lib_version) {
+            let (admits, mut note) = match (&pinned, &lib_version) {
                 (Some(p), Some(v)) => match range_admits(p, v) {
                     Some(b) => (Some(b), None),
                     None => (None, Some(format!("unsupported range syntax '{p}' — skipped"))),
@@ -385,7 +448,7 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
                 (None, _) => (
                     None,
                     Some(format!(
-                        "package '{}' not found in {}'s dependencies/devDependencies",
+                        "package '{}' not found in {}'s dependencies/devDependencies/peerDependencies/optionalDependencies",
                         edge.package, edge.consumer
                     )),
                 ),
@@ -394,6 +457,19 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
                     Some(format!("no `version` found in {}'s package.json", edge.library)),
                 ),
             };
+            // #1959 finding 11: a prerelease library version is treated as
+            // its release-line core version for the range check (the same
+            // normalization `semver::parse_semver` already applies) — note
+            // it explicitly rather than letting that normalization happen
+            // silently. Only overrides a still-empty note (an
+            // unsupported-range/not-found note already explains itself).
+            if note.is_none() {
+                if let Some(v) = &lib_version {
+                    if let Some(tag) = prerelease_tag(v) {
+                        note = Some(format!("prerelease `{tag}` ignored for the range check"));
+                    }
+                }
+            }
 
             edge_ledger.push(EdgeLedgerEntry {
                 consumer: edge.consumer.clone(),
@@ -409,10 +485,29 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
                 continue;
             }
 
+            // #1959 finding 4: the model reads the library's entry surface
+            // (package.json's main/module/types/typings/exports + any
+            // top-level CHANGELOG*), not its whole tree — resolved once per
+            // edge and reused across every batch of this edge's units.
+            // Reuses the library source's own file cache (`SourceFiles::get`)
+            // so a surface file already read by another rule pass isn't
+            // read from disk twice, same reasoning as every other read
+            // path in this module.
+            let (surface_rels, surface_note) = resolve_library_surface(&library.tree);
+            let mut surface_tokens = 0usize;
+            {
+                let lib_files = files_by_id.get_mut(&edge.library).expect("library resolved");
+                for rel in &surface_rels {
+                    if let Some(text) = lib_files.get(rel, &mut skipped, &edge.library) {
+                        surface_tokens += estimate_tokens(&text);
+                    }
+                }
+            }
+
             let files = files_by_id.get_mut(&edge.consumer).expect("consumer resolved");
             let hits = collect_edge_import_sites(rule, &edge.package, files, &mut skipped, &edge.consumer)?;
             for batch in hits.chunks(MAX_EDGE_SITES_PER_UNIT) {
-                let est_tokens: usize = batch.iter().map(|(_, tok)| *tok).sum();
+                let est_tokens: usize = batch.iter().map(|(_, tok)| *tok).sum::<usize>() + surface_tokens;
                 units.push(Unit::Edge {
                     id: next_unit_id(&mut unit_seq),
                     rule: rule.id.clone(),
@@ -423,6 +518,9 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
                     library_version: lib_version.clone().unwrap_or_default(),
                     range_admits: false,
                     sites: batch.iter().map(|(s, _)| s.clone()).collect(),
+                    library_tree: library.tree.clone(),
+                    library_surface: surface_rels.clone(),
+                    note: surface_note.clone(),
                     est_tokens,
                 });
             }
@@ -440,7 +538,7 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
         })
         .collect();
 
-    let totals = compute_totals(&units, skipped, edge_ledger);
+    let totals = compute_totals(rules, &units, skipped, edge_ledger);
 
     Ok(Plan {
         schema_version: PLAN_SCHEMA_VERSION.to_string(),
@@ -452,8 +550,19 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
     })
 }
 
-fn compute_totals(units: &[Unit], skipped: Vec<SkippedEntry>, edges: Vec<EdgeLedgerEntry>) -> Totals {
+fn compute_totals(
+    rules: &[Rule],
+    units: &[Unit],
+    skipped: Vec<SkippedEntry>,
+    edges: Vec<EdgeLedgerEntry>,
+) -> Totals {
     let mut by_rule: BTreeMap<String, RuleTotal> = BTreeMap::new();
+    // #1959 finding 8: seed every resolved rule id at zero FIRST, so "this
+    // rule ran and matched nothing" is a visible `units: 0` row rather than
+    // an absent one indistinguishable from "this rule never ran".
+    for rule in rules {
+        by_rule.entry(rule.id.clone()).or_default();
+    }
     for unit in units {
         match unit {
             Unit::Site { rule, sites, est_tokens, .. } => {
@@ -463,11 +572,19 @@ fn compute_totals(units: &[Unit], skipped: Vec<SkippedEntry>, edges: Vec<EdgeLed
                 t.est_tokens += est_tokens;
             }
             Unit::Read { rules, files, est_tokens, .. } => {
+                // #1959 finding 17: a read unit shared by more than one
+                // active read rule (the combined read pass groups files by
+                // their exact ruleset) contributes its `est_tokens` to
+                // EVERY rule sharing it — flag those rules so the CLI table
+                // can say so, rather than let the per-rule sums silently
+                // outrun `totals.est_tokens`.
+                let shared = rules.len() > 1;
                 for rid in rules {
                     let t = by_rule.entry(rid.clone()).or_default();
                     t.units += 1;
                     *t.files.get_or_insert(0) += files.len();
                     t.est_tokens += est_tokens;
+                    t.shared = t.shared || shared;
                 }
             }
             Unit::Edge { rule, sites, est_tokens, .. } => {
@@ -519,9 +636,9 @@ fn collect_site_units(
         if hits.is_empty() {
             continue;
         }
-        for (s, e, first) in merge_windows(&hits, window, total) {
+        for (s, e, first, hit_list) in merge_windows(&hits, window, total) {
             let tokens = estimate_tokens(&window_text(&lines, s, e));
-            batch.push((Site { file: rel.clone(), line: first, start: s, end: e }, tokens));
+            batch.push((Site { file: rel.clone(), line: first, start: s, end: e, hits: hit_list }, tokens));
         }
     }
 
@@ -687,8 +804,21 @@ fn collect_edge_import_sites(
     source_id: &str,
 ) -> Result<Vec<(Site, usize)>> {
     let esc = regex::escape(package);
-    // `from "<pkg>"` / `from "<pkg>/subpath"` / `require("<pkg>...")`.
-    let pattern = format!(r#"from\s*['"]{esc}(?:/|['"])|require\(\s*['"]{esc}"#);
+    // Every import shape that names a bare package specifier, each
+    // requiring the same terminator (`/` for a subpath, or the closing
+    // quote) right after the package name so `@org/lib-extra` never
+    // matches a site rule scoped to `@org/lib` (#1959 finding 3 — the
+    // `require` branch used to lack this terminator entirely, so
+    // `require('@org/lib-extra')` matched `@org/lib` as a bare prefix):
+    //   - `from "<pkg>"` / `from "<pkg>/subpath"` (static ESM, covers
+    //     `import type { X } from "<pkg>"` too — `from` appears regardless
+    //     of what precedes it on the line)
+    //   - `import("<pkg>")` (dynamic import)
+    //   - `import "<pkg>"` (side-effect import, no braces/`from`)
+    //   - `require("<pkg>")` / `require("<pkg>/subpath")`
+    let pattern = format!(
+        r#"from\s*['"]{esc}(?:/|['"])|import\(\s*['"]{esc}(?:/|['"])|import\s*['"]{esc}(?:/|['"])|require\(\s*['"]{esc}(?:/|['"])"#
+    );
     let re = Regex::new(&pattern)
         .with_context(|| format!("compiling import-site regex for package '{package}'"))?;
     let window = rule.window_or_default();
@@ -708,9 +838,9 @@ fn collect_edge_import_sites(
         if hits.is_empty() {
             continue;
         }
-        for (s, e, first) in merge_windows(&hits, window, total) {
+        for (s, e, first, hit_list) in merge_windows(&hits, window, total) {
             let tokens = estimate_tokens(&window_text(&lines, s, e));
-            out.push((Site { file: rel.clone(), line: first, start: s, end: e }, tokens));
+            out.push((Site { file: rel.clone(), line: first, start: s, end: e, hits: hit_list }, tokens));
         }
     }
     Ok(out)
@@ -722,16 +852,122 @@ fn read_package_json(tree: &Path) -> Result<serde_json::Value> {
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// The four dependency-map fields npm resolves a specifier's pinned range
+/// from, checked in this order (#1959 finding 10 — `peerDependencies` and
+/// `optionalDependencies` used to be silently unchecked, so a peer-only
+/// pin looked identical to "not pinned at all"). The edge ledger's
+/// not-found note names all four so an operator reading it knows exactly
+/// where the planner looked, not just where it happened to look first.
+const DEPENDENCY_FIELDS: &[&str] =
+    &["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
+
 fn pinned_range(pkg: &serde_json::Value, package: &str) -> Option<String> {
-    pkg.get("dependencies")
-        .and_then(|d| d.get(package))
-        .and_then(|v| v.as_str())
-        .or_else(|| pkg.get("devDependencies").and_then(|d| d.get(package)).and_then(|v| v.as_str()))
-        .map(|s| s.to_string())
+    DEPENDENCY_FIELDS.iter().find_map(|field| {
+        pkg.get(field)
+            .and_then(|d| d.get(package))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    })
 }
 
 fn package_version(pkg: &serde_json::Value) -> Option<String> {
     pkg.get("version").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// The package.json fields naming a whole-file entry point — checked for
+/// `main`, `module`, `types`, `typings` (#1959 finding 4). `exports` is
+/// handled separately below since it can nest arbitrarily deep.
+const ENTRY_POINT_FIELDS: &[&str] = &["main", "module", "types", "typings"];
+
+/// Resolve a library's package.json-declared entry points (`main`,
+/// `module`, `types`/`typings`, and every string value reachable under
+/// `exports`) plus any top-level `CHANGELOG*` file, to paths RELATIVE to
+/// `tree` that actually exist there — the "library surface" a
+/// `stale-consumer` edge unit hands the model instead of the library's
+/// entire tree (#1959 finding 4). Deduplicated, in the order resolved.
+/// Returns a `note` explaining why when nothing resolved, so an empty
+/// surface reads as "looked, found nothing" rather than "didn't look".
+fn resolve_library_surface(tree: &Path) -> (Vec<String>, Option<String>) {
+    let mut rels: Vec<String> = Vec::new();
+
+    if let Ok(pkg) = read_package_json(tree) {
+        for field in ENTRY_POINT_FIELDS {
+            if let Some(v) = pkg.get(field).and_then(|v| v.as_str()) {
+                push_surface_path_if_exists(tree, v, &mut rels);
+            }
+        }
+        if let Some(exports) = pkg.get("exports") {
+            let mut export_strings = Vec::new();
+            collect_export_strings(exports, &mut export_strings);
+            for v in export_strings {
+                push_surface_path_if_exists(tree, &v, &mut rels);
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(tree) {
+        let mut changelogs: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let is_changelog = e
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.to_ascii_uppercase().starts_with("CHANGELOG"));
+                (is_changelog && e.path().is_file()).then(|| e.file_name().to_string_lossy().into_owned())
+            })
+            .collect();
+        changelogs.sort();
+        for c in changelogs {
+            if !rels.contains(&c) {
+                rels.push(c);
+            }
+        }
+    }
+
+    if rels.is_empty() {
+        let note = "no package.json entry point (main/module/types/typings/exports) or \
+                     top-level CHANGELOG file resolved to an existing file in the library tree"
+            .to_string();
+        (rels, Some(note))
+    } else {
+        (rels, None)
+    }
+}
+
+/// Push `rel` (a package.json-declared path, possibly `./`-prefixed) onto
+/// `out` — deduplicated — if it resolves to an existing FILE under `tree`.
+/// A declared entry point that doesn't exist (a stale field, a build
+/// output that hasn't run) is silently skipped, same leniency as every
+/// other "does this resolve" check in this module.
+fn push_surface_path_if_exists(tree: &Path, rel: &str, out: &mut Vec<String>) {
+    let rel = rel.strip_prefix("./").unwrap_or(rel);
+    if rel.is_empty() || out.iter().any(|r| r == rel) {
+        return;
+    }
+    if tree.join(rel).is_file() {
+        out.push(rel.to_string());
+    }
+}
+
+/// Recursively collect every string value reachable under a package.json
+/// `exports` field — which can be a bare string, or arbitrarily nested
+/// objects/arrays keyed by condition (`"import"`/`"require"`/`"types"`/a
+/// subpath) or target platform (#1959 finding 4).
+fn collect_export_strings(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Object(map) => {
+            for vv in map.values() {
+                collect_export_strings(vv, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for vv in arr {
+                collect_export_strings(vv, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -832,9 +1068,9 @@ mod tests {
         lines.push("}".to_string());
         fs::write(dir.path().join("x.ts"), lines.join("\n")).unwrap();
 
-        let mut files = SourceFiles::new(dir.path()).unwrap();
-        let source = resolved("app", dir.path());
         let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let source = resolved("app", dir.path());
         let mut seq = 1usize;
         let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
         assert_eq!(units.len(), 1, "{units:?}");
@@ -855,9 +1091,9 @@ mod tests {
         }
         fs::write(dir.path().join("x.ts"), lines.join("\n")).unwrap();
 
-        let mut files = SourceFiles::new(dir.path()).unwrap();
-        let source = resolved("app", dir.path());
         let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let source = resolved("app", dir.path());
         let mut seq = 1usize;
         let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
         assert_eq!(units.len(), 2, "expected a 40 + 1 split: {units:?}");
@@ -873,9 +1109,9 @@ mod tests {
         fs::write(dir.path().join("a.ts"), "x".repeat(20)).unwrap(); // 20 chars ~5 tokens
         fs::write(dir.path().join("README.md"), "y".repeat(400)).unwrap(); // 400 chars ~100 tokens > chunk_tokens=50
 
-        let mut files = SourceFiles::new(dir.path()).unwrap();
-        let source = resolved("app", dir.path());
         let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let source = resolved("app", dir.path());
         let mut seq = 1usize;
         let rule = read_rule();
         let read_rules: Vec<&Rule> = vec![&rule];
@@ -919,9 +1155,6 @@ mod tests {
         )
         .unwrap();
 
-        let mut files_by_id: BTreeMap<String, SourceFiles> = BTreeMap::new();
-        files_by_id.insert("app".to_string(), SourceFiles::new(&app_dir).unwrap());
-        files_by_id.insert("lib".to_string(), SourceFiles::new(&lib_dir).unwrap());
         let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
         let manifest = manifest_with_edge("app", "lib", "@org/lib");
         let rules = vec![edge_rule()];
@@ -937,7 +1170,6 @@ mod tests {
 
         assert_eq!(out.totals.edges.len(), 1);
         assert_eq!(out.totals.edges[0].range_admits, Some(false));
-        let _ = files_by_id; // constructed above to mirror plan()'s own per-source cache shape
     }
 
     #[test]
@@ -976,14 +1208,308 @@ mod tests {
         fs::write(dir.path().join("big.ts"), vec![b'a'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
         fs::write(dir.path().join("bad.ts"), [0xFFu8, 0xFE, 0x00]).unwrap();
 
-        let mut files = SourceFiles::new(dir.path()).unwrap();
-        let source = resolved("app", dir.path());
         let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let source = resolved("app", dir.path());
         let mut seq = 1usize;
         let _ = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
         let reasons: Vec<&str> = skipped.iter().map(|s| s.reason.as_str()).collect();
         assert!(reasons.iter().any(|r| r.contains("exceeds")), "{reasons:?}");
         assert!(reasons.iter().any(|r| r.contains("UTF-8")), "{reasons:?}");
+    }
+
+    // ── #1959 finding 9: merge_windows carries every hit line, not just the first ──
+
+    #[test]
+    fn merge_windows_carries_every_hit_line_in_a_merged_span() {
+        let spans = merge_windows(&[1, 62], 30, 1000);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let (start, end, first, hits) = &spans[0];
+        assert_eq!(*first, 1);
+        assert_eq!(hits, &vec![1, 62]);
+        assert_eq!(*start, 1);
+        assert_eq!(*end, 92);
+    }
+
+    // ── #1959 finding 8: by_rule seeds every resolved rule at zero ──
+
+    #[test]
+    fn by_rule_seeds_a_rule_that_matched_nothing_at_zero() {
+        let dir = TempDir::new().unwrap();
+        // No catch/`.catch(`/`void fn(` anywhere — the site rule's
+        // prefilter matches nothing in this tree.
+        fs::write(dir.path().join("x.ts"), "const x = 1;\n").unwrap();
+
+        let sources = vec![resolved("app", dir.path())];
+        let manifest = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "sources": [{"id": "app", "path": "/x", "ref": "main"}],
+        }))
+        .unwrap();
+        let rules = vec![site_rule()];
+
+        let out = plan(&manifest, &rules, &sources).unwrap();
+        assert_eq!(out.totals.units, 0);
+        let t = out.totals.by_rule.get("swallowed-error").expect("rule seeded even with zero matches");
+        assert_eq!(t.units, 0);
+        assert_eq!(t.est_tokens, 0);
+    }
+
+    // ── #1959 finding 3: edge import regex covers require/dynamic import/side-effect import ──
+
+    #[test]
+    fn edge_import_regex_covers_every_import_shape_with_a_terminator() {
+        let dir = TempDir::new().unwrap();
+        let lines = [
+            "const x = require('@org/lib-extra');", // must NOT match @org/lib
+            "const y = require('@org/lib');",
+            "const z = import('@org/lib');",
+            "import '@org/lib';",
+            "import type { X } from '@org/lib';",
+            "import { Y } from '@org/lib/sub';",
+            "import { Z } from '@org/lib-extra';", // must NOT match @org/lib
+        ];
+        fs::write(dir.path().join("x.ts"), lines.join("\n")).unwrap();
+
+        let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let rule = edge_rule();
+        let hits = collect_edge_import_sites(&rule, "@org/lib", &mut files, &mut skipped, "app").unwrap();
+        let all_hit_lines: Vec<usize> = hits.iter().flat_map(|(s, _)| s.hits.clone()).collect();
+
+        // 1-indexed line numbers: 2 (require), 3 (dynamic import), 4
+        // (side-effect import), 5 (import type ... from), 6 (from .../sub).
+        // Lines 1 and 7 (the `-extra` false positives) must be absent.
+        assert!(all_hit_lines.contains(&2), "{all_hit_lines:?}");
+        assert!(all_hit_lines.contains(&3), "{all_hit_lines:?}");
+        assert!(all_hit_lines.contains(&4), "{all_hit_lines:?}");
+        assert!(all_hit_lines.contains(&5), "{all_hit_lines:?}");
+        assert!(all_hit_lines.contains(&6), "{all_hit_lines:?}");
+        assert!(!all_hit_lines.contains(&1), "{all_hit_lines:?}");
+        assert!(!all_hit_lines.contains(&7), "{all_hit_lines:?}");
+    }
+
+    // ── #1959 finding 10: pinned_range checks all four dependency fields ──
+
+    #[test]
+    fn pinned_range_resolves_a_peer_only_pin() {
+        let pkg = serde_json::json!({"peerDependencies": {"@org/lib": "^5.5.0"}});
+        assert_eq!(pinned_range(&pkg, "@org/lib"), Some("^5.5.0".to_string()));
+    }
+
+    #[test]
+    fn pinned_range_resolves_an_optional_only_pin() {
+        let pkg = serde_json::json!({"optionalDependencies": {"@org/lib": "^5.5.0"}});
+        assert_eq!(pinned_range(&pkg, "@org/lib"), Some("^5.5.0".to_string()));
+    }
+
+    #[test]
+    fn pinned_range_ledger_note_names_all_four_fields_when_absent() {
+        let workdir = TempDir::new().unwrap();
+        let app_dir = workdir.path().join("app");
+        let lib_dir = workdir.path().join("lib");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::create_dir_all(&lib_dir).unwrap();
+        fs::write(app_dir.join("package.json"), serde_json::json!({}).to_string()).unwrap();
+        fs::write(
+            lib_dir.join("package.json"),
+            serde_json::json!({"version": "8.1.1"}).to_string(),
+        )
+        .unwrap();
+
+        let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
+        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let rules = vec![edge_rule()];
+        let out = plan(&manifest, &rules, &sources).unwrap();
+
+        let note = out.totals.edges[0].note.as_deref().unwrap_or("");
+        for field in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] {
+            assert!(note.contains(field), "{note}");
+        }
+    }
+
+    // ── #1959 finding 11: prerelease library version is noted, not silent ──
+
+    #[test]
+    fn prerelease_library_version_notes_the_tag_in_the_ledger() {
+        let workdir = TempDir::new().unwrap();
+        let app_dir = workdir.path().join("app");
+        let lib_dir = workdir.path().join("lib");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::create_dir_all(&lib_dir).unwrap();
+        fs::write(
+            app_dir.join("package.json"),
+            serde_json::json!({"dependencies": {"@org/lib": "^5.5.0"}}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            lib_dir.join("package.json"),
+            serde_json::json!({"version": "8.1.1-rc.1"}).to_string(),
+        )
+        .unwrap();
+
+        let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
+        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let rules = vec![edge_rule()];
+        let out = plan(&manifest, &rules, &sources).unwrap();
+
+        assert_eq!(out.totals.edges.len(), 1);
+        let note = out.totals.edges[0].note.as_deref().unwrap_or("");
+        assert!(note.contains("prerelease"), "{note}");
+        assert!(note.contains("rc.1"), "{note}");
+    }
+
+    // ── #1959 finding 4: edge units carry the library's entry surface ──
+
+    #[test]
+    fn edge_unit_carries_library_entry_points_and_changelog() {
+        let workdir = TempDir::new().unwrap();
+        let app_dir = workdir.path().join("app");
+        let lib_dir = workdir.path().join("lib");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::create_dir_all(lib_dir.join("dist")).unwrap();
+        fs::write(
+            app_dir.join("package.json"),
+            serde_json::json!({"dependencies": {"@org/lib": "^5.5.0"}}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            lib_dir.join("package.json"),
+            serde_json::json!({"version": "8.1.1", "main": "dist/index.js"}).to_string(),
+        )
+        .unwrap();
+        fs::write(lib_dir.join("dist/index.js"), "module.exports = {};\n").unwrap();
+        fs::write(lib_dir.join("CHANGELOG.md"), "## 8.1.1\n- breaking change\n").unwrap();
+        fs::write(
+            app_dir.join("uses-lib.ts"),
+            "import { thing } from '@org/lib';\nthing();\n",
+        )
+        .unwrap();
+
+        let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
+        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let rules = vec![edge_rule()];
+        let out = plan(&manifest, &rules, &sources).unwrap();
+
+        let edge_units: Vec<&Unit> = out.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
+        assert_eq!(edge_units.len(), 1, "{:?}", out.units);
+        let Unit::Edge { library_tree, library_surface, note, .. } = edge_units[0] else { panic!() };
+        assert_eq!(library_tree, &lib_dir);
+        assert!(library_surface.contains(&"dist/index.js".to_string()), "{library_surface:?}");
+        assert!(library_surface.contains(&"CHANGELOG.md".to_string()), "{library_surface:?}");
+        assert!(note.is_none(), "{note:?}");
+    }
+
+    #[test]
+    fn edge_unit_notes_when_no_library_surface_resolves() {
+        let workdir = TempDir::new().unwrap();
+        let app_dir = workdir.path().join("app");
+        let lib_dir = workdir.path().join("lib");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::create_dir_all(&lib_dir).unwrap();
+        fs::write(
+            app_dir.join("package.json"),
+            serde_json::json!({"dependencies": {"@org/lib": "^5.5.0"}}).to_string(),
+        )
+        .unwrap();
+        // No main/module/types/typings/exports, no CHANGELOG.
+        fs::write(
+            lib_dir.join("package.json"),
+            serde_json::json!({"version": "8.1.1"}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            app_dir.join("uses-lib.ts"),
+            "import { thing } from '@org/lib';\nthing();\n",
+        )
+        .unwrap();
+
+        let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
+        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let rules = vec![edge_rule()];
+        let out = plan(&manifest, &rules, &sources).unwrap();
+
+        let edge_units: Vec<&Unit> = out.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
+        assert_eq!(edge_units.len(), 1, "{:?}", out.units);
+        let Unit::Edge { library_surface, note, .. } = edge_units[0] else { panic!() };
+        assert!(library_surface.is_empty(), "{library_surface:?}");
+        assert!(note.is_some(), "expected a note explaining the empty surface");
+    }
+
+    // ── #1959 finding 6: symlinks are recorded in totals.skipped, never followed ──
+
+    #[test]
+    fn symlinks_are_recorded_in_skipped_and_never_followed() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("real.ts"), "const x = 1;\n").unwrap();
+
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(outside.path().join("secret")).unwrap();
+        fs::write(outside.path().join("secret/leak.ts"), "catch (e) {}").unwrap();
+        fs::write(outside.path().join("file-leak.ts"), "catch (e) {}").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link-dir")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("file-leak.ts"),
+                dir.path().join("link-file.ts"),
+            )
+            .unwrap();
+        }
+
+        let sources = vec![resolved("app", dir.path())];
+        let manifest = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "sources": [{"id": "app", "path": "/x", "ref": "main"}],
+        }))
+        .unwrap();
+        let rules = vec![site_rule()];
+        let out = plan(&manifest, &rules, &sources).unwrap();
+
+        // Never followed: nothing from outside the tree shows up as a hit.
+        for unit in &out.units {
+            if let Unit::Site { sites, .. } = unit {
+                for s in sites {
+                    assert!(!s.file.contains("leak"), "{s:?}");
+                }
+            }
+        }
+        // Recorded: both the dir symlink and the file symlink are in skipped.
+        let symlink_skips: Vec<&SkippedEntry> =
+            out.totals.skipped.iter().filter(|s| s.reason == "symlink").collect();
+        assert_eq!(symlink_skips.len(), 2, "{:?}", out.totals.skipped);
+        assert!(symlink_skips.iter().any(|s| s.file == "link-dir"), "{symlink_skips:?}");
+        assert!(symlink_skips.iter().any(|s| s.file == "link-file.ts"), "{symlink_skips:?}");
+    }
+
+    // ── #1959 finding 18: plan() is deterministic for a fixed set of trees ──
+
+    #[test]
+    fn plan_is_deterministic_across_repeated_runs() {
+        let dir = TempDir::new().unwrap();
+        let mut lines = vec!["function a() {".to_string(), "  try {}".to_string(), "  catch (e) {}".to_string(), "}".to_string()];
+        for _ in 0..80 {
+            lines.push(String::new());
+        }
+        lines.push("function b() {".to_string());
+        lines.push("  p().catch(e => {})".to_string());
+        fs::write(dir.path().join("x.ts"), lines.join("\n")).unwrap();
+        fs::write(dir.path().join("README.md"), "docs\n").unwrap();
+
+        let sources = vec![resolved("app", dir.path())];
+        let manifest = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "sources": [{"id": "app", "path": "/x", "ref": "main"}],
+        }))
+        .unwrap();
+        let rules = vec![site_rule(), read_rule()];
+
+        let out1 = plan(&manifest, &rules, &sources).unwrap();
+        let out2 = plan(&manifest, &rules, &sources).unwrap();
+        let units1 = serde_json::to_value(&out1.units).unwrap();
+        let units2 = serde_json::to_value(&out2.units).unwrap();
+        assert_eq!(units1, units2);
     }
 
     #[test]
@@ -995,9 +1521,9 @@ mod tests {
         fs::write(dir.path().join("node_modules/pkg.ts"), "catch (e) {}").unwrap();
         fs::write(dir.path().join("real.ts"), "catch (e) {}").unwrap();
 
-        let mut files = SourceFiles::new(dir.path()).unwrap();
-        let source = resolved("app", dir.path());
         let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let source = resolved("app", dir.path());
         let mut seq = 1usize;
         let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
         let files_hit: Vec<&str> = units
