@@ -17,8 +17,11 @@ pub(crate) fn cmd_crawl(sub: CrawlCmd) -> Result<i32> {
 }
 
 fn cmd_crawl_plan(manifest_path: &std::path::Path, out: Option<PathBuf>, no_fetch: bool, json: bool) -> Result<i32> {
-    let manifest = CorpusManifest::load(manifest_path)
+    let (manifest, manifest_warnings) = CorpusManifest::load(manifest_path)
         .with_context(|| format!("loading corpus manifest {}", manifest_path.display()))?;
+    for w in &manifest_warnings {
+        eprintln!("{}", style::warn(w));
+    }
 
     let (rules, rule_warnings) = rules::resolve_default(&manifest.rules)?;
     for w in &rule_warnings {

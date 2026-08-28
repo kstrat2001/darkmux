@@ -97,30 +97,62 @@ const PACING_REJECTION: &str = "pacing is not a corpus setting: set `runtime.tur
 impl CorpusManifest {
     /// Load + validate a corpus manifest from disk. Validation is loud by
     /// design (#1959 packet 1 spec) — a malformed manifest fails here, not
-    /// partway through a later resolve/plan pass.
-    pub fn load(path: &Path) -> Result<Self> {
+    /// partway through a later resolve/plan pass. Non-fatal issues (a
+    /// `schema_version` major bump the binary doesn't recognize yet) come
+    /// back as warnings alongside the manifest, the same `(T, Vec<String>)`
+    /// shape `rules::load_all`/`rules::resolve` already use — the caller
+    /// (`crawl_cli::cmd_crawl_plan`) prints them with the identical
+    /// `style::warn` loop it already runs for rule warnings.
+    pub fn load(path: &Path) -> Result<(Self, Vec<String>)> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("reading corpus manifest {}", path.display()))?;
         let manifest: CorpusManifest = serde_json::from_str(&text)
             .with_context(|| format!("parsing corpus manifest {}", path.display()))?;
-        manifest.validate()?;
-        Ok(manifest)
+        let warnings = manifest.validate()?;
+        Ok((manifest, warnings))
     }
 
-    /// Structural validation: duplicate source ids, a source naming neither
-    /// (or both) of `git`/`path`, an edge naming an unknown source, and any
-    /// pacing-shaped key (`duty_cycle` or `budget`) — rejected loudly
-    /// rather than silently dropped, since manifests already on disk were
-    /// written against earlier revisions of this design and must fail
-    /// visibly, not run with a silently-ignored setting.
+    /// Structural validation: source id shape + case-insensitive
+    /// uniqueness, a source naming neither (or both) of `git`/`path`, an
+    /// edge naming an unknown source, and any pacing-shaped key
+    /// (`duty_cycle` or `budget`) — rejected loudly rather than silently
+    /// dropped, since manifests already on disk were written against
+    /// earlier revisions of this design and must fail visibly, not run
+    /// with a silently-ignored setting. Returns non-fatal warnings (a
+    /// `schema_version` major mismatch) on success.
     ///
     /// Rule-id resolution ("a rule id that resolves nowhere") is NOT checked
     /// here — that lives in `rules::resolve`, which is the single place that
     /// knows the full rule registry (embedded + user tier). Calling it is
     /// the caller's job (`crawl_cli::plan` does, immediately after loading).
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
+
+        if let Some(sv) = &self.schema_version {
+            if let (Some(got), Some(want)) = (schema_major(sv), schema_major(MANIFEST_SCHEMA_VERSION)) {
+                if got != want {
+                    warnings.push(format!(
+                        "corpus manifest '{}': schema_version '{sv}' is a different major version than this binary's manifest schema ('{MANIFEST_SCHEMA_VERSION}') — fields may not resolve as expected",
+                        self.name
+                    ));
+                }
+            }
+        }
+
         let mut seen = std::collections::BTreeSet::new();
+        // lowercase id -> the first original-case id seen for it, so an
+        // APFS-colliding pair (`app`/`App`) can be named in the error even
+        // though APFS itself would silently treat them as the same path.
+        let mut seen_lower: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
         for s in &self.sources {
+            if !valid_source_id(&s.id) {
+                bail!(
+                    "corpus manifest '{}': source id '{}' is invalid — ids must match \
+                     ^[A-Za-z0-9][A-Za-z0-9._-]*$ and must not be '.' or '..'",
+                    self.name,
+                    s.id
+                );
+            }
             if !seen.insert(s.id.as_str()) {
                 bail!(
                     "corpus manifest '{}': duplicate source id '{}'",
@@ -128,6 +160,17 @@ impl CorpusManifest {
                     s.id
                 );
             }
+            let lower = s.id.to_lowercase();
+            if let Some(prev) = seen_lower.get(lower.as_str()) {
+                bail!(
+                    "corpus manifest '{}': source ids '{}' and '{}' collide case-insensitively \
+                     (APFS treats these as the same path)",
+                    self.name,
+                    prev,
+                    s.id
+                );
+            }
+            seen_lower.insert(lower, s.id.as_str());
             match (&s.git, &s.path) {
                 (None, None) => bail!(
                     "corpus manifest '{}': source '{}' names neither `git` nor `path`",
@@ -161,7 +204,7 @@ impl CorpusManifest {
         if self.extras.contains_key("duty_cycle") || self.extras.contains_key("budget") {
             bail!("corpus manifest '{}': {PACING_REJECTION}", self.name);
         }
-        Ok(())
+        Ok(warnings)
     }
 
     /// Resolve `root`, `~`-expanding an explicit value or defaulting to
@@ -176,6 +219,33 @@ impl CorpusManifest {
                 .join(&self.name),
         }
     }
+}
+
+/// A source id is safe to join onto a filesystem root (`sources::resolve`
+/// does exactly that, for both the mirror and the tree path) only if it
+/// can't smuggle a path-traversal or hidden-file component through: ASCII
+/// alphanumeric, `.`, `_`, `-`, starting with an alphanumeric, and never
+/// exactly `.` or `..` (#1959 finding 1). `sources::resolve_one` also
+/// asserts containment on the resolved paths directly — this is the first,
+/// cheap layer; that one is the structural backstop for any caller that
+/// skips `validate()`.
+fn valid_source_id(id: &str) -> bool {
+    if id == "." || id == ".." {
+        return false;
+    }
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The major component of a `schema_version` string (`"1.0"` -> `"1"`).
+/// `None` for an empty/malformed value — that's a separate, not-yet-scoped
+/// concern from the major-mismatch warning this feeds (#1959 finding 13).
+fn schema_major(v: &str) -> Option<&str> {
+    v.split('.').next().filter(|s| !s.is_empty())
 }
 
 /// Expand a leading `~` to the user's home directory; pass through
@@ -226,7 +296,7 @@ mod tests {
     fn loads_valid_manifest() {
         let dir = TempDir::new().unwrap();
         let path = write(&dir, "corpus.json", &minimal_manifest_json().to_string());
-        let m = CorpusManifest::load(&path).unwrap();
+        let (m, _) = CorpusManifest::load(&path).unwrap();
         assert_eq!(m.name, "example");
         assert_eq!(m.sources.len(), 2);
         assert_eq!(m.edges.len(), 1);
@@ -308,7 +378,7 @@ mod tests {
         json["root"] = serde_json::json!("~/somewhere/crawl-x");
         let dir = TempDir::new().unwrap();
         let path = write(&dir, "corpus.json", &json.to_string());
-        let m = CorpusManifest::load(&path).unwrap();
+        let (m, _) = CorpusManifest::load(&path).unwrap();
         let root = m.resolved_root();
         assert!(!root.to_string_lossy().starts_with('~'), "{root:?}");
         assert!(root.ends_with("somewhere/crawl-x"), "{root:?}");
@@ -325,7 +395,7 @@ mod tests {
         let json = minimal_manifest_json();
         let dir = TempDir::new().unwrap();
         let path = write(&dir, "corpus.json", &json.to_string());
-        let m = CorpusManifest::load(&path).unwrap();
+        let (m, _) = CorpusManifest::load(&path).unwrap();
         let root = m.resolved_root();
         unsafe {
             match &prev {
@@ -342,10 +412,62 @@ mod tests {
         json["future_field"] = serde_json::json!("kept");
         let dir = TempDir::new().unwrap();
         let path = write(&dir, "corpus.json", &json.to_string());
-        let m = CorpusManifest::load(&path).unwrap();
+        let (m, _) = CorpusManifest::load(&path).unwrap();
         assert_eq!(
             m.extras.get("future_field"),
             Some(&serde_json::json!("kept"))
         );
+    }
+
+    // ── #1959 finding 1: source id shape + case-insensitive uniqueness ──
+
+    #[test]
+    fn source_id_with_path_traversal_shape_is_rejected() {
+        let mut json = minimal_manifest_json();
+        json["sources"][0]["id"] = serde_json::json!("../../victim");
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "corpus.json", &json.to_string());
+        let err = CorpusManifest::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("../../victim"), "{msg}");
+        assert!(msg.contains("invalid"), "{msg}");
+    }
+
+    #[test]
+    fn source_ids_differing_only_by_case_are_rejected_together() {
+        let mut json = minimal_manifest_json();
+        json["sources"][0]["id"] = serde_json::json!("app");
+        json["sources"][1]["id"] = serde_json::json!("App");
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "corpus.json", &json.to_string());
+        let err = CorpusManifest::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("app"), "{msg}");
+        assert!(msg.contains("App"), "{msg}");
+        assert!(msg.contains("case-insensitively"), "{msg}");
+    }
+
+    // ── #1959 finding 13: schema_version major mismatch warns, doesn't fail ──
+
+    #[test]
+    fn schema_version_major_mismatch_warns_not_fails() {
+        let mut json = minimal_manifest_json();
+        json["schema_version"] = serde_json::json!("2.0");
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "corpus.json", &json.to_string());
+        let (m, warnings) = CorpusManifest::load(&path).unwrap();
+        assert_eq!(m.name, "example");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("2.0"), "{warnings:?}");
+        assert!(warnings[0].contains(MANIFEST_SCHEMA_VERSION), "{warnings:?}");
+    }
+
+    #[test]
+    fn schema_version_matching_major_is_silent() {
+        let json = minimal_manifest_json(); // schema_version: "1.0"
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "corpus.json", &json.to_string());
+        let (_, warnings) = CorpusManifest::load(&path).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

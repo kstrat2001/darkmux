@@ -115,6 +115,23 @@ fn token_admits(token: &RangeToken, v: SemVer) -> bool {
     }
 }
 
+/// The prerelease tag (everything between the version core and any build
+/// metadata `+...`) of a semver string, if it carries one — `"8.1.1-rc.1"`
+/// -> `Some("rc.1")`, `"8.1.1"` -> `None`. Used by
+/// `crate::crawl::plan::plan` (#1959 finding 11) to note in the edge ledger
+/// that a prerelease's range check treats it as its release-line core
+/// version (the same normalization `parse_semver` already applies), rather
+/// than silently doing that with no record of it.
+pub fn prerelease_tag(s: &str) -> Option<String> {
+    let core = s.trim().trim_start_matches('v');
+    // Strip build metadata (`+build5`) before hunting for the prerelease
+    // separator — `-` inside build metadata isn't a prerelease marker.
+    let without_build = core.split('+').next().unwrap_or(core);
+    let mut parts = without_build.splitn(2, '-');
+    let _version_core = parts.next();
+    parts.next().filter(|tag| !tag.is_empty()).map(str::to_string)
+}
+
 /// Does `range` (an npm semver range string) admit `version`? `None` means
 /// "unsupported syntax — don't know", never a silent `false`.
 pub fn range_admits(range: &str, version: &str) -> Option<bool> {
@@ -209,5 +226,14 @@ mod tests {
     #[test]
     fn malformed_version_is_none() {
         assert_eq!(range_admits("^1.0.0", "not-a-version"), None);
+    }
+
+    #[test]
+    fn prerelease_tag_extracted_ignoring_build_metadata() {
+        assert_eq!(prerelease_tag("8.1.1-rc.1"), Some("rc.1".to_string()));
+        assert_eq!(prerelease_tag("8.1.1-rc.1+build5"), Some("rc.1".to_string()));
+        assert_eq!(prerelease_tag("v8.1.1-beta"), Some("beta".to_string()));
+        assert_eq!(prerelease_tag("8.1.1"), None);
+        assert_eq!(prerelease_tag("8.1.1+build5"), None);
     }
 }
