@@ -247,6 +247,7 @@ fn hooks_status_json(
                 "undelivered": s.undelivered,
                 "last_delivery_ts": s.last_delivery_ts,
                 "last_error": s.last_error,
+                "dropped_appends": s.dropped_appends,
             })
         })
         .collect();
@@ -291,6 +292,9 @@ fn render_hooks_status_human(
         }
         if let Some(err) = &s.last_error {
             let _ = writeln!(out, "      last error: {err}");
+        }
+        if s.dropped_appends > 0 {
+            let _ = writeln!(out, "      dropped: {} (over the outbox cap, or an append failure)", s.dropped_appends);
         }
     }
     out
@@ -700,6 +704,7 @@ mod tests {
             undelivered: 3,
             last_delivery_ts: Some("2026-08-29T00:00:00Z".to_string()),
             last_error: None,
+            dropped_appends: 0,
         }
     }
 
@@ -727,6 +732,21 @@ mod tests {
         assert_eq!(v["rules"][0]["index"], serde_json::json!(0));
         assert_eq!(v["rules"][0]["undelivered"], serde_json::json!(3));
         assert_eq!(v["rules"][0]["last_delivery_ts"], Value::String("2026-08-29T00:00:00Z".to_string()));
+    }
+
+    /// (#2093 merge-gate finding 9) `dropped_appends` (either the hard
+    /// cap or an append failure) surfaces in BOTH the human and `--json`
+    /// renderings of `flow hooks status` — not just as an in-process
+    /// counter nobody outside the running dispatch can see.
+    #[test]
+    fn hooks_status_surfaces_dropped_appends() {
+        let mut s = sample_rule_summary(0);
+        s.dropped_appends = 42;
+        let human = render_hooks_status_human(true, &PathBuf::from("/tmp/hooks"), &[s.clone()]);
+        assert!(human.contains("dropped: 42"), "{human}");
+
+        let v = hooks_status_json(true, &PathBuf::from("/tmp/hooks"), &[s]);
+        assert_eq!(v["rules"][0]["dropped_appends"], serde_json::json!(42));
     }
 
     #[serial_test::serial]

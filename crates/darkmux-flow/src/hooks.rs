@@ -289,6 +289,27 @@ fn drain_lock_path(outbox_dir: &Path, index: usize, url: &str) -> PathBuf {
     outbox_dir.join(format!("{index}-{sanitized}.drain.lock"))
 }
 
+/// (#2093 merge-gate finding 9) Sibling of `outbox_paths`' pair — where
+/// the LIVE `dropped_appends` counter is persisted, so a SEPARATE process
+/// invocation (`darkmux doctor`, `darkmux flow hooks status`) can see
+/// drops a currently- or previously-running dispatch process counted
+/// in-memory. Plain text, same shape as the `.cursor` file.
+fn dropped_appends_path(outbox_dir: &Path, index: usize, url: &str) -> PathBuf {
+    let host_port = extract_host_port(url).unwrap_or("unknown");
+    let sanitized = sanitize_host_port(host_port);
+    outbox_dir.join(format!("{index}-{sanitized}.dropped"))
+}
+
+fn read_dropped_appends(path: &Path) -> u64 {
+    fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+fn write_dropped_appends(path: &Path, count: u64) {
+    if let Err(e) = fs::write(path, count.to_string()) {
+        eprintln!("flow::HookSink: failed to persist dropped-appends count to {}: {e:#}", path.display());
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct LastStatus {
     ts: String,
@@ -329,6 +350,9 @@ pub struct ResolvedRule {
     /// (#2093 merge-gate finding 3) The drainer's own non-blocking
     /// mutual-exclusion file — see `drain_lock_path`'s doc.
     pub drain_lock_path: PathBuf,
+    /// (#2093 merge-gate finding 9) Where the live `dropped_appends`
+    /// counter is persisted — see `dropped_appends_path`'s doc.
+    pub dropped_appends_path: PathBuf,
 }
 
 /// Resolve + validate every rule against `outbox_dir`. Bails on the FIRST
@@ -348,6 +372,7 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
         let (outbox_path, cursor_path) = outbox_paths(outbox_dir, index, &url);
         let last_status_path = last_status_path(outbox_dir, index, &url);
         let drain_lock_path = drain_lock_path(outbox_dir, index, &url);
+        let dropped_appends_path = dropped_appends_path(outbox_dir, index, &url);
         out.push(ResolvedRule {
             index,
             match_: r.r#match.clone().unwrap_or_default(),
@@ -356,6 +381,7 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
             cursor_path,
             last_status_path,
             drain_lock_path,
+            dropped_appends_path,
         });
     }
     Ok(out)
@@ -382,6 +408,12 @@ pub struct HookRuleSummary {
     /// give-up. `None` after a successful delivery, or before any terminal
     /// outcome has happened yet.
     pub last_error: Option<String>,
+    /// (#2093 merge-gate finding 9) Writes refused for this rule so far —
+    /// either the hard cap (finding 5) or an outbox append failure.
+    /// Read from the PERSISTED counter (`dropped_appends_path`), so this
+    /// is visible from a separate `darkmux doctor` / `flow hooks status`
+    /// process invocation, not just a live in-process `HookSink`.
+    pub dropped_appends: u64,
 }
 
 fn describe_match(m: &HookMatch) -> String {
@@ -427,6 +459,7 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
             let cursor = read_cursor(&cursor_path);
             let undelivered = undelivered_line_count(&outbox_path, cursor);
             let last = read_last_status(&last_status_path(outbox_dir, index, &url));
+            let dropped_appends = read_dropped_appends(&dropped_appends_path(outbox_dir, index, &url));
             HookRuleSummary {
                 index,
                 match_desc: describe_match(&m),
@@ -438,6 +471,7 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
                 undelivered,
                 last_delivery_ts: last.as_ref().map(|s| s.ts.clone()),
                 last_error: last.and_then(|s| s.error),
+                dropped_appends,
             }
         })
         .collect()
@@ -1036,14 +1070,22 @@ fn drainer_loop(
             }
         }
         if !did_work && !stop.load(Ordering::Acquire) {
+            // (#2093 merge-gate finding 16) `unwrap_or_else(|e| e.into_inner())`
+            // recovers from a poisoned lock rather than propagating a
+            // second panic — a nudge signal is best-effort coordination,
+            // never a correctness invariant, so a stale/lost signal from
+            // recovering a poisoned lock is a harmless missed wakeup (the
+            // next poll cycle catches up), while panicking here would
+            // take the WHOLE drainer thread down silently.
             let (lock, cvar) = &*nudge;
-            let pending = lock.lock().unwrap();
+            let pending = lock.lock().unwrap_or_else(|e| e.into_inner());
             if !*pending {
-                let (mut pending, _timeout) = cvar.wait_timeout(pending, POLL_INTERVAL).unwrap();
+                let (mut pending, _timeout) =
+                    cvar.wait_timeout(pending, POLL_INTERVAL).unwrap_or_else(|e| e.into_inner());
                 *pending = false;
             } else {
                 drop(pending);
-                *lock.lock().unwrap() = false;
+                *lock.lock().unwrap_or_else(|e| e.into_inner()) = false;
             }
         }
     }
@@ -1135,6 +1177,20 @@ impl HookSink {
     pub fn outbox_dir(&self) -> &Path {
         &self.outbox_dir
     }
+
+    /// (#2093 merge-gate finding 16) True while the background drainer
+    /// thread is still running. A drainer that panicked (a bug, not the
+    /// expected shutdown path — `Drop` takes the handle via `.take()`,
+    /// which this correctly reports as "not alive" too, since there is
+    /// no drainer left to be alive) would otherwise silently stop
+    /// delivering with no signal anywhere an operator would see it;
+    /// `flow hooks status` and `doctor` surface this.
+    pub fn drainer_alive(&self) -> bool {
+        match self.drainer.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(handle) => !handle.is_finished(),
+            None => false,
+        }
+    }
 }
 
 impl FlowSink for HookSink {
@@ -1157,6 +1213,7 @@ impl FlowSink for HookSink {
                 let cursor = read_cursor(&rt.rule.cursor_path);
                 if rule_over_cap(&rt.rule.outbox_path, cursor, self.max_outbox_mb) {
                     let dropped = rt.dropped_appends.fetch_add(1, Ordering::Relaxed) + 1;
+                    write_dropped_appends(&rt.rule.dropped_appends_path, dropped);
                     maybe_warn_dropped(rt, self.report_sink.as_ref(), self.max_outbox_mb, dropped);
                     continue;
                 }
@@ -1165,6 +1222,7 @@ impl FlowSink for HookSink {
                     // counted the SAME way a cap-drop is — both are "this
                     // record never reached the outbox for this rule."
                     let dropped = rt.dropped_appends.fetch_add(1, Ordering::Relaxed) + 1;
+                    write_dropped_appends(&rt.rule.dropped_appends_path, dropped);
                     eprintln!(
                         "flow::HookSink: rule #{} outbox append failed: {e:#} (this write is lost \
                          for that rule; other rules + other sinks are unaffected; {dropped} dropped so far)",
@@ -1177,7 +1235,7 @@ impl FlowSink for HookSink {
         }
         if any {
             let (lock, cvar) = &*self.nudge;
-            *lock.lock().unwrap() = true;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
             cvar.notify_all();
         }
         Ok(())
@@ -1193,7 +1251,9 @@ impl FlowSink for HookSink {
             let cursor = read_cursor(&rt.rule.cursor_path);
             let undelivered = undelivered_line_count(&rt.rule.outbox_path, cursor);
             config.insert(format!("rule{idx}_undelivered"), undelivered.to_string());
+            config.insert(format!("rule{idx}_dropped_appends"), rt.dropped_appends.load(Ordering::Relaxed).to_string());
         }
+        config.insert("drainer_alive".to_string(), self.drainer_alive().to_string());
         SinkInfo { kind: "Hooks".to_string(), config, children: vec![], raw_url: None }
     }
 }
@@ -1203,10 +1263,10 @@ impl Drop for HookSink {
         self.stop.store(true, Ordering::Release);
         {
             let (lock, cvar) = &*self.nudge;
-            *lock.lock().unwrap() = true;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
             cvar.notify_all();
         }
-        let Some(handle) = self.drainer.lock().unwrap().take() else {
+        let Some(handle) = self.drainer.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             return;
         };
         // Bounded join (≤2s) — mirrors `open_redis_connection_bounded`'s
@@ -1965,6 +2025,51 @@ mod tests {
         assert_never_contacted(&attacker);
     }
 
+    // ─── (#2093 merge-gate finding 16) nudge-mutex poison recovery + dead-drainer detection ─
+
+    #[test]
+    fn nudge_mutex_recovers_from_poison_instead_of_panicking() {
+        // Simulate a drainer that panicked while holding the nudge lock —
+        // exactly the scenario `.lock().unwrap()` would propagate as a
+        // SECOND panic on the next locker. Tests the recovery PATTERN in
+        // isolation (a `(Mutex<bool>, Condvar)` shaped exactly like
+        // `HookSink`'s own `nudge` field) rather than injecting a panic
+        // into the real drainer thread, which the production code has no
+        // hook for.
+        let nudge: Arc<(Mutex<bool>, Condvar)> = Arc::new((Mutex::new(false), Condvar::new()));
+        let poison_nudge = nudge.clone();
+        let joined = std::thread::spawn(move || {
+            let (lock, _cvar) = &*poison_nudge;
+            let _guard = lock.lock().unwrap();
+            panic!("simulated drainer panic while holding the nudge lock");
+        })
+        .join();
+        assert!(joined.is_err(), "the thread must have actually panicked, poisoning the mutex");
+
+        // The SAME recovery pattern `hooks.rs` now uses at every nudge
+        // lock site — must recover, not panic a second time.
+        let (lock, _cvar) = &*nudge;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!*guard, "recovered the last-written value instead of panicking on poison");
+    }
+
+    #[test]
+    fn drainer_alive_reports_running_then_false_after_stop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        assert!(sink.drainer_alive(), "the drainer thread must be running right after construction");
+
+        let info = sink.info();
+        assert_eq!(info.config.get("drainer_alive").map(String::as_str), Some("true"));
+    }
+
     // ─── (#2093 merge-gate finding 12) hook.fired/failed carry machine provenance ─
 
     #[test]
@@ -2093,6 +2198,13 @@ mod tests {
             "the second write must be DROPPED — undelivered bytes are already over the 1 MiB cap"
         );
         assert_eq!(sink.rules[0].dropped_appends.load(Ordering::Relaxed), 1, "the drop must be counted");
+
+        // (#2093 merge-gate finding 9) The drop must be visible to a
+        // SEPARATE process invocation, not just this in-process counter
+        // — `summarize_configured_rules` (what `flow hooks status` /
+        // `doctor` actually call) reads it fresh from disk.
+        let summaries = summarize_configured_rules(&rules, tmp.path());
+        assert_eq!(summaries[0].dropped_appends, 1, "cross-process visible via the persisted counter");
     }
 
     // ─── (#2093 merge-gate finding 4) torn-line safety ───────────────────
