@@ -140,43 +140,100 @@ pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
 /// (bracketed), or `localhost`. A token-bearing remote hook is a later
 /// packet (#2093's own "out of scope"); until then, refusing at config
 /// load is the whole enforcement.
+///
+/// (#2093 merge-gate finding 1) Parses with `url::Url` rather than
+/// `strip_prefix`/`split('/')` string-slicing — the slicing approach was
+/// fooled by userinfo confusion (`http://localhost@evil.com/`, where the
+/// slicer read the pre-`@` text as the host but the browser/`ureq`/every
+/// real HTTP client reads it as the AUTHORITY'S username and `evil.com` as
+/// the actual target) and by fragment confusion
+/// (`http://evil.com#127.0.0.1`). Three checks, all against the PARSED
+/// structure, never against `raw` byte-slices of the authority:
+///
+/// 1. `raw` must literally start with `http://` (lowercase, no leading
+///    whitespace) — `url::Url` normalizes the scheme to lowercase and
+///    trims surrounding whitespace, so checking `parsed.scheme()` alone
+///    would silently accept `HTTP://` or a leading-space URL.
+/// 2. The authority may carry NO userinfo — any non-empty username or
+///    non-empty password refuses the whole URL, unconditionally, before
+///    the host is even inspected.
+/// 3. The host, exactly as `url::Url` resolves it, must be one of the
+///    three canonical spellings (`127.0.0.1` / `[::1]` / `localhost`,
+///    case-insensitive) — AND the literal text `raw` uses for the host
+///    must match that canonical spelling byte-for-byte (case-insensitive).
+///    The second half of check 3 is deliberate belt-and-braces: standard
+///    URL host parsing canonicalizes shorthand/alternate IPv4 notations
+///    (`127.1`, octal, hex, decimal) onto the same `Ipv4Addr` as
+///    `127.0.0.1` — genuinely the same bits, not a distinct target — but
+///    this allowlist accepts exactly the one blessed spelling per host,
+///    not every notation that happens to canonicalize onto it.
 pub fn validate_loopback_http_url(raw: &str) -> Result<()> {
-    let rest = raw.strip_prefix("http://").ok_or_else(|| {
-        anyhow!(
-            "hook URL `{raw}` must use http:// and target loopback — a token-bearing remote \
-             hook is a later packet"
-        )
-    })?;
-    let host_port = rest.split('/').next().unwrap_or("");
-    let host = extract_host(host_port);
-    let is_loopback = host.eq_ignore_ascii_case("localhost")
-        || host == "::1"
-        || (host.starts_with("127.") && host.split('.').count() == 4 && host.split('.').all(|o| o.parse::<u8>().is_ok()));
+    if !raw.starts_with("http://") {
+        bail!(
+            "hook URL `{raw}` must literally start with `http://` (lowercase, no leading \
+             whitespace) and target loopback — a token-bearing remote hook is a later packet"
+        );
+    }
+    let parsed = url::Url::parse(raw).with_context(|| format!("parsing hook URL `{raw}`"))?;
+    if parsed.scheme() != "http" {
+        bail!("hook URL `{raw}` must use http:// and target loopback");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some_and(|p| !p.is_empty()) {
+        bail!(
+            "hook URL `{raw}` may not carry userinfo (username/password) in its authority — \
+             `user@host` is refused unconditionally, regardless of what host follows"
+        );
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("hook URL `{raw}` has no host"))?
+        .to_ascii_lowercase();
+    let is_loopback = host == "127.0.0.1" || host == "[::1]" || host == "localhost";
     if !is_loopback {
         bail!(
-            "hook URL `{raw}` targets non-loopback host `{host}` — only 127.0.0.1/::1/localhost \
+            "hook URL `{raw}` targets non-loopback host `{host}` — only 127.0.0.1/[::1]/localhost \
              are allowed; a token-bearing remote hook is a later packet"
         );
     }
+    let raw_host = raw_authority_host(raw)
+        .with_context(|| format!("hook URL `{raw}` has a malformed authority"))?;
+    if !raw_host.eq_ignore_ascii_case(&host) {
+        bail!(
+            "hook URL `{raw}` spells its host as `{raw_host}`, which is not the canonical form \
+             `{host}` — only the exact canonical spelling of a loopback host is accepted, not an \
+             alternate notation that merely resolves to it"
+        );
+    }
     Ok(())
+}
+
+/// The literal `host[:port]` → `host` text `raw` uses in its authority,
+/// with NO normalization — the counterpart `validate_loopback_http_url`
+/// compares against `url::Url`'s canonicalized `host_str()` to catch
+/// alternate IPv4 notations that canonicalize onto the same address.
+/// Safe to slice `raw` directly here ONLY because the caller has already
+/// confirmed (via `url::Url`) that the authority carries no userinfo — an
+/// `@`-bearing authority is refused before this function is ever called,
+/// so there is no username/password segment left to be confused with the
+/// host.
+fn raw_authority_host(raw: &str) -> Result<String> {
+    let rest = raw.strip_prefix("http://").ok_or_else(|| anyhow!("missing http:// prefix"))?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed.find(']').ok_or_else(|| anyhow!("unterminated IPv6 literal"))?;
+        return Ok(format!("[{}]", &bracketed[..close]));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => Ok(host.to_string()),
+        _ => Ok(authority.to_string()),
+    }
 }
 
 /// The `host[:port]` portion of a `scheme://host[:port]/path` URL, or
 /// `None` if `raw` doesn't start with `http://`.
 fn extract_host_port(raw: &str) -> Option<&str> {
     raw.strip_prefix("http://").map(|rest| rest.split('/').next().unwrap_or(""))
-}
-
-/// Extract the bare host from a `host[:port]` string, handling a bracketed
-/// IPv6 literal (`[::1]:8790` → `::1`).
-fn extract_host(host_port: &str) -> &str {
-    if let Some(rest) = host_port.strip_prefix('[') {
-        if let Some(idx) = rest.find(']') {
-            return &rest[..idx];
-        }
-        return rest;
-    }
-    host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port)
 }
 
 /// Filesystem-safe form of a `host[:port]` string for an outbox filename.
@@ -437,13 +494,63 @@ const POST_TIMEOUT: Duration = Duration::from_secs(5);
 enum DeliveryOutcome {
     Success,
     ClientError,
+    /// (#2093 merge-gate finding 2) A 3xx response — the receiver telling
+    /// us to go elsewhere, which we refuse rather than follow. Treated as
+    /// a PERMANENT failure (never retried), same as `ClientError`'s
+    /// give-up path, but distinct so the emitted reason can name the
+    /// status + redirect target host rather than "4xx". Carries the
+    /// status code and the `Location` target's host (best-effort — "" if
+    /// the header is absent or unparseable) for the `hook.failed` reason.
+    RedirectRefused(u16, String),
     RetryableFailure,
 }
 
+/// (#2093 merge-gate finding 429/408) A 429 (Too Many Requests) or 408
+/// (Request Timeout) is the RECEIVER asking us to back off and retry —
+/// not a permanent rejection of this payload the way a 400/404/422 is.
+/// Counting it toward `MAX_CLIENT_ERROR_ATTEMPTS`'s give-up threshold
+/// would abandon a delivery the receiver explicitly asked us to retry.
+fn is_retryable_client_status(code: u16) -> bool {
+    code == 429 || code == 408
+}
+
 fn try_post(url: &str, body: &str) -> DeliveryOutcome {
-    let agent = ureq::AgentBuilder::new().timeout(POST_TIMEOUT).build();
+    // (#2093 merge-gate finding 1, belt-and-braces) Re-validate at POST
+    // time — the URL was already validated at `resolve_rules` /
+    // `HookSink::new`, but a future refactor that plumbs a URL through a
+    // new path (or a construction bug) must not get a free pass to the
+    // network just because construction-time validation happened to run.
+    // No listener is contacted when this fails: refused locally, treated
+    // as a permanent (never-retried) failure like any other 4xx.
+    if let Err(e) = validate_loopback_http_url(url) {
+        eprintln!("flow::HookSink: try_post refusing to send — URL failed re-validation: {e:#}");
+        return DeliveryOutcome::ClientError;
+    }
+    // (#2093 merge-gate finding 2) Redirects are never followed — a
+    // redirect target is the RECEIVER telling us to go elsewhere, and
+    // "elsewhere" is exactly the case `validate_loopback_http_url` exists
+    // to gate. `ureq` with `redirects(0)` does NOT error on a 3xx; it
+    // returns it as an `Ok` response with the 3xx status, so the status
+    // must be checked on the `Ok` arm too, not just the `Err` arm.
+    let agent = ureq::AgentBuilder::new().timeout(POST_TIMEOUT).redirects(0).build();
     match agent.post(url).set("Content-Type", "application/json").send_string(body) {
-        Ok(_resp) => DeliveryOutcome::Success,
+        Ok(resp) => {
+            let status = resp.status();
+            if (300..400).contains(&status) {
+                let location = resp.header("Location").unwrap_or("");
+                let target_host = url::Url::parse(location)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_else(|| location.to_string());
+                DeliveryOutcome::RedirectRefused(status, target_host)
+            } else {
+                // ureq only returns `Ok` for 2xx/3xx by default; any other
+                // status here would already have been `Err(Status(..))`
+                // below. Treat conservatively as success only for 2xx.
+                DeliveryOutcome::Success
+            }
+        }
+        Err(ureq::Error::Status(code, _resp)) if is_retryable_client_status(code) => DeliveryOutcome::RetryableFailure,
         Err(ureq::Error::Status(code, _resp)) if (400..500).contains(&code) => DeliveryOutcome::ClientError,
         Err(_) => DeliveryOutcome::RetryableFailure,
     }
@@ -454,8 +561,18 @@ struct RuleRuntime {
     backoff: Mutex<Duration>,
     next_attempt: Mutex<Instant>,
     /// Attempts made against the CURRENT undelivered line — reset on
-    /// success or give-up, so it never leaks across lines.
+    /// success or give-up, so it never leaks across lines. Reported
+    /// verbatim in the emitted `hook.fired`/`hook.failed` payload's
+    /// `attempt` field — the TRUE count across every outcome kind
+    /// (success, client error, retryable failure), for observability.
     attempt_count: Mutex<u32>,
+    /// (#2093 merge-gate finding 6) CLIENT-ERROR attempts only, against the
+    /// CURRENT undelivered line — the counter the give-up threshold
+    /// (`MAX_CLIENT_ERROR_ATTEMPTS`) actually checks. Kept separate from
+    /// `attempt_count` on purpose: a line that saw two retryable 500s and
+    /// then one 400 has seen 3 total attempts but only ONE client error,
+    /// and must not be abandoned after that single 4xx.
+    client_error_count: Mutex<u32>,
 }
 
 fn apply_backoff(rt: &RuleRuntime) {
@@ -469,6 +586,7 @@ fn reset_backoff(rt: &RuleRuntime) {
     *rt.backoff.lock().unwrap() = INITIAL_BACKOFF;
     *rt.next_attempt.lock().unwrap() = Instant::now();
     *rt.attempt_count.lock().unwrap() = 0;
+    *rt.client_error_count.lock().unwrap() = 0;
 }
 
 /// Emit `hook.fired` (success) or `hook.failed` (give-up) through
@@ -568,15 +686,42 @@ fn drainer_loop(
                         *c += 1;
                         *c
                     };
-                    if attempt >= MAX_CLIENT_ERROR_ATTEMPTS {
+                    // (#2093 merge-gate finding 6) The give-up threshold
+                    // counts CLIENT-ERROR attempts only — a line that also
+                    // saw retryable 5xx/network failures first must not be
+                    // abandoned early because `attempt` (the mixed total)
+                    // happened to cross 3.
+                    let client_errors = {
+                        let mut c = rt.client_error_count.lock().unwrap();
+                        *c += 1;
+                        *c
+                    };
+                    if client_errors >= MAX_CLIENT_ERROR_ATTEMPTS {
                         let _ = write_cursor(&rt.rule.cursor_path, new_cursor);
                         reset_backoff(rt);
-                        let reason = "4xx response, skipped after 3 attempts";
-                        write_last_status(&rt.rule.last_status_path, false, Some(reason));
-                        emit_hook_record(report_sink.as_ref(), false, &rt.rule, &line, attempt, Some(reason));
+                        let reason = format!("4xx response, skipped after {client_errors} client-error attempts");
+                        write_last_status(&rt.rule.last_status_path, false, Some(&reason));
+                        emit_hook_record(report_sink.as_ref(), false, &rt.rule, &line, attempt, Some(&reason));
                     } else {
                         apply_backoff(rt);
                     }
+                }
+                // (#2093 merge-gate finding 2) A redirect is a PERMANENT
+                // failure — never retried, cursor advances immediately —
+                // because following it would mean sending this record's
+                // body to a receiver-chosen destination `resolve_rules`
+                // never validated.
+                DeliveryOutcome::RedirectRefused(status, target_host) => {
+                    let attempt = {
+                        let mut c = rt.attempt_count.lock().unwrap();
+                        *c += 1;
+                        *c
+                    };
+                    let _ = write_cursor(&rt.rule.cursor_path, new_cursor);
+                    reset_backoff(rt);
+                    let reason = format!("redirect refused: {status} to {target_host}");
+                    write_last_status(&rt.rule.last_status_path, false, Some(&reason));
+                    emit_hook_record(report_sink.as_ref(), false, &rt.rule, &line, attempt, Some(&reason));
                 }
                 DeliveryOutcome::RetryableFailure => {
                     {
@@ -628,6 +773,7 @@ impl HookSink {
                     backoff: Mutex::new(INITIAL_BACKOFF),
                     next_attempt: Mutex::new(now),
                     attempt_count: Mutex::new(0),
+                    client_error_count: Mutex::new(0),
                 })
             })
             .collect();
@@ -744,6 +890,7 @@ pub mod test_receiver {
         pub addr: SocketAddr,
         received: Arc<Mutex<Vec<String>>>,
         statuses: Arc<Mutex<VecDeque<u16>>>,
+        redirect_location: Arc<Mutex<Option<String>>>,
         stop: Arc<AtomicBool>,
         handle: Option<JoinHandle<()>>,
     }
@@ -780,10 +927,12 @@ pub mod test_receiver {
             let addr = listener.local_addr().unwrap();
             let received = Arc::new(Mutex::new(Vec::new()));
             let statuses = Arc::new(Mutex::new(VecDeque::new()));
+            let redirect_location = Arc::new(Mutex::new(None));
             let stop = Arc::new(AtomicBool::new(false));
 
             let thread_received = received.clone();
             let thread_statuses = statuses.clone();
+            let thread_redirect_location = redirect_location.clone();
             let thread_stop = stop.clone();
             let handle = std::thread::spawn(move || {
                 loop {
@@ -792,7 +941,7 @@ pub mod test_receiver {
                     }
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            let _ = handle_one(stream, &thread_received, &thread_statuses);
+                            let _ = handle_one(stream, &thread_received, &thread_statuses, &thread_redirect_location);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -802,13 +951,20 @@ pub mod test_receiver {
                 }
             });
 
-            Self { addr, received, statuses, stop, handle: Some(handle) }
+            Self { addr, received, statuses, redirect_location, stop, handle: Some(handle) }
         }
 
         /// Queue a sequence of HTTP status codes to return, one per
         /// request; the LAST entry repeats once the queue is exhausted.
         pub fn with_status_sequence(self, statuses: impl IntoIterator<Item = u16>) -> Self {
             *self.statuses.lock().unwrap() = statuses.into_iter().collect();
+            self
+        }
+
+        /// When a queued status is 3xx, answer with this `Location` header
+        /// — for tests proving a redirect is refused rather than followed.
+        pub fn with_redirect_location(self, location: &str) -> Self {
+            *self.redirect_location.lock().unwrap() = Some(location.to_string());
             self
         }
 
@@ -843,6 +999,7 @@ pub mod test_receiver {
         mut stream: TcpStream,
         received: &Arc<Mutex<Vec<String>>>,
         statuses: &Arc<Mutex<VecDeque<u16>>>,
+        redirect_location: &Arc<Mutex<Option<String>>>,
     ) -> std::io::Result<()> {
         stream.set_nonblocking(false)?;
         let mut reader = BufReader::new(stream.try_clone()?);
@@ -878,12 +1035,21 @@ pub mod test_receiver {
         };
         let reason = match status {
             200 => "OK",
+            302 => "Found",
+            307 => "Temporary Redirect",
             400 => "Bad Request",
             404 => "Not Found",
+            408 => "Request Timeout",
+            429 => "Too Many Requests",
             500 => "Internal Server Error",
             _ => "Status",
         };
-        let resp = format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let location_header = if (300..400).contains(&status) {
+            redirect_location.lock().unwrap().as_ref().map(|loc| format!("Location: {loc}\r\n")).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let resp = format!("HTTP/1.1 {status} {reason}\r\n{location_header}Content-Length: 0\r\nConnection: close\r\n\r\n");
         stream.write_all(resp.as_bytes())?;
         stream.flush()?;
         Ok(())
@@ -1018,6 +1184,47 @@ mod tests {
         assert!(validate_loopback_http_url("http://10.0.0.5:8790/x").is_err());
         assert!(validate_loopback_http_url("http://example.com/x").is_err());
         assert!(validate_loopback_http_url("https://127.0.0.1/x").is_err(), "https refused for loopback too — http only");
+    }
+
+    /// (#2093 merge-gate finding 1) The reviewer's exact vectors: a real
+    /// `url::Url` parse replaces the old `strip_prefix`/`split('/')`
+    /// string-slicing, which was fooled by userinfo confusion
+    /// (`user@evil.com`), fragment confusion (`evil.com#127.0.0.1`), and
+    /// suffix confusion (`localhost.evil.com`). Every one of these must be
+    /// REFUSED.
+    #[test]
+    fn validate_loopback_http_url_refuses_every_reviewer_bypass_vector() {
+        let refused = [
+            "http://[::1]@192.168.1.5:18901/x",
+            "http://[::1]@evil.com/x",
+            "http://[::1]:80@evil.com/x",
+            "http://127.0.0.1:80@evil.com/x",
+            "http://127.0.0.1:8790@evil.com/x",
+            "http://localhost:80@evil.com/x",
+            "http://127.0.0.1:1@169.254.169.254/latest/meta-data",
+            "http://localhost.evil.com/",
+            "http://127.0.0.1.evil.com/",
+            "http://0.0.0.0/",
+            "http://127.1/",
+            "http://localhost@evil.com/",
+            "http://evil.com#127.0.0.1",
+            "http://user:pass@127.0.0.1/",
+            "https://127.0.0.1/",
+            "HTTP://127.0.0.1/",
+            " http://127.0.0.1/",
+            "http://[::ffff:127.0.0.1]/",
+        ];
+        for raw in refused {
+            assert!(validate_loopback_http_url(raw).is_err(), "must be REFUSED: {raw}");
+        }
+    }
+
+    #[test]
+    fn validate_loopback_http_url_accepts_the_reviewer_allowlist() {
+        let accepted = ["http://127.0.0.1:8790/events", "http://localhost:8790/x", "http://[::1]:8790/x"];
+        for raw in accepted {
+            assert!(validate_loopback_http_url(raw).is_ok(), "must be ACCEPTED: {raw}");
+        }
     }
 
     #[test]
@@ -1292,6 +1499,195 @@ mod tests {
         let fired = capture.0.lock().unwrap();
         let fired = fired.iter().find(|r| r.action == "hook.fired").unwrap();
         assert_eq!(fired.payload.as_ref().unwrap()["attempt"], 3, "500, 500, 200 = 3 attempts total");
+    }
+
+    // ─── (#2093 merge-gate finding 2) No redirects; explicit status ──────
+
+    #[derive(Default)]
+    struct CapturingSink(Mutex<Vec<FlowRecord>>);
+    impl FlowSink for CapturingSink {
+        fn write(&self, record: &FlowRecord) -> Result<()> {
+            self.0.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+        fn info(&self) -> SinkInfo {
+            SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+        }
+    }
+
+    /// A redirect target the drainer must NEVER connect to — bound but with
+    /// no accept loop running, so a pending-connection check after the fact
+    /// proves nothing ever reached it (a refused connection would fail
+    /// near-instantly either way; only an unaccepted-but-bound listener
+    /// distinguishes "never even tried" from "tried and it happened to be
+    /// unreachable").
+    fn assert_never_contacted(listener: &std::net::TcpListener) {
+        listener.set_nonblocking(true).unwrap();
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // nothing pending — never contacted
+            other => panic!("redirect target was contacted, expected nothing pending: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redirect_302_refused_as_permanent_failure_never_followed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let attacker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let attacker_addr = attacker.local_addr().unwrap();
+        let receiver = HookReceiver::start()
+            .with_status_sequence([302])
+            .with_redirect_location(&format!("http://{attacker_addr}/evil"));
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("dispatch start")).unwrap();
+
+        assert!(
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(3)),
+            "a 3xx must be treated as a PERMANENT failure, not retried forever"
+        );
+        {
+            let guard = capture.0.lock().unwrap();
+            let failed = guard.iter().find(|r| r.action == "hook.failed").unwrap();
+            let err = failed.payload.as_ref().unwrap()["error"].as_str().unwrap_or_default();
+            assert!(err.contains("redirect refused"), "reason should name the redirect refusal: {err}");
+            assert!(err.contains("302"), "reason should name the status: {err}");
+        }
+        // The line must never be retried after a redirect — cursor advanced.
+        assert!(wait_until(
+            || undelivered_line_count(&sink.rules[0].rule.outbox_path, read_cursor(&sink.rules[0].rule.cursor_path)) == 0,
+            Duration::from_secs(2)
+        ));
+        assert_never_contacted(&attacker);
+    }
+
+    #[test]
+    fn redirect_307_refused_as_permanent_failure_never_followed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let attacker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let attacker_addr = attacker.local_addr().unwrap();
+        let receiver = HookReceiver::start()
+            .with_status_sequence([307])
+            .with_redirect_location(&format!("http://{attacker_addr}/evil"));
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("dispatch start")).unwrap();
+
+        assert!(
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(3)),
+            "307 must also be refused as a permanent failure"
+        );
+        assert_never_contacted(&attacker);
+    }
+
+    // ─── (#2093 merge-gate finding 6) client-error attempts counted per line ─
+
+    #[test]
+    fn client_error_giveup_threshold_counts_only_client_errors_not_mixed_attempts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // 500 (retryable) then 400 repeating forever — a mixed sequence.
+        // After the first two responses, only ONE is a 4xx; the give-up
+        // threshold (3) must count client errors, not total attempts.
+        let receiver = HookReceiver::start().with_status_sequence([500, 400, 400]);
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("dispatch error")).unwrap();
+
+        // After 500, 400 — exactly one client error so far, one retryable.
+        assert!(wait_until(|| receiver.request_count() >= 2, Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            undelivered_line_count(&sink.rules[0].rule.outbox_path, read_cursor(&sink.rules[0].rule.cursor_path)),
+            1,
+            "must NOT give up after just one 4xx mixed in with a retryable failure"
+        );
+        assert!(
+            !capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"),
+            "no hook.failed yet — only 1 of 3 required client errors observed (2 total attempts)"
+        );
+
+        // The sequence repeats its last entry (400) forever, so two more
+        // requests reach the true 3-client-error threshold and give up.
+        // Exponential backoff (1s, 2s, 4s between attempts) means this can
+        // take several seconds — bound generously rather than tightening
+        // the assertion window.
+        assert!(
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(15)),
+            "gives up once 3 client errors (not 3 total attempts) are observed"
+        );
+    }
+
+    // ─── (#2093 merge-gate finding 7) 429/408 are retryable, not permanent ──
+
+    #[test]
+    fn status_429_is_retried_not_treated_as_client_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_status_sequence([429, 429, 429, 200]);
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("dispatch start")).unwrap();
+
+        // 3 consecutive 429s would exceed MAX_CLIENT_ERROR_ATTEMPTS (3) if
+        // miscounted as client errors — it must NOT give up, and must
+        // eventually succeed on the 4th (200) response.
+        assert!(
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(8)),
+            "429 is retryable — must eventually succeed, never give up as a client error"
+        );
+        assert!(!capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), "429 must never produce hook.failed");
+    }
+
+    #[test]
+    fn status_408_is_retried_not_treated_as_client_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_status_sequence([408, 200]);
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("dispatch start")).unwrap();
+
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn try_post_revalidates_the_url_before_every_send() {
+        // Belt-and-braces (finding 1): `try_post` must refuse to send when
+        // its URL argument fails `validate_loopback_http_url`, WITHOUT
+        // attempting a network call. There is no listener at all behind
+        // this URL — if `try_post` tried to actually connect, it would
+        // hang on connection refused / DNS, not return promptly.
+        let start = Instant::now();
+        let outcome = try_post("http://evil.example.com/x", "{}");
+        assert!(start.elapsed() < Duration::from_millis(500), "must refuse locally, never attempt the network");
+        assert!(matches!(outcome, DeliveryOutcome::ClientError), "an invalid URL is a permanent, non-retryable failure");
     }
 
     #[test]

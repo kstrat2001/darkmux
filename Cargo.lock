@@ -798,6 +798,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "ureq",
+ "url",
 ]
 
 [[package]]

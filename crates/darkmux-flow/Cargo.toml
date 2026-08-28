@@ -39,6 +39,15 @@ darkmux-types = { path = "../darkmux-types" }
 # the write side. `default-features = false` matches the root crate's own
 # usage — HTTP/1.1 POST + timeouts is all this needs, no TLS/gzip surface.
 ureq = { version = "2.10", default-features = false }
+# #2093 (merge-gate finding 1) — promoted from a transitive dep (ureq
+# already pulls it in; already present in Cargo.lock) to a direct one. The
+# hook outbox is an operator-facing SSRF surface — every hook URL is
+# refused unless it targets loopback — and the loopback check needs a real
+# URL parser (scheme/userinfo/host/port boundaries correctly delimited)
+# rather than the hand-rolled `strip_prefix`/`split('/')` slicing that
+# shipped first and missed userinfo-confusion and fragment-confusion
+# bypasses.
+url = "2.5"
 
 [dev-dependencies]
 tempfile = "3.10"
