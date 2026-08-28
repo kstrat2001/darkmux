@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
-import { missionGraphReachable } from "../../lib/injectedMeta";
+import { missionGraphReachable } from "../../lib/source";
 import { getSource, labRunsSrc, runsSrc } from "../../lib/source";
 import { useDay } from "../../hooks/useDay";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
@@ -40,8 +40,8 @@ import {
  *
  * Data: `GET /runs` (the flat cross-source view-model, every kind) and
  * `GET /lab/runs` (the lab-only staffing/bundle extras), fetched TOGETHER on
- * every mount — via `staticSource.ts`'s `resolveRunsSrc()`/
- * `resolveLabRunsSrc()` rather than the two literal paths directly, so a
+ * every mount — via `source.ts`'s `runsSrc()`/
+ * `labRunsSrc()` rather than the two literal paths directly, so a
  * static build (`darkmux-runs-src`/`darkmux-lab-runs-src` metas — #1801,
  * viewer.html:4077/4027) reads its committed fixture files instead of
  * hitting a daemon that isn't there. A daemon-served page is unaffected:
@@ -384,7 +384,7 @@ export function RunsBoard({
   // query, #1960). The shape is a view that describes NOW and fetches ONCE.
   //
   // Gated the same way every other live-only poll in this app is: a
-  // daemon-less static build has no daemon to answer, and `resolveRunsSrc()`
+  // daemon-less static build has no daemon to answer, and `runsSrc()`
   // there points at a committed file that cannot change.
   const runsQuery = useQuery({
     queryKey: queryKeys.runs(),
@@ -405,7 +405,7 @@ export function RunsBoard({
   // `#meta` and the machine-lens crumb) — same "cache reuse, not a second
   // network round trip" TanStack dedup App.tsx's own module doc names for
   // `MachineLens`. `useLiveMachines` is gated the same way every OTHER
-  // live-only poll in this app is (`isStaticBuild()` — see that hook's own
+  // live-only poll in this app is (a static build (`getSource().kind`) — see that hook's own
   // doc and `MachineLens.tsx`'s identical gate): a daemon-less static build
   // has no `/fleet/machines/live` to poll.
   const nowMs = Date.now();
@@ -428,8 +428,11 @@ export function RunsBoard({
   // The alias set is not time-scoped; the whole file is the source.
   //
   // (#2086) The static day comes from the one resolver (`useDay`); the shell
-  // already holds it for the transport on every route, so this is cache
-  // reuse, not a download of its own. Loading is not "empty": until the file
+  // (`App.tsx`) calls it on EVERY static route for the transport, so this
+  // read is cache reuse. That is a dependency, not a coincidence: if the
+  // shell's call is ever route-gated, this board becomes the one that
+  // downloads the multi-megabyte file on the runs route, and it would then
+  // want its own `machineUid !== null` gate back. Loading is not "empty": until the file
   // lands, an empty alias set would render the pre-#2063 symptom as a flash
   // ("no runs recorded yet" under a raw-uid chip); folded into the pending
   // branch below.

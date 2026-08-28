@@ -99,7 +99,7 @@ export const queryKeys = {
    * (viewer.html:3497) — see `lib/flow.ts`'s module doc for the fetch-order
    * subtlety that makes the two-day merge order load-bearing. */
   flowDate: (date: string) => ["flow", date] as const,
-  /** `staticSource.ts::staticFlowSrc()`'s committed `.jsonl` (#1801) — the
+  /** `source.ts, the flow file`'s committed `.jsonl` (#1801) — the
    * static-demo twin of `flowDate` above, keyed on the SRC PATH rather than
    * a date (a static build has no daemon-assigned date until the file's own
    * first record supplies one — see `lib/flow.ts::firstRecordDate`'s own
@@ -117,13 +117,13 @@ export const queryKeys = {
    * FLOW RECORD backfill for the same mission id, not the persisted
    * Phase/Task/Step graph structure. */
   missionGraph: (id: string) => ["mission", id, "graph"] as const,
-  /** `staticSource.ts::staticGraphsSrc()`'s committed mission-id -> graph
+  /** `source.ts, the graphs fixture`'s committed mission-id -> graph
    * map (#2032 packet 2) — the static-demo twin of `missionGraph` above,
    * keyed on the SRC PATH rather than the mission id (one fetch loads
    * EVERY mission's graph at once, matching `staticMachine`'s own
    * one-fixture-one-fetch shape, not `missionGraph`'s per-id shape). */
   staticGraphs: (src: string) => ["mission", "graph", "static", src] as const,
-  /** `staticSource.ts::staticFleetSrc()`'s committed `/fleet/machines/live`
+  /** `source.ts, the fleet fixture`'s committed `/fleet/machines/live`
    * snapshot (#2067) — the fleet cards' hardware line on a static build.
    * Keyed by SRC like every other static twin here. */
   staticFleet: (src: string) => ["fleet", "machines", "static", src] as const,

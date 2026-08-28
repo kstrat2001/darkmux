@@ -126,7 +126,7 @@ export function parseFlowJsonl(text: string): FlowRecord[] {
     .filter((r): r is FlowRecord => r !== null);
 }
 
-/** GETs a static playback source (`staticSource.ts::staticFlowSrc()`) and
+/** GETs a static playback source (`source.ts, the flow file`) and
  * parses it via `parseFlowJsonl` above — the static-build twin of
  * `GET /flow/<date>`, read directly by both `useRouteRecords` (the event
  * log's data) and `PlaybackLens` (the stage's data), each via the SAME

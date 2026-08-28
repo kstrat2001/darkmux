@@ -13,13 +13,13 @@
  * - `GET /mission/:id/graph.json` — the initial node/edge snapshot. New
  *   query key (`queryKeys.missionGraph`), nothing else in this app reads it.
  *   **Daemon-backed builds only** (`daemonBacked`, below). On a static build
- *   (#2032 packet 2) this is replaced entirely by `staticGraphsSrc()`'s
+ *   (#2032 packet 2) this is replaced entirely by `getSource().graphs`'s
  *   committed `{"<mission-id>": <graph>, ...}` fixture
  *   (`queryKeys.staticGraphs`) — one fetch for every mission this build
  *   knows about, this mission's own entry looked up client-side. No flow
  *   backfill, no live tail, no SSE: a static build renders exactly the
  *   snapshot the fixture captured, same as `MachineLens.tsx`'s
- *   `staticMachineSrc()` precedent.
+ *   `getSource().machine` precedent.
  * - `GET /flow-mission/:id` — the mission's cross-day flow-record backfill.
  *   SAME `queryKeys.flowMission` key `MissionReplay` used to fetch before
  *   this lens replaced it (retired this packet).

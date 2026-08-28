@@ -302,7 +302,7 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // is the wrong trade: this page is the RESIDENCY ROOM (see the module doc)
   // and the whole point of #1809 is that run accounting belongs to the runs
   // lens. Adding a second live-only query, and a second thing to gate on
-  // `isStaticBuild`, to label a hyperlink would walk that back. A count that
+  // the static-build check (`getSource().kind`), to label a hyperlink would walk that back. A count that
   // cannot drift because it is not there beats a count that is right today.
 
   return (

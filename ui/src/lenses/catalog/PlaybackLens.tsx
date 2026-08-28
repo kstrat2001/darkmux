@@ -28,48 +28,10 @@ import type { FlowRecord } from "../../types/handwritten";
  * `useRouteRecords` deliberately — one cache slot for one endpoint, so the
  * stage and the event log beside it can never disagree about the day.
  *
- * (#1801) `date` is `string | null` — `null` exactly when `staticSource.ts`'s
- * `isStaticBuild()` forced this route (`route.ts`'s own doc on the widened
- * playback variant). In that case this component reads the committed
- * `.jsonl` (`staticFlowSrc()`) instead of `/flow/<date>`, sharing
- * `queryKeys.staticFlowSrc` with `useRouteRecords`' own static branch for
- * the same one-cache-slot reason the date-keyed branch already shares
- * `flowDate`. The static branch ignores `date` entirely rather than trying
- * to fetch `/flow/<date>` first and falling back — there is no daemon to
- * serve that path at all, and legacy's own flowSrc branch reads the
- * committed file unconditionally too (see `route.ts`'s doc on why a static
- * build's date hash doesn't request a different day).
- *
- * (#1869) This component OWNS the playback transport's `t` (playhead)
- * state — `play`/`rewind`/`speed`/the scrub `<input type=range>` all live
- * here, not in `FleetLens` or `Scrubber` (a pure controlled view). `t` is
- * threaded down as `FleetLens`'s `playhead` prop — a NEW, separate prop
- * from `tMax`, not a reuse of the argument this component already passed.
- * The first cut reused `tMax` for both the day's fixed ceiling and the
- * scrub position (they were always the same number pre-transport, so
- * nothing distinguished them), and that conflation broke live: rewinding to
- * a day's start collapsed the activity axis itself down to a single
- * instant instead of staying fixed while the playhead marker swept back
- * across it. `tMax` here stays `computeTMax(dayRecords)` — the day's true,
- * FIXED ceiling, exactly as it was before this packet; `playhead` is the
- * new thing. `tMin` is unchanged either way. See `FleetLens.tsx`'s own
- * `playhead` prop doc and `timeline.ts`'s module doc for the fuller
- * account. One implementation, shared by the daemon's `#<date>` route and
- * the static demo build, by construction — both branches below call the
- * same
- * `renderTransportStage` closure.
- *
- * (#2071) The transport (play/pause, scrubber, tick loop) moved to the app
- * shell (`usePlaybackTransport`), which hands this lens the `playhead` it
- * renders at; nothing here owns time any more.
- * (#1869 code review, historical) `onPlayheadChange` reported the resolved playhead
- * (`playheadT`, the same value `Scrubber` and `FleetLens`'s `scopedData`
- * already read) up to `App`, which threads it into `EventLogColumn` — a
- * SIBLING of this whole lens in the DOM, not a descendant, so it can't
- * reach it any other way (see `App.tsx`'s own `eventLogRecords` doc).
- * Optional: every test in `PlaybackLens.test.tsx` mounts this component
- * standalone with no callback, which is fine — the reporter below no-ops
- * when it isn't given one.
+ * (#1801, #2086) `date` is `string | null` — `null` exactly when `route.ts`
+ * forced this route on a static build, which has one committed file and no
+ * date until that file resolves. Either way the day comes from `useDay`
+ * (`hooks/useDay.ts`): this lens has no fetch of its own.
  */
 export function PlaybackLens({ date, playhead = null }: { date: string | null; playhead?: number | null }) {
   // (#2086) The day comes from the one resolver; this lens only renders it.

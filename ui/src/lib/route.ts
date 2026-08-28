@@ -184,7 +184,7 @@ export type Route =
    * the same one. See `route.ts`'s own module doc for the precedence this
    * sits at (lowest, below every `lens=`/`mission=`/`session=` form).
    *
-   * (#1801) `date` is `string | null` — `null` ONLY when `isStaticBuild()`
+   * (#1801) `date` is `string | null` — `null` ONLY when a static build (`getSource().kind`)
    * forced this route (see below): a static demo build has no server-
    * assigned date the way `/play/<date>`'s injected meta does, and no daemon
    * to ask `/flow/<date>` for one either. Legacy's own flowSrc branch has the
