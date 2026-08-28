@@ -38,12 +38,8 @@
 
 <section>
   <div class="wrap">
-    <h2>Before you start: about consistency</h2>
-    <div class="callout warn">
-      <strong>Results will vary based on your frontier configuration.</strong>
-      <p style="margin: 8px 0 0;">The frontier model you use as the orchestrator (Claude Code is the proven path; other frontiers can drive it too) needs proper guidance to make the most of darkmux. This guide is a starting reference, not doctrine to enforce. Contradictory statements between this guide, your project's <code>CLAUDE.md</code>, and other frontier configs will cause more harm than good. Configure to your own strategy and goals; treat what's below as inspiration, not commandments.</p>
-    </div>
-    <p>darkmux deliberately leaves the operator in control of how their environment is shaped. The same command (<code>darkmux dispatch</code>, say) can feel different from one machine to another because the <em>frontier</em> driving it reads different doctrine. That's by design. The trade-off: don't expect identical experiences across operators. Expect <em>consistent foundations</em> (the CLI, the records, the viewer) and operator-shaped behavior on top.</p>
+    <h2>Two ways to drive it</h2>
+    <p>Every page here shows the commands. Run them yourself at a terminal, or hand the page to an agent: Claude Code and any harness that reads <code>CLAUDE.md</code> or <code>AGENTS.md</code> can follow the same steps, and <code>darkmux init</code> installs the skills that make that smooth. Nothing in the guide requires an agent in the loop; the mission, review, and crawl workflows also run from the command line and from CI. Where a page shows output, it was captured from a real run and says so.</p>
   </div>
 </section>
 
@@ -54,7 +50,7 @@
       <a href="getting-started.html">
         <span class="label">01 · Foundation</span>
         <div class="title">Getting started</div>
-        <div class="desc">Install darkmux, run <code>doctor</code>, declare your first profile, dispatch a role, launch a mission.</div>
+        <div class="desc">Install, <code>init</code>, first inference, then the checks, a first dispatch, and the viewer. Every step captured from a fresh machine.</div>
       </a>
       <a href="radio.html">
         <span class="label">02 · First inference</span>
@@ -104,17 +100,15 @@
 
 <section>
   <div class="wrap">
-    <h2>How darkmux is meant to be used</h2>
-    <h3>A complement to your frontier orchestrator, not a replacement.</h3>
-    <p>darkmux is an AI-first local-AI orchestrator: a CLI that manages local LLM stacks on your machine and dispatches utility-agent models internally for bounded structuring tasks (compaction, phase estimation, mission proposal). The strategic reasoning loop lives in your <em>frontier orchestrator</em>: Claude Code is the proven path, and other frontiers like Gemini, Codex, and Copilot can drive it with their own guidance. The utility agent absorbs the routine bounded work; the orchestrator stays on strategy.</p>
-    <p>The intended division of labor:</p>
+    <h2>Who does what</h2>
+    <h3>Local models do the work. You, or your agent, decide what runs.</h3>
+    <p>darkmux keeps a crew of local models resident on your Apple Silicon and hands them bounded work: implementation, review, crawling, structuring. A small utility model handles the routine internal jobs (compaction, mission proposals, notebook drafts) so the specialists do not have to. Above that sits whoever holds the intent: you at a terminal, a CI job with a config, or a frontier agent such as Claude Code that reads the docs and proposes the commands. darkmux surfaces, suggests, and records; it never substitutes its judgment for yours.</p>
     <ul>
-      <li><strong>Frontier orchestrator</strong>: design decisions, complex reasoning, code review, multi-step debugging, narrative for what's being built.</li>
-      <li><strong>Local specialist models (driven by darkmux)</strong>: routine implementation, scaffolding, bounded refactors, parallel work that doesn't need full session context.</li>
-      <li><strong>Local utility agent (dispatched internally by darkmux)</strong>: compaction, structured-output tasks (mission proposals, notebook drafts). Small, fast, dependable on bounded-reasoning work. You rarely interact with it directly; darkmux dispatches it when a verb needs that capability.</li>
-      <li><strong>You</strong>, the operator: pick the tier per task, name your intent, override defaults when you have specific judgment.</li>
+      <li><strong>Local specialists</strong> (coder, reviewer, analyst, crawler): the judgment-bearing work, on your hardware, off the meter.</li>
+      <li><strong>Local utility model</strong>: compaction and structured output. Small, fast, dispatched internally; you rarely address it directly.</li>
+      <li><strong>You, a config, or an agent</strong>: pick the work, name the intent, sign off at the gates. A frontier agent is the most capable version of this seat, not a requirement for it.</li>
     </ul>
-    <p>This guide assumes you have an orchestrator and want to use darkmux as the local-tier resource it dispatches to. If you're running darkmux purely as a CLI (no orchestrator), most of the guide still applies: just skip the agentic sections (dispatch, mission launch review).</p>
+    <p><code>darkmux doctor</code>'s output is the canonical troubleshooting surface. For the precise model rather than a walkthrough (role families, the mission and phase schema, telemetry, the flow record), see the <a href="https://github.com/kstrat2001/darkmux/blob/main/docs/architecture/CONCEPTS.md">concepts reference</a>.</p>
   </div>
 </section>
 
