@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.24.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.25.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -394,6 +394,19 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.24.0";
 //           above landed via merge-gate review on the same branch that
 //           introduced 1.24.0, before this schema version ever shipped —
 //           amending this entry in place, not a further version bump.)
+//   1.25.0 (#2094): additive payload fields for the global inter-turn
+//           rest — `turn_delay_ms` (the resolved knob) on `dispatch.start`,
+//           and `rest_ms` / `rests` (sum + count of the rests this
+//           dispatch took) on `dispatch.complete`, surfaced beside the
+//           existing `wall_ms` (which INCLUDES rest time; a consumer
+//           wanting model-only time subtracts `rest_ms`). No struct/field
+//           change — same `payload` blob every other richer action
+//           already uses. Older readers ignore the new keys; new records
+//           only, prior AuditFileSink chains survive without rotation.
+//           This branch took 1.25.0 directly (skipping the two RESERVED
+//           slots above) so the eventual three-way merge is a one-line
+//           reconcile: whichever branch lands last just renumbers its own
+//           bump past whatever the other two already claimed.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

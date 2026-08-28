@@ -2591,7 +2591,11 @@ mod tests {
         //           note.
         //   1.24.0: new `crawl.*` action family for `darkmux mission
         //           launch crawl` (#1959 packet 2). See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.24.0");
+        //   1.25.0: added `turn_delay_ms` on `dispatch.start` and
+        //           `rest_ms`/`rests` on `dispatch.complete` — the global
+        //           inter-turn rest (#2094). Additive payload fields, no
+        //           struct change. See schema.rs.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.25.0");
     }
 
     #[test]
