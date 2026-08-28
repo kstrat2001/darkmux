@@ -26,7 +26,7 @@ describe("useDay", () => {
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
     const { result } = renderHook(() => useDay(null), { wrapper: wrapper() });
-    expect(result.current).toEqual({ records: null, loading: false, date: null, error: null });
+    expect(result.current).toEqual({ records: null, raw: null, loading: false, date: null, error: null });
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -80,5 +80,15 @@ describe("useDay", () => {
     const { result } = renderHook(() => useDay(null), { wrapper: wrapper() });
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.date).toBe("2026-08-09");
+  });
+
+  it("exposes the RAW day beside the normalized one: normalized carries the synthetic runtime row, raw does not", async () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(['{"ts":"2026-08-09T05:00:00Z","action":"dispatch.start","session_id":"s1"}', '{"ts":"2026-08-09T05:00:01Z","action":"dispatch.turn","session_id":"s1","payload":{"turn_seq":1}}'].join("\n") + "\n", { status: 200 }))));
+    const { result } = renderHook(() => useDay(null), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    const runtime = (rs: { source?: string }[] | null) => (rs ?? []).filter((r) => r.source === "runtime").length;
+    expect(runtime(result.current.raw)).toBe(0);
+    expect(runtime(result.current.records)).toBe(1);
   });
 });

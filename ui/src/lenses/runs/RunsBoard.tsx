@@ -434,7 +434,7 @@ export function RunsBoard({
   // ("no runs recorded yet" under a raw-uid chip); folded into the pending
   // branch below.
   const day = useDay(null);
-  const pinRecords = daemonBacked ? flowWindow.data : (day.records ?? []);
+  const pinRecords = daemonBacked ? flowWindow.data : (day.raw ?? []); // identity fields only; raw as before
   const staticPinPending = !daemonBacked && machineUid !== null && day.loading;
 
   // The lab-run detail pane is its own top-level render, reached without

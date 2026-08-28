@@ -87,10 +87,13 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
   // holds it for the transport; same cache slot, no second download).
   const day = useDay(null);
   const staticSlice: FlowRecordsResponse | null = useMemo(() => {
-    if (flowSrc === null || day.records === null) return null;
-    const recs = day.records.filter((r) => r.session_id === sessionId);
+    // RAW, not `day.records`: `/flow-session` hands back raw records and
+    // `flowToRenderModel` synthesizes the runtime row itself; the normalized
+    // day already carries one, so slicing it would double the row.
+    if (flowSrc === null || day.raw === null) return null;
+    const recs = day.raw.filter((r) => r.session_id === sessionId);
     return { records: recs, count: recs.length, truncated: false, generated_at_ms: 0 };
-  }, [flowSrc, day.records, sessionId]);
+  }, [flowSrc, day.raw, sessionId]);
   const session: FetchResult<FlowRecordsResponse> | undefined =
     flowSrc === null ? query.data : staticSlice === null ? undefined : { ok: true, data: staticSlice };
 
