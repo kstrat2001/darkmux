@@ -2877,6 +2877,39 @@ fn integrity_check_never_claims_exit_zero_on_a_run_that_exits_nonzero() {
     );
 }
 
+/// (#2093) `darkmux flow hooks status` wires end-to-end: parses, dispatches,
+/// and prints valid JSON naming the resolved (disabled-by-default) state —
+/// a fresh `DARKMUX_HOME` has no config.json, so hooks are off and no rules
+/// are configured.
+#[test]
+fn flow_hooks_status_json_reports_disabled_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .args(["flow", "hooks", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON on stdout");
+    assert_eq!(v["enabled"], serde_json::Value::Bool(false));
+    assert_eq!(v["rules"], serde_json::json!([]));
+}
+
+/// The human-formatted form names the disabled state too, without needing
+/// `--json`.
+#[test]
+fn flow_hooks_status_human_reports_disabled_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("darkmux")
+        .unwrap()
+        .env("DARKMUX_HOME", tmp.path())
+        .args(["flow", "hooks", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("enabled: false"));
+}
+
 /// Sets a process-global env var and restores its previous value on drop.
 ///
 /// Same shape as `crates/darkmux-serve/src/lib_tests.rs`'s `CrewDirGuard`.

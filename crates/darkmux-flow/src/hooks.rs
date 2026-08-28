@@ -193,13 +193,45 @@ fn outbox_paths(outbox_dir: &Path, index: usize, url: &str) -> (PathBuf, PathBuf
     (outbox_dir.join(format!("{base}.outbox.jsonl")), outbox_dir.join(format!("{base}.cursor")))
 }
 
+/// Sibling of `outbox_paths`' pair — where the rule's last-terminal-outcome
+/// (success or give-up; never an ordinary retry) is recorded, for `darkmux
+/// doctor` and `darkmux flow hooks status`'s "last delivery ts / last
+/// error" columns. Same naming scheme, different suffix.
+fn last_status_path(outbox_dir: &Path, index: usize, url: &str) -> PathBuf {
+    let host_port = extract_host_port(url).unwrap_or("unknown");
+    let sanitized = sanitize_host_port(host_port);
+    outbox_dir.join(format!("{index}-{sanitized}.last"))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LastStatus {
+    ts: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn write_last_status(path: &Path, ok: bool, error: Option<&str>) {
+    let status = LastStatus { ts: schema::ts_utc_now(), ok, error: error.map(str::to_string) };
+    if let Ok(json) = serde_json::to_string(&status) {
+        if let Err(e) = fs::write(path, json) {
+            eprintln!("flow::HookSink: failed to write last-status {}: {e:#}", path.display());
+        }
+    }
+}
+
+fn read_last_status(path: &Path) -> Option<LastStatus> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 // ─── Resolved rules ─────────────────────────────────────────────────────
 
 /// A `HookRule` resolved against an outbox dir: validated URL + the outbox
-/// / cursor file paths it owns. `HookSink::new` builds these (and refuses
-/// the WHOLE sink on the first invalid rule); `summarize_configured_rules`
-/// builds an unvalidated variant for read-only introspection (doctor,
-/// `flow hooks status`) that never bails.
+/// / cursor / last-status file paths it owns. `HookSink::new` builds these
+/// (and refuses the WHOLE sink on the first invalid rule);
+/// `summarize_configured_rules` builds an unvalidated variant for read-only
+/// introspection (doctor, `flow hooks status`) that never bails.
 #[derive(Debug, Clone)]
 pub struct ResolvedRule {
     pub index: usize,
@@ -207,6 +239,7 @@ pub struct ResolvedRule {
     pub url: String,
     pub outbox_path: PathBuf,
     pub cursor_path: PathBuf,
+    pub last_status_path: PathBuf,
 }
 
 /// Resolve + validate every rule against `outbox_dir`. Bails on the FIRST
@@ -224,12 +257,14 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
             .ok_or_else(|| anyhow!("hook rule #{index} has no `http` target"))?;
         validate_loopback_http_url(&url).with_context(|| format!("hook rule #{index}"))?;
         let (outbox_path, cursor_path) = outbox_paths(outbox_dir, index, &url);
+        let last_status_path = last_status_path(outbox_dir, index, &url);
         out.push(ResolvedRule {
             index,
             match_: r.r#match.clone().unwrap_or_default(),
             url,
             outbox_path,
             cursor_path,
+            last_status_path,
         });
     }
     Ok(out)
@@ -248,6 +283,14 @@ pub struct HookRuleSummary {
     pub outbox_path: PathBuf,
     pub cursor_path: PathBuf,
     pub undelivered: usize,
+    /// When the last delivery attempt reached a TERMINAL outcome (success or
+    /// give-up — never an ordinary in-progress retry), the ISO-8601
+    /// timestamp of that outcome. `None` until the first terminal outcome.
+    pub last_delivery_ts: Option<String>,
+    /// The error named by the last terminal outcome, when it was a
+    /// give-up. `None` after a successful delivery, or before any terminal
+    /// outcome has happened yet.
+    pub last_error: Option<String>,
 }
 
 fn describe_match(m: &HookMatch) -> String {
@@ -292,6 +335,7 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
             let (outbox_path, cursor_path) = outbox_paths(outbox_dir, index, &url);
             let cursor = read_cursor(&cursor_path);
             let undelivered = undelivered_line_count(&outbox_path, cursor);
+            let last = read_last_status(&last_status_path(outbox_dir, index, &url));
             HookRuleSummary {
                 index,
                 match_desc: describe_match(&m),
@@ -301,6 +345,8 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
                 outbox_path,
                 cursor_path,
                 undelivered,
+                last_delivery_ts: last.as_ref().map(|s| s.ts.clone()),
+                last_error: last.and_then(|s| s.error),
             }
         })
         .collect()
@@ -497,6 +543,7 @@ fn drainer_loop(
                     };
                     let _ = write_cursor(&rt.rule.cursor_path, new_cursor);
                     reset_backoff(rt);
+                    write_last_status(&rt.rule.last_status_path, true, None);
                     emit_hook_record(report_sink.as_ref(), true, &rt.rule, &line, attempt, None);
                 }
                 DeliveryOutcome::ClientError => {
@@ -508,14 +555,9 @@ fn drainer_loop(
                     if attempt >= MAX_CLIENT_ERROR_ATTEMPTS {
                         let _ = write_cursor(&rt.rule.cursor_path, new_cursor);
                         reset_backoff(rt);
-                        emit_hook_record(
-                            report_sink.as_ref(),
-                            false,
-                            &rt.rule,
-                            &line,
-                            attempt,
-                            Some("4xx response, skipped after 3 attempts"),
-                        );
+                        let reason = "4xx response, skipped after 3 attempts";
+                        write_last_status(&rt.rule.last_status_path, false, Some(reason));
+                        emit_hook_record(report_sink.as_ref(), false, &rt.rule, &line, attempt, Some(reason));
                     } else {
                         apply_backoff(rt);
                     }
@@ -960,6 +1002,37 @@ mod tests {
         assert!(validate_loopback_http_url("http://10.0.0.5:8790/x").is_err());
         assert!(validate_loopback_http_url("http://example.com/x").is_err());
         assert!(validate_loopback_http_url("https://127.0.0.1/x").is_err(), "https refused for loopback too — http only");
+    }
+
+    #[test]
+    fn last_status_summary_reflects_delivery_outcome() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+
+        // Before any delivery: no last-status yet.
+        let summaries = summarize_configured_rules(&rules, tmp.path());
+        assert_eq!(summaries[0].last_delivery_ts, None);
+        assert_eq!(summaries[0].last_error, None);
+
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("dispatch start")).unwrap();
+        assert!(wait_until(|| receiver.request_count() == 1, Duration::from_secs(3)));
+
+        // Give the drainer a moment to persist the last-status file after the
+        // successful POST.
+        let ok = wait_until(
+            || summarize_configured_rules(&rules, tmp.path())[0].last_delivery_ts.is_some(),
+            Duration::from_secs(2),
+        );
+        assert!(ok, "last_delivery_ts populated after a successful delivery");
+        let summaries = summarize_configured_rules(&rules, tmp.path());
+        assert!(summaries[0].last_error.is_none(), "a successful delivery clears/omits last_error");
     }
 
     #[test]

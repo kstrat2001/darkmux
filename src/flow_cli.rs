@@ -169,6 +169,25 @@ pub enum FlowCmd {
         #[arg(long)]
         json: bool,
     },
+    /// (#2093) The flow-record hook sink — per-rule delivery status.
+    Hooks {
+        #[command(subcommand)]
+        cmd: HooksCmd,
+    },
+}
+
+/// `darkmux flow hooks <verb>` — kept tiny (one verb) per the issue's own
+/// scope: read-only introspection of the configured rules, nothing that
+/// mutates config or touches the network itself.
+#[derive(Subcommand)]
+pub enum HooksCmd {
+    /// Per rule: match + target URL, undelivered count, last delivery
+    /// timestamp, last error.
+    Status {
+        /// Emit machine-readable JSON instead of the human-formatted summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cmd: FlowCmd) -> Result<()> {
@@ -180,10 +199,101 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
             return print_integrity_check(path, json, strict)
         }
         FlowCmd::Tail { session, json } => return run_tail(session.as_deref(), json),
+        FlowCmd::Hooks { cmd } => return run_hooks(cmd),
         _ => {}
     }
     let record = build_record(cmd);
     flow::record(record).context("writing flow record")
+}
+
+fn run_hooks(cmd: HooksCmd) -> Result<()> {
+    match cmd {
+        HooksCmd::Status { json } => print_hooks_status(json),
+    }
+}
+
+/// Render `darkmux flow hooks status` to stdout.
+fn print_hooks_status(json: bool) -> Result<()> {
+    let enabled = darkmux_types::config_access::hooks_enabled();
+    let rules = darkmux_types::config_access::hooks_rules();
+    let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
+    let summaries = flow::hooks::summarize_configured_rules(&rules, &outbox_dir);
+
+    if json {
+        // (#776) machine-readable: force color off (defense-in-depth).
+        darkmux_types::style::set_colorize_override(Some(false));
+        let v = hooks_status_json(enabled, &outbox_dir, &summaries);
+        println!("{}", serde_json::to_string_pretty(&v).context("serializing hooks status to JSON")?);
+    } else {
+        print!("{}", render_hooks_status_human(enabled, &outbox_dir, &summaries));
+    }
+    Ok(())
+}
+
+fn hooks_status_json(
+    enabled: bool,
+    outbox_dir: &std::path::Path,
+    summaries: &[flow::hooks::HookRuleSummary],
+) -> serde_json::Value {
+    let rules: Vec<serde_json::Value> = summaries
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "index": s.index,
+                "match": s.match_desc,
+                "url": s.url,
+                "is_loopback": s.is_loopback,
+                "is_empty_match": s.is_empty_match,
+                "undelivered": s.undelivered,
+                "last_delivery_ts": s.last_delivery_ts,
+                "last_error": s.last_error,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "enabled": enabled,
+        "outbox_dir": outbox_dir.display().to_string(),
+        "rules": rules,
+    })
+}
+
+fn render_hooks_status_human(
+    enabled: bool,
+    outbox_dir: &std::path::Path,
+    summaries: &[flow::hooks::HookRuleSummary],
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "darkmux flow hooks status — enabled: {enabled}");
+    let _ = writeln!(out, "  outbox_dir: {}", outbox_dir.display());
+    if summaries.is_empty() {
+        let _ = writeln!(out, "  (no rules configured)");
+        return out;
+    }
+    for s in summaries {
+        let mut flags = Vec::new();
+        if s.is_empty_match {
+            flags.push("EMPTY MATCH");
+        }
+        if !s.is_loopback {
+            flags.push("NON-LOOPBACK URL");
+        }
+        let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
+        let _ = writeln!(out, "  #{}: {} -> {}{flag_str}", s.index, s.match_desc, s.url);
+        let _ = writeln!(out, "      undelivered: {}", s.undelivered);
+        match &s.last_delivery_ts {
+            Some(ts) => {
+                let _ = writeln!(out, "      last delivery: {ts}");
+            }
+            None => {
+                let _ = writeln!(out, "      last delivery: (never)");
+            }
+        }
+        if let Some(err) = &s.last_error {
+            let _ = writeln!(out, "      last error: {err}");
+        }
+    }
+    out
 }
 
 /// Render `darkmux flow status` to stdout. Calls `flow::collect_status()`
@@ -558,6 +668,9 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
         FlowCmd::Tail { .. } => unreachable!(
             "FlowCmd::Tail is a read verb and must be handled by run() before build_record"
         ),
+        FlowCmd::Hooks { .. } => unreachable!(
+            "FlowCmd::Hooks is a read verb and must be handled by run() before build_record"
+        ),
     }
 }
 
@@ -575,6 +688,47 @@ mod tests {
     /// piped to a pager, or run interactively for debugging). We simulate the
     /// TTY case by forcing colorize ON, then assert the `--json` path flips it
     /// back off. `#[serial]` because the override is process-global.
+    fn sample_rule_summary(index: usize) -> flow::hooks::HookRuleSummary {
+        flow::hooks::HookRuleSummary {
+            index,
+            match_desc: "action=crawl.*".to_string(),
+            url: "http://127.0.0.1:8790/events".to_string(),
+            is_loopback: true,
+            is_empty_match: false,
+            outbox_path: PathBuf::from("/tmp/0.outbox.jsonl"),
+            cursor_path: PathBuf::from("/tmp/0.cursor"),
+            undelivered: 3,
+            last_delivery_ts: Some("2026-08-29T00:00:00Z".to_string()),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn hooks_status_human_disabled_names_it() {
+        let out = render_hooks_status_human(false, &PathBuf::from("/tmp/hooks"), &[]);
+        assert!(out.contains("enabled: false"), "{out}");
+    }
+
+    #[test]
+    fn hooks_status_human_lists_each_rule() {
+        let summaries = vec![sample_rule_summary(0)];
+        let out = render_hooks_status_human(true, &PathBuf::from("/tmp/hooks"), &summaries);
+        assert!(out.contains("enabled: true"), "{out}");
+        assert!(out.contains("crawl.*"), "{out}");
+        assert!(out.contains("undelivered: 3"), "{out}");
+        assert!(out.contains("2026-08-29T00:00:00Z"), "last delivery ts shown: {out}");
+    }
+
+    #[test]
+    fn hooks_status_json_shape() {
+        let summaries = vec![sample_rule_summary(0)];
+        let v = hooks_status_json(true, &PathBuf::from("/tmp/hooks"), &summaries);
+        assert_eq!(v["enabled"], Value::Bool(true));
+        assert_eq!(v["rules"][0]["index"], serde_json::json!(0));
+        assert_eq!(v["rules"][0]["undelivered"], serde_json::json!(3));
+        assert_eq!(v["rules"][0]["last_delivery_ts"], Value::String("2026-08-29T00:00:00Z".to_string()));
+    }
+
     #[serial_test::serial]
     #[test]
     fn flow_json_paths_force_colorize_off() {
