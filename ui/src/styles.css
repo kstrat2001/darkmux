@@ -421,6 +421,10 @@ body {
   font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
   letter-spacing: 0.12em;
   text-transform: uppercase;
+  /* The caret (`.catalog-toggle::after`) is part of the label: on a phone
+     the masthead's flex row wrapped it onto its own line above `REPLAY`
+     (operator screenshot, 2026-08-28). */
+  white-space: nowrap;
   color: var(--accent);
   background: transparent;
   border: 1px solid var(--accent);
