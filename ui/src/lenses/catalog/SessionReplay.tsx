@@ -1,10 +1,11 @@
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { fetchJson } from "../../lib/fetcher";
+import { fetchJson, type FetchResult } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { useSessionLiveness } from "../../hooks/useSessionLiveness";
-import { flowToRenderModel } from "../../lib/flow";
+import { fetchStaticFlowRecords, flowToRenderModel, normalizeRecords } from "../../lib/flow";
 import { useNowMs } from "../../lib/clock";
-import { isStaticBuild } from "../../lib/staticSource";
+import { isStaticBuild, staticFlowSrc } from "../../lib/staticSource";
 import { injectedPlaybackDate } from "../../lib/injectedMeta";
 
 /** (#1972) How long a run may go silent before it is treated as abandoned
@@ -62,11 +63,30 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
   // disagree about when the run ended.
   const { shouldPoll, endedByPresence } = useSessionLiveness(sessionId);
 
+  // (#2065) A static build has no `/flow-session/<id>` to reach — the demo's
+  // dispatch-row tap 404'd here. Read the committed file instead (the same
+  // `queryKeys.staticFlowSrc` slot the playback lens and `useRouteRecords`
+  // fill, so this is cache reuse) and slice this session out of it, shaped
+  // exactly like the daemon's response so nothing below has to know.
+  const flowSrc = staticFlowSrc();
   const query = useQuery({
     queryKey: queryKeys.flowSession(sessionId),
     queryFn: () => fetchJson<FlowRecordsResponse>(`/flow-session/${encodeURIComponent(sessionId)}`),
+    enabled: flowSrc === null,
     refetchInterval: shouldPoll ? PRESENCE_POLL_MS : false,
   });
+  const staticQuery = useQuery({
+    queryKey: queryKeys.staticFlowSrc(flowSrc ?? ""),
+    queryFn: () => fetchStaticFlowRecords(flowSrc ?? ""),
+    enabled: flowSrc !== null,
+  });
+  const staticSlice: FlowRecordsResponse | null = useMemo(() => {
+    if (flowSrc === null || staticQuery.data === undefined) return null;
+    const recs = normalizeRecords(staticQuery.data).filter((r) => r.session_id === sessionId);
+    return { records: recs, count: recs.length, truncated: false, generated_at_ms: 0 };
+  }, [flowSrc, staticQuery.data, sessionId]);
+  const session: FetchResult<FlowRecordsResponse> | undefined =
+    flowSrc === null ? query.data : staticSlice === null ? undefined : { ok: true, data: staticSlice };
 
   // (#1972) HOISTED ABOVE EVERY EARLY RETURN, deliberately. React counts
   // hooks per render, so calling `useNowMs` after the loading/error/empty
@@ -81,7 +101,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
   // a fraction of a millisecond, and it is what makes the elapsed counter
   // advance during a STALL rather than freezing at the newest record's
   // timestamp.
-  const records = query.data?.ok ? query.data.data.records : null;
+  const records = session?.ok ? session.data.records : null;
   const data = records ? flowToRenderModel(records) : [];
   const base = records && records.length ? runRegions(data, sessionId) : null;
   // Gated on PLAYBACK too, not just on the run's own liveness. A recorded
@@ -121,7 +141,7 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
   const ticking = plausiblyRunning && !isStaticBuild() && injectedPlaybackDate() == null;
   const nowMs = useNowMs(ticking);
 
-  if (!query.data) {
+  if (!session) {
     return (
       <div data-state="pending" role="status" aria-label={`Loading session ${sessionId}`}>
         <div className="stagehdr">session replay</div>
@@ -130,19 +150,19 @@ export function SessionReplay({ sessionId }: { sessionId: string }) {
     );
   }
 
-  if (!query.data.ok) {
+  if (!session.ok) {
     return (
       <div data-state="error" role="alert">
         <div className="stagehdr">session replay</div>
         <div className="none">
           couldn't reach /flow-session/{sessionId}
-          {query.data.status !== null ? ` (HTTP ${query.data.status})` : ""}: {query.data.message}
+          {session.status !== null ? ` (HTTP ${session.status})` : ""}: {session.message}
         </div>
       </div>
     );
   }
 
-  const count = query.data.data.count;
+  const count = session.data.count;
 
   if (count === 0) {
     return (

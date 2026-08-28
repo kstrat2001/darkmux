@@ -155,6 +155,35 @@ describe("useRouteRecords — the static-demo flow-src route (#1801)", () => {
     expect(calls.some((u) => u.startsWith("/flow/"))).toBe(false);
   });
 
+  it("(#2065) slices ONE session out of the flow-src file on a dispatch route, never GET /flow-session/<id>", async () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    vi.stubGlobal(
+      "fetch",
+      mockStaticSrc(
+        [
+          { ts: "2026-08-07T00:00:00Z", action: "dispatch.start", session_id: "s1" },
+          { ts: "2026-08-07T00:00:01Z", action: "dispatch.start", session_id: "s2" },
+          { ts: "2026-08-07T00:00:02Z", action: "dispatch.complete", session_id: "s1" },
+        ]
+          .map((r) => JSON.stringify(r))
+          .join("\n") + "\n",
+      ),
+    );
+    const route: Route = { kind: "dispatch", dispatchId: "s1" };
+
+    const { result } = renderHook(() => useRouteRecords(route, LIVE), { wrapper: wrapper() });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.historical).toBe(true);
+    expect(result.current.error).toBeNull();
+    expect(result.current.records.map((r) => [r.session_id, r.action])).toEqual([
+      ["s1", "dispatch.start"],
+      ["s1", "dispatch.complete"],
+    ]);
+    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+    expect(calls.some((u) => u.startsWith("/flow-session/"))).toBe(false);
+  });
+
   it("is EMPTY, not the live window, when the static source is unreachable", async () => {
     injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
     vi.stubGlobal(

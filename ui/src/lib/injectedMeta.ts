@@ -38,6 +38,13 @@ export function injectedMeta(name: string): string | null {
  * permanently-loading mission lens instead of the honest
  * `MISSION_GRAPH_UNREACHABLE_NOTICE` (`RunsBoard.tsx`). */
 export function missionGraphReachable(): boolean {
+  // (#2065) A static build that ships a committed graphs file
+  // (`darkmux-graphs-src`, #2032 packet 2) CAN answer the lens for the
+  // missions that file lists — the demo's mission row must open its MAP
+  // rather than the daemon-less notice. A mission absent from the file
+  // still gets the lens's own honest notice, so this predicate need not
+  // know which ids it holds.
+  if (injectedMeta("darkmux-graphs-src") !== null) return true;
   return !!injectedMeta("darkmux-mode") && !injectedMeta("darkmux-flow-src");
 }
 

@@ -375,6 +375,29 @@ describe("RunsBoard", () => {
     expect(notice.textContent).toMatch(/this static build has no mission graph data to show/i);
   });
 
+  it("(#2065) a static build that ships a graphs file opens the mission's MAP lens, not the daemon-less notice", async () => {
+    mockFetch();
+    for (const [name, content] of [
+      ["darkmux-flow-src", "./demo-flow.jsonl"],
+      ["darkmux-graphs-src", "./demo-graphs.json"],
+    ]) {
+      const meta = document.createElement("meta");
+      meta.name = name;
+      meta.content = content;
+      document.head.appendChild(meta);
+    }
+    try {
+      renderBoard();
+      await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+      fireEvent.click(screen.getByText("m1").closest(".labrunrow")!);
+      expect(window.location.hash).toBe("#mission=m1");
+      expect(screen.queryByText(/needs a running daemon/i)).not.toBeInTheDocument();
+    } finally {
+      document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
+      window.location.hash = "";
+    }
+  });
+
   it("the daemon-less notice also fires from a keyboard Enter activation", async () => {
     mockFetch();
     renderBoard();

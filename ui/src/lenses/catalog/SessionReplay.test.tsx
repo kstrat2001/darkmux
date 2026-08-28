@@ -478,3 +478,49 @@ describe("SessionReplay", () => {
     );
   });
 });
+
+/**
+ * (#2065) On a daemon-less static build (darkmux.com/demo) there is no
+ * `/flow-session/<id>` — every dispatch-row tap rendered "couldn't reach
+ * /flow-session/… (HTTP 404)". The replay reads the committed flow file
+ * (`darkmux-flow-src`) and slices this session out of it instead.
+ */
+describe("SessionReplay — static build (#2065)", () => {
+  afterEach(() => {
+    document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
+  });
+
+  it("replays the session from the flow-src file and never asks for /flow-session", async () => {
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-flow-src";
+    meta.content = "./demo-flow.jsonl";
+    document.head.appendChild(meta);
+    const mine = {
+      ts: "2026-08-26T07:36:48Z",
+      action: "dispatch.start",
+      session_id: "s-static",
+      machine_id: "m5-ultra-256gb",
+      category: "work",
+      source: "crew",
+      payload: { role: "crawler", prompt: "the static brief", prompt_chars: 16 },
+    };
+    const other = { ...mine, session_id: "s-other", payload: { role: "scribe", prompt: "somebody else's brief", prompt_chars: 21 } };
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        seen.push(String(url));
+        if (String(url) === "./demo-flow.jsonl") {
+          return Promise.resolve(new Response([mine, other].map((r) => JSON.stringify(r)).join("\n") + "\n", { status: 200 }));
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    renderReplay("s-static");
+    await waitFor(() => expect(screen.queryByRole("status", { name: /Loading session/ })).not.toBeInTheDocument());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(document.body.textContent).toContain("the static brief");
+    expect(document.body.textContent).not.toContain("somebody else's brief");
+    expect(seen.filter((u) => u.startsWith("/flow-session/"))).toEqual([]);
+  });
+});
