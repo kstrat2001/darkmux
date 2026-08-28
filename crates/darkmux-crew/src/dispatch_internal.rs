@@ -3425,10 +3425,12 @@ pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
     }
 }
 
-/// (#2094) Sum + count of the inter-turn rests the runtime took during this
-/// dispatch, read from `metrics.json` the same way [`TokenTotals`] is —
-/// same file, same best-effort degrade-to-zero-on-missing/malformed
-/// contract (observability enrichment, never a dispatch failure).
+/// (#2094) Sum + count of the inter-turn rests the runtime took during
+/// this dispatch. Read primarily from `metrics.json`, same as
+/// [`TokenTotals`] — but see [`read_rest_totals`]'s own doc for the
+/// `trajectory.jsonl` fallback (finding 5) that source alone doesn't
+/// have. Best-effort degrade-to-zero when neither source is available
+/// (observability enrichment, never a dispatch failure).
 #[derive(Default, Debug, Clone, Copy)]
 pub struct RestTotals {
     pub rest_ms: u64,
@@ -3436,20 +3438,57 @@ pub struct RestTotals {
 }
 
 /// Read `rest_ms` / `rests` from the runtime's `metrics.json` under
-/// `<out_dir>/.darkmux-runtime/`. Mirrors [`read_token_totals`] exactly —
-/// same file, same missing/malformed degrade-to-default contract.
+/// `<out_dir>/.darkmux-runtime/`, the same way [`read_token_totals`] does.
+///
+/// (#2094 finding 5) Unlike token totals, rest totals have a second
+/// source: when `metrics.json` is absent, unparseable, or simply carries
+/// no `rest_ms` key at all (predates #2094; or the runtime never reached
+/// its own exit-time write — SIGKILL, Ctrl-C, a hard crash before the
+/// clean-exit path runs), fall back to SUMMING the `runtime.rest` events
+/// straight out of `trajectory.jsonl`. Those events are durably streamed
+/// to disk as each rest happens (`Trajectory::append_rest`), so this
+/// fallback covers exactly the case `metrics.json` structurally cannot: a
+/// dispatch that never got to write its own totals file. Both sources
+/// degrade to `RestTotals::default()` when neither is available —
+/// observability enrichment, never a dispatch failure.
 pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
     let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
-    let Ok(raw) = fs::read_to_string(&metrics_path) else {
-        return RestTotals::default();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return RestTotals::default();
-    };
-    RestTotals {
-        rest_ms: v.get("rest_ms").and_then(|n| n.as_u64()).unwrap_or(0),
-        rests: v.get("rests").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+    let from_metrics = fs::read_to_string(&metrics_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.get("rest_ms").is_some());
+    if let Some(v) = from_metrics {
+        return RestTotals {
+            rest_ms: v.get("rest_ms").and_then(|n| n.as_u64()).unwrap_or(0),
+            rests: v.get("rests").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+        };
     }
+    sum_rest_totals_from_trajectory(out_dir)
+}
+
+/// (#2094 finding 5) The fallback source `read_rest_totals` reaches for
+/// when `metrics.json` can't answer: sum every `runtime.rest` event's
+/// `ms` out of `<out_dir>/.darkmux-runtime/trajectory.jsonl`. Malformed
+/// or unreadable lines are skipped rather than aborting the whole sum —
+/// the same lenient-on-read posture the live tailer uses on this file.
+fn sum_rest_totals_from_trajectory(out_dir: &Path) -> RestTotals {
+    let traj_path = out_dir.join(".darkmux-runtime").join("trajectory.jsonl");
+    let Ok(raw) = fs::read_to_string(&traj_path) else {
+        return RestTotals::default();
+    };
+    let mut totals = RestTotals::default();
+    for line in raw.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(|t| t.as_str()) != Some("runtime.rest") {
+            continue;
+        }
+        let ms = event.get("ms").and_then(|n| n.as_u64()).unwrap_or(0);
+        totals.rest_ms = totals.rest_ms.saturating_add(ms);
+        totals.rests = totals.rests.saturating_add(1);
+    }
+    totals
 }
 
 /// (#2094 finding 4) Whether the operator's configured `turn_delay_ms`

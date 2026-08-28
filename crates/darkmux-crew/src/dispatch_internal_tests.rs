@@ -596,28 +596,110 @@
 
     #[test]
     fn read_rest_totals_degrades_to_zero_on_missing_or_malformed() {
+        // (#2094 finding 5) Both cases now also fall back to
+        // trajectory.jsonl — but neither temp dir has one, so the
+        // fallback itself degrades to zero too, same end result as before
+        // the fallback existed.
         let missing = TempDir::new().unwrap();
         let r = read_rest_totals(missing.path());
-        assert_eq!((r.rest_ms, r.rests), (0, 0), "missing metrics.json → zero totals");
+        assert_eq!((r.rest_ms, r.rests), (0, 0), "missing metrics.json + no trajectory → zero");
 
         let bad = TempDir::new().unwrap();
         let rt = bad.path().join(".darkmux-runtime");
         fs::create_dir_all(&rt).unwrap();
         fs::write(rt.join("metrics.json"), "{not valid json").unwrap();
         let r = read_rest_totals(bad.path());
-        assert_eq!((r.rest_ms, r.rests), (0, 0), "malformed metrics.json → zero totals");
+        assert_eq!((r.rest_ms, r.rests), (0, 0), "malformed metrics.json + no trajectory → zero");
     }
 
     #[test]
-    fn read_rest_totals_absent_fields_default_to_zero() {
+    fn read_rest_totals_absent_fields_falls_back_to_trajectory_or_zero() {
         // A metrics.json from BEFORE #2094 (or a build without the feature)
-        // has no rest_ms/rests keys at all — must degrade to zero, not error.
+        // has no rest_ms/rests keys at all. With no trajectory.jsonl either,
+        // this must still degrade to zero, not error.
         let out = TempDir::new().unwrap();
         let rt = out.path().join(".darkmux-runtime");
         fs::create_dir_all(&rt).unwrap();
         fs::write(rt.join("metrics.json"), r#"{"total_prompt_tokens": 100}"#).unwrap();
         let r = read_rest_totals(out.path());
         assert_eq!((r.rest_ms, r.rests), (0, 0));
+    }
+
+    // ─── #2094 finding 5: rest_ms on the error path ──────────────────────
+
+    #[test]
+    fn read_rest_totals_falls_back_to_trajectory_when_metrics_json_is_absent() {
+        // No metrics.json at all — e.g. the runtime was SIGKILLed before
+        // its exit-time write ran. The runtime.rest events are durably
+        // streamed to trajectory.jsonl as they happen, so summing them
+        // recovers the totals metrics.json never got the chance to write.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":500}\n\
+             {\"type\":\"model.completed\",\"seq\":1}\n\
+             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":300}\n",
+        )
+        .unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!(r.rest_ms, 800, "sum of both runtime.rest ms fields");
+        assert_eq!(r.rests, 2, "count of runtime.rest events, ignoring other event types");
+    }
+
+    #[test]
+    fn read_rest_totals_falls_back_to_trajectory_when_metrics_lacks_rest_ms() {
+        // metrics.json IS present and valid JSON, but (pre-#2094 shape, or
+        // a runtime build without the feature) carries no rest_ms key —
+        // must still reach for the trajectory fallback rather than
+        // treating a present-but-incomplete file as authoritative zero.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"total_prompt_tokens": 100}"#).unwrap();
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":250}\n",
+        )
+        .unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!(r.rest_ms, 250);
+        assert_eq!(r.rests, 1);
+    }
+
+    #[test]
+    fn read_rest_totals_prefers_metrics_json_over_trajectory_when_both_present() {
+        // metrics.json carrying rest_ms is authoritative — the trajectory
+        // fallback only kicks in when metrics.json can't answer at all.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 1000, "rests": 2}"#).unwrap();
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":9999}\n",
+        )
+        .unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!(r.rest_ms, 1000, "metrics.json wins, not the trajectory sum");
+        assert_eq!(r.rests, 2);
+    }
+
+    #[test]
+    fn read_rest_totals_skips_malformed_trajectory_lines() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "not even json\n\
+             {\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":500}\n",
+        )
+        .unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!(r.rest_ms, 500, "the malformed line is skipped, not fatal to the sum");
+        assert_eq!(r.rests, 1);
     }
 
     // ─── #2094 finding 4: never rest an agentic-REMOTE dispatch ──────────
