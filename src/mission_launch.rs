@@ -352,6 +352,19 @@ pub fn launch(
     darkmux_types::dispatch_liveness::liveness("process-start");
     fleet::validate_identifier("config_id", config_id)?;
 
+    // (#1959 packet 2) `crawl` has NO `mission-configs/crawl.json` to load
+    // structurally against — its Task/Step graph is computed at run time
+    // from a resolved crawl plan, not declared ahead of time in a JSON
+    // document (see `crawl_launch`'s module doc). Routed by literal id,
+    // BEFORE `mission_config::load` below (which would otherwise fail —
+    // there is no such config to find), the same way `review` was
+    // literal-id-routed before #1538 made it structural: there is exactly
+    // one crawl entry point today, so there is nothing to route
+    // structurally ON.
+    if config_id == "crawl" {
+        return crate::crawl_launch::launch(input_file, params, timeout_seconds);
+    }
+
     let loaded = mission_config::load(config_id).with_context(|| {
         format!(
             "loading mission config \"{config_id}\" — note: a user-tier copy \
