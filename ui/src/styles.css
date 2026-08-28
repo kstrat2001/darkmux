@@ -339,6 +339,13 @@ body {
   font-weight: 700;
   letter-spacing: 0.04em;
   white-space: nowrap;
+  /* (operator, on the phone, 2026-08-28) "leave the branding on the left
+     alone and everything else right justified": the brand is the only
+     left-anchored item; the version, the date chip, the mode badge and the
+     top nav all pack against the right edge. The one auto margin lives
+     here, not on `.masthead__nav`, or the free space would split between
+     the two and leave the chip floating mid-row. */
+  margin-right: auto;
 }
 .masthead__brand a {
   color: inherit;
@@ -445,7 +452,6 @@ body {
   }
 }
 .masthead__nav {
-  margin-left: auto;
   display: flex;
   gap: 16px;
   align-items: center;
