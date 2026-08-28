@@ -358,13 +358,29 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
 /// to the outbox at `path`, flock'd like `AuditFileSink` — cross-process
 /// safe, and never torn against another writer (single `write_all` under
 /// the lock, mirroring `audit_record_at_locked`).
+///
+/// **Deliberately no `fsync`** (unlike `AuditFileSink`, which calls
+/// `sync_all()` for compliance-grade crash durability). Measured (#2093
+/// Self-QA gate, `cost_check_write_latency_hooks_enabled_vs_disabled`):
+/// with `sync_all()`, 10k matching writes took ~41s (≈4.1ms/write, ~11,000x
+/// the disabled baseline's 0.36us/write) on this machine's disk — almost
+/// entirely the fsync itself (macOS's `fsync` crosses the journal layer on
+/// every call). Without it, the same 10k writes took ~450ms (≈45us/write,
+/// ~120x baseline) — flock + seek + write, no disk-flush wait. The outbox
+/// still needs to survive an ordinary PROCESS restart (a `HookSink` drop +
+/// reconstruction) — page-cache-buffered writes survive that fine, no
+/// fsync required; only a hard power-loss between the write and the next
+/// cache flush could lose an unflushed line, a narrower risk than the
+/// audit trail's regulatory-compliance requirement. This sink sits on the
+/// same write path as every other flow record when hooks are enabled, so
+/// the throughput cost of fsync-per-line is not proportionate to what it
+/// buys here.
 fn append_outbox_line(path: &Path, line: &str) -> Result<()> {
     darkmux_types::flock::with_locked_file(path, |file| {
         file.seek(SeekFrom::End(0)).with_context(|| format!("seek to end of {}", path.display()))?;
         file.write_all(line.as_bytes())
             .and_then(|_| file.write_all(b"\n"))
             .with_context(|| format!("appending to hook outbox {}", path.display()))?;
-        file.sync_all().with_context(|| format!("syncing hook outbox {}", path.display()))?;
         Ok(())
     })
 }
@@ -1323,5 +1339,57 @@ mod tests {
         let (outbox, cursor) = outbox_paths(&dir, 2, "http://127.0.0.1:8790/events");
         assert_eq!(outbox, dir.join("2-127.0.0.1-8790.outbox.jsonl"));
         assert_eq!(cursor, dir.join("2-127.0.0.1-8790.cursor"));
+    }
+
+    /// (#2093 Self-QA gate — cost check) `write()` latency with hooks
+    /// enabled (3 rules, one matching) vs disabled, 10k records each.
+    /// `#[ignore]`d — a throwaway timing measurement, not a correctness
+    /// assertion; run explicitly with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn cost_check_write_latency_hooks_enabled_vs_disabled() {
+        let n = 10_000;
+
+        // Disabled: a bare NullSink, no hooks in the chain at all.
+        let disabled: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let start = Instant::now();
+        for i in 0..n {
+            disabled.write(&record(&format!("work.item.{i}"))).unwrap();
+        }
+        let disabled_elapsed = start.elapsed();
+
+        // Enabled: 3 rules, one of which matches every record written below.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![
+            HookRule {
+                r#match: Some(HookMatch { action: Some("work.*".to_string()), ..Default::default() }),
+                http: Some("http://127.0.0.1:1/a".to_string()),
+                extras: Default::default(),
+            },
+            HookRule {
+                r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+                http: Some("http://127.0.0.1:1/b".to_string()),
+                extras: Default::default(),
+            },
+            HookRule {
+                r#match: Some(HookMatch { mission_id: Some("no-such-mission".to_string()), ..Default::default() }),
+                http: Some("http://127.0.0.1:1/c".to_string()),
+                extras: Default::default(),
+            },
+        ];
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let start = Instant::now();
+        for i in 0..n {
+            sink.write(&record(&format!("work.item.{i}"))).unwrap();
+        }
+        let enabled_elapsed = start.elapsed();
+
+        println!(
+            "cost check: {n} writes — disabled: {disabled_elapsed:?} ({:.2}us/write) — \
+             hooks enabled (3 rules, 1 matching): {enabled_elapsed:?} ({:.2}us/write)",
+            disabled_elapsed.as_micros() as f64 / n as f64,
+            enabled_elapsed.as_micros() as f64 / n as f64,
+        );
     }
 }
