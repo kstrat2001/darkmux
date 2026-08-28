@@ -292,6 +292,18 @@ body {
   }
   .app-shell__navtabs {
     order: 0;
+    /* (operator, on the phone, 2026-08-28) Uniform-width tabs filling the
+       row: sized by their labels, RUNS was the slim one and the strip sat
+       ragged against the full-width transport under it. Equal cells line
+       up with the content edges, center by construction, and widen each
+       tap target from ~70px to a quarter of the row. */
+    display: flex;
+    width: 100%;
+  }
+  .app-shell__navtabs .nav-tab {
+    flex: 1 1 0;
+    justify-content: center;
+    text-align: center;
   }
   .app-shell__crumb {
     order: 1;
