@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, fireEvent, cleanup } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
 
@@ -782,6 +782,150 @@ describe("App", () => {
       expect(document.getElementById("crumb")!.className).toMatch(/\bis-replay\b/);
     } finally {
       meta.remove();
+    }
+  });
+
+  // (#2071) The transport lives in the shell's sticky block on every route
+  // of a loaded day. Static cases stay at the end of the file (the
+  // `useHashRoute` memo, see above).
+  const DAY_FOR_TRANSPORT = [
+    { ts: "2026-08-07T00:00:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1" },
+    { ts: "2026-08-07T00:30:00.000Z", category: "dispatch", action: "dispatch.reasoning", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1" },
+    { ts: "2026-08-07T00:45:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s2" },
+    { ts: "2026-08-07T01:00:00.000Z", category: "dispatch", action: "dispatch.complete", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1" },
+  ];
+  function mockStaticDay() {
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-flow-src";
+    meta.content = "./demo-flow.jsonl";
+    document.head.appendChild(meta);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (String(url) === "./demo-flow.jsonl") {
+          return Promise.resolve(new Response(DAY_FOR_TRANSPORT.map((r) => JSON.stringify(r)).join("\n") + "\n", { status: 200 }));
+        }
+        if (String(url) === "/runs") return Promise.resolve(new Response(JSON.stringify({ runs: [], generated_at_ms: 1 }), { status: 200 }));
+        if (String(url) === "/lab/runs") return Promise.resolve(new Response(JSON.stringify({ configured: false, dir: null, exists: false, runs: [] }), { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    return meta;
+  }
+  function renderApp() {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("(#2071) a live daemon route renders no transport — nothing to scrub", async () => {
+    window.location.hash = "#lens=runs";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".app-shell__navtabs")).toBeTruthy());
+    expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
+  });
+
+  it("(#2071) a static build renders the transport beside the tabs in the sticky block, on a NON-playback route", async () => {
+    const meta = mockStaticDay();
+    window.location.hash = "#lens=runs";
+    try {
+      renderApp();
+      const group = await screen.findByRole("group", { name: "playback transport" });
+      const sticky = group.closest(".app-shell__sticky");
+      expect(sticky).toBeTruthy();
+      expect(sticky!.querySelector(".app-shell__navtabs")).toBeTruthy();
+      expect(screen.getByRole("button", { name: /^play$/i })).toBeInTheDocument();
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it("(#2071) on a static dispatch route, scrubbing to the start cuts that session's events to the playhead", async () => {
+    const meta = mockStaticDay();
+    window.location.hash = "#dispatch=s1";
+    try {
+      renderApp();
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(3)); // s1's three, never s2's
+      fireEvent.change(screen.getByRole("slider"), { target: { value: "0" } });
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1));
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it("(#2071) on a static dispatch route the run detail itself replays at the playhead: scrubbed to the start it is RUNNING", async () => {
+    const meta = mockStaticDay();
+    window.location.hash = "#dispatch=s1";
+    try {
+      renderApp();
+      await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(3));
+      const pillAtEnd = document.querySelector(".session-run__header .pill")!.textContent;
+      expect(pillAtEnd).not.toMatch(/running/i);
+      fireEvent.change(screen.getByRole("slider"), { target: { value: "0" } });
+      await waitFor(() => expect(document.querySelector(".session-run__header .pill")!.textContent).toMatch(/running/i));
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it("(#2071) the mission route shows no transport — nothing there answers it", async () => {
+    const meta = mockStaticDay();
+    window.location.hash = "#lens=runs";
+    try {
+      renderApp();
+      // First prove the day is loaded: the transport is up on the runs route.
+      await screen.findByRole("group", { name: "playback transport" });
+      // Then the route gate, on the same loaded day: switching to a mission
+      // takes the transport down (a vacuous "never appeared" would pass
+      // before the day loaded, which is why the order matters).
+      await act(async () => {
+        window.location.hash = "#mission=m1";
+        window.dispatchEvent(new HashChangeEvent("hashchange"));
+      });
+      await waitFor(() => expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument());
+      expect(document.querySelector(".app-shell__sticky .app-shell__navtabs")).toBeTruthy();
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it("(#2071) a dispatch route scrubbed to BEFORE its run's first record says so, instead of crashing the lens", async () => {
+    const meta = mockStaticDay();
+    window.location.hash = "#dispatch=s2"; // s2 starts at 00:45, the day at 00:00
+    try {
+      renderApp();
+      await waitFor(() => expect(document.querySelector(".session-run__header .pill")).toBeTruthy());
+      fireEvent.change(screen.getByRole("slider"), { target: { value: "0" } });
+      await waitFor(() => expect(screen.getByRole("status", { name: /not started yet/i })).toBeInTheDocument());
+      expect(document.body.textContent).not.toMatch(/stopped rendering/i);
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it("(#2071) play advances the playhead from the shell's transport and stops at the end", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const meta = mockStaticDay();
+    try {
+      renderApp();
+      await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
+      fireEvent.click(screen.getByRole("button", { name: /^play$/i }));
+      await waitFor(() => expect(screen.getByRole("slider")).toHaveValue("0"));
+      expect(screen.getByRole("button", { name: /^pause$/i })).toBeInTheDocument();
+      await vi.advanceTimersByTimeAsync(1500);
+      const mid = Number(screen.getByRole("slider").getAttribute("value"));
+      expect(mid).toBeGreaterThan(0);
+      expect(mid).toBeLessThan(100);
+      await vi.advanceTimersByTimeAsync(15000);
+      await waitFor(() => expect(screen.getByRole("slider")).toHaveValue("100"));
+      expect(screen.getByRole("button", { name: /^play$/i })).toBeInTheDocument();
+    } finally {
+      meta.remove();
+      vi.useRealTimers();
     }
   });
 });

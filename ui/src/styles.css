@@ -73,10 +73,20 @@ html,
 body {
   margin: 0;
   padding: 0;
-  /* No horizontal document scroll at any width, including 390px phone
-     viewports — the overnight runbook's render-sanity contract. */
-  overflow-x: hidden;
   max-width: 100%;
+}
+/* No horizontal document scroll at any width, including 390px phone
+   viewports — the overnight runbook's render-sanity contract. On `html`
+   ONLY (#2071): `overflow-x: hidden` on `body` too made body a scroll
+   container, and `position: sticky` descendants then stuck to a box that
+   never scrolls (measured: the sticky block's top at -1360px after a 1500px
+   scroll). With body left `visible`, the block sticks to the viewport AND
+   `document.body.scrollWidth` keeps reporting overflowing content, which
+   is what every "no horizontal scroll" guard in tests/parity reads (they
+   moved off `documentElement.scrollWidth` precisely because the root clamps
+   it). `clip` on body would have kept sticky but clamped that too. */
+html {
+  overflow-x: hidden;
 }
 
 body {
@@ -98,6 +108,30 @@ body {
    Packets 1-3 — only their PARENT moved), so this is pure layout, not a
    content change; the parity extractor selects by id regardless of DOM
    nesting. */
+/* (#2071) The sticky block: tab strip + playback transport. Sticks under
+   the top of the viewport on every route; the masthead, crumb and meta line
+   scroll away above it. Its height never depends on the route (the meta
+   line is deliberately NOT in it), which is what stopped the tab strip
+   jumping 32px between the fleet and the other tabs on a phone. */
+.app-shell__sticky {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 8px 16px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+.app-shell__sticky .scrub {
+  flex: 1 1 320px;
+  margin: 0;
+  padding: 0;
+  border-top: none;
+}
+
 .app-shell__crumbbar {
   display: flex;
   align-items: center;
@@ -374,6 +408,18 @@ body {
   border: 1px solid var(--accent);
   padding: 4px 8px;
   border-radius: 3px;
+}
+@media (max-width: 768px) {
+  /* (operator, on the phone, 2026-08-28) "leave the branding on the left
+     alone and everything else right justified": on a phone the brand is
+     the only left-anchored item and the date chip + mode badge pack
+     against the right edge. Desktop keeps its shape (brand, chip, badge,
+     then the nav on the far right) — the operator judged the right-packed
+     row a phone answer, not a desktop one. The nav is hidden at this width,
+     so its own auto margin does not compete with this one. */
+  .masthead__brand {
+    margin-right: auto;
+  }
 }
 @media (max-width: 560px) {
   /* (#2073) Brand + `FLOW · <date>` + `▣ PLAYBACK` overflowed 390px and
@@ -714,8 +760,35 @@ body {
 }
 
 @media (max-width: 768px) {
+  .app-shell__sticky {
+    gap: 6px 8px;
+    padding: 6px 12px;
+  }
+  .app-shell__sticky .scrub {
+    flex-basis: 100%;
+  }
+  /* (#2071) Tap targets: the transport's buttons keep their painted size
+     and extend an invisible 44px hit region, the `.catalog-toggle::after`
+     pattern (hit area and visual weight are different things). */
+  .scrub button {
+    position: relative;
+  }
+  .scrub button::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: max(100%, 44px);
+    height: 44px;
+    transform: translate(-50%, -50%);
+  }
   .eventlog {
     width: 100%;
+    /* (#2071) `position: sticky; height: calc(100vh - chrome)` is the
+       desktop two-column sidebar rule; on the single-column phone layout it
+       pinned a ~743px column over 67% of the viewport once scrolled. Below
+       the stage the column is a page section: it flows. */
+    position: static;
     /* Grows with its content up to most of the viewport, rather than being
        pinned to 60vh regardless of what is in it. Below the stage on a phone
        the column is a page section, not a sidebar, so a hard height only
