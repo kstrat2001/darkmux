@@ -3304,6 +3304,15 @@ struct TrajectorySummary {
     tool_calls: u32,
     compactions: u32,
     heartbeats: u32,
+    /// (#2094 finding 2) Live running sum/count of the `runtime.rest`
+    /// events this dispatch has taken so far — mirrors the runtime's own
+    /// `rest_ms`/`rests` accumulators (`runtime/src/loop_runner.rs`), kept
+    /// host-side too so each `dispatch.rest` flow record can carry the
+    /// cumulative totals alongside its own `ms`, the same "live running
+    /// total" shape `turns_so_far`/`tool_calls_so_far` already give the
+    /// mission-graph viewer's seat-card meter.
+    rest_ms: u64,
+    rests: u32,
     // (#1955) The two things the orchestrator could not see.
     //
     // Both were already COMPUTED here — the tailer forwards checkpoints and
@@ -4268,6 +4277,37 @@ impl TailerState {
                     "max": event.get("max"),
                     "threshold": self.compaction_threshold,
                 }));
+            }
+            // (#2094 finding 2) A rest IS host-side proof-of-work — the
+            // runtime deliberately sleeps between turns (GPU thermal/power
+            // relief), and this catch-all previously dropped that event on
+            // the floor entirely. Two consequences, both fixed here:
+            //
+            // (a) The host-side hard-kill watchdog's `inactivity_deadline`
+            //     never saw the rest as activity, so a long enough
+            //     `turn_delay_ms` could tick the deadline down toward the
+            //     hard kill during time the dispatch was deliberately idle
+            //     BY DESIGN, not stalled. Reset it exactly the way
+            //     `tool.completed`/`compaction` do — same signal class.
+            // (b) The rest was invisible on the flow stream entirely — no
+            //     `dispatch.rest` record, so a rested run's live view gave
+            //     no indication anything was happening between turns.
+            "runtime.rest" => {
+                let ms = event.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.summary.rest_ms = self.summary.rest_ms.saturating_add(ms);
+                self.summary.rests = self.summary.rests.saturating_add(1);
+                if let Some(deadline) = &self.inactivity_deadline {
+                    let new_deadline =
+                        Instant::now() + Duration::from_secs(self.inactivity_secs);
+                    *lock_deadline(deadline) = new_deadline;
+                }
+                let payload = serde_json::json!({
+                    "ms": ms,
+                    "turn": event.get("seq"),
+                    "rest_ms": self.summary.rest_ms,
+                    "rests": self.summary.rests,
+                });
+                self.emit("dispatch.rest", darkmux_flow::Level::Info, payload);
             }
             _ => {
                 // Other event types (dispatch.start/complete from the

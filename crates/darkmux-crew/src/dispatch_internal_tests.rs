@@ -2967,6 +2967,122 @@
         );
     }
 
+    // ─── #2094 finding 2: a rest is host-side proof-of-work too ─────────
+
+    /// A `runtime.rest` trajectory event must reset the host-side
+    /// `inactivity_deadline` exactly like `tool.completed`/`compaction` do
+    /// — the runtime deliberately sleeps between turns (GPU thermal/power
+    /// relief), and without this the host-side hard-kill watchdog would
+    /// tick the deadline down toward a kill during time the dispatch was
+    /// idle BY DESIGN, not stalled.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record()
+    fn tailer_runtime_rest_event_resets_inactivity_deadline() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let traj_path = tmp.path().join("trajectory.jsonl");
+
+        let inactivity_secs = 600u64;
+        let original_deadline = Instant::now() - Duration::from_secs(3600);
+        let shared = Arc::new(Mutex::new(original_deadline));
+
+        let mut state = TailerState::new(
+            traj_path.clone(),
+            "test-session".into(),
+            "test-role".into(),
+            "test-model".into(),
+            Arc::clone(&shared),
+            inactivity_secs,
+        );
+
+        let mut f = std::fs::File::create(&traj_path).unwrap();
+        writeln!(f, r#"{{"type":"runtime.rest","seq":2,"ts":1234567890,"ms":500}}"#).unwrap();
+        drop(f);
+
+        let before_reset = Instant::now();
+        state.poll_and_emit();
+
+        let new_deadline = *shared.lock().unwrap();
+        let expected_min =
+            before_reset + Duration::from_secs(inactivity_secs) - Duration::from_millis(50);
+        assert!(
+            new_deadline >= expected_min,
+            "a runtime.rest event must reset the inactivity deadline — a \
+             deliberate inter-turn rest is not a stalled dispatch"
+        );
+        assert!(
+            new_deadline > original_deadline,
+            "reset must overwrite the prior stale deadline"
+        );
+    }
+
+    /// Each `runtime.rest` trajectory event must emit exactly one
+    /// `dispatch.rest` flow record, carrying this rest's own `ms` + `turn`
+    /// alongside the RUNNING cumulative `rest_ms`/`rests` totals — so a
+    /// rested run is visible on the live flow stream turn-by-turn, not
+    /// only summarized at `dispatch.complete`.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn handle_event_runtime_rest_emits_dispatch_rest_with_cumulative_totals() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-rest".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(r#"{"type":"runtime.rest","seq":1,"ts":1,"ms":500}"#);
+        state.handle_event(r#"{"type":"runtime.rest","seq":2,"ts":2,"ms":500}"#);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["session_id"] == "sess-rest" && v["action"] == "dispatch.rest")
+            .collect();
+
+        assert_eq!(records.len(), 2, "one dispatch.rest record per runtime.rest event");
+
+        assert_eq!(records[0]["payload"]["ms"], 500);
+        assert_eq!(records[0]["payload"]["turn"], 1);
+        assert_eq!(records[0]["payload"]["rest_ms"], 500, "first rest: running total = 500");
+        assert_eq!(records[0]["payload"]["rests"], 1);
+
+        assert_eq!(records[1]["payload"]["ms"], 500);
+        assert_eq!(records[1]["payload"]["turn"], 2);
+        assert_eq!(records[1]["payload"]["rest_ms"], 1000, "second rest: running total = 1000");
+        assert_eq!(records[1]["payload"]["rests"], 2);
+    }
+
     // ─── #557 slice 2 detector telemetry ──────────────────────────────
 
     /// The pure mapping helper: a `dispatch.cycle.suspected` event →

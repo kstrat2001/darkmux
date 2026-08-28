@@ -407,6 +407,14 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.25.0";
 //           slots above) so the eventual three-way merge is a one-line
 //           reconcile: whichever branch lands last just renumbers its own
 //           bump past whatever the other two already claimed.
+//           (finding 2, same 1.25.0) Also added the `dispatch.rest` action
+//           itself — one per `runtime.rest` trajectory event, live on the
+//           flow stream (not just summarized at `dispatch.complete`).
+//           Payload: `ms` (this rest's duration), `turn`, and the running
+//           `rest_ms` / `rests` totals so far. A new action value under the
+//           same additive rule this whole version already documents; older
+//           readers that don't recognize `dispatch.rest` ignore it exactly
+//           like they ignore any other unfamiliar action.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
