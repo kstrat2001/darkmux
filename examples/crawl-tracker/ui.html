@@ -1,0 +1,526 @@
+<meta charset="utf-8" />
+<title>crawl-tracker</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #161922;
+    --border: #262b38;
+    --text: #e4e7ee;
+    --muted: #8b93a7;
+    --accent: #5b9dff;
+    --new: #5b9dff;
+    --confirmed: #52c785;
+    --rejected: #e05c5c;
+    --deferred: #d9a441;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 1rem;
+    margin: 0;
+    font-weight: 600;
+  }
+  nav {
+    display: flex;
+    gap: 0.25rem;
+  }
+  nav button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 0.35rem 0.75rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  nav button[aria-current="true"] {
+    background: var(--panel);
+    color: var(--text);
+    border-color: var(--accent);
+  }
+  main {
+    padding: 1rem;
+  }
+  .view { display: none; }
+  .view[data-active="true"] { display: block; }
+
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+  }
+  .toolbar input, .toolbar select {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    font-size: 0.85rem;
+  }
+  .toolbar input[type="search"] { flex: 1; min-width: 180px; }
+
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.2fr);
+    gap: 1rem;
+    align-items: start;
+  }
+  @media (max-width: 800px) {
+    .layout { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left;
+    padding: 0.5rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.82rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  th { color: var(--muted); font-weight: 500; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: rgba(255,255,255,0.03); }
+  tbody tr[aria-selected="true"] { background: rgba(91,157,255,0.12); }
+
+  .status-pill {
+    display: inline-block;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .status-new { background: rgba(91,157,255,0.15); color: var(--new); }
+  .status-confirmed { background: rgba(82,199,133,0.15); color: var(--confirmed); }
+  .status-rejected { background: rgba(224,92,92,0.15); color: var(--rejected); }
+  .status-deferred { background: rgba(217,164,65,0.15); color: var(--deferred); }
+
+  .detail { padding: 1rem; }
+  .detail h2 { margin: 0 0 0.25rem; font-size: 0.95rem; }
+  .detail .meta { color: var(--muted); font-size: 0.78rem; margin-bottom: 0.75rem; }
+  .detail .field-label { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; margin: 0.75rem 0 0.25rem; }
+  .detail p { margin: 0; }
+
+  pre.context {
+    background: #0a0c10;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.6rem;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.78rem;
+    line-height: 1.5;
+  }
+  pre.context .cited-line { background: rgba(224,92,92,0.18); display: block; margin: 0 -0.6rem; padding: 0 0.6rem; }
+
+  .status-buttons { display: flex; gap: 0.4rem; margin-top: 0.5rem; }
+  .status-buttons button {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    padding: 0.35rem 0.6rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.78rem;
+  }
+  .status-buttons button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+
+  textarea {
+    width: 100%;
+    min-height: 4.5em;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 0.5rem;
+    font-family: inherit;
+    font-size: 0.82rem;
+    resize: vertical;
+  }
+  .save-row { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.5rem; }
+  .save-row button {
+    background: var(--accent);
+    color: #06121f;
+    border: none;
+    border-radius: 6px;
+    padding: 0.4rem 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 0.82rem;
+  }
+
+  .sightings { margin-top: 0.4rem; }
+  .sightings li { font-size: 0.78rem; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  .empty, .muted { color: var(--muted); padding: 1rem; font-size: 0.85rem; }
+  .save-status { font-size: 0.78rem; color: var(--muted); align-self: center; }
+</style>
+
+<header>
+  <h1>crawl-tracker</h1>
+  <nav id="tabs">
+    <button type="button" data-view="findings" aria-current="true">Findings</button>
+    <button type="button" data-view="coverage">Coverage</button>
+    <button type="button" data-view="missions">Missions</button>
+  </nav>
+</header>
+
+<main>
+  <section class="view" data-view="findings" data-active="true">
+    <div class="toolbar">
+      <input type="search" id="q" placeholder="Search evidence, why, file, rule, source..." />
+      <input type="text" id="filter-corpus" placeholder="corpus" />
+      <input type="text" id="filter-source" placeholder="source" />
+      <input type="text" id="filter-rule" placeholder="rule" />
+      <select id="filter-status">
+        <option value="">any status</option>
+        <option value="new">new</option>
+        <option value="confirmed">confirmed</option>
+        <option value="rejected">rejected</option>
+        <option value="deferred">deferred</option>
+      </select>
+    </div>
+    <div class="layout">
+      <div class="card">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th><th>status</th><th>rule</th><th>source</th><th>file:line</th><th>seen</th><th>last</th>
+            </tr>
+          </thead>
+          <tbody id="findings-body"></tbody>
+        </table>
+        <p class="empty" id="findings-empty" hidden>No findings match the current filters.</p>
+      </div>
+      <div class="card detail" id="detail-pane">
+        <p class="empty">Select a finding to see its evidence and history.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="view" data-view="coverage">
+    <div class="toolbar">
+      <input type="text" id="coverage-corpus" placeholder="corpus" />
+    </div>
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>source</th><th>sha</th><th>rule</th><th>units started</th><th>units completed</th>
+            <th>findings</th><th>exclusions</th><th>last activity</th>
+          </tr>
+        </thead>
+        <tbody id="coverage-body"></tbody>
+      </table>
+      <p class="empty" id="coverage-empty" hidden>No coverage recorded yet.</p>
+    </div>
+  </section>
+
+  <section class="view" data-view="missions">
+    <div class="toolbar">
+      <input type="text" id="missions-corpus" placeholder="corpus" />
+    </div>
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th>mission</th><th>first seen</th><th>last seen</th><th>units completed</th><th>findings</th></tr>
+        </thead>
+        <tbody id="missions-body"></tbody>
+      </table>
+      <p class="empty" id="missions-empty" hidden>No mission activity recorded yet.</p>
+    </div>
+  </section>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  var STATUSES = ['new', 'confirmed', 'rejected', 'deferred'];
+  var state = { selectedId: null, findings: [] };
+
+  function qs(id) { return document.getElementById(id); }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function fetchJson(url, opts) {
+    return fetch(url, opts).then(function (res) {
+      return res.json().then(function (body) {
+        if (!res.ok) throw new Error((body && body.error) || ('request failed: ' + res.status));
+        return body;
+      });
+    });
+  }
+
+  function buildQuery(params) {
+    var usp = new URLSearchParams();
+    Object.keys(params).forEach(function (k) {
+      var v = params[k];
+      if (v !== undefined && v !== null && v !== '') usp.set(k, v);
+    });
+    var s = usp.toString();
+    return s ? '?' + s : '';
+  }
+
+  // --- tab switching -----------------------------------------------------
+
+  function activateView(name) {
+    document.querySelectorAll('.view').forEach(function (el) {
+      el.dataset.active = String(el.dataset.view === name);
+    });
+    document.querySelectorAll('#tabs button').forEach(function (btn) {
+      btn.setAttribute('aria-current', String(btn.dataset.view === name));
+    });
+    if (name === 'findings') loadFindings();
+    if (name === 'coverage') loadCoverage();
+    if (name === 'missions') loadMissions();
+  }
+
+  qs('tabs').addEventListener('click', function (ev) {
+    var btn = ev.target.closest('button[data-view]');
+    if (!btn) return;
+    activateView(btn.dataset.view);
+  });
+
+  // --- findings view -------------------------------------------------------
+
+  function currentFilters() {
+    return {
+      q: qs('q').value.trim(),
+      corpus: qs('filter-corpus').value.trim(),
+      source: qs('filter-source').value.trim(),
+      rule: qs('filter-rule').value.trim(),
+      status: qs('filter-status').value,
+    };
+  }
+
+  function renderFindingsTable(items) {
+    var body = qs('findings-body');
+    body.innerHTML = '';
+    qs('findings-empty').hidden = items.length !== 0;
+    items.forEach(function (f, idx) {
+      var tr = document.createElement('tr');
+      tr.dataset.id = String(f.id);
+      tr.setAttribute('aria-selected', String(f.id === state.selectedId));
+      tr.innerHTML =
+        '<td>' + (idx + 1) + '</td>' +
+        '<td><span class="status-pill status-' + escapeHtml(f.status) + '">' + escapeHtml(f.status) + '</span></td>' +
+        '<td>' + escapeHtml(f.rule) + '</td>' +
+        '<td>' + escapeHtml(f.source) + '</td>' +
+        '<td>' + escapeHtml(f.file) + ':' + escapeHtml(f.line) + '</td>' +
+        '<td>' + escapeHtml(f.times_seen) + '</td>' +
+        '<td>' + escapeHtml(f.last_seen) + '</td>';
+      body.appendChild(tr);
+    });
+  }
+
+  function loadFindings() {
+    fetchJson('/findings' + buildQuery(currentFilters()))
+      .then(function (data) {
+        state.findings = data.items;
+        renderFindingsTable(data.items);
+      })
+      .catch(function (err) {
+        qs('detail-pane').innerHTML = '<p class="empty">' + escapeHtml(err.message) + '</p>';
+      });
+  }
+
+  ['q', 'filter-corpus', 'filter-source', 'filter-rule', 'filter-status'].forEach(function (id) {
+    qs(id).addEventListener('input', debounce(loadFindings, 200));
+    qs(id).addEventListener('change', loadFindings);
+  });
+
+  function debounce(fn, ms) {
+    var t = null;
+    return function () {
+      clearTimeout(t);
+      t = setTimeout(fn, ms);
+    };
+  }
+
+  qs('findings-body').addEventListener('click', function (ev) {
+    var tr = ev.target.closest('tr[data-id]');
+    if (!tr) return;
+    selectFinding(Number(tr.dataset.id));
+  });
+
+  function selectFinding(id) {
+    state.selectedId = id;
+    document.querySelectorAll('#findings-body tr').forEach(function (tr) {
+      tr.setAttribute('aria-selected', String(Number(tr.dataset.id) === id));
+    });
+    fetchJson('/findings/' + id).then(renderDetail).catch(function (err) {
+      qs('detail-pane').innerHTML = '<p class="empty">' + escapeHtml(err.message) + '</p>';
+    });
+  }
+
+  function contextWithHighlight(finding) {
+    var lines = String(finding.context || '').split('\n');
+    var start = finding.context_start || 1;
+    return lines
+      .map(function (line, idx) {
+        var lineNo = start + idx;
+        var isCited = lineNo === finding.line;
+        var text = escapeHtml(lineNo) + '  ' + escapeHtml(line);
+        return isCited ? '<span class="cited-line">' + text + '</span>' : text;
+      })
+      .join('\n');
+  }
+
+  function renderDetail(finding) {
+    var pane = qs('detail-pane');
+    var sightingsHtml = finding.sightings
+      .map(function (s) {
+        return (
+          '<li>' +
+          escapeHtml(s.ts || '') + ' &middot; mission ' + escapeHtml(s.mission_id || 'n/a') +
+          ' &middot; sha ' + escapeHtml((s.sha || '').slice(0, 12)) +
+          ' &middot; unit ' + escapeHtml(s.unit || 'n/a') +
+          ' &middot; session ' + escapeHtml(s.session_id || 'n/a') +
+          '</li>'
+        );
+      })
+      .join('');
+
+    pane.innerHTML =
+      '<h2>' + escapeHtml(finding.file) + ':' + escapeHtml(finding.line) + '</h2>' +
+      '<div class="meta">' + escapeHtml(finding.rule) + ' &middot; ' + escapeHtml(finding.source) +
+      ' &middot; ' + escapeHtml(finding.corpus) + ' &middot; seen ' + escapeHtml(finding.times_seen) + '&times;</div>' +
+      '<div class="field-label">why</div><p>' + escapeHtml(finding.why || '—') + '</p>' +
+      '<div class="field-label">context</div><pre class="context">' + contextWithHighlight(finding) + '</pre>' +
+      '<div class="field-label">status</div>' +
+      '<div class="status-buttons" id="status-buttons"></div>' +
+      '<div class="field-label">note</div>' +
+      '<textarea id="note-field">' + escapeHtml(finding.note || '') + '</textarea>' +
+      '<div class="save-row"><span class="save-status" id="save-status"></span><button type="button" id="save-note">Save</button></div>' +
+      '<div class="field-label">sightings (' + finding.sightings.length + ')</div>' +
+      '<ul class="sightings">' + sightingsHtml + '</ul>';
+
+    var statusButtons = qs('status-buttons');
+    STATUSES.forEach(function (s) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = s;
+      btn.setAttribute('aria-pressed', String(s === finding.status));
+      btn.addEventListener('click', function () {
+        patchFinding(finding.id, { status: s });
+      });
+      statusButtons.appendChild(btn);
+    });
+
+    qs('save-note').addEventListener('click', function () {
+      patchFinding(finding.id, { note: qs('note-field').value });
+    });
+  }
+
+  function patchFinding(id, body) {
+    var status = qs('save-status');
+    if (status) status.textContent = 'saving…';
+    fetchJson('/findings/' + id, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+      .then(function (finding) {
+        renderDetail(finding);
+        var saved = qs('save-status');
+        if (saved) saved.textContent = 'saved';
+        loadFindings();
+      })
+      .catch(function (err) {
+        var failed = qs('save-status');
+        if (failed) failed.textContent = err.message;
+      });
+  }
+
+  // --- coverage view -------------------------------------------------------
+
+  function renderCoverage(items) {
+    var body = qs('coverage-body');
+    body.innerHTML = '';
+    qs('coverage-empty').hidden = items.length !== 0;
+    var bySource = {};
+    items.forEach(function (row) {
+      (bySource[row.source] = bySource[row.source] || []).push(row);
+    });
+    Object.keys(bySource)
+      .sort()
+      .forEach(function (source) {
+        bySource[source].forEach(function (row) {
+          var tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td>' + escapeHtml(row.source) + '</td>' +
+            '<td>' + escapeHtml((row.sha || '').slice(0, 12)) + '</td>' +
+            '<td>' + escapeHtml(row.rule) + '</td>' +
+            '<td>' + escapeHtml(row.units_started) + '</td>' +
+            '<td>' + escapeHtml(row.units_completed) + '</td>' +
+            '<td>' + escapeHtml(row.findings) + '</td>' +
+            '<td>' + escapeHtml(row.exclusions) + '</td>' +
+            '<td>' + escapeHtml(row.last_activity) + '</td>';
+          body.appendChild(tr);
+        });
+      });
+  }
+
+  function loadCoverage() {
+    fetchJson('/coverage' + buildQuery({ corpus: qs('coverage-corpus').value.trim() })).then(renderCoverage);
+  }
+  qs('coverage-corpus').addEventListener('input', debounce(loadCoverage, 200));
+
+  // --- missions view -------------------------------------------------------
+
+  function renderMissions(items) {
+    var body = qs('missions-body');
+    body.innerHTML = '';
+    qs('missions-empty').hidden = items.length !== 0;
+    items.forEach(function (m) {
+      var tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + escapeHtml(m.mission_id) + '</td>' +
+        '<td>' + escapeHtml(m.first_seen) + '</td>' +
+        '<td>' + escapeHtml(m.last_seen) + '</td>' +
+        '<td>' + escapeHtml(m.units_completed) + '</td>' +
+        '<td>' + escapeHtml(m.findings) + '</td>';
+      body.appendChild(tr);
+    });
+  }
+
+  function loadMissions() {
+    fetchJson('/missions' + buildQuery({ corpus: qs('missions-corpus').value.trim() })).then(renderMissions);
+  }
+  qs('missions-corpus').addEventListener('input', debounce(loadMissions, 200));
+
+  // --- boot ------------------------------------------------------------
+
+  loadFindings();
+})();
+</script>
