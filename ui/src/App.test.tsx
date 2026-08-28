@@ -916,7 +916,7 @@ describe("App", () => {
       fireEvent.click(screen.getByRole("button", { name: /^play$/i }));
       await waitFor(() => expect(screen.getByRole("slider")).toHaveValue("0"));
       expect(screen.getByRole("button", { name: /^pause$/i })).toBeInTheDocument();
-      await vi.advanceTimersByTimeAsync(1500);
+      await vi.advanceTimersByTimeAsync(400); // the fixture day is one hour; at 1h/s it is over in one real second
       const mid = Number(screen.getByRole("slider").getAttribute("value"));
       expect(mid).toBeGreaterThan(0);
       expect(mid).toBeLessThan(100);
