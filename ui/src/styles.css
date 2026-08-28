@@ -2503,11 +2503,10 @@ body {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
-.scrub button.primary {
-  background: var(--accent);
-  color: var(--bg);
-  border-color: var(--accent);
-}
+/* (operator, 2026-08-28) Play/pause is styled like the other transport
+   controls: the filled accent slab made it a different kind of object from
+   the rewind and speed buttons beside it. The `primary` class stays as the
+   e2e selector (`.scrub button.primary`); it no longer carries a look. */
 /* The icon buttons are fixed squares with the path flex-centered, so the
    rewind and play/pause controls are the same size and their marks sit in
    the same place (see `Scrubber.tsx` for why text glyphs could not). */
