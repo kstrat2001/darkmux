@@ -7,6 +7,7 @@
 //! atomically prepends a schema header so partial-file recovery is possible.
 
 pub mod daemon_probe;
+pub mod hooks;
 pub mod presence;
 pub mod presence_reconciler;
 pub mod session_presence;
@@ -1278,6 +1279,39 @@ fn build_default_sink() -> Arc<dyn FlowSink> {
             Err(e) => {
                 eprintln!(
                     "flow: Redis sink construction failed ({e:#}); continuing without it. \
+                     Other sinks intact."
+                );
+            }
+        }
+    }
+
+    // (#2093) Hooks — composed AFTER Redis, against the sinks accumulated
+    // so far (never against itself). `hook.fired`/`hook.failed` records
+    // land in that snapshot tee, so they reach the durable + coordination
+    // substrate without any self-referential `Arc` at construction time —
+    // the module's own `hook.*` loop guard is what makes even a literal
+    // self-reference safe, but this ordering doesn't lean on that as the
+    // only defense.
+    if darkmux_types::config_access::hooks_enabled() {
+        let rules = darkmux_types::config_access::hooks_rules();
+        let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
+        let report_sink: Arc<dyn FlowSink> = if sinks.len() == 1 {
+            sinks[0].clone()
+        } else {
+            Arc::new(TeeSink::new(sinks.clone()))
+        };
+        match hooks::HookSink::new(&rules, outbox_dir, report_sink) {
+            Ok(hook_sink) => {
+                eprintln!(
+                    "flow: Hooks sink enabled — {} rule(s), outbox={}",
+                    rules.len(),
+                    hook_sink.outbox_dir().display()
+                );
+                sinks.push(Arc::new(hook_sink));
+            }
+            Err(e) => {
+                eprintln!(
+                    "flow: Hooks sink construction failed ({e:#}); continuing without it. \
                      Other sinks intact."
                 );
             }
@@ -2586,9 +2620,10 @@ mod tests {
         //           `ok: true`. A defect correction — the field always
         //           documented itself as tool-success — but a boundary for
         //           any series aggregating `ok` across it. See schema.rs.
-        //   1.23.0: RESERVED for `hook.*` (#2093), landing on a sibling
-        //           branch — see schema.rs's version history for the merge
-        //           note.
+        //   1.23.0: new action values `hook.fired`/`hook.failed` (#2093) —
+        //           `HookSink`'s own firing/failure records. No struct/enum
+        //           change; older readers ignore the two new action values.
+        //           See schema.rs's fuller changelog entry.
         //   1.24.0: new `crawl.*` action family for `darkmux mission
         //           launch crawl` (#1959 packet 2). See schema.rs.
         //   1.25.0: added `turn_delay_ms` on `dispatch.start` and
@@ -2740,6 +2775,31 @@ mod tests {
         let (kinds, composition) = summarize_sink(&info);
         assert_eq!(kinds, vec!["LocalFile", "Redis"]);
         assert_eq!(composition, "Tee([LocalFile, Redis])");
+    }
+
+    /// (#2093) `build_default_sink()` composes a `HookSink` after Redis when
+    /// `DARKMUX_HOOKS_ENABLED` is truthy. Zero configured rules (the
+    /// test-build config tier is empty by construction — see #811) means
+    /// `HookSink::new` never touches disk beyond spawning its idle drainer
+    /// thread, so this is safe to run without a real outbox dir.
+    #[serial_test::serial]
+    #[test]
+    fn build_default_sink_composes_hooks_when_enabled() {
+        isolate_test_env_once();
+        let prev = std::env::var("DARKMUX_HOOKS_ENABLED").ok();
+        unsafe { std::env::set_var("DARKMUX_HOOKS_ENABLED", "true"); }
+
+        let sink = build_default_sink();
+        let (kinds, _composition) = summarize_sink(&sink.info());
+        assert!(kinds.contains(&"Hooks".to_string()), "kinds: {kinds:?}");
+        assert!(kinds.contains(&"LocalFile".to_string()), "LocalFile stays present alongside Hooks");
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_ENABLED"),
+            }
+        }
     }
 
     #[test]

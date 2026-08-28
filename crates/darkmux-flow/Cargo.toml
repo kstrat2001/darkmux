@@ -33,6 +33,12 @@ darkmux-hardware = { path = "../darkmux-hardware" }
 # #661 — config accessors (env > config.json > default). The one new edge in
 # the dep graph; darkmux-types is the leaf (no darkmux-* deps), so no cycle.
 darkmux-types = { path = "../darkmux-types" }
+# #2093 — HookSink's drainer POSTs a matching flow record to a loopback
+# receiver. Already a workspace dependency (the root crate's `fleet_cli.rs`
+# GET path); this is the same client, now also linked into this crate for
+# the write side. `default-features = false` matches the root crate's own
+# usage — HTTP/1.1 POST + timeouts is all this needs, no TLS/gzip surface.
+ureq = { version = "2.10", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.10"
