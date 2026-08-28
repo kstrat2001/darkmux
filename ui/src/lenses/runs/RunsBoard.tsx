@@ -4,11 +4,11 @@ import { fetchJson } from "../../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../../lib/queryKeys";
 import { canonicalHash, writeHash } from "../../lib/hashSync";
 import { missionGraphReachable } from "../../lib/injectedMeta";
-import { isStaticBuild, resolveLabRunsSrc, resolveRunsSrc } from "../../lib/staticSource";
+import { isStaticBuild, resolveLabRunsSrc, resolveRunsSrc, staticFlowSrc } from "../../lib/staticSource";
 import { RUNS_KINDS, type RunsKind } from "../../lib/route";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
-import { machineNames, nameOf } from "../../lib/flow";
+import { fetchStaticFlowRecords, machineNames, nameOf } from "../../lib/flow";
 import { LabRunDetail } from "./LabRunDetail";
 import type { RunsResponse, LabRunsResponse, LabRun } from "../../types/handwritten";
 import type { Run } from "../../types/generated/Run";
@@ -406,6 +406,39 @@ export function RunsBoard({
   const flowWindow = useFlowWindow(nowMs);
   const liveMachines = useLiveMachines(daemonBacked);
 
+  // (#2063) On a daemon-less static build BOTH of the above are gated off
+  // (nothing to fetch), which left a machine pin with an EMPTY alias set:
+  // every fleet-card drill-in on darkmux.com/demo landed on "no runs
+  // recorded yet" while the unpinned board listed the same rows. There the
+  // uid -> name mapping has to come from the committed flow file itself —
+  // the same `queryKeys.staticFlowSrc` slot `useRouteRecords`/the playback
+  // lens already fill, so this is cache reuse, not a second download.
+  //
+  // Deliberately NOT routed through `useFlowWindow` (making it read the
+  // static file on a static build): that window is "the last 24h by the
+  // VIEWER's clock", the right shape for a live daemon and the wrong one
+  // for an identity mapping over a fixture whose timestamps are frozen at
+  // export time — it would resolve on deploy day and decay empty after.
+  // The alias set is not time-scoped; the whole file is the source.
+  //
+  // Read RAW (no `normalizeRecords`) on purpose: only `machine_uid` /
+  // `machine_id` are consulted, and the schema-header line the normalizer
+  // drops carries neither. Fetched only while a pin needs it — the demo's
+  // file is megabytes, and an unpinned board never reads a record of it.
+  const flowSrc = daemonBacked ? null : staticFlowSrc();
+  const staticPinFetch = flowSrc !== null && machineUid !== null;
+  const staticFlowQuery = useQuery({
+    queryKey: queryKeys.staticFlowSrc(flowSrc ?? ""),
+    queryFn: () => fetchStaticFlowRecords(flowSrc ?? ""),
+    enabled: staticPinFetch,
+  });
+  const pinRecords = daemonBacked ? flowWindow.data : (staticFlowQuery.data ?? []);
+  // Loading is not "empty": until the file lands, an empty alias set would
+  // render the pre-#2063 symptom as a flash ("no runs recorded yet" under a
+  // raw-uid chip) for as long as the download takes. Folded into the
+  // pending branch below.
+  const staticPinPending = staticPinFetch && staticFlowQuery.data === undefined;
+
   // The lab-run detail pane is its own top-level render, reached without
   // waiting on the two queries above and independent of `kind` (see
   // `labRunDir`'s own doc above for why it isn't gated to kind==="lab").
@@ -413,8 +446,9 @@ export function RunsBoard({
     return <LabRunDetail dir={labRunDir} onBack={closeLabRun} onUnresolvable={onLabRunUnresolvable} />;
   }
 
-  // Pending: neither query has resolved yet (matches `RUNS_LOADED===null`).
-  if (!runsQuery.data || !labRunsQuery.data) {
+  // Pending: neither query has resolved yet (matches `RUNS_LOADED===null`),
+  // or (#2063) a static-build pin is still waiting on its alias source.
+  if (!runsQuery.data || !labRunsQuery.data || staticPinPending) {
     return (
       <div data-state="pending" role="status" aria-label="Loading runs">
         <div className="stagehdr">runs</div>
@@ -435,8 +469,8 @@ export function RunsBoard({
   // re-deriving its own filter — see `format.ts::runsForMachine`'s own doc
   // for the alias-matching rationale and the "50 missions + 15 dispatches
   // carry no machine at all" exclusion it names.
-  const pinnedMachineName = machineUid != null ? nameOf(flowWindow.data, liveMachines, machineUid) : null;
-  const scopedRuns = machineUid != null ? runsForMachine(runs, machineNames(flowWindow.data, liveMachines, machineUid)) : runs;
+  const pinnedMachineName = machineUid != null ? nameOf(pinRecords, liveMachines, machineUid) : null;
+  const scopedRuns = machineUid != null ? runsForMachine(runs, machineNames(pinRecords, liveMachines, machineUid)) : runs;
   // `LabRun` (the `/lab/runs` series-view source) carries no machine field
   // at all (`crates/darkmux-serve/src/lib.rs::LabRunSummary` — verified,
   // not assumed) — bridged via the ONE field the two sources share: a lab
