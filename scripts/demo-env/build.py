@@ -237,6 +237,112 @@ def replay(source, plan, machine, now_ms, session_id):
     return out, start
 
 
+# --------------------------------------------------------- mission replay
+
+# Per-slug placement for an imported mission fixture (`missions/<slug>/`,
+# from `import_mission.py`) — where it sits on the fleet and how long ago it
+# finished, same idea as `REPLAYS`' `ends_ago_min`. A slug not listed here
+# gets `DEFAULT_MISSION_PLACEMENT`, so a freshly-imported mission with no
+# entry yet still materializes (no build break waiting on a config edit).
+MISSION_PLACEMENT = {
+    "demo-review-nameof-recency": dict(machine="m5-ultra-256gb", ends_ago_min=38),
+}
+DEFAULT_MISSION_PLACEMENT = dict(machine="m5-ultra-256gb", ends_ago_min=30)
+
+
+def _walk_ts_rel(obj):
+    """Every `*_ts_rel` value in a mission-fixture JSON object, recursively."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.endswith("_ts_rel") and isinstance(v, (int, float)) and not isinstance(v, bool):
+                yield v
+            yield from _walk_ts_rel(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_ts_rel(v)
+
+
+def _reanchor_ts_rel(obj, start_s):
+    """Invert `import_mission.py::rewrite_ts` — `*_ts_rel` -> `*_ts` at `start_s`.
+
+    The inverse of the SAME rename, not a re-derivation of it: every key
+    import_mission.py renamed `X_ts` -> `X_ts_rel` (dropping an absolute
+    epoch in favor of an offset from the mission's own start) gets renamed
+    back here, with the offset added to THIS build's `start_s` instead of
+    the original run's real start. Nothing in between ever holds a mixed
+    fixed/relative timestamp — the file on disk between import and build has
+    ONLY `_ts_rel` keys, and every JSON file written into the demo home has
+    ONLY `_ts` keys, by construction of this rename/derename pair.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k.endswith("_ts_rel") and isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[k[: -len("_rel")]] = start_s + int(v)
+            else:
+                out[k] = _reanchor_ts_rel(v, start_s)
+        return out
+    if isinstance(obj, list):
+        return [_reanchor_ts_rel(v, start_s) for v in obj]
+    return obj
+
+
+def materialize_mission(slug, plan, machine, home, now_ms):
+    """Write one imported mission fixture into the demo home + flow stream.
+
+    `missions/<slug>/` (from `import_mission.py`) holds the mission's
+    persisted Phase/Task/Step graph with every timestamp stored as a
+    `*_ts_rel` offset from the mission's own start, and `sessions/<slug>.jsonl`
+    holds its correlated flow records the same way (`t_ms`). Both get
+    anchored to ONE `start_s` here — never two independent anchors — so the
+    graph route's `startedTs`/`completedTs` and the replayed flow records'
+    `ts` agree on when the mission ran (`/mission/:id/graph.json` reads only
+    the directory; the runs board and SSE status layering read only the
+    records — the SAME wall-clock story has to reach both).
+
+    The mission MUST read as COMPLETE: `import_mission.py` already refuses
+    to import anything but a `"status": "finalized"` mission, so there is
+    nothing to force here — an in-flight-forever mission (#2032's defect) is
+    prevented at import time, not papered over at materialize time.
+    """
+    mdir = HERE / "missions" / slug
+    files = {}
+    for f in sorted(mdir.rglob("*.json")):
+        files[f.relative_to(mdir)] = json.loads(f.read_text())
+
+    span_s = max((v for obj in files.values() for v in _walk_ts_rel(obj)), default=0)
+    start_s = now_ms // 1000 - plan["ends_ago_min"] * 60 - span_s
+
+    # `home / "crew"`, NOT `home / "missions"` directly: `panel_env`/`serve.py`
+    # both pin `DARKMUX_CREW_DIR` at `<home>/crew` (the env var names the
+    # directory CONTAINING `missions/`/`phases/`/`roles/`/…, no extra nesting
+    # — see `darkmux-crew::loader::resolve_user_subdir`), so that is where
+    # `load_missions()` actually walks. Missing this the first time round
+    # made the graph route 404 with "no mission with id ... found" even
+    # though the files existed, just one directory level off from where the
+    # daemon was told to look.
+    out_dir = home / "crew" / "missions" / slug  # mission id == slug by import_mission.py's construction
+    for relpath, obj in files.items():
+        obj = _reanchor_ts_rel(obj, start_s)
+        p = out_dir / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
+
+    sess_path = HERE / "sessions" / f"{slug}.jsonl"
+    src = [json.loads(l) for l in sess_path.read_text().splitlines() if l.strip()]
+    start_ms = start_s * 1000
+    out_recs = []
+    for rec in src:
+        r = json.loads(json.dumps(rec))          # deep copy; nothing else reuses `src`
+        t = r.pop("t_ms")
+        r["ts"] = iso(start_ms + t)
+        r["machine_id"] = machine["id"]
+        r["machine_uid"] = machine["uid"]
+        out_recs.append(r)
+
+    return out_recs, start_s
+
+
 # ------------------------------------------------------------ canned panels
 
 def canned_machine_status(machine, ledger):
@@ -389,6 +495,21 @@ def main():
         minted.append((sid, plan))
         records.extend(recs)
 
+    # ---- imported mission(s) (#2032 Packet 1) ------------------------------
+    # Auto-discovered rather than a fixed list: a fresh `import_mission.py`
+    # run drops a new `missions/<slug>/` + `sessions/<slug>.jsonl` pair, and
+    # this picks it up with no second edit required. Absent entirely (no
+    # mission imported yet) is a normal, silent no-op — the rest of the demo
+    # world builds the same as before this packet.
+    missions_root = HERE / "missions"
+    mission_slugs = sorted(p.name for p in missions_root.iterdir() if p.is_dir()) \
+        if missions_root.exists() else []
+    for slug in mission_slugs:
+        plan = MISSION_PLACEMENT.get(slug, DEFAULT_MISSION_PLACEMENT)
+        machine = by_id[plan["machine"]]
+        mission_recs, _ = materialize_mission(slug, plan, machine, home, now_ms)
+        records.extend(mission_recs)
+
     # Presence: one `machine.online` per machine, recent enough that the fleet
     # lens shows all three as live. Same shape the presence reconciler emits.
     for m in world["machines"]:
@@ -446,6 +567,26 @@ def main():
         "hooks": {},
     }, indent=2) + "\n")
     (home / "audit").mkdir(exist_ok=True)
+
+    # ---- demo lab-fixture registry -----------------------------------------
+    # `lab fixture list` is a PASSTHROUGH panel (unlike `doctor`/`machine
+    # status`, it reads the demo home directly), so seeding it means the demo
+    # home needs a REAL `lab-registry.json` — without one it captures as "No
+    # registry at ..." (#2032). Run the real `register` verb rather than
+    # hand-writing the registry file: it computes a real content hash via
+    # `hash_sandbox_dir`, so this fixture's registry entry is exactly what an
+    # operator's own `dm lab fixture register` would produce, not a shape
+    # this code merely believes is right. `demo-tiny-py` is a repo-owned
+    # built-in fixture (`templates/builtin/lab-fixtures/demo-tiny-py`) —
+    # public darkmux content, already used by `scripts/lab-init.sh` for the
+    # SAME purpose on a real machine.
+    demo_fixture_dir = ROOT / "templates" / "builtin" / "lab-fixtures" / "demo-tiny-py"
+    reg = subprocess.run(
+        ["darkmux", "lab", "fixture", "register", str(demo_fixture_dir)],
+        env=panel_env(home), capture_output=True, text=True)
+    if reg.returncode != 0:
+        print(f"  ! lab fixture register failed ({reg.stderr.strip()}); "
+              f"`lab fixture list` will still say 'No registry'", file=sys.stderr)
 
     # ---- machine fixtures (one per machine; serve.py picks the hero) ------
     ledgers = {}
@@ -507,6 +648,12 @@ def main():
           f"(hero: {hero['id']}, {hero['ram_gb']} GB {hero['cpu_brand']})")
     print(f"  panels     {', '.join(sorted(p.stem for p in (fx / 'panel').glob('*.json')))} canned; "
           f"the rest render from the demo home")
+    if mission_slugs:
+        print(f"  missions   {', '.join(mission_slugs)} materialized under "
+              f"{home / 'crew' / 'missions'}")
+    else:
+        print(f"  missions   none imported yet — run ./import_mission.py <mission-id> "
+              f"first")
     print(f"\nnext:  ./serve.py")
 
 

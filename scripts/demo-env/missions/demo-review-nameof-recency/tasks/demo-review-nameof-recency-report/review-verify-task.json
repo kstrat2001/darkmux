@@ -1,0 +1,15 @@
+{
+  "depends_on": [],
+  "description": "verify \u2014 render frozen per-finding prompts, then adjudicate confirmed findings via the generic dispatch.map",
+  "display_name": "Verify",
+  "id": "review-verify-task",
+  "phase_id": "demo-review-nameof-recency-report",
+  "reads": [
+    "review-judge-task"
+  ],
+  "role_id": "review-verify",
+  "step_ids": [
+    "review-verify-render-step",
+    "review-verify-step"
+  ]
+}

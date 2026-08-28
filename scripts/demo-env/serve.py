@@ -20,6 +20,8 @@ import argparse, http.server, json, os, pathlib, re, signal, socket, subprocess,
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
+sys.path.insert(0, str(HERE))
+from lib_identity_scrub import scrub as _identity_scrub, FORBIDDEN  # noqa: E402
 
 MACHINE_ROUTES = {"/machine/specs": "specs", "/machine/resources": "resources",
                   "/machine/status": "status"}
@@ -106,25 +108,69 @@ def make_handler(inner, fx, hero, demo_uids, home):
             return None
 
         def _scrub_passthrough(self, data):
-            """Rewrite host paths in a PASSTHROUGH response.
+            """Rewrite identity carriers in a PASSTHROUGH response.
 
             The canned panels go through the importer's scrub at build time,
-            but a passthrough panel is rendered live by the daemon and never
-            saw it — `lab fixture list` printed the demo home's real absolute
-            path (`/Users/<you>/de-projects/.../screenshots/demo-home`) into a
-            frame headed for a public docs page. Scrubbing HERE covers every
-            passthrough panel, including ones added later, rather than
-            requiring each to be remembered.
+            but a passthrough panel is rendered LIVE by the daemon on THIS
+            machine and never saw it. Two real leaks were caught this way,
+            not by inspection: `lab fixture list` printed the demo home's
+            real absolute path (`/Users/<you>/de-projects/.../screenshots/
+            demo-home`) into a frame headed for a public docs page; once a
+            real mission existed for `mission-status` to link to (#2032
+            Packet 1), it rendered a deep-link URL through
+            `darkmux_doctor::viewer_link_base` — this MACHINE's real
+            Tailscale MagicDNS hostname (`http://macbook-pro.taild<...>.
+            ts.net/mission/.../graph`), not the demo's fictional one. Same
+            failure shape as the first leak (a probe-derived value, not
+            fixture content), so it gets the same fix: scrub every
+            passthrough, not just the one route that happened to be caught
+            first.
+
+            Reuses `lib_identity_scrub.scrub()` — the SAME rewrite
+            `import_session.py`/`import_mission.py` run at build time —
+            rather than a second hand-rolled pattern set that could drift
+            from it. `FORBIDDEN` is the live backstop: if a scrubbed panel
+            STILL carries a known identity pattern, the panel is replaced
+            with a placeholder rather than shipped dirty, mirroring
+            `build.py::canned_doctor`'s "omit rather than ship" rule for the
+            live path.
             """
             try:
                 text = data.decode()
             except UnicodeDecodeError:
                 return data
-            if str(home) not in text and "/Users/" not in text:
+            if str(home) not in text and "/Users/" not in text \
+                    and not any(p.search(text) for p, _ in FORBIDDEN):
                 return data
             text = text.replace(str(home), "/home/demo/.darkmux")
-            # Backstop for any other host path the daemon may print.
-            text = re.sub(r"/Users/[^/\"\s\\]+", "/home/demo", text)
+            text = _identity_scrub(text)
+            for pat, what in FORBIDDEN:
+                m = pat.search(text)
+                if m:
+                    print(f"  ! passthrough panel still carries {what} "
+                          f"({m.group(0)!r}) after scrub; panel body replaced "
+                          f"rather than shipped dirty", file=sys.stderr)
+                    # Every `/panel/*` response is `panel_payload`-shaped
+                    # (`panel`, `argv`, `ansi_text`, …) — the console pane
+                    # reads those fields directly, so withholding the panel
+                    # means blanking `ansi_text`/`stderr_tail` IN that shape,
+                    # not swapping in an unrelated object the pane cannot
+                    # render at all.
+                    try:
+                        payload = json.loads(text)
+                        payload["ansi_text"] = (
+                            "panel content withheld: identity scrub could not "
+                            "clear it for the demo world"
+                        )
+                        payload["stderr_tail"] = ""
+                        return json.dumps(payload).encode()
+                    except (json.JSONDecodeError, TypeError):
+                        return json.dumps({
+                            "panel": "unknown", "argv": [], "opts": {},
+                            "ansi_text": "panel content withheld: identity scrub "
+                                         "could not clear it for the demo world",
+                            "stderr_tail": "", "exit_code": 1,
+                        }).encode()
             return text.encode()
 
         def _filter_flow(self, data):

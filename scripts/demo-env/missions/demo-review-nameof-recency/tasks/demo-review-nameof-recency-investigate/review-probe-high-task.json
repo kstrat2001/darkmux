@@ -1,0 +1,14 @@
+{
+  "depends_on": [
+    "review-bundle-task"
+  ],
+  "description": "probe role `review-probe-high` \u2014 one role, one task (#1512); parallelism with the other two probe tasks is emergent from all three depending only on review-bundle-task",
+  "display_name": "Probe high",
+  "id": "review-probe-high-task",
+  "phase_id": "demo-review-nameof-recency-investigate",
+  "role_id": "review-probe-high",
+  "step_ids": [
+    "review-probe-high-render-step",
+    "review-probe-high-step"
+  ]
+}

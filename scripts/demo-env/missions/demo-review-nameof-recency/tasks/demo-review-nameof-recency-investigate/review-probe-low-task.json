@@ -1,0 +1,14 @@
+{
+  "depends_on": [
+    "review-bundle-task"
+  ],
+  "description": "probe role `review-probe-low` \u2014 one role, one task (#1512)",
+  "display_name": "Probe low",
+  "id": "review-probe-low-task",
+  "phase_id": "demo-review-nameof-recency-investigate",
+  "role_id": "review-probe-low",
+  "step_ids": [
+    "review-probe-low-render-step",
+    "review-probe-low-step"
+  ]
+}

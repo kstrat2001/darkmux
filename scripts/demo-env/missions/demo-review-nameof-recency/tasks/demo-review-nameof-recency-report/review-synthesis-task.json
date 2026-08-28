@@ -1,0 +1,16 @@
+{
+  "depends_on": [
+    "review-verify-task"
+  ],
+  "description": "synthesis \u2014 apply verify adjudications, finalize tier counts + needs-check clustering",
+  "display_name": "Synthesis",
+  "id": "review-synthesis-task",
+  "phase_id": "demo-review-nameof-recency-report",
+  "reads": [
+    "review-dedup-task",
+    "review-judge-task"
+  ],
+  "step_ids": [
+    "review-synthesis-step"
+  ]
+}
