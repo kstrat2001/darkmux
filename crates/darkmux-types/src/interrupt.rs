@@ -70,6 +70,31 @@ pub fn is_set() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
 }
 
+/// Test-only: deliver a simulated SIGINT without installing a real signal
+/// handler or sending a real OS signal — calls the internal handler
+/// directly, exercising the exact same code path a real Ctrl-C would.
+/// Gated the same way `darkmux-types`'s other test-support hooks are
+/// (`cfg(any(test, feature = "test-support"))`, e.g. `paths.rs`/`config_
+/// access.rs`) — unreachable from any production build. A caller in
+/// ANOTHER crate (e.g. `darkmux`'s own `crawl_launch` tests, which can't
+/// see the private `on_sigint` fn directly) enables the `test-support`
+/// feature on its dev-dependency to reach this.
+#[cfg(any(test, feature = "test-support"))]
+pub fn simulate_sigint_for_test() {
+    on_sigint(libc::SIGINT);
+}
+
+/// Test-only: reset both the flag and the signal count back to their
+/// pre-[`install`] state. `is_set` never resets in production (see the
+/// module doc) — a caller using [`simulate_sigint_for_test`] needs its own
+/// way to keep back-to-back tests in the SAME process from contaminating
+/// each other via this process-wide flag.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_for_test() {
+    INTERRUPTED.store(false, Ordering::SeqCst);
+    SIGINT_COUNT.store(0, Ordering::SeqCst);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

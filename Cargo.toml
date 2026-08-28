@@ -100,6 +100,11 @@ agent-client-protocol = "2.0.0"
 # binary's test build. Feature-unification turns this on only for tests/
 # examples/benches, not for a plain `cargo build` of the release binary.
 darkmux-flow = { path = "crates/darkmux-flow", features = ["test-support"] }
+# (round-3 CONSIDER 7) enable `interrupt::simulate_sigint_for_test` /
+# `reset_for_test` for the binary's test build — `crawl_launch_tests.rs`
+# needs to simulate a SIGINT arriving mid-dispatch without sending a real
+# OS signal. Mirrors the `darkmux-flow` entry above exactly.
+darkmux-types = { path = "crates/darkmux-types", features = ["test-support"] }
 tempfile = "3.10"
 assert_cmd = "2.0"
 tower = "0.5"

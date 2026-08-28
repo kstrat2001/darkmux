@@ -547,11 +547,23 @@ impl Drop for CrawlFinalizeGuard<'_> {
             return;
         }
         self.stats.borrow_mut().stopped_by = "error";
-        // Best-effort, same as every other lifecycle call in this module
-        // (`let _ = ...`): a `Drop` can't propagate a `Result`, and this
-        // guard IS the last-resort finalize — there's nowhere further to
-        // report a failure to.
-        let _ = finalize_crawl(self.stats, &self.ctx);
+        // Best-effort, same as every other lifecycle call in this module: a
+        // `Drop` can't propagate a `Result`, and this guard IS the last-
+        // resort finalize — there's nowhere further to report a failure
+        // to. (CONSIDER 4) Not a silent `let _ = ...` though: the table
+        // above already reached the operator regardless, but a swallowed
+        // envelope-write failure here would otherwise leave NO trace at
+        // all that the write itself never landed — name the path so it's
+        // at least visible on stderr.
+        if let Err(e) = finalize_crawl(self.stats, &self.ctx) {
+            eprintln!(
+                "{}",
+                style::warn(&format!(
+                    "darkmux mission launch crawl: finalize on the abort path failed writing {} — {e:#}",
+                    self.ctx.runs_dir.join("envelope.json").display()
+                ))
+            );
+        }
     }
 }
 
@@ -559,7 +571,7 @@ impl Drop for CrawlFinalizeGuard<'_> {
 /// ([`CrawlFinalizeGuard::close`]) and the abort path
 /// ([`CrawlFinalizeGuard`]'s `Drop`): transitions the phase to its correct
 /// terminal (finding 3), closes the mission, emits `crawl.mission.
-/// completed`, writes the envelope, and prints the summary table.
+/// completed`, prints the summary table, and writes the envelope.
 fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32> {
     let s = stats.borrow();
 
@@ -626,14 +638,13 @@ fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32>
         s.first_model.as_deref(),
     ));
 
-    let mut envelope = summary.clone();
-    if let Some(obj) = envelope.as_object_mut() {
-        obj.insert("units".to_string(), json!(s.per_unit_rows));
-    }
-    let envelope_path = ctx.runs_dir.join("envelope.json");
-    std::fs::write(&envelope_path, serde_json::to_string_pretty(&envelope)?)
-        .with_context(|| format!("writing {}", envelope_path.display()))?;
-
+    // (CONSIDER 4) Printed BEFORE the envelope write below, not after: the
+    // Drop path's `let _ = finalize_crawl(...)` swallows this function's
+    // `Result`, so an envelope-write failure used to mean the operator saw
+    // NEITHER the table nor a written envelope — the one signal that
+    // finalize even ran at all was silently lost. Printing first means the
+    // table always reaches the operator, even when the write after it
+    // fails.
     print_summary_table(
         &ctx.mission_id,
         &ctx.corpus_name,
@@ -647,6 +658,14 @@ fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32>
         s.stopped_by,
         &ctx.ledger_path,
     );
+
+    let mut envelope = summary.clone();
+    if let Some(obj) = envelope.as_object_mut() {
+        obj.insert("units".to_string(), json!(s.per_unit_rows));
+    }
+    let envelope_path = ctx.runs_dir.join("envelope.json");
+    std::fs::write(&envelope_path, serde_json::to_string_pretty(&envelope)?)
+        .with_context(|| format!("writing {}", envelope_path.display()))?;
 
     Ok(match s.stopped_by {
         "kill_file" => 3,
@@ -718,43 +737,6 @@ pub(crate) fn run(
                 eprintln!("{}", style::warn(&format!("darkmux mission launch crawl: plan {} — {w}", pp.display())));
             }
 
-            for ps in &loaded_plan.sources {
-                let Some(rs) = resolved_sources.iter().find(|r| r.id == ps.id) else {
-                    bail!(
-                        "darkmux mission launch crawl: plan {} names source '{}', which the corpus \
-                         manifest no longer declares — re-run `darkmux crawl plan` against the current \
-                         manifest and pass the fresh plan.json",
-                        pp.display(),
-                        ps.id
-                    );
-                };
-                if rs.sha != ps.sha {
-                    bail!(
-                        "darkmux mission launch crawl: source '{}' has moved since {} was written \
-                         (plan sha {}, resolved tree sha {}) — re-run `darkmux crawl plan` and pass the \
-                         fresh plan.json, or omit --param plan to plan fresh",
-                        ps.id,
-                        pp.display(),
-                        ps.sha,
-                        rs.sha
-                    );
-                }
-                // (#1959 merge-gate finding 6c) Same tree the sha already
-                // vouches for, checked directly — a sha match with a
-                // relocated tree path would still dispatch against the
-                // wrong on-disk directory.
-                if rs.tree != ps.tree {
-                    bail!(
-                        "darkmux mission launch crawl: source '{}' resolves to a different tree \
-                         than plan {} recorded ({} vs {}) — re-run `darkmux crawl plan` and pass \
-                         the fresh plan.json, or omit --param plan to plan fresh",
-                        ps.id,
-                        pp.display(),
-                        ps.tree.display(),
-                        rs.tree.display()
-                    );
-                }
-            }
             loaded_plan
         }
         None => plan::plan(&manifest, &rules_vec, &resolved_sources)
@@ -767,7 +749,7 @@ pub(crate) fn run(
     //    mission (#1959 merge-gate finding 1a). A stale `--param plan=`
     //    file can name a rule id the CURRENT `--param corpus=` manifest no
     //    longer declares (renamed/removed since the plan was written) —
-    //    the sha check above catches a moved SOURCE tree, but says nothing
+    //    the sha check below catches a moved SOURCE tree, but says nothing
     //    about the manifest's `rules` list drifting. Bailing here, before
     //    any Mission/Phase/Task/Step record exists, means an operator who
     //    hits this never has a stranded mission to clean up.
@@ -780,6 +762,64 @@ pub(crate) fn run(
                      `darkmux crawl plan` for this manifest, or drop `--param plan=` to plan \
                      fresh",
                     u.id()
+                );
+            }
+        }
+    }
+
+    // ── validate every selected unit's SOURCE resolves BEFORE minting a
+    //    mission (#1959 merge-gate finding 3). Driven from the sources the
+    //    SELECTED UNITS actually name — not from `plan.sources` — because a
+    //    plan whose `sources` list is empty (or simply missing an entry a
+    //    unit references) would otherwise sail through unvalidated: the
+    //    per-unit dispatch loop's `the_plan.sources.iter().find(...)`
+    //    falls back to an empty sha (`.unwrap_or_default()`), and every
+    //    `crawl.*` record / ledger line for that unit would silently carry
+    //    `sha: ""` with no signal anything was ever wrong. Only a LOADED
+    //    plan (`--param plan=`) can go stale between planning and launch —
+    //    a freshly-built plan's `sources` are the resolved sources by
+    //    construction, so the sha/tree freshness half only applies there.
+    for u in &selected {
+        let source_id = unit_source(u);
+        let Some(ps) = the_plan.sources.iter().find(|s| s.id == source_id) else {
+            bail!(
+                "darkmux mission launch crawl: unit `{}` names source `{source_id}`, which the \
+                 plan's `sources` list does not declare — re-run `darkmux crawl plan` for this \
+                 manifest, or drop `--param plan=` to plan fresh",
+                u.id()
+            );
+        };
+        if let Some(pp) = &plan_path {
+            let Some(rs) = resolved_sources.iter().find(|r| r.id == source_id) else {
+                bail!(
+                    "darkmux mission launch crawl: plan {} names source '{source_id}', which the \
+                     corpus manifest no longer declares — re-run `darkmux crawl plan` against the \
+                     current manifest and pass the fresh plan.json",
+                    pp.display()
+                );
+            };
+            if rs.sha != ps.sha {
+                bail!(
+                    "darkmux mission launch crawl: source '{source_id}' has moved since {} was \
+                     written (plan sha {}, resolved tree sha {}) — re-run `darkmux crawl plan` and \
+                     pass the fresh plan.json, or omit --param plan to plan fresh",
+                    pp.display(),
+                    ps.sha,
+                    rs.sha
+                );
+            }
+            // (#1959 merge-gate finding 6c) Same tree the sha already
+            // vouches for, checked directly — a sha match with a
+            // relocated tree path would still dispatch against the
+            // wrong on-disk directory.
+            if rs.tree != ps.tree {
+                bail!(
+                    "darkmux mission launch crawl: source '{source_id}' resolves to a different \
+                     tree than plan {} recorded ({} vs {}) — re-run `darkmux crawl plan` and pass \
+                     the fresh plan.json, or omit --param plan to plan fresh",
+                    pp.display(),
+                    ps.tree.display(),
+                    rs.tree.display()
                 );
             }
         }
@@ -805,6 +845,15 @@ pub(crate) fn run(
     let phase_id = format!("{mission_id}-crawl");
     let now = now_unix();
 
+    // ── kill file / per-run artifact directory (path only — the actual
+    //    `create_dir_all` is the LAST fallible call in the guarded mint
+    //    window below, since it's the last thing the original code did
+    //    before the per-unit loop started) ────────────────────────────
+    let root = manifest.resolved_root();
+    let kill_file = root.join("STOP");
+    let runs_dir = root.join("runs").join(&mission_id);
+    let ledger_path = runs_dir.join("ledger.jsonl");
+
     let spec = MissionSpec {
         config_id: "crawl".to_string(),
         inputs_fingerprint: mission_launch::spec_fingerprint(collected)?,
@@ -825,91 +874,6 @@ pub(crate) fn run(
     };
     crew::lifecycle::save_mission(&mission).context("persisting mission.json")?;
 
-    let tree_root = manifest.resolved_root().join("tree");
-    let phase = Phase {
-        id: phase_id.clone(),
-        mission_id: mission_id.clone(),
-        description: format!("Sequential crawl of {} unit(s) across {} source(s)", selected.len(), the_plan.sources.len()),
-        display_name: Some("Crawl".to_string()),
-        status: PhaseStatus::Planned,
-        created_ts: now,
-        started_ts: None,
-        completed_ts: None,
-        abandoned_ts: None,
-        task_ids: Vec::new(),
-    };
-    crew::lifecycle::save_phase(&phase).context("persisting phase")?;
-
-    // ── group selected units into Tasks by (source, rule); one Step per
-    //    unit, in plan order, so `mission status` / the viewer show real
-    //    structure instead of one flat task per unit ──────────────────
-    let mut groups: Vec<TaskGroup> = Vec::new();
-    let mut group_index: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for (i, u) in selected.iter().enumerate() {
-        let key = group_key(u);
-        let gi = *group_index.entry(key.clone()).or_insert_with(|| {
-            let idx = groups.len();
-            groups.push(TaskGroup {
-                id: format!("{phase_id}-task-{:03}", idx + 1),
-                source: key.0.clone(),
-                rules_label: key.1.clone(),
-                unit_indices: Vec::new(),
-            });
-            idx
-        });
-        groups[gi].unit_indices.push(i);
-    }
-
-    let mut step_id_by_index: Vec<String> = vec![String::new(); selected.len()];
-    let mut task_ids: Vec<String> = Vec::new();
-    for g in &groups {
-        let mut step_ids_for_task: Vec<String> = Vec::new();
-        for &i in &g.unit_indices {
-            let unit = selected[i];
-            let step_id = format!("{}-step-{:04}", g.id, step_ids_for_task.len() + 1);
-            step_id_by_index[i] = step_id.clone();
-            step_ids_for_task.push(step_id.clone());
-            let step = Step {
-                id: step_id,
-                task_id: g.id.clone(),
-                // A data label only — never looked up in the StepKind
-                // registry. This module drives execution with a plain
-                // sequential loop, not `run_step_graph`; see the module doc.
-                kind: "crawl.unit".to_string(),
-                gate: None,
-                status: NodeStatus::Planned,
-                config: json!({ "unit": unit.id(), "kind": unit_kind(unit), "source": unit_source(unit) }),
-                started_ts: None,
-                completed_ts: None,
-                output: None,
-            };
-            crew::lifecycle::save_step(&mission_id, &phase_id, &step).context("persisting step")?;
-        }
-        let task = Task {
-            id: g.id.clone(),
-            phase_id: phase_id.clone(),
-            description: format!("Crawl `{}` against source '{}'", g.rules_label, g.source),
-            display_name: Some(format!("{} · {}", g.source, g.rules_label)),
-            step_ids: step_ids_for_task,
-            depends_on: Vec::new(),
-            reads: Vec::new(),
-            role_id: Some("crawler".to_string()),
-            profile_name: None,
-            workdir: Some(tree_root.clone()),
-            image: None,
-        };
-        crew::lifecycle::save_task(&mission_id, &task).context("persisting task")?;
-        task_ids.push(g.id.clone());
-    }
-
-    let mut phase = phase;
-    phase.task_ids = task_ids;
-    crew::lifecycle::save_phase(&phase).context("persisting phase task_ids")?;
-
-    crew::lifecycle::mission_start_with_reasoning(&mission_id, Some("launched from `darkmux mission launch crawl`"))
-        .context("starting the newly-minted mission")?;
-    crew::lifecycle::phase_start(&phase_id).context("starting the crawl phase")?;
-
     let sources_summary: Vec<Value> = the_plan.sources.iter().map(|s| json!({"id": s.id, "sha": s.sha})).collect();
     let est_tokens_total: usize = selected.iter().map(|u| u.est_tokens()).sum();
     // (#1959 merge-gate finding 2) `units_planned` renamed to
@@ -918,26 +882,168 @@ pub(crate) fn run(
     // count). No `units_not_run` here yet — nothing has run at start.
     let units_in_plan = the_plan.units.len();
     let units_selected = selected.len();
-    let _ = darkmux_flow::record(crawl_record(
-        "crawl.mission.started",
-        &mission_id,
-        Some(&mission_id),
-        json!({
-            "corpus": manifest.name,
-            "units_in_plan": units_in_plan,
-            "units_selected": units_selected,
-            "est_tokens": est_tokens_total,
-            "sources": sources_summary,
-        }),
-        None,
-    ));
+    let mut step_id_by_index: Vec<String> = vec![String::new(); selected.len()];
 
-    // ── kill file / per-run artifacts ──────────────────────────────────
-    let root = manifest.resolved_root();
-    let kill_file = root.join("STOP");
-    let runs_dir = root.join("runs").join(&mission_id);
-    std::fs::create_dir_all(&runs_dir).with_context(|| format!("creating {}", runs_dir.display()))?;
-    let ledger_path = runs_dir.join("ledger.jsonl");
+    // ── guarded mint window (#1959 merge-gate finding 1) ─────────────────
+    // `mission.json` now exists on disk, so every fallible call from here
+    // through the mission-specific runs-dir creation below is a strand
+    // window: a bare `?` on any of these would leave a partially-minted
+    // Active mission behind with no reconcile. Route every failure through
+    // `reconcile_mint_failure` (closes the mission terminal, cascading any
+    // partially-minted Planned/Running phase — and its steps — to
+    // Abandoned) before propagating, mirroring `dispatch_as_crew_of_one`'s
+    // identical guarding of its own post-mint setup calls. `started_emitted`
+    // tracks whether `crawl.mission.started` made it out before the failure,
+    // so the paired `crawl.mission.completed` is emitted iff its opener was.
+    let tree_root = manifest.resolved_root().join("tree");
+    let mut started_emitted = false;
+    let mint_result: Result<()> = (|| {
+        let phase = Phase {
+            id: phase_id.clone(),
+            mission_id: mission_id.clone(),
+            description: format!(
+                "Sequential crawl of {} unit(s) across {} source(s)",
+                selected.len(),
+                the_plan.sources.len()
+            ),
+            display_name: Some("Crawl".to_string()),
+            status: PhaseStatus::Planned,
+            created_ts: now,
+            started_ts: None,
+            completed_ts: None,
+            abandoned_ts: None,
+            task_ids: Vec::new(),
+        };
+        crew::lifecycle::save_phase(&phase).context("persisting phase")?;
+
+        // ── group selected units into Tasks by (source, rule); one Step
+        //    per unit, in plan order, so `mission status` / the viewer show
+        //    real structure instead of one flat task per unit ───────────
+        let mut groups: Vec<TaskGroup> = Vec::new();
+        let mut group_index: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for (i, u) in selected.iter().enumerate() {
+            let key = group_key(u);
+            let gi = *group_index.entry(key.clone()).or_insert_with(|| {
+                let idx = groups.len();
+                groups.push(TaskGroup {
+                    id: format!("{phase_id}-task-{:03}", idx + 1),
+                    source: key.0.clone(),
+                    rules_label: key.1.clone(),
+                    unit_indices: Vec::new(),
+                });
+                idx
+            });
+            groups[gi].unit_indices.push(i);
+        }
+
+        let mut task_ids: Vec<String> = Vec::new();
+        for g in &groups {
+            let mut step_ids_for_task: Vec<String> = Vec::new();
+            for &i in &g.unit_indices {
+                let unit = selected[i];
+                let step_id = format!("{}-step-{:04}", g.id, step_ids_for_task.len() + 1);
+                step_id_by_index[i] = step_id.clone();
+                step_ids_for_task.push(step_id.clone());
+                let step = Step {
+                    id: step_id,
+                    task_id: g.id.clone(),
+                    // A data label only — never looked up in the StepKind
+                    // registry. This module drives execution with a plain
+                    // sequential loop, not `run_step_graph`; see the module doc.
+                    kind: "crawl.unit".to_string(),
+                    gate: None,
+                    status: NodeStatus::Planned,
+                    config: json!({ "unit": unit.id(), "kind": unit_kind(unit), "source": unit_source(unit) }),
+                    started_ts: None,
+                    completed_ts: None,
+                    output: None,
+                };
+                crew::lifecycle::save_step(&mission_id, &phase_id, &step).context("persisting step")?;
+            }
+            let task = Task {
+                id: g.id.clone(),
+                phase_id: phase_id.clone(),
+                description: format!("Crawl `{}` against source '{}'", g.rules_label, g.source),
+                display_name: Some(format!("{} · {}", g.source, g.rules_label)),
+                step_ids: step_ids_for_task,
+                depends_on: Vec::new(),
+                reads: Vec::new(),
+                role_id: Some("crawler".to_string()),
+                profile_name: None,
+                workdir: Some(tree_root.clone()),
+                image: None,
+            };
+            crew::lifecycle::save_task(&mission_id, &task).context("persisting task")?;
+            task_ids.push(g.id.clone());
+        }
+
+        let mut phase = phase;
+        phase.task_ids = task_ids;
+        crew::lifecycle::save_phase(&phase).context("persisting phase task_ids")?;
+
+        crew::lifecycle::mission_start_with_reasoning(&mission_id, Some("launched from `darkmux mission launch crawl`"))
+            .context("starting the newly-minted mission")?;
+        crew::lifecycle::phase_start(&phase_id).context("starting the crawl phase")?;
+
+        let _ = darkmux_flow::record(crawl_record(
+            "crawl.mission.started",
+            &mission_id,
+            Some(&mission_id),
+            json!({
+                "corpus": manifest.name,
+                "units_in_plan": units_in_plan,
+                "units_selected": units_selected,
+                "est_tokens": est_tokens_total,
+                "sources": sources_summary,
+            }),
+            None,
+        ));
+        started_emitted = true;
+
+        // (#1959 merge-gate finding 1) The last fallible step of the mint
+        // window — a failure here (e.g. `<corpus root>/runs` already exists
+        // as a regular file) is the one the operator is most likely to hit
+        // in practice, and it now unwinds through `reconcile_mint_failure`
+        // + the paired `crawl.mission.completed` below instead of leaving a
+        // stranded Active mission with an unpaired `crawl.mission.started`.
+        std::fs::create_dir_all(&runs_dir).with_context(|| format!("creating {}", runs_dir.display()))?;
+
+        Ok(())
+    })();
+
+    if let Err(e) = mint_result {
+        crew::lifecycle::reconcile_mint_failure(&mission_id, &format!("mission launch crawl errored during mint: {e:#}"));
+        if started_emitted {
+            let _ = darkmux_flow::record(crawl_record(
+                "crawl.mission.completed",
+                &mission_id,
+                Some(&mission_id),
+                json!({
+                    "corpus": manifest.name,
+                    "units_in_plan": units_in_plan,
+                    "units_selected": units_selected,
+                    "units_not_run": units_in_plan,
+                    "units_completed": 0,
+                    "units_errored": 0,
+                    "units_skipped": 0,
+                    "findings": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "wall_ms": 0,
+                    "tokens_per_hour": 0,
+                    "stopped_by": "error",
+                    "model": Value::Null,
+                    "profile": Value::Null,
+                    "timeout_secs": timeout,
+                    "limit": limit,
+                    "plan_path": plan_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "planned in-process".to_string()),
+                    "units_filter": units_filter,
+                }),
+                None,
+            ));
+        }
+        return Err(e);
+    }
 
     #[cfg(unix)]
     darkmux_types::interrupt::install();

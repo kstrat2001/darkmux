@@ -606,10 +606,16 @@ pub(crate) enum MissionCmd {
     /// (every selected unit attempted, or `--param limit=` cut the
     /// selection short by design — both read as an honest completion);
     /// `1` an error before or during the per-unit loop (a pre-mint
-    /// validation bail, or the RAII finalize guard catching an early
-    /// return/panic mid-loop); `3` the operator dropped a `STOP` kill file
+    /// validation bail, a mint-window failure — mission/phase/task/step
+    /// persistence or the runs-dir creation, reconciled to a terminal
+    /// mission rather than left stranded Active — or the RAII finalize
+    /// guard catching an early return/panic mid-loop); `3` the operator
+    /// dropped a `STOP` kill file
     /// in the corpus root — honored BETWEEN units, never mid-dispatch;
-    /// `130` SIGINT, same between-units timing as the kill file.
+    /// `130` SIGINT (a first Ctrl-C is honored the same between-units way
+    /// as the kill file; a second Ctrl-C restores the default handler; a
+    /// third kills the process outright — `darkmux_types::interrupt`'s own
+    /// doc).
     Launch {
         /// Mission config id to launch — a built-in (e.g. `coder-phase`)
         /// or a `darkmux mission propose`-drafted user-tier config.
@@ -823,14 +829,14 @@ pub(crate) enum MissionConfigCmd {
     /// hides every other registered config. Read-only.
     ///
     /// `crawl` (`darkmux mission launch crawl`, #1959 packet 2) does NOT
-    /// appear here — this list enumerates `templates/builtin/mission-
-    /// configs/*.json` documents (plus the user tier), and crawl has no
-    /// such document: its Task/Step graph is computed at RUN TIME from a
-    /// resolved corpus plan, not declared ahead of time (see `src/crawl_
-    /// launch.rs`'s module doc for the full reasoning). It is routed by
-    /// literal config id in `mission_launch::launch`, checked BEFORE this
-    /// registry is consulted at all. This is absence by design, not a gap
-    /// in the list.
+    /// appear here — this list enumerates
+    /// `templates/builtin/mission-configs/*.json` documents (plus the user
+    /// tier), and crawl has no such document: its Task/Step graph is
+    /// computed at RUN TIME from a resolved corpus plan, not declared
+    /// ahead of time (see `src/crawl_launch.rs`'s module doc for the full
+    /// reasoning). It is routed by literal config id in `mission_launch::
+    /// launch`, checked BEFORE this registry is consulted at all. This is
+    /// absence by design, not a gap in the list.
     List {
         #[command(flatten)]
         json: JsonFlag,

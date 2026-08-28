@@ -347,7 +347,36 @@ fn unit_loop_emits_started_dispatch_findings_completed_in_order_with_mission_id(
 
     for r in records.iter().filter(|r| r["action"].as_str().unwrap_or("").starts_with("crawl.")) {
         assert!(r["mission_id"].is_string(), "record missing mission_id: {r:#?}");
+        // (#1959 merge-gate finding 3) No `crawl.*` record may ever carry
+        // an empty sha — that's the exact tell of a unit whose source
+        // silently fell through `the_plan.sources.iter().find(...).
+        // unwrap_or_default()` unvalidated.
+        if let Some(sha) = r["payload"]["sha"].as_str() {
+            assert_ne!(sha, "", "record must never carry an empty sha: {r:#?}");
+        }
     }
+
+    // (#1959 merge-gate finding 6) `model` is pinned on the top-level
+    // FlowRecord for a `crawl.finding` and a `crawl.unit.completed`
+    // record, not just buried in the payload.
+    let finding_record = records.iter().find(|r| r["action"] == "crawl.finding").expect("expected one finding");
+    assert_eq!(finding_record["model"], "darkmux:test-model");
+    let completed_record =
+        records.iter().find(|r| r["action"] == "crawl.unit.completed").expect("expected a completed record");
+    assert_eq!(completed_record["model"], "darkmux:test-model");
+
+    // (#1959 merge-gate finding 3) The ledger line for the one finding must
+    // carry the real source sha too, never "".
+    let mission_id = mission_id_from_records(&records);
+    let ledger_path = fx.root.path().join("runs").join(&mission_id).join("ledger.jsonl");
+    let ledger_body = std::fs::read_to_string(&ledger_path).unwrap();
+    let mut ledger_lines = 0;
+    for line in ledger_body.lines().filter(|l| !l.trim().is_empty()) {
+        let rec: Value = serde_json::from_str(line).unwrap();
+        assert_ne!(rec["sha"].as_str().unwrap_or(""), "", "ledger line must never carry an empty sha: {rec:#?}");
+        ledger_lines += 1;
+    }
+    assert_eq!(ledger_lines, 1, "expected exactly u-0001's one finding in the ledger");
 }
 
 // ── test 2: finding path rewrite + ledger + per-unit copy ──────────────
@@ -505,7 +534,7 @@ fn stale_plan_sha_bails_loud_before_any_dispatch() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
     let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
-    let (rules_vec, _) = rules::resolve_default(&manifest.rules).unwrap();
+    let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
     let resolved = sources::resolve(&manifest, true).unwrap();
     let mut stale_plan = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
     stale_plan.sources[0].sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
@@ -767,11 +796,14 @@ fn mission_and_task_structure_is_the_shape_mission_status_reads() {
 /// `swallowed-error` against source `app1` (present in `two_source_
 /// fixture`'s manifest) — used where a test needs a plan LARGER than the
 /// fixture's own 2-unit corpus (finding 2's "70 in plan, 1 selected"
-/// shape) without spinning up 70 real git repos. `sources` is left empty
-/// deliberately: with no `PlanSource` entries, the sha/tree reconcile
-/// loop in `run()` has nothing to check, so this plan is valid to load
-/// regardless of what `sources::resolve` returns for the real fixture.
-fn synthetic_plan_with_n_units(corpus_name: &str, n: usize) -> Plan {
+/// shape) without spinning up 70 real git repos. `sources` is built from
+/// the CALLER-supplied `resolved` list (real `sources::resolve` output for
+/// the fixture) rather than left empty: an empty `sources` here used to
+/// exploit the exact hole finding 3 closes — a unit naming a source absent
+/// from `plan.sources` sailed through unvalidated, defaulting to `sha: ""`
+/// in every downstream `crawl.*` record. Declaring `app1` properly keeps
+/// this fixture honest against that guard.
+fn synthetic_plan_with_n_units(corpus_name: &str, n: usize, resolved: &[sources::ResolvedSource]) -> Plan {
     let units: Vec<Unit> = (1..=n)
         .map(|i| Unit::Site {
             id: format!("u-{i:04}"),
@@ -781,11 +813,21 @@ fn synthetic_plan_with_n_units(corpus_name: &str, n: usize) -> Plan {
             est_tokens: 10,
         })
         .collect();
+    let plan_sources: Vec<plan::PlanSource> = resolved
+        .iter()
+        .map(|r| plan::PlanSource {
+            id: r.id.clone(),
+            sha: r.sha.clone(),
+            git_ref: r.git_ref.clone(),
+            tree: r.tree.clone(),
+            files_walked: 0,
+        })
+        .collect();
     Plan {
         schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
         corpus: corpus_name.to_string(),
         planned_at: "2026-01-01T00:00:00Z".to_string(),
-        sources: Vec::new(),
+        sources: plan_sources,
         units,
         totals: plan::Totals::default(),
     }
@@ -809,7 +851,7 @@ fn plan_naming_a_rule_the_manifest_no_longer_declares_bails_before_any_mint() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
     let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
-    let (rules_vec, _) = rules::resolve_default(&manifest.rules).unwrap();
+    let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
     let resolved = sources::resolve(&manifest, true).unwrap();
     let mut stale_plan = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
     match &mut stale_plan.units[0] {
@@ -825,6 +867,101 @@ fn plan_naming_a_rule_the_manifest_no_longer_declares_bails_before_any_mint() {
     let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
     let err = run(&params, None, &mut dispatch).unwrap_err();
     assert!(err.to_string().contains("ghost-rule"), "{err}");
+    assert!(calls.borrow().clone().is_empty(), "no dispatch before the pre-mint bail");
+
+    let records = read_all_flow_records();
+    assert!(
+        records.iter().all(|r| r["action"] != "crawl.mission.started"),
+        "a pre-mint bail must never emit crawl.mission.started — no mission was minted: {records:#?}"
+    );
+}
+
+// ── round-3 must-fix 1: the guarded mint window ─────────────────────────
+
+/// A failure in the mint window (mission mint through the mission-specific
+/// runs-dir creation) must never strand an Active mission with an unpaired
+/// `crawl.mission.started`. `<corpus root>/runs` already existing as a
+/// regular file forces `create_dir_all` to fail at the LAST fallible step
+/// of the window — after the mission/phase/task/step records and the
+/// `crawl.mission.started` record have already been written — which is
+/// exactly the shape that used to strand.
+#[test]
+#[serial_test::serial]
+fn runs_dir_collision_reconciles_the_mint_instead_of_stranding_it() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    // `runs` as a regular FILE, not a directory — `create_dir_all` on any
+    // path under it must fail.
+    std::fs::write(fx.root.path().join("runs"), "not a directory").unwrap();
+
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let err = run(&params_for(&fx), None, &mut dispatch).unwrap_err();
+    assert!(err.to_string().contains("runs"), "{err}");
+    assert!(calls.borrow().clone().is_empty(), "no dispatch — the mint window fails before the per-unit loop");
+
+    let records = read_all_flow_records();
+    let mission_id = mission_id_from_records(&records);
+
+    // paired-or-both-absent: `crawl.mission.started` DID fire (the window
+    // fails after it), so `crawl.mission.completed` must have too.
+    let started = records.iter().filter(|r| r["action"] == "crawl.mission.started").count();
+    let completed = records.iter().filter(|r| r["action"] == "crawl.mission.completed").count();
+    assert_eq!(started, completed, "crawl.mission.started/completed must be paired, never one without the other: {records:#?}");
+    assert_eq!(started, 1, "expected exactly the one mint attempt's started record: {records:#?}");
+    let completed_record = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    assert_eq!(completed_record["payload"]["stopped_by"], "error");
+    assert_eq!(completed_record["payload"]["units_completed"], 0);
+
+    // never left stuck Active — reconciled to a terminal by `reconcile_
+    // mint_failure`, matching `dispatch_as_crew_of_one`'s own mint-window
+    // guard and `mission status`'s ACTIVE bucket definition (both key off
+    // exactly this field).
+    let mission_json = std::fs::read_to_string(crew::lifecycle::mission_path(&mission_id)).unwrap();
+    let mission: crew::types::Mission = serde_json::from_str(&mission_json).unwrap();
+    assert_ne!(
+        mission.status,
+        crew::types::MissionStatus::Active,
+        "a mint-window failure must never leave the mission stuck Active — {mission:#?}"
+    );
+}
+
+// ── round-3 must-fix 3: the `sources: []` plan hole ─────────────────────
+
+/// A hand-crafted (or corrupted) plan whose `units` name a real source but
+/// whose `sources` list is empty must bail BEFORE any mint, naming both
+/// the unit and the source — not sail through and let the unit's sha
+/// silently default to `""` in every downstream `crawl.*` record.
+#[test]
+#[serial_test::serial]
+fn plan_with_empty_sources_naming_a_real_unit_bails_before_any_mint() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let empty_sources_plan = Plan {
+        schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
+        corpus: manifest.name.clone(),
+        planned_at: "2026-01-01T00:00:00Z".to_string(),
+        sources: Vec::new(),
+        units: vec![Unit::Site {
+            id: "u-0001".to_string(),
+            rule: "swallowed-error".to_string(),
+            source: "app1".to_string(),
+            sites: vec![Site { file: "x.ts".to_string(), line: 5, start: 1, end: 6, hits: vec![5] }],
+            est_tokens: 10,
+        }],
+        totals: plan::Totals::default(),
+    };
+    let plan_path = fx.root.path().join("empty-sources-plan.json");
+    std::fs::write(&plan_path, serde_json::to_string(&empty_sources_plan).unwrap()).unwrap();
+
+    let mut params = params_for(&fx);
+    params.insert("plan".to_string(), Value::String(plan_path.to_string_lossy().to_string()));
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let err = run(&params, None, &mut dispatch).unwrap_err();
+    assert!(err.to_string().contains("u-0001"), "{err}");
+    assert!(err.to_string().contains("app1"), "{err}");
     assert!(calls.borrow().clone().is_empty(), "no dispatch before the pre-mint bail");
 
     let records = read_all_flow_records();
@@ -901,7 +1038,8 @@ fn seventy_in_plan_one_selected_reports_units_not_run_everywhere() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
     let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
-    let synthetic = synthetic_plan_with_n_units(&manifest.name, 70);
+    let resolved = sources::resolve(&manifest, true).unwrap();
+    let synthetic = synthetic_plan_with_n_units(&manifest.name, 70, &resolved);
     let plan_path = fx.root.path().join("big-plan.json");
     std::fs::write(&plan_path, serde_json::to_string(&synthetic).unwrap()).unwrap();
 
@@ -1006,7 +1144,7 @@ fn every_shipped_rule_avoids_darkmux_internal_vocabulary() {
     let all_ids: Vec<String> = embedded.keys().cloned().collect();
     assert!(all_ids.len() >= 3, "expected at least the 3 known built-in rules: {all_ids:?}");
 
-    let (resolved, resolve_warnings) = rules::resolve_default(&all_ids).unwrap();
+    let (resolved, resolve_warnings) = rules::resolve(&all_ids, None).unwrap();
     assert!(resolve_warnings.is_empty(), "{resolve_warnings:?}");
     assert_eq!(resolved.len(), all_ids.len());
 
@@ -1064,7 +1202,7 @@ fn plan_corpus_mismatch_bails_loud() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
     let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
-    let (rules_vec, _) = rules::resolve_default(&manifest.rules).unwrap();
+    let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
     let resolved = sources::resolve(&manifest, true).unwrap();
     let mut plan_wrong_corpus = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
     plan_wrong_corpus.corpus = "some-other-corpus".to_string();
@@ -1086,7 +1224,7 @@ fn plan_source_tree_mismatch_bails_loud() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
     let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
-    let (rules_vec, _) = rules::resolve_default(&manifest.rules).unwrap();
+    let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
     let resolved = sources::resolve(&manifest, true).unwrap();
     let mut plan_wrong_tree = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
     plan_wrong_tree.sources[0].tree = PathBuf::from("/nonexistent/relocated/tree");
@@ -1155,6 +1293,64 @@ fn envelope_is_self_describing() {
 
     let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
     assert_eq!(completed["model"], "darkmux:test-model", "the mission-level record's own FlowRecord.model field");
+}
+
+// ── round-3 CONSIDER 7: interrupted classification at readback ──────────
+
+/// `INTERRUPTED` (`darkmux_types::interrupt`) is a process-wide flag that
+/// never resets in production — see that module's own doc. Reset it
+/// around this test (both before AND, via `Drop`, after) so a SIGINT
+/// simulated here can never leak into any OTHER test sharing this same
+/// test binary process.
+struct InterruptFlagGuard;
+
+impl InterruptFlagGuard {
+    fn new() -> Self {
+        darkmux_types::interrupt::reset_for_test();
+        Self
+    }
+}
+
+impl Drop for InterruptFlagGuard {
+    fn drop(&mut self) {
+        darkmux_types::interrupt::reset_for_test();
+    }
+}
+
+/// (#1959 merge-gate finding 13) SIGINT arriving WHILE a unit's dispatch
+/// is in flight must classify that unit as `"interrupted"` at readback —
+/// neither a completion nor a per-unit error — and the mission overall as
+/// `stopped_by: "interrupted"`, exit 130. Simulated by setting the flag
+/// from inside the scripted dispatch closure itself (via `interrupt::
+/// simulate_sigint_for_test`, the `test-support` hook — calls the SAME
+/// internal handler a real Ctrl-C would), mimicking a signal that arrives
+/// mid-dispatch rather than between units (the loop-top kill-file/
+/// interrupt check, already covered by `kill_file_stop_abandons_the_
+/// phase_not_completes_it`'s sibling tests, is a different code path).
+#[test]
+#[serial_test::serial]
+fn interrupted_at_readback_reports_interrupted_not_error() {
+    let _guard = TestGuard::new();
+    let _interrupt_guard = InterruptFlagGuard::new();
+    let fx = two_source_fixture();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {
+        darkmux_types::interrupt::simulate_sigint_for_test();
+    });
+
+    let code = run(&params_for(&fx), None, &mut dispatch).unwrap();
+    assert_eq!(code, 130, "an interrupted run must exit 130");
+    assert_eq!(calls.borrow().len(), 1, "the second unit must never be dispatched once interrupted");
+
+    let records = read_all_flow_records();
+    let completed =
+        records.iter().find(|r| r["action"] == "crawl.unit.completed").expect("expected one completed record");
+    assert_eq!(completed["payload"]["result"], "interrupted");
+
+    let mission_completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    assert_eq!(mission_completed["payload"]["stopped_by"], "interrupted");
+    assert_eq!(mission_completed["payload"]["units_errored"], 0, "an interrupted unit must not count as errored");
+    assert_eq!(mission_completed["payload"]["units_completed"], 0, "an interrupted unit must not count as completed either");
 }
 
 // ── finding 9: watchdog timeout detection ───────────────────────────────
