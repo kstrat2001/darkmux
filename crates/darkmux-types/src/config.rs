@@ -292,8 +292,15 @@ pub struct RuntimeBehaviorConfig {
     /// existing behavior). Applied in `runtime/src/loop_runner.rs` between
     /// turns, never before the first turn; clamped below the inactivity
     /// timeout with a loud warning if configured at or above it. Local
-    /// dispatches only — the remote single-shot path and endpoint-staffed
-    /// seats have nothing to rest, so the forwarded value is inert there.
+    /// dispatches only. The remote single-shot path never forwards this at
+    /// all (it never builds a `DockerRunConfig`). An agentic-REMOTE
+    /// dispatch (a tool-granting role on an endpoint profile, which DOES
+    /// run the same container/`loop_runner.rs` local dispatches use) is
+    /// force-overridden to `0` HOST-side regardless of this setting
+    /// (`dispatch_internal.rs`'s `DockerRunConfig` construction, #2094
+    /// finding 4) — an endpoint has no local GPU on this host to rest, so
+    /// honoring an operator's configured rest there would only add real
+    /// latency the per-execution remote token allowance pays for nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub turn_delay_ms: Option<u64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }

@@ -620,6 +620,24 @@
         assert_eq!((r.rest_ms, r.rests), (0, 0));
     }
 
+    // ─── #2094 finding 4: never rest an agentic-REMOTE dispatch ──────────
+
+    #[test]
+    fn effective_turn_delay_ms_forces_zero_for_agentic_remote_regardless_of_config() {
+        // A remote-agentic dispatch's "brain" is a hosted endpoint, not
+        // local LMStudio — there is no local GPU on this host to rest, so
+        // the configured rest must never reach it even at a large nonzero
+        // value.
+        assert_eq!(effective_turn_delay_ms(3000, true), 0);
+        assert_eq!(effective_turn_delay_ms(0, true), 0);
+    }
+
+    #[test]
+    fn effective_turn_delay_ms_passes_through_unchanged_for_local() {
+        assert_eq!(effective_turn_delay_ms(3000, false), 3000);
+        assert_eq!(effective_turn_delay_ms(0, false), 0);
+    }
+
     #[test]
     #[serial]
     fn config_path_reaches_dispatch_resolvers_not_just_env() {
@@ -1189,6 +1207,10 @@
             // (#2094) Nonzero here so the complete-vector assertion below
             // pins the forwarded `-e DARKMUX_TURN_DELAY_MS=<n>` pair too.
             turn_delay_ms: 3000,
+            // (#2094 finding 1) A distinct, non-default value so the
+            // complete-vector assertion below pins the forwarded
+            // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` pair too.
+            inactivity_timeout_seconds: 900,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1257,66 +1279,76 @@
         assert_eq!(argv[23], "-e");
         assert_eq!(argv[24], "DARKMUX_TURN_DELAY_MS=3000");
 
+        // 5d. (#2094 finding 1) Verify the inactivity-timeout env var is
+        // forwarded too (`config.inactivity_timeout_seconds: 900` in this
+        // test's config → `DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900` on argv)
+        // — the piece #2094's original cut left unforwarded, so the
+        // runtime's soft-warning detector silently used its own 600s
+        // literal default instead of the operator's configured budget.
+        assert_eq!(argv[25], "-e");
+        assert_eq!(argv[26], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900");
+
         // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[25], "-v");
+        assert_eq!(argv[27], "-v");
         assert_eq!(
-            argv[26],
+            argv[28],
             "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
         );
-        assert_eq!(argv[27], "--entrypoint");
-        assert_eq!(argv[28], "/darkmux-runtime");
+        assert_eq!(argv[29], "--entrypoint");
+        assert_eq!(argv[30], "/darkmux-runtime");
 
         // 7. Verify `--` + image + runtime CLI args
-        assert_eq!(argv[29], "--");
-        assert_eq!(argv[30], "rust:slim"); // image
-        assert_eq!(argv[31], "run"); // runtime subcommand
-        assert_eq!(argv[32], "--model");
-        assert_eq!(argv[33], "llama3-8b");
-        assert_eq!(argv[34], "--system");
-        assert_eq!(argv[35], "You are a coding assistant.");
+        assert_eq!(argv[31], "--");
+        assert_eq!(argv[32], "rust:slim"); // image
+        assert_eq!(argv[33], "run"); // runtime subcommand
+        assert_eq!(argv[34], "--model");
+        assert_eq!(argv[35], "llama3-8b");
+        assert_eq!(argv[36], "--system");
+        assert_eq!(argv[37], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[36], "--prompt-file");
-        assert_eq!(argv[37], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[38], "--prompt-file");
+        assert_eq!(argv[39], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[38], "--json");
+        assert_eq!(argv[40], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[39], "--allowed-tools");
-        assert_eq!(argv[40], "exec,edit");
+        assert_eq!(argv[41], "--allowed-tools");
+        assert_eq!(argv[42], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[41], "--compact-threshold-tokens");
-        assert_eq!(argv[42], "4096");
-        assert_eq!(argv[43], "--compactor-model");
-        assert_eq!(argv[44], "util-model");
-        assert_eq!(argv[45], "--compact-threshold-ratio");
-        assert_eq!(argv[46], "0.75");
-        assert_eq!(argv[47], "--context-window");
-        assert_eq!(argv[48], "32000");
-        assert_eq!(argv[49], "--compact-strategy");
-        assert_eq!(argv[50], "structured-slot");
-        assert_eq!(argv[51], "--bail-after-compactions");
-        assert_eq!(argv[52], "10");
-        assert_eq!(argv[53], "--compactor-custom-instructions");
-        assert_eq!(argv[54], "Be terse.");
+        assert_eq!(argv[43], "--compact-threshold-tokens");
+        assert_eq!(argv[44], "4096");
+        assert_eq!(argv[45], "--compactor-model");
+        assert_eq!(argv[46], "util-model");
+        assert_eq!(argv[47], "--compact-threshold-ratio");
+        assert_eq!(argv[48], "0.75");
+        assert_eq!(argv[49], "--context-window");
+        assert_eq!(argv[50], "32000");
+        assert_eq!(argv[51], "--compact-strategy");
+        assert_eq!(argv[52], "structured-slot");
+        assert_eq!(argv[53], "--bail-after-compactions");
+        assert_eq!(argv[54], "10");
+        assert_eq!(argv[55], "--compactor-custom-instructions");
+        assert_eq!(argv[56], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[55], "--feedback-templates-json");
+        assert_eq!(argv[57], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[56].contains("error"));
-        assert!(argv[56].contains("An error occurred"));
+        assert!(argv[58].contains("error"));
+        assert!(argv[58].contains("An error occurred"));
 
-        // Total arg count: 57 (0..=56) — 53 pre-#1548, +2 for
+        // Total arg count: 59 (0..=58) — 53 pre-#1548, +2 for
         // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
-        // `-e DARKMUX_TURN_DELAY_MS=<ms>` (#2094).
-        assert_eq!(argv.len(), 57);
+        // `-e DARKMUX_TURN_DELAY_MS=<ms>` (#2094), +2 for
+        // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` (#2094 finding 1).
+        assert_eq!(argv.len(), 59);
     }
 
     #[test]
@@ -1358,6 +1390,7 @@
             // cover "both string forms" mattered.
             feedback_injection: false,
             turn_delay_ms: 0,
+            inactivity_timeout_seconds: 600,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1381,6 +1414,15 @@
         assert!(
             argv.contains(&"DARKMUX_TURN_DELAY_MS=0".to_string()),
             "the unconfigured (0) turn-delay must still be forwarded verbatim: {argv:?}"
+        );
+
+        // (#2094 finding 1) The inactivity-timeout env var is ALWAYS
+        // forwarded too — a minimal dispatch still needs the runtime's
+        // soft-warning detector to see the operator's real budget, not
+        // silently fall back to its own 600s literal default.
+        assert!(
+            argv.contains(&"DARKMUX_INACTIVITY_TIMEOUT_SECONDS=600".to_string()),
+            "the resolved inactivity timeout must be forwarded verbatim: {argv:?}"
         );
 
         // Should NOT contain optional flags
@@ -1460,6 +1502,7 @@
             cache_dir: PathBuf::from("/tmp/cache"),
             feedback_injection: true,
             turn_delay_ms: 0,
+            inactivity_timeout_seconds: 600,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1508,6 +1551,7 @@
             cache_dir: PathBuf::from("/tmp/cache"),
             feedback_injection: true,
             turn_delay_ms: 0,
+            inactivity_timeout_seconds: 600,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1760,6 +1804,7 @@
             cache_dir: PathBuf::from("/tmp/cache"),
             feedback_injection: true,
             turn_delay_ms: 0,
+            inactivity_timeout_seconds: 600,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,

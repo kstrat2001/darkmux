@@ -465,10 +465,29 @@ pub struct DockerRunConfig {
     /// container as `-e DARKMUX_TURN_DELAY_MS=<ms>` — the SAME #1548 pattern
     /// `feedback_injection` above uses (the runtime crate can't depend on
     /// `config_access`; the host does the tier resolution and always
-    /// forwards its result, even at `0`). Local dispatches only — this
-    /// field is meaningless on the remote/endpoint single-shot path, which
-    /// never builds a `DockerRunConfig` at all.
+    /// forwards its result, even at `0`). The remote single-shot path
+    /// never sets this at all — it never builds a `DockerRunConfig`. An
+    /// agentic-REMOTE dispatch (a tool-granting role on an endpoint
+    /// profile, `remote_chat_url.is_some()` below) DOES build one and run
+    /// the same container `loop_runner.rs` local dispatches use, so
+    /// leaving this at the operator's configured value there would
+    /// actually sleep between turns against an endpoint with no local GPU
+    /// to rest — the call site force-overrides this field to `0` whenever
+    /// the dispatch is agentic-remote, regardless of config (#2094 finding 4).
     pub turn_delay_ms: u64,
+    /// (#2094 finding 1) The resolved `runtime.inactivity_timeout_seconds`
+    /// setting (`darkmux_types::config_access::inactivity_timeout_seconds()`),
+    /// forwarded into the container as
+    /// `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` — the SAME #1548 pattern
+    /// `feedback_injection` and `turn_delay_ms` above use. Before this field
+    /// existed, the runtime's own soft-warning reader
+    /// (`runtime/src/loop_runner.rs`) fell back to its unconditional 600s
+    /// literal default on EVERY dispatch, silently diverging from an
+    /// operator override the host-side watchdog (which reads the same
+    /// config accessor directly, not through `docker run`) already honored
+    /// — the runtime and the host disagreed about when "inactivity" starts.
+    /// Always forwarded, matching the host's hard-kill value exactly.
+    pub inactivity_timeout_seconds: u64,
     /// (#1187) When Some, this dispatch's "brain" is a remote OpenAI-compatible
     /// endpoint rather than local LMStudio — passed to the container as
     /// `--chat-url`. Set for a role whose tool_palette grants at least one
@@ -569,6 +588,19 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // absent var means "not configured" or "the host forgot to forward it."
     args.push("-e".to_string());
     args.push(format!("DARKMUX_TURN_DELAY_MS={}", config.turn_delay_ms));
+
+    // (#2094 finding 1) Forward the resolved `inactivity_timeout_seconds`
+    // setting — the SAME #1548 pattern as `feedback_injection` and
+    // `turn_delay_ms` above. Always emitted so the runtime's soft-warning
+    // detector (`runtime/src/loop_runner.rs`) reads the SAME budget the
+    // host-side hard-kill watchdog uses, instead of silently falling back
+    // to its own unconditional 600s literal on every dispatch regardless
+    // of an operator override.
+    args.push("-e".to_string());
+    args.push(format!(
+        "DARKMUX_INACTIVITY_TIMEOUT_SECONDS={}",
+        config.inactivity_timeout_seconds
+    ));
 
     // Runtime binary injection (non-default images only)
     if config.inject {
@@ -2467,7 +2499,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // (#2094) The resolved inter-turn rest this dispatch forwards into
         // the container — recorded up front so a rested run's wall clock
         // is never misread as a slow model without the knob that caused it.
-        "turn_delay_ms": darkmux_types::config_access::turn_delay_ms(),
+        // (#2094 finding 4) Stamped `0` for an agentic-REMOTE dispatch
+        // (`agentic_pm.is_some()`) via `effective_turn_delay_ms` — mirrors
+        // the same forced override on `DockerRunConfig.turn_delay_ms`
+        // below, so the flow record never claims a rest a remote endpoint
+        // never actually takes.
+        "turn_delay_ms": effective_turn_delay_ms(
+            darkmux_types::config_access::turn_delay_ms(),
+            agentic_pm.is_some(),
+        ),
     });
     // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
@@ -2648,7 +2688,21 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         feedback_templates: feedback_json,
         cache_dir: cache_dir.clone(),
         feedback_injection: darkmux_types::config_access::feedback_injection(),
-        turn_delay_ms: darkmux_types::config_access::turn_delay_ms(),
+        // (#2094 finding 4) Never rest an agentic-REMOTE dispatch
+        // (`agentic_pm.is_some()`, i.e. this container's brain is a hosted
+        // endpoint, not local LMStudio). The rest exists for GPU thermal /
+        // power relief between LOCAL inference bursts; an endpoint has no
+        // GPU on this host to rest, and the per-execution remote allowance
+        // (`DARKMUX_REMOTE_MAX_TOKENS_PER_EXECUTION`) should not pay
+        // latency for a knob that does nothing for it. Forced to `0`
+        // regardless of the operator's configured `turn_delay_ms` — see
+        // the matching `dispatch_start_payload["turn_delay_ms"]` stamp
+        // above, which mirrors this same override via `effective_turn_delay_ms`.
+        turn_delay_ms: effective_turn_delay_ms(
+            darkmux_types::config_access::turn_delay_ms(),
+            agentic_pm.is_some(),
+        ),
+        inactivity_timeout_seconds: darkmux_types::config_access::inactivity_timeout_seconds(),
         remote_chat_url: agentic_pm
             .as_ref()
             .and_then(|pm| pm.endpoint.as_ref())
@@ -3386,6 +3440,24 @@ pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
     RestTotals {
         rest_ms: v.get("rest_ms").and_then(|n| n.as_u64()).unwrap_or(0),
         rests: v.get("rests").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+    }
+}
+
+/// (#2094 finding 4) Whether the operator's configured `turn_delay_ms`
+/// should reach this dispatch's container. Never for an agentic-REMOTE
+/// dispatch (`is_agentic_remote` = `agentic_pm.is_some()` at the call
+/// site) — that dispatch's "brain" is a hosted endpoint, not local
+/// LMStudio, so there is no local GPU on THIS host to rest, and honoring
+/// the configured rest there would only add real latency the
+/// per-execution remote token allowance pays for nothing. Pure so the
+/// call site's two consumers (`DockerRunConfig.turn_delay_ms` and the
+/// `dispatch.start` payload's `turn_delay_ms` field) can't drift from
+/// each other or be tested only through a live container spawn.
+pub(crate) fn effective_turn_delay_ms(configured_ms: u64, is_agentic_remote: bool) -> u64 {
+    if is_agentic_remote {
+        0
+    } else {
+        configured_ms
     }
 }
 
