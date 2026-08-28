@@ -70,6 +70,10 @@ export function specOf(
   liveMachines: Map<string, PresenceBeat>,
   specs: MachineSpecs | null,
   m: string,
+  /** (#2067) Where a REMOTE card's hardware line comes from. Defaults to the
+   * presence beats; a static build passes its committed fleet snapshot
+   * instead, since it cannot poll presence at all. */
+  specBeats: Map<string, PresenceBeat> = liveMachines,
 ): string {
   if (m === "unknown") {
     const ns = [...new Set(data.filter((r) => uidOf(r) === "unknown" && r.machine_id).map((r) => r.machine_id as string))];
@@ -90,7 +94,7 @@ export function specOf(
     const gb = specs.ram_total_bytes ? ` · ${Math.round(specs.ram_total_bytes / 1073741824)} GB` : "";
     return specs.cpu_brand + gb;
   }
-  const beat = liveMachines.get(m);
+  const beat = specBeats.get(m);
   return beat?.specs || "";
 }
 
@@ -134,6 +138,9 @@ export function buildFleetCard(
    * route). `sessionRunning`'s replay arm and `machActive`'s `T(r.ts) <= t`
    * gate are both defined against it. */
   t: number,
+  /** (#2067) See `specOf`'s own doc — the spec source, when it is not the
+   * presence beats (a static build). */
+  specBeats: Map<string, PresenceBeat> = liveMachines,
 ): FleetCard {
   const active = machActive(data, liveSet, m, liveMode, t);
   const stat = machAbsent ? "offline" : active ? "dispatch in flight" : "idle";
@@ -146,7 +153,7 @@ export function buildFleetCard(
   return {
     uid: m,
     name: nameOf(data, liveMachines, m),
-    spec: specOf(data, liveMachines, specs, m),
+    spec: specOf(data, liveMachines, specs, m, specBeats),
     active,
     absent: machAbsent,
     stat,

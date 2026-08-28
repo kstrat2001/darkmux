@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
+import type { FlowRecord } from "../../types/handwritten";
 import { todayUTC, prevDateUTC, FLOW_LIVE_TTL_MS } from "../../lib/flow";
 import { closeOpenModal } from "../../lib/dialogManager";
 
@@ -177,6 +178,54 @@ describe("FleetLens", () => {
     expect(tile.className).toMatch(/\bunknown\b/);
     expect(tile.className).toMatch(/\bzero\b/);
     expect(tile.querySelector(".savnum")!.textContent).toBe("0");
+  });
+
+  it("(#2067) on a static build the card's hardware line comes from the committed fleet snapshot, never from a daemon route", async () => {
+    for (const [name, content] of [
+      ["darkmux-flow-src", "./demo-flow.jsonl"],
+      ["darkmux-fleet-src", "./demo-fleet.json"],
+    ]) {
+      const meta = document.createElement("meta");
+      meta.name = name;
+      meta.content = content;
+      document.head.appendChild(meta);
+    }
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        seen.push(path);
+        if (path === "./demo-fleet.json") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                machines: [{ machine_uid: "u1", display_name: "m5-ultra-256gb", specs: "Apple M5 Ultra · 256 GB", beat_ts_ms: 1 }],
+                meta: { sources: { fleet: { state: "ok" } }, complete: true },
+              }),
+              { status: 200 },
+            ),
+          );
+        }
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    try {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const records = [
+        { ts: "2026-08-26T10:00:00.000Z", machine_uid: "u1", machine_id: "m5-ultra-256gb", action: "machine.online", source: "presence-reconciler" },
+      ] as unknown as FlowRecord[];
+      render(
+        <QueryClientProvider client={queryClient}>
+          <FleetLens records={records} tMax={Date.parse("2026-08-26T10:00:00.000Z")} historical />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(screen.getByText("Apple M5 Ultra · 256 GB")).toBeInTheDocument());
+      expect(screen.queryByText("hardware not reported")).not.toBeInTheDocument();
+      expect(seen.filter((p) => p === "/fleet/machines/live" || p === "/machine/specs")).toEqual([]);
+    } finally {
+      document.head.querySelectorAll('meta[name^="darkmux-"]').forEach((m) => m.remove());
+    }
   });
 
   it("honesty about incomplete data: a session with no dispatch bookend renders as 'unattributed', not silently local", async () => {

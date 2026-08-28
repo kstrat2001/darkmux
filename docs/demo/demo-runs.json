@@ -1,5 +1,5 @@
 {
-  "generated_at_ms": 1787892244745,
+  "generated_at_ms": 1787897595327,
   "meta": {
     "complete": true,
     "sources": {
@@ -10,55 +10,17 @@
   },
   "runs": [
     {
-      "completed_ts": 1787889241,
+      "completed_ts": 1787895301,
       "id": "demo-review-nameof-recency",
       "kind": "mission",
       "machine": "m5-ultra-256gb",
       "model": "darkmux:mistralai/devstral-small-2-2512, darkmux:qwen/qwen3.8-27b, darkmux:qwen3-4b-instruct-2507, darkmux:qwen3.6-35b-a3b-turboquant-mlx",
       "role": "deep+diff-review+probe-4b+probe-qwen38",
       "session_id": "demo-review-nameof-recency",
-      "started_ts": 1787887309,
+      "started_ts": 1787893369,
       "status": "complete",
       "tracked": true,
-      "updated_ts": 1787889241
-    },
-    {
-      "id": "darkmux-crawler-crawl-discarded-locks-2250176547",
-      "kind": "dispatch",
-      "machine": "m5-ultra-256gb",
-      "model": "qwen3.6-35b-a3b-turboquant-mlx",
-      "role": "crawler",
-      "session_id": "darkmux-crawler-crawl-discarded-locks-2250176547",
-      "started_ts": 1787891161,
-      "status": "running",
-      "tracked": false,
-      "updated_ts": 1787891161
-    },
-    {
-      "completed_ts": 1787764645,
-      "id": "darkmux-compactor-compact-trajectories-2619114180",
-      "kind": "dispatch",
-      "machine": "m1-max-32gb-studio",
-      "model": "qwen3-4b-instruct-2507",
-      "role": "compactor",
-      "session_id": "darkmux-compactor-compact-trajectories-2619114180",
-      "started_ts": 1787764097,
-      "status": "complete",
-      "tracked": false,
-      "updated_ts": 1787764645
-    },
-    {
-      "completed_ts": 1787781385,
-      "id": "darkmux-scribe-doc-drift-sweep-3918945565",
-      "kind": "dispatch",
-      "machine": "m1-max-32gb-studio",
-      "model": "qwen3-4b-instruct-2507",
-      "role": "scribe",
-      "session_id": "darkmux-scribe-doc-drift-sweep-3918945565",
-      "started_ts": 1787780837,
-      "status": "complete",
-      "tracked": false,
-      "updated_ts": 1787781385
+      "updated_ts": 1787895301
     },
     {
       "completed_ts": 1787768065,
@@ -87,6 +49,19 @@
       "updated_ts": 1787774725
     },
     {
+      "completed_ts": 1787771485,
+      "id": "darkmux-estimator-estimate-backlog-4092573714",
+      "kind": "dispatch",
+      "machine": "mac-mini-m4-16gb",
+      "model": "qwen3-4b-instruct-2507",
+      "role": "estimator",
+      "session_id": "darkmux-estimator-estimate-backlog-4092573714",
+      "started_ts": 1787770937,
+      "status": "complete",
+      "tracked": false,
+      "updated_ts": 1787771485
+    },
+    {
       "completed_ts": 1787778505,
       "id": "darkmux-reviewer-review-serve-routes-1318381388",
       "kind": "dispatch",
@@ -98,32 +73,6 @@
       "status": "complete",
       "tracked": false,
       "updated_ts": 1787778505
-    },
-    {
-      "completed_ts": 1787783545,
-      "id": "darkmux-crawler-crawl-unwrap-paths-4040708454",
-      "kind": "dispatch",
-      "machine": "m5-ultra-256gb",
-      "model": "qwen3.6-35b-a3b-turboquant-mlx",
-      "role": "crawler",
-      "session_id": "darkmux-crawler-crawl-unwrap-paths-4040708454",
-      "started_ts": 1787782997,
-      "status": "complete",
-      "tracked": false,
-      "updated_ts": 1787783545
-    },
-    {
-      "completed_ts": 1787786245,
-      "id": "darkmux-reviewer-review-flow-sinks-987519170",
-      "kind": "dispatch",
-      "machine": "m5-ultra-256gb",
-      "model": "qwen3.5-122b-a10b",
-      "role": "reviewer",
-      "session_id": "darkmux-reviewer-review-flow-sinks-987519170",
-      "started_ts": 1787785697,
-      "status": "complete",
-      "tracked": false,
-      "updated_ts": 1787786245
     },
     {
       "completed_ts": 1787788525,
@@ -139,17 +88,68 @@
       "updated_ts": 1787788525
     },
     {
-      "completed_ts": 1787771485,
-      "id": "darkmux-estimator-estimate-backlog-4092573714",
+      "completed_ts": 1787786245,
+      "id": "darkmux-reviewer-review-flow-sinks-987519170",
       "kind": "dispatch",
-      "machine": "mac-mini-m4-16gb",
-      "model": "qwen3-4b-instruct-2507",
-      "role": "estimator",
-      "session_id": "darkmux-estimator-estimate-backlog-4092573714",
-      "started_ts": 1787770937,
+      "machine": "m5-ultra-256gb",
+      "model": "qwen3.5-122b-a10b",
+      "role": "reviewer",
+      "session_id": "darkmux-reviewer-review-flow-sinks-987519170",
+      "started_ts": 1787785697,
       "status": "complete",
       "tracked": false,
-      "updated_ts": 1787771485
+      "updated_ts": 1787786245
+    },
+    {
+      "completed_ts": 1787783545,
+      "id": "darkmux-crawler-crawl-unwrap-paths-4040708454",
+      "kind": "dispatch",
+      "machine": "m5-ultra-256gb",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "role": "crawler",
+      "session_id": "darkmux-crawler-crawl-unwrap-paths-4040708454",
+      "started_ts": 1787782997,
+      "status": "complete",
+      "tracked": false,
+      "updated_ts": 1787783545
+    },
+    {
+      "completed_ts": 1787781385,
+      "id": "darkmux-scribe-doc-drift-sweep-3918945565",
+      "kind": "dispatch",
+      "machine": "m1-max-32gb-studio",
+      "model": "qwen3-4b-instruct-2507",
+      "role": "scribe",
+      "session_id": "darkmux-scribe-doc-drift-sweep-3918945565",
+      "started_ts": 1787780837,
+      "status": "complete",
+      "tracked": false,
+      "updated_ts": 1787781385
+    },
+    {
+      "completed_ts": 1787764645,
+      "id": "darkmux-compactor-compact-trajectories-2619114180",
+      "kind": "dispatch",
+      "machine": "m1-max-32gb-studio",
+      "model": "qwen3-4b-instruct-2507",
+      "role": "compactor",
+      "session_id": "darkmux-compactor-compact-trajectories-2619114180",
+      "started_ts": 1787764097,
+      "status": "complete",
+      "tracked": false,
+      "updated_ts": 1787764645
+    },
+    {
+      "id": "darkmux-crawler-crawl-discarded-locks-2250176547",
+      "kind": "dispatch",
+      "machine": "m5-ultra-256gb",
+      "model": "qwen3.6-35b-a3b-turboquant-mlx",
+      "role": "crawler",
+      "session_id": "darkmux-crawler-crawl-discarded-locks-2250176547",
+      "started_ts": 1787897221,
+      "status": "running",
+      "tracked": false,
+      "updated_ts": 1787897221
     }
   ]
 }

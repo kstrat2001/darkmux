@@ -78,13 +78,13 @@ export function hybridNote(data: FlowRecord[], t: TokensOffMeter): HybridNote {
     const lr = t.runs - t.cloudRuns;
     const d = (n: number) => `dispatch${n === 1 ? "" : "es"}`;
     if (!t.cloudRuns) {
-      return { text: `${t.runs} local ${d(t.runs)} — the hybrid loop is humming. keep it up.`, hasHistory };
+      return { text: `${t.runs} local ${d(t.runs)}. The hybrid loop is humming, keep it up.`, hasHistory };
     }
     if (!lr) {
-      return { text: `${t.runs} ${d(t.runs)} via cloud — the right brain for the job. keep it up.`, hasHistory };
+      return { text: `${t.runs} ${d(t.runs)} via cloud. The right brain for the job, keep it up.`, hasHistory };
     }
     return {
-      text: `${lr} ${d(lr)} local + ${t.cloudRuns} via cloud — the hybrid loop is humming. keep it up.`,
+      text: `${lr} ${d(lr)} local + ${t.cloudRuns} via cloud. The hybrid loop is humming, keep it up.`,
       hasHistory,
     };
   }

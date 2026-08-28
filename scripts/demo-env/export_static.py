@@ -153,6 +153,11 @@ def main():
                               {"X-Darkmux-Panel": "1", "accept": "application/json"})
         machine = {"specs": get(a.base, "/machine/specs"),
                    "resources": get(a.base, "/machine/resources")}
+        # (#2067) The fleet snapshot serve.py answers from the world's own
+        # `fleet-machines-live.json` — the cards' HARDWARE line on the static
+        # build (`darkmux-fleet-src`). Without it every card read "hardware
+        # not reported" under a machine named after its chip and RAM.
+        fleet = get(a.base, "/fleet/machines/live")
         # (#2032 packet 2) `/missions` and `/phases` are real daemon routes
         # `serve.py` passes straight through to the isolated demo-world
         # daemon (see this script's own module doc) — re-exporting them
@@ -205,6 +210,7 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "demo-panels.json").write_text(json.dumps(panels, indent=2, sort_keys=True) + "\n")
     (OUT / "demo-machine.json").write_text(json.dumps(machine, indent=2, sort_keys=True) + "\n")
+    (OUT / "demo-fleet.json").write_text(json.dumps(fleet, indent=2, sort_keys=True) + "\n")
     (OUT / "demo-missions.json").write_text(json.dumps(missions_resp, indent=2, sort_keys=True) + "\n")
     (OUT / "demo-phases.json").write_text(json.dumps(phases_resp, indent=2, sort_keys=True) + "\n")
     (OUT / "demo-graphs.json").write_text(json.dumps(graphs, indent=2, sort_keys=True) + "\n")
@@ -222,6 +228,7 @@ def main():
         n = len(panels[pid].get("ansi_text", ""))
         flag = "  ⚠ empty-ish" if n < 150 else ""
         print(f"    {pid:<20} {n:>6} chars{flag}")
+    print(f"wrote {OUT / 'demo-fleet.json'} ({len(fleet.get('machines', []))} machine(s) with a hardware line)")
     print(f"wrote {OUT / 'demo-machine.json'} "
           f"({machine['specs'].get('machine_id')}, {machine['specs'].get('cpu_brand')})")
     print(f"wrote {OUT / 'demo-missions.json'} ({len(missions_resp.get('missions', []))} missions)")

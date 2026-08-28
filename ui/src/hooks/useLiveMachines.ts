@@ -3,6 +3,32 @@ import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "../lib/fetcher";
 import { queryKeys, PRESENCE_POLL_MS } from "../lib/queryKeys";
 import type { CoverageMeta, FleetMachinesLiveResponse, PresenceBeat } from "../types/handwritten";
+import { staticFleetSrc } from "../lib/staticSource";
+
+/** (#2067) The committed fleet snapshot a daemon-less build ships
+ * (`darkmux-fleet-src`), as the same uid-keyed map `useLiveMachines`
+ * returns — so `cards.ts::specOf` can read a hardware line from it without
+ * knowing which build it is on. Fetched once (no poll: a file does not
+ * change under the page) and only when the meta names one; every other
+ * build gets an empty map. Feed this to the SPEC lookup only, never to
+ * presence: a snapshot says what the hardware is, not who is online now. */
+export function useStaticFleetBeats(): Map<string, PresenceBeat> {
+  const src = staticFleetSrc();
+  const query = useQuery({
+    enabled: src !== null,
+    queryKey: queryKeys.staticFleet(src ?? ""),
+    queryFn: () => fetchJson<FleetMachinesLiveResponse>(src ?? ""),
+  });
+  return useMemo(() => {
+    const map = new Map<string, PresenceBeat>();
+    if (query.data?.ok) {
+      for (const beat of query.data.data.machines ?? []) {
+        if (beat?.machine_uid) map.set(beat.machine_uid, beat);
+      }
+    }
+    return map;
+  }, [query.data]);
+}
 
 /** `pollLiveMachines()` (viewer.html:3678) as a query hook — `LIVE_MACHINES`
  * as a `Map<machine_uid, PresenceBeat>`, same key shape legacy builds. */
