@@ -460,6 +460,15 @@ pub struct DockerRunConfig {
     /// never received, so the container always saw it unset and injection was
     /// unconditionally on regardless of `config.json` or a host-side export.
     pub feedback_injection: bool,
+    /// (#2094) The resolved `runtime.turn_delay_ms` setting
+    /// (`darkmux_types::config_access::turn_delay_ms()`), forwarded into the
+    /// container as `-e DARKMUX_TURN_DELAY_MS=<ms>` — the SAME #1548 pattern
+    /// `feedback_injection` above uses (the runtime crate can't depend on
+    /// `config_access`; the host does the tier resolution and always
+    /// forwards its result, even at `0`). Local dispatches only — this
+    /// field is meaningless on the remote/endpoint single-shot path, which
+    /// never builds a `DockerRunConfig` at all.
+    pub turn_delay_ms: u64,
     /// (#1187) When Some, this dispatch's "brain" is a remote OpenAI-compatible
     /// endpoint rather than local LMStudio — passed to the container as
     /// `--chat-url`. Set for a role whose tool_palette grants at least one
@@ -552,6 +561,14 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // resolved value on every dispatch, not just when the operator overrides.
     args.push("-e".to_string());
     args.push(format!("DARKMUX_FEEDBACK_INJECTION={}", config.feedback_injection));
+
+    // (#2094) Forward the resolved `turn_delay_ms` setting into the
+    // container — the SAME #1548 pattern as `feedback_injection` above.
+    // Always emitted, including at `0` (no rest, the pre-existing
+    // behavior), so the container's reader never has to guess whether an
+    // absent var means "not configured" or "the host forgot to forward it."
+    args.push("-e".to_string());
+    args.push(format!("DARKMUX_TURN_DELAY_MS={}", config.turn_delay_ms));
 
     // Runtime binary injection (non-default images only)
     if config.inject {
@@ -2447,6 +2464,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         "prompt": crate::dispatch::capped_prompt(&opts.message),
         "system_chars": system_prompt.chars().count(),
         "workspace": workspace.display().to_string(),
+        // (#2094) The resolved inter-turn rest this dispatch forwards into
+        // the container — recorded up front so a rested run's wall clock
+        // is never misread as a slow model without the knob that caused it.
+        "turn_delay_ms": darkmux_types::config_access::turn_delay_ms(),
     });
     // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
@@ -2627,6 +2648,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         feedback_templates: feedback_json,
         cache_dir: cache_dir.clone(),
         feedback_injection: darkmux_types::config_access::feedback_injection(),
+        turn_delay_ms: darkmux_types::config_access::turn_delay_ms(),
         remote_chat_url: agentic_pm
             .as_ref()
             .and_then(|pm| pm.endpoint.as_ref())
@@ -2962,11 +2984,20 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     // container has exited. Best-effort — zero totals on any read failure
     // (this is observability enrichment, never a dispatch-failing path).
     let tokens = read_token_totals(&host_out);
+    // (#2094) Same best-effort read, same source file — the sum of every
+    // inter-turn rest this dispatch took + how many. `wall_ms` above
+    // INCLUDES this time (wall stays wall); a caller wanting model-only
+    // time subtracts `rest_ms` from `wall_ms` itself.
+    let rest = read_rest_totals(&host_out);
 
     // 8. Emit dispatch.complete flow record with summary metadata.
     let mut dispatch_complete_payload = serde_json::json!({
         "runtime": "internal",
         "wall_ms": wall_ms,
+        // (#2094) Surfaced NEXT TO wall_ms per the issue's own framing — a
+        // rested run's wall clock must never be misread as a slow model.
+        "rest_ms": rest.rest_ms,
+        "rests": rest.rests,
         "stdout_chars": stdout.chars().count(),
         "stderr_chars": stderr.chars().count(),
         // (#1042) On the error path, carry a bounded stderr TAIL so a failed
@@ -3328,6 +3359,33 @@ pub fn read_token_totals(out_dir: &Path) -> TokenTotals {
     TokenTotals {
         prompt: v.get("total_prompt_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
         completion: v.get("total_completion_tokens").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
+    }
+}
+
+/// (#2094) Sum + count of the inter-turn rests the runtime took during this
+/// dispatch, read from `metrics.json` the same way [`TokenTotals`] is —
+/// same file, same best-effort degrade-to-zero-on-missing/malformed
+/// contract (observability enrichment, never a dispatch failure).
+#[derive(Default, Debug, Clone, Copy)]
+pub struct RestTotals {
+    pub rest_ms: u64,
+    pub rests: u32,
+}
+
+/// Read `rest_ms` / `rests` from the runtime's `metrics.json` under
+/// `<out_dir>/.darkmux-runtime/`. Mirrors [`read_token_totals`] exactly —
+/// same file, same missing/malformed degrade-to-default contract.
+pub fn read_rest_totals(out_dir: &Path) -> RestTotals {
+    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
+    let Ok(raw) = fs::read_to_string(&metrics_path) else {
+        return RestTotals::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return RestTotals::default();
+    };
+    RestTotals {
+        rest_ms: v.get("rest_ms").and_then(|n| n.as_u64()).unwrap_or(0),
+        rests: v.get("rests").and_then(|n| n.as_u64()).unwrap_or(0) as u32,
     }
 }
 

@@ -581,6 +581,45 @@
         assert_eq!(t.total(), u32::MAX);
     }
 
+    // ─── (#2094) read_rest_totals — mirrors read_token_totals exactly ────
+
+    #[test]
+    fn read_rest_totals_parses_metrics_json() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 1000, "rests": 2}"#).unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!(r.rest_ms, 1000);
+        assert_eq!(r.rests, 2);
+    }
+
+    #[test]
+    fn read_rest_totals_degrades_to_zero_on_missing_or_malformed() {
+        let missing = TempDir::new().unwrap();
+        let r = read_rest_totals(missing.path());
+        assert_eq!((r.rest_ms, r.rests), (0, 0), "missing metrics.json → zero totals");
+
+        let bad = TempDir::new().unwrap();
+        let rt = bad.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), "{not valid json").unwrap();
+        let r = read_rest_totals(bad.path());
+        assert_eq!((r.rest_ms, r.rests), (0, 0), "malformed metrics.json → zero totals");
+    }
+
+    #[test]
+    fn read_rest_totals_absent_fields_default_to_zero() {
+        // A metrics.json from BEFORE #2094 (or a build without the feature)
+        // has no rest_ms/rests keys at all — must degrade to zero, not error.
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(rt.join("metrics.json"), r#"{"total_prompt_tokens": 100}"#).unwrap();
+        let r = read_rest_totals(out.path());
+        assert_eq!((r.rest_ms, r.rests), (0, 0));
+    }
+
     #[test]
     #[serial]
     fn config_path_reaches_dispatch_resolvers_not_just_env() {
@@ -1147,6 +1186,9 @@
             // two tests together pin BOTH string forms the container's
             // falsy-set reader must distinguish.
             feedback_injection: true,
+            // (#2094) Nonzero here so the complete-vector assertion below
+            // pins the forwarded `-e DARKMUX_TURN_DELAY_MS=<n>` pair too.
+            turn_delay_ms: 3000,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1209,65 +1251,72 @@
         assert_eq!(argv[21], "-e");
         assert_eq!(argv[22], "DARKMUX_FEEDBACK_INJECTION=true");
 
+        // 5c. (#2094) Verify the turn-delay env var is forwarded — ALWAYS,
+        // including at nonzero values (`config.turn_delay_ms: 3000` in this
+        // test's config → `DARKMUX_TURN_DELAY_MS=3000` on argv).
+        assert_eq!(argv[23], "-e");
+        assert_eq!(argv[24], "DARKMUX_TURN_DELAY_MS=3000");
+
         // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[23], "-v");
+        assert_eq!(argv[25], "-v");
         assert_eq!(
-            argv[24],
+            argv[26],
             "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
         );
-        assert_eq!(argv[25], "--entrypoint");
-        assert_eq!(argv[26], "/darkmux-runtime");
+        assert_eq!(argv[27], "--entrypoint");
+        assert_eq!(argv[28], "/darkmux-runtime");
 
         // 7. Verify `--` + image + runtime CLI args
-        assert_eq!(argv[27], "--");
-        assert_eq!(argv[28], "rust:slim"); // image
-        assert_eq!(argv[29], "run"); // runtime subcommand
-        assert_eq!(argv[30], "--model");
-        assert_eq!(argv[31], "llama3-8b");
-        assert_eq!(argv[32], "--system");
-        assert_eq!(argv[33], "You are a coding assistant.");
+        assert_eq!(argv[29], "--");
+        assert_eq!(argv[30], "rust:slim"); // image
+        assert_eq!(argv[31], "run"); // runtime subcommand
+        assert_eq!(argv[32], "--model");
+        assert_eq!(argv[33], "llama3-8b");
+        assert_eq!(argv[34], "--system");
+        assert_eq!(argv[35], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[34], "--prompt-file");
-        assert_eq!(argv[35], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[36], "--prompt-file");
+        assert_eq!(argv[37], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[36], "--json");
+        assert_eq!(argv[38], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[37], "--allowed-tools");
-        assert_eq!(argv[38], "exec,edit");
+        assert_eq!(argv[39], "--allowed-tools");
+        assert_eq!(argv[40], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[39], "--compact-threshold-tokens");
-        assert_eq!(argv[40], "4096");
-        assert_eq!(argv[41], "--compactor-model");
-        assert_eq!(argv[42], "util-model");
-        assert_eq!(argv[43], "--compact-threshold-ratio");
-        assert_eq!(argv[44], "0.75");
-        assert_eq!(argv[45], "--context-window");
-        assert_eq!(argv[46], "32000");
-        assert_eq!(argv[47], "--compact-strategy");
-        assert_eq!(argv[48], "structured-slot");
-        assert_eq!(argv[49], "--bail-after-compactions");
-        assert_eq!(argv[50], "10");
-        assert_eq!(argv[51], "--compactor-custom-instructions");
-        assert_eq!(argv[52], "Be terse.");
+        assert_eq!(argv[41], "--compact-threshold-tokens");
+        assert_eq!(argv[42], "4096");
+        assert_eq!(argv[43], "--compactor-model");
+        assert_eq!(argv[44], "util-model");
+        assert_eq!(argv[45], "--compact-threshold-ratio");
+        assert_eq!(argv[46], "0.75");
+        assert_eq!(argv[47], "--context-window");
+        assert_eq!(argv[48], "32000");
+        assert_eq!(argv[49], "--compact-strategy");
+        assert_eq!(argv[50], "structured-slot");
+        assert_eq!(argv[51], "--bail-after-compactions");
+        assert_eq!(argv[52], "10");
+        assert_eq!(argv[53], "--compactor-custom-instructions");
+        assert_eq!(argv[54], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[53], "--feedback-templates-json");
+        assert_eq!(argv[55], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[54].contains("error"));
-        assert!(argv[54].contains("An error occurred"));
+        assert!(argv[56].contains("error"));
+        assert!(argv[56].contains("An error occurred"));
 
-        // Total arg count: 55 (0..=54) — 53 pre-#1548, +2 for the new
-        // `-e DARKMUX_FEEDBACK_INJECTION=<v>` pair.
-        assert_eq!(argv.len(), 55);
+        // Total arg count: 57 (0..=56) — 53 pre-#1548, +2 for
+        // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
+        // `-e DARKMUX_TURN_DELAY_MS=<ms>` (#2094).
+        assert_eq!(argv.len(), 57);
     }
 
     #[test]
@@ -1308,6 +1357,7 @@
             // caught it, which is exactly why the sibling test's claim to
             // cover "both string forms" mattered.
             feedback_injection: false,
+            turn_delay_ms: 0,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1323,6 +1373,14 @@
             argv.contains(&"DARKMUX_FEEDBACK_INJECTION=false".to_string()),
             "the OFF state must be forwarded verbatim — the runtime only honors \
              `0|off|false|no`, so any other rendering silently re-enables it: {argv:?}"
+        );
+
+        // (#2094) The turn-delay env var is ALWAYS forwarded too, including
+        // at its unconfigured `0` value — never an absent var the container
+        // has to interpret as "not configured."
+        assert!(
+            argv.contains(&"DARKMUX_TURN_DELAY_MS=0".to_string()),
+            "the unconfigured (0) turn-delay must still be forwarded verbatim: {argv:?}"
         );
 
         // Should NOT contain optional flags
@@ -1401,6 +1459,7 @@
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
             feedback_injection: true,
+            turn_delay_ms: 0,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1448,6 +1507,7 @@
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
             feedback_injection: true,
+            turn_delay_ms: 0,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1699,6 +1759,7 @@
             feedback_templates: serde_json::Value::Null,
             cache_dir: PathBuf::from("/tmp/cache"),
             feedback_injection: true,
+            turn_delay_ms: 0,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
