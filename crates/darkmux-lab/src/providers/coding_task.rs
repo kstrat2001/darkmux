@@ -542,7 +542,19 @@ impl WorkloadProvider for CodingTaskProvider {
         // (#2094 finding 7) Computed once here — used both for the
         // classification below and the report's own `rest_ms` field /
         // notes line, so all three readings agree.
-        let rest_ms: u64 = runtime_metrics.as_ref().map(|m| m.rest_ms).unwrap_or(0);
+        //
+        // (#2094 second round, finding 5 CONSIDER) `max()` against the
+        // trajectory-derived sum, the same reconcile shape `turns`/
+        // `compactions` already get via `reconcile_count` — a
+        // zeroed-but-present metrics.json (the exit-time write raced a
+        // crash, same shape `darkmux-crew`'s `reconcile_rest_totals`
+        // fixes host-side) must not undercut a trajectory that actually
+        // recorded rests.
+        let rest_ms: u64 = runtime_metrics
+            .as_ref()
+            .map(|m| m.rest_ms)
+            .unwrap_or(0)
+            .max(sum_rest_ms_from_events(&events));
         // Classify on MODEL time, not raw wall clock. Fast/Slow is a claim
         // about the MODEL's speed; a rested run's wall clock includes real
         // idle time (GPU thermal/power relief between turns, #2094) that
@@ -1212,9 +1224,13 @@ struct InternalRuntimeMetrics {
     turns: Option<u32>,
     compactions: Option<u32>,
     /// (#2094) Sum of inter-turn rests, in milliseconds — `0` (not
-    /// `None`) when absent, since there's no trajectory-derived fallback
-    /// to reconcile against the way `turns`/`compactions` have (unlike
-    /// those, an absent value here has nothing to be "lower than").
+    /// `None`) when absent. (#2094 second round, finding 5 CONSIDER:
+    /// this field DOES now have a trajectory-derived fallback to
+    /// reconcile against, the same shape `turns`/`compactions` have via
+    /// `reconcile_count` — see the call site in `inspect`, which takes
+    /// `max(this field, sum_rest_ms_from_events(&events))` so a
+    /// zeroed-but-present metrics.json can't undercut a trajectory that
+    /// actually recorded rests.)
     rest_ms: u64,
 }
 
@@ -1245,6 +1261,22 @@ fn count_event_type(events: &[serde_json::Value], ty: &str) -> u32 {
 /// when the trajectory itself is truncated, the higher metric is kept.
 fn reconcile_count(metric: Option<u32>, trajectory: u32) -> u32 {
     metric.unwrap_or(0).max(trajectory)
+}
+
+/// (#2094 second round, finding 5 CONSIDER) Sum every `runtime.rest`
+/// event's `ms` out of an already-parsed trajectory. Mirrors
+/// `darkmux_crew::dispatch_internal::sum_rest_totals_from_trajectory`
+/// (cited here rather than called directly: that helper re-reads
+/// `trajectory.jsonl` from disk given a directory, but `inspect` already
+/// has the events parsed into memory as `events` by the time `rest_ms`
+/// is computed — re-reading the file here would be a redundant disk pass
+/// over identical data).
+fn sum_rest_ms_from_events(events: &[serde_json::Value]) -> u64 {
+    events
+        .iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("runtime.rest"))
+        .map(|e| e.get("ms").and_then(|n| n.as_u64()).unwrap_or(0))
+        .fold(0u64, u64::saturating_add)
 }
 
 fn read_metrics_json(path: &Path) -> Option<InternalRuntimeMetrics> {
@@ -2106,6 +2138,45 @@ not-valid-json
             "notes must surface the rest that explains the wall/model-time gap: {:?}",
             report.notes
         );
+    }
+
+    /// (#2094 second round, finding 5 CONSIDER) The same "zeroed-but-present
+    /// metrics.json" gap `darkmux-crew`'s `reconcile_rest_totals` fixes on
+    /// the host side, reproduced here: `rest_ms: 0` in metrics.json must
+    /// not be trusted as an authoritative zero when the trajectory
+    /// recorded real `runtime.rest` events — fall back to summing them.
+    #[test]
+    fn inspect_falls_back_to_trajectory_rest_when_metrics_rest_ms_is_zero() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox = tmp.path().join("sandbox");
+        let runtime_dir = sandbox.join(".darkmux-runtime");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(
+            run_dir.join("manifest.json"),
+            format!(
+                r#"{{"session_id":"sess","duration_ms":60000,"sandbox":"{}"}}"#,
+                sandbox.display()
+            ),
+        )
+        .unwrap();
+        // metrics.json IS present with the key, but zeroed — the same
+        // "exit-time write raced a crash" shape as the host-side finding.
+        fs::write(
+            runtime_dir.join("metrics.json"),
+            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":3,"compactions":0,"rest_ms":0,"rests":0}"#,
+        )
+        .unwrap();
+        fs::write(
+            run_dir.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":400}\n\
+             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":600}\n",
+        )
+        .unwrap();
+        let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+        assert_eq!(report.rest_ms, 1000, "sum of both runtime.rest ms fields from the trajectory");
     }
 
     // ─── #364: inspect prefers run_dir/metrics.json over sandbox ──
