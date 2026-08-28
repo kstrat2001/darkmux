@@ -716,10 +716,11 @@ fn emit_phase_added_record_with_reasoning(
 /// `eprintln!`s a named warning so the operator sees the backstop actually
 /// caught something, matching the drift-warning style `finalize_mission`
 /// already uses.
-fn reconcile_phase_steps_terminal(mission_id: &str, phase_id: &str) {
+fn reconcile_phase_steps_terminal(mission_id: &str, phase_id: &str) -> Vec<String> {
     let Ok(steps) = load_steps_for_phase(mission_id, phase_id) else {
-        return;
+        return Vec::new();
     };
+    let mut warned = Vec::new();
     for mut step in steps {
         if !matches!(step.status, NodeStatus::Planned | NodeStatus::Running) {
             continue;
@@ -736,14 +737,25 @@ fn reconcile_phase_steps_terminal(mission_id: &str, phase_id: &str) {
                 if was_running { "Running" } else { "Planned" }
             ));
         }
-        eprintln!(
-            "warning: mission `{mission_id}` phase `{phase_id}` step `{}` was still {} while the \
-             phase reached a terminal status — reconciled to Abandoned (#1504 defensive backstop)",
-            step.id,
-            if was_running { "Running" } else { "Planned" }
-        );
+        // (#1959 merge-gate finding 3) Only a `Running` step reconciled
+        // here is a genuine anomaly worth an operator-facing warning — it
+        // was picked up and then orphaned. A `Planned` step never started;
+        // a phase-level stop (kill file / interrupt / an early error)
+        // leaving it Planned is the EXPECTED shape of "we stopped early,"
+        // not a defect the backstop needs to flag. Still reconciled to
+        // Abandoned either way — just quietly for the Planned case.
+        if was_running {
+            eprintln!(
+                "warning: mission `{mission_id}` phase `{phase_id}` step `{}` was still Running \
+                 while the phase reached a terminal status — reconciled to Abandoned (#1504 \
+                 defensive backstop)",
+                step.id,
+            );
+            warned.push(step.id.clone());
+        }
         let _ = save_step(mission_id, phase_id, &step);
     }
+    warned
 }
 
 /// Roll every non-terminal (`Planned`/`Running`) Phase belonging to
@@ -1531,6 +1543,36 @@ mod tests {
 
         let step = load_step("test-mission", "p-planned", "never-started-step").unwrap();
         assert_eq!(step.status, crate::types::NodeStatus::Abandoned);
+    }
+
+    /// (#1959 merge-gate finding 3) The #1504 backstop's `eprintln!` warning
+    /// exists to flag a step that WAS running and got orphaned — a real
+    /// anomaly. It should not also fire for every `Planned` step a
+    /// deliberate stop (kill file / interrupt / an early error) leaves
+    /// behind before that step was ever picked up — that's not an anomaly,
+    /// it's the intended shape of "we stopped early." `reconcile_phase_
+    /// steps_terminal` returns the ids it actually warned about (the
+    /// `Running` ones) so this is observable without scraping stderr.
+    #[serial_test::serial]
+    #[test]
+    fn reconcile_phase_steps_terminal_warns_only_for_running_not_planned() {
+        let _g = CrewGuard::new();
+        seed_phase("p-warn", PhaseStatus::Running);
+        seed_step("test-mission", "p-warn", "never-started-step", crate::types::NodeStatus::Planned);
+        seed_step("test-mission", "p-warn", "mid-flight-step", crate::types::NodeStatus::Running);
+
+        let warned = reconcile_phase_steps_terminal("test-mission", "p-warn");
+
+        assert_eq!(
+            warned,
+            vec!["mid-flight-step".to_string()],
+            "only the Running step should be warned about — the Planned one is reconciled quietly"
+        );
+
+        let planned = load_step("test-mission", "p-warn", "never-started-step").unwrap();
+        let running = load_step("test-mission", "p-warn", "mid-flight-step").unwrap();
+        assert_eq!(planned.status, crate::types::NodeStatus::Abandoned, "still reconciled — just quietly");
+        assert_eq!(running.status, crate::types::NodeStatus::Abandoned);
     }
 
     /// `phase_abandon` gets the same treatment as `phase_complete` — an
