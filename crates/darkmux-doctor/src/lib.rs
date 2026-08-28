@@ -1427,14 +1427,23 @@ fn check_review_judge_exhaustion_policy() -> Check {
 /// that cheaply"). Showing the resolved value is what's left.
 fn check_turn_delay() -> Check {
     let name = "runtime.turn_delay_ms";
-    let env_set = std::env::var("DARKMUX_TURN_DELAY_MS")
+    // (#2094 finding 9) `env_raw` is the RAW string, if the env var is set
+    // to anything non-empty at all — distinct from whether it actually
+    // PARSED. `config_access::turn_delay_ms()` (below) silently falls
+    // through to the config/default tier on a parse failure
+    // (`pick_parsed`'s contract), so a set-but-garbage env var was
+    // previously reported as `"from DARKMUX_TURN_DELAY_MS env"` while the
+    // resolved `ms` value actually came from a LOWER tier — provenance
+    // and value disagreeing with nothing here to say so.
+    let env_raw = std::env::var("DARKMUX_TURN_DELAY_MS")
         .ok()
-        .is_some_and(|s| !s.trim().is_empty());
+        .filter(|s| !s.trim().is_empty());
+    let env_parses = env_raw.as_deref().is_some_and(|s| s.trim().parse::<u64>().is_ok());
     let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
         .runtime
         .and_then(|r| r.turn_delay_ms)
         .is_some();
-    let provenance = if env_set {
+    let provenance = if env_parses {
         "from DARKMUX_TURN_DELAY_MS env"
     } else if cfg_set {
         "from config.json"
@@ -1443,6 +1452,25 @@ fn check_turn_delay() -> Check {
     };
     let ms = darkmux_types::config_access::turn_delay_ms();
     let timeout_ms = darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(1000);
+    // An env var IS set but did not parse as an integer — this is a
+    // config mistake, not silence, and it must say so rather than quietly
+    // reporting whatever lower tier resolved instead.
+    if let Some(raw) = env_raw.as_deref() {
+        if !env_parses {
+            return Check {
+                name: name.into(),
+                status: Status::Warn,
+                message: format!(
+                    "DARKMUX_TURN_DELAY_MS=`{raw}` is not an integer; using {ms}ms ({provenance})"
+                ),
+                hint: Some(
+                    "Set DARKMUX_TURN_DELAY_MS to a plain integer number of milliseconds \
+                     (e.g. `3000`), or unset it to fall through to config.json / the default."
+                        .into(),
+                ),
+            };
+        }
+    }
     if ms == 0 {
         return Check {
             name: name.into(),
@@ -4768,6 +4796,43 @@ mod tests {
             match prev_t {
                 Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
                 None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
+    /// (#2094 finding 9) An env var set to garbage must not be silently
+    /// reported as `"from ... env"` — `config_access::turn_delay_ms()`
+    /// falls through to a lower tier on a parse failure, and provenance
+    /// claiming "env" while the resolved value came from config/default
+    /// is a doctor surface actively lying about where a number came from.
+    #[serial_test::serial]
+    #[test]
+    fn check_turn_delay_unparseable_env_warns_and_names_the_raw_value() {
+        let prev_d = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_TURN_DELAY_MS", "3s");
+        }
+        let check = check_turn_delay();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("DARKMUX_TURN_DELAY_MS") && check.message.contains("3s"),
+            "must name the raw unparseable value: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("not an integer"),
+            "must say WHY it's rejected, not just show a resolved number: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("from DARKMUX_TURN_DELAY_MS env"),
+            "must NOT claim provenance is env when the env value didn't parse: {}",
+            check.message
+        );
+        unsafe {
+            match prev_d {
+                Some(v) => std::env::set_var("DARKMUX_TURN_DELAY_MS", v),
+                None => std::env::remove_var("DARKMUX_TURN_DELAY_MS"),
             }
         }
     }

@@ -291,7 +291,17 @@ pub struct RuntimeBehaviorConfig {
     /// and always forwards its result). Default `0` (no rest — the pre-
     /// existing behavior). Applied in `runtime/src/loop_runner.rs` between
     /// turns, never before the first turn; clamped below the inactivity
-    /// timeout with a loud warning if configured at or above it. Local
+    /// timeout with a loud warning if configured at or above it.
+    ///
+    /// (#2094 finding 10) "Between turns" means between LOGICAL turns, not
+    /// between every individual inference call: a checkpoint continuation
+    /// (the model resuming mid-thought after hitting the per-call token
+    /// cap) and the compactor's own call are both part of the SAME turn by
+    /// design (`resuming_after_checkpoint` / the compactor's separate
+    /// client), so neither one triggers a rest — only the boundary between
+    /// one completed turn and the next model-facing turn does. This keeps
+    /// the knob's cost proportional to actual GPU inference bursts rather
+    /// than to how finely one burst happens to get checkpointed. Local
     /// dispatches only. The remote single-shot path never forwards this at
     /// all (it never builds a `DockerRunConfig`). An agentic-REMOTE
     /// dispatch (a tool-granting role on an endpoint profile, which DOES
