@@ -1,3 +1,4 @@
+import { speedLabel } from "../../hooks/usePlaybackTransport";
 import { clkhm, clkrange } from "../../lib/format";
 
 /**
@@ -106,8 +107,8 @@ export function Scrubber({
         onChange={(e) => onScrub(tMin + (span * Number(e.target.value)) / 100)}
         aria-valuetext={`${clkhm(t)} of ${clkrange(tMin, tMax)}`}
       />
-      <button type="button" onClick={onCycleSpeed} title="playback speed" aria-label={`playback speed, ${speed}×`}>
-        {speed}×
+      <button type="button" onClick={onCycleSpeed} title="playback speed (recorded time per second)" aria-label={`playback speed, ${speedLabel(speed)}`}>
+        {speedLabel(speed)}
       </button>
       <span className="clock" data-testid="scrubber-clock">
         {clkhm(t)} · {visibleCount}/{totalCount} rec

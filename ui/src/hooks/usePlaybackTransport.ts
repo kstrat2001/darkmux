@@ -13,10 +13,25 @@ import type { FlowRecord } from "../types/handwritten";
  * itself changes (its span or size), matching the lens's old `[date]`
  * reset. The tick loop advances `t` by a fixed fraction of the day's span
  * per tick so a day of any length plays out in the same wall-clock time. */
-export const SPEEDS = [0.5, 1, 2, 4] as const;
+/** Speed is a REAL multiplier of elapsed time: at `3600` one second of
+ * wall clock replays one recorded hour. It used to be a fraction of the
+ * day per tick (`PLAY_SPAN_DIVISOR = 120`: any recording, however long,
+ * played out in 12 seconds), which made the "1×" label a lie — a 13-hour
+ * demo day ran at ~3,900× real time under it (operator: "1× doesn't seem
+ * 1×"). Labeled as recorded time per second (`speedLabel`) because a bare
+ * multiplier is meaningless to a reader: `1h/s` is. Cycle order: the
+ * default first, then the slow presets, so one tap from the default is
+ * the slowest. */
+export const SPEEDS = [3600, 60, 600] as const;
 export type Speed = (typeof SPEEDS)[number];
+export const DEFAULT_SPEED: Speed = 3600;
 export const PLAY_TICK_MS = 100;
-export const PLAY_SPAN_DIVISOR = 120;
+
+export function speedLabel(speed: number): string {
+  if (speed % 3600 === 0) return `${speed / 3600}h/s`;
+  if (speed % 60 === 0) return `${speed / 60}m/s`;
+  return `${speed}s/s`;
+}
 
 export interface PlaybackTransport {
   /** A day is loaded and non-empty: the transport renders and the lenses
@@ -45,21 +60,23 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null): PlaybackT
 
   const [t, setT] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
-  const [speed, setSpeed] = useState<Speed>(1);
+  const [speed, setSpeed] = useState<Speed>(DEFAULT_SPEED);
   useEffect(() => {
     setT(null);
     setPlaying(false);
-    setSpeed(1);
+    setSpeed(DEFAULT_SPEED);
   }, [dayKey]);
 
   const playheadT = t ?? tMax;
 
   // Keyed on the day (`dayKey`), not on the records array: a daemon
   // playback route rebuilds that array per render, and an effect keyed on it
-  // would clear and restart the interval on every render.
+  // would clear and restart the interval on every render. The step is
+  // recorded time per tick, so a day of any length plays at the labeled
+  // rate rather than in a fixed number of ticks.
   useEffect(() => {
     if (!playing || !dayKey) return;
-    const step = ((tMax - tMin) / PLAY_SPAN_DIVISOR) * speed;
+    const step = PLAY_TICK_MS * speed; // recorded ms per tick
     const id = setInterval(() => {
       setT((prev) => Math.min((prev ?? tMax) + step, tMax));
     }, PLAY_TICK_MS);
