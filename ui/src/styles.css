@@ -1997,6 +1997,20 @@ body {
 @media (max-width: 560px) {
   .savrow {
     grid-template-columns: minmax(0, 1fr);
+    row-gap: 18px;
+  }
+  /* Label ABOVE its figure, tight to it. Stacked one per row, the old
+     number-then-label order put a 6px gap above each label and ~15px below
+     it, so the eye bound each label to the figure BENEATH it — the hero read
+     "local tokens 0, cloud 342,201" for a day that was local 12.1M, cloud
+     0. Vertical proximity was the ambiguity; this removes it. */
+  .savlead {
+    display: flex;
+    flex-direction: column-reverse;
+  }
+  .savlead .savlbl {
+    margin-top: 0;
+    margin-bottom: 3px;
   }
 }
 .savlbl {
