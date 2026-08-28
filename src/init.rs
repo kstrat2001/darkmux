@@ -36,6 +36,11 @@ pub struct InitReport {
     pub worker_model_filled: Option<String>,
     /// (#2038) Why the placeholder was left in place, when it was.
     pub worker_model_unfilled_reason: Option<String>,
+    /// (#2053) The utility (compactor) model id `init` wrote in place of one
+    /// LM Studio does not have, chosen from what is downloaded.
+    pub utility_model_filled: Option<String>,
+    /// (#2053) Why the utility binding was left as written, when it was.
+    pub utility_model_unfilled_reason: Option<String>,
     pub config_path: Option<PathBuf>,
     pub config_created: bool,
     pub config_already_present: bool,
@@ -102,6 +107,14 @@ pub fn init(opts: &InitOptions) -> Result<InitReport> {
             Ok(Some(id)) => report.worker_model_filled = Some(id),
             Ok(None) => {}
             Err(reason) => report.worker_model_unfilled_reason = Some(reason),
+        }
+        // (#2053) The utility binding ships as a literal id too; on a machine
+        // whose key differs (publisher prefix, or no such model) the first
+        // dispatch warned about its compactor. Verify it the same way.
+        match fill_utility_model(&registry_path) {
+            Ok(Some(id)) => report.utility_model_filled = Some(id),
+            Ok(None) => {}
+            Err(reason) => report.utility_model_unfilled_reason = Some(reason),
         }
     }
 
@@ -235,6 +248,99 @@ fn fill_worker_model(registry_path: &std::path::Path) -> std::result::Result<Opt
     let filled = fill_placeholder_models(&text, &id).expect("placeholder was present");
     fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
     Ok(Some(id))
+}
+
+/// A utility model has to be a real model, not a toy: the smallest LLM at or
+/// above this size. Keeps a 0.5B experiment from becoming the compactor.
+const UTILITY_MODEL_MIN_BYTES: u64 = 1_000_000_000;
+
+/// (#2053) The utility (compactor) model: the registry's `current` id if
+/// LM Studio has it under that key; the bare key if `current` only differs
+/// by a publisher prefix (`qwen/qwen3-4b-instruct-2507` vs
+/// `qwen3-4b-instruct-2507`, the shape that shipped in the example
+/// registry); else the smallest downloaded LLM that is a real model.
+pub fn choose_utility_model(current: &str, available: &[darkmux_profiles::lms::ModelMeta]) -> Option<String> {
+    let llms: Vec<&darkmux_profiles::lms::ModelMeta> = available.iter().filter(|m| m.model_type == "llm").collect();
+    if llms.iter().any(|m| m.model_key == current) {
+        return Some(current.to_string());
+    }
+    let bare = current.rsplit('/').next().unwrap_or(current);
+    if let Some(m) = llms.iter().find(|m| m.model_key == bare || m.model_key.rsplit('/').next() == Some(bare)) {
+        return Some(m.model_key.clone());
+    }
+    llms.iter()
+        .filter(|m| m.size_bytes >= UTILITY_MODEL_MIN_BYTES)
+        .min_by_key(|m| m.size_bytes)
+        .map(|m| m.model_key.clone())
+}
+
+/// Locate the value of the registry's `"utility": "<id>"` binding in the
+/// raw text: the byte range of `<id>`. A hand-rolled scan rather than a
+/// regex dependency (the dep set is small on purpose). `None` when the key
+/// is absent or not followed by a string.
+fn utility_value_span(registry_json: &str) -> Option<(usize, usize)> {
+    let key = "\"utility\"";
+    let k = registry_json.find(key)?;
+    let rest = &registry_json[k + key.len()..];
+    let colon = rest.find(':')?;
+    if !rest[..colon].trim().is_empty() {
+        return None;
+    }
+    let after = &rest[colon + 1..];
+    let ws = after.len() - after.trim_start().len();
+    let quote = k + key.len() + colon + 1 + ws;
+    if !registry_json[quote..].starts_with('"') {
+        return None;
+    }
+    let start = quote + 1;
+    let end = start + registry_json[start..].find('"')?;
+    Some((start, end))
+}
+
+/// (#2053) Rewrite `internal.utility`'s value, and only that: a profile model
+/// with the same id is a worker slot and stays. Text-level, like the worker
+/// fill, so the operator's file keeps its shape. `None` when there is
+/// nothing to replace.
+pub fn fill_utility_binding(registry_json: &str, current: &str, new_id: &str) -> Option<String> {
+    let (start, end) = utility_value_span(registry_json)?;
+    if &registry_json[start..end] != current || current == new_id {
+        return None;
+    }
+    Some(format!("{}{}{}", &registry_json[..start], new_id, &registry_json[end..]))
+}
+
+fn fill_utility_model(registry_path: &std::path::Path) -> std::result::Result<Option<String>, String> {
+    let text = fs::read_to_string(registry_path).map_err(|e| format!("reading {}: {e}", registry_path.display()))?;
+    let Some((vs, ve)) = utility_value_span(&text) else {
+        return Ok(None);
+    };
+    let current = text[vs..ve].to_string();
+    // Only the value the example registry ships is init's to change. An
+    // operator who set a utility id by hand, downloaded or not, keeps it.
+    let shipped = utility_value_span(EXAMPLE_PROFILES_JSON).map(|(a, b)| &EXAMPLE_PROFILES_JSON[a..b]);
+    if shipped != Some(current.as_str()) {
+        return Ok(None);
+    }
+    let available = match darkmux_profiles::lms::list_available() {
+        Ok(v) => v,
+        Err(_) => return Ok(None), // the worker fill already reported an unreachable lms
+    };
+    if available.iter().any(|m| m.model_type == "llm" && m.model_key == current) {
+        return Ok(None);
+    }
+    let Some(id) = choose_utility_model(&current, &available) else {
+        return Err(format!(
+            "the registry's utility model `{current}` is not downloaded and no LLM of at least 1 GB is. \
+             Download a small instruct model (a 4B is ideal) in LM Studio, then re-run `darkmux init`."
+        ));
+    };
+    match fill_utility_binding(&text, &current, &id) {
+        Some(filled) => {
+            fs::write(registry_path, filled).map_err(|e| format!("writing {}: {e}", registry_path.display()))?;
+            Ok(Some(id))
+        }
+        None => Ok(None),
+    }
 }
 
 fn user_profile_registry_path() -> Result<PathBuf> {
@@ -944,6 +1050,39 @@ mod tests {
         // cache, and a utility model need room too.
         assert!(worker_model_budget_bytes(32) < 32 * 1_000_000_000);
         assert!(worker_model_budget_bytes(32) >= 16 * 1_000_000_000);
+    }
+
+    // ── #2053: init verifies the utility binding against LM Studio ────────
+
+    #[test]
+    fn utility_model_keeps_a_present_key_and_otherwise_picks_the_smallest_real_llm() {
+        let avail = vec![meta("qwen3-4b-instruct-2507", 2, "llm"), meta("big-70b", 45, "llm"), meta("tiny-0.5b", 0, "llm"), meta("embed", 1, "embedding")];
+        // Present as written: keep it, even if a smaller one exists.
+        assert_eq!(choose_utility_model("big-70b", &avail).as_deref(), Some("big-70b"));
+        // A publisher-prefixed id that LM Studio knows by its bare key: the bare key wins.
+        assert_eq!(choose_utility_model("qwen/qwen3-4b-instruct-2507", &avail).as_deref(), Some("qwen3-4b-instruct-2507"));
+        // Absent entirely: the smallest LLM that is at least a real model (>= 1 GB), never an embedding.
+        assert_eq!(choose_utility_model("nobody/4b", &avail).as_deref(), Some("qwen3-4b-instruct-2507"));
+        // Nothing usable downloaded.
+        assert_eq!(choose_utility_model("nobody/4b", &[meta("embed", 1, "embedding")]), None);
+    }
+
+    #[test]
+    fn fill_utility_binding_rewrites_only_that_value() {
+        let reg = r#"{"internal":{"utility":"qwen/qwen3-4b-instruct-2507"},"profiles":{"fast":{"models":[{"id":"qwen/qwen3-4b-instruct-2507","n_ctx":32000}]}}}"#;
+        let out = fill_utility_binding(reg, "qwen/qwen3-4b-instruct-2507", "qwen3-4b-instruct-2507").expect("binding present");
+        assert!(out.contains(r#""utility":"qwen3-4b-instruct-2507""#), "{out}");
+        assert!(out.contains(r#""id":"qwen/qwen3-4b-instruct-2507""#), "a profile model with the same id is not the utility binding: {out}");
+        assert_eq!(fill_utility_binding(&out, "qwen/qwen3-4b-instruct-2507", "x"), None, "nothing to replace");
+    }
+
+    /// The scanner reads the shipped example's own binding, so the gate that
+    /// protects an operator's hand-set value compares against the real
+    /// shipped string, not a copy that could drift.
+    #[test]
+    fn the_shipped_utility_binding_is_readable_from_the_example() {
+        let (a, b) = utility_value_span(EXAMPLE_PROFILES_JSON).expect("example registry declares internal.utility");
+        assert_eq!(&EXAMPLE_PROFILES_JSON[a..b], "qwen/qwen3-4b-instruct-2507");
     }
 }
 
