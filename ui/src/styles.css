@@ -2510,6 +2510,21 @@ body {
   color: var(--bg);
   border-color: var(--accent);
 }
+/* The icon buttons are fixed squares with the path flex-centered, so the
+   rewind and play/pause controls are the same size and their marks sit in
+   the same place (see `Scrubber.tsx` for why text glyphs could not). */
+.scrub button.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 34px;
+  padding: 0;
+  line-height: 0;
+}
+.scrub button.icon svg {
+  display: block;
+}
 .scrub input[type="range"] {
   flex: 1;
   min-width: 0;

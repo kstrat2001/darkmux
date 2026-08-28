@@ -85,17 +85,32 @@ export function Scrubber({
 
   return (
     <div className="scrub" data-testid="scrubber" role="group" aria-label="playback transport">
-      <button type="button" onClick={onRewind} title="jump to start" aria-label="jump to start">
-        ⏮
+      {/* (operator, on the phone, 2026-08-28) Inline SVG icons in fixed
+          square buttons, not text glyphs: `⏮` rendered as a 48x40 emoji on
+          iOS while `▶` was a 39x32 mono-font triangle whose ink sat low in
+          its box, so neither looked centered and the two never matched. A
+          path is the same shape at the same place on every platform. */}
+      <button type="button" className="icon" onClick={onRewind} title="jump to start" aria-label="jump to start">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+          <path d="M2 2h2v12H2zM14 2v12L5 8z" fill="currentColor" />
+        </svg>
       </button>
       <button
         type="button"
-        className="primary"
+        className="primary icon"
         onClick={onTogglePlay}
         title={playing ? "pause" : "play"}
         aria-label={playing ? "pause" : "play"}
       >
-        {playing ? "⏸" : "▶"}
+        {playing ? (
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+            <path d="M3 2h4v12H3zM9 2h4v12H9z" fill="currentColor" />
+          </svg>
+        ) : (
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+            <path d="M4 2l10 6-10 6z" fill="currentColor" />
+          </svg>
+        )}
       </button>
       <input
         type="range"
