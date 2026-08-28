@@ -260,6 +260,20 @@ fn last_status_path(outbox_dir: &Path, index: usize, url: &str) -> PathBuf {
     outbox_dir.join(format!("{index}-{sanitized}.last"))
 }
 
+/// (#2093 merge-gate finding 3) Sibling of `outbox_paths`' pair — a
+/// dedicated lock file the DRAINER (never the appender) takes
+/// non-blockingly for the whole read-cursor → POST → write-cursor
+/// sequence. Kept SEPARATE from the outbox file's own append lock
+/// (`append_outbox_line`'s `flock`) on purpose: a POST can take up to
+/// `POST_TIMEOUT` (5s), and an appender taking the SAME lock the drainer
+/// holds during a POST would block `write()` for that long — the one
+/// thing this sink promises never to do.
+fn drain_lock_path(outbox_dir: &Path, index: usize, url: &str) -> PathBuf {
+    let host_port = extract_host_port(url).unwrap_or("unknown");
+    let sanitized = sanitize_host_port(host_port);
+    outbox_dir.join(format!("{index}-{sanitized}.drain.lock"))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct LastStatus {
     ts: String,
@@ -297,6 +311,9 @@ pub struct ResolvedRule {
     pub outbox_path: PathBuf,
     pub cursor_path: PathBuf,
     pub last_status_path: PathBuf,
+    /// (#2093 merge-gate finding 3) The drainer's own non-blocking
+    /// mutual-exclusion file — see `drain_lock_path`'s doc.
+    pub drain_lock_path: PathBuf,
 }
 
 /// Resolve + validate every rule against `outbox_dir`. Bails on the FIRST
@@ -315,6 +332,7 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
         validate_loopback_http_url(&url).with_context(|| format!("hook rule #{index}"))?;
         let (outbox_path, cursor_path) = outbox_paths(outbox_dir, index, &url);
         let last_status_path = last_status_path(outbox_dir, index, &url);
+        let drain_lock_path = drain_lock_path(outbox_dir, index, &url);
         out.push(ResolvedRule {
             index,
             match_: r.r#match.clone().unwrap_or_default(),
@@ -322,6 +340,7 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
             outbox_path,
             cursor_path,
             last_status_path,
+            drain_lock_path,
         });
     }
     Ok(out)
@@ -446,11 +465,23 @@ fn read_cursor(cursor_path: &Path) -> u64 {
     fs::read_to_string(cursor_path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
+/// (#2093 merge-gate finding 3, cursor-monotonicity corollary) Writes via a
+/// sibling temp file + atomic `rename(2)` rather than `fs::write`'s
+/// truncate-then-write — a concurrent `read_cursor` racing a plain
+/// truncate-then-write can observe the file MID-TRUNCATE (empty, parsed as
+/// `0`), which is exactly a cursor regression from the outside even though
+/// nothing durable ever moved backward. Discovered by the drain-lock
+/// test's cursor monitor: the drain lock alone prevents two drainers from
+/// racing the SAME cursor write, but says nothing about a READER racing a
+/// single writer's own two-syscall write — `rename` closes that gap by
+/// making the visible update a single atomic filesystem operation.
 fn write_cursor(cursor_path: &Path, offset: u64) -> Result<()> {
     if let Some(parent) = cursor_path.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::write(cursor_path, offset.to_string()).with_context(|| format!("writing cursor {}", cursor_path.display()))
+    let tmp_path = cursor_path.with_extension("cursor.tmp");
+    fs::write(&tmp_path, offset.to_string()).with_context(|| format!("writing {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, cursor_path).with_context(|| format!("renaming {} to {}", tmp_path.display(), cursor_path.display()))
 }
 
 /// The next fully-committed line at or after `cursor`, plus the byte
@@ -663,6 +694,16 @@ fn drainer_loop(
             if Instant::now() < *rt.next_attempt.lock().unwrap() {
                 continue;
             }
+            // (#2093 merge-gate finding 3) Non-blocking — another
+            // `HookSink` instance (or drainer thread) draining this SAME
+            // rule's outbox right now just means this cycle is skipped;
+            // the next poll tries again. Held across the ENTIRE
+            // read-cursor → POST → write-cursor sequence below, so two
+            // concurrent drainers can never both read the same pending
+            // line, both POST it, and both advance the cursor.
+            let Ok(Some(_drain_lock)) = darkmux_types::flock::try_lock_exclusive(&rt.rule.drain_lock_path) else {
+                continue;
+            };
             let cursor = read_cursor(&rt.rule.cursor_path);
             let Some((line, new_cursor)) = next_pending_line(&rt.rule.outbox_path, cursor) else {
                 continue;
@@ -1688,6 +1729,70 @@ mod tests {
         let outcome = try_post("http://evil.example.com/x", "{}");
         assert!(start.elapsed() < Duration::from_millis(500), "must refuse locally, never attempt the network");
         assert!(matches!(outcome, DeliveryOutcome::ClientError), "an invalid URL is a permanent, non-retryable failure");
+    }
+
+    // ─── (#2093 merge-gate finding 3) drain lock — no duplicate delivery ────
+
+    #[test]
+    fn two_sinks_draining_same_outbox_dont_duplicate_and_cursor_never_regresses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let (_outbox_path, cursor_path) = outbox_paths(tmp.path(), 0, &rules[0].http.clone().unwrap());
+
+        // Monitor the cursor file concurrently with the run — proves it
+        // never regresses, not just that its FINAL value is sane.
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let stop_monitor = Arc::new(AtomicBool::new(false));
+        let mon_cursor_path = cursor_path.clone();
+        let mon_observed = observed.clone();
+        let mon_stop = stop_monitor.clone();
+        let monitor = std::thread::spawn(move || {
+            while !mon_stop.load(Ordering::Acquire) {
+                mon_observed.lock().unwrap().push(read_cursor(&mon_cursor_path));
+                std::thread::sleep(Duration::from_millis(3));
+            }
+        });
+
+        let report1: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let report2: Arc<dyn FlowSink> = Arc::new(NullSink);
+        // Two INDEPENDENT `HookSink`s, each with its own drainer thread,
+        // pointed at the SAME outbox dir + same rule — the shape a
+        // restarted-while-old-instance-still-shutting-down process, or two
+        // cooperating processes, would produce.
+        let sink1 = HookSink::new(&rules, tmp.path().to_path_buf(), report1).unwrap();
+        let sink2 = HookSink::new(&rules, tmp.path().to_path_buf(), report2).unwrap();
+
+        let n = 21;
+        for i in 0..n {
+            sink1.write(&record(&format!("work.item.{i}"))).unwrap();
+        }
+
+        assert!(wait_until(|| receiver.request_count() >= n, Duration::from_secs(15)));
+        // Give any would-be duplicate delivery several more poll cycles to
+        // show up before declaring victory.
+        std::thread::sleep(POLL_INTERVAL * 10);
+        stop_monitor.store(true, Ordering::Release);
+        monitor.join().unwrap();
+        drop(sink1);
+        drop(sink2);
+
+        assert_eq!(receiver.request_count(), n, "no duplicate deliveries from two concurrent drainers on one outbox");
+        let bodies = receiver.bodies();
+        let actions: std::collections::BTreeSet<String> = bodies
+            .iter()
+            .map(|b| serde_json::from_str::<serde_json::Value>(b).unwrap()["action"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(actions.len(), n, "{n} distinct actions delivered, none repeated");
+
+        let seq = observed.lock().unwrap();
+        for w in seq.windows(2) {
+            assert!(w[0] <= w[1], "cursor regressed: {:?} at index {:?}", *seq, seq.iter().position(|x| *x == w[0]));
+        }
     }
 
     #[test]
