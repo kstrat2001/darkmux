@@ -49,5 +49,10 @@
     "enabled": false,
     "allowed": []
   },
+  "hooks": {
+    "enabled": false,
+    "outbox_dir": "~/.darkmux/hooks",
+    "rules": []
+  },
   "role_profiles": {}
 }

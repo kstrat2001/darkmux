@@ -680,6 +680,10 @@ mod tests {
         let cfg: DarkmuxConfig = serde_json::from_str(EXAMPLE_CONFIG).unwrap();
         assert_eq!(cfg.redis.as_ref().and_then(|r| r.enabled), Some(false));
         assert_eq!(cfg.audit.as_ref().and_then(|a| a.enabled), Some(false));
+        // (#2093) The hooks block ships visible + off too, outbox_dir populated.
+        assert_eq!(cfg.hooks.as_ref().and_then(|h| h.enabled), Some(false));
+        assert_eq!(cfg.hooks.as_ref().and_then(|h| h.outbox_dir.as_deref()), Some("~/.darkmux/hooks"));
+        assert_eq!(cfg.hooks.as_ref().and_then(|h| h.rules.as_ref().map(|r| r.is_empty())), Some(true));
         assert!(cfg.extras.is_empty(), "example must use only documented keys");
     }
 
@@ -712,6 +716,8 @@ mod tests {
             cfg.runtime.as_ref().and_then(|r| r.model_load_timeout_seconds),
             Some(600)
         );
+        // (#2093) The hooks feature block ships visible + off, same pattern.
+        assert_eq!(cfg.hooks.as_ref().and_then(|h| h.enabled), Some(false));
         // The written config personalizes machine_id away from the placeholder.
         assert_ne!(cfg.machine_id.as_deref(), Some("my-machine"));
         // Derived/advanced fields stay absent (dirs derived; caps = uncapped).
