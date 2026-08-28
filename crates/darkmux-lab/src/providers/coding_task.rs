@@ -539,7 +539,20 @@ impl WorkloadProvider for CodingTaskProvider {
         }
 
         let walltime_ms = meta.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
-        let mode = classify_mode(walltime_ms, loaded);
+        // (#2094 finding 7) Computed once here — used both for the
+        // classification below and the report's own `rest_ms` field /
+        // notes line, so all three readings agree.
+        let rest_ms: u64 = runtime_metrics.as_ref().map(|m| m.rest_ms).unwrap_or(0);
+        // Classify on MODEL time, not raw wall clock. Fast/Slow is a claim
+        // about the MODEL's speed; a rested run's wall clock includes real
+        // idle time (GPU thermal/power relief between turns, #2094) that
+        // has nothing to do with how fast the model itself ran. Without
+        // this, a heavily-rested run can misclassify as Slow purely
+        // because of the pacing knob, not the model. The DISPLAYED
+        // walltime stays the raw wall clock (below) — only the
+        // classification input changes.
+        let model_time_ms = walltime_ms.saturating_sub(u128::from(rest_ms));
+        let mode = classify_mode(model_time_ms, loaded);
 
         // Prefer runtime metrics when present (internal-runtime path);
         // fall back to trajectory-derived counts (openclaw shell-out
@@ -570,6 +583,13 @@ impl WorkloadProvider for CodingTaskProvider {
             format!("compactions={}", compactions),
             format!("walltime={}s", walltime_ms / 1000),
         ];
+        // (#2094 finding 7) Only when non-zero — a clean unrested run's
+        // summary line stays exactly as it read before this feature
+        // existed, and a rested run's summary makes the pacing knob's
+        // cost visible right next to the walltime it inflated.
+        if rest_ms > 0 {
+            notes.push(format!("rest={rest_ms}ms"));
+        }
         if let Some(m) = mode {
             notes.push(format!(
                 "mode={}",
@@ -611,7 +631,9 @@ impl WorkloadProvider for CodingTaskProvider {
             // compactions there's no trajectory-derived series to
             // reconcile against; `0` means "no rests" or "no metrics.json"
             // and either reading is correct (the runtime's own default).
-            rest_ms: runtime_metrics.as_ref().map(|m| m.rest_ms).unwrap_or(0),
+            // (#2094 finding 7) Same variable the classification above and
+            // the notes line use — can't drift from either.
+            rest_ms,
             tokens_before,
             summary_chars,
             mode,
@@ -2031,6 +2053,59 @@ not-valid-json
         let loaded = make_loaded(basic_spec(), tmp.path().to_path_buf());
         let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
         assert_eq!(report.rest_ms, 1000);
+    }
+
+    /// (#2094 finding 7) `classify_mode` must judge MODEL time
+    /// (walltime - rest), not raw wall clock — Fast/Slow is a claim about
+    /// the model. A run whose raw walltime crosses into the Slow cluster
+    /// ONLY because it took a long rest (GPU thermal/power pacing, not
+    /// the model actually being slow) must still classify Fast once the
+    /// rest is subtracted out. The DISPLAYED walltime note stays the raw
+    /// wall clock — only the classification input changes.
+    #[test]
+    fn inspect_classifies_fast_when_rest_ms_pulls_model_time_below_slow_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run");
+        let sandbox = tmp.path().join("sandbox");
+        let runtime_dir = sandbox.join(".darkmux-runtime");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&runtime_dir).unwrap();
+        // Raw walltime (700s) lands inside slow_cluster_seconds (600,950)
+        // below — a naive raw-wall classification would read Slow.
+        fs::write(
+            run_dir.join("manifest.json"),
+            format!(
+                r#"{{"session_id":"sess","duration_ms":700000,"sandbox":"{}"}}"#,
+                sandbox.display()
+            ),
+        )
+        .unwrap();
+        // 450s of that 700s was rest, not inference — model time is
+        // 250s, squarely inside fast_cluster_seconds (197,280).
+        fs::write(
+            runtime_dir.join("metrics.json"),
+            r#"{"runtime":"darkmux-runtime","version":"0.1.0","turns":3,"compactions":0,"rest_ms":450000,"rests":5}"#,
+        )
+        .unwrap();
+        fs::write(run_dir.join("trajectory.jsonl"), "").unwrap();
+
+        let mut spec = basic_spec();
+        spec.expected = Some(ExpectedSpec {
+            fast_cluster_seconds: Some((197, 280)),
+            slow_cluster_seconds: Some((600, 950)),
+            ..Default::default()
+        });
+        let loaded = make_loaded(spec, tmp.path().to_path_buf());
+        let report = CodingTaskProvider.inspect(&loaded, &run_dir).unwrap();
+
+        assert_eq!(report.mode, Some(RunMode::Fast), "model time (250s) is Fast, not raw wall (700s)");
+        assert_eq!(report.walltime_ms, 700_000, "the DISPLAYED walltime stays the raw wall clock");
+        assert_eq!(report.rest_ms, 450_000);
+        assert!(
+            report.notes.iter().any(|n| n == "rest=450000ms"),
+            "notes must surface the rest that explains the wall/model-time gap: {:?}",
+            report.notes
+        );
     }
 
     // ─── #364: inspect prefers run_dir/metrics.json over sandbox ──
