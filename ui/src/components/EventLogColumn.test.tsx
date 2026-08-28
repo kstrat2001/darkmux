@@ -1,5 +1,5 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { EventLogColumn } from "./EventLogColumn";
 import type { FlowRecord } from "../types/handwritten";
 import { closeOpenModal } from "../lib/dialogManager";
@@ -143,6 +143,43 @@ describe("EventLogColumn", () => {
     expect(document.getElementById("detailbody")!.textContent).toContain("s-old");
     // Clicking turned follow off.
     expect(document.getElementById("follow")!.className).not.toMatch(/\bon\b/);
+  });
+
+  it("(#2068) the detail pane is marked `following` while it tracks the newest record, and not once a row is picked", () => {
+    const records = [
+      rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-old" }),
+      rec({ ts: "2026-08-08T12:05:00.000Z", session_id: "s-new" }),
+    ];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    const detail = document.getElementById("detail")!;
+    expect(detail.className).toMatch(/\bfollowing\b/);
+    fireEvent.click(document.querySelectorAll('[data-act="rec"]')[1]);
+    expect(detail.className).not.toMatch(/\bfollowing\b/);
+    fireEvent.click(document.getElementById("follow")!);
+    expect(detail.className).toMatch(/\bfollowing\b/);
+  });
+
+  it("(#2068) while following, the detail card holds a record for the throttle window even as newer ones stream in", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    try {
+      const older = rec({ ts: "2026-08-08T12:00:00.000Z", session_id: "s-one" });
+      const { rerender } = render(<EventLogColumn scopeLabel="fleet" records={[older]} visible />);
+      expect(document.getElementById("detailbody")!.textContent).toContain("s-one");
+      // A burst: two newer records land within the hold window.
+      rerender(<EventLogColumn scopeLabel="fleet" records={[older, rec({ ts: "2026-08-08T12:00:01.000Z", session_id: "s-two" })]} visible />);
+      expect(document.getElementById("detailbody")!.textContent).toContain("s-two"); // first change lands at once
+      rerender(<EventLogColumn scopeLabel="fleet" records={[older, rec({ ts: "2026-08-08T12:00:01.000Z", session_id: "s-two" }), rec({ ts: "2026-08-08T12:00:02.000Z", session_id: "s-three" })]} visible />);
+      expect(document.getElementById("detailbody")!.textContent).toContain("s-two"); // held
+      // The LIST already shows the newest; only the card holds.
+      expect(document.querySelectorAll('[data-act="rec"]')[0].textContent).toContain("s-three");
+      act(() => {
+        vi.advanceTimersByTime(600);
+      });
+      expect(document.getElementById("detailbody")!.textContent).toContain("s-three");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("the follow toggle re-enables auto-selecting the newest record", () => {

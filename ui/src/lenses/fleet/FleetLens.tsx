@@ -153,15 +153,21 @@ function SavingsHero({
           <div className="savnum">{fmtN(t.cloud)}</div>
           <div className="savlbl">cloud tokens</div>
         </div>
-        {t.unknown ? (
-          <div
-            className="savlead unknown"
-            title="No dispatch record for these sessions named an endpoint, so darkmux cannot say whether the model ran locally or on a hosted endpoint. They are excluded from the local figure rather than assumed to be free."
-          >
-            <div className="savnum">{fmtN(t.unknown)}</div>
-            <div className="savlbl">unattributed</div>
-          </div>
-        ) : null}
+        {/* (#2068) ALWAYS rendered, dimmed at zero. "Unattributed" is the
+            state of every dispatch between its start and its completion, so
+            mounting this tile only when the figure is non-zero made it
+            appear and vanish with each in-flight dispatch — 85px of reflow
+            under the hero on a phone, on every event during playback
+            (measured CLS 1.21 over 12s). A streaming view must not let
+            transient data change its geometry; the zero state is honest and
+            the title already explains the figure. */}
+        <div
+          className={`savlead unknown${t.unknown ? "" : " zero"}`}
+          title="No dispatch record for these sessions named an endpoint, so darkmux cannot say whether the model ran locally or on a hosted endpoint. They are excluded from the local figure rather than assumed to be free."
+        >
+          <div className="savnum">{fmtN(t.unknown)}</div>
+          <div className="savlbl">unattributed</div>
+        </div>
         <div className="savclasses">
           <Chip value={fmtC(t.completion)} label="generated" cls="gen" />
           <Chip value={fmtC(t.fresh)} label="fresh input" />

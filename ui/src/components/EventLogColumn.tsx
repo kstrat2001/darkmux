@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type { FlowRecord } from "../types/handwritten";
 import { recKey } from "../lib/flow";
+import { useThrottledValue } from "../hooks/useThrottledValue";
 import { LIVE_WINDOW_MS } from "../lib/flow";
 import { clk } from "../lib/format";
 import { RecordView } from "./RecordView";
@@ -22,6 +23,15 @@ import { openModalEl } from "../lib/dialogManager";
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
  * newest 50, newest-first. */
 const LOG_CAP = 50;
+/** (#2068) How long the followed record holds in the detail card before the
+ * next one may replace it. Two updates a second is still "live"; faster is
+ * unreadable on a phone and reads as flicker. */
+const FOLLOW_HOLD_MS = 500;
+function sameRecord(a: FlowRecord | null, b: FlowRecord | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return recKey(a) === recKey(b);
+}
 
 /** The live window the counter reports, in hours — the status bar used to
  *  state this and no longer does (it belongs beside the records). */
@@ -321,10 +331,18 @@ export function EventLogColumn({
   const capped = filtered.length > LOG_CAP;
   const visibleRecs = useMemo(() => filtered.slice(-LOG_CAP).reverse(), [filtered]);
 
+  // (#2068) The followed record is throttled: at playback speed the newest
+  // record changed several times a second and the detail card swapped its
+  // whole body each time, which on a phone reads as the pane "flickering
+  // around". The list below still shows every record as it lands; only the
+  // card holds still long enough to be read. Compared by `recKey`, since
+  // `visibleRecs` is a fresh array per render around the same records.
+  const newest = visibleRecs[0] ?? null;
+  const followed = useThrottledValue(newest, FOLLOW_HOLD_MS, sameRecord);
   const selected = useMemo(() => {
-    if (follow) return visibleRecs[0] ?? null;
+    if (follow) return followed;
     return visibleRecs.find((r) => recKey(r) === selectedKey) ?? null;
-  }, [follow, visibleRecs, selectedKey]);
+  }, [follow, followed, visibleRecs, selectedKey]);
 
   function selectRecord(r: FlowRecord) {
     setSelectedKey(recKey(r));
@@ -415,7 +433,12 @@ export function EventLogColumn({
       >
         {collapsed ? "\u2039" : "\u203a"}
       </button>
-      <div className="eventlog__detail" id="detail" style={{ flexBasis: `${detailPct}%` }}>
+      {/* (#2068) `following` lets the narrow-viewport stylesheet pin this
+          pane's height while it tracks the newest record: content-sized, it
+          re-heighted with every followed record's payload and moved the list
+          under it on each event. A hand-picked record keeps the content-sized
+          pane, since nothing is streaming into it then. */}
+      <div className={`eventlog__detail${follow ? " following" : ""}`} id="detail" style={{ flexBasis: `${detailPct}%` }}>
         {/* (operator) No "selected event" title. It was static chrome
             competing with the record's own headline — `RecordView` already
             leads with the action in accent colour, so the label was a second
