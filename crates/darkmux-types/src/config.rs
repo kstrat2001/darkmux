@@ -75,11 +75,10 @@ use std::path::Path;
 // the PR-flow guide). darkmux holds no credentials of its own; this
 // block only says which verb NAMES the operator has opted into running.
 // Minor bump, same lenient-read reasoning as every other additive block.
-// 1.12 is RESERVED for a sibling branch's additive `hooks{}` block — not
-// present in this tree yet. This branch (#2094) takes 1.13 directly rather
-// than colliding on 1.12, so the eventual merge is a one-line reconcile
-// (whichever branch lands second just bumps its own number by one) instead
-// of a real conflict over the same version string.
+// 1.12 (#2093): additive `hooks{}` block (`enabled` / `outbox_dir` / `rules`
+// — the flow-record hook sink: match a record, POST it to a loopback
+// receiver). Minor bump, same lenient-read reasoning as every other
+// additive block.
 // 1.13 (#2094): additive `runtime.turn_delay_ms` (a global rest, in
 // milliseconds, the internal runtime sleeps between inference turns on
 // every LOCAL dispatch — GPU thermal/power relief for sustained runs, see
@@ -128,6 +127,10 @@ pub struct DarkmuxConfig {
     /// (#1685) The `gh`-verb allowlist — see [`CmdConfig`]'s own doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmd: Option<CmdConfig>,
+    /// (#2093) Flow-record hooks — the filter → HTTP-POST outcome sink. See
+    /// [`HooksConfig`]'s own doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HooksConfig>,
 
     /// (#1475 packet 1) The machine-local **role → profile** map — the binding
     /// that welds an abstract role id (e.g. `judge`, `probe-high`) to a
@@ -528,6 +531,96 @@ pub struct CmdConfig {
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
+/// (#2093) Flow-record hooks — a fourth `FlowSink` kind: match → POST. A
+/// **feature block gated by `enabled`**, same pattern as `RedisConfig` /
+/// `AuditConfig` / `CmdConfig`. `darkmux init` writes the whole block with
+/// `enabled: false`, the default `outbox_dir` populated, and an EMPTY
+/// `rules` array — darkmux ships no opinion about which hooks an operator
+/// wants; the surface is discoverable and one flip + one rule from live.
+///
+/// Every `write()` is filtered against `rules` (see `HookRule`/`HookMatch`);
+/// a match appends the record verbatim to that rule's outbox file, and a
+/// background drainer POSTs it to `http` with bounded retries. The write
+/// path never blocks on the network — see `darkmux_flow::hooks` for the
+/// sink implementation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HooksConfig {
+    /// The gate: `true` → the drainer thread starts and `rules` are
+    /// consulted; `false`/absent → off, regardless of `rules`. Declared
+    /// first so it reads at the top of the block. The ONLY env override is
+    /// the whole-feature gate (`DARKMUX_HOOKS_ENABLED`) — individual rules
+    /// are config-only (a rule is a structured object, not a scalar an env
+    /// var can carry).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
+    /// Where per-rule outbox + cursor files live. Each rule gets
+    /// `<outbox_dir>/<index>-<host-port>.outbox.jsonl` (the pending queue,
+    /// append-only) and a sibling `.cursor` file (the byte offset of the
+    /// first undelivered line) — durable across restarts, so a down
+    /// receiver never loses a firing.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub outbox_dir: Option<String>,
+    /// The filter → target list. Evaluated in order against every record
+    /// this process writes; a record may match more than one rule (each
+    /// gets its own outbox line). An empty `match` on a rule matches
+    /// nothing (`darkmux doctor` warns — that rule is dead weight, not a
+    /// catch-all, to keep "matches everything" an explicit `*` action
+    /// rather than an easy-to-write-by-accident empty object). Records
+    /// whose `action` starts with `hook.` (the sink's own firing/failure
+    /// records) never match any rule — loop prevention.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub rules: Option<Vec<HookRule>>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One hook rule: a predicate (`match`) plus an HTTP outcome (`http`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookRule {
+    /// Renamed `match` on the wire (a Rust keyword) — see `HookMatch`.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "match")]
+    pub r#match: Option<HookMatch>,
+    /// The loopback-only target URL a matching record is POSTed to
+    /// (`Content-Type: application/json`, body = the record verbatim).
+    /// Refused at config load (the whole hooks sink degrades, loudly) when
+    /// the host isn't `127.0.0.1` / `::1` / `localhost` — a token-bearing
+    /// remote hook is a later packet (#2093's own "out of scope").
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub http: Option<String>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A hook rule's match predicate — every field is an independent AND'd
+/// condition; a field left `None` doesn't gate. `action` is a small glob
+/// (`*` within a segment, or a trailing `*` segment matching one-or-more
+/// further dot-separated segments — e.g. `crawl.*` matches `crawl.finding`
+/// but not `crawler`; a bare `*` matches every action). The rest are exact
+/// matches against the record's own fields — `session_id`/`mission_id`/
+/// `machine_id` compare as plain strings, `category`/`level` compare
+/// against the record's serialized (lowercase) enum value.
+///
+/// **An all-`None` match is deliberately NOT a catch-all** — it matches
+/// nothing, and `darkmux doctor` warns (a rule an operator forgot to fill
+/// in should look broken, not silently subscribe to everything).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookMatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub mission_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub level: Option<String>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+impl HookMatch {
+    /// True when every field is `None` — the "matches nothing" state a
+    /// half-filled-in rule leaves. `darkmux doctor` uses this to warn.
+    pub fn is_empty(&self) -> bool {
+        self.action.is_none()
+            && self.session_id.is_none()
+            && self.mission_id.is_none()
+            && self.machine_id.is_none()
+            && self.category.is_none()
+            && self.level.is_none()
+    }
+}
+
 /// A machine's declared fleet position. `Standalone` (default) = a
 /// single-machine install with no fleet; `Hub` = the always-on coordinator
 /// (and, per #936, supervises its own Redis); `Peer` = points at a hub.
@@ -670,6 +763,16 @@ impl DarkmuxConfig {
             cmd: Some(CmdConfig {
                 enabled: Some(false),
                 allowed: Some(Vec::new()),
+                extras: Default::default(),
+            }),
+            // (#2093) Written visible with `enabled: false`, the default
+            // outbox dir populated, and an empty `rules` array — the
+            // operator's own rules are structured objects with no sensible
+            // literal default, so the surface is the empty array itself.
+            hooks: Some(HooksConfig {
+                enabled: Some(false),
+                outbox_dir: Some("~/.darkmux/hooks".to_string()),
+                rules: Some(Vec::new()),
                 extras: Default::default(),
             }),
             extras: Default::default(),
@@ -860,6 +963,67 @@ mod tests {
         // Absent map -> None (lenient; a fresh/older config never carries it).
         let cfg: DarkmuxConfig = serde_json::from_str(r#"{ "machine_id": "x" }"#).unwrap();
         assert!(cfg.role_profiles.is_none(), "absent role_profiles is None, not a brick");
+    }
+
+    /// (#2093) `with_defaults()` writes the `hooks` block visible, gated off,
+    /// with an empty (but present) `rules` array — same feature-block shape
+    /// as `redis`/`audit`: `enabled` declared first, sub-defaults populated
+    /// where a literal is sensible (`outbox_dir`), and the array left empty
+    /// because darkmux ships no opinion about which rules an operator wants.
+    #[test]
+    fn hooks_config_visible_default_and_round_trips() {
+        let cfg = DarkmuxConfig::with_defaults();
+        let hooks = cfg.hooks.as_ref().expect("hooks block is written visible");
+        assert_eq!(hooks.enabled, Some(false));
+        assert_eq!(hooks.outbox_dir.as_deref(), Some("~/.darkmux/hooks"));
+        assert_eq!(hooks.rules.as_ref().map(|r| r.is_empty()), Some(true));
+
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        assert!(json.contains("\"hooks\""), "hooks block visible in serialized config");
+        assert!(json.contains("\"rules\": []"), "empty rules array is VISIBLE, not omitted: {json}");
+        assert!(
+            json.find("\"hooks\"").unwrap() > 0
+                && json[json.find("\"hooks\"").unwrap()..].find("\"enabled\"").unwrap()
+                    < json[json.find("\"hooks\"").unwrap()..].find("\"outbox_dir\"").unwrap(),
+            "enabled precedes outbox_dir within the hooks block"
+        );
+
+        // Lossless round-trip, including a populated rule.
+        let populated = r#"{
+            "hooks": {
+                "enabled": true,
+                "outbox_dir": "~/.darkmux/hooks",
+                "rules": [
+                    { "match": { "action": "crawl.*" }, "http": "http://127.0.0.1:8790/events" },
+                    { "match": { "action": "dispatch error", "session_id": "abc" }, "http": "http://localhost:9000/alerts" }
+                ]
+            }
+        }"#;
+        let cfg: DarkmuxConfig = serde_json::from_str(populated).unwrap();
+        let hooks = cfg.hooks.as_ref().unwrap();
+        assert_eq!(hooks.enabled, Some(true));
+        let rules = hooks.rules.as_ref().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].http.as_deref(), Some("http://127.0.0.1:8790/events"));
+        assert_eq!(rules[0].r#match.as_ref().unwrap().action.as_deref(), Some("crawl.*"));
+        assert_eq!(rules[1].r#match.as_ref().unwrap().session_id.as_deref(), Some("abc"));
+        let back: DarkmuxConfig = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.hooks.as_ref().unwrap().rules.as_ref().unwrap().len(), 2);
+
+        // Absent block -> None (lenient; an older config never carries it).
+        let cfg: DarkmuxConfig = serde_json::from_str(r#"{ "machine_id": "x" }"#).unwrap();
+        assert!(cfg.hooks.is_none(), "absent hooks block is None, not a brick");
+    }
+
+    /// (#2093) An unrecognized `hooks` sub-field (schema skew from a newer
+    /// binary) overflows into `extras`, never bricking the parse — the
+    /// lenient-on-read contract (registry entry 7).
+    #[test]
+    fn hooks_config_unknown_field_overflows_to_extras() {
+        let json = r#"{ "hooks": { "enabled": false, "future_field": 42 } }"#;
+        let cfg: DarkmuxConfig = serde_json::from_str(json).unwrap();
+        let hooks = cfg.hooks.as_ref().unwrap();
+        assert_eq!(hooks.extras.get("future_field"), Some(&serde_json::json!(42)));
     }
 
     /// (#933) `FleetMode::parse` is lenient (trim + case-insensitive) and
