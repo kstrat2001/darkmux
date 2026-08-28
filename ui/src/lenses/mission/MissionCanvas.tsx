@@ -9,7 +9,7 @@
  * the SAME goldens `mission-graph-goldens.spec.ts` captured from the
  * standalone page, and the e2e behavioral specs assert on these classes too.
  */
-import { useMemo } from "react";
+import { useLayoutEffect, useMemo, useRef } from "react";
 import ReactFlow, {
   Background,
   Controls,
@@ -146,12 +146,31 @@ export function MissionCanvas({
   note?: string;
   minimapOn: boolean;
 }) {
+  // (#2058) The canvas fills whatever viewport is left below it. React Flow
+  // pins its controls and minimap to the canvas's own bottom edge; a canvas
+  // taller than the window put them below the fold with no way to reach
+  // them. `min-height: 0` flex chains above this do not give it a definite
+  // height, so measure once and on resize: the distance from the canvas's
+  // top to the window's bottom is exactly the height it may have.
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    const fit = () => {
+      const top = el.getBoundingClientRect().top + window.scrollY;
+      const h = Math.max(240, window.innerHeight - top);
+      el.style.height = `${h}px`;
+    };
+    fit();
+    window.addEventListener("resize", fit);
+    return () => window.removeEventListener("resize", fit);
+  }, []);
   const layout = useMemo(() => computeLayout(graphNodes), [graphNodes]);
   const rfNodes = useMemo(() => toRfNodes(graphNodes, layout, metrics, now), [graphNodes, layout, metrics, now]);
   const rfEdges = useMemo(() => toRfEdges(graphEdges, graphNodes), [graphEdges, graphNodes]);
 
   return (
-    <div className="canvas missionlens__canvas">
+    <div className="canvas missionlens__canvas" ref={canvasRef}>
       {note ? <div className="note">{note}</div> : null}
       <ReactFlowProvider>
         <ReactFlow nodes={rfNodes} edges={rfEdges} nodeTypes={nodeTypes} fitView minZoom={0.1} maxZoom={2} proOptions={{ hideAttribution: true }}>

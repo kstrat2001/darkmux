@@ -74,7 +74,7 @@ describe("EventLogColumn", () => {
       rec({ ts: "2026-08-08T12:05:00.000Z", action: "dispatch.tool", session_id: "s-beta" }),
     ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
-    fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "s-alpha" } });
+    fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
     const rows = document.querySelectorAll('[data-act="rec"]');
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain("s-alpha");
@@ -82,7 +82,7 @@ describe("EventLogColumn", () => {
 
   it("shows 'no match' in the query count when the search matches nothing", () => {
     render(<EventLogColumn scopeLabel="fleet" records={[rec({})]} visible />);
-    fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "nothing-matches-this" } });
+    fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "nothing-matches-this" } });
     expect(screen.getByText("no match")).toBeInTheDocument();
   });
 
@@ -94,7 +94,7 @@ describe("EventLogColumn", () => {
   it("shows a singular match count with no plural 's' for exactly one match", () => {
     const records = [rec({ session_id: "s-alpha" }), rec({ session_id: "s-beta" })];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
-    fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "s-alpha" } });
+    fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
     expect(document.getElementById("qcount")?.textContent).toBe("1 match");
   });
 
@@ -105,7 +105,7 @@ describe("EventLogColumn", () => {
       rec({ session_id: "s-beta" }),
     ];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
-    fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "s-alpha" } });
+    fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
     expect(document.getElementById("qcount")?.textContent).toBe("2 matches");
   });
 
@@ -114,7 +114,7 @@ describe("EventLogColumn", () => {
       rec({ ts: `2026-08-08T12:${String(i).padStart(2, "0")}:00.000Z`, session_id: `s-alpha-${i}` }),
     );
     render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
-    fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "s-alpha" } });
+    fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
     expect(document.getElementById("qcount")?.textContent).toBe("60 matches · 50 shown");
   });
 
@@ -125,7 +125,7 @@ describe("EventLogColumn", () => {
     // slice was exactly as truncated as it was with no filter typed.
     const records = [rec({ session_id: "s-alpha-1" }), rec({ session_id: "s-alpha-2" })];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible serverTruncated />);
-    fireEvent.change(screen.getByPlaceholderText("filter the stream…"), { target: { value: "s-alpha" } });
+    fireEvent.change(screen.getByPlaceholderText("filter events…"), { target: { value: "s-alpha" } });
     expect(document.getElementById("qcount")?.textContent).toBe("2+ matches");
   });
 

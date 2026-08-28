@@ -917,6 +917,11 @@ body {
 .eventlog__searchbox input::placeholder {
   color: var(--dim);
   font-style: italic;
+  /* A narrow field (the collapsed mainstay, a phone) clips a long
+     placeholder mid-word; ellipsize it instead. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .eventlog__sclear {
   position: absolute;

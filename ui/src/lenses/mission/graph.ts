@@ -78,9 +78,16 @@ export interface MissionGraph {
 // the inline comment below) so dependency order reads left-to-right.
 export const COL_W = 260;
 export const COL_GAP = 80;
+// (#2057) These describe the card `.missionlens .mnode` actually draws,
+// measured in a real browser at scale 1 (2026-08-28): a one-step card is
+// 85 px, a plain step row adds ~17 px, a row carrying a model chip ~28 px.
+// The old 40 + 20/row described a card the CSS no longer drew, and three
+// two-step siblings overlapped by ~30 px each. `tests/e2e/mission-lens-
+// layout-geometry.spec.js` asserts no two task boxes intersect; if the CSS
+// grows a card again, that test is the thing that says so.
 export const TASK_MIN_PITCH = 70;
-export const TASK_HEADER_H = 40;
-export const STEP_ROW_H = 20;
+export const TASK_HEADER_H = 68;
+export const STEP_ROW_H = 28;
 export const TASK_GAP = 16;
 export const PHASE_LABEL_W = 40;
 export const BAND_GAP = 40;
@@ -153,6 +160,14 @@ export function computeLayout(nodes: GraphNode[]): Layout {
     }
     bandTop += bandHeight + BAND_GAP;
   }
+  // (#2057) One width for every band: the widest one's. Bands sized to their
+  // own content and anchored left put each phase's center somewhere
+  // different, so the phase→phase edge (bottom-center to top-center) ran
+  // diagonally. Equal widths put every center on one line and the edges
+  // are vertical.
+  let widest = 0;
+  for (const b of Object.values(boxes)) widest = Math.max(widest, b.w);
+  for (const b of Object.values(boxes)) b.w = widest;
   return { positions, boxes };
 }
 
