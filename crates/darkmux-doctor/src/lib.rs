@@ -156,6 +156,7 @@ pub fn run() -> DoctorReport {
         check_redis_config(),
         check_gh_allowlist(),
         check_review_judge_exhaustion_policy(),
+        check_turn_delay(),
         check_remote_endpoint_credentials(),
         check_env_masks_config(),
         check_binary_split_brain(),
@@ -1403,6 +1404,75 @@ fn check_review_judge_exhaustion_policy() -> Check {
         )
     };
     Check { name: name.into(), status: Status::Pass, message, hint: None }
+}
+
+/// (#2094) Surface the resolved `runtime.turn_delay_ms` with provenance —
+/// the global inter-turn rest, in milliseconds, the internal runtime
+/// sleeps between inference turns on every local dispatch (GPU thermal /
+/// power relief for sustained runs). Always Pass at `0` (informational —
+/// the pre-existing no-rest behavior, not a defect) and at any value below
+/// the inactivity timeout.
+///
+/// Warns (advice, never a gate — operator sovereignty #44) when the
+/// configured value is AT OR ABOVE the inactivity timeout: the runtime
+/// clamps it to half the timeout rather than honoring it verbatim (see
+/// `runtime/src/loop_runner.rs`), so a value the operator actually meant
+/// would otherwise silently become a different number with nothing here
+/// to say so before the first dispatch discovers it via a stderr line.
+///
+/// No laptop-class hardware signal exists in `darkmux-hardware` today (only
+/// `Platform` + `RamTier`, no chassis/battery detection) — the issue's
+/// "warn on a laptop with 0" clause is deliberately not implemented; the
+/// issue itself names this as conditional ("if the hardware crate exposes
+/// that cheaply"). Showing the resolved value is what's left.
+fn check_turn_delay() -> Check {
+    let name = "runtime.turn_delay_ms";
+    let env_set = std::env::var("DARKMUX_TURN_DELAY_MS")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
+        .runtime
+        .and_then(|r| r.turn_delay_ms)
+        .is_some();
+    let provenance = if env_set {
+        "from DARKMUX_TURN_DELAY_MS env"
+    } else if cfg_set {
+        "from config.json"
+    } else {
+        "default"
+    };
+    let ms = darkmux_types::config_access::turn_delay_ms();
+    let timeout_ms = darkmux_types::config_access::inactivity_timeout_seconds().saturating_mul(1000);
+    if ms == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("0ms ({provenance}) — no inter-turn rest"),
+            hint: None,
+        };
+    }
+    if ms >= timeout_ms {
+        let clamped = timeout_ms / 2;
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "{ms}ms ({provenance}) is at or above the inactivity timeout ({timeout_ms}ms) — \
+                 the runtime clamps it to {clamped}ms (half the timeout) rather than honoring it verbatim"
+            ),
+            hint: Some(
+                "Lower `runtime.turn_delay_ms` well below the inactivity timeout, or raise \
+                 `runtime.inactivity_timeout_seconds` if the longer rest is intentional."
+                    .into(),
+            ),
+        };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!("{ms}ms ({provenance}) — rest between inference turns on every local dispatch"),
+        hint: None,
+    }
 }
 
 /// (#85/#91) Surface profile models declaring a remote endpoint
@@ -4659,6 +4729,76 @@ mod tests {
         }
     }
 
+    // ─── (#2094) check_turn_delay — resolved state + provenance + clamp warn ─
+
+    #[serial_test::serial]
+    #[test]
+    fn check_turn_delay_zero_by_default_is_pass() {
+        let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
+        unsafe { std::env::remove_var("DARKMUX_TURN_DELAY_MS") };
+        let check = check_turn_delay();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("0ms"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_TURN_DELAY_MS", v),
+                None => std::env::remove_var("DARKMUX_TURN_DELAY_MS"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_turn_delay_below_timeout_is_pass_and_names_provenance() {
+        let prev_d = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
+        let prev_t = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_TURN_DELAY_MS", "3000");
+            std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        }
+        let check = check_turn_delay();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("3000ms"), "{}", check.message);
+        assert!(check.message.contains("env"), "provenance named: {}", check.message);
+        unsafe {
+            match prev_d {
+                Some(v) => std::env::set_var("DARKMUX_TURN_DELAY_MS", v),
+                None => std::env::remove_var("DARKMUX_TURN_DELAY_MS"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_turn_delay_at_or_above_timeout_warns_and_names_the_clamp() {
+        let prev_d = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
+        let prev_t = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe {
+            // 10s timeout (10000ms); a 10000ms delay is AT the timeout.
+            std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "10");
+            std::env::set_var("DARKMUX_TURN_DELAY_MS", "10000");
+        }
+        let check = check_turn_delay();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("10000ms"), "{}", check.message);
+        assert!(check.message.contains("5000ms"), "names the clamped half: {}", check.message);
+        assert!(check.hint.is_some());
+        unsafe {
+            match prev_d {
+                Some(v) => std::env::set_var("DARKMUX_TURN_DELAY_MS", v),
+                None => std::env::remove_var("DARKMUX_TURN_DELAY_MS"),
+            }
+            match prev_t {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
     // ─── (#1769) summarize_audit_reports — Fail / Warn / Pass split ────────
     //
     // Pure-function tests: no filesystem, no `DARKMUX_AUDIT_DIR`. Each test
@@ -5592,11 +5732,11 @@ mod tests {
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
-        // mission-envelope-readability [#1881]) + one per active eureka
-        // rule.
+        // turn-delay [#2094] + mission-envelope-readability [#1881]) + one
+        // per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 39 + darkmux_eureka::all_rules().len();
+        let expected = 40 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
