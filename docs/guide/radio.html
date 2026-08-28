@@ -30,197 +30,133 @@
 
 <header class="page-head">
   <div class="wrap">
-    <div class="label">09 <span class="dot">·</span> advanced</div>
-    <h1><code>radio</code>: talk to the command registry</h1>
-    <p class="lede">A conversational channel over darkmux's advertised commands. Instead of remembering that a review is <code>darkmux mission launch review</code>, you say what you want in plain text and a bounded routing dispatch picks one advertised command, or refuses rather than guess. A refusal isn't a dead end: the same text goes to a second, grounded seat that answers in prose instead.</p>
+    <div class="label">02 <span class="dot">·</span> first inference</div>
+    <h1><code>radio</code>: darkmux in plain text</h1>
+    <p class="lede">Interactive help and a plain-text way to run things. Ask radio anything about darkmux and a local model answers from the command tree and your machine’s state; say what you want done and it routes to one advertised command, or refuses rather than guess. Two model calls at most, no tools, nothing invented.</p>
   </div>
 </header>
 
 <section>
   <div class="wrap">
-    <h2>The problem it solves</h2>
-    <p>darkmux's command surface grows as you and your mission configs grow: built-ins like <code>review</code>, plus whatever procedural or agentic commands you've advertised yourself (see <a href="missions.html#task-step-graphs">Task/Step graphs</a> for how a mission config becomes a runnable command). Memorizing exact ids and flags doesn't scale, and it's the wrong layer to ask an operator to hold in their head at a terminal.</p>
-    <p><code>darkmux radio "&lt;text&gt;"</code> takes one short message and maps it onto exactly one advertised command, or declines. It never invents a command, never chains commands, and never guesses when a message is ambiguous. Those are the two safety walls this feature is built around, covered below. This is also the CLI's own consumer of the same registry-advertised catalog that feeds <code>darkmux acp</code>'s editor integration for Zed: radio is the terminal-native way to use that same catalog without an editor in the loop.</p>
+    <h2>Ask it anything about darkmux</h2>
+    <p>radio is interactive help. The answering seat is handed the whole command tree, every runnable verb with its options and one line each, plus your config, the mission board, and the session’s recent outputs. A question about darkmux is a lookup, not a guess.</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "how do I see what models are loaded right now?"</span><button class="copy-btn" data-copy="darkmux radio &quot;how do I see what models are loaded right now?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">radio: Run <code>darkmux machine status</code>. It will show exactly what models are loaded in LMStudio right now, grouped by ownership and matching profile.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "is my other Mac online?"</span><button class="copy-btn" data-copy="darkmux radio &quot;is my other Mac online?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">radio: Run <code>darkmux machine list</code> to check the fleet roster and per-machine reachability. I don't have live telemetry on your other Mac, but that command will tell you exactly whether it's online and reachable.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "how do I look at a past lab run?"</span><button class="copy-btn" data-copy="darkmux radio &quot;how do I look at a past lab run?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">radio: To inspect a specific past run, use <code>darkmux lab run inspect</code>. You'll need the run ID; if you don't have it handy, run <code>darkmux lab run list</code> to pull one from the recent history. If you just want a quick overview of what happened, append <code>--summary</code>.</div>
+    </div>
+    <p class="session-caption">Verbatim, captured 2026-08-28 on an M5 Max: qwen3.6-35b-a3b answering, qwen3-4b routing, humor at the shipped default of 50 unless shown otherwise.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Two seats, one exchange</h2>
-    <p>radio is built on two distinct dispatches, each staffed by its own role, because the two jobs have different shapes:</p>
-    <ul>
-      <li><strong>The routing seat</strong> (<code>radio-router</code>, <code>role_family: utility</code>) does bounded classification. It's handed your text plus the full list of advertised commands (id + description + optional hint) and returns exactly one JSON object: a chosen command and its trailing args, or a refusal with a reason. No agent loop, no tools, no free-form output. It can only choose among the closed set it was given.</li>
-      <li><strong>The answering seat</strong> (<code>radio-host</code>, <code>role_family: specialist</code>) is dispatched only when the routing seat refuses. It reads a compiled bundle of local facts: the command catalog, live config, a mission-board summary, and so on (see <a href="#grounding">the grounding boundary</a> below), and replies in prose, in persona. It has no tools either: every fact it can cite was already gathered deterministically and handed to it before it ever runs.</li>
-    </ul>
-    <p>Splitting the two matters because they're asymmetric jobs: routing is small, bounded I/O well suited to a fast utility-class model; answering needs enough headroom to reply with some personality, which is why it defaults to your normal specialist tier rather than the compact utility binding. One exchange, one routing call, at most one more dispatch for the answer. Never a loop, never a retry-on-refusal.</p>
-    <p>Inspect either role like any other: <code>darkmux role show radio-router</code> or <code>darkmux role show radio-host</code>.</p>
+    <h2>When it cannot reach a model</h2>
+    <p>A setup problem is not a refusal. If the routing seat cannot run, radio says why once, names the fix, and exits 1, so a script can tell. No registry, a placeholder model, a model that is not downloaded, the LM Studio server down, and a missing <code>lms</code> each get their own message.</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "what can you do?"</span><button class="copy-btn" data-copy="darkmux radio &quot;what can you do?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">radio: could not reach a model.
+darkmux: no profile registry found.
+Looked in:
+  /private/tmp/fresh-home/.darkmux.json
+  /private/tmp/fresh-home/.darkmux/profiles.json
+  /tmp/fresh-home/.darkmux/profiles.json
+  /tmp/fresh-home/.config/darkmux/profiles.json
+Run <code>darkmux init</code> to bootstrap one, or create it manually (see profiles.example.json in the darkmux repo).</div>
+    </div>
+    <p class="session-caption">Captured from a home directory with no <code>~/.darkmux</code> at all. Exit status 1.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Using it</h2>
-    <p>The built-in registry ships with exactly one command advertised today: <code>review</code>. Anything else you want radio to route to is a mission config in <code>~/.darkmux/mission-configs/</code> carrying its own <code>panel</code> block (see <a href="#catalog">the catalog</a> below). A live example against the built-in:</p>
-    <pre><code>darkmux radio "please review my changes"
-<span class="comment"># radio: routing to /review — from your text
-# radio: launching `review` …
-# (mission launch's own interactive sign-off gate applies from here)</span></code></pre>
-    <p>A routed command that spawns a mission (the review pipeline, or any model-seated command you've added) runs as a real <code>darkmux mission launch &lt;id&gt;</code> child process inheriting your terminal. The same interactive sign-off gate you'd see running that command directly applies unchanged. A routed command whose graph is entirely procedural (no model dispatch at all) runs in-process instead, with no mission instance minted.</p>
-    <p>Spoken <em>"review this"</em> reviews your uncommitted working-tree diff (<code>git diff HEAD</code>), not the branch-vs-base diff <code>darkmux mission launch review</code> uses when run directly. If there's nothing uncommitted, radio says so and stops:</p>
-    <pre><code>radio: no uncommitted changes to review in this working tree.</code></pre>
-    <p>See the plan before it runs with <code>--dry-run</code>, which prints the resolved route and exits without executing anything. The routing line prints the same way as the live example above; only the added dry-run line is new:</p>
-    <pre><code>darkmux radio "please review my changes" --dry-run
-<span class="comment"># radio: --dry-run — would invoke `review` with no arguments</span></code></pre>
-    <p>If your text carries trailing args past the matched command's intent, the dry-run line names them too (<code>would invoke `&lt;id&gt;` with args: "&lt;text&gt;"</code>). If nothing is currently advertised at all (no mission config anywhere declares a <code>panel</code> block), radio says so up front and does nothing:</p>
-    <pre><code>radio: no commands are currently advertised.
-No mission config in the merged registry (built-ins + ~/.darkmux/mission-configs/) declares a `panel` block.</code></pre>
-  </div>
-</section>
-
-<section id="catalog">
-  <div class="wrap">
-    <h2>The command catalog: what's advertised</h2>
-    <p>radio only ever routes to what's already advertised. It never composes a new action out of your words. A mission config becomes routable by adding a top-level <code>panel</code> block:</p>
-    <pre><code>{
-  "id": "my-command",
-  "name": "My Command",
-  "panel": {
-    "description": "One-line label for the command palette.",
-    "hint": "optional input hint shown before you type anything"
-  }
-}</code></pre>
-    <p><code>panel.description</code> is what the routing seat actually reads to decide whether your text matches. It's deliberately the short palette label, never a mission config's own top-level <code>description</code> field (which tends to be long-form engineering provenance, unsuitable for a model deciding "does this text mean run this command").</p>
-    <p>How a routed command actually executes depends on what its graph declares, structurally, not on its id or name:</p>
-    <ul>
-      <li>A graph using review-pipeline step kinds routes to the dedicated review launcher (the same path <code>mission launch review</code> itself uses).</li>
-      <li>A graph whose every step is procedural (no model dispatch anywhere in it) runs ephemeral, in-process, with no mission instance minted.</li>
-      <li>Anything else (at least one model-seated step) launches as a normal <code>darkmux mission launch &lt;id&gt;</code> subprocess.</li>
-    </ul>
-    <p>See <a href="missions.html#task-step-graphs">Task/Step graphs: authoring an automated phase</a> for the full mission-config shape and step-kind reference.</p>
-  </div>
-</section>
-
-<section id="forge-verbs">
-  <div class="wrap">
-    <h2>Worked example: gated forge verbs</h2>
-    <p>The catalog above is generic on purpose. darkmux doesn't ship pull-request verbs itself: GitHub, GitLab, and Perforce shops each want a different vocabulary, so an ecosystem tool never graduates into a built-in. Forge-specific commands are configs you write and keep in <code>~/.darkmux/mission-configs/</code>, following the pattern in this section (#1685). <code>gh</code> never appears inside darkmux; it appears in the shell command your own config runs.</p>
-    <p>The pattern combines three pieces: a <code>panel</code> block for the catalog, a <code>procedural.shell</code> step for the actual work, and a <code>gate: "operator"</code> step property for anything that changes state. Here's <code>pr-merge</code>:</p>
-    <pre><code>{
-  "id": "pr-merge",
-  "name": "PR Merge",
-  "panel": {
-    "description": "Merge a pull request once every check is green.",
-    "hint": "[PR number]"
-  },
-  "phases": [
-    {
-      "id": "run",
-      "tasks": [
-        {
-          "id": "merge-task",
-          "description": "merge the named PR",
-          "reads": ["__panel_args__"],
-          "steps": [
-            {
-              "id": "merge-step",
-              "kind": "procedural.shell",
-              "gate": "operator",
-              "config": {
-                "command": "gh pr merge $DARKMUX_STEP_INPUT___PANEL_ARGS__ --squash --delete-branch"
-              }
-            }
-          ]
-        }
-      ]
-    }
-  ]
-}</code></pre>
-    <p><code>reads: ["__panel_args__"]</code> is the reserved id that hands a task the raw text you typed after the command name, an empty string when you typed none. darkmux exposes it to the shell step as the environment variable named in the command above. The <code>gate: "operator"</code> property means the step doesn't run until you confirm it: the editor's native permission dialog in the panel, a <code>y/N</code> prompt at an interactive terminal, or a blocked pending sign-off from a non-interactive launch. <code>radio "merge 422"</code> routes here, the routing seat carries the PR number as the trailing arg, and the merge itself waits on your confirm either way.</p>
-    <p><code>pr-list</code> (read-only, no gate key at all) and <code>pr-approve</code> (gated, posts your review text as the rest-of-line) follow the identical shape: a <code>panel</code> block for the catalog entry, one <code>procedural.shell</code> step running your own <code>gh</code> invocation, and <code>gate: "operator"</code> on anything past a plain read. Write the config once and radio routes free text onto it exactly like any built-in.</p>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <h2>Fail closed: refuse, don't guess</h2>
-    <p>Every failure mode the routing seat can hit (empty output, malformed JSON, a command name outside the catalog, more than one fenced block in the response) becomes a refusal, never a guess and never a crash. The routing seat's own instructions put it plainly: when in doubt, refuse; a wrong refusal costs you one extra step, a wrong route runs the wrong command.</p>
-    <p>A refusal at the CLI doesn't just print the reason and stop. The same text is handed to the answering seat for a grounded, in-persona reply first:</p>
-    <pre><code>darkmux radio "what's slow about my last review"
-<span class="comment"># radio: &lt;the answering seat's prose reply, possibly naming a /command to run&gt;</span></code></pre>
-    <p>Only if that dispatch itself fails (no model loaded, a timeout) does radio fall back to the bare refusal plus a plain command listing, never silently swallowed:</p>
-    <pre><code>radio: the answering seat failed (...); falling back to the plain refusal
-radio: &lt;reason&gt;
-Available commands: `/review`.</code></pre>
-    <p>One CLI-specific limitation worth knowing: the CLI has no persistent session, so every invocation answers against a fresh, empty recent-output shelf (the last few rendered command outputs a longer-lived session, like the editor integration, would carry forward). That's a documented limitation of one-shot terminal use, not a bug.</p>
+    <h2>The dial</h2>
+    <p>The answering seat has a persona, RADIO, and one knob: <code>radio.humor</code>, 0 to 100. It ships at 50. Under about 40 the model answers plainly; 100 is the full voice.</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "do you have a brain?"</span><button class="copy-btn" data-copy="darkmux radio &quot;do you have a brain?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">radio: No biological brain. I'm a local inference engine running on your MacBook-Pro, backed by LMStudio and a handful of quantized models. No synapses, just tensors—processing your inputs on your hardware, not the other way around.</div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux config set radio.humor 100</span><button class="copy-btn" data-copy="darkmux config set radio.humor 100" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux radio "do you have a brain?"</span><button class="copy-btn" data-copy="darkmux radio &quot;do you have a brain?&quot;" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-out">radio: Negative. I'm a local-AI console interface running on your hardware, backed by LMStudio and whatever models you've got loaded. No neurons required—just silicon, a config file, and a healthy respect for thermodynamics. If you need me to route commands or check the flow substrate, I'm on frequency.</div>
+    </div>
+    <p class="session-caption">Verbatim, captured 2026-08-28 on an M5 Max: qwen3.6-35b-a3b answering, qwen3-4b routing, humor at the shipped default of 50 unless shown otherwise.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
     <h2>Configuration</h2>
-    <p>Three knobs, all under the <code>radio</code> config block. <code>darkmux init</code> writes them visible with their defaults, same as every other config surface:</p>
-    <pre><code>"radio": { "router_profile": "", "answerer_profile": "", "humor": 50 }</code></pre>
-    <table>
-      <tr><th>Config key</th><th>Env override</th><th>Default</th><th>Effect</th></tr>
-      <tr>
-        <td><code>radio.router_profile</code></td>
-        <td><code>DARKMUX_RADIO_ROUTER_PROFILE</code></td>
-        <td>unset</td>
-        <td>Explicit profile for the routing seat. Empty/unset falls through to <code>role_profiles.radio-router</code> if you've bound one, then <code>default_profile</code>.</td>
-      </tr>
-      <tr>
-        <td><code>radio.answerer_profile</code></td>
-        <td><code>DARKMUX_RADIO_ANSWERER_PROFILE</code></td>
-        <td>unset</td>
-        <td>Explicit profile for the answering seat. Same fall-through: <code>role_profiles.radio-host</code>, then <code>default_profile</code>.</td>
-      </tr>
-      <tr>
-        <td><code>radio.humor</code></td>
-        <td><code>DARKMUX_RADIO_HUMOR</code></td>
-        <td><code>50</code></td>
-        <td>0-100 dial substituted into the answering persona's prompt. Values outside that range are accepted by <code>config set</code> but clamped to <code>0..=100</code> when actually read.</td>
-      </tr>
+    <p>Three keys under <code>radio</code> in <code>config.json</code>; <code>darkmux init</code> writes them visible with their defaults. Each has an env override that wins live.</p>
+    <table class="cfg">
+      <thead><tr><th>Key</th><th>Env</th><th>Default</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>radio.router_profile</code></td><td><code>DARKMUX_RADIO_ROUTER_PROFILE</code></td><td>unset</td><td>Profile for the routing seat. Unset falls through to <code>role_profiles.radio-router</code>, then <code>default_profile</code>.</td></tr>
+        <tr><td><code>radio.answerer_profile</code></td><td><code>DARKMUX_RADIO_ANSWERER_PROFILE</code></td><td>unset</td><td>Profile for the answering seat. Same fall-through via <code>role_profiles.radio-host</code>.</td></tr>
+        <tr><td><code>radio.humor</code></td><td><code>DARKMUX_RADIO_HUMOR</code></td><td><code>50</code></td><td>0 to 100, substituted into the persona. Out-of-range values are clamped when read.</td></tr>
+      </tbody>
     </table>
-    <p>Set them the same way as any other config field:</p>
-    <pre><code>darkmux config set radio.router_profile &lt;profile-name&gt;
-darkmux config set radio.answerer_profile &lt;profile-name&gt;
-darkmux config set radio.humor 80
-darkmux config get radio.humor</code></pre>
-    <p>An explicit <code>radio.*_profile</code> setting always wins over an existing <code>role_profiles.radio-router</code> / <code>role_profiles.radio-host</code> pin, the same precedence every other profile override in darkmux uses. Leaving both set is harmless; the more specific one wins.</p>
-
-    <h3>Tuning live from the editor</h3>
-    <p>If you're driving darkmux through the editor integration (<code>darkmux acp</code>), the answering seat's staffing is also available as two live session config options: a "Radio host" picker listing every profile in your registry plus "Use configured default," and a "Radio humor" picker offering four presets (10, 35, 65, 90). Both are session-scoped: changing one re-staffs the answering seat for the rest of that session without touching <code>config.json</code>, and the routing seat's own staffing is unaffected either way. Reach for <code>radio.answerer_profile</code>/<code>radio.humor</code> for a durable default; reach for the pickers when you want to try a different host mid-session without leaving the thread.</p>
-  </div>
-</section>
-
-<section id="grounding">
-  <div class="wrap">
-    <h2>The grounding boundary</h2>
-    <p>The answering seat's replies are grounded in real local facts, assembled deterministically before the one model call it makes: the command catalog, the current <code>darkmux config list</code> output, a compact mission-board summary, your session's recent command outputs, and (when your message names one) one mission's full detail. The seat itself has no tools and can't fetch any of this on its own; it only ever sees what was already gathered and handed to it in the message.</p>
-    <p>What actually gets assembled depends on where that grounding is headed. If the resolved <code>radio-host</code> profile is served locally, everything above is in scope. If it resolves to a remote, hosted endpoint instead, the grounding narrows automatically to what's already public: the command catalog and the CLI's own <code>--help</code> text. The config surface, the mission-board summary, your session's recent outputs, and any named mission detail are withheld. The gate checks where the answering seat resolves <em>before</em> assembling, so those fields are never placed in the outbound message.</p>
-    <div class="callout warn">
-      <strong>Why this boundary exists.</strong>
-      <p style="margin: 6px 0 0;">After a review, the recent-outputs shelf holds rendered output over your own private diff. The config block carries machine ids, URLs, and directory layout. Mission ids can encode repository names and commit SHAs. None of that is safe to hand to a model you don't control the serving of, so the gate checks where the answering seat resolves <em>before</em> assembling anything, not after. This mirrors darkmux's existing rule that a machine's identity context is withheld from every remote endpoint, approved ones included. A grounding bundle is strictly more sensitive.</p>
+    <div class="session">
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux config set radio.answerer_profile deep</span><button class="copy-btn" data-copy="darkmux config set radio.answerer_profile deep" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux config set radio.humor 80</span><button class="copy-btn" data-copy="darkmux config set radio.humor 80" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+      <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux config get radio.humor</span><button class="copy-btn" data-copy="darkmux config get radio.humor" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
     </div>
-    <p>Practically: if you want radio's answers to be specific about this machine's state (what's running, what config you've set, what a named mission looks like), keep <code>radio.answerer_profile</code> pointed at a local profile. Pointing it at a remote/hosted profile is sends only the command catalog and the CLI’s <code>--help</code> text, so answers about your own local state will be honestly limited, but answers about your own local state will be honestly limited to "that's outside what I can ground an answer in from here," since the seat's persona refuses to invent facts it wasn't handed.</p>
+    <p class="session-caption">The answering seat honors <code>runtime.max_tokens_per_call</code> as its per-call budget and otherwise uses 16,384; a reasoning model that spends the whole budget thinking gets reported as a failed answer, not a blank line. In the editor integration (<code>darkmux acp</code>) the host profile and humor are also session pickers (presets 10 / 50 / 75 / 100) that never touch <code>config.json</code>.</p>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <h2>Where this fits</h2>
-    <p>radio sits on top of the same registry and dispatch machinery the rest of the advanced surface uses. If you haven't read it yet, <a href="missions.html">Missions, phases, and dispatch</a> covers roles, mission configs, and the review funnel radio routes into by default. Everything radio does (dispatching a role, launching a mission, running the review funnel) you can also do directly with the commands named throughout that page. radio is a shortcut over the same primitives, not a separate system.</p>
+    <h2>In your editor</h2>
+    <p>The same two seats sit behind <code>darkmux acp</code>, an agent server for editors that speak the Agent Client Protocol. In Zed, register it once and the advertised catalog becomes slash commands in the agent panel: <code>/review</code>, plus whatever you advertise yourself. Type without a slash and the message goes to the routing seat first, a small model that maps it onto exactly one advertised command or refuses; a refusal falls through to the answering seat with the session’s recent outputs in its grounding. A gated step asks for permission in Zed’s own dialog before it runs. The host profile and humor are session pickers there, so you can try a different answering seat without touching <code>config.json</code>.</p>
+    <pre><code>// Zed settings.json
+"agent_servers": {
+  "darkmux": {
+    "type": "custom",
+    "command": "darkmux",
+    "args": ["acp"],
+    "env": { "DARKMUX_ORCHESTRATOR": "zed" }
+  }
+}</code></pre>
+    <p>If <code>darkmux</code> is not on the PATH Zed launches with, give <code>command</code> the full path (<code>$(brew --prefix)/bin/darkmux</code> for a Homebrew install). <code>DARKMUX_ORCHESTRATOR</code> stamps every flow record the session writes, so the viewer can tell editor-driven work from terminal work.</p>
+  </div>
+</section>
+<a id="advertise"></a>
+<section>
+  <div class="wrap">
+    <h2>Advertise your own commands</h2>
+    <p>radio only routes to what is advertised. A mission config in <code>~/.darkmux/mission-configs/</code> joins the catalog by carrying a <code>panel</code> block; its <code>description</code> is what the router reads. A step that changes state carries <code>"gate": "operator"</code> and waits for your confirmation, at the terminal or in the editor.</p>
+    <pre><code>{
+  "id": "pr-merge",
+  "name": "PR Merge",
+  "panel": { "description": "Merge a pull request once every check is green.", "hint": "[PR number]" },
+  "phases": [{ "id": "run", "tasks": [{
+    "id": "merge-task", "description": "merge the named PR", "reads": ["__panel_args__"],
+    "steps": [{ "id": "merge-step", "kind": "procedural.shell", "gate": "operator",
+                "config": { "command": "gh pr merge $DARKMUX_STEP_INPUT___PANEL_ARGS__ --squash --delete-branch" } }]
+  }]}]
+}</code></pre>
+    <p><code>__panel_args__</code> hands the step the text you typed after the command’s intent ("merge PR 2049" carries <code>"PR 2049"</code>), as an environment variable. darkmux ships no forge verbs of its own: GitHub, GitLab, and Perforce want different vocabularies, so <code>gh</code> lives in your config, never in darkmux. A graph with no model step runs in-process; one with a model step launches as <code>darkmux mission launch &lt;id&gt;</code>. The full config shape is in <a href="missions.html#task-step-graphs">Task/Step graphs</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What it is grounded in, and where that stops</h2>
+    <p>The answering seat has no tools. Everything it can say was gathered before it ran: the command catalog, the command index, your <code>config list</code>, a mission-board summary, the session’s recent outputs, and one named mission’s detail when you ask about it. If <code>radio.answerer_profile</code> resolves to a hosted endpoint, only the catalog and the command index are sent; your config, board, and outputs stay on the machine. Keep the seat local if you want answers about this machine’s state.</p>
   </div>
 </section>
 
 <nav class="page-nav wrap">
-  <a href="pr-flow.html" class="prev">
+  <a href="getting-started.html" class="prev">
     <span class="dir">‹ Previous</span>
-    <span class="title">PR-flow panel verbs</span>
+    <span class="title">Getting started</span>
   </a>
-  <a href="index.html" class="next">
-    <span class="dir">Guide home ›</span>
-    <span class="title">Back to TOC</span>
+  <a href="observability.html" class="next">
+    <span class="dir">Next ›</span>
+    <span class="title">Observability: daemon + viewer</span>
   </a>
 </nav>
 

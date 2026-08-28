@@ -37,6 +37,41 @@
     return text.replace(/\s+$/, "");
   }
 
+  // Session-card buttons (icon, `data-copy` carries the exact command):
+  // copy it, flip the glyph to a check, and if the clipboard cannot be
+  // written (plain HTTP on a named host has no navigator.clipboard) fall
+  // back to execCommand, then to selecting the command so Cmd+C works.
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest(".session .copy-btn[data-copy]");
+    if (!btn) return;
+    e.stopImmediatePropagation();
+    var cmd = btn.getAttribute("data-copy") || "";
+    var done = function (ok) {
+      if (ok) {
+        btn.classList.add("copied");
+        btn.setAttribute("aria-label", "Copied");
+        setTimeout(function () { btn.classList.remove("copied"); btn.setAttribute("aria-label", "Copy command"); }, 1200);
+        return;
+      }
+      var cmdEl = btn.parentNode.querySelector(".cmd");
+      if (cmdEl && window.getSelection) {
+        var range = document.createRange(); range.selectNodeContents(cmdEl);
+        var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      }
+      btn.setAttribute("title", "Press Cmd+C to copy");
+    };
+    var legacy = function () {
+      var ta = document.createElement("textarea");
+      ta.value = cmd; ta.setAttribute("readonly", ""); ta.style.position = "fixed"; ta.style.top = "-1000px";
+      document.body.appendChild(ta); ta.select();
+      var ok = false; try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
+      document.body.removeChild(ta); done(ok);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(cmd).then(function () { done(true); }, legacy);
+    } else { legacy(); }
+  }, true);
+
   document.addEventListener("click", function (e) {
     var btn = e.target.closest(".copy-btn");
     if (!btn) return;
