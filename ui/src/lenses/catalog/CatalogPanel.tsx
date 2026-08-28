@@ -165,6 +165,7 @@ export function CatalogPanel({ label }: { label?: string } = {}) {
         aria-label="browse history"
       >
         {label ?? "browse history"}
+        <span className="chip__caret" aria-hidden="true" />
       </button>
       {open && (
         <div className="catpanel" id="catpanel">

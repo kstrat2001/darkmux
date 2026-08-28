@@ -1896,8 +1896,14 @@ body {
   /* Look: `.chip`. Only what makes it a control lives here. */
   cursor: pointer;
 }
-.catalog-toggle::after {
-  content: " ▾";
+/* The caret is a real (empty, aria-hidden) span drawn by its own `::before`:
+   `::after` on the toggle is the phone-width 44px hit region, and content
+   put there rendered inside that box, above the label (operator screenshot).
+   Drawn with CSS content so `innerText` (what the parity goldens read)
+   stays exactly the label. */
+.chip__caret::before {
+  content: "▾";
+  margin-left: 0.45em;
   letter-spacing: 0;
 }
 .catalog-toggle:hover {
