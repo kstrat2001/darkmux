@@ -24,7 +24,7 @@ import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
 import { primaryReplayMission, replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
-import { T, firstRecordDate, localMachineUid, nameOf, todayUTC } from "./lib/flow";
+import { T, asRecordArray, firstRecordDate, localMachineUid, nameOf, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
 import { useQuery } from "@tanstack/react-query";
 import { fetchJson } from "./lib/fetcher";
@@ -153,15 +153,40 @@ export function App() {
   // (#2086) One resolver for the loaded day — static file on every route,
   // `/flow/<date>` on a daemon playback, nothing on a live route.
   const source = getSource();
-  const day = useDay(route.kind === "playback" ? route.date : null);
+  // The day a daemon replay belongs to. A playback route names it; a
+  // dispatch or mission replay does not, so it is derived from the replayed
+  // records themselves (the earliest one's day) — the shell then loads that
+  // day, the transport appears, and the chip names the date instead of the
+  // bare "RESULT" the demo never showed (operator: "says replay not the
+  // date"). The mission records ride the same `queryKeys.flowMission` slot
+  // the mission lens fetches, so this is cache reuse.
+  const missionRecordsQuery = useQuery({
+    queryKey: queryKeys.flowMission(route.kind === "mission" ? route.missionId : ""),
+    queryFn: () => fetchJson<unknown>(`/flow-mission/${encodeURIComponent(route.kind === "mission" ? route.missionId : "")}`),
+    enabled: source.kind === "daemon" && route.kind === "mission",
+  });
+  const replayDate = useMemo(() => {
+    if (route.kind === "playback") return route.date;
+    if (source.kind !== "daemon") return null;
+    if (route.kind === "dispatch") return earliestDate(routeRecords.records);
+    if (route.kind === "mission") return missionRecordsQuery.data?.ok ? earliestDate(asRecordArray(missionRecordsQuery.data.data)) : null;
+    return null;
+  }, [route, source.kind, routeRecords.records, missionRecordsQuery.data]);
+  const day = useDay(replayDate);
   const dayRecords = day.records;
   const transport = usePlaybackTransport(dayRecords);
   // (#2071 review) Show the transport only where something on screen
   // answers it. The mission lens takes no playhead and mounts its own log
   // (`showsEventLog` excludes it), so play/pause there would move nothing.
   const transportShown = transport.active && route.kind !== "mission";
+  // Lenses and the log scope to the playhead only once it has MOVED
+  // (`transport.scrubbed`): at rest the playhead is the loaded day's end,
+  // which can sit before the end of a run that crossed midnight, and the
+  // default render must be the whole run (measured: a session page lost
+  // half its elapsed time to the cut before this guard).
+  const playhead = transport.active && transport.scrubbed ? transport.t : null;
   const eventLogRecords = useMemo(() => {
-    if (!transport.active) return routeRecords.records;
+    if (playhead === null) return routeRecords.records;
     // A static build's runs/machine/console routes have no slice of their
     // own (the live window is empty there); the day's log, scoped to the
     // playhead, is what the transport is scrubbing. Playback and dispatch
@@ -170,8 +195,8 @@ export function App() {
     const base = own ? routeRecords.records : (dayRecords ?? []);
     // `!(ts > t)`, not `ts <= t`: a record with an unparseable `ts` stays
     // in the log, as it did before the transport scoped every route.
-    return base.filter((r) => !(T(r.ts) > transport.t));
-  }, [transport.active, transport.t, route.kind, routeRecords.records, source.kind, dayRecords]);
+    return base.filter((r) => !(T(r.ts) > playhead));
+  }, [playhead, route.kind, routeRecords.records, source.kind, dayRecords]);
   // (#2071) The sticky block's measured height feeds `--chrome-h`, the
   // offset the event log column sticks under on desktop. It used to be a
   // 97px constant that assumed the masthead + one chrome row.
@@ -316,7 +341,7 @@ export function App() {
           to live on this line) now lives there instead. Precedes
           `.app-shell__crumbbar`, matching legacy's DOM order (`.top` before
           `.crumbbar`). */}
-      <Masthead route={displayRoute} liveStatus={liveStatus} specs={specs} />
+      <Masthead route={displayRoute} liveStatus={liveStatus} specs={specs} replayDate={route.kind === "playback" ? null : replayDate} />
       {/* (#2071) The sticky block: the tab strip plus, while a day is loaded,
           the playback transport. Operator decision: sticky row, tabs
           included; the masthead, crumb and meta line scroll away. Its height
@@ -399,7 +424,7 @@ export function App() {
               navigation: switching tabs remounts the boundary, which is the
               recovery an operator will reach for first. */}
           <LensErrorBoundary key={route.kind} name={route.kind}>
-            {renderRoute(route, transport.active ? transport.t : null)}
+            {renderRoute(route, playhead)}
           </LensErrorBoundary>
         </main>
         <EventLogColumn
@@ -551,6 +576,18 @@ function routeChrome(
  * calls it) know this parameter exists. See `App`'s own
  * `playbackPlayheadMs`/`eventLogRecords` doc for why the event log needs it.
  */
+/** The day of the earliest record with a usable timestamp, or null. Not
+ * `firstRecordDate` (file order): a session or mission slice from the daemon
+ * is not guaranteed to arrive sorted. */
+function earliestDate(records: FlowRecord[]): string | null {
+  let min = Infinity;
+  for (const r of records) {
+    const t = T(r.ts);
+    if (!Number.isNaN(t) && t < min) min = t;
+  }
+  return Number.isFinite(min) ? new Date(min).toISOString().slice(0, 10) : null;
+}
+
 function renderRoute(route: Route, playhead: number | null) {
   switch (route.kind) {
     case "fleet":

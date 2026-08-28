@@ -62,7 +62,7 @@ import type { MachineSpecs } from "../types/handwritten";
  * outside-click + Escape dismissal, live/mission/day rows) with a full test
  * suite (`CatalogPanel.test.tsx`) pinned to that button's ACCESSIBLE NAME
  * ("browse history", via `aria-label` — see `CatalogPanel.tsx`'s own doc).
- * This component passes `label={srcbadgeText(route)}` to override the
+ * This component passes `label={srcbadgeText(route, replayDate)}` to override the
  * button's VISIBLE text to legacy's actual `#srcbadge` content ("TODAY" in
  * live mode, matching `setBadges()`'s `dl` — viewer.html:3432/3439) —
  * literally pre-uppercased, the SAME "uppercase the STRING directly, don't
@@ -112,6 +112,7 @@ export function Masthead({
   route,
   liveStatus,
   specs = null,
+  replayDate = null,
 }: {
   route: Route;
   liveStatus: LiveTailStatus;
@@ -119,6 +120,10 @@ export function Masthead({
    *  optional (defaults to `null`) so every existing caller/test that
    *  doesn't pass it is unaffected; only a live route ever reads it. */
   specs?: MachineSpecs | null;
+  /** The day a daemon dispatch/mission page belongs to, once the shell has
+   * derived it from the records; `null` until then (the chip reads "RESULT"
+   * meanwhile) and on every other route. */
+  replayDate?: string | null;
 }) {
   const queryClient = useQueryClient();
   const [spinning, setSpinning] = useState(false);
@@ -184,11 +189,11 @@ export function Masthead({
         // (#1801) No `<CatalogPanel>` here — see this component's own doc
         // for why a static build gets inert text instead of a button that
         // would 404 on click.
-        <span className="chip masthead__srcbadge" title={/^\d{4}-\d{2}-\d{2}$/.test(srcbadgeText(route)) ? "the first recorded day in this replay" : undefined}>
-          {srcbadgeText(route)}
+        <span className="chip masthead__srcbadge" title={/^\d{4}-\d{2}-\d{2}$/.test(srcbadgeText(route, replayDate)) ? "the first recorded day in this replay" : undefined}>
+          {srcbadgeText(route, replayDate)}
         </span>
       ) : (
-        <CatalogPanel label={srcbadgeText(route)} />
+        <CatalogPanel label={srcbadgeText(route, replayDate)} />
       )}
       {/* (#1801) A static build shows the PLAYBACK badge on every lens, not
           just the playback route. `isLiveRoute()` now returns false for the
@@ -199,7 +204,7 @@ export function Masthead({
           badge on every lens, mode being global there. */}
       {live ? (
         <LiveStatusBadge status={liveStatus} />
-      ) : getSource().kind === "static" || route.kind === "playback" ? (
+      ) : getSource().kind === "static" || route.kind === "playback" || replayDate !== null ? (
         <PlaybackModeBadge />
       ) : null}
       {/* (operator: "a reload button next to 'live' is absurd") — and it is:
@@ -266,7 +271,7 @@ export function Masthead({
  * doc for why: matches
  * `App.tsx`'s `routeChrome` precedent for the fleet `#logscope` value)
  * except the literal ISO date, which has no case to begin with. */
-function srcbadgeText(route: Route): string {
+function srcbadgeText(route: Route, replayDate: string | null = null): string {
   // (#1800) `"Flow · "+date` verbatim from legacy's `play` arm, pre-uppercased
   // per this component's own module doc. The previous version rendered a bare
   // ISO date and said why: the "Flow · " prefix was "a borrowed live-mode
@@ -300,6 +305,9 @@ function srcbadgeText(route: Route): string {
     // the demo's dated one. `TODAY` is the LIVE view's word.
     return date;
   }
-  if (route.kind === "dispatch" || route.kind === "mission") return "REPLAY";
+  // A dispatch or mission page names its day once the shell has derived it
+  // from the records; until then it is what the page shows: a RESULT
+  // (operator, 2026-08-28: "instead of replay doesn't result seem better?").
+  if (route.kind === "dispatch" || route.kind === "mission") return replayDate ?? "RESULT";
   return "TODAY";
 }

@@ -785,6 +785,59 @@ describe("App", () => {
     }
   });
 
+  function renderApp() {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+  }
+
+  // (daemon replay day) A dispatch or mission page on a DAEMON derives its
+  // day from the replayed records, loads it, and gets the transport (dispatch)
+  // and the dated chip with the playback badge (both). Daemon routes are not
+  // static, so these run before the static cases below.
+  function mockDaemonReplay() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        const recs = [
+          { ts: "2026-08-07T09:00:00.000Z", category: "dispatch", action: "dispatch.start", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", mission_id: "m-one" },
+          { ts: "2026-08-07T09:30:00.000Z", category: "dispatch", action: "dispatch.complete", machine_uid: "m1", machine_id: "MacBook-Pro", session_id: "s1", mission_id: "m-one" },
+        ];
+        if (path === "/flow-session/s1") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 2, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        if (path === "/flow-mission/m-one") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: 2, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        if (path === "/flow/2026-08-07") return Promise.resolve(new Response(JSON.stringify(recs), { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response("[]", { status: 200 }));
+        if (path === "/fleet/sessions/live") return Promise.resolve(new Response(JSON.stringify({ sessions: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        if (path === "/fleet/machines/live") return Promise.resolve(new Response(JSON.stringify({ machines: [], meta: { sources: { fleet: { state: "off" } }, complete: true } }), { status: 200 }));
+        // Anything else (the mission graph, runs, specs) is absent: the lenses
+        // render their honest not-found states rather than choking on "[]".
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+  }
+
+  it("a daemon dispatch page names its day in the chip, shows the playback badge, and gets the transport", async () => {
+    mockDaemonReplay();
+    window.location.hash = "#dispatch=s1";
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07"));
+    expect(document.querySelector("#modebadge")?.textContent).toMatch(/playback/i);
+    await screen.findByRole("group", { name: "playback transport" });
+  });
+
+  it("a daemon mission page names its day in the chip with the playback badge, and (for now) no transport", async () => {
+    mockDaemonReplay();
+    window.location.hash = "#mission=m-one";
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07"));
+    expect(document.querySelector("#modebadge")?.textContent).toMatch(/playback/i);
+    expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
+  });
+
   // (#2071) The transport lives in the shell's sticky block on every route
   // of a loaded day. Static cases stay at the end of the file (the
   // `useHashRoute` memo, see above).
@@ -811,14 +864,6 @@ describe("App", () => {
       }),
     );
     return meta;
-  }
-  function renderApp() {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <QueryClientProvider client={queryClient}>
-        <App />
-      </QueryClientProvider>,
-    );
   }
 
   it("(#2071) a live daemon route renders no transport — nothing to scrub", async () => {
