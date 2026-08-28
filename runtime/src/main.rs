@@ -828,6 +828,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             max_turns_reached,
             rest_ms: o.rest_ms,
             rests: o.rests,
+            turn_delay_effective_ms: o.turn_delay_effective_ms,
             final_assistant_preview: preview,
         };
         let _ = traj.save_metrics(&metrics);
@@ -895,6 +896,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             // reason turns/compactions above are hardcoded 0, not a new gap).
             rest_ms: 0,
             rests: 0,
+            turn_delay_effective_ms: 0,
             final_assistant_preview: String::new(),
         };
         let _ = traj.save_metrics(&metrics);

@@ -415,6 +415,12 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.25.0";
 //           same additive rule this whole version already documents; older
 //           readers that don't recognize `dispatch.rest` ignore it exactly
 //           like they ignore any other unfamiliar action.
+//           (finding 8, same 1.25.0) Also added `turn_delay_effective_ms`
+//           to `dispatch.complete` — the POST-CLAMP cadence the runtime
+//           actually applied, distinct from `rest_ms`/`rests` (what
+//           happened) and from the operator's raw configured value
+//           (`dispatch.start`'s `turn_delay_ms`). `null` when unknowable.
+//           Additive payload field, same rule as the rest of this version.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

@@ -702,6 +702,65 @@
         assert_eq!(r.rests, 1);
     }
 
+    // ─── #2094 finding 8: turn_delay_effective_ms ─────────────────────────
+
+    #[test]
+    fn read_turn_delay_effective_ms_prefers_the_metrics_json_field() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        fs::write(
+            rt.join("metrics.json"),
+            r#"{"rest_ms": 1000, "rests": 2, "turn_delay_effective_ms": 500}"#,
+        )
+        .unwrap();
+        let rest = read_rest_totals(out.path());
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, Some(500), "the exact resolved constant, not the 1000/2 average");
+    }
+
+    #[test]
+    fn read_turn_delay_effective_ms_falls_back_to_rest_average_when_metrics_json_absent() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        // No metrics.json at all — trajectory carries two rests of 500ms
+        // and 300ms, summing 800ms over 2 rests.
+        fs::write(
+            rt.join("trajectory.jsonl"),
+            "{\"type\":\"runtime.rest\",\"seq\":1,\"ts\":1,\"ms\":500}\n\
+             {\"type\":\"runtime.rest\",\"seq\":2,\"ts\":2,\"ms\":300}\n",
+        )
+        .unwrap();
+        let rest = read_rest_totals(out.path());
+        assert_eq!((rest.rest_ms, rest.rests), (800, 2));
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, Some(400), "800ms / 2 rests = 400ms average, the derived fallback");
+    }
+
+    #[test]
+    fn read_turn_delay_effective_ms_falls_back_when_metrics_json_lacks_the_field() {
+        let out = TempDir::new().unwrap();
+        let rt = out.path().join(".darkmux-runtime");
+        fs::create_dir_all(&rt).unwrap();
+        // metrics.json present (pre-finding-8 shape) but has no
+        // turn_delay_effective_ms key — must still reach for the average.
+        fs::write(rt.join("metrics.json"), r#"{"rest_ms": 600, "rests": 3}"#).unwrap();
+        let rest = RestTotals { rest_ms: 600, rests: 3 };
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, Some(200));
+    }
+
+    #[test]
+    fn read_turn_delay_effective_ms_is_none_when_nothing_is_knowable() {
+        let out = TempDir::new().unwrap();
+        // No metrics.json, no trajectory.jsonl, zero rests — genuinely
+        // unknowable, not a misleading 0.
+        let rest = RestTotals::default();
+        let effective = read_turn_delay_effective_ms(out.path(), rest);
+        assert_eq!(effective, None);
+    }
+
     // ─── #2094 finding 4: never rest an agentic-REMOTE dispatch ──────────
 
     #[test]

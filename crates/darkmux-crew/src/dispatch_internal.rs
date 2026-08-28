@@ -3043,6 +3043,10 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     // INCLUDES this time (wall stays wall); a caller wanting model-only
     // time subtracts `rest_ms` from `wall_ms` itself.
     let rest = read_rest_totals(&host_out);
+    // (#2094 finding 8) Best-effort read of the post-clamp cadence this
+    // dispatch actually applied — see read_turn_delay_effective_ms's own
+    // doc for the metrics.json-then-derived-average fallback chain.
+    let turn_delay_effective_ms = read_turn_delay_effective_ms(&host_out, rest);
 
     // 8. Emit dispatch.complete flow record with summary metadata.
     let mut dispatch_complete_payload = serde_json::json!({
@@ -3052,6 +3056,9 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
         // rested run's wall clock must never be misread as a slow model.
         "rest_ms": rest.rest_ms,
         "rests": rest.rests,
+        // (#2094 finding 8) null when unknowable (no metrics.json field
+        // AND zero rests) rather than a misleading 0.
+        "turn_delay_effective_ms": turn_delay_effective_ms,
         "stdout_chars": stdout.chars().count(),
         "stderr_chars": stderr.chars().count(),
         // (#1042) On the error path, carry a bounded stderr TAIL so a failed
@@ -3489,6 +3496,36 @@ fn sum_rest_totals_from_trajectory(out_dir: &Path) -> RestTotals {
         totals.rests = totals.rests.saturating_add(1);
     }
     totals
+}
+
+/// (#2094 finding 8) The POST-CLAMP `turn_delay_ms` cadence this dispatch
+/// actually applied — `resolve_turn_delay_ms`'s output
+/// (`runtime/src/loop_runner.rs`), written by the runtime into
+/// `metrics.json` as `turn_delay_effective_ms` because only the runtime
+/// knows the clamped value. Preferred source: the metrics.json field
+/// itself, when present. Fallback (metrics.json absent, or present but
+/// missing this field — predates finding 8, or the runtime never reached
+/// its clean-exit write): `rest.rest_ms / rest.rests` when `rest.rests >
+/// 0` — a derived AVERAGE cadence, not the exact resolved constant, but
+/// the cheapest available approximation from data that already exists
+/// (`RestTotals`, itself already trajectory-fallback-covered by
+/// [`read_rest_totals`]). `None` when nothing is knowable at all (no
+/// metrics.json field AND zero rests — could mean turn_delay_ms was never
+/// configured, or the dispatch never reached a second turn).
+pub fn read_turn_delay_effective_ms(out_dir: &Path, rest: RestTotals) -> Option<u64> {
+    let metrics_path = out_dir.join(".darkmux-runtime").join("metrics.json");
+    let from_metrics = fs::read_to_string(&metrics_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("turn_delay_effective_ms").and_then(|n| n.as_u64()));
+    if from_metrics.is_some() {
+        return from_metrics;
+    }
+    if rest.rests > 0 {
+        Some(rest.rest_ms / u64::from(rest.rests))
+    } else {
+        None
+    }
 }
 
 /// (#2094 finding 4) Whether the operator's configured `turn_delay_ms`

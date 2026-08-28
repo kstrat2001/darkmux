@@ -291,6 +291,14 @@ pub struct LoopOutcome {
     pub rest_ms: u64,
     /// (#2094) How many inter-turn rests fired during this dispatch.
     pub rests: u32,
+    /// (#2094 finding 8) The POST-CLAMP `turn_delay_ms` this dispatch
+    /// actually applied — i.e. `resolve_turn_delay_ms`'s output, not the
+    /// operator's raw configured value. Distinct from `rest_ms`/`rests`
+    /// (which describe what actually happened): this is the CADENCE the
+    /// runtime resolved once at startup and would apply to every rest,
+    /// known even on a dispatch that took zero rests (e.g. a single-turn
+    /// dispatch) — the effective knob, not a derived average.
+    pub turn_delay_effective_ms: u64,
 
     /// (#799) Bash invocations that FAILED TO RUN (never executed) during the
     /// dispatch — the verifier-fabrication backstop. Empty on an honest run.
@@ -1133,6 +1141,7 @@ fn run_with_sleeper(
                     compactions,
                     rest_ms,
                     rests,
+                    turn_delay_effective_ms: turn_delay_ms,
                     failed_to_run: failed_to_run.clone(),
                 });
             }
@@ -1163,6 +1172,7 @@ fn run_with_sleeper(
                     compactions,
                     rest_ms,
                     rests,
+                    turn_delay_effective_ms: turn_delay_ms,
                     failed_to_run: failed_to_run.clone(),
                 });
             }
@@ -1605,6 +1615,7 @@ fn run_with_sleeper(
                     compactions,
                     rest_ms,
                     rests,
+                    turn_delay_effective_ms: turn_delay_ms,
                     failed_to_run: failed_to_run.clone(),
                 });
             }
@@ -1664,6 +1675,7 @@ fn run_with_sleeper(
                             compactions,
                             rest_ms,
                             rests,
+                            turn_delay_effective_ms: turn_delay_ms,
                             failed_to_run: failed_to_run.clone(),
                         });
                     }
@@ -2103,6 +2115,7 @@ fn run_with_sleeper(
                                 compactions,
                                 rest_ms,
                                 rests,
+                                turn_delay_effective_ms: turn_delay_ms,
                                 failed_to_run: failed_to_run.clone(),
                             });
                         }
@@ -2209,6 +2222,7 @@ fn run_with_sleeper(
                         compactions,
                         rest_ms,
                         rests,
+                        turn_delay_effective_ms: turn_delay_ms,
                         failed_to_run: failed_to_run.clone(),
                     });
                 }
@@ -2426,6 +2440,7 @@ fn run_with_sleeper(
                             compactions,
                             rest_ms,
                             rests,
+                            turn_delay_effective_ms: turn_delay_ms,
                             failed_to_run: failed_to_run.clone(),
                         });
                     }
@@ -3168,6 +3183,10 @@ mod tests {
         );
         assert_eq!(outcome.rest_ms, 1000, "LoopOutcome carries the same sum the sleeper saw");
         assert_eq!(outcome.rests, 2);
+        assert_eq!(
+            outcome.turn_delay_effective_ms, 500,
+            "(#2094 finding 8) the POST-CLAMP cadence actually applied, not the raw config"
+        );
 
         drop(traj);
         let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
@@ -3208,6 +3227,10 @@ mod tests {
         assert!(sleeper.calls.borrow().is_empty(), "delay=0 must never sleep");
         assert_eq!(outcome.rest_ms, 0);
         assert_eq!(outcome.rests, 0);
+        assert_eq!(
+            outcome.turn_delay_effective_ms, 0,
+            "(#2094 finding 8) known and zero, even though this dispatch never rested"
+        );
     }
 
     #[test]
