@@ -420,13 +420,24 @@ export function RunsBoard({
   // for an identity mapping over a fixture whose timestamps are frozen at
   // export time — it would resolve on deploy day and decay empty after.
   // The alias set is not time-scoped; the whole file is the source.
+  //
+  // Read RAW (no `normalizeRecords`) on purpose: only `machine_uid` /
+  // `machine_id` are consulted, and the schema-header line the normalizer
+  // drops carries neither. Fetched only while a pin needs it — the demo's
+  // file is megabytes, and an unpinned board never reads a record of it.
   const flowSrc = daemonBacked ? null : staticFlowSrc();
+  const staticPinFetch = flowSrc !== null && machineUid !== null;
   const staticFlowQuery = useQuery({
     queryKey: queryKeys.staticFlowSrc(flowSrc ?? ""),
     queryFn: () => fetchStaticFlowRecords(flowSrc ?? ""),
-    enabled: flowSrc !== null,
+    enabled: staticPinFetch,
   });
   const pinRecords = daemonBacked ? flowWindow.data : (staticFlowQuery.data ?? []);
+  // Loading is not "empty": until the file lands, an empty alias set would
+  // render the pre-#2063 symptom as a flash ("no runs recorded yet" under a
+  // raw-uid chip) for as long as the download takes. Folded into the
+  // pending branch below.
+  const staticPinPending = staticPinFetch && staticFlowQuery.data === undefined;
 
   // The lab-run detail pane is its own top-level render, reached without
   // waiting on the two queries above and independent of `kind` (see
@@ -435,8 +446,9 @@ export function RunsBoard({
     return <LabRunDetail dir={labRunDir} onBack={closeLabRun} onUnresolvable={onLabRunUnresolvable} />;
   }
 
-  // Pending: neither query has resolved yet (matches `RUNS_LOADED===null`).
-  if (!runsQuery.data || !labRunsQuery.data) {
+  // Pending: neither query has resolved yet (matches `RUNS_LOADED===null`),
+  // or (#2063) a static-build pin is still waiting on its alias source.
+  if (!runsQuery.data || !labRunsQuery.data || staticPinPending) {
     return (
       <div data-state="pending" role="status" aria-label="Loading runs">
         <div className="stagehdr">runs</div>

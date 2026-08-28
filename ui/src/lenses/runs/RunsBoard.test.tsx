@@ -991,4 +991,40 @@ describe("RunsBoard — the machine pin on a static build (#2063)", () => {
     expect(screen.getByText(/m5-ultra-256gb/)).toBeInTheDocument();
     expect(seen.filter((p) => p.startsWith("/flow/") || p === "/fleet/machines/live")).toEqual([]);
   });
+
+  it("shows the loading state, not an empty pin, while the flow file is still downloading", async () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "/runs") {
+          return Promise.resolve(new Response(JSON.stringify({ runs: STATIC_RUNS, generated_at_ms: 1 }), { status: 200 }));
+        }
+        if (path === "/lab/runs") {
+          return Promise.resolve(new Response(JSON.stringify({ configured: false, dir: null, exists: false, runs: [] }), { status: 200 }));
+        }
+        // The multi-megabyte demo file, still in flight: never resolves.
+        if (path === "./demo-flow.jsonl") return new Promise<Response>(() => {});
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+    renderBoard("all", null, "u1");
+    // Give the runs + lab queries every chance to settle first.
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.length).toBeGreaterThanOrEqual(3));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(screen.getByRole("status", { name: "Loading runs" })).toBeInTheDocument();
+    expect(screen.queryByText(/no runs recorded yet/)).not.toBeInTheDocument();
+  });
+
+  it("never downloads the flow file for an unpinned board", async () => {
+    injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
+    const seen = mockStaticFetch();
+    renderBoard("all", null, null);
+    await waitFor(() => expect(screen.getByText("m1")).toBeInTheDocument());
+    expect(screen.getByText("m2")).toBeInTheDocument();
+    expect(seen).not.toContain("./demo-flow.jsonl");
+  });
 });
