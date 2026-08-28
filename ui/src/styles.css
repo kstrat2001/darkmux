@@ -142,7 +142,13 @@ body {
 }
 
 .app-shell__navtabs {
-  display: inline-flex;
+  /* (operator, 2026-08-28) Uniform cells on every width: `grid-auto-columns:
+     1fr` sizes every tab to the widest label (MACHINE) instead of its own,
+     so RUNS is no longer the slim one. On desktop the strip stays compact
+     beside the transport; the phone rule below stretches it to the row. */
+  display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
   flex: none;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -151,6 +157,7 @@ body {
 
 .nav-tab {
   display: inline-block;
+  text-align: center;
   font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -297,11 +304,10 @@ body {
        ragged against the full-width transport under it. Equal cells line
        up with the content edges, center by construction, and widen each
        tap target from ~70px to a quarter of the row. */
-    display: flex;
+    display: grid;
     width: 100%;
   }
   .app-shell__navtabs .nav-tab {
-    flex: 1 1 0;
     justify-content: center;
     text-align: center;
   }
