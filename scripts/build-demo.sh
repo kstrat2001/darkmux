@@ -93,7 +93,11 @@ SRC="$ROOT/crates/darkmux-serve/assets/$ASSET"
 # `records[0]` (`firstRecordDate`); file order only happens to agree today.
 # Lets the masthead name the day on every route without downloading the
 # file. The demo world spans more than one day; this is its first.
-FLOW_DATE=$(grep -o '"ts": *"[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' "$ROOT/docs/demo/demo-flow.jsonl" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' | sort | head -1)
+# `sed -n 1p`, not `head -1`: `head` closes the pipe after one line, `sort`
+# takes a SIGPIPE, and under `pipefail` this script then exits silently
+# BEFORE writing the page (observed: a rerun printed nothing and left the
+# previous index.html in place).
+FLOW_DATE=$(grep -o '"ts": *"[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' "$ROOT/docs/demo/demo-flow.jsonl" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' | sort | sed -n 1p)
 if [ -z "$FLOW_DATE" ]; then
   echo "build-demo: could not derive the replayed day from docs/demo/demo-flow.jsonl" >&2
   exit 1
