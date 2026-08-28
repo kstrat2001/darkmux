@@ -34,28 +34,45 @@ fn cmd_crawl_plan(manifest_path: &std::path::Path, out: Option<PathBuf>, no_fetc
     let the_plan = plan::plan(&manifest, &rules, &resolved)
         .with_context(|| format!("planning corpus '{}'", manifest.name))?;
 
-    let out_path = out.unwrap_or_else(|| manifest.resolved_root().join("plan.json"));
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
     let plan_json = serde_json::to_string_pretty(&the_plan)?;
-    std::fs::write(&out_path, &plan_json)
-        .with_context(|| format!("writing plan to {}", out_path.display()))?;
+
+    // #1959 finding 17: `--json` means "print the plan to stdout", not
+    // "also write it to disk" — a plan.json under the corpus root only
+    // gets written when the operator names a destination (`--out`, or the
+    // implicit default when NOT running `--json`). Writing it unconditionally
+    // under `--json` silently left a stale file behind every JSON-piping
+    // invocation (`crawl plan ... --json | jq ...`) even though nothing
+    // asked for one.
+    let out_path = match (&out, json) {
+        (Some(p), _) => Some(p.clone()),
+        (None, true) => None,
+        (None, false) => Some(manifest.resolved_root().join("plan.json")),
+    };
+    if let Some(op) = &out_path {
+        if let Some(parent) = op.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(op, &plan_json)
+            .with_context(|| format!("writing plan to {}", op.display()))?;
+    }
 
     if json {
         println!("{plan_json}");
         return Ok(0);
     }
 
-    print_plan_table(&the_plan, &out_path);
+    print_plan_table(&the_plan, out_path.as_deref());
     Ok(0)
 }
 
-fn print_plan_table(the_plan: &plan::Plan, out_path: &std::path::Path) {
+fn print_plan_table(the_plan: &plan::Plan, out_path: Option<&std::path::Path>) {
     println!("{}", style::header(&format!("darkmux crawl plan — {}", the_plan.corpus)));
     println!("{}", style::dim(&format!("planned_at: {}", the_plan.planned_at)));
-    println!("{}", style::dim(&format!("written to: {}", out_path.display())));
+    match out_path {
+        Some(p) => println!("{}", style::dim(&format!("written to: {}", p.display()))),
+        None => println!("{}", style::dim("written to: (not written — pass --out to write plan.json)")),
+    }
     println!();
 
     println!("{}", style::header("sources"));
@@ -82,8 +99,13 @@ fn print_plan_table(the_plan: &plan::Plan, out_path: &std::path::Path) {
                 (_, Some(n)) => format!("files={n}"),
                 _ => "extent=0".to_string(),
             };
+            // #1959 finding 17: a read unit shared with another active
+            // read rule contributes its est_tokens to EVERY rule sharing
+            // it — flag it so the per-rule sums visibly overlap
+            // totals.est_tokens instead of silently outrunning it.
+            let shared_marker = if t.shared { " (shared read pass)" } else { "" };
             println!(
-                "  {:<24} units={:<4} {:<14} est_tokens={}",
+                "  {:<24} units={:<4} {:<14} est_tokens={}{shared_marker}",
                 rule_id, t.units, extent, t.est_tokens
             );
         }

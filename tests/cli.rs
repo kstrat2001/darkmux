@@ -3145,6 +3145,7 @@ fn crawl_plan_produces_one_site_one_read_one_stale_edge_unit() {
         .unwrap()
         .args(["crawl", "plan", "--no-fetch", "--json"])
         .arg(&manifest_path)
+        .env("DARKMUX_HOME", workdir.path())
         .output()
         .expect("crawl plan runs");
     assert!(
@@ -3187,7 +3188,7 @@ fn crawl_plan_produces_one_site_one_read_one_stale_edge_unit() {
     // "0 units" must never look like nothing printed — the text-table path,
     // exercised separately below, is the loud-zero guarantee; this asserts
     // the same run isn't silently vacuous on the JSON side either.
-    assert!(plan["totals"]["units"].as_u64().unwrap() >= 3);
+    assert_eq!(plan["totals"]["units"].as_u64().unwrap(), 3);
 }
 
 #[test]
@@ -3207,6 +3208,7 @@ fn crawl_plan_admitted_range_produces_no_edge_unit_but_is_ledgered() {
         .unwrap()
         .args(["crawl", "plan", "--no-fetch", "--json"])
         .arg(&manifest_path)
+        .env("DARKMUX_HOME", workdir.path())
         .output()
         .expect("crawl plan runs");
     assert!(
@@ -3255,9 +3257,106 @@ fn crawl_plan_zero_units_says_so_loudly_in_the_text_table() {
         .unwrap()
         .args(["crawl", "plan", "--no-fetch"])
         .arg(&manifest_path)
+        .env("DARKMUX_HOME", workdir.path())
         .output()
         .expect("crawl plan runs");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("0 units"), "got:\n{stdout}");
+}
+
+/// #1959 finding 17: `--json` with no `--out` prints to stdout only — it
+/// must not ALSO silently write `plan.json` under the corpus root. `--json`
+/// WITH `--out` still writes (to the named path); `--json` is orthogonal to
+/// "should a file land on disk", not a proxy for "keep it in memory".
+#[test]
+fn crawl_plan_json_without_out_does_not_write_plan_json_to_disk() {
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let lib = workdir.path().join("lib");
+    write_app_repo(&app, "^5.5.0");
+    write_lib_repo(&lib, "8.1.1");
+
+    let manifest_path = workdir.path().join("corpus.json");
+    let root = workdir.path().join("croot");
+    write_manifest(&manifest_path, &root, &app, &lib);
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["crawl", "plan", "--no-fetch", "--json"])
+        .arg(&manifest_path)
+        .env("DARKMUX_HOME", workdir.path())
+        .output()
+        .expect("crawl plan runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !root.join("plan.json").exists(),
+        "plan.json should not be written to disk without --out"
+    );
+
+    // With --out, --json still writes to the NAMED path.
+    let out_path = workdir.path().join("explicit-plan.json");
+    let out2 = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["crawl", "plan", "--no-fetch", "--json", "--out"])
+        .arg(&out_path)
+        .arg(&manifest_path)
+        .env("DARKMUX_HOME", workdir.path())
+        .output()
+        .expect("crawl plan runs");
+    assert!(out2.status.success(), "stderr: {}", String::from_utf8_lossy(&out2.stderr));
+    assert!(out_path.exists(), "plan.json should be written when --out is given");
+}
+
+/// #1959 finding 17: the by-rule table marks a read rule's row "(shared
+/// read pass)" when its units are shared with another active read rule —
+/// otherwise the per-rule est_tokens sums silently double-count against
+/// totals.est_tokens with no visible explanation.
+#[test]
+fn crawl_plan_table_marks_shared_read_pass_rows() {
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let lib = workdir.path().join("lib");
+    write_app_repo(&app, "^5.5.0");
+    write_lib_repo(&lib, "8.1.1");
+
+    // A second read rule matching the SAME `.ts` files as the built-in
+    // doc-contradicts-code rule, so they share exactly one ruleset and
+    // land in the same unit(s).
+    let user_rules_dir = workdir.path().join("crawl-rules");
+    fs::create_dir_all(&user_rules_dir).unwrap();
+    fs::write(
+        user_rules_dir.join("second-read-rule.json"),
+        serde_json::json!({
+            "id": "second-read-rule",
+            "kind": "read",
+            "applies_to": ["**/*.ts"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let manifest = serde_json::json!({
+        "schema_version": "1.0",
+        "name": "shared-corpus",
+        "root": workdir.path().join("croot").to_string_lossy(),
+        "sources": [
+            {"id": "app", "path": app.to_string_lossy(), "ref": "main"},
+            {"id": "lib", "path": lib.to_string_lossy(), "ref": "main"}
+        ],
+        "rules": ["doc-contradicts-code", "second-read-rule"]
+    });
+    let manifest_path = workdir.path().join("corpus.json");
+    fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["crawl", "plan", "--no-fetch"])
+        .arg(&manifest_path)
+        .env("DARKMUX_HOME", workdir.path())
+        .output()
+        .expect("crawl plan runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("shared read pass"), "got:\n{stdout}");
 }
