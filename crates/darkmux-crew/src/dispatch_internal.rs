@@ -133,9 +133,13 @@ fn ensure_darkmux_image_present() -> Result<String> {
 /// Extracted from the docker-spawn site so the mount-translation rule is
 /// unit-testable without spawning a container (same rationale as
 /// `apply_compaction_flags`).
-pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host_out: &Path) {
+/// `read_only` appends `:ro` to the workspace bind (#1959 packet 2) — the
+/// out-dir mount is NEVER read-only regardless of `read_only`, since the
+/// runtime writes its own bookkeeping (trajectory, findings) there.
+pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host_out: &Path, read_only: bool) {
     args.push("-v".to_string());
-    args.push(format!("{}:/workspace", workspace.display()));
+    let suffix = if read_only { ":ro" } else { "" };
+    args.push(format!("{}:/workspace{suffix}", workspace.display()));
     args.push("-v".to_string());
     args.push(format!("{}:/darkmux-out", host_out.display()));
 }
@@ -478,6 +482,11 @@ pub struct DockerRunConfig {
     /// (see `runtime/src/main.rs`'s client construction). Carries no secret
     /// material — safe on argv/`ps`, same as `--model`.
     pub base_url_override: Option<String>,
+    /// (#1959 packet 2) Mount `/workspace` `:ro` instead of read-write —
+    /// see `DispatchOpts::workspace_read_only`'s doc for why. `false`
+    /// preserves the existing read-write mount for every caller that
+    /// doesn't set it.
+    pub workspace_read_only: bool,
 }
 
 /// (#842) Build the complete `docker` command from a prepared config: the
@@ -514,7 +523,7 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     }
 
     // Workspace + out-dir volume mounts
-    apply_volume_mounts(&mut args, &config.workspace, &config.host_out);
+    apply_volume_mounts(&mut args, &config.workspace, &config.host_out, config.workspace_read_only);
 
     // Shared toolchain cache mount (always applied). The host dir is
     // resolved + created at the call site (see DockerRunConfig.cache_dir);
@@ -2615,6 +2624,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             .map(remote_chat_url),
         remote_needs_auth,
         base_url_override: opts.model_base_url_override.clone(),
+        workspace_read_only: opts.workspace_read_only,
     };
 
     // (#907) Validate the image ref before it reaches docker as a positional

@@ -846,6 +846,7 @@ impl StepKind for MissionCoderStepKind {
         let image = step.config.get("image").and_then(|v| v.as_str()).map(String::from);
 
         let opts = crew::dispatch::DispatchOpts {
+            workspace_read_only: false,
             role_id: ctx.role.clone(),
             message,
             session_id: Some(ctx.session_id.clone()),

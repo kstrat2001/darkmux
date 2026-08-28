@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.22.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.24.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -345,6 +345,35 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.22.0";
 //           `mission_graph::fold_step_finals`) ignore the unknown action.
 //           New records only, prior AuditFileSink chains survive without
 //           rotation.
+//   1.23.0: RESERVED for the `hook.*` action family (#2093), landing on a
+//           sibling branch concurrently with this one. Not present in this
+//           branch's history — noted here only so the merge of both onto
+//           `main` is a one-line reconcile (both branches bump from
+//           1.22.0; whichever merges second re-numbers its own bump to
+//           come after the other's).
+//   1.24.0: new action family for `darkmux mission launch crawl` (#1959
+//           packet 2, the crawl LAUNCHER — packet 1 landed the corpus
+//           manifest / rules / read-only source worktrees / `darkmux crawl
+//           plan` machinery with no flow-record vocabulary of its own).
+//           `crawl.mission.started` / `crawl.mission.completed` bookend
+//           the whole sequential unit loop (payload: corpus, units
+//           planned/completed/errored/skipped, tokens, wall_ms,
+//           tokens_per_hour, stopped_by); `crawl.unit.started` /
+//           `crawl.unit.completed` bookend each unit (payload: corpus,
+//           unit, source, sha, rule, kind, result, findings, tokens);
+//           `crawl.finding` carries one recorded finding (payload: corpus,
+//           unit, source, sha, rule, plus the finding record's own fields
+//           verbatim — `file` rewritten from the container path to a
+//           source-relative path, with the original kept as `file_raw`).
+//           The launcher's own PER-UNIT model dispatch already satisfies
+//           the dispatch-liveness contract (registry entry 2) via the
+//           ordinary `dispatch start`/`dispatch complete`/`dispatch error`
+//           bookends `crew::dispatch::dispatch` always emits — this new
+//           family is descriptive scaffolding around that, not a
+//           replacement for it. Minor + additive: five new action values,
+//           same `payload` blob shape every other richer action already
+//           uses; older readers ignore the unknown actions. New records
+//           only, prior AuditFileSink chains survive without rotation.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

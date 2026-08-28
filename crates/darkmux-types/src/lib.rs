@@ -10,6 +10,8 @@ pub mod config_access;
 pub mod dispatch_liveness;
 #[cfg(unix)]
 pub mod flock;
+#[cfg(unix)]
+pub mod interrupt;
 pub mod paths;
 pub mod residency_lease;
 pub mod session_id;

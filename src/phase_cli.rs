@@ -451,6 +451,7 @@ pub(crate) fn phase_review_output_at(
     );
 
     let dispatch_opts = crate::crew::dispatch::DispatchOpts {
+        workspace_read_only: false,
         role_id: "code-reviewer".to_string(),
         message: prompt,
         session_id: Some(session_id.clone()),

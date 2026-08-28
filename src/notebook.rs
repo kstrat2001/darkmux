@@ -161,6 +161,7 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
 /// under `~/.darkmux/roles/`).
 fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Result<String> {
     let opts = DispatchOpts {
+        workspace_read_only: false,
         role_id: role.to_string(),
         message: prompt.to_string(),
         session_id: Some(session_id.to_string()),

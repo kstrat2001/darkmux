@@ -307,6 +307,7 @@ impl WorkJob {
     pub fn into_dispatch_opts(self) -> darkmux_crew::dispatch::DispatchOpts {
         use darkmux_crew::dispatch::DispatchOpts;
         DispatchOpts {
+            workspace_read_only: false,
             role_id: self.role_id,
             message: self.message,
             session_id: Some(self.session_id),
