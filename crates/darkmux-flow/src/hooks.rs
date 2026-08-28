@@ -454,11 +454,65 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
 fn append_outbox_line(path: &Path, line: &str) -> Result<()> {
     darkmux_types::flock::with_locked_file(path, |file| {
         file.seek(SeekFrom::End(0)).with_context(|| format!("seek to end of {}", path.display()))?;
-        file.write_all(line.as_bytes())
-            .and_then(|_| file.write_all(b"\n"))
-            .with_context(|| format!("appending to hook outbox {}", path.display()))?;
+        // (#2093 merge-gate finding 4) ONE `write_all` of the combined
+        // body + trailing newline, not two separate calls — shrinks the
+        // crash/kill window from "between two syscalls" (where a torn
+        // write leaves the body with no newline, silently gluing onto
+        // the NEXT append) down to "mid one syscall".
+        let mut buf = Vec::with_capacity(line.len() + 1);
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+        file.write_all(&buf).with_context(|| format!("appending to hook outbox {}", path.display()))?;
         Ok(())
     })
+}
+
+/// (#2093 merge-gate finding 4) If `path` exists and its last byte isn't
+/// `\n`, append one — turning a torn prefix (left by a kill mid-write,
+/// before this fix's single-`write_all` change existed, or a filesystem
+/// that doesn't guarantee syscall atomicity) into its OWN complete-but-
+/// invalid line, so the JSON-validation quarantine check below catches it
+/// as a distinct malformed record instead of it silently gluing onto the
+/// next real append (corrupting BOTH). Locked the same way an append is,
+/// so this can't race a concurrent appender.
+fn ensure_trailing_newline(path: &Path) -> Result<()> {
+    darkmux_types::flock::with_locked_file(path, |file| {
+        let len = file.seek(SeekFrom::End(0)).with_context(|| format!("seek to end of {}", path.display()))?;
+        if len == 0 {
+            return Ok(());
+        }
+        file.seek(SeekFrom::Start(len - 1)).with_context(|| format!("seeking {}", path.display()))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last).with_context(|| format!("reading last byte of {}", path.display()))?;
+        if last[0] != b'\n' {
+            file.seek(SeekFrom::End(0)).with_context(|| format!("seek to end of {}", path.display()))?;
+            file.write_all(b"\n").with_context(|| format!("appending newline to {}", path.display()))?;
+        }
+        Ok(())
+    })
+}
+
+/// (#2093 merge-gate finding 4) Sibling of an outbox path — where a line
+/// that failed JSON validation is preserved (never silently dropped)
+/// before its cursor position is skipped past.
+fn quarantine_path(outbox_path: &Path) -> PathBuf {
+    let mut s = outbox_path.as_os_str().to_os_string();
+    s.push(".quarantine");
+    PathBuf::from(s)
+}
+
+fn quarantine_line(outbox_path: &Path, line: &str) {
+    let path = quarantine_path(outbox_path);
+    match fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.write_all(b"\n")) {
+                eprintln!("flow::HookSink: failed to quarantine invalid outbox line into {}: {e:#}", path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("flow::HookSink: failed to open quarantine file {}: {e:#}", path.display());
+        }
+    }
 }
 
 fn read_cursor(cursor_path: &Path) -> u64 {
@@ -709,6 +763,22 @@ fn drainer_loop(
                 continue;
             };
             did_work = true;
+            // (#2093 merge-gate finding 4) A line that isn't valid JSON —
+            // most likely a torn fragment that `ensure_trailing_newline`
+            // turned into its own complete-but-malformed line at
+            // construction — is never POSTed. Quarantine it (preserve the
+            // raw bytes, never silently drop them), advance the cursor
+            // past it so it doesn't block every line after it forever,
+            // and emit `hook.failed` naming the reason.
+            if serde_json::from_str::<serde_json::Value>(&line).is_err() {
+                quarantine_line(&rt.rule.outbox_path, &line);
+                let _ = write_cursor(&rt.rule.cursor_path, new_cursor);
+                reset_backoff(rt);
+                let reason = "invalid outbox line";
+                write_last_status(&rt.rule.last_status_path, false, Some(reason));
+                emit_hook_record(report_sink.as_ref(), false, &rt.rule, &line, 1, Some(reason));
+                continue;
+            }
             match try_post(&rt.rule.url, &line) {
                 DeliveryOutcome::Success => {
                     let attempt = {
@@ -805,6 +875,17 @@ impl HookSink {
     /// it's a snapshot of the OTHER sinks, not this one.
     pub fn new(rules: &[HookRule], outbox_dir: PathBuf, report_sink: Arc<dyn FlowSink>) -> Result<Self> {
         let resolved = resolve_rules(rules, &outbox_dir)?;
+        // (#2093 merge-gate finding 4) Fix up a torn trailing line BEFORE
+        // this process's drainer (or any appender) touches the file — see
+        // `ensure_trailing_newline`'s doc. Best-effort: a failure here
+        // (e.g. an unreadable outbox on a fresh install where the file
+        // doesn't exist yet) is logged, not fatal — construction must not
+        // brick over pre-existing on-disk damage.
+        for r in &resolved {
+            if let Err(e) = ensure_trailing_newline(&r.outbox_path) {
+                eprintln!("flow::HookSink: failed to check/fix trailing newline on {}: {e:#}", r.outbox_path.display());
+            }
+        }
         let now = Instant::now();
         let rule_runtimes: Vec<Arc<RuleRuntime>> = resolved
             .into_iter()
@@ -1630,6 +1711,86 @@ mod tests {
             "307 must also be refused as a permanent failure"
         );
         assert_never_contacted(&attacker);
+    }
+
+    // ─── (#2093 merge-gate finding 4) torn-line safety ───────────────────
+
+    /// The reviewer's phase A/B scenario: phase A simulates a crash
+    /// mid-write (a torn line with no trailing newline, written DIRECTLY
+    /// to the outbox file, bypassing `append_outbox_line`); phase B
+    /// constructs a `HookSink` on top of that pre-existing damage, then a
+    /// normal `write()` appends one valid record. Expected: the torn
+    /// fragment is quarantined (never delivered, never blocks the line
+    /// after it), exactly one valid delivery happens, and no `hook.fired`
+    /// is ever emitted for the torn line.
+    #[test]
+    fn torn_line_at_construction_is_quarantined_not_glued_or_delivered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let (outbox_path, _cursor_path) = outbox_paths(tmp.path(), 0, &rules[0].http.clone().unwrap());
+
+        // Phase A — simulate a crash mid-write: a truncated JSON fragment
+        // with NO trailing newline, written directly (not through
+        // `append_outbox_line`).
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(&outbox_path, br#"{"action":"work.torn","unterminat"#).unwrap();
+
+        // Phase B — construct a HookSink on top of the pre-existing
+        // damage, then append one normal, valid record.
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("work.valid")).unwrap();
+
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(5)));
+        // Give any (incorrect) further delivery attempt time to happen.
+        std::thread::sleep(POLL_INTERVAL * 5);
+        assert_eq!(receiver.request_count(), 1, "only the valid line was ever POSTed — the torn line must never reach the network");
+        let delivered: serde_json::Value = serde_json::from_str(&receiver.bodies()[0]).unwrap();
+        assert_eq!(delivered["action"], "work.valid");
+
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"), Duration::from_secs(3)));
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)));
+        let guard = capture.0.lock().unwrap();
+        let fired: Vec<_> = guard.iter().filter(|r| r.action == "hook.fired").collect();
+        assert_eq!(fired.len(), 1, "exactly one hook.fired — never for the torn line");
+        assert_eq!(fired[0].payload.as_ref().unwrap()["delivered_action"], "work.valid");
+        let failed: Vec<_> = guard.iter().filter(|r| r.action == "hook.failed").collect();
+        assert_eq!(failed.len(), 1, "exactly one hook.failed — the quarantined torn line");
+        let reason = failed[0].payload.as_ref().unwrap()["error"].as_str().unwrap_or_default();
+        assert_eq!(reason, "invalid outbox line");
+        drop(guard);
+
+        let quarantine_path = PathBuf::from(format!("{}.quarantine", outbox_path.display()));
+        assert!(quarantine_path.exists(), "the torn line must be preserved in a quarantine file, not silently dropped");
+        let quarantined = std::fs::read_to_string(&quarantine_path).unwrap();
+        assert!(quarantined.contains("work.torn"), "quarantine file should contain the torn fragment: {quarantined}");
+    }
+
+    #[test]
+    fn append_outbox_line_is_a_single_write_syscall_worth_of_bytes() {
+        // A structural smoke test, not a proof of atomicity — no
+        // in-process unit test can inject a kill between two syscalls.
+        // `append_outbox_line` hands the OS one combined buffer (body +
+        // trailing newline) rather than two separate `write_all` calls,
+        // which shrinks the crash window from "between two syscalls" to
+        // "mid one syscall" (a single `write(2)` to a local disk file is
+        // effectively atomic for records this size). This test only
+        // confirms the happy-path bytes are still correct after the
+        // change — it will NOT go red if reverted to two calls, since the
+        // two-call sequence produces the same final bytes when nothing
+        // interrupts it. The real proof-by-recovery is
+        // `torn_line_at_construction_is_quarantined_not_glued_or_delivered`,
+        // which simulates the RESULT of a kill mid-append directly.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("x.outbox.jsonl");
+        append_outbox_line(&path, r#"{"a":1}"#).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":1}\n");
     }
 
     // ─── (#2093 merge-gate finding 6) client-error attempts counted per line ─
