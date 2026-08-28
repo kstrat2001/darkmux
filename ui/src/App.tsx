@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useHashRoute } from "./lib/useHashRoute";
+import { isStaticBuild } from "./lib/staticSource";
 import { useSyncHash } from "./lib/hashSync";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
@@ -202,6 +203,11 @@ export function App() {
     () => (replayMeta ? null : readyParts(flowWindow.data, liveMachines, nowMs)),
     [replayMeta, flowWindow.data, liveMachines, nowMs],
   );
+  // (#2072) `computeMetaLines` describes a DAEMON's idle state ("waiting for
+  // a machine", "N machines · last dispatch …"); a static build has no
+  // daemon, so a non-playback route there gets no meta line rather than a
+  // live-only phrase about a machine that will never arrive.
+  const staticIdle = isStaticBuild() && !replayMeta;
 
   // (#1801) A static-build playback route carries `date: null` at parse time
   // (`route.ts`'s own doc on the widened variant) — the real date is only
@@ -240,8 +246,10 @@ export function App() {
     () =>
       replayMeta
         ? replayMetaLines(replayMeta, displayRoute.kind === "playback" ? (displayRoute.date ?? "") : "")
-        : computeMetaLines(flowWindow.data, liveMachines, nowMs),
-    [replayMeta, displayRoute, flowWindow.data, liveMachines, nowMs],
+        : staticIdle
+          ? []
+          : computeMetaLines(flowWindow.data, liveMachines, nowMs),
+    [replayMeta, displayRoute, flowWindow.data, liveMachines, nowMs, staticIdle],
   );
 
   // `logscope` is no longer SHOWN — the outer UI owns context (see
@@ -268,7 +276,10 @@ export function App() {
       <Masthead route={displayRoute} liveStatus={liveStatus} specs={specs} />
       <div className="app-shell__crumbbar">
         <NavChrome route={route} />
-        <header className="app-shell__crumb" id="crumb">
+        {/* (#2073) `is-replay`: on a playback route the crumb repeats the
+            meta line's own lead (`◆ <mission>`); the narrow stylesheet drops
+            this copy, where a phone has no room for the same name twice. */}
+        <header className={`app-shell__crumb${route.kind === "playback" ? " is-replay" : ""}`} id="crumb">
           {crumb}
         </header>
         <div className="app-shell__meta" id="meta">
@@ -279,12 +290,12 @@ export function App() {
               one space here, since there's no element in the way. Preserving
               it verbatim is simpler and more robust than reproducing the
               icon-boundary quirk with a real (empty) element. */}
-          {ready ? (
+          {ready && !staticIdle ? (
             <div><ReadyHeadline n={ready.n} ago={ready.ago} /></div>
           ) : (
-            <div style={{ whiteSpace: "pre" }}>{metaLines[0]}</div>
+            <div className="app-shell__metaline">{metaLines[0]}</div>
           )}
-          <div style={{ whiteSpace: "pre" }}>{metaLines[1]}</div>
+          <div className="app-shell__metaline">{metaLines[1]}</div>
         </div>
       </div>
       {/* (Chrome packet) `.wrap` — `#stage` beside the event-log column,

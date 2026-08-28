@@ -186,6 +186,14 @@ body {
   font-size: calc(11px * var(--fs-scale));
   color: var(--dim);
   text-align: right;
+  min-width: 0;
+  max-width: 100%;
+}
+/* The double space before "· last run" (see `metaLine.ts`'s module doc) is a
+   preserved legacy artifact, hence `pre`; the narrow override below keeps
+   the spaces but lets the line wrap. */
+.app-shell__metaline {
+  white-space: pre;
 }
 
 /* `#modebadge` (Packet 5) — viewer.html:406 (`#modebadge.stale{opacity:.65}`)
@@ -256,6 +264,17 @@ body {
     flex: 1 1 auto;
     overflow-x: auto;
     white-space: nowrap;
+  }
+  /* (#2073) Measured at 390px: the replay meta line laid out 510px wide
+     under `white-space: pre` and clipped the date and time range mid-word.
+     Wrap it (spaces preserved), and drop the playback crumb, which only
+     repeats that line's `◆ <mission>` lead. */
+  .app-shell__metaline {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .app-shell__crumb.is-replay {
+    display: none;
   }
 }
 
@@ -339,10 +358,22 @@ body {
   font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--bg);
-  background: var(--accent);
-  padding: 5px 9px;
+  /* (#2072) A LABEL, not a filled slab: the filled accent box is the
+     daemon build's `.catalog-toggle` button, and painting the inert span
+     the same way made it read as tappable (operator, on the phone). */
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--accent);
+  padding: 4px 8px;
   border-radius: 3px;
+}
+@media (max-width: 480px) {
+  /* (#2073) Brand + `FLOW · <date>` + `▣ PLAYBACK` overflowed 390px and
+     wrapped the mode badge onto its own masthead line; the date alone is
+     the information. */
+  .masthead__srcpre {
+    display: none;
+  }
 }
 .masthead__refresh {
   background: none;

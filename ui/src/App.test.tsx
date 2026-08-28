@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, cleanup } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
 
@@ -15,6 +15,10 @@ import { App } from "./App";
  * test rendered `<App>` itself, only its leaf components).
  */
 afterEach(() => {
+  // Unmount between tests: without a setup file RTL does not auto-clean, and
+  // a previous test's App stays mounted, still subscribed to the hash and the
+  // fetch stub of the test that follows.
+  cleanup();
   vi.unstubAllGlobals();
   window.location.hash = "";
 });
@@ -51,6 +55,7 @@ const FLEET_OFF = (key: "machines" | "sessions") => ({
 });
 
 describe("App", () => {
+
   it("mounts without an infinite update-depth error and renders the fleet lens by default", async () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -733,5 +738,50 @@ describe("App", () => {
     );
     await waitFor(() => expect(document.querySelector(".eventlog")).toBeTruthy());
     expect(document.querySelector(".eventlog")!.className).toMatch(/eventlog--hidden/);
+  });
+
+  // (#2072/#2073) Static-build tests run LAST: `useHashRoute` caches the parsed
+  // route per hash string, and a hash parsed while the static meta is present
+  // resolves to the playback route; a later test on the same hash would
+  // inherit it. In production the build flag never changes at runtime.
+  it("(#2072) a static build never says 'waiting for a machine' — there is no daemon to wait for", async () => {
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-flow-src";
+    meta.content = "./demo-flow.jsonl";
+    document.head.appendChild(meta);
+    window.location.hash = "#lens=runs";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    try {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <App />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(document.querySelector(".app-shell__navtabs")).toBeTruthy());
+      expect(document.body.textContent).not.toContain("waiting for a machine");
+    } finally {
+      meta.remove();
+    }
+  });
+
+  it("(#2073) the playback crumb is marked as a replay crumb so narrow viewports can drop the duplicate of the meta line's lead", async () => {
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-flow-src";
+    meta.content = "./demo-flow.jsonl";
+    document.head.appendChild(meta);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    try {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <App />
+        </QueryClientProvider>,
+      );
+      await waitFor(() => expect(document.getElementById("crumb")).toBeTruthy());
+      expect(document.getElementById("crumb")!.className).toMatch(/\bis-replay\b/);
+    } finally {
+      meta.remove();
+    }
   });
 });

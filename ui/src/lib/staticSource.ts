@@ -110,3 +110,15 @@ export function staticGraphsSrc(): string | null {
 export function staticFleetSrc(): string | null {
   return injectedMeta("darkmux-fleet-src");
 }
+
+/** `darkmux-flow-date` (#2072) — the day the committed flow file replays,
+ * derived by `scripts/build-demo.sh` from the file's first record so the
+ * masthead can name it on EVERY route without downloading the multi-megabyte
+ * file just to read one timestamp. Before this the badge said `TODAY` on
+ * runs/machine/console and `REPLAY` on mission/dispatch, and only the
+ * playback route knew the date. `null` when a static harness injects no
+ * date (the e2e pages) — callers fall back to the old wording. */
+export function staticFlowDate(): string | null {
+  const d = injectedMeta("darkmux-flow-date");
+  return d && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+}
