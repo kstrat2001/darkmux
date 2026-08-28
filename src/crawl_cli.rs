@@ -125,7 +125,9 @@ fn print_plan_table(the_plan: &plan::Plan, out_path: Option<&std::path::Path>) {
     if the_plan.totals.skipped.is_empty() {
         println!("  skipped: (none)");
     } else {
-        println!("  skipped: {} files", the_plan.totals.skipped.len());
+        let n = the_plan.totals.skipped.len();
+        let noun = if n == 1 { "file" } else { "files" };
+        println!("  skipped: {n} {noun}");
         for s in &the_plan.totals.skipped {
             println!("    {} — {}", s.file, s.reason);
         }

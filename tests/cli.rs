@@ -3108,9 +3108,16 @@ fn write_lib_repo(dir: &std::path::Path, version: &str) {
     init_repo(dir);
     fs::write(
         dir.join("package.json"),
-        serde_json::json!({"name": "@org/lib", "version": version}).to_string(),
+        serde_json::json!({"name": "@org/lib", "version": version, "types": "index.d.ts"}).to_string(),
     )
     .unwrap();
+    // A resolvable entry point — #1959 second-round CONSIDER 5 stops
+    // emitting an edge unit when `library_surface` is empty, so a stale
+    // edge test needs the library to actually have one. `.d.ts` (not
+    // `.js`/`.ts`) deliberately: every built-in rule's `exclude` already
+    // drops `**/*.d.ts`, so this stays invisible to the site/read rules
+    // and doesn't perturb the unit counts those tests assert.
+    fs::write(dir.join("index.d.ts"), "export {};\n").unwrap();
     commit_all(dir, "lib: initial");
 }
 
@@ -3263,6 +3270,56 @@ fn crawl_plan_zero_units_says_so_loudly_in_the_text_table() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("0 units"), "got:\n{stdout}");
+}
+
+/// #1959 second-round CONSIDER 6: the text table's `skipped:` line must
+/// pluralize correctly — "1 file", never "1 files". A tracked symlink is
+/// recorded in `totals.skipped` by the source walk itself (never
+/// followed), independent of which rules are active, so `rules: []` still
+/// produces exactly one skipped entry.
+#[test]
+fn crawl_plan_skipped_line_pluralizes_a_single_file_correctly() {
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let lib = workdir.path().join("lib");
+    write_app_repo(&app, "^5.5.0");
+    write_lib_repo(&lib, "8.1.1");
+
+    // A tracked symlink inside the app repo — git preserves it as a real
+    // symlink on checkout, and the source walk records (never follows) it.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("src/x.ts", app.join("link.ts")).unwrap();
+        commit_all(&app, "app: add a symlink");
+    }
+
+    let manifest = serde_json::json!({
+        "schema_version": "1.0",
+        "name": "skipped-plural-corpus",
+        "root": workdir.path().join("croot").to_string_lossy(),
+        "sources": [
+            {"id": "app", "path": app.to_string_lossy(), "ref": "main"},
+            {"id": "lib", "path": lib.to_string_lossy(), "ref": "main"}
+        ],
+        "rules": []
+    });
+    let manifest_path = workdir.path().join("corpus.json");
+    fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+    let out = Command::cargo_bin("darkmux")
+        .unwrap()
+        .args(["crawl", "plan", "--no-fetch"])
+        .arg(&manifest_path)
+        .env("DARKMUX_HOME", workdir.path())
+        .output()
+        .expect("crawl plan runs");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    #[cfg(unix)]
+    {
+        assert!(stdout.contains("skipped: 1 file"), "got:\n{stdout}");
+        assert!(!stdout.contains("skipped: 1 files"), "got:\n{stdout}");
+    }
 }
 
 /// #1959 finding 17: `--json` with no `--out` prints to stdout only — it

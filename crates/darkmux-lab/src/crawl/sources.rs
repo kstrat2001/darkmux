@@ -56,7 +56,18 @@ fn resolve_one(
     let origin = source
         .origin()
         .ok_or_else(|| anyhow::anyhow!("source '{}' names neither `git` nor `path`", source.id))?;
-    let mirror_path = mirror_root.join(format!("{}.git", source.id));
+    // #1959 second-round finding: `assert_direct_child` below only ran
+    // inside the `tree_path.exists()` branch, so a manifest-supplied
+    // escaping id (`../../victim`) sailed straight through on a FIRST-time
+    // resolve — past the bare clone AND `git worktree add` — with nothing
+    // to catch it until a stale-cleanup pass happened to run later, if
+    // ever. Compute both paths through the containment guard ONCE, up
+    // front, so neither the clone nor the worktree checkout below can run
+    // against an escaping path in the first place.
+    let mirror_path = contained_child(mirror_root, &format!("{}.git", source.id))
+        .with_context(|| format!("resolving mirror path for source '{}'", source.id))?;
+    let tree_path = contained_child(tree_root, &source.id)
+        .with_context(|| format!("resolving tree path for source '{}'", source.id))?;
 
     if !mirror_path.exists() {
         // #1959 finding 15: --no-fetch promises "fully offline against
@@ -88,10 +99,24 @@ fn resolve_one(
             &["config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"],
             &format!("configuring fetch refspec for source '{}'", source.id),
         )?;
+        // A second, `--add`ed refspec for tags — same `+` force-update
+        // prefix as the branches refspec above, and for the same reason:
+        // without it, a tag that already exists locally (from an earlier
+        // resolve) and gets force-moved on the remote is left stale.
+        // `git`'s default auto-follow-tags behavior fetches a NEW tag
+        // reachable from a fetched commit, but refuses to move an
+        // EXISTING local tag ref that has diverged — it treats tags as
+        // immutable by default and silently skips the update rather than
+        // erroring (#1959 second-round CONSIDER 3).
+        run_git(
+            Some(&mirror_path),
+            &["config", "--add", "remote.origin.fetch", "+refs/tags/*:refs/tags/*"],
+            &format!("configuring tag fetch refspec for source '{}'", source.id),
+        )?;
     } else if fetch {
         run_git(
             Some(&mirror_path),
-            &["fetch", "--prune", "origin"],
+            &["fetch", "--prune", "--prune-tags", "origin"],
             &format!("fetching source '{}'", source.id),
         )?;
     }
@@ -118,14 +143,15 @@ fn resolve_one(
     }
     let sha = String::from_utf8_lossy(&rev_out.stdout).trim().to_string();
 
-    let tree_path = tree_root.join(&source.id);
     if tree_path.exists() {
         // #1959 finding 1: a manifest-supplied id feeds straight into
         // `tree_root.join(id)`/`mirror_root.join(id)` above.
         // `CorpusManifest::validate` rejects a shape that could escape
-        // (`../../victim`) before a manifest ever reaches here, but this is
-        // the structural backstop for any caller that skips validation —
-        // asserted right before the destructive ops that follow.
+        // (`../../victim`) before a manifest ever reaches here, and
+        // `contained_child` above is now the guard for the CREATE path —
+        // this canonicalized check is the belt-and-suspenders backstop
+        // right before the destructive ops that follow (`worktree remove`
+        // / `remove_dir_all`), independent of either.
         assert_direct_child(tree_root, &tree_path, &format!("tree path for source '{}'", source.id))?;
         assert_direct_child(mirror_root, &mirror_path, &format!("mirror path for source '{}'", source.id))?;
         // The prior checkout may have been made read-only — restore write
@@ -166,6 +192,32 @@ fn resolve_one(
         git_ref: git_ref.to_string(),
         tree: tree_path,
     })
+}
+
+/// Compute `root/name`, refusing unless `name` is a single, non-escaping
+/// path component — the containment guard for the CREATE path (#1959
+/// second-round finding: `assert_direct_child` below only fires once a
+/// stale tree/mirror already exists, which skips a manifest-supplied
+/// escaping id entirely on a first-time resolve). `root.canonicalize()`
+/// requires `root` already exist (`resolve()` `fs::create_dir_all`s both
+/// `mirror_root`/`tree_root` before any source is resolved); `name` itself
+/// may not exist yet (it's what's ABOUT to be created), so it's validated
+/// lexically — rejecting an absolute path, any `..`/`.` component, and any
+/// path with more than one component — rather than canonicalized.
+fn contained_child(root: &Path, name: &str) -> Result<PathBuf> {
+    let canon_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing root {}", root.display()))?;
+    let mut components = Path::new(name).components();
+    let single_normal_component =
+        matches!(components.next(), Some(std::path::Component::Normal(_))) && components.next().is_none();
+    if !single_normal_component {
+        bail!(
+            "refusing to resolve '{name}' under {} — not a single non-escaping path component (possible path traversal via source id)",
+            canon_root.display()
+        );
+    }
+    Ok(canon_root.join(name))
 }
 
 /// Bail unless `child`'s canonical form is an IMMEDIATE child of `parent`'s
@@ -487,6 +539,87 @@ mod tests {
         let child = parent.join("app");
         fs::create_dir_all(&child).unwrap();
         assert_direct_child(&parent, &child, "tree path for source 'app'").unwrap();
+    }
+
+    // ── #1959 second-round finding: the containment guard must cover the
+    // CREATE path too, not just the exists()-already branch ──
+
+    /// Before this fix `assert_direct_child` only ran inside `if
+    /// tree_path.exists()` — a FIRST-time resolve of a manifest-supplied
+    /// escaping id skipped it entirely and went straight to `git clone
+    /// --bare` / `git worktree add`. `resolve()` must refuse BEFORE either
+    /// runs, proven here by a manifest with no prior mirror/tree state.
+    #[test]
+    fn create_path_containment_guard_rejects_escaping_id_before_any_clone() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let mut manifest = manifest_for("t6", workdir.path(), source.path(), "main");
+        manifest.sources[0].id = "../../victim3".to_string();
+
+        let err = resolve(&manifest, true).unwrap_err();
+        assert!(err.to_string().contains("victim3"), "{err}");
+
+        // No clone escaped: neither of the corpus root's own mirror/tree
+        // dirs picked up anything at all — the guard fired before any
+        // `git` process ran, not just before the escaping path
+        // specifically. (A naive `mirror_root.join(id)` would have landed
+        // the clone at `<system temp root>/victim3.git`, two levels above
+        // `workdir` — proven by hand while red-proving this fix: before
+        // the guard existed, that exact clone showed up there.)
+        assert!(
+            fs::read_dir(workdir.path().join("mirror")).unwrap().next().is_none(),
+            "mirror dir should stay empty"
+        );
+        assert!(
+            fs::read_dir(workdir.path().join("tree")).unwrap().next().is_none(),
+            "tree dir should stay empty"
+        );
+    }
+
+    #[test]
+    fn create_path_containment_guard_accepts_a_normal_id() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let manifest = manifest_for("t7", workdir.path(), source.path(), "main");
+
+        let resolved = resolve(&manifest, true).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].tree.join("a.txt").exists());
+    }
+
+    // ── #1959 second-round CONSIDER 3: tag refs advance on fetch ──
+
+    #[test]
+    fn resolve_advances_a_moved_tag_on_fetch() {
+        let source = init_source_repo();
+        let run = |args: &[&str]| {
+            let out = Command::new("git").current_dir(source.path()).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["tag", "v1"]);
+
+        let workdir = TempDir::new().unwrap();
+        let manifest = manifest_for("t8", workdir.path(), source.path(), "v1");
+
+        let first = resolve(&manifest, true).unwrap();
+        let first_sha = first[0].sha.clone();
+
+        // Advance the source past the tag, then force-move the tag onto
+        // the new commit — the mirror already has a local `v1` from the
+        // first resolve, so this exercises "advance an EXISTING tag ref",
+        // not just "fetch a tag for the first time".
+        fs::write(source.path().join("moved.txt"), "moved\n").unwrap();
+        run(&["add", "moved.txt"]);
+        run(&["commit", "-q", "-m", "advance"]);
+        run(&["tag", "-f", "v1"]);
+
+        let second = resolve(&manifest, true).unwrap();
+        assert_ne!(second[0].sha, first_sha, "a moved tag must advance on the next fetch");
+        assert!(second[0].tree.join("moved.txt").exists());
     }
 
     // ── #1959 finding 15: --no-fetch with an absent mirror ──

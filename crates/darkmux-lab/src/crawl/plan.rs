@@ -493,7 +493,32 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
             // so a surface file already read by another rule pass isn't
             // read from disk twice, same reasoning as every other read
             // path in this module.
-            let (surface_rels, surface_note) = resolve_library_surface(&library.tree);
+            let (surface_rels, surface_note) = resolve_library_surface(&library.tree, &mut skipped, &edge.library);
+
+            if surface_rels.is_empty() {
+                // #1959 second-round CONSIDER 5: nothing resolved for the
+                // model to compare the consumer's usage against — emitting
+                // a unit here would just burn a dispatch confirming
+                // "nothing to compare". The edge still reads as CHECKED
+                // (the ledger entry pushed above), just with the note
+                // extended to name why no unit followed. Appends onto
+                // whatever note the entry already carries (e.g. the
+                // prerelease-tag note above) rather than overwriting it.
+                if let Some(entry) = edge_ledger.last_mut() {
+                    const NO_UNIT: &str = "no unit emitted: nothing to compare against";
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(existing) = entry.note.take() {
+                        parts.push(existing);
+                    }
+                    if let Some(sn) = &surface_note {
+                        parts.push(sn.clone());
+                    }
+                    parts.push(NO_UNIT.to_string());
+                    entry.note = Some(parts.join("; "));
+                }
+                continue;
+            }
+
             let mut surface_tokens = 0usize;
             {
                 let lib_files = files_by_id.get_mut(&edge.library).expect("library resolved");
@@ -887,20 +912,24 @@ const ENTRY_POINT_FIELDS: &[&str] = &["main", "module", "types", "typings"];
 /// entire tree (#1959 finding 4). Deduplicated, in the order resolved.
 /// Returns a `note` explaining why when nothing resolved, so an empty
 /// surface reads as "looked, found nothing" rather than "didn't look".
-fn resolve_library_surface(tree: &Path) -> (Vec<String>, Option<String>) {
+fn resolve_library_surface(
+    tree: &Path,
+    skipped: &mut Vec<SkippedEntry>,
+    library_id: &str,
+) -> (Vec<String>, Option<String>) {
     let mut rels: Vec<String> = Vec::new();
 
     if let Ok(pkg) = read_package_json(tree) {
         for field in ENTRY_POINT_FIELDS {
             if let Some(v) = pkg.get(field).and_then(|v| v.as_str()) {
-                push_surface_path_if_exists(tree, v, &mut rels);
+                push_surface_path_if_exists(tree, v, &mut rels, skipped, library_id);
             }
         }
         if let Some(exports) = pkg.get("exports") {
             let mut export_strings = Vec::new();
             collect_export_strings(exports, &mut export_strings);
             for v in export_strings {
-                push_surface_path_if_exists(tree, &v, &mut rels);
+                push_surface_path_if_exists(tree, &v, &mut rels, skipped, library_id);
             }
         }
     }
@@ -939,14 +968,76 @@ fn resolve_library_surface(tree: &Path) -> (Vec<String>, Option<String>) {
 /// A declared entry point that doesn't exist (a stale field, a build
 /// output that hasn't run) is silently skipped, same leniency as every
 /// other "does this resolve" check in this module.
-fn push_surface_path_if_exists(tree: &Path, rel: &str, out: &mut Vec<String>) {
+///
+/// `rel` is THIRD-PARTY data — a library's own `package.json` — so it gets
+/// the same treatment as any other untrusted path input: absolute paths
+/// and `..` components are rejected outright (string-level, before ever
+/// touching the filesystem), the resolved candidate's canonical form must
+/// be a DESCENDANT of `tree`'s canonical form (subpaths are fine; this
+/// guards an intermediate directory component that's itself a symlink
+/// escaping the tree), and the final component is never followed if it's
+/// a symlink (`symlink_metadata`, not `metadata`/`is_file` — a symlink
+/// whose target happens to sit inside the tree is still rejected, same
+/// "never follow a symlink" posture as the main file walk). A rejected
+/// candidate is recorded in `skipped` with the raw candidate (not the
+/// resolved path) so the refusal is visible rather than a silent
+/// omission indistinguishable from "field absent" (#1959 second-round
+/// finding: path traversal via `library_surface`).
+fn push_surface_path_if_exists(
+    tree: &Path,
+    rel: &str,
+    out: &mut Vec<String>,
+    skipped: &mut Vec<SkippedEntry>,
+    library_id: &str,
+) {
     let rel = rel.strip_prefix("./").unwrap_or(rel);
     if rel.is_empty() || out.iter().any(|r| r == rel) {
         return;
     }
-    if tree.join(rel).is_file() {
-        out.push(rel.to_string());
+
+    let reject = |skipped: &mut Vec<SkippedEntry>| {
+        skipped.push(SkippedEntry {
+            reason: "library_surface_outside_tree".to_string(),
+            file: rel.to_string(),
+            source: Some(library_id.to_string()),
+        });
+    };
+
+    let path = Path::new(rel);
+    if path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        reject(skipped);
+        return;
     }
+
+    let candidate = tree.join(rel);
+    // Never follow a symlink for the final component, inside the tree or
+    // not — `symlink_metadata` reports the link's own type without
+    // resolving it, so a symlinked entry point is caught here regardless
+    // of where it points.
+    let meta = match fs::symlink_metadata(&candidate) {
+        Ok(m) => m,
+        Err(_) => return, // doesn't exist — same leniency as before, no skip entry
+    };
+    if !meta.file_type().is_file() {
+        reject(skipped);
+        return;
+    }
+
+    // Defense in depth: an intermediate directory component could itself
+    // be a symlink escaping `tree` even though the final component is a
+    // regular file. Canonicalize both sides and require descendant
+    // containment (a subpath is fine; this is not the direct-child check
+    // `sources::assert_direct_child` uses).
+    let (Ok(canon_tree), Ok(canon_candidate)) = (tree.canonicalize(), candidate.canonicalize()) else {
+        reject(skipped);
+        return;
+    };
+    if !canon_candidate.starts_with(&canon_tree) {
+        reject(skipped);
+        return;
+    }
+
+    out.push(rel.to_string());
 }
 
 /// Recursively collect every string value reachable under a package.json
@@ -1146,9 +1237,10 @@ mod tests {
         .unwrap();
         fs::write(
             lib_dir.join("package.json"),
-            serde_json::json!({"version": "8.1.1"}).to_string(),
+            serde_json::json!({"version": "8.1.1", "main": "index.js"}).to_string(),
         )
         .unwrap();
+        fs::write(lib_dir.join("index.js"), "module.exports = {};\n").unwrap();
         fs::write(
             app_dir.join("uses-lib.ts"),
             "import { thing } from '@org/lib';\nthing();\n",
@@ -1400,8 +1492,103 @@ mod tests {
         assert!(note.is_none(), "{note:?}");
     }
 
+    // ── #1959 second-round finding: library_surface path traversal ──
+
     #[test]
-    fn edge_unit_notes_when_no_library_surface_resolves() {
+    fn edge_unit_rejects_library_surface_path_traversal() {
+        let workdir = TempDir::new().unwrap();
+        let app_dir = workdir.path().join("app");
+        // Nested a few levels deep so "../../../secret.txt" resolves to a
+        // real file OUTSIDE the library's own tree, at the corpus workdir
+        // root — proving the traversal would otherwise leak a file that
+        // was never part of the library.
+        let lib_dir = workdir.path().join("nested").join("deep").join("lib");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::create_dir_all(lib_dir.join("dist")).unwrap();
+        fs::write(workdir.path().join("secret.txt"), "TOP SECRET, DO NOT LEAK\n").unwrap();
+
+        // A symlink entry point pointing outside the library tree too —
+        // must be rejected the same way, without ever being followed.
+        let outside_dir = TempDir::new().unwrap();
+        fs::write(outside_dir.path().join("evil.js"), "leak_everything();\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside_dir.path().join("evil.js"), lib_dir.join("evil-link.js")).unwrap();
+
+        fs::write(
+            app_dir.join("package.json"),
+            serde_json::json!({"dependencies": {"@org/lib": "^5.5.0"}}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            lib_dir.join("package.json"),
+            serde_json::json!({
+                "version": "8.1.1",
+                "main": "../../../secret.txt",
+                "module": "dist/index.js",
+                "types": "evil-link.js",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(lib_dir.join("dist/index.js"), "module.exports = {};\n").unwrap();
+        fs::write(
+            app_dir.join("uses-lib.ts"),
+            "import { thing } from '@org/lib';\nthing();\n",
+        )
+        .unwrap();
+
+        let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
+        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let rules = vec![edge_rule()];
+        let out = plan(&manifest, &rules, &sources).unwrap();
+
+        let edge_units: Vec<&Unit> = out.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
+        assert_eq!(edge_units.len(), 1, "{:?}", out.units);
+        let Unit::Edge { library_surface, est_tokens, .. } = edge_units[0] else { panic!() };
+        assert!(!library_surface.iter().any(|s| s.contains("secret")), "{library_surface:?}");
+        assert!(!library_surface.iter().any(|s| s.contains("evil")), "{library_surface:?}");
+        assert_eq!(library_surface, &vec!["dist/index.js".to_string()], "{library_surface:?}");
+
+        let traversal_skips: Vec<&SkippedEntry> = out
+            .totals
+            .skipped
+            .iter()
+            .filter(|s| s.reason == "library_surface_outside_tree")
+            .collect();
+        assert_eq!(traversal_skips.len(), 2, "{:?}", out.totals.skipped);
+        assert!(
+            traversal_skips.iter().any(|s| s.file == "../../../secret.txt"),
+            "{traversal_skips:?}"
+        );
+        assert!(
+            traversal_skips.iter().any(|s| s.file == "evil-link.js"),
+            "{traversal_skips:?}"
+        );
+        assert!(
+            traversal_skips.iter().all(|s| s.source.as_deref() == Some("lib")),
+            "{traversal_skips:?}"
+        );
+
+        // Baseline: same setup but WITHOUT the malicious fields — est_tokens
+        // must be identical, proving the rejected candidates contributed
+        // nothing to the estimate (not even a partial/short read).
+        fs::write(
+            lib_dir.join("package.json"),
+            serde_json::json!({"version": "8.1.1", "module": "dist/index.js"}).to_string(),
+        )
+        .unwrap();
+        let sources_clean = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
+        let out_clean = plan(&manifest, &rules, &sources_clean).unwrap();
+        let clean_edge_units: Vec<&Unit> =
+            out_clean.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
+        let Unit::Edge { est_tokens: clean_tokens, .. } = clean_edge_units[0] else { panic!() };
+        assert_eq!(est_tokens, clean_tokens);
+    }
+
+    // ── #1959 second-round CONSIDER 5: empty library surface emits no unit ──
+
+    #[test]
+    fn edge_with_no_library_surface_emits_no_unit_but_ledgers_the_reason() {
         let workdir = TempDir::new().unwrap();
         let app_dir = workdir.path().join("app");
         let lib_dir = workdir.path().join("lib");
@@ -1412,7 +1599,8 @@ mod tests {
             serde_json::json!({"dependencies": {"@org/lib": "^5.5.0"}}).to_string(),
         )
         .unwrap();
-        // No main/module/types/typings/exports, no CHANGELOG.
+        // No main/module/types/typings/exports, no CHANGELOG — nothing for
+        // the library surface to resolve.
         fs::write(
             lib_dir.join("package.json"),
             serde_json::json!({"version": "8.1.1"}).to_string(),
@@ -1429,11 +1617,17 @@ mod tests {
         let rules = vec![edge_rule()];
         let out = plan(&manifest, &rules, &sources).unwrap();
 
+        // No unit emitted — nothing for the model to compare against.
         let edge_units: Vec<&Unit> = out.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
-        assert_eq!(edge_units.len(), 1, "{:?}", out.units);
-        let Unit::Edge { library_surface, note, .. } = edge_units[0] else { panic!() };
-        assert!(library_surface.is_empty(), "{library_surface:?}");
-        assert!(note.is_some(), "expected a note explaining the empty surface");
+        assert!(edge_units.is_empty(), "{:?}", out.units);
+
+        // But the edge still reads as "checked": the ledger entry carries
+        // both the original surface-resolution note AND the reason no
+        // unit followed.
+        assert_eq!(out.totals.edges.len(), 1, "{:?}", out.totals.edges);
+        let note = out.totals.edges[0].note.as_deref().unwrap_or("");
+        assert!(note.contains("no package.json entry point"), "{note}");
+        assert!(note.contains("no unit emitted: nothing to compare against"), "{note}");
     }
 
     // ── #1959 finding 6: symlinks are recorded in totals.skipped, never followed ──
