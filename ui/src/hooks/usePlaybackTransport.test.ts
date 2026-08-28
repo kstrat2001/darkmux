@@ -20,8 +20,11 @@ describe("usePlaybackTransport", () => {
     expect(result.current.active).toBe(false);
     rerender({ d: DAY });
     expect(result.current.active).toBe(true);
+    expect(result.current.scrubbed).toBe(false); // at rest: nothing is cut
     expect(result.current.t).toBe(Date.parse("2026-08-07T01:00:00.000Z"));
     expect(result.current.visibleCount).toBe(3);
+    act(() => result.current.rewind());
+    expect(result.current.scrubbed).toBe(true);
   });
 
   it("scrub and rewind move the playhead; visibleCount follows it", () => {

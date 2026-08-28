@@ -6,11 +6,11 @@ import type { Route } from "../lib/route";
 import { closeOpenModal } from "../lib/dialogManager";
 import type { MachineSpecs } from "../types/handwritten";
 
-function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live", specs: MachineSpecs | null = null) {
+function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live", specs: MachineSpecs | null = null, replayDate: string | null = null) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <Masthead route={route} liveStatus={liveStatus} specs={specs} />
+      <Masthead route={route} liveStatus={liveStatus} specs={specs} replayDate={replayDate} />
     </QueryClientProvider>,
   );
 }
@@ -205,6 +205,18 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
       expect(badge?.textContent).toBe("2026-08-26");
       unmount();
     }
+    vi.unstubAllGlobals();
+  });
+
+  it("a daemon dispatch/mission page reads RESULT until the shell knows its day, then the date with the playback badge", () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const unknown = renderMasthead({ kind: "dispatch", dispatchId: "s1" } as never);
+    expect(unknown.container.querySelector(".catalog-toggle")?.textContent).toBe("RESULT");
+    expect(unknown.container.querySelector("#modebadge")).toBeNull();
+    unknown.unmount();
+    const known = renderMasthead({ kind: "mission", missionId: "m1" } as never, "live", null, "2026-08-07");
+    expect(known.container.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07");
+    expect(known.container.querySelector("#modebadge")?.textContent).toMatch(/playback/i);
     vi.unstubAllGlobals();
   });
 

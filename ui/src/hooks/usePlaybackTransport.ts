@@ -39,6 +39,13 @@ export interface PlaybackTransport {
   /** A day is loaded and non-empty: the transport renders and the lenses
    * scope to `t`. */
   active: boolean;
+  /** The playhead has been moved (scrub, rewind, play) since the day
+   * loaded. Until then `t` is pinned at the day's end and NOTHING is cut:
+   * a session or mission that ran past the loaded day's last record (a
+   * run crossing midnight) must render whole by default, exactly as it
+   * did before the transport existed. Lenses scope to `t` only while this
+   * is true. */
+  scrubbed: boolean;
   t: number;
   tMin: number;
   tMax: number;
@@ -118,6 +125,7 @@ export function usePlaybackTransport(dayRecords: FlowRecord[] | null): PlaybackT
 
   return {
     active: records !== null,
+    scrubbed: t !== null,
     t: playheadT,
     tMin,
     tMax,
