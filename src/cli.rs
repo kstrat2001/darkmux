@@ -390,7 +390,12 @@ pub(crate) enum CrawlCmd {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
         /// Resolve sources against the mirror as-is, without `git fetch`ing
-        /// first — fully offline against whatever's already mirrored.
+        /// first — fully offline against whatever's already mirrored. A
+        /// `git` source with no mirror yet REFUSES instead of cloning (a
+        /// first clone needs the network, which this flag promises not to
+        /// use) — rerun once without `--no-fetch` to populate it. A `path`
+        /// source's first clone is local-filesystem-only, so it's exempt
+        /// and still populates on the first run.
         #[arg(long)]
         no_fetch: bool,
         /// Print the plan JSON to stdout instead of the human table.

@@ -59,9 +59,22 @@ fn resolve_one(
     let mirror_path = mirror_root.join(format!("{}.git", source.id));
 
     if !mirror_path.exists() {
+        // #1959 finding 15: --no-fetch promises "fully offline against
+        // whatever's already mirrored". A `git`-origin mirror that doesn't
+        // exist yet can only be populated over the network, which breaks
+        // that promise silently if we clone anyway. A `path`-origin clone
+        // is local-filesystem-only regardless of `fetch` — no network
+        // activity either way — so it stays consistent with the promise
+        // and is allowed through unconditionally.
+        if !fetch && source.git.is_some() {
+            bail!(
+                "mirror for source '{}' does not exist; run without --no-fetch once",
+                source.id
+            );
+        }
         run_git(
             None,
-            &["clone", "--bare", origin, &mirror_path.to_string_lossy()],
+            &["clone", "--bare", "--no-hardlinks", "--", origin, &mirror_path.to_string_lossy()],
             &format!("cloning source '{}' ({origin})", source.id),
         )?;
         // `git clone --bare` does NOT configure `remote.origin.fetch` the
@@ -86,7 +99,14 @@ fn resolve_one(
     let git_ref = source.resolved_ref();
     let rev_out = Command::new("git")
         .current_dir(&mirror_path)
-        .args(["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")])
+        // `--` before a rev-parse positional means "everything after this is
+        // a path", not "end of options for a revision" — it broke every
+        // valid ref (`git rev-parse --verify -- main^{commit}` fails with
+        // "Needed a single revision", confirmed against git 2.50.1).
+        // `--end-of-options` is rev-parse's actual "stop parsing options"
+        // marker that still treats what follows as a revision (#1959
+        // finding 14).
+        .args(["rev-parse", "--verify", "--end-of-options", &format!("{git_ref}^{{commit}}")])
         .output()
         .with_context(|| format!("running git rev-parse for source '{}'", source.id))?;
     if !rev_out.status.success() {
@@ -100,6 +120,14 @@ fn resolve_one(
 
     let tree_path = tree_root.join(&source.id);
     if tree_path.exists() {
+        // #1959 finding 1: a manifest-supplied id feeds straight into
+        // `tree_root.join(id)`/`mirror_root.join(id)` above.
+        // `CorpusManifest::validate` rejects a shape that could escape
+        // (`../../victim`) before a manifest ever reaches here, but this is
+        // the structural backstop for any caller that skips validation —
+        // asserted right before the destructive ops that follow.
+        assert_direct_child(tree_root, &tree_path, &format!("tree path for source '{}'", source.id))?;
+        assert_direct_child(mirror_root, &mirror_path, &format!("mirror path for source '{}'", source.id))?;
         // The prior checkout may have been made read-only — restore write
         // access before `git worktree remove`/`remove_dir_all` need it.
         make_tree_writable(&tree_path)?;
@@ -108,7 +136,7 @@ fn resolve_one(
         // below is the real safety net if this fails.
         let _ = Command::new("git")
             .current_dir(&mirror_path)
-            .args(["worktree", "remove", "--force", &tree_path.to_string_lossy()])
+            .args(["worktree", "remove", "--force", "--", &tree_path.to_string_lossy()])
             .output();
         if tree_path.exists() {
             fs::remove_dir_all(&tree_path)
@@ -123,6 +151,7 @@ fn resolve_one(
             "add",
             "--detach",
             "--force",
+            "--",
             &tree_path.to_string_lossy(),
             &sha,
         ],
@@ -137,6 +166,30 @@ fn resolve_one(
         git_ref: git_ref.to_string(),
         tree: tree_path,
     })
+}
+
+/// Bail unless `child`'s canonical form is an IMMEDIATE child of `parent`'s
+/// canonical form — the containment guard that stands between a
+/// manifest-supplied source id and any destructive filesystem operation
+/// (`make_tree_writable`, `git worktree remove`, `fs::remove_dir_all`).
+/// Independent of `CorpusManifest::validate`'s id-shape check: a caller
+/// that constructs a `SourceSpec` directly (a test, a future entry point)
+/// still can't smuggle `../../victim` past a delete (#1959 finding 1).
+fn assert_direct_child(parent: &Path, child: &Path, what: &str) -> Result<()> {
+    let canon_parent = parent
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {what} root {}", parent.display()))?;
+    let canon_child = child
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {what} {}", child.display()))?;
+    if canon_child.parent() != Some(canon_parent.as_path()) {
+        bail!(
+            "refusing to touch {what} {} — it resolves outside {} (possible path traversal via source id)",
+            canon_child.display(),
+            canon_parent.display()
+        );
+    }
+    Ok(())
 }
 
 fn run_git(cwd: Option<&Path>, args: &[&str], context: &str) -> Result<Output> {
@@ -179,9 +232,43 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// `chmod -R a-w` on every FILE under `tree` — directories keep their
-/// permissions (and stay traversable) so the read-only guarantee is
-/// "the model can't edit what it reads" without breaking directory listing.
+/// Recursively list every directory AT OR UNDER `dir` (including `dir`
+/// itself), skipping `.git`. `top_down` controls whether `dir` is emitted
+/// before or after its descendants — `make_tree_writable` wants top-down
+/// (parent restored before its children), `make_tree_read_only` wants
+/// bottom-up (a directory's own write bit is cleared only after every file
+/// and subdirectory under it has already been touched, #1959 finding 12).
+/// Never descends into a symlinked directory (`entry.file_type()` reports
+/// a symlink's own type without following it, same as `walk_files` below)
+/// — a symlink is neither read-only-locked nor writable-restored, matching
+/// the "never follow, never touch the target" contract `plan.rs`'s walker
+/// keeps for the same reason (#1959 finding 6).
+fn walk_dirs(dir: &Path, out: &mut Vec<PathBuf>, top_down: bool) -> Result<()> {
+    if top_down {
+        out.push(dir.to_path_buf());
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            walk_dirs(&path, out, top_down)?;
+        }
+    }
+    if !top_down {
+        out.push(dir.to_path_buf());
+    }
+    Ok(())
+}
+
+/// `chmod -R a-w` on every FILE, then every DIRECTORY (bottom-up, including
+/// `tree` itself), under `tree` — the read-only guarantee is "the model
+/// can't edit what it reads AND can't create/rename/delete anything in the
+/// tree either" (#1959 finding 12: locking files alone left every
+/// directory's write bit — including the tree's own top level — untouched,
+/// so a new file could still be created inside a "read-only" tree).
 /// POSIX-only (mirrors the existing POSIX-only carve-out for
 /// `DARKMUX_AUDIT_DIR` — Windows is unsupported for darkmux generally); a
 /// no-op elsewhere.
@@ -197,6 +284,16 @@ fn make_tree_read_only(tree: &Path) -> Result<()> {
         fs::set_permissions(&f, perm)
             .with_context(|| format!("setting {} read-only", f.display()))?;
     }
+
+    let mut dirs = Vec::new();
+    walk_dirs(tree, &mut dirs, false)?; // bottom-up: tree's own top level last
+    for d in dirs {
+        let meta = fs::metadata(&d)?;
+        let mut perm = meta.permissions();
+        perm.set_mode(perm.mode() & !0o222);
+        fs::set_permissions(&d, perm)
+            .with_context(|| format!("setting {} read-only", d.display()))?;
+    }
     Ok(())
 }
 #[cfg(not(unix))]
@@ -204,10 +301,22 @@ fn make_tree_read_only(_tree: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Undo `make_tree_read_only` before deleting/re-checking-out a stale tree.
+/// Undo `make_tree_read_only` before deleting/re-checking-out a stale tree
+/// — directories top-down (the tree's own top level restored first) before
+/// any file, mirroring `make_tree_read_only`'s reverse order.
 #[cfg(unix)]
 fn make_tree_writable(tree: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    let mut dirs = Vec::new();
+    walk_dirs(tree, &mut dirs, true)?; // top-down: tree's own top level first
+    for d in dirs {
+        let meta = fs::metadata(&d)?;
+        let mut perm = meta.permissions();
+        perm.set_mode(perm.mode() | 0o200);
+        fs::set_permissions(&d, perm)
+            .with_context(|| format!("restoring write access to {}", d.display()))?;
+    }
+
     let mut files = Vec::new();
     walk_files(tree, &mut files)?;
     for f in files {
@@ -346,5 +455,121 @@ mod tests {
 
         let err = resolve(&manifest, true).unwrap_err();
         assert!(err.to_string().contains("does-not-exist"), "{err}");
+    }
+
+    // ── #1959 finding 1: containment guard ──
+
+    /// Direct call to the guard (not routed through `resolve_one`): an
+    /// escaping path must bail WITHOUT touching the target — proven by
+    /// creating a "victim" dir with a file and confirming it's still there.
+    #[test]
+    fn containment_guard_rejects_escaping_path_without_touching_it() {
+        let root = TempDir::new().unwrap();
+        let parent = root.path().join("tree_root");
+        fs::create_dir_all(&parent).unwrap();
+        let victim = root.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("canary.txt"), "still here").unwrap();
+
+        let err = assert_direct_child(&parent, &victim, "tree path for source 'x'").unwrap_err();
+        assert!(err.to_string().contains("outside"), "{err}");
+
+        // Untouched: still exists, still readable, content unchanged.
+        let canary = victim.join("canary.txt");
+        assert!(canary.exists());
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "still here");
+    }
+
+    #[test]
+    fn containment_guard_accepts_a_direct_child() {
+        let root = TempDir::new().unwrap();
+        let parent = root.path().join("tree_root");
+        let child = parent.join("app");
+        fs::create_dir_all(&child).unwrap();
+        assert_direct_child(&parent, &child, "tree path for source 'app'").unwrap();
+    }
+
+    // ── #1959 finding 15: --no-fetch with an absent mirror ──
+
+    #[test]
+    fn no_fetch_with_absent_mirror_bails_for_a_git_origin_instead_of_cloning() {
+        let workdir = TempDir::new().unwrap();
+        let json = serde_json::json!({
+            "name": "t4",
+            "root": workdir.path().to_string_lossy(),
+            "sources": [
+                {"id": "app", "git": "https://example.invalid/never-cloned.git", "ref": "main"}
+            ]
+        });
+        let manifest: CorpusManifest = serde_json::from_value(json).unwrap();
+
+        let err = resolve(&manifest, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("does not exist"), "{msg}");
+        assert!(msg.contains("--no-fetch"), "{msg}");
+        assert!(msg.contains("app"), "{msg}");
+    }
+
+    #[test]
+    fn no_fetch_with_absent_mirror_still_clones_a_local_path_origin() {
+        // A `path` origin's first clone is local-filesystem-only — no
+        // network activity — so it stays consistent with --no-fetch's
+        // "fully offline" promise and is allowed through.
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let manifest = manifest_for("t5", workdir.path(), source.path(), "main");
+
+        let resolved = resolve(&manifest, false).unwrap();
+        assert_eq!(resolved.len(), 1);
+    }
+
+    // ── #1959 finding 12: read-only tree locks directories too ──
+
+    #[test]
+    fn make_tree_read_only_locks_the_top_level_directory() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let manifest = manifest_for("t6", workdir.path(), source.path(), "main");
+
+        let resolved = resolve(&manifest, true).unwrap();
+        let tree = &resolved[0].tree;
+
+        // Before this fix, only FILES lost their write bit — the tree's own
+        // top-level directory kept it, so a brand new file could still be
+        // created directly inside the "read-only" tree.
+        let result = fs::write(tree.join("new-file.txt"), "should not be allowed");
+        assert!(
+            result.is_err(),
+            "creating a new file inside the read-only tree must fail"
+        );
+    }
+
+    // ── #1959 finding 6: the chmod walker never follows a symlink ──
+
+    #[test]
+    fn make_tree_read_only_never_chmods_through_a_symlink() {
+        let dir = TempDir::new().unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("real.txt"), "in tree").unwrap();
+
+        // A file OUTSIDE the tree, symlinked from inside it.
+        let outside_dir = dir.path().join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_file = outside_dir.join("external.txt");
+        fs::write(&outside_file, "outside").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, tree.join("link-to-external.txt")).unwrap();
+
+        make_tree_read_only(&tree).unwrap();
+
+        // The tree's own file lost its write bit...
+        use std::os::unix::fs::PermissionsExt;
+        let real_mode = fs::metadata(tree.join("real.txt")).unwrap().permissions().mode();
+        assert_eq!(real_mode & 0o222, 0, "{real_mode:o}");
+
+        // ...but the symlink target OUTSIDE the tree was never touched.
+        let outside_mode = fs::metadata(&outside_file).unwrap().permissions().mode();
+        assert_ne!(outside_mode & 0o222, 0, "symlink target must be untouched: {outside_mode:o}");
     }
 }
