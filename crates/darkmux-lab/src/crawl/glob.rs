@@ -13,6 +13,19 @@
 /// zero or more characters within one segment; `?` matches exactly one
 /// character within one segment.
 pub fn matches(pattern: &str, path: &str) -> bool {
+    // #1959 finding 7: a trailing-slash pattern (`node_modules/`) reads as
+    // "this directory and everything under it" to a human author, but
+    // segment-matching it literally requires an exact empty final segment,
+    // which never matches a nested path. Normalize `<stem>/` to
+    // `<stem>/**` before matching so the natural spelling works.
+    let normalized;
+    let pattern = match pattern.strip_suffix('/') {
+        Some(stem) => {
+            normalized = format!("{stem}/**");
+            normalized.as_str()
+        }
+        None => pattern,
+    };
     let pat: Vec<&str> = pattern.split('/').collect();
     let pth: Vec<&str> = path.split('/').collect();
     match_segments(&pat, &pth)
@@ -92,5 +105,23 @@ mod tests {
         assert!(applies(&applies_to, &exclude, "src/a.ts"));
         assert!(!applies(&applies_to, &exclude, "node_modules/pkg/a.ts"));
         assert!(!applies(&applies_to, &exclude, "src/a.js"));
+    }
+
+    /// #1959 finding 7: a trailing-slash pattern like `node_modules/` reads
+    /// as "this whole directory" to a human author, but before this fix
+    /// `match_segments` required an EXACT empty final segment to match —
+    /// `node_modules/` (segments `["node_modules", ""]`) never matched a
+    /// path under it (`node_modules/pkg/a.ts`), so an exclude written the
+    /// natural way silently excluded nothing.
+    #[test]
+    fn trailing_slash_pattern_excludes_the_whole_directory() {
+        assert!(matches("node_modules/", "node_modules/pkg/a.ts"));
+        assert!(matches("node_modules/", "node_modules/a.ts"));
+        assert!(!matches("node_modules/", "not_node_modules/a.ts"));
+
+        let applies_to = vec!["**/*.ts".to_string()];
+        let exclude = vec!["node_modules/".to_string()];
+        assert!(!applies(&applies_to, &exclude, "node_modules/pkg/a.ts"));
+        assert!(applies(&applies_to, &exclude, "src/a.ts"));
     }
 }
