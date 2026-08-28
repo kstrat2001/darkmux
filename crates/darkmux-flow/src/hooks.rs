@@ -2093,6 +2093,21 @@ mod tests {
 
         let info = sink.info();
         assert_eq!(info.config.get("drainer_alive").map(String::as_str), Some("true"));
+
+        // Signal stop and join the drainer directly — the same mechanics
+        // `Drop` uses — WITHOUT dropping the whole `sink`, so `drainer_alive()`
+        // can actually be observed flipping to false once the thread has
+        // genuinely stopped (a full `drop(sink)` would consume `sink`,
+        // making it impossible to call anything on it afterward).
+        sink.stop.store(true, Ordering::Release);
+        {
+            let (lock, cvar) = &*sink.nudge;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cvar.notify_all();
+        }
+        let handle = sink.drainer.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap();
+        handle.join().unwrap();
+        assert!(!sink.drainer_alive(), "drainer_alive must report false once the thread has actually stopped");
     }
 
     // ─── (#2093 merge-gate finding 12) hook.fired/failed carry machine provenance ─
