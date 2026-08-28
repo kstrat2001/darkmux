@@ -501,7 +501,7 @@ export function EventLogColumn({
               <input
                 id="logq"
                 type="search"
-                placeholder="filter the stream…"
+                placeholder="filter events…"
                 autoComplete="off"
                 spellCheck={false}
                 aria-label="search events"
