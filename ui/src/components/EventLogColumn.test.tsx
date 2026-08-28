@@ -159,6 +159,11 @@ describe("EventLogColumn", () => {
     expect(detail.className).toMatch(/\bfollowing\b/);
   });
 
+  it("(#2068) an empty log is never marked `following` — nothing streams into an empty pane", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible />);
+    expect(document.getElementById("detail")!.className).not.toMatch(/\bfollowing\b/);
+  });
+
   it("(#2068) while following, the detail card holds a record for the throttle window even as newer ones stream in", () => {
     vi.useFakeTimers();
     vi.setSystemTime(10_000);

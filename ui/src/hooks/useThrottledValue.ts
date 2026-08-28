@@ -22,8 +22,14 @@ export function useThrottledValue<T>(value: T, holdMs: number, same: (a: T, b: T
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    if (same(shownRef.current, value)) return;
     pending.current = value;
+    if (same(shownRef.current, value)) {
+      if (timer.current) {
+        clearTimeout(timer.current);
+        timer.current = null;
+      }
+      return;
+    }
     const now = Date.now();
     const elapsed = now - lastAt.current;
     const commit = () => {

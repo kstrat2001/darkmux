@@ -1937,11 +1937,27 @@ body {
 @media (max-width: 768px) {
   .savrow {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    /* `minmax(0, 1fr)`, not `1fr`: a bare `1fr` track cannot shrink below
+       its content's min-content width, so a nine-digit local figure pushed
+       the second column past the viewport (measured: cloud tile's right
+       edge at 395px in a 320px viewport). */
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     align-items: start;
+  }
+  .savlead {
+    min-width: 0;
   }
   .savclasses {
     grid-column: 1 / -1;
+  }
+}
+/* Phones: one tile per row. Two columns cannot hold the fluid figure
+   (`min(48px, 13vw)` was measured against the FULL row width at 320px) and
+   a smaller figure would undercut the number the hero exists to show. The
+   row count is still fixed — four rows, whatever the digits. */
+@media (max-width: 560px) {
+  .savrow {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 .savlbl {

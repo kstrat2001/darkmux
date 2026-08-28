@@ -437,8 +437,9 @@ export function EventLogColumn({
           pane's height while it tracks the newest record: content-sized, it
           re-heighted with every followed record's payload and moved the list
           under it on each event. A hand-picked record keeps the content-sized
-          pane, since nothing is streaming into it then. */}
-      <div className={`eventlog__detail${follow ? " following" : ""}`} id="detail" style={{ flexBasis: `${detailPct}%` }}>
+          pane, since nothing is streaming into it then — and so does an
+          empty log, where a pinned box would hold nothing but the hint. */}
+      <div className={`eventlog__detail${follow && selected ? " following" : ""}`} id="detail" style={{ flexBasis: `${detailPct}%` }}>
         {/* (operator) No "selected event" title. It was static chrome
             competing with the record's own headline — `RecordView` already
             leads with the action in accent colour, so the label was a second
