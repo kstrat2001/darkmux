@@ -88,10 +88,12 @@ fi
 ASSET=$(printf '%s\n' "$ASSET_MATCHES" | grep . | head -1)
 
 SRC="$ROOT/crates/darkmux-serve/assets/$ASSET"
-# (#2072) The day the committed flow file replays, from its first record's
-# `ts` — the same rule the viewer's own `firstRecordDate` applies — so the
-# masthead can name it on every route without downloading the file.
-FLOW_DATE=$(grep -m1 -o '"ts": *"[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' "$ROOT/docs/demo/demo-flow.jsonl" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' | head -1)
+# (#2072) The first recorded day of the committed flow file — the EARLIEST
+# `ts`, not the first line, because the viewer sorts records before it reads
+# `records[0]` (`firstRecordDate`); file order only happens to agree today.
+# Lets the masthead name the day on every route without downloading the
+# file. The demo world spans more than one day; this is its first.
+FLOW_DATE=$(grep -o '"ts": *"[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' "$ROOT/docs/demo/demo-flow.jsonl" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}' | sort | head -1)
 if [ -z "$FLOW_DATE" ]; then
   echo "build-demo: could not derive the replayed day from docs/demo/demo-flow.jsonl" >&2
   exit 1

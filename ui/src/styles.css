@@ -350,10 +350,12 @@ body {
   white-space: nowrap;
   cursor: pointer;
 }
-/* (#1801) The static build's inert stand-in for `.catalog-toggle` — same
-   box, no `cursor:pointer`/hover treatment, because it isn't a button
+/* (#1801) The static build's inert stand-in for `.catalog-toggle` — no
+   `cursor:pointer`/hover treatment, because it isn't a button
    (`Masthead.tsx`'s own doc: a static demo has no `/flow-days`/
-   `/flow-missions` daemon endpoints for the real toggle to fetch). */
+   `/flow-missions` daemon endpoints for the real toggle to fetch). Since
+   #2072 it is also drawn as an outlined label rather than the toggle's
+   filled box, so it no longer reads as tappable. */
 .masthead__srcbadge {
   font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
   letter-spacing: 0.12em;
@@ -367,10 +369,10 @@ body {
   padding: 4px 8px;
   border-radius: 3px;
 }
-@media (max-width: 480px) {
+@media (max-width: 560px) {
   /* (#2073) Brand + `FLOW · <date>` + `▣ PLAYBACK` overflowed 390px and
      wrapped the mode badge onto its own masthead line; the date alone is
-     the information. */
+     the information. Same breakpoint as the masthead's other phone rules. */
   .masthead__srcpre {
     display: none;
   }

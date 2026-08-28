@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { isStaticBuild, staticFlowSrc, resolveRunsSrc, resolveLabRunsSrc, staticGraphsSrc } from "./staticSource";
+import { isStaticBuild, staticFlowSrc, resolveRunsSrc, resolveLabRunsSrc, staticGraphsSrc, staticFlowDate } from "./staticSource";
 
 /**
  * (#1801) The one resolver every static-build consumer (`route.ts`,
@@ -81,5 +81,22 @@ describe("staticGraphsSrc (#2032 packet 2)", () => {
     // it".
     expect(staticGraphsSrc()).toBeNull();
     expect(typeof staticGraphsSrc()).not.toBe("string");
+  });
+});
+
+/** (#2072) `darkmux-flow-date` — the replayed day a static build names on
+ * every route. */
+describe("staticFlowDate", () => {
+  afterEach(() => {
+    document.head.querySelectorAll('meta[name="darkmux-flow-date"]').forEach((m) => m.remove());
+  });
+  it("is null with no meta, and null for a malformed one — callers fall back to the old wording", () => {
+    expect(staticFlowDate()).toBeNull();
+    injectMeta("darkmux-flow-date", "yesterday");
+    expect(staticFlowDate()).toBeNull();
+  });
+  it("returns a well-formed date verbatim", () => {
+    injectMeta("darkmux-flow-date", "2026-08-26");
+    expect(staticFlowDate()).toBe("2026-08-26");
   });
 });

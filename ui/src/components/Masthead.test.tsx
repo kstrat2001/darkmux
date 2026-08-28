@@ -196,7 +196,10 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     injectMeta("darkmux-flow-src", "./demo-flow.jsonl");
     injectMeta("darkmux-flow-date", "2026-08-26");
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
-    for (const route of [{ kind: "runs", runsKind: "all", run: null, machine: null }, { kind: "fleet" }, { kind: "mission", missionId: "m1" }] as const) {
+    // The playback route is the demo's LANDING route: its own date resolves
+    // only after the flow file loads, so it must read the meta too or it
+    // flashes TODAY while every other tab already shows the day.
+    for (const route of [{ kind: "playback", date: null }, { kind: "runs", runsKind: "all", run: null, machine: null }, { kind: "fleet" }, { kind: "mission", missionId: "m1" }] as const) {
       const { container, unmount } = renderMasthead(route as never);
       const badge = container.querySelector(".masthead__srcbadge");
       expect(badge?.textContent).toBe("FLOW · 2026-08-26");
