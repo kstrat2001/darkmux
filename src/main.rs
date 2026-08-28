@@ -1905,23 +1905,20 @@ fn cmd_init(
     } else {
         println!();
         println!("Next steps:");
+        // (#2053) The runtime image is pulled from GHCR on the first dispatch;
+        // telling a new user to `docker build` it was the guide's own
+        // prerequisites table contradicted by init's last lines.
+        let mut n = 0;
+        let mut step = |text: &str| {
+            n += 1;
+            println!("  {n}. {text}");
+        };
         if report.profile_registry_created && report.worker_model_filled.is_none() {
-            println!("  1. Edit ~/.darkmux/profiles.json to point at your downloaded models");
-            println!("     (run `lms ls` to see what's available)");
-            println!(
-                "  2. Build the internal-runtime image (one-time, ~50 MB, from the darkmux repo root):"
-            );
-            println!("       docker build -t darkmux-runtime:latest runtime/");
-            println!("  3. Run `darkmux doctor` to verify your setup");
-            println!("  4. Run `darkmux lab characterize` to smoke-test your machine");
-        } else {
-            println!(
-                "  1. Build the internal-runtime image if you haven't (one-time, ~50 MB, from the darkmux repo root):"
-            );
-            println!("       docker build -t darkmux-runtime:latest runtime/");
-            println!("  2. Run `darkmux doctor` to verify your setup");
-            println!("  3. Run `darkmux lab characterize` to smoke-test your machine");
+            step("Edit ~/.darkmux/profiles.json to point at a downloaded model (`lms ls` lists them)");
         }
+        step("First answer, no Docker needed: `darkmux radio \"do you have a brain?\"`");
+        step("Check the setup: `darkmux doctor`");
+        step("With Docker running, a first dispatch: `darkmux dispatch code-reviewer \"What do you do?\"` (the runtime image is pulled on first use)");
     }
     Ok(0)
 }
