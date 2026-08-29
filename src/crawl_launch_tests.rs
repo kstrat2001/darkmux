@@ -88,23 +88,41 @@ fn mission_id_from_records(records: &[Value]) -> String {
     records
         .iter()
         .find_map(|r| {
-            if r["action"] == "crawl.mission.started" {
+            if r["action"] == "mission start" {
                 r["mission_id"].as_str().map(String::from)
             } else {
                 None
             }
         })
-        .expect("expected a crawl.mission.started record carrying mission_id")
+        .expect("expected a mission start record carrying mission_id")
 }
 
-/// Only the actions this module's own tests care about — excludes the
-/// `mission start`/`phase start`/`mission close`/`phase complete`
-/// lifecycle bookkeeping `crew::lifecycle` ALSO emits on the same stream.
+/// Only the actions this module's own tests care about — the generic
+/// mission/step lifecycle actions the launcher now emits directly
+/// (`mission start`/`mission close`, `step start`/`step complete`/`step
+/// error`) plus the dispatch bookends every unit's model call already
+/// produces. Deliberately EXCLUDES `phase start`/`phase complete`/`phase
+/// abandon` — `crew::lifecycle` emits those too on the same stream, but no
+/// test in this module asserts on phase-level ordering. (#1959, revised:
+/// this used to filter on a bespoke `crawl.*` prefix; there is no such
+/// prefix left to filter on — the launcher's own records are no longer
+/// distinguishable from any other mission's by action name alone, which is
+/// the whole point of this packet.)
 fn crawl_relevant_actions(records: &[Value]) -> Vec<String> {
+    const RELEVANT: &[&str] = &[
+        "mission start",
+        "mission close",
+        "step start",
+        "step complete",
+        "step error",
+        "dispatch start",
+        "dispatch complete",
+        "dispatch error",
+    ];
     records
         .iter()
         .filter_map(|r| r["action"].as_str())
-        .filter(|a| a.starts_with("crawl.") || *a == "dispatch start" || *a == "dispatch complete" || *a == "dispatch error")
+        .filter(|a| RELEVANT.contains(a))
         .map(String::from)
         .collect()
 }
@@ -330,25 +348,27 @@ fn unit_loop_emits_started_dispatch_findings_completed_in_order_with_mission_id(
     assert_eq!(
         actions,
         vec![
-            "crawl.mission.started",
-            "crawl.unit.started",
+            "mission start",
+            "step start",
             "dispatch start",
             "dispatch complete",
-            "crawl.finding",
-            "crawl.unit.completed",
-            "crawl.unit.started",
+            "step complete",
+            "step start",
             "dispatch start",
             "dispatch complete",
-            "crawl.unit.completed",
-            "crawl.mission.completed",
+            "step complete",
+            "mission close",
         ],
         "{actions:#?}"
     );
 
-    for r in records.iter().filter(|r| r["action"].as_str().unwrap_or("").starts_with("crawl.")) {
+    // (#1959, revised) There is no `crawl.*` action left to filter on — the
+    // launcher's own records are the generic `step start`/`step complete`
+    // family; filter on THOSE instead of a bespoke prefix.
+    for r in records.iter().filter(|r| matches!(r["action"].as_str(), Some("step start") | Some("step complete") | Some("step error"))) {
         assert!(r["mission_id"].is_string(), "record missing mission_id: {r:#?}");
-        // (#1959 merge-gate finding 3) No `crawl.*` record may ever carry
-        // an empty sha — that's the exact tell of a unit whose source
+        // (#1959 merge-gate finding 3) No step record may ever carry an
+        // empty sha — that's the exact tell of a unit whose source
         // silently fell through `the_plan.sources.iter().find(...).
         // unwrap_or_default()` unvalidated.
         if let Some(sha) = r["payload"]["sha"].as_str() {
@@ -356,13 +376,14 @@ fn unit_loop_emits_started_dispatch_findings_completed_in_order_with_mission_id(
         }
     }
 
-    // (#1959 merge-gate finding 6) `model` is pinned on the top-level
-    // FlowRecord for a `crawl.finding` and a `crawl.unit.completed`
-    // record, not just buried in the payload.
-    let finding_record = records.iter().find(|r| r["action"] == "crawl.finding").expect("expected one finding");
-    assert_eq!(finding_record["model"], "darkmux:test-model");
+    // (#1959 merge-gate finding 6, revised) `model` is pinned on the
+    // top-level FlowRecord for the `step complete` record that carried a
+    // finding — a plain accepted `report_finding` call has no flow record
+    // of its own anymore (see the module doc), so there is nothing to
+    // check there; the model IS still visible on the unit's own
+    // completion record.
     let completed_record =
-        records.iter().find(|r| r["action"] == "crawl.unit.completed").expect("expected a completed record");
+        records.iter().find(|r| r["action"] == "step complete").expect("expected a completed record");
     assert_eq!(completed_record["model"], "darkmux:test-model");
 
     // (#1959 merge-gate finding 3) The ledger line for the one finding must
@@ -398,17 +419,17 @@ fn findings_get_path_rewritten_and_land_in_ledger_and_per_unit_copy() {
 
     let records = read_all_flow_records();
     let mission_id = mission_id_from_records(&records);
-    let finding_rec = records.iter().find(|r| r["action"] == "crawl.finding").expect("one crawl.finding record");
-    assert_eq!(finding_rec["payload"]["file"], "x.ts");
-    assert_eq!(finding_rec["payload"]["file_raw"], "/workspace/app1/x.ts");
-    assert_eq!(finding_rec["payload"]["source"], "app1");
-    assert_eq!(finding_rec["payload"]["evidence"], "catch (e) {");
 
+    // (#1959, revised) No flow record per finding anymore — the ledger IS
+    // the durable, harness-verified record of this finding (see the
+    // module doc); check it directly instead of a `crawl.finding` record.
     let runs_dir = fx.root.path().join("runs").join(&mission_id);
     let ledger = std::fs::read_to_string(runs_dir.join("ledger.jsonl")).unwrap();
     let ledger_rec: Value = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
     assert_eq!(ledger_rec["file"], "x.ts");
     assert_eq!(ledger_rec["file_raw"], "/workspace/app1/x.ts");
+    assert_eq!(ledger_rec["source"], "app1");
+    assert_eq!(ledger_rec["evidence"], "catch (e) {");
 
     let copy = std::fs::read_to_string(runs_dir.join("u-0001.findings.jsonl")).unwrap();
     let copy_rec: Value = serde_json::from_str(copy.lines().next().unwrap()).unwrap();
@@ -444,7 +465,7 @@ fn kill_file_present_before_second_unit_stops_the_crawl() {
     assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string()], "u-0002 must never be dispatched");
 
     let records = read_all_flow_records();
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["stopped_by"], "kill_file");
     assert_eq!(completed["payload"]["units_completed"], 1);
     assert_eq!(completed["payload"]["units_skipped"], 1);
@@ -469,7 +490,7 @@ fn limit_caps_the_unit_count_and_reports_stopped_by_limit() {
     assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string()]);
 
     let records = read_all_flow_records();
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["stopped_by"], "limit");
 }
 
@@ -520,7 +541,7 @@ fn a_dispatch_error_on_one_unit_does_not_stop_the_crawl() {
     assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string(), "u-0002".to_string()]);
 
     let records = read_all_flow_records();
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["units_errored"], 1);
     assert_eq!(completed["payload"]["units_completed"], 1);
     assert_eq!(completed["payload"]["stopped_by"], "done");
@@ -738,7 +759,7 @@ fn tokens_per_hour_is_total_tokens_over_wall_hours() {
     run(&params_for(&fx), None, &mut dispatch).unwrap();
 
     let records = read_all_flow_records();
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["tokens_per_hour"], 1500);
     assert_eq!(completed["payload"]["prompt_tokens"], 1000);
     assert_eq!(completed["payload"]["completion_tokens"], 500);
@@ -871,8 +892,8 @@ fn plan_naming_a_rule_the_manifest_no_longer_declares_bails_before_any_mint() {
 
     let records = read_all_flow_records();
     assert!(
-        records.iter().all(|r| r["action"] != "crawl.mission.started"),
-        "a pre-mint bail must never emit crawl.mission.started — no mission was minted: {records:#?}"
+        records.iter().all(|r| r["action"] != "mission start"),
+        "a pre-mint bail must never emit mission start — no mission was minted: {records:#?}"
     );
 }
 
@@ -880,10 +901,10 @@ fn plan_naming_a_rule_the_manifest_no_longer_declares_bails_before_any_mint() {
 
 /// A failure in the mint window (mission mint through the mission-specific
 /// runs-dir creation) must never strand an Active mission with an unpaired
-/// `crawl.mission.started`. `<corpus root>/runs` already existing as a
+/// `mission start`. `<corpus root>/runs` already existing as a
 /// regular file forces `create_dir_all` to fail at the LAST fallible step
 /// of the window — after the mission/phase/task/step records and the
-/// `crawl.mission.started` record have already been written — which is
+/// `mission start` record have already been written — which is
 /// exactly the shape that used to strand.
 #[test]
 #[serial_test::serial]
@@ -903,13 +924,13 @@ fn runs_dir_collision_reconciles_the_mint_instead_of_stranding_it() {
     let records = read_all_flow_records();
     let mission_id = mission_id_from_records(&records);
 
-    // paired-or-both-absent: `crawl.mission.started` DID fire (the window
-    // fails after it), so `crawl.mission.completed` must have too.
-    let started = records.iter().filter(|r| r["action"] == "crawl.mission.started").count();
-    let completed = records.iter().filter(|r| r["action"] == "crawl.mission.completed").count();
-    assert_eq!(started, completed, "crawl.mission.started/completed must be paired, never one without the other: {records:#?}");
+    // paired-or-both-absent: `mission start` DID fire (the window
+    // fails after it), so `mission close` must have too.
+    let started = records.iter().filter(|r| r["action"] == "mission start").count();
+    let completed = records.iter().filter(|r| r["action"] == "mission close").count();
+    assert_eq!(started, completed, "mission start/completed must be paired, never one without the other: {records:#?}");
     assert_eq!(started, 1, "expected exactly the one mint attempt's started record: {records:#?}");
-    let completed_record = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed_record = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed_record["payload"]["stopped_by"], "error");
     assert_eq!(completed_record["payload"]["units_completed"], 0);
 
@@ -966,8 +987,8 @@ fn plan_with_empty_sources_naming_a_real_unit_bails_before_any_mint() {
 
     let records = read_all_flow_records();
     assert!(
-        records.iter().all(|r| r["action"] != "crawl.mission.started"),
-        "a pre-mint bail must never emit crawl.mission.started — no mission was minted: {records:#?}"
+        records.iter().all(|r| r["action"] != "mission start"),
+        "a pre-mint bail must never emit mission start — no mission was minted: {records:#?}"
     );
 }
 
@@ -1006,8 +1027,8 @@ fn a_panic_mid_loop_still_finalizes_via_the_raii_guard() {
     let mission_id = mission_id_from_records(&records);
     let completed = records
         .iter()
-        .find(|r| r["action"] == "crawl.mission.completed")
-        .expect("the RAII guard must still emit crawl.mission.completed on a panic");
+        .find(|r| r["action"] == "mission close")
+        .expect("the RAII guard must still emit mission close on a panic");
     assert_eq!(completed["payload"]["stopped_by"], "error");
     assert_eq!(completed["payload"]["units_completed"], 0);
 
@@ -1057,11 +1078,11 @@ fn seventy_in_plan_one_selected_reports_units_not_run_everywhere() {
     assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string()], "only the selected unit is ever dispatched");
 
     let records = read_all_flow_records();
-    let started = records.iter().find(|r| r["action"] == "crawl.mission.started").unwrap();
+    let started = records.iter().find(|r| r["action"] == "mission start").unwrap();
     assert_eq!(started["payload"]["units_in_plan"], 70);
     assert_eq!(started["payload"]["units_selected"], 1);
 
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["units_in_plan"], 70);
     assert_eq!(completed["payload"]["units_selected"], 1);
     assert_eq!(completed["payload"]["units_not_run"], 69);
@@ -1160,7 +1181,7 @@ fn every_shipped_rule_avoids_darkmux_internal_vocabulary() {
     }
 }
 
-// ── finding 5: crawl.unit.started carries the UNIT session id ───────────
+// ── finding 5: step start carries the UNIT session id ───────────
 
 #[test]
 #[serial_test::serial]
@@ -1175,17 +1196,17 @@ fn unit_started_and_completed_share_the_same_session_id() {
     run(&params_for(&fx), None, &mut dispatch).unwrap();
 
     let records = read_all_flow_records();
-    for r in records.iter().filter(|r| r["action"] == "crawl.unit.started") {
-        let sid = r["session_id"].as_str().expect("crawl.unit.started must carry a session_id");
+    for r in records.iter().filter(|r| r["action"] == "step start") {
+        let sid = r["session_id"].as_str().expect("step start must carry a session_id");
         assert!(sid.starts_with("crawl-"), "{r:#?}");
         assert_ne!(sid, r["mission_id"].as_str().unwrap(), "must be the UNIT session, not the mission id");
     }
 
     let started_sessions: Vec<&str> =
-        records.iter().filter(|r| r["action"] == "crawl.unit.started").map(|r| r["session_id"].as_str().unwrap()).collect();
+        records.iter().filter(|r| r["action"] == "step start").map(|r| r["session_id"].as_str().unwrap()).collect();
     let completed_sessions: Vec<&str> = records
         .iter()
-        .filter(|r| r["action"] == "crawl.unit.completed")
+        .filter(|r| r["action"] == "step complete")
         .map(|r| r["session_id"].as_str().unwrap())
         .collect();
     assert_eq!(
@@ -1291,8 +1312,13 @@ fn envelope_is_self_describing() {
     assert!(envelope["units_filter"].is_null());
     assert_eq!(envelope["units"][0]["model"], "darkmux:test-model");
 
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
-    assert_eq!(completed["model"], "darkmux:test-model", "the mission-level record's own FlowRecord.model field");
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
+    // (#1959, revised) `model` lives in the PAYLOAD for the generic
+    // `mission close` record (`emit_mission_transition_record_with_
+    // reasoning_and_payload` never sets the top-level `FlowRecord.model`
+    // field — that generic helper has no per-call model concept; only
+    // this launcher's OWN payload numbers carry it).
+    assert_eq!(completed["payload"]["model"], "darkmux:test-model", "the mission close record's payload.model field");
 }
 
 // ── round-3 CONSIDER 7: interrupted classification at readback ──────────
@@ -1343,11 +1369,16 @@ fn interrupted_at_readback_reports_interrupted_not_error() {
     assert_eq!(calls.borrow().len(), 1, "the second unit must never be dispatched once interrupted");
 
     let records = read_all_flow_records();
+    // (#1959, revised) An interrupted unit's step reaches `NodeStatus::
+    // Abandoned` on disk, reported through the same `"step error"`
+    // action every genuine error uses (`STEP_LIFECYCLE_ACTIONS` has no
+    // dedicated "abandon" action) — `payload.result` carries the real
+    // nuance ("interrupted" vs "error"/"timeout").
     let completed =
-        records.iter().find(|r| r["action"] == "crawl.unit.completed").expect("expected one completed record");
+        records.iter().find(|r| r["action"] == "step error").expect("expected one step-error record");
     assert_eq!(completed["payload"]["result"], "interrupted");
 
-    let mission_completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let mission_completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(mission_completed["payload"]["stopped_by"], "interrupted");
     assert_eq!(mission_completed["payload"]["units_errored"], 0, "an interrupted unit must not count as errored");
     assert_eq!(mission_completed["payload"]["units_completed"], 0, "an interrupted unit must not count as completed either");
@@ -1417,7 +1448,7 @@ fn limit_zero_selects_nothing_and_completes_cleanly() {
     assert!(calls.borrow().clone().is_empty(), "zero selected units means zero dispatches");
 
     let records = read_all_flow_records();
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["units_selected"], 0);
     assert_eq!(completed["payload"]["units_completed"], 0);
     assert_eq!(completed["payload"]["stopped_by"], "limit");

@@ -836,6 +836,17 @@ fn reconcile_mission_phases_terminal(mission_id: &str) {
 /// error is what propagates; this is defensive cleanup, never the primary
 /// failure signal.
 pub fn reconcile_mint_failure(mission_id: &str, reason: &str) {
+    reconcile_mint_failure_with_payload(mission_id, reason, None);
+}
+
+/// (#1959) Payload-carrying variant — lets a caller that already knows
+/// SOME numbers about the failed run (the crawl launcher's `workspace`/
+/// `units_in_plan`/`units_selected`, all-zero completion counts, a
+/// `stopped_by: "error"`) put them on the mint-failure `mission close`/
+/// `mission abort` record, instead of the bare unpayloaded terminal every
+/// other caller gets. Every existing caller routes through the 2-arg
+/// wrapper above with `payload: None` — behavior unchanged.
+pub fn reconcile_mint_failure_with_payload(mission_id: &str, reason: &str, payload: Option<serde_json::Value>) {
     if !mission_path(mission_id).is_file() {
         return; // never minted — nothing on disk to reconcile
     }
@@ -843,7 +854,9 @@ pub fn reconcile_mint_failure(mission_id: &str, reason: &str) {
     // A swallowed `let _ =` here would leave the mission Active with ZERO
     // signal that reconcile was even attempted, defeating the entire point
     // of this function.
-    if let Err(e) = mission_close_with_reasoning(mission_id, Some(reason)) {
+    if let Err(e) =
+        mission_terminal_with_reasoning_and_payload(mission_id, MissionStatus::Finalized, Some(reason), payload)
+    {
         eprintln!(
             "warning: mission `{mission_id}` errored during mint AND could not be reconciled to \
              terminal ({e:#}) — it is STRANDED Active. Run `darkmux mission abort {mission_id}` by \

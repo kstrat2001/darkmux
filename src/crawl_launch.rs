@@ -35,10 +35,15 @@
 //! module never dispatches model work directly — every unit's model work
 //! goes through `crew::dispatch::dispatch`, which already emits the
 //! `dispatch start` / `dispatch complete` / `dispatch error` bookends on
-//! every exit path. The `crawl.*` records this module emits (`crawl.
-//! mission.started/completed`, `crawl.unit.started/completed`, `crawl.
-//! finding`) are descriptive scaffolding around those bookends, not a
-//! replacement for them.
+//! every exit path. This launcher's OWN records (`mission start`/
+//! `mission close`, `step start`/`step complete`/`step error` — the
+//! generic lifecycle vocabulary every mission uses, carrying this
+//! launcher's own numbers in `payload`; see the "flow records" section
+//! below) are descriptive scaffolding around those bookends, not a
+//! replacement for them. (#1959, revised: a bespoke `crawl.*` action
+//! family — `crawl.mission.started/completed`, `crawl.unit.started/
+//! completed`, `crawl.finding` — lived here through an earlier packet
+//! and is now retired; see the flow schema's own changelog entry.)
 //!
 //! **Testing (no real model, no container).** The per-unit loop takes an
 //! injectable `dispatch_fn: &mut dyn FnMut(DispatchOpts) -> Result<
@@ -358,16 +363,20 @@ fn watchdog_timeout_fired(stderr: &str) -> bool {
 }
 
 /// Pull `(result, wall_ms, prompt_tokens, completion_tokens, model,
-/// detections)` out of a dispatch's `--json` envelope (`res.stdout`).
-/// `result` is `"stop"` on a clean finish, `"timeout"` when `stderr`
-/// carries the host watchdog's marker (see [`watchdog_timeout_fired`]),
-/// else `"error"` (a hard-to-parse envelope, `max_turns`, an escalation
-/// variant, or a bare non-zero exit with neither signal). When `stdout`
-/// is non-empty but doesn't parse as the expected JSON envelope, this
-/// prints a warning naming the unit and the first 120 chars — silent
-/// swallowing here previously meant a model that broke the `--json`
-/// contract read as an ordinary clean "stop" whenever `exit_code == 0`.
-fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> (String, u64, u64, u64, Option<String>, Option<Value>) {
+/// detections, rest_ms)` out of a dispatch's `--json` envelope
+/// (`res.stdout`). `result` is `"stop"` on a clean finish, `"timeout"`
+/// when `stderr` carries the host watchdog's marker (see
+/// [`watchdog_timeout_fired`]), else `"error"` (a hard-to-parse envelope,
+/// `max_turns`, an escalation variant, or a bare non-zero exit with
+/// neither signal). When `stdout` is non-empty but doesn't parse as the
+/// expected JSON envelope, this prints a warning naming the unit and the
+/// first 120 chars — silent swallowing here previously meant a model that
+/// broke the `--json` contract read as an ordinary clean "stop" whenever
+/// `exit_code == 0`. `rest_ms` (#1959) is the global inter-turn rest this
+/// dispatch actually took (`metrics.rest_ms`, #2094) — surfaced beside
+/// `wall_ms` on the `step complete`/`step error` payload so a rested
+/// unit's wall clock is never misread as a slow model.
+fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> (String, u64, u64, u64, Option<String>, Option<Value>, u64) {
     let envelope: Option<Value> = if res.stdout.trim().starts_with('{') {
         serde_json::from_str(&res.stdout).ok()
     } else {
@@ -397,40 +406,52 @@ fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> (String, u6
     let completion_tok =
         envelope.as_ref().and_then(|e| e.pointer("/metrics/completion_tokens")).and_then(Value::as_u64).unwrap_or(0);
     let detections = envelope.as_ref().and_then(|e| e.get("detections")).cloned();
-    (result_label, wall_ms, prompt_tok, completion_tok, model, detections)
+    let rest_ms = envelope.as_ref().and_then(|e| e.pointer("/metrics/rest_ms")).and_then(Value::as_u64).unwrap_or(0);
+    (result_label, wall_ms, prompt_tok, completion_tok, model, detections, rest_ms)
 }
 
-// ── flow records ─────────────────────────────────────────────────────────
+// ── flow records (#1959, revised — no bespoke `crawl.*` vocabulary) ──────
+//
+// The crawl launcher mints a real Mission/Phase/Task/Step (it always
+// has), so it uses the SAME generic lifecycle actions every other
+// mission uses — `mission start`/`mission close` (via
+// `crew::lifecycle::mission_start_with_reasoning_and_payload`/
+// `mission_terminal_with_reasoning_and_payload`) and `step start`/`step
+// complete`/`step error` (via this module's own `unit_step_record`,
+// wrapping `darkmux_crew::scheduler::step_lifecycle_record_with_payload`)
+// — with the crawl-specific numbers riding in `payload`. There is no
+// `crawl.finding` and no replacement for it: the runtime classifies a
+// REJECTED/NOT-RECORDED `report_finding` reply as a FAILED tool call, so
+// `payload.ok` on the ordinary `dispatch.tool` record already tells an
+// external tracker whether a finding was accepted — see
+// `crew::dispatch::DispatchOpts::record_context`, set per unit on the
+// dispatch below, which merges this unit's `workspace`/`source`/`sha`/
+// `rule`/`unit` under `payload.context` on every record that dispatch's
+// flow-record surface emits.
 
-fn crawl_record(
+/// `step_lifecycle_record_with_payload` stamps `session_id` from
+/// `session_id::task(&step.task_id)` — the convention every
+/// `run_step_graph`-driven mission uses. This launcher drives its own
+/// sequential loop instead and has its OWN established per-unit session
+/// id (`crawl-{mission_id}-{unit_id}`, shared with that unit's dispatch
+/// and findings) — this wrapper builds the record via the shared
+/// builder (so the canonical action/shape is never hand-duplicated) then
+/// overrides `session_id`/`mission_id` to this launcher's own
+/// convention, keeping a unit's `step start`/`step complete` correlated
+/// with its dispatch by session id, same as before this packet.
+fn unit_step_record(
+    step: &crew::types::Step,
     action: &str,
     mission_id: &str,
-    session_id: Option<&str>,
+    session_id: &str,
     payload: Value,
     model: Option<&str>,
 ) -> darkmux_flow::FlowRecord {
-    darkmux_flow::FlowRecord {
-        ts: darkmux_flow::ts_utc_now(),
-        level: darkmux_flow::Level::Info,
-        category: darkmux_flow::Category::Work,
-        tier: darkmux_flow::Tier::Local,
-        stage: darkmux_flow::Stage::Dispatch,
-        action: action.to_string(),
-        handle: "crawler".to_string(),
-        phase_id: None,
-        session_id: session_id.map(String::from),
-        source: Some("crawl".to_string()),
-        model: model.map(String::from),
-        reasoning: None,
-        mission_id: Some(mission_id.to_string()),
-        machine_id: None,
-        machine_uid: None,
-        prev_hash: None,
-        hash: None,
-        payload: Some(payload),
-        work_id: None,
-        attempt: None,
-    }
+    let mut rec = darkmux_crew::scheduler::step_lifecycle_record_with_payload(step, action, Some(payload));
+    rec.mission_id = Some(mission_id.to_string());
+    rec.session_id = Some(session_id.to_string());
+    rec.model = model.map(String::from);
+    rec
 }
 
 /// Strip a container-path prefix off a finding's `file` field — either the
@@ -481,6 +502,31 @@ fn append_file(path: &Path, text: &str) -> Result<()> {
     f.write_all(text.as_bytes())
         .with_context(|| format!("appending to {}", path.display()))?;
     Ok(())
+}
+
+/// (#1959) Count `report_finding` tool calls THIS unit's dispatch made
+/// that the runtime rejected (`tool.completed` events with
+/// `tool_name == "report_finding"` and `ok == false` — see
+/// `runtime::failure_rate::classify_outcome`'s REJECTED/NOT-RECORDED
+/// classification). Reads `out_dir/.darkmux-runtime/trajectory.jsonl`,
+/// the same file the host tailer streams live; a missing/unreadable file
+/// or a line that doesn't parse is silently skipped (this is a
+/// best-effort "exclusions" count for the operator-facing payload/table,
+/// never a correctness-bearing value — the ledger and the accepted-
+/// findings count are unaffected by anything this function returns).
+fn count_rejected_report_findings(out_dir: &Path) -> usize {
+    let traj_path = out_dir.join(".darkmux-runtime").join("trajectory.jsonl");
+    let Ok(body) = std::fs::read_to_string(&traj_path) else {
+        return 0;
+    };
+    body.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| {
+            v.get("type").and_then(Value::as_str) == Some("tool.completed")
+                && v.get("tool_name").and_then(Value::as_str) == Some("report_finding")
+                && v.get("ok").and_then(Value::as_bool) == Some(false)
+        })
+        .count()
 }
 
 /// One (source, rule-group) Task, and the ordered Step ids of the units
@@ -538,7 +584,7 @@ struct FinalizeCtx {
 /// `build_message`'s rule lookup — see finding 1a for why that's
 /// unreachable in production, and this module's tests for a panic-
 /// injection proof of the same safety net) or a panic still leaves a
-/// matching `crawl.mission.completed` record, a written envelope, and a
+/// matching `mission close` record, a written envelope, and a
 /// non-`Active` mission behind — never a mission stuck `Active` with the
 /// counts accumulated so far silently lost. `close()` (the normal
 /// end-of-loop path) disarms the guard so `Drop` never double-finalizes.
@@ -589,8 +635,10 @@ impl Drop for CrawlFinalizeGuard<'_> {
 /// Shared finalize logic for both the normal end-of-loop path
 /// ([`CrawlFinalizeGuard::close`]) and the abort path
 /// ([`CrawlFinalizeGuard`]'s `Drop`): transitions the phase to its correct
-/// terminal (finding 3), closes the mission, emits `crawl.mission.
-/// completed`, prints the summary table, and writes the envelope.
+/// terminal (finding 3), closes the mission (the generic `mission close`
+/// record, carrying this run's own numbers in its payload — see this
+/// module's "flow records" section), prints the summary table, and
+/// writes the envelope.
 fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32> {
     let s = stats.borrow();
 
@@ -603,10 +651,6 @@ fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32>
     } else {
         let _ = crew::lifecycle::phase_abandon(&ctx.phase_id);
     }
-    let _ = crew::lifecycle::mission_close_with_reasoning(
-        &ctx.mission_id,
-        Some(&format!("crawl stopped_by={}", s.stopped_by)),
-    );
 
     let total_tokens = s.prompt_tokens_total + s.completion_tokens_total;
     let wall_hours = (s.wall_ms_total as f64) / 1000.0 / 3600.0;
@@ -619,7 +663,7 @@ fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32>
 
     let summary = json!({
         "mission_id": ctx.mission_id,
-        "corpus": ctx.corpus_name,
+        "workspace": ctx.corpus_name,
         "units_in_plan": ctx.units_in_plan,
         "units_selected": ctx.units_selected,
         "units_not_run": units_not_run,
@@ -649,13 +693,12 @@ fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32>
             .unwrap_or_else(|| "planned in-process".to_string()),
         "units_filter": ctx.units_filter,
     });
-    let _ = darkmux_flow::record(crawl_record(
-        "crawl.mission.completed",
+    let _ = crew::lifecycle::mission_terminal_with_reasoning_and_payload(
         &ctx.mission_id,
-        Some(&ctx.mission_id),
-        summary.clone(),
-        s.first_model.as_deref(),
-    ));
+        MissionStatus::Finalized,
+        Some(&format!("crawl stopped_by={}", s.stopped_by)),
+        Some(summary.clone()),
+    );
 
     // (CONSIDER 4) Printed BEFORE the envelope write below, not after: the
     // Drop path's `let _ = finalize_crawl(...)` swallows this function's
@@ -908,14 +951,17 @@ pub(crate) fn run(
     // through the mission-specific runs-dir creation below is a strand
     // window: a bare `?` on any of these would leave a partially-minted
     // Active mission behind with no reconcile. Route every failure through
-    // `reconcile_mint_failure` (closes the mission terminal, cascading any
-    // partially-minted Planned/Running phase — and its steps — to
-    // Abandoned) before propagating, mirroring `dispatch_as_crew_of_one`'s
-    // identical guarding of its own post-mint setup calls. `started_emitted`
-    // tracks whether `crawl.mission.started` made it out before the failure,
-    // so the paired `crawl.mission.completed` is emitted iff its opener was.
+    // `reconcile_mint_failure` (closes the mission terminal via the SAME
+    // generic `mission close`/`mission abort` record every other mission
+    // uses, cascading any partially-minted Planned/Running phase — and its
+    // steps — to Abandoned, before propagating) — mirroring
+    // `dispatch_as_crew_of_one`'s identical guarding of its own post-mint
+    // setup calls. Unlike the retired bespoke `crawl.mission.*` pairing,
+    // there is nothing extra to track here: `reconcile_mint_failure` is a
+    // no-op when `mission.json` was never written, and always emits the
+    // paired terminal record when it was — whether or not `mission start`
+    // itself got as far as running.
     let tree_root = manifest.resolved_root().join("tree");
-    let mut started_emitted = false;
     let mint_result: Result<()> = (|| {
         let phase = Phase {
             id: phase_id.clone(),
@@ -1000,67 +1046,63 @@ pub(crate) fn run(
         phase.task_ids = task_ids;
         crew::lifecycle::save_phase(&phase).context("persisting phase task_ids")?;
 
-        crew::lifecycle::mission_start_with_reasoning(&mission_id, Some("launched from `darkmux mission launch crawl`"))
-            .context("starting the newly-minted mission")?;
-        crew::lifecycle::phase_start(&phase_id).context("starting the crawl phase")?;
-
-        let _ = darkmux_flow::record(crawl_record(
-            "crawl.mission.started",
+        crew::lifecycle::mission_start_with_reasoning_and_payload(
             &mission_id,
-            Some(&mission_id),
-            json!({
-                "corpus": manifest.name,
+            Some("launched from `darkmux mission launch crawl`"),
+            Some(json!({
+                "workspace": manifest.name,
                 "units_in_plan": units_in_plan,
                 "units_selected": units_selected,
                 "est_tokens": est_tokens_total,
                 "sources": sources_summary,
-            }),
-            None,
-        ));
-        started_emitted = true;
+            })),
+        )
+        .context("starting the newly-minted mission")?;
+        crew::lifecycle::phase_start(&phase_id).context("starting the crawl phase")?;
 
         // (#1959 merge-gate finding 1) The last fallible step of the mint
         // window — a failure here (e.g. `<corpus root>/runs` already exists
         // as a regular file) is the one the operator is most likely to hit
-        // in practice, and it now unwinds through `reconcile_mint_failure`
-        // + the paired `crawl.mission.completed` below instead of leaving a
-        // stranded Active mission with an unpaired `crawl.mission.started`.
+        // in practice, and it now unwinds through `reconcile_mint_failure`'s
+        // own paired `mission close`/`mission abort` instead of leaving a
+        // stranded Active mission behind.
         std::fs::create_dir_all(&runs_dir).with_context(|| format!("creating {}", runs_dir.display()))?;
 
         Ok(())
     })();
 
     if let Err(e) = mint_result {
-        crew::lifecycle::reconcile_mint_failure(&mission_id, &format!("mission launch crawl errored during mint: {e:#}"));
-        if started_emitted {
-            let _ = darkmux_flow::record(crawl_record(
-                "crawl.mission.completed",
-                &mission_id,
-                Some(&mission_id),
-                json!({
-                    "corpus": manifest.name,
-                    "units_in_plan": units_in_plan,
-                    "units_selected": units_selected,
-                    "units_not_run": units_in_plan,
-                    "units_completed": 0,
-                    "units_errored": 0,
-                    "units_skipped": 0,
-                    "findings": 0,
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "wall_ms": 0,
-                    "tokens_per_hour": 0,
-                    "stopped_by": "error",
-                    "model": Value::Null,
-                    "profile": Value::Null,
-                    "timeout_secs": timeout,
-                    "limit": limit,
-                    "plan_path": plan_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "planned in-process".to_string()),
-                    "units_filter": units_filter,
-                }),
-                None,
-            ));
-        }
+        // (#1959) A best-effort payload — every count is honestly zero
+        // (nothing ran before the mint window itself failed), but
+        // `workspace`/`units_in_plan`/`units_selected` are already known
+        // and `stopped_by: "error"` is the one signal a reader actually
+        // needs from this record.
+        let payload = json!({
+            "workspace": manifest.name,
+            "units_in_plan": units_in_plan,
+            "units_selected": units_selected,
+            "units_not_run": units_in_plan,
+            "units_completed": 0,
+            "units_errored": 0,
+            "units_skipped": 0,
+            "findings": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "wall_ms": 0,
+            "tokens_per_hour": 0,
+            "stopped_by": "error",
+            "model": Value::Null,
+            "profile": Value::Null,
+            "timeout_secs": timeout,
+            "limit": limit,
+            "plan_path": plan_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "planned in-process".to_string()),
+            "units_filter": units_filter,
+        });
+        crew::lifecycle::reconcile_mint_failure_with_payload(
+            &mission_id,
+            &format!("mission launch crawl errored during mint: {e:#}"),
+            Some(payload),
+        );
         return Err(e);
     }
 
@@ -1119,42 +1161,42 @@ pub(crate) fn run(
         let kind = unit_kind(unit);
 
         let step_id = step_id_by_index[i].clone();
-        if let Ok(mut step) = crew::lifecycle::load_step(&mission_id, &phase_id, &step_id) {
-            step.status = NodeStatus::Running;
-            step.started_ts = Some(now_unix());
-            let _ = crew::lifecycle::save_step(&mission_id, &phase_id, &step);
-        }
 
-        // (#1959 merge-gate finding 5) Computed BEFORE `crawl.unit.started`
-        // is emitted, so that record's `session_id` carries the UNIT's own
+        // (#1959 merge-gate finding 5) Computed BEFORE `step start` is
+        // emitted, so that record's `session_id` carries the UNIT's own
         // session — it used to carry the mission id (the same value every
-        // OTHER `crawl.*` record for this mission already carries), which
-        // made `crawl.unit.started` the one record in this family you
-        // couldn't correlate to its matching `crawl.unit.completed` by
-        // session id alone.
+        // OTHER record for this mission already carries), which made this
+        // the one record in the family you couldn't correlate to its
+        // matching completion by session id alone.
         let session_id = format!("crawl-{mission_id}-{}", unit.id());
 
         let started_payload = match unit {
             Unit::Site { sites, .. } => json!({
-                "corpus": manifest.name, "unit": unit.id(), "source": source, "sha": sha,
+                "workspace": manifest.name, "unit": unit.id(), "source": source, "sha": sha,
                 "rule": rule_ids, "kind": kind, "est_tokens": unit.est_tokens(), "sites": sites.len(),
             }),
             Unit::Read { files, .. } => json!({
-                "corpus": manifest.name, "unit": unit.id(), "source": source, "sha": sha,
+                "workspace": manifest.name, "unit": unit.id(), "source": source, "sha": sha,
                 "rule": rule_ids, "kind": kind, "est_tokens": unit.est_tokens(), "files": files.len(),
             }),
             Unit::Edge { sites, .. } => json!({
-                "corpus": manifest.name, "unit": unit.id(), "source": source, "sha": sha,
+                "workspace": manifest.name, "unit": unit.id(), "source": source, "sha": sha,
                 "rule": rule_ids, "kind": kind, "est_tokens": unit.est_tokens(), "sites": sites.len(),
             }),
         };
-        let _ = darkmux_flow::record(crawl_record(
-            "crawl.unit.started",
-            &mission_id,
-            Some(&session_id),
-            started_payload,
-            None,
-        ));
+        if let Ok(mut step) = crew::lifecycle::load_step(&mission_id, &phase_id, &step_id) {
+            step.status = NodeStatus::Running;
+            step.started_ts = Some(now_unix());
+            let _ = crew::lifecycle::save_step(&mission_id, &phase_id, &step);
+            let _ = darkmux_flow::record(unit_step_record(
+                &step,
+                "step start",
+                &mission_id,
+                &session_id,
+                started_payload,
+                None,
+            ));
+        }
 
         let message = build_message(&rules_by_id, unit)?;
         let opts = DispatchOpts {
@@ -1179,9 +1221,10 @@ pub(crate) fn run(
             system_prompt_override: None,
             workspace_read_only: true,
             // (#1959 flow-record vocabulary retirement) Provenance the
-            // runtime cannot know — merged by the host tailer into every
-            // `dispatch.finding` record this unit's dispatch produces (see
-            // `dispatch_internal.rs`'s `"tool.completed"` handler).
+            // runtime cannot know — merged by the host tailer under
+            // `payload.context` on every record this unit's dispatch
+            // produces (`dispatch.tool`, the bookends, …; see
+            // `dispatch_internal.rs`'s `merge_record_context`).
             record_context: Some(json!({
                 "workspace": manifest.name,
                 "source": source,
@@ -1193,8 +1236,8 @@ pub(crate) fn run(
 
         let dispatch_outcome = dispatch_fn(opts);
 
-        let (mut result_label, wall_ms, prompt_tok, completion_tok, model, detections) = match &dispatch_outcome {
-            Err(_) => ("error".to_string(), 0u64, 0u64, 0u64, None, None),
+        let (mut result_label, wall_ms, prompt_tok, completion_tok, model, detections, rest_ms) = match &dispatch_outcome {
+            Err(_) => ("error".to_string(), 0u64, 0u64, 0u64, None, None, 0u64),
             Ok(res) => interpret_dispatch_result(unit.id(), res),
         };
         // (#1959 merge-gate finding 13) SIGINT may have arrived WHILE this
@@ -1221,6 +1264,18 @@ pub(crate) fn run(
         }
 
         let mut findings_n = 0usize;
+        // (#1959) `exclusions` — rejected `report_finding` calls this unit
+        // made, read from the SAME `trajectory.jsonl` the tailer streams
+        // live (see runtime::failure_rate::classify_outcome's REJECTED/
+        // NOT-RECORDED classification): a cheap sibling scan to the
+        // findings.jsonl read just below, giving an accurate count rather
+        // than inferring it from the accepted-findings count alone.
+        let exclusions_n = dispatch_outcome
+            .as_ref()
+            .ok()
+            .and_then(|res| res.out_dir.as_deref())
+            .map(count_rejected_report_findings)
+            .unwrap_or(0);
         if let Ok(res) = &dispatch_outcome {
             if let Some(out_dir) = &res.out_dir {
                 let findings_path = out_dir.join(".darkmux-runtime").join("findings.jsonl");
@@ -1257,13 +1312,17 @@ pub(crate) fn run(
                         let line_out = serde_json::to_string(&rec).unwrap_or_default();
                         ledger_buf.push_str(&line_out);
                         ledger_buf.push('\n');
-                        let _ = darkmux_flow::record(crawl_record(
-                            "crawl.finding",
-                            &mission_id,
-                            Some(&session_id),
-                            rec,
-                            model.as_deref(),
-                        ));
+                        // (#1959, revised) No flow record here — a finding
+                        // is never a special record. The runtime already
+                        // classified this `report_finding` call's outcome
+                        // on the `dispatch.tool` record its own tailer
+                        // emitted (`payload.ok: true` for an accepted
+                        // finding), and `DispatchOpts::record_context`
+                        // (set on this unit's dispatch, above)
+                        // carried this launcher's provenance under
+                        // `payload.context` on that SAME record. The
+                        // ledger line just written IS the durable,
+                        // harness-verified record of this finding.
                     }
                     if !ledger_buf.is_empty() {
                         let _ = append_file(&ledger_path, &ledger_buf);
@@ -1296,6 +1355,26 @@ pub(crate) fn run(
             s.wall_ms_total += wall_ms;
         }
 
+        let mut completed_payload = json!({
+            "workspace": manifest.name,
+            "unit": unit.id(),
+            "source": source,
+            "sha": sha,
+            "rule": rule_ids,
+            "result": result_label,
+            "findings": findings_n,
+            "exclusions": exclusions_n,
+            "prompt_tokens": prompt_tok,
+            "completion_tokens": completion_tok,
+            "wall_ms": wall_ms,
+            "rest_ms": rest_ms,
+        });
+        if let Some(d) = &detections {
+            completed_payload["detections"] = d.clone();
+        }
+        if let Some(m) = &model {
+            completed_payload["model"] = json!(m);
+        }
         if let Ok(mut step) = crew::lifecycle::load_step(&mission_id, &phase_id, &step_id) {
             step.status = if interrupted_at_readback {
                 NodeStatus::Abandoned
@@ -1307,30 +1386,27 @@ pub(crate) fn run(
             step.completed_ts = Some(now_unix());
             step.output = Some(result_label.clone());
             let _ = crew::lifecycle::save_step(&mission_id, &phase_id, &step);
+            // (#1959, revised) `STEP_LIFECYCLE_ACTIONS` has no dedicated
+            // "abandon" action — a kill-file/interrupted unit's step
+            // reaches `NodeStatus::Abandoned` on disk but is reported
+            // through the SAME `"step error"` action every genuine error
+            // uses; `payload.result` (already `"interrupted"` vs
+            // `"error"`/`"timeout"`) is where the real nuance lives, the
+            // same design the retired `crawl.unit.completed` action used
+            // for all four outcomes under one action string.
+            let action = match step.status {
+                NodeStatus::Complete => "step complete",
+                _ => "step error",
+            };
+            let _ = darkmux_flow::record(unit_step_record(
+                &step,
+                action,
+                &mission_id,
+                &session_id,
+                completed_payload,
+                model.as_deref(),
+            ));
         }
-
-        let mut completed_payload = json!({
-            "corpus": manifest.name,
-            "unit": unit.id(),
-            "source": source,
-            "sha": sha,
-            "rule": rule_ids,
-            "result": result_label,
-            "findings": findings_n,
-            "prompt_tokens": prompt_tok,
-            "completion_tokens": completion_tok,
-            "wall_ms": wall_ms,
-        });
-        if let Some(d) = &detections {
-            completed_payload["detections"] = d.clone();
-        }
-        let _ = darkmux_flow::record(crawl_record(
-            "crawl.unit.completed",
-            &mission_id,
-            Some(&session_id),
-            completed_payload,
-            model.as_deref(),
-        ));
 
         stats.borrow_mut().per_unit_rows.push(json!({
             "unit": unit.id(),

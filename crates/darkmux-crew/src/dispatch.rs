@@ -289,18 +289,22 @@ pub struct DispatchOpts {
     /// read-write workspace exactly.
     pub workspace_read_only: bool,
     /// (#1959 flow-record vocabulary retirement) Provenance the runtime
-    /// CANNOT know, merged into the payload of the ONE live `dispatch.
-    /// finding` record the host tailer emits per accepted `report_finding`
-    /// tool call (see `dispatch_internal.rs`'s `handle_event` doc on
-    /// `"tool.completed"`). The runtime only sees the model's own claimed
-    /// `file`/`line`/`pattern`/`evidence`/`why` — it has no concept of
-    /// which workspace/source/sha/rule/unit this dispatch belongs to. The
+    /// itself has no concept of — merged under `payload.context` on EVERY
+    /// record this dispatch's flow-record surface emits: the `dispatch
+    /// start`/`dispatch complete`/`dispatch error` bookends and every
+    /// live per-event record the host tailer produces (`dispatch.tool`,
+    /// `dispatch.turn`, `telemetry.*`, …). Deliberately NOT scoped to one
+    /// action — the hook layer stays event-agnostic; an external tracker
+    /// that wants "an accepted `report_finding` call" subscribes via a
+    /// `HookMatch` payload predicate (`"payload.tool_name":
+    /// "report_finding", "payload.ok": true`) against the ordinary
+    /// `dispatch.tool` record instead of a bespoke finding action. The
     /// crawl launcher is the one caller that sets this today (`workspace,
-    /// source, sha, rule, unit`); every other caller passes `None`, which
-    /// is a complete no-op — no merge happens, `dispatch.finding` payload
-    /// carries only what the tool call itself reported. Must be a JSON
-    /// object when `Some` (a non-object is ignored rather than corrupting
-    /// the payload shape — see the merge site's own doc).
+    /// source, sha, rule, unit`, per unit); every other caller passes
+    /// `None`, which is a complete no-op — no `context` key appears at
+    /// all. Must be a JSON object when `Some` (a non-object is ignored
+    /// rather than corrupting the payload shape — see
+    /// `dispatch_internal::merge_record_context`'s own doc).
     pub record_context: Option<serde_json::Value>,
 }
 

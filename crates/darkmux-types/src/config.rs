@@ -610,8 +610,9 @@ pub struct HookRule {
 /// A hook rule's match predicate — every field is an independent AND'd
 /// condition; a field left `None` doesn't gate. `action` is a small glob
 /// (`*` within a segment, or a trailing `*` segment matching one-or-more
-/// further dot-separated segments — e.g. `crawl.*` matches `crawl.finding`
-/// but not `crawler`; a bare `*` matches every action). The rest are exact
+/// further dot-separated segments — e.g. `dispatch.*` matches
+/// `dispatch.tool` but not `dispatched`; a bare `*` matches every action).
+/// The rest are exact
 /// matches against the record's own fields — `session_id`/`mission_id`/
 /// `machine_id` compare as plain strings, `category`/`level` compare
 /// against the record's serialized (lowercase) enum value.

@@ -3414,8 +3414,10 @@ fn crawl_plan_table_marks_shared_read_pass_rows() {
 
     // A second read rule matching the SAME `.ts` files as the built-in
     // doc-contradicts-code rule, so they share exactly one ruleset and
-    // land in the same unit(s).
-    let user_rules_dir = workdir.path().join("crawl-rules");
+    // land in the same unit(s). (#1959: the user-tier rules dir moved
+    // from `<darkmux root>/crawl-rules` to `<darkmux root>/rules` when
+    // rules were promoted to a general template kind.)
+    let user_rules_dir = workdir.path().join("rules");
     fs::create_dir_all(&user_rules_dir).unwrap();
     fs::write(
         user_rules_dir.join("second-read-rule.json"),

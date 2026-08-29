@@ -3925,8 +3925,8 @@ fn drain_complete_lines_from_bytes(pending: &mut Vec<u8>) -> Vec<String> {
     out
 }
 
-/// (#1959, revised — no `dispatch.finding` action; `record_context` rides
-/// EVERY tailer/bookend record instead) Merge `record_context` under
+/// (#1959, revised — no bespoke per-finding action; `record_context`
+/// rides EVERY tailer/bookend record instead) Merge `record_context` under
 /// `payload.context` — provenance a dispatch caller supplied (the crawl
 /// launcher's `workspace`/`source`/`sha`/`rule`/`unit`) that no runtime
 /// signal can derive on its own. Applied uniformly wherever a flow record
@@ -4004,9 +4004,9 @@ struct TailerState {
     /// (#1959 flow-record vocabulary retirement) `DispatchOpts::record_context`
     /// forwarded from the call site — provenance the runtime cannot know
     /// (e.g. the crawl launcher's `workspace`/`source`/`sha`/`rule`/`unit`),
-    /// merged into every `dispatch.finding` record this dispatch's
-    /// `report_finding` tool calls produce. `None` for every caller that
-    /// doesn't set `DispatchOpts::record_context` — a complete no-op.
+    /// merged under `payload.context` on every record this dispatch's
+    /// tailer emits. `None` for every caller that doesn't set
+    /// `DispatchOpts::record_context` — a complete no-op.
     record_context: Option<serde_json::Value>,
 }
 
@@ -4040,10 +4040,10 @@ impl TailerState {
     }
 
     /// (#1959 flow-record vocabulary retirement) Forward
-    /// `DispatchOpts::record_context` so `dispatch.finding` records can
-    /// carry provenance the runtime itself has no concept of. Builder-style,
-    /// same pattern as `with_step`/`with_compaction_threshold`; only
-    /// production `run_tailer` opts in.
+    /// `DispatchOpts::record_context` so every record this tailer emits
+    /// can carry provenance the runtime itself has no concept of.
+    /// Builder-style, same pattern as `with_step`/`with_compaction_threshold`;
+    /// only production `run_tailer` opts in.
     fn with_record_context(mut self, record_context: Option<serde_json::Value>) -> Self {
         self.record_context = record_context;
         self
