@@ -203,7 +203,45 @@ function machineChromePrefixOf(fullText: string): string {
   const stageMarker = "=== stage ===\n";
   const idx = fullText.indexOf(stageMarker);
   if (idx === -1) throw new Error(`machineChromePrefixOf: no "${stageMarker.trim()}" marker found`);
-  return fullText.slice(0, idx);
+  return normalizeMachineCrumb(fullText.slice(0, idx));
+}
+
+/**
+ * (operator finding, phone screenshot) A NAMED normalization, per this
+ * file's own top-of-file discipline ("Byte equality is the default... the
+ * fix is a NAMED normalization with a comment justifying it here — never a
+ * silent fuzzy match").
+ *
+ * `#crumb` on the machine lens used to repeat the machine name
+ * (`targetMachineName ?? "this machine"`, matching legacy's `renderCrumb()`
+ * byte-for-byte — this is why `goldens/machine.txt`'s own `=== crumb ===`
+ * section still reads "MacBook-Pro", a frozen LEGACY artifact never edited
+ * out of the golden). `App.tsx` kept that text but folded the element into
+ * the sticky tab row on desktop; on a phone the narrow stylesheet gave the
+ * SAME in-DOM element its own full-width row regardless of its text, so the
+ * machine name rendered as a whole standalone line between the tab bar and
+ * `MachineLens`'s own `.machine-lens__hdr` breadcrumb, which had already
+ * dropped its OWN copy of the name for the identical reason (see that
+ * component's own doc). Root cause was DOM PRESENCE, not text content — so
+ * `App.tsx` now doesn't render `<header id="crumb">` AT ALL on the machine
+ * route, at any width. `#crumb` extracts as `(empty)` on this lens now,
+ * genuinely (not just normalized-away): this function is applied to BOTH
+ * sides of the comparison below, so the golden's literal "MacBook-Pro" is
+ * replaced with the SAME placeholder the port's real empty crumb already
+ * produces, and the surrounding topbar/meta/logscope stay byte-exact. If a
+ * future regression brings the name back OR removes it from somewhere it
+ * should still appear, this normalization does not hide that — it only
+ * neutralizes the one, understood, deliberate divergence named here.
+ */
+function normalizeMachineCrumb(chromeText: string): string {
+  const crumbMarker = "=== crumb ===\n";
+  const metaMarker = "=== meta ===\n";
+  const crumbIdx = chromeText.indexOf(crumbMarker);
+  if (crumbIdx === -1) throw new Error(`normalizeMachineCrumb: no "${crumbMarker.trim()}" marker found`);
+  const contentStart = crumbIdx + crumbMarker.length;
+  const metaIdx = chromeText.indexOf(metaMarker, contentStart);
+  if (metaIdx === -1) throw new Error(`normalizeMachineCrumb: no "${metaMarker.trim()}" marker found after crumb`);
+  return chromeText.slice(0, contentStart) + "(empty)\n" + chromeText.slice(metaIdx);
 }
 
 /** The golden's own stage text, sliced down to JUST the header line — the
@@ -260,14 +298,21 @@ test("next: click-navigation into #lens=machine matches goldens/machine.txt", as
   await expect(page.locator("body")).not.toHaveClass(/booting/);
 
   // (#1809, then narrowed further by #1806 Stage 2/3, then narrowed a THIRD
-  // time by the utility-block redesign + its reorder follow-up) See this
-  // file's own `machineChromePrefixOf`/`goldenMachineHdrText` doc for
-  // exactly which regions no longer correspond (the runs list, then the
-  // whole flat ledger, then the utility block itself) and why each is a
-  // deliberate divergence, not a regression.
+  // time by the utility-block redesign + its reorder follow-up, then a
+  // FOURTH time — operator finding, phone screenshot — for `#crumb` itself.
+  // See this file's own `machineChromePrefixOf`/`normalizeMachineCrumb`/
+  // `goldenMachineHdrText` doc for exactly which regions no longer
+  // correspond and why each is a deliberate divergence, not a regression.
   const got = await extractLensText(page);
   const golden = readGolden("machine");
-  expect(machineChromePrefixOf(got), "topbar/crumb/meta/logscope must still match byte-for-byte").toBe(
+  // Prove `#crumb` is genuinely empty on THIS side before normalizing it
+  // away below — `normalizeMachineCrumb` applies the same placeholder to
+  // both sides, which would silently mask a real (non-"MacBook-Pro")
+  // regression in the got side if this weren't checked directly first.
+  expect(await regionText(page, "crumb"), "#crumb must not render at all on the machine lens (operator finding)").toBe(
+    "",
+  );
+  expect(machineChromePrefixOf(got), "topbar/meta/logscope must still match byte-for-byte; crumb is normalized, see normalizeMachineCrumb's doc").toBe(
     machineChromePrefixOf(golden),
   );
   const gotHdr = await machineHdrText(page);
@@ -293,11 +338,15 @@ test("next: #lens=machine deep-link boot matches goldens/machine-deeplink.txt", 
   await expect(page.locator("body")).not.toHaveClass(/booting/);
 
   // (#1809, then narrowed further by #1806 Stage 2/3, then narrowed a THIRD
-  // time by the utility-block redesign + its reorder follow-up) — same
-  // split as the click-navigation test above.
+  // time by the utility-block redesign + its reorder follow-up, then a
+  // FOURTH time for `#crumb` itself) — same split as the click-navigation
+  // test above.
   const got = await extractLensText(page);
   const golden = readGolden("machine-deeplink");
-  expect(machineChromePrefixOf(got), "topbar/crumb/meta/logscope must still match byte-for-byte").toBe(
+  expect(await regionText(page, "crumb"), "#crumb must not render at all on the machine lens (operator finding)").toBe(
+    "",
+  );
+  expect(machineChromePrefixOf(got), "topbar/meta/logscope must still match byte-for-byte; crumb is normalized, see normalizeMachineCrumb's doc").toBe(
     machineChromePrefixOf(golden),
   );
   const gotHdr = await machineHdrText(page);

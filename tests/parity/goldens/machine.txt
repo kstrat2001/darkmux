@@ -18,7 +18,7 @@ MacBook-Pro
 MacBook-Pro
 
 === stage ===
-fleet › machine · MacBook-Pro — Apple M5 Max · 128 GB
+fleet › machine — Apple M5 Max · 128 GB
 darkmux/utility
 utility tier · darkmux:qwen3-4b-instruct-2507
 compaction · mission-compile · estimate · scribe

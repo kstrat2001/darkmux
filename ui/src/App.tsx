@@ -454,9 +454,32 @@ export function App() {
         {/* (#2073) `is-replay`: on a playback route the crumb repeats the
             meta line's own lead (`◆ <mission>`); the narrow stylesheet drops
             this copy, where a phone has no room for the same name twice. */}
-        <header className={`app-shell__crumb${route.kind === "playback" ? " is-replay" : ""}`} id="crumb">
-          {crumb}
-        </header>
+        {/* (operator finding, phone screenshot) `route.kind === "machine"` is
+            excluded from rendering `#crumb` AT ALL — not just emptied. The
+            #2108 round-N "desktop tab-row fold" comment above USED to claim
+            the machine-name crumb was handled by folding it into the tab
+            row; that only changed WHERE it sat, never WHETHER it rendered,
+            and the mobile-only override two rules below
+            (`.app-shell__crumb { flex: 1 1 100%; }`, `styles.css`) gives an
+            in-DOM `#crumb` its own full-width row regardless of whether its
+            text is empty or "MacBook-Pro" — a real element in a `gap`-ed
+            flex row still consumes a gap slot even with zero text. So the
+            machine name kept showing as a whole standalone line on a phone,
+            directly above `MachineLens`'s own `.machine-lens__hdr`
+            breadcrumb ("fleet › machine — <spec>", which already dropped
+            its OWN copy of the name for exactly this reason — see that
+            component's own doc). Root cause was DOM presence, not text
+            content, hence unmounting the element here rather than returning
+            `crumb: ""` from `routeChrome`'s `machine` branch (which still
+            feeds `logscope`, used elsewhere, and is left untouched).
+            `tests/parity/next-parity.spec.ts`'s machine-lens goldens are
+            updated to match — see that file's own `normalizeMachineCrumb`
+            doc for the byte-parity side of this call. */}
+        {route.kind !== "machine" && (
+          <header className={`app-shell__crumb${route.kind === "playback" ? " is-replay" : ""}`} id="crumb">
+            {crumb}
+          </header>
+        )}
         {/* (#2108, operator finding — round 2) `#meta` moved HERE too, from
             the now-deleted `.app-shell__crumbbar` wrapper, so the "N ⚙ ·
             last dispatch …" summary shares the tab row with the tabs and

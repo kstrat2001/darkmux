@@ -192,6 +192,36 @@ describe("App", () => {
     expect(machineHeaderMatches(/fleet › machine/)).toBe(true);
   });
 
+  // (operator finding, phone screenshot) `#crumb` used to repeat the
+  // machine name (`routeChrome`'s `machine` branch, `App.tsx`) — folded
+  // into the tab row on desktop, but given its OWN full-width row by the
+  // mobile stylesheet (`.app-shell__crumb { flex: 1 1 100%; }` under
+  // `max-width: 768px`), so a phone showed a whole standalone line reading
+  // just the machine name, directly above `MachineLens`'s own
+  // `.machine-lens__hdr` breadcrumb ("fleet › machine — <spec>"), which had
+  // already dropped its own copy of the name for the identical reason. The
+  // fix is App.tsx not rendering `<header id="crumb">` AT ALL on the
+  // machine route — jsdom performs no layout, so this doesn't simulate the
+  // phone breakpoint, but a genuinely absent element renders at every
+  // width, mobile included; the real, viewport-verified behavior is the
+  // `next-parity.spec.ts` machine-lens tests (desktop) and this fix's own
+  // real-browser screenshots (phone + desktop).
+  it("(operator finding) never renders #crumb on the machine lens — no machine-name row above the breadcrumb, at any width", async () => {
+    window.location.hash = "#lens=machine";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(machineHeaderMatches(/fleet › machine/)).toBe(true));
+    expect(document.getElementById("crumb")).toBeNull();
+    // The sibling `#meta` summary row is untouched by this fix — it must
+    // still be present and still sit inside the sticky block.
+    expect(document.getElementById("meta")).toBeTruthy();
+  });
+
   it("renders a named placeholder (with the raw hash) for an unrecognized route, never a blank page", () => {
     window.location.hash = "#lens=totally-bogus";
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
