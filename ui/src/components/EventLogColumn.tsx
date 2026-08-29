@@ -660,6 +660,20 @@ export function EventLogColumn({
                 filters
                 {activeFilters > 0 ? <span className="eventlog__fcount"> · {activeFilters}</span> : null}
               </button>
+              {/* (#2108, operator finding — real device, oversized Events
+                  header) Moved here from `.eventlog__search` below — on a
+                  phone this groups ALL three "controls" (follow, filters,
+                  the matches count) into one row alongside the search box's
+                  own row, matching the operator's ask for a compact
+                  two-row header instead of two half-empty ones. Desktop's
+                  own layout is unaffected: `.eventlog__headbtns` and
+                  `.eventlog__search` render exactly where they always
+                  did, this is purely which FLEX GROUP the pill's DOM node
+                  sits in — `id="qcount"` and its content are unchanged, so
+                  nothing that reads it by id cares that it moved. */}
+              <span className={`eventlog__qcount${qcountText ? " show" : ""}${q && filtered.length === 0 ? " zero" : ""}`} id="qcount" aria-live="polite">
+                {qcountText}
+              </span>
             </span>
           </h3>
           <div className="eventlog__search">
@@ -690,9 +704,6 @@ export function EventLogColumn({
                 </button>
               ) : null}
             </div>
-            <span className={`eventlog__qcount${qcountText ? " show" : ""}${q && filtered.length === 0 ? " zero" : ""}`} id="qcount" aria-live="polite">
-              {qcountText}
-            </span>
           </div>
         </div>
         {/* (#2108, operator finding — one-tap expand) Expanded, the list

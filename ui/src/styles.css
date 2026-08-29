@@ -754,19 +754,39 @@ body {
   outline-offset: 1px;
 }
 
-/* (operator, on the phone) The detail panel's height is an INLINE
-   `flex-basis` driven by the split-resizer's state — 38% by default. On
-   desktop that is legacy's draggable split and the operator can change it.
-   On mobile the resizer is hidden, so 38% becomes a permanent RESERVATION:
-   a short selected event leaves most of it blank, and the log list — the
-   thing you opened the panel to read — gets pushed below a screenful of
-   nothing. Measured at 402x844: a 192px detail holding 163px of body, with
-   the list starting 1279px down the page.
+/* (operator, on the phone — SUPERSEDED, see #2108 doc immediately below)
+   The detail panel's height is an INLINE `flex-basis` driven by the
+   split-resizer's state — 38% by default. On desktop that is legacy's
+   draggable split and the operator can change it. On mobile the resizer
+   is hidden, so 38% becomes a permanent RESERVATION: a short selected
+   event leaves most of it blank, and the log list — the thing you opened
+   the panel to read — gets pushed below a screenful of nothing. Measured
+   at 402x844: a 192px detail holding 163px of body, with the list
+   starting 1279px down the page.
 
    `flex-basis: auto` makes it size to CONTENT instead, capped so a large
-   event can still not swallow the column. `!important` is deliberate and is
-   the correct tool here: it exists to override an inline style, which is
-   exactly what this is doing. */
+   event can still not swallow the column. `!important` is deliberate and
+   is the correct tool here: it exists to override an inline style, which
+   is exactly what this is doing.
+
+   This comment's own premise — "the resizer is hidden" on mobile — is
+   what #2108 changed: the divider drag was re-enabled at this width
+   (`.eventlog__split`'s own doc), and this `!important` was never
+   reconciled with that. `!important` always outranks an inline style
+   regardless of specificity or source order, so EVERY drag on a phone
+   was setting `detailPct` in React state (confirmed: the inline
+   `flex-basis` percent genuinely changed, 38% → 15%) while this rule
+   silently kept the rendered box pinned to its own content size the
+   entire time — the actual root cause of "DIVIDER DRAG DOES NOTHING" on
+   a real device. The concern above doesn't carry over to the phone-
+   drawer sheet the same way it did to a page section: the sheet is a
+   BOUNDED, fixed-height container (`.phone-drawer__body .eventlog`'s own
+   `height: 100%`), so "38% of it" is a fixed, reasonable slice, not a
+   reservation that pushes the list down an open-ended SCROLLING page —
+   that failure mode was specific to `.eventlog{height:auto}` page-flow
+   layout this rule was written against. `max-height: 28vh` (kept, right
+   below) is still the safety valve against a large event swallowing the
+   column either way. */
 @media (max-width: 768px) {
   /* The record card shares this column with the event list, and at 45vh
      inside a 60vh column it left the list about 15vh — three or four rows,
@@ -774,9 +794,18 @@ body {
      selected record; the list is the thing being scanned, so the card yields
      first. */
   .eventlog__detail {
-    flex-basis: auto !important;
     max-height: 28vh;
   }
+  /* (#2108, operator finding — real device, dead EXPAND) This 28vh cap
+     predates the one-tap expand feature and quietly defeated it: even
+     though `toggleExpanded()` correctly applied `.eventlog__detail--
+     expanded` (verified — the class WAS toggling), this rule's
+     `max-height` clamped the pane's rendered box to ~28vh regardless,
+     so nothing on screen ever changed size. Equal specificity to
+     `.eventlog__detail--expanded` below, but that rule comes LATER in
+     the file, so its own `max-height: none` wins by source order and
+     lifts the cap — only while expanded; collapsed, this 28vh ceiling
+     is exactly right and untouched. */
   /* (#2068) While the pane follows the newest record its content changes on
      every event; a content-sized box then moves the whole list under it. Pin
      the height for that mode only — a hand-picked record is not streaming. */
@@ -790,6 +819,30 @@ body {
      twenty. */
   .eventlog__list {
     min-height: 340px;
+  }
+  /* (#2108, operator finding — real device, dead EXPAND) The mirror half
+     of the fix above: this floor ALSO predates one-tap expand and kept
+     the list at least 340px tall even while showing nothing but the
+     1-row `.eventlog__liststrip` — so the list never visibly "collapsed"
+     either, on top of the pane never visibly growing. `:has()` targets
+     only the collapsed-strip state (the ONLY time `.eventlog__liststrip`
+     is a child), leaving the 340px floor untouched for the normal full
+     list.
+
+     `flex: 0 0 auto` (not just the `min-height: 0` alone) is the actual
+     completion of the fix: `.eventlog__list`'s base rule is `flex: 1`
+     (grow: 1), the SAME grow factor `.eventlog__detail--expanded` has —
+     so even with the caps above lifted, list and pane still split the
+     free space evenly, and the strip (which needs ~40px under its own
+     header) got clipped to invisible by `.eventlog__list`'s own
+     `overflow: hidden` the moment list's ~50% share landed anywhere
+     under "header + 40px". Sizing list to its OWN content instead
+     (grow: 0) hands essentially all the free space to the pane, which
+     is what "the pane fills the sheet, the list collapses to a 1-row
+     strip" actually means. */
+  .eventlog__list:has(.eventlog__liststrip) {
+    flex: 0 0 auto;
+    min-height: 0;
   }
 }
 
@@ -953,6 +1006,16 @@ body {
     height: 28px;
     background: var(--border);
   }
+  /* (#2108, operator finding — real device, dead EXPAND) A `::after`
+     pseudo-element is always painted as the LAST child of its host, no
+     matter where its rule sits in the stylesheet — so this full-width
+     44px hit-area, meant only to extend the SPLIT's own touch target,
+     was stacking on TOP of `.eventlog__expand` and swallowing every tap
+     meant for the button (both share the split's `position:relative`
+     containing block; `z-index:auto` here loses to the button's explicit
+     `z-index` below purely by DOM-generation order, not by the rule
+     order on the page). `z-index: 0` pins it under the button instead of
+     leaving it implicit-last. */
   .eventlog__split::after {
     content: "";
     position: absolute;
@@ -961,6 +1024,7 @@ body {
     top: 50%;
     height: 44px;
     transform: translateY(-50%);
+    z-index: 0;
   }
   .eventlog__expand {
     display: inline-flex;
@@ -969,6 +1033,9 @@ body {
     right: 10px;
     top: 50%;
     transform: translateY(-50%);
+    /* Must outrank `::after` above (see that rule's own doc) — this is
+       the actual fix, not decoration. */
+    z-index: 1;
     padding: 3px 10px;
     border: 1px solid var(--border);
     border-radius: 999px;
@@ -991,9 +1058,15 @@ body {
    body; the list collapses to a 1-row strip beside it. `.eventlog__detail`
    normally sizes via the INLINE `flexBasis: detailPct%` style
    (`EventLogColumn.tsx`) — expanded, that inline style is omitted and
-   this class takes over instead. */
+   this class takes over instead. `max-height: none` lifts the OLDER
+   28vh mobile cap (the `@media (max-width: 768px) { .eventlog__detail
+   { max-height: 28vh } }` rule above, predating this feature) — without
+   it the class toggled correctly but the pane's rendered box never
+   actually changed size, which is exactly the "EXPAND does nothing" bug
+   a real device caught (that rule's own doc has the full story). */
 .eventlog__detail--expanded {
   flex: 1 1 auto;
+  max-height: none;
 }
 .eventlog__liststrip {
   flex: 0 0 auto;
@@ -5624,6 +5697,69 @@ body {
      scroll or the (now `position: fixed`) page behind it either. */
   .phone-drawer__body .eventlog__detailbody {
     overscroll-behavior: contain;
+  }
+  /* (#2108, operator finding — real device, oversized Events header) The
+     general ≤768px rules a few blocks up size `.eventlog__follow`/
+     `.eventlog__fbtn` to a 44x44 Apple-minimum tap target and the search
+     input to a ~50px-tall field — reasonable defaults for the standalone
+     narrow-page eventlog, but inside the SHEET (already squeezed by the
+     masthead-clearance cap, item 1 above) they made the header alone run
+     ~117px before a single event was visible. Scoped to
+     `.phone-drawer__body` specifically — the standalone layout keeps its
+     44px targets untouched; this is the operator's own explicit call for
+     the sheet ("36 px height with tight padding"), not a blanket
+     accessibility rollback.
+
+     Two-row layout, reordered via `order` (the label span and the two
+     rows stay exactly where `EventLogColumn.tsx` renders them — the
+     shared component's own DOM/parity contract is untouched, same
+     discipline as the list/split/detail reordering above): row 1 is the
+     search box alone, full width; row 2 is the follow/filters/matches-
+     count group `.eventlog__qcount` moved into (that move IS a real DOM
+     change, but a parity-safe one — see `EventLogColumn.tsx`'s own doc
+     on it). The "EVENTS LAST 24H" label is dropped here, not just
+     hidden-but-present like `#logscope` — the Events TAB already reads
+     "Events · N" a few px above it, so the label was pure repetition in
+     this one context; it stays fully visible in the standalone layout,
+     where there's no tab bar saying the same thing. */
+  .phone-drawer__body .eventlog__head {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 12px;
+  }
+  .phone-drawer__body .eventlog__head h3 {
+    order: 2;
+    min-height: 0;
+  }
+  .phone-drawer__body .eventlog__head h3 > span:first-child {
+    display: none;
+  }
+  .phone-drawer__body .eventlog__search {
+    order: 1;
+    margin-top: 0;
+  }
+  .phone-drawer__body .eventlog__follow,
+  .phone-drawer__body .eventlog__fbtn,
+  .phone-drawer__body .eventlog__qcount {
+    box-sizing: border-box;
+    min-width: 0;
+    height: 36px;
+    min-height: 0;
+    max-height: none;
+    padding: 0 10px;
+    display: inline-flex;
+    align-items: center;
+  }
+  .phone-drawer__body .eventlog__qcount {
+    justify-content: center;
+  }
+  /* 16px stays — dropping it re-triggers iOS Safari's zoom-on-focus for
+     any input under 16px (`.eventlog__searchbox input`'s own base-rule
+     doc has the full reasoning); this only trims the PADDING toward the
+     asked-for ~36px total, not the font. */
+  .phone-drawer__body .eventlog__searchbox input {
+    padding: 8px 26px;
   }
   .phone-drawer__handle {
     display: flex;

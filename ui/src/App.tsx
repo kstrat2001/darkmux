@@ -225,6 +225,34 @@ export function App() {
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
+  // (#2108, operator finding — real device) The masthead's own measured
+  // height feeds `--masthead-h`, so the phone drawer can cap its OPEN
+  // height and never draw its top edge over the logo row — a fixed 88vh
+  // covered the masthead on a real iPhone, where the ~64px the backdrop's
+  // own scrim clearance assumed wasn't quite what the real masthead
+  // rendered at. Queried directly by class rather than via a ref threaded
+  // through `<Masthead>` — that component's DOM is a parity-golden
+  // surface (`no-danger.test.ts` et al.); a `ref` prop wouldn't change
+  // its rendered output, but this keeps that file from needing to know
+  // about a purely-measurement need elsewhere. Same `ResizeObserver`
+  // pattern as `--chrome-h` above; set on `documentElement` rather than
+  // `.app-shell` since `PhoneDrawer`'s sheet is `position: fixed` and a
+  // custom property only needs to be somewhere in its ancestor chain —
+  // the root is the least assumption-laden place for that.
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") return undefined;
+    const el = document.querySelector(".masthead");
+    if (!el) return undefined;
+    const apply = () =>
+      document.documentElement.style.setProperty(
+        "--masthead-h",
+        `${Math.round(el.getBoundingClientRect().height)}px`,
+      );
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   // (#1800 P2, QA gate) Route-gated for the same reason `useLiveTail` above
   // is, and the gate is load-bearing in a way that is easy to get wrong:
   // `FleetLens` already passed `enabled: false` on a replay, but a DISABLED

@@ -386,7 +386,22 @@ export function PhoneDrawer({
         // to/from the closed CSS value smoothly (both are concrete
         // lengths — see this file's own doc on why that works without a
         // JS-side safe-area calculation).
-        style={open ? { height: `${openPct}vh` } : undefined}
+        //
+        // (#2108, operator finding — real device) `min(...)` caps the
+        // rendered height so the sheet's TOP EDGE never draws over the
+        // masthead: a plain `${openPct}vh` let the sheet grow tall enough
+        // to cover the logo row on a real iPhone. `--masthead-h` is
+        // `App.tsx`'s own `ResizeObserver`-measured value (that effect's
+        // doc); `64px` is only the fallback for the one frame before it
+        // has run. This only clamps what's PAINTED — `openPct` itself
+        // (the drag state, persistence, `MAX_OPEN_PCT`) is untouched, so
+        // the drag still tracks the finger 1:1 up to the same ceiling the
+        // finger would visually hit.
+        style={
+          open
+            ? { height: `min(${openPct}vh, calc(100vh - var(--masthead-h, 64px) - 8px))` }
+            : undefined
+        }
       >
         {/* (#2108, "one card" packet) The handle + two tabs are now PART
             of the sliding sheet, not a second, separately-positioned

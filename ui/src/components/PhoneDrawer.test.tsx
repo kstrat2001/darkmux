@@ -243,7 +243,13 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     let sheet = document.querySelector(
       '[data-act="phone-drawer"]',
     ) as HTMLElement;
-    expect(sheet.style.height).toBe("30vh");
+    // (#2108, operator finding — real device, masthead cap) The raw
+    // `${openPct}vh` is now wrapped in `min(...)` against a masthead-
+    // height CSS var, so the sheet's top edge can never draw over the
+    // masthead — see `PhoneDrawer.tsx`'s own doc on this inline style.
+    expect(sheet.style.height).toBe(
+      "min(30vh, calc(100vh - var(--masthead-h, 64px) - 8px))",
+    );
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-events"]')!,
     );
@@ -252,7 +258,13 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     ) as HTMLElement;
     // (#2108, operator's core ask) Switching tabs while open must NEVER
     // change the sheet's height — one shared value, not a per-tab one.
-    expect(sheet.style.height).toBe("30vh");
+    // (#2108, operator finding — real device, masthead cap) The raw
+    // `${openPct}vh` is now wrapped in `min(...)` against a masthead-
+    // height CSS var, so the sheet's top edge can never draw over the
+    // masthead — see `PhoneDrawer.tsx`'s own doc on this inline style.
+    expect(sheet.style.height).toBe(
+      "min(30vh, calc(100vh - var(--masthead-h, 64px) - 8px))",
+    );
   });
 
   // (#2108, operator correction — reverted from the earlier "every row
@@ -372,7 +384,14 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     const sheet = document.querySelector(
       '[data-act="phone-drawer"]',
     ) as HTMLElement;
-    const vh = parseFloat(sheet.style.height);
+    // (#2108, operator finding — real device, masthead cap) The style is
+    // now `min(${openPct}vh, calc(...))`, not a bare `${openPct}vh` —
+    // `parseFloat` on the whole string returns `NaN` since it no longer
+    // starts with a number. Pull the FIRST argument out of `min(...)`,
+    // which is exactly `openPct` (the masthead-cap ceiling is jsdom-inert
+    // anyway: no layout, no real `--masthead-h`), matching what the raw
+    // `parseFloat` used to read before this change.
+    const vh = parseFloat(sheet.style.height.replace(/^min\(/, ""));
     expect(vh).toBeGreaterThanOrEqual(85);
   });
 
