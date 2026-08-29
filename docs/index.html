@@ -226,6 +226,25 @@
     align-items: center;
     gap: 20px;
   }
+  /* Large-title brand hand-off: on load the hero lockup is the only brand on
+     screen; the nav wordmark is held out of its slot until the lockup scrolls
+     away, then slides down into place (and back out when the user returns to
+     the top). Gated on the `js-brand` class so a no-JS load keeps the nav
+     brand visible. Reduced-motion users get the swap without the slide. */
+  html.js-brand .homenav__brand {
+    opacity: 0;
+    transform: translateY(-14px);
+    transition: opacity .28s ease, transform .28s ease;
+    pointer-events: none;
+  }
+  html.js-brand .homenav--branded .homenav__brand {
+    opacity: 1;
+    transform: none;
+    pointer-events: auto;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html.js-brand .homenav__brand { transition: none; transform: none; }
+  }
   .homenav__brand {
     display: inline-flex;
     align-items: center;
@@ -729,6 +748,18 @@
 </div>
 
 <script>
+// Large-title brand hand-off (see the .homenav__brand CSS): show the nav
+// wordmark only once the hero lockup has scrolled out of view.
+(function () {
+  var nav = document.querySelector('.homenav');
+  var lockup = document.querySelector('.hero-lockup');
+  if (!nav || !lockup || !('IntersectionObserver' in window)) return;
+  document.documentElement.classList.add('js-brand');
+  new IntersectionObserver(function (entries) {
+    nav.classList.toggle('homenav--branded', !entries[0].isIntersecting);
+  }, { rootMargin: '-56px 0px 0px 0px', threshold: 0 }).observe(lockup);
+})();
+
   // Copy-to-clipboard for install commands. One delegated listener (no inline
   // handlers); each `.copy-btn` carries its exact command in `data-copy`. The
   // commands are static page content, so there is no untrusted input here.
