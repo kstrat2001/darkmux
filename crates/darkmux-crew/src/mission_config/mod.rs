@@ -1649,6 +1649,46 @@ mod tests {
         }
     }
 
+    // ─── crawl (#1959): documentation-only, zero-graph builtin ─────────
+    // Deliberately NOT folded into `both_builtins_*` above — those loops
+    // assert graph-shaped invariants (Tier 3 step-kind warnings, a real
+    // phase/task/step shape) that are meaningless for a document with zero
+    // phases by design. `crawl` gets its own goldens instead.
+
+    #[test]
+    fn crawl_builtin_validates_with_zero_error_findings_despite_zero_phases() {
+        let known = known_kinds();
+        let known_refs = known_kinds_refs(&known);
+        let cfg = embedded_config("crawl");
+        assert_eq!(cfg.id, "crawl");
+        assert_eq!(cfg.schema_version.as_deref(), Some(MISSION_CONFIG_SCHEMA));
+        assert!(cfg.phases.is_empty(), "crawl carries no graph — see its own description field");
+        let findings = cfg.validate(&known_refs);
+        let errors: Vec<&ValidationFinding> =
+            findings.iter().filter(|f| f.severity == FindingSeverity::Error).collect();
+        assert!(errors.is_empty(), "`crawl` must validate with zero Error findings, got: {errors:?}");
+        assert!(cfg.is_valid(&known_refs));
+    }
+
+    #[test]
+    fn crawl_builtin_declares_every_launcher_input() {
+        let cfg = embedded_config("crawl");
+        let names: Vec<&str> = cfg.inputs.iter().map(|i| i.name.as_str()).collect();
+        for expected in [
+            "workspace", "rules", "source", "rule", "plan", "units", "limit", "no_fetch", "dry_run", "plan_out",
+        ] {
+            assert!(names.contains(&expected), "crawl.json must declare input `{expected}`: {names:?}");
+        }
+    }
+
+    #[test]
+    fn crawl_builtin_round_trips_through_json() {
+        let cfg = embedded_config("crawl");
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: MissionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back, "`crawl` must round-trip through JSON unchanged");
+    }
+
     #[test]
     fn document_round_trips_through_json() {
         let cfg = doc(vec![phase(

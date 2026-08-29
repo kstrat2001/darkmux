@@ -1,0 +1,59 @@
+{
+  "id": "crawl",
+  "name": "Crawl",
+  "description": "Documentation-only (#1959) — `crawl` carries NO Task/Step graph. `darkmux mission launch crawl` is routed by literal config id in `mission_launch::launch`, BEFORE this document (or any mission-config document) is ever loaded: its Task/Step graph is computed at RUN TIME from a resolved crawl plan, one Task per (source, rule-set) grouping, built fresh from whatever the `workspace`/`rules`/`source`+`rule` inputs below resolve to on THIS invocation — there is nothing static to declare ahead of time the way `coder-phase`'s fixed worktree->coder->verify chain or `review`'s fixed bundle->probe->dedup->judge->verify->synthesis chain can. This file exists purely so `mission config list`/`mission config show crawl` can enumerate crawl's inputs for a curious operator; editing `phases` here has NO effect on what a real crawl launch does — see `src/crawl_launch.rs`'s own module doc for the real launcher.",
+  "schema_version": "3.0",
+  "inputs": [
+    {
+      "name": "workspace",
+      "description": "Path to a workspace spec JSON (darkmux_crew::workspace_spec::WorkspaceSpec) — named sources + include/exclude filters + optional rule-id defaults. Required unless `source` is given for a one-shot crawl. The spec's own `rules` array is the default rule binding when `--param rules=` is absent.",
+      "required": false
+    },
+    {
+      "name": "rules",
+      "description": "Comma-separated rule ids to crawl with. Wins over the workspace spec's own `rules` array when given; wins over a one-shot `--param rule=` too.",
+      "required": false
+    },
+    {
+      "name": "source",
+      "description": "One-shot crawl: a single path or git URL, synthesizing a one-source workspace spec in memory (no spec file needed). Requires `--param rule=` (a one-shot crawl runs exactly one rule). Mutually exclusive with `workspace` in practice — when both are given, `workspace` wins.",
+      "required": false
+    },
+    {
+      "name": "rule",
+      "description": "The single rule id to run against `--param source=` in the one-shot path. Ignored when `--param rules=` or a workspace spec's own `rules` array supplies a binding instead.",
+      "required": false
+    },
+    {
+      "name": "plan",
+      "description": "Path to a previously-written plan JSON (`--param plan_out=` from an earlier `--dry-run`, or a plan a prior run left behind) — skips re-planning and dispatches straight from it. Bails loudly if the plan's `workspace` name or any resolved source's sha/tree has drifted since it was written.",
+      "required": false
+    },
+    {
+      "name": "units",
+      "description": "Comma-separated unit ids to run, filtering the resolved plan down to exactly those. Bails on an unknown id.",
+      "required": false
+    },
+    {
+      "name": "limit",
+      "description": "Cap the number of units dispatched this run (after any `--param units=` filter). `0` selects nothing and completes cleanly — the run's own honest no-op.",
+      "required": false
+    },
+    {
+      "name": "no_fetch",
+      "description": "Resolve sources against the mirror as-is, without `git fetch`ing first — fully offline against whatever's already mirrored. A `git` source with no mirror yet REFUSES instead of cloning; a `path` source's first clone is local-filesystem-only and is exempt.",
+      "required": false
+    },
+    {
+      "name": "dry_run",
+      "description": "(#1959) The generic `mission launch --dry-run` flag, injected as `dry_run=true` by the CLI layer — never set by hand. Resolves + plans (everything a real launch does, so a missing/invalid input still bails the same way), then prints the plan table and mints NOTHING: no mission, no flow records, no dispatch. Writes nothing to disk unless `plan_out` is also given.",
+      "required": false
+    },
+    {
+      "name": "plan_out",
+      "description": "(#1959) Path to write the full plan JSON to, on a `--dry-run` invocation. Absent means a dry run writes nothing — read-only by default.",
+      "required": false
+    }
+  ],
+  "phases": []
+}

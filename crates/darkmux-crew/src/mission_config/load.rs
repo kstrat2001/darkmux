@@ -37,6 +37,18 @@ const EMBEDDED_MISSION_CONFIGS: &[(&str, &str)] = &[
             "/../../templates/builtin/mission-configs/coder-phase.json"
         )),
     ),
+    // (#1959) Documentation-only — `crawl` is routed by literal config id
+    // in `mission_launch::launch`, BEFORE this (or any) document loads;
+    // its Task/Step graph is computed at run time, never declared here.
+    // Embedded purely so `mission config list`/`show` can enumerate its
+    // inputs — see the document's own `description` field.
+    (
+        "crawl",
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../templates/builtin/mission-configs/crawl.json"
+        )),
+    ),
 ];
 
 /// The raw embedded JSON for a built-in id. `pub(crate)` (#1284 review
