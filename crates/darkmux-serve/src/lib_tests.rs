@@ -4122,7 +4122,7 @@
     /// `image/png` — the iOS home-screen icon + the manifest icons.
     #[tokio::test]
     async fn app_icons_served_as_png() {
-        for path in ["/apple-touch-icon.png", "/icon-192.png", "/icon-512.png"] {
+        for path in ["/apple-touch-icon.png", "/icon-192.png", "/icon-512.png", "/favicon-32.png", "/favicon-16.png"] {
             let app = build_router_local(PathBuf::new());
             let response = app
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -5516,6 +5516,8 @@ fn every_manifest_icon_has_a_route() {
 #[cfg(test)]
 const ROUTED_ICON_PATHS: &[&str] = &[
     "/icon-192.png",
+    "/favicon-32.png",
+    "/favicon-16.png",
     "/icon-512.png",
     "/icon-512-maskable.png",
     "/apple-touch-icon.png",

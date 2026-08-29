@@ -157,6 +157,12 @@ const NEXT_HTML: &str = include_str!("../assets/next.html");
 /// standalone-capable browsers.
 const APPLE_TOUCH_ICON_PNG: &[u8] = include_bytes!("../assets/apple-touch-icon.png");
 const ICON_192_PNG: &[u8] = include_bytes!("../assets/icon-192.png");
+/// The TAB favicon is the small two-input mux glyph (the same files
+/// `docs/` serves for darkmux.com), not the 192 px home-screen mark: at 16-32
+/// px the full mark reads as a smudge. Home-screen / manifest icons above are
+/// unchanged.
+const FAVICON_32_PNG: &[u8] = include_bytes!("../assets/favicon-32.png");
+const FAVICON_16_PNG: &[u8] = include_bytes!("../assets/favicon-16.png");
 const ICON_512_PNG: &[u8] = include_bytes!("../assets/icon-512.png");
 /// (#2022) The MASKABLE variant, a separate file on purpose.
 ///
@@ -411,6 +417,8 @@ pub(crate) fn build_router_full(
         .route("/manifest.webmanifest", get(web_manifest_handler))
         .route("/apple-touch-icon.png", get(apple_touch_icon_handler))
         .route("/icon-192.png", get(icon_192_handler))
+        .route("/favicon-32.png", get(favicon_32_handler))
+        .route("/favicon-16.png", get(favicon_16_handler))
         .route("/icon-512.png", get(icon_512_handler))
         .route("/icon-512-maskable.png", get(icon_512_maskable_handler))
         .route("/fleet/sessions/live", get(fleet_sessions_live_handler))
@@ -1745,6 +1753,16 @@ async fn apple_touch_icon_handler() -> impl IntoResponse {
 /// (#1403) `GET /icon-192.png` — manifest icon for non-iOS standalone browsers.
 async fn icon_192_handler() -> impl IntoResponse {
     png_response(ICON_192_PNG)
+}
+
+/// `GET /favicon-32.png` / `GET /favicon-16.png` — the tab favicon (the small
+/// two-input glyph, same bytes as darkmux.com).
+async fn favicon_32_handler() -> impl IntoResponse {
+    png_response(FAVICON_32_PNG)
+}
+
+async fn favicon_16_handler() -> impl IntoResponse {
+    png_response(FAVICON_16_PNG)
 }
 
 /// (#1403) `GET /icon-512.png` — manifest icon (also the maskable source).
