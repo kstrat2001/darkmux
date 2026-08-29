@@ -16,7 +16,7 @@ use std::io::{BufRead, IsTerminal};
 use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +45,9 @@ pub mod mission_graph;
 /// `runs_handler` calls, rather than computing its own. `AbandonReason`
 /// joined the list in #1907, same reasoning: the CLI's own `Abandoned`
 /// rendering needs it too, not just the wire response.
+/// (#2107, #1833) The daemon-side continuous host sampler feeding the
+/// machine stats drawer's live `load` block — see the module's own doc.
+mod host_sampler;
 mod panel;
 mod runs;
 pub use runs::{build_runs, AbandonReason, Run, RunKind, RunStatus};
@@ -1106,6 +1109,23 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         darkmux_flow::presence_reconciler::emit_machine_online_edge();
         let _reconciler_handle = darkmux_flow::presence_reconciler::spawn_reconciler_thread();
 
+        // (#2107, #1833) Spawn the daemon-side continuous host sampler
+        // feeding the machine stats drawer's live `/machine/resources`
+        // `load` block. Same dedicated-std::thread shape as the runner /
+        // presence threads above, and same self-disable convention as
+        // `runtime.turn_delay_ms`'s `0` — `host_sampler::spawn` returns
+        // `None` (no thread) when the resolved cadence is `0`. Stopped
+        // explicitly on shutdown (below), unlike the other background
+        // threads here, which merely ride the process force-exit: this one
+        // has a cheap, prompt stop condition (`STOP_POLL_INTERVAL` ≤200ms)
+        // worth using rather than leaving to the exit-window timer.
+        let host_sampler_stop = Arc::new(AtomicBool::new(false));
+        let _host_sampler_handle = host_sampler::spawn(
+            darkmux_types::config_access::host_sampler_interval_ms(),
+            host_sampler::ring().clone(),
+            Arc::clone(&host_sampler_stop),
+        );
+
         // Shutdown plumbing: multiplex one signal to two consumers
         // (axum's graceful shutdown future and the force-exit timer).
         // `watch::channel` is the right shape — both consumers wait_for
@@ -1115,6 +1135,7 @@ pub fn run(port: u16, bind: String, flows_dir: PathBuf, lab_dir: Option<PathBuf>
         tokio::spawn(async move {
             shutdown_signal().await;
             let _ = shutdown_tx.send(true);
+            host_sampler_stop.store(true, Ordering::SeqCst);
             eprintln!(
                 "\ndarkmux serve: shutdown signal received, {SHUTDOWN_GRACE_SECS}s grace for in-flight connections"
             );
@@ -2370,13 +2391,31 @@ fn machine_resources_cached_fresh() -> Option<serde_json::Value> {
 /// other route (loopback open, remote requires the token) — nothing extra
 /// here.
 ///
+/// (#2107, #1833) Attach the daemon-side host sampler's `load` block —
+/// `now`/`window`/`sampler_cost_ms_mean`, see `host_sampler`'s own doc — to
+/// a `/machine/resources` payload. Applied AFTER the ledger cache
+/// lookup/write, never cached itself: the ledger gather is the expensive
+/// shelled-out part worth a 2s cache; the ring read underneath `load` is a
+/// mutex lock plus arithmetic, cheap enough to be freshest-possible on
+/// every request rather than inheriting the ledger's cache staleness.
+/// Absent (no `load` key at all) when the sampler hasn't produced a sample
+/// yet — disabled (`runtime.host_sampler_interval_ms: 0`) or just started —
+/// which is the same "absent means not measured" contract the envelope's
+/// `host` block uses.
+fn attach_load(mut value: serde_json::Value) -> serde_json::Value {
+    if let (Some(load), Some(obj)) = (host_sampler::ring().snapshot(), value.as_object_mut()) {
+        obj.insert("load".to_string(), load);
+    }
+    value
+}
+
 /// The gather shells out (bounded) — runs on the blocking pool. Best-effort
 /// contract like /machine/specs: probe failures degrade to `warnings` in
 /// the payload, never a 500.
 async fn machine_resources_handler() -> axum::Json<serde_json::Value> {
     // Fast path: a fresh cache serves without touching the gather lock.
     if let Some(v) = machine_resources_cached_fresh() {
-        return axum::Json(v);
+        return axum::Json(attach_load(v));
     }
     // Single-flight (#1286): serialize cold-cache refreshers on the gather
     // lock, then RE-CHECK the cache under it — a request that waited behind an
@@ -2384,7 +2423,7 @@ async fn machine_resources_handler() -> axum::Json<serde_json::Value> {
     // a second one, so a poll burst costs one gather.
     let _permit = machine_resources_gather_lock().lock().await;
     if let Some(v) = machine_resources_cached_fresh() {
-        return axum::Json(v);
+        return axum::Json(attach_load(v));
     }
     let result = tokio::task::spawn_blocking(darkmux_profiles::model_ledger::gather).await;
     let mut value = match result {
@@ -2405,7 +2444,7 @@ async fn machine_resources_handler() -> axum::Json<serde_json::Value> {
     if let Ok(mut guard) = MACHINE_RESOURCES_CACHE.lock() {
         *guard = Some((std::time::Instant::now(), value.clone()));
     }
-    axum::Json(value)
+    axum::Json(attach_load(value))
 }
 
 /// GET /machine/specs — local-machine spec sheet for `darkmux machine list

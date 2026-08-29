@@ -4035,9 +4035,33 @@ body {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 18px 20px;
+  /* (operator finding, phone install review — "the desktop modal fades/
+     scales in briefly too") `Dialog.tsx` conditionally MOUNTS this element
+     only while open (`{open ? (<div className="dialog">...) : null}`) —
+     unlike `.phone-drawer__body`, which had to move to an always-mounted
+     `transition` because it needed a symmetric close animation too. A
+     `.dialog` has no such need (it simply unmounts on close, same as
+     before), so a CSS `animation` — which plays automatically on mount,
+     no persistent element required — is the simpler correct tool here. */
+  animation: dialog-pop-in 160ms ease-out;
 }
 .dialog--wide {
   width: 540px;
+}
+@keyframes dialog-pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dialog {
+    animation: none;
+  }
 }
 .dialog__head {
   display: flex;
@@ -5141,6 +5165,18 @@ body {
   .app-shell {
     padding-bottom: calc(58px + env(safe-area-inset-bottom, 0px));
   }
+  /* (operator finding, phone install review) A transparent full-viewport
+     tap-catcher, sitting just BEHIND `.phone-drawer` (lower z-index) —
+     while the drawer is open, a tap anywhere outside the sheet/bar/handle
+     dismisses it instead of reaching the page underneath. No visible
+     dimming: the sheet's own opaque background is already the visual cue
+     that the page is "behind" something. */
+  .phone-drawer__backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 79;
+    background: transparent;
+  }
   .phone-drawer {
     position: fixed;
     left: 0;
@@ -5158,12 +5194,42 @@ body {
     display: flex;
     flex-direction: column;
     min-height: 0;
-    /* `height` is set inline per-drag (`PhoneDrawer.tsx`); this transition
-       only applies to a TAP-driven open/close/tab-switch — the inline
-       style's own `transition: "none"` while actively dragging (same
-       discipline the retired sheet used) keeps a live drag from lagging
-       behind the pointer. */
-    transition: height 0.2s ease;
+    /* (operator finding, phone install review) ALWAYS mounted now
+       (`PhoneDrawer.tsx`'s own doc) — closed state sits fully off-screen
+       via `transform: translateY(100%)`, a compositor-only property so a
+       real device doesn't lay out/paint the hidden sheet during the
+       slide. `height` is still set inline per-drag (`PhoneDrawer.tsx`);
+       that transition applies to a TAP-driven open/close/tab-switch RESIZE
+       (switching tabs while already open, snapping to that tab's own
+       remembered height) — the `.phone-drawer--dragging` override below
+       (replacing the old inline `transition: "none"`) keeps a live drag
+       from lagging behind the pointer.
+
+       `visibility`'s transition is asymmetric ON PURPOSE: this (closed)
+       rule delays it by the FULL slide duration, so closing stays visible
+       for the whole 220ms slide-down instead of vanishing the instant the
+       class is removed; the `--open` rule below has NO delay, so opening
+       becomes visible immediately as the slide-up begins. Per the CSS
+       Transitions spec, a property change is governed by the AFTER-change
+       style's `transition` declaration — closing lands on THIS rule
+       (delayed), opening lands on the `--open` rule (not delayed). */
+    transition:
+      height 0.2s ease,
+      transform 220ms ease-out,
+      visibility 0s linear 220ms;
+    transform: translateY(100%);
+    visibility: hidden;
+  }
+  .phone-drawer--open .phone-drawer__body {
+    transition:
+      height 0.2s ease,
+      transform 220ms ease-out,
+      visibility 0s linear;
+    transform: translateY(0);
+    visibility: visible;
+  }
+  .phone-drawer--dragging .phone-drawer__body {
+    transition: none;
   }
   .phone-drawer__panel {
     flex: 1;

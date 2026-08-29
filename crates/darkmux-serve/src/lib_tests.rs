@@ -794,6 +794,60 @@
         assert_eq!(json["cache_ttl_ms"].as_u64(), Some(2_000));
     }
 
+    /// (#2107, #1833) GET /machine/resources carries a `load` block — the
+    /// daemon-side continuous host sampler's `now`/`window`/
+    /// `sampler_cost_ms_mean` — once the ring holds samples. Injects
+    /// fabricated samples straight into the process-wide ring via
+    /// `HostSamplerRing::push_for_test` (no real sampler thread, no real
+    /// `ioreg`/`top`/`vm_stat` shell-out) so the ROUTE's shape is exercised
+    /// deterministically. `#[serial]`: the ring and the ledger cache are
+    /// both process-wide statics shared with the sibling test above.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn machine_resources_endpoint_carries_the_daemon_load_block_once_sampled() {
+        let prev = std::env::var("DARKMUX_LMS_BIN").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_LMS_BIN", "/nonexistent/darkmux-serve-test-lms");
+        }
+        let ring = host_sampler::ring();
+        ring.push_for_test(0, 50, 60, 70, 5);
+        ring.push_for_test(2_000, 90, 65, 85, 6);
+        ring.push_for_test(4_000, 40, 62, 30, 4);
+
+        let app = build_router_local(PathBuf::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/machine/resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_LMS_BIN", v),
+                None => std::env::remove_var("DARKMUX_LMS_BIN"),
+            }
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+
+        let load = &json["load"];
+        assert!(load.is_object(), "expected a `load` block: {json}");
+        assert_eq!(load["now"]["cpu_pct"], 40, "now reflects the LATEST injected sample");
+        assert_eq!(load["now"]["mem_pct"], 62);
+        assert_eq!(load["now"]["gpu_pct"], 30);
+        assert_eq!(load["now"]["sampled_at_ms"], 4_000);
+        assert_eq!(load["window"]["samples"], 3);
+        assert_eq!(load["window"]["interval_ms"], 2_000, "measured, not nominal");
+        assert_eq!(load["window"]["span_ms"], 4_000);
+        assert_eq!(load["window"]["cpu"]["max_pct"], 90);
+        assert_eq!(load["window"]["cpu"]["mean_pct"], 60.0);
+        assert!(load["sampler_cost_ms_mean"].is_number());
+    }
+
     /// /machine/specs MUST redact the Redis URL's password. Wide-open
     /// redaction is already in place via `flow::RawRedisUrl` (#216); this
     /// test pins that the new endpoint doesn't bypass it.

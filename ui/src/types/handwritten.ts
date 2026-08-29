@@ -339,7 +339,12 @@ export interface MachineResources {
    *   rename. Kept in the payload but deliberately NOT given prime space
    *   next to `available_bytes` in the k/v row — two figures both reading
    *   as "how much is left" was the defect being fixed. */
-  pool: { capacity_bytes: number; used_bytes: number; available_bytes: number; free_bytes: number };
+  pool: {
+    capacity_bytes: number;
+    used_bytes: number;
+    available_bytes: number;
+    free_bytes: number;
+  };
   pressure: {
     swap_used_bytes: number;
     compressor_bytes: number;
@@ -394,6 +399,49 @@ export interface MachineResources {
   /** #1821 — replaces `warnings: string[]`. See [`LedgerMessage`]. */
   messages: LedgerMessage[];
   cache_ttl_ms: number;
+  /** #2107, #1833 — the daemon-side continuous host sampler's reading,
+   * independent of any dispatch. Absent when the sampler hasn't produced a
+   * sample yet (disabled via `runtime.host_sampler_interval_ms: 0`, or the
+   * daemon just started) — an older daemon that predates this field simply
+   * omits the key, which the viewer reads the same way ("not measured",
+   * never a zeroed placeholder). Source:
+   * `crates/darkmux-serve/src/host_sampler.rs::HostSamplerRing::snapshot`. */
+  load?: MachineLoad;
+}
+
+/** #2107, #1833 — one metric's window reduction as the daemon sampler's
+ * `load.window` block reports it. Field names deliberately differ from the
+ * Rust-side `MetricStats` (`peak_pct` there, `max_pct` here) — this is the
+ * ROUTE's own wire contract, not a re-export of the internal reduction
+ * type; the internal `peak_pct`/`mean_pct`/`p95_pct` naming FEEDS these
+ * numbers (never re-derived), but the wire shape is whatever
+ * `/machine/resources` actually promises callers. */
+export interface MachineLoadMetric {
+  mean_pct: number | null;
+  p95_pct: number | null;
+  max_pct: number | null;
+}
+
+export interface MachineLoad {
+  now: {
+    cpu_pct: number | null;
+    mem_pct: number | null;
+    gpu_pct: number | null;
+    sampled_at_ms: number;
+  };
+  window: {
+    cpu: MachineLoadMetric;
+    mem: MachineLoadMetric;
+    gpu: MachineLoadMetric;
+    samples: number;
+    /** MEASURED mean gap between samples, not the nominal configured
+     * cadence — `null` when fewer than two samples have landed. */
+    interval_ms: number | null;
+    span_ms: number;
+  };
+  /** The sampler's own measured mean gather cost — the observer-cost
+   * self-stamp (CLAUDE.md "the observer must not join the observed"). */
+  sampler_cost_ms_mean: number;
 }
 
 /** `GET /fleet/sessions/live` — `axum::Json(Vec<LiveSessionBeat>)`, the

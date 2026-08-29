@@ -82,6 +82,34 @@ def ledger_for(machine, world, now_ms):
     for m in models:
         m["state"] = state
 
+    # (#2107, #1833) The daemon-side continuous host sampler's `load` block
+    # — a plausible-not-real reading, same spirit as `gather_ms` above: the
+    # demo has no real `top`/`vm_stat`/`ioreg` to sample, so this derives a
+    # small, internally-consistent window (mean <= max, p95 <= max) around a
+    # random "now" reading rather than hand-picking numbers that could drift
+    # out of shape on a future edit. `samples: 120` / `interval_ms: 5000` /
+    # `span_ms: 595000` match the daemon's own `RING_CAPACITY` (120) at its
+    # default 5s cadence (`crates/darkmux-serve/src/host_sampler.rs`).
+    def window_metric(now_val, spread):
+        return {
+            "mean_pct": round(max(0, now_val - spread), 1),
+            "p95_pct": min(100, now_val + spread),
+            "max_pct": min(100, now_val + spread + 2),
+        }
+
+    cpu_now = random.randint(15, 35)
+    mem_now = min(95, max(5, int(pool_used / cap * 100) + random.randint(-3, 3)))
+    gpu_now = random.randint(40, 85)
+    load = {
+        "now": {"cpu_pct": cpu_now, "mem_pct": mem_now, "gpu_pct": gpu_now, "sampled_at_ms": now_ms},
+        "window": {
+            "cpu": window_metric(cpu_now, 6), "mem": window_metric(mem_now, 3),
+            "gpu": window_metric(gpu_now, 10),
+            "samples": 120, "interval_ms": 5000, "span_ms": 595000,
+        },
+        "sampler_cost_ms_mean": round(random.uniform(2.0, 5.0), 1),
+    }
+
     return {
         "schema_version": "2.1", "generated_at_ms": now_ms,
         "gather_ms": random.randint(180, 460),
@@ -110,6 +138,7 @@ def ledger_for(machine, world, now_ms):
             "models by weights (largest worker <-> largest weights)"
         ),
         "messages": [], "cache_ttl_ms": 2000,
+        "load": load,
     }
 
 

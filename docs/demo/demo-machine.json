@@ -7,6 +7,18 @@
     "generated_at_ms": 1787897595280,
     "limit_bytes": 274877906944,
     "limit_source": "physical_pool",
+    "load": {
+      "now": { "cpu_pct": 22, "mem_pct": 46, "gpu_pct": 68, "sampled_at_ms": 1787897595280 },
+      "window": {
+        "cpu": { "mean_pct": 19.4, "p95_pct": 27, "max_pct": 27 },
+        "mem": { "mean_pct": 44.8, "p95_pct": 47, "max_pct": 47 },
+        "gpu": { "mean_pct": 61.2, "p95_pct": 71, "max_pct": 71 },
+        "samples": 120,
+        "interval_ms": 5000,
+        "span_ms": 595000
+      },
+      "sampler_cost_ms_mean": 3.1
+    },
     "machine": {
       "current_bytes": 127834497549,
       "estimated_models": 0,

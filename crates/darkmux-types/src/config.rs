@@ -83,7 +83,12 @@ use std::path::Path;
 // milliseconds, the internal runtime sleeps between inference turns on
 // every LOCAL dispatch — GPU thermal/power relief for sustained runs, see
 // that field's own doc). Minor bump, same lenient-read reasoning.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.13";
+// 1.14 (#2107, #1833): additive `runtime.host_sampler_interval_ms` — the
+// daemon-side continuous host sampler `darkmux serve` runs for the machine
+// stats drawer's live `/machine/resources` `load` block (cpu/mem/gpu on a
+// fixed cadence, kept in an in-memory ring; no flow records). `0` disables
+// the sampler entirely. Minor bump, same lenient-read reasoning.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.14";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -315,6 +320,22 @@ pub struct RuntimeBehaviorConfig {
     /// honoring an operator's configured rest there would only add real
     /// latency the per-execution remote token allowance pays for nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub turn_delay_ms: Option<u64>,
+    /// (#2107, #1833) Cadence, in milliseconds, of `darkmux serve`'s
+    /// daemon-side continuous host sampler — the background thread that
+    /// reads cpu/mem/gpu (via `darkmux_crew::telemetry_sampler::sample_host`,
+    /// the SAME kernel-counter/`ioreg` mechanism the per-dispatch sampler
+    /// uses) into an in-memory ring so the machine stats drawer (phone
+    /// bottom tab, desktop modal) has live numbers between dispatches
+    /// instead of reading "idle · no samples" until one starts. `0`
+    /// disables the sampler entirely (an explicit opt-out, mirroring
+    /// `remote.max_tokens_per_execution`'s `0`-means-hard-off convention).
+    /// The sampler writes NO flow records (CLAUDE.md "the observer must not
+    /// join the observed" — zero model dispatches, and this must not double
+    /// the fleet stream's size); it only feeds the `/machine/resources`
+    /// `load` block, which stamps its own measured cost
+    /// (`sampler_cost_ms_mean`) and the measured (not nominal) sample
+    /// interval into the payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub host_sampler_interval_ms: Option<u64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -768,6 +789,10 @@ impl DarkmuxConfig {
                 // (#2094) Visible `0` — the pre-existing no-rest behavior,
                 // discoverable + one edit from a thermal-friendly value.
                 turn_delay_ms: Some(0),
+                // (#2107, #1833) Visible `5000` — the machine stats
+                // drawer's daemon-side sampler cadence, discoverable and
+                // one edit from `0` (disabled) or a tighter/looser value.
+                host_sampler_interval_ms: Some(5000),
                 extras: Default::default(),
             }),
             fleet: Some(FleetConfig {

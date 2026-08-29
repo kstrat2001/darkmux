@@ -110,6 +110,9 @@ const KEYS: &[(&str, Ty)] = &[
     // (#2094) The global inter-turn rest, in milliseconds, the internal
     // runtime sleeps between inference turns on every LOCAL dispatch.
     ("runtime.turn_delay_ms", Ty::Uint),
+    // (#2107, #1833) Cadence of `darkmux serve`'s daemon-side continuous
+    // host sampler feeding the machine stats drawer. `0` disables it.
+    ("runtime.host_sampler_interval_ms", Ty::Uint),
     ("fleet.mode", Ty::FleetMode),
     // (#1260) The per-execution remote token allowance for endpoint-staffed
     // crew seats (one pipeline stage = one execution). Tokens, never currency.

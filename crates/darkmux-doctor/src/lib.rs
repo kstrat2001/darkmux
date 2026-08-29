@@ -158,6 +158,7 @@ pub fn run() -> DoctorReport {
         check_gh_allowlist(),
         check_review_judge_exhaustion_policy(),
         check_turn_delay(),
+        check_host_sampler_interval(),
         check_remote_endpoint_credentials(),
         check_env_masks_config(),
         check_binary_split_brain(),
@@ -1767,6 +1768,71 @@ fn check_turn_delay() -> Check {
         name: name.into(),
         status: Status::Pass,
         message: format!("{ms}ms ({provenance}) — rest between inference turns on every local dispatch"),
+        hint: None,
+    }
+}
+
+/// (#2107, #1833) Surface the resolved `runtime.host_sampler_interval_ms`
+/// with provenance — the cadence `darkmux serve`'s daemon-side continuous
+/// host sampler runs at, feeding the machine stats drawer's live
+/// `/machine/resources` `load` block between dispatches. Always Pass: `0`
+/// is an honest opt-out (the sampler simply doesn't start, same convention
+/// as `runtime.turn_delay_ms`'s `0`), not a defect. Mirrors
+/// `check_turn_delay`'s provenance-first shape exactly, minus that check's
+/// clamp-warn branch (this knob isn't clamped against anything else).
+fn check_host_sampler_interval() -> Check {
+    let name = "runtime.host_sampler_interval_ms";
+    let env_raw = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let env_parses = env_raw.as_deref().is_some_and(|s| s.trim().parse::<u64>().is_ok());
+    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
+        .runtime
+        .and_then(|r| r.host_sampler_interval_ms)
+        .is_some();
+    let provenance = if env_parses {
+        "from DARKMUX_HOST_SAMPLER_INTERVAL_MS env"
+    } else if cfg_set {
+        "from config.json"
+    } else {
+        "default"
+    };
+    let ms = darkmux_types::config_access::host_sampler_interval_ms();
+    if let Some(raw) = env_raw.as_deref() {
+        if !env_parses {
+            return Check {
+                name: name.into(),
+                status: Status::Warn,
+                message: format!(
+                    "DARKMUX_HOST_SAMPLER_INTERVAL_MS=`{raw}` is not an integer; using {ms}ms ({provenance})"
+                ),
+                hint: Some(
+                    "Set DARKMUX_HOST_SAMPLER_INTERVAL_MS to a plain integer number of \
+                     milliseconds (e.g. `5000`), or unset it to fall through to config.json / \
+                     the default."
+                        .into(),
+                ),
+            };
+        }
+    }
+    if ms == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!(
+                "0ms ({provenance}) — daemon host sampler disabled; the machine stats drawer \
+                 shows live numbers only while a dispatch's own per-dispatch sampler is running"
+            ),
+            hint: None,
+        };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "{ms}ms ({provenance}) — darkmux serve's daemon-side host sampler cadence for the \
+             machine stats drawer"
+        ),
         hint: None,
     }
 }
@@ -5400,6 +5466,85 @@ mod tests {
         }
     }
 
+    // ─── (#2107, #1833) check_host_sampler_interval — resolved state + provenance ─
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_interval_default_is_pass_and_names_5000ms() {
+        let prev = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe { std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS") };
+        let check = check_host_sampler_interval();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("5000ms"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_interval_zero_is_pass_and_says_disabled() {
+        let prev = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe { std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "0") };
+        let check = check_host_sampler_interval();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("disabled"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_interval_env_override_names_provenance() {
+        let prev = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe { std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "2000") };
+        let check = check_host_sampler_interval();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("2000ms"), "{}", check.message);
+        assert!(check.message.contains("env"), "provenance named: {}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
+    /// Mirrors `check_turn_delay_unparseable_env_warns_and_names_the_raw_value`
+    /// — a set-but-garbage env var must not be silently reported as "from
+    /// ... env" while the resolved value actually came from a lower tier.
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_interval_unparseable_env_warns_and_names_the_raw_value() {
+        let prev = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe { std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5s") };
+        let check = check_host_sampler_interval();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("DARKMUX_HOST_SAMPLER_INTERVAL_MS") && check.message.contains("5s"),
+            "must name the raw unparseable value: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("from DARKMUX_HOST_SAMPLER_INTERVAL_MS env"),
+            "must NOT claim provenance is env when the env value didn't parse: {}",
+            check.message
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
     // ─── (#1769) summarize_audit_reports — Fail / Warn / Pass split ────────
     //
     // Pure-function tests: no filesystem, no `DARKMUX_AUDIT_DIR`. Each test
@@ -6333,11 +6478,12 @@ mod tests {
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
-        // turn-delay [#2094] + mission-envelope-readability [#1881] + hooks
-        // [#2093] + rules [#1959]) + one per active eureka rule.
+        // turn-delay [#2094] + host-sampler-interval [#2107, #1833] +
+        // mission-envelope-readability [#1881] + hooks [#2093] +
+        // rules [#1959]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 42 + darkmux_eureka::all_rules().len();
+        let expected = 43 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

@@ -220,6 +220,129 @@ pub fn sample_host() -> HostSample {
     HostSample { cpu, mem, gpu }
 }
 
+/// (#2107, moved from `dispatch_internal.rs` where it originated) One
+/// host-load reading, timestamped relative to whichever clock the caller's
+/// sampler uses — `dispatch_internal`'s dispatch-scoped sampler uses a
+/// clock relative to its own start (`Instant::now()` since the sampler
+/// spawned); `darkmux-serve`'s daemon-side continuous sampler (#2107,
+/// #1833 — the machine stats drawer's live feed) uses wall-clock epoch ms
+/// instead, since it has no single dispatch start to be relative TO. Both
+/// are valid: [`reduce_metric`]'s `above_80_ms` duty measure only needs the
+/// GAP between consecutive `at_ms` values, and that gap is identical
+/// whether the clock's zero point is a dispatch start or the Unix epoch.
+/// `cpu`/`mem`/`gpu` stay `Option`: each is independently best-effort per
+/// tick (see [`sample_host`]'s own doc), so one metric's read failing on a
+/// given tick must not corrupt another's.
+#[derive(Debug, Clone, Copy)]
+pub struct HostSampleAt {
+    pub at_ms: u64,
+    pub cpu: Option<u64>,
+    pub mem: Option<u64>,
+    pub gpu: Option<u64>,
+}
+
+/// (#2107) One metric's (cpu, mem, or gpu) reduction over a set of samples.
+///
+/// `mean_pct` is rounded to ONE DECIMAL — enough resolution to distinguish
+/// "sat near idle" from "sat near saturated" across a run with only a
+/// handful of samples, without asserting false precision the sample
+/// cadence never measured. `p95_pct` uses the nearest-rank method
+/// (`ceil(0.95 * n)`th smallest value, 1-indexed) — the standard convention
+/// for a small, unweighted sample set. `above_80_ms` is a DUTY measure — the
+/// wall-clock time this metric's own consecutive samples spent above 80%,
+/// using each sample's OWN measured gap to the next (see [`HostSampleAt`]),
+/// not a synthetic `samples_above_80 × <nominal interval>` count that would
+/// silently assume a constant cadence.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct MetricStats {
+    pub peak_pct: Option<u64>,
+    pub mean_pct: Option<f64>,
+    pub p95_pct: Option<u64>,
+    pub above_80_ms: u64,
+}
+
+/// (#1955, revised #2107) The host-telemetry reduction. Originated as the
+/// dispatch-envelope's `host` block reduction; #2107/#1833 additionally
+/// reuses it — unmodified — for the daemon-side continuous sampler's
+/// `/machine/resources` `load.window` block, so the two surfaces can never
+/// silently disagree on what "peak"/"mean"/"p95" mean.
+///
+/// This is a pure REDUCTION over samples that are already being taken — it
+/// adds no probe, no syscall, and no cost to the measured system, which is
+/// what the observer-must-not-join-the-observed rule (CLAUDE.md) requires
+/// of anything on this path.
+///
+/// `samples` is carried deliberately: a peak of 0 and "we never sampled" are
+/// different claims. `sample_interval_ms` is the MEASURED mean gap between
+/// ticks (not a nominal configured cadence) — `None` when fewer than two
+/// samples landed, since an interval needs two points.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct HostStats {
+    pub cpu: MetricStats,
+    pub mem: MetricStats,
+    pub gpu: MetricStats,
+    pub samples: u32,
+    pub sample_interval_ms: Option<u64>,
+}
+
+/// Reduce one metric's `(at_ms, pct)` readings — already filtered to the
+/// ticks where THIS metric actually read a value — into peak/mean/p95/duty.
+/// `pairs` must be in chronological order (the order ticks were taken);
+/// empty input yields an all-`None`/`0` [`MetricStats`], the same "not
+/// measured" default [`HostStats`] uses.
+pub fn reduce_metric(pairs: &[(u64, u64)]) -> MetricStats {
+    if pairs.is_empty() {
+        return MetricStats::default();
+    }
+    let peak_pct = pairs.iter().map(|(_, v)| *v).max();
+    let sum: u64 = pairs.iter().map(|(_, v)| *v).sum();
+    let mean_pct = Some((sum as f64 / pairs.len() as f64 * 10.0).round() / 10.0);
+    let p95_pct = {
+        let mut sorted: Vec<u64> = pairs.iter().map(|(_, v)| *v).collect();
+        sorted.sort_unstable();
+        // Nearest-rank: the `ceil(0.95 * n)`th smallest (1-indexed), clamped
+        // into range so a single-sample list resolves to that sample.
+        let rank = ((sorted.len() as f64) * 0.95).ceil() as usize;
+        let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+        Some(sorted[idx])
+    };
+    // Duty: for each consecutive pair, the FIRST sample's value is assumed
+    // to hold until the next one is taken (left-Riemann) — the only honest
+    // assumption between two point-in-time readings. A trailing sample past
+    // 80% with no successor to bound it contributes nothing (there is no
+    // measured interval to attribute to it), which undercounts a run that
+    // was cut off mid-spike rather than overcounting one that wasn't.
+    let above_80_ms = pairs
+        .windows(2)
+        .filter(|w| w[0].1 > 80)
+        .map(|w| w[1].0.saturating_sub(w[0].0))
+        .sum();
+    MetricStats { peak_pct, mean_pct, p95_pct, above_80_ms }
+}
+
+/// Reduce a full set of host readings into [`HostStats`]. Pure and
+/// independently testable — a scripted list of [`HostSampleAt`] in, exact
+/// stats out, with no sampler thread / clock / shell-out involved.
+pub fn reduce_host_stats(raw: &[HostSampleAt]) -> HostStats {
+    let samples = raw.len() as u32;
+    let sample_interval_ms = if raw.len() >= 2 {
+        let span = raw.last().unwrap().at_ms.saturating_sub(raw.first().unwrap().at_ms);
+        Some(span / (raw.len() as u64 - 1))
+    } else {
+        None
+    };
+    let pairs_of = |get: fn(&HostSampleAt) -> Option<u64>| -> Vec<(u64, u64)> {
+        raw.iter().filter_map(|s| get(s).map(|v| (s.at_ms, v))).collect()
+    };
+    HostStats {
+        cpu: reduce_metric(&pairs_of(|s| s.cpu)),
+        mem: reduce_metric(&pairs_of(|s| s.mem)),
+        gpu: reduce_metric(&pairs_of(|s| s.gpu)),
+        samples,
+        sample_interval_ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

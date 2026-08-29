@@ -39,16 +39,36 @@
  * committed fixtures on a static build and from the daemon otherwise (see
  * that file's own `getSource()`/`isStaticBuild` doc) — this component only
  * ever reads the records it's given.
+ *
+ * **Both surfaces now read a static `Machine info` label at rest — no live
+ * numbers on the pill or the closed tab** (operator finding: a live
+ * `GPU 68%` pill "looks too busy" for a resting indicator). Live numbers
+ * exist ONLY inside the opened body. This is also what makes the daemon
+ * poll gate correct: `useMachineStatsContent`'s `isOpen` input needs to
+ * know whether THIS surface is currently visible, and since neither the
+ * pill nor the tab shows a number at rest there is nothing to keep warm
+ * while closed. On desktop that's `desktopOpen` (the same `dialogManager`
+ * subscription driving `<Dialog>` itself); on phone, `PhoneDrawer` owns
+ * its own open/tab state internally, so it reports back via
+ * `onMachineOpenChange` — see that prop's own doc on `PhoneDrawer`.
  */
+import { useState } from "react";
 import { Dialog } from "./Dialog";
-import { openModalEl, closeOpenModal, useOpenModalId } from "../lib/dialogManager";
-import { fmtPct } from "./Meter";
+import {
+  openModalEl,
+  closeOpenModal,
+  useOpenModalId,
+} from "../lib/dialogManager";
 import { useMachineStatsContent } from "./machineStatsContent";
 import { PhoneDrawer } from "./PhoneDrawer";
 import { useIsMobile } from "../hooks/useIsMobile";
 import type { Route } from "../lib/route";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
-import type { FlowRecord, MachineSpecs, PresenceBeat } from "../types/handwritten";
+import type {
+  FlowRecord,
+  MachineSpecs,
+  PresenceBeat,
+} from "../types/handwritten";
 
 export interface MachineDrawerProps {
   route: Route;
@@ -111,8 +131,17 @@ export function MachineDrawer({
   // subscription `<Dialog>` itself uses, so this component and the shell
   // it renders through can never disagree about whether they're open.
   const desktopOpen = useOpenModalId() === "imodalbg";
+  // (#2107, #1833) `PhoneDrawer` owns its own open/activeTab state
+  // internally (uncontrolled — see that component's own doc on why it
+  // stays that way rather than being lifted wholesale); it mirrors just
+  // the one bit this component needs — "is the Machine tab open right
+  // now" — via `onMachineOpenChange`. Starts `false`, matching
+  // `PhoneDrawer`'s own initial closed state, so the very first render
+  // never polls before the drawer has actually been opened.
+  const [phoneMachineTabOpen, setPhoneMachineTabOpen] = useState(false);
+  const isStatsSurfaceOpen = isMobile ? phoneMachineTabOpen : desktopOpen;
 
-  const { compactLine, gpuNow, body } = useMachineStatsContent({
+  const { body } = useMachineStatsContent({
     route,
     routeRecords,
     flowWindow,
@@ -120,6 +149,7 @@ export function MachineDrawer({
     liveMachines,
     specs,
     liveStatus,
+    isOpen: isStatsSurfaceOpen,
     nowMsOverride,
   });
 
@@ -128,7 +158,8 @@ export function MachineDrawer({
       <PhoneDrawer
         route={route}
         liveStatus={liveStatus}
-        machineTab={{ compactLine, body }}
+        machineTab={{ body }}
+        onMachineOpenChange={setPhoneMachineTabOpen}
         events={{
           records: eventLogRecords,
           scopeLabel: eventLogScopeLabel,
@@ -150,9 +181,11 @@ export function MachineDrawer({
         data-act="machine-drawer-pill"
         aria-haspopup="dialog"
         aria-expanded={desktopOpen}
-        onClick={() => (desktopOpen ? closeOpenModal() : openModalEl("imodalbg"))}
+        onClick={() =>
+          desktopOpen ? closeOpenModal() : openModalEl("imodalbg")
+        }
       >
-        <span className="machine-pill__dim">machine ·</span> GPU {fmtPct(gpuNow)}
+        Machine info
       </button>
       <Dialog id="imodalbg" titleId="machine-stats-title" title="Machine stats">
         {body}
