@@ -448,7 +448,12 @@ impl HostProbe {
         // bindings are read-only, and declaring them `mut` unconditionally
         // is a dead-code warning under `-D warnings` (#2108 CI finding).
         let gpu_mhz = None;
-        let power = None;
+        // `power_from_rails(None, None, None)` is always `None` — written
+        // this way (not a bare `None`) so the helper is a genuine call on
+        // EVERY target, not dead code the non-aarch64 lib build would flag
+        // under `-D warnings`, matching the module doc's "tested (and, here,
+        // exercised) everywhere" promise.
+        let power = power_from_rails(None, None, None);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let (clusters, gpu_mhz, power) = {
             let mut clusters = clusters;
@@ -458,13 +463,7 @@ impl HostProbe {
                 if let Some(s) = p.sample(interval_ms) {
                     gpu_mhz = s.gpu_mhz;
                     attach_cluster_mhz(&mut clusters, &s.cluster_mhz, &s.cluster_cores);
-                    if s.cpu_mw.is_some() || s.gpu_mw.is_some() || s.ane_mw.is_some() {
-                        power = Some(PowerSample {
-                            cpu_mw: s.cpu_mw.unwrap_or(0.0),
-                            gpu_mw: s.gpu_mw.unwrap_or(0.0),
-                            ane_mw: s.ane_mw.unwrap_or(0.0),
-                        });
-                    }
+                    power = power_from_rails(s.cpu_mw, s.gpu_mw, s.ane_mw);
                 }
             }
             (clusters, gpu_mhz, power)
@@ -487,6 +486,27 @@ impl HostProbe {
             thermal: thermal::sample(),
             power,
         }
+    }
+}
+
+/// Combine the three IOReport energy rails into one [`PowerSample`] — ALL
+/// three or none (#2108 review finding).
+///
+/// A rail's unit can independently fail to match the closed set
+/// `energy_delta_to_mw` recognizes (`ioreport::energy_delta_to_mw`'s doc:
+/// "an unrecognized unit yields `None`, never a guessed scale"). Reporting
+/// the other two real numbers alongside a zeroed one for that rail is
+/// indistinguishable on the wire from "this rail genuinely measured zero
+/// milliwatts" — exactly the degradation contract
+/// `a_sample_missing_power_is_skipped_not_zeroed` (below, one reduction
+/// layer up) exists to prevent. `None` — "not measured this sample" —
+/// rather than mixing two real readings with one fabricated zero. Pure,
+/// unlike its caller's aarch64-only branch, so it's unit-tested on every
+/// target the way the module doc promises the arithmetic is.
+fn power_from_rails(cpu_mw: Option<f64>, gpu_mw: Option<f64>, ane_mw: Option<f64>) -> Option<PowerSample> {
+    match (cpu_mw, gpu_mw, ane_mw) {
+        (Some(cpu_mw), Some(gpu_mw), Some(ane_mw)) => Some(PowerSample { cpu_mw, gpu_mw, ane_mw }),
+        _ => None,
     }
 }
 
@@ -843,6 +863,38 @@ mod tests {
         assert_eq!(p.total_mw(), 1235.0);
     }
 
+    // (#2108 review finding) `power_from_rails`: an unrecognized unit on
+    // ONE rail (e.g. `ioreport::energy_delta_to_mw` sees a unit outside its
+    // closed set) must not zero that rail while reporting the other two —
+    // that is indistinguishable on the wire from "this rail genuinely
+    // measured zero milliwatts".
+    #[test]
+    fn power_from_rails_requires_all_three_or_none() {
+        assert_eq!(
+            power_from_rails(Some(1200.0), Some(30.0), Some(5.0)),
+            Some(PowerSample { cpu_mw: 1200.0, gpu_mw: 30.0, ane_mw: 5.0 }),
+            "all three present ⇒ a real reading"
+        );
+        assert_eq!(power_from_rails(None, None, None), None, "none present ⇒ no reading at all");
+    }
+
+    #[test]
+    fn power_from_rails_an_unknown_unit_rail_is_not_zeroed() {
+        // ANE's unit failed to parse (e.g. an unrecognized energy unit);
+        // CPU and GPU read fine. The pre-fix code reported
+        // `Some(PowerSample { cpu_mw: 1200.0, gpu_mw: 30.0, ane_mw: 0.0 })`
+        // — a fabricated "ANE draws 0 mW" that looks exactly like a real
+        // measurement. The fix reports no power at all for this sample
+        // rather than mixing two real numbers with one invented zero.
+        assert_eq!(
+            power_from_rails(Some(1200.0), Some(30.0), None),
+            None,
+            "one rail unmeasured ⇒ the WHOLE sample is unmeasured, never partially zeroed"
+        );
+        assert_eq!(power_from_rails(Some(1200.0), None, Some(5.0)), None, "same for the GPU rail");
+        assert_eq!(power_from_rails(None, Some(30.0), Some(5.0)), None, "same for the CPU rail");
+    }
+
     // ── The one test that runs the REAL probe ─────────────────────────────
     //
     // macOS/aarch64-gated: every source it exercises is Apple-Silicon-only,
@@ -864,6 +916,12 @@ mod tests {
     // docs/ENVIRONMENT.md. Unconditional either way: no panic, the cost
     // budget, and every field in range or `None` — the degradation
     // contract this module exists to guarantee.
+    // Only called from the aarch64-gated live-probe test below — cfg-gated
+    // the same way so a non-Apple-Silicon TEST build doesn't flag it as
+    // dead code under `-D warnings` (the same class of finding as #1's
+    // `attach_cluster_mhz`, caught the same way: `cargo clippy --target
+    // x86_64-apple-darwin --all-targets`, not just `--lib`).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn expect_ioreport() -> bool {
         std::env::var("DARKMUX_EXPECT_IOREPORT").as_deref() == Ok("1")
     }
