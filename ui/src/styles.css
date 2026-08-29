@@ -2365,6 +2365,44 @@ body {
     grid-column: 1 / -1;
   }
 }
+/* (#2108 review finding 5, screenshot-proven) The two-column band
+   (561px–1180px — excludes the ≤560px single-column stack just below,
+   which the base `.savnum` formula already handles correctly) still
+   collided: `.savnum`'s font-size is `min(48px * fs-scale, 13vw)`, sized
+   against the FULL VIEWPORT width — right for the single-tile-per-row
+   phone case that formula was measured against (this file's own comment
+   two rules down), wrong here, where each tile gets only HALF the grid's
+   own (already-narrower-than-viewport) row. At 974px wide, `13vw` ≈
+   127px, still clamped to the full 48px design size by `min()`, rendered
+   into a track measured at 238px — a 9-digit local figure's natural
+   (unbreakable — no space to wrap at) width of 312px overflowed 34px into
+   the cloud tile's column, painting over its own "0" (verified:
+   `.savnum`'s `scrollWidth` 312 vs `clientWidth` 238 at 974px, real
+   Chromium layout, not the string-content check this used to have).
+
+   The fix ties the font to the TRACK's own measured width via a CSS
+   container query (`cqi` — 1% of the nearest `container-type: inline-
+   size` ancestor's inline size) instead of the viewport. This is the
+   "principled long-term fix" the comment on the block above already
+   named as blocked on verifiability — it's verifiable now because a real
+   browser (Playwright/Chromium) does layout; jsdom, which still can't,
+   never exercised this formula's actual pixel output anyway. Only
+   `.savlead` — the grid ITEM, which stretches to a definite track width
+   in this band (`min-width: 0` above) — gets `container-type`; the
+   `.savrow` grid container itself deliberately doesn't, since a
+   container can't query its own inline size. 18cqi is calibrated against
+   the measured 238px-track/312px-content failure case above (56.64px
+   design font → ~42px fits) and re-verified with a Playwright sweep
+   across the whole band (600–1180px) at the same 9-digit figure: no
+   `scrollWidth > clientWidth` at any point in it. */
+@media (min-width: 561px) and (max-width: 1180px) {
+  .savlead {
+    container-type: inline-size;
+  }
+  .savnum {
+    font-size: min(calc(48px * var(--fs-scale)), 18cqi);
+  }
+}
 /* Phones: one tile per row. Two columns cannot hold the fluid figure
    (`min(48px, 13vw)` was measured against the FULL row width at 320px) and
    a smaller figure would undercut the number the hero exists to show. The
