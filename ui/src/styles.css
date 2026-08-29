@@ -4905,3 +4905,229 @@ body {
   color: var(--dim);
   margin-bottom: 12px;
 }
+
+/* ── (#2107, #1833) Meter — the generic CPU/GPU/MEM semicircle gauge ──────
+   Used by the global machine drawer/modal AND the machine lens's own
+   live-stats section. Sized to a ~100px flex basis so three fit one row at
+   a 390px viewport with room for gaps and container padding; below that
+   they wrap 2-then-1 rather than overflow (`.meter-row`'s `flex-wrap`). */
+.meter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1 1 100px;
+  min-width: 100px;
+  gap: 2px;
+}
+.meter svg {
+  display: block;
+}
+.meter-track {
+  stroke: var(--border);
+}
+.meter-fill {
+  stroke: var(--accent, var(--good));
+}
+.meter-needle {
+  stroke: var(--fg);
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+.meter-hub {
+  fill: var(--fg);
+}
+.meter-mark {
+  stroke: var(--dim);
+  stroke-width: 2;
+}
+.meter-mark-max {
+  stroke: var(--warn);
+}
+.meter-label {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: calc(10px * var(--fs-scale));
+  color: var(--dim);
+  margin-top: 2px;
+}
+.meter-numbers {
+  font: 600 calc(12px * var(--fs-scale))/1.3 var(--font-mono);
+  /* Fixed-width numerals so the row doesn't reflow/jitter as live values
+     tick over (operator: "no layout shift as values change"). */
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
+}
+.meter-now {
+  color: var(--fg);
+}
+.meter-avg,
+.meter-max {
+  color: var(--dim);
+}
+.meter-sep {
+  color: var(--dim);
+}
+.meter-scope {
+  font-size: calc(9px * var(--fs-scale));
+  color: var(--dim);
+  margin-top: 1px;
+}
+
+/* ── (#2107) The global machine drawer/modal ───────────────────────────── */
+
+/* A FIXED-position overlay pill, not a child of `<Masthead>` — deliberately.
+   `<Masthead>`'s own DOM is byte-parity-golden-protected
+   (`tests/parity/lib/extract-lens.js`'s `extractTopbarText`), and this pill
+   is mounted as a sibling in `App.tsx` precisely so adding it can never
+   touch that surface. Visible on every route, closed or open. Tabular
+   numerals so the live GPU% doesn't jitter the pill's width every ~2s
+   tick. */
+.machine-pill {
+  position: fixed;
+  top: 10px;
+  right: 12px;
+  z-index: 80;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg, #0b0b0d);
+  color: var(--fg);
+  font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+.machine-pill:hover {
+  border-color: var(--dim);
+}
+.machine-pill__dim {
+  color: var(--dim);
+  font-weight: 400;
+}
+
+.machine-drawer__backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 90;
+}
+/* Desktop: a centered modal. Mobile (≤768px, below) overrides this into a
+   bottom sheet. */
+.machine-drawer {
+  position: fixed;
+  z-index: 91;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(520px, calc(100vw - 32px));
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+  background: var(--bg, #0b0b0d);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+}
+.machine-drawer__handle {
+  display: none;
+}
+.machine-drawer__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.machine-drawer__title {
+  font: 600 calc(13px * var(--fs-scale))/1.3 var(--font-mono);
+  color: var(--fg);
+}
+.machine-drawer__close {
+  background: none;
+  border: none;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: calc(16px * var(--fs-scale));
+  line-height: 1;
+  padding: 4px;
+}
+.machine-drawer__close:hover {
+  color: var(--fg);
+}
+/* (#2107) Machine name · hardware · darkmux version — the phone's only
+   route to the version info the desktop-only ⓘ shows (`Masthead.tsx`'s
+   doc). */
+.machine-drawer__identity {
+  font: 500 calc(11px * var(--fs-scale))/1.4 var(--font-mono);
+  color: var(--dim);
+  margin-bottom: 4px;
+  overflow-wrap: anywhere;
+}
+.machine-drawer__scope {
+  font-size: calc(11px * var(--fs-scale));
+  color: var(--dim);
+  margin-bottom: 12px;
+}
+.meter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  justify-content: space-around;
+}
+
+@media (max-width: 768px) {
+  /* Phones: a bottom sheet instead of a centered modal — same content,
+     different chrome. `translateY` transition (see MachineDrawer.tsx's
+     inline transform), respecting `prefers-reduced-motion` there. */
+  .machine-drawer {
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    transform: none;
+    width: 100%;
+    max-height: 75vh;
+    border-radius: 16px 16px 0 0;
+    border-bottom: none;
+    padding: 8px 16px 20px;
+  }
+  .machine-drawer__handle {
+    display: flex;
+    justify-content: center;
+    padding: 6px 0 10px;
+    cursor: pointer;
+  }
+  .machine-drawer__handle-bar {
+    width: 36px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .machine-drawer,
+  .machine-pill {
+    transition: none !important;
+  }
+}
+
+/* ── (#1833) The machine lens's own live CPU/GPU/MEM section ────────────── */
+.mm-live-section {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.mm-live-section__title {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: calc(10px * var(--fs-scale));
+  color: var(--dim);
+  margin-bottom: 10px;
+}

@@ -9,6 +9,7 @@ import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
 import { Masthead } from "./components/Masthead";
+import { MachineDrawer } from "./components/MachineDrawer";
 import { EventLogColumn } from "./components/EventLogColumn";
 import { LensErrorBoundary } from "./components/LensErrorBoundary";
 import { MachineLens } from "./lenses/machine/MachineLens";
@@ -347,6 +348,23 @@ export function App() {
           `.app-shell__crumbbar`, matching legacy's DOM order (`.top` before
           `.crumbbar`). */}
       <Masthead route={displayRoute} liveStatus={liveStatus} specs={specs} replayDate={route.kind === "playback" ? null : replayDate} />
+      {/* (#2107) Global machine-stats pill/drawer — a SIBLING of `<Masthead>`,
+          not a child of it, so it can never touch that component's own
+          byte-parity-golden DOM (see `Masthead.tsx`'s doc). Fixed-position
+          via CSS, so it renders identically regardless of where in the DOM
+          it sits. Reads the SAME `routeRecords`/`flowWindow`/`localUid`
+          this file already resolves for the meta line and the machine
+          lens — cache reuse, not a second fetch; see
+          `lib/machineDrawerScope.ts` for the mission/dispatch-vs-rolling-
+          window scope rule. */}
+      <MachineDrawer
+        route={route}
+        routeRecords={routeRecords.records}
+        flowWindow={flowWindow.data}
+        localUid={localUid}
+        liveMachines={liveMachines}
+        specs={specs}
+      />
       {/* (#2071) The sticky block: the tab strip plus, while a day is loaded,
           the playback transport. Operator decision: sticky row, tabs
           included; the masthead, crumb and meta line scroll away. Its height

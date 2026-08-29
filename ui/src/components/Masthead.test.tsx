@@ -51,7 +51,7 @@ describe("Masthead", () => {
     vi.unstubAllGlobals();
   });
 
-  it("#verbadge renders the version + schema + info affordance when the metas ARE present (a real daemon)", () => {
+  it("(#2107) #verbadge renders ONLY the ⓘ affordance when the metas ARE present (a real daemon) — the inline text moved to the machine drawer's header", () => {
     const meta1 = document.createElement("meta");
     meta1.name = "darkmux-version";
     meta1.content = "2.7.0 (abc1234)";
@@ -63,7 +63,9 @@ describe("Masthead", () => {
 
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     renderMasthead({ kind: "fleet" });
-    expect(document.getElementById("verbadge")?.textContent).toBe("v2.7.0 (abc1234) · schema 1.16  ⓘ");
+    expect(document.getElementById("verbadge")?.textContent).toBe("ⓘ");
+    // The full detail survives as a hover tooltip, not lost.
+    expect(document.getElementById("verbadge")?.getAttribute("title")).toBe("darkmux 2.7.0 (abc1234) · flow schema 1.16 — about");
     vi.unstubAllGlobals();
   });
 

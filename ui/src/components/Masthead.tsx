@@ -131,7 +131,16 @@ export function Masthead({
 
   const verMeta = injectedMeta("darkmux-version");
   const schemaMeta = injectedMeta("darkmux-flow-schema");
-  const verText = verMeta ? `v${verMeta}${schemaMeta ? ` · schema ${schemaMeta}` : ""}  ⓘ` : "";
+  // (#2107) The inline `v<semver> (<sha>) · schema <n>` text is GONE — it
+  // was 200-225px of the masthead's own width budget (see `styles.css`'s
+  // `.masthead__ver` sub-560px doc, which already hides the whole chip on
+  // phones for exactly that reason), and the new global machine pill needs
+  // that room on desktop too. The full detail survives in TWO places: the
+  // `title` attribute below (a hover tooltip on the bare ⓘ) and — now
+  // reachable from every viewport, phones included, where this affordance
+  // itself stays hidden — the machine drawer's own header line
+  // (`MachineDrawer.tsx`), which reads the SAME `injectedMeta` values.
+  const verText = verMeta ? "ⓘ" : "";
   const verTitle = verMeta ? `darkmux ${verMeta}${schemaMeta ? ` · flow schema ${schemaMeta}` : ""} — about` : undefined;
 
   // `refreshbtn` — viewer.html:809/3439-ish (`refetchLive()`). No single

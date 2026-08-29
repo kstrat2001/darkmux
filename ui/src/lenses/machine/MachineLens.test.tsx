@@ -164,6 +164,52 @@ describe("MachineLens", () => {
     expect(screen.queryByText(/not reported from here/i)).not.toBeInTheDocument();
   });
 
+  it("(#1833) shows live CPU/GPU/MEM now/avg/max for this machine's own telemetry.process samples", async () => {
+    // (rolling-window fix) The 10-minute window is measured against REAL
+    // `Date.now()`, not the test's nominal "today" — a midnight-UTC
+    // timestamp is routinely hours outside that window depending on when
+    // the suite actually runs. Recent-relative-to-now instead.
+    const oldIso = new Date(Date.now() - 5 * 60_000).toISOString();
+    const newIso = new Date(Date.now() - 60_000).toISOString();
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 },
+      flowToday: [
+        { ts: newIso, machine_uid: "self-uid", machine_id: "MacBook-Pro" },
+        // Distinct values per metric so each assertion below can only match
+        // the ONE tile it names — cpu/mem/gpu never share an avg/now/max.
+        { ts: oldIso, machine_uid: "self-uid", category: "telemetry", source: "process", action: "telemetry.process", payload: { cpu: 40, mem: 20, gpu: 60 } },
+        { ts: newIso, machine_uid: "self-uid", category: "telemetry", source: "process", action: "telemetry.process", payload: { cpu: 80, mem: 50, gpu: 90 } },
+        // A peer's own sample, same window — must NOT be averaged in.
+        { ts: newIso, machine_uid: "peer-uid", category: "telemetry", source: "process", action: "telemetry.process", payload: { cpu: 999, mem: 999, gpu: 999 } },
+      ],
+    });
+    renderMachine(null);
+    // The section title renders unconditionally; the METER VALUES only once
+    // specs has resolved `targetUid` to "self-uid" (an async render pass) —
+    // wait on those, not the static title, so this isn't a false-pass on a
+    // render that hasn't caught up yet.
+    await waitFor(() => expect(screen.getByText("live load · last 10 min")).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector(".mm-live-section .meter-now")?.textContent).toBe("80%"));
+
+    const section = document.querySelector(".mm-live-section")!;
+    const tile = (metric: string) => section.querySelector(`[data-meter="${metric}"]`)!;
+    // cpu: [40, 80] — now (last) 80, avg 60, max 80.
+    expect(tile("cpu").querySelector(".meter-now")!.textContent).toBe("80%");
+    expect(tile("cpu").querySelector(".meter-avg")!.textContent).toBe("60% avg");
+    expect(tile("cpu").querySelector(".meter-max")!.textContent).toBe("80% max");
+    // mem: [20, 50] — now 50, avg 35, max 50.
+    expect(tile("mem").querySelector(".meter-now")!.textContent).toBe("50%");
+    expect(tile("mem").querySelector(".meter-avg")!.textContent).toBe("35% avg");
+    // gpu: [60, 90] — now 90, avg 75, max 90.
+    expect(tile("gpu").querySelector(".meter-now")!.textContent).toBe("90%");
+    expect(tile("gpu").querySelector(".meter-avg")!.textContent).toBe("75% avg");
+    // The peer's 999s must never appear anywhere in this section.
+    expect(section.textContent).not.toContain("999");
+    // The VRAM gauge is untouched by this section — still rendered, same as
+    // every other test in this file that reaches the health region.
+    expect(screen.getByText(/limit source/i)).toBeInTheDocument();
+  });
+
   it("an unrecognized/stale uid degrades gracefully — names the raw uid, links to its (empty) runs lens, never crashes", async () => {
     mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" } });
     renderMachine("totally-unknown-uid-nobody-has-ever-seen");

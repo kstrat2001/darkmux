@@ -47,6 +47,7 @@
 
 import { T, dispatchErrored, dispatchKilled, statusLabel, computeTMax } from "../../lib/flow";
 import { fmtDuration, clk, fmtC } from "../../lib/format";
+import { aggregateHostSamples, roundPct } from "../../lib/hostStats";
 import type { FlowRecord, DispatchStartPayload, DispatchCompletePayload } from "../../types/handwritten";
 
 export type PillCls = "run" | "err" | "done" | "canceled";
@@ -551,21 +552,29 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // records, the prompt, and now this): the data is in hand and the renderer
   // drops it.
   //
-  // PEAK rather than latest, because the question a local-AI operator asks of
-  // a finished run is "did this saturate the machine" — a last-sample reading
-  // taken after the model stopped answers nothing. `mean` is deliberately not
-  // shown: a run that pegged the GPU for ten seconds inside two minutes is a
-  // very different fact from one that sat at the mean throughout, and only
-  // the peak makes the first visible.
-  const peakOf = (key: string): number | null => {
-    const vals = procs
-      .map((r) => Number((r.fields as Record<string, unknown> | undefined)?.[key]))
-      .filter((n) => Number.isFinite(n));
-    return vals.length ? Math.max(...vals) : null;
+  // (#2107) PEAK alone answered "did this saturate the machine" but not how
+  // hard it was driven ON AVERAGE — the same gap the host-side reduction
+  // (`dispatch_internal.rs`'s `HostStats`) closed for the envelope. `avg`
+  // now rides beside `high` in the SAME tile ("add the avg to the card with
+  // the high" — operator), through the ONE aggregation
+  // (`lib/hostStats.ts::aggregateHostSamples`) the global machine drawer
+  // also uses, so the two surfaces can't report different numbers for
+  // overlapping samples.
+  const toNum = (v: unknown): number | undefined => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
   };
-  const cpuPeak = peakOf("cpu");
-  const ramPeak = peakOf("mem");
-  const gpuPeak = peakOf("gpu");
+  const hostAgg = aggregateHostSamples(
+    procs.map((r) => {
+      const f = r.fields as Record<string, unknown> | undefined;
+      return { cpu: toNum(f?.cpu), mem: toNum(f?.mem), gpu: toNum(f?.gpu) };
+    }),
+  );
+  const cpuPeak = hostAgg.cpu.high;
+  const ramPeak = hostAgg.mem.high;
+  const gpuPeak = hostAgg.gpu.high;
+  const avgHighValue = (m: { avg: number | null; high: number | null }): string =>
+    `${roundPct(m.avg)}% avg · ${roundPct(m.high)}% high`;
 
   // Built as a list with its scope recorded AS EACH TILE IS ADDED, rather
   // than as a fixed array plus hardcoded indices. The indices are now
@@ -597,9 +606,9 @@ export function runRegions(data: FlowRecord[], sid: string, nowOverride?: number
   // would assert "the harness compacted nothing" where the truth is "there
   // was nothing here that could be compacted".
   if (hasModelWork) push(systemIdx, String(comps.length), "COMPACTIONS");
-  if (cpuPeak != null) push(systemIdx, `${Math.round(cpuPeak)}%`, "CPU PEAK");
-  if (ramPeak != null) push(systemIdx, `${Math.round(ramPeak)}%`, "RAM PEAK");
-  if (gpuPeak != null) push(systemIdx, `${Math.round(gpuPeak)}%`, "GPU PEAK");
+  if (cpuPeak != null) push(systemIdx, avgHighValue(hostAgg.cpu), "CPU");
+  if (ramPeak != null) push(systemIdx, avgHighValue(hostAgg.mem), "RAM");
+  if (gpuPeak != null) push(systemIdx, avgHighValue(hostAgg.gpu), "GPU");
 
   // (#1973) Indices into `metrics`, not a second copy — one ordered list, one
   // grouping over it, so the two cannot drift apart. TURNS/TOKENS/CTX/

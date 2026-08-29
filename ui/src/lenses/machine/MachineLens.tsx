@@ -10,6 +10,9 @@ import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
 import { getSource } from "../../lib/source";
+import { Meter } from "../../components/Meter";
+import { aggregateHostSamples } from "../../lib/hostStats";
+import { rollingWindowSamples } from "../../lib/machineDrawerScope";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
 /** The health region's state vocabulary, verbatim from `/machine/resources`
@@ -188,6 +191,15 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // fleet-card drill, local or remote) or, absent one, the local machine
   // (the nav-tab/deep-link entry — legacy's `goMachine`).
   const targetUid = routeUid ?? localUid;
+  // (#1833) The live CPU/GPU/MEM section's own reduction — SAME window
+  // function + aggregation the global machine drawer uses
+  // (`lib/machineDrawerScope.ts`, `lib/hostStats.ts`), scoped to
+  // `targetUid` so a drilled-into remote machine's card reads ITS load,
+  // not always the local box's.
+  const liveAgg = useMemo(
+    () => aggregateHostSamples(rollingWindowSamples(flowWindow.data, targetUid, nowMs)),
+    [flowWindow.data, targetUid, nowMs],
+  );
   // Identity is the UID, never the display name. This compared
   // `nameOf(targetUid) === specs.machine_id`, which asks whether the label we
   // happen to show equals the name specs happens to report — and those are
@@ -366,6 +378,26 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
           nowMs={nowMs}
           utilityModelId={utilityModelId(specs, isLocalSpecs)}
         />
+      </div>
+
+      {/* (#1833) Live CPU/GPU/MEM — the surface half of #1833: the
+          rolling host sampler (`telemetry.process`) has been shipping
+          since #557/#1064 with no display anywhere on this lens. Same
+          [[Meter]] component + rolling-10-minute window the global
+          machine drawer uses (`lib/machineDrawerScope.ts`'s
+          `rollingWindowSamples`), scoped to `targetUid` (not always the
+          LOCAL machine) so a drilled-into remote machine's card shows
+          ITS OWN load, not this box's. The global pill/drawer stays
+          reachable on this lens too — the redundancy is accepted
+          (operator), since this section answers "what is THIS machine
+          doing" in place, without a click. */}
+      <div className="mm-live-section">
+        <div className="mm-live-section__title">live load · last 10 min</div>
+        <div className="meter-row">
+          <Meter label="CPU" now={liveAgg.cpu.now} avg={liveAgg.cpu.avg} max={liveAgg.cpu.high} />
+          <Meter label="GPU" now={liveAgg.gpu.now} avg={liveAgg.gpu.avg} max={liveAgg.gpu.high} />
+          <Meter label="MEM" now={liveAgg.mem.now} avg={liveAgg.mem.avg} max={liveAgg.mem.high} />
+        </div>
       </div>
 
       {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —
