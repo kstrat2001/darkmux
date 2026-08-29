@@ -118,10 +118,17 @@ body {
    content change; the parity extractor selects by id regardless of DOM
    nesting. */
 /* (#2071) The sticky block: tab strip + playback transport. Sticks under
-   the top of the viewport on every route; the masthead, crumb and meta line
-   scroll away above it. Its height never depends on the route (the meta
-   line is deliberately NOT in it), which is what stopped the tab strip
-   jumping 32px between the fleet and the other tabs on a phone. */
+   the top of the viewport on every route; the masthead scrolls away above
+   it. Originally the crumb and meta line scrolled away too, and this
+   comment said so — #2108 rounds 1 and 2 moved BOTH into this row (see
+   the doc further down), so on desktop the row's height is now whatever
+   the folded-in crumb/meta content needs, not route-independent by
+   construction the way it was at #2071. In practice the tabs still set
+   the row's floor height and crumb/meta share the remaining line via
+   `margin-left: auto`/`flex: 1 1 auto`, so this hasn't reintroduced the
+   original 32px jump the route-independence was written to prevent —
+   flagged here rather than silently left describing behavior that no
+   longer holds. */
 .app-shell__sticky {
   position: sticky;
   top: 0;
@@ -139,15 +146,6 @@ body {
   margin: 0;
   padding: 0;
   border-top: none;
-}
-
-.app-shell__crumbbar {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--border);
-  flex-wrap: wrap;
 }
 
 .app-shell__navtabs {
@@ -231,6 +229,15 @@ body {
   color: var(--dim);
 }
 
+/* (#2108, operator finding — round 2) `#meta` now lives in `.app-shell__sticky`
+   (`App.tsx`'s own doc on the move), the same flex row as the tabs and
+   `#crumb`. `margin-left: auto` is what pins it to the right end of that
+   row: `#crumb` already flex-grows to fill the space between the tabs and
+   here, so this margin is normally absorbing zero leftover space in
+   practice — it is kept anyway as the belt-and-braces right-anchor for any
+   layout where crumb's grow doesn't consume every last pixel (e.g. crumb
+   at its own max-content width). Desktop only; the mobile override below
+   gives it back its own full-width row. */
 .app-shell__meta {
   margin-left: auto;
   font-size: calc(11px * var(--fs-scale));
@@ -290,13 +297,16 @@ body {
   opacity: 0.85;
 }
 
-/* (#2108, operator finding — desktop tab-row fold) `#crumb` moved from
-   `.app-shell__crumbbar` into `.app-shell__sticky` (`App.tsx`'s own doc on
-   that move) — on desktop it now shares the tabs' row for free (the
-   sticky container is already `display:flex; flex-wrap:wrap;`). This rule
-   is the phone-only exception: give crumb back its OWN row (matching the
-   pre-move visual, "phones keep two rows") rather than letting it wrap
-   ragged beside a half-empty tab strip.
+/* (#2108, operator finding — desktop tab-row fold, rounds 1 + 2) `#crumb`
+   AND `#meta` both moved out of the now-deleted `.app-shell__crumbbar`
+   into `.app-shell__sticky` (`App.tsx`'s own doc on both moves) — on
+   desktop they now share the tabs' row for free (the sticky container is
+   already `display:flex; flex-wrap:wrap;`): tabs left, crumb filling the
+   middle, meta right-anchored via its own `margin-left: auto`. This rule
+   is the phone-only exception: give crumb AND meta back their OWN rows
+   (matching the pre-move visual, "phones keep two rows" — crumb's row,
+   then meta's) rather than letting either wrap ragged beside a
+   half-empty tab strip.
 
    (Supersedes an OLDER order-based reflow here, #1613/#1614 precedent,
    `tests/e2e/chrome-order.spec.js` — that block assumed `#crumb`/`#meta`/
@@ -305,15 +315,14 @@ body {
    `.app-shell__sticky`. The e2e spec was updated for #2071 (asserts
    `tabs.y < meta.y` directly, no `order` involved) and that block went
    dead without anyone noticing — CSS `order` silently doing nothing to
-   elements that are no longer siblings. Deleted rather than "fixed" since
-   `#meta` isn't moving and doesn't need reordering; the surviving rules
-   below are new, not a repair of the old ones.) */
+   elements that are no longer siblings. Deleted rather than "fixed"; the
+   surviving rules below are new, not a repair of the old ones.) */
 @media (max-width: 768px) {
   .app-shell__crumb {
     flex: 1 1 100%;
   }
-  .app-shell__crumbbar {
-    gap: 6px 8px;
+  .app-shell__meta {
+    flex: 1 1 100%;
   }
   /* (operator, on the phone, 2026-08-28) Uniform-width tabs filling the
      row: sized by their labels, RUNS was the slim one and the strip sat

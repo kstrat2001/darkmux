@@ -389,11 +389,15 @@ export function App() {
         eventLogError={routeRecords.error}
         eventLogHistorical={routeRecords.historical}
       />
-      {/* (#2071) The sticky block: the tab strip plus, while a day is loaded,
-          the playback transport. Operator decision: sticky row, tabs
-          included; the masthead, crumb and meta line scroll away. Its height
-          is route-independent by construction (the meta line is NOT in it),
-          which is what stopped the 32px tab-strip jump between routes. */}
+      {/* (#2071, superseded by #2108 rounds 1+2 below) Originally: sticky row
+          holds only the tab strip + transport; the masthead, crumb and meta
+          line scroll away, and the row's height is route-independent
+          because the meta line is NOT in it. Both crumb and meta have since
+          moved into this row (see their own doc comments a few lines down)
+          — the masthead is the only chrome still left scrolling away above
+          it. Kept as history rather than deleted: it's the reasoning that
+          stopped the original 32px tab-strip jump, still worth knowing when
+          touching this row again. */}
       <div className="app-shell__sticky" ref={stickyRef}>
         <NavChrome route={route} />
         {transportShown ? (
@@ -412,28 +416,32 @@ export function App() {
           />
         ) : null}
         {/* (#2108, operator finding — desktop tab-row fold) `#crumb` moved
-            HERE from its old home in `.app-shell__crumbbar` below — on
-            desktop it now reads on the SAME row as the tabs ("subtitle
-            folded into the tab row"), a real DOM move (not a CSS trick),
-            safe for parity since the extractor selects `#crumb` BY ID
-            regardless of parent (this file's own module doc, Packet 1.5).
-            `#meta` stays behind in `.app-shell__crumbbar`, UNCHANGED — the
-            #2071 sticky packet's own operator decision ("masthead, crumb
-            AND meta line scroll away") named crumb specifically as
-            scrolling content; folding crumb into the tabs supersedes that
-            HALF of the decision (crumb is now sticky too, deliberately —
-            it identifies WHERE you are, same as the tabs beside it), but
-            meta (session/timing info) keeps scrolling away exactly as
-            before. `styles.css`'s mobile override puts crumb back on its
-            OWN row below the tabs — "phones keep two rows". */}
+            HERE from its old home in `.app-shell__crumbbar` — on desktop it
+            now reads on the SAME row as the tabs ("subtitle folded into the
+            tab row"), a real DOM move (not a CSS trick), safe for parity
+            since the extractor selects `#crumb` BY ID regardless of parent
+            (this file's own module doc, Packet 1.5). `styles.css`'s mobile
+            override puts crumb back on its OWN row below the tabs —
+            "phones keep two rows". */}
         {/* (#2073) `is-replay`: on a playback route the crumb repeats the
             meta line's own lead (`◆ <mission>`); the narrow stylesheet drops
             this copy, where a phone has no room for the same name twice. */}
         <header className={`app-shell__crumb${route.kind === "playback" ? " is-replay" : ""}`} id="crumb">
           {crumb}
         </header>
-      </div>
-      <div className="app-shell__crumbbar">
+        {/* (#2108, operator finding — round 2) `#meta` moved HERE too, from
+            the now-deleted `.app-shell__crumbbar` wrapper, so the "N ⚙ ·
+            last dispatch …" summary shares the tab row with the tabs and
+            `#crumb` instead of sitting on its own full-height row beneath
+            it. This SUPERSEDES the other half of the #2071 sticky packet's
+            original call ("masthead, crumb AND meta line scroll away") —
+            round 1 already moved crumb into the sticky row; meta joining it
+            here means the whole row, meta included, is sticky now. `#meta`
+            keeps its own id/content (pure DOM move, parity-safe same as
+            crumb's move above). `.app-shell__meta`'s existing
+            `margin-left: auto` is what pins it to the right of the row;
+            `styles.css`'s mobile override gives it back its OWN row below
+            crumb, same "phones keep two rows" treatment. */}
         <div className="app-shell__meta" id="meta">
           {/* `whiteSpace: "pre"` — the idle headline's literal double space
               before "· last run" (see `metaLine.ts`'s module doc) is an

@@ -921,17 +921,34 @@ describe("App", () => {
     return meta;
   }
 
-  it("(#2108, operator finding — desktop tab-row fold) #crumb lives inside .app-shell__sticky now (folded into the tab row); #meta stays behind in .app-shell__crumbbar, unmoved", async () => {
+  it("(#2108, operator finding — desktop tab-row fold, rounds 1 + 2) #crumb AND #meta both live inside .app-shell__sticky now, folded into the tab row; .app-shell__crumbbar no longer exists", async () => {
     window.location.hash = "#lens=runs";
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     renderApp();
     await waitFor(() => expect(document.querySelector(".app-shell__navtabs")).toBeTruthy());
+    expect(document.querySelector(".app-shell__crumbbar")).toBeNull();
     const crumb = document.querySelector("#crumb")!;
-    expect(crumb.closest(".app-shell__sticky")).toBeTruthy();
-    expect(crumb.closest(".app-shell__crumbbar")).toBeNull();
     const meta = document.querySelector("#meta")!;
-    expect(meta.closest(".app-shell__crumbbar")).toBeTruthy();
-    expect(meta.closest(".app-shell__sticky")).toBeNull();
+    expect(crumb.closest(".app-shell__sticky")).toBeTruthy();
+    expect(meta.closest(".app-shell__sticky")).toBeTruthy();
+  });
+
+  it("(#2108, operator finding — round 2) the summary (#meta) and the tab list (.app-shell__navtabs) share the SAME container, not just the same page — the structural proof that they render on one row", async () => {
+    window.location.hash = "#lens=runs";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".app-shell__navtabs")).toBeTruthy());
+    const navtabs = document.querySelector(".app-shell__navtabs")!;
+    const meta = document.querySelector("#meta")!;
+    const sticky = document.querySelector(".app-shell__sticky")!;
+    // Same immediate row container — this is the real proof available in
+    // jsdom, which performs no layout (so a literal offsetTop comparison
+    // below would pass trivially for ANY two elements at 0,0 regardless of
+    // whether they actually share a row; it's asserted too, for the
+    // record, but the parentElement check is what's load-bearing).
+    expect(navtabs.parentElement).toBe(sticky);
+    expect(meta.parentElement).toBe(sticky);
+    expect((navtabs as HTMLElement).offsetTop).toBe((meta as HTMLElement).offsetTop);
   });
 
   it("(#2071) a live daemon route renders no transport — nothing to scrub", async () => {
