@@ -1098,6 +1098,33 @@ body {
   overflow: auto;
   padding: 6px 12px 8px;
 }
+/* (#2108, `inlineDetail`) Each record's own full `RecordView`, stacked,
+   instead of one-line rows — the list itself still owns the ONE scroll
+   region (`overscroll-behavior: contain` so reaching its top/bottom
+   doesn't chain into the page/sheet behind it); a single oversized
+   record gets its OWN capped scroll below instead of stretching the
+   whole list. */
+.eventlog__body--inline {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overscroll-behavior: contain;
+}
+.eventlog__inlinerec {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 10px;
+  background: rgba(255, 255, 255, 0.02);
+  /* A record with an unusually large payload (a long tool-call arg
+     string, a big raw JSON blob) caps here rather than growing the
+     whole list — its OWN scroll, contained so it doesn't leak into the
+     list's scroll above it. The cap is generous (a `vh` unit, not a
+     fixed px) so it scales with the sheet's own 85-90vh open height
+     instead of clipping at an arbitrary small number on a tall phone. */
+  max-height: 50vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .eventlog__rec {
   font: calc(11px * var(--fs-scale))/1.5 var(--font-mono);
   color: var(--dim);
@@ -5264,20 +5291,78 @@ body {
   text-align: center;
 }
 
-/* ── (#2107 tabbed-drawer packet) The phone-only (≤768px) tabbed bottom
-   drawer — `Machine` and `Events`. Replaces the earlier single-purpose
-   `machine-bottombar`/one-sheet phone chrome entirely (retired along with
-   this packet; see `PhoneDrawer.tsx`'s own doc for the interaction model).
+/* ── (#2108, operator finding — wrap fix) `InlineOrCells`' mobile cell
+   grid — the shared fix for a dotted list that wrapped mid-item at
+   ~390px ("15.0 W / p95" split across two lines, "ANE" pushed onto its
+   own broken line). `auto-fit`/`minmax` lets whole CELLS reflow to the
+   next row as a unit (never mid-phrase); `nowrap` + tabular-nums on the
+   value is what makes a single cell's own text un-splittable. `minmax`'s
+   64px floor comfortably clears 2+ columns at the drawer/lens's own
+   content width (~300-330px after padding) for every caller today
+   (2, 3, and 4-item rows), satisfying the "2 per row minimum" rule
+   without hand-tuning a column count per caller. */
+.inline-or-cells {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
+  gap: 6px 12px;
+  width: 100%;
+}
+.inline-or-cells__cell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.inline-or-cells__cell-label {
+  font-size: calc(9px * var(--fs-scale));
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.inline-or-cells__cell-value {
+  font: 600 calc(11px * var(--fs-scale))/1.3 var(--font-mono);
+  color: var(--fg);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* Inside a `.dialog__kv` row (Power/Channels/thermal-window's own wrapper),
+   the grid is the "value" half of the existing label-left/value-right
+   flex row — `min-width: 0` lets it actually SHRINK into the row's
+   available space rather than being pushed wide by its own content
+   (the same flex-shrink fix `.mm-gauge--compact` needed). */
+.dialog__kv .inline-or-cells {
+  min-width: 0;
+  flex: 1;
+}
 
-   `.phone-drawer__bar` (handle + two tab buttons) is a permanent
-   "mainstay" — fixed to the viewport bottom, `.app-shell` reserves its
-   height via `padding-bottom` below, same discipline a native app's own
-   tab bar follows, `env(safe-area-inset-bottom)` clear of an iPhone's home
-   indicator. `.phone-drawer__body` (whichever tab is active) only exists
-   while open; since `.phone-drawer` itself is bottom-anchored and the
-   bar's height never changes, the body simply grows the WHOLE column
-   upward as it opens/drags — no separate "collapsed vs full" class swap
-   the old single-sheet chrome needed. */
+/* (#2108, operator finding — wrap fix) The mobile identity block — two
+   stacked lines (machine name, then hardware) with NO separators,
+   replacing the single dotted `headerLine` that wrapped after "128 GB ·"
+   on a phone. The version is dropped entirely on this form (it's already
+   the `build` row in the "about" kv block below). */
+.machine-drawer__identity--mobile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.machine-drawer__identity-line {
+  overflow-wrap: anywhere;
+}
+
+/* ── (#2107 tabbed-drawer packet, restructured #2108 "one card" packet)
+   The phone-only (≤768px) tabbed bottom drawer — `Machine` and `Events`.
+   See `PhoneDrawer.tsx`'s own doc for the full interaction model.
+
+   ONE card, `.phone-drawer` itself: the sole element carrying a
+   background/border/border-radius, `position:fixed`+bottom-anchored, and
+   the ONE thing whose `height` animates (closed → this rule's own
+   `calc(58px + env(safe-area-inset-bottom, 0px))`, open → an inline
+   `openPct vh` `PhoneDrawer.tsx` sets). `.phone-drawer__bar` (handle,
+   then the two tabs) is its FIRST child, pinned at the card's own top
+   edge; `.phone-drawer__body` (the active tab's content, `flex: 1`) is
+   its SECOND, filling whatever height remains below the bar. Neither
+   inner section carries its own background/transform any more — there is
+   only the one card, moving as one unit. */
 @media (max-width: 768px) {
   .app-shell {
     padding-bottom: calc(58px + env(safe-area-inset-bottom, 0px));
@@ -5307,51 +5392,36 @@ body {
     z-index: 80;
     display: flex;
     flex-direction: column;
-  }
-  .phone-drawer__body {
     background: var(--bg, #0b0b0d);
     border-top: 1px solid var(--border);
     border-radius: 16px 16px 0 0;
     overflow: hidden;
+    /* Closed height — just enough for the handle+tabs bar below, nothing
+       more (there is no content mounted to show anyway). `PhoneDrawer.tsx`
+       overrides this with an inline `openPct vh` while open; the browser
+       transitions between the two since both are concrete lengths. */
+    height: calc(58px + env(safe-area-inset-bottom, 0px));
+    transition: height 220ms ease-out;
+  }
+  .phone-drawer--dragging {
+    /* Tracks the finger with zero lag during a live drag — re-enabled
+       (the base rule's `transition` above) the instant the pointer
+       releases. */
+    transition: none;
+  }
+  .phone-drawer__bar {
+    flex: 0 0 auto;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    /* (iOS scroll-lock fix) The mainstay bar's own non-scrolling chrome —
+       a touch here must never scroll the page behind it either. */
+    touch-action: none;
+  }
+  .phone-drawer__body {
+    flex: 1;
+    min-height: 0;
     display: flex;
     flex-direction: column;
-    min-height: 0;
-    /* (operator finding, phone install review) ALWAYS mounted now
-       (`PhoneDrawer.tsx`'s own doc) — closed state sits fully off-screen
-       via `transform: translateY(100%)`, a compositor-only property so a
-       real device doesn't lay out/paint the hidden sheet during the
-       slide. `height` is still set inline per-drag (`PhoneDrawer.tsx`);
-       that transition applies to a TAP-driven open/close/tab-switch RESIZE
-       (switching tabs while already open, snapping to that tab's own
-       remembered height) — the `.phone-drawer--dragging` override below
-       (replacing the old inline `transition: "none"`) keeps a live drag
-       from lagging behind the pointer.
-
-       `visibility`'s transition is asymmetric ON PURPOSE: this (closed)
-       rule delays it by the FULL slide duration, so closing stays visible
-       for the whole 220ms slide-down instead of vanishing the instant the
-       class is removed; the `--open` rule below has NO delay, so opening
-       becomes visible immediately as the slide-up begins. Per the CSS
-       Transitions spec, a property change is governed by the AFTER-change
-       style's `transition` declaration — closing lands on THIS rule
-       (delayed), opening lands on the `--open` rule (not delayed). */
-    transition:
-      height 0.2s ease,
-      transform 220ms ease-out,
-      visibility 0s linear 220ms;
-    transform: translateY(100%);
-    visibility: hidden;
-  }
-  .phone-drawer--open .phone-drawer__body {
-    transition:
-      height 0.2s ease,
-      transform 220ms ease-out,
-      visibility 0s linear;
-    transform: translateY(0);
-    visibility: visible;
-  }
-  .phone-drawer--dragging .phone-drawer__body {
-    transition: none;
+    overflow: hidden;
   }
   .phone-drawer__panel {
     flex: 1;
@@ -5379,15 +5449,6 @@ body {
   }
   .phone-drawer__body .eventlog__list {
     min-height: 0;
-  }
-  .phone-drawer__bar {
-    flex: 0 0 auto;
-    background: var(--bg, #0b0b0d);
-    border-top: 1px solid var(--border);
-    padding-bottom: env(safe-area-inset-bottom, 0px);
-    /* (iOS scroll-lock fix) The mainstay bar's own non-scrolling chrome —
-       a touch here must never scroll the page behind it either. */
-    touch-action: none;
   }
   .phone-drawer__handle {
     display: flex;
@@ -5454,7 +5515,7 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .machine-drawer,
-  .phone-drawer__body {
+  .phone-drawer {
     transition: none !important;
   }
 }
