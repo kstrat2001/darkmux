@@ -66,6 +66,9 @@ pub struct Materialized {
     /// `include`/`exclude`, sorted.
     pub files: std::collections::BTreeMap<String, Vec<String>>,
     pub skipped: Vec<SkippedFile>,
+    /// Per source: files the spec\'s include/exclude left out — out of scope,
+    /// counted, never listed (#1959).
+    pub out_of_scope: std::collections::BTreeMap<String, usize>,
 }
 
 /// Resolve every source in the spec, then walk + filter each tree.
@@ -88,10 +91,12 @@ pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Mat
     let exclude = spec.effective_exclude();
     let mut files = std::collections::BTreeMap::new();
     let mut skipped = Vec::new();
+    let mut out_of_scope = std::collections::BTreeMap::new();
     for s in &sources {
-        let (kept, mut skip) = walk_and_filter(&s.tree, &include, &exclude, &s.id)?;
+        let (kept, mut skip, oos) = walk_and_filter(&s.tree, &include, &exclude, &s.id)?;
         files.insert(s.id.clone(), kept);
         skipped.append(&mut skip);
+        out_of_scope.insert(s.id.clone(), oos);
     }
 
     Ok(Materialized {
@@ -101,6 +106,7 @@ pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Mat
         edges: spec.edges.clone(),
         files,
         skipped,
+        out_of_scope,
     })
 }
 
@@ -337,12 +343,16 @@ fn walk_and_filter(
     include: &[String],
     exclude: &[String],
     source_id: &str,
-) -> Result<(Vec<String>, Vec<SkippedFile>)> {
+) -> Result<(Vec<String>, Vec<SkippedFile>, usize)> {
     let mut entries = Vec::new();
     walk_relative(tree, &mut entries)?;
 
     let mut kept = Vec::new();
     let mut skipped = Vec::new();
+    // A file the spec's include/exclude leaves out is OUT OF SCOPE, not
+    // skipped: counted so the plan can say how much of the tree it covers,
+    // never listed (a dry run on a real tree printed 541 such lines, #1959).
+    let mut out_of_scope = 0usize;
     for (path, is_symlink) in entries {
         let rel = path
             .strip_prefix(tree)
@@ -360,15 +370,11 @@ fn walk_and_filter(
         if super::glob::applies(include, exclude, &rel) {
             kept.push(rel);
         } else {
-            skipped.push(SkippedFile {
-                source_id: source_id.to_string(),
-                relative_path: rel,
-                reason: "excluded by include/exclude".to_string(),
-            });
+            out_of_scope += 1;
         }
     }
     kept.sort();
-    Ok((kept, skipped))
+    Ok((kept, skipped, out_of_scope))
 }
 
 /// `chmod -R a-w` on every FILE, then every DIRECTORY (bottom-up), under
@@ -763,9 +769,13 @@ mod tests {
 
         let m = materialize(&spec, RW).unwrap();
         assert_eq!(m.files["app"], vec!["src/a.ts".to_string(), "src/z.ts".to_string()]);
+        // Out-of-scope files are COUNTED, never listed as skipped (#1959: a
+        // dry run on a real tree printed 541 "excluded" lines as if they were
+        // failures). README.md and a.txt fall outside `**/*.ts`.
+        assert!(m.out_of_scope["app"] >= 2, "{:?}", m.out_of_scope);
         assert!(
-            m.skipped.iter().any(|s| s.relative_path == "README.md" || s.relative_path == "a.txt"),
-            "{:?}",
+            !m.skipped.iter().any(|s| s.reason.contains("include/exclude")),
+            "out-of-scope files must not appear in skipped: {:?}",
             m.skipped
         );
     }

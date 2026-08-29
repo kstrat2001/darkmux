@@ -866,6 +866,7 @@ fn synthetic_plan_with_n_units(workspace_name: &str, n: usize, materialized: &[w
             git_ref: r.git_ref.clone(),
             tree: r.tree.clone(),
             files_walked: 0,
+            out_of_scope: 0,
         })
         .collect();
     Plan {

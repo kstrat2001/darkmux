@@ -145,6 +145,10 @@ pub struct PlanSource {
     /// Total regular files found under this source's tree (before any
     /// rule's glob filtering) — the CLI table's `files_walked` column.
     pub files_walked: usize,
+    /// Files the workspace spec's include/exclude left out of this source —
+    /// out of scope, counted, never listed (#1959).
+    #[serde(default)]
+    pub out_of_scope: usize,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -549,6 +553,7 @@ pub fn plan(materialized: &Materialized, rules: &[Rule]) -> Result<Plan> {
             git_ref: s.git_ref.clone(),
             tree: s.tree.clone(),
             files_walked: files_by_id.get(&s.id).map(|f| f.all.len()).unwrap_or(0),
+            out_of_scope: materialized.out_of_scope.get(&s.id).copied().unwrap_or(0),
         })
         .collect();
 
@@ -1187,7 +1192,7 @@ mod tests {
             files.insert(s.id.clone(), all);
             skipped.append(&mut sk);
         }
-        Materialized { name: "t".to_string(), root: PathBuf::new(), sources, edges, files, skipped }
+        Materialized { name: "t".to_string(), root: PathBuf::new(), sources, edges, files, skipped, out_of_scope: Default::default() }
     }
 
     fn edge_spec(app: &str, lib: &str, package: &str) -> Vec<EdgeSpec> {

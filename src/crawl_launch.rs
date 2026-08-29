@@ -1615,7 +1615,10 @@ fn print_plan_table(the_plan: &plan::Plan, out_path: Option<&Path>) {
     } else {
         for s in &the_plan.sources {
             let short_sha = &s.sha[..s.sha.len().min(8)];
-            println!("  {:<16} {:<10} files_walked={}", s.id, short_sha, s.files_walked);
+            println!(
+                "  {:<16} {:<10} in_scope={} out_of_scope={}",
+                s.id, short_sha, s.files_walked, s.out_of_scope
+            );
         }
     }
     println!();
