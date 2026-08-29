@@ -440,6 +440,25 @@ fn crawl_record(
 /// listing this launcher itself handed it). Falls through unchanged when
 /// neither prefix matches (a model that ignored the given source id
 /// entirely — rare, but the raw value survives in `file_raw` either way).
+/// (#1959) Pick the ONE rule id a finding belongs to. A single-rule unit needs
+/// no disambiguation; a multi-rule (read) unit uses the `pattern` the model
+/// reported, matched case-insensitively against the unit's rule ids. When the
+/// model's pattern names none of them, the first rule stands in and the
+/// pattern is returned so the record can say so (`rule_unmatched_pattern`).
+pub(crate) fn finding_rule_for(pattern: Option<&str>, rule_ids: &[String]) -> (String, Option<String>) {
+    if let [only] = rule_ids {
+        return (only.clone(), None);
+    }
+    let wanted = pattern.map(str::trim).unwrap_or("");
+    if let Some(hit) = rule_ids.iter().find(|r| r.eq_ignore_ascii_case(wanted)) {
+        return (hit.clone(), None);
+    }
+    (
+        rule_ids.first().cloned().unwrap_or_default(),
+        if wanted.is_empty() { None } else { Some(wanted.to_string()) },
+    )
+}
+
 fn strip_source_prefix(source_id: &str, raw: &str) -> String {
     let abs_prefix = format!("/workspace/{source_id}/");
     if let Some(rel) = raw.strip_prefix(&abs_prefix) {
@@ -1208,7 +1227,17 @@ pub(crate) fn run(
                             obj.insert("unit".to_string(), json!(unit.id()));
                             obj.insert("source".to_string(), json!(source));
                             obj.insert("sha".to_string(), json!(sha));
-                            obj.insert("rule".to_string(), json!(rule_ids));
+                            // (#1959) `rule` is ONE id — the pattern the model reported this
+                            // finding under — never the unit's whole list: the hook receiver
+                            // keys finding identity on it and refuses an array. The unit's full
+                            // list rides alongside as `rules`.
+                            let pattern = obj.get("pattern").and_then(Value::as_str).map(str::to_string);
+                            let (rule_id, unmatched) = finding_rule_for(pattern.as_deref(), &rule_ids);
+                            obj.insert("rule".to_string(), json!(rule_id));
+                            obj.insert("rules".to_string(), json!(rule_ids));
+                            if let Some(u) = unmatched {
+                                obj.insert("rule_unmatched_pattern".to_string(), json!(u));
+                            }
                             obj.insert("session_id".to_string(), json!(session_id));
                             if let Some(m) = &model {
                                 obj.insert("model".to_string(), json!(m));
