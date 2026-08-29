@@ -159,6 +159,7 @@ pub fn run() -> DoctorReport {
         check_review_judge_exhaustion_policy(),
         check_turn_delay(),
         check_host_sampler_interval(),
+        check_host_probe(),
         check_remote_endpoint_credentials(),
         check_env_masks_config(),
         check_binary_split_brain(),
@@ -1834,6 +1835,94 @@ fn check_host_sampler_interval() -> Check {
              machine stats drawer"
         ),
         hint: None,
+    }
+}
+
+/// (#2108) Which host-probe SOURCES actually resolved on this machine, and
+/// what one sample costs.
+///
+/// The probe reads four independent sources (mach kernel counters, the
+/// private IOReport framework, the SoC's DVFS frequency tables, the OS
+/// thermal state, and the `IOAccelerator` IORegistry node) and each degrades
+/// to null fields on its own. Without this check an operator looking at a
+/// drawer with no power numbers cannot tell "this Mac does not expose
+/// IOReport" from "darkmux forgot to read it" — the exact
+/// operator-sovereignty failure (#44: never wonder where a decision came
+/// from) that a silent degradation path invites.
+///
+/// **Takes TWO samples, deliberately.** CPU percent and every power rail are
+/// counter DELTAS, so the first sample a probe takes only seeds them; a
+/// one-sample check would report the cost of the seeding read and a null CPU
+/// figure. The reported cost is the SECOND sample's own self-stamp — the
+/// number the operator should compare against the sampler cadence.
+///
+/// Costs ~120 ms total (a one-time probe construction plus two samples);
+/// `doctor` is a diagnostic command, not a hot path.
+fn check_host_probe() -> Check {
+    let name = "host probe";
+    let mut probe = darkmux_crew::host_probe::HostProbe::new();
+    let _seed = probe.sample();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let s = probe.sample();
+    let src = probe.sources();
+
+    let resolved: Vec<&str> = [
+        ("mach", src.mach),
+        ("ioreport", src.ioreport),
+        ("freq-tables", src.freq_tables),
+        ("thermal", src.thermal),
+        ("ioreg-gpu", src.ioreg_gpu),
+    ]
+    .into_iter()
+    .filter_map(|(n, ok)| ok.then_some(n))
+    .collect();
+    let missing: Vec<&str> = [
+        ("mach", src.mach),
+        ("ioreport", src.ioreport),
+        ("freq-tables", src.freq_tables),
+        ("thermal", src.thermal),
+        ("ioreg-gpu", src.ioreg_gpu),
+    ]
+    .into_iter()
+    .filter_map(|(n, ok)| (!ok).then_some(n))
+    .collect();
+
+    let cost = format!("{}ms/sample", s.cost_ms);
+    if resolved.is_empty() {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "no host sources resolved ({cost}) — cpu/mem/gpu/power/thermal all report null"
+            ),
+            hint: Some(
+                "The host probe is implemented for Apple Silicon macOS. On any other platform \
+                 the machine stats drawer and the dispatch envelope's `host` block are \
+                 expected to be empty."
+                    .into(),
+            ),
+        };
+    }
+    let msg = if missing.is_empty() {
+        format!("{} ({cost})", resolved.join(" + "))
+    } else {
+        format!("{} ({cost}); unavailable: {}", resolved.join(" + "), missing.join(", "))
+    };
+    // Anything short of mach is a real gap worth surfacing — without tick
+    // counters there is no CPU figure at all. A missing IOReport is a
+    // property of the host, reported without alarm.
+    let status = if src.mach { Status::Pass } else { Status::Warn };
+    Check {
+        name: name.into(),
+        status,
+        message: msg,
+        hint: (!missing.is_empty()).then(|| {
+            "Sources are read independently and each degrades to null on its own. `ioreport` \
+             and `freq-tables` are Apple-Silicon-only (and IOReport is a private framework \
+             whose path has moved between macOS releases); a host without them still reports \
+             cpu/mem/gpu."
+                .into()
+        }),
     }
 }
 
@@ -5464,6 +5553,36 @@ mod tests {
                 None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
             }
         }
+    }
+
+    // ─── (#2108) check_host_probe — which sources resolved + the cost ──────
+
+    /// Runs the REAL probe. macOS/aarch64-gated for the same reason the
+    /// probe's own live test is: on any other platform every source is
+    /// legitimately unavailable and these assertions would be vacuous.
+    /// `#[serial]` because it measures the machine.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[serial_test::serial]
+    fn check_host_probe_names_the_resolved_sources_and_the_measured_cost() {
+        let check = check_host_probe();
+        assert_eq!(check.name, "host probe");
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "mach counters are always available on macOS: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("mach"),
+            "the operator must be able to tell WHICH sources resolved: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("ms/sample"),
+            "the observer's own cost is part of the report: {}",
+            check.message
+        );
     }
 
     // ─── (#2107, #1833) check_host_sampler_interval — resolved state + provenance ─
