@@ -545,6 +545,17 @@ pub(crate) fn finding_rule_for(pattern: Option<&str>, rule_ids: &[String]) -> (S
     )
 }
 
+/// (#1959) A payload's `rule`: ONE id when the unit has exactly one rule (site
+/// and edge units always do) so a receiver can key on it; `null` for a
+/// multi-rule read unit, whose `rules` array (always present beside it) lists
+/// them and whose findings name their own `pattern`.
+fn single_rule(rule_ids: &[String]) -> Value {
+    match rule_ids {
+        [only] => json!(only),
+        _ => Value::Null,
+    }
+}
+
 fn strip_source_prefix(source_id: &str, raw: &str) -> String {
     let abs_prefix = format!("/workspace/{source_id}/");
     if let Some(rel) = raw.strip_prefix(&abs_prefix) {
@@ -1320,15 +1331,18 @@ pub(crate) fn run(
         let started_payload = match unit {
             Unit::Site { sites, .. } => json!({
                 "workspace": manifest_name, "unit": unit.id(), "source": source, "sha": sha,
-                "rule": rule_ids, "kind": kind, "est_tokens": unit.est_tokens(), "sites": sites.len(),
+                "rule": single_rule(&rule_ids),
+                "rules": rule_ids, "kind": kind, "est_tokens": unit.est_tokens(), "sites": sites.len(),
             }),
             Unit::Read { files, .. } => json!({
                 "workspace": manifest_name, "unit": unit.id(), "source": source, "sha": sha,
-                "rule": rule_ids, "kind": kind, "est_tokens": unit.est_tokens(), "files": files.len(),
+                "rule": single_rule(&rule_ids),
+                "rules": rule_ids, "kind": kind, "est_tokens": unit.est_tokens(), "files": files.len(),
             }),
             Unit::Edge { sites, .. } => json!({
                 "workspace": manifest_name, "unit": unit.id(), "source": source, "sha": sha,
-                "rule": rule_ids, "kind": kind, "est_tokens": unit.est_tokens(), "sites": sites.len(),
+                "rule": single_rule(&rule_ids),
+                "rules": rule_ids, "kind": kind, "est_tokens": unit.est_tokens(), "sites": sites.len(),
             }),
         };
         if let Ok(mut step) = crew::lifecycle::load_step(&mission_id, &phase_id, &step_id) {
@@ -1376,7 +1390,8 @@ pub(crate) fn run(
                 "workspace": manifest_name,
                 "source": source,
                 "sha": sha,
-                "rule": rule_ids,
+                "rule": single_rule(&rule_ids),
+                "rules": rule_ids,
                 "unit": unit.id(),
             })),
         };
