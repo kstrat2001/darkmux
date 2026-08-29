@@ -191,11 +191,22 @@ function HostExtras({
 }) {
   if (load === null) return null;
   const { thermal, power_mw, cpu_clusters } = load.now;
-  const windowThermal = load.window.thermal;
-  const windowPower = load.window.power_mw;
-  const energyLine = fmtEnergyMwh(load.window.energy_mwh);
-  const gpuMhz = load.now.gpu_mhz;
-  const gpuMem = fmtGpuMemBytes(load.now.gpu_mem_bytes);
+  // (#2108 review finding 7) `load.window` itself, and the v2-only
+  // thermal/power/energy sub-fields on it, are typed as always-present —
+  // but a pre-#2108 v1-shaped daemon/fixture (this file's sibling doc on
+  // `effectiveHostAggregate` has the full story) can hand this component
+  // a `window` missing all three. `?.`/`?? null` degrades each to "not
+  // measured" (hides its row below) instead of throwing on `undefined`.
+  const windowThermal = load.window?.thermal ?? null;
+  const windowPower = load.window?.power_mw ?? null;
+  const energyLine = fmtEnergyMwh(load.window?.energy_mwh ?? null);
+  // `?? null` here too: a v1-shaped `now` predates `gpu_mhz`/
+  // `gpu_mem_bytes` entirely, and `undefined` fails both formatters' `===
+  // null` checks (`fmtGpuMemBytes` below), rendering a literal "NaN MHz ·
+  // NaN MB" instead of hiding the row — caught by this file's own v1
+  // render test.
+  const gpuMhz = load.now.gpu_mhz ?? null;
+  const gpuMem = fmtGpuMemBytes(load.now.gpu_mem_bytes ?? null);
   const gpuExtraItems: InlineOrCellsItem[] = [
     gpuMhz !== null
       ? { cellLabel: "MHz", cellValue: `${Math.round(gpuMhz)}`, inline: `${Math.round(gpuMhz)} MHz` }
@@ -210,18 +221,18 @@ function HostExtras({
           ? [
               {
                 cellLabel: "avg",
-                cellValue: fmtMw(windowPower.total.mean) ?? "—",
-                inline: `${fmtMw(windowPower.total.mean)} avg`,
+                cellValue: fmtMw(windowPower.total?.mean ?? null) ?? "—",
+                inline: `${fmtMw(windowPower.total?.mean ?? null)} avg`,
               },
               {
                 cellLabel: "p95",
-                cellValue: fmtMw(windowPower.total.p95) ?? "—",
-                inline: `${fmtMw(windowPower.total.p95)} p95`,
+                cellValue: fmtMw(windowPower.total?.p95 ?? null) ?? "—",
+                inline: `${fmtMw(windowPower.total?.p95 ?? null)} p95`,
               },
               {
                 cellLabel: "max",
-                cellValue: fmtMw(windowPower.total.max) ?? "—",
-                inline: `${fmtMw(windowPower.total.max)} max`,
+                cellValue: fmtMw(windowPower.total?.max ?? null) ?? "—",
+                inline: `${fmtMw(windowPower.total?.max ?? null)} max`,
               },
             ]
           : []),
@@ -371,26 +382,36 @@ export function effectiveHostAggregate(
       count: dispatchAgg.count,
     };
   }
+  // (#2108 review finding 7) `load.window` and its `{cpu,gpu,mem}_pct`
+  // sub-objects are typed as always-present (the CURRENT/v2 wire shape,
+  // `MachineLoad`'s own doc above), but the type only binds the compiler
+  // — a daemon still on the pre-#2108 v1 shape (or a mismatched/hand-
+  // edited fixture; see the sibling Rust-side fix in
+  // `scripts/demo-env/build.py`) can hand this hook a `load` missing
+  // `window` entirely, or a `window` missing its `*_pct` keys, and `.mean`
+  // on `undefined` throws — taking the whole machine panel down with it.
+  // Optional chaining + `?? null` degrades every reading to "not
+  // measured" instead (this file's own absence-never-zero convention).
   return {
     cpu: {
       now: load.now.cpu_pct,
-      avg: load.window.cpu_pct.mean,
-      high: load.window.cpu_pct.max,
-      p95: load.window.cpu_pct.p95,
+      avg: load.window?.cpu_pct?.mean ?? null,
+      high: load.window?.cpu_pct?.max ?? null,
+      p95: load.window?.cpu_pct?.p95 ?? null,
     },
     mem: {
       now: load.now.mem_pct,
-      avg: load.window.mem_pct.mean,
-      high: load.window.mem_pct.max,
-      p95: load.window.mem_pct.p95,
+      avg: load.window?.mem_pct?.mean ?? null,
+      high: load.window?.mem_pct?.max ?? null,
+      p95: load.window?.mem_pct?.p95 ?? null,
     },
     gpu: {
       now: load.now.gpu_pct,
-      avg: load.window.gpu_pct.mean,
-      high: load.window.gpu_pct.max,
-      p95: load.window.gpu_pct.p95,
+      avg: load.window?.gpu_pct?.mean ?? null,
+      high: load.window?.gpu_pct?.max ?? null,
+      p95: load.window?.gpu_pct?.p95 ?? null,
     },
-    count: load.window.samples,
+    count: load.window?.samples ?? 0,
   };
 }
 
@@ -526,9 +547,13 @@ export function useMachineStatsContent({
   // min" claim the ring may not have earned yet. Every other case keeps
   // `scope.scopeLabel` unchanged ("this mission" / "this dispatch" / the
   // pre-daemon "last 10 min" fallback).
+  // (#2108 review finding 7) `daemonLoad.window` is typed as always-present;
+  // `?? 0` covers a v1-shaped/absent `window` the same way the sibling
+  // guards above do (`daemonWindowLabel(0)` reads "last <1 min", the
+  // correct degraded answer — never a thrown TypeError).
   const scopeLabel =
     !isMissionOrDispatch && daemonLoad != null
-      ? daemonWindowLabel(daemonLoad.window.span_ms)
+      ? daemonWindowLabel(daemonLoad.window?.span_ms ?? 0)
       : scope.scopeLabel;
   const samplerCostLine =
     !isMissionOrDispatch && daemonLoad != null

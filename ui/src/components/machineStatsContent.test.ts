@@ -86,4 +86,45 @@ describe("effectiveHostAggregate (#2107, #1833)", () => {
     expect(agg.cpu).toEqual({ now: 11, avg: null, high: null, p95: null });
     expect(agg.count).toBe(0);
   });
+
+  // (#2108 review finding 7) `window.{cpu,gpu,mem}_pct` are typed as
+  // always-present `MachineLoadMetric`s, but a pre-#2108 v1-shaped daemon
+  // reply — `window` present, its sub-fields keyed the OLD way — can hand
+  // this function a `load` where every one of those keys is simply absent.
+  // The type only binds the compiler; at runtime this is a plain object
+  // literal, so `as unknown as MachineLoad` here is testing exactly the
+  // shape a real fetch response can produce, not a contrived impossible
+  // value. Must not throw, and must degrade every reading to null/0 (this
+  // file's own absence-never-zero convention) rather than crash.
+  it("a v1-shaped window (missing cpu_pct/gpu_pct/mem_pct/samples entirely) degrades to null/0 instead of throwing", () => {
+    const v1Load = {
+      now: LOAD.now,
+      window: {
+        // v1's own naming — no `cpu_pct`/`gpu_pct`/`mem_pct`/`samples` keys
+        // at all, just the old nested `cpu`/`gpu`/`mem` shape.
+        cpu: { mean_pct: 10, peak_pct: 20, p95_pct: 15 },
+        gpu: { mean_pct: 50, peak_pct: 60, p95_pct: 55 },
+        mem: { mean_pct: 30, peak_pct: 40, p95_pct: 35 },
+        span_ms: 90_000,
+      },
+    } as unknown as MachineLoad;
+
+    expect(() => effectiveHostAggregate(false, DISPATCH_AGG, v1Load)).not.toThrow();
+    const agg = effectiveHostAggregate(false, DISPATCH_AGG, v1Load);
+    expect(agg.cpu).toEqual({ now: 11, avg: null, high: null, p95: null });
+    expect(agg.mem).toEqual({ now: 22, avg: null, high: null, p95: null });
+    expect(agg.gpu).toEqual({ now: 33, avg: null, high: null, p95: null });
+    expect(agg.count).toBe(0);
+  });
+
+  // A `window` missing ENTIRELY (an even older/malformed shape) must
+  // degrade the same way, not throw on `load.window.cpu_pct` reading off
+  // `undefined`.
+  it("a `load` with no `window` at all degrades to null/0 instead of throwing", () => {
+    const noWindowLoad = { now: LOAD.now } as unknown as MachineLoad;
+    expect(() => effectiveHostAggregate(false, DISPATCH_AGG, noWindowLoad)).not.toThrow();
+    const agg = effectiveHostAggregate(false, DISPATCH_AGG, noWindowLoad);
+    expect(agg.cpu).toEqual({ now: 11, avg: null, high: null, p95: null });
+    expect(agg.count).toBe(0);
+  });
 });

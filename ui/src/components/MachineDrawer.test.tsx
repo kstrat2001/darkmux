@@ -277,7 +277,7 @@ describe("MachineDrawer (#2107)", () => {
         liveMachines={new Map()}
         specs={{
           darkmux_version: "3.3.0 (abc1234)",
-          flow_schema_version: "1.27.0",
+          flow_schema_version: "1.28.0",
           machine_id: "MacBook-Pro",
           os: "macOS",
           ram_total_bytes: 137438953472,
@@ -935,6 +935,82 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     expect(document.querySelector(".machine-drawer__gpu-extra")).toBeNull();
   });
 
+  // (#2108 review finding 7) A pre-#2108 v1-shaped daemon reply — `window`
+  // present but keyed the OLD way (`window.cpu.mean_pct`, no `cpu_pct`/
+  // `gpu_pct`/`mem_pct`/`thermal`/`power_mw`/`energy_mwh` at all — the
+  // exact mismatch the sibling Rust-side finding traced to
+  // `scripts/demo-env/build.py` emitting v1 against a v2-shaped committed
+  // fixture). `effectiveHostAggregate`/`HostExtras`'s `?.`/`?? null` guards
+  // (`machineStatsContent.tsx`) are what stand between this payload and a
+  // thrown `TypeError: Cannot read properties of undefined` that would
+  // have taken the whole dialog down — this is the render-level proof, not
+  // just the pure-function unit test in `machineStatsContent.test.ts`.
+  it("a v1-shaped daemon window (old field names, none of the v2 keys) renders the degraded meters instead of throwing", async () => {
+    const v1Load = {
+      ...FULL_LOAD,
+      load: {
+        now: {
+          sampled_at_ms: 4000,
+          sampler_cost_ms: 4.2,
+          cpu_pct: 12,
+          mem_pct: 34,
+          gpu_pct: 56,
+          // v1 never had cpu_clusters/gpu_mhz/gpu_mem_bytes/thermal/power_mw.
+        },
+        window: {
+          samples: 3,
+          span_ms: 90_000,
+          // v1's OWN naming — nested `mean_pct`/`peak_pct`/`p95_pct` under
+          // `cpu`/`gpu`/`mem`, never the v2 `cpu_pct: { mean, max, p95 }`
+          // shape `MachineLoad`'s type declares as always-present.
+          cpu: { mean_pct: 10, peak_pct: 20, p95_pct: 15 },
+          mem: { mean_pct: 30, peak_pct: 40, p95_pct: 35 },
+          gpu: { mean_pct: 50, peak_pct: 60, p95_pct: 55 },
+        },
+      },
+    };
+    const fetchMock = stubFetch(v1Load);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    // The meters still render (this doesn't throw) — `now` is present on
+    // this v1 shape, so it renders; avg/max/p95 degrade to "—" since the
+    // v2 keys they'd read from are entirely absent.
+    await waitFor(() =>
+      expect(document.querySelector(".meter-row")).not.toBeNull(),
+    );
+    expect(screen.getByText("56%")).toBeInTheDocument(); // GPU `now`
+    // avg/max degrade to the "—" placeholder (`Meter.tsx`'s own
+    // null-renders-as-"—" convention) — every meter's avg/max row reads
+    // it, not just one exact-text match, since "—" sits alongside " avg "/
+    // " max " text nodes rather than in its own wrapping element.
+    const avgmaxRows = document.querySelectorAll(".meter-avgmax");
+    expect(avgmaxRows.length).toBeGreaterThan(0);
+    avgmaxRows.forEach((row) => expect(row.textContent).toContain("—"));
+    // GPU extras (MHz/memory) never appeared either — v1's `now` lacks
+    // `gpu_mhz`/`gpu_mem_bytes` entirely, not just as explicit nulls.
+    expect(document.querySelector(".machine-drawer__gpu-extra")).toBeNull();
+    // None of the v2-only rows render — their source data is entirely
+    // absent on this shape, same degraded-hides-the-row contract as the
+    // explicit-null case above.
+    expect(document.querySelector(".thermal-row")).toBeNull();
+    expect(document.querySelector(".power-block")).toBeNull();
+    expect(document.querySelector(".cluster-block")).toBeNull();
+    expect(document.querySelector(".machine-drawer__gpu-extra")).toBeNull();
+  });
+
   it("the phone drawer's Machine tab renders the SAME host-extras rows as the desktop dialog", async () => {
     stubFetch(FULL_LOAD);
     render(
@@ -1004,7 +1080,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         liveMachines={new Map()}
         specs={{
           darkmux_version: "3.3.0 (ea3caf27)",
-          flow_schema_version: "1.27.0",
+          flow_schema_version: "1.28.0",
           machine_id: "MacBook-Pro",
           os: "macOS",
           ram_total_bytes: 137438953472,
@@ -1061,7 +1137,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
         liveMachines={new Map()}
         specs={{
           darkmux_version: "3.3.0 (ea3caf27)",
-          flow_schema_version: "1.27.0",
+          flow_schema_version: "1.28.0",
           machine_id: "MacBook-Pro",
           os: "macOS",
           ram_total_bytes: 137438953472,
