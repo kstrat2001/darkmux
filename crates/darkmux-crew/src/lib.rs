@@ -85,3 +85,9 @@ pub mod single_shot;
 pub mod step_kinds;
 pub mod telemetry_sampler;
 pub mod types;
+// (#1959) A generic mission input: named sources materialized into a
+// read-only tree, filtered by include/exclude globs. Promoted out of the
+// crawl module's `CorpusManifest` — see the module doc for the descope
+// this packet states plainly (the crawl planner doesn't consume
+// `Materialized` yet).
+pub mod workspace_spec;

@@ -4,7 +4,7 @@
 //! mechanical, free-to-compute half of the crawler (prefilters, globs, the
 //! npm range check) that the (future) dispatch loop consumes.
 
-use crate::crawl::glob;
+use darkmux_crew::workspace_spec::glob;
 use crate::crawl::manifest::CorpusManifest;
 use darkmux_crew::rules::{Rule, RuleKind};
 use crate::crawl::semver::{prerelease_tag, range_admits};
