@@ -32,6 +32,7 @@
   <div class="wrap">
     <div class="label">10 <span class="dot">·</span> advanced</div>
     <h1>Crawl a codebase against your rules, and route what it finds</h1>
+<p class="note"><strong>Beta.</strong> The crawl mission and hooks shipped in 3.4.0 as a public beta: the pieces on this page run and are exercised on darkmux's own code every day, but the mission inputs and the hook record shapes may still change between minor releases without a deprecation period. Mechanical coverage accounting and typed hook kinds are not built yet.</p>
     <p class="lede">A <strong>crawl</strong> (#1959) is a mission like any other: point it at real source trees, name the rules you want checked, and a local model reads bounded slices of code and reports findings through <code>report_finding</code>. Everything the crawl does streams as ordinary flow records, so the last piece is routing: <strong>hooks</strong> (#2093) match those records against operator rules and POST the matches to your own loopback receiver — no external tracker knows darkmux exists, and darkmux never leaves loopback to reach one.</p>
   </div>
 </header>
