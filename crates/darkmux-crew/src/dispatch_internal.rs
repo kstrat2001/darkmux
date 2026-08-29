@@ -1567,7 +1567,7 @@ fn remote_chat_attempt(
         f.write_all(cfg.as_bytes())
             .context("writing curl config body")?;
         drop(f);
-        Command::new("curl")
+        let child = Command::new("curl")
             .args([
                 "-sS",
                 "-m",
@@ -1575,8 +1575,26 @@ fn remote_chat_attempt(
                 "-K",
                 &cfg_path.to_string_lossy(),
             ])
-            .output()
-            .context("running curl for hosted dispatch")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning curl for hosted dispatch")?;
+        // (#2124) Registered the moment the child exists — BEFORE the
+        // blocking wait below — so a signal-interrupted launcher
+        // (`darkmux mission launch review`'s `ReviewFinalizeGuard`) can
+        // reap this EXACT pid on an interrupted run without touching this
+        // process's own process group. `spawn()` + `wait_with_output()`
+        // in place of the old single `.output()` call is what opens the
+        // window to register the pid before the blocking wait — see
+        // `darkmux_types::child_registry`'s own module doc for why a
+        // process-group-based approach was tried here first and rejected
+        // (proven, via a pty test, to silently break a terminal's Ctrl-C
+        // delivery to the launcher in a real invocation shape).
+        let child_pid = child.id();
+        darkmux_types::child_registry::register(child_pid);
+        let wait_result = child.wait_with_output().context("running curl for hosted dispatch");
+        darkmux_types::child_registry::deregister(child_pid);
+        wait_result
     };
     let result = run();
     let _ = std::fs::remove_file(&cfg_path); // ALWAYS remove the secret-bearing file
