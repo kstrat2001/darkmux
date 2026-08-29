@@ -104,6 +104,11 @@
       "required": false
     },
     {
+      "name": "workspace",
+      "description": "(#1959) Optional path to a workspace spec JSON (darkmux_crew::workspace_spec::WorkspaceSpec) scoping this review. When given, resolve_bundles drops every bundle whose changed-file path fails the spec's include/exclude (workspace_spec::glob::applies, matching what a crawl materializing the same spec would keep), recorded as SkipReason::ExcludedByWorkspaceSpec so a zero-bundle run this scoping causes renders as a benign no-op, not an unexplained error. Absent -> unfiltered, byte-identical to before this input existed. Wired into the --charges-file (run_judge_only) path only -- the main graph launch path (ReviewBundleStepKind) does not yet read this input; materialization (git resolution) is NOT performed for review, only the spec's static include/exclude globs are matched against already-known bundle paths.",
+      "required": false
+    },
+    {
       "name": "charges_file",
       "description": "Re-judge a previously-recorded flag list without re-running the probe (run_judge_only) -- the bundler still runs, since the judge needs the code each flag's bundle_id refers to. Mints NO mission (same as the retired CLI).",
       "required": false

@@ -100,6 +100,8 @@ use darkmux_lab::lab::review::{
     ExecMode, LmsCycler, ProbeFlag, ReviewEmitter, ReviewEnvelope, ReviewInputs, ReviewStepContext,
 };
 use darkmux_crew::resourcing::{resolve_review_roles, ResolvedReviewRoles, ResolvedSeatStaffing, ReviewRoleStaffing};
+// (#1959) The review's optional `workspace` input.
+use darkmux_crew::workspace_spec::WorkspaceSpec;
 use darkmux_profiles::profiles::load_registry;
 use darkmux_profiles::swap;
 use darkmux_types::dispatch_liveness::{liveness, liveness_case, liveness_detail};
@@ -960,6 +962,25 @@ fn run_dispatch(
         None => String::new(),
     };
 
+    // (#1959) Optional workspace scope: `resolve_bundles` (inside
+    // `run_judge_only`) drops every bundle whose path fails the spec's
+    // include/exclude. Loaded eagerly here — cheap (JSON parse +
+    // validate, no git resolution) — so it's ready for the `charges_file`
+    // branch's `ReviewInputs` below. NOT wired into the graph launch path
+    // (`ReviewBundleStepKind`) yet — see `review.json`'s own doc for that
+    // follow-up.
+    let workspace_spec: Option<WorkspaceSpec> = match path_input(collected, "workspace") {
+        Some(p) => {
+            let (spec, warnings) =
+                WorkspaceSpec::load(&p).with_context(|| format!("loading workspace spec {}", p.display()))?;
+            for w in &warnings {
+                eprintln!("{}", style::warn(w));
+            }
+            Some(spec)
+        }
+        None => None,
+    };
+
     let mode_str = str_input(collected, "mode").unwrap_or("auto").to_string();
     let mode = parse_exec_mode(&mode_str)?;
     // (#1530) `bundles` is stamped onto the "dispatch start" payload only
@@ -1063,6 +1084,7 @@ fn run_dispatch(
             )),
             remote_max_tokens_per_execution,
             judge_exhaustion_strict,
+            workspace: workspace_spec.as_ref(),
             // (#1748) The same `FileSource` bundling used above — lets the
             // mechanical absence-claim backstop check a confirmed finding
             // against the whole file on the `--charges-file` re-judge path
