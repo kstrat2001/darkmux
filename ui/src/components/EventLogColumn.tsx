@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type { FlowRecord } from "../types/handwritten";
 import { recKey } from "../lib/flow";
 import { useThrottledValue } from "../hooks/useThrottledValue";
@@ -375,6 +375,22 @@ export function EventLogColumn({
   useEffect(() => {
     if (!visible && pushDetail) setPushedDetailOpen(false);
   }, [visible, pushDetail]);
+  // (#2108, operator finding — real device, round 4) `pushDetail`'s list
+  // and its pushed-detail screen are different branches of one ternary
+  // (below) — React unmounts one and mounts the other, so `#logbody`'s
+  // own scroll position is lost on every push/pop unless saved
+  // somewhere that outlives the unmount. `savedScrollRef` is that
+  // somewhere: `selectRecord` captures `listBodyRef.current.scrollTop`
+  // just before pushing; the `useLayoutEffect` below restores it the
+  // instant the list remounts, BEFORE the browser paints (so there's no
+  // visible flash back to the top).
+  const listBodyRef = useRef<HTMLDivElement | null>(null);
+  const savedScrollRef = useRef(0);
+  useLayoutEffect(() => {
+    if (!pushedDetailOpen && listBodyRef.current) {
+      listBodyRef.current.scrollTop = savedScrollRef.current;
+    }
+  }, [pushedDetailOpen]);
 
   const columnRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ startY: number; startPct: number } | null>(null);
@@ -418,13 +434,33 @@ export function EventLogColumn({
   function selectRecord(r: FlowRecord) {
     setSelectedKey(recKey(r));
     setFollow(false);
-    if (pushDetail) setPushedDetailOpen(true);
+    if (pushDetail) {
+      // (#2108, operator finding — round 4) Captured HERE, before the
+      // list unmounts, is the only point this value is ever knowable —
+      // `listBodyRef.current` still points at the live list's scroll
+      // container on this exact render.
+      if (listBodyRef.current) savedScrollRef.current = listBodyRef.current.scrollTop;
+      setPushedDetailOpen(true);
+    }
   }
 
   function toggleFollow() {
     setFollow((f) => {
       const next = !f;
-      if (next) setSelectedKey(null);
+      if (next) {
+        setSelectedKey(null);
+        // (#2108, operator's final form — round 4) The invariant is "in
+        // follow mode you are always in the list state", enforced
+        // structurally: the follow control only exists inside the
+        // list's own header (`.eventlog__headbtns` below) — it is NOT
+        // rendered on `pushDetail`'s pushed-detail screen at all (that
+        // screen's own doc), so this function can only ever run while
+        // the list is already showing. Landing at the top is still the
+        // point ("go to latest"): `selected` already resolves to
+        // `followed` the instant `follow` is true (see that `useMemo`
+        // above), so nothing else has to pick the record.
+        if (listBodyRef.current) listBodyRef.current.scrollTop = 0;
+      }
       return next;
     });
   }
@@ -520,12 +556,24 @@ export function EventLogColumn({
           {collapsed ? "\u2039" : "\u203a"}
         </button>
       )}
-      {/* (#2107 tabbed-drawer packet) `pushDetail`'s own branch — a
-          full-height detail SCREEN with a back button, replacing the list
-          entirely, rather than the split layout below. Only reachable via
-          an explicit tap (`selectRecord` sets `pushedDetailOpen`), never
-          via `follow`'s passive re-selection — see `pushedDetailOpen`'s
-          own doc above. */}
+      {/* (#2107 tabbed-drawer packet, restyled #2108 round 4 — operator
+          design change) `pushDetail`'s own branch — a full-height detail
+          SCREEN, replacing the list entirely, rather than the split
+          layout below. Only reachable via an explicit tap (`selectRecord`
+          sets `pushedDetailOpen`), never via `follow`'s passive
+          re-selection — see `pushedDetailOpen`'s own doc above.
+
+          Two additions over the #2107 original: `.eventlog__back` now
+          reads as a real full-width bar (≥44px tall, the Apple
+          tap-target floor) rather than a small text link — the
+          coordinator's own ask, "a clear back control ... that returns
+          to the list at the same scroll position" (the scroll-position
+          half is `listBodyRef`/`savedScrollRef`'s own doc above, not
+          CSS) — and the SAME one-row strip summary
+          (`.eventlog__rec--strip`) the retired expand mode used to show,
+          so the pushed screen still names WHICH record it's showing
+          without scrolling up into `EventDetail`'s own body to find the
+          timestamp again. */}
       {pushDetail && pushedDetailOpen && selected ? (
         <div className="eventlog__pushed" data-act="eventlog-pushed">
           <button
@@ -535,8 +583,14 @@ export function EventLogColumn({
             aria-label="back to the event list"
             onClick={() => setPushedDetailOpen(false)}
           >
-            {"\u2039"} back
+            {"\u2039"} list
           </button>
+          <div className="eventlog__rec sel eventlog__rec--strip" data-act="rec-strip">
+            <span className="eventlog__rectime">{clk(Date.parse(selected.ts))}</span>{" "}
+            <ActivityIcon act={activityOf(selected)} />
+            <span className="eventlog__ractivity">{activityOf(selected)}</span>
+            {recordDetail(selected) ? <span className="preview-text"> · {recordDetail(selected)}</span> : null}
+          </div>
           <div className="eventlog__detailbody eventlog__detailbody--pushed">
             <EventDetail record={selected} />
           </div>
@@ -731,7 +785,7 @@ export function EventLogColumn({
             )}
           </div>
         ) : (
-        <div id="logbody" className="eventlog__body">
+        <div id="logbody" className="eventlog__body" ref={listBodyRef}>
           {visibleRecs.length ? (
             visibleRecs.map((r) => {
               const key = recKey(r);

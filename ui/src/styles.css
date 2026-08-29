@@ -1077,6 +1077,54 @@ body {
   border-bottom: none;
   cursor: default;
 }
+/* (#2108, operator design change, round 4) `pushDetail`'s pushed-detail
+   screen (`EventLogColumn.tsx`'s own doc on the branch) — previously
+   dead CSS, since no call site passed `pushDetail` until the phone
+   drawer's Events tab started using it here. Fills whatever space its
+   sibling `.eventlog__list` would have (same `flex: 1` the list itself
+   carries — see the base `.eventlog__list` rule above), since the two
+   are mutually exclusive children of `.eventlog`'s flex column. */
+.eventlog__pushed {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+/* A real bar, not a small text link — the operator's own ask ("a clear
+   back control ... ≥44 px tall"). `min-height: 44px` is the Apple
+   tap-target floor this codebase uses everywhere else a control needs
+   one (`.nav-tab`, `.phone-drawer__tab`); this one's PAINTED at that
+   height too (not just an invisible `::after` hit-area), since it's the
+   sheet's own "you are in detail, tap here to leave" affordance and
+   should read as one at a glance. */
+.eventlog__back {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 0 12px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--accent);
+  font: 600 calc(12px * var(--fs-scale))/1 var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.eventlog__back:hover {
+  color: var(--fg);
+}
+/* The record card's own scroll region — the ONLY one inside the pushed
+   screen (the strip above it is fixed, `flex: none`, via the shared
+   `.eventlog__rec` rules). */
+.eventlog__detailbody--pushed {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px;
+}
 .eventlog__head {
   flex: none;
   padding: 8px 12px 6px;
@@ -5643,7 +5691,14 @@ body {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+    /* (#2108, operator finding — round 4 item 4) 16px -> 12px, matching
+       the operator's literal figure ("pane content padding-bottom =
+       env(safe-area-inset-bottom) + 12px"). Kept as the single shared
+       reservation both tabs render into (this rule's own doc above),
+       rather than duplicating it onto each tab's own scroll region —
+       that consolidation already achieves the asked-for outcome
+       (content never renders under the safe area, for either tab). */
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
   }
   .phone-drawer__panel {
     flex: 1;
@@ -5672,26 +5727,16 @@ body {
   .phone-drawer__body .eventlog__list {
     min-height: 0;
   }
-  /* (#2108, operator correction) Desktop's own column is pane-above-list
-     (`.eventlog`'s plain `flex-direction: column`, source order: detail,
-     split, list) — the operator wants the sheet to read list-on-top,
-     pane-below instead. Reordered here via `order` rather than touching
-     `EventLogColumn.tsx`'s own DOM (shared with the desktop column;
-     changing its actual element order would move desktop's layout too,
-     and this component's DOM shape is a real reuse contract, not just
-     this one caller's). The split handle keeps a middle order so it
-     still visually sits between the two — it's re-enabled at this width
-     now (the `.eventlog__split` rule above, `@media (max-width:768px)`),
-     not hidden, so the operator can touch-drag the ratio here directly. */
-  .phone-drawer__body .eventlog__list {
-    order: 1;
-  }
-  .phone-drawer__body .eventlog__split {
-    order: 2;
-  }
-  .phone-drawer__body .eventlog__detail {
-    order: 3;
-  }
+  /* (#2108, operator design change, round 4 — SUPERSEDES the split-pane
+     reorder this comment used to describe) `.eventlog__list`/
+     `.eventlog__split`/`.eventlog__detail` no longer coexist inside the
+     sheet: the Events tab now runs `pushDetail` (`PhoneDrawer.tsx`'s own
+     doc on the switch), so it's ALWAYS either the plain list or
+     `.eventlog__pushed` (below), never a two-pane split needing a
+     reorder. The `order` rules that used to live here are gone with it —
+     dead CSS the moment nothing renders `.eventlog__split`/
+     `.eventlog__detail` inside `.phone-drawer__body` any more. Desktop's
+     own instance (no `pushDetail`) still runs the split, untouched. */
   /* The pane is the SECOND scroll region inside the sheet (the list above
      it is the first) — its own top/bottom must not chain into the list's
      scroll or the (now `position: fixed`) page behind it either. */

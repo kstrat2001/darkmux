@@ -243,13 +243,17 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     let sheet = document.querySelector(
       '[data-act="phone-drawer"]',
     ) as HTMLElement;
-    // (#2108, operator finding — real device, masthead cap) The raw
-    // `${openPct}vh` is now wrapped in `min(...)` against a masthead-
-    // height CSS var, so the sheet's top edge can never draw over the
-    // masthead — see `PhoneDrawer.tsx`'s own doc on this inline style.
-    expect(sheet.style.height).toBe(
-      "min(30vh, calc(100vh - var(--masthead-h, 64px) - 8px))",
-    );
+    // (#2108, operator finding — real device, round 2) The style is now
+    // a REAL PIXEL height computed in JS against jsdom's default
+    // 768px `innerHeight` (no `visualViewport` there) and the 64px
+    // masthead-height fallback (no `--masthead-h` set in this test) —
+    // `openHeightPx(30, 768, 64)` = min(0.30*768, 768-64-8) =
+    // min(230.4, 696) = 230.4. `toBeCloseTo` (not `toBe`) because
+    // `0.30 * 768` is `230.39999999999998` in IEEE-754 floating point —
+    // a real value, not a bug, and exact string equality on it is
+    // fragile in a way the underlying claim ("~230.4px") isn't.
+    expect(parseFloat(sheet.style.height)).toBeCloseTo(230.4, 5);
+    expect(sheet.style.height.endsWith("px")).toBe(true);
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-events"]')!,
     );
@@ -258,13 +262,17 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     ) as HTMLElement;
     // (#2108, operator's core ask) Switching tabs while open must NEVER
     // change the sheet's height — one shared value, not a per-tab one.
-    // (#2108, operator finding — real device, masthead cap) The raw
-    // `${openPct}vh` is now wrapped in `min(...)` against a masthead-
-    // height CSS var, so the sheet's top edge can never draw over the
-    // masthead — see `PhoneDrawer.tsx`'s own doc on this inline style.
-    expect(sheet.style.height).toBe(
-      "min(30vh, calc(100vh - var(--masthead-h, 64px) - 8px))",
-    );
+    // (#2108, operator finding — real device, round 2) The style is now
+    // a REAL PIXEL height computed in JS against jsdom's default
+    // 768px `innerHeight` (no `visualViewport` there) and the 64px
+    // masthead-height fallback (no `--masthead-h` set in this test) —
+    // `openHeightPx(30, 768, 64)` = min(0.30*768, 768-64-8) =
+    // min(230.4, 696) = 230.4. `toBeCloseTo` (not `toBe`) because
+    // `0.30 * 768` is `230.39999999999998` in IEEE-754 floating point —
+    // a real value, not a bug, and exact string equality on it is
+    // fragile in a way the underlying claim ("~230.4px") isn't.
+    expect(parseFloat(sheet.style.height)).toBeCloseTo(230.4, 5);
+    expect(sheet.style.height.endsWith("px")).toBe(true);
   });
 
   // (#2108, operator correction — reverted from the earlier "every row
@@ -273,7 +281,13 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
   // Tapping a row shows that record in the pane, right here in the sheet
   // — no route change, no drill-in navigation, no separate card. The pane
   // is empty/placeholder until a row is tapped.
-  it("the pane is empty/placeholder until a row is tapped (no records yet)", () => {
+  // (#2108, operator design change, round 4 — REWRITTEN) The phone Events
+  // tab dropped the always-present split pane in favor of `pushDetail`
+  // (`EventLogColumn.tsx`'s own doc on the switch, `PhoneDrawer.tsx`'s
+  // call site): with no records, the LIST shows its own "no events yet"
+  // placeholder — there is no separate pane to be empty any more, since
+  // no pane renders at all until a row is tapped and pushed.
+  it("with no records, the list shows its own empty placeholder — no pane, no pushed screen", () => {
     render(
       <PhoneDrawer
         machineTab={NOOP_MACHINE_TAB}
@@ -285,10 +299,13 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-events"]')!,
     );
-    expect(document.querySelector(".eventlog__none")).not.toBeNull();
+    const empty = document.querySelector(".eventlog__empty");
+    expect(empty).not.toBeNull();
+    expect(empty!.textContent).toBe("no events yet");
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
   });
 
-  it("tapping a row populates the detail pane inside the sheet — no per-row expanded payload in the list", () => {
+  it("tapping a row PUSHES a full detail screen — the strip names the record, the back control returns to the list", () => {
     const older: FlowRecord = { ...record(1), payload: { tool_name: "grep", args_chars: 42 } } as FlowRecord;
     const newer: FlowRecord = { ...record(2), payload: { tool_name: "ls", args_chars: 3 } } as FlowRecord;
     const events = { ...NO_EVENTS, records: [older, newer] };
@@ -303,6 +320,8 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-events"]')!,
     );
+    // No pushed screen yet — the list is what's showing.
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
     const rows = document.querySelectorAll('[data-act="rec"]');
     // Newest-first: `newer` (handle "rec-2", the row's own `title`
     // attribute — hover provenance, not visible row text) renders first.
@@ -313,23 +332,123 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     rows.forEach((row) => {
       expect(row.textContent).not.toContain("tool name");
     });
-    // `follow` mode (the desktop pane's own default) already shows the
-    // newest record's detail — tapping the OLDER row is the real proof
-    // that a tap changes what the pane shows, in the sheet.
     fireEvent.click(rows[1]);
-    const pane = document.querySelector(".eventlog__detailbody")!;
+    // The list is REPLACED by the pushed screen (mutually exclusive
+    // branches — see `EventLogColumn.tsx`'s own doc), not shown beside it.
+    const pushed = document.querySelector('[data-act="eventlog-pushed"]');
+    expect(pushed).not.toBeNull();
+    expect(document.querySelector('[data-act="rec"]')).toBeNull();
+    // The one-row strip at the top names WHICH record this is.
+    const strip = document.querySelector('[data-act="rec-strip"]')!;
+    expect(strip.textContent).toContain("note");
+    // The back control is a real, ≥44px control — checked here on
+    // PRESENCE + label; its painted height is a stylesheet-body concern,
+    // covered by this file's own stylesheet-check tests below.
+    const back = document.querySelector('[data-act="eventlog-back"]')!;
+    expect(back.getAttribute("aria-label")).toBe("back to the event list");
     // `RecordView`'s own key rendering replaces underscores with spaces
     // (`Row`'s `.rv__key`) — asserting on ITS actual output, not a guess.
+    const pane = document.querySelector(".eventlog__detailbody--pushed")!;
     expect(pane.textContent).toContain("tool name");
     expect(pane.textContent).toContain("grep");
     expect(pane.textContent).toContain("args chars");
-    // Confirms the pane actually SWITCHED to the tapped (older) record,
-    // not merely appended to whatever `follow` mode had shown before.
     expect(pane.textContent).not.toContain("rec-2");
     expect(pane.textContent).toContain("rec-1");
-    // In the sheet — no navigation, no push screen, no hash change.
-    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+    // No navigation, no hash change — this stays ON the sheet.
     expect(window.location.hash).toBe("");
+    // Tapping back returns to the list, and the pushed screen is gone.
+    fireEvent.click(back);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+    expect(document.querySelectorAll('[data-act="rec"]').length).toBe(2);
+  });
+
+  // (#2108, operator correction — round 4) "follow" stays a real toggle on
+  // the phone, not a one-shot "go to latest" action (the operator's own
+  // reversal of an earlier ask on the same thread) — matching desktop's
+  // own `selectRecord`, tapping a row clears it.
+  it("tapping a row while follow is ON pushes detail and clears the armed follow state", () => {
+    const events = { ...NO_EVENTS, records: [record(1), record(2), record(3)] };
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={events}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-events"]')!,
+    );
+    // `follow` defaults ON.
+    expect(document.getElementById("follow")!.className).toContain(" on");
+    fireEvent.click(document.querySelectorAll('[data-act="rec"]')[1]);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).not.toBeNull();
+    // The follow control isn't even in the DOM on the pushed screen (see
+    // the test below) — going BACK is what proves it was actually
+    // cleared, not just hidden.
+    fireEvent.click(document.querySelector('[data-act="eventlog-back"]')!);
+    expect(document.getElementById("follow")!.className).not.toContain(" on");
+  });
+
+  // (#2108, operator's final form — round 4) The invariant is "in follow
+  // mode you are always in the list state", enforced STRUCTURALLY: the
+  // follow control lives only in the list's own header, never on the
+  // pushed-detail screen — so follow can only ever be toggled from the
+  // list, and there is no "pop the detail when follow turns on" code
+  // path to test (an earlier draft of this had one; removed per the
+  // operator's own correction).
+  it("the pushed detail screen has NO follow control; back returns to the list with follow still off", () => {
+    const events = { ...NO_EVENTS, records: [record(1), record(2), record(3)] };
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={events}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-events"]')!,
+    );
+    fireEvent.click(document.querySelectorAll('[data-act="rec"]')[1]);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).not.toBeNull();
+    // No follow control, no filter row — just the strip, back, and body.
+    expect(document.getElementById("follow")).toBeNull();
+    expect(document.querySelector(".eventlog__search")).toBeNull();
+    fireEvent.click(document.querySelector('[data-act="eventlog-back"]')!);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+    // Tapping a row turned follow off (matching desktop's own
+    // `selectRecord`); going back doesn't turn it back on.
+    expect(document.getElementById("follow")!.className).not.toContain(" on");
+  });
+
+  it("toggling follow ON from the list pins to the newest row and scrolls the list to the top", () => {
+    const events = { ...NO_EVENTS, records: [record(1), record(2), record(3)] };
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={events}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-events"]')!,
+    );
+    // Tap an older row first: turns follow off (per the test above) and
+    // scrolls the list, simulating a mid-read position.
+    fireEvent.click(document.querySelectorAll('[data-act="rec"]')[1]);
+    fireEvent.click(document.querySelector('[data-act="eventlog-back"]')!);
+    (document.getElementById("logbody") as HTMLElement).scrollTop = 120;
+    expect(document.getElementById("follow")!.className).not.toContain(" on");
+    fireEvent.click(document.getElementById("follow")!);
+    expect(document.getElementById("follow")!.className).toContain(" on");
+    expect((document.getElementById("logbody") as HTMLElement).scrollTop).toBe(0);
+    // Newest row (rec-3, first — newest-first order) is the one pinned/
+    // highlighted.
+    const rows = document.querySelectorAll('[data-act="rec"]');
+    expect(rows[0].getAttribute("title")).toBe("rec-3");
+    expect(rows[0].className).toContain(" sel");
   });
 
   it("the list rows render identically to the desktop column's rows (same classes, same content)", () => {
@@ -384,15 +503,14 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     const sheet = document.querySelector(
       '[data-act="phone-drawer"]',
     ) as HTMLElement;
-    // (#2108, operator finding — real device, masthead cap) The style is
-    // now `min(${openPct}vh, calc(...))`, not a bare `${openPct}vh` —
-    // `parseFloat` on the whole string returns `NaN` since it no longer
-    // starts with a number. Pull the FIRST argument out of `min(...)`,
-    // which is exactly `openPct` (the masthead-cap ceiling is jsdom-inert
-    // anyway: no layout, no real `--masthead-h`), matching what the raw
-    // `parseFloat` used to read before this change.
-    const vh = parseFloat(sheet.style.height.replace(/^min\(/, ""));
-    expect(vh).toBeGreaterThanOrEqual(85);
+    // (#2108, operator finding — real device, round 2) The style is now
+    // a real PIXEL height (`openHeightPx`'s own doc), not a percentage
+    // string — recompute the percentage of the 844px viewport this test
+    // set, rather than parsing a percent straight off the style (there
+    // isn't one to parse any more).
+    const px = parseFloat(sheet.style.height);
+    const pct = (px / 844) * 100;
+    expect(pct).toBeGreaterThanOrEqual(85);
   });
 
   it("the Events tab's connection dot reflects a live route's live status", () => {
@@ -798,7 +916,10 @@ describe("PhoneDrawer — stylesheet checks (#2108)", () => {
   it("the sheet body reserves padding for the iOS home-indicator safe area", () => {
     const css = readStylesheet();
     const rule = ruleBody(css, ".phone-drawer__body");
-    expect(rule).toMatch(/padding-bottom:\s*calc\(16px \+ env\(safe-area-inset-bottom, 0px\)\)/);
+    // (#2108, operator finding — round 4, item 4) 16px -> 12px, the
+    // operator's own literal figure ("pane content padding-bottom =
+    // env(safe-area-inset-bottom) + 12px").
+    expect(rule).toMatch(/padding-bottom:\s*calc\(12px \+ env\(safe-area-inset-bottom, 0px\)\)/);
   });
 
   it("the detail pane's font-size is bumped to >= 14px on the narrow render, not the app's smaller default", () => {

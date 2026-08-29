@@ -126,6 +126,40 @@ function clampPct(pct: number): number {
   return Math.max(MIN_OPEN_PCT, Math.min(MAX_OPEN_PCT, pct));
 }
 
+/** (#2108, operator finding — real device, masthead still covered) The
+ * previous fix wrapped the open height in CSS `min(${openPct}vh,
+ * calc(100vh - var(--masthead-h) - 8px))` — measured correctly under
+ * Chromium touch emulation, and STILL wrong on a real iPhone, because
+ * iOS Safari's `100vh` (and its own `var(--masthead-h)` comparison,
+ * which was fine) is computed against the LAYOUT viewport, which is
+ * TALLER than what's actually visible once the toolbar/home-indicator
+ * chrome is accounted for — the exact reason the operator's fix
+ * demanded "no vh anywhere in the open state". This reads the REAL
+ * visible height from `visualViewport` (falling back to `innerHeight`
+ * where it's unavailable — jsdom, older engines) and does the masthead-
+ * clearance arithmetic in JS, in PIXELS, so no `vh` unit is ever part of
+ * the rendered style string. `mastheadH` is `App.tsx`'s own
+ * `ResizeObserver`-measured `--masthead-h`, read back via
+ * `getComputedStyle` rather than duplicating a second observer here. */
+function visibleViewportHeight(): number {
+  if (typeof window === "undefined") return 0;
+  return window.visualViewport?.height ?? window.innerHeight ?? 0;
+}
+function readMastheadHeightPx(): number {
+  if (typeof document === "undefined") return 64;
+  const raw = getComputedStyle(document.documentElement).getPropertyValue("--masthead-h").trim();
+  const n = parseFloat(raw);
+  return Number.isFinite(n) ? n : 64;
+}
+/** The sheet's OPEN height in real pixels, clamped so its top edge can
+ * never draw above `mastheadH + 8`px — `openPct`/drag state/persistence
+ * are all untouched by this; it only changes what gets PAINTED. */
+function openHeightPx(openPct: number, viewportH: number, mastheadH: number): number {
+  const ceiling = Math.max(0, viewportH - mastheadH - 8);
+  const desired = (openPct / 100) * viewportH;
+  return Math.min(desired, ceiling);
+}
+
 export interface PhoneDrawerMachineTab {
   /** identity + scope + meters/idle + about — `useMachineStatsContent`'s
    * `body`, unchanged, reused rather than re-derived. The tab button
@@ -188,6 +222,30 @@ export function PhoneDrawer({
   // listener needs a real DOM node to attach to — see that effect's own
   // doc below.
   const backdropRef = useRef<HTMLDivElement | null>(null);
+  // (#2108, operator finding — real device, masthead still covered) The
+  // REAL visible viewport height, kept as state (not read once) because
+  // it changes live on a real device — the toolbar/URL-bar chrome
+  // showing or hiding, the keyboard opening, a rotation — none of which
+  // fire a React render on their own. `visualViewport`'s own `resize`
+  // event is what iOS actually dispatches for those; `window`'s `resize`
+  // is the fallback for engines without it. See `openHeightPx`'s own doc
+  // for why this replaces every `vh` in the open-state style.
+  const [viewportH, setViewportH] = useState<number>(() => visibleViewportHeight());
+  const [mastheadH, setMastheadH] = useState<number>(() => readMastheadHeightPx());
+  useEffect(() => {
+    const update = () => {
+      setViewportH(visibleViewportHeight());
+      setMastheadH(readMastheadHeightPx());
+    };
+    update();
+    const vv = typeof window !== "undefined" ? window.visualViewport : undefined;
+    vv?.addEventListener("resize", update);
+    window.addEventListener("resize", update);
+    return () => {
+      vv?.removeEventListener("resize", update);
+      window.removeEventListener("resize", update);
+    };
+  }, []);
 
   function close() {
     setOpen(false);
@@ -324,7 +382,7 @@ export function PhoneDrawer({
     const dy = drag.startY - e.clientY; // positive == dragged UP == taller
     if (Math.abs(dy) > TAP_SLOP_PX) drag.moved = true;
     if (!drag.moved) return;
-    const vh = window.innerHeight || 1;
+    const vh = viewportH || 1;
     const deltaPct = (dy / vh) * 100;
     const nextPct = clampPct(drag.startPct + deltaPct);
     if (!open) setOpen(true);
@@ -382,24 +440,26 @@ export function PhoneDrawer({
         // (#2108, "one card" packet) Closed: NO inline height — falls
         // back to `styles.css`'s own `calc(58px + env(safe-area-inset-
         // bottom, 0px))` rule, just enough for the handle+tabs below.
-        // Open: the live-dragged `openPct`, which the browser transitions
-        // to/from the closed CSS value smoothly (both are concrete
-        // lengths — see this file's own doc on why that works without a
-        // JS-side safe-area calculation).
+        // Open: a REAL PIXEL height (`openHeightPx`'s own doc) — the
+        // browser still transitions smoothly to/from the closed CSS
+        // value, since both are concrete, definite lengths (never
+        // `auto`, which a CSS `transition` can't interpolate).
         //
-        // (#2108, operator finding — real device) `min(...)` caps the
-        // rendered height so the sheet's TOP EDGE never draws over the
-        // masthead: a plain `${openPct}vh` let the sheet grow tall enough
-        // to cover the logo row on a real iPhone. `--masthead-h` is
-        // `App.tsx`'s own `ResizeObserver`-measured value (that effect's
-        // doc); `64px` is only the fallback for the one frame before it
-        // has run. This only clamps what's PAINTED — `openPct` itself
-        // (the drag state, persistence, `MAX_OPEN_PCT`) is untouched, so
-        // the drag still tracks the finger 1:1 up to the same ceiling the
-        // finger would visually hit.
+        // (#2108, operator finding — real device, ROUND 2) A prior fix
+        // here used CSS `min(${openPct}vh, calc(100vh - var(--masthead-
+        // h) - 8px))` — verified under Chromium touch emulation, and
+        // STILL wrong on a real iPhone: iOS Safari's `100vh` resolves
+        // against the LAYOUT viewport, taller than the actually-visible
+        // one, so the sheet's top edge kept drawing over the masthead
+        // regardless of the clamp. `openHeightPx` does the identical
+        // clamp arithmetic in JS instead, against `visualViewport`'s
+        // REAL measured height — no `vh` unit anywhere in this style.
+        // `openPct` itself (the drag state, persistence, `MAX_OPEN_PCT`)
+        // is untouched, so the drag still tracks the finger 1:1 up to
+        // the same ceiling the finger would visually hit.
         style={
           open
-            ? { height: `min(${openPct}vh, calc(100vh - var(--masthead-h, 64px) - 8px))` }
+            ? { height: `${openHeightPx(openPct, viewportH, mastheadH)}px` }
             : undefined
         }
       >
@@ -483,24 +543,27 @@ export function PhoneDrawer({
                 {machineTab.body}
               </div>
             ) : (
-              // (#2108, operator correction) The events tab is the SAME
-              // list + detail-pane split the desktop events column uses —
-              // not a drill-in push, not every row's detail expanded
-              // inline (both tried, both wrong: a route change/back button
-              // for something that should stay ON the sheet; an unreadable
-              // wall of expanded records). Tapping a row selects it and
-              // shows its detail in the pane, right here in the sheet — no
-              // navigation. `styles.css`'s `.phone-drawer__body .eventlog`
-              // block reorders the pane BELOW the list (desktop's own
-              // order is pane-above-list) and sizes it via the SAME
-              // `detailPct` split state the desktop column already has
-              // (default ~38/62, i.e. the instructed "~40/60"; not
-              // draggable on a phone — the resize handle's existing
-              // `@media (max-width:768px) { .eventlog__split { display:
-              // none } }` rule already hides it here, same as it always
-              // has for a stacked-width `EventLogColumn`). Neither
-              // `pushDetail` nor `inlineDetail` — this is `EventLogColumn`
-              // at its plain default.
+              // (#2108, operator design change, real-device round 4 —
+              // SUPERSEDES the split-pane attempt this comment used to
+              // describe) The list-plus-draggable-split model that ran
+              // here before was verified dead on a real iPhone: the
+              // divider was ungrabbable by touch and EXPAND toggled its
+              // class without producing a usable layout (both traced to
+              // real, fixable CSS bugs — see `styles.css`'s own history
+              // on them) — but the operator's call, independent of
+              // whether those bugs could be patched, is that a phone has
+              // no room for a resizable two-pane split at all. `pushDetail`
+              // (this component's own long-existing, previously-unused
+              // click-through mode — see that prop's own doc) is what
+              // this tab now runs: the list fills the sheet body; tapping
+              // a row PUSHES a full-height detail screen (the SAME
+              // one-row strip the old expand mode showed, plus a clear
+              // ≥44px "‹ list" control) in its place, and the list is
+              // still there, at the SAME SCROLL POSITION, when you go
+              // back. No touch-drag handlers on the phone at all — the
+              // split/expand/drag machinery stays exactly as it was for
+              // desktop and `MissionGraphLens.tsx`'s own instance
+              // (neither passes `pushDetail`), untouched by this change. */}
               <EventLogColumn
                 paneId="phone-drawer"
                 scopeLabel={events.scopeLabel}
@@ -510,6 +573,7 @@ export function PhoneDrawer({
                 error={events.error}
                 historical={events.historical}
                 serverTruncated={events.serverTruncated}
+                pushDetail
               />
             ))}
         </div>
