@@ -447,6 +447,16 @@ export interface MachineStatsContent {
   /** identity + scope + meters/idle + rule + about — the WHOLE dialog/tab
    * body, ready to drop into a `<Dialog>` or a tab panel unchanged. */
   body: React.ReactNode;
+  /** (#2108, operator finding — MachineLens/sheet unification) JUST the
+   * gauges (CPU/GPU/MEM, or the idle line) plus `HostExtras`
+   * (thermal/power/CPU-cluster) — no identity line, no scope label, no
+   * "about" section. `MachineLens.tsx` renders THIS, not `body`, in place
+   * of its own old flow-aggregation-only live-load section: the lens
+   * already has its own header/ledger/peers/history, so pulling in the
+   * drawer's full `body` would duplicate the identity/about content the
+   * lens already shows in its own words. The sheet and the ⓘ modal keep
+   * using `body` unchanged. */
+  liveBlock: React.ReactNode;
 }
 
 export function useMachineStatsContent({
@@ -665,5 +675,21 @@ export function useMachineStatsContent({
     </>
   );
 
-  return { body };
+  const liveBlock = (
+    <>
+      {isIdle ? (
+        <div className="machine-drawer__idle">
+          <div className="machine-drawer__idle-line">{idleLine}</div>
+          {lastKnownLine && (
+            <div className="machine-drawer__lastknown">{lastKnownLine}</div>
+          )}
+        </div>
+      ) : (
+        meters
+      )}
+      {hostExtras}
+    </>
+  );
+
+  return { body, liveBlock };
 }

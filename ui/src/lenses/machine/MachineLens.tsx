@@ -15,6 +15,7 @@ import { useIsMobile } from "../../hooks/useIsMobile";
 import { Meter, compactMeterProps, fmtPct, COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "../../components/Meter";
 import { aggregateHostSamples } from "../../lib/hostStats";
 import { rollingWindowSamples, findLastKnownSample } from "../../lib/machineDrawerScope";
+import { useMachineStatsContent } from "../../components/machineStatsContent";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
 /** The health region's state vocabulary, verbatim from `/machine/resources`
@@ -243,6 +244,43 @@ export function MachineLens({
   const machineIsLocal = routeUid == null;
   const isLocalMach = machineIsLocal || isLocalSpecs;
 
+  // (#2108, operator design rule — "the lens must be a strict SUPERSET of
+  // the sheet") The SAME shared hook `MachineDrawer.tsx`'s desktop dialog
+  // and `PhoneDrawer.tsx`'s Machine tab already use — `liveBlock` is just
+  // the gauges (CPU/GPU/MEM, or the idle line) plus `HostExtras`
+  // (thermal/power/CPU-cluster), fed by the DAEMON's continuous host
+  // sampler ring (`useDaemonLoad`, polled every `DAEMON_LOAD_POLL_MS`
+  // while `isOpen` — `true` here unconditionally, since this LENS being
+  // mounted at all IS its own "currently visible" gate, the same way the
+  // sheet/dialog's own open state is theirs). `route` is built from THIS
+  // lens's own `routeUid`, not `targetUid` — `useMachineStatsContent`'s
+  // daemon-fed reading is always THIS APP'S OWN local host, so it is only
+  // ever correct for the LOCAL machine page (`isLocalMach`); a drilled-
+  // into REMOTE machine keeps the OLDER flow-aggregation section below
+  // instead (this daemon has no probe access to a machine that isn't the
+  // one it's running on). `routeRecords` is `[]` — this hook's
+  // mission/dispatch-scoped branch never triggers for a `kind:"machine"`
+  // route, so there is nothing for it to scope. */
+  const { liveBlock } = useMachineStatsContent({
+    route: { kind: "machine", uid: routeUid },
+    routeRecords: [],
+    flowWindow: flowWindow.data,
+    localUid,
+    liveMachines,
+    specs,
+    liveStatus: "live",
+    // (#2108) Gated on `isLocalMach`, not unconditionally `true` — a
+    // remote machine's page never renders `liveBlock` at all (see the JSX
+    // below), and `useDaemonLoad` polls `/machine/resources` whenever
+    // `isOpen` is true regardless of whether anything on screen will use
+    // the result. Without this gate, drilling into a REMOTE machine still
+    // fetched the LOCAL daemon's own probe every 3s for a value nothing
+    // displays — exactly the wasted/misleading request `isLocalMach` was
+    // introduced to prevent everywhere else on this page.
+    isOpen: isLocalMach,
+    isMobile,
+  });
+
   // The resources probe is LOCAL-ONLY data (`/machine/resources` always
   // describes THIS daemon's own host) — legacy's `pollMachineMem` never
   // even fetches it for a remote machine's page (viewer.html:4906-4907:
@@ -408,20 +446,22 @@ export function MachineLens({
         />
       </div>
 
-      {/* (#1833) Live CPU/GPU/MEM — the surface half of #1833: the
-          rolling host sampler (`telemetry.process`) has been shipping
-          since #557/#1064 with no display anywhere on this lens. Same
-          [[Meter]] component + rolling-10-minute window the global
-          machine drawer uses (`lib/machineDrawerScope.ts`'s
-          `rollingWindowSamples`), scoped to `targetUid` (not always the
-          LOCAL machine) so a drilled-into remote machine's card shows
-          ITS OWN load, not this box's. The global pill/drawer stays
-          reachable on this lens too — the redundancy is accepted
-          (operator), since this section answers "what is THIS machine
-          doing" in place, without a click. */}
+      {/* (#2108, operator design rule — the lens is a strict SUPERSET of
+          the sheet) The LOCAL machine renders the SAME shared block the
+          global sheet/dialog render — gauges + thermal/power/CPU-cluster,
+          daemon-fed — in place of the old flow-aggregation-only CPU/GPU/
+          MEM section (#1833). A REMOTE machine (`!isLocalMach`) keeps that
+          OLDER section instead: `useMachineStatsContent`'s daemon reading
+          is always THIS APP'S OWN local host, so it cannot answer for a
+          machine that isn't the one darkmux is actually running on — the
+          flow-aggregation path (`rollingWindowSamples`, scoped to
+          `targetUid` via FLOW RECORDS rather than a local probe) is kept
+          deliberately for exactly that case, not dead code. */}
       <div className="mm-live-section">
         <div className="mm-live-section__title">live load · last 10 min</div>
-        {liveSamples.length === 0 ? (
+        {isLocalMach ? (
+          liveBlock
+        ) : liveSamples.length === 0 ? (
           <div className="machine-drawer__idle">
             <div className="machine-drawer__idle-line">idle · no samples in the last 10 min</div>
             {liveLastKnown && (

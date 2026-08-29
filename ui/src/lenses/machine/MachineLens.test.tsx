@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { MachineLens } from "./MachineLens";
 import { todayUTC, prevDateUTC } from "../../lib/flow";
 
@@ -549,5 +552,81 @@ describe("MachineLens — the runs-lens link (#1809)", () => {
     const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
     expect(link.className).not.toMatch(/--mobile/);
     expect(link.textContent).toBe("runs on MacBook-Pro →");
+  });
+});
+
+// ── (#2108, operator design rule — "the lens is a strict SUPERSET of the
+//    sheet") The LOCAL machine page renders the SAME shared
+//    `useMachineStatsContent` block (`liveBlock`) the global sheet/dialog
+//    render, in place of the old flow-aggregation-only CPU/GPU/MEM
+//    section — gaining thermal/power/CPU-cluster for free, fed by the
+//    daemon ring. ──────────────────────────────────────────────────────
+
+const LOAD_WITH_EXTRAS = {
+  now: {
+    sampled_at_ms: 4000,
+    sampler_cost_ms: 4.2,
+    cpu_pct: 22,
+    cpu_clusters: [
+      { name: "Super", cores: 6, pct: 46, mhz: 4400 },
+      { name: "Performance", cores: 12, pct: 22, mhz: 3400 },
+    ],
+    mem_pct: 46,
+    gpu_pct: 68,
+    gpu_mhz: null,
+    gpu_mem_bytes: null,
+    thermal: { state: "fair", cpu_speed_limit_pct: 87 },
+    power_mw: null,
+  },
+  window: {
+    samples: 3,
+    interval_ms: 2000,
+    span_ms: 90_000,
+    cpu_pct: { mean: 10, p95: 15, max: 20 },
+    mem_pct: { mean: 30, p95: 35, max: 40 },
+    gpu_pct: { mean: 50, p95: 55, max: 60 },
+    power_mw: null,
+    thermal: null,
+    energy_mwh: null,
+  },
+};
+
+describe("MachineLens — the live block is the SAME shared component the sheet uses (#2108)", () => {
+  it("the local machine page renders the thermal pill and CPU-cluster tiles from the daemon fixture", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 },
+      resources: { ...RESOURCES, load: LOAD_WITH_EXTRAS },
+    });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    // Thermal pill + CPU-cluster tiles — content ONLY `HostExtras`
+    // (inside `useMachineStatsContent`'s `liveBlock`) can produce; the
+    // OLD flow-aggregation section never rendered either.
+    await waitFor(() => expect(screen.getByText("Fair")).toBeInTheDocument());
+    expect(screen.getByText("Super")).toBeInTheDocument();
+    expect(screen.getByText("Performance")).toBeInTheDocument();
+  });
+
+  it("a REMOTE machine page still shows nothing from the daemon-fed block (no thermal pill) — the flow-aggregation fallback stays for that case", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      resources: { ...RESOURCES, load: LOAD_WITH_EXTRAS },
+      liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
+    });
+    renderMachine("remote-uid");
+    await waitFor(() => expect(screen.getByText(/not reported from here/i)).toBeInTheDocument());
+    expect(screen.queryByText("Fair")).toBeNull();
+    expect(screen.queryByText("Super")).toBeNull();
+  });
+
+  it("MachineLens.tsx and MachineDrawer.tsx both source their live block from the SAME hook module", () => {
+    // A source-level check alongside the behavioral one above: proves
+    // this isn't two independently-built blocks that happen to render
+    // similar text, but the literal SAME `useMachineStatsContent` export.
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    const lensSrc = readFileSync(path.join(dir, "MachineLens.tsx"), "utf-8");
+    const drawerSrc = readFileSync(path.join(dir, "../../components/MachineDrawer.tsx"), "utf-8");
+    expect(lensSrc).toMatch(/import \{ useMachineStatsContent \} from "\.\.\/\.\.\/components\/machineStatsContent"/);
+    expect(drawerSrc).toMatch(/useMachineStatsContent/);
   });
 });
