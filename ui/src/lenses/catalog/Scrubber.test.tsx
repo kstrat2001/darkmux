@@ -23,8 +23,6 @@ function renderScrubber(overrides: Partial<ComponentProps<typeof Scrubber>> = {}
       onRewind={onRewind}
       onTogglePlay={onTogglePlay}
       onCycleSpeed={onCycleSpeed}
-      visibleCount={1}
-      totalCount={4}
       {...overrides}
     />,
   );
@@ -88,8 +86,6 @@ describe("Scrubber", () => {
         onRewind={() => {}}
         onTogglePlay={() => {}}
         onCycleSpeed={() => {}}
-        visibleCount={1}
-        totalCount={4}
       />,
     );
     const playBtn = screen.getByRole("button", { name: "play" });
@@ -106,8 +102,6 @@ describe("Scrubber", () => {
         onRewind={() => {}}
         onTogglePlay={() => {}}
         onCycleSpeed={() => {}}
-        visibleCount={1}
-        totalCount={4}
       />,
     );
     const pauseBtn = screen.getByRole("button", { name: "pause" });
@@ -115,9 +109,19 @@ describe("Scrubber", () => {
     expect(screen.queryByRole("button", { name: "play" })).not.toBeInTheDocument();
   });
 
-  it("the clock readout names the playhead time and the visible/total record count", () => {
-    renderScrubber({ t: TMIN, visibleCount: 2, totalCount: 9 });
-    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${clkhm(TMIN)} · 2/9 rec`);
+  // (#2120, operator finding — "almost none of it is meaningful") The
+  // rec-count readout is gone; the range input is the progress indicator
+  // now. The clock reads bare when the caller passes no label (a phone
+  // route, or a desktop route with nothing derivable — see `App.tsx`'s own
+  // `playbackMissionLabel` doc).
+  it("the clock readout names only the playhead time when no label is given", () => {
+    renderScrubber({ t: TMIN });
+    expect(screen.getByTestId("scrubber-clock").textContent).toBe(clkhm(TMIN));
+  });
+
+  it("appends the label after the clock, separated by a middot, when one is given", () => {
+    renderScrubber({ t: TMIN, label: "Review · nameof recency" });
+    expect(screen.getByTestId("scrubber-clock").textContent).toBe(`${clkhm(TMIN)} · Review · nameof recency`);
   });
 
   // (#1869 code review) A zero-span day pins the thumb at the RIGHT edge
@@ -126,9 +130,9 @@ describe("Scrubber", () => {
   // test pinned the WRONG value (0): with `tMin === tMax`, `t - tMin` is 0,
   // and the pre-fix code floored `span` to 1 before dividing, so `raw`
   // silently computed to 0 instead of following legacy's explicit `else
-  // 100` branch — thumb hard left while the clock reads "1/1 rec" and the
-  // hero shows the whole day. Never divides by zero either way; only the
-  // RENDERED VALUE was wrong.
+  // 100` branch — thumb hard left while the day's whole span read as
+  // scrubbed already. Never divides by zero either way; only the RENDERED
+  // VALUE was wrong.
   it("a zero-span day (tMin === tMax) pins the thumb at the end, not the start (#1640)", () => {
     render(
       <Scrubber
@@ -141,8 +145,6 @@ describe("Scrubber", () => {
         onRewind={() => {}}
         onTogglePlay={() => {}}
         onCycleSpeed={() => {}}
-        visibleCount={1}
-        totalCount={1}
       />,
     );
     expect(screen.getByRole("slider")).toHaveValue("100");

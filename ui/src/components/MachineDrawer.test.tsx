@@ -256,6 +256,58 @@ describe("MachineDrawer (#2107)", () => {
     ).toBe("55%");
   });
 
+  // (#2120) The `playback` kv row — everything the sticky row's folded
+  // `#meta` summary used to carry that the transport doesn't already say:
+  // the flow day, the recorded time span, the day's record/machine census,
+  // and the raw mission id (the transport itself shows only a human label,
+  // or nothing — `App.tsx`'s own `playbackMissionLabel` doc). `routeRecords`
+  // here stands in for what `App.tsx` hands down on a playback route — the
+  // WHOLE loaded day, not a rolling window.
+  it("(#2120) shows the `playback` row — day, span, census, and the raw mission id — on a playback route", () => {
+    const dayRecords: FlowRecord[] = [
+      { ts: "2026-08-26T01:08:17.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "demo-review-nameof-recency", session_id: "s1", action: "dispatch.start" } as FlowRecord,
+      { ts: "2026-08-26T14:13:01.000Z", machine_uid: "m1", machine_id: "MacBook-Pro", mission_id: "demo-review-nameof-recency", session_id: "s1", action: "dispatch.complete" } as FlowRecord,
+    ];
+    render(
+      <MachineDrawer
+        route={{ kind: "playback", date: "2026-08-26" }}
+        routeRecords={dayRecords}
+        flowWindow={[]}
+        localUid={null}
+        nowMsOverride={NOW}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    expect(screen.getByText("playback")).toBeInTheDocument();
+    const row = screen.getByText("playback").closest(".dialog__kv")!;
+    const value = row.querySelector("span")!.textContent ?? "";
+    expect(value).toContain("flow 2026-08-26");
+    expect(value).toContain("2 records · 1 machines");
+    expect(value).toContain("mission demo-review-nameof-recency");
+  });
+
+  it("(#2120) renders no `playback` row on a live route — nothing to replay", () => {
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        nowMsOverride={NOW}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    expect(screen.queryByText("playback")).toBeNull();
+  });
+
   it("(#2107) the header line carries machine name · hardware · darkmux version — the phone's only route to that info", () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-version";

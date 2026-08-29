@@ -29,32 +29,34 @@ test('pressing play on the static build actually advances the playhead', async (
   await expect(range).toHaveValue('100');
   await expect(playBtn).toHaveAttribute('title', 'play');
 
-  const clock = page.locator('[data-testid="scrubber-clock"]');
-  const clockBefore = await clock.innerText();
-  // "HH:MM · N/M rec" — read the fixture's own total off the DOM rather
-  // than hardcoding it, so this spec never has to be re-numbered if the
-  // fixture (shared with `viewer-xss.spec.js`) grows or shrinks a record.
-  const total = clockBefore.match(/\/(\d+) rec$/)[1];
-
+  // (#2120, operator finding — "almost none of it is meaningful") The
+  // clock's own "N/M rec" readout is gone — the range input is the
+  // progress indicator now, and the record/machine counts moved to the
+  // Machine info modal's `playback` row. This fixture's mission id is an
+  // XSS payload string with no "review" token, so `humanMissionLabel`
+  // (`ui/src/lib/replayMeta.ts`) derives no label either — the clock
+  // renders bare `HH:MM` throughout this run, which at this fixture's
+  // 13-SECOND span never even changes minute. The clock is therefore no
+  // longer a usable movement signal for this spec; the range value and
+  // the play/pause button title carry the whole proof below, same as they
+  // always did independently of the (now-removed) rec count.
+  //
   // The 13-second fixture day plays inside ONE 100 ms tick at the default
   // 1h/s, so asserting the "rewound and playing" state from the test side
   // is a race against the loop. Record the transitions from INSIDE the page
   // instead: a requestAnimationFrame sampler (~16 ms, finer than the tick)
-  // captures every distinct (range value, button title, clock) state the
+  // captures every distinct (range value, button title) state the
   // transport passes through; the assertions read that record once the run
   // has completed. Pressing play while pinned at the end restarts from the
   // beginning (`togglePlay`'s "restart if at the end" rule, ported from
   // legacy's `if(state.t>=tMax)state.t=tMin;`), so the first state seen
-  // must be the range at 0 with the button reading "pause" and the clock's
-  // NUMERATOR below the day's total — the denominator is invariant across
-  // the test, so it alone could never prove the playhead moved.
+  // must be the range at 0 with the button reading "pause".
   await page.evaluate(() => {
     const range = document.querySelector('.scrub input[type="range"]');
     const btn = document.querySelector('.scrub button.primary');
-    const clockEl = document.querySelector('[data-testid="scrubber-clock"]');
     window.__transport = [];
     const sample = () => {
-      const state = `${range.value}|${btn.title}|${clockEl.textContent}`;
+      const state = `${range.value}|${btn.title}`;
       if (state !== window.__transport[window.__transport.length - 1]) window.__transport.push(state);
       window.__transportRaf = requestAnimationFrame(sample);
     };
@@ -69,22 +71,20 @@ test('pressing play on the static build actually advances the playhead', async (
   // a fluke.
   // Speed is a real multiplier of elapsed time now ("1× doesn't seem 1×",
   // the #2071 follow-up): at the default 1h/s this 13-second fixture day
-  // plays out inside ONE tick, so sampling the clock mid-flight is a race
-  // against the loop. The advance is proven by the run COMPLETING instead:
-  // the range returns to 100, the play button flips back from "pause", and
-  // the clock (real DOM text, not the input's own `.value`) counts every
-  // record again — three independent signals of a playhead that moved.
+  // plays out inside ONE tick, so sampling mid-flight is a race against
+  // the loop. The advance is proven by the run COMPLETING instead: the
+  // range returns to 100 and the play button flips back from "pause" —
+  // two independent signals of a playhead that moved, cross-checked
+  // against the transitions record below for the REWOUND state in between.
   await expect(range).toHaveValue('100', { timeout: 5_000 });
   await expect(playBtn).toHaveAttribute('title', 'play');
-  expect(await clock.innerText()).toMatch(new RegExp(`${total}/${total} rec$`));
   const transitions = await page.evaluate(() => {
     cancelAnimationFrame(window.__transportRaf);
     return window.__transport;
   });
-  const rewound = transitions.find((st) => st.startsWith('0|pause|'));
+  const rewound = transitions.find((st) => st === '0|pause');
   expect(rewound, `transitions seen: ${transitions.join(' → ')}`).toBeTruthy();
-  expect(Number(rewound.match(/(\d+)\/\d+ rec$/)[1])).toBeLessThan(Number(total));
-  expect(transitions[transitions.length - 1]).toMatch(new RegExp(`^100\\|play\\|.*${total}/${total} rec$`));
+  expect(transitions[transitions.length - 1]).toBe('100|play');
 
   expect(pageErrors, `pageerror events: ${pageErrors.join('; ')}`).toHaveLength(0);
 });
