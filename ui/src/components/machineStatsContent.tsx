@@ -50,8 +50,9 @@ import { COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "./Meter";
 import { aggregateHostSamples, type HostAggregate } from "../lib/hostStats";
 import { resolveDrawerScope } from "../lib/machineDrawerScope";
 import { injectedMeta } from "../lib/injectedMeta";
-import { nameOf } from "../lib/flow";
+import { firstRecordDate, nameOf, todayUTC } from "../lib/flow";
 import { relAgoFrom } from "../lib/format";
+import { replayPlaybackKvValue } from "../lib/replayMeta";
 import { specOf } from "../lenses/fleet/cards";
 import { isLiveRoute, type Route } from "../lib/route";
 import { useDaemonLoad } from "../hooks/useDaemonLoad";
@@ -685,6 +686,22 @@ export function useMachineStatsContent({
     aboutLive && specs?.cpu_brand
       ? `${specs.cpu_brand}${specs.ram_total_bytes ? ` · ${Math.round(specs.ram_total_bytes / 1073741824)} GB` : ""}`
       : "";
+  // (#2120) The `playback` row — everything the sticky row's folded `#meta`
+  // summary used to carry that the transport itself does not already say:
+  // the flow day, the recorded time span, the day's record/machine census,
+  // and the raw mission id (the transport shows only a HUMAN label for the
+  // same mission, or nothing — `App.tsx`'s own `playbackMissionLabel` doc).
+  // `routeRecords` on a playback route IS the loaded day's records (`App
+  // .tsx`'s own `replayMeta` doc: "routeRecords is already that day's
+  // records"), so this reads the SAME set the sticky row used to, no
+  // second fetch. `route.date` is `null` on a static build until the day's
+  // flow file resolves (`route.ts`'s widened `playback` variant); falls
+  // back to the earliest record's own day, then today, matching
+  // `App.tsx`'s identical `displayRoute` fallback for the same gap.
+  const playbackValue =
+    route.kind === "playback"
+      ? replayPlaybackKvValue(routeRecords, route.date ?? firstRecordDate(routeRecords) ?? todayUTC())
+      : "";
   const aboutSection = (
     <div className="dialog__rrdetail">
       <Kv label="build" value={verMeta ?? ""} />
@@ -693,6 +710,7 @@ export function useMachineStatsContent({
       <Kv label="mode" value={modeText(route)} />
       <Kv label="machine" value={aboutMachine} />
       <Kv label="hardware" value={aboutHardware} />
+      <Kv label="playback" value={playbackValue} />
     </div>
   );
 

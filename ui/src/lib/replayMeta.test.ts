@@ -1,7 +1,15 @@
 import { describe, it, expect } from "vitest";
-import { primaryReplayMission, replayMissionLabel, replayMetaLines, replayMetaParts, replayDataSource } from "./replayMeta";
+import {
+  primaryReplayMission,
+  replayMissionLabel,
+  replayMetaLines,
+  replayMetaParts,
+  replayDataSource,
+  humanMissionLabel,
+  replayPlaybackKvValue,
+} from "./replayMeta";
 import { normalizeRecords } from "./flow";
-import { clk, lday } from "./format";
+import { clk, clkrange, lday } from "./format";
 import type { FlowRecord } from "../types/handwritten";
 
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
@@ -152,5 +160,55 @@ describe("replayMetaParts", () => {
     expect(parts.source).toBe("flow · 2026-08-26");
     expect(`${parts.head} · ${parts.source} · ${parts.span}`).toBe(replayMetaLines(data, "2026-08-26")[0]);
     expect(parts.census).toBe(replayMetaLines(data, "2026-08-26")[1]);
+  });
+});
+
+/** (#2120) A human label for a mission id, read off the id's own naming
+ * convention — never a fetch. Only the `review` convention is recognized
+ * today; everything else returns `null` so the caller can fall back (the
+ * modal, to the raw id) or omit the label (the transport, per the
+ * operator's "raw id lives only in the modal" call). */
+describe("humanMissionLabel", () => {
+  it("reads a review-config id's trailing slug as a title", () => {
+    expect(humanMissionLabel("demo-review-nameof-recency")).toBe("Review · nameof recency");
+  });
+
+  it("works with no prefix before the review token", () => {
+    expect(humanMissionLabel("review-quarterly-audit")).toBe("Review · quarterly audit");
+  });
+
+  it("falls back to a bare 'Review' when the token has no trailing slug", () => {
+    expect(humanMissionLabel("demo-review")).toBe("Review");
+  });
+
+  it("returns null for an id with no recognizable convention — the caller decides the fallback", () => {
+    expect(humanMissionLabel("coder-phase-1786068582-93f404")).toBeNull();
+    expect(humanMissionLabel("acp-ephemeral-pr-ship-123")).toBeNull();
+  });
+});
+
+/** (#2120) The Machine info modal's `playback` kv row — the day/span/
+ * census/raw-id information the sticky row's folded `#meta` summary used
+ * to carry, now that the transport shows only a human mission label (or
+ * nothing) in its place. */
+describe("replayPlaybackKvValue", () => {
+  const day: FlowRecord[] = [
+    { ts: "2026-08-26T01:08:17.000Z", machine_uid: "u1", mission_id: "demo-review-nameof-recency" } as FlowRecord,
+    { ts: "2026-08-26T14:13:01.000Z", machine_uid: "u1", mission_id: "demo-review-nameof-recency" } as FlowRecord,
+    { ts: "2026-08-26T09:00:00.000Z", machine_uid: "u2", mission_id: "demo-review-nameof-recency" } as FlowRecord,
+  ];
+
+  it("names the day, the bare time span (no repeated date), the census, and the raw mission id", () => {
+    const tMin = Date.parse("2026-08-26T01:08:17.000Z");
+    const tMax = Date.parse("2026-08-26T14:13:01.000Z");
+    expect(replayPlaybackKvValue(day, "2026-08-26")).toBe(
+      `flow 2026-08-26 · ${clkrange(tMin, tMax)} · 3 records · 2 machines · mission demo-review-nameof-recency`,
+    );
+  });
+
+  it("omits the mission clause entirely when the day has no mission ids", () => {
+    const noMission: FlowRecord[] = [{ ts: "2026-08-26T01:08:17.000Z", machine_uid: "u1" } as FlowRecord];
+    expect(replayPlaybackKvValue(noMission, "2026-08-26")).toBe(`flow 2026-08-26 · ${clkrange(Date.parse("2026-08-26T01:08:17.000Z"), Date.parse("2026-08-26T01:08:17.000Z"))} · 1 records · 1 machines`);
+    expect(replayPlaybackKvValue(noMission, "2026-08-26")).not.toContain("mission");
   });
 });

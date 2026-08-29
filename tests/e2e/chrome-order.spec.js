@@ -74,24 +74,36 @@ test('at phone width the chrome reads broadest-scope-first', async ({ page }) =>
   // BEM convention (`app-shell__meta`, `app-shell__navtabs` —
   // `NavChrome.tsx`'s own doc calls out that `.lenstabs` is what this bar
   // ports), so neither bare class selects anything on this page anymore.
-  // `#meta` is still unique; the tab bar has no id, so its `aria-label` (set
-  // for the same reason a `<nav>` landmark needs one) is the stable hook.
-  const meta = await page.locator('#meta').first().boundingBox();
+  // The tab bar has no id, so its `aria-label` (set for the same reason a
+  // `<nav>` landmark needs one) is the stable hook.
+  //
+  // (#2120 update) `#meta` itself is GONE on this fixture now, not just
+  // renamed — `index-lab.html` injects `darkmux-flow-src`, so this route
+  // carries the playback transport too (`usePlaybackTransport`'s own doc:
+  // a static build loads its one committed day on every route), and the
+  // sticky row no longer renders the folded `#meta` summary at all while
+  // that transport is mounted (`App.tsx`'s own `!transportShown` doc). The
+  // element between the tab strip and the panel that this test's original
+  // regression cared about — SOMETHING sitting directly under the tabs,
+  // directly above the panel, never wrapping into the panel's own first
+  // line — is `.scrub` (the transport) now, so the ordering check moves to
+  // that element instead of chasing a region that no longer exists here.
+  const scrub = await page.locator('.scrub').first().boundingBox();
   const tabs = await page.locator('nav[aria-label="lens navigation"]').first().boundingBox();
-  expect(meta, '#meta must be present to be ordered').not.toBeNull();
+  expect(scrub, 'the playback transport must be present to be ordered').not.toBeNull();
   expect(tabs, 'the lens-tab nav must be present to be ordered').not.toBeNull();
 
   // The regression: machine-scope status ("coder on MacBook-Pro") wrapped to
   // BELOW the tab strip and one line above the panel, where it read as the
   // selected tab's first line of content.
   // (#2071) The tab strip is the top of the sticky block now (tabs +
-  // transport, operator decision), and the status line sits directly under
+  // transport, operator decision), and the transport sits directly under
   // it, above the panel. Before #2071 the order was status, tabs, panel.
   expect(
     tabs.y,
-    'the tab selector is the top of the sticky block; the status line sits under it'
-  ).toBeLessThan(meta.y);
-  expect(meta.y, 'the status line sits above the panel').toBeLessThan((await page.locator('.panelout').boundingBox()).y);
+    'the tab selector is the top of the sticky block; the transport sits under it'
+  ).toBeLessThan(scrub.y);
+  expect(scrub.y, 'the transport sits above the panel').toBeLessThan((await page.locator('.panelout').boundingBox()).y);
 
   // ...and the tab strip ends up directly above the panel it selects, which is
   // the association a tab bar exists to carry.

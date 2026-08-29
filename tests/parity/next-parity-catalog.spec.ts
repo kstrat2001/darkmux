@@ -56,6 +56,26 @@
 //     because it matches how every other clock in this viewer already
 //     reads and is more useful than an elapsed counter. Nothing else in
 //     this golden changed at #1869.
+//
+//     (#2120 update) The paragraph above is now partly stale — worth
+//     flagging rather than silently leaving wrong. The "five transport
+//     lines… hand-added to the golden" claim never actually held for THIS
+//     region: `Scrubber` (`.scrub`) has lived in `.app-shell__sticky` since
+//     the #2071 packet, a body-level SIBLING of `#stage`/`#crumb`/`#meta`,
+//     so `regionText(page, "crumb"|"meta"|"stage")` never reached it either
+//     — the golden captured at #1869 never actually contained transport
+//     text, the doc above just said it did. What #2120 DID change for
+//     real: `#crumb` and `#meta` used to carry the replay's OWN summary
+//     (`◆ <mission>` / the folded day/span/census line) on a playback
+//     route; both are `(empty)` now — the transport shows a human mission
+//     label instead (`Scrubber`'s own `label` prop, still outside this
+//     extraction's reach for the reason above), and the raw id + census
+//     moved to the Machine info modal's `playback` kv row (covered by
+//     `machineStatsContent.test.ts`/`MachineDrawer.test.tsx` in `ui/`, not
+//     this harness — the modal is not part of the four extracted regions
+//     either). `goldens/playback-date.txt`'s crumb/meta sections were
+//     hand-edited to `(empty)` to match; nothing else in this golden
+//     changed.
 //   - `mission-replay`: still NOT byte parity, and now for a DIFFERENT
 //     reason than before #1868 — `mission-replay.txt` is legacy's fleet-hero
 //     render for `#mission=<id>`, a route this port no longer stands in
