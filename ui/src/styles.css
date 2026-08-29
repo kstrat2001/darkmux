@@ -5677,8 +5677,17 @@ body {
    edge; `.phone-drawer__body` (the active tab's content, `flex: 1`) is
    its SECOND, filling whatever height remains below the bar. Neither
    inner section carries its own background/transform any more — there is
-   only the one card, moving as one unit. */
-@media (max-width: 768px) {
+   only the one card, moving as one unit.
+
+   (#2108 review finding 10, WebKit-proven) The query is now `(max-width:
+   768px), (pointer: coarse) and (max-width: 1024px) and (orientation:
+   landscape)` — a plain OR of the two conditions `useIsMobile.ts`'s
+   `computeIsMobile` checks (that file's own doc has the full reasoning).
+   A landscape phone (iPhone 14: 844×390) is wider than 768 but still a
+   phone; without the second clause, this whole block's CSS would stop
+   applying to `.phone-drawer` the instant JS decided to keep rendering it
+   — the sheet would mount unstyled. Both halves must always agree. */
+@media (max-width: 768px), (pointer: coarse) and (max-width: 1024px) and (orientation: landscape) {
   .app-shell {
     padding-bottom: calc(58px + env(safe-area-inset-bottom, 0px));
   }
