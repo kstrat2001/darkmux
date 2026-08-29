@@ -1,4 +1,5 @@
 import { useMemo, useRef, useEffect } from "react";
+import { useIsMobile } from "./hooks/useIsMobile";
 import { useHashRoute } from "./lib/useHashRoute";
 import { getSource } from "./lib/source";
 import { useDay } from "./hooks/useDay";
@@ -106,6 +107,14 @@ import type { Route } from "./lib/route";
 export function App() {
   const route = useHashRoute();
   const nowMs = Date.now();
+  // (#2107 tabbed-drawer packet) The SAME phone/desktop call
+  // `MachineDrawer.tsx` makes internally (see that file's own doc) —
+  // needed here too, since a phone route's events pane now lives INSIDE
+  // the drawer's own Events tab rather than in this file's inline
+  // `EventLogColumn` mount below. Two independent measurements of the
+  // same `window.innerWidth`, deliberately (see `useIsMobile`'s own doc
+  // for why that's the right call, not a shared subscription).
+  const isMobile = useIsMobile();
 
   // (Packet 5) The SSE tail + reconcile backstop + date-rollover handler —
   // gated by `isLiveRoute` (see that function's own doc) so a genuinely
@@ -356,7 +365,15 @@ export function App() {
           this file already resolves for the meta line and the machine
           lens — cache reuse, not a second fetch; see
           `lib/machineDrawerScope.ts` for the mission/dispatch-vs-rolling-
-          window scope rule. */}
+          window scope rule.
+
+          (#2107 tabbed-drawer packet) The `eventLog*` props are the SAME
+          values the inline `<EventLogColumn>` mount below receives —
+          `MachineDrawer` only actually uses them on a phone route, where
+          they become the drawer's Events tab (see that component's own
+          doc), and ignores them entirely on desktop. Passed
+          unconditionally rather than gated here too, since the cost is a
+          few extra props on an already-cheap render, not a second fetch. */}
       <MachineDrawer
         route={route}
         routeRecords={routeRecords.records}
@@ -365,6 +382,12 @@ export function App() {
         liveMachines={liveMachines}
         specs={specs}
         liveStatus={liveStatus}
+        eventLogRecords={eventLogRecords}
+        eventLogScopeLabel={logscope}
+        eventLogVisible={showsEventLog(route)}
+        eventLogLoading={routeRecords.loading}
+        eventLogError={routeRecords.error}
+        eventLogHistorical={routeRecords.historical}
       />
       {/* (#2071) The sticky block: the tab strip plus, while a day is loaded,
           the playback transport. Operator decision: sticky row, tabs
@@ -426,14 +449,30 @@ export function App() {
           of the always-rendered standalone span this file used to have —
           see that component's own doc for why: rendering it loose above the
           stage regardless of lens produced the stray uppercase "FLEET" the
-          operator caught) is ALWAYS mounted — `visible={showsEventLog(route)}`
-          toggles a CSS `display:none` class on it instead of conditionally
-          unmounting (see `EventLogColumn.tsx`'s own `visible` doc for why
-          unmounting is wrong: legacy's real `#logscope` stays present, with
-          real text, even when its ancestor is hidden — `next-parity.spec.ts`'s
-          byte-parity goldens for the machine lens depend on that). A hidden
-          flex item doesn't consume row width, so `#stage` still fills the
-          row on its own — no separate CSS class needed here. */}
+          operator caught) is ALWAYS mounted on DESKTOP —
+          `visible={showsEventLog(route)}` toggles a CSS `display:none`
+          class on it instead of conditionally unmounting (see
+          `EventLogColumn.tsx`'s own `visible` doc for why unmounting is
+          wrong: legacy's real `#logscope` stays present, with real text,
+          even when its ancestor is hidden — `next-parity.spec.ts`'s
+          byte-parity goldens for the machine lens depend on that — those
+          goldens are captured at a desktop viewport, so gating this mount
+          on `!isMobile` below never touches them). A hidden flex item
+          doesn't consume row width, so `#stage` still fills the row on its
+          own — no separate CSS class needed here.
+
+          (#2107 tabbed-drawer packet) On a PHONE this mount is gone
+          entirely — not CSS-hidden, actually unmounted — because the
+          events pane now lives inside `<MachineDrawer>`'s own Events tab
+          (`PhoneDrawer.tsx`), fed the identical `eventLog*` props passed
+          to `MachineDrawer` above. Two live mounts of the same pane at
+          once would fight over `dialogManager`'s `modalbg` id and over
+          which one "the" event log is; only one of {this mount, the
+          drawer's} is ever actually in the DOM for a given viewport. This
+          is also the "remove the inline section from the page flow on
+          phones so the lens above gets the full height" requirement — the
+          lens in `#stage` is no longer followed by a full-width event-log
+          section pushing the page's scroll further down. */}
       <div className="app-shell__content">
         <main className="app-shell__stage" id="stage">
           {/* (#2027) There was no error boundary anywhere in this app, so ANY
@@ -451,14 +490,16 @@ export function App() {
             {renderRoute(route, playhead)}
           </LensErrorBoundary>
         </main>
-        <EventLogColumn
-          scopeLabel={logscope}
-          records={eventLogRecords}
-          visible={showsEventLog(route)}
-          loading={routeRecords.loading}
-          error={routeRecords.error}
-          historical={routeRecords.historical}
-        />
+        {!isMobile && (
+          <EventLogColumn
+            scopeLabel={logscope}
+            records={eventLogRecords}
+            visible={showsEventLog(route)}
+            loading={routeRecords.loading}
+            error={routeRecords.error}
+            historical={routeRecords.historical}
+          />
+        )}
       </div>
     </div>
   );

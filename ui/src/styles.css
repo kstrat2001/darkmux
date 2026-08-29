@@ -5120,95 +5120,146 @@ body {
   justify-content: space-around;
 }
 
-/* ── (phone feedback, 2026-08-29) The phone bottom bar + sheet ───────────
-   Replaces the floating pill ENTIRELY below 768px — no overlay of any
-   kind sits over page content on a phone. The bar is laid out IN FLOW
-   (fixed to the viewport bottom, but `.app-shell` reserves its height via
-   `padding-bottom` below), the same discipline a native app's own tab bar
-   follows. `env(safe-area-inset-bottom)` keeps it clear of an iPhone's
-   home indicator. */
+/* ── (#2107 tabbed-drawer packet) The phone-only (≤768px) tabbed bottom
+   drawer — `Machine` and `Events`. Replaces the earlier single-purpose
+   `machine-bottombar`/one-sheet phone chrome entirely (retired along with
+   this packet; see `PhoneDrawer.tsx`'s own doc for the interaction model).
+
+   `.phone-drawer__bar` (handle + two tab buttons) is a permanent
+   "mainstay" — fixed to the viewport bottom, `.app-shell` reserves its
+   height via `padding-bottom` below, same discipline a native app's own
+   tab bar follows, `env(safe-area-inset-bottom)` clear of an iPhone's home
+   indicator. `.phone-drawer__body` (whichever tab is active) only exists
+   while open; since `.phone-drawer` itself is bottom-anchored and the
+   bar's height never changes, the body simply grows the WHOLE column
+   upward as it opens/drags — no separate "collapsed vs full" class swap
+   the old single-sheet chrome needed. */
 @media (max-width: 768px) {
   .machine-pill {
     display: none;
   }
   .app-shell {
-    padding-bottom: calc(44px + env(safe-area-inset-bottom, 0px));
+    padding-bottom: calc(58px + env(safe-area-inset-bottom, 0px));
   }
-  .machine-bottombar {
+  .phone-drawer {
     position: fixed;
     left: 0;
     right: 0;
     bottom: 0;
     z-index: 80;
-    height: calc(44px + env(safe-area-inset-bottom, 0px));
-    padding-bottom: env(safe-area-inset-bottom, 0px);
     display: flex;
     flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 2px;
+  }
+  .phone-drawer__body {
     background: var(--bg, #0b0b0d);
     border-top: 1px solid var(--border);
-    cursor: pointer;
-  }
-  .machine-bottombar__handle-bar {
-    width: 32px;
-    height: 3px;
-    border-radius: 2px;
-    background: var(--border);
-  }
-  .machine-bottombar__numbers {
-    font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
-    font-variant-numeric: tabular-nums;
-    color: var(--fg);
-    white-space: nowrap;
-  }
-
-  /* Phones: a bottom sheet instead of a centered modal — same content,
-     different chrome. `translateY` transition (see MachineDrawer.tsx's
-     inline transform during a drag), respecting `prefers-reduced-motion`
-     below. Sized to CONTENT up to `max-height`, never a fixed height — a
-     short idle reading doesn't drag a nearly-empty sheet up to 85vh, and
-     a genuinely tall one scrolls internally (`.machine-drawer__body`)
-     rather than clipping the meters' own bottom labels off the viewport
-     edge (the exact defect a real phone test caught: the pull handle did
-     nothing because there was no taller state to reveal AND no scroll to
-     reach it). */
-  .machine-drawer {
-    top: auto;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    transform: none;
-    width: 100%;
-    max-height: 85vh;
     border-radius: 16px 16px 0 0;
-    border-bottom: none;
-    padding: 8px 16px calc(20px + env(safe-area-inset-bottom, 0px));
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    /* `height` is set inline per-drag (`PhoneDrawer.tsx`); this transition
+       only applies to a TAP-driven open/close/tab-switch — the inline
+       style's own `transition: "none"` while actively dragging (same
+       discipline the retired sheet used) keeps a live drag from lagging
+       behind the pointer. */
+    transition: height 0.2s ease;
   }
-  /* The drag-to-expand snap (`MachineDrawer.tsx`'s handle `touchmove`). */
-  .machine-drawer--full {
-    max-height: 92vh;
+  .phone-drawer__panel {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 12px 16px calc(16px + env(safe-area-inset-bottom, 0px));
   }
-  .machine-drawer__handle {
+  /* The Events tab's OWN `EventLogColumn` instance fills the panel
+     exactly, overriding the general phone-width `.eventlog` rule
+     elsewhere in this file (a page SECTION with its own `max-height:88vh`
+     flowing under the stage) — inside the drawer it is a FIXED slice of
+     an already-bounded panel, not a block in the page's own scroll. */
+  .phone-drawer__body .eventlog {
+    width: 100%;
+    height: 100%;
+    max-height: none;
+    position: static;
+    border-left: none;
+    border-top: none;
+  }
+  .phone-drawer__body .eventlog__list {
+    min-height: 0;
+  }
+  .phone-drawer__bar {
+    flex: 0 0 auto;
+    background: var(--bg, #0b0b0d);
+    border-top: 1px solid var(--border);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .phone-drawer__handle {
     display: flex;
     justify-content: center;
-    padding: 6px 0 10px;
+    padding: 6px 0 4px;
     cursor: pointer;
-    flex: 0 0 auto;
     touch-action: none;
   }
-  .machine-drawer__handle-bar {
+  .phone-drawer__handle-bar {
     width: 36px;
     height: 4px;
     border-radius: 2px;
     background: var(--border);
   }
+  .phone-drawer__tabs {
+    display: flex;
+  }
+  /* Two buttons, each >=44px tall (tap-target floor) — the tab IS its own
+     label; see `PhoneDrawer.tsx`'s own doc for why Machine carries no
+     separate word the way `Events · N` does. */
+  .phone-drawer__tab {
+    flex: 1;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    color: var(--dim);
+    cursor: pointer;
+    padding: 4px 10px;
+  }
+  .phone-drawer__tab--active {
+    color: var(--fg);
+  }
+  .phone-drawer__tab + .phone-drawer__tab {
+    border-left: 1px solid var(--border);
+  }
+  .phone-drawer__tabvalue {
+    font: 600 calc(11px * var(--fs-scale))/1.3 var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .phone-drawer__dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--dim);
+  }
+  .phone-drawer__dot--live {
+    background: var(--accent, var(--good));
+  }
+  .phone-drawer__dot--reconnecting {
+    background: var(--warn);
+  }
+  .phone-drawer__dot--replay {
+    background: var(--dim);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .machine-drawer,
-  .machine-pill {
+  .machine-pill,
+  .phone-drawer__body {
     transition: none !important;
   }
 }

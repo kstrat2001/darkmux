@@ -14,6 +14,19 @@ const proc = (ts: string, cpu: number, gpu: number, mem: number): FlowRecord => 
 
 const NOW = Date.parse("2026-01-01T00:20:00Z");
 
+/** (#2107 tabbed-drawer packet) `MachineDrawer` now also carries the
+ * Events tab's props through to the phone drawer — irrelevant to every
+ * desktop-only test in this file, so a shared empty default keeps those
+ * unchanged rather than repeating five extra props at every call site. */
+const EMPTY_EVENTLOG = {
+  eventLogRecords: [] as FlowRecord[],
+  eventLogScopeLabel: "fleet",
+  eventLogVisible: true,
+  eventLogLoading: false,
+  eventLogError: null,
+  eventLogHistorical: false,
+};
+
 beforeEach(() => {
   window.localStorage.clear();
 });
@@ -32,14 +45,38 @@ afterEach(() => {
 describe("MachineDrawer (#2107)", () => {
   it("renders the pill with the live GPU value, closed by default", () => {
     const rolling = [proc("2026-01-01T00:19:00Z", 10, 68, 20)];
-    render(<MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={rolling} localUid={null} nowMsOverride={NOW} liveMachines={new Map()} specs={null} liveStatus="live" />);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={rolling}
+        localUid={null}
+        nowMsOverride={NOW}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        {...EMPTY_EVENTLOG}
+      />,
+    );
     expect(screen.getByText(/GPU 68%/)).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("opens the dialog on pill click and shows all three meters", () => {
     const rolling = [proc("2026-01-01T00:19:00Z", 10, 68, 20)];
-    render(<MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={rolling} localUid={null} nowMsOverride={NOW} liveMachines={new Map()} specs={null} liveStatus="live" />);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={rolling}
+        localUid={null}
+        nowMsOverride={NOW}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        {...EMPTY_EVENTLOG}
+      />,
+    );
     fireEvent.click(screen.getByText(/GPU 68%/));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByText("CPU")).toBeInTheDocument();
@@ -54,15 +91,28 @@ describe("MachineDrawer (#2107)", () => {
   // That is why "closes on a downward swipe of the handle" and "an upward
   // or negligible swipe does not close the sheet" (desktop versions) are
   // GONE rather than updated: desktop has no handle to swipe any more —
-  // those gestures are a PHONE-ONLY concept now, already covered by the
-  // "phone chrome" describe block below. Likewise "remembers open state
-  // across mounts via localStorage" is gone, not failing-and-ignored:
-  // `dialogManager`'s store has never persisted across a page load (no
-  // other dialog in this app does either), so a stats panel reopening
-  // itself on every fresh load would be the one exception — dropped
-  // deliberately, see `MachineDrawer.tsx`'s own module doc.
+  // those gestures are a PHONE-ONLY concept now, covered by
+  // `PhoneDrawer.test.tsx` (#2107 tabbed-drawer packet). Likewise
+  // "remembers open state across mounts via localStorage" is gone, not
+  // failing-and-ignored: `dialogManager`'s store has never persisted
+  // across a page load (no other dialog in this app does either), so a
+  // stats panel reopening itself on every fresh load would be the one
+  // exception — dropped deliberately, see `MachineDrawer.tsx`'s own
+  // module doc.
   it("closes on the close button", () => {
-    render(<MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[]} localUid={null} nowMsOverride={NOW} liveMachines={new Map()} specs={null} liveStatus="live" />);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        nowMsOverride={NOW}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        {...EMPTY_EVENTLOG}
+      />,
+    );
     fireEvent.click(screen.getByRole("button", { name: /machine ·/ }));
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     fireEvent.click(document.querySelector("#imodalbg .dialog__close")!);
@@ -70,21 +120,57 @@ describe("MachineDrawer (#2107)", () => {
   });
 
   it("closes on backdrop click", () => {
-    render(<MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[]} localUid={null} nowMsOverride={NOW} liveMachines={new Map()} specs={null} liveStatus="live" />);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        nowMsOverride={NOW}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        {...EMPTY_EVENTLOG}
+      />,
+    );
     fireEvent.click(screen.getByRole("button", { name: /machine ·/ }));
     fireEvent.click(document.getElementById("imodalbg")!);
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("closes on Escape", () => {
-    render(<MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[]} localUid={null} nowMsOverride={NOW} liveMachines={new Map()} specs={null} liveStatus="live" />);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        nowMsOverride={NOW}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        {...EMPTY_EVENTLOG}
+      />,
+    );
     fireEvent.click(screen.getByRole("button", { name: /machine ·/ }));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("clicking the pill again while open closes it (toggle)", () => {
-    render(<MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[]} localUid={null} nowMsOverride={NOW} liveMachines={new Map()} specs={null} liveStatus="live" />);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        nowMsOverride={NOW}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        {...EMPTY_EVENTLOG}
+      />,
+    );
     const pill = screen.getByRole("button", { name: /machine ·/ });
     fireEvent.click(pill);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
@@ -104,6 +190,7 @@ describe("MachineDrawer (#2107)", () => {
         liveMachines={new Map()}
         specs={null}
         liveStatus="live"
+        {...EMPTY_EVENTLOG}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /machine ·/ }));
@@ -140,6 +227,7 @@ describe("MachineDrawer (#2107)", () => {
         }}
         liveStatus="live"
         nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /machine ·/ }));
@@ -151,18 +239,41 @@ describe("MachineDrawer (#2107)", () => {
   });
 
   it("(#2107) omits the header line entirely when nothing is known yet, rather than rendering an empty row", () => {
-    render(<MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[]} localUid={null} liveMachines={new Map()} specs={null} liveStatus="live" nowMsOverride={NOW} />);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
     fireEvent.click(screen.getByRole("button", { name: /machine ·/ }));
     expect(document.querySelector(".machine-drawer__identity")).toBeNull();
   });
-
 });
 
 // ── (phone feedback, 2026-08-29) idle state + last-known ─────────────────
 
 describe("MachineDrawer — idle state (no samples)", () => {
   it("shows an idle line and no meters when the rolling window has no samples at all", () => {
-    render(<MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[]} localUid={null} liveMachines={new Map()} specs={null} liveStatus="live" nowMsOverride={NOW} />);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
     fireEvent.click(screen.getByRole("button", { name: /machine ·/ }));
     expect(screen.getByText("idle · no samples in the last 10 min")).toBeInTheDocument();
     expect(document.querySelector(".meter-row")).toBeNull();
@@ -177,7 +288,17 @@ describe("MachineDrawer — idle state (no samples)", () => {
       payload: { cpu: 40, gpu: 55, mem: 30 },
     };
     render(
-      <MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[oldSample]} localUid={null} liveMachines={new Map()} specs={null} liveStatus="live" nowMsOverride={NOW} />,
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[oldSample]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
     );
     fireEvent.click(screen.getByRole("button", { name: /machine ·/ }));
     expect(screen.getByText(/last sample 1h ago/)).toBeInTheDocument();
@@ -195,8 +316,10 @@ describe("MachineDrawer — idle state (no samples)", () => {
         flowWindow={[]}
         localUid={null}
         liveMachines={new Map()}
-        specs={null} liveStatus="live"
+        specs={null}
+        liveStatus="live"
         nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: /machine ·/ }));
@@ -205,10 +328,17 @@ describe("MachineDrawer — idle state (no samples)", () => {
   });
 });
 
-// ── (phone feedback, 2026-08-29) the phone bottom bar + drag-to-expand ───
+// ── (#2107 tabbed-drawer packet) the phone skin delegates to PhoneDrawer ──
+//
+// The tab/drag/height mechanics themselves are `PhoneDrawer.test.tsx`'s job
+// (that component is decoupled from `MachineDrawer`'s data-fetching, so it
+// is tested directly with plain pre-built props). What belongs HERE is the
+// wiring: on a phone, `MachineDrawer` renders `PhoneDrawer` instead of the
+// pill/dialog, and hands it the SAME machine-stats content the desktop
+// dialog would have shown, plus the `eventLog*` props threaded through.
 
-describe("MachineDrawer — phone chrome (isMobileOverride)", () => {
-  it("renders the bottom bar instead of the pill on a phone, closed by default", () => {
+describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverride)", () => {
+  it("renders the phone drawer's bar (not the desktop pill) with the live compact numbers", () => {
     render(
       <MachineDrawer
         route={{ kind: "fleet" }}
@@ -216,57 +346,87 @@ describe("MachineDrawer — phone chrome (isMobileOverride)", () => {
         flowWindow={[proc("2026-01-01T00:19:00Z", 10, 68, 20)]}
         localUid={null}
         liveMachines={new Map()}
-        specs={null} liveStatus="live"
+        specs={null}
+        liveStatus="live"
         nowMsOverride={NOW}
         isMobileOverride={true}
+        {...EMPTY_EVENTLOG}
       />,
     );
-    expect(document.querySelector('[data-act="machine-bottombar"]')).not.toBeNull();
+    expect(document.querySelector('[data-act="phone-drawer-bar"]')).not.toBeNull();
     expect(document.querySelector('[data-act="machine-drawer-pill"]')).toBeNull();
     expect(screen.getByText(/GPU 68%/)).toBeInTheDocument();
   });
 
-  it("tapping the bar opens the sheet, and the bar disappears while open", () => {
+  it("tapping the Machine tab opens the drawer to the SAME stats content the desktop dialog renders", () => {
+    const rolling = [proc("2026-01-01T00:19:00Z", 10, 68, 20)];
     render(
-      <MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[]} localUid={null} liveMachines={new Map()} specs={null} liveStatus="live" nowMsOverride={NOW} isMobileOverride={true} />,
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={rolling}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        isMobileOverride={true}
+        {...EMPTY_EVENTLOG}
+      />,
     );
-    fireEvent.click(document.querySelector('[data-act="machine-bottombar"]')!);
+    fireEvent.click(document.querySelector('[data-act="phone-drawer-tab-machine"]')!);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
-    expect(document.querySelector('[data-act="machine-bottombar"]')).toBeNull();
+    expect(screen.getByText("CPU")).toBeInTheDocument();
+    expect(screen.getByText("last 10 min")).toBeInTheDocument();
   });
 
-  it("a swipe up on the closed bar opens the sheet", () => {
+  it("tapping the Events tab mounts the EventLogColumn with the records handed down from App", () => {
+    const records: FlowRecord[] = [
+      { ts: "2026-01-01T00:00:00Z", category: "note", source: "operator", action: "note", handle: "hello" },
+    ];
     render(
-      <MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[]} localUid={null} liveMachines={new Map()} specs={null} liveStatus="live" nowMsOverride={NOW} isMobileOverride={true} />,
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        isMobileOverride={true}
+        eventLogRecords={records}
+        eventLogScopeLabel="fleet"
+        eventLogVisible={true}
+        eventLogLoading={false}
+        eventLogError={null}
+        eventLogHistorical={false}
+      />,
     );
-    const bar = document.querySelector('[data-act="machine-bottombar"]')!;
-    fireEvent.touchStart(bar, { touches: [{ clientY: 200 }] });
-    fireEvent.touchEnd(bar, { changedTouches: [{ clientY: 150 }] });
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(document.querySelector('[data-act="phone-drawer-tab-events"]')!);
+    expect(document.querySelector(".eventlog")).not.toBeNull();
+    expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1);
+    // Only ONE events pane exists — `MachineDrawer` never ALSO renders the
+    // desktop pill/dialog while in the phone skin.
+    expect(document.querySelector('[data-act="machine-drawer-pill"]')).toBeNull();
   });
 
-  it("dragging the open sheet's handle up past the threshold snaps to the full-height class", () => {
+  it("desktop skin never mounts the phone drawer bar", () => {
     render(
-      <MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[]} localUid={null} liveMachines={new Map()} specs={null} liveStatus="live" nowMsOverride={NOW} isMobileOverride={true} />,
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        isMobileOverride={false}
+        {...EMPTY_EVENTLOG}
+      />,
     );
-    fireEvent.click(document.querySelector('[data-act="machine-bottombar"]')!);
-    const handle = document.querySelector('[data-act="machine-drawer-handle"]')!;
-    fireEvent.touchStart(handle, { touches: [{ clientY: 300 }] });
-    fireEvent.touchMove(handle, { touches: [{ clientY: 250 }] }); // 50px up
-    expect(document.querySelector(".machine-drawer--full")).not.toBeNull();
-  });
-
-  it("closing and reopening resets the full-height snap", () => {
-    render(
-      <MachineDrawer route={{ kind: "fleet" }} routeRecords={[]} flowWindow={[]} localUid={null} liveMachines={new Map()} specs={null} liveStatus="live" nowMsOverride={NOW} isMobileOverride={true} />,
-    );
-    fireEvent.click(document.querySelector('[data-act="machine-bottombar"]')!);
-    const handle = document.querySelector('[data-act="machine-drawer-handle"]')!;
-    fireEvent.touchStart(handle, { touches: [{ clientY: 300 }] });
-    fireEvent.touchMove(handle, { touches: [{ clientY: 250 }] });
-    expect(document.querySelector(".machine-drawer--full")).not.toBeNull();
-    fireEvent.click(screen.getByLabelText("Close"));
-    fireEvent.click(document.querySelector('[data-act="machine-bottombar"]')!);
-    expect(document.querySelector(".machine-drawer--full")).toBeNull();
+    expect(document.querySelector('[data-act="phone-drawer-bar"]')).toBeNull();
+    expect(document.querySelector('[data-act="machine-drawer-pill"]')).not.toBeNull();
   });
 });

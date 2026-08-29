@@ -390,3 +390,75 @@ describe("EventLogColumn", () => {
     expect(document.querySelector(".eventlog")!.className).toMatch(/eventlog--collapsed/);
   });
 });
+
+// ── (#2107 tabbed-drawer packet) `pushDetail` — the phone drawer's Events
+// tab interaction model: selecting a record replaces the list with a
+// full-height detail SCREEN carrying a back button, instead of the default
+// split (detail-above-list) layout. ─────────────────────────────────────
+
+describe("EventLogColumn — pushDetail mode", () => {
+  it("shows the list, not the split detail/list layout, when nothing is selected yet", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({})]} visible pushDetail />);
+    expect(document.querySelector(".eventlog__rec")).not.toBeNull();
+    expect(document.querySelector("#detail")).toBeNull();
+    expect(document.querySelector("#split")).toBeNull();
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+  });
+
+  it("selecting a record replaces the list with a full-height detail screen carrying a back button", () => {
+    const records = [rec({ session_id: "s1" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    const pushed = document.querySelector('[data-act="eventlog-pushed"]');
+    expect(pushed).not.toBeNull();
+    expect(pushed!.textContent).toContain("s1");
+    expect(document.querySelector('[data-act="rec"]')).toBeNull();
+    expect(document.querySelector('[data-act="eventlog-back"]')).not.toBeNull();
+  });
+
+  it("the back button returns to the list, and the record stays highlighted as selected", () => {
+    const records = [rec({ session_id: "s1" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    fireEvent.click(document.querySelector('[data-act="eventlog-back"]')!);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+    const row = document.querySelector('[data-act="rec"]')!;
+    expect(row).not.toBeNull();
+    expect(row.className).toMatch(/\bsel\b/);
+  });
+
+  it("omits the collapse rail entirely — collapsing a drawer TAB makes no sense", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible pushDetail />);
+    expect(document.querySelector('[data-act="togglelog"]')).toBeNull();
+  });
+
+  it("passive follow-latest re-selection never yanks the operator into the pushed detail screen", () => {
+    // Only an explicit tap (`selectRecord`) opens the pushed screen — the
+    // `follow` toggle keeps re-selecting the newest record on every new
+    // event, and doing that in pushDetail mode too would fight any record
+    // the operator is deliberately reading.
+    const { rerender } = render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible pushDetail />);
+    rerender(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" }), rec({ ts: "2026-08-08T12:05:00.000Z", session_id: "s2" })]} visible pushDetail />);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+    expect(document.querySelectorAll('[data-act="rec"]').length).toBe(2);
+  });
+
+  it("closes the pushed detail screen when the pane becomes invisible, so reopening lands on the list", () => {
+    const records = [rec({ session_id: "s1" })];
+    const { rerender } = render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).not.toBeNull();
+    rerender(<EventLogColumn scopeLabel="fleet" records={records} visible={false} pushDetail />);
+    rerender(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+  });
+
+  it("a caller that omits pushDetail keeps the original split layout unchanged (regression guard)", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible />);
+    expect(document.querySelector("#detail")).not.toBeNull();
+    expect(document.querySelector("#split")).not.toBeNull();
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+    expect(document.querySelector('[data-act="rec"]')).not.toBeNull();
+  });
+});

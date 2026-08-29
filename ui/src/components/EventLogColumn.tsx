@@ -165,6 +165,7 @@ export function EventLogColumn({
   historical = false,
   serverTruncated = false,
   paneId = "app",
+  pushDetail = false,
 }: {
   records: FlowRecord[];
   visible: boolean;
@@ -198,6 +199,21 @@ export function EventLogColumn({
    *  reports a real total (not the search-match count, which is a
    *  different metric). */
   serverTruncated?: boolean;
+  /** (#2107 tabbed-drawer packet) True for the phone bottom drawer's
+   * Events tab ONLY. The default split layout (`.eventlog__detail` above
+   * `.eventlog__list`, resized via `.eventlog__split`) makes sense with
+   * real vertical room to spare; inside a draggable phone sheet that
+   * layout either shows a nearly-empty detail card or eats the whole list.
+   * `pushDetail` swaps the interaction model instead: selecting a record
+   * REPLACES the whole pane with a full-height detail screen carrying a
+   * "back" button, rather than showing both at once — a standard mobile
+   * list→detail push, not a resizable split. The collapse rail
+   * (`.eventlog__collapse`) also makes no sense inside a drawer tab that
+   * the operator already opened/closed themselves, so it's omitted too.
+   * Every other mount site (`App.tsx`'s own desktop instance,
+   * `MissionGraphLens.tsx`'s) omits this prop and keeps the original split
+   * behavior unchanged. */
+  pushDetail?: boolean;
 }) {
   // The full facet-filter model (activity/category/tier/telemetry-source +
   // free-text search) — `FiltersDialog` renders the checkbox grid for it,
@@ -304,6 +320,19 @@ export function EventLogColumn({
 
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [detailPct, setDetailPct] = useState(DEFAULT_DETAIL_PCT);
+  // (#2107 tabbed-drawer packet) `pushDetail`-only: whether the pushed
+  // detail SCREEN is showing (vs the list). Deliberately separate from
+  // `follow`/`selectedKey` — `follow` mode keeps re-selecting the newest
+  // record continuously, and pushing to a full-screen detail on every one
+  // of those passive updates would yank the operator back to detail on
+  // every incoming event. Only an explicit tap (`selectRecord`) opens it.
+  const [pushedDetailOpen, setPushedDetailOpen] = useState(false);
+  // Land back on the list, not mid-detail, the next time this pane becomes
+  // visible again (drawer tab switch, drawer close/reopen) — a detail
+  // screen the operator can't remember opening reads as broken chrome.
+  useEffect(() => {
+    if (!visible && pushDetail) setPushedDetailOpen(false);
+  }, [visible, pushDetail]);
 
   const columnRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<{ startY: number; startPct: number } | null>(null);
@@ -347,6 +376,7 @@ export function EventLogColumn({
   function selectRecord(r: FlowRecord) {
     setSelectedKey(recKey(r));
     setFollow(false);
+    if (pushDetail) setPushedDetailOpen(true);
   }
 
   function toggleFollow() {
@@ -422,45 +452,76 @@ export function EventLogColumn({
           rendered in BOTH states, never swapped for a different element, so
           keyboard focus survives the toggle instead of being dropped on the
           floor when its host unmounts. */}
-      <button
-        type="button"
-        className="eventlog__collapse"
-        data-act="togglelog"
-        aria-expanded={!collapsed}
-        aria-label={collapsed ? "expand the event log" : "collapse the event log"}
-        title={collapsed ? "expand the event log" : "collapse the event log"}
-        onClick={toggleCollapsed}
-      >
-        {collapsed ? "\u2039" : "\u203a"}
-      </button>
-      {/* (#2068) `following` lets the narrow-viewport stylesheet pin this
-          pane's height while it tracks the newest record: content-sized, it
-          re-heighted with every followed record's payload and moved the list
-          under it on each event. A hand-picked record keeps the content-sized
-          pane, since nothing is streaming into it then — and so does an
-          empty log, where a pinned box would hold nothing but the hint. */}
-      <div className={`eventlog__detail${follow && selected ? " following" : ""}`} id="detail" style={{ flexBasis: `${detailPct}%` }}>
-        {/* (operator) No "selected event" title. It was static chrome
-            competing with the record's own headline — `RecordView` already
-            leads with the action in accent colour, so the label was a second
-            heading fighting the real one, and one more thing to read before
-            reaching the content. The empty-state line below still explains
-            the panel when nothing is selected, which is the only moment a
-            title would have earned its place. Free to remove: this panel sits
-            outside every extracted golden region. */}
-        <div id="detailbody" className="eventlog__detailbody">
-          {selected ? <EventDetail record={selected} /> : <div className="eventlog__none">select an event from the log to inspect it</div>}
+      {!pushDetail && (
+        <button
+          type="button"
+          className="eventlog__collapse"
+          data-act="togglelog"
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? "expand the event log" : "collapse the event log"}
+          title={collapsed ? "expand the event log" : "collapse the event log"}
+          onClick={toggleCollapsed}
+        >
+          {collapsed ? "\u2039" : "\u203a"}
+        </button>
+      )}
+      {/* (#2107 tabbed-drawer packet) `pushDetail`'s own branch — a
+          full-height detail SCREEN with a back button, replacing the list
+          entirely, rather than the split layout below. Only reachable via
+          an explicit tap (`selectRecord` sets `pushedDetailOpen`), never
+          via `follow`'s passive re-selection — see `pushedDetailOpen`'s
+          own doc above. */}
+      {pushDetail && pushedDetailOpen && selected ? (
+        <div className="eventlog__pushed" data-act="eventlog-pushed">
+          <button
+            type="button"
+            className="eventlog__back"
+            data-act="eventlog-back"
+            aria-label="back to the event list"
+            onClick={() => setPushedDetailOpen(false)}
+          >
+            {"\u2039"} back
+          </button>
+          <div className="eventlog__detailbody eventlog__detailbody--pushed">
+            <EventDetail record={selected} />
+          </div>
         </div>
-      </div>
-      <div
-        className="eventlog__split"
-        id="split"
-        title="drag to resize"
-        onPointerDown={onSplitPointerDown}
-        onPointerMove={onSplitPointerMove}
-        onPointerUp={onSplitPointerUp}
-      />
-      <div className="eventlog__list">
+      ) : (
+        <>
+          {/* (#2068) `following` lets the narrow-viewport stylesheet pin this
+              pane's height while it tracks the newest record: content-sized, it
+              re-heighted with every followed record's payload and moved the list
+              under it on each event. A hand-picked record keeps the content-sized
+              pane, since nothing is streaming into it then — and so does an
+              empty log, where a pinned box would hold nothing but the hint.
+              Omitted entirely in `pushDetail` mode — that layout replaces
+              this split with the pushed screen above instead. */}
+          {!pushDetail && (
+            <div className={`eventlog__detail${follow && selected ? " following" : ""}`} id="detail" style={{ flexBasis: `${detailPct}%` }}>
+              {/* (operator) No "selected event" title. It was static chrome
+                  competing with the record's own headline — `RecordView` already
+                  leads with the action in accent colour, so the label was a second
+                  heading fighting the real one, and one more thing to read before
+                  reaching the content. The empty-state line below still explains
+                  the panel when nothing is selected, which is the only moment a
+                  title would have earned its place. Free to remove: this panel sits
+                  outside every extracted golden region. */}
+              <div id="detailbody" className="eventlog__detailbody">
+                {selected ? <EventDetail record={selected} /> : <div className="eventlog__none">select an event from the log to inspect it</div>}
+              </div>
+            </div>
+          )}
+          {!pushDetail && (
+            <div
+              className="eventlog__split"
+              id="split"
+              title="drag to resize"
+              onPointerDown={onSplitPointerDown}
+              onPointerMove={onSplitPointerMove}
+              onPointerUp={onSplitPointerUp}
+            />
+          )}
+          <div className="eventlog__list">
         <div className="eventlog__head">
           <h3>
             {/* (operator) The header names the WINDOW; the outer UI owns
@@ -605,7 +666,9 @@ export function EventLogColumn({
             </div>
           )}
         </div>
-      </div>
+          </div>
+        </>
+      )}
       <FiltersDialog
         facets={facets}
         filters={filters}
