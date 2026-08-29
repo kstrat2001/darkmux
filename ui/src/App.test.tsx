@@ -679,19 +679,19 @@ describe("App", () => {
     expect(document.getElementById("modebadge")?.textContent).toBe("▶ playback");
 
     // crumb: empty now — the raw-id `◆ <mission>` this used to carry moved
-    // into the transport's own human label (asserted below) and the Machine
-    // info modal's `playback` row (`review-1`'s trailing token has no
-    // recognizable title, so `humanMissionLabel` reads "Review · 1").
+    // into the Machine info modal's `playback` row only (the transport
+    // carries no label, asserted below).
     expect(document.getElementById("crumb")?.textContent).toBe("");
 
     // meta: gone entirely — the transport is mounted (a real day loaded on
     // a daemon's `#<date>` route), so `#meta` doesn't render at all.
     expect(document.getElementById("meta")).toBeNull();
 
-    // The transport itself carries the mission as a human label, desktop
-    // width (jsdom's default `innerWidth` is 1024, above the 768 breakpoint).
+    // (#2121, operator) The transport carries NO label at any width: the
+    // clock is bare and the mission's title lives only in the Machine info
+    // playback row. The demo speaks for itself as it runs.
     const clock = document.querySelector('[data-testid="scrubber-clock"]');
-    expect(clock?.textContent).toMatch(/Review · 1$/);
+    expect(clock?.textContent).toMatch(/^\d\d:\d\d$/);
   });
 
   /**

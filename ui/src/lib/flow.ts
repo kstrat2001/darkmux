@@ -453,9 +453,23 @@ export interface MachineSessionRun {
 export function sessionRunsOn(data: FlowRecord[], m: string): MachineSessionRun[] {
   const seen = new Set<string>();
   const out: MachineSessionRun[] = [];
+  // (#2125 follow-up) A session's bookends (`session.end`, some dispatch
+  // records) may carry no `mission_id` while its work records do. Those
+  // mission-less records belong to the session's mission when it has exactly
+  // ONE; only a session that genuinely spans several missions (the review
+  // pipeline's reused step sessions) keeps them apart. Without this, one
+  // session renders as two overlapping bars.
+  const missionsBySid = new Map<string, Set<string>>();
+  for (const r of data) {
+    if (uidOf(r) !== m || !r.session_id || !r.mission_id) continue;
+    let set = missionsBySid.get(r.session_id);
+    if (!set) { set = new Set(); missionsBySid.set(r.session_id, set); }
+    set.add(r.mission_id);
+  }
   for (const r of data) {
     if (uidOf(r) !== m || !r.session_id) continue;
-    const missionId = r.mission_id || undefined;
+    const only = missionsBySid.get(r.session_id);
+    const missionId = r.mission_id || (only && only.size === 1 ? [...only][0] : undefined);
     const key = `${r.session_id}\x1f${missionId ?? ""}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -471,7 +485,7 @@ export function sessionRunsOn(data: FlowRecord[], m: string): MachineSessionRun[
  * session_id-only behavior. */
 export function dispatchRec(data: FlowRecord[], sid: string, act: string, missionId?: string): FlowRecord | undefined {
   return data.find(
-    (r) => r.session_id === sid && r.action === "dispatch." + act && (missionId === undefined || r.mission_id === missionId),
+    (r) => r.session_id === sid && r.action === "dispatch." + act && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
   );
 }
 
@@ -491,7 +505,7 @@ export const dispatchKilled = (rec: FlowRecord | undefined): boolean =>
  * own doc. */
 export function sessEnd(data: FlowRecord[], sid: string, missionId?: string): FlowRecord | undefined {
   return data.find(
-    (r) => r.session_id === sid && r.action === "session.end" && (missionId === undefined || r.mission_id === missionId),
+    (r) => r.session_id === sid && r.action === "session.end" && (missionId === undefined || !r.mission_id || r.mission_id === missionId),
   );
 }
 
