@@ -21,22 +21,41 @@ use tempfile::TempDir;
 struct TestGuard {
     _crew: TempDir,
     _flows: TempDir,
+    _home: TempDir,
     prev_crew: Option<String>,
     prev_flows: Option<String>,
+    prev_home: Option<String>,
 }
 
 impl TestGuard {
     fn new() -> Self {
         let crew_dir = TempDir::new().unwrap();
         let flows_dir = TempDir::new().unwrap();
+        // (#1959) Also isolate DARKMUX_HOME: the launcher derives *crawl
+        // program state* (kill file, runs, ledger) from
+        // `darkmux_types::paths::resolve(ResolveScope::Auto)`, which
+        // defaults to the operator's REAL `~/.darkmux` unless overridden.
+        // Without this, these tests wrote ledgers/kill-files into the
+        // operator's actual home directory. Mirrors the guard pattern
+        // `workspace_spec::mod.rs`'s own tests already use.
+        let home_dir = TempDir::new().unwrap();
         let prev_crew = env::var("DARKMUX_CREW_DIR").ok();
         let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
+        let prev_home = env::var("DARKMUX_HOME").ok();
         // SAFETY: every caller is #[serial_test::serial].
         unsafe {
             env::set_var("DARKMUX_CREW_DIR", crew_dir.path());
             env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            env::set_var("DARKMUX_HOME", home_dir.path());
         }
-        Self { _crew: crew_dir, _flows: flows_dir, prev_crew, prev_flows }
+        Self {
+            _crew: crew_dir,
+            _flows: flows_dir,
+            _home: home_dir,
+            prev_crew,
+            prev_flows,
+            prev_home,
+        }
     }
 }
 
@@ -51,6 +70,10 @@ impl Drop for TestGuard {
             match &self.prev_flows {
                 Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
                 None => env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match &self.prev_home {
+                Some(v) => env::set_var("DARKMUX_HOME", v),
+                None => env::remove_var("DARKMUX_HOME"),
             }
         }
     }
@@ -127,7 +150,7 @@ fn crawl_relevant_actions(records: &[Value]) -> Vec<String> {
         .collect()
 }
 
-// ── corpus fixture: two tiny local git repos, one `catch` site each ─────
+// ── workspace fixture: two tiny local git repos, one `catch` site each ──
 
 fn init_source_repo(dir: &std::path::Path, filename: &str, contents: &str) {
     let run = |args: &[&str]| {
@@ -146,7 +169,7 @@ fn init_source_repo(dir: &std::path::Path, filename: &str, contents: &str) {
 struct Fixture {
     _workdir: TempDir,
     root: TempDir,
-    manifest_path: PathBuf,
+    spec_path: PathBuf,
 }
 
 /// Two sources ("app1"/"app2"), one `catch` site each, `swallowed-error`
@@ -172,15 +195,15 @@ fn two_source_fixture() -> Fixture {
         ],
         "rules": ["swallowed-error"]
     });
-    let manifest_path = workdir.path().join("corpus.json");
-    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let spec_path = workdir.path().join("workspace.json");
+    std::fs::write(&spec_path, manifest.to_string()).unwrap();
 
-    Fixture { _workdir: workdir, root, manifest_path }
+    Fixture { _workdir: workdir, root, spec_path }
 }
 
 fn params_for(fx: &Fixture) -> BTreeMap<String, Value> {
     let mut m = BTreeMap::new();
-    m.insert("corpus".to_string(), Value::String(fx.manifest_path.to_string_lossy().to_string()));
+    m.insert("workspace".to_string(), Value::String(fx.spec_path.to_string_lossy().to_string()));
     m
 }
 
@@ -434,7 +457,7 @@ fn findings_get_path_rewritten_and_land_in_ledger_and_per_unit_copy() {
     let copy = std::fs::read_to_string(runs_dir.join("u-0001.findings.jsonl")).unwrap();
     let copy_rec: Value = serde_json::from_str(copy.lines().next().unwrap()).unwrap();
     // The per-unit copy is the RAW findings file, unmodified — file is
-    // still the container path, no file_raw/corpus/unit/etc. added.
+    // still the container path, no file_raw/workspace/unit/etc. added.
     assert_eq!(copy_rec["file"], "/workspace/app1/x.ts");
     assert!(copy_rec.get("file_raw").is_none(), "{copy_rec:#?}");
 }
@@ -554,10 +577,10 @@ fn a_dispatch_error_on_one_unit_does_not_stop_the_crawl() {
 fn stale_plan_sha_bails_loud_before_any_dispatch() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
-    let resolved = sources::resolve(&manifest, true).unwrap();
-    let mut stale_plan = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
+    let materialized = workspace_spec::materialize(&manifest, MaterializeOptions { fetch: true, read_only: true }).unwrap();
+    let mut stale_plan = plan::plan(&materialized, &rules_vec).unwrap();
     stale_plan.sources[0].sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
     let plan_path = fx.root.path().join("stale-plan.json");
     std::fs::write(&plan_path, serde_json::to_string(&stale_plan).unwrap()).unwrap();
@@ -816,15 +839,16 @@ fn mission_and_task_structure_is_the_shape_mission_status_reads() {
 /// A synthetic plan with `n` `Unit::Site` entries, all bound to
 /// `swallowed-error` against source `app1` (present in `two_source_
 /// fixture`'s manifest) — used where a test needs a plan LARGER than the
-/// fixture's own 2-unit corpus (finding 2's "70 in plan, 1 selected"
+/// fixture's own 2-unit workspace (finding 2's "70 in plan, 1 selected"
 /// shape) without spinning up 70 real git repos. `sources` is built from
-/// the CALLER-supplied `resolved` list (real `sources::resolve` output for
-/// the fixture) rather than left empty: an empty `sources` here used to
-/// exploit the exact hole finding 3 closes — a unit naming a source absent
-/// from `plan.sources` sailed through unvalidated, defaulting to `sha: ""`
-/// in every downstream `crawl.*` record. Declaring `app1` properly keeps
-/// this fixture honest against that guard.
-fn synthetic_plan_with_n_units(corpus_name: &str, n: usize, resolved: &[sources::ResolvedSource]) -> Plan {
+/// the CALLER-supplied `materialized` list (real `workspace_spec::
+/// materialize` output for the fixture) rather than left empty: an empty
+/// `sources` here used to exploit the exact hole finding 3 closes — a
+/// unit naming a source absent from `plan.sources` sailed through
+/// unvalidated, defaulting to `sha: ""` in every downstream record.
+/// Declaring `app1` properly keeps this fixture honest against that
+/// guard.
+fn synthetic_plan_with_n_units(workspace_name: &str, n: usize, materialized: &[workspace_spec::MaterializedSource]) -> Plan {
     let units: Vec<Unit> = (1..=n)
         .map(|i| Unit::Site {
             id: format!("u-{i:04}"),
@@ -834,7 +858,7 @@ fn synthetic_plan_with_n_units(corpus_name: &str, n: usize, resolved: &[sources:
             est_tokens: 10,
         })
         .collect();
-    let plan_sources: Vec<plan::PlanSource> = resolved
+    let plan_sources: Vec<plan::PlanSource> = materialized
         .iter()
         .map(|r| plan::PlanSource {
             id: r.id.clone(),
@@ -846,7 +870,7 @@ fn synthetic_plan_with_n_units(corpus_name: &str, n: usize, resolved: &[sources:
         .collect();
     Plan {
         schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
-        corpus: corpus_name.to_string(),
+        workspace: workspace_name.to_string(),
         planned_at: "2026-01-01T00:00:00Z".to_string(),
         sources: plan_sources,
         units,
@@ -871,10 +895,10 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 fn plan_naming_a_rule_the_manifest_no_longer_declares_bails_before_any_mint() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
-    let resolved = sources::resolve(&manifest, true).unwrap();
-    let mut stale_plan = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
+    let materialized = workspace_spec::materialize(&manifest, MaterializeOptions { fetch: true, read_only: true }).unwrap();
+    let mut stale_plan = plan::plan(&materialized, &rules_vec).unwrap();
     match &mut stale_plan.units[0] {
         Unit::Site { rule, .. } => *rule = "ghost-rule".to_string(),
         other => panic!("fixture expected to produce Unit::Site units, got {other:?}"),
@@ -901,7 +925,7 @@ fn plan_naming_a_rule_the_manifest_no_longer_declares_bails_before_any_mint() {
 
 /// A failure in the mint window (mission mint through the mission-specific
 /// runs-dir creation) must never strand an Active mission with an unpaired
-/// `mission start`. `<corpus root>/runs` already existing as a
+/// `mission start`. `<darkmux root>/crawl/<name>/runs` already existing as a
 /// regular file forces `create_dir_all` to fail at the LAST fallible step
 /// of the window — after the mission/phase/task/step records and the
 /// `mission start` record have already been written — which is
@@ -958,10 +982,10 @@ fn runs_dir_collision_reconciles_the_mint_instead_of_stranding_it() {
 fn plan_with_empty_sources_naming_a_real_unit_bails_before_any_mint() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let empty_sources_plan = Plan {
         schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
-        corpus: manifest.name.clone(),
+        workspace: manifest.effective_name().to_string(),
         planned_at: "2026-01-01T00:00:00Z".to_string(),
         sources: Vec::new(),
         units: vec![Unit::Site {
@@ -1058,9 +1082,9 @@ fn a_panic_mid_loop_still_finalizes_via_the_raii_guard() {
 fn seventy_in_plan_one_selected_reports_units_not_run_everywhere() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
-    let resolved = sources::resolve(&manifest, true).unwrap();
-    let synthetic = synthetic_plan_with_n_units(&manifest.name, 70, &resolved);
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
+    let materialized = workspace_spec::materialize(&manifest, MaterializeOptions { fetch: true, read_only: true }).unwrap();
+    let synthetic = synthetic_plan_with_n_units(manifest.effective_name(), 70, &materialized.sources);
     let plan_path = fx.root.path().join("big-plan.json");
     std::fs::write(&plan_path, serde_json::to_string(&synthetic).unwrap()).unwrap();
 
@@ -1219,23 +1243,23 @@ fn unit_started_and_completed_share_the_same_session_id() {
 
 #[test]
 #[serial_test::serial]
-fn plan_corpus_mismatch_bails_loud() {
+fn plan_workspace_mismatch_bails_loud() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
-    let resolved = sources::resolve(&manifest, true).unwrap();
-    let mut plan_wrong_corpus = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
-    plan_wrong_corpus.corpus = "some-other-corpus".to_string();
-    let plan_path = fx.root.path().join("wrong-corpus-plan.json");
-    std::fs::write(&plan_path, serde_json::to_string(&plan_wrong_corpus).unwrap()).unwrap();
+    let materialized = workspace_spec::materialize(&manifest, MaterializeOptions { fetch: true, read_only: true }).unwrap();
+    let mut plan_wrong_workspace = plan::plan(&materialized, &rules_vec).unwrap();
+    plan_wrong_workspace.workspace = "some-other-workspace".to_string();
+    let plan_path = fx.root.path().join("wrong-workspace-plan.json");
+    std::fs::write(&plan_path, serde_json::to_string(&plan_wrong_workspace).unwrap()).unwrap();
 
     let mut params = params_for(&fx);
     params.insert("plan".to_string(), Value::String(plan_path.to_string_lossy().to_string()));
     let calls = RefCell::new(Vec::new());
     let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
     let err = run(&params, None, &mut dispatch).unwrap_err();
-    assert!(err.to_string().contains("some-other-corpus"), "{err}");
+    assert!(err.to_string().contains("some-other-workspace"), "{err}");
     assert!(calls.borrow().clone().is_empty());
 }
 
@@ -1244,10 +1268,10 @@ fn plan_corpus_mismatch_bails_loud() {
 fn plan_source_tree_mismatch_bails_loud() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
-    let resolved = sources::resolve(&manifest, true).unwrap();
-    let mut plan_wrong_tree = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
+    let materialized = workspace_spec::materialize(&manifest, MaterializeOptions { fetch: true, read_only: true }).unwrap();
+    let mut plan_wrong_tree = plan::plan(&materialized, &rules_vec).unwrap();
     plan_wrong_tree.sources[0].tree = PathBuf::from("/nonexistent/relocated/tree");
     let plan_path = fx.root.path().join("wrong-tree-plan.json");
     std::fs::write(&plan_path, serde_json::to_string(&plan_wrong_tree).unwrap()).unwrap();
