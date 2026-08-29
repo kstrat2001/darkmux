@@ -6707,10 +6707,10 @@ mod tests {
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
         // turn-delay [#2094] + host-sampler-interval [#2107, #1833] +
         // mission-envelope-readability [#1881] + hooks [#2093] +
-        // rules [#1959]) + one per active eureka rule.
+        // rules [#1959] + host-probe [#2107]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 43 + darkmux_eureka::all_rules().len();
+        let expected = 44 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
