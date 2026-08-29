@@ -811,9 +811,8 @@ pub(crate) enum MissionConfigCmd {
     ///
     /// `crawl` (`darkmux mission launch crawl`, #1959) DOES appear here —
     /// `templates/builtin/mission-configs/crawl.json` exists purely for
-    /// discoverability (it declares `workspace`/`rules`/`source`/`rule`/
-    /// `plan`/`plan_out`/`units`/`limit`/`no_fetch`/`dry_run` as inputs
-    /// with zero phases) — but its listed 0 phases / 0 tasks are the
+    /// discoverability (it declares workspace, rules, source, rule, plan, plan_out, units, limit, no_fetch, and dry_run as inputs with zero phases)
+    /// — but its listed 0 phases / 0 tasks are the
     /// honest count of a document that carries NO real graph: crawl's
     /// Task/Step graph is computed at RUN TIME from a resolved crawl plan,
     /// never declared ahead of time (see `src/crawl_launch.rs`'s module
