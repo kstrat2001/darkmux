@@ -24,7 +24,7 @@ import { useRouteRecords } from "./hooks/useRouteRecords";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
-import { primaryReplayMission, replayMetaLines, replayMetaParts, resolvedMissionLabel } from "./lib/replayMeta";
+import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
 import { T, asRecordArray, firstRecordDate, localMachineUid, nameOf, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
@@ -384,8 +384,6 @@ export function App() {
   // fall back to the raw id here (per the operator's earlier refinement:
   // "the raw id lives only in the Machine info modal's playback row") —
   // the transport shows a human label or nothing, never the id.
-  const playbackMissionId = route.kind === "playback" ? primaryReplayMission(routeRecords.records) : null;
-  const playbackMissionLabel = playbackMissionId ? resolvedMissionLabel(routeRecords.records, playbackMissionId) : null;
 
   useSyncHash(route);
 
@@ -453,12 +451,6 @@ export function App() {
             onRewind={transport.rewind}
             onTogglePlay={transport.togglePlay}
             onCycleSpeed={transport.cycleSpeed}
-            /* (#2120) Desktop only — a phone route never passes a label, so
-               the clock renders alone there no matter what the day's
-               mission id resolves to (see this file's own
-               `playbackMissionLabel` doc above and `Scrubber`'s own doc on
-               why there is no raw-id fallback inside the component). */
-            label={!isMobile ? playbackMissionLabel : undefined}
           />
         ) : null}
         {/* (#2108, operator finding — desktop tab-row fold) `#crumb` moved
