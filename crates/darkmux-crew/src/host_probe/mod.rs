@@ -40,6 +40,10 @@ pub mod thermal;
 
 pub use thermal::ThermalSample;
 
+// Only used by `attach_cluster_mhz` and its direct unit tests, both
+// aarch64-gated below (#2108 CI finding — see the comment on
+// `attach_cluster_mhz`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::collections::BTreeMap;
 
 /// One perf-level cluster's reading. `name`/`cores` come from
@@ -313,14 +317,19 @@ impl HostProbe {
     pub fn new() -> Self {
         let levels = mach_cpu::perf_levels();
         let ranges = mach_cpu::core_ranges(&levels);
-        let mut sources = HostProbeSources {
+        // Not `mut`: only the aarch64 branch below ever assigns
+        // `sources.ioreport`/`sources.freq_tables` — on every other target
+        // this binding is read-only, and a `mut` here would be a dead-code
+        // warning under `-D warnings` on those targets (#2108 CI finding).
+        let sources = HostProbeSources {
             mach: mach_cpu::per_core_ticks().is_some(),
             thermal: thermal::sample().is_some(),
             ioreg_gpu: platform::gpu_read().is_some(),
             ..Default::default()
         };
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let ioreport = {
+        let (ioreport, sources) = {
+            let mut sources = sources;
             let p = ioreport::IoReportProbe::new();
             if p.is_none() {
                 log_once(
@@ -336,7 +345,7 @@ impl HostProbe {
                     "host probe: the SoC DVFS frequency tables could not be read — CPU/GPU frequency will be reported as null",
                 );
             }
-            p
+            (p, sources)
         };
         if !sources.mach {
             log_once(
@@ -370,7 +379,7 @@ impl HostProbe {
 
         // CPU: per-core tick deltas, grouped into perf-level clusters.
         let cur_ticks = mach_cpu::per_core_ticks();
-        let (cpu_pct, mut clusters) = match (&self.prev_ticks, &cur_ticks) {
+        let (cpu_pct, clusters) = match (&self.prev_ticks, &cur_ticks) {
             (Some(prev), Some(cur)) => {
                 let whole = mach_cpu::range_busy_pct(prev, cur, &(0..cur.len().min(prev.len())));
                 let per_level = self
@@ -403,23 +412,33 @@ impl HostProbe {
             self.prev_ticks = cur_ticks;
         }
 
-        // IOReport: DVFS frequency per cluster + the power rails.
-        let mut gpu_mhz = None;
-        let mut power = None;
+        // IOReport: DVFS frequency per cluster + the power rails. Not `mut`
+        // out here: only the aarch64 branch below ever reassigns
+        // `gpu_mhz`/`power`/`clusters` — on every other target these
+        // bindings are read-only, and declaring them `mut` unconditionally
+        // is a dead-code warning under `-D warnings` (#2108 CI finding).
+        let gpu_mhz = None;
+        let power = None;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let Some(p) = self.ioreport.as_mut() {
-            if let Some(s) = p.sample(interval_ms) {
-                gpu_mhz = s.gpu_mhz;
-                attach_cluster_mhz(&mut clusters, &s.cluster_mhz, &s.cluster_cores);
-                if s.cpu_mw.is_some() || s.gpu_mw.is_some() || s.ane_mw.is_some() {
-                    power = Some(PowerSample {
-                        cpu_mw: s.cpu_mw.unwrap_or(0.0),
-                        gpu_mw: s.gpu_mw.unwrap_or(0.0),
-                        ane_mw: s.ane_mw.unwrap_or(0.0),
-                    });
+        let (clusters, gpu_mhz, power) = {
+            let mut clusters = clusters;
+            let mut gpu_mhz = gpu_mhz;
+            let mut power = power;
+            if let Some(p) = self.ioreport.as_mut() {
+                if let Some(s) = p.sample(interval_ms) {
+                    gpu_mhz = s.gpu_mhz;
+                    attach_cluster_mhz(&mut clusters, &s.cluster_mhz, &s.cluster_cores);
+                    if s.cpu_mw.is_some() || s.gpu_mw.is_some() || s.ane_mw.is_some() {
+                        power = Some(PowerSample {
+                            cpu_mw: s.cpu_mw.unwrap_or(0.0),
+                            gpu_mw: s.gpu_mw.unwrap_or(0.0),
+                            ane_mw: s.ane_mw.unwrap_or(0.0),
+                        });
+                    }
                 }
             }
-        }
+            (clusters, gpu_mhz, power)
+        };
         let _ = interval_ms; // unused on non-Apple-Silicon builds
 
         let gpu = platform::gpu_read();
@@ -445,6 +464,11 @@ impl HostProbe {
 /// serves, matching by core count (see
 /// [`ioreport::assign_groups_to_levels`]). A cluster with no matching
 /// IOReport group keeps `mhz: None` rather than borrowing another's.
+///
+/// Only called from [`HostProbe::sample`]'s aarch64 branch — cfg-gated the
+/// same way so non-Apple-Silicon targets don't carry it as dead code under
+/// `-D warnings` (#2108 CI finding).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn attach_cluster_mhz(
     clusters: &mut [CpuCluster],
     cluster_mhz: &BTreeMap<String, u32>,
@@ -468,7 +492,14 @@ fn attach_cluster_mhz(
 
 // Log-once latches: an unavailable source is a fact about the HOST, so
 // repeating it every tick would be noise proportional to uptime.
+// UNAVAILABLE_IOREPORT/UNAVAILABLE_FREQS are only read from the aarch64
+// branch of `HostProbe::new` — cfg-gated so non-Apple-Silicon targets don't
+// carry them as dead code under `-D warnings` (#2108 CI finding).
+// UNAVAILABLE_MACH is read unconditionally (mach counters are checked on
+// every target), so it stays ungated.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 static UNAVAILABLE_IOREPORT: std::sync::Once = std::sync::Once::new();
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 static UNAVAILABLE_FREQS: std::sync::Once = std::sync::Once::new();
 static UNAVAILABLE_MACH: std::sync::Once = std::sync::Once::new();
 
@@ -673,6 +704,12 @@ mod tests {
         assert_eq!(w.cpu.mean_mw, Some(2000.0), "the null sample must not drag the mean to 1333");
     }
 
+    // `attach_cluster_mhz` itself is aarch64-gated (#2108 CI finding — see
+    // its definition), so these two direct-call tests are a known, narrower
+    // coverage than the module doc's stated "arithmetic is unit-tested
+    // everywhere" goal: revisit if the DVFS-matching arithmetic is ever
+    // split out into a target-independent helper.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn attach_cluster_mhz_matches_by_core_count() {
         let mut clusters = vec![
@@ -686,6 +723,7 @@ mod tests {
         assert_eq!(clusters[1].mhz, Some(2038), "Performance(12) ← MCPU(12)");
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn attach_cluster_mhz_leaves_an_unmatched_cluster_null() {
         let mut clusters = vec![
