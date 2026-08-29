@@ -83,8 +83,16 @@ test("a foreign step-lifecycle record does not flip this mission's step status",
   ];
   const errors = await open(page, RECORDS);
 
+  // (#2117) NOT `toBeVisible()`: on the desktop-default canvas view this
+  // row lives inside a React Flow node, which React Flow keeps
+  // `visibility: hidden` until its own measurement pass completes on the
+  // next animation frame — a race the 5s visibility wait sometimes lost in
+  // headless Chromium, independent of whether the status logic was
+  // correct. The claim under test is the STATUS class, not paint, and
+  // `toHaveClass`/`not.toHaveClass` already retry until the element is
+  // attached with the right `class` attribute — attachment is what this
+  // test needs, not visibility.
   const stepRow = page.locator('.steprow').first();
-  await expect(stepRow).toBeVisible();
   await expect(stepRow, "mission A's step must still be running — a foreign step-complete flipped it").toHaveClass(/s-running/);
   await expect(stepRow).not.toHaveClass(/s-complete/);
 
