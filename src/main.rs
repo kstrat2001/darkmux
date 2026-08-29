@@ -42,9 +42,6 @@ mod fleet_cli;
 // re-export keeps all existing `crate::flow::*` paths resolving unchanged.
 pub use darkmux_flow as flow;
 mod flow_cli;
-// `darkmux crawl` command handlers (#1959 packet 1) — split out of main.rs
-// alongside flow_cli/lab_cli.
-mod crawl_cli;
 // #515 — zero-edge leaf extracted to darkmux-hardware. Re-export keeps
 // crate::hardware::* resolving for heuristics/eureka/recommendations/doctor/etc.
 pub use darkmux_hardware as hardware;
@@ -175,7 +172,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             flow_cli::run(sub)?;
             Ok(0)
         }
-        Cmd::Crawl { sub } => crawl_cli::cmd_crawl(sub),
         Cmd::Config { sub } => {
             config_cmd::run(sub)?;
             Ok(0)
