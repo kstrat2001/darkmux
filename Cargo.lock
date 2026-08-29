@@ -797,6 +797,8 @@ dependencies = [
  "serde_json",
  "serial_test",
  "tempfile",
+ "ureq",
+ "url",
 ]
 
 [[package]]

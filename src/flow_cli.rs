@@ -2,7 +2,7 @@
 
 use crate::flow;
 use crate::flow::{Category, FlowRecord, Level, Stage, Tier};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 
 
@@ -169,6 +169,59 @@ pub enum FlowCmd {
         #[arg(long)]
         json: bool,
     },
+    /// (#2093) The flow-record hook sink — per-rule delivery status.
+    Hooks {
+        #[command(subcommand)]
+        cmd: HooksCmd,
+    },
+}
+
+/// `darkmux flow hooks <verb>` — kept tiny (one verb) per the issue's own
+/// scope: read-only introspection of the configured rules, nothing that
+/// mutates config or touches the network itself.
+#[derive(Subcommand)]
+pub enum HooksCmd {
+    /// Per rule: match + target URL, undelivered count, last delivery
+    /// timestamp, last error.
+    Status {
+        /// Emit machine-readable JSON instead of the human-formatted summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// (#2093 merge-gate finding 10) Run the drainer SYNCHRONOUSLY until
+    /// every pending line is delivered (or `--max-seconds` elapses),
+    /// then print delivered/failed counts and exit — for an operator who
+    /// wants to flush the queue right now, rather than waiting on the
+    /// long-running background drainer inside a real dispatch process.
+    Drain {
+        /// Only drain this rule's outbox (by its index in `hooks.rules`).
+        /// Unset drains every configured rule. Mutually exclusive with
+        /// `--file`.
+        #[arg(long)]
+        rule: Option<usize>,
+        /// Give up waiting for the queue to empty after this many
+        /// seconds (the drainer's own retry/backoff still applies, so an
+        /// unreachable receiver's pending lines may remain undelivered
+        /// when this returns — that's reported, not treated as an
+        /// error).
+        #[arg(long, default_value_t = 30)]
+        max_seconds: u64,
+        /// (fix-round finding 6) Drain a STRAY outbox file by exact path
+        /// instead — one `darkmux doctor`/`flow hooks status` named as
+        /// belonging to no currently-configured rule (its rule was
+        /// removed or edited). Requires `--to`. One straight pass, no
+        /// retry/backoff — a repeat call after fixing the receiver picks
+        /// up where the last one stopped.
+        #[arg(long, conflicts_with = "rule")]
+        file: Option<std::path::PathBuf>,
+        /// The loopback URL to deliver `--file`'s lines to — validated
+        /// the same way every configured rule's `http` target is.
+        #[arg(long, requires = "file")]
+        to: Option<String>,
+        /// Emit machine-readable JSON instead of the human-formatted summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(cmd: FlowCmd) -> Result<()> {
@@ -180,10 +233,346 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
             return print_integrity_check(path, json, strict)
         }
         FlowCmd::Tail { session, json } => return run_tail(session.as_deref(), json),
+        FlowCmd::Hooks { cmd } => return run_hooks(cmd),
         _ => {}
     }
     let record = build_record(cmd);
     flow::record(record).context("writing flow record")
+}
+
+fn run_hooks(cmd: HooksCmd) -> Result<()> {
+    match cmd {
+        HooksCmd::Status { json } => print_hooks_status(json),
+        HooksCmd::Drain { file: Some(file), to: Some(to), json, .. } => run_hooks_drain_file(&file, &to, json),
+        HooksCmd::Drain { file: Some(_), to: None, .. } => bail!("--file requires --to"),
+        HooksCmd::Drain { rule, max_seconds, json, .. } => run_hooks_drain(rule, max_seconds, json),
+    }
+}
+
+/// (fix-round finding 6) `flow hooks drain --file <path> --to <url>` —
+/// see `flow::hooks::drain_stray_file`'s doc for the one-shot semantics.
+fn run_hooks_drain_file(file: &std::path::Path, to: &str, json: bool) -> Result<()> {
+    let result = flow::hooks::drain_stray_file(file, to)?;
+    if json {
+        darkmux_types::style::set_colorize_override(Some(false));
+        let v = serde_json::json!({
+            "file": file.display().to_string(),
+            "to": to,
+            "delivered": result.delivered,
+            "failed": result.failed,
+            "remaining_undelivered": result.remaining_undelivered,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).context("serializing stray-file drain result to JSON")?);
+    } else {
+        println!(
+            "darkmux flow hooks drain --file {} — delivered: {}, failed: {}, remaining undelivered: {}",
+            file.display(),
+            result.delivered,
+            result.failed,
+            result.remaining_undelivered
+        );
+    }
+    Ok(())
+}
+
+/// A `FlowSink` that counts `hook.fired`/`hook.failed` records for ONE
+/// targeted rule index (or every rule, when unfiltered) — the drain
+/// verb's report is "how many did THIS run deliver/fail", which the
+/// persisted `.last`/`.dropped` sidecar files don't distinguish (they
+/// hold the latest outcome / a running total, not "since I started
+/// draining"), so counting live through a dedicated sink for the
+/// duration of this one call is the correct source of truth.
+#[derive(Default)]
+struct DrainCountingSink {
+    rule_filter: Option<usize>,
+    delivered: std::sync::atomic::AtomicU64,
+    failed: std::sync::atomic::AtomicU64,
+}
+
+impl flow::FlowSink for DrainCountingSink {
+    fn write(&self, record: &FlowRecord) -> Result<()> {
+        if let Some(idx) = self.rule_filter {
+            let matches_idx = record
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("rule_index"))
+                .and_then(|v| v.as_u64())
+                .is_some_and(|v| v as usize == idx);
+            if !matches_idx {
+                return Ok(());
+            }
+        }
+        match record.action.as_str() {
+            "hook.fired" => {
+                self.delivered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            "hook.failed" => {
+                self.failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn info(&self) -> flow::SinkInfo {
+        flow::SinkInfo { kind: "DrainCounting".into(), config: Default::default(), children: vec![], raw_url: None }
+    }
+}
+
+/// Outcome of one `drain_hooks` call — split out from the CLI's own
+/// render/print so it's testable directly against synthetic `rules`,
+/// mirroring `build_hooks_check`'s split (#811 empties the global config
+/// tier in test builds, so there's no way to inject `hooks.rules` through
+/// the real accessor path in a unit test).
+#[derive(Debug, PartialEq, Eq)]
+struct DrainResult {
+    rule_filter: Option<usize>,
+    delivered: u64,
+    failed: u64,
+    remaining_undelivered: usize,
+    /// (fix-round finding 8) Target rule indices whose drain lock a
+    /// post-timeout probe found held by ANOTHER process — see
+    /// `flow::hooks::rules_with_drain_lock_held_elsewhere`'s doc on why
+    /// this is best-effort. Always empty when `remaining_undelivered`
+    /// is 0 (nothing left to explain).
+    lock_held_rules: Vec<usize>,
+}
+
+/// Run the drainer SYNCHRONOUSLY, against `rules`/`outbox_dir` directly,
+/// until every targeted rule's outbox is empty or `max_seconds` elapses.
+fn drain_hooks(
+    rules: &[darkmux_types::config::HookRule],
+    outbox_dir: &std::path::Path,
+    rule_filter: Option<usize>,
+    max_seconds: u64,
+) -> Result<DrainResult> {
+    if let Some(idx) = rule_filter {
+        if idx >= rules.len() {
+            bail!("no hook rule #{idx} configured ({} rule(s) total)", rules.len());
+        }
+    }
+    if rules.is_empty() {
+        return Ok(DrainResult {
+            rule_filter,
+            delivered: 0,
+            failed: 0,
+            remaining_undelivered: 0,
+            lock_held_rules: Vec::new(),
+        });
+    }
+
+    let counting = std::sync::Arc::new(DrainCountingSink { rule_filter, ..Default::default() });
+    let report: std::sync::Arc<dyn flow::FlowSink> = counting.clone();
+    // Constructed against the FULL rule set (not a filtered slice) so
+    // every rule's outbox/cursor/lock file paths — which are derived from
+    // a content hash of the rule's (match, host), NOT its array position
+    // (see `darkmux_flow::hooks::rule_key`) — line up EXACTLY with what
+    // the live dispatch process already wrote. `--rule N` narrows what
+    // this call WAITS on and REPORTS, not which rules get a `HookSink`
+    // at all.
+    let sink = flow::hooks::HookSink::new(rules, outbox_dir.to_path_buf(), report)
+        .context("constructing hook sink for drain")?;
+
+    let targets: Vec<usize> = match rule_filter {
+        Some(idx) => vec![idx],
+        None => (0..rules.len()).collect(),
+    };
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(max_seconds);
+    loop {
+        let summaries = flow::hooks::summarize_configured_rules(rules, outbox_dir);
+        let all_drained = targets.iter().all(|&idx| summaries.get(idx).map(|s| s.undelivered == 0).unwrap_or(true));
+        if all_drained || start.elapsed() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    drop(sink); // bounded join stops the background drainer thread
+
+    let delivered = counting.delivered.load(std::sync::atomic::Ordering::Relaxed);
+    let failed = counting.failed.load(std::sync::atomic::Ordering::Relaxed);
+    let remaining_undelivered: usize = {
+        let summaries = flow::hooks::summarize_configured_rules(rules, outbox_dir);
+        targets.iter().filter_map(|&idx| summaries.get(idx).map(|s| s.undelivered)).sum()
+    };
+    // (fix-round finding 8) Only worth probing when something's actually
+    // left undelivered — distinguishes "another drainer is already
+    // working this rule" from an ordinary down/slow receiver.
+    let lock_held_rules = if remaining_undelivered > 0 {
+        let held = flow::hooks::rules_with_drain_lock_held_elsewhere(rules, outbox_dir);
+        held.into_iter().filter(|idx| targets.contains(idx)).collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(DrainResult { rule_filter, delivered, failed, remaining_undelivered, lock_held_rules })
+}
+
+fn render_drain_result_human(r: &DrainResult, max_seconds: u64) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let scope = match r.rule_filter {
+        Some(idx) => format!("rule #{idx}"),
+        None => "all rules".to_string(),
+    };
+    let _ = writeln!(out, "darkmux flow hooks drain ({scope}) — delivered: {}, failed: {}", r.delivered, r.failed);
+    if r.remaining_undelivered > 0 {
+        let _ = writeln!(
+            out,
+            "  {} line(s) still undelivered after {max_seconds}s — the drainer's own retry/backoff continues \
+             in a real dispatch process; this was a bounded wait, not an error.",
+            r.remaining_undelivered
+        );
+        // (fix-round finding 8) A specific, actionable reason ON TOP of
+        // the generic line above: a live process's own drainer already
+        // holds this rule's lock, so nothing was ever going to be
+        // delivered by THIS invocation regardless of how long it waited.
+        for idx in &r.lock_held_rules {
+            let _ =
+                writeln!(out, "  another drainer holds the lock for rule #{idx}; nothing delivered by this process.");
+        }
+    }
+    out
+}
+
+fn drain_result_json(r: &DrainResult) -> serde_json::Value {
+    serde_json::json!({
+        "rule": r.rule_filter,
+        "delivered": r.delivered,
+        "failed": r.failed,
+        "remaining_undelivered": r.remaining_undelivered,
+        "timed_out": r.remaining_undelivered > 0,
+        "lock_held_rules": r.lock_held_rules,
+    })
+}
+
+fn run_hooks_drain(rule_filter: Option<usize>, max_seconds: u64, json: bool) -> Result<()> {
+    let rules = darkmux_types::config_access::hooks_rules();
+    let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
+    let result = drain_hooks(&rules, &outbox_dir, rule_filter, max_seconds)?;
+    if json {
+        darkmux_types::style::set_colorize_override(Some(false));
+        let v = drain_result_json(&result);
+        println!("{}", serde_json::to_string_pretty(&v).context("serializing drain result to JSON")?);
+    } else {
+        print!("{}", render_drain_result_human(&result, max_seconds));
+    }
+    Ok(())
+}
+
+/// Render `darkmux flow hooks status` to stdout.
+fn print_hooks_status(json: bool) -> Result<()> {
+    let enabled = darkmux_types::config_access::hooks_enabled();
+    let rules = darkmux_types::config_access::hooks_rules();
+    let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
+    let summaries = flow::hooks::summarize_configured_rules(&rules, &outbox_dir);
+
+    if json {
+        // (#776) machine-readable: force color off (defense-in-depth).
+        darkmux_types::style::set_colorize_override(Some(false));
+        let v = hooks_status_json(enabled, &outbox_dir, &summaries);
+        println!("{}", serde_json::to_string_pretty(&v).context("serializing hooks status to JSON")?);
+    } else {
+        print!("{}", render_hooks_status_human(enabled, &outbox_dir, &summaries));
+    }
+    Ok(())
+}
+
+fn hooks_status_json(
+    enabled: bool,
+    outbox_dir: &std::path::Path,
+    summaries: &[flow::hooks::HookRuleSummary],
+) -> serde_json::Value {
+    let rules: Vec<serde_json::Value> = summaries
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "index": s.index,
+                "match": s.match_desc,
+                "url": s.url,
+                "is_loopback": s.is_loopback,
+                "is_empty_match": s.is_empty_match,
+                "undelivered": s.undelivered,
+                "last_delivery_ts": s.last_delivery_ts,
+                "last_error": s.last_error,
+                "dropped_appends": s.dropped_appends,
+                "cursor_write_failures": s.cursor_write_failures,
+                "stalled": s.stalled,
+                "last_drainer_heartbeat": s.last_drainer_heartbeat,
+                "quarantined_lines": s.quarantined_lines,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "enabled": enabled,
+        "outbox_dir": outbox_dir.display().to_string(),
+        "rules": rules,
+    })
+}
+
+fn render_hooks_status_human(
+    enabled: bool,
+    outbox_dir: &std::path::Path,
+    summaries: &[flow::hooks::HookRuleSummary],
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "darkmux flow hooks status — enabled: {enabled}");
+    let _ = writeln!(out, "  outbox_dir: {}", outbox_dir.display());
+    if summaries.is_empty() {
+        let _ = writeln!(out, "  (no rules configured)");
+        return out;
+    }
+    for s in summaries {
+        let mut flags = Vec::new();
+        if s.is_empty_match {
+            flags.push("EMPTY MATCH");
+        }
+        if !s.is_loopback {
+            flags.push("NON-LOOPBACK URL");
+        }
+        if s.stalled {
+            flags.push("STALLED");
+        }
+        let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
+        let _ = writeln!(out, "  #{}: {} -> {}{flag_str}", s.index, s.match_desc, s.url);
+        let _ = writeln!(out, "      undelivered: {}", s.undelivered);
+        match &s.last_delivery_ts {
+            Some(ts) => {
+                let _ = writeln!(out, "      last delivery: {ts}");
+            }
+            None => {
+                let _ = writeln!(out, "      last delivery: (never)");
+            }
+        }
+        if let Some(err) = &s.last_error {
+            let _ = writeln!(out, "      last error: {err}");
+        }
+        if s.dropped_appends > 0 {
+            let _ = writeln!(out, "      dropped: {} (over the outbox cap, or an append failure)", s.dropped_appends);
+        }
+        if s.quarantined_lines > 0 {
+            let _ = writeln!(out, "      quarantined: {} (invalid JSON — never redelivered)", s.quarantined_lines);
+        }
+        if s.stalled {
+            let _ = writeln!(
+                out,
+                "      STALLED: {} consecutive cursor-write failure(s) — the drainer has stopped attempting \
+                 new deliveries for this rule until its cursor file becomes writable again",
+                s.cursor_write_failures
+            );
+        } else if s.cursor_write_failures > 0 {
+            let _ = writeln!(out, "      cursor-write failures: {} (recovered)", s.cursor_write_failures);
+        }
+        match &s.last_drainer_heartbeat {
+            Some(ts) => {
+                let _ = writeln!(out, "      last drainer heartbeat: {ts}");
+            }
+            None => {
+                let _ = writeln!(out, "      last drainer heartbeat: (none seen — no drainer has cycled here yet)");
+            }
+        }
+    }
+    out
 }
 
 /// Render `darkmux flow status` to stdout. Calls `flow::collect_status()`
@@ -558,6 +947,9 @@ pub fn build_record(cmd: FlowCmd) -> FlowRecord {
         FlowCmd::Tail { .. } => unreachable!(
             "FlowCmd::Tail is a read verb and must be handled by run() before build_record"
         ),
+        FlowCmd::Hooks { .. } => unreachable!(
+            "FlowCmd::Hooks is a read verb and must be handled by run() before build_record"
+        ),
     }
 }
 
@@ -575,6 +967,111 @@ mod tests {
     /// piped to a pager, or run interactively for debugging). We simulate the
     /// TTY case by forcing colorize ON, then assert the `--json` path flips it
     /// back off. `#[serial]` because the override is process-global.
+    fn sample_rule_summary(index: usize) -> flow::hooks::HookRuleSummary {
+        flow::hooks::HookRuleSummary {
+            index,
+            match_desc: "action=crawl.*".to_string(),
+            url: "http://127.0.0.1:8790/events".to_string(),
+            is_loopback: true,
+            is_empty_match: false,
+            outbox_path: PathBuf::from("/tmp/0.outbox.jsonl"),
+            cursor_path: PathBuf::from("/tmp/0.cursor"),
+            undelivered: 3,
+            last_delivery_ts: Some("2026-08-29T00:00:00Z".to_string()),
+            last_error: None,
+            dropped_appends: 0,
+            cursor_write_failures: 0,
+            stalled: false,
+            last_drainer_heartbeat: None,
+            quarantined_lines: 0,
+            key: format!("127.0.0.1-8790-{index}"),
+        }
+    }
+
+    #[test]
+    fn hooks_status_human_disabled_names_it() {
+        let out = render_hooks_status_human(false, &PathBuf::from("/tmp/hooks"), &[]);
+        assert!(out.contains("enabled: false"), "{out}");
+    }
+
+    #[test]
+    fn hooks_status_human_lists_each_rule() {
+        let summaries = vec![sample_rule_summary(0)];
+        let out = render_hooks_status_human(true, &PathBuf::from("/tmp/hooks"), &summaries);
+        assert!(out.contains("enabled: true"), "{out}");
+        assert!(out.contains("crawl.*"), "{out}");
+        assert!(out.contains("undelivered: 3"), "{out}");
+        assert!(out.contains("2026-08-29T00:00:00Z"), "last delivery ts shown: {out}");
+    }
+
+    #[test]
+    fn hooks_status_json_shape() {
+        let summaries = vec![sample_rule_summary(0)];
+        let v = hooks_status_json(true, &PathBuf::from("/tmp/hooks"), &summaries);
+        assert_eq!(v["enabled"], Value::Bool(true));
+        assert_eq!(v["rules"][0]["index"], serde_json::json!(0));
+        assert_eq!(v["rules"][0]["undelivered"], serde_json::json!(3));
+        assert_eq!(v["rules"][0]["last_delivery_ts"], Value::String("2026-08-29T00:00:00Z".to_string()));
+    }
+
+    /// (#2093 merge-gate finding 9) `dropped_appends` (either the hard
+    /// cap or an append failure) surfaces in BOTH the human and `--json`
+    /// renderings of `flow hooks status` — not just as an in-process
+    /// counter nobody outside the running dispatch can see.
+    #[test]
+    fn hooks_status_surfaces_dropped_appends() {
+        let mut s = sample_rule_summary(0);
+        s.dropped_appends = 42;
+        let human = render_hooks_status_human(true, &PathBuf::from("/tmp/hooks"), &[s.clone()]);
+        assert!(human.contains("dropped: 42"), "{human}");
+
+        let v = hooks_status_json(true, &PathBuf::from("/tmp/hooks"), &[s]);
+        assert_eq!(v["rules"][0]["dropped_appends"], serde_json::json!(42));
+    }
+
+    // ─── (#2093 merge-gate finding 10) drain verb ────────────────────────
+
+    #[test]
+    fn drain_hooks_delivers_pending_lines_and_reports_counts() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = TempDir::new().unwrap();
+        let receiver = flow::hooks::test_receiver::HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+
+        // Seed the outbox directly (bypassing a live HookSink write) —
+        // simulates lines a PRIOR dispatch process already wrote.
+        // `summarize_configured_rules` is the read-only path that derives
+        // the same deterministic outbox path a real `HookSink` would.
+        let outbox_path = flow::hooks::summarize_configured_rules(&rules, tmp.path())[0].outbox_path.clone();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(&outbox_path, "{\"action\":\"work.a\"}\n{\"action\":\"work.b\"}\n{\"action\":\"work.c\"}\n").unwrap();
+
+        let result = drain_hooks(&rules, tmp.path(), None, 10).unwrap();
+        assert_eq!(result.delivered, 3, "{result:?}");
+        assert_eq!(result.failed, 0, "{result:?}");
+        assert_eq!(result.remaining_undelivered, 0, "{result:?}");
+        assert_eq!(receiver.request_count(), 3);
+
+        let human = render_drain_result_human(&result, 10);
+        assert!(human.contains("delivered: 3"), "{human}");
+        assert!(!human.contains("still undelivered"), "{human}");
+
+        let json = drain_result_json(&result);
+        assert_eq!(json["delivered"], serde_json::json!(3));
+        assert_eq!(json["timed_out"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn drain_hooks_refuses_an_out_of_range_rule_index() {
+        let tmp = TempDir::new().unwrap();
+        let err = drain_hooks(&[], tmp.path(), Some(0), 1).unwrap_err();
+        assert!(err.to_string().contains("no hook rule #0"), "{err}");
+    }
+
     #[serial_test::serial]
     #[test]
     fn flow_json_paths_force_colorize_off() {

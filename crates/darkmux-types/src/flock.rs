@@ -89,6 +89,40 @@ where
     f(guard.file())
 }
 
+/// (#2093 merge-gate finding 3) Non-blocking sibling of `lock_exclusive` —
+/// `flock(LOCK_EX | LOCK_NB)`. Returns `Ok(Some(guard))` when the lock was
+/// acquired, `Ok(None)` when another holder already has it (never blocks
+/// waiting), and `Err` only for a genuine I/O failure. The right shape for
+/// a periodic background task (e.g. a drainer poll cycle) that should
+/// SKIP this round rather than stall behind a slow holder — a blocking
+/// `lock_exclusive` would make every concurrent instance queue up single
+/// file, defeating the point of running more than one.
+pub fn try_lock_exclusive(path: &Path) -> Result<Option<FlockGuard>> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("opening lock file {}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(FlockGuard(file)));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(anyhow!("flock(LOCK_EX|LOCK_NB) failed on {}: {}", path.display(), err))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +163,31 @@ mod tests {
         let path = tmp.path().join("lock");
         let result: Result<()> = with_locked_file(&path, |_file| Err(anyhow!("boom")));
         assert!(result.is_err());
+    }
+
+    /// (#2093 merge-gate finding 3) `try_lock_exclusive` must never block —
+    /// while another holder has the lock, it returns `Ok(None)` instead of
+    /// waiting, so a drainer can skip this cycle rather than stall behind
+    /// a slow (up to `POST_TIMEOUT`) holder.
+    #[test]
+    fn try_lock_exclusive_returns_none_when_already_held() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("drain.lock");
+        let _held = lock_exclusive(&path).unwrap();
+
+        let attempt = try_lock_exclusive(&path).unwrap();
+        assert!(attempt.is_none(), "must return Ok(None), never block, while another holder has the lock");
+    }
+
+    #[test]
+    fn try_lock_exclusive_succeeds_once_released() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("drain.lock");
+        {
+            let _held = lock_exclusive(&path).unwrap();
+        } // released here
+
+        let attempt = try_lock_exclusive(&path).unwrap();
+        assert!(attempt.is_some(), "must acquire once the prior holder released");
     }
 }

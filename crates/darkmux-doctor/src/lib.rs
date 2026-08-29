@@ -172,7 +172,7 @@ pub fn run() -> DoctorReport {
         check_legacy_compaction_extras(),
         check_mission_envelope_readability(),
     ];
-    let checks = [checks, eureka_checks()].concat();
+    let checks = [checks, check_hooks(), eureka_checks()].concat();
     DoctorReport { checks }
 }
 
@@ -1367,6 +1367,268 @@ fn check_gh_allowlist() -> Check {
         message: format!("enabled ({provenance}) — allowed: {}", allowed.join(", ")),
         hint: None,
     }
+}
+
+/// (#2093) Surface the flow-record hook sink's resolved state: whether it's
+/// enabled (with provenance), and — when it is — every configured rule's
+/// match + URL + undelivered-line count, flagging a rule whose match is
+/// empty (Warn — matches nothing, likely an operator forgot to fill it in)
+/// or whose URL isn't loopback (Fail — `HookSink::new` refuses the whole
+/// sink over this, so it's a hard block, not a suggestion).
+///
+/// (#2093 merge-gate finding 14) Returns ONE `Check` per flagged rule
+/// (`hooks.rule.<index>`), not a single aggregate — so a flag attaches
+/// to the rule it names in the checks list itself, the same shape
+/// `eureka_checks()` already established for a check family with more
+/// than one member. Provenance distinguishes `env` / `config.json` /
+/// `default` (mirrors `check_review_judge_exhaustion_policy`'s own
+/// three-way provenance) — previously any non-`env` case was reported as
+/// `config.json` even when NEITHER tier actually set it.
+fn check_hooks() -> Vec<Check> {
+    let env_set = std::env::var("DARKMUX_HOOKS_ENABLED").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let config_set = darkmux_types::config::DarkmuxConfig::load_resolved().hooks.as_ref().and_then(|h| h.enabled).is_some();
+    let provenance = if env_set {
+        "env"
+    } else if config_set {
+        "config.json"
+    } else {
+        "default"
+    };
+    let enabled = darkmux_types::config_access::hooks_enabled();
+    let rules = darkmux_types::config_access::hooks_rules();
+    let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
+    build_hooks_check(enabled, provenance, &rules, &outbox_dir)
+}
+
+/// (#2093 merge-gate finding 17) True when a rule's match risks the
+/// observer joining the observed (this project's own doctrine,
+/// CLAUDE.md's "The observer must not join the observed") — matching
+/// `telemetry.*` / category `telemetry`, or a bare `*` action that
+/// (among everything else) would also catch every telemetry record.
+/// String-matching against `describe_match`'s rendered form since
+/// `HookRuleSummary` carries only the description, not the structured
+/// `HookMatch` — good enough for a doctor Warn, not a security boundary.
+fn hooks_match_risks_observing_the_observer(match_desc: &str) -> bool {
+    match_desc.contains("category=telemetry") || match_desc.contains("action=telemetry.") || match_desc == "action=*"
+}
+
+/// (#2093 merge-gate finding 15) `*.outbox.jsonl` files in `outbox_dir`
+/// whose key (the content-hash `rule_key` — see `darkmux_flow::hooks`'
+/// own doc) matches no CURRENTLY-configured rule. Belongs to a rule
+/// since removed from config (or edited enough to change its
+/// `match`/`http`) — the outbox still holds whatever was undelivered
+/// when that happened, and nothing will ever drain it again unless the
+/// rule comes back verbatim.
+/// (fix-round finding 6) One stray `*.outbox.jsonl` file — one whose
+/// owning rule no longer exists in current config — plus the detail an
+/// operator deciding "safe to delete?" actually needs: how many lines
+/// were never delivered, and which sibling sidecar files (all sharing
+/// the same content-hash key) go with it.
+struct StrayOutbox {
+    path: std::path::PathBuf,
+    undelivered: usize,
+    siblings: Vec<String>,
+}
+
+/// Sibling sidecar suffixes a stray outbox's key can carry — see
+/// `darkmux_flow::hooks`'s per-rule file layout (`outbox_paths`,
+/// `last_status_path`, `dropped_appends_path`, `drain_lock_path`,
+/// `quarantine_path`).
+const HOOK_SIDECAR_SUFFIXES: &[&str] = &[".cursor", ".last", ".dropped", ".drain.lock", ".outbox.jsonl.quarantine"];
+
+fn stray_outbox_files(rules: &[darkmux_types::config::HookRule], outbox_dir: &std::path::Path) -> Vec<StrayOutbox> {
+    let current_keys: std::collections::HashSet<String> = rules
+        .iter()
+        .map(|r| {
+            let m = r.r#match.clone().unwrap_or_default();
+            let url = r.http.clone().unwrap_or_default();
+            darkmux_flow::hooks::rule_key(&m, &url)
+        })
+        .collect();
+    let Ok(entries) = std::fs::read_dir(outbox_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter_map(|path| {
+            let name = path.file_name().and_then(|n| n.to_str())?;
+            let key = name.strip_suffix(".outbox.jsonl")?;
+            if current_keys.contains(key) {
+                return None;
+            }
+            // The stray file's own `.cursor` sidecar (if it survived
+            // alongside it) still names the true last-delivered offset;
+            // falling back to 0 (nothing ever delivered) only overcounts
+            // when that sidecar is itself missing.
+            let cursor = std::fs::read_to_string(outbox_dir.join(format!("{key}.cursor")))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            let undelivered = darkmux_flow::hooks::undelivered_line_count(&path, cursor);
+            let siblings: Vec<String> = HOOK_SIDECAR_SUFFIXES
+                .iter()
+                .map(|suffix| format!("{key}{suffix}"))
+                .filter(|sibling_name| outbox_dir.join(sibling_name).exists())
+                .collect();
+            Some(StrayOutbox { path, undelivered, siblings })
+        })
+        .collect()
+}
+
+/// The pure rollup `check_hooks()` delegates to — split out so it's testable
+/// against synthetic rules without the global config/env tier (#811 empties
+/// `config()` in test builds, so there's no way to inject `hooks.rules`
+/// through the real accessor path in a unit test).
+fn build_hooks_check(
+    enabled: bool,
+    provenance: &str,
+    rules: &[darkmux_types::config::HookRule],
+    outbox_dir: &std::path::Path,
+) -> Vec<Check> {
+    let name = "hooks";
+    if !enabled {
+        return vec![Check { name: name.into(), status: Status::Pass, message: format!("disabled ({provenance})"), hint: None }];
+    }
+    if rules.is_empty() {
+        return vec![Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!("enabled ({provenance}) but no rules configured — outbox_dir={}", outbox_dir.display()),
+            hint: Some(
+                "Add a rule to config.json's `hooks.rules`, e.g. `darkmux config set hooks.rules \
+                 '[{\"match\":{\"action\":\"crawl.*\"},\"http\":\"http://127.0.0.1:8790/events\"}]'`."
+                    .into(),
+            ),
+        }];
+    }
+
+    let summaries = darkmux_flow::hooks::summarize_configured_rules(rules, outbox_dir);
+    let mut worst = Status::Pass;
+    let mut overview_lines = Vec::with_capacity(summaries.len());
+    let mut rule_checks = Vec::with_capacity(summaries.len());
+
+    for s in &summaries {
+        let mut flags = Vec::new();
+        let mut rule_status = Status::Pass;
+        if s.is_empty_match {
+            flags.push("EMPTY MATCH — matches nothing".to_string());
+            rule_status = Status::Warn;
+        }
+        if !s.is_loopback {
+            flags.push("NON-LOOPBACK URL — refused at load".to_string());
+            rule_status = Status::Fail;
+        }
+        // (#2093 merge-gate finding 9) A rule that's been dropping writes
+        // (over the outbox cap, or an append failure) is a Warn — not a
+        // Fail, since delivery for every OTHER pending line keeps working.
+        if s.dropped_appends > 0 {
+            flags.push(format!(
+                "{} write(s) dropped so far (over the outbox cap, or an append failure)",
+                s.dropped_appends
+            ));
+            if rule_status == Status::Pass {
+                rule_status = Status::Warn;
+            }
+        }
+        // (fix-round finding 1) A STALLED rule has stopped attempting
+        // deliveries entirely — surfaced loudly, same severity as the
+        // other operational (not config-validation) flags here.
+        if s.stalled {
+            flags.push(format!(
+                "STALLED — {} consecutive cursor-write failure(s); the drainer has stopped attempting new \
+                 deliveries for this rule until its cursor file becomes writable again",
+                s.cursor_write_failures
+            ));
+            if rule_status == Status::Pass {
+                rule_status = Status::Warn;
+            }
+        }
+        // (fix-round finding 7) Quarantined (invalid-JSON) lines are
+        // never redelivered — worth naming, same as a dropped append.
+        if s.quarantined_lines > 0 {
+            flags.push(format!("{} line(s) quarantined (invalid JSON — never redelivered)", s.quarantined_lines));
+            if rule_status == Status::Pass {
+                rule_status = Status::Warn;
+            }
+        }
+        if hooks_match_risks_observing_the_observer(&s.match_desc) {
+            flags.push(
+                "matches telemetry / a bare `*` action — the observer must not join the observed".to_string(),
+            );
+            if rule_status == Status::Pass {
+                rule_status = Status::Warn;
+            }
+        }
+        if worst == Status::Pass && rule_status != Status::Pass {
+            worst = rule_status;
+        } else if rule_status == Status::Fail {
+            worst = Status::Fail;
+        }
+
+        let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
+        let message = format!("{} -> {} (undelivered: {}){flag_str}", s.match_desc, s.url, s.undelivered);
+        overview_lines.push(format!("  #{}: {message}", s.index));
+        rule_checks.push(Check {
+            name: format!("hooks.rule.{}", s.index),
+            status: rule_status,
+            message,
+            hint: if flags.is_empty() {
+                None
+            } else {
+                Some("Fix this rule in ~/.darkmux/config.json (or `darkmux config set hooks.rules ...`).".into())
+            },
+        });
+    }
+
+    let overview = Check {
+        name: name.into(),
+        status: worst,
+        message: format!(
+            "enabled ({provenance}) — {} rule(s), outbox_dir={}\n{}",
+            summaries.len(),
+            outbox_dir.display(),
+            overview_lines.join("\n")
+        ),
+        hint: if worst != Status::Pass {
+            Some("See the individual `hooks.rule.*` checks below for which rule(s).".into())
+        } else {
+            None
+        },
+    };
+    let mut out = vec![overview];
+    out.extend(rule_checks);
+
+    // (#2093 merge-gate finding 15) A file that belongs to no CURRENT
+    // rule — named so, rather than silently taking up disk forever.
+    let stray = stray_outbox_files(rules, outbox_dir);
+    if !stray.is_empty() {
+        // (fix-round finding 6) Name each stray file's undelivered line
+        // count and its sibling sidecars — an operator deciding whether
+        // it's "safe to delete" needs both, not just the outbox name.
+        let details: Vec<String> = stray
+            .iter()
+            .map(|s| {
+                let name = s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let siblings =
+                    if s.siblings.is_empty() { String::new() } else { format!("; siblings: {}", s.siblings.join(", ")) };
+                format!("{name} ({} undelivered line(s){siblings})", s.undelivered)
+            })
+            .collect();
+        out.push(Check {
+            name: "hooks.stray".into(),
+            status: Status::Warn,
+            message: format!("{} outbox file(s) belong to no currently-configured rule: {}", stray.len(), details.join(", ")),
+            hint: Some(
+                "A rule was removed or edited since these were written. `darkmux flow hooks drain --file <path> \
+                 --to <loopback url>` delivers a stray file's undelivered lines before you delete it; once \
+                 undelivered is 0, it (and its sibling sidecars) are safe to remove."
+                    .into(),
+            ),
+        });
+    }
+
+    out
 }
 
 /// (#1876/#1877) Informational: the review pipeline's judge-stage
@@ -4735,6 +4997,163 @@ mod tests {
         }
     }
 
+    // ─── (#2093) check_hooks — flow-record hooks ───────────────────────────
+
+    #[serial_test::serial]
+    #[test]
+    fn check_hooks_disabled_by_default_is_pass() {
+        let prev = std::env::var("DARKMUX_HOOKS_ENABLED").ok();
+        unsafe { std::env::remove_var("DARKMUX_HOOKS_ENABLED"); }
+        let checks = check_hooks();
+        assert_eq!(checks.len(), 1, "disabled → the one overview check, no per-rule checks");
+        let check = &checks[0];
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("disabled"), "{}", check.message);
+        // (#2093 merge-gate finding 14) No env, no config tier in test
+        // builds (#811) → provenance is `default`, not silently `config.json`.
+        assert!(check.message.contains("default"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_ENABLED"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_hooks_enabled_with_no_rules_warns() {
+        let prev = std::env::var("DARKMUX_HOOKS_ENABLED").ok();
+        unsafe { std::env::set_var("DARKMUX_HOOKS_ENABLED", "true"); }
+        let checks = check_hooks();
+        assert_eq!(checks.len(), 1);
+        let check = &checks[0];
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("no rules"), "{}", check.message);
+        assert!(check.hint.is_some());
+        // env DID set it here, so provenance must say `env`, not `default`.
+        assert!(check.message.contains("env"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_ENABLED"),
+            }
+        }
+    }
+
+    /// (#2093 merge-gate finding 14) `build_hooks_check` now returns ONE
+    /// `Check` per flagged rule (`hooks.rule.<index>`) plus one overview
+    /// (`hooks`) — so a flag attaches to the RULE it names, not to an
+    /// aggregate message an operator has to cross-reference by hand.
+    /// Exercised against `build_hooks_check` directly with synthetic
+    /// rules, since the global `config()` tier is empty by construction
+    /// in test builds (#811) — there is no way to inject a populated
+    /// `hooks.rules` through `check_hooks()`'s normal env/config path.
+    #[test]
+    fn hooks_check_rollup_flags_attach_to_the_right_rule() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![
+            HookRule {
+                r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+                http: Some("http://127.0.0.1:8790/events".to_string()),
+                extras: Default::default(),
+            },
+            HookRule { r#match: None, http: Some("http://127.0.0.1:9000/x".to_string()), extras: Default::default() },
+            HookRule {
+                r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+                http: Some("http://10.0.0.5:8790/x".to_string()),
+                extras: Default::default(),
+            },
+        ];
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
+        assert_eq!(checks.len(), 4, "1 overview + 3 per-rule checks");
+
+        let overview = checks.iter().find(|c| c.name == "hooks").unwrap();
+        assert_eq!(overview.status, Status::Fail, "worst of the three rules — a non-loopback rule is a hard block");
+
+        let healthy = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert_eq!(healthy.status, Status::Pass, "{}", healthy.message);
+        assert!(healthy.message.contains("crawl.*"), "{}", healthy.message);
+        assert!(healthy.message.contains("undelivered"), "{}", healthy.message);
+
+        let empty_match = checks.iter().find(|c| c.name == "hooks.rule.1").unwrap();
+        assert_eq!(empty_match.status, Status::Warn, "{}", empty_match.message);
+        assert!(empty_match.message.contains("EMPTY MATCH"), "{}", empty_match.message);
+        assert!(!empty_match.message.contains("NON-LOOPBACK"), "rule 1's own flags only: {}", empty_match.message);
+
+        let non_loopback = checks.iter().find(|c| c.name == "hooks.rule.2").unwrap();
+        assert_eq!(non_loopback.status, Status::Fail, "{}", non_loopback.message);
+        assert!(non_loopback.message.contains("NON-LOOPBACK"), "{}", non_loopback.message);
+        assert!(!non_loopback.message.contains("EMPTY MATCH"), "rule 2's own flags only: {}", non_loopback.message);
+    }
+
+    /// (#2093 merge-gate finding 17) A rule matching `telemetry.*` (or the
+    /// `telemetry` category) or a bare `*` action risks the observer
+    /// joining the observed — this project's own doctrine (CLAUDE.md
+    /// "The observer must not join the observed"). Doctor names it.
+    #[test]
+    fn hooks_check_warns_on_telemetry_or_bare_star_match() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![
+            HookRule {
+                r#match: Some(HookMatch { action: Some("telemetry.tokens".to_string()), ..Default::default() }),
+                http: Some("http://127.0.0.1:8790/a".to_string()),
+                extras: Default::default(),
+            },
+            HookRule {
+                r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+                http: Some("http://127.0.0.1:8790/b".to_string()),
+                extras: Default::default(),
+            },
+        ];
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
+        let telemetry = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert_eq!(telemetry.status, Status::Warn, "{}", telemetry.message);
+        assert!(telemetry.message.contains("observer must not join the observed"), "{}", telemetry.message);
+
+        let bare_star = checks.iter().find(|c| c.name == "hooks.rule.1").unwrap();
+        assert_eq!(bare_star.status, Status::Warn, "{}", bare_star.message);
+        assert!(bare_star.message.contains("observer must not join the observed"), "{}", bare_star.message);
+    }
+
+    /// (#2093 merge-gate finding 15) A `*.outbox.jsonl` file that belongs
+    /// to no CURRENTLY-configured rule — the artifact of a rule since
+    /// removed (or, before content-hash keying, silently reassigned by a
+    /// reorder) — is named, not silently ignored.
+    #[test]
+    fn hooks_check_warns_on_stray_outbox_file() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:8790/events".to_string()),
+            extras: Default::default(),
+        }];
+        // A stray file belonging to a rule that's since been removed from
+        // config — its key can't match any CURRENT rule's `rule_key`.
+        std::fs::write(tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.outbox.jsonl"), "").unwrap();
+
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
+        let stray = checks.iter().find(|c| c.name == "hooks.stray").expect("a stray-file check must be present");
+        assert_eq!(stray.status, Status::Warn, "{}", stray.message);
+        assert!(stray.message.contains("127.0.0.1-9999-deadbeefdeadbeef"), "{}", stray.message);
+    }
+
+    #[test]
+    fn hooks_check_no_stray_file_check_when_nothing_stray() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:8790/events".to_string()),
+            extras: Default::default(),
+        }];
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
+        assert!(checks.iter().all(|c| c.name != "hooks.stray"), "no stray files → no stray check emitted");
+    }
+
     #[serial_test::serial]
     #[test]
     fn check_gh_allowlist_enabled_with_verbs_is_pass_and_names_them() {
@@ -5834,11 +6253,11 @@ mod tests {
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
-        // turn-delay [#2094] + mission-envelope-readability [#1881]) + one
-        // per active eureka rule.
+        // turn-delay [#2094] + mission-envelope-readability [#1881] + hooks
+        // [#2093]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 40 + darkmux_eureka::all_rules().len();
+        let expected = 41 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

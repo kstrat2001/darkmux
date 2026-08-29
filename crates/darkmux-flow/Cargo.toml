@@ -33,6 +33,21 @@ darkmux-hardware = { path = "../darkmux-hardware" }
 # #661 — config accessors (env > config.json > default). The one new edge in
 # the dep graph; darkmux-types is the leaf (no darkmux-* deps), so no cycle.
 darkmux-types = { path = "../darkmux-types" }
+# #2093 — HookSink's drainer POSTs a matching flow record to a loopback
+# receiver. Already a workspace dependency (the root crate's `fleet_cli.rs`
+# GET path); this is the same client, now also linked into this crate for
+# the write side. `default-features = false` matches the root crate's own
+# usage — HTTP/1.1 POST + timeouts is all this needs, no TLS/gzip surface.
+ureq = { version = "2.10", default-features = false }
+# #2093 (merge-gate finding 1) — promoted from a transitive dep (ureq
+# already pulls it in; already present in Cargo.lock) to a direct one. The
+# hook outbox is an operator-facing SSRF surface — every hook URL is
+# refused unless it targets loopback — and the loopback check needs a real
+# URL parser (scheme/userinfo/host/port boundaries correctly delimited)
+# rather than the hand-rolled `strip_prefix`/`split('/')` slicing that
+# shipped first and missed userinfo-confusion and fragment-confusion
+# bypasses.
+url = "2.5"
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -250,6 +250,70 @@ pub fn cmd_allowed(verb: &str) -> bool {
     cmd_enabled() && cmd_allowed_verbs().iter().any(|v| v == verb)
 }
 
+// ── (#2093) Hooks — flow-record hook sink (match → HTTP POST) ──
+/// The hooks feature gate: `env(DARKMUX_HOOKS_ENABLED)` truthy
+/// (`1`/`true`/`yes`/`on`, case-insensitive) > `config.hooks.enabled` >
+/// `false` — fail closed, mirroring `cmd_enabled`. There is deliberately NO
+/// env override for individual rules; a rule is a structured object, not a
+/// scalar an env var can carry — the env tier only gates the feature as a
+/// whole.
+pub fn hooks_enabled() -> bool {
+    if let Some(s) = env_str("DARKMUX_HOOKS_ENABLED") {
+        return matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    config().hooks.as_ref().and_then(|h| h.enabled).unwrap_or(false)
+}
+/// (#2093 merge-gate finding 8) Derived from the SAME root resolution
+/// every other darkmux directory resolves through —
+/// `paths::resolve(Auto)`, which honors `DARKMUX_HOME` and a
+/// project-local `./.darkmux` before `~/.darkmux` — mirroring
+/// `lab_dir_default`'s own doc. Before this fix, `hooks_outbox_dir`'s
+/// fallback went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-
+/// scoped install still wrote hook outbox files to the operator's REAL
+/// `~/.darkmux/hooks` regardless — the same bug class #1585 fixed for
+/// `lab_dir`, one directory over.
+#[cfg(not(any(test, feature = "test-support")))]
+fn hooks_outbox_dir_default() -> std::path::PathBuf {
+    crate::paths::resolve(crate::paths::ResolveScope::Auto).root.join("hooks")
+}
+
+/// Test builds must never default onto the operator's real
+/// `~/.darkmux/hooks` — same isolation discipline as `lab_dir_default`'s
+/// own test-build variant (#994). A test that DID isolate itself (a
+/// `DARKMUX_HOME` tempdir, or a project-local `./.darkmux`) is honored
+/// verbatim, because a test that isolated itself means it.
+#[cfg(any(test, feature = "test-support"))]
+fn hooks_outbox_dir_default() -> std::path::PathBuf {
+    let resolved = crate::paths::resolve(crate::paths::ResolveScope::Auto);
+    let real_user_root = dirs::home_dir().map(|h| h.join(".darkmux"));
+    if real_user_root.as_ref() == Some(&resolved.root) {
+        return std::path::PathBuf::from("/tmp/darkmux-test-isolated/hooks");
+    }
+    resolved.root.join("hooks")
+}
+
+/// Where per-rule outbox/cursor files live: `config.hooks.outbox_dir`
+/// (tilde-expanded) or the built-in default `<darkmux root>/hooks`.
+/// CONFIG-ONLY — no per-field env var (see `hooks_enabled`'s doc for why).
+pub fn hooks_outbox_dir() -> std::path::PathBuf {
+    pick_dir(None, config().hooks.as_ref().and_then(|h| h.outbox_dir.as_deref()), hooks_outbox_dir_default)
+}
+/// The configured hook rules, verbatim (raw `HookRule`s — match validation
+/// and URL-loopback validation happen at `HookSink` construction, not here;
+/// this accessor is a pure config-tier read). CONFIG-ONLY, same reasoning
+/// as `hooks_outbox_dir`.
+pub fn hooks_rules() -> Vec<crate::config::HookRule> {
+    config().hooks.as_ref().and_then(|h| h.rules.clone()).unwrap_or_default()
+}
+/// (#2093 merge-gate finding 5) The hard cap, in MiB, on undelivered bytes
+/// a single rule's outbox may hold before appends for that rule stop:
+/// `env(DARKMUX_HOOKS_MAX_OUTBOX_MB)` > `config.hooks.max_outbox_mb` >
+/// built-in default `256`.
+pub fn hooks_max_outbox_mb() -> u64 {
+    let cfg = config().hooks.as_ref().and_then(|h| h.max_outbox_mb);
+    pick_parsed("DARKMUX_HOOKS_MAX_OUTBOX_MB", cfg, Some(256)).unwrap()
+}
+
 // ── Runtime behavior ──
 pub fn inactivity_timeout_seconds() -> u64 {
     let cfg = config().runtime.as_ref().and_then(|r| r.inactivity_timeout_seconds);
@@ -1569,6 +1633,91 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_LMSTUDIO_URL", v),
                 None => std::env::remove_var("DARKMUX_LMSTUDIO_URL"),
+            }
+        }
+    }
+
+    // ── (#2093) Hooks — env/default tier only (the config tier is empty by
+    // construction in test builds; per-rule config-tier behavior is tested
+    // in darkmux-flow against real `HookRule`/`HookMatch` values instead). ──
+
+    #[serial_test::serial]
+    #[test]
+    fn hooks_enabled_env_truthy_then_default_false() {
+        let prev = std::env::var("DARKMUX_HOOKS_ENABLED").ok();
+        for truthy in ["1", "true", "YES", "On"] {
+            unsafe { std::env::set_var("DARKMUX_HOOKS_ENABLED", truthy); }
+            assert!(hooks_enabled(), "{truthy} → true (case-insensitive)");
+        }
+        unsafe { std::env::set_var("DARKMUX_HOOKS_ENABLED", "nope"); }
+        assert!(!hooks_enabled(), "non-truthy → false");
+        unsafe { std::env::remove_var("DARKMUX_HOOKS_ENABLED"); }
+        assert!(!hooks_enabled(), "unset → false default (fail closed)");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_ENABLED", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_ENABLED"),
+            }
+        }
+    }
+
+    #[test]
+    fn hooks_outbox_dir_default_is_darkmux_hooks() {
+        // No config tier in test builds → default only. Lenient suffix
+        // (matches `lab_dir`'s own convention) since the test-isolated
+        // fallback path differs from the real `~/.darkmux/hooks` shape.
+        let dir = hooks_outbox_dir();
+        assert!(dir.ends_with("hooks"), "default outbox dir should end in a `hooks` dir, got {}", dir.display());
+    }
+
+    /// (#2093 merge-gate finding 8) `hooks_outbox_dir` resolves under
+    /// `paths::resolve(Auto)` — same root every other darkmux directory
+    /// resolves under — so `DARKMUX_HOME` scopes it too. Before this fix
+    /// it went straight to `dirs::home_dir()`, so a `DARKMUX_HOME`-scoped
+    /// install (a relocated root, or test isolation) still wrote hook
+    /// outbox files to the OPERATOR'S REAL `~/.darkmux/hooks` regardless.
+    #[serial_test::serial]
+    #[test]
+    fn hooks_outbox_dir_honors_darkmux_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var("DARKMUX_HOME").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOME", tmp.path());
+        }
+        let dir = hooks_outbox_dir();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOME", v),
+                None => std::env::remove_var("DARKMUX_HOME"),
+            }
+        }
+        assert_eq!(dir, tmp.path().join("hooks"), "must scope under DARKMUX_HOME, not the real user home");
+    }
+
+    #[test]
+    fn hooks_rules_empty_by_default() {
+        assert!(hooks_rules().is_empty(), "no config tier in test builds → no rules");
+    }
+
+    // ─── (#2093 merge-gate finding 5) hard outbox cap ────────────────────
+
+    #[test]
+    fn hooks_max_outbox_mb_defaults_to_256() {
+        assert_eq!(hooks_max_outbox_mb(), 256, "no config tier in test builds → built-in default");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn hooks_max_outbox_mb_env_overrides_the_default() {
+        let prev = std::env::var("DARKMUX_HOOKS_MAX_OUTBOX_MB").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", "5");
+        }
+        assert_eq!(hooks_max_outbox_mb(), 5);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_MAX_OUTBOX_MB"),
             }
         }
     }

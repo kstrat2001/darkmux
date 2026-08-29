@@ -345,12 +345,16 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.25.0";
 //           `mission_graph::fold_step_finals`) ignore the unknown action.
 //           New records only, prior AuditFileSink chains survive without
 //           rotation.
-//   1.23.0: RESERVED for the `hook.*` action family (#2093), landing on a
-//           sibling branch concurrently with this one. Not present in this
-//           branch's history — noted here only so the merge of both onto
-//           `main` is a one-line reconcile (both branches bump from
-//           1.22.0; whichever merges second re-numbers its own bump to
-//           come after the other's).
+//   1.23.0: new action values `hook.fired` / `hook.failed` (#2093) —
+//           `darkmux_flow::hooks::HookSink`'s own firing/failure records,
+//           emitted after each delivery attempt against a configured hook
+//           rule. Payload carries `rule_index` / `target_host` /
+//           `delivered_action` / `attempt`, plus `delivered_hash` and
+//           `error` when present. No struct/enum change — both actions use
+//           the existing `Category::Machinery` / `Tier::Local` /
+//           `Stage::Ship`. Minor + additive: older readers ignore the two
+//           new action values; new records only, prior AuditFileSink
+//           chains survive without rotation.
 //   1.24.0: new action family for `darkmux mission launch crawl` (#1959
 //           packet 2, the crawl LAUNCHER — packet 1 landed the corpus
 //           manifest / rules / read-only source worktrees / `darkmux crawl

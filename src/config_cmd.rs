@@ -59,6 +59,14 @@ enum Ty {
     /// REPLACES the whole array (there is no incremental add); an empty
     /// string clears it to `[]`.
     StrList,
+    /// (#2093) The value is parsed as raw JSON and stored verbatim — for a
+    /// field too structured for any scalar `Ty` (`hooks.rules`: an array of
+    /// `{match: {...}, http: "..."}` objects). Any syntactically valid JSON
+    /// is accepted here; SEMANTIC validation (a non-loopback URL, an empty
+    /// match) is `HookSink`/`darkmux doctor`'s job, per the config-leniency
+    /// contract (registry entry 7 — validation at resolution/consumption,
+    /// never the hot load path).
+    Json,
 }
 
 /// Every settable dotted key + its type — THE contract for `config set`. A key
@@ -140,6 +148,18 @@ const KEYS: &[(&str, Ty)] = &[
     // (#1685) The `gh`-verb allowlist gate — see `CmdConfig`'s own doc.
     ("cmd.enabled", Ty::Bool),
     ("cmd.allowed", Ty::StrList),
+    // (#2093) The flow-record hook sink — see `HooksConfig`'s own doc.
+    // `hooks.rules` is deliberately NOT a per-field-settable structure (a
+    // rule is an object, not a scalar) — it's settable only as a whole,
+    // via raw JSON (`Ty::Json`). An operator wiring up their first rule by
+    // hand-editing `~/.darkmux/config.json` is the expected path; `config
+    // set hooks.rules '[...]'` covers the scriptable case.
+    ("hooks.enabled", Ty::Bool),
+    ("hooks.outbox_dir", Ty::Str),
+    ("hooks.rules", Ty::Json),
+    // (#2093 merge-gate finding 5) The hard cap on undelivered bytes per
+    // rule, in MiB — see `HooksConfig::max_outbox_mb`'s own doc.
+    ("hooks.max_outbox_mb", Ty::Uint),
 ];
 
 /// Keys that are deliberately NOT config — a secret that lives in the macOS
@@ -372,6 +392,8 @@ fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
                 .map(|s| Value::String(s.to_string()))
                 .collect(),
         ),
+        Ty::Json => serde_json::from_str(raw)
+            .map_err(|e| anyhow!("not valid JSON: {e}"))?,
     })
 }
 
@@ -559,6 +581,47 @@ mod tests {
         assert_eq!(cfg.cmd.unwrap().allowed, Some(Vec::<String>::new()));
     }
 
+    /// (#2093) `hooks.enabled` and `hooks.outbox_dir` are ordinary scalar
+    /// keys through the dotted-key registry.
+    #[test]
+    fn hooks_enabled_and_outbox_dir_set() {
+        let f = tmp();
+        let p = f.path();
+        set_at(p, "hooks.enabled", "true").unwrap();
+        set_at(p, "hooks.outbox_dir", "~/.darkmux/hooks").unwrap();
+        let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        let hooks = cfg.hooks.unwrap();
+        assert_eq!(hooks.enabled, Some(true));
+        assert_eq!(hooks.outbox_dir.as_deref(), Some("~/.darkmux/hooks"));
+    }
+
+    /// (#2093) `hooks.rules` is a structured array — settable as raw JSON
+    /// (`Ty::Json`), the one exception to the scalar-only registry. Valid
+    /// JSON that doesn't shape-match `Vec<HookRule>` is still accepted at
+    /// THIS layer (HookRule's own fields are all-`Option` + `extras`
+    /// overflow, so it never fails to parse) — semantic validation (a
+    /// non-loopback URL, an empty match) is `HookSink`/doctor's job, not
+    /// `config set`'s, per the config-leniency contract.
+    #[test]
+    fn hooks_rules_settable_as_raw_json() {
+        let f = tmp();
+        let p = f.path();
+        set_at(
+            p,
+            "hooks.rules",
+            r#"[{"match":{"action":"crawl.*"},"http":"http://127.0.0.1:8790/events"}]"#,
+        )
+        .unwrap();
+        let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        let rules = cfg.hooks.unwrap().rules.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].http.as_deref(), Some("http://127.0.0.1:8790/events"));
+        assert_eq!(rules[0].r#match.as_ref().unwrap().action.as_deref(), Some("crawl.*"));
+
+        // Invalid JSON is a clean rejection, not a panic.
+        assert!(set_at(p, "hooks.rules", "not json").is_err());
+    }
+
     #[test]
     fn unknown_key_is_rejected_with_suggestion() {
         let f = tmp();
@@ -650,6 +713,11 @@ mod tests {
                 // a valid FleetMode token doubles as the generic string sentinel
                 Ty::Str | Ty::FleetMode => Value::String("standalone".into()),
                 Ty::StrList => serde_json::json!(["sentinel"]),
+                // An empty array is valid JSON that parses cleanly to an
+                // empty `Vec<HookRule>` — sufficient to prove the KEY
+                // resolves to the typed `hooks.rules` field rather than
+                // overflowing into `extras`.
+                Ty::Json => serde_json::json!([]),
             };
             let mut root = Value::Object(Default::default());
             set_path(&mut root, key, sentinel);
@@ -672,6 +740,7 @@ mod tests {
             + c.runtime.as_ref().map_or(0, |x| x.extras.len())
             + c.fleet.as_ref().map_or(0, |x| x.extras.len())
             + c.cmd.as_ref().map_or(0, |x| x.extras.len())
+            + c.hooks.as_ref().map_or(0, |x| x.extras.len())
     }
 
     #[test]
