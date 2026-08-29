@@ -53,8 +53,15 @@ pub struct SkippedFile {
 
 #[derive(Debug, Clone)]
 pub struct Materialized {
+    /// (#1959) The spec's own `effective_name()`, carried here so a
+    /// consumer (the crawl planner) has everything it needs from ONE
+    /// `Materialized` value without also holding a `&WorkspaceSpec`.
+    pub name: String,
     pub root: PathBuf,
     pub sources: Vec<MaterializedSource>,
+    /// (#1959) The spec's own `edges`, carried verbatim — same reasoning
+    /// as `name`.
+    pub edges: Vec<super::EdgeSpec>,
     /// Per source id: the relative paths that pass the spec's
     /// `include`/`exclude`, sorted.
     pub files: std::collections::BTreeMap<String, Vec<String>>,
@@ -87,7 +94,14 @@ pub fn materialize(spec: &WorkspaceSpec, opts: MaterializeOptions) -> Result<Mat
         skipped.append(&mut skip);
     }
 
-    Ok(Materialized { root, sources, files, skipped })
+    Ok(Materialized {
+        name: spec.effective_name().to_string(),
+        root,
+        sources,
+        edges: spec.edges.clone(),
+        files,
+        skipped,
+    })
 }
 
 fn resolve_one(
@@ -487,6 +501,28 @@ mod tests {
 
     const RW: MaterializeOptions = MaterializeOptions { fetch: true, read_only: false };
     const RO: MaterializeOptions = MaterializeOptions { fetch: true, read_only: true };
+
+    /// (#1959) `Materialized.name`/`.edges` carry the spec's own
+    /// `effective_name()`/`edges` verbatim — so a consumer (the crawl
+    /// planner) has everything it needs from ONE `Materialized` value
+    /// without also holding a reference to the original `WorkspaceSpec`.
+    #[test]
+    fn materialized_carries_the_spec_name_and_edges() {
+        let source = init_source_repo();
+        let workdir = TempDir::new().unwrap();
+        let mut spec = spec_for("edges-test", workdir.path(), source.path(), "main");
+        spec.edges = vec![crate::workspace_spec::EdgeSpec {
+            consumer: "app".to_string(),
+            library: "app".to_string(),
+            package: "self".to_string(),
+            extras: Default::default(),
+        }];
+
+        let m = materialize(&spec, RW).unwrap();
+        assert_eq!(m.name, "edges-test");
+        assert_eq!(m.edges.len(), 1);
+        assert_eq!(m.edges[0].package, "self");
+    }
 
     #[test]
     fn materialize_checks_out_at_correct_sha_and_advances_on_new_commit() {
