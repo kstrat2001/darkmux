@@ -207,6 +207,17 @@ jobs:
           # reference plugin built above, run through the SAME public
           # `bundler` input seam a third-party plugin author would use.
           #
+          # (darkmux#2119) Pinning this plugin does NOT mean every self-
+          # review needs a `.rs` hunk: a docs/config/UI-only PR (the
+          # #2118 3.4.0 release PR — Cargo manifests, CHANGELOG, guide
+          # HTML) makes the reference plugin exit 1 with its own "nothing
+          # to bundle" line, since it only handles `.rs` files. That decline
+          # is read as `bundle_skip` for THIS plugin, not a review failure —
+          # `review-bundle-step` falls back to the built-in bundler over the
+          # same diff and records `bundler_fallback` on the envelope, so a
+          # non-Rust PR still gets reviewed instead of failing this check by
+          # construction.
+          #
           # Invoked via the explicit $DARKMUX_BIN path built above (#1359),
           # NOT a bare `darkmux` PATH lookup — guarantees this dispatch runs
           # the binary built from this run's own trusted-main checkout, not

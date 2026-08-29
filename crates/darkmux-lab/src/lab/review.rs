@@ -539,6 +539,18 @@ pub struct ReviewEnvelope {
     /// [`ReviewEnvelope::degenerate_kind`] classifies against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_skip: Option<BundleSkipReport>,
+    /// (#2119) Set only when a pinned `--bundler` plugin declined this diff
+    /// (its own stderr matched
+    /// [`crate::lab::bundle::external::PLUGIN_DECLINE_MARKER`] — "not my
+    /// language," not a crash) and `ReviewBundleStepKind::run_streaming`
+    /// fell back to the built-in bundler over the same diff instead of
+    /// erroring the whole review graph. `"built-in (plugin declined:
+    /// <reason>)"`, where `<reason>` is the plugin's own error text. `None`
+    /// on every other run: no `--bundler` pinned, a pinned plugin that
+    /// produced bundles normally, or one that failed for a real reason
+    /// (still a hard step error, unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundler_fallback: Option<String>,
     /// (#1605) Distinguishes a genuinely EMPTY-but-honest diff (every
     /// touched file declined for a benign reason — non-code content, no
     /// signal to review) from a real ERROR/unexplained degenerate outcome
@@ -3747,8 +3759,8 @@ use std::sync::Mutex as StdMutex;
 // calls these directly (moved out of `src/mission_launch_review.rs`'s
 // pre-graph prelude); see `ReviewBundleStepKind`'s doc.
 use super::bundle::{
-    build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, BundleSkipReport,
-    FileSource, SkipReason, SkippedFile,
+    build_bundles, external_bundles, is_plugin_decline, slice_code, slice_code_probe, BundleSet,
+    BundleSkipReport, FileSource, SkipReason, SkippedFile,
 };
 use std::path::{Path, PathBuf};
 
@@ -4423,6 +4435,10 @@ impl StepKind for ReviewBundleStepKind {
         // — that path hands in `Vec<BundleInput>` directly, with no
         // `BundleSet` (and so no skip bookkeeping) behind it.
         let mut bundle_skip: Option<BundleSkipReport> = None;
+        // (#2119) Set only on the specific "plugin declined this diff, fell
+        // back to the built-in bundler" path below — see
+        // `ReviewEnvelope::bundler_fallback`'s own doc.
+        let mut bundler_fallback: Option<String> = None;
         let bundle_inputs: Vec<BundleInput> = if let Some(over) = &ctx.bundle_override {
             over()?
         } else {
@@ -4439,7 +4455,26 @@ impl StepKind for ReviewBundleStepKind {
                         FileSource::Worktree(p) => Some(p.as_path()),
                         FileSource::GithubApi { .. } => None,
                     };
-                    external_bundles(cmd, worktree, Path::new(diff_file))?
+                    match external_bundles(cmd, worktree, Path::new(diff_file)) {
+                        Ok(set) => set,
+                        // (#2119) A pinned `--bundler` plugin declaring "not my
+                        // language" for this diff (darkmux-bundler-rust exits 1
+                        // on a diff with no `.rs` hunks, see its own doc) is not
+                        // a review failure — it means the pinned plugin has
+                        // nothing for THIS diff, not that the diff has nothing
+                        // reviewable. Fall back to the built-in bundler over the
+                        // same diff, same as an unpinned run would use, and name
+                        // the fallback on the envelope so the posted review says
+                        // why a non-Rust bundler ran a Rust-pinned check. A
+                        // genuine plugin failure (a crash, malformed output, an
+                        // unreadable diff) still propagates as a hard step
+                        // error, unchanged from before this fix.
+                        Err(e) if is_plugin_decline(&e) => {
+                            bundler_fallback = Some(format!("built-in (plugin declined: {e:#})"));
+                            build_bundles(&source, &ctx.diff)?
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 None => build_bundles(&source, &ctx.diff)?,
             };
@@ -4476,6 +4511,9 @@ impl StepKind for ReviewBundleStepKind {
             // synthesis step's zero-bundle degenerate gate reads this to
             // build a REASONED message instead of a bare count.
             env.bundle_skip = bundle_skip;
+            // (#2119) Stamped alongside them — `None` on every run except
+            // the plugin-declined-and-fell-back-to-built-in one above.
+            env.bundler_fallback = bundler_fallback;
         }
 
         let output = serde_json::to_string(&bundle_inputs).context("serializing bundles")?;

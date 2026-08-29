@@ -3017,6 +3017,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             remote_budgets: Vec::new(),
             needs_check_clusters: Vec::new(),
             bundle_skip: None,
+            bundler_fallback: None,
             degenerate_kind: None,
             probe_retries: 0,
         };
@@ -7817,6 +7818,253 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             judge_kind.residency(&judge_step, &judge_task, &input, &run_ctx).is_none(),
             "an empty bundle set must still skip the judge model load, exactly like the retired \
              ctx.bundles.is_empty() check did"
+        );
+    }
+
+    // ── (#2119) a pinned `--bundler` plugin declining a diff falls back to
+    //    the built-in bundler instead of erroring the whole review ────────
+
+    /// Write an executable shell stub standing in for a `--bundler` plugin
+    /// that ignores its argv (same convention `lab::bundle::external`'s own
+    /// `write_stub_script` uses) and just prints `stderr_line` then exits 1
+    /// — this test only cares how `ReviewBundleStepKind::run_streaming`
+    /// reacts to the exit, not that the stub actually bundles anything.
+    #[cfg(unix)]
+    fn write_stub_bundler_plugin(dir: &std::path::Path, stderr_line: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("bundler-stub.sh");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "echo {} >&2", shell_quote(stderr_line)).unwrap();
+        writeln!(f, "exit 1").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// Single-quote a shell word (the stub scripts' stderr lines are fixed
+    /// test strings with no embedded single quotes, so the naive `'...'`
+    /// wrap is sufficient — this exists only to keep `write_stub_bundler_
+    /// plugin`'s call sites readable, not as a general-purpose shell
+    /// escaper).
+    #[cfg(unix)]
+    fn shell_quote(s: &str) -> String {
+        assert!(!s.contains('\''), "test fixture must not embed a single quote: {s}");
+        format!("'{s}'")
+    }
+
+    /// The exact reference-plugin phrasing (`plugins/darkmux-bundler-rust/
+    /// src/main.rs`'s `eprintln!`, darkmux#2119) — a fixture-local copy
+    /// rather than a cross-crate import, since the plugin is a genuinely
+    /// standalone Cargo project with zero path dependency on darkmux-lab
+    /// (see that plugin's own module doc for why).
+    const RUST_PLUGIN_DECLINE_MESSAGE: &str = "darkmux-bundler-rust: no .rs files with reviewable \
+         hunks in this diff — nothing to bundle. (If this diff touches non-Rust files, the \
+         built-in bundler or another --bundler plugin may be the right tool for it; this plugin \
+         only handles .rs.)";
+
+    /// THE #2119 fix, proven end to end: a pinned `--bundler` plugin that
+    /// declines this diff (its own stderr matches the reference plugin's
+    /// "nothing to bundle" phrasing, on a non-zero exit) must not fail the
+    /// review graph — `ReviewBundleStepKind::run_streaming` falls back to
+    /// the built-in bundler over the SAME diff, publishes exactly what an
+    /// unpinned run would have, and names the fallback on the envelope so
+    /// the posted review can say why. Uses the same `tests/fixtures/bundle/`
+    /// worktree+diff the faithfulness test above uses, so "what the
+    /// built-in bundler alone would have produced" is the same known-good
+    /// `expected` value.
+    #[cfg(unix)]
+    #[test]
+    fn review_bundle_step_falls_back_to_built_in_bundler_when_the_pinned_plugin_declines() {
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bundle");
+        let worktree = fixture_dir.join("worktree");
+        let diff_text = std::fs::read_to_string(fixture_dir.join("diff.patch"))
+            .expect("read the bundle_golden integration test's own diff.patch fixture");
+
+        let expected_source = FileSource::worktree(&worktree);
+        let expected_set =
+            build_bundles(&expected_source, &diff_text).expect("build_bundles over the bundle_golden fixture");
+        let expected = bundle_inputs_from_set(&expected_set, &expected_source)
+            .expect("bundle_inputs_from_set over the bundle_golden fixture");
+        assert!(!expected.is_empty(), "the fixture must produce real bundles, or this test proves nothing");
+
+        let stub_dir = tempfile::TempDir::new().expect("tempdir");
+        let plugin = write_stub_bundler_plugin(stub_dir.path(), RUST_PLUGIN_DECLINE_MESSAGE);
+
+        let ctx = Arc::new(ReviewStepContext {
+            case_id: "case-1".to_string(),
+            roles: valid_crew(),
+            intent_title: String::new(),
+            intent_body: String::new(),
+            diff: diff_text,
+            probe_system: String::new(),
+            probe_role_prompts: BTreeMap::new(),
+            judge_system: String::new(),
+            verify_system: String::new(),
+            remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
+            timeout_seconds: 30,
+            chat_override: None,
+            bundle_override: None,
+            mission_id: None,
+        });
+        let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
+        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as Arc<dyn Any + Send + Sync>);
+        bus.materialize(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact);
+        let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
+
+        let diff_file = stub_dir.path().join("d.diff");
+        std::fs::write(&diff_file, "").expect("write a placeholder diff file (the stub plugin never reads it)");
+        let step = darkmux_crew::types::Step {
+            id: "review-bundle-step".to_string(),
+            task_id: "review-bundle-task".to_string(),
+            gate: None,
+            kind: "review.bundle".to_string(),
+            status: NodeStatus::default(),
+            config: serde_json::json!({
+                "source": { "kind": "worktree", "path": worktree.display().to_string() },
+                "bundler": plugin.display().to_string(),
+                "diff_file": diff_file.display().to_string(),
+            }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = darkmux_crew::types::Task {
+            id: "review-bundle-task".to_string(),
+            phase_id: "investigate".to_string(),
+            description: "bundle".to_string(),
+            display_name: None,
+            step_ids: vec!["review-bundle-step".to_string()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let input = BTreeMap::new();
+
+        use darkmux_crew::step_kinds::StepKind as _;
+        let kind = ReviewBundleStepKind;
+        kind.run_streaming(&step, &task, &input, &run_ctx)
+            .expect("a plugin decline must fall back to the built-in bundler, not error the step");
+
+        let published: Vec<BundleInput> = run_ctx
+            .artifact::<StdMutex<Vec<BundleInput>>>(REVIEW_BUNDLES_ARTIFACT)
+            .expect("this kind's own provides() materializes review.bundles")
+            .lock()
+            .expect("review bundles mutex poisoned")
+            .clone();
+        assert_eq!(
+            serde_json::to_value(&published).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "the fallback must publish exactly what an unpinned (built-in-bundler) run would have"
+        );
+
+        let env = env.lock().expect("shared review envelope mutex poisoned");
+        assert_eq!(env.bundles, expected.len());
+        assert!(
+            env.bundle_skip.is_some(),
+            "the fallback must carry the BUILT-IN bundler's real per-file skip accounting, not the \
+             plugin's empty default"
+        );
+        let fallback = env
+            .bundler_fallback
+            .as_deref()
+            .expect("bundler_fallback must be set when a plugin declined and the step fell back");
+        assert!(
+            fallback.starts_with("built-in (plugin declined: "),
+            "unexpected bundler_fallback shape: {fallback}"
+        );
+        assert!(
+            fallback.contains("nothing to bundle"),
+            "the fallback reason must carry the plugin's own message: {fallback}"
+        );
+    }
+
+    /// The converse of the fallback above: a pinned `--bundler` plugin that
+    /// fails for a REAL reason (a crash, a message that does not match the
+    /// reference plugin's decline phrasing) must still error the whole
+    /// step, exactly as before #2119 — the fallback is scoped to the one
+    /// named decline shape, never a blanket "any non-zero exit is fine."
+    #[cfg(unix)]
+    #[test]
+    fn review_bundle_step_still_errors_when_the_pinned_plugin_fails_for_a_real_reason() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stub_dir = tempfile::TempDir::new().expect("tempdir");
+        let plugin = write_stub_bundler_plugin(stub_dir.path(), "some-bundler: panicked reading the diff file");
+
+        let ctx = Arc::new(ReviewStepContext {
+            case_id: "case-1".to_string(),
+            roles: valid_crew(),
+            intent_title: String::new(),
+            intent_body: String::new(),
+            diff: String::new(),
+            probe_system: String::new(),
+            probe_role_prompts: BTreeMap::new(),
+            judge_system: String::new(),
+            verify_system: String::new(),
+            remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
+            timeout_seconds: 30,
+            chat_override: None,
+            bundle_override: None,
+            mission_id: None,
+        });
+        let env: Arc<StdMutex<ReviewEnvelope>> = Arc::new(StdMutex::new(ReviewEnvelope::default()));
+        let mut bus = ArtifactBus::new();
+        bus.seed(REVIEW_CONTEXT_ARTIFACT, ctx.clone() as Arc<dyn Any + Send + Sync>);
+        bus.seed(REVIEW_ENVELOPE_ARTIFACT, env.clone() as Arc<dyn Any + Send + Sync>);
+        bus.materialize(REVIEW_BUNDLES_ARTIFACT, make_review_bundles_artifact);
+        let run_ctx = StepRunCtx::new(None, None, None, Arc::new(bus));
+
+        let diff_file = stub_dir.path().join("d.diff");
+        std::fs::write(&diff_file, "").expect("write a placeholder diff file (the stub plugin never reads it)");
+        let step = darkmux_crew::types::Step {
+            id: "review-bundle-step".to_string(),
+            task_id: "review-bundle-task".to_string(),
+            gate: None,
+            kind: "review.bundle".to_string(),
+            status: NodeStatus::default(),
+            config: serde_json::json!({
+                "source": { "kind": "worktree", "path": dir.path().display().to_string() },
+                "bundler": plugin.display().to_string(),
+                "diff_file": diff_file.display().to_string(),
+            }),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        };
+        let task = darkmux_crew::types::Task {
+            id: "review-bundle-task".to_string(),
+            phase_id: "investigate".to_string(),
+            description: "bundle".to_string(),
+            display_name: None,
+            step_ids: vec!["review-bundle-step".to_string()],
+            depends_on: Vec::new(),
+            reads: Vec::new(),
+            role_id: None,
+            profile_name: None,
+            workdir: None,
+            image: None,
+        };
+        let input = BTreeMap::new();
+
+        use darkmux_crew::step_kinds::StepKind as _;
+        let kind = ReviewBundleStepKind;
+        let err = kind
+            .run_streaming(&step, &task, &input, &run_ctx)
+            .expect_err("a genuine plugin failure must still error the step, unchanged from before #2119");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("panicked reading the diff file"), "unexpected error message: {msg}");
+        assert!(
+            !msg.contains("nothing to bundle"),
+            "a genuine failure must never be misread as a decline: {msg}"
         );
     }
 

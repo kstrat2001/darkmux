@@ -11,6 +11,23 @@ use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::process::Command;
 
+/// (#2119) The exact phrase the `darkmux-bundler-rust` reference plugin
+/// writes to stderr when a diff has no `.rs` hunks to bundle
+/// (`plugins/darkmux-bundler-rust/src/main.rs`) — not a crash, not
+/// malformed output, just "not my language." Any `--bundler` plugin whose
+/// stderr contains this substring on a non-zero exit is read the same way
+/// by [`is_plugin_decline`]: a decline, never a genuine bundler failure.
+pub const PLUGIN_DECLINE_MARKER: &str = "nothing to bundle";
+
+/// True when an [`external_bundles`] error is a plugin declaring it has
+/// nothing to bundle for this diff (see [`PLUGIN_DECLINE_MARKER`]) rather
+/// than a genuine failure (a crash, malformed output, an unreadable diff
+/// file). `ReviewBundleStepKind::run_streaming` falls back to the
+/// built-in bundler on `true`; propagates the error unchanged on `false`.
+pub fn is_plugin_decline(err: &anyhow::Error) -> bool {
+    err.to_string().contains(PLUGIN_DECLINE_MARKER)
+}
+
 /// Run `<cmd> --worktree <dir> --diff <file>` (worktree omitted when
 /// `None`, for a `GithubApi`-sourced external bundler that has no local
 /// checkout) and parse its stdout as a [`BundleSet`]. Validates LOUDLY —
@@ -159,5 +176,40 @@ EOF
             msg.contains("missing a required field") || msg.contains("wrong shape"),
             "unexpected error message: {msg}"
         );
+    }
+
+    // (#2119) `is_plugin_decline` is the classification `ReviewBundleStepKind::
+    // run_streaming` uses to tell "not my language" from a real plugin
+    // failure — proven at both ends: the exact reference-plugin phrasing
+    // reads as a decline, and an unrelated exit-1 message does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_decline_phrased_like_the_reference_rust_plugin_is_recognized() {
+        let dir = TempDir::new().unwrap();
+        let script = write_stub_script(
+            dir.path(),
+            "declining-bundler.sh",
+            "echo 'darkmux-bundler-rust: no .rs files with reviewable hunks in this diff — \
+             nothing to bundle.' >&2\nexit 1\n",
+        );
+        let diff_path = dir.path().join("d.diff");
+        std::fs::write(&diff_path, "").unwrap();
+        let err = external_bundles(script.to_str().unwrap(), Some(dir.path()), &diff_path).unwrap_err();
+        assert!(is_plugin_decline(&err), "expected a decline, got: {err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_genuine_plugin_failure_is_not_read_as_a_decline() {
+        let dir = TempDir::new().unwrap();
+        let script = write_stub_script(
+            dir.path(),
+            "crashing-bundler.sh",
+            "echo 'darkmux-bundler-rust: panicked reading diff file' >&2\nexit 1\n",
+        );
+        let diff_path = dir.path().join("d.diff");
+        std::fs::write(&diff_path, "").unwrap();
+        let err = external_bundles(script.to_str().unwrap(), Some(dir.path()), &diff_path).unwrap_err();
+        assert!(!is_plugin_decline(&err), "expected NOT a decline, got: {err:#}");
     }
 }
