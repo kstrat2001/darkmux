@@ -28,6 +28,7 @@ import {
 import { memBytes, reclaimableNote } from "../../lib/format";
 import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
 import { Meter, CX, type MeterBand, type MeterTick } from "../../components/Meter";
+import { useIsMobile } from "../../hooks/useIsMobile";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
 /**
@@ -636,6 +637,12 @@ export interface HealthRegionProps {
    * see `isUtilityTierRow`'s doc for why the caller pre-filters to just
    * the resident case. */
   utilityModelId?: string | null;
+  /** (#2108, operator finding) Test-only override for the mobile/desktop
+   * ledger-summary split below — production omits this and measures
+   * `window.innerWidth` via `useIsMobile` (see that hook's own doc; the
+   * SAME 768px breakpoint `MachineDrawer.tsx`/`PhoneDrawer.tsx` key their
+   * own phone skin off). */
+  isMobileOverride?: boolean;
 }
 
 export function MachineHealthRegion({
@@ -647,7 +654,10 @@ export function MachineHealthRegion({
   residencyChanged = false,
   nowMs = Date.now(),
   utilityModelId = null,
+  isMobileOverride,
 }: HealthRegionProps) {
+  const measuredIsMobile = useIsMobile();
+  const isMobile = isMobileOverride ?? measuredIsMobile;
   if (!isLocalMach) {
     return (
       <div className="memcard">
@@ -704,54 +714,128 @@ export function MachineHealthRegion({
           always computed in binary), and relabelling that one token is gated on
           retiring the machine stage's last byte-exact parity tie to legacy.
           Operator call, still not a drive-by. */}
-      <div className="mm-kv mm-kv--machine">
-        {/* #1821 (operator-approved naming): this row used to read
-            `pool free <memBytes(pool.available_bytes)>` — truly-free pages,
-            sitting a few inches from a "% free" pressure tile that measured
-            something else entirely (82% margin vs 30.8% truly-free, same
-            instant). `used` and `available` now name what they actually
-            are; `available` (the colloquial "how much is left" —
-            free + inactive + speculative) is the headline figure in the
-            slot `pool free` used to occupy. Truly-free pages (`free_bytes`)
-            stay in the payload but are deliberately NOT given prime space
-            here — two figures both reading as "how much is left" was the
-            defect being fixed, not something to preserve under a new name. */}
-        limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b>{" "}
-        · used <b>{memBytes(b.pool?.used_bytes)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>
-        {reclaimableNote(b.pool?.available_bytes, b.pool?.free_bytes)}{" "}
-        · unpriced{" "}
-        {/* A non-breaking space, not a plain one: this k/v strip is a flat text
-            run with no per-pair element, so the browser may break at ANY space
-            in it — and at the wider type scale it chose the one INSIDE this
-            value, rendering `unpriced 0` on one line and `models` alone on the
-            next. A count severed from its unit is the same defect as a label
-            severed from its value (#2000), just produced by inline wrapping
-            rather than by a grid.
-
-            Scoped to the counts rather than `white-space: nowrap` on every
-            `<b>`: other values in this strip are phrases, not short tokens,
-            and must stay breakable or they overflow a phone. */}
-        <b>
-          {Number(b.machine.unpriced_models) || 0}&nbsp;model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}
-        </b>
-        {/* #1819: the same row that already discloses the genuinely-unpriced
-            count discloses the ESTIMATED count too — a different fact
-            (counted, but via a labeled guess, not a measurement), stated
-            beside it rather than folded into the same number. Omitted
-            entirely when zero, matching the unpriced clause's own
-            always-present-but-usually-zero shape being the one exception
-            worth keeping (unpriced is a structural row; estimated only
-            earns its place on the page when it's actually true). */}
-        {Number(b.machine.estimated_models) > 0 && (
+      {/* (#2108, operator finding) A phone found this row's dotted inline
+          form — "limit source physical pool · pool 128.00 GiB · used … ·
+          available … (… reclaimable) · unpriced 0 models" — wrapping into
+          four ragged lines with the ` · ` separators landing mid-line. On
+          a narrow viewport (`useIsMobile`, the SAME 768px breakpoint the
+          drawer keys its own phone skin off) this renders the identical
+          FACTS as a definition-style list instead — one row per item,
+          muted label left, bold value right — rather than one long
+          wrapping run; desktop keeps the inline dotted form unchanged.
+          Every string is computed ONCE (`unpricedValue`/`estimatedValue`/
+          `reclaim` below) and reused by both branches, so the two forms
+          can never drift apart on the actual numbers, only on layout. */}
+      {(() => {
+        const unpricedCount = Number(b.machine.unpriced_models) || 0;
+        const estimatedCount = Number(b.machine.estimated_models) || 0;
+        const reclaim = reclaimableNote(b.pool?.available_bytes, b.pool?.free_bytes);
+        // A non-breaking space, not a plain one: a count severed from its
+        // unit ("0" alone on one line, "models" on the next) is the same
+        // defect as a label severed from its value (#2000) — see the
+        // desktop branch's own historical note below for the wrapping
+        // case this originally guarded.
+        const unpricedValue = (
           <>
-            {" "}
-            · estimated{" "}
-            <b>
-              {b.machine.estimated_models}&nbsp;model{b.machine.estimated_models === 1 ? "" : "s"}
-            </b>
+            {unpricedCount}&nbsp;model{unpricedCount === 1 ? "" : "s"}
           </>
-        )}
-      </div>
+        );
+        const estimatedValue = (
+          <>
+            {estimatedCount}&nbsp;model{estimatedCount === 1 ? "" : "s"}
+          </>
+        );
+
+        if (isMobile) {
+          return (
+            <div className="mm-kv mm-kv--machine mm-kv--machine-mobile" data-act="machine-detail-rows">
+              <div className="mm-kv-row">
+                <span className="mm-kv-row__label">limit source</span>
+                <span className="mm-kv-row__value">{limitDescription(b.limit_source)}</span>
+              </div>
+              <div className="mm-kv-row">
+                <span className="mm-kv-row__label">pool</span>
+                <span className="mm-kv-row__value">{memBytes(b.pool?.capacity_bytes)}</span>
+              </div>
+              <div className="mm-kv-row">
+                <span className="mm-kv-row__label">used</span>
+                <span className="mm-kv-row__value">{memBytes(b.pool?.used_bytes)}</span>
+              </div>
+              <div className="mm-kv-row">
+                <span className="mm-kv-row__label">available</span>
+                <span className="mm-kv-row__value">{memBytes(b.pool?.available_bytes)}</span>
+              </div>
+              {/* The overlap parenthetical, as its OWN row under `available`
+                  rather than folded onto that row's already-tight two-column
+                  line — it is a secondary, explanatory fact, not a fourth
+                  column. Trimmed of its wrapping parens/space (desktop's own
+                  inline form keeps them, since there it reads as a trailing
+                  parenthetical, not a standalone line). */}
+              {reclaim && (
+                <div className="mm-kv-row mm-kv-row--note">
+                  {reclaim.replace(/^\s*\(|\)\s*$/g, "")}
+                </div>
+              )}
+              <div className="mm-kv-row">
+                <span className="mm-kv-row__label">unpriced</span>
+                <span className="mm-kv-row__value">{unpricedValue}</span>
+              </div>
+              {estimatedCount > 0 && (
+                <div className="mm-kv-row">
+                  <span className="mm-kv-row__label">estimated</span>
+                  <span className="mm-kv-row__value">{estimatedValue}</span>
+                </div>
+              )}
+            </div>
+          );
+        }
+
+        return (
+          <div className="mm-kv mm-kv--machine">
+            {/* #1821 (operator-approved naming): this row used to read
+                `pool free <memBytes(pool.available_bytes)>` — truly-free pages,
+                sitting a few inches from a "% free" pressure tile that measured
+                something else entirely (82% margin vs 30.8% truly-free, same
+                instant). `used` and `available` now name what they actually
+                are; `available` (the colloquial "how much is left" —
+                free + inactive + speculative) is the headline figure in the
+                slot `pool free` used to occupy. Truly-free pages (`free_bytes`)
+                stay in the payload but are deliberately NOT given prime space
+                here — two figures both reading as "how much is left" was the
+                defect being fixed, not something to preserve under a new name. */}
+            limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b>{" "}
+            · used <b>{memBytes(b.pool?.used_bytes)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>
+            {reclaim}{" "}
+            · unpriced{" "}
+            {/* A non-breaking space, not a plain one: this k/v strip is a flat text
+                run with no per-pair element, so the browser may break at ANY space
+                in it — and at the wider type scale it chose the one INSIDE this
+                value, rendering `unpriced 0` on one line and `models` alone on the
+                next. A count severed from its unit is the same defect as a label
+                severed from its value (#2000), just produced by inline wrapping
+                rather than by a grid.
+
+                Scoped to the counts rather than `white-space: nowrap` on every
+                `<b>`: other values in this strip are phrases, not short tokens,
+                and must stay breakable or they overflow a phone. */}
+            <b>{unpricedValue}</b>
+            {/* #1819: the same row that already discloses the genuinely-unpriced
+                count discloses the ESTIMATED count too — a different fact
+                (counted, but via a labeled guess, not a measurement), stated
+                beside it rather than folded into the same number. Omitted
+                entirely when zero, matching the unpriced clause's own
+                always-present-but-usually-zero shape being the one exception
+                worth keeping (unpriced is a structural row; estimated only
+                earns its place on the page when it's actually true). */}
+            {estimatedCount > 0 && (
+              <>
+                {" "}
+                · estimated <b>{estimatedValue}</b>
+              </>
+            )}
+          </div>
+        );
+      })()}
 
       {/* The machine's OWN shrink hint (distinct from a per-model one — an
           `amber` "Σ potential > limit" verdict names a shrink target at the
