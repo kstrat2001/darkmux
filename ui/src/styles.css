@@ -4442,6 +4442,18 @@ body {
 .dialog--wide {
   width: 540px;
 }
+/* (#2116) Filters gets its own width rule rather than reusing
+   `.dialog--wide` — Notes' fixed 540px is tuned for prose; the activity
+   facet's grid below wants to actually USE the extra room a wider
+   viewport offers, so this scales with the viewport instead of pinning a
+   second fixed number. `max-width: 92vw` on the base `.dialog` rule above
+   still applies (this is additive, not a full override), so a narrow
+   viewport is already covered without a separate phone override — see
+   `.dialog__fgroup--activity` below for why the grid itself needs none
+   either. */
+.dialog--filters {
+  width: min(90vw, 720px);
+}
 @keyframes dialog-pop-in {
   from {
     opacity: 0;
@@ -4492,6 +4504,26 @@ body {
   font: calc(12px * var(--fs-scale)) var(--font-mono);
   color: var(--fg);
   cursor: pointer;
+}
+/* (#2116) The activity facet's own layout — the one group that can grow
+   to ~40 checkboxes on a busy day (`computeFacets` derives it from the
+   day's own records, `lib/eventFilters.ts`). `repeat(auto-fill,
+   minmax(180px, 1fr))` fills as many 180px columns as `.dialog--filters`'
+   own width offers; NO separate phone override is needed — at a ~350px
+   content width (a 390px viewport's `min(90vw, 720px)`, minus the
+   dialog's own padding) `auto-fill` already computes to exactly one
+   column, the same single-column behavior every other facet group keeps
+   at every width via its own `inline-flex` wrap. `computeFacets` itself
+   sorts same-prefix actions (`mission.*`/`phase.*`/`step.*`/`dispatch.*`/
+   `hook.*`) together, so reading down a column groups related actions
+   the way reading across the old two-column swarm never did. */
+.dialog__fgroup--activity {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 2px 12px;
+}
+.dialog__fgroup--activity label {
+  margin: 0 0 5px;
 }
 .dialog__fgroup input {
   accent-color: var(--accent);

@@ -49,10 +49,22 @@ export function FiltersDialog({
   onClearAll: () => void;
 }) {
   return (
-    <Dialog id="modalbg" titleId="filters-title" title="filter events">
+    // (#2116) `className="dialog--filters"` — the activity facet alone can
+    // run to ~40 checkboxes on a busy day (facets are computed from the
+    // day's own records), which the shared 380px `.dialog` box turns into
+    // a skinny scrolling column. `dialog--filters` (styles.css) widens
+    // ONLY this dialog to `min(90vw, 720px)`; About and Machine info,
+    // which share the plain `.dialog` class, are untouched.
+    <Dialog id="modalbg" titleId="filters-title" title="filter events" className="dialog--filters">
       <div id="filterbody">
         {GROUPS.map(({ title, key }) => (
-          <div className="dialog__fgroup" key={key}>
+          // The activity group alone gets the multi-column grid
+          // (`.dialog__fgroup--activity`) — category/tier/telemetry
+          // source stay short lists that read fine as the default
+          // wrapped-inline-label layout; only `act` grows into the
+          // dozens `computeFacets` (`lib/eventFilters.ts`) can surface on
+          // a busy day.
+          <div className={`dialog__fgroup${key === "act" ? " dialog__fgroup--activity" : ""}`} key={key}>
             <h4>{title}</h4>
             {facets[key].map((value) => (
               <label key={value}>

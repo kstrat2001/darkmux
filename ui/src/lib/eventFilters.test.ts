@@ -10,6 +10,7 @@ import {
   activeFilterCount,
   restoreFilterState,
   persistFilterState,
+  sortUnmappedActivities,
 } from "./eventFilters";
 import type { Facets } from "./eventFilters";
 import { onlyModelFacet } from "../components/FiltersDialog";
@@ -37,6 +38,42 @@ describe("computeFacets / defaultFilterState", () => {
     expect(filters.tier.has("local")).toBe(true);
     expect(filters.tier.has("cloud")).toBe(true);
     expect(filters.q).toBe("");
+  });
+
+  // (#2116) On a busy day `activityOf()`'s own fallback — `return a ||
+  // "other"` — passes still-unmapped `r.action` strings straight through,
+  // and those used to land at the END of the activity facet in bare
+  // Set-iteration (first-seen) order. This proves the replacement:
+  // grouped by namespace prefix, alphabetical within a group, regardless
+  // of arrival order.
+  it("groups still-unmapped activity strings by namespace prefix, after the known ACT_ORDER entries", () => {
+    const records = [
+      rec({ action: "hook.enqueue" }),
+      rec({ action: "step.dispatch" }),
+      rec({ action: "mission.debrief" }),
+      rec({ action: "mission.start" }),
+      rec({ action: "phase.begin" }),
+      rec({ action: "dispatch.reasoning" }), // a KNOWN activity — "reasoning"
+    ];
+    const facets = computeFacets(records);
+    // "reasoning" is a known ACT_ORDER entry and sorts first regardless of
+    // this test's own record order; the four unmapped raw actions follow,
+    // grouped by prefix and alphabetical within each group — not the
+    // first-seen order the records above were listed in.
+    expect(facets.act).toEqual(["reasoning", "hook.enqueue", "mission.debrief", "mission.start", "phase.begin", "step.dispatch"]);
+  });
+
+  it("sortUnmappedActivities groups by prefix before falling back to the full string", () => {
+    expect(sortUnmappedActivities(["step.b", "mission.z", "step.a", "mission.a"])).toEqual([
+      "mission.a",
+      "mission.z",
+      "step.a",
+      "step.b",
+    ]);
+  });
+
+  it("sortUnmappedActivities leaves a prefix-less value alone (groups with itself)", () => {
+    expect(sortUnmappedActivities(["zeta", "mission.a", "alpha"])).toEqual(["alpha", "mission.a", "zeta"]);
   });
 });
 
