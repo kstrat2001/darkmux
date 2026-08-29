@@ -3076,7 +3076,18 @@ fn run_list_binary_agrees_with_the_shared_union_it_calls() {
     );
 }
 
-// ── crawl plan (#1959 packet 1) ──
+// ── crawl --dry-run (#1959) ──
+//
+// Migrated from the retired `darkmux crawl plan` verb (deleted alongside
+// the standalone CLI family — see `src/cli.rs`'s Crawl retirement commit).
+// The equivalent surface today is `darkmux mission launch crawl
+// --dry-run`: it resolves + plans exactly the same way, mints nothing,
+// and either prints the human plan table (the default) or writes the
+// full plan JSON to `--param plan_out=<path>` when the assertion needs
+// structured data. `--param workspace=<spec.json>` replaces the old
+// positional manifest arg; the manifest/spec JSON SHAPE is unchanged
+// (`SourceSpec`/`EdgeSpec` are wire-compatible with the retired
+// `CorpusManifest`'s own fields).
 
 fn git(dir: &std::path::Path, args: &[&str]) {
     let out = std::process::Command::new("git")
@@ -3156,10 +3167,14 @@ fn write_lib_repo(dir: &std::path::Path, version: &str) {
     commit_all(dir, "lib: initial");
 }
 
-fn write_manifest(path: &std::path::Path, root: &std::path::Path, app: &std::path::Path, lib: &std::path::Path) {
-    let manifest = serde_json::json!({
+/// (#1959) `SourceSpec`/`EdgeSpec`'s wire shape is unchanged from the
+/// retired `CorpusManifest`'s own fields — only the file's ROLE changed
+/// (a generic `WorkspaceSpec` any mission can take, not a crawl-only
+/// manifest).
+fn write_workspace_spec(path: &std::path::Path, root: &std::path::Path, app: &std::path::Path, lib: &std::path::Path) {
+    let spec = serde_json::json!({
         "schema_version": "1.0",
-        "name": "test-corpus",
+        "name": "test-workspace",
         "root": root.to_string_lossy(),
         "sources": [
             {"id": "app", "path": app.to_string_lossy(), "ref": "main"},
@@ -3168,36 +3183,54 @@ fn write_manifest(path: &std::path::Path, root: &std::path::Path, app: &std::pat
         "edges": [{"consumer": "app", "library": "lib", "package": "@org/lib"}],
         "rules": ["swallowed-error", "doc-contradicts-code", "stale-consumer"]
     });
-    fs::write(path, manifest.to_string()).unwrap();
+    fs::write(path, spec.to_string()).unwrap();
 }
 
-#[test]
-fn crawl_plan_produces_one_site_one_read_one_stale_edge_unit() {
-    let workdir = TempDir::new().unwrap();
-    let app = workdir.path().join("app");
-    let lib = workdir.path().join("lib");
-    write_app_repo(&app, "^5.5.0");
-    write_lib_repo(&lib, "8.1.1");
-
-    let manifest_path = workdir.path().join("corpus.json");
-    let root = workdir.path().join("croot");
-    write_manifest(&manifest_path, &root, &app, &lib);
-
+/// Runs `mission launch crawl --dry-run` with the given workspace spec,
+/// writing the full plan JSON to a fresh `plan.json` under `workdir` and
+/// returning it parsed. Panics (with stdout/stderr) on a non-zero exit.
+fn dry_run_plan_json(workdir: &std::path::Path, spec_path: &std::path::Path) -> serde_json::Value {
+    let plan_out = workdir.join("plan.json");
     let out = Command::cargo_bin("darkmux")
         .unwrap()
-        .args(["crawl", "plan", "--no-fetch", "--json"])
-        .arg(&manifest_path)
-        .env("DARKMUX_HOME", workdir.path())
+        .args([
+            "mission",
+            "launch",
+            "crawl",
+            "--dry-run",
+            "--param",
+            &format!("workspace={}", spec_path.display()),
+            "--param",
+            "no_fetch=true",
+            "--param",
+            &format!("plan_out={}", plan_out.display()),
+        ])
+        .env("DARKMUX_HOME", workdir)
         .output()
-        .expect("crawl plan runs");
+        .expect("mission launch crawl --dry-run runs");
     assert!(
         out.status.success(),
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let plan: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid plan JSON");
+    let text = fs::read_to_string(&plan_out).expect("plan_out was written");
+    serde_json::from_str(&text).expect("valid plan JSON")
+}
+
+#[test]
+fn dry_run_produces_one_site_one_read_one_stale_edge_unit() {
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let lib = workdir.path().join("lib");
+    write_app_repo(&app, "^5.5.0");
+    write_lib_repo(&lib, "8.1.1");
+
+    let spec_path = workdir.path().join("workspace.json");
+    let root = workdir.path().join("wroot");
+    write_workspace_spec(&spec_path, &root, &app, &lib);
+
+    let plan = dry_run_plan_json(workdir.path(), &spec_path);
 
     let units = plan["units"].as_array().expect("units array");
     let site_units: Vec<&serde_json::Value> =
@@ -3231,10 +3264,11 @@ fn crawl_plan_produces_one_site_one_read_one_stale_edge_unit() {
     // exercised separately below, is the loud-zero guarantee; this asserts
     // the same run isn't silently vacuous on the JSON side either.
     assert_eq!(plan["totals"]["units"].as_u64().unwrap(), 3);
+    assert_eq!(plan["workspace"], serde_json::json!("test-workspace"));
 }
 
 #[test]
-fn crawl_plan_admitted_range_produces_no_edge_unit_but_is_ledgered() {
+fn dry_run_admitted_range_produces_no_edge_unit_but_is_ledgered() {
     let workdir = TempDir::new().unwrap();
     let app = workdir.path().join("app");
     let lib = workdir.path().join("lib");
@@ -3242,25 +3276,11 @@ fn crawl_plan_admitted_range_produces_no_edge_unit_but_is_ledgered() {
     write_app_repo(&app, "^8.0.0");
     write_lib_repo(&lib, "8.1.1");
 
-    let manifest_path = workdir.path().join("corpus.json");
-    let root = workdir.path().join("croot");
-    write_manifest(&manifest_path, &root, &app, &lib);
+    let spec_path = workdir.path().join("workspace.json");
+    let root = workdir.path().join("wroot");
+    write_workspace_spec(&spec_path, &root, &app, &lib);
 
-    let out = Command::cargo_bin("darkmux")
-        .unwrap()
-        .args(["crawl", "plan", "--no-fetch", "--json"])
-        .arg(&manifest_path)
-        .env("DARKMUX_HOME", workdir.path())
-        .output()
-        .expect("crawl plan runs");
-    assert!(
-        out.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let plan: serde_json::Value =
-        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid plan JSON");
+    let plan = dry_run_plan_json(workdir.path(), &spec_path);
 
     let units = plan["units"].as_array().expect("units array");
     let edge_units: Vec<&serde_json::Value> =
@@ -3273,8 +3293,8 @@ fn crawl_plan_admitted_range_produces_no_edge_unit_but_is_ledgered() {
 }
 
 #[test]
-fn crawl_plan_zero_units_says_so_loudly_in_the_text_table() {
-    // A corpus with no rules matches nothing — the table must say "0
+fn dry_run_zero_units_says_so_loudly_in_the_text_table() {
+    // A workspace with no rules matches nothing — the table must say "0
     // units", never print an empty section that reads as silent success.
     let workdir = TempDir::new().unwrap();
     let app = workdir.path().join("app");
@@ -3282,26 +3302,25 @@ fn crawl_plan_zero_units_says_so_loudly_in_the_text_table() {
     write_app_repo(&app, "^5.5.0");
     write_lib_repo(&lib, "8.1.1");
 
-    let manifest = serde_json::json!({
+    let spec = serde_json::json!({
         "schema_version": "1.0",
-        "name": "empty-corpus",
-        "root": workdir.path().join("croot").to_string_lossy(),
+        "name": "empty-workspace",
+        "root": workdir.path().join("wroot").to_string_lossy(),
         "sources": [
             {"id": "app", "path": app.to_string_lossy(), "ref": "main"},
             {"id": "lib", "path": lib.to_string_lossy(), "ref": "main"}
         ],
         "rules": []
     });
-    let manifest_path = workdir.path().join("corpus.json");
-    fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(&spec_path, spec.to_string()).unwrap();
 
     let out = Command::cargo_bin("darkmux")
         .unwrap()
-        .args(["crawl", "plan", "--no-fetch"])
-        .arg(&manifest_path)
+        .args(["mission", "launch", "crawl", "--dry-run", "--param", &format!("workspace={}", spec_path.display()), "--param", "no_fetch=true"])
         .env("DARKMUX_HOME", workdir.path())
         .output()
-        .expect("crawl plan runs");
+        .expect("mission launch crawl --dry-run runs");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("0 units"), "got:\n{stdout}");
@@ -3313,7 +3332,7 @@ fn crawl_plan_zero_units_says_so_loudly_in_the_text_table() {
 /// followed), independent of which rules are active, so `rules: []` still
 /// produces exactly one skipped entry.
 #[test]
-fn crawl_plan_skipped_line_pluralizes_a_single_file_correctly() {
+fn dry_run_skipped_line_pluralizes_a_single_file_correctly() {
     let workdir = TempDir::new().unwrap();
     let app = workdir.path().join("app");
     let lib = workdir.path().join("lib");
@@ -3328,26 +3347,25 @@ fn crawl_plan_skipped_line_pluralizes_a_single_file_correctly() {
         commit_all(&app, "app: add a symlink");
     }
 
-    let manifest = serde_json::json!({
+    let spec = serde_json::json!({
         "schema_version": "1.0",
-        "name": "skipped-plural-corpus",
-        "root": workdir.path().join("croot").to_string_lossy(),
+        "name": "skipped-plural-workspace",
+        "root": workdir.path().join("wroot").to_string_lossy(),
         "sources": [
             {"id": "app", "path": app.to_string_lossy(), "ref": "main"},
             {"id": "lib", "path": lib.to_string_lossy(), "ref": "main"}
         ],
         "rules": []
     });
-    let manifest_path = workdir.path().join("corpus.json");
-    fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(&spec_path, spec.to_string()).unwrap();
 
     let out = Command::cargo_bin("darkmux")
         .unwrap()
-        .args(["crawl", "plan", "--no-fetch"])
-        .arg(&manifest_path)
+        .args(["mission", "launch", "crawl", "--dry-run", "--param", &format!("workspace={}", spec_path.display()), "--param", "no_fetch=true"])
         .env("DARKMUX_HOME", workdir.path())
         .output()
-        .expect("crawl plan runs");
+        .expect("mission launch crawl --dry-run runs");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     #[cfg(unix)]
@@ -3357,47 +3375,54 @@ fn crawl_plan_skipped_line_pluralizes_a_single_file_correctly() {
     }
 }
 
-/// #1959 finding 17: `--json` with no `--out` prints to stdout only — it
-/// must not ALSO silently write `plan.json` under the corpus root. `--json`
-/// WITH `--out` still writes (to the named path); `--json` is orthogonal to
-/// "should a file land on disk", not a proxy for "keep it in memory".
+/// (#1959) A dry run is read-only by default — it must never write
+/// `plan.json` (or anything else) unless `--param plan_out=<path>` names a
+/// destination. `plan_out` still writes to the named path when given.
 #[test]
-fn crawl_plan_json_without_out_does_not_write_plan_json_to_disk() {
+fn dry_run_writes_no_plan_file_unless_plan_out_is_given() {
     let workdir = TempDir::new().unwrap();
     let app = workdir.path().join("app");
     let lib = workdir.path().join("lib");
     write_app_repo(&app, "^5.5.0");
     write_lib_repo(&lib, "8.1.1");
 
-    let manifest_path = workdir.path().join("corpus.json");
-    let root = workdir.path().join("croot");
-    write_manifest(&manifest_path, &root, &app, &lib);
+    let spec_path = workdir.path().join("workspace.json");
+    let root = workdir.path().join("wroot");
+    write_workspace_spec(&spec_path, &root, &app, &lib);
 
     let out = Command::cargo_bin("darkmux")
         .unwrap()
-        .args(["crawl", "plan", "--no-fetch", "--json"])
-        .arg(&manifest_path)
+        .args(["mission", "launch", "crawl", "--dry-run", "--param", &format!("workspace={}", spec_path.display()), "--param", "no_fetch=true"])
         .env("DARKMUX_HOME", workdir.path())
         .output()
-        .expect("crawl plan runs");
+        .expect("mission launch crawl --dry-run runs");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(
         !root.join("plan.json").exists(),
-        "plan.json should not be written to disk without --out"
+        "plan.json should not be written to disk without --param plan_out="
     );
 
-    // With --out, --json still writes to the NAMED path.
+    // With plan_out, the plan still writes to the NAMED path.
     let out_path = workdir.path().join("explicit-plan.json");
     let out2 = Command::cargo_bin("darkmux")
         .unwrap()
-        .args(["crawl", "plan", "--no-fetch", "--json", "--out"])
-        .arg(&out_path)
-        .arg(&manifest_path)
+        .args([
+            "mission",
+            "launch",
+            "crawl",
+            "--dry-run",
+            "--param",
+            &format!("workspace={}", spec_path.display()),
+            "--param",
+            "no_fetch=true",
+            "--param",
+            &format!("plan_out={}", out_path.display()),
+        ])
         .env("DARKMUX_HOME", workdir.path())
         .output()
-        .expect("crawl plan runs");
+        .expect("mission launch crawl --dry-run runs");
     assert!(out2.status.success(), "stderr: {}", String::from_utf8_lossy(&out2.stderr));
-    assert!(out_path.exists(), "plan.json should be written when --out is given");
+    assert!(out_path.exists(), "plan.json should be written when plan_out is given");
 }
 
 /// #1959 finding 17: the by-rule table marks a read rule's row "(shared
@@ -3405,7 +3430,7 @@ fn crawl_plan_json_without_out_does_not_write_plan_json_to_disk() {
 /// otherwise the per-rule est_tokens sums silently double-count against
 /// totals.est_tokens with no visible explanation.
 #[test]
-fn crawl_plan_table_marks_shared_read_pass_rows() {
+fn dry_run_table_marks_shared_read_pass_rows() {
     let workdir = TempDir::new().unwrap();
     let app = workdir.path().join("app");
     let lib = workdir.path().join("lib");
@@ -3430,26 +3455,25 @@ fn crawl_plan_table_marks_shared_read_pass_rows() {
     )
     .unwrap();
 
-    let manifest = serde_json::json!({
+    let spec = serde_json::json!({
         "schema_version": "1.0",
-        "name": "shared-corpus",
-        "root": workdir.path().join("croot").to_string_lossy(),
+        "name": "shared-workspace",
+        "root": workdir.path().join("wroot").to_string_lossy(),
         "sources": [
             {"id": "app", "path": app.to_string_lossy(), "ref": "main"},
             {"id": "lib", "path": lib.to_string_lossy(), "ref": "main"}
         ],
         "rules": ["doc-contradicts-code", "second-read-rule"]
     });
-    let manifest_path = workdir.path().join("corpus.json");
-    fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let spec_path = workdir.path().join("workspace.json");
+    fs::write(&spec_path, spec.to_string()).unwrap();
 
     let out = Command::cargo_bin("darkmux")
         .unwrap()
-        .args(["crawl", "plan", "--no-fetch"])
-        .arg(&manifest_path)
+        .args(["mission", "launch", "crawl", "--dry-run", "--param", &format!("workspace={}", spec_path.display()), "--param", "no_fetch=true"])
         .env("DARKMUX_HOME", workdir.path())
         .output()
-        .expect("crawl plan runs");
+        .expect("mission launch crawl --dry-run runs");
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("shared read pass"), "got:\n{stdout}");

@@ -850,19 +850,21 @@ pub(crate) fn run(
     // (#1959) `--param rules=<csv>` wins when given; else the spec's own
     // `rules` array is the default binding (documented on the crawl
     // config's own inputs); else (the one-shot path already set it) the
-    // one-shot `--param rule=`.
+    // one-shot `--param rule=`. A workspace spec's `rules` field has no
+    // None-vs-empty distinction (it's a plain `Vec<String>`, not an
+    // `Option`), so an explicitly-empty `"rules": []` and an ABSENT
+    // `rules` key are indistinguishable here — both mean "nothing bound
+    // yet." Rather than guess which one the operator meant, an empty
+    // `rule_ids` is NOT an error: it plans cleanly to zero units (the
+    // "0 units" table below says so loudly), matching the pre-#1959
+    // CorpusManifest's own tested behavior for an explicitly-empty
+    // `rules: []` — this launcher never second-guesses a resolved-empty
+    // rule set into a hard failure.
     let rule_ids: Vec<String> = match &rules_csv {
         Some(csv) => csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
         None if !wspec.rules.is_empty() => wspec.rules.clone(),
         None => rule_one_shot.clone().into_iter().collect(),
     };
-    if rule_ids.is_empty() {
-        bail!(
-            "darkmux mission launch crawl: no rules resolved — pass --param rules=<csv>, use a \
-             workspace spec whose own `rules` array is non-empty, or pass --param source=/--param \
-             rule= for a one-shot crawl"
-        );
-    }
 
     let (rules_vec, rule_warnings) = rules::resolve_default(&rule_ids)?;
     for w in &rule_warnings {
