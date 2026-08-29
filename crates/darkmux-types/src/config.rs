@@ -320,12 +320,16 @@ pub struct RuntimeBehaviorConfig {
     /// honoring an operator's configured rest there would only add real
     /// latency the per-execution remote token allowance pays for nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub turn_delay_ms: Option<u64>,
-    /// (#2107, #1833) Cadence, in milliseconds, of `darkmux serve`'s
+    /// (#2107, #1833, #2108) Cadence, in milliseconds, of `darkmux serve`'s
     /// daemon-side continuous host sampler — the background thread that
-    /// reads cpu/mem/gpu (via `darkmux_crew::telemetry_sampler::sample_host`,
-    /// the SAME kernel-counter/`ioreg` mechanism the per-dispatch sampler
-    /// uses) into an in-memory ring so the machine stats drawer (phone
-    /// bottom tab, desktop modal) has live numbers between dispatches
+    /// reads cpu/mem/gpu/power/thermal (via its OWN privately-owned
+    /// `darkmux_crew::host_probe::HostProbe`, constructed inside the
+    /// sampler thread — NOT `telemetry_sampler::sample_host`'s shared,
+    /// `Mutex`-guarded singleton; the two are separate `HostProbe`
+    /// instances with separate cadences, on purpose, the same way
+    /// `dispatch_internal`'s per-dispatch sampler owns its own) into an
+    /// in-memory ring so the machine stats drawer (phone bottom tab,
+    /// desktop modal) has live numbers between dispatches
     /// instead of reading "idle · no samples" until one starts. `0`
     /// disables the sampler entirely (an explicit opt-out, mirroring
     /// `remote.max_tokens_per_execution`'s `0`-means-hard-off convention).

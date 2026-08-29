@@ -518,8 +518,19 @@ mod imp {
                 if all.is_null() {
                     return None;
                 }
-                let key = iokit::CfString::new("IOReportChannels")?;
-                let arr = iokit::dict_get(all, "IOReportChannels")?;
+                // (#2108 review finding) `all` is owned from here on, so
+                // every early return below must release it first — a `?`
+                // on `key`/`arr` would skip that (a one-time leak, since
+                // `new()` runs once per probe construction, not once per
+                // sample, but a leak all the same).
+                let Some(key) = iokit::CfString::new("IOReportChannels") else {
+                    iokit::release(all);
+                    return None;
+                };
+                let Some(arr) = iokit::dict_get(all, "IOReportChannels") else {
+                    iokit::release(all);
+                    return None;
+                };
                 let n = iokit::array_count(arr);
                 if n <= 0 {
                     iokit::release(all);
@@ -528,6 +539,11 @@ mod imp {
                 let chan = iokit::dict_mutable_copy(all);
                 let sel = iokit::array_mutable(n);
                 if chan.is_null() || sel.is_null() {
+                    // Whichever of `chan`/`sel` DID allocate is a real,
+                    // owned CF reference — `release` no-ops on the null one,
+                    // so both calls are safe regardless of which failed.
+                    iokit::release(chan as *const c_void);
+                    iokit::release(sel as *const c_void);
                     iokit::release(all);
                     return None;
                 }
