@@ -149,6 +149,7 @@ pub fn run() -> DoctorReport {
         check_power_state(),
         check_platform_and_provider(),
         check_crew_role_prompt_coverage(),
+        check_rules_registry(),
         check_flow_sink_health(),
         check_machine_id_resolution(),
         check_fleet_mode(),
@@ -2228,6 +2229,84 @@ fn check_crew_role_prompt_coverage() -> Check {
                 "Author the missing prompts at `templates/builtin/roles/<id>.md` and \
                  add them to `BUILTIN_ROLE_PROMPTS` in `src/crew/loader.rs`. Operators can \
                  override at `~/.darkmux/roles/<id>.md`."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// (#1959) The rule registry check — mirrors `check_crew_role_prompt_coverage`'s
+/// shape (built-in coverage + provenance, warn-not-fail on a thin config).
+/// Loads every rule (embedded + the `<darkmux root>/rules` user tier),
+/// reports the count and where they came from, and surfaces
+/// `darkmux_crew::rules::load_all`'s own warnings (a malformed user file,
+/// naming it) plus a check over EVERY loaded rule — not just one
+/// manifest's resolved subset, since doctor is asking "is the whole
+/// registry healthy" — for an empty `applies_to` or a `site` rule with no
+/// `prefilter` (either makes the rule inert: `warn_on_thin_rules` in
+/// `crew::rules` only runs over a manifest's resolved ids, so a rule
+/// nobody's manifest currently references would otherwise go unchecked
+/// forever).
+fn check_rules_registry() -> Check {
+    let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+        .root
+        .join("rules");
+    build_rules_check(Some(&user_dir))
+}
+
+fn build_rules_check(user_dir: Option<&std::path::Path>) -> Check {
+    use darkmux_crew::rules::RuleKind;
+
+    let (embedded_only, _) = darkmux_crew::rules::load_all(None);
+    let (map, mut warnings) = darkmux_crew::rules::load_all(user_dir);
+
+    for rule in map.values() {
+        if matches!(rule.kind, RuleKind::Site | RuleKind::Read) && rule.applies_to.is_empty() {
+            warnings.push(format!(
+                "rule '{}' has an empty `applies_to` — it will never match any file",
+                rule.id
+            ));
+        }
+        if rule.kind == RuleKind::Site && rule.prefilter.is_empty() {
+            warnings.push(format!(
+                "rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
+                rule.id
+            ));
+        }
+    }
+
+    let user_file_count = user_dir
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+
+    let provenance = match user_dir {
+        Some(d) if user_file_count > 0 => format!(
+            "{} built-in, {} user-tier file(s) at {}",
+            embedded_only.len(),
+            user_file_count,
+            d.display()
+        ),
+        _ => format!("{} built-in, no user tier", embedded_only.len()),
+    };
+
+    let message = format!("{} rule(s) loaded ({provenance})", map.len());
+
+    if warnings.is_empty() {
+        Check { name: "rules".into(), status: Status::Pass, message, hint: None }
+    } else {
+        Check {
+            name: "rules".into(),
+            status: Status::Warn,
+            message: format!("{message} — {}", warnings.join("; ")),
+            hint: Some(
+                "Fix the named rule file(s) under `<darkmux root>/rules/`, or drop the empty \
+                 `applies_to`/`prefilter` field so the rule actually matches something."
                     .into(),
             ),
         }
@@ -6254,10 +6333,10 @@ mod tests {
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
         // turn-delay [#2094] + mission-envelope-readability [#1881] + hooks
-        // [#2093]) + one per active eureka rule.
+        // [#2093] + rules [#1959]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 41 + darkmux_eureka::all_rules().len();
+        let expected = 42 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -7957,5 +8036,57 @@ mod tests {
             "a readable envelope must not be named among the unreadable ones: {}",
             check.message
         );
+    }
+
+    // ─── (#1959) check_rules_registry / build_rules_check ───────────────
+
+    #[test]
+    fn rules_check_passes_with_only_the_three_builtins_and_no_user_tier() {
+        let check = build_rules_check(None);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains('3'), "{}", check.message);
+        assert!(check.message.contains("built-in"), "{}", check.message);
+    }
+
+    #[test]
+    fn rules_check_reports_user_tier_provenance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("custom-rule.json"),
+            serde_json::json!({"id": "custom-rule", "kind": "read", "applies_to": ["**/*.py"]})
+                .to_string(),
+        )
+        .unwrap();
+
+        let check = build_rules_check(Some(tmp.path()));
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains('4'), "{}", check.message);
+        assert!(check.message.contains("1 user-tier file"), "{}", check.message);
+    }
+
+    #[test]
+    fn rules_check_warns_on_a_malformed_user_file_naming_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("broken.json"), "{ not json").unwrap();
+
+        let check = build_rules_check(Some(tmp.path()));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("broken.json"), "{}", check.message);
+    }
+
+    #[test]
+    fn rules_check_warns_on_empty_applies_to_and_site_with_no_prefilter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("thin-site.json"),
+            serde_json::json!({"id": "thin-site", "kind": "site"}).to_string(),
+        )
+        .unwrap();
+
+        let check = build_rules_check(Some(tmp.path()));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("thin-site"), "{}", check.message);
+        assert!(check.message.contains("applies_to"), "{}", check.message);
+        assert!(check.message.contains("prefilter"), "{}", check.message);
     }
 }

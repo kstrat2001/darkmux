@@ -55,6 +55,12 @@ pub mod mission_config;
 // `dispatch.map` fan-out and `darkmux-lab`'s review pipeline construct.
 pub mod remote_budget;
 pub mod resourcing;
+// (#1959) The rule registry — a named, searchable property bound to files
+// by glob, with match/no-match prose. Promoted out of the crawl module
+// (originally `darkmux_lab::crawl::rules`) to a general template kind so
+// any role's mission can bind to a rule, not only the crawler. See the
+// module doc for the search-order + merge-override contract.
+pub mod rules;
 // (#1877 item 5, motivated by #1876) The generic Complete/Partial/Empty run
 // outcome — see the module doc for why a budget-exhausted-but-mostly-
 // completed run needs a THIRD state, not just a binary degenerate flag.

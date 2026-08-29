@@ -10,7 +10,7 @@
 
 use super::*;
 use anyhow::anyhow;
-use darkmux_lab::crawl::rules::RuleKind;
+use darkmux_crew::rules::RuleKind;
 use std::cell::RefCell;
 use std::env;
 use std::process::Command;

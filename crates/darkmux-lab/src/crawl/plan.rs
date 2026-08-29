@@ -6,7 +6,7 @@
 
 use crate::crawl::glob;
 use crate::crawl::manifest::CorpusManifest;
-use crate::crawl::rules::{Rule, RuleKind};
+use darkmux_crew::rules::{Rule, RuleKind};
 use crate::crawl::semver::{prerelease_tag, range_admits};
 use crate::crawl::sources::ResolvedSource;
 use anyhow::{Context, Result};
@@ -745,7 +745,7 @@ fn collect_read_units(
             .filter_map(|rid| read_rules.iter().find(|r| &r.id == rid))
             .map(|r| r.chunk_tokens_or_default())
             .min()
-            .unwrap_or(crate::crawl::rules::DEFAULT_READ_CHUNK_TOKENS);
+            .unwrap_or(darkmux_crew::rules::DEFAULT_READ_CHUNK_TOKENS);
 
         let mut cur_files: Vec<ReadFileEntry> = Vec::new();
         let mut cur_tokens = 0usize;
@@ -1071,7 +1071,7 @@ fn collect_export_strings(v: &serde_json::Value, out: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crawl::rules::EdgeRuleConfig;
+    use darkmux_crew::rules::EdgeRuleConfig;
     use tempfile::TempDir;
 
     fn site_rule() -> Rule {

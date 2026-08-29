@@ -4,7 +4,8 @@
 //! per-family module convention.
 
 use anyhow::{Context, Result};
-use darkmux_lab::crawl::{manifest::CorpusManifest, plan, rules, sources};
+use darkmux_crew::rules;
+use darkmux_lab::crawl::{manifest::CorpusManifest, plan, sources};
 use darkmux_types::style;
 use std::path::PathBuf;
 

@@ -70,7 +70,7 @@ use crew::types::{
 };
 use darkmux_lab::crawl::manifest::CorpusManifest;
 use darkmux_lab::crawl::plan::{self, Plan, ReadFileEntry, Site, Unit};
-use darkmux_lab::crawl::rules::{self, Rule};
+use darkmux_crew::rules::{self, Rule};
 use darkmux_lab::crawl::sources;
 use darkmux_types::style;
 use serde_json::{json, Value};
