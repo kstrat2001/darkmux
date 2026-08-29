@@ -118,7 +118,10 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
       document.querySelector('[data-act="phone-drawer-panel-machine"]'),
     ).toBeNull();
     expect(document.querySelector(".eventlog")).not.toBeNull();
-    expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(2);
+    // (#2108) The Events tab now renders `inlineDetail` — each record's
+    // OWN full detail stacked inline, not the row-list `.eventlog__rec`
+    // shape (that's `EventLogColumn`'s non-inline mode).
+    expect(document.querySelectorAll(".eventlog__inlinerec")).toHaveLength(2);
   });
 
   it("tapping the handle closes the open drawer", () => {
@@ -171,10 +174,13 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     );
     const handle = document.querySelector('[data-act="phone-drawer-handle"]')!;
     drag(handle, 600, 200); // drag up 400px — well past the tap threshold
-    const body = document.querySelector(
-      '[data-act="phone-drawer-body"]',
+    // (#2108, "one card" packet) The animated height now lives on the
+    // OUTER sheet (`[data-act="phone-drawer"]`), not a separate body
+    // element — the whole card grows/shrinks as one unit.
+    const sheet = document.querySelector(
+      '[data-act="phone-drawer"]',
     ) as HTMLElement;
-    expect(body.style.height).not.toBe("50vh"); // moved off the default
+    expect(sheet.style.height).not.toBe("50vh"); // moved off the default
     expect(
       window.localStorage.getItem("dmux.phone-drawer.height.machine"),
     ).not.toBeNull();
@@ -215,21 +221,30 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
     );
-    let body = document.querySelector(
-      '[data-act="phone-drawer-body"]',
+    // (#2108, "one card" packet) Same outer-sheet height as above.
+    let sheet = document.querySelector(
+      '[data-act="phone-drawer"]',
     ) as HTMLElement;
-    expect(body.style.height).toBe("30vh");
+    expect(sheet.style.height).toBe("30vh");
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-events"]')!,
     );
-    body = document.querySelector(
-      '[data-act="phone-drawer-body"]',
+    sheet = document.querySelector(
+      '[data-act="phone-drawer"]',
     ) as HTMLElement;
-    expect(body.style.height).toBe("80vh");
+    expect(sheet.style.height).toBe("80vh");
   });
 
-  it("Events tab mounts EventLogColumn in pushDetail mode — selecting a record pushes a back-button detail screen", () => {
-    const events = { ...NO_EVENTS, records: [record(1)] };
+  // (#2108, operator finding) The Events tab, at its new 85-90vh open
+  // height, has real room — a drill-in tap is no longer needed. Each
+  // record renders its OWN full detail (the same `RecordView` a click
+  // used to open) inline, stacked, newest first.
+  it("Events tab renders each record's payload fields inline, with no click", () => {
+    const withPayload: FlowRecord = {
+      ...record(1),
+      payload: { tool_name: "grep", args_chars: 42 },
+    } as FlowRecord;
+    const events = { ...NO_EVENTS, records: [withPayload] };
     render(
       <PhoneDrawer
         machineTab={NOOP_MACHINE_TAB}
@@ -241,14 +256,40 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-events"]')!,
     );
-    fireEvent.click(document.querySelector('[data-act="rec"]')!);
-    expect(
-      document.querySelector('[data-act="eventlog-pushed"]'),
-    ).not.toBeNull();
-    expect(document.querySelector('[data-act="eventlog-back"]')).not.toBeNull();
-    fireEvent.click(document.querySelector('[data-act="eventlog-back"]')!);
+    // No click on the record itself — the payload is already rendered.
+    const recs = document.querySelectorAll('[data-act="eventlog-inline-rec"]');
+    expect(recs).toHaveLength(1);
+    // `RecordView`'s own key rendering replaces underscores with spaces
+    // (`Row`'s `.rv__key`) — asserting on ITS actual output, not a guess.
+    expect(recs[0].textContent).toContain("tool name");
+    expect(recs[0].textContent).toContain("grep");
+    expect(recs[0].textContent).toContain("args chars");
+    // The OLD click-to-push interaction is gone from this surface.
+    expect(document.querySelector('[data-act="rec"]')).toBeNull();
     expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
-    expect(document.querySelector('[data-act="rec"]')).not.toBeNull();
+  });
+
+  it("the sheet's open height is at least 85% of the viewport on first open (844px viewport)", () => {
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 844,
+    });
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    const sheet = document.querySelector(
+      '[data-act="phone-drawer"]',
+    ) as HTMLElement;
+    const vh = parseFloat(sheet.style.height);
+    expect(vh).toBeGreaterThanOrEqual(85);
   });
 
   it("the Events tab's connection dot reflects a live route's live status", () => {

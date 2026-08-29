@@ -23,6 +23,9 @@ import { openModalEl } from "../lib/dialogManager";
 /** Row cap — `renderLog()`'s `all.slice(-50).reverse()` (viewer.html:2443):
  * newest 50, newest-first. */
 const LOG_CAP = 50;
+/** (#2108) `inlineDetail`'s own windowing batch size — see that prop's
+ * own doc for why windowed rather than fully virtualized. */
+const INLINE_DETAIL_BATCH = 15;
 /** (#2068) How long the followed record holds in the detail card before the
  * next one may replace it. Two updates a second is still "live"; faster is
  * unreadable on a phone and reads as flicker. */
@@ -166,6 +169,7 @@ export function EventLogColumn({
   serverTruncated = false,
   paneId = "app",
   pushDetail = false,
+  inlineDetail = false,
 }: {
   records: FlowRecord[];
   visible: boolean;
@@ -214,6 +218,21 @@ export function EventLogColumn({
    * `MissionGraphLens.tsx`'s) omits this prop and keeps the original split
    * behavior unchanged. */
   pushDetail?: boolean;
+  /** (#2108, operator finding) The phone drawer's Events tab, at its new
+   * 85-90vh open height, has real room — but a drill-in tap is still one
+   * extra step for something the operator wants to just SCAN. Each
+   * record renders its OWN full detail (the exact `RecordView` a click
+   * would have opened) inline, stacked, newest first — no selection, no
+   * split, no push/back. Mutually exclusive with `pushDetail` in
+   * practice (a caller picks one interaction model), but kept as an
+   * independent prop rather than a third enum value on the same flag —
+   * `pushDetail`'s own tested behavior stays available to any future
+   * caller that still wants push-navigation. WINDOWED (not virtualized):
+   * only the first `INLINE_DETAIL_BATCH` records mount as real
+   * `RecordView`s; scrolling the list near its own bottom reveals the
+   * next batch, so a long capped list (`LOG_CAP` = 50) never mounts more
+   * expensive per-record DOM than the operator has actually scrolled to. */
+  inlineDetail?: boolean;
 }) {
   // The full facet-filter model (activity/category/tier/telemetry-source +
   // free-text search) — `FiltersDialog` renders the checkbox grid for it,
@@ -360,6 +379,38 @@ export function EventLogColumn({
   const capped = filtered.length > LOG_CAP;
   const visibleRecs = useMemo(() => filtered.slice(-LOG_CAP).reverse(), [filtered]);
 
+  // (#2108, `inlineDetail` — windowed, not virtualized, see that prop's
+  // own doc) How many of `visibleRecs`, in order, currently mount a real
+  // `RecordView`. Resets to one batch whenever the record SET changes
+  // (a route/filter change should not keep a stale count from a
+  // different list around) but NOT on every re-render of the same set —
+  // `visibleRecs.length` alone as the dep would also fire on every
+  // incoming live record, snapping an operator's scroll-revealed window
+  // back down. Keyed on the OLDEST record's own identity plus the count,
+  // which changes on a genuine set swap but not on an in-place append.
+  const inlineSetKey = visibleRecs.length ? `${recKey(visibleRecs[visibleRecs.length - 1])}:${visibleRecs.length}` : "";
+  const [inlineVisibleCount, setInlineVisibleCount] = useState(INLINE_DETAIL_BATCH);
+  useEffect(() => {
+    if (!inlineDetail) return;
+    // Not a full new-batch reset on EVERY change — only when the window
+    // would otherwise show fewer records than one batch's worth (a fresh
+    // mount, or a filter that shrank the set below the current reveal).
+    // Keyed on the OLDEST visible record's own identity plus the count
+    // (`inlineSetKey`), which changes on a genuine set swap but not on an
+    // in-place append at the front, so an operator's scroll-revealed
+    // window doesn't snap back down on every incoming live record.
+    setInlineVisibleCount((n) => (n < INLINE_DETAIL_BATCH ? INLINE_DETAIL_BATCH : n));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `inlineSetKey` IS the intended dependency (see comment above); `inlineDetail` guards the whole effect.
+  }, [inlineDetail, inlineSetKey]);
+  const inlineNearBottomPx = 300;
+  function onInlineListScroll(e: React.UIEvent<HTMLDivElement>) {
+    const el = e.currentTarget;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < inlineNearBottomPx;
+    if (nearBottom) {
+      setInlineVisibleCount((n) => Math.min(visibleRecs.length, n + INLINE_DETAIL_BATCH));
+    }
+  }
+
   // (#2068) The followed record is throttled: at playback speed the newest
   // record changed several times a second and the detail card swapped its
   // whole body each time, which on a phone reads as the pane "flickering
@@ -494,9 +545,10 @@ export function EventLogColumn({
               under it on each event. A hand-picked record keeps the content-sized
               pane, since nothing is streaming into it then — and so does an
               empty log, where a pinned box would hold nothing but the hint.
-              Omitted entirely in `pushDetail` mode — that layout replaces
-              this split with the pushed screen above instead. */}
-          {!pushDetail && (
+              Omitted entirely in `pushDetail`/`inlineDetail` mode — that
+              layout replaces this split with the pushed screen (or the
+              inline-stacked list) instead. */}
+          {!pushDetail && !inlineDetail && (
             <div className={`eventlog__detail${follow && selected ? " following" : ""}`} id="detail" style={{ flexBasis: `${detailPct}%` }}>
               {/* (operator) No "selected event" title. It was static chrome
                   competing with the record's own headline — `RecordView` already
@@ -511,7 +563,7 @@ export function EventLogColumn({
               </div>
             </div>
           )}
-          {!pushDetail && (
+          {!pushDetail && !inlineDetail && (
             <div
               className="eventlog__split"
               id="split"
@@ -611,6 +663,41 @@ export function EventLogColumn({
             </span>
           </div>
         </div>
+        {inlineDetail ? (
+          // (#2108, `inlineDetail`) Each record's OWN full detail, stacked,
+          // newest first — no selection state, no click. WINDOWED to
+          // `inlineVisibleCount` (see that state's own doc); scrolling
+          // this list near its own bottom reveals the next batch.
+          <div
+            id="logbody"
+            className="eventlog__body eventlog__body--inline"
+            data-act="eventlog-inline-list"
+            onScroll={onInlineListScroll}
+          >
+            {visibleRecs.length ? (
+              visibleRecs.slice(0, inlineVisibleCount).map((r) => (
+                <div
+                  key={recKey(r)}
+                  className="eventlog__inlinerec"
+                  data-act="eventlog-inline-rec"
+                  title={r.handle || undefined}
+                >
+                  <EventDetail record={r} />
+                </div>
+              ))
+            ) : (
+              <div className="eventlog__empty" data-state={error ? "error" : loading ? "loading" : "empty"} role={error ? "alert" : undefined}>
+                {error
+                  ? `couldn't load events${error.status !== null ? ` (HTTP ${error.status})` : ""}: ${error.message}`
+                  : loading
+                    ? "loading…"
+                    : records.length > 0
+                      ? "no events match your filters"
+                      : "no events yet"}
+              </div>
+            )}
+          </div>
+        ) : (
         <div id="logbody" className="eventlog__body">
           {visibleRecs.length ? (
             visibleRecs.map((r) => {
@@ -666,6 +753,7 @@ export function EventLogColumn({
             </div>
           )}
         </div>
+        )}
           </div>
         </>
       )}

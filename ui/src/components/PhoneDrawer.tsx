@@ -1,66 +1,61 @@
 /**
- * (#2107 tabbed-drawer packet) The phone-only (≤768px) bottom chrome — a
- * persistent, always-in-flow "mainstay" bar with two tabs, `Machine` and
- * `Events`, that opens into a draggable-height sheet. Replaces the earlier
- * single-purpose `machine-bottombar`/single-sheet phone chrome
- * `MachineDrawer.tsx` used to render inline (see that file's own doc for
- * the desktop skin, which is unchanged by this packet).
+ * (#2107 tabbed-drawer packet, restructured #2108 "one card" packet) The
+ * phone-only (≤768px) bottom chrome — ONE sheet, one handle, two tabs.
  *
  * **Why a separate component, not a third branch inside `MachineDrawer`:**
  * the tab-bar/drag/per-tab-height machinery here is generic chrome that
  * knows nothing about machine stats OR events — it takes two pre-built
  * panels (`machineTab.body`, an `EventLogColumn` instance) and hosts them.
  * `MachineDrawer.tsx` still owns the DECISION of which skin to render
- * (desktop pill/dialog vs this), and still owns the machine-stats DATA
+ * (desktop dialog vs this), and still owns the machine-stats DATA
  * (`useMachineStatsContent`, shared with the desktop dialog so the two
  * skins never duplicate that logic — see that hook's own doc).
  *
- * **Layout:** `.phone-drawer` is a `position:fixed` column pinned to the
- * viewport bottom. Its LAST child, `.phone-drawer__bar` (handle + two tab
- * buttons), has a FIXED height and is always rendered — the "mainstay".
- * Its FIRST child, `.phone-drawer__body`, is ALWAYS MOUNTED too (revised
- * #2107/#1833 "animate the slide" packet — see below); only its CONTENT
- * (the active tab's panel) is conditionally rendered while `open`. Its
- * height is the live-dragged `openPct` (vh); because the container is
- * bottom-anchored and the bar's height never changes, the body simply
- * grows the whole column upward as it opens/drags — no separate
- * "collapsed vs full" class swap the way the old single-sheet chrome
- * needed.
+ * **Layout, ONE card (#2108, operator finding — real-device review):** the
+ * #2107 shape had `.phone-drawer__bar` (handle+tabs) as an ALWAYS-VISIBLE
+ * separately-styled strip and `.phone-drawer__body` (content) as a SECOND
+ * element sliding independently behind/under it — on a real phone this
+ * read as two stacked cards, not one sheet, and the tabs never
+ * participated in the drag. `.phone-drawer` is now the ONE sliding/
+ * growing element (`position:fixed`, bottom-anchored) and is the sole
+ * thing that owns a background/border/border-radius — a real card. It
+ * contains, top to bottom: `.phone-drawer__bar` (handle, then the two
+ * tabs — the drag handle sits at the sheet's own TOP edge) FIRST, then
+ * `.phone-drawer__body` (the active tab's content) SECOND, filling the
+ * rest of the sheet's height. Both are permanent children of the SAME
+ * subtree; there is no second independently-transformed element.
  *
- * **The open/close slide (operator finding, phone install review):** a
- * conditionally-MOUNTED body (`{open && <div>...}`, the original #2107
- * shape) can never play an exit transition — React removes it from the DOM
- * the instant `open` flips, before any CSS transition gets a frame to
- * animate. The body is now always in the DOM; `styles.css`'s
- * `.phone-drawer__body` base rule sits at `transform: translateY(100%)`
- * (fully below the viewport, `visibility: hidden`), and
- * `.phone-drawer--open .phone-drawer__body` slides it to
- * `translateY(0)` over ~220ms ease-out — a real CSS `transition` on a
- * persistent element, not a keyframe replayed on every mount. Dragging
- * disables the transition via the `.phone-drawer--dragging` class (so the
- * sheet tracks the finger with zero lag) and it's re-enabled the instant
- * the pointer releases. `visibility`'s own transition is asymmetric on
- * purpose — instant on open (so the slide-up is visible from frame one),
- * DELAYED on close (so the sheet stays visible for the full 220ms slide-
- * down instead of vanishing first) — see the CSS rule's own comment.
- * `@media (prefers-reduced-motion: reduce)` already existed for this
- * class's height-only transition and now covers the transform too.
+ * **Height, not transform, drives open/close.** Closed, `.phone-drawer`
+ * has NO inline `height` — it falls back to `styles.css`'s own rule
+ * (`calc(58px + env(safe-area-inset-bottom, 0px))`, just enough for the
+ * handle+tabs, which is all that's visible). Open, an inline
+ * `style={{ height: `${openPct}vh` }}` overrides that, and CSS `height`
+ * genuinely transitions between the two (both are concrete lengths — no
+ * `auto`, so it interpolates smoothly) — `.phone-drawer__bar` stays
+ * pinned at the top of whichever height is current, `.phone-drawer__body`
+ * (`flex: 1`, gated open) fills what's left below it. The 2026-08-29
+ * "always mounted" fix that answered the OLD problem (a conditionally-
+ * mounted element can't play an exit transition) still applies here —
+ * `.phone-drawer` itself is always mounted, only removing/adding the
+ * inline height style, which the browser can transition either direction.
+ * Dragging disables the transition via `.phone-drawer--dragging` (so the
+ * sheet tracks the finger with zero lag) and it's re-enabled on release.
  *
  * **The body's own content stays gated on `open`** (`{open &&
  * (activeTab === "machine" ? ... : <EventLogColumn/>)}`) even though the
  * wrapper is always mounted — this is what keeps `EventLogColumn` (and the
  * machine stats panel's own daemon polling, gated separately via
  * `onMachineOpenChange` below) from rendering/fetching while the sheet is
- * closed and merely sliding off past the edge of the viewport.
+ * closed (58px tall — there is no room to show it anyway).
  *
- * **Modal while open, at ANY height (operator finding, same review):** the
- * page behind is unusable while the drawer is open — body scroll is locked
- * for the drawer's ENTIRE open lifetime now, not just "past ~50%" the way
- * the original spec had it, and a transparent full-viewport
- * `.phone-drawer__backdrop` (no visible dimming — the sheet itself already
- * reads as the foreground) sits behind the drawer and in front of the
- * page, so a tap anywhere outside the sheet DISMISSES it instead of
- * reaching whatever button/link happened to be under it.
+ * **Modal while open, at ANY height (operator finding, phone install
+ * review):** the page behind is unusable while the drawer is open — body
+ * scroll is locked for the drawer's ENTIRE open lifetime now, not just
+ * "past ~50%" the way the original spec had it, and a transparent
+ * full-viewport `.phone-drawer__backdrop` (no visible dimming — the sheet
+ * itself already reads as the foreground) sits behind the drawer and in
+ * front of the page, so a tap anywhere outside the sheet DISMISSES it
+ * instead of reaching whatever button/link happened to be under it.
  *
  * **Tap/drag semantics on the handle** (spec, #2107 packet brief):
  * - tapping a CLOSED tab opens the drawer to that tab, at its own
@@ -99,9 +94,13 @@ import {
   type DrawerTabId,
 } from "../lib/drawerStorage";
 
-/** vh used the first time a tab is ever opened (nothing stored yet) — a
- * sensible half-sheet, matching common bottom-sheet defaults. */
-const DEFAULT_OPEN_PCT = 50;
+/** vh used the first time a tab is ever opened (nothing stored yet).
+ * (#2108, operator finding) Raised from a half-sheet (50) to most of the
+ * viewport (85-90 is the instructed range) — a phone drawer that only
+ * shows half the screen leaves the operator scrolling BOTH the sheet and
+ * its own content unnecessarily; the sheet should be the primary surface
+ * once open, for both tabs. `MAX_OPEN_PCT` already accommodates this. */
+const DEFAULT_OPEN_PCT = 88;
 /** The spec's own ceiling ("~90vh"). */
 const MAX_OPEN_PCT = 90;
 /** A floor once genuinely open — below this the sheet reads as "barely
@@ -363,45 +362,20 @@ export function PhoneDrawer({
       <div
         className={`phone-drawer${open ? " phone-drawer--open" : ""}${dragging ? " phone-drawer--dragging" : ""}`}
         data-act="phone-drawer"
+        // (#2108, "one card" packet) Closed: NO inline height — falls
+        // back to `styles.css`'s own `calc(58px + env(safe-area-inset-
+        // bottom, 0px))` rule, just enough for the handle+tabs below.
+        // Open: the live-dragged `openPct`, which the browser transitions
+        // to/from the closed CSS value smoothly (both are concrete
+        // lengths — see this file's own doc on why that works without a
+        // JS-side safe-area calculation).
+        style={open ? { height: `${openPct}vh` } : undefined}
       >
-        {/* Always mounted (never conditionally unmounted) so the CSS
-            `transform`/`visibility` transition on `.phone-drawer--open
-            .phone-drawer__body` has a persistent element to animate — see
-            this file's own doc on why a conditionally-mounted body can
-            never play an exit transition. The CONTENT inside stays gated
-            on `open` so nothing renders/polls/fetches while the sheet is
-            merely slid off past the viewport edge. */}
-        <div
-          className="phone-drawer__body"
-          data-act="phone-drawer-body"
-          style={{ height: `${openPct}vh` }}
-          role={open ? "dialog" : undefined}
-          aria-modal={open ? true : undefined}
-          aria-hidden={!open}
-          aria-label={activeTab === "machine" ? "Machine stats" : "Events"}
-        >
-          {open &&
-            (activeTab === "machine" ? (
-              <div
-                className="phone-drawer__panel"
-                data-act="phone-drawer-panel-machine"
-              >
-                {machineTab.body}
-              </div>
-            ) : (
-              <EventLogColumn
-                paneId="phone-drawer"
-                scopeLabel={events.scopeLabel}
-                records={events.records}
-                visible={events.visible}
-                loading={events.loading}
-                error={events.error}
-                historical={events.historical}
-                serverTruncated={events.serverTruncated}
-                pushDetail
-              />
-            ))}
-        </div>
+        {/* (#2108, "one card" packet) The handle + two tabs are now PART
+            of the sliding sheet, not a second, separately-positioned
+            element — sitting at the sheet's own TOP edge (its FIRST
+            child), so they visibly move/grow WITH the card instead of
+            reading as a static strip a second card appears behind. */}
         <div className="phone-drawer__bar" data-act="phone-drawer-bar">
           <div
             className="phone-drawer__handle"
@@ -428,7 +402,7 @@ export function PhoneDrawer({
               className={`phone-drawer__tab${open && activeTab === "machine" ? " phone-drawer__tab--active" : ""}`}
               data-act="phone-drawer-tab-machine"
               aria-pressed={open && activeTab === "machine"}
-              aria-label="Machine stats"
+              aria-label="Machine info"
               onClick={() => onTabClick("machine")}
             >
               {/* (operator finding) A static label, not a live line — see
@@ -452,6 +426,43 @@ export function PhoneDrawer({
               </span>
             </button>
           </div>
+        </div>
+        {/* Always mounted (never conditionally unmounted) — same reasoning
+            as before the "one card" restructure, just now a plain flex
+            section (`flex: 1`) inside the ONE sliding sheet rather than a
+            second independently-animated element. The CONTENT inside
+            stays gated on `open` so nothing renders/polls/fetches while
+            the sheet is closed (58px tall — there is no room for it
+            anyway). */}
+        <div
+          className="phone-drawer__body"
+          data-act="phone-drawer-body"
+          role={open ? "dialog" : undefined}
+          aria-modal={open ? true : undefined}
+          aria-hidden={!open}
+          aria-label={activeTab === "machine" ? "Machine info" : "Events"}
+        >
+          {open &&
+            (activeTab === "machine" ? (
+              <div
+                className="phone-drawer__panel"
+                data-act="phone-drawer-panel-machine"
+              >
+                {machineTab.body}
+              </div>
+            ) : (
+              <EventLogColumn
+                paneId="phone-drawer"
+                scopeLabel={events.scopeLabel}
+                records={events.records}
+                visible={events.visible}
+                loading={events.loading}
+                error={events.error}
+                historical={events.historical}
+                serverTruncated={events.serverTruncated}
+                inlineDetail
+              />
+            ))}
         </div>
       </div>
     </>
