@@ -553,10 +553,12 @@ pub struct HooksConfig {
     /// var can carry).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
     /// Where per-rule outbox + cursor files live. Each rule gets
-    /// `<outbox_dir>/<index>-<host-port>.outbox.jsonl` (the pending queue,
-    /// append-only) and a sibling `.cursor` file (the byte offset of the
-    /// first undelivered line) — durable across restarts, so a down
-    /// receiver never loses a firing.
+    /// `<outbox_dir>/<host-port>-<hash16>.outbox.jsonl` (the pending
+    /// queue, append-only — keyed by a content hash of the rule's
+    /// `match`+`http`, NOT its position in `rules`, so reordering rules
+    /// in config never orphans an in-flight outbox) and a sibling
+    /// `.cursor` file (the byte offset of the first undelivered line) —
+    /// durable across restarts, so a down receiver never loses a firing.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub outbox_dir: Option<String>,
     /// The filter → target list. Evaluated in order against every record
     /// this process writes; a record may match more than one rule (each

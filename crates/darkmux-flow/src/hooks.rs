@@ -293,6 +293,19 @@ fn last_status_path(outbox_dir: &Path, key: &str) -> PathBuf {
     outbox_dir.join(format!("{key}.last"))
 }
 
+/// (fix-round finding 3) Sibling of `outbox_paths`' pair — a per-rule
+/// heartbeat timestamp, rewritten every drainer poll cycle regardless of
+/// whether that rule had pending work. Cross-process visible (unlike
+/// `HookSink::drainer_alive()`, which only reflects the CALLING process's
+/// own in-memory thread handle) — a SEPARATE `flow hooks status`/`doctor`
+/// invocation reads this to tell "drainer cycling" from "drainer dead"
+/// for a `HookSink` running in a different process. Best-effort, no
+/// atomic rename: a torn write here just gets overwritten next cycle
+/// ~100ms later, and this is purely informational, never load-bearing.
+fn heartbeat_path(cursor_path: &Path) -> PathBuf {
+    cursor_path.with_extension("heartbeat")
+}
+
 /// (#2093 merge-gate finding 3) Sibling of `outbox_paths`' pair — a
 /// dedicated lock file the DRAINER (never the appender) takes
 /// non-blockingly for the whole read-cursor → POST → write-cursor
@@ -318,9 +331,42 @@ fn read_dropped_appends(path: &Path) -> u64 {
     fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
-fn write_dropped_appends(path: &Path, count: u64) {
-    if let Err(e) = fs::write(path, count.to_string()) {
-        eprintln!("flow::HookSink: failed to persist dropped-appends count to {}: {e:#}", path.display());
+/// Write via a sibling temp file + atomic `rename(2)` — same shape as
+/// `write_cursor` — so a concurrent `read_dropped_appends` never observes
+/// the sidecar mid-truncate.
+fn write_dropped_appends_atomic(path: &Path, count: u64) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    let tmp_path = path.with_extension("dropped.tmp");
+    fs::write(&tmp_path, count.to_string()).with_context(|| format!("writing {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))
+}
+
+/// (fix-round finding 2) Cross-process read-modify-write increment of the
+/// persisted `dropped_appends` sidecar, under the SAME `flock` an append
+/// to `outbox_path` takes (`append_outbox_line`/`with_locked_file`) — so
+/// two `HookSink` instances (two darkmux processes racing the same
+/// outbox) can never both read the sidecar's stale value and each write
+/// back their own single-process count, clobbering one another. Returns
+/// the new persisted total (best-effort: on a lock/IO failure, falls back
+/// to a `+1` off whatever was last read, so the return value is never
+/// worse than the pre-fix single-process behavior).
+fn increment_dropped_appends(outbox_path: &Path, dropped_appends_path: &Path) -> u64 {
+    let result = darkmux_types::flock::with_locked_file(outbox_path, |_file| {
+        let count = read_dropped_appends(dropped_appends_path) + 1;
+        write_dropped_appends_atomic(dropped_appends_path, count)?;
+        Ok(count)
+    });
+    match result {
+        Ok(count) => count,
+        Err(e) => {
+            eprintln!(
+                "flow::HookSink: failed to persist dropped-appends count to {}: {e:#}",
+                dropped_appends_path.display()
+            );
+            read_dropped_appends(dropped_appends_path) + 1
+        }
     }
 }
 
@@ -330,13 +376,72 @@ struct LastStatus {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// (fix-round finding 1) Consecutive cursor-write failures against
+    /// this rule's `.cursor` file — the same counter `SinkInfo` exposes
+    /// live (`rule{idx}_cursor_write_failures`), persisted here so a
+    /// SEPARATE `darkmux doctor` / `flow hooks status` process
+    /// invocation can see it too. Lenient-on-read: absent in a sidecar
+    /// written before this field existed, defaults to 0.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    cursor_write_failures: u64,
+    /// (fix-round finding 1) True once `cursor_write_failures` has
+    /// crossed `CURSOR_WRITE_STALL_THRESHOLD` and the drainer has
+    /// stopped attempting new deliveries for this rule until a
+    /// writability probe against the cursor file succeeds again.
+    #[serde(default, skip_serializing_if = "is_false")]
+    stalled: bool,
 }
 
-fn write_last_status(path: &Path, ok: bool, error: Option<&str>) {
-    let status = LastStatus { ts: schema::ts_utc_now(), ok, error: error.map(str::to_string) };
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// Write the TERMINAL delivery outcome (success or give-up) for a rule's
+/// current line — `ok`/`error` describe that outcome. The cursor-write
+/// bookkeeping fields (`cursor_write_failures`/`stalled`) are read from
+/// `rt`'s own atomics rather than defaulted, so a terminal write here
+/// never clobbers a stall recorded moments earlier by `advance_cursor`
+/// (finding 1) — the two can legitimately coexist: the POST succeeded
+/// (this call reports `ok: true`) even though the cursor write that was
+/// supposed to record it durably is currently failing.
+fn write_last_status(rt: &RuleRuntime, ok: bool, error: Option<&str>) {
+    let status = LastStatus {
+        ts: schema::ts_utc_now(),
+        ok,
+        error: error.map(str::to_string),
+        cursor_write_failures: rt.cursor_write_failures.load(Ordering::Acquire),
+        stalled: rt.stalled.load(Ordering::Acquire),
+    };
+    if let Ok(json) = serde_json::to_string(&status) {
+        if let Err(e) = fs::write(&rt.rule.last_status_path, json) {
+            eprintln!("flow::HookSink: failed to write last-status {}: {e:#}", rt.rule.last_status_path.display());
+        }
+    }
+}
+
+/// (fix-round finding 1) Read-modify-write ONLY the cursor-write
+/// bookkeeping fields onto whatever `.last` sidecar already exists —
+/// used when a cursor write fails, so the last known DELIVERY outcome
+/// (`ok`/`error`/`ts`) is preserved rather than reset. No prior sidecar
+/// (a fresh rule that hasn't had a terminal outcome yet) seeds one with
+/// `ok: true`/no error, since "no delivery outcome yet" is not a failure.
+fn write_cursor_write_status(path: &Path, cursor_write_failures: u64, stalled: bool) {
+    let mut status = read_last_status(path).unwrap_or_else(|| LastStatus {
+        ts: schema::ts_utc_now(),
+        ok: true,
+        error: None,
+        cursor_write_failures: 0,
+        stalled: false,
+    });
+    status.cursor_write_failures = cursor_write_failures;
+    status.stalled = stalled;
     if let Ok(json) = serde_json::to_string(&status) {
         if let Err(e) = fs::write(path, json) {
-            eprintln!("flow::HookSink: failed to write last-status {}: {e:#}", path.display());
+            eprintln!("flow::HookSink: failed to write cursor-write status {}: {e:#}", path.display());
         }
     }
 }
@@ -403,6 +508,26 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
     Ok(out)
 }
 
+/// (fix-round finding 8) Non-blocking probe: which of `rules`' drain
+/// locks are held by ANOTHER process/thread right now. `flow hooks
+/// drain` uses this, after a bounded wait comes up short, to tell "a
+/// live dispatch process's own drainer is already working this rule" —
+/// a specific, actionable reason — from an ordinary down/slow receiver.
+/// Best-effort and inherently racy (a drain lock is only held for the
+/// brief read-cursor→POST→write-cursor window, so a probe an instant
+/// later can miss it); an empty result never proves the lock was free
+/// throughout the wait, only that it wasn't held at THIS instant.
+pub fn rules_with_drain_lock_held_elsewhere(rules: &[HookRule], outbox_dir: &Path) -> Vec<usize> {
+    let Ok(resolved) = resolve_rules(rules, outbox_dir) else {
+        return Vec::new();
+    };
+    resolved
+        .iter()
+        .filter(|r| matches!(darkmux_types::flock::try_lock_exclusive(&r.drain_lock_path), Ok(None)))
+        .map(|r| r.index)
+        .collect()
+}
+
 /// A read-only summary of one configured rule, for `darkmux doctor` and
 /// `darkmux flow hooks status` — never bails (an invalid URL is reported
 /// AS a field, not an error), and never touches the network.
@@ -430,6 +555,26 @@ pub struct HookRuleSummary {
     /// is visible from a separate `darkmux doctor` / `flow hooks status`
     /// process invocation, not just a live in-process `HookSink`.
     pub dropped_appends: u64,
+    /// (fix-round finding 1) Consecutive cursor-write failures against
+    /// this rule's `.cursor` file, read from the PERSISTED `.last`
+    /// sidecar — cross-process visible, same as `dropped_appends`.
+    pub cursor_write_failures: u64,
+    /// (fix-round finding 1) True when this rule is STALLED — the
+    /// drainer has stopped attempting new deliveries for it until a
+    /// writability probe against the cursor file succeeds again.
+    pub stalled: bool,
+    /// (fix-round finding 3) The drainer's last heartbeat timestamp for
+    /// this rule, cross-process visible via `heartbeat_path`. `None` when
+    /// no drainer has EVER cycled for this rule in this `outbox_dir` (a
+    /// fresh install, or a rule whose key just changed) — distinct from
+    /// a heartbeat that stopped updating, which is an OLD but present
+    /// timestamp.
+    pub last_drainer_heartbeat: Option<String>,
+    /// (fix-round finding 7) Lines quarantined because they weren't valid
+    /// JSON (see `quarantine_line`) — never redelivered, never counted
+    /// toward `undelivered`, so this is the only place they're visible
+    /// short of reading the `.outbox.jsonl.quarantine` file by hand.
+    pub quarantined_lines: usize,
     /// (#2093 merge-gate finding 15) This rule's stable filename key —
     /// see `rule_key`'s doc. Exposed so a caller (`darkmux doctor`) can
     /// diff the set of CURRENT rules' keys against what's actually on
@@ -484,6 +629,8 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
             let undelivered = undelivered_line_count(&outbox_path, cursor);
             let last = read_last_status(&last_status_path(outbox_dir, &key));
             let dropped_appends = read_dropped_appends(&dropped_appends_path(outbox_dir, &key));
+            let last_drainer_heartbeat = fs::read_to_string(heartbeat_path(&cursor_path)).ok();
+            let quarantined_lines = undelivered_line_count(&quarantine_path(&outbox_path), 0);
             HookRuleSummary {
                 index,
                 match_desc: describe_match(&m),
@@ -494,8 +641,12 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
                 cursor_path,
                 undelivered,
                 last_delivery_ts: last.as_ref().map(|s| s.ts.clone()),
-                last_error: last.and_then(|s| s.error),
+                last_error: last.as_ref().and_then(|s| s.error.clone()),
                 dropped_appends,
+                cursor_write_failures: last.as_ref().map(|s| s.cursor_write_failures).unwrap_or(0),
+                stalled: last.as_ref().map(|s| s.stalled).unwrap_or(false),
+                last_drainer_heartbeat,
+                quarantined_lines,
                 key,
             }
         })
@@ -603,7 +754,36 @@ fn read_cursor(cursor_path: &Path) -> u64 {
 /// racing the SAME cursor write, but says nothing about a READER racing a
 /// single writer's own two-syscall write — `rename` closes that gap by
 /// making the visible update a single atomic filesystem operation.
+/// (fix-round finding 1) Test-only fault-injection registry — forces
+/// `write_cursor` to fail for a SPECIFIC cursor path, so the redelivery-
+/// storm / stall test can exercise a genuinely unwritable cursor
+/// deterministically (no chmod gymnastics, no race between the drainer
+/// thread and a filesystem permission flip). Keyed by path (not a single
+/// global switch) so it never leaks into other tests running in
+/// parallel against their own, distinct temp-dir paths — no `#[serial]`
+/// needed. Never compiled into a release binary.
+#[cfg(test)]
+static FORCE_CURSOR_WRITE_FAILURE_PATHS: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn set_force_cursor_write_failure(path: &Path, fail: bool) {
+    let set = FORCE_CURSOR_WRITE_FAILURE_PATHS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut set = set.lock().unwrap();
+    if fail {
+        set.insert(path.to_path_buf());
+    } else {
+        set.remove(path);
+    }
+}
+
 fn write_cursor(cursor_path: &Path, offset: u64) -> Result<()> {
+    #[cfg(test)]
+    if let Some(set) = FORCE_CURSOR_WRITE_FAILURE_PATHS.get() {
+        if set.lock().unwrap().contains(cursor_path) {
+            bail!("injected test failure: cursor write refused for {}", cursor_path.display());
+        }
+    }
     if let Some(parent) = cursor_path.parent() {
         fs::create_dir_all(parent).ok();
     }
@@ -753,6 +933,16 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const MAX_CLIENT_ERROR_ATTEMPTS: u32 = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const POST_TIMEOUT: Duration = Duration::from_secs(5);
+/// (fix-round finding 1) Consecutive cursor-write failures after which a
+/// rule is marked STALLED — the drainer stops attempting new deliveries
+/// for it (beyond one writability probe per backoff cycle) until the
+/// cursor file becomes writable again.
+const CURSOR_WRITE_STALL_THRESHOLD: u64 = 3;
+/// (fix-round finding 1) Rate limit for the cursor-write-failure stderr
+/// log — mirrors `maybe_warn_dropped`'s `WARNING_INTERVAL` so a cursor
+/// path that's been unwritable for hours doesn't turn into one log line
+/// per failed write.
+const CURSOR_WRITE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 enum DeliveryOutcome {
     Success,
@@ -819,6 +1009,57 @@ fn try_post(url: &str, body: &str) -> DeliveryOutcome {
     }
 }
 
+/// (fix-round finding 6) Outcome of `drain_stray_file`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StrayDrainResult {
+    pub delivered: usize,
+    pub failed: usize,
+    pub remaining_undelivered: usize,
+}
+
+fn key_from_outbox_path(outbox_path: &Path) -> Option<String> {
+    outbox_path.file_name()?.to_str()?.strip_suffix(".outbox.jsonl").map(str::to_string)
+}
+
+/// (fix-round finding 6) One-shot, best-effort drain of a STRAY outbox
+/// file — one whose owning rule no longer exists in current config, so
+/// no running `HookSink`'s background drainer will ever pick it up
+/// (`stray_outbox_files` in `darkmux-doctor` is what NAMES these).
+/// `to_url` is validated with the SAME `validate_loopback_http_url` every
+/// other delivery path uses — this is not a way to POST an arbitrary
+/// file to an arbitrary URL.
+///
+/// Unlike the background drainer, this makes ONE straight pass with no
+/// retry/backoff: the first delivery failure stops the walk immediately
+/// (never hammers a down receiver) and is reported as `failed: 1`,
+/// leaving the cursor exactly where it was — a repeat call after fixing
+/// the receiver picks up right where this one stopped. Reuses the SAME
+/// `.cursor` sidecar the file's original (now-removed) rule would have
+/// used, derived from the outbox filename's own key.
+pub fn drain_stray_file(outbox_path: &Path, to_url: &str) -> Result<StrayDrainResult> {
+    validate_loopback_http_url(to_url).context("--to")?;
+    let key = key_from_outbox_path(outbox_path)
+        .ok_or_else(|| anyhow!("{} is not a *.outbox.jsonl file", outbox_path.display()))?;
+    let cursor_path = outbox_path.with_file_name(format!("{key}.cursor"));
+    let mut cursor = read_cursor(&cursor_path);
+    let mut result = StrayDrainResult::default();
+    while let Some((line, new_cursor)) = next_pending_line(outbox_path, cursor) {
+        match try_post(to_url, &line) {
+            DeliveryOutcome::Success => {
+                result.delivered += 1;
+                cursor = new_cursor;
+                write_cursor(&cursor_path, cursor)?;
+            }
+            _ => {
+                result.failed += 1;
+                break;
+            }
+        }
+    }
+    result.remaining_undelivered = undelivered_line_count(outbox_path, cursor);
+    Ok(result)
+}
+
 struct RuleRuntime {
     rule: ResolvedRule,
     backoff: Mutex<Duration>,
@@ -849,6 +1090,24 @@ struct RuleRuntime {
     /// receiver that's been down for hours must not turn into one
     /// `hook.failed` record per dropped write.
     last_drop_warning: Mutex<Option<Instant>>,
+    /// (fix-round finding 1) Consecutive `write_cursor` failures against
+    /// this rule's `.cursor` file. Reset to 0 on the next successful
+    /// cursor write; NEVER on an ordinary delivery success/give-up — a
+    /// terminal delivery outcome without a durable cursor advance is
+    /// exactly the case this counter exists to track. Crosses
+    /// `CURSOR_WRITE_STALL_THRESHOLD` → `stalled` is set.
+    cursor_write_failures: AtomicU64,
+    /// (fix-round finding 1) True once the drainer has stopped attempting
+    /// new deliveries for this rule pending a successful cursor-write
+    /// probe. Checked at the top of `drainer_loop`'s per-rule iteration.
+    stalled: AtomicBool,
+    /// (fix-round finding 1) Rate-limits the cursor-write-failure stderr
+    /// log — same pattern as `last_drop_warning`.
+    last_cursor_write_warning: Mutex<Option<Instant>>,
+    /// (fix-round finding 5) Delivered lines that were valid JSON but had
+    /// no `action` field — never quarantined (lenient on read), just
+    /// counted. In-process only; never reset.
+    non_record_lines: AtomicU64,
 }
 
 fn apply_backoff(rt: &RuleRuntime) {
@@ -856,6 +1115,68 @@ fn apply_backoff(rt: &RuleRuntime) {
     let wait = *backoff;
     *rt.next_attempt.lock().unwrap() = Instant::now() + wait;
     *backoff = (*backoff * 2).min(MAX_BACKOFF);
+}
+
+/// (fix-round finding 1) Advance a rule's on-disk delivery cursor after a
+/// TERMINAL outcome (delivered, or given up on). On success, resets
+/// backoff and clears any stall — the normal case. On failure, this
+/// deliberately does NOT call `reset_backoff`: retrying the exact same
+/// line immediately (backoff reset to `INITIAL_BACKOFF`'s effectively-now
+/// `next_attempt`) is what turns a persistently unwritable cursor file
+/// into a redelivery storm — the receiver sees the SAME line re-POSTed
+/// every poll cycle forever, since a failed cursor write means the next
+/// `next_pending_line` call returns that same line again. Instead:
+/// `apply_backoff` (exponential, same as any retryable failure), log
+/// once per `CURSOR_WRITE_WARNING_INTERVAL`, persist the failure count +
+/// stall flag to the `.last` sidecar, and — after
+/// `CURSOR_WRITE_STALL_THRESHOLD` consecutive failures — mark the rule
+/// STALLED so `drainer_loop` stops reaching `next_pending_line`/`try_post`
+/// for it entirely until a writability probe succeeds (see the stall
+/// check at the top of `drainer_loop`'s per-rule loop body).
+///
+/// Returns whether the cursor actually advanced. Callers still run their
+/// terminal bookkeeping (`write_last_status`, `emit_hook_record`)
+/// regardless of the return value — the delivery attempt itself (POST
+/// success or give-up) genuinely happened even when we can't yet durably
+/// record having moved past it; the outbox's documented at-least-once
+/// contract covers the resulting possible redelivery once the cursor
+/// becomes writable again.
+fn advance_cursor(rt: &RuleRuntime, new_cursor: u64) -> bool {
+    match write_cursor(&rt.rule.cursor_path, new_cursor) {
+        Ok(()) => {
+            rt.cursor_write_failures.store(0, Ordering::Release);
+            rt.stalled.store(false, Ordering::Release);
+            reset_backoff(rt);
+            true
+        }
+        Err(e) => {
+            let failures = rt.cursor_write_failures.fetch_add(1, Ordering::AcqRel) + 1;
+            let should_log = {
+                let mut last = rt.last_cursor_write_warning.lock().unwrap();
+                let now = Instant::now();
+                let should = last.map(|prev| now.duration_since(prev) >= CURSOR_WRITE_WARNING_INTERVAL).unwrap_or(true);
+                if should {
+                    *last = Some(now);
+                }
+                should
+            };
+            if should_log {
+                eprintln!(
+                    "flow::HookSink: rule #{} failed to persist delivery cursor to {}: {e:#} \
+                     ({failures} consecutive cursor-write failure(s) — backing off, not retrying immediately)",
+                    rt.rule.index,
+                    rt.rule.cursor_path.display()
+                );
+            }
+            let stalled = failures >= CURSOR_WRITE_STALL_THRESHOLD;
+            if stalled {
+                rt.stalled.store(true, Ordering::Release);
+            }
+            write_cursor_write_status(&rt.rule.last_status_path, failures, stalled);
+            apply_backoff(rt);
+            false
+        }
+    }
 }
 
 fn reset_backoff(rt: &RuleRuntime) {
@@ -871,20 +1192,35 @@ fn reset_backoff(rt: &RuleRuntime) {
 fn emit_hook_record(
     report_sink: &dyn FlowSink,
     success: bool,
-    rule: &ResolvedRule,
+    rt: &RuleRuntime,
     delivered_line: &str,
     attempt: u32,
     error: Option<&str>,
 ) {
-    let parsed: serde_json::Value = serde_json::from_str(delivered_line).unwrap_or_default();
-    let action = parsed.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let hash = parsed.get("hash").and_then(|v| v.as_str()).map(str::to_string);
+    let rule = &rt.rule;
+    // (fix-round finding 5) Lenient on read: a delivered line that IS
+    // valid JSON but carries no `action` field (not a real flow record —
+    // e.g. a stray/foreign line in the outbox) is never quarantined, just
+    // reported honestly. `action_val` stays `None` for that case AND for
+    // genuinely invalid JSON (the quarantine call site) — only the
+    // valid-JSON-but-no-`action` case counts toward `non_record_lines`,
+    // since invalid JSON is already tracked via the quarantine file.
+    let parse_result = serde_json::from_str::<serde_json::Value>(delivered_line);
+    let parsed = parse_result.as_ref().ok();
+    let action_val = parsed.and_then(|v| v.get("action")).and_then(|v| v.as_str()).map(str::to_string);
+    if parse_result.is_ok() && action_val.is_none() {
+        rt.non_record_lines.fetch_add(1, Ordering::Relaxed);
+    }
+    let hash = parsed.and_then(|v| v.get("hash")).and_then(|v| v.as_str()).map(str::to_string);
     let host = extract_host_port(&rule.url).unwrap_or("").to_string();
 
     let mut payload = serde_json::json!({
         "rule_index": rule.index,
         "target_host": host,
-        "delivered_action": action,
+        // `null` (never `""`) when the delivered line had no `action` —
+        // an empty string would read as "delivered a record whose action
+        // was blank", which is a different (and untrue) claim.
+        "delivered_action": action_val.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
         "attempt": attempt,
     });
     if let Some(h) = hash {
@@ -992,6 +1328,9 @@ fn drainer_loop(
             if stop.load(Ordering::Acquire) {
                 return;
             }
+            // (fix-round finding 3) Heartbeat every poll cycle, whether or
+            // not this rule has pending work — see `heartbeat_path`'s doc.
+            let _ = fs::write(heartbeat_path(&rt.rule.cursor_path), schema::ts_utc_now());
             if Instant::now() < *rt.next_attempt.lock().unwrap() {
                 continue;
             }
@@ -1005,6 +1344,25 @@ fn drainer_loop(
             let Ok(Some(_drain_lock)) = darkmux_types::flock::try_lock_exclusive(&rt.rule.drain_lock_path) else {
                 continue;
             };
+            // (fix-round finding 1) A STALLED rule gets ONE writability
+            // probe per backoff cycle before anything else this
+            // iteration — a no-op `write_cursor` of the CURRENT offset
+            // (never advances past an undelivered line). A failing probe
+            // re-applies backoff and moves on to the next rule WITHOUT
+            // ever reaching `next_pending_line`/`try_post` — that's what
+            // keeps a persistently-unwritable cursor from re-POSTing the
+            // same line every cycle. A succeeding probe clears the stall
+            // and falls through to normal delivery this same cycle.
+            if rt.stalled.load(Ordering::Acquire) {
+                let probe_cursor = read_cursor(&rt.rule.cursor_path);
+                if write_cursor(&rt.rule.cursor_path, probe_cursor).is_err() {
+                    apply_backoff(rt);
+                    continue;
+                }
+                rt.stalled.store(false, Ordering::Release);
+                rt.cursor_write_failures.store(0, Ordering::Release);
+                reset_backoff(rt);
+            }
             // (#2093 merge-gate finding 5) Compaction runs under the SAME
             // drain lock this iteration already holds — checked (and, at
             // most, performed) once per poll cycle per rule.
@@ -1023,11 +1381,10 @@ fn drainer_loop(
             // and emit `hook.failed` naming the reason.
             if serde_json::from_str::<serde_json::Value>(&line).is_err() {
                 quarantine_line(&rt.rule.outbox_path, &line);
-                let _ = write_cursor(&rt.rule.cursor_path, new_cursor);
-                reset_backoff(rt);
+                advance_cursor(rt, new_cursor);
                 let reason = "invalid outbox line";
-                write_last_status(&rt.rule.last_status_path, false, Some(reason));
-                emit_hook_record(report_sink.as_ref(), false, &rt.rule, &line, 1, Some(reason));
+                write_last_status(rt, false, Some(reason));
+                emit_hook_record(report_sink.as_ref(), false, rt, &line, 1, Some(reason));
                 continue;
             }
             match try_post(&rt.rule.url, &line) {
@@ -1037,10 +1394,9 @@ fn drainer_loop(
                         *c += 1;
                         *c
                     };
-                    let _ = write_cursor(&rt.rule.cursor_path, new_cursor);
-                    reset_backoff(rt);
-                    write_last_status(&rt.rule.last_status_path, true, None);
-                    emit_hook_record(report_sink.as_ref(), true, &rt.rule, &line, attempt, None);
+                    advance_cursor(rt, new_cursor);
+                    write_last_status(rt, true, None);
+                    emit_hook_record(report_sink.as_ref(), true, rt, &line, attempt, None);
                 }
                 DeliveryOutcome::ClientError => {
                     let attempt = {
@@ -1059,11 +1415,10 @@ fn drainer_loop(
                         *c
                     };
                     if client_errors >= MAX_CLIENT_ERROR_ATTEMPTS {
-                        let _ = write_cursor(&rt.rule.cursor_path, new_cursor);
-                        reset_backoff(rt);
+                        advance_cursor(rt, new_cursor);
                         let reason = format!("4xx response, skipped after {client_errors} client-error attempts");
-                        write_last_status(&rt.rule.last_status_path, false, Some(&reason));
-                        emit_hook_record(report_sink.as_ref(), false, &rt.rule, &line, attempt, Some(&reason));
+                        write_last_status(rt, false, Some(&reason));
+                        emit_hook_record(report_sink.as_ref(), false, rt, &line, attempt, Some(&reason));
                     } else {
                         apply_backoff(rt);
                     }
@@ -1079,11 +1434,10 @@ fn drainer_loop(
                         *c += 1;
                         *c
                     };
-                    let _ = write_cursor(&rt.rule.cursor_path, new_cursor);
-                    reset_backoff(rt);
+                    advance_cursor(rt, new_cursor);
                     let reason = format!("redirect refused: {status} to {target_host}");
-                    write_last_status(&rt.rule.last_status_path, false, Some(&reason));
-                    emit_hook_record(report_sink.as_ref(), false, &rt.rule, &line, attempt, Some(&reason));
+                    write_last_status(rt, false, Some(&reason));
+                    emit_hook_record(report_sink.as_ref(), false, rt, &line, attempt, Some(&reason));
                 }
                 DeliveryOutcome::RetryableFailure => {
                     {
@@ -1167,6 +1521,10 @@ impl HookSink {
                     client_error_count: Mutex::new(0),
                     dropped_appends: AtomicU64::new(0),
                     last_drop_warning: Mutex::new(None),
+                    cursor_write_failures: AtomicU64::new(0),
+                    stalled: AtomicBool::new(false),
+                    last_cursor_write_warning: Mutex::new(None),
+                    non_record_lines: AtomicU64::new(0),
                 })
             })
             .collect();
@@ -1208,8 +1566,15 @@ impl HookSink {
     /// expected shutdown path — `Drop` takes the handle via `.take()`,
     /// which this correctly reports as "not alive" too, since there is
     /// no drainer left to be alive) would otherwise silently stop
-    /// delivering with no signal anywhere an operator would see it;
-    /// `flow hooks status` and `doctor` surface this.
+    /// delivering with no signal anywhere an operator would see it.
+    ///
+    /// (fix-round finding 3) This reads an in-process `JoinHandle` — it
+    /// is surfaced in `SinkInfo`/`flow status --json` for THIS process's
+    /// own `HookSink` only. A separate `darkmux doctor`/`flow hooks
+    /// status` invocation (a different process) cannot observe it and
+    /// falls back to `HookRuleSummary::last_drainer_heartbeat` instead —
+    /// a per-rule timestamp the drainer rewrites every poll cycle
+    /// (`heartbeat_path`), which IS cross-process visible.
     pub fn drainer_alive(&self) -> bool {
         match self.drainer.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Some(handle) => !handle.is_finished(),
@@ -1237,8 +1602,15 @@ impl FlowSink for HookSink {
                 // correct across compaction shrinking the file back down.
                 let cursor = read_cursor(&rt.rule.cursor_path);
                 if rule_over_cap(&rt.rule.outbox_path, cursor, self.max_outbox_mb) {
-                    let dropped = rt.dropped_appends.fetch_add(1, Ordering::Relaxed) + 1;
-                    write_dropped_appends(&rt.rule.dropped_appends_path, dropped);
+                    // (fix-round finding 2) Cross-process read-modify-
+                    // write under the outbox's own flock — see
+                    // `increment_dropped_appends`'s doc. The in-process
+                    // atomic is then set (not merely bumped) to the
+                    // returned TRUE total, so a live `info()` call from
+                    // THIS process reflects every process's drops, not
+                    // just its own.
+                    let dropped = increment_dropped_appends(&rt.rule.outbox_path, &rt.rule.dropped_appends_path);
+                    rt.dropped_appends.store(dropped, Ordering::Relaxed);
                     maybe_warn_dropped(rt, self.report_sink.as_ref(), self.max_outbox_mb, dropped);
                     continue;
                 }
@@ -1246,8 +1618,8 @@ impl FlowSink for HookSink {
                     // (#2093 merge-gate finding 9) An append failure is
                     // counted the SAME way a cap-drop is — both are "this
                     // record never reached the outbox for this rule."
-                    let dropped = rt.dropped_appends.fetch_add(1, Ordering::Relaxed) + 1;
-                    write_dropped_appends(&rt.rule.dropped_appends_path, dropped);
+                    let dropped = increment_dropped_appends(&rt.rule.outbox_path, &rt.rule.dropped_appends_path);
+                    rt.dropped_appends.store(dropped, Ordering::Relaxed);
                     eprintln!(
                         "flow::HookSink: rule #{} outbox append failed: {e:#} (this write is lost \
                          for that rule; other rules + other sinks are unaffected; {dropped} dropped so far)",
@@ -1277,6 +1649,15 @@ impl FlowSink for HookSink {
             let undelivered = undelivered_line_count(&rt.rule.outbox_path, cursor);
             config.insert(format!("rule{idx}_undelivered"), undelivered.to_string());
             config.insert(format!("rule{idx}_dropped_appends"), rt.dropped_appends.load(Ordering::Relaxed).to_string());
+            config.insert(
+                format!("rule{idx}_cursor_write_failures"),
+                rt.cursor_write_failures.load(Ordering::Relaxed).to_string(),
+            );
+            config.insert(format!("rule{idx}_stalled"), rt.stalled.load(Ordering::Relaxed).to_string());
+            config.insert(
+                format!("rule{idx}_non_record_lines"),
+                rt.non_record_lines.load(Ordering::Relaxed).to_string(),
+            );
         }
         config.insert("drainer_alive".to_string(), self.drainer_alive().to_string());
         SinkInfo { kind: "Hooks".to_string(), config, children: vec![], raw_url: None }
@@ -2110,6 +2491,191 @@ mod tests {
         assert!(!sink.drainer_alive(), "drainer_alive must report false once the thread has actually stopped");
     }
 
+    // ─── (fix-round finding 1) cursor-write failure must not storm ────────
+
+    /// Mutation check (self-QA gate), narrow: calls `advance_cursor`
+    /// directly and asserts on `RuleRuntime`'s own backoff state, rather
+    /// than on request counts — the integration test below has a SECOND,
+    /// independent line of defense (the stall-probe's own `apply_backoff`
+    /// call, once 3 failures mark the rule stalled) that keeps its
+    /// `request_count <= 3` assertion green even if `advance_cursor`'s
+    /// OWN failure branch were reverted to `reset_backoff` — confirmed by
+    /// actually running that mutation before writing this comment. This
+    /// test isolates the ONE line the mutation targets: reverting
+    /// `apply_backoff(rt)` (line ~1176) back to `reset_backoff(rt)` makes
+    /// `next_attempt > Instant::now()` and `backoff > INITIAL_BACKOFF`
+    /// both fail, with no stall-probe safety net to hide it.
+    #[test]
+    fn advance_cursor_backs_off_never_resets_on_write_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:1/unused".to_string()),
+            extras: Default::default(),
+        }];
+        let rule = resolve_rules(&rules, tmp.path()).unwrap().into_iter().next().unwrap();
+        let rt = RuleRuntime {
+            rule,
+            backoff: Mutex::new(INITIAL_BACKOFF),
+            next_attempt: Mutex::new(Instant::now()),
+            attempt_count: Mutex::new(0),
+            client_error_count: Mutex::new(0),
+            dropped_appends: AtomicU64::new(0),
+            last_drop_warning: Mutex::new(None),
+            cursor_write_failures: AtomicU64::new(0),
+            stalled: AtomicBool::new(false),
+            last_cursor_write_warning: Mutex::new(None),
+            non_record_lines: AtomicU64::new(0),
+        };
+        set_force_cursor_write_failure(&rt.rule.cursor_path, true);
+
+        let advanced = advance_cursor(&rt, 0);
+
+        assert!(!advanced, "the forced cursor write must have failed");
+        assert_eq!(rt.cursor_write_failures.load(Ordering::Relaxed), 1);
+        assert!(
+            *rt.next_attempt.lock().unwrap() > Instant::now(),
+            "a failed cursor write must push next_attempt into the FUTURE — `reset_backoff` would leave it at \
+             effectively now, which is the redelivery-storm bug"
+        );
+        assert!(
+            *rt.backoff.lock().unwrap() > INITIAL_BACKOFF,
+            "a failed cursor write must DOUBLE the backoff (apply_backoff) — reset_backoff would leave it at \
+             INITIAL_BACKOFF"
+        );
+
+        set_force_cursor_write_failure(&rt.rule.cursor_path, false);
+    }
+
+    /// Integration-level companion to the narrow test above: end-to-end
+    /// proof that a persistently unwritable cursor bounds request volume
+    /// and eventually stalls, via the REAL drainer loop (not a direct
+    /// `advance_cursor` call). Its `request_count <= 3` / `fired_count <=
+    /// 3` assertions stay green under EITHER of two independent backoff
+    /// paths (`advance_cursor`'s own, or the stall-probe's) — see the
+    /// narrow test's doc for why that redundancy means THIS test alone
+    /// doesn't isolate a reverted `advance_cursor`.
+    #[test]
+    fn cursor_write_failure_backs_off_and_stalls_instead_of_storming() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start(); // default: 200 OK to every POST
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        let cursor_path = sink.rules[0].rule.cursor_path.clone();
+        set_force_cursor_write_failure(&cursor_path, true);
+        sink.write(&record("storm.candidate")).unwrap();
+
+        // One pending record; the receiver accepts every POST, but the
+        // cursor can never be persisted, so every "delivery" is really a
+        // REdelivery of the same undelivered line. Give it 5s to prove
+        // the backoff (not the receiver, not luck) is what bounds it.
+        std::thread::sleep(Duration::from_secs(5));
+
+        let request_count = receiver.request_count();
+        assert!(request_count <= 3, "cursor-write failures must back off, not storm the receiver — saw {request_count} requests");
+
+        let fired_count = capture.0.lock().unwrap().iter().filter(|r| r.action == "hook.fired").count();
+        assert!(fired_count <= 3, "hook.fired must not fire once per redelivery-storm attempt — saw {fired_count}");
+
+        let summaries = summarize_configured_rules(&rules, tmp.path());
+        assert!(summaries[0].stalled, "3 consecutive cursor-write failures must mark the rule stalled");
+        assert!(
+            summaries[0].cursor_write_failures >= CURSOR_WRITE_STALL_THRESHOLD,
+            "cursor_write_failures must be persisted and visible cross-process: {}",
+            summaries[0].cursor_write_failures
+        );
+
+        // Recovery: the cursor becomes writable again.
+        set_force_cursor_write_failure(&cursor_path, false);
+        assert!(
+            wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)),
+            "once the cursor is writable again the pending record must actually deliver"
+        );
+        assert!(
+            wait_until(|| !summarize_configured_rules(&rules, tmp.path())[0].stalled, Duration::from_secs(3)),
+            "the stall must clear once a cursor write succeeds"
+        );
+
+        drop(sink);
+    }
+
+    // ─── (fix-round finding 2) dropped-appends counter is cross-process ───
+
+    /// Mutation check (self-QA gate): reverting `increment_dropped_appends`
+    /// back to the old "read the in-process atomic, write that" shape
+    /// makes this test read `1` (instance 3's own fresh atomic, fetch_add
+    /// to 1) instead of `3` — proving the fix is what makes the count
+    /// survive across separate `HookSink` instances (simulating separate
+    /// processes sharing the same outbox directory).
+    #[test]
+    #[serial_test::serial] // mutates the process-global DARKMUX_HOOKS_MAX_OUTBOX_MB env var
+    fn dropped_appends_counter_accumulates_across_separate_hook_sink_instances() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A black-hole target: bound but never accepted, so nothing is
+        // ever delivered and the outbox stays over cap for the whole test.
+        let black_hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = black_hole.local_addr().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(format!("http://{addr}/unreachable")),
+            extras: Default::default(),
+        }];
+
+        let prev = std::env::var("DARKMUX_HOOKS_MAX_OUTBOX_MB").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", "1");
+        }
+
+        // "Process 1": push the outbox over the 1 MiB cap, then drop one
+        // append of its own.
+        {
+            let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+            let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+            let mut big = record("work.big");
+            big.reasoning = Some("x".repeat(2 * 1024 * 1024));
+            sink.write(&big).unwrap();
+            sink.write(&record("work.drop.1")).unwrap();
+        }
+        let after_1 = summarize_configured_rules(&rules, tmp.path())[0].dropped_appends;
+
+        // "Process 2": a FRESH `HookSink` — its own in-process
+        // `dropped_appends` atomic starts at 0 — dropping one append
+        // against the SAME already-over-cap outbox.
+        {
+            let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+            let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+            sink.write(&record("work.drop.2")).unwrap();
+        }
+        let after_2 = summarize_configured_rules(&rules, tmp.path())[0].dropped_appends;
+
+        // "Process 3": same again.
+        {
+            let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+            let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+            sink.write(&record("work.drop.3")).unwrap();
+        }
+        let after_3 = summarize_configured_rules(&rules, tmp.path())[0].dropped_appends;
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_MAX_OUTBOX_MB", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_MAX_OUTBOX_MB"),
+            }
+        }
+
+        assert_eq!(after_1, 1, "process 1's own drop");
+        assert_eq!(after_2, 2, "process 2 must ADD to process 1's count, not clobber it back to 1");
+        assert_eq!(after_3, 3, "process 3 must ADD to process 2's count, not clobber it back to 1");
+        assert!(after_2 >= after_1 && after_3 >= after_2, "the persisted count must never decrease");
+    }
+
     // ─── (#2093 merge-gate finding 12) hook.fired/failed carry machine provenance ─
 
     #[test]
@@ -2184,6 +2750,8 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // (fix-round) mutates the process-global DARKMUX_HOOKS_MAX_OUTBOX_MB env var —
+    // races `dropped_appends_counter_accumulates_across_separate_hook_sink_instances` without this
     fn hook_write_drops_appends_past_the_cap_and_counts_them() {
         let tmp = tempfile::TempDir::new().unwrap();
         // A "black hole" target: bound but never accepted, so nothing is
@@ -2305,6 +2873,108 @@ mod tests {
         assert!(quarantine_path.exists(), "the torn line must be preserved in a quarantine file, not silently dropped");
         let quarantined = std::fs::read_to_string(&quarantine_path).unwrap();
         assert!(quarantined.contains("work.torn"), "quarantine file should contain the torn fragment: {quarantined}");
+    }
+
+    // ─── (fix-round finding 5) valid JSON, no `action` — lenient on read ──
+
+    #[test]
+    fn valid_json_with_no_action_field_delivers_with_null_action_and_is_never_quarantined() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
+        let (outbox_path, _cursor_path) = outbox_paths(tmp.path(), &key);
+
+        // A line that IS valid JSON but is not a flow record at all — no
+        // `action` field. Seeded directly, not through `HookSink::write`
+        // (which always serializes a real `FlowRecord`, always carrying
+        // `action` — this simulates a stray/foreign line reaching the
+        // outbox some other way).
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        std::fs::write(&outbox_path, b"{\"not_a_flow_record\":true}\n").unwrap();
+
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+
+        // Delivered — never quarantined. Lenient on read: valid JSON
+        // that isn't a flow record still gets POSTed verbatim, exactly
+        // like any other line.
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(5)));
+        let quarantine_path = PathBuf::from(format!("{}.quarantine", outbox_path.display()));
+        assert!(!quarantine_path.exists(), "a valid-JSON-but-no-action line must NOT be quarantined");
+
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)));
+        let guard = capture.0.lock().unwrap();
+        let fired = guard.iter().find(|r| r.action == "hook.fired").unwrap();
+        assert_eq!(
+            fired.payload.as_ref().unwrap()["delivered_action"],
+            serde_json::Value::Null,
+            "delivered_action must be JSON null, not an empty string, when the line has no `action` field"
+        );
+        drop(guard);
+
+        assert_eq!(
+            sink.rules[0].non_record_lines.load(Ordering::Relaxed),
+            1,
+            "a valid-JSON-no-action line must count toward non_record_lines"
+        );
+    }
+
+    // ─── (fix-round finding 6) drain_stray_file ────────────────────────────
+
+    #[test]
+    fn drain_stray_file_delivers_pending_lines_and_advances_its_cursor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        // A stray outbox: no config rule owns this key any more — seeded
+        // directly, exactly as `darkmux doctor`/`flow hooks status` would
+        // find one left behind by a removed rule.
+        let outbox_path = tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.outbox.jsonl");
+        std::fs::write(&outbox_path, "{\"action\":\"work.a\"}\n{\"action\":\"work.b\"}\n").unwrap();
+
+        let result = drain_stray_file(&outbox_path, &receiver.url("/events")).unwrap();
+        assert_eq!(result.delivered, 2);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.remaining_undelivered, 0);
+        assert_eq!(receiver.request_count(), 2);
+
+        // The cursor sidecar it wrote is the SAME key-derived path a
+        // normal `HookSink` would have used — a repeat call redelivers
+        // nothing, since the cursor is now at EOF.
+        let cursor_path = tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.cursor");
+        assert!(cursor_path.exists());
+        let result2 = drain_stray_file(&outbox_path, &receiver.url("/events")).unwrap();
+        assert_eq!(result2.delivered, 0, "nothing left to redeliver — the cursor already advanced past both lines");
+        assert_eq!(receiver.request_count(), 2, "no duplicate POSTs on a repeat call");
+    }
+
+    #[test]
+    fn drain_stray_file_stops_at_first_failure_without_advancing_past_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A black hole: bound but never accepted, so every POST fails.
+        let black_hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = black_hole.local_addr().unwrap();
+        let outbox_path = tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.outbox.jsonl");
+        std::fs::write(&outbox_path, "{\"action\":\"work.a\"}\n").unwrap();
+
+        let result = drain_stray_file(&outbox_path, &format!("http://{addr}/unreachable")).unwrap();
+        assert_eq!(result.delivered, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.remaining_undelivered, 1, "the failed line's cursor position must not advance");
+    }
+
+    #[test]
+    fn drain_stray_file_refuses_a_non_loopback_url() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outbox_path = tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.outbox.jsonl");
+        std::fs::write(&outbox_path, "{\"action\":\"work.a\"}\n").unwrap();
+        let err = drain_stray_file(&outbox_path, "http://example.com/events").unwrap_err();
+        assert!(format!("{err:#}").contains("--to"), "the error must be attributed to --to: {err:#}");
     }
 
     #[test]

@@ -195,7 +195,8 @@ pub enum HooksCmd {
     /// long-running background drainer inside a real dispatch process.
     Drain {
         /// Only drain this rule's outbox (by its index in `hooks.rules`).
-        /// Unset drains every configured rule.
+        /// Unset drains every configured rule. Mutually exclusive with
+        /// `--file`.
         #[arg(long)]
         rule: Option<usize>,
         /// Give up waiting for the queue to empty after this many
@@ -205,6 +206,18 @@ pub enum HooksCmd {
         /// error).
         #[arg(long, default_value_t = 30)]
         max_seconds: u64,
+        /// (fix-round finding 6) Drain a STRAY outbox file by exact path
+        /// instead — one `darkmux doctor`/`flow hooks status` named as
+        /// belonging to no currently-configured rule (its rule was
+        /// removed or edited). Requires `--to`. One straight pass, no
+        /// retry/backoff — a repeat call after fixing the receiver picks
+        /// up where the last one stopped.
+        #[arg(long, conflicts_with = "rule")]
+        file: Option<std::path::PathBuf>,
+        /// The loopback URL to deliver `--file`'s lines to — validated
+        /// the same way every configured rule's `http` target is.
+        #[arg(long, requires = "file")]
+        to: Option<String>,
         /// Emit machine-readable JSON instead of the human-formatted summary.
         #[arg(long)]
         json: bool,
@@ -230,8 +243,36 @@ pub fn run(cmd: FlowCmd) -> Result<()> {
 fn run_hooks(cmd: HooksCmd) -> Result<()> {
     match cmd {
         HooksCmd::Status { json } => print_hooks_status(json),
-        HooksCmd::Drain { rule, max_seconds, json } => run_hooks_drain(rule, max_seconds, json),
+        HooksCmd::Drain { file: Some(file), to: Some(to), json, .. } => run_hooks_drain_file(&file, &to, json),
+        HooksCmd::Drain { file: Some(_), to: None, .. } => bail!("--file requires --to"),
+        HooksCmd::Drain { rule, max_seconds, json, .. } => run_hooks_drain(rule, max_seconds, json),
     }
+}
+
+/// (fix-round finding 6) `flow hooks drain --file <path> --to <url>` —
+/// see `flow::hooks::drain_stray_file`'s doc for the one-shot semantics.
+fn run_hooks_drain_file(file: &std::path::Path, to: &str, json: bool) -> Result<()> {
+    let result = flow::hooks::drain_stray_file(file, to)?;
+    if json {
+        darkmux_types::style::set_colorize_override(Some(false));
+        let v = serde_json::json!({
+            "file": file.display().to_string(),
+            "to": to,
+            "delivered": result.delivered,
+            "failed": result.failed,
+            "remaining_undelivered": result.remaining_undelivered,
+        });
+        println!("{}", serde_json::to_string_pretty(&v).context("serializing stray-file drain result to JSON")?);
+    } else {
+        println!(
+            "darkmux flow hooks drain --file {} — delivered: {}, failed: {}, remaining undelivered: {}",
+            file.display(),
+            result.delivered,
+            result.failed,
+            result.remaining_undelivered
+        );
+    }
+    Ok(())
 }
 
 /// A `FlowSink` that counts `hook.fired`/`hook.failed` records for ONE
@@ -288,6 +329,12 @@ struct DrainResult {
     delivered: u64,
     failed: u64,
     remaining_undelivered: usize,
+    /// (fix-round finding 8) Target rule indices whose drain lock a
+    /// post-timeout probe found held by ANOTHER process — see
+    /// `flow::hooks::rules_with_drain_lock_held_elsewhere`'s doc on why
+    /// this is best-effort. Always empty when `remaining_undelivered`
+    /// is 0 (nothing left to explain).
+    lock_held_rules: Vec<usize>,
 }
 
 /// Run the drainer SYNCHRONOUSLY, against `rules`/`outbox_dir` directly,
@@ -304,16 +351,24 @@ fn drain_hooks(
         }
     }
     if rules.is_empty() {
-        return Ok(DrainResult { rule_filter, delivered: 0, failed: 0, remaining_undelivered: 0 });
+        return Ok(DrainResult {
+            rule_filter,
+            delivered: 0,
+            failed: 0,
+            remaining_undelivered: 0,
+            lock_held_rules: Vec::new(),
+        });
     }
 
     let counting = std::sync::Arc::new(DrainCountingSink { rule_filter, ..Default::default() });
     let report: std::sync::Arc<dyn flow::FlowSink> = counting.clone();
     // Constructed against the FULL rule set (not a filtered slice) so
     // every rule's outbox/cursor/lock file paths — which are derived from
-    // (index-in-array, host) — line up EXACTLY with what the live
-    // dispatch process already wrote. `--rule N` narrows what this call
-    // WAITS on and REPORTS, not which rules get a `HookSink` at all.
+    // a content hash of the rule's (match, host), NOT its array position
+    // (see `darkmux_flow::hooks::rule_key`) — line up EXACTLY with what
+    // the live dispatch process already wrote. `--rule N` narrows what
+    // this call WAITS on and REPORTS, not which rules get a `HookSink`
+    // at all.
     let sink = flow::hooks::HookSink::new(rules, outbox_dir.to_path_buf(), report)
         .context("constructing hook sink for drain")?;
 
@@ -339,8 +394,17 @@ fn drain_hooks(
         let summaries = flow::hooks::summarize_configured_rules(rules, outbox_dir);
         targets.iter().filter_map(|&idx| summaries.get(idx).map(|s| s.undelivered)).sum()
     };
+    // (fix-round finding 8) Only worth probing when something's actually
+    // left undelivered — distinguishes "another drainer is already
+    // working this rule" from an ordinary down/slow receiver.
+    let lock_held_rules = if remaining_undelivered > 0 {
+        let held = flow::hooks::rules_with_drain_lock_held_elsewhere(rules, outbox_dir);
+        held.into_iter().filter(|idx| targets.contains(idx)).collect()
+    } else {
+        Vec::new()
+    };
 
-    Ok(DrainResult { rule_filter, delivered, failed, remaining_undelivered })
+    Ok(DrainResult { rule_filter, delivered, failed, remaining_undelivered, lock_held_rules })
 }
 
 fn render_drain_result_human(r: &DrainResult, max_seconds: u64) -> String {
@@ -358,6 +422,14 @@ fn render_drain_result_human(r: &DrainResult, max_seconds: u64) -> String {
              in a real dispatch process; this was a bounded wait, not an error.",
             r.remaining_undelivered
         );
+        // (fix-round finding 8) A specific, actionable reason ON TOP of
+        // the generic line above: a live process's own drainer already
+        // holds this rule's lock, so nothing was ever going to be
+        // delivered by THIS invocation regardless of how long it waited.
+        for idx in &r.lock_held_rules {
+            let _ =
+                writeln!(out, "  another drainer holds the lock for rule #{idx}; nothing delivered by this process.");
+        }
     }
     out
 }
@@ -369,6 +441,7 @@ fn drain_result_json(r: &DrainResult) -> serde_json::Value {
         "failed": r.failed,
         "remaining_undelivered": r.remaining_undelivered,
         "timed_out": r.remaining_undelivered > 0,
+        "lock_held_rules": r.lock_held_rules,
     })
 }
 
@@ -422,6 +495,10 @@ fn hooks_status_json(
                 "last_delivery_ts": s.last_delivery_ts,
                 "last_error": s.last_error,
                 "dropped_appends": s.dropped_appends,
+                "cursor_write_failures": s.cursor_write_failures,
+                "stalled": s.stalled,
+                "last_drainer_heartbeat": s.last_drainer_heartbeat,
+                "quarantined_lines": s.quarantined_lines,
             })
         })
         .collect();
@@ -453,6 +530,9 @@ fn render_hooks_status_human(
         if !s.is_loopback {
             flags.push("NON-LOOPBACK URL");
         }
+        if s.stalled {
+            flags.push("STALLED");
+        }
         let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
         let _ = writeln!(out, "  #{}: {} -> {}{flag_str}", s.index, s.match_desc, s.url);
         let _ = writeln!(out, "      undelivered: {}", s.undelivered);
@@ -469,6 +549,27 @@ fn render_hooks_status_human(
         }
         if s.dropped_appends > 0 {
             let _ = writeln!(out, "      dropped: {} (over the outbox cap, or an append failure)", s.dropped_appends);
+        }
+        if s.quarantined_lines > 0 {
+            let _ = writeln!(out, "      quarantined: {} (invalid JSON — never redelivered)", s.quarantined_lines);
+        }
+        if s.stalled {
+            let _ = writeln!(
+                out,
+                "      STALLED: {} consecutive cursor-write failure(s) — the drainer has stopped attempting \
+                 new deliveries for this rule until its cursor file becomes writable again",
+                s.cursor_write_failures
+            );
+        } else if s.cursor_write_failures > 0 {
+            let _ = writeln!(out, "      cursor-write failures: {} (recovered)", s.cursor_write_failures);
+        }
+        match &s.last_drainer_heartbeat {
+            Some(ts) => {
+                let _ = writeln!(out, "      last drainer heartbeat: {ts}");
+            }
+            None => {
+                let _ = writeln!(out, "      last drainer heartbeat: (none seen — no drainer has cycled here yet)");
+            }
         }
     }
     out
@@ -879,6 +980,10 @@ mod tests {
             last_delivery_ts: Some("2026-08-29T00:00:00Z".to_string()),
             last_error: None,
             dropped_appends: 0,
+            cursor_write_failures: 0,
+            stalled: false,
+            last_drainer_heartbeat: None,
+            quarantined_lines: 0,
             key: format!("127.0.0.1-8790-{index}"),
         }
     }

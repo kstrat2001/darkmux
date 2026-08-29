@@ -1419,10 +1419,24 @@ fn hooks_match_risks_observing_the_observer(match_desc: &str) -> bool {
 /// `match`/`http`) — the outbox still holds whatever was undelivered
 /// when that happened, and nothing will ever drain it again unless the
 /// rule comes back verbatim.
-fn stray_outbox_files(
-    rules: &[darkmux_types::config::HookRule],
-    outbox_dir: &std::path::Path,
-) -> Vec<std::path::PathBuf> {
+/// (fix-round finding 6) One stray `*.outbox.jsonl` file — one whose
+/// owning rule no longer exists in current config — plus the detail an
+/// operator deciding "safe to delete?" actually needs: how many lines
+/// were never delivered, and which sibling sidecar files (all sharing
+/// the same content-hash key) go with it.
+struct StrayOutbox {
+    path: std::path::PathBuf,
+    undelivered: usize,
+    siblings: Vec<String>,
+}
+
+/// Sibling sidecar suffixes a stray outbox's key can carry — see
+/// `darkmux_flow::hooks`'s per-rule file layout (`outbox_paths`,
+/// `last_status_path`, `dropped_appends_path`, `drain_lock_path`,
+/// `quarantine_path`).
+const HOOK_SIDECAR_SUFFIXES: &[&str] = &[".cursor", ".last", ".dropped", ".drain.lock", ".outbox.jsonl.quarantine"];
+
+fn stray_outbox_files(rules: &[darkmux_types::config::HookRule], outbox_dir: &std::path::Path) -> Vec<StrayOutbox> {
     let current_keys: std::collections::HashSet<String> = rules
         .iter()
         .map(|r| {
@@ -1437,14 +1451,27 @@ fn stray_outbox_files(
     entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                return false;
-            };
-            let Some(key) = name.strip_suffix(".outbox.jsonl") else {
-                return false;
-            };
-            !current_keys.contains(key)
+        .filter_map(|path| {
+            let name = path.file_name().and_then(|n| n.to_str())?;
+            let key = name.strip_suffix(".outbox.jsonl")?;
+            if current_keys.contains(key) {
+                return None;
+            }
+            // The stray file's own `.cursor` sidecar (if it survived
+            // alongside it) still names the true last-delivered offset;
+            // falling back to 0 (nothing ever delivered) only overcounts
+            // when that sidecar is itself missing.
+            let cursor = std::fs::read_to_string(outbox_dir.join(format!("{key}.cursor")))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            let undelivered = darkmux_flow::hooks::undelivered_line_count(&path, cursor);
+            let siblings: Vec<String> = HOOK_SIDECAR_SUFFIXES
+                .iter()
+                .map(|suffix| format!("{key}{suffix}"))
+                .filter(|sibling_name| outbox_dir.join(sibling_name).exists())
+                .collect();
+            Some(StrayOutbox { path, undelivered, siblings })
         })
         .collect()
 }
@@ -1504,6 +1531,27 @@ fn build_hooks_check(
                 rule_status = Status::Warn;
             }
         }
+        // (fix-round finding 1) A STALLED rule has stopped attempting
+        // deliveries entirely — surfaced loudly, same severity as the
+        // other operational (not config-validation) flags here.
+        if s.stalled {
+            flags.push(format!(
+                "STALLED — {} consecutive cursor-write failure(s); the drainer has stopped attempting new \
+                 deliveries for this rule until its cursor file becomes writable again",
+                s.cursor_write_failures
+            ));
+            if rule_status == Status::Pass {
+                rule_status = Status::Warn;
+            }
+        }
+        // (fix-round finding 7) Quarantined (invalid-JSON) lines are
+        // never redelivered — worth naming, same as a dropped append.
+        if s.quarantined_lines > 0 {
+            flags.push(format!("{} line(s) quarantined (invalid JSON — never redelivered)", s.quarantined_lines));
+            if rule_status == Status::Pass {
+                rule_status = Status::Warn;
+            }
+        }
         if hooks_match_risks_observing_the_observer(&s.match_desc) {
             flags.push(
                 "matches telemetry / a bare `*` action — the observer must not join the observed".to_string(),
@@ -1555,19 +1603,26 @@ fn build_hooks_check(
     // rule — named so, rather than silently taking up disk forever.
     let stray = stray_outbox_files(rules, outbox_dir);
     if !stray.is_empty() {
-        let names: Vec<String> =
-            stray.iter().filter_map(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+        // (fix-round finding 6) Name each stray file's undelivered line
+        // count and its sibling sidecars — an operator deciding whether
+        // it's "safe to delete" needs both, not just the outbox name.
+        let details: Vec<String> = stray
+            .iter()
+            .map(|s| {
+                let name = s.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let siblings =
+                    if s.siblings.is_empty() { String::new() } else { format!("; siblings: {}", s.siblings.join(", ")) };
+                format!("{name} ({} undelivered line(s){siblings})", s.undelivered)
+            })
+            .collect();
         out.push(Check {
             name: "hooks.stray".into(),
             status: Status::Warn,
-            message: format!(
-                "{} outbox file(s) belong to no currently-configured rule: {}",
-                names.len(),
-                names.join(", ")
-            ),
+            message: format!("{} outbox file(s) belong to no currently-configured rule: {}", stray.len(), details.join(", ")),
             hint: Some(
-                "A rule was removed or edited since these were written. Safe to delete once you've \
-                 confirmed nothing important is still undelivered in them."
+                "A rule was removed or edited since these were written. `darkmux flow hooks drain --file <path> \
+                 --to <loopback url>` delivers a stray file's undelivered lines before you delete it; once \
+                 undelivered is 0, it (and its sibling sidecars) are safe to remove."
                     .into(),
             ),
         });
