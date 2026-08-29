@@ -11,9 +11,10 @@
 //!   payload shapes the served demo viewer consumes:
 //!   `{event:"load", model:<id>, gb:<N>}` (load) /
 //!   `{event:"unload", model:<id>}` (unload — no `gb`).
-//! - `source="process"` → the HOST system load: CPU% (`top`), RAM used%
-//!   (`vm_stat` + `sysctl -n hw.memsize`), GPU util% (`ioreg`
-//!   IOAccelerator `"Device Utilization %"`). Wire payload:
+//! - `source="process"` → the HOST system load: CPU%, RAM used%, GPU util%,
+//!   read in-process through `crate::host_probe` (#2108 — mach tick
+//!   counters, `host_statistics64`, and the `IOAccelerator` IORegistry
+//!   node; before that, four shell-outs costing ~780 ms). Wire payload:
 //!   `{cpu, mem, gpu}` (integer %, each best-effort / omitted-on-failure).
 //!   The per-dispatch container is NOT sampled — inference runs in
 //!   LMStudio off-container, so container CPU reads ~0 (#814/#1064).
@@ -25,11 +26,16 @@
 //! back it replaced an OpenClaw-gateway CPU sampler; the lab-side
 //! `instrument.rs` sidecar + `--instrument` flag were retired in #557.)
 //!
-//! This module holds the PURE, unit-testable parse helpers (`lms_diff`,
-//! `host_cpu_percent_from_top`, `mem_percent_from_vm_stat`,
-//! `gpu_percent_from_ioreg`) plus [`sample_host`], the one IMPURE entry
-//! point that actually shells out to `top`/`vm_stat`/`sysctl`/`ioreg` and
-//! feeds their output through the parsers above. `sample_host` is `pub`
+//! This module holds the PURE, unit-testable helpers (`lms_diff`,
+//! `mem_percent_from_vm_stat`) plus [`sample_host`], the one IMPURE entry
+//! point, and the [`reduce_host_stats`] window reduction. (#2108 removed
+//! `host_cpu_percent_from_top`, `gpu_percent_from_ioreg` and the `run_ok`
+//! shell-out helper along with the commands they parsed;
+//! `mem_percent_from_vm_stat` survives as the REFERENCE DEFINITION of
+//! darkmux's memory-pressure semantics — `host_probe::mach_cpu::mem_pct`
+//! reproduces exactly this number from kernel counters, and
+//! `darkmux-profiles`' `gestalt_host::mac_probe` cites it for the same
+//! reason.) `sample_host` is `pub`
 //! (not `pub(crate)`) so a second sampler thread outside this crate can
 //! reuse the exact host-reading mechanism instead of re-deriving it —
 //! `darkmux-lab`'s review driver does this (#1247 doctrine surface) to
@@ -41,7 +47,6 @@
 //! only the host-reading mechanism is shared here.
 
 use darkmux_types::LoadedModel;
-use std::process::Command;
 
 /// Compare two loaded-model snapshots and emit one telemetry payload per
 /// change. Comparison key is `LoadedModel::model` — the bare LMStudio
@@ -104,20 +109,6 @@ fn gb_from_size_string(size: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Parse host **system CPU%** out of `top -l 1 -n 0` output. The header line
-/// `CPU usage: 3.82% user, 7.30% sys, 89.13% idle` → `100 - round(idle)` = 11.
-/// Locates the `idle` token and reads the percent immediately before it, so
-/// format shuffles (user/sys order) don't matter. `None` if the line or the
-/// idle token is absent. Pure — unit-testable without shelling `top`. (#1064)
-pub(crate) fn host_cpu_percent_from_top(top: &str) -> Option<u64> {
-    let line = top.lines().find(|l| l.contains("CPU usage:"))?;
-    let toks: Vec<&str> = line.split_whitespace().collect();
-    let idle_pos = toks.iter().position(|t| t.eq_ignore_ascii_case("idle"))?;
-    let num = toks.get(idle_pos.checked_sub(1)?)?.trim_end_matches('%');
-    let idle = num.parse::<f64>().ok()?;
-    Some((100.0 - idle).clamp(0.0, 100.0).round() as u64)
-}
-
 /// Parse host **RAM used%** out of `vm_stat` output plus the machine's total
 /// bytes (from `sysctl -n hw.memsize`). Available ≈ (`Pages free` +
 /// `Pages inactive` + `Pages speculative`) × page-size — inactive + speculative
@@ -129,7 +120,7 @@ pub(crate) fn host_cpu_percent_from_top(top: &str) -> Option<u64> {
 /// vm_stat's own header (`page size of N bytes`), defaulting to 16384 on
 /// Apple Silicon. `None` if total is 0 or the page fields are missing. Pure.
 /// (#1064)
-pub(crate) fn mem_percent_from_vm_stat(vm_stat: &str, total_bytes: u64) -> Option<u64> {
+pub fn mem_percent_from_vm_stat(vm_stat: &str, total_bytes: u64) -> Option<u64> {
     if total_bytes == 0 {
         return None;
     }
@@ -158,40 +149,6 @@ pub(crate) fn mem_percent_from_vm_stat(vm_stat: &str, total_bytes: u64) -> Optio
     Some(((used as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0).round() as u64)
 }
 
-/// Parse host **GPU utilization%** out of `ioreg -r -d 1 -c IOAccelerator`
-/// output. The `PerformanceStatistics` dict carries `"Device Utilization %"=N`;
-/// a machine can expose more than one accelerator node, so take the MAX across
-/// all of them. `None` when the field is absent (non-Apple-Silicon, or the key
-/// isn't present). Unprivileged — no `sudo`/`powermetrics` (that deeper path is
-/// #2). Pure — unit-testable without shelling `ioreg`. (#1064)
-pub(crate) fn gpu_percent_from_ioreg(ioreg: &str) -> Option<u64> {
-    let mut best: Option<u64> = None;
-    for chunk in ioreg.split("\"Device Utilization %\"=").skip(1) {
-        let digits: String = chunk
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if let Ok(v) = digits.parse::<u64>() {
-            best = Some(best.map_or(v, |b| b.max(v)));
-        }
-    }
-    best.map(|v| v.min(100))
-}
-
-/// Run `cmd`, returning its stdout as a lossy UTF-8 string on a zero exit,
-/// `None` on any spawn/exit failure. Keeps the host-load sampler's three
-/// best-effort reads terse. (#1064; moved from `dispatch_internal.rs` when
-/// [`sample_host`] was extracted so both sampler call sites — the
-/// dispatch-internal thread and `darkmux-lab`'s review driver — share one
-/// copy of the shell-out mechanism.)
-fn run_ok(cmd: &mut Command) -> Option<String> {
-    let out = cmd.output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// One host-load reading — CPU/RAM/GPU utilization%, each best-effort and
 /// independently `None` on failure. See [`sample_host`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -201,23 +158,52 @@ pub struct HostSample {
     pub gpu: Option<u64>,
 }
 
-/// Shell out to `top`/`sysctl`+`vm_stat`/`ioreg` and parse one host-load
-/// reading. Unprivileged, best-effort per field (a failed read yields
-/// `None` for that field only, never an `Err` — see the individual parse
-/// helpers' docs for the exact commands and formats). Extracted out of
-/// `dispatch_internal::run_telemetry_sampler` (#1064's original site) so
-/// the review driver's sampler (#1247 doctrine surface) reads host load
-/// through the exact same mechanism rather than re-deriving it — the two
-/// sampler THREADS differ (poll cadence, stop-flag ownership, sink), but
-/// "what a host sample looks like" is one function.
+/// Read one host-load sample.
+///
+/// **(#2108) The mechanism underneath changed; the signature did not.** This
+/// used to spawn `top -l 1 -n 0`, `sysctl -n hw.memsize`, `vm_stat` and
+/// `ioreg -r -d 1 -c IOAccelerator` — four processes, ~780 ms, and a CPU
+/// number that was a SINCE-BOOT average rather than a reading of the
+/// interval (`top -l 1`'s first and only sample always is, which made every
+/// CPU figure darkmux recorded before #2108 both expensive and wrong-ish).
+/// It now reads [`crate::host_probe::HostProbe`], which takes the same three
+/// numbers from mach kernel counters and the IORegistry in ~5-10 ms, with
+/// `cpu` a TRUE mean over the interval since the previous call.
+///
+/// Two consequences worth knowing at the call sites:
+///
+/// - **`cpu` is `None` on the process's FIRST call.** A tick-counter delta
+///   needs two reads. Every subsequent call has one. `mem`/`gpu` are
+///   unaffected (neither is a delta).
+/// - **The probe is process-wide and `Mutex`-guarded**, so `cpu` is the mean
+///   since whoever called last — which, for a single sampler thread, is
+///   exactly its own cadence. A caller wanting a private interval (and the
+///   per-cluster frequency / power / thermal fields this triple cannot
+///   carry) owns a [`crate::host_probe::HostProbe`] directly, as
+///   `dispatch_internal`'s and `darkmux-serve`'s samplers now do.
+///
+/// `pub` (not `pub(crate)`) for the same reason as before: `darkmux-lab`'s
+/// review driver (#1247 doctrine surface) samples host load through the
+/// exact same mechanism rather than re-deriving it.
 pub fn sample_host() -> HostSample {
-    let cpu = run_ok(Command::new("top").args(["-l", "1", "-n", "0"])).and_then(|s| host_cpu_percent_from_top(&s));
-    let mem = run_ok(Command::new("sysctl").args(["-n", "hw.memsize"]))
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .and_then(|total| run_ok(&mut Command::new("vm_stat")).and_then(|s| mem_percent_from_vm_stat(&s, total)));
-    let gpu = run_ok(Command::new("ioreg").args(["-r", "-d", "1", "-c", "IOAccelerator"]))
-        .and_then(|s| gpu_percent_from_ioreg(&s));
-    HostSample { cpu, mem, gpu }
+    static PROBE: std::sync::OnceLock<std::sync::Mutex<crate::host_probe::HostProbe>> =
+        std::sync::OnceLock::new();
+    let mut guard = match PROBE
+        .get_or_init(|| std::sync::Mutex::new(crate::host_probe::HostProbe::new()))
+        .lock()
+    {
+        Ok(g) => g,
+        // A panic in another caller must not take the sampler down with it —
+        // the probe's state is just counter snapshots, so the worst a
+        // poisoned lock costs is one stale delta.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let s = guard.sample();
+    HostSample {
+        cpu: s.cpu_pct,
+        mem: s.mem_pct,
+        gpu: s.gpu_pct,
+    }
 }
 
 /// (#2107, moved from `dispatch_internal.rs` where it originated) One
@@ -347,26 +333,36 @@ pub fn reduce_host_stats(raw: &[HostSampleAt]) -> HostStats {
 mod tests {
     use super::*;
 
-    /// The one test that exercises the REAL `sample_host()` shell-outs —
-    /// macOS-gated because every command it runs (`top -l`, `vm_stat`,
-    /// `sysctl hw.memsize`, `ioreg`) is macOS-only; on Linux the shells
-    /// all fail and every field is `None`, which would make this assert
-    /// meaningless there. Consumers that need `sample_host` in a
-    /// cross-platform test (e.g. `darkmux-lab`'s review telemetry tests)
-    /// inject a fake sampling function instead — this test is where the
-    /// real path keeps its coverage. Costs one real `top -l 1` call
-    /// (~600-900ms); kept to a single invocation for that reason.
+    /// The one test that exercises the REAL `sample_host()` reads —
+    /// macOS-gated because every source it touches (mach CPU/VM counters,
+    /// the `IOAccelerator` IORegistry node) is macOS-only; elsewhere every
+    /// field is `None`, which would make this assert meaningless.
+    /// Consumers that need `sample_host` in a cross-platform test (e.g.
+    /// `darkmux-lab`'s review telemetry tests) inject a fake sampling
+    /// function instead — this test is where the real path keeps its
+    /// coverage.
+    ///
+    /// TWO calls, deliberately: `cpu` is a tick-counter DELTA (#2108), so
+    /// the first call in a process can only report `mem`/`gpu`. Asserting
+    /// on the second call is what proves the delta path works rather than
+    /// just the seeding path. Costs ~10 ms now (it was ~780 ms).
     #[test]
     #[cfg(target_os = "macos")]
+    #[serial_test::serial]
     fn sample_host_reads_at_least_one_field_on_macos() {
+        let first = sample_host();
+        assert!(
+            first.mem.is_some() || first.gpu.is_some(),
+            "the seeding call still reports the non-delta fields; got {first:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let s = sample_host();
         assert!(
             s.cpu.is_some() || s.mem.is_some() || s.gpu.is_some(),
             "on macOS at least one of cpu/mem/gpu must read successfully; got {s:?}"
         );
-        // Parsed values are percentages — each present field must be in
-        // range (the parsers clamp, so a violation means a parser change
-        // broke the clamp).
+        // Values are percentages — each present field must be in range (the
+        // readers clamp, so a violation means a clamp was lost).
         for v in [s.cpu, s.mem, s.gpu].into_iter().flatten() {
             assert!(v <= 100, "percent field out of range: {v}");
         }
@@ -441,29 +437,7 @@ mod tests {
         assert!(models.contains("primary") && models.contains("compactor"));
     }
 
-    #[test]
-    fn host_cpu_percent_from_top_reads_idle() {
-        let top = "Processes: 700 total\n\
-                   2026/07/03 10:00:00\nLoad Avg: 3.2, 3.0, 2.9\n\
-                   CPU usage: 3.82% user, 7.30% sys, 89.13% idle\n\
-                   SharedLibs: 500M resident\n";
-        assert_eq!(host_cpu_percent_from_top(top), Some(11), "100 - 89.13 = 10.87 → 11");
-    }
 
-    #[test]
-    fn host_cpu_percent_from_top_handles_missing_and_saturated() {
-        assert_eq!(host_cpu_percent_from_top("no cpu line here"), None);
-        // 0% idle → fully busy; clamps at 100.
-        assert_eq!(
-            host_cpu_percent_from_top("CPU usage: 60.00% user, 40.00% sys, 0.00% idle"),
-            Some(100)
-        );
-        // 100% idle → nothing busy.
-        assert_eq!(
-            host_cpu_percent_from_top("CPU usage: 0.00% user, 0.00% sys, 100.00% idle"),
-            Some(0)
-        );
-    }
 
     #[test]
     fn mem_percent_from_vm_stat_computes_pressure() {
@@ -512,17 +486,5 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gpu_percent_from_ioreg_takes_max_across_nodes() {
-        let ioreg = "  | \"PerformanceStatistics\" = {\"Tiler Utilization %\"=3,\"Device Utilization %\"=4,\"SplitSceneCount\"=0}\n\
-                      +-o AGXAccelerator\n\
-                      | \"PerformanceStatistics\" = {\"Device Utilization %\"=87,\"recoveryCount\"=0}\n";
-        assert_eq!(gpu_percent_from_ioreg(ioreg), Some(87), "max of 4 and 87");
-    }
 
-    #[test]
-    fn gpu_percent_from_ioreg_absent_is_none() {
-        assert_eq!(gpu_percent_from_ioreg("no accelerator stats here"), None);
-        assert_eq!(gpu_percent_from_ioreg("\"Device Utilization %\"=0"), Some(0));
-    }
 }

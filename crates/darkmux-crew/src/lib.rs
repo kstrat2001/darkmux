@@ -34,6 +34,12 @@ pub mod dispatch_internal;
 // `refusal_handler`/`tty_prompt_handler` are the non-interactive/CLI
 // production handlers. See the module doc.
 pub mod gate;
+// (#2108) The in-process host probe — mach tick counters, IOReport power +
+// DVFS residency, thermal state, and the IOKit GPU read — that replaced the
+// `top`/`vm_stat`/`sysctl`/`ioreg` shell-outs `telemetry_sampler` used to
+// make. `telemetry_sampler::sample_host` still exists with the same
+// signature; it now reads THROUGH this probe.
+pub mod host_probe;
 // (#1284 Packet 2) The standard output contract every mission emits +
 // generalized finalization. `ReviewEnvelope` (darkmux-lab) maps INTO
 // `MissionEnvelope::payload` — this crate has no reverse dependency on

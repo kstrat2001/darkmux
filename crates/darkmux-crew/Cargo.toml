@@ -39,3 +39,14 @@ httpmock = "0.7"
 # operator's real runtime.inactivity_timeout_seconds. Dev-dep only; off in the
 # release binary.
 darkmux-types = { path = "../darkmux-types", features = ["test-support"] }
+
+# (#2108) The host probe's mach kernel-counter reads (`host_processor_info`,
+# `host_statistics64`, `sysctlbyname`) and its `dlopen`/`dlsym` of the PRIVATE
+# IOReport framework. Already in the lockfile transitively at this version —
+# this promotes it to a direct dependency, and it is the ONLY new dependency
+# #2108 adds. CoreFoundation and IOKit are PUBLIC system frameworks present on
+# every macOS install and are linked directly from inside the probe's own
+# `cfg(all(target_os = "macos", target_arch = "aarch64"))` modules, so no
+# other target sees either the crate or the frameworks.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
