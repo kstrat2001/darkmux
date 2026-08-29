@@ -3,45 +3,92 @@
     "attribution": "per_process",
     "attribution_note": "4 worker(s) for 4 resident(s) \u2014 per-model footprint (max of rss and phys_footprint), workers rank-matched to models by weights (largest worker <-> largest weights)",
     "cache_ttl_ms": 2000,
-    "gather_ms": 345,
-    "generated_at_ms": 1787897595280,
+    "gather_ms": 303,
+    "generated_at_ms": 1788010882879,
     "limit_bytes": 274877906944,
     "limit_source": "physical_pool",
     "load": {
       "now": {
-        "sampled_at_ms": 1787897595280,
-        "sampler_cost_ms": 3.1,
-        "cpu_pct": 22,
         "cpu_clusters": [
-          { "name": "Super", "cores": 6, "pct": 46, "mhz": 4400 },
-          { "name": "Performance", "cores": 12, "pct": 22, "mhz": 3400 },
-          { "name": "Efficiency", "cores": 4, "pct": 9, "mhz": 2100 }
+          {
+            "cores": 6,
+            "mhz": 4559,
+            "name": "Super",
+            "pct": 33
+          },
+          {
+            "cores": 12,
+            "mhz": 3494,
+            "name": "Performance",
+            "pct": 18
+          },
+          {
+            "cores": 4,
+            "mhz": 2264,
+            "name": "Efficiency",
+            "pct": 30
+          }
         ],
-        "mem_pct": 46,
-        "gpu_pct": 68,
-        "gpu_mhz": 1296,
-        "gpu_mem_bytes": 912000000,
-        "thermal": { "state": "nominal", "cpu_speed_limit_pct": 100 },
-        "power_mw": { "cpu": 5200, "gpu": 3400, "ane": 400, "total": 9000 }
+        "cpu_pct": 25,
+        "gpu_mem_bytes": 924189395,
+        "gpu_mhz": 398,
+        "gpu_pct": 65,
+        "mem_pct": 62,
+        "power_mw": {
+          "ane": 13,
+          "cpu": 2112,
+          "gpu": 2516,
+          "total": 4641
+        },
+        "sampled_at_ms": 1788010848015,
+        "sampler_cost_ms": 3,
+        "thermal": {
+          "cpu_speed_limit_pct": 100,
+          "state": "nominal"
+        }
       },
       "window": {
+        "cpu_pct": {
+          "max": 33,
+          "mean": 19,
+          "p95": 31
+        },
+        "energy_mwh": 603,
+        "gpu_pct": {
+          "max": 77,
+          "mean": 55,
+          "p95": 75
+        },
+        "interval_ms": 5000,
+        "mem_pct": {
+          "max": 67,
+          "mean": 59,
+          "p95": 65
+        },
+        "power_mw": {
+          "cpu": {
+            "max": 2981.9,
+            "mean": 1443.7,
+            "p95": 2781.3
+          },
+          "gpu": {
+            "max": 2935.5,
+            "mean": 2193.3,
+            "p95": 2838.7
+          },
+          "total": {
+            "max": 5930.2,
+            "mean": 3649.8,
+            "p95": 5632.8
+          }
+        },
         "samples": 120,
         "span_ms": 595000,
-        "interval_ms": 5000,
-        "cpu_pct": { "mean": 19.4, "p95": 27, "max": 27 },
-        "gpu_pct": { "mean": 61.2, "p95": 71, "max": 71 },
-        "mem_pct": { "mean": 44.8, "p95": 47, "max": 47 },
-        "power_mw": {
-          "total": { "mean": 7800, "p95": 9200, "max": 11000 },
-          "gpu": { "mean": 2600, "p95": 3600, "max": 4200 },
-          "cpu": { "mean": 4700, "p95": 5300, "max": 6200 }
-        },
         "thermal": {
-          "worst_state": "nominal",
           "above_nominal_ms": 0,
-          "min_cpu_speed_limit_pct": 100
-        },
-        "energy_mwh": 1289
+          "min_cpu_speed_limit_pct": 100,
+          "worst_state": "nominal"
+        }
       }
     },
     "machine": {
@@ -125,9 +172,9 @@
   },
   "specs": {
     "cpu_brand": "Apple M5 Ultra",
-    "darkmux_version": "3.2.0",
+    "darkmux_version": "3.3.0",
     "flow_schema_version": "1.20.0",
-    "generated_at_ms": 1787897595280,
+    "generated_at_ms": 1788010882879,
     "lms_unreachable": false,
     "loaded_models": [
       {

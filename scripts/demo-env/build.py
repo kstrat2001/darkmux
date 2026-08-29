@@ -32,6 +32,19 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 GIB = 1024 ** 3
 
+# Per-machine perf-level topology for the `load.now.cpu_clusters` fixture —
+# (name, cores, base_mhz) tuples, HIGHEST tier first, mirroring
+# `mach_cpu::PerfLevel`'s "hw.perflevelN, 0 = highest tier" convention
+# (`crates/darkmux-crew/src/host_probe/mach_cpu.rs`). M1 Max's 8+2 and the
+# base M4's 4+6 are their real, documented core counts; the M5 Ultra is
+# fictional (no such chip exists) — its 6+12+4 split is this demo world's
+# own invention.
+CPU_TOPOLOGY = {
+    "m5-ultra-256gb": [("Super", 6, 4600), ("Performance", 12, 3600), ("Efficiency", 4, 2200)],
+    "m1-max-32gb-studio": [("Performance", 8, 3200), ("Efficiency", 2, 2000)],
+    "mac-mini-m4-16gb": [("Performance", 4, 4100), ("Efficiency", 6, 2600)],
+}
+
 # ---------------------------------------------------------------- world math
 
 def ledger_for(machine, world, now_ms):
@@ -82,32 +95,108 @@ def ledger_for(machine, world, now_ms):
     for m in models:
         m["state"] = state
 
-    # (#2107, #1833) The daemon-side continuous host sampler's `load` block
-    # — a plausible-not-real reading, same spirit as `gather_ms` above: the
-    # demo has no real `top`/`vm_stat`/`ioreg` to sample, so this derives a
-    # small, internally-consistent window (mean <= max, p95 <= max) around a
-    # random "now" reading rather than hand-picking numbers that could drift
-    # out of shape on a future edit. `samples: 120` / `interval_ms: 5000` /
-    # `span_ms: 595000` match the daemon's own `RING_CAPACITY` (120) at its
-    # default 5s cadence (`crates/darkmux-serve/src/host_sampler.rs`).
-    def window_metric(now_val, spread):
+    # (#2107, #1833, #2108) The daemon-side continuous host sampler's `load`
+    # block — a plausible-not-real reading, same spirit as `gather_ms`
+    # above: the demo has no real `top`/`vm_stat`/`ioreg`/IOReport to
+    # sample, so this derives a small, internally-consistent window
+    # (mean <= max, p95 <= max) around a random "now" reading rather than
+    # hand-picking numbers that could drift out of shape on a future edit.
+    # `samples: 120` / `interval_ms: 5000` / `span_ms: 595000` match the
+    # daemon's own `RING_CAPACITY` (120) at its default 5s cadence.
+    #
+    # This is host-sample-shape v2 (`HostSamplerRing::snapshot`,
+    # `crates/darkmux-serve/src/host_sampler.rs`) — the ONLY shape the real
+    # daemon ever serves at `/machine/resources`'s `load` key. A v1 shape
+    # here (`window.cpu.mean_pct`, `now.sampler_cost_ms_mean`) is not a
+    # style choice, it is a wire-contract break: `ui/src/components/
+    # machineStatsContent.tsx` reads `load.window.cpu_pct.mean` unguarded.
+    def window_metric(now_val, spread, cap=100):
         return {
-            "mean_pct": round(max(0, now_val - spread), 1),
-            "p95_pct": min(100, now_val + spread),
-            "max_pct": min(100, now_val + spread + 2),
+            "mean": round(max(0, now_val - spread), 1),
+            "p95": min(cap, now_val + spread),
+            "max": min(cap, now_val + spread + 2),
         }
+
+    def mw_window(now_mw, spread_mw):
+        return {
+            "mean": round(max(0.0, now_mw - spread_mw), 1),
+            "p95": round(now_mw + spread_mw, 1),
+            "max": round(now_mw + spread_mw * 1.3, 1),
+        }
+
+    # Per-perf-level cluster topology, HIGHEST tier first — mirrors
+    # `mach_cpu::PerfLevel`'s "hw.perflevelN, 0 = highest tier" convention
+    # (`crates/darkmux-crew/src/host_probe/mach_cpu.rs`). M1 Max and the
+    # base M4 use their real, documented core counts; the M5 Ultra is
+    # fictional (no such chip exists) — this demo world's own invention, so
+    # its 6+12+4 split is this file's to declare.
+    topo = CPU_TOPOLOGY.get(machine["id"], CPU_TOPOLOGY["m1-max-32gb-studio"])
+    # Power class (peak CPU/GPU/ANE draw in mW) scaled to the machine's
+    # tier — never written down twice against `topo`'s core counts:
+    # roughly proportional to total core count, which is what actually
+    # drives an Apple Silicon part's power envelope.
+    total_cores = sum(cores for _, cores, _ in topo)
+    cpu_peak_mw = 380.0 * total_cores
+    gpu_peak_mw = 550.0 * (total_cores / 3)
+    ane_peak_mw = 25.0 * total_cores
 
     cpu_now = random.randint(15, 35)
     mem_now = min(95, max(5, int(pool_used / cap * 100) + random.randint(-3, 3)))
     gpu_now = random.randint(40, 85)
+    gpu_mhz_now = random.randint(300, 1400)
+    gpu_mem_bytes_now = int(cap * random.uniform(0.003, 0.008))
+    cpu_power_now = round(cpu_peak_mw * (cpu_now / 100) * random.uniform(0.85, 1.15), 1)
+    gpu_power_now = round(gpu_peak_mw * (gpu_now / 100) * random.uniform(0.85, 1.15), 1)
+    ane_power_now = round(ane_peak_mw * random.uniform(0.0, 0.4), 1)
+    total_power_now = round(cpu_power_now + gpu_power_now + ane_power_now, 1)
+
+    cpu_clusters = [
+        {
+            "name": name, "cores": cores,
+            "pct": min(100, max(0, cpu_now + random.randint(-8, 8))),
+            "mhz": mhz + random.randint(-150, 150),
+        }
+        for name, cores, mhz in topo
+    ]
+
+    interval_ms, samples, span_ms = 5000, 120, 595000
+    cpu_power_window = mw_window(cpu_power_now, cpu_peak_mw * 0.08)
+    gpu_power_window = mw_window(gpu_power_now, gpu_peak_mw * 0.08)
+    total_power_window = mw_window(total_power_now, (cpu_peak_mw + gpu_peak_mw) * 0.08)
+
     load = {
-        "now": {"cpu_pct": cpu_now, "mem_pct": mem_now, "gpu_pct": gpu_now, "sampled_at_ms": now_ms},
-        "window": {
-            "cpu": window_metric(cpu_now, 6), "mem": window_metric(mem_now, 3),
-            "gpu": window_metric(gpu_now, 10),
-            "samples": 120, "interval_ms": 5000, "span_ms": 595000,
+        "now": {
+            "sampled_at_ms": now_ms,
+            "sampler_cost_ms": random.randint(2, 12),
+            "cpu_pct": cpu_now,
+            "cpu_clusters": cpu_clusters,
+            "mem_pct": mem_now,
+            "gpu_pct": gpu_now,
+            "gpu_mhz": gpu_mhz_now,
+            "gpu_mem_bytes": gpu_mem_bytes_now,
+            "thermal": {"state": "nominal", "cpu_speed_limit_pct": 100},
+            "power_mw": {
+                "cpu": round(cpu_power_now), "gpu": round(gpu_power_now),
+                "ane": round(ane_power_now), "total": round(total_power_now),
+            },
         },
-        "sampler_cost_ms_mean": round(random.uniform(2.0, 5.0), 1),
+        "window": {
+            "samples": samples, "span_ms": span_ms, "interval_ms": interval_ms,
+            "cpu_pct": window_metric(cpu_now, 6),
+            "gpu_pct": window_metric(gpu_now, 10),
+            "mem_pct": window_metric(mem_now, 3),
+            "power_mw": {
+                "total": total_power_window, "gpu": gpu_power_window, "cpu": cpu_power_window,
+            },
+            "thermal": {
+                "worst_state": "nominal", "above_nominal_ms": 0,
+                "min_cpu_speed_limit_pct": 100,
+            },
+            # mWh = mean total mW * span (h). `mean` from the SAME
+            # `total_power_window` above the JSON echoes — never re-derived,
+            # so this can't silently disagree with the window it summarizes.
+            "energy_mwh": round(total_power_window["mean"] * span_ms / 1000 / 3600),
+        },
     }
 
     return {
