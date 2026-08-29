@@ -101,6 +101,17 @@ export interface MeterBand {
    * other band (VRAM's `other`/`growth`, every CPU/GPU/MEM band) is
    * omitted entirely at `lengthPct <= 0`. */
   alwaysRender?: boolean;
+  /** (#2122) Marks this as the auto-colored compact-meter fill band — set
+   * by `simpleBand()`, the one producer every CPU/GPU/MEM gauge and the
+   * CPU-cluster tiles go through. `Meter` colors a `banded` band (and the
+   * caption's numeral) by `lengthPct` against `warnAt`/`criticalAt`,
+   * OVERRIDING its literal `stroke` once the value crosses a threshold —
+   * a quiet gauge stays whatever accent color the caller supplied, a
+   * loaded one goes amber then red regardless of what `stroke` says.
+   * VRAM's own bands (`mm-gauge-val`/`mm-gauge-other`/`mm-gauge-growth`)
+   * never set this — its color story is the ramp gradient + redline, and
+   * stays exactly as it was before this prop existed. */
+  banded?: boolean;
 }
 
 export interface MeterTick {
@@ -163,6 +174,17 @@ export interface MeterProps {
    * (a CPU cluster's own per-core %). Every existing caller omits this
    * and keeps the line, all-null included; see that line's own doc. */
   hideAvgMax?: boolean;
+  /** (#2122) Per-metric override for where a `banded` band (and the
+   * caption numeral) turn amber/red. Defaults to `DEFAULT_WARN_AT`/
+   * `DEFAULT_CRITICAL_AT` (80/95, CPU/GPU's own numbers) — MEM passes a
+   * gentler 90/97 so its own gauge doesn't fire on the same margin the
+   * VRAM pressure ledger already alarms on (see `MachineLens.tsx`'s call
+   * site for the full reasoning: the ledger's kernel-pressure trigger
+   * stays the authority for memory red, this is a softer heads-up). A
+   * caller with no `banded` bands (VRAM, any future non-compact use)
+   * never reads these — nothing to threshold. */
+  warnAt?: number;
+  criticalAt?: number;
   /** Extra SVG content drawn last, before `</svg>` closes — VRAM's
    * odometer digit group + its two text labels. The one thing that isn't
    * shared core (see this module's own doc). */
@@ -174,6 +196,55 @@ export interface MeterProps {
  * stays `—`, never coerced to 0 (absence is a different claim). */
 export function fmtPct(v: number | null): string {
   return v === null ? "—" : `${Math.round(v)}%`;
+}
+
+/** (#2122) `quiet` / `warn` / `critical` — the three-band severity a
+ * compact gauge's fill and caption both key on. `null` (no reading yet)
+ * always reads `quiet`: an unmeasured gauge has nothing to alarm about,
+ * matching this file's absence-never-zero convention everywhere else. */
+export type MeterBandLevel = "quiet" | "warn" | "critical";
+
+/** Default thresholds — CPU/GPU and the mockup's own numbers (#2122's
+ * ask): quiet below 80, warning from 80, critical from 95. Matches the
+ * host sampler's own `above_80_ms` reduction threshold, so the gauge's
+ * color band and the "time above 80%" figure elsewhere on the panel never
+ * disagree about where "elevated" starts. */
+export const DEFAULT_WARN_AT = 80;
+export const DEFAULT_CRITICAL_AT = 95;
+
+/** (#2122) MEM's own gentler pair — the compact MEM gauge draws from raw
+ * `mem_pct` (system memory in use), a DIFFERENT signal than the VRAM
+ * pressure ledger's `pressure.margin_percent` (kernel headroom,
+ * `machineGauge.ts`'s own note: "the only figure that can trigger RED").
+ * The ledger stays the authority for a genuine memory alarm; this gauge's
+ * job is a quieter heads-up on raw usage, so it gets a higher bar (90/97
+ * instead of the 80/95 default) rather than co-firing on the same margin
+ * the ledger already covers — two reds for one condition reads as a
+ * louder alarm than the data supports. */
+export const MEM_WARN_AT = 90;
+export const MEM_CRITICAL_AT = 97;
+
+/** Pure threshold lookup — `warnAt`/`criticalAt` are per-metric props
+ * (MEM wants 90/97, see `MachineLens.tsx`'s own note on why) rather than
+ * hardcoded here, so this stays one function for every caller. `>=` at
+ * each edge: a reading AT the threshold is already the next band up,
+ * matching the thermal pill's own `>= 80` / `>= 95` wording (#2122). */
+export function meterBandLevel(now: number | null, warnAt: number, criticalAt: number): MeterBandLevel {
+  if (now === null) return "quiet";
+  if (now >= criticalAt) return "critical";
+  if (now >= warnAt) return "warn";
+  return "quiet";
+}
+
+/** The CSS class a `banded` band's SVG path (and the caption's
+ * `.meter-now`) picks up for a given level — `""` for `quiet` leaves the
+ * element's existing class/color untouched entirely (the caller's own
+ * accent stroke, `--fg` for the numeral), so a never-loaded gauge is
+ * byte-identical to before this packet. */
+export function bandLevelClass(level: MeterBandLevel): string {
+  if (level === "warn") return "mm-band-warn";
+  if (level === "critical") return "mm-band-critical";
+  return "";
 }
 
 /** `pct * 1.8` — the dial's own 180°-sweep angle formula (matches
@@ -189,10 +260,13 @@ export function angleForPct(pct: number): number {
 
 /** A compact meter's single fill band — `now` percent, 0-100, clamped.
  * `null` (no reading yet) yields NO band at all, matching the same
- * absence-never-zero rule the needle already follows. */
+ * absence-never-zero rule the needle already follows. `banded: true`
+ * (#2122) opts this band into `Meter`'s threshold coloring — every
+ * current caller of `simpleBand` IS a compact CPU/GPU/MEM/cluster gauge,
+ * so this is the one place that needs to say so. */
 export function simpleBand(className: string, stroke: string, now: number | null): MeterBand[] {
   if (now === null) return [];
-  return [{ className, stroke, lengthPct: Math.max(0, Math.min(100, now)) }];
+  return [{ className, stroke, lengthPct: Math.max(0, Math.min(100, now)), banded: true }];
 }
 
 /** A compact meter's avg/max marks — small unlabeled ticks on the arc, the
@@ -244,8 +318,16 @@ export function Meter({
   label,
   numerals,
   hideAvgMax,
+  warnAt = DEFAULT_WARN_AT,
+  criticalAt = DEFAULT_CRITICAL_AT,
   children,
 }: MeterProps) {
+  // (#2122) The caption numeral colors itself off its OWN value — every
+  // `banded` band's `lengthPct` is drawn from the same reading, so the two
+  // never disagree, but computing this independently means a caller with
+  // `numerals` and no `banded` band (none exist today) simply gets no
+  // caption color rather than crashing on a band lookup.
+  const nowLevelCls = numerals ? bandLevelClass(meterBandLevel(numerals.now, warnAt, criticalAt)) : "";
   return (
     <div className={wrapperClassName} data-meter={label ? label.toLowerCase() : undefined}>
       <svg width={width} height={height} viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
@@ -261,19 +343,30 @@ export function Meter({
         <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={STROKE_W} pathLength={100} />
         {bands
           .filter((b) => b.alwaysRender || b.lengthPct > 0)
-          .map((b) => (
-            <path
-              key={b.className}
-              className={b.className}
-              stroke={b.stroke}
-              d={HALF_ARC_D}
-              fill="none"
-              strokeWidth={STROKE_W}
-              pathLength={100}
-              strokeDasharray={b.hatchedDasharray ?? `${b.lengthPct} 100`}
-              strokeDashoffset={b.hatchedDasharray ? undefined : b.startPct ? -b.startPct : undefined}
-            />
-          ))}
+          .map((b) => {
+            // (#2122) Only a `banded` band (every `simpleBand()` output —
+            // CPU/GPU/MEM, the CPU-cluster tiles) is eligible; VRAM's own
+            // bands never set the flag and always render exactly as
+            // before. The level's CSS class (`.mm-band-warn`/
+            // `.mm-band-critical`, styles.css) overrides the literal
+            // `stroke` prop via ordinary CSS cascade — SVG presentation
+            // attributes sit below any stylesheet rule in priority, so no
+            // conditional here is needed to suppress `b.stroke`.
+            const levelCls = b.banded ? bandLevelClass(meterBandLevel(b.lengthPct, warnAt, criticalAt)) : "";
+            return (
+              <path
+                key={b.className}
+                className={levelCls ? `${b.className} ${levelCls}` : b.className}
+                stroke={b.stroke}
+                d={HALF_ARC_D}
+                fill="none"
+                strokeWidth={STROKE_W}
+                pathLength={100}
+                strokeDasharray={b.hatchedDasharray ?? `${b.lengthPct} 100`}
+                strokeDashoffset={b.hatchedDasharray ? undefined : b.startPct ? -b.startPct : undefined}
+              />
+            );
+          })}
         {ticks.map((t, i) => (
           <line
             // Index, not `t.pct` — a compact meter's avg/max ticks can
@@ -333,7 +426,9 @@ export function Meter({
       {(label || numerals) && (
         <div className="meter-caption">
           {label && <div className="meter-label">{label}</div>}
-          {numerals && <div className="meter-now">{fmtPct(numerals.now)}</div>}
+          {numerals && (
+            <div className={nowLevelCls ? `meter-now ${nowLevelCls}` : "meter-now"}>{fmtPct(numerals.now)}</div>
+          )}
         </div>
       )}
       {/* (phone feedback, 2026-08-29; nowrap restored #2108) `avg · max`

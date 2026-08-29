@@ -42,6 +42,8 @@ import {
   fmtPct,
   simpleBand,
   angleForPct,
+  MEM_WARN_AT,
+  MEM_CRITICAL_AT,
 } from "./Meter";
 import { InlineOrCells, type InlineOrCellsItem } from "./InlineOrCells";
 import { COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "./Meter";
@@ -601,6 +603,8 @@ export function useMachineStatsContent({
         width={COMPACT_METER_WIDTH}
         height={COMPACT_METER_HEIGHT}
         ariaLabel={`MEM: ${scopeLabel}`}
+        warnAt={MEM_WARN_AT}
+        criticalAt={MEM_CRITICAL_AT}
         {...compactMeterProps(
           "MEM",
           "mm-gauge-fill-compact",
