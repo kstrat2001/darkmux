@@ -223,13 +223,18 @@ pub fn reduce_host_extras(raw: &[HostExtraAt]) -> HostExtras {
     // no measured interval to attribute), which undercounts a window cut off
     // mid-spike rather than overcounting one that wasn't.
     let energy_mwh = power.is_some().then(|| {
-        raw.windows(2)
+        let joules: f64 = raw
+            .windows(2)
             .filter_map(|w| {
                 let p = w[0].power?;
                 let gap = w[1].at_ms.saturating_sub(w[0].at_ms) as f64;
                 Some(p.total_mw() * gap / 3.6e6)
             })
-            .sum::<f64>()
+            .sum();
+        // Rounded to microwatt-hours. The sum's full binary expansion
+        // (`31.049011483786114`) asserts a precision no sampler at a 1-5s
+        // cadence has, and it reads as noise on the wire.
+        (joules * 1e3).round() / 1e3
     });
 
     let thermals: Vec<&HostExtraAt> = raw.iter().filter(|s| s.thermal.is_some()).collect();
@@ -572,6 +577,20 @@ mod tests {
         let raw = vec![at(0, p(3600.0, 0.0, 0.0), None), at(1000, p(0.0, 0.0, 0.0), None)];
         let e = reduce_host_extras(&raw).energy_mwh.expect("energy measured");
         assert!((e - 1.0).abs() < 1e-9, "got {e}");
+    }
+
+    #[test]
+    fn energy_is_rounded_to_microwatt_hours_not_full_float_noise() {
+        // A gap that produces a repeating expansion: 1000 mW for 1111 ms.
+        let raw = vec![
+            at(0, p(1000.0, 0.0, 0.0), None),
+            at(1111, p(0.0, 0.0, 0.0), None),
+        ];
+        let e = reduce_host_extras(&raw).energy_mwh.expect("energy");
+        assert_eq!(
+            e, 0.309,
+            "no sampler at a 1-5s cadence justifies more than microwatt-hour precision"
+        );
     }
 
     #[test]
