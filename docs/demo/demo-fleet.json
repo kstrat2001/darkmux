@@ -1,9 +1,9 @@
 {
   "machines": [
     {
-      "beat_ts_ms": 1787897595281,
-      "darkmux_version": "3.2.0",
-      "display_name": "m5-ultra-256gb",
+      "beat_ts_ms": 1788023120593,
+      "darkmux_version": "3.3.0",
+      "display_name": "Workstation",
       "loaded_models": [
         "darkmux:qwen3.5-122b-a10b",
         "darkmux:qwen3.6-35b-a3b-turboquant-mlx",
@@ -15,9 +15,9 @@
       "specs": "Apple M5 Ultra \u00b7 256 GB"
     },
     {
-      "beat_ts_ms": 1787897595281,
-      "darkmux_version": "3.2.0",
-      "display_name": "m1-max-32gb-studio",
+      "beat_ts_ms": 1788023120593,
+      "darkmux_version": "3.3.0",
+      "display_name": "Studio",
       "loaded_models": [
         "darkmux:qwen3-4b-instruct-2507"
       ],
@@ -26,9 +26,9 @@
       "specs": "Apple M1 Max \u00b7 32 GB"
     },
     {
-      "beat_ts_ms": 1787897595281,
-      "darkmux_version": "3.2.0",
-      "display_name": "mac-mini-m4-16gb",
+      "beat_ts_ms": 1788023120593,
+      "darkmux_version": "3.3.0",
+      "display_name": "Mini",
       "loaded_models": [
         "darkmux:qwen3-4b-instruct-2507"
       ],

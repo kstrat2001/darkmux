@@ -13,7 +13,14 @@ runs board / mission-status panel / SSE status layering), using the SAME
 scrub and the SAME identity-anchoring philosophy as `import_session.py`.
 
   ./import_mission.py review-<epoch>-<hex> \\
-      --missions-out missions --sessions-out sessions
+      --missions-out missions --sessions-out sessions \\
+      --title "Review of a merged darkmux PR"
+
+`--title` (#2121) is the "visitor pass": what a first-time visitor sees
+wherever the viewer would otherwise show this mission's own id (the
+playback transport, the Machine info modal's playback row's fallback).
+See the flag's own `--help` text for exactly where it lands and why it
+rides the flow records rather than `mission.json`.
 
 Identity handled here, beyond what `import_session.py` already does for a
 flow session:
@@ -308,6 +315,28 @@ def main():
                      help="demo mission id / fixture dirname (default: the "
                           "mission's own case_id from envelope.payload.case_id, "
                           "slugified; falls back to the mission id itself)")
+    ap.add_argument("--title", default=None,
+                     help="(#2121) a human title for this mission — e.g. "
+                          "'Review of a merged darkmux PR'. Stamped as "
+                          "`mission_title` on every correlated flow record "
+                          "(never into mission.json: `Mission` has no title "
+                          "field, and an unknown key there would silently "
+                          "drop on the next real `/missions`/graph "
+                          "round-trip — see this module's own doc). Omit to "
+                          "leave the mission unlabeled; the viewer's "
+                          "id-derived heuristic (`humanMissionLabel`) is the "
+                          "fallback for a mission with no title.")
+    ap.add_argument("--reviewed", default=None,
+                     help="(#2121) the real `owner/repo#pr` this review "
+                          "mission actually reviewed — e.g. "
+                          "'kstrat2001/darkmux#2030'. Stamped as "
+                          "`mission_reviewed` alongside `mission_title` "
+                          "(same rationale: rides the flow record, never "
+                          "`mission.json`). Surfaces ONLY in the Machine "
+                          "info modal's playback row, next to the raw "
+                          "mission id — never in the transport, which shows "
+                          "the title alone. Omit for a mission with no real "
+                          "PR to name.")
     ap.add_argument("--missions-out", default=str(HERE / "missions"))
     ap.add_argument("--sessions-out", default=str(HERE / "sessions"))
     ap.add_argument("--flows-dir", default=None,
@@ -409,6 +438,35 @@ def main():
         r = replace_id(r, old_id, new_id)
         r = scrub(r)
         r["t_ms"] = t_ms
+        # (#2121) A human title for the mission, stamped directly onto every
+        # correlated record that carries THIS mission's id (never a task
+        # session record scoped in only by the time-window pad, which has
+        # no `mission_id` of its own — see `collect_flow_records`'s doc).
+        # This rides the flow record's own free-form JSON, not
+        # `mission.json`'s `Mission` struct: `Mission` has no title field,
+        # and an unknown key there would silently vanish the next time a
+        # real daemon deserializes-then-reserializes it for `/missions` or
+        # `/mission/:id/graph.json` (both build on the typed struct, not a
+        # raw file passthrough — see `crates/darkmux-serve/src/lib.rs`'s
+        # `missions_handler`). `/flow/:date`, by contrast, reads each line
+        # as a generic `serde_json::Value` (`push_flow_line`) and a static
+        # build parses the committed `.jsonl` client-side — an extra field
+        # here survives BOTH untouched. Stamping every eligible record
+        # (rather than only the `mission start` bookend) means the viewer's
+        # lookup — scan `data` for `r.mission_id === id && r.mission_title`
+        # — finds it regardless of scan order or which records a given view
+        # happens to have loaded.
+        if a.title and r.get("mission_id") == new_id:
+            r["mission_title"] = a.title
+        # (#2121) The real PR this review actually reviewed — same
+        # stamp-every-eligible-record rationale as `mission_title` just
+        # above. Deliberately a SEPARATE field, not folded into the title:
+        # the transport shows the title alone, the raw id lives in the
+        # Machine info modal's playback row, and `mission_reviewed` is that
+        # row's OWN addition next to the id — three independent surfaces,
+        # three independent fields, none inferred from another.
+        if a.reviewed and r.get("mission_id") == new_id:
+            r["mission_reviewed"] = a.reviewed
         # Identity is assigned at build time from world.json, never
         # inherited — same convention as `import_session.py`.
         for k in ("ts", "machine_id", "machine_uid"):

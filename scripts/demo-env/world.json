@@ -6,7 +6,16 @@
     "self-consistent no matter what you change (see build.py's `ledger_for`).",
     "",
     "This is illustrative data for documentation. It is not a measurement, and",
-    "nothing here should be read as a benchmark result."
+    "nothing here should be read as a benchmark result.",
+    "",
+    "`id` is the internal correlation key only (CPU_TOPOLOGY/ledger dict keys,",
+    "REPLAYS/MISSION_PLACEMENT `machine=` references, per-machine fixture",
+    "filenames) — it never reaches the wire. `display_name` (#2121) is what",
+    "build.py writes into every fixture field a real operator's own",
+    "DARKMUX_MACHINE_ID would occupy (a flow record's `machine_id`, a",
+    "presence edge's `handle`, `fleet-machines-live.json`'s `display_name`) —",
+    "the label a visitor actually sees. `cpu_brand`/`ram_gb` keep serving as",
+    "the hardware subtitle underneath it, unchanged."
   ],
 
   "hero_machine": "m5-ultra-256gb",
@@ -29,6 +38,7 @@
   "machines": [
     {
       "id": "m5-ultra-256gb",
+      "display_name": "Workstation",
       "uid": "DEMO-M5ULTRA-2F4A-11F0-9C3D-A2B1C0D4E5F6",
       "cpu_brand": "Apple M5 Ultra",
       "ram_gb": 256,
@@ -47,6 +57,7 @@
     },
     {
       "id": "m1-max-32gb-studio",
+      "display_name": "Studio",
       "uid": "DEMO-M1MAX-3B7C-11F0-8E21-5D4C3B2A1908",
       "cpu_brand": "Apple M1 Max",
       "ram_gb": 32,
@@ -62,6 +73,7 @@
     },
     {
       "id": "mac-mini-m4-16gb",
+      "display_name": "Mini",
       "uid": "DEMO-MINIM4-5C9D-11F0-A44B-7E6F5A4B3C2D",
       "cpu_brand": "Apple M4",
       "ram_gb": 16,

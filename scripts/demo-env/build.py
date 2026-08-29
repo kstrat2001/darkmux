@@ -45,6 +45,22 @@ CPU_TOPOLOGY = {
     "mac-mini-m4-16gb": [("Performance", 4, 4100), ("Efficiency", 6, 2600)],
 }
 
+
+def disp(machine):
+    """(#2121) The label a visitor sees for this machine — everywhere a real
+    operator's own `DARKMUX_MACHINE_ID` would land on the wire (a flow
+    record's `machine_id`, a presence edge's `handle`,
+    `fleet-machines-live.json`'s `display_name`). `machine["id"]`
+    (`m5-ultra-256gb`, ...) stays the internal correlation key this script
+    uses for itself (`CPU_TOPOLOGY`/ledger dict keys, `REPLAYS`/
+    `MISSION_PLACEMENT` `machine=` references, per-machine fixture
+    filenames) — it never reaches a fixture field a visitor's eyes land on
+    first. Falls back to the id when a machine declares no `display_name`,
+    so a hand-added `world.json` entry never regresses to `KeyError`.
+    """
+    return machine.get("display_name", machine["id"])
+
+
 # ---------------------------------------------------------------- world math
 
 def ledger_for(machine, world, now_ms):
@@ -241,7 +257,13 @@ def specs_for(machine, world, ledger, now_ms, version, schema):
     util = next((r for r in machine["residents"] if r.get("utility")), None)
     return {
         "darkmux_version": version, "flow_schema_version": schema,
-        "machine_id": machine["id"], "os": "macos aarch64",
+        # (#2121) The display label, not the internal id — matches what
+        # `replay()`/`materialize_mission()` now stamp into every flow
+        # record's own `machine_id`, so `cards.ts::specOf`'s "is this uid
+        # the machine `/machine/specs` describes" alias check (keyed off
+        # `machineNames()`, which reads records' `machine_id`) still finds
+        # this machine under the SAME value it publishes here.
+        "machine_id": disp(machine), "os": "macos aarch64",
         "ram_total_bytes": machine["ram_gb"] * GIB,
         "ram_free_for_ai_bytes": ledger["pool"]["available_bytes"],
         "cpu_brand": machine["cpu_brand"], "loaded_models": loaded,
@@ -330,7 +352,7 @@ def replay(source, plan, machine, now_ms, session_id):
             continue
         r["ts"] = iso(start + t)
         r["session_id"] = session_id
-        r["machine_id"] = machine["id"]
+        r["machine_id"] = disp(machine)  # (#2121) the visitor label, not the internal id
         r["machine_uid"] = machine["uid"]
         if r.get("model") == source_primary:
             r["model"] = plan["model"]
@@ -454,7 +476,7 @@ def materialize_mission(slug, plan, machine, home, now_ms):
         r = json.loads(json.dumps(rec))          # deep copy; nothing else reuses `src`
         t = r.pop("t_ms")
         r["ts"] = iso(start_ms + t)
-        r["machine_id"] = machine["id"]
+        r["machine_id"] = disp(machine)  # (#2121) the visitor label, not the internal id
         r["machine_uid"] = machine["uid"]
         out_recs.append(r)
 
@@ -644,13 +666,16 @@ def main():
         records.extend(mission_recs)
 
     # Presence: one `machine.online` per machine, recent enough that the fleet
-    # lens shows all three as live. Same shape the presence reconciler emits.
+    # lens shows all three as live. Same shape the presence reconciler emits
+    # (`build_machine_edge_record` in `presence_reconciler.rs` stamps BOTH
+    # `handle` and `machine_id` to the display label, never the raw id —
+    # #2121 matches that here too).
     for m in world["machines"]:
         records.append({
             "ts": iso(now_ms - 90_000), "level": "info", "category": "machinery",
             "tier": "local", "stage": "dispatch", "action": "machine.online",
-            "handle": m["id"], "source": "presence-reconciler",
-            "machine_id": m["id"], "machine_uid": m["uid"],
+            "handle": disp(m), "source": "presence-reconciler",
+            "machine_id": disp(m), "machine_uid": m["uid"],
         })
 
     records.sort(key=lambda r: r["ts"])
@@ -759,7 +784,10 @@ def main():
         # "hardware not reported", which is the one thing a fleet screenshot
         # exists to show.
         "machines": [{
-            "machine_uid": m["uid"], "display_name": m["id"],
+            # (#2121) The fleet cards' first line — `disp(m)`, not the raw
+            # correlation id, matching every other display-facing
+            # `machine_id`/`handle` this script now stamps.
+            "machine_uid": m["uid"], "display_name": disp(m),
             "schema_version": schema, "beat_ts_ms": now_ms,
             "darkmux_version": version,
             "specs": f"{m['cpu_brand']} · {m['ram_gb']} GB",
