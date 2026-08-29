@@ -5,6 +5,8 @@
 //! from `src/lab/paths.rs`) so downstream crates can depend on path resolution
 //! without pulling in the lab crate.
 
+#[cfg(unix)]
+pub mod child_registry;
 pub mod config;
 pub mod config_access;
 pub mod dispatch_liveness;
@@ -13,8 +15,6 @@ pub mod flock;
 #[cfg(unix)]
 pub mod interrupt;
 pub mod paths;
-#[cfg(unix)]
-pub mod proc_group;
 pub mod residency_lease;
 pub mod session_id;
 pub mod size;

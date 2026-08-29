@@ -29,53 +29,48 @@
 //! finer-grained (a probe step can itself run for the full `--timeout`) and
 //! needs no change to shared scheduler code.
 //!
-//! **Reaping.** A worker thread blocked deep in `Command::new("curl")
-//! .output()` can't be interrupted from outside without killing something
-//! — Rust has no cooperative-cancellation primitive for a blocking foreign
-//! `wait(2)`. [`arm`] isolates the launcher into its own process group
-//! (`darkmux_types::proc_group::become_group_leader`) BEFORE any dispatch
-//! runs, so every `curl`/`docker` child this run spawns — however deep the
-//! call stack that spawns it — shares that one group id. Once the guard has
-//! already written a durable terminal record for the run (see
-//! `finalize_and_maybe_reap` below), it is safe to `SIGKILL` that whole
-//! group — worker thread's blocked child included, launcher process
-//! itself included — and let the OS finish tearing everything down in one
-//! shot. See `darkmux_types::proc_group`'s own module doc for the full
-//! reasoning on why self-inclusion is deliberate.
+//! **Reaping — by pid, never by process group.** A worker thread blocked
+//! deep in `Command::new("curl").output()` can't be interrupted from
+//! outside without killing something — Rust has no cooperative-
+//! cancellation primitive for a blocking foreign `wait(2)`. An EARLIER cut
+//! of this fix isolated the launcher into its own process group
+//! (`setpgid(0, 0)`) and `SIGKILL`ed the whole group on a caught signal —
+//! proven WRONG by a pty-based test before merge: it silently broke a
+//! terminal's Ctrl-C delivery whenever darkmux ran as a plain child of some
+//! other foreground process (a non-interactive wrapper script, job control
+//! off), moving the launcher OUT of the terminal's registered foreground
+//! group so a real Ctrl-C only reached the wrapper, never darkmux. See
+//! `darkmux_types::child_registry`'s own module doc for the full
+//! measured-wrong story. This module NEVER touches its own process group
+//! now — [`arm`] only installs signal handlers. Reaping instead goes
+//! through `darkmux_types::child_registry`: every child the review
+//! pipeline spawns (today, `curl` — `darkmux-crew`'s
+//! `remote_chat_attempt`) registers its pid there before blocking on it;
+//! [`ReviewFinalizeGuard::close`]/`Drop` call `child_registry::kill_all`,
+//! which signals exactly those pids by number, once the guard has already
+//! written a durable terminal record for the run.
 
 use anyhow::{anyhow, Result};
 use darkmux_lab::lab::review::ReviewEnvelope;
 use std::any::Any;
 
-/// Install SIGINT + SIGTERM handling and isolate this process into its own
-/// group — call ONCE, before minting the mission this run's
-/// [`ReviewFinalizeGuard`] will cover. Idempotent (both underlying calls
-/// are; see their own docs), so it's safe even if a future caller ends up
-/// invoking it more than once in the same process.
-///
-/// Returns the process group id [`ReviewFinalizeGuard`] later hands to
-/// `darkmux_types::proc_group::kill_group`.
-pub(crate) fn arm() -> u32 {
+/// Install SIGINT + SIGTERM handling — call ONCE, before minting the
+/// mission this run's [`ReviewFinalizeGuard`] will cover. Idempotent (the
+/// underlying `darkmux_types::interrupt` calls are; see their own docs),
+/// so it's safe even if a future caller ends up invoking it more than once
+/// in the same process. Deliberately does NOT touch this process's own
+/// group — see this module's own doc for why an earlier version did and
+/// was proven wrong.
+pub(crate) fn arm() {
     darkmux_types::interrupt::install();
     darkmux_types::interrupt::install_term();
-    match darkmux_types::proc_group::become_group_leader() {
-        Ok(pgid) => pgid,
-        Err(e) => {
-            // Best-effort, matching this guard's whole posture: a failure
-            // to isolate the process group degrades ONLY the reaping half
-            // of this fix (the mission's terminal record still gets
-            // written either way) — surfaced, never silently swallowed.
-            eprintln!(
-                "{}",
-                darkmux_types::style::warn(&format!(
-                    "darkmux mission launch review: could not isolate this process's group \
-                     ({e}) — a SIGTERM/SIGINT during this run may leave a remote `curl` call \
-                     running past the mission's own terminal record"
-                ))
-            );
-            std::process::id()
-        }
-    }
+    // (#2124 pty-test finding) See `darkmux_types::interrupt`'s own module
+    // doc: a wrapper-script invocation shape can deliver SIGHUP to darkmux
+    // when the wrapper (the session's controlling-terminal owner) dies
+    // from Ctrl-C — without this, that SIGHUP kills darkmux via its
+    // unhandled default disposition before the SIGINT-handling story ever
+    // gets a chance to run.
+    darkmux_types::interrupt::install_hup();
 }
 
 /// Best-effort rendering of a caught `std::thread::JoinHandle::join()`
@@ -107,12 +102,11 @@ pub(crate) struct ReviewFinalizeGuard {
     armed: bool,
     mission_id: String,
     phase_ids: Vec<String>,
-    pgid: u32,
 }
 
 impl ReviewFinalizeGuard {
-    pub(crate) fn new(mission_id: String, phase_ids: Vec<String>, pgid: u32) -> Self {
-        Self { armed: true, mission_id, phase_ids, pgid }
+    pub(crate) fn new(mission_id: String, phase_ids: Vec<String>) -> Self {
+        Self { armed: true, mission_id, phase_ids }
     }
 
     /// The normal end-of-run path: writes the mission's terminal record
@@ -122,25 +116,26 @@ impl ReviewFinalizeGuard {
     /// see `run_dispatch`'s own supervisor-loop comment), then disarms the
     /// guard so its `Drop` becomes a no-op.
     ///
-    /// When `result` reflects a SIGTERM/SIGINT that arrived during the
-    /// run (`darkmux_types::interrupt::is_set()`), this ALSO reaps every
-    /// process in this run's process group — the worker thread may still
-    /// be blocked deep inside a `curl`/`docker` child at this point, and
-    /// the terminal record just written is already durable, so it's safe
-    /// to tear the whole group down, launcher included. See this module's
-    /// own doc for why that self-inclusion is deliberate. A normal
-    /// completion (no signal observed) never reaches this branch — the
-    /// launcher still has work to do afterward (`envelope_out`, rendering
-    /// the review to `--emit`, the process exit code).
+    /// When `result` reflects a SIGTERM/SIGINT that arrived during the run
+    /// (`darkmux_types::interrupt::is_set()`), this ALSO reaps every pid
+    /// `darkmux_types::child_registry` knows about — the worker thread may
+    /// still be blocked deep inside a `curl` child at this point, and the
+    /// terminal record just written is already durable, so it's safe to
+    /// kill it by pid and exit. A normal completion (no signal observed)
+    /// never reaches this branch — the launcher still has work to do
+    /// afterward (`envelope_out`, rendering the review to `--emit`, the
+    /// process exit code).
     pub(crate) fn close(&mut self, result: &Result<ReviewEnvelope>) {
         self.armed = false;
         crate::mission_launch_review::finalize_review_mission(&self.mission_id, &self.phase_refs(), result);
         if darkmux_types::interrupt::is_set() {
-            darkmux_types::proc_group::kill_group(self.pgid, darkmux_types::proc_group::SIGKILL);
-            // Unreachable in practice — `SIGKILL` to a group this process
-            // is a member of ends this process the same instant. Kept as
-            // a named, honest fallback rather than assuming that holds in
-            // every environment this binary ever runs in.
+            darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
+            // Unlike the earlier process-group approach, `SIGKILL`ing a
+            // child pid does NOT end this process — the launcher must
+            // explicitly exit here, now that finalize + reap are both
+            // durable, rather than relying on a self-inclusion side
+            // effect that (as this module's own doc explains) turned out
+            // to have a real safety cost.
             std::process::exit(130);
         }
     }
@@ -165,9 +160,12 @@ impl Drop for ReviewFinalizeGuard {
         // definition, reaching `Drop` still armed means something already
         // went wrong in a way this module's author didn't name a more
         // specific path for, so the safe default is "assume a child might
-        // still be alive and tear the group down" rather than trying to
-        // decide case by case.
-        darkmux_types::proc_group::kill_group(self.pgid, darkmux_types::proc_group::SIGKILL);
+        // still be alive and kill it by pid" rather than trying to decide
+        // case by case. No `std::process::exit` here (unlike `close()`'s
+        // signal branch) — `Drop` can fire mid-unwind from many places,
+        // some of which (a test, a caller with more cleanup of its own)
+        // must not have the whole process pulled out from under them.
+        darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
     }
 }
 
@@ -234,6 +232,26 @@ mod tests {
         }
     }
 
+    /// `darkmux_types::child_registry`'s `CHILDREN` set is process-wide,
+    /// same as the interrupt flag above — isolate it around any test that
+    /// exercises `close()`/`Drop`'s `kill_all` call, so a stray pid this
+    /// test registers (or a real one some OTHER test in this binary
+    /// happens to register concurrently) can't leak across tests.
+    struct ChildRegistryGuard;
+
+    impl ChildRegistryGuard {
+        fn new() -> Self {
+            darkmux_types::child_registry::reset_for_test();
+            Self
+        }
+    }
+
+    impl Drop for ChildRegistryGuard {
+        fn drop(&mut self) {
+            darkmux_types::child_registry::reset_for_test();
+        }
+    }
+
     fn mission_status_str(mission_id: &str) -> String {
         let path = crew::lifecycle::mission_path(mission_id);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
@@ -295,7 +313,7 @@ mod tests {
         let _guard = CrewDirGuard::new();
         let (mission_id, phase_ids) = mint_review_instance("owner/repo@guard-close-error");
         let mut guard =
-            ReviewFinalizeGuard::new(mission_id.clone(), phase_ids.to_vec(), std::process::id());
+            ReviewFinalizeGuard::new(mission_id.clone(), phase_ids.to_vec());
 
         let result: Result<ReviewEnvelope> = Err(anyhow!("simulated worker-thread panic"));
         guard.close(&result);
@@ -312,29 +330,30 @@ mod tests {
     /// test`, the real handler's exact code path minus an actual OS
     /// signal) and then drops the guard without ever calling `close()` —
     /// mirroring `run_dispatch`'s supervisor loop abandoning an interrupted
-    /// worker thread's handle. `pgid` is this TEST process's own — the
-    /// reap step below (SIGKILL to our own group) would kill the test
-    /// binary if `interrupt::is_set()` were checked here the way `close()`
-    /// checks it, which is exactly why `Drop`'s reap happens
-    /// UNCONDITIONALLY on the fallback path and this test asserts the
-    /// finalize record, not the (untestable-in-process) self-kill.
+    /// worker thread's handle. Unlike the earlier process-group design,
+    /// `Drop`'s `kill_all` reap never touches THIS test process itself —
+    /// it only signals pids `darkmux_types::child_registry` was told
+    /// about, which `ChildRegistryGuard` guarantees is none here — so this
+    /// test can assert the finalize record directly without needing a
+    /// subprocess to observe anything being killed.
     #[test]
     #[serial_test::serial]
     fn drop_writes_the_terminal_record_after_a_simulated_signal() {
         let _guard = CrewDirGuard::new();
         let _interrupt_guard = InterruptFlagGuard::new();
+        let _children_guard = ChildRegistryGuard::new();
         let (mission_id, phase_ids) = mint_review_instance("owner/repo@guard-drop-signal");
 
         {
-            let guard = ReviewFinalizeGuard::new(mission_id.clone(), phase_ids.to_vec(), 0);
+            let guard = ReviewFinalizeGuard::new(mission_id.clone(), phase_ids.to_vec());
             darkmux_types::interrupt::simulate_sigterm_for_test();
             assert!(darkmux_types::interrupt::is_set(), "the simulated SIGTERM must set the flag");
             // Deliberately no `guard.close(...)` call — the guard goes out
-            // of scope here still armed, exercising `Drop`. `pgid: 0` above
-            // makes the fallback's `kill_group` call a documented no-op
-            // (see `proc_group::kill_group`'s own doc), so this test proves
-            // the RECORD-WRITING half of the fallback without needing a
-            // subprocess to observe a self-kill.
+            // of scope here still armed, exercising `Drop`. The child
+            // registry is empty (`ChildRegistryGuard` above), so `Drop`'s
+            // `kill_all` call is a documented no-op — this proves the
+            // RECORD-WRITING half of the fallback without needing a real
+            // child pid or a subprocess to observe anything being killed.
             drop(guard);
         }
 
@@ -362,7 +381,7 @@ mod tests {
         let _guard = CrewDirGuard::new();
         let (mission_id, phase_ids) = mint_review_instance("owner/repo@guard-disarm");
         let mut guard =
-            ReviewFinalizeGuard::new(mission_id.clone(), phase_ids.to_vec(), std::process::id());
+            ReviewFinalizeGuard::new(mission_id.clone(), phase_ids.to_vec());
         let result: Result<ReviewEnvelope> = Ok(ReviewEnvelope { degenerate: None, ..Default::default() });
         guard.close(&result);
         assert_eq!(mission_status_str(&mission_id), "finalized");

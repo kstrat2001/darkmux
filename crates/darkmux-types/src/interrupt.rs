@@ -1,6 +1,6 @@
-//! Process-wide SIGINT (Ctrl-C) / SIGTERM flag, for a synchronous CLI loop
-//! that needs to notice an interrupt BETWEEN units of work rather than
-//! mid-syscall.
+//! Process-wide SIGINT (Ctrl-C) / SIGTERM / SIGHUP flag, for a synchronous
+//! CLI loop that needs to notice an interrupt BETWEEN units of work rather
+//! than mid-syscall.
 //!
 //! `libc` is already a dependency of this crate (`flock.rs`,
 //! `residency_lease.rs`, `style.rs`); this module is the natural home for a
@@ -13,14 +13,31 @@
 //! a worker thread, so a `kill <pid>` (SIGTERM) mid-probe still leaves a
 //! terminal mission record instead of an orphaned Active mission).
 //!
-//! SIGINT and SIGTERM share ONE flag ([`INTERRUPTED`]) — a caller that
-//! wants "stop cleanly on either" polls [`is_set`] once, regardless of
-//! which signal arrived; a caller that only cares about one (crawl, SIGINT
-//! only) simply never calls [`install_term`]. Each signal keeps its OWN
-//! escalation counter so the "two presses, then the OS default disposition
-//! comes back" escape hatch (see [`on_sigint`]'s doc) works independently
-//! per signal — a SIGINT then a SIGTERM is two DIFFERENT first presses, not
-//! one signal's second.
+//! **SIGHUP (#2124 pty-test finding).** `install_hup` exists because of a
+//! measured, NOT hypothetical failure mode: when `darkmux mission launch
+//! review` runs as a plain child of some OTHER foreground process sharing
+//! its process group (a non-interactive wrapper SCRIPT, job control off —
+//! darkmux deliberately never calls `setpgid` itself; see `darkmux_types::
+//! child_registry`'s module doc for why), and that OTHER process is the
+//! session leader holding the controlling terminal, a Ctrl-C that kills
+//! the wrapper (no handler of its own) makes the kernel tear down the
+//! session's controlling terminal — which sends SIGHUP to every SURVIVING
+//! member of the terminal's foreground process group, darkmux included.
+//! Proven via a pty test: without a SIGHUP handler, darkmux died silently
+//! (unhandled SIGHUP's default disposition is terminate) with its mission
+//! left `active` — no different from the original #2124 bug, just a new
+//! trigger. `install_hup` closes that gap the same cooperative way
+//! SIGINT/SIGTERM already do.
+//!
+//! SIGINT, SIGTERM, and SIGHUP share ONE flag ([`INTERRUPTED`]) — a caller
+//! that wants "stop cleanly on any of them" polls [`is_set`] once,
+//! regardless of which signal arrived; a caller that only cares about one
+//! (crawl, SIGINT only) simply never calls [`install_term`]/
+//! [`install_hup`]. Each signal keeps its OWN escalation counter so the
+//! "two presses, then the OS default disposition comes back" escape hatch
+//! (see [`on_sigint`]'s doc) works independently per signal — a SIGINT
+//! then a SIGTERM is two DIFFERENT first deliveries, not one signal's
+//! second.
 //!
 //! Deliberately minimal: one flag, set once, never cleared. A process that
 //! wants "handle Ctrl-C/TERM for this one operation" installs the
@@ -42,6 +59,10 @@ static SIGINT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// [`install_term`] — the SIGTERM twin of [`SIGINT_COUNT`], counted
 /// separately so the two signals' escalation ladders don't interfere.
 static SIGTERM_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// (#2124) SIGHUP twin of [`SIGTERM_COUNT`] — see this module's own doc
+/// for why SIGHUP needs the same treatment.
+static SIGHUP_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Shared handler body for both signals: set the flag, bump `count`, and
 /// restore the OS default disposition for `signum` on the second delivery
@@ -77,6 +98,13 @@ extern "C" fn on_sigterm(signum: libc::c_int) {
     deliver(signum, &SIGTERM_COUNT);
 }
 
+/// (#2124) SIGHUP twin of [`on_sigint`] — same shared-flag, own
+/// escalation counter. See this module's own doc for why SIGHUP needs a
+/// handler at all.
+extern "C" fn on_sighup(signum: libc::c_int) {
+    deliver(signum, &SIGHUP_COUNT);
+}
+
 /// Install the SIGINT handler for this process. Idempotent — calling it
 /// more than once just re-installs the same handler and resets the
 /// signal count, so a caller that (re)installs before starting a new
@@ -105,8 +133,21 @@ pub fn install_term() {
     }
 }
 
-/// Whether SIGINT or SIGTERM has been received since [`install`]/
-/// [`install_term`] was called. Never resets — see the module doc.
+/// (#2124) Install the SIGHUP handler for this process — see this
+/// module's own doc for the measured failure mode this closes (a
+/// controlling terminal torn down out from under a surviving process in
+/// the same foreground process group). Same idempotent,
+/// two-chances-then-default shape as [`install`].
+pub fn install_hup() {
+    SIGHUP_COUNT.store(0, Ordering::SeqCst);
+    unsafe {
+        libc::signal(libc::SIGHUP, on_sighup as *const () as libc::sighandler_t);
+    }
+}
+
+/// Whether SIGINT, SIGTERM, or SIGHUP has been received since [`install`]/
+/// [`install_term`]/[`install_hup`] was called. Never resets — see the
+/// module doc.
 pub fn is_set() -> bool {
     INTERRUPTED.load(Ordering::SeqCst)
 }
@@ -132,17 +173,26 @@ pub fn simulate_sigterm_for_test() {
     on_sigterm(libc::SIGTERM);
 }
 
-/// Test-only: reset the flag and BOTH signal counts back to their
-/// pre-[`install`]/[`install_term`] state. `is_set` never resets in
-/// production (see the module doc) — a caller using
-/// [`simulate_sigint_for_test`]/[`simulate_sigterm_for_test`] needs its own
-/// way to keep back-to-back tests in the SAME process from contaminating
-/// each other via this process-wide flag.
+/// (#2124) Test-only: deliver a simulated SIGHUP the same way
+/// [`simulate_sigint_for_test`] delivers a simulated SIGINT.
+#[cfg(any(test, feature = "test-support"))]
+pub fn simulate_sighup_for_test() {
+    on_sighup(libc::SIGHUP);
+}
+
+/// Test-only: reset the flag and ALL THREE signal counts back to their
+/// pre-[`install`]/[`install_term`]/[`install_hup`] state. `is_set` never
+/// resets in production (see the module doc) — a caller using
+/// [`simulate_sigint_for_test`]/[`simulate_sigterm_for_test`]/
+/// [`simulate_sighup_for_test`] needs its own way to keep back-to-back
+/// tests in the SAME process from contaminating each other via this
+/// process-wide flag.
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_for_test() {
     INTERRUPTED.store(false, Ordering::SeqCst);
     SIGINT_COUNT.store(0, Ordering::SeqCst);
     SIGTERM_COUNT.store(0, Ordering::SeqCst);
+    SIGHUP_COUNT.store(0, Ordering::SeqCst);
 }
 
 #[cfg(test)]

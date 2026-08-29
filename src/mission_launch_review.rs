@@ -939,13 +939,14 @@ fn run_dispatch(
     // (#2124) Installed unconditionally, ahead of everything else this
     // function does — including the `charges_file` re-judge side path,
     // which spawns remote `curl` children of its own even though it mints
-    // no Mission. `pgid` is used only by the graph path's own
-    // `ReviewFinalizeGuard` below (the re-judge path has no mission to
-    // finalize and today accepts the pre-#2124 signal behavior — see this
-    // launcher's own module doc on why that path is out of scope for this
-    // fix), but arming here means BOTH paths' process group is isolated
-    // from the moment any dispatch could start, not just the graph one.
-    let pgid = review_finalize_guard::arm();
+    // no Mission. Only installs signal handlers (never touches this
+    // process's own group — see `review_finalize_guard`'s module doc for
+    // why an earlier version did and was proven wrong by a pty test): the
+    // re-judge path has no `ReviewFinalizeGuard` and no mission to
+    // finalize, so it still accepts the pre-#2124 signal behavior — see
+    // this launcher's own module doc on why that path is out of scope for
+    // this fix.
+    review_finalize_guard::arm();
     let case = derive_case_id(collected);
 
     let source = resolve_source(collected)?;
@@ -1443,7 +1444,6 @@ fn run_dispatch(
         let mut guard = ReviewFinalizeGuard::new(
             mission_id.clone(),
             vec![investigate_phase_id.clone(), adjudicate_phase_id.clone(), report_phase_id.clone()],
-            pgid,
         );
 
         // (#2124) `with_dispatch_bookends`/`run_review_graph` is ONE
@@ -1586,8 +1586,9 @@ fn run_dispatch(
         // without this, never reach a terminal status regardless of
         // outcome — every review, clean, errored, or signal-interrupted,
         // would be left permanently "stuck" in `darkmux mission status`.
-        // (#2124) `guard.close` also reaps this run's process group when
-        // `result` reflects a caught signal — see its own doc.
+        // (#2124) `guard.close` also reaps this run's registered child
+        // pids (by number, never a process group — see its own doc) when
+        // `result` reflects a caught signal.
         guard.close(&result);
 
         result
