@@ -280,7 +280,7 @@ pub struct DispatchOpts {
     pub system_prompt_override: Option<String>,
     /// (#1959 packet 2) Mount `/workspace` read-only (`-v <ws>:/workspace:ro`)
     /// instead of the default read-write bind. The crawler role reads a
-    /// corpus tree it must never modify — a role holding only `read`/`exec`/
+    /// workspace tree it must never modify — a role holding only `read`/`exec`/
     /// `report_finding` (no `edit`/`write`) is already tool-gated against
     /// writing, but the mount itself is the second, filesystem-level layer:
     /// a `write`/`edit` grant added to the role later, or a shell escape via

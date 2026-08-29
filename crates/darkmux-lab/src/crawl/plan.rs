@@ -1,8 +1,9 @@
-//! Crawl planning (#1959 packet 1) — turns a resolved corpus (manifest +
-//! rules + checked-out sources) into a deterministic `Plan` of work units
-//! with token estimates. NO model dispatch happens here; this is the
-//! mechanical, free-to-compute half of the crawler (prefilters, globs, the
-//! npm range check) that the (future) dispatch loop consumes.
+//! Crawl planning (#1959) — turns a MATERIALIZED workspace (a resolved
+//! `darkmux_crew::workspace_spec::Materialized`, checked out sources +
+//! rules) into a deterministic `Plan` of work units with token estimates.
+//! NO model dispatch happens here; this is the mechanical, free-to-compute
+//! half of the crawler (prefilters, globs, the npm range check) that the
+//! launcher's (`src/crawl_launch.rs`) dispatch loop consumes.
 
 use darkmux_crew::workspace_spec::{glob, Materialized, MaterializedSource};
 use darkmux_crew::rules::{Rule, RuleKind};
@@ -1548,7 +1549,7 @@ mod tests {
         let workdir = TempDir::new().unwrap();
         let app_dir = workdir.path().join("app");
         // Nested a few levels deep so "../../../secret.txt" resolves to a
-        // real file OUTSIDE the library's own tree, at the corpus workdir
+        // real file OUTSIDE the library's own tree, at the fixture's workdir
         // root — proving the traversal would otherwise leak a file that
         // was never part of the library.
         let lib_dir = workdir.path().join("nested").join("deep").join("lib");

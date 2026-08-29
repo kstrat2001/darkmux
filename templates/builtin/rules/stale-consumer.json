@@ -1,5 +1,5 @@
 {
-  "_comment": "(#1959) Edge-shaped rule: fires on a dependency EDGE the corpus manifest declares (consumer -> library, both in the corpus). The prefilter is fully mechanical and costs no tokens: the consumer's pinned range for the library vs. the library version being examined, and the consumer's import sites of that library. The model reads the consumer's import sites plus the library entry files and changelog listed with the unit, and reports the sites whose meaning would change.",
+  "_comment": "(#1959) Edge-shaped rule: fires on a dependency EDGE the workspace spec declares (consumer -> library, both in the workspace). The prefilter is fully mechanical and costs no tokens: the consumer's pinned range for the library vs. the library version being examined, and the consumer's import sites of that library. The model reads the consumer's import sites plus the library entry files and changelog listed with the unit, and reports the sites whose meaning would change.",
   "id": "stale-consumer",
   "kind": "edge",
   "title": "A consumer pins a library version its range cannot advance to, and imports symbols that changed",

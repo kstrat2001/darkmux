@@ -577,7 +577,9 @@ pub(crate) enum MissionCmd {
     /// mission rather than left stranded Active — or the RAII finalize
     /// guard catching an early return/panic mid-loop); `3` the operator
     /// dropped a `STOP` kill file
-    /// in the corpus root — honored BETWEEN units, never mid-dispatch;
+    /// in the crawl-state root (`<darkmux root>/crawl/<name>/`, or the
+    /// workspace spec's own explicit `root:` when it sets one) — honored
+    /// BETWEEN units, never mid-dispatch;
     /// `130` SIGINT (a first Ctrl-C is honored the same between-units way
     /// as the kill file; a second Ctrl-C restores the default handler; a
     /// third kills the process outright — `darkmux_types::interrupt`'s own
@@ -807,15 +809,18 @@ pub(crate) enum MissionConfigCmd {
     /// of being silently dropped, so one broken user-tier override never
     /// hides every other registered config. Read-only.
     ///
-    /// `crawl` (`darkmux mission launch crawl`, #1959 packet 2) does NOT
-    /// appear here — this list enumerates
-    /// `templates/builtin/mission-configs/*.json` documents (plus the user
-    /// tier), and crawl has no such document: its Task/Step graph is
-    /// computed at RUN TIME from a resolved corpus plan, not declared
-    /// ahead of time (see `src/crawl_launch.rs`'s module doc for the full
-    /// reasoning). It is routed by literal config id in `mission_launch::
-    /// launch`, checked BEFORE this registry is consulted at all. This is
-    /// absence by design, not a gap in the list.
+    /// `crawl` (`darkmux mission launch crawl`, #1959) DOES appear here —
+    /// `templates/builtin/mission-configs/crawl.json` exists purely for
+    /// discoverability (it declares `workspace`/`rules`/`source`/`rule`/
+    /// `plan`/`plan_out`/`units`/`limit`/`no_fetch`/`dry_run` as inputs
+    /// with zero phases) — but its listed 0 phases / 0 tasks are the
+    /// honest count of a document that carries NO real graph: crawl's
+    /// Task/Step graph is computed at RUN TIME from a resolved crawl plan,
+    /// never declared ahead of time (see `src/crawl_launch.rs`'s module
+    /// doc for the full reasoning). `mission launch crawl` is routed by
+    /// literal config id in `mission_launch::launch`, BEFORE this document
+    /// (or any mission-config document) is ever loaded — editing
+    /// `crawl.json`'s `phases` field has no effect on a real crawl launch.
     List {
         #[command(flatten)]
         json: JsonFlag,
