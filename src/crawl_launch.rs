@@ -428,7 +428,7 @@ fn watchdog_timeout_fired(stderr: &str) -> bool {
 }
 
 /// Pull `(result, wall_ms, prompt_tokens, completion_tokens, model,
-/// detections, rest_ms)` out of a dispatch's `--json` envelope
+/// detections, rest_ms, host)` out of a dispatch's `--json` envelope
 /// (`res.stdout`). `result` is `"stop"` on a clean finish, `"timeout"`
 /// when `stderr` carries the host watchdog's marker (see
 /// [`watchdog_timeout_fired`]), else `"error"` (a hard-to-parse envelope,
@@ -441,7 +441,34 @@ fn watchdog_timeout_fired(stderr: &str) -> bool {
 /// dispatch actually took (`metrics.rest_ms`, #2094) — surfaced beside
 /// `wall_ms` on the `step complete`/`step error` payload so a rested
 /// unit's wall clock is never misread as a slow model.
-fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> (String, u64, u64, u64, Option<String>, Option<Value>, u64) {
+///
+/// `host` (#2107) is the SAME `envelope["host"]` block
+/// `dispatch_internal::enrich_envelope_with_summary` writes — the per-metric
+/// peak/mean/p95/duty reduction over this unit's own `telemetry.process`
+/// samples. This was the #2107 gap: the sampler runs per-dispatch (every
+/// crawl unit gets its own container, its own sampler thread, its own
+/// samples — verified by reading `dispatch_internal::dispatch`, which this
+/// launcher calls once per unit), and it genuinely populates `host` on the
+/// RAW envelope whenever `HostStats::samples > 0`. Nothing past this point
+/// ever read it: `host` is not in this function's return tuple, so it never
+/// reaches `completed_payload` (the unit's `step complete`/`step error` flow
+/// record) or `per_unit_rows` (the mission's `envelope.json`) — the two
+/// surfaces an operator or a tool actually inspects for "what did this unit
+/// see". A raw envelope that HAS the block and every downstream summary that
+/// doesn't reads exactly like the reported symptom: samples present in the
+/// flow stream (the sampler emits `telemetry.process` live, independent of
+/// what this function extracts), `host` absent (read as `null` by a `jq`
+/// query, or by any viewer defaulting a missing key) on the unit's own
+/// record. Threading it through here is the fix — no session/mission-id
+/// keying bug was found in the reduction itself (`HostStats` is a plain
+/// in-process accumulator scoped to one dispatch call, never looked up by
+/// id), so this was a launcher-side readback gap, not a host-side one.
+/// `(result, wall_ms, prompt_tokens, completion_tokens, model, detections,
+/// rest_ms, host)` — named here so clippy's `type_complexity` lint (crossed
+/// once `host` made this an 8-tuple) doesn't have to be silenced instead.
+type UnitDispatchOutcome = (String, u64, u64, u64, Option<String>, Option<Value>, u64, Option<Value>);
+
+fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDispatchOutcome {
     let envelope: Option<Value> = if res.stdout.trim().starts_with('{') {
         serde_json::from_str(&res.stdout).ok()
     } else {
@@ -472,7 +499,13 @@ fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> (String, u6
         envelope.as_ref().and_then(|e| e.pointer("/metrics/completion_tokens")).and_then(Value::as_u64).unwrap_or(0);
     let detections = envelope.as_ref().and_then(|e| e.get("detections")).cloned();
     let rest_ms = envelope.as_ref().and_then(|e| e.pointer("/metrics/rest_ms")).and_then(Value::as_u64).unwrap_or(0);
-    (result_label, wall_ms, prompt_tok, completion_tok, model, detections, rest_ms)
+    // (#2107) See this function's own doc — this is the one line that was
+    // missing. `host` is absent from the envelope whenever the sampler never
+    // got a reading (`HostStats::samples == 0`, e.g. a unit that errored
+    // before the first ~2s tick landed), which `.cloned()` on a missing key
+    // preserves as `None`, not a zeroed block.
+    let host = envelope.as_ref().and_then(|e| e.get("host")).cloned();
+    (result_label, wall_ms, prompt_tok, completion_tok, model, detections, rest_ms, host)
 }
 
 // ── flow records (#1959, revised — no bespoke `crawl.*` vocabulary) ──────
@@ -1398,8 +1431,8 @@ pub(crate) fn run(
 
         let dispatch_outcome = dispatch_fn(opts);
 
-        let (mut result_label, wall_ms, prompt_tok, completion_tok, model, detections, rest_ms) = match &dispatch_outcome {
-            Err(_) => ("error".to_string(), 0u64, 0u64, 0u64, None, None, 0u64),
+        let (mut result_label, wall_ms, prompt_tok, completion_tok, model, detections, rest_ms, host) = match &dispatch_outcome {
+            Err(_) => ("error".to_string(), 0u64, 0u64, 0u64, None, None, 0u64, None),
             Ok(res) => interpret_dispatch_result(unit.id(), res),
         };
         // (#1959 merge-gate finding 13) SIGINT may have arrived WHILE this
@@ -1537,6 +1570,14 @@ pub(crate) fn run(
         if let Some(m) = &model {
             completed_payload["model"] = json!(m);
         }
+        // (#2107) Thread the per-metric peak/mean/p95/duty reduction through
+        // to the unit's own `step complete`/`step error` record — the exact
+        // gap the issue named. Absent (not a zeroed block) whenever this
+        // unit's dispatch never sampled, same honesty rule the source block
+        // itself follows.
+        if let Some(h) = &host {
+            completed_payload["host"] = h.clone();
+        }
         if let Ok(mut step) = crew::lifecycle::load_step(&mission_id, &phase_id, &step_id) {
             step.status = if interrupted_at_readback {
                 NodeStatus::Abandoned
@@ -1580,6 +1621,11 @@ pub(crate) fn run(
             "completion_tokens": completion_tok,
             "wall_ms": wall_ms,
             "model": model,
+            // (#2107) Same convention as `model` above — `null` when this
+            // unit's dispatch never sampled, not an omitted key, so
+            // `envelope.json`'s per-unit rows stay a fixed, tool-parseable
+            // shape.
+            "host": host,
         }));
 
         #[cfg(unix)]

@@ -5424,7 +5424,7 @@ fn a_detection_reaches_the_envelope() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &summary_with(vec![det.clone()]),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5440,7 +5440,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &summary_with(vec![]),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5466,7 +5466,7 @@ fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         s,
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
         no_findings_dir(),
     );
     serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
@@ -5546,7 +5546,7 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5566,7 +5566,7 @@ fn enrichment_does_not_duplicate_the_runtime_metrics_block() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop","metrics":{"turns":1}}"#.to_string(),
         &s,
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5581,32 +5581,138 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
     let s = summary_with(vec![serde_json::json!({"kind":"cycle"})]);
     for raw in ["plain model output", "", "{ not json"] {
         assert_eq!(
-            super::enrich_envelope_with_summary(raw.to_string(), &s, &super::HostPeaks::default(), no_findings_dir()),
+            super::enrich_envelope_with_summary(raw.to_string(), &s, &super::HostStats::default(), no_findings_dir()),
             raw,
             "the non-json path must pass through verbatim: {raw:?}"
         );
     }
 }
 
+// ---------------------------------------------------------------
+// (#2107) The host reduction: peak/mean/p95/duty, not peak alone.
+//
+// A peak answers "did this ever spike"; it can't say how hard the host was
+// driven ON AVERAGE, which is what `runtime.turn_delay_ms` (#2094) needs.
+// `reduce_metric`/`reduce_host_stats` are pure — a scripted sample list in,
+// exact numbers out — so these are driven directly, not through a live
+// sampler thread.
+// ---------------------------------------------------------------
+
+/// A hand-worked fixture: 5 samples at a steady 2000ms cadence, arithmetic
+/// checked by hand in the PR description. Exercises peak, mean (including a
+/// non-integer mean for `mem`), p95 (nearest-rank), and duty (a value that
+/// stays above 80% for exactly one measured gap, plus a trailing above-80
+/// sample with no successor — which must contribute NOTHING, since there is
+/// no measured interval to attribute to it).
+fn worked_samples() -> Vec<super::HostSampleAt> {
+    vec![
+        super::HostSampleAt { at_ms: 0, cpu: Some(50), mem: Some(60), gpu: Some(70) },
+        super::HostSampleAt { at_ms: 2000, cpu: Some(90), mem: Some(65), gpu: Some(85) },
+        super::HostSampleAt { at_ms: 4000, cpu: Some(95), mem: Some(68), gpu: Some(90) },
+        super::HostSampleAt { at_ms: 6000, cpu: Some(40), mem: Some(62), gpu: Some(30) },
+        super::HostSampleAt { at_ms: 8000, cpu: Some(85), mem: Some(78), gpu: Some(95) },
+    ]
+}
+
 #[test]
-fn host_peaks_reach_the_envelope_when_sampled() {
-    let peaks = super::HostPeaks {
-        peak_mem_pct: Some(78),
-        peak_cpu_pct: Some(412),
-        samples: 46,
-    };
+fn the_reduction_yields_the_exact_hand_worked_numbers() {
+    let stats = super::reduce_host_stats(&worked_samples());
+
+    assert_eq!(stats.samples, 5);
+    assert_eq!(stats.sample_interval_ms, Some(2000), "8000ms span / 4 gaps");
+
+    // cpu: [50, 90, 95, 40, 85] — peak 95, mean 72.0, p95 (nearest-rank of
+    // [40,50,85,90,95]) 95. above_80: the 90→95 gap (2000ms) and the 95→40
+    // gap (2000ms) both start above 80; the trailing 85 has no successor.
+    assert_eq!(stats.cpu.peak_pct, Some(95));
+    assert_eq!(stats.cpu.mean_pct, Some(72.0));
+    assert_eq!(stats.cpu.p95_pct, Some(95));
+    assert_eq!(stats.cpu.above_80_ms, 4000, "trailing above-80 sample must not count: {stats:?}");
+
+    // mem: [60, 65, 68, 62, 78] — never crosses 80, so above_80_ms is 0 and
+    // the non-integer mean (333/5 = 66.6 exactly) proves the ONE-DECIMAL
+    // rounding, not a truncation to an integer.
+    assert_eq!(stats.mem.peak_pct, Some(78));
+    assert_eq!(stats.mem.mean_pct, Some(66.6));
+    assert_eq!(stats.mem.p95_pct, Some(78));
+    assert_eq!(stats.mem.above_80_ms, 0);
+
+    // gpu: [70, 85, 90, 30, 95] — same duty shape as cpu (85→90 and 90→30
+    // gaps), on different underlying values.
+    assert_eq!(stats.gpu.peak_pct, Some(95));
+    assert_eq!(stats.gpu.mean_pct, Some(74.0));
+    assert_eq!(stats.gpu.p95_pct, Some(95));
+    assert_eq!(stats.gpu.above_80_ms, 4000);
+}
+
+#[test]
+fn mean_rounds_to_one_decimal_not_a_truncated_integer() {
+    // 1+1+2 = 4 / 3 = 1.3333… — a truncating or floor'd reduction would read
+    // 1, silently discarding the fractional signal a ~2s cadence can still
+    // carry across even a few samples.
+    let m = super::reduce_metric(&[(0, 1), (1, 1), (2, 2)]);
+    assert_eq!(m.mean_pct, Some(1.3));
+}
+
+#[test]
+fn an_empty_metric_reduces_to_all_none_not_zero() {
+    // Zero is a real value a metric can report; "no reading" is a different
+    // claim and must not collapse into it.
+    let m = super::reduce_metric(&[]);
+    assert_eq!(m.peak_pct, None);
+    assert_eq!(m.mean_pct, None);
+    assert_eq!(m.p95_pct, None);
+    assert_eq!(m.above_80_ms, 0);
+}
+
+#[test]
+fn a_single_sample_has_no_measured_interval() {
+    // One point has no gap to measure — `sample_interval_ms` must say so
+    // rather than assert an interval that was never observed.
+    let stats = super::reduce_host_stats(&[super::HostSampleAt {
+        at_ms: 0,
+        cpu: Some(50),
+        mem: Some(50),
+        gpu: Some(50),
+    }]);
+    assert_eq!(stats.samples, 1);
+    assert_eq!(stats.sample_interval_ms, None);
+    // A single reading is still its own peak/mean/p95 — one point IS the
+    // whole distribution.
+    assert_eq!(stats.cpu.peak_pct, Some(50));
+    assert_eq!(stats.cpu.mean_pct, Some(50.0));
+    assert_eq!(stats.cpu.p95_pct, Some(50));
+}
+
+#[test]
+fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
+    let stats = super::reduce_host_stats(&worked_samples());
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &peaks,
+        &stats,
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["host"]["peak_mem_pct"], 78);
-    assert_eq!(v["host"]["peak_cpu_pct"], 412);
+    assert_eq!(v["host"]["cpu"]["peak_pct"], 95);
+    assert_eq!(v["host"]["cpu"]["mean_pct"], 72.0);
+    assert_eq!(v["host"]["cpu"]["p95_pct"], 95);
+    assert_eq!(v["host"]["cpu"]["above_80_ms"], 4000);
+    assert_eq!(v["host"]["mem"]["peak_pct"], 78);
+    assert_eq!(v["host"]["gpu"]["peak_pct"], 95);
+    assert_eq!(v["host"]["samples"], 5);
+    assert_eq!(v["host"]["sample_interval_ms"], 2000);
+    // (#2107) Deprecated top-level aliases — kept for one release for any
+    // reader still looking at the pre-#2107 shape. They must read straight
+    // off the SAME nested peaks, never a second, independently-computed
+    // figure that could drift from them.
     assert_eq!(
-        v["host"]["samples"], 46,
-        "the sample count distinguishes 'idle' from 'never measured': {out}"
+        v["host"]["peak_cpu_pct"], 95,
+        "alias must mirror host.cpu.peak_pct exactly: {out}"
+    );
+    assert_eq!(
+        v["host"]["peak_mem_pct"], 78,
+        "alias must mirror host.mem.peak_pct exactly: {out}"
     );
 }
 
@@ -5617,7 +5723,7 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5660,7 +5766,7 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
         td.path(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5679,7 +5785,7 @@ fn a_trailing_newline_is_not_a_finding() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
         td.path(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5696,7 +5802,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();

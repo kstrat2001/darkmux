@@ -2646,7 +2646,15 @@ mod tests {
         //           provenance under `payload.context` on every record a
         //           dispatch's flow-record surface emits. See schema.rs's
         //           fuller changelog entry.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.26.0");
+        //   1.27.0 (#2107): `dispatch.complete`'s `host` envelope block
+        //           gains a real per-metric reduction (`peak_pct`,
+        //           `mean_pct`, `p95_pct`, `above_80_ms` for each of
+        //           `cpu`/`mem`/`gpu`) instead of two bare peaks, plus
+        //           `sample_interval_ms`. The pre-1.27.0 top-level
+        //           `peak_cpu_pct`/`peak_mem_pct` are kept as aliases for
+        //           one release. Additive; no struct/field REMOVAL. See
+        //           schema.rs's fuller changelog entry.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.27.0");
     }
 
     #[test]

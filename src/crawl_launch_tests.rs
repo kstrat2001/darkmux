@@ -219,6 +219,12 @@ struct ScriptedUnit {
     completion_tokens: u64,
     wall_ms: u64,
     model: &'static str,
+    /// (#2107) The `host` block a real envelope carries when the sampler
+    /// took at least one reading. `None` reproduces the ordinary "too short
+    /// to sample" case; a scripted `Some(..)` is how
+    /// `host_threads_through_to_the_unit_record` drives the #2107
+    /// regression without a live sampler thread.
+    host: Option<Value>,
 }
 
 impl Default for ScriptedUnit {
@@ -232,6 +238,7 @@ impl Default for ScriptedUnit {
             completion_tokens: 5,
             wall_ms: 100,
             model: "darkmux:test-model",
+            host: None,
         }
     }
 }
@@ -283,7 +290,7 @@ fn scripted_ok_result(unit_id: &str, script: &ScriptedUnit, session_id: String) 
         std::fs::write(runtime_dir.join("findings.jsonl"), body).unwrap();
     }
 
-    let envelope = json!({
+    let mut envelope = json!({
         "result": script.result,
         "final_assistant": format!("covered {unit_id}"),
         "metrics": {
@@ -294,6 +301,12 @@ fn scripted_ok_result(unit_id: &str, script: &ScriptedUnit, session_id: String) 
         },
         "detections": [],
     });
+    // (#2107) Only inserted when scripted — mirrors the real envelope, which
+    // omits `host` entirely (not a null block) whenever the sampler never
+    // took a reading.
+    if let Some(h) = &script.host {
+        envelope["host"] = h.clone();
+    }
 
     DispatchResult {
         exit_code: script.exit_code,
@@ -1344,6 +1357,88 @@ fn envelope_is_self_describing() {
     // field — that generic helper has no per-call model concept; only
     // this launcher's OWN payload numbers carry it).
     assert_eq!(completed["payload"]["model"], "darkmux:test-model", "the mission close record's payload.model field");
+}
+
+// ── #2107: the crawl launcher's null-host regression ─────────────────────
+//
+// The live 2026-08-29 crawl run showed `telemetry.process` samples in the
+// flow stream for a unit's own session, while that unit's own reported
+// outcome carried no `host` block at all. Root cause: the sampler runs
+// per-dispatch (every unit gets its own container + its own sampler
+// thread, verified by reading `dispatch_internal::dispatch`, which this
+// launcher calls once per unit) and genuinely writes `host` onto the raw
+// `--json` envelope whenever it sampled — but `interpret_dispatch_result`
+// never extracted that field, so nothing past it (the unit's `step
+// complete` record, the mission's `envelope.json` per-unit row) ever saw
+// it. No session/mission-id keying bug was found; this is a readback gap.
+
+#[test]
+#[serial_test::serial]
+fn host_threads_through_to_the_unit_record() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut params = params_for(&fx);
+    params.insert("limit".to_string(), Value::String("1".to_string()));
+    let host_block = json!({
+        "cpu": {"peak_pct": 91, "mean_pct": 62.4, "p95_pct": 88, "above_80_ms": 4000},
+        "mem": {"peak_pct": 70, "mean_pct": 55.0, "p95_pct": 68, "above_80_ms": 0},
+        "gpu": {"peak_pct": 95, "mean_pct": 71.2, "p95_pct": 93, "above_80_ms": 6000},
+        "samples": 12,
+        "sample_interval_ms": 2000,
+        "peak_cpu_pct": 91,
+        "peak_mem_pct": 70,
+    });
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit { host: Some(host_block.clone()), ..Default::default() });
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    run(&params, None, &mut dispatch).unwrap();
+
+    let records = read_all_flow_records();
+    let mission_id = mission_id_from_records(&records);
+    let runs_dir = fx.root.path().join("runs").join(&mission_id);
+    let envelope: Value = serde_json::from_str(&std::fs::read_to_string(runs_dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(
+        envelope["units"][0]["host"], host_block,
+        "the mission's own per-unit summary must carry the sampled host block: {envelope}"
+    );
+
+    let step_complete = records
+        .iter()
+        .find(|r| r["action"] == "step complete" && r["payload"]["unit"] == "u-0001")
+        .expect("this unit's own step complete record");
+    assert_eq!(
+        step_complete["payload"]["host"], host_block,
+        "the unit's own flow record must carry it too, not just the mission summary: {step_complete}"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn a_unit_that_never_sampled_reports_no_host_block_rather_than_a_null_one() {
+    // The honesty rule the source block follows (absence, not a zeroed
+    // block) must survive the trip through this launcher too.
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut params = params_for(&fx);
+    params.insert("limit".to_string(), Value::String("1".to_string()));
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    run(&params, None, &mut dispatch).unwrap();
+
+    let records = read_all_flow_records();
+    let step_complete = records
+        .iter()
+        .find(|r| r["action"] == "step complete" && r["payload"]["unit"] == "u-0001")
+        .expect("this unit's own step complete record");
+    assert!(
+        step_complete["payload"].get("host").is_none(),
+        "no sampled reading must not become a `null` block: {step_complete}"
+    );
 }
 
 // ── round-3 CONSIDER 7: interrupted classification at readback ──────────

@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.26.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.27.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -468,6 +468,30 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.26.0";
 //           ledger written to `<workspace root>/runs/<mission>/
 //           ledger.jsonl` at readback is UNCHANGED by any of this — it was
 //           never part of the flow-record schema.
+//   1.27.0 (#2107): `dispatch.complete`'s `host` block (carried in the
+//           `--json` envelope's payload, not the flow record itself — see
+//           `dispatch_internal::enrich_envelope_with_summary`) gains a
+//           real reduction per metric instead of two bare peaks. `host.cpu`
+//           / `host.mem` / `host.gpu` each carry `{peak_pct, mean_pct,
+//           p95_pct, above_80_ms}` — a peak alone answers "did this ever
+//           spike"; it cannot say how hard the host was driven ON AVERAGE,
+//           which `runtime.turn_delay_ms` (#2094) needs. `host.samples` is
+//           unchanged; `host.sample_interval_ms` is new (the MEASURED mean
+//           gap between ticks, not the nominal constant). Additive and
+//           backward compatible: the pre-1.27.0 top-level `peak_cpu_pct` /
+//           `peak_mem_pct` fields are KEPT on `host` for one release,
+//           mirroring `host.cpu.peak_pct` / `host.mem.peak_pct` exactly, so
+//           a reader that never upgrades keeps working. Also fixes the
+//           null-host-on-crawl-units gap named in the same issue: the
+//           sampler always populated `host` on the raw envelope
+//           per-dispatch, but the crawl launcher's own readback
+//           (`interpret_dispatch_result` in `src/crawl_launch.rs`) never
+//           extracted it, so it never reached the unit's own `step
+//           complete`/`step error` payload or the mission's `envelope.json`
+//           — a launcher-side readback gap, not a flow-schema change (no
+//           new field on the FLOW record itself; `payload.host` on `step
+//           complete`/`step error` was always a legal free-form key under
+//           the existing `payload` blob).
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

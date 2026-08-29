@@ -2985,7 +2985,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // panicked sampler thread degrades to "no more samples", not a
     // failed dispatch).
     sampler_stop.store(true, Ordering::SeqCst);
-let host_peaks = sampler_handle.join().unwrap_or_default();
+    let host_stats = sampler_handle.join().unwrap_or_default();
 
     // (#638) The container has exited — the session is no longer running.
     // Stop the liveness heartbeat and DELete its key so the live view drops
@@ -3047,7 +3047,7 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
-    let stdout = enrich_envelope_with_summary(stdout, &trajectory_summary, &host_peaks, &host_out);
+    let stdout = enrich_envelope_with_summary(stdout, &trajectory_summary, &host_stats, &host_out);
 
     // (#782) Read the runtime's token totals from metrics.json now the
     // container has exited. Best-effort — zero totals on any read failure
@@ -3235,7 +3235,7 @@ fn rewrite_container_paths_for_host(stdout: String, host_out: &std::path::Path) 
 fn enrich_envelope_with_summary(
     stdout: String,
     summary: &TrajectorySummary,
-    peaks: &HostPeaks,
+    stats: &HostStats,
     out_dir: &std::path::Path,
 ) -> String {
     let trimmed = stdout.trim();
@@ -3257,13 +3257,33 @@ fn enrich_envelope_with_summary(
     // Host pressure, reduced. Included only when the sampler actually ran —
     // an absent block says "not measured", which is honest, where a zeroed
     // one would read as "measured, and idle".
-    if peaks.samples > 0 {
+    //
+    // (#2107) `cpu`/`mem`/`gpu` each carry the full peak/mean/p95/duty
+    // reduction — a peak alone answers "did this ever spike"; it can't say
+    // how hard the host was driven ON AVERAGE. `peak_cpu_pct`/`peak_mem_pct`
+    // stay at the TOP LEVEL as aliases for one release in case a reader
+    // still looks there (the pre-#2107 shape); they read straight off the
+    // same nested `cpu.peak_pct`/`mem.peak_pct`, so the two can't drift.
+    fn metric_json(m: &MetricStats) -> serde_json::Value {
+        serde_json::json!({
+            "peak_pct": m.peak_pct,
+            "mean_pct": m.mean_pct,
+            "p95_pct": m.p95_pct,
+            "above_80_ms": m.above_80_ms,
+        })
+    }
+    if stats.samples > 0 {
         obj.insert(
             "host".into(),
             serde_json::json!({
-                "peak_mem_pct": peaks.peak_mem_pct,
-                "peak_cpu_pct": peaks.peak_cpu_pct,
-                "samples": peaks.samples,
+                "cpu": metric_json(&stats.cpu),
+                "mem": metric_json(&stats.mem),
+                "gpu": metric_json(&stats.gpu),
+                "samples": stats.samples,
+                "sample_interval_ms": stats.sample_interval_ms,
+                // Deprecated top-level aliases — see the comment above.
+                "peak_cpu_pct": stats.cpu.peak_pct,
+                "peak_mem_pct": stats.mem.peak_pct,
             }),
         );
     }
@@ -3315,7 +3335,48 @@ fn read_findings_summary(out_dir: &std::path::Path) -> Option<serde_json::Value>
     }))
 }
 
-/// (#1955) The host-telemetry reduction the envelope carries.
+/// (#2107) One host-load reading captured during a dispatch, timestamped
+/// relative to the sampler's own start.
+///
+/// The relative (not wall-clock) timestamp is what lets [`reduce_metric`]'s
+/// `above_80_ms` duty measure use the REAL measured gap between consecutive
+/// samples rather than the nominal `TELEMETRY_SAMPLE_INTERVAL` constant — a
+/// slow `sample_host()` probe (a laggy `ioreg`/`top` call, or a tick that
+/// raced the stop signal) widens the true gap, and duty math that assumed
+/// the constant would misattribute how long the host actually sat above the
+/// threshold. `cpu`/`mem`/`gpu` stay `Option`: each is independently
+/// best-effort per tick (see `run_telemetry_sampler`'s own doc), so one
+/// metric's read failing on a given tick must not corrupt another's.
+#[derive(Debug, Clone, Copy)]
+struct HostSampleAt {
+    at_ms: u64,
+    cpu: Option<u64>,
+    mem: Option<u64>,
+    gpu: Option<u64>,
+}
+
+/// (#2107) One metric's (cpu, mem, or gpu) reduction over the samples taken
+/// during a dispatch.
+///
+/// `mean_pct` is rounded to ONE DECIMAL — enough resolution to distinguish
+/// "sat near idle" from "sat near saturated" across a run with only a
+/// handful of samples, without asserting false precision the ~2s sample
+/// cadence never measured. `p95_pct` uses the nearest-rank method
+/// (`ceil(0.95 * n)`th smallest value, 1-indexed) — the standard convention
+/// for a small, unweighted sample set. `above_80_ms` is a DUTY measure — the
+/// wall-clock time this metric's own consecutive samples spent above 80%,
+/// using each sample's OWN measured gap to the next (see [`HostSampleAt`]),
+/// not a synthetic `samples_above_80 × TELEMETRY_SAMPLE_INTERVAL` count that
+/// would silently assume a constant cadence.
+#[derive(Default, Debug, Clone, Copy)]
+struct MetricStats {
+    peak_pct: Option<u64>,
+    mean_pct: Option<f64>,
+    p95_pct: Option<u64>,
+    above_80_ms: u64,
+}
+
+/// (#1955, revised #2107) The host-telemetry reduction the envelope carries.
 ///
 /// The sampler already walks cpu/ram/gpu at a fixed cadence and emits each
 /// sample to the flow stream. This is a pure REDUCTION over samples that are
@@ -3325,12 +3386,81 @@ fn read_findings_summary(out_dir: &std::path::Path) -> Option<serde_json::Value>
 ///
 /// `samples` is carried deliberately: a peak of 0 and "we never sampled" are
 /// different claims, and an orchestrator reasoning about whether a dispatch
-/// was memory-starved has to be able to tell them apart.
+/// was memory-starved has to be able to tell them apart. `sample_interval_ms`
+/// is the MEASURED mean gap between ticks (not the nominal constant) — `None`
+/// when fewer than two samples landed, since an interval needs two points.
+///
+/// Was `HostPeaks` (`peak_mem_pct`/`peak_cpu_pct` only, no GPU peak at all).
+/// A peak alone answers "did this ever spike"; it cannot answer how hard the
+/// host was driven ON AVERAGE, which is the question `runtime.turn_delay_ms`
+/// (#2094) exists to act on. See `enrich_envelope_with_summary`'s doc for the
+/// `peak_cpu_pct`/`peak_mem_pct` top-level aliases this replacement keeps for
+/// one release.
 #[derive(Default, Debug, Clone, Copy)]
-struct HostPeaks {
-    peak_mem_pct: Option<u64>,
-    peak_cpu_pct: Option<u64>,
+struct HostStats {
+    cpu: MetricStats,
+    mem: MetricStats,
+    gpu: MetricStats,
     samples: u32,
+    sample_interval_ms: Option<u64>,
+}
+
+/// Reduce one metric's `(at_ms, pct)` readings — already filtered to the
+/// ticks where THIS metric actually read a value — into peak/mean/p95/duty.
+/// `pairs` must be in chronological order (the order ticks were taken),
+/// which is how the sampler builds it; empty input yields an all-`None`/`0`
+/// [`MetricStats`], the same "not measured" default `HostStats` uses.
+fn reduce_metric(pairs: &[(u64, u64)]) -> MetricStats {
+    if pairs.is_empty() {
+        return MetricStats::default();
+    }
+    let peak_pct = pairs.iter().map(|(_, v)| *v).max();
+    let sum: u64 = pairs.iter().map(|(_, v)| *v).sum();
+    let mean_pct = Some((sum as f64 / pairs.len() as f64 * 10.0).round() / 10.0);
+    let p95_pct = {
+        let mut sorted: Vec<u64> = pairs.iter().map(|(_, v)| *v).collect();
+        sorted.sort_unstable();
+        // Nearest-rank: the `ceil(0.95 * n)`th smallest (1-indexed), clamped
+        // into range so a single-sample list resolves to that sample.
+        let rank = ((sorted.len() as f64) * 0.95).ceil() as usize;
+        let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+        Some(sorted[idx])
+    };
+    // Duty: for each consecutive pair, the FIRST sample's value is assumed
+    // to hold until the next one is taken (left-Riemann) — the only honest
+    // assumption between two point-in-time readings. A trailing sample past
+    // 80% with no successor to bound it contributes nothing (there is no
+    // measured interval to attribute to it), which undercounts a run that
+    // was cut off mid-spike rather than overcounting one that wasn't.
+    let above_80_ms = pairs
+        .windows(2)
+        .filter(|w| w[0].1 > 80)
+        .map(|w| w[1].0.saturating_sub(w[0].0))
+        .sum();
+    MetricStats { peak_pct, mean_pct, p95_pct, above_80_ms }
+}
+
+/// Reduce the full set of a dispatch's host readings into [`HostStats`].
+/// Pure and independently testable — a scripted list of [`HostSampleAt`] in,
+/// exact stats out, with no sampler thread / clock / shell-out involved.
+fn reduce_host_stats(raw: &[HostSampleAt]) -> HostStats {
+    let samples = raw.len() as u32;
+    let sample_interval_ms = if raw.len() >= 2 {
+        let span = raw.last().unwrap().at_ms.saturating_sub(raw.first().unwrap().at_ms);
+        Some(span / (raw.len() as u64 - 1))
+    } else {
+        None
+    };
+    let pairs_of = |get: fn(&HostSampleAt) -> Option<u64>| -> Vec<(u64, u64)> {
+        raw.iter().filter_map(|s| get(s).map(|v| (s.at_ms, v))).collect()
+    };
+    HostStats {
+        cpu: reduce_metric(&pairs_of(|s| s.cpu)),
+        mem: reduce_metric(&pairs_of(|s| s.mem)),
+        gpu: reduce_metric(&pairs_of(|s| s.gpu)),
+        samples,
+        sample_interval_ms,
+    }
 }
 
 /// Summary of what the trajectory tailer surfaced. Used to enrich the
@@ -3791,8 +3921,13 @@ fn run_telemetry_sampler(
     model: String,
     mission_id: Option<String>,
     phase_id: Option<String>,
-) -> HostPeaks {
-    let mut peaks = HostPeaks::default();
+) -> HostStats {
+    // (#2107) Relative to THIS sampler's own start, not wall-clock — the
+    // reduction only needs the gaps BETWEEN samples, and a relative clock
+    // makes `reduce_host_stats` testable with plain integers instead of
+    // `SystemTime`.
+    let started = Instant::now();
+    let mut raw: Vec<HostSampleAt> = Vec::new();
     let emit = |source: &str, action: &str, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
@@ -3850,17 +3985,19 @@ fn run_telemetry_sampler(
         // `darkmux-lab`'s review driver samples through the same function.
         let sample = crate::telemetry_sampler::sample_host();
         if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
-            // Reduce as we sample. Max, not last: the question an orchestrator
-            // asks afterward is "did this run approach the ceiling", and the
-            // final sample is taken as the container tears down, which is the
-            // least representative moment of the whole run.
-            peaks.samples = peaks.samples.saturating_add(1);
-            if let Some(m) = sample.mem {
-                peaks.peak_mem_pct = Some(peaks.peak_mem_pct.map_or(m, |p| p.max(m)));
-            }
-            if let Some(c) = sample.cpu {
-                peaks.peak_cpu_pct = Some(peaks.peak_cpu_pct.map_or(c, |p| p.max(c)));
-            }
+            // (#2107) Record the raw reading, timestamped against this
+            // sampler's own clock. The REDUCTION (peak/mean/p95/duty) is a
+            // pure fold over `raw` computed once at the end
+            // (`reduce_host_stats`) — this loop's only job is to capture
+            // what was observed, not to fold it live, so the reduction
+            // logic has exactly one implementation, shared with the unit
+            // tests that drive it directly.
+            raw.push(HostSampleAt {
+                at_ms: started.elapsed().as_millis() as u64,
+                cpu: sample.cpu,
+                mem: sample.mem,
+                gpu: sample.gpu,
+            });
             let mut payload = serde_json::Map::new();
             if let Some(c) = sample.cpu {
                 payload.insert("cpu".into(), c.into());
@@ -3885,15 +4022,15 @@ fn run_telemetry_sampler(
         while slept < TELEMETRY_SAMPLE_INTERVAL {
             if stop_flag.load(Ordering::SeqCst) {
                 // Teardown mid-interval: return what was observed, never a
-                // default. A killed or short dispatch still has real peaks.
-                return peaks;
+                // default. A killed or short dispatch still has real stats.
+                return reduce_host_stats(&raw);
             }
             let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
             thread::sleep(nap);
             slept += nap;
         }
     }
-    peaks
+    reduce_host_stats(&raw)
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,
