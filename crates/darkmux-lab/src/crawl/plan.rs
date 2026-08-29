@@ -1,14 +1,13 @@
-//! Crawl planning (#1959 packet 1) — turns a resolved corpus (manifest +
-//! rules + checked-out sources) into a deterministic `Plan` of work units
-//! with token estimates. NO model dispatch happens here; this is the
-//! mechanical, free-to-compute half of the crawler (prefilters, globs, the
-//! npm range check) that the (future) dispatch loop consumes.
+//! Crawl planning (#1959) — turns a MATERIALIZED workspace (a resolved
+//! `darkmux_crew::workspace_spec::Materialized`, checked out sources +
+//! rules) into a deterministic `Plan` of work units with token estimates.
+//! NO model dispatch happens here; this is the mechanical, free-to-compute
+//! half of the crawler (prefilters, globs, the npm range check) that the
+//! launcher's (`src/crawl_launch.rs`) dispatch loop consumes.
 
-use crate::crawl::glob;
-use crate::crawl::manifest::CorpusManifest;
-use crate::crawl::rules::{Rule, RuleKind};
+use darkmux_crew::workspace_spec::{glob, Materialized, MaterializedSource};
+use darkmux_crew::rules::{Rule, RuleKind};
 use crate::crawl::semver::{prerelease_tag, range_admits};
-use crate::crawl::sources::ResolvedSource;
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Serialize;
@@ -146,6 +145,10 @@ pub struct PlanSource {
     /// Total regular files found under this source's tree (before any
     /// rule's glob filtering) — the CLI table's `files_walked` column.
     pub files_walked: usize,
+    /// Files the workspace spec's include/exclude left out of this source —
+    /// out of scope, counted, never listed (#1959).
+    #[serde(default)]
+    pub out_of_scope: usize,
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -213,7 +216,7 @@ pub struct Totals {
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Plan {
     pub schema_version: String,
-    pub corpus: String,
+    pub workspace: String,
     pub planned_at: String,
     pub sources: Vec<PlanSource>,
     pub units: Vec<Unit>,
@@ -232,15 +235,18 @@ struct SourceFiles {
 }
 
 impl SourceFiles {
-    fn new(tree: &Path, source_id: &str, skipped: &mut Vec<SkippedEntry>) -> Result<Self> {
-        let mut all = Vec::new();
-        walk_relative(tree, tree, &mut all, source_id, skipped)?;
-        all.sort();
-        Ok(Self {
+    /// (#1959) `all` is the ALREADY spec-filtered, already-sorted file
+    /// list `workspace_spec::materialize` computed for this source
+    /// (`Materialized.files[source_id]`) — this no longer walks the tree
+    /// itself. A rule's own `applies_to`/`exclude` (`matching`, below)
+    /// filters ON TOP of that: a file must pass both the spec's
+    /// include/exclude AND the rule's own to be read.
+    fn new(tree: &Path, all: Vec<String>) -> Self {
+        Self {
             tree: tree.to_path_buf(),
             all,
             content: HashMap::new(),
-        })
+        }
     }
 
     fn matching(&self, applies_to: &[String], exclude: &[String]) -> Vec<String> {
@@ -300,49 +306,6 @@ impl SourceFiles {
     }
 }
 
-fn walk_relative(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<String>,
-    source_id: &str,
-    skipped: &mut Vec<SkippedEntry>,
-) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
-            continue;
-        }
-        let ft = entry.file_type()?;
-        let rel = || {
-            path.strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/")
-        };
-        if ft.is_symlink() {
-            // Never followed — `file_type()` reports a symlink's own type
-            // without resolving it, so neither the `is_dir`/`is_file` arm
-            // below ever fires for one. Before this fix that meant a
-            // symlink simply vanished from the walk with no record; now
-            // it's recorded so a plan's totals account for every entry the
-            // walker actually met (#1959 finding 6).
-            skipped.push(SkippedEntry {
-                reason: "symlink".to_string(),
-                file: rel(),
-                source: Some(source_id.to_string()),
-            });
-            continue;
-        }
-        if ft.is_dir() {
-            walk_relative(root, &path, out, source_id, skipped)?;
-        } else if ft.is_file() {
-            out.push(rel());
-        }
-    }
-    Ok(())
-}
-
 /// Merge 1-indexed hit line numbers into `(start, end, first_hit_line,
 /// every_hit_line)` spans using `window` lines of context on each side,
 /// clamped to `[1, total_lines]`. `hits` must be sorted ascending (callers
@@ -377,15 +340,37 @@ fn next_unit_id(seq: &mut usize) -> String {
     id
 }
 
-/// Plan a resolved corpus. Deterministic for a fixed set of trees: files
-/// are walked once and sorted; unit ids are assigned sequentially in a
-/// fixed pass order (every `site` rule, then the combined `read` pass per
-/// source, then every `edge` rule).
-pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource]) -> Result<Plan> {
-    let mut skipped: Vec<SkippedEntry> = Vec::new();
+/// Plan a materialized workspace. Deterministic for a fixed set of trees:
+/// files are pre-walked once (by `workspace_spec::materialize`) and
+/// sorted; unit ids are assigned sequentially in a fixed pass order
+/// (every `site` rule, then the combined `read` pass per source, then
+/// every `edge` rule).
+///
+/// (#1959) Takes a `Materialized` (spec + git resolution + the spec's own
+/// include/exclude already applied) instead of a `CorpusManifest` +
+/// separately-resolved sources — the crawl module's `manifest.rs`/
+/// `sources.rs` retired in favor of the generic `workspace_spec` module.
+/// A rule's own `applies_to`/`exclude` filters ON TOP of the spec's
+/// include/exclude (`SourceFiles::matching`, unchanged) — a file must
+/// pass both.
+pub fn plan(materialized: &Materialized, rules: &[Rule]) -> Result<Plan> {
+    // (#1959) Seed `skipped` from what `workspace_spec::materialize`
+    // already found (symlinks, files excluded by the spec's own
+    // include/exclude) — the file-size/read-error skips below are still
+    // this module's own concern (materialize never reads file CONTENTS).
+    let mut skipped: Vec<SkippedEntry> = materialized
+        .skipped
+        .iter()
+        .map(|sf| SkippedEntry {
+            reason: sf.reason.clone(),
+            file: sf.relative_path.clone(),
+            source: Some(sf.source_id.clone()),
+        })
+        .collect();
     let mut files_by_id: BTreeMap<String, SourceFiles> = BTreeMap::new();
-    for s in sources {
-        files_by_id.insert(s.id.clone(), SourceFiles::new(&s.tree, &s.id, &mut skipped)?);
+    for s in &materialized.sources {
+        let files = materialized.files.get(&s.id).cloned().unwrap_or_default();
+        files_by_id.insert(s.id.clone(), SourceFiles::new(&s.tree, files));
     }
 
     let mut units: Vec<Unit> = Vec::new();
@@ -393,7 +378,7 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
 
     // --- site rules ---
     for rule in rules.iter().filter(|r| r.kind == RuleKind::Site) {
-        for source in sources {
+        for source in &materialized.sources {
             let files = files_by_id.get_mut(&source.id).expect("source resolved");
             units.extend(collect_site_units(rule, source, files, &mut skipped, &mut unit_seq)?);
         }
@@ -402,7 +387,7 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
     // --- read pass (all read rules share one pass per source) ---
     let read_rules: Vec<&Rule> = rules.iter().filter(|r| r.kind == RuleKind::Read).collect();
     if !read_rules.is_empty() {
-        for source in sources {
+        for source in &materialized.sources {
             let files = files_by_id.get_mut(&source.id).expect("source resolved");
             units.extend(collect_read_units(&read_rules, source, files, &mut skipped, &mut unit_seq)?);
         }
@@ -410,10 +395,10 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
 
     // --- edge rules ---
     let mut edge_ledger: Vec<EdgeLedgerEntry> = Vec::new();
-    let sources_by_id: BTreeMap<String, &ResolvedSource> =
-        sources.iter().map(|s| (s.id.clone(), s)).collect();
+    let sources_by_id: BTreeMap<String, &MaterializedSource> =
+        materialized.sources.iter().map(|s| (s.id.clone(), s)).collect();
     for rule in rules.iter().filter(|r| r.kind == RuleKind::Edge) {
-        for edge in &manifest.edges {
+        for edge in &materialized.edges {
             let (Some(_consumer), Some(_library)) =
                 (sources_by_id.get(&edge.consumer), sources_by_id.get(&edge.library))
             else {
@@ -559,7 +544,8 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
         }
     }
 
-    let plan_sources: Vec<PlanSource> = sources
+    let plan_sources: Vec<PlanSource> = materialized
+        .sources
         .iter()
         .map(|s| PlanSource {
             id: s.id.clone(),
@@ -567,6 +553,7 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
             git_ref: s.git_ref.clone(),
             tree: s.tree.clone(),
             files_walked: files_by_id.get(&s.id).map(|f| f.all.len()).unwrap_or(0),
+            out_of_scope: materialized.out_of_scope.get(&s.id).copied().unwrap_or(0),
         })
         .collect();
 
@@ -574,7 +561,7 @@ pub fn plan(manifest: &CorpusManifest, rules: &[Rule], sources: &[ResolvedSource
 
     Ok(Plan {
         schema_version: PLAN_SCHEMA_VERSION.to_string(),
-        corpus: manifest.name.clone(),
+        workspace: materialized.name.clone(),
         planned_at: darkmux_flow::ts_utc_now(),
         sources: plan_sources,
         units,
@@ -638,7 +625,7 @@ fn compute_totals(
 
 fn collect_site_units(
     rule: &Rule,
-    source: &ResolvedSource,
+    source: &MaterializedSource,
     files: &mut SourceFiles,
     skipped: &mut Vec<SkippedEntry>,
     unit_seq: &mut usize,
@@ -707,7 +694,7 @@ fn collect_site_units(
 
 fn collect_read_units(
     read_rules: &[&Rule],
-    source: &ResolvedSource,
+    source: &MaterializedSource,
     files: &mut SourceFiles,
     skipped: &mut Vec<SkippedEntry>,
     unit_seq: &mut usize,
@@ -745,7 +732,7 @@ fn collect_read_units(
             .filter_map(|rid| read_rules.iter().find(|r| &r.id == rid))
             .map(|r| r.chunk_tokens_or_default())
             .min()
-            .unwrap_or(crate::crawl::rules::DEFAULT_READ_CHUNK_TOKENS);
+            .unwrap_or(darkmux_crew::rules::DEFAULT_READ_CHUNK_TOKENS);
 
         let mut cur_files: Vec<ReadFileEntry> = Vec::new();
         let mut cur_tokens = 0usize;
@@ -1071,7 +1058,8 @@ fn collect_export_strings(v: &serde_json::Value, out: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crawl::rules::EdgeRuleConfig;
+    use darkmux_crew::rules::EdgeRuleConfig;
+    use darkmux_crew::workspace_spec::EdgeSpec;
     use tempfile::TempDir;
 
     fn site_rule() -> Rule {
@@ -1131,8 +1119,8 @@ mod tests {
         }
     }
 
-    fn resolved(id: &str, tree: &Path) -> ResolvedSource {
-        ResolvedSource {
+    fn resolved(id: &str, tree: &Path) -> MaterializedSource {
+        MaterializedSource {
             id: id.to_string(),
             sha: "deadbeef".to_string(),
             git_ref: "main".to_string(),
@@ -1140,16 +1128,80 @@ mod tests {
         }
     }
 
-    fn manifest_with_edge(app: &str, lib: &str, package: &str) -> CorpusManifest {
-        let json = serde_json::json!({
-            "name": "t",
-            "sources": [
-                {"id": app, "path": "/x", "ref": "main"},
-                {"id": lib, "path": "/y", "ref": "main"}
-            ],
-            "edges": [{"consumer": app, "library": lib, "package": package}]
-        });
-        serde_json::from_value(json).unwrap()
+    /// (#1959) Test-only recursive walk mirroring
+    /// `workspace_spec::materialize`'s own symlink-skip behavior (same
+    /// reason string, `"symlink — never followed"`) so a test checking
+    /// `Plan.totals.skipped` sees the same shape production `materialize()`
+    /// produces. Spec-level include/exclude filtering is out of scope for
+    /// these rule-level tests — every file passes (matching the
+    /// pre-#1959 shape: `CorpusManifest` never had include/exclude
+    /// either).
+    fn walk_all(tree: &Path, source_id: &str) -> (Vec<String>, Vec<darkmux_crew::workspace_spec::SkippedFile>) {
+        fn go(
+            root: &Path,
+            dir: &Path,
+            out: &mut Vec<String>,
+            skipped: &mut Vec<darkmux_crew::workspace_spec::SkippedFile>,
+            source_id: &str,
+        ) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                    continue;
+                }
+                let ft = entry.file_type().unwrap();
+                let rel = || {
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/")
+                };
+                if ft.is_symlink() {
+                    skipped.push(darkmux_crew::workspace_spec::SkippedFile {
+                        source_id: source_id.to_string(),
+                        relative_path: rel(),
+                        reason: "symlink — never followed".to_string(),
+                    });
+                    continue;
+                }
+                if ft.is_dir() {
+                    go(root, &path, out, skipped, source_id);
+                } else if ft.is_file() {
+                    out.push(rel());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut skipped = Vec::new();
+        go(tree, tree, &mut out, &mut skipped, source_id);
+        out.sort();
+        (out, skipped)
+    }
+
+    /// (#1959) Build a `Materialized` fixture directly from already
+    /// locally-written trees (bypassing real git resolution — the trees
+    /// are plain tempdirs in these tests) — the direct twin of
+    /// `crawl::sources`'s retired `manifest_with_edge` helper, now over
+    /// `workspace_spec` types.
+    fn materialized_for(sources: Vec<MaterializedSource>, edges: Vec<EdgeSpec>) -> Materialized {
+        let mut files = BTreeMap::new();
+        let mut skipped = Vec::new();
+        for s in &sources {
+            let (all, mut sk) = walk_all(&s.tree, &s.id);
+            files.insert(s.id.clone(), all);
+            skipped.append(&mut sk);
+        }
+        Materialized { name: "t".to_string(), root: PathBuf::new(), sources, edges, files, skipped, out_of_scope: Default::default() }
+    }
+
+    fn edge_spec(app: &str, lib: &str, package: &str) -> Vec<EdgeSpec> {
+        vec![EdgeSpec {
+            consumer: app.to_string(),
+            library: lib.to_string(),
+            package: package.to_string(),
+            extras: Default::default(),
+        }]
     }
 
     #[test]
@@ -1167,7 +1219,7 @@ mod tests {
         fs::write(dir.path().join("x.ts"), lines.join("\n")).unwrap();
 
         let mut skipped = Vec::new();
-        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
         let source = resolved("app", dir.path());
         let mut seq = 1usize;
         let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
@@ -1190,7 +1242,7 @@ mod tests {
         fs::write(dir.path().join("x.ts"), lines.join("\n")).unwrap();
 
         let mut skipped = Vec::new();
-        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
         let source = resolved("app", dir.path());
         let mut seq = 1usize;
         let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
@@ -1208,7 +1260,7 @@ mod tests {
         fs::write(dir.path().join("README.md"), "y".repeat(400)).unwrap(); // 400 chars ~100 tokens > chunk_tokens=50
 
         let mut skipped = Vec::new();
-        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
         let source = resolved("app", dir.path());
         let mut seq = 1usize;
         let rule = read_rule();
@@ -1255,10 +1307,10 @@ mod tests {
         .unwrap();
 
         let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
-        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let materialized = materialized_for(sources, edge_spec("app", "lib", "@org/lib"));
         let rules = vec![edge_rule()];
 
-        let out = plan(&manifest, &rules, &sources).unwrap();
+        let out = plan(&materialized, &rules).unwrap();
         let edge_units: Vec<&Unit> = out.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
         assert_eq!(edge_units.len(), 1, "{:?}", out.units);
         let Unit::Edge { range_admits, sites, pinned, library_version, .. } = edge_units[0] else { panic!() };
@@ -1291,10 +1343,10 @@ mod tests {
         fs::write(app_dir.join("uses-lib.ts"), "import { thing } from '@org/lib';\n").unwrap();
 
         let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
-        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let materialized = materialized_for(sources, edge_spec("app", "lib", "@org/lib"));
         let rules = vec![edge_rule()];
 
-        let out = plan(&manifest, &rules, &sources).unwrap();
+        let out = plan(&materialized, &rules).unwrap();
         let edge_units: Vec<&Unit> = out.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
         assert!(edge_units.is_empty(), "{:?}", out.units);
         assert_eq!(out.totals.edges.len(), 1);
@@ -1308,7 +1360,7 @@ mod tests {
         fs::write(dir.path().join("bad.ts"), [0xFFu8, 0xFE, 0x00]).unwrap();
 
         let mut skipped = Vec::new();
-        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
         let source = resolved("app", dir.path());
         let mut seq = 1usize;
         let _ = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
@@ -1340,14 +1392,10 @@ mod tests {
         fs::write(dir.path().join("x.ts"), "const x = 1;\n").unwrap();
 
         let sources = vec![resolved("app", dir.path())];
-        let manifest = serde_json::from_value(serde_json::json!({
-            "name": "t",
-            "sources": [{"id": "app", "path": "/x", "ref": "main"}],
-        }))
-        .unwrap();
+        let materialized = materialized_for(sources, Vec::new());
         let rules = vec![site_rule()];
 
-        let out = plan(&manifest, &rules, &sources).unwrap();
+        let out = plan(&materialized, &rules).unwrap();
         assert_eq!(out.totals.units, 0);
         let t = out.totals.by_rule.get("swallowed-error").expect("rule seeded even with zero matches");
         assert_eq!(t.units, 0);
@@ -1371,7 +1419,7 @@ mod tests {
         fs::write(dir.path().join("x.ts"), lines.join("\n")).unwrap();
 
         let mut skipped = Vec::new();
-        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
         let rule = edge_rule();
         let hits = collect_edge_import_sites(&rule, "@org/lib", &mut files, &mut skipped, "app").unwrap();
         let all_hit_lines: Vec<usize> = hits.iter().flat_map(|(s, _)| s.hits.clone()).collect();
@@ -1417,9 +1465,9 @@ mod tests {
         .unwrap();
 
         let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
-        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let materialized = materialized_for(sources, edge_spec("app", "lib", "@org/lib"));
         let rules = vec![edge_rule()];
-        let out = plan(&manifest, &rules, &sources).unwrap();
+        let out = plan(&materialized, &rules).unwrap();
 
         let note = out.totals.edges[0].note.as_deref().unwrap_or("");
         for field in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] {
@@ -1448,9 +1496,9 @@ mod tests {
         .unwrap();
 
         let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
-        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let materialized = materialized_for(sources, edge_spec("app", "lib", "@org/lib"));
         let rules = vec![edge_rule()];
-        let out = plan(&manifest, &rules, &sources).unwrap();
+        let out = plan(&materialized, &rules).unwrap();
 
         assert_eq!(out.totals.edges.len(), 1);
         let note = out.totals.edges[0].note.as_deref().unwrap_or("");
@@ -1486,9 +1534,9 @@ mod tests {
         .unwrap();
 
         let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
-        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let materialized = materialized_for(sources, edge_spec("app", "lib", "@org/lib"));
         let rules = vec![edge_rule()];
-        let out = plan(&manifest, &rules, &sources).unwrap();
+        let out = plan(&materialized, &rules).unwrap();
 
         let edge_units: Vec<&Unit> = out.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
         assert_eq!(edge_units.len(), 1, "{:?}", out.units);
@@ -1506,7 +1554,7 @@ mod tests {
         let workdir = TempDir::new().unwrap();
         let app_dir = workdir.path().join("app");
         // Nested a few levels deep so "../../../secret.txt" resolves to a
-        // real file OUTSIDE the library's own tree, at the corpus workdir
+        // real file OUTSIDE the library's own tree, at the fixture's workdir
         // root — proving the traversal would otherwise leak a file that
         // was never part of the library.
         let lib_dir = workdir.path().join("nested").join("deep").join("lib");
@@ -1545,9 +1593,9 @@ mod tests {
         .unwrap();
 
         let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
-        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let materialized = materialized_for(sources, edge_spec("app", "lib", "@org/lib"));
         let rules = vec![edge_rule()];
-        let out = plan(&manifest, &rules, &sources).unwrap();
+        let out = plan(&materialized, &rules).unwrap();
 
         let edge_units: Vec<&Unit> = out.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
         assert_eq!(edge_units.len(), 1, "{:?}", out.units);
@@ -1585,7 +1633,8 @@ mod tests {
         )
         .unwrap();
         let sources_clean = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
-        let out_clean = plan(&manifest, &rules, &sources_clean).unwrap();
+        let materialized_clean = materialized_for(sources_clean, edge_spec("app", "lib", "@org/lib"));
+        let out_clean = plan(&materialized_clean, &rules).unwrap();
         let clean_edge_units: Vec<&Unit> =
             out_clean.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
         let Unit::Edge { est_tokens: clean_tokens, .. } = clean_edge_units[0] else { panic!() };
@@ -1620,9 +1669,9 @@ mod tests {
         .unwrap();
 
         let sources = vec![resolved("app", &app_dir), resolved("lib", &lib_dir)];
-        let manifest = manifest_with_edge("app", "lib", "@org/lib");
+        let materialized = materialized_for(sources, edge_spec("app", "lib", "@org/lib"));
         let rules = vec![edge_rule()];
-        let out = plan(&manifest, &rules, &sources).unwrap();
+        let out = plan(&materialized, &rules).unwrap();
 
         // No unit emitted — nothing for the model to compare against.
         let edge_units: Vec<&Unit> = out.units.iter().filter(|u| matches!(u, Unit::Edge { .. })).collect();
@@ -1660,13 +1709,9 @@ mod tests {
         }
 
         let sources = vec![resolved("app", dir.path())];
-        let manifest = serde_json::from_value(serde_json::json!({
-            "name": "t",
-            "sources": [{"id": "app", "path": "/x", "ref": "main"}],
-        }))
-        .unwrap();
+        let materialized = materialized_for(sources, Vec::new());
         let rules = vec![site_rule()];
-        let out = plan(&manifest, &rules, &sources).unwrap();
+        let out = plan(&materialized, &rules).unwrap();
 
         // Never followed: nothing from outside the tree shows up as a hit.
         for unit in &out.units {
@@ -1677,8 +1722,11 @@ mod tests {
             }
         }
         // Recorded: both the dir symlink and the file symlink are in skipped.
+        // (#1959) The symlink walk moved into `workspace_spec::materialize`
+        // -- its own reason string ("symlink -- never followed") is what
+        // `plan()` now surfaces verbatim from `Materialized.skipped`.
         let symlink_skips: Vec<&SkippedEntry> =
-            out.totals.skipped.iter().filter(|s| s.reason == "symlink").collect();
+            out.totals.skipped.iter().filter(|s| s.reason.contains("symlink")).collect();
         assert_eq!(symlink_skips.len(), 2, "{:?}", out.totals.skipped);
         assert!(symlink_skips.iter().any(|s| s.file == "link-dir"), "{symlink_skips:?}");
         assert!(symlink_skips.iter().any(|s| s.file == "link-file.ts"), "{symlink_skips:?}");
@@ -1699,15 +1747,11 @@ mod tests {
         fs::write(dir.path().join("README.md"), "docs\n").unwrap();
 
         let sources = vec![resolved("app", dir.path())];
-        let manifest = serde_json::from_value(serde_json::json!({
-            "name": "t",
-            "sources": [{"id": "app", "path": "/x", "ref": "main"}],
-        }))
-        .unwrap();
+        let materialized = materialized_for(sources, Vec::new());
         let rules = vec![site_rule(), read_rule()];
 
-        let out1 = plan(&manifest, &rules, &sources).unwrap();
-        let out2 = plan(&manifest, &rules, &sources).unwrap();
+        let out1 = plan(&materialized, &rules).unwrap();
+        let out2 = plan(&materialized, &rules).unwrap();
         let units1 = serde_json::to_value(&out1.units).unwrap();
         let units2 = serde_json::to_value(&out2.units).unwrap();
         assert_eq!(units1, units2);
@@ -1723,7 +1767,7 @@ mod tests {
         fs::write(dir.path().join("real.ts"), "catch (e) {}").unwrap();
 
         let mut skipped = Vec::new();
-        let mut files = SourceFiles::new(dir.path(), "app", &mut skipped).unwrap();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
         let source = resolved("app", dir.path());
         let mut seq = 1usize;
         let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();

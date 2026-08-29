@@ -275,14 +275,6 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         sub: crate::flow_cli::FlowCmd,
     },
-    /// The agentic bug crawler (#1959). Packet 1: `crawl plan` turns a
-    /// corpus manifest into a deterministic, token-estimated work-unit
-    /// plan — mechanical only, no model dispatch. Later packets add the
-    /// dispatch loop this plan feeds.
-    Crawl {
-        #[command(subcommand)]
-        sub: CrawlCmd,
-    },
     /// Read/write `~/.darkmux/config.json` settings (#937). `set` validates the
     /// key + coerces the value; secrets stay in the Keychain. Distinct from
     /// `profile` (the profiles registry).
@@ -375,32 +367,6 @@ pub(crate) enum RoleCmd {
         id: String,
         #[command(flatten)]
         json: JsonFlag,
-    },
-}
-
-#[derive(Subcommand)]
-pub(crate) enum CrawlCmd {
-    /// Load a corpus manifest, resolve its rules + sources (git mirrors ->
-    /// read-only worktrees), and write a token-estimated work-unit plan.
-    /// Mechanical only — no model dispatch (#1959 packet 1).
-    Plan {
-        /// Path to the corpus manifest JSON.
-        manifest: std::path::PathBuf,
-        /// Where to write the plan JSON (default: `<corpus root>/plan.json`).
-        #[arg(long)]
-        out: Option<std::path::PathBuf>,
-        /// Resolve sources against the mirror as-is, without `git fetch`ing
-        /// first — fully offline against whatever's already mirrored. A
-        /// `git` source with no mirror yet REFUSES instead of cloning (a
-        /// first clone needs the network, which this flag promises not to
-        /// use) — rerun once without `--no-fetch` to populate it. A `path`
-        /// source's first clone is local-filesystem-only, so it's exempt
-        /// and still populates on the first run.
-        #[arg(long)]
-        no_fetch: bool,
-        /// Print the plan JSON to stdout instead of the human table.
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -611,7 +577,9 @@ pub(crate) enum MissionCmd {
     /// mission rather than left stranded Active — or the RAII finalize
     /// guard catching an early return/panic mid-loop); `3` the operator
     /// dropped a `STOP` kill file
-    /// in the corpus root — honored BETWEEN units, never mid-dispatch;
+    /// in the crawl-state root (`<darkmux root>/crawl/<name>/`, or the
+    /// workspace spec's own explicit `root:` when it sets one) — honored
+    /// BETWEEN units, never mid-dispatch;
     /// `130` SIGINT (a first Ctrl-C is honored the same between-units way
     /// as the kill file; a second Ctrl-C restores the default handler; a
     /// third kills the process outright — `darkmux_types::interrupt`'s own
@@ -638,6 +606,19 @@ pub(crate) enum MissionCmd {
         /// other config-less-graph default uses).
         #[arg(long)]
         timeout: Option<u32>,
+        /// (#1959) Resolve config + inputs, mint NOTHING, emit NO flow
+        /// records, dispatch NOTHING — print what would run and exit.
+        /// `crawl` prints the plan table (writes it to disk only when
+        /// `--param plan_out=<path>` names a destination); `review`
+        /// prints resolved inputs and, when the source is a local
+        /// worktree, the bundle count (a GitHub source says the count
+        /// isn't computed in dry-run — that would cost a network fetch
+        /// per changed file); every other config prints its task/step
+        /// graph after the same input validation a real launch runs, so
+        /// a missing required input still bails exactly as it would
+        /// without `--dry-run`.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
     /// Add a new Phase to an existing Mission mid-flight (#107).
     /// Operator-sovereign scope growth — alternative to either hand-
@@ -828,15 +809,17 @@ pub(crate) enum MissionConfigCmd {
     /// of being silently dropped, so one broken user-tier override never
     /// hides every other registered config. Read-only.
     ///
-    /// `crawl` (`darkmux mission launch crawl`, #1959 packet 2) does NOT
-    /// appear here — this list enumerates
-    /// `templates/builtin/mission-configs/*.json` documents (plus the user
-    /// tier), and crawl has no such document: its Task/Step graph is
-    /// computed at RUN TIME from a resolved corpus plan, not declared
-    /// ahead of time (see `src/crawl_launch.rs`'s module doc for the full
-    /// reasoning). It is routed by literal config id in `mission_launch::
-    /// launch`, checked BEFORE this registry is consulted at all. This is
-    /// absence by design, not a gap in the list.
+    /// `crawl` (`darkmux mission launch crawl`, #1959) DOES appear here —
+    /// `templates/builtin/mission-configs/crawl.json` exists purely for
+    /// discoverability (it declares workspace, rules, source, rule, plan, plan_out, units, limit, no_fetch, and dry_run as inputs with zero phases)
+    /// — but its listed 0 phases / 0 tasks are the
+    /// honest count of a document that carries NO real graph: crawl's
+    /// Task/Step graph is computed at RUN TIME from a resolved crawl plan,
+    /// never declared ahead of time (see `src/crawl_launch.rs`'s module
+    /// doc for the full reasoning). `mission launch crawl` is routed by
+    /// literal config id in `mission_launch::launch`, BEFORE this document
+    /// (or any mission-config document) is ever loaded — editing
+    /// `crawl.json`'s `phases` field has no effect on a real crawl launch.
     List {
         #[command(flatten)]
         json: JsonFlag,

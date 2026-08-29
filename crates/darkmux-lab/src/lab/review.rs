@@ -213,6 +213,10 @@ pub use darkmux_crew::run_record::{
     seat_identifier, staffing_snapshot, MemberRecord, SeatStaffingSnapshot, StaffingSnapshot, StepRecord,
 };
 use darkmux_crew::single_shot::SingleShotReply;
+// (#1959) The review's optional `workspace` input — filters bundles by
+// the spec's include/exclude before probe/judge/verify ever see them.
+// See `resolve_bundles`/`filter_bundles_by_workspace` below.
+use darkmux_crew::workspace_spec::{glob, WorkspaceSpec};
 use darkmux_crew::step_kinds::patterns::dedup::{dedup as pattern_dedup, DedupStrategy};
 use darkmux_crew::step_kinds::patterns::multi_pass_confirm::{multi_pass_confirm, ConfirmTier, PassClass};
 // (#1877 item 2) `HostSample` itself is no longer named directly in this
@@ -613,7 +617,13 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
     };
     let benign = !report.files_skipped.is_empty()
         && report.files_skipped.iter().all(|f| {
-            matches!(f.reason, SkipReason::NonCodeExtension | SkipReason::TestFileExcluded)
+            // (#1959) ExcludedByWorkspaceSpec joins the benign bucket: the
+            // operator scoped the review to a workspace on purpose, same
+            // deliberate-exclusion reasoning as TestFileExcluded.
+            matches!(
+                f.reason,
+                SkipReason::NonCodeExtension | SkipReason::TestFileExcluded | SkipReason::ExcludedByWorkspaceSpec
+            )
         });
     // (#1757) A diff whose declines are entirely explained by the two benign
     // reasons plus real-but-unparseable source, with at least one of the
@@ -623,9 +633,16 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
     let unsupported_language = !report.files_skipped.is_empty()
         && report.files_skipped.iter().any(|f| f.reason == SkipReason::SourceLanguageUnsupported)
         && report.files_skipped.iter().all(|f| {
+            // (#1959) ExcludedByWorkspaceSpec joins this bucket's allowed
+            // mix too — a workspace-scoped-out file alongside a real
+            // unsupported-language file is still "nothing benign-Error
+            // here," never a mix that demotes to Error.
             matches!(
                 f.reason,
-                SkipReason::NonCodeExtension | SkipReason::TestFileExcluded | SkipReason::SourceLanguageUnsupported
+                SkipReason::NonCodeExtension
+                    | SkipReason::TestFileExcluded
+                    | SkipReason::SourceLanguageUnsupported
+                    | SkipReason::ExcludedByWorkspaceSpec
             )
         });
     let mut by_reason: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
@@ -647,6 +664,10 @@ pub(crate) fn classify_zero_bundle_degenerate(skip: &Option<BundleSkipReport>) -
             SkipReason::NoEnclosingFunction => "no enclosing function",
             SkipReason::OverSizeCap => "over the bundler's size cap",
             SkipReason::TopLevelOverSizeCap => "top-level run over the bundler's size cap",
+            // (#1959) Same benign treatment as TestFileExcluded below — a
+            // workspace-spec exclusion is a deliberate operator scoping
+            // decision, not a bundler failure.
+            SkipReason::ExcludedByWorkspaceSpec => "excluded by the workspace spec's include/exclude",
         };
         *by_reason.entry(label).or_insert(0) += 1;
     }
@@ -1852,10 +1873,46 @@ fn bundles_from_diff(diff: &str) -> Vec<BundleInput> {
 /// supplied real ones (production), else the provisional [`bundles_from_diff`]
 /// (this module's own pre-packet-3 tests only — see [`ReviewInputs::bundles`]).
 fn resolve_bundles(inputs: &ReviewInputs) -> Vec<BundleInput> {
-    match &inputs.bundles {
+    let raw = match &inputs.bundles {
         Some(b) => b.clone(),
         None => bundles_from_diff(inputs.diff),
+    };
+    match inputs.workspace {
+        Some(spec) => filter_bundles_by_workspace(raw, spec).0,
+        None => raw,
     }
+}
+
+/// (#1959) Drop every bundle whose `id` (the changed-file path) fails
+/// `spec`'s `effective_include`/`effective_exclude`, via the SAME
+/// `workspace_spec::glob::applies` filter language
+/// `workspace_spec::materialize`'s own file walk uses — so a bundle
+/// review scopes out is the identical decision a crawl materializing the
+/// same spec would make. Each drop is recorded as a
+/// [`SkippedFile`]/[`SkipReason::ExcludedByWorkspaceSpec`] entry, so a
+/// zero-bundle run this filter causes renders through
+/// [`classify_zero_bundle_degenerate`] like any other skip, not as a bare
+/// unexplained count. Pure and independent of the real bundler
+/// (`build_bundles`) — this is a POST-filter on whatever bundles already
+/// came out of it (or the provisional [`bundles_from_diff`]), never a
+/// change to the bundler's own decline logic.
+fn filter_bundles_by_workspace(bundles: Vec<BundleInput>, spec: &WorkspaceSpec) -> (Vec<BundleInput>, Vec<SkippedFile>) {
+    let include = spec.effective_include();
+    let exclude = spec.effective_exclude();
+    let mut kept = Vec::with_capacity(bundles.len());
+    let mut skipped = Vec::new();
+    for bundle in bundles {
+        if glob::applies(&include, &exclude, &bundle.id) {
+            kept.push(bundle);
+        } else {
+            skipped.push(SkippedFile {
+                path: bundle.id.clone(),
+                reason: SkipReason::ExcludedByWorkspaceSpec,
+                function: None,
+            });
+        }
+    }
+    (kept, skipped)
 }
 
 /// A staffing with a `bundle_selector` runs only on bundles whose
@@ -1979,6 +2036,21 @@ pub struct ReviewInputs<'a> {
     /// the backstop is a no-op (never a hard error) — most of this
     /// module's own tests have no real file tree to check against.
     pub source: Option<&'a FileSource>,
+    /// (#1959) The review's optional `workspace` input (`--param
+    /// workspace=<spec.json>`) — when `Some`, [`resolve_bundles`] drops
+    /// every bundle whose path fails the spec's `effective_include`/
+    /// `effective_exclude` (via the same `workspace_spec::glob::applies`
+    /// filter language `materialize.rs` uses), recording each drop as a
+    /// [`SkipReason::ExcludedByWorkspaceSpec`] entry. `None` (the default —
+    /// review has no workspace concept of its own) is BYTE-IDENTICAL to
+    /// before this field existed: `resolve_bundles` returns its bundles
+    /// completely unfiltered. Deliberately NOT wired into the materialized
+    /// tree (`workspace_spec::materialize`) — this only matches the
+    /// spec's include/exclude GLOBS against already-known bundle paths, no
+    /// git resolution or file walk. The main graph launch path
+    /// (`ReviewBundleStepKind` in this file) does not yet read this field
+    /// either — see #1959's own tracking for that follow-up.
+    pub workspace: Option<&'a WorkspaceSpec>,
 }
 
 pub fn fingerprint(judge_identifier: &str, judge_system: &str) -> serde_json::Value {
@@ -3676,7 +3748,7 @@ use std::sync::Mutex as StdMutex;
 // pre-graph prelude); see `ReviewBundleStepKind`'s doc.
 use super::bundle::{
     build_bundles, external_bundles, slice_code, slice_code_probe, BundleSet, BundleSkipReport,
-    FileSource, SkipReason,
+    FileSource, SkipReason, SkippedFile,
 };
 use std::path::{Path, PathBuf};
 

@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClientProvider, QueryClient } from "@tanstack/react-query";
 import { FleetLens } from "./FleetLens";
@@ -585,5 +588,30 @@ describe("FleetLens", () => {
     expect((document.querySelector(".ph") as HTMLElement).style.left).toBe("0%");
     // The hero moved too — the completion is no longer visible at tMin.
     expect(screen.getByText("local tokens").previousSibling?.textContent).toBe("0");
+  });
+});
+
+// ── (#2108, operator finding — "hero local/cloud figure collision") ──
+//
+// `.eventlog` is a fixed 380px side panel shown whenever the viewport is
+// above the 768px mobile breakpoint (`App.tsx`'s `isMobile`), and
+// `.app-shell__stage` carries 32px of its own horizontal padding — so in
+// the viewport band (768px, 1180px], the STAGE's actual rendered width is
+// BELOW 768px even though the raw viewport reads "desktop". `.savrow`'s
+// OLD `max-width:768px` query keyed off the viewport, so in that band it
+// stayed in flex-row mode inside a container narrower than it assumed,
+// and the local/cloud/unattributed tiles collided against the chips
+// rather than cleanly wrapping. The stylesheet, not a jsdom-computed
+// style — jsdom performs no real layout, so this is the actual verifiable
+// claim: the `.savrow` grid-switch rule's OWN threshold is the computed
+// number (768 + 380 + 32 = 1180), not the un-widened 768 that produced
+// the collision.
+describe("FleetLens — hero grid-switch breakpoint accounts for the eventlog panel's width (#2108)", () => {
+  it("the .savrow stylesheet rule switches to the 2-column grid at 1180px, not 768px", () => {
+    const cssPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+    const match = css.match(/@media \(max-width: (\d+)px\) \{\s*\.savrow \{\s*display: grid;/);
+    expect(match, "the .savrow grid-switch media query must exist").not.toBeNull();
+    expect(Number(match![1])).toBe(1180);
   });
 });

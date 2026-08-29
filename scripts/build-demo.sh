@@ -175,7 +175,7 @@ EOF
 # known. Rewrite to relative and ship local copies alongside.
 DEMO_DIR="$(dirname "$OUT")"
 ASSET_DIR="$ROOT/crates/darkmux-serve/assets"
-for a in manifest.webmanifest icon-192.png apple-touch-icon.png; do
+for a in manifest.webmanifest icon-192.png apple-touch-icon.png favicon-32.png favicon-16.png; do
   if [ -f "$ASSET_DIR/$a" ]; then
     cp "$ASSET_DIR/$a" "$DEMO_DIR/$a"
   else
@@ -188,6 +188,8 @@ sed -i.bak \
   -e 's|href="/manifest.webmanifest"|href="./manifest.webmanifest"|' \
   -e 's|href="/icon-192.png"|href="./icon-192.png"|' \
   -e 's|href="/apple-touch-icon.png"|href="./apple-touch-icon.png"|' \
+  -e 's|href="/favicon-32.png"|href="./favicon-32.png"|' \
+  -e 's|href="/favicon-16.png"|href="./favicon-16.png"|' \
   "$OUT"
 rm -f "$OUT.bak"
 

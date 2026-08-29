@@ -2633,7 +2633,34 @@ mod tests {
         //           (one per `runtime.rest` trajectory event, live on the
         //           flow stream). Additive payload fields + one new
         //           action value, no struct change. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.25.0");
+        //   1.26.0 (#1959, revised): RETIRED the 1.24.0 `crawl.*` action
+        //           family — the crawl launcher now uses the generic
+        //           `mission start`/`mission close`/`step start`/`step
+        //           complete`/`step error` actions with additive payload
+        //           keys (`workspace`, `unit`, `source`, `sha`, `rule`,
+        //           `est_tokens`, `findings`, …). `crawl.finding` has no
+        //           replacement action: a rejected `report_finding` reply
+        //           now classifies as a FAILED tool call (`payload.ok:
+        //           false` on the ordinary `dispatch.tool` record), and
+        //           `DispatchOpts::record_context` merges caller-supplied
+        //           provenance under `payload.context` on every record a
+        //           dispatch's flow-record surface emits. See schema.rs's
+        //           fuller changelog entry.
+        //   1.27.0 (#2107): `dispatch.complete`'s `host` envelope block
+        //           gains a real per-metric reduction (`peak_pct`,
+        //           `mean_pct`, `p95_pct`, `above_80_ms` for each of
+        //           `cpu`/`mem`/`gpu`) instead of two bare peaks, plus
+        //           `sample_interval_ms`. The pre-1.27.0 top-level
+        //           `peak_cpu_pct`/`peak_mem_pct` are kept as aliases for
+        //           one release. Additive; no struct/field REMOVAL. See
+        //           schema.rs's fuller changelog entry.
+        //   1.28.0 (#2108): `dispatch.complete`'s `host` envelope block
+        //           gains `power` (`{cpu,gpu,total}` × `{mean_mw, peak_mw}`),
+        //           `thermal` (`{worst_state, above_nominal_ms,
+        //           min_cpu_speed_limit_pct}`) and `energy_mwh`, from the
+        //           in-process host probe. Additive; every 1.27.0 field is
+        //           byte-identical. See schema.rs.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.28.0");
     }
 
     #[test]

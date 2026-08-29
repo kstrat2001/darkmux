@@ -1112,6 +1112,7 @@
             judge_exhaustion_strict: false,
             bundles: None,
             source: None,
+            workspace: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let mut cycler = RecordingCycler::new();
@@ -1143,6 +1144,7 @@
             judge_exhaustion_strict: false,
             bundles: None,
             source: None,
+            workspace: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` off by one")];
         let mut cycler = RecordingCycler::new();
@@ -1179,6 +1181,7 @@
             judge_exhaustion_strict: false,
             bundles: None,
             source: None,
+            workspace: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let mut cycler = RecordingCycler::new();
@@ -1652,6 +1655,7 @@
             judge_exhaustion_strict: false,
             bundles: None,
             source: Some(&source),
+            workspace: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` off by one")];
         let judge_reply = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"e\", \
@@ -1700,6 +1704,7 @@
             judge_exhaustion_strict: false,
             bundles: None,
             source: Some(&source),
+            workspace: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "off by one")];
         let judge_reply = "```json\n{\"ruling\": \"confirmed\", \"decisive_evidence\": \"e\", \
@@ -1747,6 +1752,7 @@
             judge_exhaustion_strict: false,
             bundles: None,
             source: None,
+            workspace: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let verify_calls = std::cell::RefCell::new(0u32);
@@ -1802,6 +1808,7 @@
             judge_exhaustion_strict: false,
             bundles: None,
             source: None,
+            workspace: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let verified_json =
@@ -1884,6 +1891,7 @@
             judge_exhaustion_strict: true,
             bundles: None,
             source: None,
+            workspace: None,
         };
         // Three flags in three different bundles (no anchors + distinct
         // bundle_id ⇒ all survive dedup, in input order).
@@ -1976,6 +1984,7 @@
             judge_exhaustion_strict: false,
             bundles: None,
             source: None,
+            workspace: None,
         };
         inputs.bundles = Some(vec![bundle_input("a.ts"), bundle_input("b.ts"), bundle_input("c.ts")]);
         let flags = vec![
@@ -2102,6 +2111,7 @@
             judge_exhaustion_strict: false,
             bundles: Some(vec![bundle_input("a.ts"), bundle_input("b.ts")]),
             source: None,
+            workspace: None,
         };
         let flags = vec![
             flag("a.ts", "member-a", 0, "charge one"),
@@ -2324,6 +2334,114 @@
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0].id, "billing.ts");
         assert!(bundles[0].code.contains("const end = start.plus(30)"));
+    }
+
+    // ── (#1959) review's optional workspace input: filter_bundles_by_workspace / resolve_bundles ──
+
+    fn workspace_spec_with(include: Option<Vec<&str>>, exclude: Option<Vec<&str>>) -> WorkspaceSpec {
+        WorkspaceSpec {
+            schema_version: None,
+            name: Some("test-workspace".to_string()),
+            root: None,
+            sources: Vec::new(),
+            include: include.map(|v| v.into_iter().map(str::to_string).collect()),
+            exclude: exclude.map(|v| v.into_iter().map(str::to_string).collect()),
+            edges: Vec::new(),
+            rules: Vec::new(),
+            extras: Default::default(),
+        }
+    }
+
+    #[test]
+    fn filter_bundles_by_workspace_drops_files_the_spec_excludes() {
+        let bundles = vec![
+            BundleInput {
+                id: "billing.ts".to_string(),
+                fact_family: "unscoped".to_string(),
+                code: "kept".to_string(),
+                probe_code: "kept".to_string(),
+                facts: Vec::new(),
+                manifest: Vec::new(),
+            },
+            BundleInput {
+                id: "vendor/generated.ts".to_string(),
+                fact_family: "unscoped".to_string(),
+                code: "dropped".to_string(),
+                probe_code: "dropped".to_string(),
+                facts: Vec::new(),
+                manifest: Vec::new(),
+            },
+        ];
+        let spec = workspace_spec_with(None, Some(vec!["vendor/**"]));
+        let (kept, skipped) = filter_bundles_by_workspace(bundles, &spec);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].id, "billing.ts");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].path, "vendor/generated.ts");
+        assert_eq!(skipped[0].reason, SkipReason::ExcludedByWorkspaceSpec);
+        assert!(skipped[0].function.is_none());
+    }
+
+    #[test]
+    fn filter_bundles_by_workspace_keeps_everything_when_nothing_excluded() {
+        let bundles = vec![BundleInput {
+            id: "billing.ts".to_string(),
+            fact_family: "unscoped".to_string(),
+            code: "kept".to_string(),
+            probe_code: "kept".to_string(),
+            facts: Vec::new(),
+            manifest: Vec::new(),
+        }];
+        let spec = workspace_spec_with(None, None);
+        let (kept, skipped) = filter_bundles_by_workspace(bundles, &spec);
+        assert_eq!(kept.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn resolve_bundles_is_byte_identical_when_workspace_is_absent() {
+        let inputs = ReviewInputs {
+            case_id: "c1".to_string(),
+            roles: &valid_crew(),
+            intent_title: "",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "",
+            judge_system: "",
+            verify_system: "",
+            remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
+            bundles: None,
+            source: None,
+            workspace: None,
+        };
+        let bundles = resolve_bundles(&inputs);
+        assert_eq!(bundles.len(), 1, "unfiltered — same as bundles_from_diff alone");
+        assert_eq!(bundles[0].id, "billing.ts");
+    }
+
+    #[test]
+    fn resolve_bundles_drops_files_the_workspace_spec_excludes() {
+        let spec = workspace_spec_with(None, Some(vec!["billing.ts"]));
+        let inputs = ReviewInputs {
+            case_id: "c1".to_string(),
+            roles: &valid_crew(),
+            intent_title: "",
+            intent_body: "",
+            diff: DIFF,
+            mode: ExecMode::Sequential,
+            probe_system: "",
+            judge_system: "",
+            verify_system: "",
+            remote_max_tokens_per_execution: 500_000,
+            judge_exhaustion_strict: false,
+            bundles: None,
+            source: None,
+            workspace: Some(&spec),
+        };
+        let bundles = resolve_bundles(&inputs);
+        assert!(bundles.is_empty(), "{bundles:?}");
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -2982,6 +3100,7 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
             judge_exhaustion_strict: false,
             bundles: Some(bundles),
             source: None,
+            workspace: None,
         };
         let flags = vec![flag("billing.ts", "member-a", 0, "`const end = start.plus(30)` double-counts")];
         let mut cycler = RecordingCycler::new();
@@ -7934,6 +8053,35 @@ fingerprint: fingerprint("darkmux:judge-model", "judge sys"),
         let (msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
         assert_eq!(kind, DegenerateKind::Error);
         assert!(msg.contains("over the bundler's size cap"), "{msg}");
+    }
+
+    // ── (#1959) classify_zero_bundle_degenerate: workspace-spec exclusion ──
+
+    #[test]
+    fn classify_zero_bundle_degenerate_excluded_by_workspace_spec_is_benign() {
+        // A review scoped to a workspace spec whose include/exclude drops
+        // every touched file is a deliberate operator scoping decision,
+        // same benign treatment as TestFileExcluded — never a bundler
+        // failure.
+        let skip = skip_report(vec![
+            ("vendor/generated.ts", SkipReason::ExcludedByWorkspaceSpec),
+            ("vendor/another.ts", SkipReason::ExcludedByWorkspaceSpec),
+        ]);
+        let (msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(kind, DegenerateKind::BenignEmpty, "a workspace-spec exclusion is a deliberate scope, not a failure");
+        assert!(msg.contains("excluded by the workspace spec"), "{msg}");
+    }
+
+    #[test]
+    fn classify_zero_bundle_degenerate_workspace_excluded_mixed_with_unreadable_stays_error() {
+        // A workspace-spec exclusion mixed with a genuine error reason
+        // must never launder that error into benign.
+        let skip = skip_report(vec![
+            ("vendor/generated.ts", SkipReason::ExcludedByWorkspaceSpec),
+            ("src/missing.ts", SkipReason::UnreadableInWorktree),
+        ]);
+        let (_msg, kind) = classify_zero_bundle_degenerate(&Some(skip));
+        assert_eq!(kind, DegenerateKind::Error);
     }
 
     // ── (#1757) classify_zero_bundle_degenerate: unsupported-language ──

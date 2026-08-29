@@ -10,7 +10,7 @@
 
 use super::*;
 use anyhow::anyhow;
-use darkmux_lab::crawl::rules::RuleKind;
+use darkmux_crew::rules::RuleKind;
 use std::cell::RefCell;
 use std::env;
 use std::process::Command;
@@ -21,22 +21,41 @@ use tempfile::TempDir;
 struct TestGuard {
     _crew: TempDir,
     _flows: TempDir,
+    _home: TempDir,
     prev_crew: Option<String>,
     prev_flows: Option<String>,
+    prev_home: Option<String>,
 }
 
 impl TestGuard {
     fn new() -> Self {
         let crew_dir = TempDir::new().unwrap();
         let flows_dir = TempDir::new().unwrap();
+        // (#1959) Also isolate DARKMUX_HOME: the launcher derives *crawl
+        // program state* (kill file, runs, ledger) from
+        // `darkmux_types::paths::resolve(ResolveScope::Auto)`, which
+        // defaults to the operator's REAL `~/.darkmux` unless overridden.
+        // Without this, these tests wrote ledgers/kill-files into the
+        // operator's actual home directory. Mirrors the guard pattern
+        // `workspace_spec::mod.rs`'s own tests already use.
+        let home_dir = TempDir::new().unwrap();
         let prev_crew = env::var("DARKMUX_CREW_DIR").ok();
         let prev_flows = env::var("DARKMUX_FLOWS_DIR").ok();
+        let prev_home = env::var("DARKMUX_HOME").ok();
         // SAFETY: every caller is #[serial_test::serial].
         unsafe {
             env::set_var("DARKMUX_CREW_DIR", crew_dir.path());
             env::set_var("DARKMUX_FLOWS_DIR", flows_dir.path());
+            env::set_var("DARKMUX_HOME", home_dir.path());
         }
-        Self { _crew: crew_dir, _flows: flows_dir, prev_crew, prev_flows }
+        Self {
+            _crew: crew_dir,
+            _flows: flows_dir,
+            _home: home_dir,
+            prev_crew,
+            prev_flows,
+            prev_home,
+        }
     }
 }
 
@@ -51,6 +70,10 @@ impl Drop for TestGuard {
             match &self.prev_flows {
                 Some(v) => env::set_var("DARKMUX_FLOWS_DIR", v),
                 None => env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match &self.prev_home {
+                Some(v) => env::set_var("DARKMUX_HOME", v),
+                None => env::remove_var("DARKMUX_HOME"),
             }
         }
     }
@@ -88,28 +111,46 @@ fn mission_id_from_records(records: &[Value]) -> String {
     records
         .iter()
         .find_map(|r| {
-            if r["action"] == "crawl.mission.started" {
+            if r["action"] == "mission start" {
                 r["mission_id"].as_str().map(String::from)
             } else {
                 None
             }
         })
-        .expect("expected a crawl.mission.started record carrying mission_id")
+        .expect("expected a mission start record carrying mission_id")
 }
 
-/// Only the actions this module's own tests care about — excludes the
-/// `mission start`/`phase start`/`mission close`/`phase complete`
-/// lifecycle bookkeeping `crew::lifecycle` ALSO emits on the same stream.
+/// Only the actions this module's own tests care about — the generic
+/// mission/step lifecycle actions the launcher now emits directly
+/// (`mission start`/`mission close`, `step start`/`step complete`/`step
+/// error`) plus the dispatch bookends every unit's model call already
+/// produces. Deliberately EXCLUDES `phase start`/`phase complete`/`phase
+/// abandon` — `crew::lifecycle` emits those too on the same stream, but no
+/// test in this module asserts on phase-level ordering. (#1959, revised:
+/// this used to filter on a bespoke `crawl.*` prefix; there is no such
+/// prefix left to filter on — the launcher's own records are no longer
+/// distinguishable from any other mission's by action name alone, which is
+/// the whole point of this packet.)
 fn crawl_relevant_actions(records: &[Value]) -> Vec<String> {
+    const RELEVANT: &[&str] = &[
+        "mission start",
+        "mission close",
+        "step start",
+        "step complete",
+        "step error",
+        "dispatch start",
+        "dispatch complete",
+        "dispatch error",
+    ];
     records
         .iter()
         .filter_map(|r| r["action"].as_str())
-        .filter(|a| a.starts_with("crawl.") || *a == "dispatch start" || *a == "dispatch complete" || *a == "dispatch error")
+        .filter(|a| RELEVANT.contains(a))
         .map(String::from)
         .collect()
 }
 
-// ── corpus fixture: two tiny local git repos, one `catch` site each ─────
+// ── workspace fixture: two tiny local git repos, one `catch` site each ──
 
 fn init_source_repo(dir: &std::path::Path, filename: &str, contents: &str) {
     let run = |args: &[&str]| {
@@ -128,7 +169,7 @@ fn init_source_repo(dir: &std::path::Path, filename: &str, contents: &str) {
 struct Fixture {
     _workdir: TempDir,
     root: TempDir,
-    manifest_path: PathBuf,
+    spec_path: PathBuf,
 }
 
 /// Two sources ("app1"/"app2"), one `catch` site each, `swallowed-error`
@@ -154,15 +195,15 @@ fn two_source_fixture() -> Fixture {
         ],
         "rules": ["swallowed-error"]
     });
-    let manifest_path = workdir.path().join("corpus.json");
-    std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let spec_path = workdir.path().join("workspace.json");
+    std::fs::write(&spec_path, manifest.to_string()).unwrap();
 
-    Fixture { _workdir: workdir, root, manifest_path }
+    Fixture { _workdir: workdir, root, spec_path }
 }
 
 fn params_for(fx: &Fixture) -> BTreeMap<String, Value> {
     let mut m = BTreeMap::new();
-    m.insert("corpus".to_string(), Value::String(fx.manifest_path.to_string_lossy().to_string()));
+    m.insert("workspace".to_string(), Value::String(fx.spec_path.to_string_lossy().to_string()));
     m
 }
 
@@ -178,6 +219,12 @@ struct ScriptedUnit {
     completion_tokens: u64,
     wall_ms: u64,
     model: &'static str,
+    /// (#2107) The `host` block a real envelope carries when the sampler
+    /// took at least one reading. `None` reproduces the ordinary "too short
+    /// to sample" case; a scripted `Some(..)` is how
+    /// `host_threads_through_to_the_unit_record` drives the #2107
+    /// regression without a live sampler thread.
+    host: Option<Value>,
 }
 
 impl Default for ScriptedUnit {
@@ -191,6 +238,7 @@ impl Default for ScriptedUnit {
             completion_tokens: 5,
             wall_ms: 100,
             model: "darkmux:test-model",
+            host: None,
         }
     }
 }
@@ -242,7 +290,7 @@ fn scripted_ok_result(unit_id: &str, script: &ScriptedUnit, session_id: String) 
         std::fs::write(runtime_dir.join("findings.jsonl"), body).unwrap();
     }
 
-    let envelope = json!({
+    let mut envelope = json!({
         "result": script.result,
         "final_assistant": format!("covered {unit_id}"),
         "metrics": {
@@ -253,6 +301,12 @@ fn scripted_ok_result(unit_id: &str, script: &ScriptedUnit, session_id: String) 
         },
         "detections": [],
     });
+    // (#2107) Only inserted when scripted — mirrors the real envelope, which
+    // omits `host` entirely (not a null block) whenever the sampler never
+    // took a reading.
+    if let Some(h) = &script.host {
+        envelope["host"] = h.clone();
+    }
 
     DispatchResult {
         exit_code: script.exit_code,
@@ -330,25 +384,27 @@ fn unit_loop_emits_started_dispatch_findings_completed_in_order_with_mission_id(
     assert_eq!(
         actions,
         vec![
-            "crawl.mission.started",
-            "crawl.unit.started",
+            "mission start",
+            "step start",
             "dispatch start",
             "dispatch complete",
-            "crawl.finding",
-            "crawl.unit.completed",
-            "crawl.unit.started",
+            "step complete",
+            "step start",
             "dispatch start",
             "dispatch complete",
-            "crawl.unit.completed",
-            "crawl.mission.completed",
+            "step complete",
+            "mission close",
         ],
         "{actions:#?}"
     );
 
-    for r in records.iter().filter(|r| r["action"].as_str().unwrap_or("").starts_with("crawl.")) {
+    // (#1959, revised) There is no `crawl.*` action left to filter on — the
+    // launcher's own records are the generic `step start`/`step complete`
+    // family; filter on THOSE instead of a bespoke prefix.
+    for r in records.iter().filter(|r| matches!(r["action"].as_str(), Some("step start") | Some("step complete") | Some("step error"))) {
         assert!(r["mission_id"].is_string(), "record missing mission_id: {r:#?}");
-        // (#1959 merge-gate finding 3) No `crawl.*` record may ever carry
-        // an empty sha — that's the exact tell of a unit whose source
+        // (#1959 merge-gate finding 3) No step record may ever carry an
+        // empty sha — that's the exact tell of a unit whose source
         // silently fell through `the_plan.sources.iter().find(...).
         // unwrap_or_default()` unvalidated.
         if let Some(sha) = r["payload"]["sha"].as_str() {
@@ -356,13 +412,14 @@ fn unit_loop_emits_started_dispatch_findings_completed_in_order_with_mission_id(
         }
     }
 
-    // (#1959 merge-gate finding 6) `model` is pinned on the top-level
-    // FlowRecord for a `crawl.finding` and a `crawl.unit.completed`
-    // record, not just buried in the payload.
-    let finding_record = records.iter().find(|r| r["action"] == "crawl.finding").expect("expected one finding");
-    assert_eq!(finding_record["model"], "darkmux:test-model");
+    // (#1959 merge-gate finding 6, revised) `model` is pinned on the
+    // top-level FlowRecord for the `step complete` record that carried a
+    // finding — a plain accepted `report_finding` call has no flow record
+    // of its own anymore (see the module doc), so there is nothing to
+    // check there; the model IS still visible on the unit's own
+    // completion record.
     let completed_record =
-        records.iter().find(|r| r["action"] == "crawl.unit.completed").expect("expected a completed record");
+        records.iter().find(|r| r["action"] == "step complete").expect("expected a completed record");
     assert_eq!(completed_record["model"], "darkmux:test-model");
 
     // (#1959 merge-gate finding 3) The ledger line for the one finding must
@@ -398,22 +455,22 @@ fn findings_get_path_rewritten_and_land_in_ledger_and_per_unit_copy() {
 
     let records = read_all_flow_records();
     let mission_id = mission_id_from_records(&records);
-    let finding_rec = records.iter().find(|r| r["action"] == "crawl.finding").expect("one crawl.finding record");
-    assert_eq!(finding_rec["payload"]["file"], "x.ts");
-    assert_eq!(finding_rec["payload"]["file_raw"], "/workspace/app1/x.ts");
-    assert_eq!(finding_rec["payload"]["source"], "app1");
-    assert_eq!(finding_rec["payload"]["evidence"], "catch (e) {");
 
+    // (#1959, revised) No flow record per finding anymore — the ledger IS
+    // the durable, harness-verified record of this finding (see the
+    // module doc); check it directly instead of a `crawl.finding` record.
     let runs_dir = fx.root.path().join("runs").join(&mission_id);
     let ledger = std::fs::read_to_string(runs_dir.join("ledger.jsonl")).unwrap();
     let ledger_rec: Value = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
     assert_eq!(ledger_rec["file"], "x.ts");
     assert_eq!(ledger_rec["file_raw"], "/workspace/app1/x.ts");
+    assert_eq!(ledger_rec["source"], "app1");
+    assert_eq!(ledger_rec["evidence"], "catch (e) {");
 
     let copy = std::fs::read_to_string(runs_dir.join("u-0001.findings.jsonl")).unwrap();
     let copy_rec: Value = serde_json::from_str(copy.lines().next().unwrap()).unwrap();
     // The per-unit copy is the RAW findings file, unmodified — file is
-    // still the container path, no file_raw/corpus/unit/etc. added.
+    // still the container path, no file_raw/workspace/unit/etc. added.
     assert_eq!(copy_rec["file"], "/workspace/app1/x.ts");
     assert!(copy_rec.get("file_raw").is_none(), "{copy_rec:#?}");
 }
@@ -444,7 +501,7 @@ fn kill_file_present_before_second_unit_stops_the_crawl() {
     assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string()], "u-0002 must never be dispatched");
 
     let records = read_all_flow_records();
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["stopped_by"], "kill_file");
     assert_eq!(completed["payload"]["units_completed"], 1);
     assert_eq!(completed["payload"]["units_skipped"], 1);
@@ -469,7 +526,7 @@ fn limit_caps_the_unit_count_and_reports_stopped_by_limit() {
     assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string()]);
 
     let records = read_all_flow_records();
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["stopped_by"], "limit");
 }
 
@@ -520,7 +577,7 @@ fn a_dispatch_error_on_one_unit_does_not_stop_the_crawl() {
     assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string(), "u-0002".to_string()]);
 
     let records = read_all_flow_records();
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["units_errored"], 1);
     assert_eq!(completed["payload"]["units_completed"], 1);
     assert_eq!(completed["payload"]["stopped_by"], "done");
@@ -533,10 +590,10 @@ fn a_dispatch_error_on_one_unit_does_not_stop_the_crawl() {
 fn stale_plan_sha_bails_loud_before_any_dispatch() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
-    let resolved = sources::resolve(&manifest, true).unwrap();
-    let mut stale_plan = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
+    let materialized = workspace_spec::materialize(&manifest, MaterializeOptions { fetch: true, read_only: true }).unwrap();
+    let mut stale_plan = plan::plan(&materialized, &rules_vec).unwrap();
     stale_plan.sources[0].sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
     let plan_path = fx.root.path().join("stale-plan.json");
     std::fs::write(&plan_path, serde_json::to_string(&stale_plan).unwrap()).unwrap();
@@ -738,7 +795,7 @@ fn tokens_per_hour_is_total_tokens_over_wall_hours() {
     run(&params_for(&fx), None, &mut dispatch).unwrap();
 
     let records = read_all_flow_records();
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["tokens_per_hour"], 1500);
     assert_eq!(completed["payload"]["prompt_tokens"], 1000);
     assert_eq!(completed["payload"]["completion_tokens"], 500);
@@ -795,15 +852,16 @@ fn mission_and_task_structure_is_the_shape_mission_status_reads() {
 /// A synthetic plan with `n` `Unit::Site` entries, all bound to
 /// `swallowed-error` against source `app1` (present in `two_source_
 /// fixture`'s manifest) — used where a test needs a plan LARGER than the
-/// fixture's own 2-unit corpus (finding 2's "70 in plan, 1 selected"
+/// fixture's own 2-unit workspace (finding 2's "70 in plan, 1 selected"
 /// shape) without spinning up 70 real git repos. `sources` is built from
-/// the CALLER-supplied `resolved` list (real `sources::resolve` output for
-/// the fixture) rather than left empty: an empty `sources` here used to
-/// exploit the exact hole finding 3 closes — a unit naming a source absent
-/// from `plan.sources` sailed through unvalidated, defaulting to `sha: ""`
-/// in every downstream `crawl.*` record. Declaring `app1` properly keeps
-/// this fixture honest against that guard.
-fn synthetic_plan_with_n_units(corpus_name: &str, n: usize, resolved: &[sources::ResolvedSource]) -> Plan {
+/// the CALLER-supplied `materialized` list (real `workspace_spec::
+/// materialize` output for the fixture) rather than left empty: an empty
+/// `sources` here used to exploit the exact hole finding 3 closes — a
+/// unit naming a source absent from `plan.sources` sailed through
+/// unvalidated, defaulting to `sha: ""` in every downstream record.
+/// Declaring `app1` properly keeps this fixture honest against that
+/// guard.
+fn synthetic_plan_with_n_units(workspace_name: &str, n: usize, materialized: &[workspace_spec::MaterializedSource]) -> Plan {
     let units: Vec<Unit> = (1..=n)
         .map(|i| Unit::Site {
             id: format!("u-{i:04}"),
@@ -813,7 +871,7 @@ fn synthetic_plan_with_n_units(corpus_name: &str, n: usize, resolved: &[sources:
             est_tokens: 10,
         })
         .collect();
-    let plan_sources: Vec<plan::PlanSource> = resolved
+    let plan_sources: Vec<plan::PlanSource> = materialized
         .iter()
         .map(|r| plan::PlanSource {
             id: r.id.clone(),
@@ -821,11 +879,12 @@ fn synthetic_plan_with_n_units(corpus_name: &str, n: usize, resolved: &[sources:
             git_ref: r.git_ref.clone(),
             tree: r.tree.clone(),
             files_walked: 0,
+            out_of_scope: 0,
         })
         .collect();
     Plan {
         schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
-        corpus: corpus_name.to_string(),
+        workspace: workspace_name.to_string(),
         planned_at: "2026-01-01T00:00:00Z".to_string(),
         sources: plan_sources,
         units,
@@ -850,10 +909,10 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 fn plan_naming_a_rule_the_manifest_no_longer_declares_bails_before_any_mint() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
-    let resolved = sources::resolve(&manifest, true).unwrap();
-    let mut stale_plan = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
+    let materialized = workspace_spec::materialize(&manifest, MaterializeOptions { fetch: true, read_only: true }).unwrap();
+    let mut stale_plan = plan::plan(&materialized, &rules_vec).unwrap();
     match &mut stale_plan.units[0] {
         Unit::Site { rule, .. } => *rule = "ghost-rule".to_string(),
         other => panic!("fixture expected to produce Unit::Site units, got {other:?}"),
@@ -871,8 +930,8 @@ fn plan_naming_a_rule_the_manifest_no_longer_declares_bails_before_any_mint() {
 
     let records = read_all_flow_records();
     assert!(
-        records.iter().all(|r| r["action"] != "crawl.mission.started"),
-        "a pre-mint bail must never emit crawl.mission.started — no mission was minted: {records:#?}"
+        records.iter().all(|r| r["action"] != "mission start"),
+        "a pre-mint bail must never emit mission start — no mission was minted: {records:#?}"
     );
 }
 
@@ -880,10 +939,10 @@ fn plan_naming_a_rule_the_manifest_no_longer_declares_bails_before_any_mint() {
 
 /// A failure in the mint window (mission mint through the mission-specific
 /// runs-dir creation) must never strand an Active mission with an unpaired
-/// `crawl.mission.started`. `<corpus root>/runs` already existing as a
+/// `mission start`. `<darkmux root>/crawl/<name>/runs` already existing as a
 /// regular file forces `create_dir_all` to fail at the LAST fallible step
 /// of the window — after the mission/phase/task/step records and the
-/// `crawl.mission.started` record have already been written — which is
+/// `mission start` record have already been written — which is
 /// exactly the shape that used to strand.
 #[test]
 #[serial_test::serial]
@@ -903,13 +962,13 @@ fn runs_dir_collision_reconciles_the_mint_instead_of_stranding_it() {
     let records = read_all_flow_records();
     let mission_id = mission_id_from_records(&records);
 
-    // paired-or-both-absent: `crawl.mission.started` DID fire (the window
-    // fails after it), so `crawl.mission.completed` must have too.
-    let started = records.iter().filter(|r| r["action"] == "crawl.mission.started").count();
-    let completed = records.iter().filter(|r| r["action"] == "crawl.mission.completed").count();
-    assert_eq!(started, completed, "crawl.mission.started/completed must be paired, never one without the other: {records:#?}");
+    // paired-or-both-absent: `mission start` DID fire (the window
+    // fails after it), so `mission close` must have too.
+    let started = records.iter().filter(|r| r["action"] == "mission start").count();
+    let completed = records.iter().filter(|r| r["action"] == "mission close").count();
+    assert_eq!(started, completed, "mission start/completed must be paired, never one without the other: {records:#?}");
     assert_eq!(started, 1, "expected exactly the one mint attempt's started record: {records:#?}");
-    let completed_record = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed_record = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed_record["payload"]["stopped_by"], "error");
     assert_eq!(completed_record["payload"]["units_completed"], 0);
 
@@ -937,10 +996,10 @@ fn runs_dir_collision_reconciles_the_mint_instead_of_stranding_it() {
 fn plan_with_empty_sources_naming_a_real_unit_bails_before_any_mint() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let empty_sources_plan = Plan {
         schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
-        corpus: manifest.name.clone(),
+        workspace: manifest.effective_name().to_string(),
         planned_at: "2026-01-01T00:00:00Z".to_string(),
         sources: Vec::new(),
         units: vec![Unit::Site {
@@ -966,8 +1025,8 @@ fn plan_with_empty_sources_naming_a_real_unit_bails_before_any_mint() {
 
     let records = read_all_flow_records();
     assert!(
-        records.iter().all(|r| r["action"] != "crawl.mission.started"),
-        "a pre-mint bail must never emit crawl.mission.started — no mission was minted: {records:#?}"
+        records.iter().all(|r| r["action"] != "mission start"),
+        "a pre-mint bail must never emit mission start — no mission was minted: {records:#?}"
     );
 }
 
@@ -1006,8 +1065,8 @@ fn a_panic_mid_loop_still_finalizes_via_the_raii_guard() {
     let mission_id = mission_id_from_records(&records);
     let completed = records
         .iter()
-        .find(|r| r["action"] == "crawl.mission.completed")
-        .expect("the RAII guard must still emit crawl.mission.completed on a panic");
+        .find(|r| r["action"] == "mission close")
+        .expect("the RAII guard must still emit mission close on a panic");
     assert_eq!(completed["payload"]["stopped_by"], "error");
     assert_eq!(completed["payload"]["units_completed"], 0);
 
@@ -1037,9 +1096,9 @@ fn a_panic_mid_loop_still_finalizes_via_the_raii_guard() {
 fn seventy_in_plan_one_selected_reports_units_not_run_everywhere() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
-    let resolved = sources::resolve(&manifest, true).unwrap();
-    let synthetic = synthetic_plan_with_n_units(&manifest.name, 70, &resolved);
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
+    let materialized = workspace_spec::materialize(&manifest, MaterializeOptions { fetch: true, read_only: true }).unwrap();
+    let synthetic = synthetic_plan_with_n_units(manifest.effective_name(), 70, &materialized.sources);
     let plan_path = fx.root.path().join("big-plan.json");
     std::fs::write(&plan_path, serde_json::to_string(&synthetic).unwrap()).unwrap();
 
@@ -1057,11 +1116,11 @@ fn seventy_in_plan_one_selected_reports_units_not_run_everywhere() {
     assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string()], "only the selected unit is ever dispatched");
 
     let records = read_all_flow_records();
-    let started = records.iter().find(|r| r["action"] == "crawl.mission.started").unwrap();
+    let started = records.iter().find(|r| r["action"] == "mission start").unwrap();
     assert_eq!(started["payload"]["units_in_plan"], 70);
     assert_eq!(started["payload"]["units_selected"], 1);
 
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["units_in_plan"], 70);
     assert_eq!(completed["payload"]["units_selected"], 1);
     assert_eq!(completed["payload"]["units_not_run"], 69);
@@ -1160,7 +1219,7 @@ fn every_shipped_rule_avoids_darkmux_internal_vocabulary() {
     }
 }
 
-// ── finding 5: crawl.unit.started carries the UNIT session id ───────────
+// ── finding 5: step start carries the UNIT session id ───────────
 
 #[test]
 #[serial_test::serial]
@@ -1175,17 +1234,17 @@ fn unit_started_and_completed_share_the_same_session_id() {
     run(&params_for(&fx), None, &mut dispatch).unwrap();
 
     let records = read_all_flow_records();
-    for r in records.iter().filter(|r| r["action"] == "crawl.unit.started") {
-        let sid = r["session_id"].as_str().expect("crawl.unit.started must carry a session_id");
+    for r in records.iter().filter(|r| r["action"] == "step start") {
+        let sid = r["session_id"].as_str().expect("step start must carry a session_id");
         assert!(sid.starts_with("crawl-"), "{r:#?}");
         assert_ne!(sid, r["mission_id"].as_str().unwrap(), "must be the UNIT session, not the mission id");
     }
 
     let started_sessions: Vec<&str> =
-        records.iter().filter(|r| r["action"] == "crawl.unit.started").map(|r| r["session_id"].as_str().unwrap()).collect();
+        records.iter().filter(|r| r["action"] == "step start").map(|r| r["session_id"].as_str().unwrap()).collect();
     let completed_sessions: Vec<&str> = records
         .iter()
-        .filter(|r| r["action"] == "crawl.unit.completed")
+        .filter(|r| r["action"] == "step complete")
         .map(|r| r["session_id"].as_str().unwrap())
         .collect();
     assert_eq!(
@@ -1198,23 +1257,23 @@ fn unit_started_and_completed_share_the_same_session_id() {
 
 #[test]
 #[serial_test::serial]
-fn plan_corpus_mismatch_bails_loud() {
+fn plan_workspace_mismatch_bails_loud() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
-    let resolved = sources::resolve(&manifest, true).unwrap();
-    let mut plan_wrong_corpus = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
-    plan_wrong_corpus.corpus = "some-other-corpus".to_string();
-    let plan_path = fx.root.path().join("wrong-corpus-plan.json");
-    std::fs::write(&plan_path, serde_json::to_string(&plan_wrong_corpus).unwrap()).unwrap();
+    let materialized = workspace_spec::materialize(&manifest, MaterializeOptions { fetch: true, read_only: true }).unwrap();
+    let mut plan_wrong_workspace = plan::plan(&materialized, &rules_vec).unwrap();
+    plan_wrong_workspace.workspace = "some-other-workspace".to_string();
+    let plan_path = fx.root.path().join("wrong-workspace-plan.json");
+    std::fs::write(&plan_path, serde_json::to_string(&plan_wrong_workspace).unwrap()).unwrap();
 
     let mut params = params_for(&fx);
     params.insert("plan".to_string(), Value::String(plan_path.to_string_lossy().to_string()));
     let calls = RefCell::new(Vec::new());
     let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
     let err = run(&params, None, &mut dispatch).unwrap_err();
-    assert!(err.to_string().contains("some-other-corpus"), "{err}");
+    assert!(err.to_string().contains("some-other-workspace"), "{err}");
     assert!(calls.borrow().clone().is_empty());
 }
 
@@ -1223,10 +1282,10 @@ fn plan_corpus_mismatch_bails_loud() {
 fn plan_source_tree_mismatch_bails_loud() {
     let _guard = TestGuard::new();
     let fx = two_source_fixture();
-    let (manifest, _) = CorpusManifest::load(&fx.manifest_path).unwrap();
+    let (manifest, _) = WorkspaceSpec::load(&fx.spec_path).unwrap();
     let (rules_vec, _) = rules::resolve(&manifest.rules, None).unwrap();
-    let resolved = sources::resolve(&manifest, true).unwrap();
-    let mut plan_wrong_tree = plan::plan(&manifest, &rules_vec, &resolved).unwrap();
+    let materialized = workspace_spec::materialize(&manifest, MaterializeOptions { fetch: true, read_only: true }).unwrap();
+    let mut plan_wrong_tree = plan::plan(&materialized, &rules_vec).unwrap();
     plan_wrong_tree.sources[0].tree = PathBuf::from("/nonexistent/relocated/tree");
     let plan_path = fx.root.path().join("wrong-tree-plan.json");
     std::fs::write(&plan_path, serde_json::to_string(&plan_wrong_tree).unwrap()).unwrap();
@@ -1291,8 +1350,95 @@ fn envelope_is_self_describing() {
     assert!(envelope["units_filter"].is_null());
     assert_eq!(envelope["units"][0]["model"], "darkmux:test-model");
 
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
-    assert_eq!(completed["model"], "darkmux:test-model", "the mission-level record's own FlowRecord.model field");
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
+    // (#1959, revised) `model` lives in the PAYLOAD for the generic
+    // `mission close` record (`emit_mission_transition_record_with_
+    // reasoning_and_payload` never sets the top-level `FlowRecord.model`
+    // field — that generic helper has no per-call model concept; only
+    // this launcher's OWN payload numbers carry it).
+    assert_eq!(completed["payload"]["model"], "darkmux:test-model", "the mission close record's payload.model field");
+}
+
+// ── #2107: the crawl launcher's null-host regression ─────────────────────
+//
+// The live 2026-08-29 crawl run showed `telemetry.process` samples in the
+// flow stream for a unit's own session, while that unit's own reported
+// outcome carried no `host` block at all. Root cause: the sampler runs
+// per-dispatch (every unit gets its own container + its own sampler
+// thread, verified by reading `dispatch_internal::dispatch`, which this
+// launcher calls once per unit) and genuinely writes `host` onto the raw
+// `--json` envelope whenever it sampled — but `interpret_dispatch_result`
+// never extracted that field, so nothing past it (the unit's `step
+// complete` record, the mission's `envelope.json` per-unit row) ever saw
+// it. No session/mission-id keying bug was found; this is a readback gap.
+
+#[test]
+#[serial_test::serial]
+fn host_threads_through_to_the_unit_record() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut params = params_for(&fx);
+    params.insert("limit".to_string(), Value::String("1".to_string()));
+    let host_block = json!({
+        "cpu": {"peak_pct": 91, "mean_pct": 62.4, "p95_pct": 88, "above_80_ms": 4000},
+        "mem": {"peak_pct": 70, "mean_pct": 55.0, "p95_pct": 68, "above_80_ms": 0},
+        "gpu": {"peak_pct": 95, "mean_pct": 71.2, "p95_pct": 93, "above_80_ms": 6000},
+        "samples": 12,
+        "sample_interval_ms": 2000,
+        "peak_cpu_pct": 91,
+        "peak_mem_pct": 70,
+    });
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit { host: Some(host_block.clone()), ..Default::default() });
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    run(&params, None, &mut dispatch).unwrap();
+
+    let records = read_all_flow_records();
+    let mission_id = mission_id_from_records(&records);
+    let runs_dir = fx.root.path().join("runs").join(&mission_id);
+    let envelope: Value = serde_json::from_str(&std::fs::read_to_string(runs_dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(
+        envelope["units"][0]["host"], host_block,
+        "the mission's own per-unit summary must carry the sampled host block: {envelope}"
+    );
+
+    let step_complete = records
+        .iter()
+        .find(|r| r["action"] == "step complete" && r["payload"]["unit"] == "u-0001")
+        .expect("this unit's own step complete record");
+    assert_eq!(
+        step_complete["payload"]["host"], host_block,
+        "the unit's own flow record must carry it too, not just the mission summary: {step_complete}"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn a_unit_that_never_sampled_reports_no_host_block_rather_than_a_null_one() {
+    // The honesty rule the source block follows (absence, not a zeroed
+    // block) must survive the trip through this launcher too.
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut params = params_for(&fx);
+    params.insert("limit".to_string(), Value::String("1".to_string()));
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    run(&params, None, &mut dispatch).unwrap();
+
+    let records = read_all_flow_records();
+    let step_complete = records
+        .iter()
+        .find(|r| r["action"] == "step complete" && r["payload"]["unit"] == "u-0001")
+        .expect("this unit's own step complete record");
+    assert!(
+        step_complete["payload"].get("host").is_none(),
+        "no sampled reading must not become a `null` block: {step_complete}"
+    );
 }
 
 // ── round-3 CONSIDER 7: interrupted classification at readback ──────────
@@ -1343,11 +1489,16 @@ fn interrupted_at_readback_reports_interrupted_not_error() {
     assert_eq!(calls.borrow().len(), 1, "the second unit must never be dispatched once interrupted");
 
     let records = read_all_flow_records();
+    // (#1959, revised) An interrupted unit's step reaches `NodeStatus::
+    // Abandoned` on disk, reported through the same `"step error"`
+    // action every genuine error uses (`STEP_LIFECYCLE_ACTIONS` has no
+    // dedicated "abandon" action) — `payload.result` carries the real
+    // nuance ("interrupted" vs "error"/"timeout").
     let completed =
-        records.iter().find(|r| r["action"] == "crawl.unit.completed").expect("expected one completed record");
+        records.iter().find(|r| r["action"] == "step error").expect("expected one step-error record");
     assert_eq!(completed["payload"]["result"], "interrupted");
 
-    let mission_completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let mission_completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(mission_completed["payload"]["stopped_by"], "interrupted");
     assert_eq!(mission_completed["payload"]["units_errored"], 0, "an interrupted unit must not count as errored");
     assert_eq!(mission_completed["payload"]["units_completed"], 0, "an interrupted unit must not count as completed either");
@@ -1417,7 +1568,7 @@ fn limit_zero_selects_nothing_and_completes_cleanly() {
     assert!(calls.borrow().clone().is_empty(), "zero selected units means zero dispatches");
 
     let records = read_all_flow_records();
-    let completed = records.iter().find(|r| r["action"] == "crawl.mission.completed").unwrap();
+    let completed = records.iter().find(|r| r["action"] == "mission close").unwrap();
     assert_eq!(completed["payload"]["units_selected"], 0);
     assert_eq!(completed["payload"]["units_completed"], 0);
     assert_eq!(completed["payload"]["stopped_by"], "limit");
@@ -1452,4 +1603,112 @@ fn finding_rule_with_an_unmatched_pattern_keeps_the_first_rule_and_records_the_p
     let (rule, unmatched) = super::finding_rule_for(Some("zzz"), &ids);
     assert_eq!(rule, "a");
     assert_eq!(unmatched.as_deref(), Some("zzz"));
+}
+
+// ── (#1959) --dry-run: mints nothing, dispatches nothing ───────────────
+
+#[test]
+#[serial_test::serial]
+fn dry_run_mints_nothing_and_dispatches_nothing() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let mut params = params_for(&fx);
+    params.insert("dry_run".to_string(), Value::Bool(true));
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    assert!(calls.borrow().is_empty(), "a dry run must never dispatch");
+    assert!(read_all_flow_records().is_empty(), "a dry run must emit no flow records");
+}
+
+#[test]
+#[serial_test::serial]
+fn dry_run_writes_no_plan_file_by_default() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let mut params = params_for(&fx);
+    params.insert("dry_run".to_string(), Value::Bool(true));
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    // (#1959) A dry run is read-only by default — it writes NOTHING unless
+    // the operator explicitly names a destination via `--param plan_out=`
+    // (the next test). No `plan.json` (or any other file) lands under the
+    // fixture's root as a side effect of just resolving+planning.
+    let default_plan_path = fx.root.path().join("plan.json");
+    assert!(!default_plan_path.exists(), "a dry run must not write a plan file unless plan_out is given");
+}
+
+#[test]
+#[serial_test::serial]
+fn dry_run_writes_the_plan_only_when_plan_out_is_given() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let plan_out = fx.root.path().join("my-plan.json");
+    let mut params = params_for(&fx);
+    params.insert("dry_run".to_string(), Value::Bool(true));
+    params.insert("plan_out".to_string(), Value::String(plan_out.to_string_lossy().to_string()));
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    assert!(plan_out.exists(), "plan_out names a destination — the plan must land there");
+    let plan: Value = serde_json::from_str(&std::fs::read_to_string(&plan_out).unwrap()).unwrap();
+    assert_eq!(plan["workspace"], "fixture");
+    assert!(calls.borrow().is_empty());
+    assert!(read_all_flow_records().is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn dry_run_still_bails_on_a_missing_required_input() {
+    // (#1959) A dry run still validates inputs before doing anything else
+    // — it short-circuits AFTER the plan resolves, not before the same
+    // loud failure a real run would hit.
+    let _guard = TestGuard::new();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let mut params: BTreeMap<String, Value> = BTreeMap::new();
+    params.insert("dry_run".to_string(), Value::Bool(true));
+    let err = run(&params, None, &mut dispatch).unwrap_err();
+    assert!(
+        err.to_string().contains("workspace"),
+        "{err}"
+    );
+}
+
+// ── (#1959) one-shot --param source=/--param rule= synthesizes a spec ──
+
+#[test]
+#[serial_test::serial]
+fn one_shot_source_and_rule_synthesizes_a_workspace_and_dispatches() {
+    let _guard = TestGuard::new();
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app1");
+    let body = "function f() {\n  try {\n    g();\n  }\n  catch (e) {\n    void 0;\n  }\n}\n";
+    init_source_repo(&app, "x.ts", body);
+
+    let mut params: BTreeMap<String, Value> = BTreeMap::new();
+    params.insert("source".to_string(), Value::String(app.to_string_lossy().to_string()));
+    params.insert("rule".to_string(), Value::String("swallowed-error".to_string()));
+
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(calls.borrow().len(), 1, "the one-shot single source must produce exactly one dispatch");
+
+    let records = read_all_flow_records();
+    let started = records.iter().find(|r| r["action"] == "mission start").unwrap();
+    // (#1959) `one_shot_workspace_name` sanitizes the source's basename —
+    // "app1" here — into "one-shot-app1", proving the CLI-level
+    // --param source=/--param rule= inputs actually reached
+    // `synthesize_one_shot_spec` rather than being silently ignored (a
+    // `workspace` param was never given at all in this test).
+    assert_eq!(started["payload"]["workspace"], Value::String("one-shot-app1".to_string()));
 }

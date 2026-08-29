@@ -149,6 +149,7 @@ pub fn run() -> DoctorReport {
         check_power_state(),
         check_platform_and_provider(),
         check_crew_role_prompt_coverage(),
+        check_rules_registry(),
         check_flow_sink_health(),
         check_machine_id_resolution(),
         check_fleet_mode(),
@@ -157,6 +158,8 @@ pub fn run() -> DoctorReport {
         check_gh_allowlist(),
         check_review_judge_exhaustion_policy(),
         check_turn_delay(),
+        check_host_sampler_interval(),
+        check_host_probe(),
         check_remote_endpoint_credentials(),
         check_env_masks_config(),
         check_binary_split_brain(),
@@ -1497,7 +1500,8 @@ fn build_hooks_check(
             message: format!("enabled ({provenance}) but no rules configured — outbox_dir={}", outbox_dir.display()),
             hint: Some(
                 "Add a rule to config.json's `hooks.rules`, e.g. `darkmux config set hooks.rules \
-                 '[{\"match\":{\"action\":\"crawl.*\"},\"http\":\"http://127.0.0.1:8790/events\"}]'`."
+                 '[{\"match\":{\"action\":\"dispatch.tool\",\"payload.tool_name\":\"report_finding\",\
+                 \"payload.ok\":true},\"http\":\"http://127.0.0.1:8790/events\"}]'`."
                     .into(),
             ),
         }];
@@ -1620,7 +1624,7 @@ fn build_hooks_check(
             status: Status::Warn,
             message: format!("{} outbox file(s) belong to no currently-configured rule: {}", stray.len(), details.join(", ")),
             hint: Some(
-                "A rule was removed or edited since these were written. `darkmux flow hooks drain --file <path> \
+                "A rule was removed or edited since these were written. `darkmux flow drain --file <path> \
                  --to <loopback url>` delivers a stray file's undelivered lines before you delete it; once \
                  undelivered is 0, it (and its sibling sidecars) are safe to remove."
                     .into(),
@@ -1766,6 +1770,160 @@ fn check_turn_delay() -> Check {
         status: Status::Pass,
         message: format!("{ms}ms ({provenance}) — rest between inference turns on every local dispatch"),
         hint: None,
+    }
+}
+
+/// (#2107, #1833) Surface the resolved `runtime.host_sampler_interval_ms`
+/// with provenance — the cadence `darkmux serve`'s daemon-side continuous
+/// host sampler runs at, feeding the machine stats drawer's live
+/// `/machine/resources` `load` block between dispatches. Always Pass: `0`
+/// is an honest opt-out (the sampler simply doesn't start, same convention
+/// as `runtime.turn_delay_ms`'s `0`), not a defect. Mirrors
+/// `check_turn_delay`'s provenance-first shape exactly, minus that check's
+/// clamp-warn branch (this knob isn't clamped against anything else).
+fn check_host_sampler_interval() -> Check {
+    let name = "runtime.host_sampler_interval_ms";
+    let env_raw = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let env_parses = env_raw.as_deref().is_some_and(|s| s.trim().parse::<u64>().is_ok());
+    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
+        .runtime
+        .and_then(|r| r.host_sampler_interval_ms)
+        .is_some();
+    let provenance = if env_parses {
+        "from DARKMUX_HOST_SAMPLER_INTERVAL_MS env"
+    } else if cfg_set {
+        "from config.json"
+    } else {
+        "default"
+    };
+    let ms = darkmux_types::config_access::host_sampler_interval_ms();
+    if let Some(raw) = env_raw.as_deref() {
+        if !env_parses {
+            return Check {
+                name: name.into(),
+                status: Status::Warn,
+                message: format!(
+                    "DARKMUX_HOST_SAMPLER_INTERVAL_MS=`{raw}` is not an integer; using {ms}ms ({provenance})"
+                ),
+                hint: Some(
+                    "Set DARKMUX_HOST_SAMPLER_INTERVAL_MS to a plain integer number of \
+                     milliseconds (e.g. `5000`), or unset it to fall through to config.json / \
+                     the default."
+                        .into(),
+                ),
+            };
+        }
+    }
+    if ms == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!(
+                "0ms ({provenance}) — daemon host sampler disabled; the machine stats drawer \
+                 shows live numbers only while a dispatch's own per-dispatch sampler is running"
+            ),
+            hint: None,
+        };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "{ms}ms ({provenance}) — darkmux serve's daemon-side host sampler cadence for the \
+             machine stats drawer"
+        ),
+        hint: None,
+    }
+}
+
+/// (#2108) Which host-probe SOURCES actually resolved on this machine, and
+/// what one sample costs.
+///
+/// The probe reads four independent sources (mach kernel counters, the
+/// private IOReport framework, the SoC's DVFS frequency tables, the OS
+/// thermal state, and the `IOAccelerator` IORegistry node) and each degrades
+/// to null fields on its own. Without this check an operator looking at a
+/// drawer with no power numbers cannot tell "this Mac does not expose
+/// IOReport" from "darkmux forgot to read it" — the exact
+/// operator-sovereignty failure (#44: never wonder where a decision came
+/// from) that a silent degradation path invites.
+///
+/// **Takes TWO samples, deliberately.** CPU percent and every power rail are
+/// counter DELTAS, so the first sample a probe takes only seeds them; a
+/// one-sample check would report the cost of the seeding read and a null CPU
+/// figure. The reported cost is the SECOND sample's own self-stamp — the
+/// number the operator should compare against the sampler cadence.
+///
+/// Costs ~120 ms total (a one-time probe construction plus two samples);
+/// `doctor` is a diagnostic command, not a hot path.
+fn check_host_probe() -> Check {
+    let mut probe = darkmux_crew::host_probe::HostProbe::new();
+    let _seed = probe.sample();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let s = probe.sample();
+    describe_host_probe(probe.sources(), s.cost_ms)
+}
+
+/// Render [`check_host_probe`]'s verdict from an already-taken reading.
+///
+/// Split out so every degradation combination is testable — most notably
+/// "IOReport did not load", which on a healthy Apple Silicon machine cannot
+/// be produced by running the real probe, and which is precisely the
+/// combination worth pinning: a private framework whose path has already
+/// moved once between macOS releases will move again. Pure.
+fn describe_host_probe(
+    src: darkmux_crew::host_probe::HostProbeSources,
+    cost_ms: u64,
+) -> Check {
+    let name = "host probe";
+    let all = [
+        ("mach", src.mach),
+        ("ioreport", src.ioreport),
+        ("freq-tables", src.freq_tables),
+        ("thermal", src.thermal),
+        ("ioreg-gpu", src.ioreg_gpu),
+    ];
+    let resolved: Vec<&str> = all.iter().filter_map(|(n, ok)| ok.then_some(*n)).collect();
+    let missing: Vec<&str> = all.iter().filter_map(|(n, ok)| (!ok).then_some(*n)).collect();
+
+    let cost = format!("{cost_ms}ms/sample");
+    if resolved.is_empty() {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "no host sources resolved ({cost}) — cpu/mem/gpu/power/thermal all report null"
+            ),
+            hint: Some(
+                "The host probe is implemented for Apple Silicon macOS. On any other platform \
+                 the machine stats drawer and the dispatch envelope's `host` block are \
+                 expected to be empty."
+                    .into(),
+            ),
+        };
+    }
+    let msg = if missing.is_empty() {
+        format!("{} ({cost})", resolved.join(" + "))
+    } else {
+        format!("{} ({cost}); unavailable: {}", resolved.join(" + "), missing.join(", "))
+    };
+    // Anything short of mach is a real gap worth surfacing — without tick
+    // counters there is no CPU figure at all. A missing IOReport is a
+    // property of the host, reported without alarm but always NAMED.
+    let status = if src.mach { Status::Pass } else { Status::Warn };
+    Check {
+        name: name.into(),
+        status,
+        message: msg,
+        hint: (!missing.is_empty()).then(|| {
+            "Sources are read independently and each degrades to null on its own. `ioreport` \
+             and `freq-tables` are Apple-Silicon-only (and IOReport is a private framework \
+             whose path has moved between macOS releases); a host without them still reports \
+             cpu/mem/gpu."
+                .into()
+        }),
     }
 }
 
@@ -2228,6 +2386,84 @@ fn check_crew_role_prompt_coverage() -> Check {
                 "Author the missing prompts at `templates/builtin/roles/<id>.md` and \
                  add them to `BUILTIN_ROLE_PROMPTS` in `src/crew/loader.rs`. Operators can \
                  override at `~/.darkmux/roles/<id>.md`."
+                    .into(),
+            ),
+        }
+    }
+}
+
+/// (#1959) The rule registry check — mirrors `check_crew_role_prompt_coverage`'s
+/// shape (built-in coverage + provenance, warn-not-fail on a thin config).
+/// Loads every rule (embedded + the `<darkmux root>/rules` user tier),
+/// reports the count and where they came from, and surfaces
+/// `darkmux_crew::rules::load_all`'s own warnings (a malformed user file,
+/// naming it) plus a check over EVERY loaded rule — not just one
+/// manifest's resolved subset, since doctor is asking "is the whole
+/// registry healthy" — for an empty `applies_to` or a `site` rule with no
+/// `prefilter` (either makes the rule inert: `warn_on_thin_rules` in
+/// `crew::rules` only runs over a manifest's resolved ids, so a rule
+/// nobody's manifest currently references would otherwise go unchecked
+/// forever).
+fn check_rules_registry() -> Check {
+    let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
+        .root
+        .join("rules");
+    build_rules_check(Some(&user_dir))
+}
+
+fn build_rules_check(user_dir: Option<&std::path::Path>) -> Check {
+    use darkmux_crew::rules::RuleKind;
+
+    let (embedded_only, _) = darkmux_crew::rules::load_all(None);
+    let (map, mut warnings) = darkmux_crew::rules::load_all(user_dir);
+
+    for rule in map.values() {
+        if matches!(rule.kind, RuleKind::Site | RuleKind::Read) && rule.applies_to.is_empty() {
+            warnings.push(format!(
+                "rule '{}' has an empty `applies_to` — it will never match any file",
+                rule.id
+            ));
+        }
+        if rule.kind == RuleKind::Site && rule.prefilter.is_empty() {
+            warnings.push(format!(
+                "rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
+                rule.id
+            ));
+        }
+    }
+
+    let user_file_count = user_dir
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+
+    let provenance = match user_dir {
+        Some(d) if user_file_count > 0 => format!(
+            "{} built-in, {} user-tier file(s) at {}",
+            embedded_only.len(),
+            user_file_count,
+            d.display()
+        ),
+        _ => format!("{} built-in, no user tier", embedded_only.len()),
+    };
+
+    let message = format!("{} rule(s) loaded ({provenance})", map.len());
+
+    if warnings.is_empty() {
+        Check { name: "rules".into(), status: Status::Pass, message, hint: None }
+    } else {
+        Check {
+            name: "rules".into(),
+            status: Status::Warn,
+            message: format!("{message} — {}", warnings.join("; ")),
+            hint: Some(
+                "Fix the named rule file(s) under `<darkmux root>/rules/`, or drop the empty \
+                 `applies_to`/`prefilter` field so the rule actually matches something."
                     .into(),
             ),
         }
@@ -5320,6 +5556,222 @@ mod tests {
         }
     }
 
+    // ─── (#2108) check_host_probe — which sources resolved + the cost ──────
+
+    /// Runs the REAL probe. macOS/aarch64-gated for the same reason the
+    /// probe's own live test is: on any other platform every source is
+    /// legitimately unavailable and these assertions would be vacuous.
+    /// `#[serial]` because it measures the machine.
+    ///
+    /// The IOReport-dependent assertions (`ioreport`/`freq-tables`/
+    /// `ioreg-gpu` named as resolved, no `"unavailable"` clause) are gated
+    /// behind `DARKMUX_EXPECT_IOREPORT=1` — a GitHub-hosted macOS runner's
+    /// VM genuinely has no IOReport channels / `pmgr` IORegistry node (a
+    /// fact about the VM, not a regression), which panicked this test on
+    /// every macOS CI run (#2108). `mach`/`thermal` stay unconditional: both
+    /// resolve fine in that VM. Documented as a test-only knob in
+    /// docs/ENVIRONMENT.md.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[serial_test::serial]
+    fn check_host_probe_names_the_resolved_sources_and_the_measured_cost() {
+        let check = check_host_probe();
+        assert_eq!(check.name, "host probe");
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "mach counters are always available on macOS: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("mach"),
+            "the operator must be able to tell WHICH sources resolved: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("thermal"),
+            "ProcessInfo.thermalState resolves in CI too: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("ms/sample"),
+            "the observer's own cost is part of the report: {}",
+            check.message
+        );
+        if std::env::var("DARKMUX_EXPECT_IOREPORT").as_deref() == Ok("1") {
+            // Apple Silicon + IOReport is the configuration darkmux is
+            // marketed for, so a build where the IOReport half silently
+            // stopped resolving must FAIL here rather than quietly
+            // reporting null power forever. If this fires on a future
+            // macOS, the framework moved again — see
+            // `host_probe::ioreport::IOREPORT_PATHS`.
+            // Substring-matching `"ioreport"` alone would ALSO match the
+            // "unavailable: ioreport" clause, so assert on the clause
+            // itself: on Apple Silicon every source is expected to
+            // resolve, and a build where one silently stopped must fail
+            // here rather than reporting null power forever.
+            assert!(
+                !check.message.contains("unavailable"),
+                "every host source is expected to resolve on Apple Silicon: {}",
+                check.message
+            );
+            for src in ["ioreport", "freq-tables", "ioreg-gpu"] {
+                assert!(
+                    check.message.contains(src),
+                    "`{src}` must be named among the resolved sources: {}",
+                    check.message
+                );
+            }
+        }
+    }
+
+    /// The degradation combinations the live probe cannot produce on a
+    /// healthy Mac — and the ones most worth pinning, since a private
+    /// framework whose path has already moved once will move again. Pure, so
+    /// they run on every platform.
+    #[test]
+    fn describe_host_probe_names_a_missing_ioreport_rather_than_hiding_it() {
+        let src = darkmux_crew::host_probe::HostProbeSources {
+            mach: true,
+            ioreport: false,
+            freq_tables: false,
+            thermal: true,
+            ioreg_gpu: true,
+        };
+        let check = describe_host_probe(src, 3);
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "a host without IOReport still reports cpu/mem/gpu"
+        );
+        assert!(
+            check.message.contains("unavailable: ioreport, freq-tables"),
+            "the operator must be able to tell 'this Mac has no IOReport' from 'darkmux forgot \
+             to read it': {}",
+            check.message
+        );
+        assert!(check.message.contains("mach"), "{}", check.message);
+        assert!(check.hint.is_some(), "a missing source comes with an explanation");
+    }
+
+    #[test]
+    fn describe_host_probe_warns_when_nothing_resolved() {
+        let check = describe_host_probe(darkmux_crew::host_probe::HostProbeSources::default(), 0);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("no host sources resolved"), "{}", check.message);
+    }
+
+    #[test]
+    fn describe_host_probe_warns_when_mach_itself_is_missing() {
+        // Without tick counters there is no CPU figure at all — a real gap
+        // even when every other source is fine.
+        let src = darkmux_crew::host_probe::HostProbeSources {
+            mach: false,
+            ioreport: true,
+            freq_tables: true,
+            thermal: true,
+            ioreg_gpu: true,
+        };
+        let check = describe_host_probe(src, 4);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("unavailable: mach"), "{}", check.message);
+    }
+
+    #[test]
+    fn describe_host_probe_omits_the_unavailable_clause_when_all_resolved() {
+        let src = darkmux_crew::host_probe::HostProbeSources {
+            mach: true,
+            ioreport: true,
+            freq_tables: true,
+            thermal: true,
+            ioreg_gpu: true,
+        };
+        let check = describe_host_probe(src, 9);
+        assert_eq!(check.status, Status::Pass);
+        assert!(!check.message.contains("unavailable"), "{}", check.message);
+        assert!(check.message.contains("9ms/sample"), "{}", check.message);
+        assert!(check.hint.is_none(), "nothing missing ⇒ nothing to explain");
+    }
+
+    // ─── (#2107, #1833) check_host_sampler_interval — resolved state + provenance ─
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_interval_default_is_pass_and_names_5000ms() {
+        let prev = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe { std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS") };
+        let check = check_host_sampler_interval();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("5000ms"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_interval_zero_is_pass_and_says_disabled() {
+        let prev = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe { std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "0") };
+        let check = check_host_sampler_interval();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("disabled"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_interval_env_override_names_provenance() {
+        let prev = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe { std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "2000") };
+        let check = check_host_sampler_interval();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("2000ms"), "{}", check.message);
+        assert!(check.message.contains("env"), "provenance named: {}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
+    /// Mirrors `check_turn_delay_unparseable_env_warns_and_names_the_raw_value`
+    /// — a set-but-garbage env var must not be silently reported as "from
+    /// ... env" while the resolved value actually came from a lower tier.
+    #[serial_test::serial]
+    #[test]
+    fn check_host_sampler_interval_unparseable_env_warns_and_names_the_raw_value() {
+        let prev = std::env::var("DARKMUX_HOST_SAMPLER_INTERVAL_MS").ok();
+        unsafe { std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", "5s") };
+        let check = check_host_sampler_interval();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("DARKMUX_HOST_SAMPLER_INTERVAL_MS") && check.message.contains("5s"),
+            "must name the raw unparseable value: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("from DARKMUX_HOST_SAMPLER_INTERVAL_MS env"),
+            "must NOT claim provenance is env when the env value didn't parse: {}",
+            check.message
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS", v),
+                None => std::env::remove_var("DARKMUX_HOST_SAMPLER_INTERVAL_MS"),
+            }
+        }
+    }
+
     // ─── (#1769) summarize_audit_reports — Fail / Warn / Pass split ────────
     //
     // Pure-function tests: no filesystem, no `DARKMUX_AUDIT_DIR`. Each test
@@ -6253,11 +6705,12 @@ mod tests {
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
-        // turn-delay [#2094] + mission-envelope-readability [#1881] + hooks
-        // [#2093]) + one per active eureka rule.
+        // turn-delay [#2094] + host-sampler-interval [#2107, #1833] +
+        // mission-envelope-readability [#1881] + hooks [#2093] +
+        // rules [#1959] + host-probe [#2107]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 41 + darkmux_eureka::all_rules().len();
+        let expected = 44 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
@@ -7957,5 +8410,57 @@ mod tests {
             "a readable envelope must not be named among the unreadable ones: {}",
             check.message
         );
+    }
+
+    // ─── (#1959) check_rules_registry / build_rules_check ───────────────
+
+    #[test]
+    fn rules_check_passes_with_only_the_three_builtins_and_no_user_tier() {
+        let check = build_rules_check(None);
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains('3'), "{}", check.message);
+        assert!(check.message.contains("built-in"), "{}", check.message);
+    }
+
+    #[test]
+    fn rules_check_reports_user_tier_provenance() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("custom-rule.json"),
+            serde_json::json!({"id": "custom-rule", "kind": "read", "applies_to": ["**/*.py"]})
+                .to_string(),
+        )
+        .unwrap();
+
+        let check = build_rules_check(Some(tmp.path()));
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains('4'), "{}", check.message);
+        assert!(check.message.contains("1 user-tier file"), "{}", check.message);
+    }
+
+    #[test]
+    fn rules_check_warns_on_a_malformed_user_file_naming_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("broken.json"), "{ not json").unwrap();
+
+        let check = build_rules_check(Some(tmp.path()));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("broken.json"), "{}", check.message);
+    }
+
+    #[test]
+    fn rules_check_warns_on_empty_applies_to_and_site_with_no_prefilter() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("thin-site.json"),
+            serde_json::json!({"id": "thin-site", "kind": "site"}).to_string(),
+        )
+        .unwrap();
+
+        let check = build_rules_check(Some(tmp.path()));
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("thin-site"), "{}", check.message);
+        assert!(check.message.contains("applies_to"), "{}", check.message);
+        assert!(check.message.contains("prefilter"), "{}", check.message);
     }
 }

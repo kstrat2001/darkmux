@@ -177,6 +177,19 @@ test('no text input is small enough to trigger iOS auto-zoom on focus', async ({
   // this harness. Asserting the trigger condition is the most this suite can
   // honestly do.
   await page.goto('/index-lab.html');
+  // (#2108 review finding 12) `#logq` no longer renders at page load — the
+  // #2107/#2108 tabbed-drawer packet moved the phone route's events pane
+  // INTO `PhoneDrawer`'s own "Events" tab, gated on `{open && <EventLogColumn
+  // .../>}` (`PhoneDrawer.tsx`'s own doc: keeps it from rendering/fetching
+  // while the sheet is closed, which is all this page shows at first paint —
+  // a 58px-tall closed bar). This check found ZERO text inputs at all before
+  // this tap was added, which made the vacuousness guard on the next line
+  // fail instead of the real assertion — a silent false negative for the
+  // auto-zoom check itself. Tapping the Events tab is the fix (not the DOM):
+  // the gating is deliberate, documented behavior from an unrelated packet,
+  // not a regression to undo.
+  await page.click('[data-act="phone-drawer-tab-events"]');
+  await expect(page.locator('#logq')).toBeVisible();
   // (port note) The one text-entry input this app ships (`#logq`, the event
   // log's filter box — `EventLogColumn.tsx`) is a real `type="search"`, not
   // `type="text"`/typeless like legacy's `#fsearch`/`#logq` were. The iOS

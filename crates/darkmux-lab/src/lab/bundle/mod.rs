@@ -198,6 +198,16 @@ pub enum SkipReason {
     /// [`BundleSkipReport`]'s doc for what that means for the "not skipped
     /// implies fully covered" reading.
     TopLevelOverSizeCap,
+    /// (#1959) The file's path fails the review's optional workspace spec
+    /// include/exclude (`darkmux_crew::workspace_spec::WorkspaceSpec::
+    /// effective_include`/`effective_exclude`, matched via the SAME
+    /// `workspace_spec::glob::applies` filter language `materialize.rs`
+    /// uses) — a review scoped to a workspace deliberately excludes this
+    /// file, same as it would never have been materialized for a crawl.
+    /// Recorded by `review.rs`'s `filter_bundles_by_workspace`, never by
+    /// this module's own `build_bundles` (the bundler plugin itself is not
+    /// workspace-spec-aware — this is a post-filter on its output).
+    ExcludedByWorkspaceSpec,
 }
 
 /// One file the diff touched that ended up contributing zero bundles, with

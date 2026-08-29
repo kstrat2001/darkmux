@@ -789,11 +789,22 @@ impl<'a> DispatchBookendGuard<'a> {
         model: String,
         mission_id: Option<String>,
         phase_id: Option<String>,
+        // (#1959) Same provenance merge as every other record this
+        // dispatch's flow-record surface emits — see `merge_record_context`'s
+        // doc. `None` for every caller that doesn't set
+        // `DispatchOpts::record_context`.
+        record_context: Option<serde_json::Value>,
     ) -> Self {
         let on_abort = move |_id: &str, _kind: &str| {
             // Best-effort, same as every other emit on this path: a
             // flow-sink write problem must not mask the original error
             // propagating out.
+            let mut payload = serde_json::json!({
+                "runtime": "internal",
+                "result_class": "error",
+                "error": "dispatch terminated before completion (early return or panic)",
+            });
+            merge_record_context(&mut payload, &record_context);
             crate::dispatch::build_dispatch_record_with_payload(
                 darkmux_flow::Level::Error,
                 "dispatch error",
@@ -802,11 +813,7 @@ impl<'a> DispatchBookendGuard<'a> {
                 Some(&model),
                 mission_id.as_deref(),
                 phase_id.as_deref(),
-                Some(serde_json::json!({
-                    "runtime": "internal",
-                    "result_class": "error",
-                    "error": "dispatch terminated before completion (early return or panic)",
-                })),
+                Some(payload),
             )
         };
         Self { inner: darkmux_flow::BookendGuard::new(sink, on_abort) }
@@ -2516,6 +2523,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     if let Some(label) = &remote_endpoint_raw_label {
         dispatch_start_payload["endpoint"] = serde_json::json!(label);
     }
+    // (#1959) Provenance the runtime can't derive on its own (the crawl
+    // launcher's workspace/source/sha/rule/unit) — see `merge_record_context`'s
+    // own doc. A no-op for every caller that leaves `DispatchOpts::record_context`
+    // unset.
+    merge_record_context(&mut dispatch_start_payload, &opts.record_context);
     // (#717, #1230 Packet 0) Emit dispatch.start THROUGH the bookend guard's
     // `open()` — arms it, so any `?`-return or panic before the clean
     // `dispatch.complete` below emits a `dispatch.error` terminal so the
@@ -2533,6 +2545,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         model.clone(),
         mission_id.clone(),
         phase_id.clone(),
+        opts.record_context.clone(),
     );
     bookend.open(crate::dispatch::build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
@@ -2826,6 +2839,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let phase_id = phase_id.clone();
         let step_id = step_id.clone();
         let inactivity_deadline = Arc::clone(&inactivity_deadline);
+        let record_context = opts.record_context.clone();
         thread::spawn(move || {
             run_tailer(
                 out_dir,
@@ -2839,6 +2853,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 inactivity_deadline,
                 inactivity_secs,
                 compaction_threshold,
+                record_context,
             )
         })
     };
@@ -2970,7 +2985,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // panicked sampler thread degrades to "no more samples", not a
     // failed dispatch).
     sampler_stop.store(true, Ordering::SeqCst);
-let host_peaks = sampler_handle.join().unwrap_or_default();
+    let (host_stats, host_extras) = sampler_handle.join().unwrap_or_default();
 
     // (#638) The container has exited — the session is no longer running.
     // Stop the liveness heartbeat and DELete its key so the live view drops
@@ -3032,7 +3047,8 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
-    let stdout = enrich_envelope_with_summary(stdout, &trajectory_summary, &host_peaks, &host_out);
+    let stdout =
+        enrich_envelope_with_summary(stdout, &trajectory_summary, &host_stats, &host_extras, &host_out);
 
     // (#782) Read the runtime's token totals from metrics.json now the
     // container has exited. Best-effort — zero totals on any read failure
@@ -3100,6 +3116,8 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     if let Some(label) = &remote_endpoint_raw_label {
         dispatch_complete_payload["endpoint"] = serde_json::json!(label);
     }
+    // (#1959) Same provenance merge as `dispatch_start_payload` above.
+    merge_record_context(&mut dispatch_complete_payload, &opts.record_context);
     let (action, level) = if exit_code == 0 {
         ("dispatch complete", darkmux_flow::Level::Info)
     } else {
@@ -3218,7 +3236,8 @@ fn rewrite_container_paths_for_host(stdout: String, host_out: &std::path::Path) 
 fn enrich_envelope_with_summary(
     stdout: String,
     summary: &TrajectorySummary,
-    peaks: &HostPeaks,
+    stats: &HostStats,
+    extras: &HostExtras,
     out_dir: &std::path::Path,
 ) -> String {
     let trimmed = stdout.trim();
@@ -3240,15 +3259,76 @@ fn enrich_envelope_with_summary(
     // Host pressure, reduced. Included only when the sampler actually ran —
     // an absent block says "not measured", which is honest, where a zeroed
     // one would read as "measured, and idle".
-    if peaks.samples > 0 {
-        obj.insert(
-            "host".into(),
-            serde_json::json!({
-                "peak_mem_pct": peaks.peak_mem_pct,
-                "peak_cpu_pct": peaks.peak_cpu_pct,
-                "samples": peaks.samples,
-            }),
-        );
+    //
+    // (#2107) `cpu`/`mem`/`gpu` each carry the full peak/mean/p95/duty
+    // reduction — a peak alone answers "did this ever spike"; it can't say
+    // how hard the host was driven ON AVERAGE. `peak_cpu_pct`/`peak_mem_pct`
+    // stay at the TOP LEVEL as aliases for one release in case a reader
+    // still looks there (the pre-#2107 shape); they read straight off the
+    // same nested `cpu.peak_pct`/`mem.peak_pct`, so the two can't drift.
+    //
+    // (#2108) `power`/`thermal`/`energy_mwh` join them when the host probe
+    // could read those sources. They answer a question the percentages
+    // can't: a dispatch that ran at 40% CPU the whole way while the kernel
+    // held the speed cap at 62% was not a comfortable run, and the wall
+    // clock alone never says so.
+    fn metric_json(m: &MetricStats) -> serde_json::Value {
+        serde_json::json!({
+            "peak_pct": m.peak_pct,
+            "mean_pct": m.mean_pct,
+            "p95_pct": m.p95_pct,
+            "above_80_ms": m.above_80_ms,
+        })
+    }
+    // (#2108) A power rail's window reduction. `mean_mw`/`peak_mw` mirror
+    // the `mean_pct`/`peak_pct` naming above rather than the ROUTE's
+    // `mean`/`max` — this is the ENVELOPE's vocabulary, and inside it a
+    // number's unit is part of its name.
+    fn power_json(m: &MwStats) -> serde_json::Value {
+        serde_json::json!({ "mean_mw": m.mean_mw, "peak_mw": m.max_mw })
+    }
+    if stats.samples > 0 {
+        let mut host = serde_json::json!({
+            "cpu": metric_json(&stats.cpu),
+            "mem": metric_json(&stats.mem),
+            "gpu": metric_json(&stats.gpu),
+            "samples": stats.samples,
+            "sample_interval_ms": stats.sample_interval_ms,
+            // Deprecated top-level aliases — see the comment above.
+            "peak_cpu_pct": stats.cpu.peak_pct,
+            "peak_mem_pct": stats.mem.peak_pct,
+        });
+        // (#2108) Power, thermal and energy — each present only when the
+        // probe actually read that source on this host, for the same reason
+        // the whole `host` block is present only when the sampler ran: an
+        // absent block says "not measured", a zeroed one would say
+        // "measured, and idle". Purely ADDITIVE to the #2107 shape above.
+        if let Some(obj) = host.as_object_mut() {
+            if let Some(p) = &extras.power {
+                obj.insert(
+                    "power".into(),
+                    serde_json::json!({
+                        "cpu": power_json(&p.cpu),
+                        "gpu": power_json(&p.gpu),
+                        "total": power_json(&p.total),
+                    }),
+                );
+            }
+            if let Some(t) = &extras.thermal {
+                obj.insert(
+                    "thermal".into(),
+                    serde_json::json!({
+                        "worst_state": t.worst_state,
+                        "above_nominal_ms": t.above_nominal_ms,
+                        "min_cpu_speed_limit_pct": t.min_cpu_speed_limit_pct,
+                    }),
+                );
+            }
+            if let Some(e) = extras.energy_mwh {
+                obj.insert("energy_mwh".into(), serde_json::json!(e));
+            }
+        }
+        obj.insert("host".into(), host);
     }
     // (#1959) What a crawl actually FOUND. The envelope carried a converged
     // dispatch and no way to tell a run that reported twelve findings from one
@@ -3298,23 +3378,23 @@ fn read_findings_summary(out_dir: &std::path::Path) -> Option<serde_json::Value>
     }))
 }
 
-/// (#1955) The host-telemetry reduction the envelope carries.
-///
-/// The sampler already walks cpu/ram/gpu at a fixed cadence and emits each
-/// sample to the flow stream. This is a pure REDUCTION over samples that are
-/// already being taken — it adds no probe, no syscall, and no cost to the
-/// measured run, which is what the observer-must-not-join-the-observed rule
-/// requires of anything on this path.
-///
-/// `samples` is carried deliberately: a peak of 0 and "we never sampled" are
-/// different claims, and an orchestrator reasoning about whether a dispatch
-/// was memory-starved has to be able to tell them apart.
-#[derive(Default, Debug, Clone, Copy)]
-struct HostPeaks {
-    peak_mem_pct: Option<u64>,
-    peak_cpu_pct: Option<u64>,
-    samples: u32,
-}
+// (#2107) `HostSampleAt`/`MetricStats`/`HostStats`/`reduce_metric`/
+// `reduce_host_stats` moved to `crate::telemetry_sampler` (and made `pub`)
+// so the daemon-side continuous host sampler (`darkmux-serve`'s
+// `host_sampler` module, driving the machine stats drawer's `/machine/
+// resources` `load` block) can share the EXACT same reduction this
+// dispatch-scoped sampler uses — one peak/mean/p95/duty algorithm, not two
+// that could silently drift apart. See that module for the full docs; the
+// names/behavior are unchanged, only the home moved.
+use crate::host_probe::{reduce_host_extras, HostExtraAt, HostExtras, MwStats};
+use crate::telemetry_sampler::{reduce_host_stats, HostSampleAt, HostStats, MetricStats};
+// `reduce_metric` itself isn't called directly in this file (only via
+// `reduce_host_stats` above) — the direct-call tests in
+// `dispatch_internal_tests.rs` (`super::reduce_metric(...)`) are the only
+// test-cfg consumer, so the import is test-only to avoid an unused-import
+// warning in the release build.
+#[cfg(test)]
+use crate::telemetry_sampler::reduce_metric;
 
 /// Summary of what the trajectory tailer surfaced. Used to enrich the
 /// dispatch.complete payload with end-of-dispatch counts.
@@ -3605,7 +3685,11 @@ const TAILER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// trace), and each tick shells out to `docker stats --no-stream` (a
 /// ~1s blocking call) — a tighter cadence would just stack docker calls
 /// without adding resolution.
-const TELEMETRY_SAMPLE_INTERVAL: Duration = Duration::from_millis(2000);
+const TELEMETRY_SAMPLE_INTERVAL: Duration = Duration::from_millis(TELEMETRY_SAMPLE_INTERVAL_MS);
+/// Same cadence as [`TELEMETRY_SAMPLE_INTERVAL`], as a plain `u64` — feeds
+/// `reduce_host_extras`'s sleep-gap cap (#2108 review finding), which wants
+/// milliseconds, not a `Duration`.
+const TELEMETRY_SAMPLE_INTERVAL_MS: u64 = 2000;
 
 /// Granularity at which the sampler re-checks its stop flag while waiting
 /// out a `TELEMETRY_SAMPLE_INTERVAL`. Mirrors the watchdog's 500ms poll:
@@ -3698,6 +3782,7 @@ fn run_tailer(
     inactivity_deadline: Arc<Mutex<Instant>>,
     inactivity_secs: u64,
     compaction_threshold: Option<u32>,
+    record_context: Option<serde_json::Value>,
 ) -> TrajectorySummary {
     let trajectory_path = out_dir
         .join(".darkmux-runtime")
@@ -3712,7 +3797,8 @@ fn run_tailer(
     )
     .with_mission(mission_id, phase_id)
     .with_step(step_id)
-    .with_compaction_threshold(compaction_threshold);
+    .with_compaction_threshold(compaction_threshold)
+    .with_record_context(record_context);
 
     loop {
         state.poll_and_emit();
@@ -3772,8 +3858,24 @@ fn run_telemetry_sampler(
     model: String,
     mission_id: Option<String>,
     phase_id: Option<String>,
-) -> HostPeaks {
-    let mut peaks = HostPeaks::default();
+) -> (HostStats, HostExtras) {
+    // (#2107) Relative to THIS sampler's own start, not wall-clock — the
+    // reduction only needs the gaps BETWEEN samples, and a relative clock
+    // makes `reduce_host_stats` testable with plain integers instead of
+    // `SystemTime`.
+    let started = Instant::now();
+    let mut raw: Vec<HostSampleAt> = Vec::new();
+    // (#2108) The power/thermal half of the same series, reduced by
+    // `reduce_host_extras` at the end exactly as `raw` is by
+    // `reduce_host_stats`. Kept as a SECOND list rather than widening
+    // `HostSampleAt` so the cpu/mem/gpu reduction the envelope has emitted
+    // since #2107 stays byte-identical.
+    let mut extras: Vec<HostExtraAt> = Vec::new();
+    // A probe PRIVATE to this dispatch: `cpu_pct` and every power rail are
+    // counter deltas, so a probe of our own gives deltas that line up with
+    // this sampler's own 2s cadence rather than with whoever sampled last.
+    // Construction is ~80-100ms once; each sample is ~5-10ms.
+    let mut probe = crate::host_probe::HostProbe::new();
     let emit = |source: &str, action: &str, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
@@ -3821,35 +3923,37 @@ fn run_telemetry_sampler(
             }
         }
 
-        // Host system load — CPU / RAM / GPU utilization%. Inference runs in
-        // LMStudio (off-container), so the load worth watching is the HOST's,
-        // not the runtime container's (which idles waiting on the model and
-        // reads ~0 — the wrong-question problem, #814/#1064). Each read is
-        // best-effort and unprivileged; a tick emits whichever of the three
-        // succeed (a failed field is simply omitted from the payload).
-        // `sample_host` is the shared mechanism (#1247 doctrine surface) —
-        // `darkmux-lab`'s review driver samples through the same function.
-        let sample = crate::telemetry_sampler::sample_host();
-        if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
-            // Reduce as we sample. Max, not last: the question an orchestrator
-            // asks afterward is "did this run approach the ceiling", and the
-            // final sample is taken as the container tears down, which is the
-            // least representative moment of the whole run.
-            peaks.samples = peaks.samples.saturating_add(1);
-            if let Some(m) = sample.mem {
-                peaks.peak_mem_pct = Some(peaks.peak_mem_pct.map_or(m, |p| p.max(m)));
-            }
-            if let Some(c) = sample.cpu {
-                peaks.peak_cpu_pct = Some(peaks.peak_cpu_pct.map_or(c, |p| p.max(c)));
-            }
+        // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
+        // per-cluster frequency, power and thermal state the same probe
+        // reads for free. Inference runs in LMStudio (off-container), so the
+        // load worth watching is the HOST's, not the runtime container's
+        // (which idles waiting on the model and reads ~0 — the
+        // wrong-question problem, #814/#1064). Each read is best-effort and
+        // unprivileged; a tick emits whichever fields succeed.
+        let sample = probe.sample();
+        let at_ms = started.elapsed().as_millis() as u64;
+        if sample.cpu_pct.is_some() || sample.mem_pct.is_some() || sample.gpu_pct.is_some() {
+            // (#2107) Record the raw reading, timestamped against this
+            // sampler's own clock. The REDUCTION (peak/mean/p95/duty) is a
+            // pure fold over `raw` computed once at the end
+            // (`reduce_host_stats`) — this loop's only job is to capture
+            // what was observed, not to fold it live, so the reduction
+            // logic has exactly one implementation, shared with the unit
+            // tests that drive it directly.
+            raw.push(HostSampleAt {
+                at_ms,
+                cpu: sample.cpu_pct,
+                mem: sample.mem_pct,
+                gpu: sample.gpu_pct,
+            });
             let mut payload = serde_json::Map::new();
-            if let Some(c) = sample.cpu {
+            if let Some(c) = sample.cpu_pct {
                 payload.insert("cpu".into(), c.into());
             }
-            if let Some(m) = sample.mem {
+            if let Some(m) = sample.mem_pct {
                 payload.insert("mem".into(), m.into());
             }
-            if let Some(g) = sample.gpu {
+            if let Some(g) = sample.gpu_pct {
                 payload.insert("gpu".into(), g.into());
             }
             emit(
@@ -3857,6 +3961,20 @@ fn run_telemetry_sampler(
                 "telemetry.process",
                 serde_json::Value::Object(payload),
             );
+        }
+        // (#2108) Recorded on EVERY tick, including one where cpu/mem/gpu
+        // all failed: a tick that read power but not utilization is still a
+        // power measurement, and `reduce_host_extras` skips the `None`s
+        // rather than zeroing them. Deliberately NOT emitted as a flow
+        // record — the live telemetry stream's `{cpu,mem,gpu}` payload is a
+        // viewer contract, and widening it is a schema change with no
+        // consumer yet; the reduction reaches the envelope instead.
+        if sample.power.is_some() || sample.thermal.is_some() {
+            extras.push(HostExtraAt {
+                at_ms,
+                power: sample.power,
+                thermal: sample.thermal.clone(),
+            });
         }
 
         // Wait out the sample interval, but poll the stop flag every
@@ -3866,15 +3984,18 @@ fn run_telemetry_sampler(
         while slept < TELEMETRY_SAMPLE_INTERVAL {
             if stop_flag.load(Ordering::SeqCst) {
                 // Teardown mid-interval: return what was observed, never a
-                // default. A killed or short dispatch still has real peaks.
-                return peaks;
+                // default. A killed or short dispatch still has real stats.
+                return (
+                    reduce_host_stats(&raw),
+                    reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
+                );
             }
             let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
             thread::sleep(nap);
             slept += nap;
         }
     }
-    peaks
+    (reduce_host_stats(&raw), reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)))
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,
@@ -3904,6 +4025,28 @@ fn drain_complete_lines_from_bytes(pending: &mut Vec<u8>) -> Vec<String> {
         }
     }
     out
+}
+
+/// (#1959, revised — no bespoke per-finding action; `record_context`
+/// rides EVERY tailer/bookend record instead) Merge `record_context` under
+/// `payload.context` — provenance a dispatch caller supplied (the crawl
+/// launcher's `workspace`/`source`/`sha`/`rule`/`unit`) that no runtime
+/// signal can derive on its own. Applied uniformly wherever a flow record
+/// leaves this dispatch's surface: the `dispatch start`/`dispatch
+/// complete`/`dispatch error` bookends (call sites in `dispatch()`) and
+/// every `TailerState`-emitted record (`dispatch.tool`, `dispatch.turn`,
+/// `dispatch.checkpoint`, `telemetry.*`, …, via `emit`/`emit_telemetry`).
+/// One nested key so it can never collide with a record's own top-level
+/// fields. A `None` context, a non-object context, or a non-object payload
+/// are each a no-op — never a partial/corrupted merge.
+fn merge_record_context(payload: &mut serde_json::Value, record_context: &Option<serde_json::Value>) {
+    let Some(ctx) = record_context else { return };
+    if !ctx.is_object() {
+        return;
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("context".to_string(), ctx.clone());
+    }
 }
 
 /// any partial-line tail bytes carried across polls, and the last
@@ -3960,6 +4103,13 @@ struct TailerState {
     /// record so the viewer can draw the trigger line. `None` in tests / when
     /// no window is configured.
     compaction_threshold: Option<u32>,
+    /// (#1959 flow-record vocabulary retirement) `DispatchOpts::record_context`
+    /// forwarded from the call site — provenance the runtime cannot know
+    /// (e.g. the crawl launcher's `workspace`/`source`/`sha`/`rule`/`unit`),
+    /// merged under `payload.context` on every record this dispatch's
+    /// tailer emits. `None` for every caller that doesn't set
+    /// `DispatchOpts::record_context` — a complete no-op.
+    record_context: Option<serde_json::Value>,
 }
 
 impl TailerState {
@@ -3987,7 +4137,18 @@ impl TailerState {
             inactivity_deadline: Some(inactivity_deadline),
             inactivity_secs,
             compaction_threshold: None,
+            record_context: None,
         }
+    }
+
+    /// (#1959 flow-record vocabulary retirement) Forward
+    /// `DispatchOpts::record_context` so every record this tailer emits
+    /// can carry provenance the runtime itself has no concept of.
+    /// Builder-style, same pattern as `with_step`/`with_compaction_threshold`;
+    /// only production `run_tailer` opts in.
+    fn with_record_context(mut self, record_context: Option<serde_json::Value>) -> Self {
+        self.record_context = record_context;
+        self
     }
 
     /// (#714) Stamp the phase → mission this dispatch belongs to so the
@@ -4044,6 +4205,7 @@ impl TailerState {
             inactivity_deadline: None,
             inactivity_secs: 600,
             compaction_threshold: None,
+            record_context: None,
         }
     }
 
@@ -4443,6 +4605,7 @@ impl TailerState {
 
     fn emit(&self, action: &str, level: darkmux_flow::Level, mut payload: serde_json::Value) {
         self.stamp_step_id(&mut payload);
+        merge_record_context(&mut payload, &self.record_context);
         let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
             level,
             action,
@@ -4473,6 +4636,7 @@ impl TailerState {
     /// (`"detector"`, `"runtime"`, …) the observability viewer keys on.
     fn emit_telemetry(&self, source: &str, action: &str, mut payload: serde_json::Value) {
         self.stamp_step_id(&mut payload);
+        merge_record_context(&mut payload, &self.record_context);
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             action,

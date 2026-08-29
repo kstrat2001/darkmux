@@ -1133,6 +1133,24 @@ pub const STEP_LIFECYCLE_ACTIONS: [&str; 3] = ["step start", "step complete", "s
 /// across every mission launched from the same config, so two concurrent
 /// runs collide in the viewer with no `mission_id` to tell them apart.
 fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
+    step_lifecycle_record_with_payload(step, action, None)
+}
+
+/// (#1959) Payload-carrying variant, exported so a Tier-3 bespoke driver
+/// that mints its own `Step`s outside `run_step_graph` (the crawl
+/// launcher — see `CLAUDE.md`'s StepKind tiering doc for why it's Tier 3)
+/// can still emit the SAME canonical `"step start"`/`"step complete"`/
+/// `"step error"` vocabulary (`STEP_LIFECYCLE_ACTIONS`) with its own
+/// numbers in the payload, rather than inventing a competing action
+/// family. Every in-crate call site routes through the 2-arg wrapper
+/// above with `payload: None` — behavior unchanged.
+///
+/// `mission_id` is `None` here for the SAME reason the module doc on the
+/// 2-arg wrapper names: this function has no `Mission` concept of its
+/// own. A caller outside `run_step_graph`'s own backfill wrap (like the
+/// crawl launcher) sets `.mission_id` on the returned record directly
+/// before emitting it.
+pub fn step_lifecycle_record_with_payload(step: &Step, action: &str, payload: Option<serde_json::Value>) -> FlowRecord {
     FlowRecord {
         ts: darkmux_flow::ts_utc_now(),
         level: if action == "step error" { Level::Warn } else { Level::Info },
@@ -1151,7 +1169,7 @@ fn step_lifecycle_record(step: &Step, action: &str) -> FlowRecord {
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: None,
+        payload,
         work_id: None,
         attempt: None,
     }
@@ -1244,6 +1262,56 @@ mod tests {
     /// `concurrent_dispatch.rs`'s own test discipline (#1360 follow-up).
     fn mock_host_factory() -> Box<dyn ModelHost> {
         Box::new(MockHost::new())
+    }
+
+    // ─── (#1959) step_lifecycle_record_with_payload ────────────────────
+
+    fn bare_step(id: &str) -> Step {
+        Step {
+            id: id.to_string(),
+            task_id: "t-1".to_string(),
+            gate: None,
+            kind: "crawl.unit".to_string(),
+            status: NodeStatus::Planned,
+            config: json!(null),
+            started_ts: None,
+            completed_ts: None,
+            output: None,
+        }
+    }
+
+    /// A Tier-3 bespoke driver (the crawl launcher) that mints its own
+    /// `Step`s outside `run_step_graph` can still emit the SAME canonical
+    /// `"step start"`/`"step complete"`/`"step error"` vocabulary with its
+    /// own payload — this is the export `step_lifecycle_record` (the
+    /// 2-arg, in-crate wrapper) can't offer since it always passes `None`.
+    #[test]
+    fn step_lifecycle_record_with_payload_carries_the_payload_and_the_canonical_action() {
+        let step = bare_step("s-0001");
+        let rec = step_lifecycle_record_with_payload(
+            &step,
+            "step start",
+            Some(json!({"workspace": "acme", "unit": "u-0001", "source": "app", "sha": "abc123"})),
+        );
+        assert_eq!(rec.action, "step start");
+        assert!(STEP_LIFECYCLE_ACTIONS.contains(&rec.action.as_str()));
+        let payload = rec.payload.expect("payload set");
+        assert_eq!(payload["workspace"], "acme");
+        assert_eq!(payload["unit"], "u-0001");
+        // mission_id is deliberately None here — the caller stamps it
+        // (see the function's own doc); this test pins that it does NOT
+        // silently get set.
+        assert!(rec.mission_id.is_none());
+    }
+
+    /// The 2-arg in-crate wrapper (every `run_step_graph` call site) must
+    /// still emit a record with no `payload` at all — no behavior change
+    /// from this packet.
+    #[test]
+    fn step_lifecycle_record_two_arg_wrapper_emits_no_payload() {
+        let step = bare_step("s-0002");
+        let rec = step_lifecycle_record(&step, "step complete");
+        assert!(rec.payload.is_none());
     }
 
     // ─── fixtures (#1341 Task-level model) ─────────────────────────────

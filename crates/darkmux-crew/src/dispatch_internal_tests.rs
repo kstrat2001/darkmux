@@ -3322,6 +3322,139 @@
         assert_eq!(records[1]["payload"]["rests"], 2);
     }
 
+    // ─── #1959 (revised) record_context rides every tailer record ─────
+
+    /// `DispatchOpts::record_context` (threaded to `TailerState` via
+    /// `with_record_context`) merges under `payload.context` on EVERY
+    /// record the tailer emits for this dispatch — proven here against a
+    /// `dispatch.tool` record for a `report_finding` call, but the merge
+    /// itself (`merge_record_context`) is called from `emit`/`emit_telemetry`
+    /// unconditionally, not gated on tool name.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn record_context_merges_under_payload_context_on_a_tool_completed_record() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-context".into(),
+            "crawler".into(),
+            "darkmux:qwen3.6".into(),
+        )
+        .with_record_context(Some(serde_json::json!({
+            "workspace": "acme",
+            "source": "acme-core",
+            "sha": "abc123",
+            "rule": ["swallowed-error"],
+            "unit": "u-0001",
+        })));
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"report_finding","args":"{\"file\":\"a.rs\"}","result":"Recorded. 1 finding(s) so far, 39 remaining in this run's budget.","ok":true}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-context" && v["action"] == "dispatch.tool")
+            .expect("a dispatch.tool record for the report_finding call");
+
+        assert_eq!(record["payload"]["context"]["workspace"], "acme");
+        assert_eq!(record["payload"]["context"]["source"], "acme-core");
+        assert_eq!(record["payload"]["context"]["sha"], "abc123");
+        assert_eq!(record["payload"]["context"]["unit"], "u-0001");
+        // The record's OWN fields survive alongside the merged context —
+        // the merge adds a key, it never replaces the payload.
+        assert_eq!(record["payload"]["tool_name"], "report_finding");
+    }
+
+    /// The other half of the same contract: `record_context: None` (every
+    /// caller that doesn't set `DispatchOpts::record_context`) must leave
+    /// NO `context` key at all — not `null`, not an empty object. A caller
+    /// that never opted in must see byte-identical payloads to before this
+    /// feature existed.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn no_record_context_means_no_context_key_at_all() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        // No `.with_record_context(...)` — the default `None`.
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-no-context".into(),
+            "crawler".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"read","args":"{}","result":"ok","ok":true}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-no-context" && v["action"] == "dispatch.tool")
+            .expect("a dispatch.tool record");
+
+        assert!(
+            record["payload"].as_object().unwrap().get("context").is_none(),
+            "no record_context set — payload must carry no `context` key at all: {:?}",
+            record["payload"]
+        );
+    }
+
     // ─── #557 slice 2 detector telemetry ──────────────────────────────
 
     /// The pure mapping helper: a `dispatch.cycle.suspected` event →
@@ -3501,6 +3634,7 @@
                 "darkmux:qwen3.6".into(),
                 Some("pre-1.0-compat-sweep".into()),
                 Some("s694".into()),
+                None,
             );
             guard.open(crate::dispatch::build_dispatch_record_with_payload(
                 darkmux_flow::Level::Info,
@@ -3561,6 +3695,7 @@
                 "darkmux:qwen3.6".into(),
                 None,
                 None,
+                None,
             );
             guard.open(crate::dispatch::build_dispatch_record_with_payload(
                 darkmux_flow::Level::Info,
@@ -3619,6 +3754,7 @@
                 "sess-panic".into(),
                 "darkmux:qwen3.6".into(),
                 Some("pre-1.0-compat-sweep".into()),
+                None,
                 None,
             );
             guard.open(crate::dispatch::build_dispatch_record_with_payload(
@@ -5288,7 +5424,8 @@ fn a_detection_reaches_the_envelope() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &summary_with(vec![det.clone()]),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5304,7 +5441,8 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &summary_with(vec![]),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5330,7 +5468,8 @@ fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         s,
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
@@ -5410,7 +5549,8 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5430,7 +5570,8 @@ fn enrichment_does_not_duplicate_the_runtime_metrics_block() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop","metrics":{"turns":1}}"#.to_string(),
         &s,
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5445,33 +5586,224 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
     let s = summary_with(vec![serde_json::json!({"kind":"cycle"})]);
     for raw in ["plain model output", "", "{ not json"] {
         assert_eq!(
-            super::enrich_envelope_with_summary(raw.to_string(), &s, &super::HostPeaks::default(), no_findings_dir()),
+            super::enrich_envelope_with_summary(
+                raw.to_string(),
+                &s,
+                &super::HostStats::default(),
+                &no_extras(),
+                no_findings_dir(),
+            ),
             raw,
             "the non-json path must pass through verbatim: {raw:?}"
         );
     }
 }
 
+// ---------------------------------------------------------------
+// (#2107) The host reduction: peak/mean/p95/duty, not peak alone.
+//
+// A peak answers "did this ever spike"; it can't say how hard the host was
+// driven ON AVERAGE, which is what `runtime.turn_delay_ms` (#2094) needs.
+// `reduce_metric`/`reduce_host_stats` are pure — a scripted sample list in,
+// exact numbers out — so these are driven directly, not through a live
+// sampler thread.
+// ---------------------------------------------------------------
+
+/// A hand-worked fixture: 5 samples at a steady 2000ms cadence, arithmetic
+/// checked by hand in the PR description. Exercises peak, mean (including a
+/// non-integer mean for `mem`), p95 (nearest-rank), and duty (a value that
+/// stays above 80% for exactly one measured gap, plus a trailing above-80
+/// sample with no successor — which must contribute NOTHING, since there is
+/// no measured interval to attribute to it).
+fn worked_samples() -> Vec<super::HostSampleAt> {
+    vec![
+        super::HostSampleAt { at_ms: 0, cpu: Some(50), mem: Some(60), gpu: Some(70) },
+        super::HostSampleAt { at_ms: 2000, cpu: Some(90), mem: Some(65), gpu: Some(85) },
+        super::HostSampleAt { at_ms: 4000, cpu: Some(95), mem: Some(68), gpu: Some(90) },
+        super::HostSampleAt { at_ms: 6000, cpu: Some(40), mem: Some(62), gpu: Some(30) },
+        super::HostSampleAt { at_ms: 8000, cpu: Some(85), mem: Some(78), gpu: Some(95) },
+    ]
+}
+
 #[test]
-fn host_peaks_reach_the_envelope_when_sampled() {
-    let peaks = super::HostPeaks {
-        peak_mem_pct: Some(78),
-        peak_cpu_pct: Some(412),
-        samples: 46,
-    };
+fn the_reduction_yields_the_exact_hand_worked_numbers() {
+    let stats = super::reduce_host_stats(&worked_samples());
+
+    assert_eq!(stats.samples, 5);
+    assert_eq!(stats.sample_interval_ms, Some(2000), "8000ms span / 4 gaps");
+
+    // cpu: [50, 90, 95, 40, 85] — peak 95, mean 72.0, p95 (nearest-rank of
+    // [40,50,85,90,95]) 95. above_80: the 90→95 gap (2000ms) and the 95→40
+    // gap (2000ms) both start above 80; the trailing 85 has no successor.
+    assert_eq!(stats.cpu.peak_pct, Some(95));
+    assert_eq!(stats.cpu.mean_pct, Some(72.0));
+    assert_eq!(stats.cpu.p95_pct, Some(95));
+    assert_eq!(stats.cpu.above_80_ms, 4000, "trailing above-80 sample must not count: {stats:?}");
+
+    // mem: [60, 65, 68, 62, 78] — never crosses 80, so above_80_ms is 0 and
+    // the non-integer mean (333/5 = 66.6 exactly) proves the ONE-DECIMAL
+    // rounding, not a truncation to an integer.
+    assert_eq!(stats.mem.peak_pct, Some(78));
+    assert_eq!(stats.mem.mean_pct, Some(66.6));
+    assert_eq!(stats.mem.p95_pct, Some(78));
+    assert_eq!(stats.mem.above_80_ms, 0);
+
+    // gpu: [70, 85, 90, 30, 95] — same duty shape as cpu (85→90 and 90→30
+    // gaps), on different underlying values.
+    assert_eq!(stats.gpu.peak_pct, Some(95));
+    assert_eq!(stats.gpu.mean_pct, Some(74.0));
+    assert_eq!(stats.gpu.p95_pct, Some(95));
+    assert_eq!(stats.gpu.above_80_ms, 4000);
+}
+
+#[test]
+fn mean_rounds_to_one_decimal_not_a_truncated_integer() {
+    // 1+1+2 = 4 / 3 = 1.3333… — a truncating or floor'd reduction would read
+    // 1, silently discarding the fractional signal a ~2s cadence can still
+    // carry across even a few samples.
+    let m = super::reduce_metric(&[(0, 1), (1, 1), (2, 2)]);
+    assert_eq!(m.mean_pct, Some(1.3));
+}
+
+#[test]
+fn an_empty_metric_reduces_to_all_none_not_zero() {
+    // Zero is a real value a metric can report; "no reading" is a different
+    // claim and must not collapse into it.
+    let m = super::reduce_metric(&[]);
+    assert_eq!(m.peak_pct, None);
+    assert_eq!(m.mean_pct, None);
+    assert_eq!(m.p95_pct, None);
+    assert_eq!(m.above_80_ms, 0);
+}
+
+#[test]
+fn a_single_sample_has_no_measured_interval() {
+    // One point has no gap to measure — `sample_interval_ms` must say so
+    // rather than assert an interval that was never observed.
+    let stats = super::reduce_host_stats(&[super::HostSampleAt {
+        at_ms: 0,
+        cpu: Some(50),
+        mem: Some(50),
+        gpu: Some(50),
+    }]);
+    assert_eq!(stats.samples, 1);
+    assert_eq!(stats.sample_interval_ms, None);
+    // A single reading is still its own peak/mean/p95 — one point IS the
+    // whole distribution.
+    assert_eq!(stats.cpu.peak_pct, Some(50));
+    assert_eq!(stats.cpu.mean_pct, Some(50.0));
+    assert_eq!(stats.cpu.p95_pct, Some(50));
+}
+
+#[test]
+fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
+    let stats = super::reduce_host_stats(&worked_samples());
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &peaks,
+        &stats,
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["host"]["peak_mem_pct"], 78);
-    assert_eq!(v["host"]["peak_cpu_pct"], 412);
+    assert_eq!(v["host"]["cpu"]["peak_pct"], 95);
+    assert_eq!(v["host"]["cpu"]["mean_pct"], 72.0);
+    assert_eq!(v["host"]["cpu"]["p95_pct"], 95);
+    assert_eq!(v["host"]["cpu"]["above_80_ms"], 4000);
+    assert_eq!(v["host"]["mem"]["peak_pct"], 78);
+    assert_eq!(v["host"]["gpu"]["peak_pct"], 95);
+    assert_eq!(v["host"]["samples"], 5);
+    assert_eq!(v["host"]["sample_interval_ms"], 2000);
+    // (#2107) Deprecated top-level aliases — kept for one release for any
+    // reader still looking at the pre-#2107 shape. They must read straight
+    // off the SAME nested peaks, never a second, independently-computed
+    // figure that could drift from them.
     assert_eq!(
-        v["host"]["samples"], 46,
-        "the sample count distinguishes 'idle' from 'never measured': {out}"
+        v["host"]["peak_cpu_pct"], 95,
+        "alias must mirror host.cpu.peak_pct exactly: {out}"
     );
+    assert_eq!(
+        v["host"]["peak_mem_pct"], 78,
+        "alias must mirror host.mem.peak_pct exactly: {out}"
+    );
+}
+
+#[test]
+fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape() {
+    use crate::host_probe::{HostExtraAt, PowerSample, ThermalSample};
+    // `None`: this test is about envelope SHAPE (the #2107/#2108 additive
+    // contract below), not the sleep-gap cap — that's covered by its own
+    // tests in host_probe::mod.rs and darkmux-serve's host_sampler.rs.
+    let extras = crate::host_probe::reduce_host_extras(
+        &[
+            HostExtraAt {
+                at_ms: 0,
+                power: Some(PowerSample { cpu_mw: 1000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                thermal: Some(ThermalSample { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
+            },
+            HostExtraAt {
+                at_ms: 3_600_000,
+                power: Some(PowerSample { cpu_mw: 3000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
+            },
+        ],
+        None,
+    );
+    let stats = super::reduce_host_stats(&worked_samples());
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &stats,
+        &extras,
+        no_findings_dir(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["host"]["power"]["cpu"]["peak_mw"], 3000);
+    assert_eq!(v["host"]["power"]["cpu"]["mean_mw"], 2000.0);
+    assert_eq!(v["host"]["power"]["gpu"]["mean_mw"], 100.0);
+    assert_eq!(v["host"]["power"]["total"]["peak_mw"], 3100);
+    assert_eq!(v["host"]["thermal"]["worst_state"], "serious");
+    assert_eq!(v["host"]["thermal"]["min_cpu_speed_limit_pct"], 62);
+    // 1100 mW held for exactly one hour → 1100 mWh (left-Riemann: the FIRST
+    // sample's power holds until the second).
+    let e = v["host"]["energy_mwh"].as_f64().expect("energy");
+    assert!((e - 1100.0).abs() < 0.001, "got {e}: {out}");
+
+    // ADDITIVE only: every #2107 field is byte-identical to what the same
+    // stats produce with no extras at all.
+    let without = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &stats,
+        &no_extras(),
+        no_findings_dir(),
+    );
+    let w: serde_json::Value = serde_json::from_str(&without).unwrap();
+    for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms", "peak_cpu_pct", "peak_mem_pct"] {
+        assert_eq!(v["host"][key], w["host"][key], "#2108 must not move `host.{key}`");
+    }
+}
+
+#[test]
+fn a_host_without_power_or_thermal_sources_omits_those_blocks() {
+    // The non-Apple-Silicon case, and the "IOReport unavailable" case: the
+    // cpu/mem/gpu reduction still lands, and the blocks the probe could not
+    // read are ABSENT rather than zeroed.
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &super::reduce_host_stats(&worked_samples()),
+        &no_extras(),
+        no_findings_dir(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["host"]["cpu"]["peak_pct"].is_number(), "the #2107 block still lands");
+    for key in ["power", "thermal", "energy_mwh"] {
+        assert!(
+            v["host"].get(key).is_none(),
+            "`host.{key}` must be absent (not measured), never zeroed: {out}"
+        );
+    }
 }
 
 #[test]
@@ -5481,7 +5813,8 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5499,6 +5832,14 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
 // The findings were also never copied into the lab run dir, so the run's
 // durable artifact recorded that work happened and not what it produced.
 // ---------------------------------------------------------------
+
+/// (#2108) The "this host reported no power/thermal source" extras — the
+/// state every pre-#2108 assertion in this file was implicitly written
+/// against, so the #2107 `host` block's shape stays pinned by tests that say
+/// nothing about power. The #2108 fields get their own tests below.
+fn no_extras() -> crate::host_probe::HostExtras {
+    crate::host_probe::HostExtras::default()
+}
 
 /// A path with no `findings.jsonl` under it — the shape every non-crawler
 /// dispatch has, and the reason the block must be absent rather than zeroed.
@@ -5524,7 +5865,8 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
+        &no_extras(),
         td.path(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5543,7 +5885,8 @@ fn a_trailing_newline_is_not_a_finding() {
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
+        &no_extras(),
         td.path(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5560,7 +5903,8 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
-        &super::HostPeaks::default(),
+        &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();

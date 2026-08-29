@@ -5,11 +5,17 @@ import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, nameOf } from "../../lib/flow";
+import { relAgoFrom } from "../../lib/format";
 import { specOf } from "../fleet/cards";
 import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
 import { getSource } from "../../lib/source";
+import { useIsMobile } from "../../hooks/useIsMobile";
+import { Meter, compactMeterProps, fmtPct, COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "../../components/Meter";
+import { aggregateHostSamples } from "../../lib/hostStats";
+import { rollingWindowSamples, findLastKnownSample } from "../../lib/machineDrawerScope";
+import { useMachineStatsContent } from "../../components/machineStatsContent";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
 /** The health region's state vocabulary, verbatim from `/machine/resources`
@@ -126,8 +132,21 @@ export function lineClass(line: string): string | undefined {
  * OLD runs list for its live-vs-ended status labels — is gone along with
  * that list; nothing on this page needs session liveness anymore.
  */
-export function MachineLens({ uid: routeUid }: { uid: string | null }) {
+export function MachineLens({
+  uid: routeUid,
+  isMobileOverride,
+}: {
+  uid: string | null;
+  /** (#2108, operator finding) Test-only override for the "runs on
+   * <machine> →" link's mobile full-width treatment below — production
+   * omits this and measures `window.innerWidth` via `useIsMobile` (the
+   * SAME 768px breakpoint the drawer/health-region key their own mobile
+   * forms off). */
+  isMobileOverride?: boolean;
+}) {
   const nowMs = Date.now();
+  const measuredIsMobile = useIsMobile();
+  const isMobile = isMobileOverride ?? measuredIsMobile;
 
   // (#1801) A daemon-less build has nothing to poll. `App.tsx` gates its own
   // copies of these on `isLiveRoute(route)` and states the rule in place:
@@ -188,6 +207,21 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // fleet-card drill, local or remote) or, absent one, the local machine
   // (the nav-tab/deep-link entry — legacy's `goMachine`).
   const targetUid = routeUid ?? localUid;
+  // (#1833) The live CPU/GPU/MEM section's own reduction — SAME window
+  // function + aggregation the global machine drawer uses
+  // (`lib/machineDrawerScope.ts`, `lib/hostStats.ts`), scoped to
+  // `targetUid` so a drilled-into remote machine's card reads ITS load,
+  // not always the local box's.
+  const liveSamples = useMemo(() => rollingWindowSamples(flowWindow.data, targetUid, nowMs), [flowWindow.data, targetUid, nowMs]);
+  const liveAgg = useMemo(() => aggregateHostSamples(liveSamples), [liveSamples]);
+  // (phone feedback, 2026-08-29) Same idle+last-known treatment the global
+  // drawer uses (`MachineDrawer.tsx`'s own doc) — three dashed meters is
+  // not a state, and the sampler only runs during a dispatch, so an idle
+  // machine's rolling window is legitimately empty most of the time.
+  const liveLastKnown = useMemo(
+    () => (liveSamples.length === 0 ? findLastKnownSample(flowWindow.data, targetUid, nowMs) : null),
+    [liveSamples, flowWindow.data, targetUid, nowMs],
+  );
   // Identity is the UID, never the display name. This compared
   // `nameOf(targetUid) === specs.machine_id`, which asks whether the label we
   // happen to show equals the name specs happens to report — and those are
@@ -209,6 +243,43 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // `isLocalSpecs` is what self-corrects that case once specs resolve).
   const machineIsLocal = routeUid == null;
   const isLocalMach = machineIsLocal || isLocalSpecs;
+
+  // (#2108, operator design rule — "the lens must be a strict SUPERSET of
+  // the sheet") The SAME shared hook `MachineDrawer.tsx`'s desktop dialog
+  // and `PhoneDrawer.tsx`'s Machine tab already use — `liveBlock` is just
+  // the gauges (CPU/GPU/MEM, or the idle line) plus `HostExtras`
+  // (thermal/power/CPU-cluster), fed by the DAEMON's continuous host
+  // sampler ring (`useDaemonLoad`, polled every `DAEMON_LOAD_POLL_MS`
+  // while `isOpen` — `true` here unconditionally, since this LENS being
+  // mounted at all IS its own "currently visible" gate, the same way the
+  // sheet/dialog's own open state is theirs). `route` is built from THIS
+  // lens's own `routeUid`, not `targetUid` — `useMachineStatsContent`'s
+  // daemon-fed reading is always THIS APP'S OWN local host, so it is only
+  // ever correct for the LOCAL machine page (`isLocalMach`); a drilled-
+  // into REMOTE machine keeps the OLDER flow-aggregation section below
+  // instead (this daemon has no probe access to a machine that isn't the
+  // one it's running on). `routeRecords` is `[]` — this hook's
+  // mission/dispatch-scoped branch never triggers for a `kind:"machine"`
+  // route, so there is nothing for it to scope. */
+  const { liveBlock } = useMachineStatsContent({
+    route: { kind: "machine", uid: routeUid },
+    routeRecords: [],
+    flowWindow: flowWindow.data,
+    localUid,
+    liveMachines,
+    specs,
+    liveStatus: "live",
+    // (#2108) Gated on `isLocalMach`, not unconditionally `true` — a
+    // remote machine's page never renders `liveBlock` at all (see the JSX
+    // below), and `useDaemonLoad` polls `/machine/resources` whenever
+    // `isOpen` is true regardless of whether anything on screen will use
+    // the result. Without this gate, drilling into a REMOTE machine still
+    // fetched the LOCAL daemon's own probe every 3s for a value nothing
+    // displays — exactly the wasted/misleading request `isLocalMach` was
+    // introduced to prevent everywhere else on this page.
+    isOpen: isLocalMach,
+    isMobile,
+  });
 
   // The resources probe is LOCAL-ONLY data (`/machine/resources` always
   // describes THIS daemon's own host) — legacy's `pollMachineMem` never
@@ -324,8 +395,15 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
         <button type="button" className="machine-lens__back" onClick={() => { location.hash = ""; }}>
           fleet
         </button>
-        {" › machine · "}
-        {label}
+        {/* (#2108, operator finding) The machine NAME is dropped from this
+            in-page header — `#crumb` (App.tsx's own `routeChrome`, now
+            folded into the desktop tab row, see that file's own doc)
+            already states it for the machine route
+            (`crumb: targetMachineName ?? "this machine"`), so repeating it
+            here a second time was pure redundancy once the two sit in the
+            same glance. The hardware spec stays — `#crumb` never carries
+            it, only the name. */}
+        {" › machine"}
         {spec ? ` — ${spec}` : ""}
       </div>
 
@@ -368,6 +446,57 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
         />
       </div>
 
+      {/* (#2108, operator design rule — the lens is a strict SUPERSET of
+          the sheet) The LOCAL machine renders the SAME shared block the
+          global sheet/dialog render — gauges + thermal/power/CPU-cluster,
+          daemon-fed — in place of the old flow-aggregation-only CPU/GPU/
+          MEM section (#1833). A REMOTE machine (`!isLocalMach`) keeps that
+          OLDER section instead: `useMachineStatsContent`'s daemon reading
+          is always THIS APP'S OWN local host, so it cannot answer for a
+          machine that isn't the one darkmux is actually running on — the
+          flow-aggregation path (`rollingWindowSamples`, scoped to
+          `targetUid` via FLOW RECORDS rather than a local probe) is kept
+          deliberately for exactly that case, not dead code. */}
+      <div className="mm-live-section">
+        <div className="mm-live-section__title">live load · last 10 min</div>
+        {isLocalMach ? (
+          liveBlock
+        ) : liveSamples.length === 0 ? (
+          <div className="machine-drawer__idle">
+            <div className="machine-drawer__idle-line">idle · no samples in the last 10 min</div>
+            {liveLastKnown && (
+              <div className="machine-drawer__lastknown">
+                {`last sample ${relAgoFrom(nowMs, liveLastKnown.ts)} — CPU ${fmtPct(liveLastKnown.point.cpu ?? null)} · GPU ${fmtPct(liveLastKnown.point.gpu ?? null)} · MEM ${fmtPct(liveLastKnown.point.mem ?? null)}`}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="meter-row">
+            <Meter
+              wrapperClassName="mm-gauge mm-gauge--compact"
+              width={COMPACT_METER_WIDTH}
+              height={COMPACT_METER_HEIGHT}
+              ariaLabel="CPU: last 10 min"
+              {...compactMeterProps("CPU", "mm-gauge-fill-compact", "var(--accent, var(--good))", liveAgg.cpu)}
+            />
+            <Meter
+              wrapperClassName="mm-gauge mm-gauge--compact"
+              width={COMPACT_METER_WIDTH}
+              height={COMPACT_METER_HEIGHT}
+              ariaLabel="GPU: last 10 min"
+              {...compactMeterProps("GPU", "mm-gauge-fill-compact", "var(--accent, var(--good))", liveAgg.gpu)}
+            />
+            <Meter
+              wrapperClassName="mm-gauge mm-gauge--compact"
+              width={COMPACT_METER_WIDTH}
+              height={COMPACT_METER_HEIGHT}
+              ariaLabel="MEM: last 10 min"
+              {...compactMeterProps("MEM", "mm-gauge-fill-compact", "var(--accent, var(--good))", liveAgg.mem)}
+            />
+          </div>
+        )}
+      </div>
+
       {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —
           #1508 step 2's own commit named it "deliberately interim". This is
           the replacement: a link into the Runs lens, pinned to this
@@ -385,18 +514,38 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
           activatable for free, and consistent with every other cross-lens
           hop in this file (`NavChrome`'s own tabs use the same direct
           hash-write pattern). */}
-      {targetUid != null && (
-        <a
-          className="machine-lens__runslink"
-          href={`#lens=runs&machine=${encodeURIComponent(targetUid)}`}
-          onClick={(e) => {
-            e.preventDefault();
-            location.hash = `lens=runs&machine=${encodeURIComponent(targetUid)}`;
-          }}
-        >
-          runs on {label} →
-        </a>
-      )}
+      {targetUid != null &&
+        (isMobile ? (
+          // (#2108, operator finding) The mobile full-width form needs TWO
+          // flex items — the label and the arrow — so `justify-content:
+          // space-between` (styles.css's `--mobile` rule) has something to
+          // pin apart; a single text run (desktop's own form, below) is
+          // ONE anonymous flex item with nothing to distribute against.
+          // Neither span is `aria-hidden` — the accessible name stays
+          // "runs on <machine> →", arrow included, exactly like desktop.
+          <a
+            className="machine-lens__runslink machine-lens__runslink--mobile"
+            href={`#lens=runs&machine=${encodeURIComponent(targetUid)}`}
+            onClick={(e) => {
+              e.preventDefault();
+              location.hash = `lens=runs&machine=${encodeURIComponent(targetUid)}`;
+            }}
+          >
+            <span>runs on {label}</span>
+            <span>→</span>
+          </a>
+        ) : (
+          <a
+            className="machine-lens__runslink"
+            href={`#lens=runs&machine=${encodeURIComponent(targetUid)}`}
+            onClick={(e) => {
+              e.preventDefault();
+              location.hash = `lens=runs&machine=${encodeURIComponent(targetUid)}`;
+            }}
+          >
+            runs on {label} →
+          </a>
+        ))}
 
     </div>
   );

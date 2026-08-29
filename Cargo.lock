@@ -729,6 +729,7 @@ dependencies = [
  "darkmux-types",
  "dirs",
  "httpmock",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

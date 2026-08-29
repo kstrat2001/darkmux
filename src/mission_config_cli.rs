@@ -1262,9 +1262,12 @@ mod tests {
         let row = rows.iter().find(|r| r.id == "broken-config").expect("broken-config must still be listed");
         assert!(row.error.is_some(), "a parse failure must be captured as an error, not hidden");
         assert!(row.name.is_none());
-        // The two embedded built-ins must still be present alongside it.
+        // The graph-bearing embedded built-ins, plus crawl's
+        // documentation-only zero-graph one, must still be present
+        // alongside it.
         assert!(rows.iter().any(|r| r.id == "review" && r.error.is_none()));
         assert!(rows.iter().any(|r| r.id == "coder-phase" && r.error.is_none()));
+        assert!(rows.iter().any(|r| r.id == "crawl" && r.error.is_none()));
     }
 
     // ── JSON shape ────────────────────────────────────────────────────
@@ -1586,7 +1589,7 @@ mod tests {
         assert!(!text.contains("document id"), "got:\n{text}");
     }
 
-    // ── the two embedded configs resolve cleanly end to end ───────────
+    // ── the graph-bearing embedded configs resolve cleanly end to end ──
 
     #[test]
     fn review_and_coder_phase_load_and_build_without_panicking() {
@@ -1597,6 +1600,27 @@ mod tests {
             assert_eq!(show.id, id);
             assert!(!show.phases.is_empty());
         }
+    }
+
+    // (#1959) `crawl` is the ONE embedded config with NO graph by design
+    // (see `templates/builtin/mission-configs/crawl.json`'s own
+    // `description`) — a separate, deliberately inverted assertion from
+    // the graph-bearing pair above, not folded into their loop.
+    #[test]
+    fn crawl_loads_and_builds_without_panicking_despite_zero_phases() {
+        let registry = crate::mission_launch::all_step_kinds().unwrap();
+        let loaded = mission_config::load("crawl").unwrap();
+        let show = build_show(
+            "crawl",
+            &loaded,
+            &registry,
+            Err("no live profiles in this test"),
+            &|_| RoleBinding::Unmapped,
+            Err("no live lms in this test"),
+            &[],
+        );
+        assert_eq!(show.id, "crawl");
+        assert!(show.phases.is_empty(), "crawl carries no graph — see its own description field");
     }
 
     #[test]

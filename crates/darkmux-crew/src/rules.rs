@@ -1,13 +1,22 @@
-//! Crawl rule registry (#1959 packet 1).
+//! Rule registry (#1959 — promoted from the crawl module to a general
+//! template kind so any role's mission can bind to a named, searchable
+//! property, not only the crawler).
 //!
-//! Rules are authored as JSON, embedded at compile time from
-//! `templates/builtin/crawl-rules/`, mirroring the `EMBEDDED_WORKLOADS`
-//! `include_str!` pattern in `crate::workloads::load` — so `cargo install
-//! --path .` ships the three built-in rules with no source checkout needed.
-//! A user tier at `<darkmux root>/crawl-rules/*.json` overrides an embedded
-//! rule sharing its id. A malformed user rule file is a WARNING naming the
-//! file, never a crash (config leniency — validation is loud only at the
-//! point a rule id is actually resolved for use).
+//! A rule is a named, searchable property bound to files by glob, with
+//! match/no-match prose — nothing in this type or its loader is
+//! crawl-specific. Rules are authored as JSON, embedded at compile time
+//! from `templates/builtin/rules/`, mirroring `crew::loader`'s
+//! `BUILTIN_ROLES` `include_str!` pattern (see `loader.rs`'s module doc:
+//! "Search order: user dir → binary-embedded built-ins") so `cargo install
+//! --path .` ships the three built-in rules with no source checkout
+//! needed. A user tier at `<darkmux root>/rules/*.json` overrides an
+//! embedded rule sharing its id — but unlike the role loader's whole-file
+//! replace, a rule override MERGES: only the fields the override names
+//! change, everything else survives from the rule underneath (#1959
+//! finding 2; see `merge_json_object_shallow`). A malformed user rule file
+//! is a WARNING naming the file, never a crash (config leniency —
+//! validation is loud only at the point a rule id is actually resolved for
+//! use).
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -16,28 +25,28 @@ use std::fs;
 use std::path::Path;
 
 /// Rules compiled into the binary. `(id, json)` pairs, verbatim file
-/// contents — see `crate::workloads::load::EMBEDDED_WORKLOADS` for the
-/// precedent this mirrors.
+/// contents — see `crate::loader::BUILTIN_ROLES` for the precedent this
+/// mirrors.
 const EMBEDDED_RULES: &[(&str, &str)] = &[
     (
         "swallowed-error",
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../templates/builtin/crawl-rules/swallowed-error.json"
+            "/../../templates/builtin/rules/swallowed-error.json"
         )),
     ),
     (
         "doc-contradicts-code",
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../templates/builtin/crawl-rules/doc-contradicts-code.json"
+            "/../../templates/builtin/rules/doc-contradicts-code.json"
         )),
     ),
     (
         "stale-consumer",
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../templates/builtin/crawl-rules/stale-consumer.json"
+            "/../../templates/builtin/rules/stale-consumer.json"
         )),
     ),
 ];
@@ -57,9 +66,9 @@ pub struct EdgeRuleConfig {
     pub extras: BTreeMap<String, serde_json::Value>,
 }
 
-/// One crawl rule, matching the shape of the three built-in rule files
-/// (`templates/builtin/crawl-rules/*.json`) — see those for worked
-/// examples of every field. Lenient on read: only `id`/`kind` are required.
+/// One rule, matching the shape of the three built-in rule files
+/// (`templates/builtin/rules/*.json`) — see those for worked examples of
+/// every field. Lenient on read: only `id`/`kind` are required.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     pub id: String,
@@ -112,11 +121,11 @@ impl Rule {
 /// any non-fatal warnings collected along the way (a malformed embedded
 /// rule — a darkmux bug — or a malformed user rule file).
 ///
-/// `user_dir` is the `<darkmux root>/crawl-rules` directory to scan for
+/// `user_dir` is the `<darkmux root>/rules` directory to scan for
 /// overrides; `None` skips the user tier entirely. Taking it as a plain
 /// param (rather than reading `paths::resolve` internally) mirrors
-/// `crate::workloads::load::load`'s `user_dir: Option<&Path>` shape, so
-/// this stays unit-testable without env-var mutation.
+/// `crate::loader`'s testable shape — this stays unit-testable without
+/// env-var mutation.
 pub fn load_all(user_dir: Option<&Path>) -> (BTreeMap<String, Rule>, Vec<String>) {
     let mut map = BTreeMap::new();
     let mut warnings = Vec::new();
@@ -127,7 +136,7 @@ pub fn load_all(user_dir: Option<&Path>) -> (BTreeMap<String, Rule>, Vec<String>
                 map.insert((*id).to_string(), r);
             }
             Err(e) => warnings.push(format!(
-                "embedded crawl rule '{id}' failed to parse ({e}) — this is a darkmux bug"
+                "embedded rule '{id}' failed to parse ({e}) — this is a darkmux bug"
             )),
         }
     }
@@ -145,7 +154,7 @@ pub fn load_all(user_dir: Option<&Path>) -> (BTreeMap<String, Rule>, Vec<String>
                         Ok(override_value) => {
                             let Some(id) = override_value.get("id").and_then(|v| v.as_str()) else {
                                 warnings.push(format!(
-                                    "user crawl rule {} has no `id` field — skipped",
+                                    "user rule {} has no `id` field — skipped",
                                     path.display()
                                 ));
                                 continue;
@@ -168,18 +177,18 @@ pub fn load_all(user_dir: Option<&Path>) -> (BTreeMap<String, Rule>, Vec<String>
                                     map.insert(id, r);
                                 }
                                 Err(e) => warnings.push(format!(
-                                    "user crawl rule {} failed to parse ({e}) — skipped",
+                                    "user rule {} failed to parse ({e}) — skipped",
                                     path.display()
                                 )),
                             }
                         }
                         Err(e) => warnings.push(format!(
-                            "user crawl rule {} failed to parse ({e}) — skipped",
+                            "user rule {} failed to parse ({e}) — skipped",
                             path.display()
                         )),
                     },
                     Err(e) => warnings.push(format!(
-                        "user crawl rule {} could not be read ({e}) — skipped",
+                        "user rule {} could not be read ({e}) — skipped",
                         path.display()
                     )),
                 }
@@ -211,7 +220,7 @@ fn merge_json_object_shallow(base: serde_json::Value, patch: serde_json::Value) 
 
 /// Warn (never fail — this is advisory, not validation) when a resolved
 /// `site`/`read` rule has an empty `applies_to` (it will never match any
-/// file) or a `site` rule has an empty `prefilter` (`plan.rs`'s
+/// file) or a `site` rule has an empty `prefilter` (the crawl planner's
 /// `collect_site_units` early-returns with zero units for exactly this
 /// case, silently before this fix — #1959 finding 2). Runs only over the
 /// rules a manifest actually RESOLVED for use — not every rule sitting in
@@ -221,13 +230,13 @@ fn warn_on_thin_rules(resolved: &[Rule], warnings: &mut Vec<String>) {
     for rule in resolved {
         if matches!(rule.kind, RuleKind::Site | RuleKind::Read) && rule.applies_to.is_empty() {
             warnings.push(format!(
-                "crawl rule '{}' has an empty `applies_to` — it will never match any file",
+                "rule '{}' has an empty `applies_to` — it will never match any file",
                 rule.id
             ));
         }
         if rule.kind == RuleKind::Site && rule.prefilter.is_empty() {
             warnings.push(format!(
-                "crawl rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
+                "rule '{}' is a `site` rule with an empty `prefilter` — it will never produce a site",
                 rule.id
             ));
         }
@@ -247,7 +256,7 @@ pub fn resolve(ids: &[String], user_dir: Option<&Path>) -> Result<(Vec<Rule>, Ve
                 let mut known: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
                 known.sort();
                 bail!(
-                    "crawl rule '{id}' not found — known rules: {}",
+                    "rule '{id}' not found — known rules: {}",
                     if known.is_empty() {
                         "(none)".to_string()
                     } else {
@@ -261,11 +270,11 @@ pub fn resolve(ids: &[String], user_dir: Option<&Path>) -> Result<(Vec<Rule>, Ve
     Ok((out, warnings))
 }
 
-/// `resolve` against the real `<darkmux root>/crawl-rules` user tier.
+/// `resolve` against the real `<darkmux root>/rules` user tier.
 pub fn resolve_default(ids: &[String]) -> Result<(Vec<Rule>, Vec<String>)> {
     let user_dir = darkmux_types::paths::resolve(darkmux_types::paths::ResolveScope::Auto)
         .root
-        .join("crawl-rules");
+        .join("rules");
     resolve(ids, Some(&user_dir))
 }
 

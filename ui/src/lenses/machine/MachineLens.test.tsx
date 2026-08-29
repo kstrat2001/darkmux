@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { MachineLens } from "./MachineLens";
 import { todayUTC, prevDateUTC } from "../../lib/flow";
 
@@ -136,11 +139,15 @@ describe("MachineLens", () => {
       liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
     });
     renderMachine("remote-uid");
-    // `label` is interpolated as a bare text node beside its `<button>`/text
-    // siblings in `.machine-lens__hdr` (no wrapping element of its own), so
-    // an EXACT-match query can't isolate it — a substring regex against the
-    // header's combined text is the reliable form here.
-    await waitFor(() => expect(screen.getByText(/machine · studio/)).toBeInTheDocument());
+    // (#2108, operator finding) The machine NAME is no longer repeated in
+    // this in-page header — `#crumb` (App.tsx, folded into the desktop tab
+    // row) already states it. The header keeps "fleet › machine" plus the
+    // hardware spec.
+    await waitFor(() =>
+      expect(document.querySelector(".machine-lens__hdr")?.textContent).toBe(
+        "fleet › machine — M1 Max · 32 GB",
+      ),
+    );
     expect(screen.getByText(/residency \/ RAM not reported from here — local-probe only/i)).toBeInTheDocument();
     expect(screen.getByText(/View the machine page on studio directly/i)).toBeInTheDocument();
     expect(screen.queryByText(/limit source/i)).not.toBeInTheDocument();
@@ -164,13 +171,68 @@ describe("MachineLens", () => {
     expect(screen.queryByText(/not reported from here/i)).not.toBeInTheDocument();
   });
 
-  it("an unrecognized/stale uid degrades gracefully — names the raw uid, links to its (empty) runs lens, never crashes", async () => {
+  it("(#1833) shows live CPU/GPU/MEM now/avg/max for this machine's own telemetry.process samples", async () => {
+    // (rolling-window fix) The 10-minute window is measured against REAL
+    // `Date.now()`, not the test's nominal "today" — a midnight-UTC
+    // timestamp is routinely hours outside that window depending on when
+    // the suite actually runs. Recent-relative-to-now instead.
+    const oldIso = new Date(Date.now() - 5 * 60_000).toISOString();
+    const newIso = new Date(Date.now() - 60_000).toISOString();
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 },
+      flowToday: [
+        { ts: newIso, machine_uid: "self-uid", machine_id: "MacBook-Pro" },
+        // Distinct values per metric so each assertion below can only match
+        // the ONE tile it names — cpu/mem/gpu never share an avg/now/max.
+        { ts: oldIso, machine_uid: "self-uid", category: "telemetry", source: "process", action: "telemetry.process", payload: { cpu: 40, mem: 20, gpu: 60 } },
+        { ts: newIso, machine_uid: "self-uid", category: "telemetry", source: "process", action: "telemetry.process", payload: { cpu: 80, mem: 50, gpu: 90 } },
+        // A peer's own sample, same window — must NOT be averaged in.
+        { ts: newIso, machine_uid: "peer-uid", category: "telemetry", source: "process", action: "telemetry.process", payload: { cpu: 999, mem: 999, gpu: 999 } },
+      ],
+    });
+    renderMachine(null);
+    // The section title renders unconditionally; the METER VALUES only once
+    // specs has resolved `targetUid` to "self-uid" (an async render pass) —
+    // wait on those, not the static title, so this isn't a false-pass on a
+    // render that hasn't caught up yet.
+    await waitFor(() => expect(screen.getByText("live load · last 10 min")).toBeInTheDocument());
+    await waitFor(() => expect(document.querySelector(".mm-live-section .meter-now")?.textContent).toBe("80%"));
+
+    const section = document.querySelector(".mm-live-section")!;
+    const tile = (metric: string) => section.querySelector(`[data-meter="${metric}"]`)!;
+    const avgmax = (metric: string) => tile(metric).querySelector(".meter-avgmax")!.textContent?.replace(/\s+/g, " ").trim();
+    // cpu: [40, 80] — now (last) 80, avg 60, max 80.
+    expect(tile("cpu").querySelector(".meter-now")!.textContent).toBe("80%");
+    expect(avgmax("cpu")).toBe("60% avg · 80% max");
+    // mem: [20, 50] — now 50, avg 35, max 50.
+    expect(tile("mem").querySelector(".meter-now")!.textContent).toBe("50%");
+    expect(avgmax("mem")).toBe("35% avg · 50% max");
+    // gpu: [60, 90] — now 90, avg 75, max 90.
+    expect(tile("gpu").querySelector(".meter-now")!.textContent).toBe("90%");
+    expect(avgmax("gpu")).toBe("75% avg · 90% max");
+    // The peer's 999s must never appear anywhere in this section.
+    expect(section.textContent).not.toContain("999");
+    // The VRAM gauge is untouched by this section — still rendered, same as
+    // every other test in this file that reaches the health region.
+    expect(screen.getByText(/limit source/i)).toBeInTheDocument();
+  });
+
+  it("an unrecognized/stale uid degrades gracefully — links to its (empty) runs lens by the raw uid, never crashes", async () => {
     mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" } });
     renderMachine("totally-unknown-uid-nobody-has-ever-seen");
-    await waitFor(() => expect(screen.getByText(/machine · totally-unknown-uid-nobody-has-ever-seen/)).toBeInTheDocument());
+    // (#2108, operator finding) No name to show (unrecognized uid, no
+    // display name resolved) and no hardware spec either — the header
+    // degrades to plain "fleet › machine", never a crash or a stale label.
+    await waitFor(() =>
+      expect(document.querySelector(".machine-lens__hdr")?.textContent).toBe(
+        "fleet › machine",
+      ),
+    );
     // (#1809) The old "no runs recorded for this machine" hint text is gone
     // with the runs list itself — a stale uid still gets a real, honestly
     // zero-count link out (never a crash, never a stale-looking count).
+    // The raw uid survives HERE, in the link's own href, even though the
+    // header above no longer names it.
     const link = screen.getByRole("link", { name: /runs on/i });
     expect(link).toHaveAttribute("href", "#lens=runs&machine=totally-unknown-uid-nobody-has-ever-seen");
     expect(screen.getByText(/not reported from here/i)).toBeInTheDocument();
@@ -347,11 +409,11 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
   });
 });
 
-function renderMachineLens() {
+function renderMachineLens(isMobileOverride?: boolean) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MachineLens uid={null} />
+      <MachineLens uid={null} isMobileOverride={isMobileOverride} />
     </QueryClientProvider>,
   );
 }
@@ -469,5 +531,102 @@ describe("MachineLens — the runs-lens link (#1809)", () => {
     await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
     expect(container.querySelector(".machine-lens__run")).toBeNull();
     expect(screen.queryByText(/RUNS ON/)).not.toBeInTheDocument();
+  });
+
+  // (#2108, operator finding) On a phone this control sat at roughly half
+  // the card's width with dead space beside it. On a narrow viewport it
+  // gets the `--mobile` full-width/48px-touch-target class, and the
+  // accessible name — arrow included — stays exactly what it was.
+  it("gets the full-width mobile class on a narrow viewport, keeping the same accessible name", async () => {
+    mockMachineRunsFetch(3);
+    renderMachineLens(true);
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    expect(link.className).toMatch(/\bmachine-lens__runslink--mobile\b/);
+    expect(link.className).toMatch(/\bmachine-lens__runslink\b/);
+    expect(link.textContent).toBe("runs on MacBook-Pro→");
+  });
+
+  it("stays the plain desktop class (no --mobile modifier) when not on a narrow viewport", async () => {
+    mockMachineRunsFetch(3);
+    renderMachineLens(false);
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    expect(link.className).not.toMatch(/--mobile/);
+    expect(link.textContent).toBe("runs on MacBook-Pro →");
+  });
+});
+
+// ── (#2108, operator design rule — "the lens is a strict SUPERSET of the
+//    sheet") The LOCAL machine page renders the SAME shared
+//    `useMachineStatsContent` block (`liveBlock`) the global sheet/dialog
+//    render, in place of the old flow-aggregation-only CPU/GPU/MEM
+//    section — gaining thermal/power/CPU-cluster for free, fed by the
+//    daemon ring. ──────────────────────────────────────────────────────
+
+const LOAD_WITH_EXTRAS = {
+  now: {
+    sampled_at_ms: 4000,
+    sampler_cost_ms: 4.2,
+    cpu_pct: 22,
+    cpu_clusters: [
+      { name: "Super", cores: 6, pct: 46, mhz: 4400 },
+      { name: "Performance", cores: 12, pct: 22, mhz: 3400 },
+    ],
+    mem_pct: 46,
+    gpu_pct: 68,
+    gpu_mhz: null,
+    gpu_mem_bytes: null,
+    thermal: { state: "fair", cpu_speed_limit_pct: 87 },
+    power_mw: null,
+  },
+  window: {
+    samples: 3,
+    interval_ms: 2000,
+    span_ms: 90_000,
+    cpu_pct: { mean: 10, p95: 15, max: 20 },
+    mem_pct: { mean: 30, p95: 35, max: 40 },
+    gpu_pct: { mean: 50, p95: 55, max: 60 },
+    power_mw: null,
+    thermal: null,
+    energy_mwh: null,
+  },
+};
+
+describe("MachineLens — the live block is the SAME shared component the sheet uses (#2108)", () => {
+  it("the local machine page renders the thermal pill and CPU-cluster tiles from the daemon fixture", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max", ram_total_bytes: 137438953472 },
+      resources: { ...RESOURCES, load: LOAD_WITH_EXTRAS },
+    });
+    renderMachine(null);
+    await waitFor(() => expect(screen.getByText(/limit source/i)).toBeInTheDocument());
+    // Thermal pill + CPU-cluster tiles — content ONLY `HostExtras`
+    // (inside `useMachineStatsContent`'s `liveBlock`) can produce; the
+    // OLD flow-aggregation section never rendered either.
+    await waitFor(() => expect(screen.getByText("Fair")).toBeInTheDocument());
+    expect(screen.getByText("Super")).toBeInTheDocument();
+    expect(screen.getByText("Performance")).toBeInTheDocument();
+  });
+
+  it("a REMOTE machine page still shows nothing from the daemon-fed block (no thermal pill) — the flow-aggregation fallback stays for that case", async () => {
+    mockMachineFetch({
+      specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" },
+      resources: { ...RESOURCES, load: LOAD_WITH_EXTRAS },
+      liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
+    });
+    renderMachine("remote-uid");
+    await waitFor(() => expect(screen.getByText(/not reported from here/i)).toBeInTheDocument());
+    expect(screen.queryByText("Fair")).toBeNull();
+    expect(screen.queryByText("Super")).toBeNull();
+  });
+
+  it("MachineLens.tsx and MachineDrawer.tsx both source their live block from the SAME hook module", () => {
+    // A source-level check alongside the behavioral one above: proves
+    // this isn't two independently-built blocks that happen to render
+    // similar text, but the literal SAME `useMachineStatsContent` export.
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    const lensSrc = readFileSync(path.join(dir, "MachineLens.tsx"), "utf-8");
+    const drawerSrc = readFileSync(path.join(dir, "../../components/MachineDrawer.tsx"), "utf-8");
+    expect(lensSrc).toMatch(/import \{ useMachineStatsContent \} from "\.\.\/\.\.\/components\/machineStatsContent"/);
+    expect(drawerSrc).toMatch(/useMachineStatsContent/);
   });
 });

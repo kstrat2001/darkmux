@@ -608,6 +608,40 @@ describe("MachineHealthRegion — the k/v row and footer the retired golden used
     expect(feet.length).toBeGreaterThanOrEqual(2);
     expect(feet.some((f) => /attribution:/i.test(f.textContent ?? ""))).toBe(true);
   });
+
+  // (#2108, operator finding) On a narrow viewport the dotted inline row
+  // wrapped into four ragged lines with the ` · ` separators landing
+  // mid-line. Mobile renders the SAME facts as a one-item-per-row list
+  // instead — proven both by a structural marker (row elements) and by
+  // the values still being present, so this can't pass by accident on a
+  // component that merely stopped rendering the row altogether.
+  it("renders the ledger summary as a definition-style list of rows on a narrow viewport, carrying the same values", () => {
+    const { container } = renderRegion(BASE, { isMobileOverride: true });
+    const wrap = container.querySelector('[data-act="machine-detail-rows"]');
+    expect(wrap).not.toBeNull();
+    const rows = wrap!.querySelectorAll(".mm-kv-row");
+    expect(rows.length).toBeGreaterThanOrEqual(5); // limit source, pool, used, available, unpriced (+ reclaim note)
+    expect(wrap!.textContent).toContain("physical pool");
+    expect(wrap!.textContent).toContain("128.00 GiB"); // pool
+    expect(wrap!.textContent).toContain("64.54 GiB"); // used
+    expect(wrap!.textContent).toContain("67.06 GiB"); // available
+    expect(wrap!.textContent).toContain("63.57 GiB reclaimable");
+    expect(wrap!.textContent).toContain("model");
+    // Each row is label-left/value-right, not one flat text run — the
+    // structural claim the mobile form is actually FOR.
+    const labelValueRows = [...rows].filter(
+      (r) => r.querySelector(".mm-kv-row__label") && r.querySelector(".mm-kv-row__value"),
+    );
+    expect(labelValueRows.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it("stays the inline dotted form (no row markup) on desktop — the mobile branch is opt-in, not the new default", () => {
+    const { container } = renderRegion(BASE, { isMobileOverride: false });
+    expect(container.querySelector('[data-act="machine-detail-rows"]')).toBeNull();
+    expect(container.querySelector(".mm-kv-row")).toBeNull();
+    const kv = container.querySelector(".mm-kv--machine")!;
+    expect(kv.textContent).toContain("limit source physical pool · pool 128.00 GiB");
+  });
 });
 
 /**

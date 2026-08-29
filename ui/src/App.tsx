@@ -1,4 +1,5 @@
 import { useMemo, useRef, useEffect } from "react";
+import { useIsMobile } from "./hooks/useIsMobile";
 import { useHashRoute } from "./lib/useHashRoute";
 import { getSource } from "./lib/source";
 import { useDay } from "./hooks/useDay";
@@ -9,6 +10,7 @@ import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
 import { Masthead } from "./components/Masthead";
+import { MachineDrawer } from "./components/MachineDrawer";
 import { EventLogColumn } from "./components/EventLogColumn";
 import { LensErrorBoundary } from "./components/LensErrorBoundary";
 import { MachineLens } from "./lenses/machine/MachineLens";
@@ -105,6 +107,14 @@ import type { Route } from "./lib/route";
 export function App() {
   const route = useHashRoute();
   const nowMs = Date.now();
+  // (#2107 tabbed-drawer packet) The SAME phone/desktop call
+  // `MachineDrawer.tsx` makes internally (see that file's own doc) —
+  // needed here too, since a phone route's events pane now lives INSIDE
+  // the drawer's own Events tab rather than in this file's inline
+  // `EventLogColumn` mount below. Two independent measurements of the
+  // same `window.innerWidth`, deliberately (see `useIsMobile`'s own doc
+  // for why that's the right call, not a shared subscription).
+  const isMobile = useIsMobile();
 
   // (Packet 5) The SSE tail + reconcile backstop + date-rollover handler —
   // gated by `isLiveRoute` (see that function's own doc) so a genuinely
@@ -210,6 +220,34 @@ export function App() {
     const el = stickyRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
     const apply = () => el.parentElement?.style.setProperty("--chrome-h", `${Math.round(el.getBoundingClientRect().height)}px`);
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // (#2108, operator finding — real device) The masthead's own measured
+  // height feeds `--masthead-h`, so the phone drawer can cap its OPEN
+  // height and never draw its top edge over the logo row — a fixed 88vh
+  // covered the masthead on a real iPhone, where the ~64px the backdrop's
+  // own scrim clearance assumed wasn't quite what the real masthead
+  // rendered at. Queried directly by class rather than via a ref threaded
+  // through `<Masthead>` — that component's DOM is a parity-golden
+  // surface (`no-danger.test.ts` et al.); a `ref` prop wouldn't change
+  // its rendered output, but this keeps that file from needing to know
+  // about a purely-measurement need elsewhere. Same `ResizeObserver`
+  // pattern as `--chrome-h` above; set on `documentElement` rather than
+  // `.app-shell` since `PhoneDrawer`'s sheet is `position: fixed` and a
+  // custom property only needs to be somewhere in its ancestor chain —
+  // the root is the least assumption-laden place for that.
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined") return undefined;
+    const el = document.querySelector(".masthead");
+    if (!el) return undefined;
+    const apply = () =>
+      document.documentElement.style.setProperty(
+        "--masthead-h",
+        `${Math.round(el.getBoundingClientRect().height)}px`,
+      );
     apply();
     const ro = new ResizeObserver(apply);
     ro.observe(el);
@@ -346,12 +384,48 @@ export function App() {
           to live on this line) now lives there instead. Precedes
           `.app-shell__crumbbar`, matching legacy's DOM order (`.top` before
           `.crumbbar`). */}
-      <Masthead route={displayRoute} liveStatus={liveStatus} specs={specs} replayDate={route.kind === "playback" ? null : replayDate} />
-      {/* (#2071) The sticky block: the tab strip plus, while a day is loaded,
-          the playback transport. Operator decision: sticky row, tabs
-          included; the masthead, crumb and meta line scroll away. Its height
-          is route-independent by construction (the meta line is NOT in it),
-          which is what stopped the 32px tab-strip jump between routes. */}
+      <Masthead route={displayRoute} liveStatus={liveStatus} replayDate={route.kind === "playback" ? null : replayDate} />
+      {/* (#2107) Global machine-stats pill/drawer — a SIBLING of `<Masthead>`,
+          not a child of it, so it can never touch that component's own
+          byte-parity-golden DOM (see `Masthead.tsx`'s doc). Fixed-position
+          via CSS, so it renders identically regardless of where in the DOM
+          it sits. Reads the SAME `routeRecords`/`flowWindow`/`localUid`
+          this file already resolves for the meta line and the machine
+          lens — cache reuse, not a second fetch; see
+          `lib/machineDrawerScope.ts` for the mission/dispatch-vs-rolling-
+          window scope rule.
+
+          (#2107 tabbed-drawer packet) The `eventLog*` props are the SAME
+          values the inline `<EventLogColumn>` mount below receives —
+          `MachineDrawer` only actually uses them on a phone route, where
+          they become the drawer's Events tab (see that component's own
+          doc), and ignores them entirely on desktop. Passed
+          unconditionally rather than gated here too, since the cost is a
+          few extra props on an already-cheap render, not a second fetch. */}
+      <MachineDrawer
+        route={route}
+        routeRecords={routeRecords.records}
+        flowWindow={flowWindow.data}
+        localUid={localUid}
+        liveMachines={liveMachines}
+        specs={specs}
+        liveStatus={liveStatus}
+        eventLogRecords={eventLogRecords}
+        eventLogScopeLabel={logscope}
+        eventLogVisible={showsEventLog(route)}
+        eventLogLoading={routeRecords.loading}
+        eventLogError={routeRecords.error}
+        eventLogHistorical={routeRecords.historical}
+      />
+      {/* (#2071, superseded by #2108 rounds 1+2 below) Originally: sticky row
+          holds only the tab strip + transport; the masthead, crumb and meta
+          line scroll away, and the row's height is route-independent
+          because the meta line is NOT in it. Both crumb and meta have since
+          moved into this row (see their own doc comments a few lines down)
+          — the masthead is the only chrome still left scrolling away above
+          it. Kept as history rather than deleted: it's the reasoning that
+          stopped the original 32px tab-strip jump, still worth knowing when
+          touching this row again. */}
       <div className="app-shell__sticky" ref={stickyRef}>
         <NavChrome route={route} />
         {transportShown ? (
@@ -369,14 +443,56 @@ export function App() {
             totalCount={transport.totalCount}
           />
         ) : null}
-      </div>
-      <div className="app-shell__crumbbar">
+        {/* (#2108, operator finding — desktop tab-row fold) `#crumb` moved
+            HERE from its old home in `.app-shell__crumbbar` — on desktop it
+            now reads on the SAME row as the tabs ("subtitle folded into the
+            tab row"), a real DOM move (not a CSS trick), safe for parity
+            since the extractor selects `#crumb` BY ID regardless of parent
+            (this file's own module doc, Packet 1.5). `styles.css`'s mobile
+            override puts crumb back on its OWN row below the tabs —
+            "phones keep two rows". */}
         {/* (#2073) `is-replay`: on a playback route the crumb repeats the
             meta line's own lead (`◆ <mission>`); the narrow stylesheet drops
             this copy, where a phone has no room for the same name twice. */}
-        <header className={`app-shell__crumb${route.kind === "playback" ? " is-replay" : ""}`} id="crumb">
-          {crumb}
-        </header>
+        {/* (operator finding, phone screenshot) `route.kind === "machine"` is
+            excluded from rendering `#crumb` AT ALL — not just emptied. The
+            #2108 round-N "desktop tab-row fold" comment above USED to claim
+            the machine-name crumb was handled by folding it into the tab
+            row; that only changed WHERE it sat, never WHETHER it rendered,
+            and the mobile-only override two rules below
+            (`.app-shell__crumb { flex: 1 1 100%; }`, `styles.css`) gives an
+            in-DOM `#crumb` its own full-width row regardless of whether its
+            text is empty or "MacBook-Pro" — a real element in a `gap`-ed
+            flex row still consumes a gap slot even with zero text. So the
+            machine name kept showing as a whole standalone line on a phone,
+            directly above `MachineLens`'s own `.machine-lens__hdr`
+            breadcrumb ("fleet › machine — <spec>", which already dropped
+            its OWN copy of the name for exactly this reason — see that
+            component's own doc). Root cause was DOM presence, not text
+            content, hence unmounting the element here rather than returning
+            `crumb: ""` from `routeChrome`'s `machine` branch (which still
+            feeds `logscope`, used elsewhere, and is left untouched).
+            `tests/parity/next-parity.spec.ts`'s machine-lens goldens are
+            updated to match — see that file's own `normalizeMachineCrumb`
+            doc for the byte-parity side of this call. */}
+        {route.kind !== "machine" && (
+          <header className={`app-shell__crumb${route.kind === "playback" ? " is-replay" : ""}`} id="crumb">
+            {crumb}
+          </header>
+        )}
+        {/* (#2108, operator finding — round 2) `#meta` moved HERE too, from
+            the now-deleted `.app-shell__crumbbar` wrapper, so the "N ⚙ ·
+            last dispatch …" summary shares the tab row with the tabs and
+            `#crumb` instead of sitting on its own full-height row beneath
+            it. This SUPERSEDES the other half of the #2071 sticky packet's
+            original call ("masthead, crumb AND meta line scroll away") —
+            round 1 already moved crumb into the sticky row; meta joining it
+            here means the whole row, meta included, is sticky now. `#meta`
+            keeps its own id/content (pure DOM move, parity-safe same as
+            crumb's move above). `.app-shell__meta`'s existing
+            `margin-left: auto` is what pins it to the right of the row;
+            `styles.css`'s mobile override gives it back its OWN row below
+            crumb, same "phones keep two rows" treatment. */}
         <div className="app-shell__meta" id="meta">
           {/* `whiteSpace: "pre"` — the idle headline's literal double space
               before "· last run" (see `metaLine.ts`'s module doc) is an
@@ -407,14 +523,30 @@ export function App() {
           of the always-rendered standalone span this file used to have —
           see that component's own doc for why: rendering it loose above the
           stage regardless of lens produced the stray uppercase "FLEET" the
-          operator caught) is ALWAYS mounted — `visible={showsEventLog(route)}`
-          toggles a CSS `display:none` class on it instead of conditionally
-          unmounting (see `EventLogColumn.tsx`'s own `visible` doc for why
-          unmounting is wrong: legacy's real `#logscope` stays present, with
-          real text, even when its ancestor is hidden — `next-parity.spec.ts`'s
-          byte-parity goldens for the machine lens depend on that). A hidden
-          flex item doesn't consume row width, so `#stage` still fills the
-          row on its own — no separate CSS class needed here. */}
+          operator caught) is ALWAYS mounted on DESKTOP —
+          `visible={showsEventLog(route)}` toggles a CSS `display:none`
+          class on it instead of conditionally unmounting (see
+          `EventLogColumn.tsx`'s own `visible` doc for why unmounting is
+          wrong: legacy's real `#logscope` stays present, with real text,
+          even when its ancestor is hidden — `next-parity.spec.ts`'s
+          byte-parity goldens for the machine lens depend on that — those
+          goldens are captured at a desktop viewport, so gating this mount
+          on `!isMobile` below never touches them). A hidden flex item
+          doesn't consume row width, so `#stage` still fills the row on its
+          own — no separate CSS class needed here.
+
+          (#2107 tabbed-drawer packet) On a PHONE this mount is gone
+          entirely — not CSS-hidden, actually unmounted — because the
+          events pane now lives inside `<MachineDrawer>`'s own Events tab
+          (`PhoneDrawer.tsx`), fed the identical `eventLog*` props passed
+          to `MachineDrawer` above. Two live mounts of the same pane at
+          once would fight over `dialogManager`'s `modalbg` id and over
+          which one "the" event log is; only one of {this mount, the
+          drawer's} is ever actually in the DOM for a given viewport. This
+          is also the "remove the inline section from the page flow on
+          phones so the lens above gets the full height" requirement — the
+          lens in `#stage` is no longer followed by a full-width event-log
+          section pushing the page's scroll further down. */}
       <div className="app-shell__content">
         <main className="app-shell__stage" id="stage">
           {/* (#2027) There was no error boundary anywhere in this app, so ANY
@@ -432,14 +564,16 @@ export function App() {
             {renderRoute(route, playhead)}
           </LensErrorBoundary>
         </main>
-        <EventLogColumn
-          scopeLabel={logscope}
-          records={eventLogRecords}
-          visible={showsEventLog(route)}
-          loading={routeRecords.loading}
-          error={routeRecords.error}
-          historical={routeRecords.historical}
-        />
+        {!isMobile && (
+          <EventLogColumn
+            scopeLabel={logscope}
+            records={eventLogRecords}
+            visible={showsEventLog(route)}
+            loading={routeRecords.loading}
+            error={routeRecords.error}
+            historical={routeRecords.historical}
+          />
+        )}
       </div>
     </div>
   );

@@ -716,6 +716,11 @@ mod tests {
             cfg.runtime.as_ref().and_then(|r| r.model_load_timeout_seconds),
             Some(600)
         );
+        // (#2107, #1833) The daemon host-sampler cadence ships visible too.
+        assert_eq!(
+            cfg.runtime.as_ref().and_then(|r| r.host_sampler_interval_ms),
+            Some(5000)
+        );
         // (#2093) The hooks feature block ships visible + off, same pattern.
         assert_eq!(cfg.hooks.as_ref().and_then(|h| h.enabled), Some(false));
         // The written config personalizes machine_id away from the placeholder.

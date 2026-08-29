@@ -634,6 +634,17 @@ pub fn turn_delay_ms() -> u64 {
     pick_parsed("DARKMUX_TURN_DELAY_MS", cfg, Some(0)).unwrap()
 }
 
+/// (#2107, #1833) Cadence, in milliseconds, of `darkmux serve`'s daemon-side
+/// continuous host sampler (the machine stats drawer's live feed). Resolves
+/// `env(DARKMUX_HOST_SAMPLER_INTERVAL_MS) > config.runtime.
+/// host_sampler_interval_ms > 5000` — mirrors `turn_delay_ms`'s wiring
+/// exactly. `0` disables the sampler entirely (an explicit opt-out, same
+/// convention as `remote.max_tokens_per_execution`'s `0`).
+pub fn host_sampler_interval_ms() -> u64 {
+    let cfg = config().runtime.as_ref().and_then(|r| r.host_sampler_interval_ms);
+    pick_parsed("DARKMUX_HOST_SAMPLER_INTERVAL_MS", cfg, Some(5000)).unwrap()
+}
+
 // ── Mission board (#1230 Packet 5) ──
 /// How many days an Active mission may sit with zero `Complete` phases
 /// before `darkmux mission status`'s drift detector flags it as stale.
@@ -1053,6 +1064,32 @@ mod tests {
         // An unparseable env value falls through (here, to the default).
         unsafe { std::env::set_var(k, "not-a-number") };
         assert_eq!(turn_delay_ms(), 0);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── host_sampler_interval_ms (#2107, #1833): env > config > 5000
+    //    default, mirroring turn_delay_ms's resolution exactly ──
+    #[serial_test::serial]
+    #[test]
+    fn host_sampler_interval_ms_env_overrides_then_default() {
+        let k = "DARKMUX_HOST_SAMPLER_INTERVAL_MS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        // No env + the empty test config (#811) → the built-in 5000ms default.
+        assert_eq!(host_sampler_interval_ms(), 5000);
+        unsafe { std::env::set_var(k, "2000") };
+        assert_eq!(host_sampler_interval_ms(), 2000, "env wins live");
+        // `0` is a real, honored value — the explicit disable.
+        unsafe { std::env::set_var(k, "0") };
+        assert_eq!(host_sampler_interval_ms(), 0, "0 disables the sampler");
+        // An unparseable env value falls through (here, to the default).
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(host_sampler_interval_ms(), 5000);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

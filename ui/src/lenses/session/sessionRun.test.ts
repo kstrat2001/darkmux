@@ -241,12 +241,12 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
     expect(view.modelTrackLines).toEqual(["a · 10GB", "b · 20GB"]);
   });
 
-  it("(#1973) host CPU/RAM/GPU PEAKS land in the system pane", () => {
+  it("(#1973, revised #2107) host CPU/RAM/GPU land in the system pane as avg + high", () => {
     // This telemetry was fetched and discarded (`void procs`) with a comment
-    // parking it for "a future packet". PEAK, not latest: the question a
-    // local-AI operator asks of a finished run is whether it saturated the
-    // machine, and a last sample taken after the model stopped answers
-    // nothing.
+    // parking it for "a future packet". `high` (the pre-#2107 "PEAK") alone
+    // answered whether the machine ever saturated; `avg` answers how hard it
+    // was driven ON AVERAGE — the operator's own framing ("add the avg to
+    // the card with the high").
     const proc = (ts: string, cpu: number, mem: number, gpu: number) => ({
       ts,
       session_id: "s1",
@@ -259,17 +259,19 @@ describe("runRegions — pure-logic unit coverage beyond the one recorded corpus
       proc("2026-01-01T00:00:10Z", 30, 60, 20),
       proc("2026-01-01T00:00:20Z", 39, 68, 97),
       // A LATER, lower sample — a "latest" reading would report 12% GPU on a
-      // run that pegged it at 97.
+      // run that pegged it at 97; `high` must still say 97.
       proc("2026-01-01T00:00:30Z", 12, 61, 12),
       { ts: "2026-01-01T00:01:00Z", session_id: "s1", action: "dispatch.complete", payload: {} },
     ];
     const view = runRegions(flowToRenderModel(data), "s1");
     const byLabel = (l: string) => view.metrics[view.metricScope.system.find((i) => view.metrics[i].label === l) ?? -1]?.value;
-    expect(byLabel("CPU PEAK")).toBe("39%");
-    expect(byLabel("RAM PEAK")).toBe("68%");
-    expect(byLabel("GPU PEAK")).toBe("97%");
+    // cpu [30,39,12]: avg 27, high 39. mem [60,68,61]: avg 63, high 68.
+    // gpu [20,97,12]: avg 43, high 97.
+    expect(byLabel("CPU")).toBe("27% avg · 39% high");
+    expect(byLabel("RAM")).toBe("63% avg · 68% high");
+    expect(byLabel("GPU")).toBe("43% avg · 97% high");
     // ...and they are HARNESS facts, not the model's own work.
-    expect(view.metricScope.model.map((i) => view.metrics[i].label)).not.toContain("GPU PEAK");
+    expect(view.metricScope.model.map((i) => view.metrics[i].label)).not.toContain("GPU");
   });
 
   it("(#1973) a run with no host telemetry shows no host tiles rather than zeros", () => {

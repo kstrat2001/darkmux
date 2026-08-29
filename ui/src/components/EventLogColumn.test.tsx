@@ -390,3 +390,174 @@ describe("EventLogColumn", () => {
     expect(document.querySelector(".eventlog")!.className).toMatch(/eventlog--collapsed/);
   });
 });
+
+// ── (#2107 tabbed-drawer packet, restyled #2108 round 5) `pushDetail` —
+// the phone drawer's Events tab interaction model: selecting a record
+// replaces the list with a full-height detail SCREEN. The selected-record
+// strip at its top IS the back control (a separate `.eventlog__back` bar
+// was tried and removed — the operator's own finding, "wastes a row").
+// ───────────────────────────────────────────────────────────────────────
+
+describe("EventLogColumn — pushDetail mode", () => {
+  it("shows the list, not the split detail/list layout, when nothing is selected yet", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({})]} visible pushDetail />);
+    expect(document.querySelector(".eventlog__rec")).not.toBeNull();
+    expect(document.querySelector("#detail")).toBeNull();
+    expect(document.querySelector("#split")).toBeNull();
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+  });
+
+  it("selecting a record replaces the list with a full-height detail screen — the strip IS the back control, no separate bar", () => {
+    const records = [rec({ session_id: "s1" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    const pushed = document.querySelector('[data-act="eventlog-pushed"]');
+    expect(pushed).not.toBeNull();
+    expect(pushed!.textContent).toContain("s1");
+    expect(document.querySelector('[data-act="rec"]')).toBeNull();
+    expect(document.querySelector('[data-act="eventlog-back"]')).toBeNull();
+    const strip = document.querySelector('[data-act="rec-strip"]')!;
+    expect(strip).not.toBeNull();
+    expect(strip.getAttribute("role")).toBe("button");
+    expect(strip.getAttribute("aria-label")).toBe("Back to list");
+    expect(strip.getAttribute("tabindex")).toBe("0");
+  });
+
+  it("tapping the strip returns to the list, and the record stays highlighted as selected", () => {
+    const records = [rec({ session_id: "s1" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    fireEvent.click(document.querySelector('[data-act="rec-strip"]')!);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+    const row = document.querySelector('[data-act="rec"]')!;
+    expect(row).not.toBeNull();
+    expect(row.className).toMatch(/\bsel\b/);
+  });
+
+  it("the strip is keyboard-activatable (Enter/Space), same as any other row", () => {
+    const records = [rec({ session_id: "s1" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).not.toBeNull();
+    fireEvent.keyDown(document.querySelector('[data-act="rec-strip"]')!, { key: "Enter" });
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+  });
+
+  it("omits the collapse rail entirely — collapsing a drawer TAB makes no sense", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[]} visible pushDetail />);
+    expect(document.querySelector('[data-act="togglelog"]')).toBeNull();
+  });
+
+  it("passive follow-latest re-selection never yanks the operator into the pushed detail screen", () => {
+    // Only an explicit tap (`selectRecord`) opens the pushed screen — the
+    // `follow` toggle keeps re-selecting the newest record on every new
+    // event, and doing that in pushDetail mode too would fight any record
+    // the operator is deliberately reading.
+    const { rerender } = render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible pushDetail />);
+    rerender(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" }), rec({ ts: "2026-08-08T12:05:00.000Z", session_id: "s2" })]} visible pushDetail />);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+    expect(document.querySelectorAll('[data-act="rec"]').length).toBe(2);
+  });
+
+  it("closes the pushed detail screen when the pane becomes invisible, so reopening lands on the list", () => {
+    const records = [rec({ session_id: "s1" })];
+    const { rerender } = render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).not.toBeNull();
+    rerender(<EventLogColumn scopeLabel="fleet" records={records} visible={false} pushDetail />);
+    rerender(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+  });
+
+  it("a caller that omits pushDetail keeps the original split layout unchanged (regression guard)", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible />);
+    expect(document.querySelector("#detail")).not.toBeNull();
+    expect(document.querySelector("#split")).not.toBeNull();
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+    expect(document.querySelector('[data-act="rec"]')).not.toBeNull();
+  });
+});
+
+// ── (#2108, operator finding — phone divider + one-tap expand) ──
+//
+// The split bar is re-enabled on the phone-width layout (no longer
+// `display:none` there) with the SAME Pointer Event drag handlers desktop
+// already has, plus a grip + an "Expand"/"Show list" control. These
+// exercise the real component, not the CSS that makes it TALL on a
+// phone (jsdom performs no layout) — see `PhoneDrawer.test.tsx`'s own
+// stylesheet-content tests for that half.
+describe("EventLogColumn — phone divider + one-tap expand (#2108)", () => {
+  function drag(el: Element, startY: number, endY: number) {
+    fireEvent.pointerDown(el, { clientY: startY, pointerId: 1 });
+    fireEvent.pointerMove(el, { clientY: endY, pointerId: 1 });
+    fireEvent.pointerUp(el, { clientY: endY, pointerId: 1 });
+  }
+
+  it("the divider bar is present with its touch-drag handlers, and dragging it resizes the pane", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible />);
+    const split = document.querySelector('[data-act="eventlog-split"]')!;
+    expect(split).not.toBeNull();
+    expect(document.querySelector(".eventlog__split-grip")).not.toBeNull();
+    const detail = document.querySelector("#detail") as HTMLElement;
+    const before = detail.style.flexBasis;
+    drag(split, 300, 100); // drag up — grows the pane
+    expect(detail.style.flexBasis).not.toBe(before);
+  });
+
+  it("dragging the divider persists the ratio to localStorage, scoped by paneId", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible paneId="phone-drawer" />);
+    const split = document.querySelector('[data-act="eventlog-split"]')!;
+    drag(split, 300, 100);
+    expect(window.localStorage.getItem("dmux.eventlog.detailpct.phone-drawer")).not.toBeNull();
+  });
+
+  it("re-mounting with a persisted ratio for this paneId restores it", () => {
+    window.localStorage.setItem("dmux.eventlog.detailpct.phone-drawer", "55");
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible paneId="phone-drawer" />);
+    const detail = document.querySelector("#detail") as HTMLElement;
+    expect(detail.style.flexBasis).toBe("55%");
+  });
+
+  it("the Expand control toggles the pane to fill the sheet and the list to a 1-row strip showing the selected record, then back", () => {
+    const records = [rec({ session_id: "s1", handle: "rec-1" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+
+    const expandBtn = document.querySelector('[data-act="eventlog-expand"]')!;
+    expect(expandBtn.textContent).toBe("Expand");
+    expect(document.querySelector('[data-act="eventlog-list-strip"]')).toBeNull();
+    expect(document.querySelector("#logbody")).not.toBeNull();
+
+    fireEvent.click(expandBtn);
+
+    // Expanded: pane fills (no inline flexBasis — the CSS class takes
+    // over), list collapses to a 1-row strip showing the selected record.
+    const detail = document.querySelector("#detail") as HTMLElement;
+    expect(detail.className).toContain("eventlog__detail--expanded");
+    expect(detail.style.flexBasis).toBe("");
+    expect(document.querySelector("#logbody")).toBeNull();
+    const strip = document.querySelector('[data-act="eventlog-list-strip"]')!;
+    expect(strip).not.toBeNull();
+    expect(strip.querySelector('[data-act="rec-strip"]')).not.toBeNull();
+    expect(expandBtn.textContent).toBe("Show list");
+
+    fireEvent.click(document.querySelector('[data-act="eventlog-expand"]')!);
+
+    // Back: full list restored, pane back to its ratio.
+    expect(document.querySelector("#logbody")).not.toBeNull();
+    expect(document.querySelector('[data-act="eventlog-list-strip"]')).toBeNull();
+    expect(detail.className).not.toContain("eventlog__detail--expanded");
+  });
+
+  it("tapping Expand does not ALSO start a drag on the bar underneath it", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible />);
+    const detail = document.querySelector("#detail") as HTMLElement;
+    const before = detail.style.flexBasis;
+    fireEvent.click(document.querySelector('[data-act="eventlog-expand"]')!);
+    // The pane switched to expanded mode (flexBasis cleared), not to some
+    // arbitrary dragged value — proving no stray drag state leaked in.
+    expect(detail.style.flexBasis).toBe("");
+    expect(before).not.toBe("");
+  });
+});

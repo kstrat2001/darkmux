@@ -42,9 +42,6 @@ mod fleet_cli;
 // re-export keeps all existing `crate::flow::*` paths resolving unchanged.
 pub use darkmux_flow as flow;
 mod flow_cli;
-// `darkmux crawl` command handlers (#1959 packet 1) — split out of main.rs
-// alongside flow_cli/lab_cli.
-mod crawl_cli;
 // #515 — zero-edge leaf extracted to darkmux-hardware. Re-export keeps
 // crate::hardware::* resolving for heuristics/eureka/recommendations/doctor/etc.
 pub use darkmux_hardware as hardware;
@@ -175,7 +172,6 @@ fn run(cmd: Cmd) -> Result<i32> {
             flow_cli::run(sub)?;
             Ok(0)
         }
-        Cmd::Crawl { sub } => crawl_cli::cmd_crawl(sub),
         Cmd::Config { sub } => {
             config_cmd::run(sub)?;
             Ok(0)
@@ -878,7 +874,16 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             start,
             ticket,
         } => mission_propose::propose(from_stdin, from_file.as_deref(), yes, start, ticket.as_deref()),
-        MissionCmd::Launch { config_id, input, params, timeout } => {
+        MissionCmd::Launch { config_id, input, params, timeout, dry_run } => {
+            // (#1959) `--dry-run` reaches every launch path (crawl,
+            // review, generic step-graph) the SAME way any other input
+            // does — a synthetic `--param dry_run=true` appended here,
+            // never a separate function parameter threaded through three
+            // different launcher signatures.
+            let mut params = params;
+            if dry_run {
+                params.push("dry_run=true".to_string());
+            }
             mission_launch::launch(&config_id, input.as_deref(), &params, timeout)
         }
         MissionCmd::AddPhase {
@@ -1393,6 +1398,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     };
     let opts = crew::dispatch::DispatchOpts {
         workspace_read_only: false,
+        record_context: None,
         role_id: role,
         message,
         session_id,

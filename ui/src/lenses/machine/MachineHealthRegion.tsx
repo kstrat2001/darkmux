@@ -27,6 +27,8 @@ import {
 } from "./machineGauge";
 import { memBytes, reclaimableNote } from "../../lib/format";
 import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
+import { Meter, CX, type MeterBand, type MeterTick } from "../../components/Meter";
+import { useIsMobile } from "../../hooks/useIsMobile";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
 /**
@@ -67,11 +69,10 @@ import type { MachineResources, MachineResourcesModel } from "../../types/handwr
  */
 
 // ── The gauge (SVG semicircle hero) ─────────────────────────────────────
-
-const CX = 120;
-const CY = 120;
-const R = 86;
-const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
+//
+// `CX`/`CY`/`R`/`HALF_ARC_D` now live in `../../components/Meter` — the
+// shared dial geometry every caller (this one included) draws from. See
+// that file's own doc for the extraction's full reasoning.
 
 /** The arc ramp's gradient id. One gauge renders per page, so a fixed id is
  * safe; it is named rather than generated so the same string can be asserted
@@ -173,141 +174,94 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
     .filter(Boolean)
     .join(" ");
 
+  // (extraction packet) Every VRAM-specific decoration this dial draws,
+  // handed to the shared `<Meter>` as data rather than inline JSX — see
+  // that component's own doc for the full reasoning. The RENDER OUTPUT
+  // this produces is byte-identical to the pre-extraction JSX; only where
+  // the markup is now assembled moved.
+  const bands: MeterBand[] = [
+    // ONE STACKED BAND, in scale order: darkmux from 0, everything else on
+    // top of it ending at the needle, then darkmux's committed growth
+    // beyond. Stacking is what restores ADDITIVITY — this page's question
+    // is "will it fit", which is a sum, and two concentric rings could show
+    // every part but never the total. It also makes `other` visible at
+    // last: as a span between darkmux's end and the needle, its derivedness
+    // is self-evident, where as an undrawn gap between two radii it was
+    // simply missing.
+    { className: "mm-gauge-val", stroke: `url(#${RAMP_ID})`, lengthPct: band.darkmux.lengthPct, alwaysRender: true },
+    { className: "mm-gauge-other", stroke: `url(#${RAMP_ID})`, lengthPct: band.other.lengthPct, startPct: band.other.startPct },
+    { className: "mm-gauge-growth", lengthPct: band.growth.lengthPct, hatchedDasharray: hatchedSegmentDash(band.growth.startPct, band.growth.lengthPct) },
+  ];
+  const ticks: MeterTick[] = geo.ticks.map((t, i) => ({
+    pct: t.pct,
+    label: t.label,
+    labelX: TICK_LABEL_XY[i][0],
+    labelY: TICK_LABEL_XY[i][1],
+  }));
+
   return (
-    <div className="mm-gauge">
-      <svg width="300" height="212" viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
-        {/* The color ramp lives across the arc's SWEEP, not in any figure
-            about the machine — laid across the arc's bounding box in user
-            space so it is independent of how much of the arc is filled. */}
-        <defs>
-          <linearGradient id={RAMP_ID} gradientUnits="userSpaceOnUse" x1={CX - R} y1={0} x2={CX + R} y2={0}>
-            {gaugeRampStops().map((s) => (
-              <stop key={s.offset} offset={s.offset} stopColor={s.color} />
-            ))}
-          </linearGradient>
-        </defs>
-        <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={11} pathLength={100} />
-        {/* ONE STACKED BAND, in scale order: darkmux from 0, everything
-            else on top of it ending at the needle, then darkmux's committed
-            growth beyond. Stacking is what restores ADDITIVITY — this page's
-            question is "will it fit", which is a sum, and two concentric
-            rings could show every part but never the total. It also makes
-            `other` visible at last: as a span between darkmux's end and the
-            needle, its derivedness is self-evident, where as an undrawn gap
-            between two radii it was simply missing. */}
-        <path
-          className="mm-gauge-val"
-          stroke={`url(#${RAMP_ID})`}
-          d={HALF_ARC_D}
-          fill="none"
-          strokeWidth={11}
-          pathLength={100}
-          strokeDasharray={`${band.darkmux.lengthPct} 100`}
-        />
-        {band.other.lengthPct > 0 && (
-          <path
-            className="mm-gauge-other"
-            stroke={`url(#${RAMP_ID})`}
-            d={HALF_ARC_D}
-            fill="none"
-            strokeWidth={11}
-            pathLength={100}
-            strokeDasharray={`${band.other.lengthPct} 100`}
-            strokeDashoffset={-band.other.startPct}
-          />
+    <Meter
+      wrapperClassName="mm-gauge"
+      ariaLabel={ariaLabel}
+      gradient={{ id: RAMP_ID, stops: gaugeRampStops() }}
+      bands={bands}
+      ticks={ticks}
+      scaleWord={geo.scaleWord}
+      redline={{ lit }}
+      needleAngleDeg={band.needleAngleDeg}
+    >
+      {/* Seven-segment, drawn as polygons in the SAME cell geometry the
+          boxed odometer used, so the figure still centers on the hub and
+          the unit still sits where it sat. `currentColor` keeps color
+          with the CSS (`.mm-gauge-center-val`) rather than moving it into
+          the component — the glyph form is what changed here, not the
+          palette. */}
+      <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
+        {odo.cells.map((c, i) =>
+          isSevenSegDot(c.ch) ? (
+            <circle
+              key={i}
+              className="mm-gauge-odo-cell"
+              cx={c.x + c.w / 2}
+              cy={ODO_TOP + ODO_H - 3.5}
+              r={1.7}
+              fill="currentColor"
+            />
+          ) : (
+            <g
+              key={i}
+              className="mm-gauge-odo-cell"
+              transform={`translate(${c.x} ${ODO_TOP}) scale(${c.w / SEVEN_SEG_CELL.w} ${ODO_H / SEVEN_SEG_CELL.h})`}
+            >
+              {sevenSegmentPolygons(c.ch).map((sg, j) => (
+                <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
+              ))}
+            </g>
+          ),
         )}
-        {band.growth.lengthPct > 0 && (
-          <path
-            className="mm-gauge-growth"
-            d={HALF_ARC_D}
-            fill="none"
-            strokeWidth={11}
-            pathLength={100}
-            strokeDasharray={hatchedSegmentDash(band.growth.startPct, band.growth.lengthPct)}
-          />
-        )}
-        {geo.ticks.map((t) => (
-          <line key={t.pct} className="mm-gauge-tick" x1={30} y1={CY} x2={38} y2={CY} transform={`rotate(${t.pct * 1.8} ${CX} ${CY})`} />
-        ))}
-        {geo.ticks.map((t, i) => (
-          <text key={t.pct} className="mm-gauge-scale-label" x={TICK_LABEL_XY[i][0]} y={TICK_LABEL_XY[i][1]} textAnchor="middle">
-            {t.label}
-          </text>
-        ))}
-        <text className="mm-gauge-scale-word" x={220} y={146} textAnchor="middle">
-          {geo.scaleWord}
+        <text className="mm-gauge-center-unit" x={CX + odo.width / 2 + 5} y={ODO_BASELINE} textAnchor="start">
+          {centerVal.unit}
         </text>
-        <path
-          className={`mm-gauge-redline${lit ? " lit" : ""}`}
-          d={HALF_ARC_D}
-          fill="none"
-          strokeWidth={11}
-          pathLength={100}
-          strokeDasharray="2.5 100"
-          strokeDashoffset="-97.5"
-        />
-        {/* The needle is deliberately UNCOLORED by state. It used to carry
-            `is-${stateCls}`, which on a real machine means `is-unknown` — a dim
-            gray needle over a dim gray fill, permanently (provenance finding
-            1). Position is the needle's whole job; the fill beside it now
-            carries the how-full channel and the lamps carry the verdict, so a
-            third, permanently-gray encoding of the same question is subtraction
-            rather than information. */}
-        <line className="mm-gauge-needle" x1={CX} y1={CY} x2={42} y2={CY} transform={`rotate(${band.needleAngleDeg} ${CX} ${CY})`} />
-        <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
-        <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
-          {/* Seven-segment, drawn as polygons in the SAME cell geometry the
-              boxed odometer used, so the figure still centers on the hub and
-              the unit still sits where it sat. `currentColor` keeps color
-              with the CSS (`.mm-gauge-center-val`) rather than moving it into
-              the component — the glyph form is what changed here, not the
-              palette. */}
-          {odo.cells.map((c, i) =>
-            isSevenSegDot(c.ch) ? (
-              <circle
-                key={i}
-                className="mm-gauge-odo-cell"
-                cx={c.x + c.w / 2}
-                cy={ODO_TOP + ODO_H - 3.5}
-                r={1.7}
-                fill="currentColor"
-              />
-            ) : (
-              <g
-                key={i}
-                className="mm-gauge-odo-cell"
-                transform={`translate(${c.x} ${ODO_TOP}) scale(${c.w / SEVEN_SEG_CELL.w} ${ODO_H / SEVEN_SEG_CELL.h})`}
-              >
-                {sevenSegmentPolygons(c.ch).map((sg, j) => (
-                  <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
-                ))}
-              </g>
-            ),
-          )}
-          <text className="mm-gauge-center-unit" x={CX + odo.width / 2 + 5} y={ODO_BASELINE} textAnchor="start">
-            {centerVal.unit}
-          </text>
-        </g>
-        {/* Rendered only when there IS a reason — see `gaugeFaceCaption`.
-            The slot exists to name which disjunct put the machine in Red,
-            beneath the reading where the eye already is; in every other
-            state it used to say `IN USE`, restating the one thing a needle
-            over a 0→LIMIT scale cannot fail to communicate. */}
-        {/* The readout's own subject label. `IN USE` was deleted as noise when
-            the dial had ONE subject and the caption restated the obvious.
-            With a machine ring and a darkmux ring on one face, naming which
-            one the big number belongs to is no longer restatement — it is the
-            difference between two readings. */}
-        <text className="mm-gauge-readout-label" x={CX} y={164} textAnchor="middle">
-          MACHINE USED
+      </g>
+      {/* Rendered only when there IS a reason — see `gaugeFaceCaption`.
+          The slot exists to name which disjunct put the machine in Red,
+          beneath the reading where the eye already is; in every other
+          state it used to say `IN USE`, restating the one thing a needle
+          over a 0→LIMIT scale cannot fail to communicate. */}
+      {/* The readout's own subject label. `IN USE` was deleted as noise when
+          the dial had ONE subject and the caption restated the obvious.
+          With a machine ring and a darkmux ring on one face, naming which
+          one the big number belongs to is no longer restatement — it is the
+          difference between two readings. */}
+      <text className="mm-gauge-readout-label" x={CX} y={164} textAnchor="middle">
+        MACHINE USED
+      </text>
+      {faceCaption && (
+        <text className="mm-gauge-center-caption" x={CX} y={176} textAnchor="middle">
+          {faceCaption}
         </text>
-        {faceCaption && (
-          <text className="mm-gauge-center-caption" x={CX} y={176} textAnchor="middle">
-            {faceCaption}
-          </text>
-        )}
-      </svg>
-    </div>
+      )}
+    </Meter>
   );
 }
 
@@ -683,6 +637,12 @@ export interface HealthRegionProps {
    * see `isUtilityTierRow`'s doc for why the caller pre-filters to just
    * the resident case. */
   utilityModelId?: string | null;
+  /** (#2108, operator finding) Test-only override for the mobile/desktop
+   * ledger-summary split below — production omits this and measures
+   * `window.innerWidth` via `useIsMobile` (see that hook's own doc; the
+   * SAME 768px breakpoint `MachineDrawer.tsx`/`PhoneDrawer.tsx` key their
+   * own phone skin off). */
+  isMobileOverride?: boolean;
 }
 
 export function MachineHealthRegion({
@@ -694,7 +654,10 @@ export function MachineHealthRegion({
   residencyChanged = false,
   nowMs = Date.now(),
   utilityModelId = null,
+  isMobileOverride,
 }: HealthRegionProps) {
+  const measuredIsMobile = useIsMobile();
+  const isMobile = isMobileOverride ?? measuredIsMobile;
   if (!isLocalMach) {
     return (
       <div className="memcard">
@@ -751,54 +714,128 @@ export function MachineHealthRegion({
           always computed in binary), and relabelling that one token is gated on
           retiring the machine stage's last byte-exact parity tie to legacy.
           Operator call, still not a drive-by. */}
-      <div className="mm-kv mm-kv--machine">
-        {/* #1821 (operator-approved naming): this row used to read
-            `pool free <memBytes(pool.available_bytes)>` — truly-free pages,
-            sitting a few inches from a "% free" pressure tile that measured
-            something else entirely (82% margin vs 30.8% truly-free, same
-            instant). `used` and `available` now name what they actually
-            are; `available` (the colloquial "how much is left" —
-            free + inactive + speculative) is the headline figure in the
-            slot `pool free` used to occupy. Truly-free pages (`free_bytes`)
-            stay in the payload but are deliberately NOT given prime space
-            here — two figures both reading as "how much is left" was the
-            defect being fixed, not something to preserve under a new name. */}
-        limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b>{" "}
-        · used <b>{memBytes(b.pool?.used_bytes)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>
-        {reclaimableNote(b.pool?.available_bytes, b.pool?.free_bytes)}{" "}
-        · unpriced{" "}
-        {/* A non-breaking space, not a plain one: this k/v strip is a flat text
-            run with no per-pair element, so the browser may break at ANY space
-            in it — and at the wider type scale it chose the one INSIDE this
-            value, rendering `unpriced 0` on one line and `models` alone on the
-            next. A count severed from its unit is the same defect as a label
-            severed from its value (#2000), just produced by inline wrapping
-            rather than by a grid.
-
-            Scoped to the counts rather than `white-space: nowrap` on every
-            `<b>`: other values in this strip are phrases, not short tokens,
-            and must stay breakable or they overflow a phone. */}
-        <b>
-          {Number(b.machine.unpriced_models) || 0}&nbsp;model{Number(b.machine.unpriced_models) === 1 ? "" : "s"}
-        </b>
-        {/* #1819: the same row that already discloses the genuinely-unpriced
-            count discloses the ESTIMATED count too — a different fact
-            (counted, but via a labeled guess, not a measurement), stated
-            beside it rather than folded into the same number. Omitted
-            entirely when zero, matching the unpriced clause's own
-            always-present-but-usually-zero shape being the one exception
-            worth keeping (unpriced is a structural row; estimated only
-            earns its place on the page when it's actually true). */}
-        {Number(b.machine.estimated_models) > 0 && (
+      {/* (#2108, operator finding) A phone found this row's dotted inline
+          form — "limit source physical pool · pool 128.00 GiB · used … ·
+          available … (… reclaimable) · unpriced 0 models" — wrapping into
+          four ragged lines with the ` · ` separators landing mid-line. On
+          a narrow viewport (`useIsMobile`, the SAME 768px breakpoint the
+          drawer keys its own phone skin off) this renders the identical
+          FACTS as a definition-style list instead — one row per item,
+          muted label left, bold value right — rather than one long
+          wrapping run; desktop keeps the inline dotted form unchanged.
+          Every string is computed ONCE (`unpricedValue`/`estimatedValue`/
+          `reclaim` below) and reused by both branches, so the two forms
+          can never drift apart on the actual numbers, only on layout. */}
+      {(() => {
+        const unpricedCount = Number(b.machine.unpriced_models) || 0;
+        const estimatedCount = Number(b.machine.estimated_models) || 0;
+        const reclaim = reclaimableNote(b.pool?.available_bytes, b.pool?.free_bytes);
+        // A non-breaking space, not a plain one: a count severed from its
+        // unit ("0" alone on one line, "models" on the next) is the same
+        // defect as a label severed from its value (#2000) — see the
+        // desktop branch's own historical note below for the wrapping
+        // case this originally guarded.
+        const unpricedValue = (
           <>
-            {" "}
-            · estimated{" "}
-            <b>
-              {b.machine.estimated_models}&nbsp;model{b.machine.estimated_models === 1 ? "" : "s"}
-            </b>
+            {unpricedCount}&nbsp;model{unpricedCount === 1 ? "" : "s"}
           </>
-        )}
-      </div>
+        );
+        const estimatedValue = (
+          <>
+            {estimatedCount}&nbsp;model{estimatedCount === 1 ? "" : "s"}
+          </>
+        );
+
+        if (isMobile) {
+          return (
+            <div className="mm-kv mm-kv--machine mm-kv--machine-mobile" data-act="machine-detail-rows">
+              <div className="mm-kv-row">
+                <span className="mm-kv-row__label">limit source</span>
+                <span className="mm-kv-row__value">{limitDescription(b.limit_source)}</span>
+              </div>
+              <div className="mm-kv-row">
+                <span className="mm-kv-row__label">pool</span>
+                <span className="mm-kv-row__value">{memBytes(b.pool?.capacity_bytes)}</span>
+              </div>
+              <div className="mm-kv-row">
+                <span className="mm-kv-row__label">used</span>
+                <span className="mm-kv-row__value">{memBytes(b.pool?.used_bytes)}</span>
+              </div>
+              <div className="mm-kv-row">
+                <span className="mm-kv-row__label">available</span>
+                <span className="mm-kv-row__value">{memBytes(b.pool?.available_bytes)}</span>
+              </div>
+              {/* The overlap parenthetical, as its OWN row under `available`
+                  rather than folded onto that row's already-tight two-column
+                  line — it is a secondary, explanatory fact, not a fourth
+                  column. Trimmed of its wrapping parens/space (desktop's own
+                  inline form keeps them, since there it reads as a trailing
+                  parenthetical, not a standalone line). */}
+              {reclaim && (
+                <div className="mm-kv-row mm-kv-row--note">
+                  {reclaim.replace(/^\s*\(|\)\s*$/g, "")}
+                </div>
+              )}
+              <div className="mm-kv-row">
+                <span className="mm-kv-row__label">unpriced</span>
+                <span className="mm-kv-row__value">{unpricedValue}</span>
+              </div>
+              {estimatedCount > 0 && (
+                <div className="mm-kv-row">
+                  <span className="mm-kv-row__label">estimated</span>
+                  <span className="mm-kv-row__value">{estimatedValue}</span>
+                </div>
+              )}
+            </div>
+          );
+        }
+
+        return (
+          <div className="mm-kv mm-kv--machine">
+            {/* #1821 (operator-approved naming): this row used to read
+                `pool free <memBytes(pool.available_bytes)>` — truly-free pages,
+                sitting a few inches from a "% free" pressure tile that measured
+                something else entirely (82% margin vs 30.8% truly-free, same
+                instant). `used` and `available` now name what they actually
+                are; `available` (the colloquial "how much is left" —
+                free + inactive + speculative) is the headline figure in the
+                slot `pool free` used to occupy. Truly-free pages (`free_bytes`)
+                stay in the payload but are deliberately NOT given prime space
+                here — two figures both reading as "how much is left" was the
+                defect being fixed, not something to preserve under a new name. */}
+            limit source <b>{limitDescription(b.limit_source)}</b> · pool <b>{memBytes(b.pool?.capacity_bytes)}</b>{" "}
+            · used <b>{memBytes(b.pool?.used_bytes)}</b> · available <b>{memBytes(b.pool?.available_bytes)}</b>
+            {reclaim}{" "}
+            · unpriced{" "}
+            {/* A non-breaking space, not a plain one: this k/v strip is a flat text
+                run with no per-pair element, so the browser may break at ANY space
+                in it — and at the wider type scale it chose the one INSIDE this
+                value, rendering `unpriced 0` on one line and `models` alone on the
+                next. A count severed from its unit is the same defect as a label
+                severed from its value (#2000), just produced by inline wrapping
+                rather than by a grid.
+
+                Scoped to the counts rather than `white-space: nowrap` on every
+                `<b>`: other values in this strip are phrases, not short tokens,
+                and must stay breakable or they overflow a phone. */}
+            <b>{unpricedValue}</b>
+            {/* #1819: the same row that already discloses the genuinely-unpriced
+                count discloses the ESTIMATED count too — a different fact
+                (counted, but via a labeled guess, not a measurement), stated
+                beside it rather than folded into the same number. Omitted
+                entirely when zero, matching the unpriced clause's own
+                always-present-but-usually-zero shape being the one exception
+                worth keeping (unpriced is a structural row; estimated only
+                earns its place on the page when it's actually true). */}
+            {estimatedCount > 0 && (
+              <>
+                {" "}
+                · estimated <b>{estimatedValue}</b>
+              </>
+            )}
+          </div>
+        );
+      })()}
 
       {/* The machine's OWN shrink hint (distinct from a per-model one — an
           `amber` "Σ potential > limit" verdict names a shrink target at the

@@ -83,7 +83,12 @@ use std::path::Path;
 // milliseconds, the internal runtime sleeps between inference turns on
 // every LOCAL dispatch — GPU thermal/power relief for sustained runs, see
 // that field's own doc). Minor bump, same lenient-read reasoning.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.13";
+// 1.14 (#2107, #1833): additive `runtime.host_sampler_interval_ms` — the
+// daemon-side continuous host sampler `darkmux serve` runs for the machine
+// stats drawer's live `/machine/resources` `load` block (cpu/mem/gpu on a
+// fixed cadence, kept in an in-memory ring; no flow records). `0` disables
+// the sampler entirely. Minor bump, same lenient-read reasoning.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.14";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -315,6 +320,26 @@ pub struct RuntimeBehaviorConfig {
     /// honoring an operator's configured rest there would only add real
     /// latency the per-execution remote token allowance pays for nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub turn_delay_ms: Option<u64>,
+    /// (#2107, #1833, #2108) Cadence, in milliseconds, of `darkmux serve`'s
+    /// daemon-side continuous host sampler — the background thread that
+    /// reads cpu/mem/gpu/power/thermal (via its OWN privately-owned
+    /// `darkmux_crew::host_probe::HostProbe`, constructed inside the
+    /// sampler thread — NOT `telemetry_sampler::sample_host`'s shared,
+    /// `Mutex`-guarded singleton; the two are separate `HostProbe`
+    /// instances with separate cadences, on purpose, the same way
+    /// `dispatch_internal`'s per-dispatch sampler owns its own) into an
+    /// in-memory ring so the machine stats drawer (phone bottom tab,
+    /// desktop modal) has live numbers between dispatches
+    /// instead of reading "idle · no samples" until one starts. `0`
+    /// disables the sampler entirely (an explicit opt-out, mirroring
+    /// `remote.max_tokens_per_execution`'s `0`-means-hard-off convention).
+    /// The sampler writes NO flow records (CLAUDE.md "the observer must not
+    /// join the observed" — zero model dispatches, and this must not double
+    /// the fleet stream's size); it only feeds the `/machine/resources`
+    /// `load` block, which stamps its own measured cost
+    /// (`sampler_cost_ms_mean`) and the measured (not nominal) sample
+    /// interval into the payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub host_sampler_interval_ms: Option<u64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -575,7 +600,7 @@ pub struct HooksConfig {
     /// exists precisely so it doesn't have to), but without a ceiling an
     /// indefinitely-down receiver turns "buffer while down" into
     /// "consume disk without bound." Past this cap, new records for that
-    /// rule are dropped (counted, surfaced in `flow hooks status` and
+    /// rule are dropped (counted, surfaced in `flow status` and
     /// `doctor`, and named in a rate-limited `hook.failed`) rather than
     /// grown further — other rules and every other sink are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_outbox_mb: Option<u64>,
@@ -610,8 +635,9 @@ pub struct HookRule {
 /// A hook rule's match predicate — every field is an independent AND'd
 /// condition; a field left `None` doesn't gate. `action` is a small glob
 /// (`*` within a segment, or a trailing `*` segment matching one-or-more
-/// further dot-separated segments — e.g. `crawl.*` matches `crawl.finding`
-/// but not `crawler`; a bare `*` matches every action). The rest are exact
+/// further dot-separated segments — e.g. `dispatch.*` matches
+/// `dispatch.tool` but not `dispatched`; a bare `*` matches every action).
+/// The rest are exact
 /// matches against the record's own fields — `session_id`/`mission_id`/
 /// `machine_id` compare as plain strings, `category`/`level` compare
 /// against the record's serialized (lowercase) enum value.
@@ -627,12 +653,21 @@ pub struct HookMatch {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub machine_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub category: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub level: Option<String>,
+    /// (#1959) Every OTHER top-level key on the wire lands here —
+    /// including the payload predicates this struct doesn't declare a
+    /// typed field for: `"payload.tool_name"`, `"payload.ok"`, or a
+    /// deeper `"payload.detections.count"`, each a literal DOTTED KEY
+    /// (never a nested `{"payload": {...}}` object — `#[serde(flatten)]`
+    /// permits exactly one flattened field per struct, so a genuinely
+    /// nested second field would collide with this one). See
+    /// [`HookMatch::payload_predicates`] for the accessor that reads
+    /// them back out.
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 impl HookMatch {
-    /// True when every field is `None` — the "matches nothing" state a
-    /// half-filled-in rule leaves. `darkmux doctor` uses this to warn.
+    /// True when every field is `None`/empty — the "matches nothing" state
+    /// a half-filled-in rule leaves. `darkmux doctor` uses this to warn.
     pub fn is_empty(&self) -> bool {
         self.action.is_none()
             && self.session_id.is_none()
@@ -640,6 +675,21 @@ impl HookMatch {
             && self.machine_id.is_none()
             && self.category.is_none()
             && self.level.is_none()
+            && self.payload_predicates().next().is_none()
+    }
+
+    /// (#1959) Every `"payload.<dotted path>"` key on this match, with the
+    /// `payload.` prefix stripped — the exact-match predicates
+    /// `hooks::hook_match` evaluates against a record's OWN `payload`
+    /// field, e.g. `{"action": "dispatch.tool", "payload.tool_name":
+    /// "report_finding", "payload.ok": true}` yields `("tool_name",
+    /// "report_finding")` and `("ok", true)`. A remaining `extras` key that
+    /// does NOT start with `payload.` is unrelated forward-compat overflow
+    /// and is not a predicate — see the struct doc.
+    pub fn payload_predicates(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+        self.extras
+            .iter()
+            .filter_map(|(k, v)| k.strip_prefix("payload.").map(|rest| (rest, v)))
     }
 }
 
@@ -743,6 +793,10 @@ impl DarkmuxConfig {
                 // (#2094) Visible `0` — the pre-existing no-rest behavior,
                 // discoverable + one edit from a thermal-friendly value.
                 turn_delay_ms: Some(0),
+                // (#2107, #1833) Visible `5000` — the machine stats
+                // drawer's daemon-side sampler cadence, discoverable and
+                // one edit from `0` (disabled) or a tighter/looser value.
+                host_sampler_interval_ms: Some(5000),
                 extras: Default::default(),
             }),
             fleet: Some(FleetConfig {

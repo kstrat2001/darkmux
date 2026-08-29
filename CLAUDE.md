@@ -431,6 +431,7 @@ src/                          CLI command layer (clap)
   (dispatch is a top-level verb; the per-command modules:)
   mission_launch.rs           `mission launch <config>`: mint + drive a mission instance from a config
   mission_launch_review.rs    The `review` config's dedicated launcher (bundle→probe→dedup→judge→verify→synthesis)
+  crawl_launch.rs             The crawl launcher (#1959) — `mission launch crawl`'s Task/Step graph is computed at run time from a resolved crawl plan (darkmux-lab's `crawl::plan`), never declared in a mission-config document; routed by literal config id, BEFORE `mission_config::load` runs
   coder_phase.rs              coder-phase pipeline StepKinds (worktree/coder/verify): Tier-3 bespoke, launch-owned (`mission run` retired #1426 ship-4)
   mission_propose.rs          `mission propose`: utility-agent intent → mission config (stdin/file)
   mission_status.rs           `mission status`: the read-only mission board
@@ -450,7 +451,10 @@ crates/
   darkmux-profiles/           Registry loader + lookup
   darkmux-gestalt/            Residency arbiter (ResourceProbe/pools; loads what each dispatch's staffing declares)
   darkmux-crew/               Roles, dispatch core, the Task/Step scheduler + step_kinds/ (builtins/patterns), lessons
+    src/rules.rs                 The general rule-file template kind (#1959) — promoted out of the crawl module; `resolve_default` reads `templates/builtin/rules/*.json` + a user-tier override dir
+    src/workspace_spec/          The generic "named sources + include/exclude + edges" mission input (#1959) — promoted out of the crawl module's retired `CorpusManifest`; `mod.rs` (WorkspaceSpec/SourceSpec/EdgeSpec, load/validate), `glob.rs` (the one filter-language matcher), `materialize.rs` (git resolution + file walk, producing a `Materialized` any mission can plan from)
   darkmux-lab/                Lab harness (lab/, providers/, workloads/) + the review pipeline (lab/review.rs)
+    src/crawl/                    The agentic bug crawler's mechanical planning half (#1959) — `plan.rs` (Materialized + [Rule] -> a token-estimated work-unit Plan; `manifest.rs`/`sources.rs` retired, superseded by `darkmux-crew`'s `workspace_spec`)
   darkmux-fleet/              Roster + cross-machine routing
   darkmux-flow/               Flow sinks (LocalFile/Audit/Redis/Tee) + Keychain-secret machinery
   darkmux-serve/              HTTP daemon + the bundled viewer (assets/next.html, built from ui/src)

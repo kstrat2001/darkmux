@@ -34,6 +34,12 @@ pub mod dispatch_internal;
 // `refusal_handler`/`tty_prompt_handler` are the non-interactive/CLI
 // production handlers. See the module doc.
 pub mod gate;
+// (#2108) The in-process host probe — mach tick counters, IOReport power +
+// DVFS residency, thermal state, and the IOKit GPU read — that replaced the
+// `top`/`vm_stat`/`sysctl`/`ioreg` shell-outs `telemetry_sampler` used to
+// make. `telemetry_sampler::sample_host` still exists with the same
+// signature; it now reads THROUGH this probe.
+pub mod host_probe;
 // (#1284 Packet 2) The standard output contract every mission emits +
 // generalized finalization. `ReviewEnvelope` (darkmux-lab) maps INTO
 // `MissionEnvelope::payload` — this crate has no reverse dependency on
@@ -55,6 +61,12 @@ pub mod mission_config;
 // `dispatch.map` fan-out and `darkmux-lab`'s review pipeline construct.
 pub mod remote_budget;
 pub mod resourcing;
+// (#1959) The rule registry — a named, searchable property bound to files
+// by glob, with match/no-match prose. Promoted out of the crawl module
+// (originally `darkmux_lab::crawl::rules`) to a general template kind so
+// any role's mission can bind to a rule, not only the crawler. See the
+// module doc for the search-order + merge-override contract.
+pub mod rules;
 // (#1877 item 5, motivated by #1876) The generic Complete/Partial/Empty run
 // outcome — see the module doc for why a budget-exhausted-but-mostly-
 // completed run needs a THIRD state, not just a binary degenerate flag.
@@ -79,3 +91,9 @@ pub mod single_shot;
 pub mod step_kinds;
 pub mod telemetry_sampler;
 pub mod types;
+// (#1959) A generic mission input: named sources materialized into a
+// read-only tree, filtered by include/exclude globs. Promoted out of the
+// crawl module's `CorpusManifest` — see the module doc for the descope
+// this packet states plainly (the crawl planner doesn't consume
+// `Materialized` yet).
+pub mod workspace_spec;

@@ -31,6 +31,9 @@ pub struct FlowStatus {
     pub warn_reasons: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fail_reasons: Vec<String>,
+    /// (#1959) The flow-record hook sink's per-rule status — folded in
+    /// from the retired standalone `darkmux flow` `hooks status` sub-verb.
+    pub hooks: HooksStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +202,7 @@ pub fn collect_status() -> FlowStatus {
         overall_state,
         warn_reasons,
         fail_reasons,
+        hooks: collect_hooks_status(),
     }
 }
 
@@ -560,5 +564,209 @@ pub fn format_status_human(status: &FlowStatus) -> String {
         }
     }
 
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Hooks");
+    let _ = writeln!(out, "  enabled:      {}", status.hooks.enabled);
+    let _ = writeln!(out, "  outbox_dir:   {}", status.hooks.outbox_dir);
+    if status.hooks.rules.is_empty() {
+        let _ = writeln!(out, "  (no rules configured)");
+    } else {
+        for r in &status.hooks.rules {
+            let mut flags = Vec::new();
+            if r.is_empty_match {
+                flags.push("EMPTY MATCH");
+            }
+            if !r.is_loopback {
+                flags.push("NON-LOOPBACK URL");
+            }
+            if r.stalled {
+                flags.push("STALLED");
+            }
+            let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
+            let _ = writeln!(out, "  #{}: {} -> {}{flag_str}", r.index, r.match_desc, r.url);
+            let _ = writeln!(out, "      undelivered: {}", r.undelivered);
+            match &r.last_delivery_ts {
+                Some(ts) => {
+                    let _ = writeln!(out, "      last delivery: {ts}");
+                }
+                None => {
+                    let _ = writeln!(out, "      last delivery: (never)");
+                }
+            }
+            if let Some(err) = &r.last_error {
+                let _ = writeln!(out, "      last error: {err}");
+            }
+            if r.dropped_appends > 0 {
+                let _ = writeln!(out, "      dropped: {} (over the outbox cap, or an append failure)", r.dropped_appends);
+            }
+            if r.quarantined_lines > 0 {
+                let _ = writeln!(out, "      quarantined: {} (invalid JSON — never redelivered)", r.quarantined_lines);
+            }
+            if r.stalled {
+                let _ = writeln!(
+                    out,
+                    "      STALLED: {} consecutive cursor-write failure(s) — the drainer has stopped attempting \
+                     new deliveries for this rule until its cursor file becomes writable again",
+                    r.cursor_write_failures
+                );
+            } else if r.cursor_write_failures > 0 {
+                let _ = writeln!(out, "      cursor-write failures: {} (recovered)", r.cursor_write_failures);
+            }
+            match &r.last_drainer_heartbeat {
+                Some(ts) => {
+                    let _ = writeln!(out, "      last drainer heartbeat: {ts}");
+                }
+                None => {
+                    let _ = writeln!(out, "      last drainer heartbeat: (none seen — no drainer has cycled here yet)");
+                }
+            }
+        }
+    }
+
     out
+}
+
+/// (#1959 flow-hooks-family retirement) One configured hook rule's
+/// read-only status, the JSON-facing shape of `hooks::HookRuleSummary` —
+/// trimmed of the two `PathBuf` fields (`outbox_path`/`cursor_path`) that
+/// don't belong in the operator-facing status surface (they're internal
+/// storage detail, not something `flow status`/`--json` consumers act on).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookRuleStatus {
+    pub index: usize,
+    pub match_desc: String,
+    pub url: String,
+    pub is_loopback: bool,
+    pub is_empty_match: bool,
+    pub undelivered: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_delivery_ts: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub dropped_appends: u64,
+    pub cursor_write_failures: u64,
+    pub stalled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_drainer_heartbeat: Option<String>,
+    pub quarantined_lines: usize,
+}
+
+/// The flow-record hook sink's status — folded into `FlowStatus` (#1959;
+/// previously the standalone `darkmux flow` `hooks status` sub-verb). Always
+/// present (unlike `FlowStatus.redis`, which is `None` when Redis isn't
+/// configured at all) because `enabled: false` IS the "not configured"
+/// state here — an operator running `flow status` on a hooks-disabled
+/// install still sees the section, just reporting itself off, the same
+/// unconditional shape the retired `hooks status` sub-verb always
+/// printed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HooksStatus {
+    pub enabled: bool,
+    pub outbox_dir: String,
+    pub rules: Vec<HookRuleStatus>,
+}
+
+/// Pure builder — takes `rules`/`outbox_dir` as params (rather than
+/// reading `config_access` internally) so it stays unit-testable without
+/// env-var mutation, mirroring `darkmux_crew::rules::resolve`'s shape.
+pub fn build_hooks_status(
+    enabled: bool,
+    outbox_dir: &std::path::Path,
+    rules: &[darkmux_types::config::HookRule],
+) -> HooksStatus {
+    let summaries = crate::hooks::summarize_configured_rules(rules, outbox_dir);
+    HooksStatus {
+        enabled,
+        outbox_dir: outbox_dir.display().to_string(),
+        rules: summaries
+            .into_iter()
+            .map(|s| HookRuleStatus {
+                index: s.index,
+                match_desc: s.match_desc,
+                url: s.url,
+                is_loopback: s.is_loopback,
+                is_empty_match: s.is_empty_match,
+                undelivered: s.undelivered,
+                last_delivery_ts: s.last_delivery_ts,
+                last_error: s.last_error,
+                dropped_appends: s.dropped_appends,
+                cursor_write_failures: s.cursor_write_failures,
+                stalled: s.stalled,
+                last_drainer_heartbeat: s.last_drainer_heartbeat,
+                quarantined_lines: s.quarantined_lines,
+            })
+            .collect(),
+    }
+}
+
+/// `build_hooks_status` against the real `config_access` tier.
+fn collect_hooks_status() -> HooksStatus {
+    let enabled = darkmux_types::config_access::hooks_enabled();
+    let rules = darkmux_types::config_access::hooks_rules();
+    let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
+    build_hooks_status(enabled, &outbox_dir, &rules)
+}
+
+#[cfg(test)]
+mod hooks_status_tests {
+    use super::*;
+    use darkmux_types::config::{HookMatch, HookRule};
+
+    #[test]
+    fn no_rules_configured_reports_enabled_flag_and_empty_rules() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let status = build_hooks_status(false, tmp.path(), &[]);
+        assert!(!status.enabled);
+        assert!(status.rules.is_empty());
+        assert_eq!(status.outbox_dir, tmp.path().display().to_string());
+    }
+
+    #[test]
+    fn one_configured_rule_reports_match_url_and_undelivered_zero() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:8790/events".to_string()),
+            extras: Default::default(),
+        }];
+        let status = build_hooks_status(true, tmp.path(), &rules);
+        assert!(status.enabled);
+        assert_eq!(status.rules.len(), 1);
+        let r = &status.rules[0];
+        assert!(r.match_desc.contains("crawl.*"), "{}", r.match_desc);
+        assert_eq!(r.url, "http://127.0.0.1:8790/events");
+        assert!(r.is_loopback);
+        assert_eq!(r.undelivered, 0);
+    }
+
+    #[test]
+    fn human_render_includes_a_hooks_section_with_per_rule_detail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:8790/events".to_string()),
+            extras: Default::default(),
+        }];
+        let hooks = build_hooks_status(true, tmp.path(), &rules);
+        let status = FlowStatus {
+            schema_version: "1.0".to_string(),
+            sinks: SinkSummary {
+                info: SinkInfo { kind: "LocalFile".into(), config: Default::default(), children: vec![], raw_url: None },
+                active_kinds: vec!["LocalFile".to_string()],
+                composition: "LocalFile".to_string(),
+            },
+            redis: None,
+            disk: DiskStatus { flows_dir: "x".into(), exists: true, day_files: 0, total_bytes: 0, observed_disk_schemas: vec![] },
+            schema: SchemaSkew { writer_version: "1.0".into(), observed_versions: vec![], skew_detected: false, skew_reason: None },
+            overall_state: HealthState::Ok,
+            warn_reasons: vec![],
+            fail_reasons: vec![],
+            hooks,
+        };
+        let rendered = format_status_human(&status);
+        assert!(rendered.contains("Hooks"), "{rendered}");
+        assert!(rendered.contains("crawl.*"), "{rendered}");
+        assert!(rendered.contains("http://127.0.0.1:8790/events"), "{rendered}");
+        assert!(rendered.contains("undelivered: 0"), "{rendered}");
+    }
 }

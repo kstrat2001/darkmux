@@ -192,6 +192,36 @@ describe("App", () => {
     expect(machineHeaderMatches(/fleet › machine/)).toBe(true);
   });
 
+  // (operator finding, phone screenshot) `#crumb` used to repeat the
+  // machine name (`routeChrome`'s `machine` branch, `App.tsx`) — folded
+  // into the tab row on desktop, but given its OWN full-width row by the
+  // mobile stylesheet (`.app-shell__crumb { flex: 1 1 100%; }` under
+  // `max-width: 768px`), so a phone showed a whole standalone line reading
+  // just the machine name, directly above `MachineLens`'s own
+  // `.machine-lens__hdr` breadcrumb ("fleet › machine — <spec>"), which had
+  // already dropped its own copy of the name for the identical reason. The
+  // fix is App.tsx not rendering `<header id="crumb">` AT ALL on the
+  // machine route — jsdom performs no layout, so this doesn't simulate the
+  // phone breakpoint, but a genuinely absent element renders at every
+  // width, mobile included; the real, viewport-verified behavior is the
+  // `next-parity.spec.ts` machine-lens tests (desktop) and this fix's own
+  // real-browser screenshots (phone + desktop).
+  it("(operator finding) never renders #crumb on the machine lens — no machine-name row above the breadcrumb, at any width", async () => {
+    window.location.hash = "#lens=machine";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(machineHeaderMatches(/fleet › machine/)).toBe(true));
+    expect(document.getElementById("crumb")).toBeNull();
+    // The sibling `#meta` summary row is untouched by this fix — it must
+    // still be present and still sit inside the sticky block.
+    expect(document.getElementById("meta")).toBeTruthy();
+  });
+
   it("renders a named placeholder (with the raw hash) for an unrecognized route, never a blank page", () => {
     window.location.hash = "#lens=totally-bogus";
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -920,6 +950,36 @@ describe("App", () => {
     );
     return meta;
   }
+
+  it("(#2108, operator finding — desktop tab-row fold, rounds 1 + 2) #crumb AND #meta both live inside .app-shell__sticky now, folded into the tab row; .app-shell__crumbbar no longer exists", async () => {
+    window.location.hash = "#lens=runs";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".app-shell__navtabs")).toBeTruthy());
+    expect(document.querySelector(".app-shell__crumbbar")).toBeNull();
+    const crumb = document.querySelector("#crumb")!;
+    const meta = document.querySelector("#meta")!;
+    expect(crumb.closest(".app-shell__sticky")).toBeTruthy();
+    expect(meta.closest(".app-shell__sticky")).toBeTruthy();
+  });
+
+  it("(#2108, operator finding — round 2) the summary (#meta) and the tab list (.app-shell__navtabs) share the SAME container, not just the same page — the structural proof that they render on one row", async () => {
+    window.location.hash = "#lens=runs";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".app-shell__navtabs")).toBeTruthy());
+    const navtabs = document.querySelector(".app-shell__navtabs")!;
+    const meta = document.querySelector("#meta")!;
+    const sticky = document.querySelector(".app-shell__sticky")!;
+    // Same immediate row container — this is the real proof available in
+    // jsdom, which performs no layout (so a literal offsetTop comparison
+    // below would pass trivially for ANY two elements at 0,0 regardless of
+    // whether they actually share a row; it's asserted too, for the
+    // record, but the parentElement check is what's load-bearing).
+    expect(navtabs.parentElement).toBe(sticky);
+    expect(meta.parentElement).toBe(sticky);
+    expect((navtabs as HTMLElement).offsetTop).toBe((meta as HTMLElement).offsetTop);
+  });
 
   it("(#2071) a live daemon route renders no transport — nothing to scrub", async () => {
     window.location.hash = "#lens=runs";
