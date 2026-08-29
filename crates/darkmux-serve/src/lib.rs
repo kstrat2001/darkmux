@@ -2391,8 +2391,8 @@ fn machine_resources_cached_fresh() -> Option<serde_json::Value> {
 /// other route (loopback open, remote requires the token) — nothing extra
 /// here.
 ///
-/// (#2107, #1833) Attach the daemon-side host sampler's `load` block —
-/// `now`/`window`/`sampler_cost_ms_mean`, see `host_sampler`'s own doc — to
+/// (#2107, #1833, #2108) Attach the daemon-side host sampler's `load` block —
+/// `now`/`window` in host-sample-shape v2, see `host_sampler`'s own doc — to
 /// a `/machine/resources` payload. Applied AFTER the ledger cache
 /// lookup/write, never cached itself: the ledger gather is the expensive
 /// shelled-out part worth a 2s cache; the ring read underneath `load` is a

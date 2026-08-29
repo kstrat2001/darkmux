@@ -794,12 +794,11 @@
         assert_eq!(json["cache_ttl_ms"].as_u64(), Some(2_000));
     }
 
-    /// (#2107, #1833) GET /machine/resources carries a `load` block — the
-    /// daemon-side continuous host sampler's `now`/`window`/
-    /// `sampler_cost_ms_mean` — once the ring holds samples. Injects
-    /// fabricated samples straight into the process-wide ring via
-    /// `HostSamplerRing::push_for_test` (no real sampler thread, no real
-    /// `ioreg`/`top`/`vm_stat` shell-out) so the ROUTE's shape is exercised
+    /// (#2107, #1833, #2108) GET /machine/resources carries a `load` block —
+    /// the daemon-side continuous host sampler's `now`/`window` — once the
+    /// ring holds samples. Injects fabricated samples straight into the
+    /// process-wide ring via `HostSamplerRing::push_for_test` (no real
+    /// sampler thread, no real host probe) so the ROUTE's shape is exercised
     /// deterministically. `#[serial]`: the ring and the ledger cache are
     /// both process-wide statics shared with the sibling test above.
     #[tokio::test]
@@ -840,12 +839,19 @@
         assert_eq!(load["now"]["mem_pct"], 62);
         assert_eq!(load["now"]["gpu_pct"], 30);
         assert_eq!(load["now"]["sampled_at_ms"], 4_000);
+        // (#2108, host-sample-shape v2) the observer cost is per-sample and
+        // lives inside `now`; the window's metric keys are the ROUTE's own
+        // `mean`/`p95`/`max` under the metric's full name.
+        assert_eq!(load["now"]["sampler_cost_ms"], 4);
         assert_eq!(load["window"]["samples"], 3);
         assert_eq!(load["window"]["interval_ms"], 2_000, "measured, not nominal");
         assert_eq!(load["window"]["span_ms"], 4_000);
-        assert_eq!(load["window"]["cpu"]["max_pct"], 90);
-        assert_eq!(load["window"]["cpu"]["mean_pct"], 60.0);
-        assert!(load["sampler_cost_ms_mean"].is_number());
+        assert_eq!(load["window"]["cpu_pct"]["max"], 90);
+        assert_eq!(load["window"]["cpu_pct"]["mean"], 60.0);
+        // Sources the injected samples never carried stay null rather than
+        // being coerced to a zeroed placeholder.
+        assert!(load["now"]["thermal"].is_null());
+        assert!(load["window"]["energy_mwh"].is_null());
     }
 
     /// /machine/specs MUST redact the Redis URL's password. Wide-open
