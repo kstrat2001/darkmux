@@ -5623,15 +5623,25 @@ body {
      open, a tap anywhere outside the sheet/bar/handle dismisses it
      instead of reaching the page underneath. A transparent scrim didn't
      read as modal at all; a real semi-opaque dim, fading in with the
-     slide, is what makes the sheet read as a sheet. `top: 64px` (not
-     `inset: 0`) is a deliberate exception, per operator correction: the
-     masthead (logo, ⓘ, day picker, LIVE) stays at full brightness above
-     the scrim — the same clearance offset the retired `.machine-pill`
-     used for the identical reason ("clears the masthead's own single
-     row"). */
+     slide, is what makes the sheet read as a sheet. `top: var(--masthead-h,
+     64px)` (not `inset: 0`) is a deliberate exception, per operator
+     correction: the masthead (logo, ⓘ, day picker, LIVE) stays at full
+     brightness above the scrim — the same clearance offset the retired
+     `.machine-pill` used for the identical reason ("clears the masthead's
+     own single row"). Was a hardcoded `64px`, off by a few px from the
+     measured masthead (App.tsx's `ResizeObserver`-fed `--masthead-h`, ~61px
+     — #2108 review nit); now reads the same live-measured value the phone
+     drawer's own open-height cap already uses, so the two can never drift
+     apart again. This band is only actually masthead-safe, though, when
+     the page is scrolled to the top before the drawer opens — see
+     `PhoneDrawer.tsx`'s own body-lock effect doc for the other half (#2108
+     review finding 4: a scrolled page broke `.app-shell__sticky`'s CSS
+     `position: sticky` once the lock effect pinned `<body>` via `position:
+     fixed`, so the sticky tab row — not the masthead — could land in this
+     unscrimmed band and eat a tap). */
   .phone-drawer__backdrop {
     position: fixed;
-    top: 64px;
+    top: var(--masthead-h, 64px);
     left: 0;
     right: 0;
     bottom: 0;

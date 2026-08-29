@@ -296,11 +296,28 @@ export function PhoneDrawer({
   // iOS Safari: a drag on the open sheet still scrolled the page BEHIND
   // it, worse than having no lock at all (the touch visually passed
   // through the front layer). The iOS-proof form pins the body via
-  // `position: fixed` at its CURRENT scroll offset — `top` carries the
-  // negative of that offset so nothing visually jumps — and restores both
-  // the styles and the exact scroll position on close via
-  // `window.scrollTo`. `overflow: hidden` stays alongside it (harmless,
-  // and still what non-iOS browsers key their own lock behavior off).
+  // `position: fixed` and restores both the styles and the exact scroll
+  // position on close via `window.scrollTo`. `overflow: hidden` stays
+  // alongside it (harmless, and still what non-iOS browsers key their own
+  // lock behavior off).
+  //
+  // (#2108 review finding 4, WebKit-proven) This USED to pin at the
+  // CURRENT scroll offset (`top: -${scrollY}px`) so nothing visually
+  // jumped. That broke `.app-shell__sticky`'s `position: sticky` — sticky
+  // computes "am I stuck" against the nearest scrolling ancestor, and once
+  // `<body>` itself becomes `position: fixed` it stops being one, so the
+  // sticky tab row fell back to its unstuck flow position instead of
+  // staying pinned under the masthead. At scrollY=40 that landed the tab
+  // row inside `.phone-drawer__backdrop`'s masthead-clearance band (the
+  // rule above), where the scrim never went — for a modal sheet, a real
+  // nav tab was one tap away with the drawer still open. Scrolling to the
+  // top BEFORE pinning sidesteps the whole class of bug: the masthead is
+  // always what occupies that band on open, because there is never a
+  // nonzero scroll offset for `position: sticky` to lose. The pre-open
+  // offset is saved and restored via `window.scrollTo` on close/unmount,
+  // same as before — the visible jump only happens on OPEN now (a sheet
+  // sliding up is already a big visual event; scrolling under it reads as
+  // "the page made room," not as a bug), never after.
   //
   // A SINGLE effect keyed on `open` covers every exit path uniformly: the
   // cleanup function below fires on close (tab re-tap, Escape, backdrop
@@ -319,8 +336,9 @@ export function PhoneDrawer({
       width: body.style.width,
       overflow: body.style.overflow,
     };
+    window.scrollTo(0, 0);
     body.style.position = "fixed";
-    body.style.top = `-${scrollY}px`;
+    body.style.top = "0";
     body.style.left = "0";
     body.style.right = "0";
     body.style.width = "100%";

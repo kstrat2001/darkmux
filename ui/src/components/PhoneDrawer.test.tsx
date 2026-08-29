@@ -720,7 +720,19 @@ describe("PhoneDrawer — iOS scroll lock (operator finding)", () => {
     document.body.style.overflow = "";
   });
 
-  it("opening pins the body at its current scroll offset (position: fixed, negative top) and restores + scrolls back on close", () => {
+  // (#2108 review finding 4, WebKit-proven) Rewritten: opening now scrolls
+  // to the TOP first, THEN pins at `top: 0` — no longer at the pre-open
+  // scroll offset (`-240px`). A negative-offset pin broke
+  // `.app-shell__sticky`'s `position: sticky` (sticky's "am I stuck" test
+  // needs a genuinely scrolling ancestor, and `<body>` becoming
+  // `position: fixed` removes that), which could land the sticky nav/tab
+  // row inside the backdrop's masthead-clearance band — a real nav tap
+  // while the drawer was supposed to be modal. Scrolling to 0 before
+  // pinning means there is never a nonzero offset for sticky to lose. The
+  // pre-open offset is still saved and restored via `window.scrollTo` on
+  // close, same as before this fix — only the OPEN-time pin position
+  // changed, not the restore contract.
+  it("opening scrolls to the top and pins the body there (position: fixed, top: 0), then restores + scrolls back to the pre-open offset on close", () => {
     const scrollToSpy = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
     Object.defineProperty(window, "scrollY", {
       configurable: true,
@@ -740,13 +752,14 @@ describe("PhoneDrawer — iOS scroll lock (operator finding)", () => {
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
     );
+    expect(scrollToSpy).toHaveBeenCalledWith(0, 0);
     expect(document.body.style.position).toBe("fixed");
-    expect(document.body.style.top).toBe("-240px");
+    expect(document.body.style.top).toBe("0px");
     expect(document.body.style.width).toBe("100%");
     expect(document.body.style.overflow).toBe("hidden");
 
     // Closing (active-tab re-tap) restores the styles AND scrolls back to
-    // the exact offset that was saved on open.
+    // the exact offset that was saved BEFORE the drawer opened.
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
     );
@@ -904,8 +917,12 @@ describe("PhoneDrawer — stylesheet checks (#2108)", () => {
     const rule = ruleBody(css, ".phone-drawer__backdrop");
     expect(rule).not.toMatch(/background:\s*transparent/);
     expect(rule).toMatch(/background:\s*rgba\(0,\s*0,\s*0,\s*0\.45\)/);
-    // Starts at a fixed offset (clears the masthead), not `inset: 0`.
-    expect(rule).toMatch(/top:\s*64px/);
+    // Starts at a live-measured offset (clears the masthead), with `64px`
+    // as its fallback for a pre-measurement first paint — not `inset: 0`,
+    // and no longer a bare hardcoded `64px` (#2108 review finding 4/nit
+    // 13(f): the real masthead measures ~61px via `--masthead-h`,
+    // App.tsx's own `ResizeObserver`-fed custom property).
+    expect(rule).toMatch(/top:\s*var\(--masthead-h,\s*64px\)/);
     expect(rule).not.toMatch(/inset:\s*0/);
   });
 
