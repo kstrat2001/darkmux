@@ -1414,6 +1414,57 @@ fn host_threads_through_to_the_unit_record() {
     );
 }
 
+/// (#2107 dogfood follow-up) The unit's own `host` block must survive the
+/// trip through this launcher AT FULL SHAPE, not just the bare cpu/mem/gpu
+/// reduction the sibling test above uses — `interpret_dispatch_result`
+/// clones the WHOLE `envelope["host"]` value verbatim
+/// (`dispatch_internal::enrich_envelope_with_summary` is the sole producer
+/// of that shape, shared by every internal-runtime dispatch, crawl units
+/// included), so `thermal`/`power`/`energy_mwh` — present whenever the host
+/// probe could read those sources (#2108) — must thread through the SAME
+/// way `cpu`/`mem`/`gpu` already do, matching field-for-field.
+#[test]
+#[serial_test::serial]
+fn host_block_including_thermal_power_and_energy_threads_through_at_full_shape() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut params = params_for(&fx);
+    params.insert("limit".to_string(), Value::String("1".to_string()));
+    let host_block = json!({
+        "cpu": {"peak_pct": 91, "mean_pct": 62.4, "p95_pct": 88, "above_80_ms": 4000},
+        "mem": {"peak_pct": 70, "mean_pct": 55.0, "p95_pct": 68, "above_80_ms": 0},
+        "gpu": {"peak_pct": 95, "mean_pct": 71.2, "p95_pct": 93, "above_80_ms": 6000},
+        "samples": 12,
+        "sample_interval_ms": 2000,
+        "peak_cpu_pct": 91,
+        "peak_mem_pct": 70,
+        "power": {
+            "cpu": {"mean_mw": 4200.0, "peak_mw": 6100.0},
+            "gpu": {"mean_mw": 9800.0, "peak_mw": 15200.0},
+            "total": {"mean_mw": 14000.0, "peak_mw": 21300.0},
+        },
+        "thermal": {"worst_state": "serious", "above_nominal_ms": 3000, "min_cpu_speed_limit_pct": 62},
+        "energy_mwh": 1580.5,
+    });
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit { host: Some(host_block.clone()), ..Default::default() });
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    run(&params, None, &mut dispatch).unwrap();
+
+    let records = read_all_flow_records();
+    let step_complete = records
+        .iter()
+        .find(|r| r["action"] == "step complete" && r["payload"]["unit"] == "u-0001")
+        .expect("this unit's own step complete record");
+    assert_eq!(
+        step_complete["payload"]["host"], host_block,
+        "power/thermal/energy_mwh must thread through alongside cpu/mem/gpu, not get dropped \
+         on the way to the unit's own flow record: {step_complete}"
+    );
+}
+
 #[test]
 #[serial_test::serial]
 fn a_unit_that_never_sampled_reports_no_host_block_rather_than_a_null_one() {

@@ -3,7 +3,20 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { render, screen } from "@testing-library/react";
-import { Meter, angleForPct, avgMaxTicks, compactMeterProps, fmtPct, simpleBand } from "./Meter";
+import {
+  Meter,
+  angleForPct,
+  avgMaxTicks,
+  compactMeterProps,
+  fmtPct,
+  simpleBand,
+  meterBandLevel,
+  bandLevelClass,
+  DEFAULT_WARN_AT,
+  DEFAULT_CRITICAL_AT,
+  MEM_WARN_AT,
+  MEM_CRITICAL_AT,
+} from "./Meter";
 
 // ── low-level Meter: the shared core (needle, arc/bands, redline, ticks,
 //    gradient, children slot) — the pieces every caller, VRAM included,
@@ -245,7 +258,7 @@ describe("angleForPct / simpleBand / avgMaxTicks / compactMeterProps", () => {
   it("compactMeterProps bundles bands/ticks/needle/numerals/label from one reading", () => {
     const props = compactMeterProps("GPU", "mm-gauge-fill-compact", "green", { now: 90, avg: 60, high: 95 });
     expect(props.label).toBe("GPU");
-    expect(props.bands).toEqual([{ className: "mm-gauge-fill-compact", stroke: "green", lengthPct: 90 }]);
+    expect(props.bands).toEqual([{ className: "mm-gauge-fill-compact", stroke: "green", lengthPct: 90, banded: true }]);
     expect(props.ticks).toEqual([
       { pct: 60, className: "mm-gauge-tick mm-gauge-tick-avg" },
       { pct: 95, className: "mm-gauge-tick mm-gauge-tick-max" },
@@ -270,5 +283,113 @@ describe("fmtPct", () => {
 
   it("renders an em-dash for null rather than coercing to 0", () => {
     expect(fmtPct(null)).toBe("—");
+  });
+});
+
+// ── (#2122) band-threshold coloring — the fill AND the caption both key
+//    off the SAME reading, so a loaded GPU or CPU stops looking identical
+//    to an idle one. Fixture renders at 79/80/95/100 per the issue's own
+//    verification ask. ─────────────────────────────────────────────────
+
+describe("meterBandLevel / bandLevelClass — the pure threshold lookup", () => {
+  it("stays quiet below warnAt, including a null (unmeasured) reading", () => {
+    expect(meterBandLevel(79, DEFAULT_WARN_AT, DEFAULT_CRITICAL_AT)).toBe("quiet");
+    expect(meterBandLevel(null, DEFAULT_WARN_AT, DEFAULT_CRITICAL_AT)).toBe("quiet");
+    expect(bandLevelClass("quiet")).toBe("");
+  });
+
+  it("crosses into warn AT the threshold (>=, matching the thermal pill's own wording)", () => {
+    expect(meterBandLevel(80, DEFAULT_WARN_AT, DEFAULT_CRITICAL_AT)).toBe("warn");
+    expect(bandLevelClass("warn")).toBe("mm-band-warn");
+  });
+
+  it("crosses into critical AT the threshold, and stays critical past 100", () => {
+    expect(meterBandLevel(95, DEFAULT_WARN_AT, DEFAULT_CRITICAL_AT)).toBe("critical");
+    expect(meterBandLevel(100, DEFAULT_WARN_AT, DEFAULT_CRITICAL_AT)).toBe("critical");
+    expect(bandLevelClass("critical")).toBe("mm-band-critical");
+  });
+
+  it("MEM's own gentler pair reads 90/97, not the 80/95 default — no double-alarm with the pressure ledger", () => {
+    expect(meterBandLevel(90, MEM_WARN_AT, MEM_CRITICAL_AT)).toBe("warn");
+    expect(meterBandLevel(89, MEM_WARN_AT, MEM_CRITICAL_AT)).toBe("quiet");
+    expect(meterBandLevel(97, MEM_WARN_AT, MEM_CRITICAL_AT)).toBe("critical");
+    expect(meterBandLevel(96, MEM_WARN_AT, MEM_CRITICAL_AT)).toBe("warn");
+  });
+});
+
+describe("Meter — band-colored fill + caption (#2122)", () => {
+  function renderAt(now: number) {
+    return render(
+      <Meter
+        wrapperClassName="mm-gauge mm-gauge--compact"
+        ariaLabel="GPU"
+        label="GPU"
+        bands={simpleBand("mm-gauge-fill-compact", "var(--accent, var(--good))", now)}
+        numerals={{ now, avg: null, max: null }}
+        hideAvgMax
+        needleAngleDeg={angleForPct(now)}
+      />,
+    );
+  }
+
+  it("79% — quiet: no band-level class on the fill or the caption", () => {
+    const { container } = renderAt(79);
+    const band = container.querySelector(".mm-gauge-fill-compact")!;
+    expect(band.getAttribute("class")).not.toMatch(/mm-band-/);
+    expect(container.querySelector(".meter-now")!.getAttribute("class")).not.toMatch(/mm-band-/);
+  });
+
+  it("80% — warn: the fill and the caption both pick up .mm-band-warn", () => {
+    const { container } = renderAt(80);
+    const band = container.querySelector(".mm-gauge-fill-compact")!;
+    expect(band.classList.contains("mm-band-warn")).toBe(true);
+    expect(container.querySelector(".meter-now")!.classList.contains("mm-band-warn")).toBe(true);
+  });
+
+  it("95% — critical: the fill and the caption both pick up .mm-band-critical", () => {
+    const { container } = renderAt(95);
+    const band = container.querySelector(".mm-gauge-fill-compact")!;
+    expect(band.classList.contains("mm-band-critical")).toBe(true);
+    expect(container.querySelector(".meter-now")!.classList.contains("mm-band-critical")).toBe(true);
+  });
+
+  it("100% — still critical, not some fourth unstyled band", () => {
+    const { container } = renderAt(100);
+    const band = container.querySelector(".mm-gauge-fill-compact")!;
+    expect(band.classList.contains("mm-band-critical")).toBe(true);
+    expect(container.querySelector(".meter-now")!.classList.contains("mm-band-critical")).toBe(true);
+  });
+
+  it("a caller passing warnAt/criticalAt overrides the 80/95 default (MEM's own 90/97)", () => {
+    const { container } = render(
+      <Meter
+        wrapperClassName="mm-gauge mm-gauge--compact"
+        ariaLabel="MEM"
+        label="MEM"
+        bands={simpleBand("mm-gauge-fill-compact", "var(--accent, var(--good))", 92)}
+        numerals={{ now: 92, avg: null, max: null }}
+        hideAvgMax
+        warnAt={MEM_WARN_AT}
+        criticalAt={MEM_CRITICAL_AT}
+      />,
+    );
+    // 92% is above MEM's own warnAt (90) but below its own criticalAt
+    // (97) — warn, not critical, and NOT quiet (which the 80/95 default
+    // alone wouldn't distinguish from the default's own warn band).
+    const band = container.querySelector(".mm-gauge-fill-compact")!;
+    expect(band.classList.contains("mm-band-warn")).toBe(true);
+    expect(band.classList.contains("mm-band-critical")).toBe(false);
+  });
+
+  it("a non-banded band (VRAM's own bands) never picks up a band-level class regardless of length", () => {
+    const { container } = render(
+      <Meter
+        wrapperClassName="mm-gauge"
+        ariaLabel="VRAM"
+        bands={[{ className: "mm-gauge-val", stroke: "url(#g)", lengthPct: 100, alwaysRender: true }]}
+      />,
+    );
+    const band = container.querySelector(".mm-gauge-val")!;
+    expect(band.getAttribute("class")).not.toMatch(/mm-band-/);
   });
 });

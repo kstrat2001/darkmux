@@ -1,7 +1,17 @@
 import { describe, it, expect } from "vitest";
-import { primaryReplayMission, replayMissionLabel, replayMetaLines, replayMetaParts, replayDataSource } from "./replayMeta";
+import {
+  primaryReplayMission,
+  replayMissionLabel,
+  replayMetaLines,
+  replayMetaParts,
+  replayDataSource,
+  humanMissionLabel,
+  missionTitle,
+  resolvedMissionLabel,
+  replayPlaybackKvValue,
+} from "./replayMeta";
 import { normalizeRecords } from "./flow";
-import { clk, lday } from "./format";
+import { clk, clkrange, lday } from "./format";
 import type { FlowRecord } from "../types/handwritten";
 
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
@@ -152,5 +162,126 @@ describe("replayMetaParts", () => {
     expect(parts.source).toBe("flow · 2026-08-26");
     expect(`${parts.head} · ${parts.source} · ${parts.span}`).toBe(replayMetaLines(data, "2026-08-26")[0]);
     expect(parts.census).toBe(replayMetaLines(data, "2026-08-26")[1]);
+  });
+});
+
+/** (#2120) A human label for a mission id, read off the id's own naming
+ * convention — never a fetch. Only the `review` convention is recognized
+ * today; everything else returns `null` so the caller can fall back (the
+ * modal, to the raw id) or omit the label (the transport, per the
+ * operator's "raw id lives only in the modal" call). */
+describe("humanMissionLabel", () => {
+  it("reads a review-config id's trailing slug as a title", () => {
+    expect(humanMissionLabel("demo-review-nameof-recency")).toBe("Review · nameof recency");
+  });
+
+  it("works with no prefix before the review token", () => {
+    expect(humanMissionLabel("review-quarterly-audit")).toBe("Review · quarterly audit");
+  });
+
+  it("falls back to a bare 'Review' when the token has no trailing slug", () => {
+    expect(humanMissionLabel("demo-review")).toBe("Review");
+  });
+
+  it("returns null for an id with no recognizable convention — the caller decides the fallback", () => {
+    expect(humanMissionLabel("coder-phase-1786068582-93f404")).toBeNull();
+    expect(humanMissionLabel("acp-ephemeral-pr-ship-123")).toBeNull();
+  });
+});
+
+/** (#2121) A REAL title, read off `mission_title` — the demo's
+ * `import_mission.py --title` writer, never a production one today (see
+ * `mission_title`'s own doc on `FlowRecord`). */
+describe("missionTitle", () => {
+  it("finds the title on any correlated record, not just the first", () => {
+    const data = [
+      rec({ mission_id: "demo-review-nameof-recency", action: "phase start" }),
+      rec({ mission_id: "demo-review-nameof-recency", action: "mission start", mission_title: "Review of a merged darkmux PR" }),
+      rec({ mission_id: "demo-review-nameof-recency", action: "dispatch start" }),
+    ];
+    expect(missionTitle(data, "demo-review-nameof-recency")).toBe("Review of a merged darkmux PR");
+  });
+
+  it("is null when no correlated record carries a title — every real dispatch today", () => {
+    const data = [rec({ mission_id: "coder-phase-1786068582-93f404", action: "mission start" })];
+    expect(missionTitle(data, "coder-phase-1786068582-93f404")).toBeNull();
+  });
+
+  it("never matches a title stamped on a DIFFERENT mission's record", () => {
+    const data = [rec({ mission_id: "other-mission", mission_title: "Wrong Title" })];
+    expect(missionTitle(data, "demo-review-nameof-recency")).toBeNull();
+  });
+});
+
+/** (#2121) The transport's resolved label — title present -> title; title
+ * absent -> [[humanMissionLabel]]'s id-derived heuristic; neither -> null
+ * (the transport omits the label entirely, same as before #2121). */
+describe("resolvedMissionLabel", () => {
+  it("prefers the real title over the id-derived heuristic", () => {
+    const data = [rec({ mission_id: "demo-review-nameof-recency", mission_title: "Review of a merged darkmux PR" })];
+    expect(resolvedMissionLabel(data, "demo-review-nameof-recency")).toBe("Review of a merged darkmux PR");
+    // Sanity: the heuristic alone would have produced a DIFFERENT string —
+    // proving this test exercises the title branch, not a coincidence.
+    expect(humanMissionLabel("demo-review-nameof-recency")).not.toBe("Review of a merged darkmux PR");
+  });
+
+  it("falls back to humanMissionLabel when no title is present — live daemon routes, unaffected", () => {
+    const data = [rec({ mission_id: "demo-review-nameof-recency" })];
+    expect(resolvedMissionLabel(data, "demo-review-nameof-recency")).toBe(humanMissionLabel("demo-review-nameof-recency"));
+  });
+
+  it("is null when the id has neither a title nor a recognizable convention", () => {
+    const data = [rec({ mission_id: "coder-phase-1786068582-93f404" })];
+    expect(resolvedMissionLabel(data, "coder-phase-1786068582-93f404")).toBeNull();
+  });
+});
+
+/** (#2120) The Machine info modal's `playback` kv row — the day/span/
+ * census/raw-id information the sticky row's folded `#meta` summary used
+ * to carry, now that the transport shows only a human mission label (or
+ * nothing) in its place. */
+describe("replayPlaybackKvValue", () => {
+  const day: FlowRecord[] = [
+    { ts: "2026-08-26T01:08:17.000Z", machine_uid: "u1", mission_id: "demo-review-nameof-recency" } as FlowRecord,
+    { ts: "2026-08-26T14:13:01.000Z", machine_uid: "u1", mission_id: "demo-review-nameof-recency" } as FlowRecord,
+    { ts: "2026-08-26T09:00:00.000Z", machine_uid: "u2", mission_id: "demo-review-nameof-recency" } as FlowRecord,
+  ];
+
+  it("names the day, the bare time span (no repeated date), the census, and the raw mission id", () => {
+    const tMin = Date.parse("2026-08-26T01:08:17.000Z");
+    const tMax = Date.parse("2026-08-26T14:13:01.000Z");
+    expect(replayPlaybackKvValue(day, "2026-08-26")).toBe(
+      `flow 2026-08-26 · ${clkrange(tMin, tMax)} · 3 records · 2 machines · mission demo-review-nameof-recency`,
+    );
+  });
+
+  it("omits the mission clause entirely when the day has no mission ids", () => {
+    const noMission: FlowRecord[] = [{ ts: "2026-08-26T01:08:17.000Z", machine_uid: "u1" } as FlowRecord];
+    expect(replayPlaybackKvValue(noMission, "2026-08-26")).toBe(`flow 2026-08-26 · ${clkrange(Date.parse("2026-08-26T01:08:17.000Z"), Date.parse("2026-08-26T01:08:17.000Z"))} · 1 records · 1 machines`);
+    expect(replayPlaybackKvValue(noMission, "2026-08-26")).not.toContain("mission");
+  });
+
+  // (#2121) "Ids remain in detail panes ... the Machine info playback row" —
+  // this row is the one exception `resolvedMissionLabel` deliberately does
+  // NOT reach: even when the mission carries a real `mission_title`, this
+  // kv value still names the RAW id, unchanged. The transport is the only
+  // surface that swaps to the title.
+  it("still names the raw id even when the mission carries a mission_title", () => {
+    const titled: FlowRecord[] = day.map((r) => ({ ...r, mission_title: "Review of a merged darkmux PR" }));
+    const value = replayPlaybackKvValue(titled, "2026-08-26");
+    expect(value).toContain("mission demo-review-nameof-recency");
+    expect(value).not.toContain("Review of a merged darkmux PR");
+  });
+
+  // (#2121) `mission_reviewed` — additional detail-pane content, appended
+  // after the raw id, never replacing it.
+  it("appends the reviewed PR reference when a correlated record carries mission_reviewed", () => {
+    const reviewed: FlowRecord[] = day.map((r, i) => (i === 1 ? { ...r, mission_reviewed: "kstrat2001/darkmux#2030" } : r));
+    const value = replayPlaybackKvValue(reviewed, "2026-08-26");
+    expect(value.endsWith("· mission demo-review-nameof-recency · reviewed kstrat2001/darkmux#2030")).toBe(true);
+  });
+
+  it("omits the reviewed clause when no correlated record carries it — every real dispatch today", () => {
+    expect(replayPlaybackKvValue(day, "2026-08-26")).not.toContain("reviewed");
   });
 });

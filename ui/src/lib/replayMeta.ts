@@ -24,7 +24,7 @@
  */
 
 import { T, uidOf } from "./flow";
-import { clk, lday } from "./format";
+import { clk, clkrange, lday } from "./format";
 import type { FlowRecord } from "../types/handwritten";
 
 /** `missions` — `recompute()`, viewer.html:1052. Distinct `mission_id`s in
@@ -111,4 +111,85 @@ export function replayMetaParts(data: FlowRecord[], date: string): ReplayMetaPar
 export function replayMetaLines(data: FlowRecord[], date: string): string[] {
   const p = replayMetaParts(data, date);
   return [`${p.head} · ${p.source} · ${p.span}`, p.census];
+}
+
+/** (#2120) A human label for a mission id, read off the id's OWN naming
+ * convention when it carries a recognizable one — never a fetch, since
+ * the sticky-row transport and the Machine info modal both need this
+ * before any extra network round trip could land, and the client has no
+ * endpoint that hands back a mission's real title/config kind today. A
+ * `review`-config mission's id is shaped `<prefix->review-<title-slug>`
+ * (the demo's own `demo-review-nameof-recency`); this recognizes that ONE
+ * convention and reads the trailing slug as a title ("Review · nameof
+ * recency"). Every other id — a `coder-phase` mission, a bare dispatch, a
+ * hand-typed id with no `review` token — returns `null`, and the caller
+ * either falls back to the raw id (the modal) or omits the label entirely
+ * (the transport, per #2120's "raw id lives only in the modal" call).
+ */
+export function humanMissionLabel(id: string): string | null {
+  const tokens = id.split("-").filter(Boolean);
+  const reviewAt = tokens.indexOf("review");
+  if (reviewAt === -1) return null;
+  const title = tokens.slice(reviewAt + 1).join(" ");
+  return title ? `Review · ${title}` : "Review";
+}
+
+/** (#2121) A REAL title for a mission, read straight off its own flow
+ * records rather than any fetch — same "no network round trip" constraint
+ * [[humanMissionLabel]] documents. Nothing in production writes this field
+ * today (see `mission_title`'s own doc on `FlowRecord`); the demo world's
+ * `import_mission.py --title` is the one writer, stamping it on every
+ * record that carries the mission's id. `null` when no correlated record
+ * carries one, which is every real dispatch until a future writer exists. */
+export function missionTitle(data: FlowRecord[], id: string): string | null {
+  const hit = data.find((r) => r.mission_id === id && r.mission_title);
+  return hit?.mission_title ?? null;
+}
+
+/** (#2121) The transport's mission label: a real [[missionTitle]] when the
+ * mission carries one, [[humanMissionLabel]]'s id-derived heuristic
+ * otherwise — "visitor pass" doctrine (#2121): prefer the human title over
+ * an id-shaped guess wherever a visitor looks first, but never invent one
+ * out of nothing. A mission with neither still returns `null`, same as
+ * `humanMissionLabel` alone did — the transport omits the label entirely
+ * rather than fall all the way back to the raw id (#2120's own rule,
+ * unchanged by this addition). */
+export function resolvedMissionLabel(data: FlowRecord[], id: string): string | null {
+  return missionTitle(data, id) ?? humanMissionLabel(id);
+}
+
+/** (#2120) The Machine info modal's `playback` kv row — everything the
+ * folded `#meta` summary used to carry that the sticky-row transport does
+ * NOT already say on its own: the flow day, the recorded time span, the
+ * day's record/machine census, and (new to this row) the raw mission id
+ * — the transport itself shows only the HUMAN label
+ * ([[humanMissionLabel]]/[[resolvedMissionLabel]]), or nothing when none is
+ * derivable, so the raw id needs a home and this is it.
+ *
+ * (#2121) Also carries `mission_reviewed` when the mission's own records
+ * name one — the real `owner/repo#pr` a review mission actually reviewed
+ * (`import_mission.py --reviewed`). Appended AFTER the id, never in place
+ * of it: this row is the one surface that keeps the raw id unconditionally
+ * (per #2121's own rule — ids stay in detail panes), and the PR reference
+ * is additional detail-pane content, not a replacement for it.
+ *
+ * Same census math as [[replayMetaParts]] (record count + distinct
+ * uids), but the time span reads bare `HH:MM:SS–HH:MM:SS` ([[clkrange]])
+ * rather than `replayMetaParts`'s own `${lday(tMin)}
+ * ${clk(tMin)}–${clk(tMax)}` — the date already opens this string once,
+ * so repeating it in the span would reproduce the exact duplication
+ * #2120 was filed to remove from the sticky row.
+ */
+export function replayPlaybackKvValue(data: FlowRecord[], date: string): string {
+  const ts = data.map((r) => T(r.ts)).filter((n) => !Number.isNaN(n));
+  const tMin = ts.length ? Math.min(...ts) : Date.now();
+  const tMax = ts.length ? Math.max(...ts) : Date.now();
+  const machineCount = new Set(data.map(uidOf)).size;
+  const mission = primaryReplayMission(data);
+  const reviewed = mission ? data.find((r) => r.mission_id === mission && r.mission_reviewed)?.mission_reviewed : null;
+  return (
+    `flow ${date} · ${clkrange(tMin, tMax)} · ${data.length} records · ${machineCount} machines` +
+    (mission ? ` · mission ${mission}` : "") +
+    (reviewed ? ` · reviewed ${reviewed}` : "")
+  );
 }

@@ -630,6 +630,18 @@ describe("App", () => {
    * `goldens/playback-date.txt` is the byte-level spec and the parity suite
    * enforces all four regions against a real browser; this is the fast guard
    * beneath it, and the one that names WHICH surface broke when it breaks.
+   *
+   * (#2120, operator decision — "the transport IS the summary") GRADUATED:
+   * `#crumb` and `#meta` used to carry the replay's own summary (`◆
+   * <mission>` / the folded census line) — now the sticky row's playback
+   * transport carries the mission as a human label instead (`Scrubber`'s
+   * own `label` prop), `#crumb` is empty on a playback route
+   * (`routeChrome`'s own doc), and `#meta` doesn't render AT ALL while the
+   * transport is mounted (this file's own doc on the `!transportShown`
+   * gate) — the day/span/census/raw-id information those two elements used
+   * to carry lives in the Machine info modal's `playback` kv row now
+   * (`machineStatsContent.test.ts`/`MachineDrawer.test.tsx` cover that row
+   * directly).
    */
   it("a replay's chrome describes the REPLAYED day, not today", async () => {
     window.location.hash = "#2026-08-07";
@@ -666,19 +678,20 @@ describe("App", () => {
     expect(document.querySelector(".catalog-toggle")?.textContent).toContain("2026-08-07");
     expect(document.getElementById("modebadge")?.textContent).toBe("▶ playback");
 
-    // crumb: `◆ <primaryMission()>`. Non-empty precisely BECAUSE a replay is
-    // not presence-scoped — the live arm filters to missions with a running
-    // session and finds none, which is why goldens/fleet.txt's crumb is empty.
-    expect(document.getElementById("crumb")?.textContent).toBe("◆ review-1");
+    // crumb: empty now — the raw-id `◆ <mission>` this used to carry moved
+    // into the Machine info modal's `playback` row only (the transport
+    // carries no label, asserted below).
+    expect(document.getElementById("crumb")?.textContent).toBe("");
 
-    // meta: the replay census, from the day's own records. Two lines, and the
-    // schema header counts as neither a record nor a machine.
-    const meta = document.getElementById("meta")?.textContent ?? "";
-    expect(meta).toContain("◆ review-1, review-2");
-    expect(meta).toContain("flow · 2026-08-07");
-    expect(meta).toContain("2 records · 1 machines");
-    // The live arm's headline must NOT appear — it is what used to render here.
-    expect(meta).not.toContain("last dispatch");
+    // meta: gone entirely — the transport is mounted (a real day loaded on
+    // a daemon's `#<date>` route), so `#meta` doesn't render at all.
+    expect(document.getElementById("meta")).toBeNull();
+
+    // (#2121, operator) The transport carries NO label at any width: the
+    // clock is bare and the mission's title lives only in the Machine info
+    // playback row. The demo speaks for itself as it runs.
+    const clock = document.querySelector('[data-testid="scrubber-clock"]');
+    expect(clock?.textContent).toMatch(/^\d\d:\d\d$/);
   });
 
   /**

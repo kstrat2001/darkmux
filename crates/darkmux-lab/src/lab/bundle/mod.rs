@@ -35,7 +35,7 @@ pub mod facts;
 pub mod scan;
 pub mod source;
 
-pub use external::external_bundles;
+pub use external::{external_bundles, is_plugin_decline};
 pub use source::FileSource;
 
 use anyhow::{Context, Result};

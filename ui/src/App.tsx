@@ -24,7 +24,7 @@ import { useRouteRecords } from "./hooks/useRouteRecords";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
-import { primaryReplayMission, replayMetaLines, replayMetaParts } from "./lib/replayMeta";
+import { replayMetaLines, replayMetaParts } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
 import { T, asRecordArray, firstRecordDate, localMachineUid, nameOf, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
@@ -371,7 +371,19 @@ export function App() {
     () => (replayMeta ? replayMetaParts(replayMeta, displayRoute.kind === "playback" ? (displayRoute.date ?? "") : "") : null),
     [replayMeta, displayRoute],
   );
-  const { crumb, logscope } = routeChrome(route, targetMachineName, replayMeta);
+  const { crumb, logscope } = routeChrome(route, targetMachineName);
+  // (#2120, operator finding — "reads like a variable name") The transport's
+  // OWN mission label, replacing the raw-id `◆ <mission>` crumb the sticky
+  // row used to carry for a playback route (see `routeChrome`'s own doc on
+  // why that branch now returns an empty crumb instead). Desktop only —
+  // the caller (below) omits the `label` prop entirely on a phone route, so
+  // `Scrubber` never has to make that call itself. `resolvedMissionLabel`
+  // (#2121) prefers a REAL title when the mission's own records carry one,
+  // falling back to `humanMissionLabel`'s id-derived heuristic — either way
+  // returns `null` when neither is available; this deliberately does NOT
+  // fall back to the raw id here (per the operator's earlier refinement:
+  // "the raw id lives only in the Machine info modal's playback row") —
+  // the transport shows a human label or nothing, never the id.
 
   useSyncHash(route);
 
@@ -439,8 +451,6 @@ export function App() {
             onRewind={transport.rewind}
             onTogglePlay={transport.togglePlay}
             onCycleSpeed={transport.cycleSpeed}
-            visibleCount={transport.visibleCount}
-            totalCount={transport.totalCount}
           />
         ) : null}
         {/* (#2108, operator finding — desktop tab-row fold) `#crumb` moved
@@ -451,9 +461,16 @@ export function App() {
             (this file's own module doc, Packet 1.5). `styles.css`'s mobile
             override puts crumb back on its OWN row below the tabs —
             "phones keep two rows". */}
-        {/* (#2073) `is-replay`: on a playback route the crumb repeats the
-            meta line's own lead (`◆ <mission>`); the narrow stylesheet drops
-            this copy, where a phone has no room for the same name twice. */}
+        {/* (#2073, superseded by #2120) `is-replay` used to matter because a
+            playback route's crumb repeated the meta line's own lead (`◆
+            <mission>`) and the narrow stylesheet dropped that copy. #2120
+            emptied the playback crumb entirely (`routeChrome`'s own doc on
+            that branch) — the mission now shows as a human label on the
+            transport itself instead — so this class is inert today (an
+            empty header either way), kept rather than stripped only
+            because removing it buys nothing: the element itself still
+            needs to exist/not-exist by `route.kind`, which is what the
+            class was never responsible for. */}
         {/* (operator finding, phone screenshot) `route.kind === "machine"` is
             excluded from rendering `#crumb` AT ALL — not just emptied. The
             #2108 round-N "desktop tab-row fold" comment above USED to claim
@@ -493,29 +510,47 @@ export function App() {
             `margin-left: auto` is what pins it to the right of the row;
             `styles.css`'s mobile override gives it back its OWN row below
             crumb, same "phones keep two rows" treatment. */}
-        <div className="app-shell__meta" id="meta">
-          {/* `whiteSpace: "pre"` — the idle headline's literal double space
-              before "· last run" (see `metaLine.ts`'s module doc) is an
-              artifact of legacy's icon SPAN breaking the whitespace-collapse
-              run; default `white-space: normal` would collapse it back to
-              one space here, since there's no element in the way. Preserving
-              it verbatim is simpler and more robust than reproducing the
-              icon-boundary quirk with a real (empty) element. */}
-          {ready && !staticIdle ? (
-            <div><ReadyHeadline n={ready.n} ago={ready.ago} /></div>
-          ) : replayParts ? (
-            /* (#2073) Same text as `metaLines[0]`; the source + span sit in
-               their own span so the narrow stylesheet can drop what the chip
-               and the activity timeline already say. */
-            <div className="app-shell__metaline">
-              {replayParts.head}
-              <span className="app-shell__metasrc">{` · ${replayParts.source} · ${replayParts.span}`}</span>
-            </div>
-          ) : (
-            <div className="app-shell__metaline">{metaLines[0]}</div>
-          )}
-          <div className="app-shell__metaline">{metaLines[1]}</div>
-        </div>
+        {/* (#2120, operator decision — "in playback mode the transport IS
+            the summary") This whole block used to render unconditionally;
+            it now doesn't render AT ALL while the sticky row's playback
+            transport is mounted, at any width. Before this, a wide desktop
+            wrapped the folded replay summary onto a second right-aligned
+            line under the transport (the bug report's own screenshot), and
+            a phone got its OWN full-width row for it (`styles.css`'s
+            mobile override) — both were the same underlying problem: the
+            transport already names the mission (via `Scrubber`'s own
+            `label` prop, above) and the day/range/census this line used to
+            carry moved into the Machine info modal's `playback` kv row
+            (`machineStatsContent.tsx`), so there is nothing left for this
+            block to say that isn't either duplicated or stale. Non-playback
+            routes are untouched: `transportShown` is false there (a live
+            route never loads a day to scrub — `usePlaybackTransport`'s own
+            doc), so this renders exactly as it did before. */}
+        {!transportShown && (
+          <div className="app-shell__meta" id="meta">
+            {/* `whiteSpace: "pre"` — the idle headline's literal double space
+                before "· last run" (see `metaLine.ts`'s module doc) is an
+                artifact of legacy's icon SPAN breaking the whitespace-collapse
+                run; default `white-space: normal` would collapse it back to
+                one space here, since there's no element in the way. Preserving
+                it verbatim is simpler and more robust than reproducing the
+                icon-boundary quirk with a real (empty) element. */}
+            {ready && !staticIdle ? (
+              <div><ReadyHeadline n={ready.n} ago={ready.ago} /></div>
+            ) : replayParts ? (
+              /* (#2073) Same text as `metaLines[0]`; the source + span sit in
+                 their own span so the narrow stylesheet can drop what the chip
+                 and the activity timeline already say. */
+              <div className="app-shell__metaline">
+                {replayParts.head}
+                <span className="app-shell__metasrc">{` · ${replayParts.source} · ${replayParts.span}`}</span>
+              </div>
+            ) : (
+              <div className="app-shell__metaline">{metaLines[0]}</div>
+            )}
+            <div className="app-shell__metaline">{metaLines[1]}</div>
+          </div>
+        )}
       </div>
       {/* (Chrome packet) `.wrap` — `#stage` beside the event-log column,
           exactly the legacy DOM shape (`.stage` then `.log`, siblings inside
@@ -600,18 +635,7 @@ export function App() {
  * these are byte-parity targets for `#crumb` (see each component's own doc
  * for why), so inventing crumb text for them would be UX decoration, not a
  * port. */
-function routeChrome(
-  route: Route,
-  targetMachineName: string | null,
-  /** (#1800) A replay's own records, or null on a live route. The fleet-level
-   *  crumb is `◆ ${primaryMission()}` (viewer.html:2596-2605), and
-   *  `primaryMission` resolves through `liveScopedMissions`, whose two arms
-   *  are why `goldens/fleet.txt` has an EMPTY crumb and
-   *  `goldens/playback-date.txt` names a mission: live filters to missions
-   *  with a RUNNING session (none, on the recorded corpus), replay shows the
-   *  window's missions. */
-  replayRecords: FlowRecord[] | null,
-): { crumb: string; logscope: string } {
+function routeChrome(route: Route, targetMachineName: string | null): { crumb: string; logscope: string } {
   if (route.kind === "machine") {
     // `$("crumb").innerHTML = state.machine!=null ? escN(state.machine) :
     // "this machine"` (viewer.html:2537); `$("logscope").textContent =
@@ -670,12 +694,16 @@ function routeChrome(
     // logscope (viewer.html:1668) it does on a live fleet view — VISIBLE,
     // already uppercase.
     //
-    // …and it therefore takes the same FLEET-LEVEL crumb branch, which is
-    // `◆ ${primaryMission()}` — non-empty here precisely because a replay is
-    // not presence-scoped. Empty when the day has no mission ids at all,
-    // matching legacy's `pm!=null ? ... : ""`.
-    const pm = replayRecords ? primaryReplayMission(replayRecords) : null;
-    return { crumb: pm != null ? `◆ ${pm}` : "", logscope: "fleet" };
+    // (#2120, operator finding — "reads like a variable name") Used to take
+    // the same FLEET-LEVEL crumb branch legacy does, `◆ ${primaryMission()}`
+    // — a RAW mission id, right next to the transport's own controls. Empty
+    // now: the transport carries a HUMAN label for the same mission itself
+    // (`App.tsx`'s own `playbackMissionLabel`, threaded into `Scrubber`'s
+    // `label` prop), and the raw id this crumb used to show moved to the
+    // Machine info modal's `playback` kv row instead — a real DOM/behavior
+    // change from legacy, not a port, made once the transport could carry
+    // this information on its own.
+    return { crumb: "", logscope: "fleet" };
   }
   if (route.kind === "mission") {
     // `MissionGraphLens` (#1868) owns its own header + events pane — see

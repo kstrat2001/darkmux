@@ -554,6 +554,23 @@ export interface FlowRecord {
   source?: string;
   model?: string;
   mission_id?: string;
+  /** (#2121) A human title for the mission this record belongs to — never
+   * written by a real dispatch; the demo's `import_mission.py --title`
+   * stamps it on every correlated record so the viewer can prefer a real
+   * title over `humanMissionLabel`'s id-derived heuristic (see
+   * `lib/replayMeta.ts`). Absent on every real daemon's own records, by
+   * construction: there is no production writer of this field, and no live
+   * route depends on it — a live/local route falls back to the existing
+   * heuristic exactly as before this field existed. */
+  mission_title?: string;
+  /** (#2121) The real `owner/repo#pr` this review mission actually
+   * reviewed, stamped by the demo's `import_mission.py --reviewed`
+   * alongside `mission_title`. Surfaces ONLY in the Machine info modal's
+   * playback row next to the raw mission id (see
+   * `replayPlaybackKvValue`) — never in the transport, which shows the
+   * title alone. Same "no production writer today" note as
+   * `mission_title` above. */
+  mission_reviewed?: string;
   phase_id?: string;
   machine_id?: string;
   machine_uid?: string;

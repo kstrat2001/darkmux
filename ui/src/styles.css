@@ -147,6 +147,14 @@ body {
   padding: 0;
   border-top: none;
 }
+/* (#2120/#2121, operator) An EMPTY crumb (fleet, console, playback) still
+   mounts as a fixture point for tests and the e2e walks, but must not take a
+   flex slot in the sticky row: with flex 1 1 auto it ate a third of the row
+   after the playback transport. React renders no text node for "", so the
+   element is :empty and collapses. */
+.app-shell__sticky .app-shell__crumb:empty {
+  display: none;
+}
 
 .app-shell__navtabs {
   /* (operator, 2026-08-28) Uniform cells on every width: `grid-auto-columns:
@@ -4442,6 +4450,18 @@ body {
 .dialog--wide {
   width: 540px;
 }
+/* (#2116) Filters gets its own width rule rather than reusing
+   `.dialog--wide` — Notes' fixed 540px is tuned for prose; the activity
+   facet's grid below wants to actually USE the extra room a wider
+   viewport offers, so this scales with the viewport instead of pinning a
+   second fixed number. `max-width: 92vw` on the base `.dialog` rule above
+   still applies (this is additive, not a full override), so a narrow
+   viewport is already covered without a separate phone override — see
+   `.dialog__fgroup--activity` below for why the grid itself needs none
+   either. */
+.dialog--filters {
+  width: min(90vw, 720px);
+}
 @keyframes dialog-pop-in {
   from {
     opacity: 0;
@@ -4492,6 +4512,26 @@ body {
   font: calc(12px * var(--fs-scale)) var(--font-mono);
   color: var(--fg);
   cursor: pointer;
+}
+/* (#2116) The activity facet's own layout — the one group that can grow
+   to ~40 checkboxes on a busy day (`computeFacets` derives it from the
+   day's own records, `lib/eventFilters.ts`). `repeat(auto-fill,
+   minmax(180px, 1fr))` fills as many 180px columns as `.dialog--filters`'
+   own width offers; NO separate phone override is needed — at a ~350px
+   content width (a 390px viewport's `min(90vw, 720px)`, minus the
+   dialog's own padding) `auto-fill` already computes to exactly one
+   column, the same single-column behavior every other facet group keeps
+   at every width via its own `inline-flex` wrap. `computeFacets` itself
+   sorts same-prefix actions (`mission.*`/`phase.*`/`step.*`/`dispatch.*`/
+   `hook.*`) together, so reading down a column groups related actions
+   the way reading across the old two-column swarm never did. */
+.dialog__fgroup--activity {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 2px 12px;
+}
+.dialog__fgroup--activity label {
+  margin: 0 0 5px;
 }
 .dialog__fgroup input {
   accent-color: var(--accent);
@@ -5363,6 +5403,26 @@ body {
 }
 .mm-gauge-fill-compact {
   stroke: var(--accent, var(--good));
+}
+/* (#2122) Band-threshold coloring for a compact gauge's fill — one class
+   per severity (`Meter.tsx`'s `bandLevelClass`), overriding whatever
+   literal `stroke` the caller passed. A CSS class rule outranks an SVG
+   presentation attribute (`stroke="..."` on the element) regardless of
+   selector order here, so this needs no `!important` and no extra
+   specificity games — same two tokens the thermal pill already uses
+   (`--warn` for fair, `--bad` for serious/critical), so a loaded GPU and
+   a loaded CPU speak the same color language on the same panel. */
+.mm-band-warn {
+  stroke: var(--warn);
+}
+.mm-band-critical {
+  stroke: var(--bad);
+}
+.meter-now.mm-band-warn {
+  color: var(--warn);
+}
+.meter-now.mm-band-critical {
+  color: var(--bad);
 }
 .mm-gauge--compact .mm-gauge-tick-avg {
   stroke: var(--dim);

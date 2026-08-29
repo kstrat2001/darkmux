@@ -49,11 +49,19 @@ export interface ScrubberProps {
   onRewind: () => void;
   onTogglePlay: () => void;
   onCycleSpeed: () => void;
-  /** Records at or before the playhead, out of the day's total — the same
-   * "N/M rec" readout legacy's own clock chip carries
-   * (`visible().length+"/"+DATA.length+" rec"`, viewer.html:2619). */
-  visibleCount: number;
-  totalCount: number;
+  /** (#2120, operator finding — "almost none of it is meaningful") A
+   * human-readable label for the played mission, shown after the clock on
+   * desktop only (the caller omits this prop entirely on a phone route —
+   * see `App.tsx`'s own doc). `undefined`/`null` when the caller has
+   * nothing derivable (no mission on the loaded day, or an id with no
+   * recognizable naming convention — `lib/replayMeta.ts`'s
+   * `humanMissionLabel`): the clock then renders alone rather than
+   * falling back to a raw id, which lives only in the Machine info
+   * modal's `playback` row now, not here. Legacy's own `visible()+"/"+DATA
+   * .length+" rec"` readout (viewer.html:2619) that used to sit here is
+   * gone too — the range input IS the progress indicator; the counts
+   * moved to that same modal row alongside the id. */
+  label?: string | null;
 }
 
 export function Scrubber({
@@ -66,8 +74,7 @@ export function Scrubber({
   onRewind,
   onTogglePlay,
   onCycleSpeed,
-  visibleCount,
-  totalCount,
+  label,
 }: ScrubberProps) {
   // `span` (floored to 1) feeds `onScrub`'s drag math below, so a drag on a
   // zero-span day never divides by zero. The RENDERED value is a separate
@@ -126,7 +133,8 @@ export function Scrubber({
         {speedLabel(speed)}
       </button>
       <span className="clock" data-testid="scrubber-clock">
-        {clkhm(t)} · {visibleCount}/{totalCount} rec
+        {clkhm(t)}
+        {label ? ` · ${label}` : ""}
       </span>
     </div>
   );
