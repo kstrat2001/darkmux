@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crawl a codebase against your rules, and route what it finds · darkmux user guide</title>
+<meta name="description" content="Run darkmux's local-model crawler against a named workspace and rule set, and route the flow records it emits to your own tracker via loopback-only hooks.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="wrap">
+    <a href="../" class="brand"><img src="../media/icon/mark-trapezoid-out.svg" width="22" height="22" alt="">darkmux</a>
+    <span class="crumbs"><a href="index.html">guide</a> <span>/</span> crawl-and-hooks</span>
+    <div class="links">
+      <a href="../guide/">Guide</a>
+      <a href="../demo/">Demo</a>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="page-head">
+  <div class="wrap">
+    <div class="label">10 <span class="dot">·</span> advanced</div>
+    <h1>Crawl a codebase against your rules, and route what it finds</h1>
+    <p class="lede">A <strong>crawl</strong> (#1959) is a mission like any other: point it at real source trees, name the rules you want checked, and a local model reads bounded slices of code and reports findings through <code>report_finding</code>. Everything the crawl does streams as ordinary flow records, so the last piece is routing: <strong>hooks</strong> (#2093) match those records against operator rules and POST the matches to your own loopback receiver — no external tracker knows darkmux exists, and darkmux never leaves loopback to reach one.</p>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>When you'd use this</h2>
+    <p>This is the deep end of the guide. Use it when you want a standing, repeatable check — "does this codebase have swallowed errors, or doc comments the code no longer matches" — run by a local model against a workspace you name, with the findings routed somewhere you already look (an issue tracker, a Slack-posting script, your own dashboard) instead of read off the terminal by hand.</p>
+    <p>The two halves compose but ship independently: you can run a crawl and read its findings straight from the flow log with no hooks configured at all, or wire hooks to route <em>any</em> flow record (mission lifecycle, dispatch bookends, a specific tool call) with no crawl in the picture. This page walks both, in the order you'd actually set them up.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>1. The workspace spec</h2>
+    <p>A crawl's target is a <strong>workspace spec</strong>: a JSON document naming one or more source trees, what to include/exclude, and which rules to check. Save it anywhere and pass its path to <code>--param workspace=</code>. Here it is pointed at darkmux's own public repo — never point a workspace spec at engagement-private source, per darkmux's own no-public-repo-for-personal-engagements posture:</p>
+    <pre><code>{
+  "schema_version": "1.0",
+  "name": "darkmux-self",
+  "sources": [
+    { "id": "darkmux", "git": "git@github.com:kstrat2001/darkmux.git", "ref": "main" }
+  ],
+  "include": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.mjs", "**/*.md"],
+  "exclude": ["**/node_modules/**", "**/dist/**", "**/docs/demo/**", "**/target/**"],
+  "edges": [],
+  "rules": ["swallowed-error", "doc-contradicts-code"]
+}</code></pre>
+    <ul>
+      <li><code>sources[]</code>: each entry is either <code>git</code> (cloned once into <code>~/.darkmux/workspaces/&lt;name&gt;/tree</code> and reused across launches at the same ref) or <code>path</code> (a local directory, used in place). <code>ref</code> names the branch/tag/sha to check out.</li>
+      <li><code>include</code>/<code>exclude</code>: glob lists that narrow the file set every rule's <code>applies_to</code> further narrows per-rule.</li>
+      <li><code>edges</code>: dependency edges between sources, consumed by <code>edge</code>-kind rules (see the built-in <code>stale-consumer</code> rule below). Empty here — this spec has one source.</li>
+      <li><code>rules</code>: the rule ids to check, resolved the same way roles resolve: user tier (<code>~/.darkmux/rules/</code>) first, then the embedded built-ins.</li>
+    </ul>
+
+    <h3>Preview the plan with <code>--dry-run</code></h3>
+    <p>Before spending any model time, resolve the spec and see exactly what would run — file counts, unit counts, and a token estimate — with nothing minted and nothing dispatched:</p>
+    <pre><code>darkmux mission launch crawl --param workspace=/path/to/darkmux-self.json --dry-run</code></pre>
+    <p>Real output, captured against the spec above:</p>
+    <pre><code>darkmux mission launch crawl --dry-run — darkmux-self
+planned_at: 2026-08-29T15:05:33Z
+written to: (not written — pass --param plan_out=&lt;path&gt; to write)
+
+sources
+  darkmux          2b4e38b5   in_scope=326 out_of_scope=551
+
+by rule
+  doc-contradicts-code     units=77   files=272      est_tokens=728457
+  swallowed-error          units=2    sites=23       est_tokens=17103
+
+totals: 79 units, 745560 est_tokens
+  skipped: (none)
+  edges: (none)</code></pre>
+    <p>Each source row shows <code>in_scope</code>/<code>out_of_scope</code> file counts after <code>include</code>/<code>exclude</code> narrowing; each rule row shows how many <strong>units</strong> (one unit = one bounded dispatch's worth of work) it decomposed into, plus a rough token estimate so you can gauge cost before committing a single dispatch.</p>
+    <div class="callout">
+      <strong>Discrepancy from what you might expect: <code>workspace=</code> takes a file PATH, not inline JSON.</strong>
+      <p style="margin: 8px 0 0;">Passing the spec's JSON text directly as the <code>--param</code> value fails: <code>darkmux</code> tries to <code>open()</code> the string you gave it as a filesystem path and reports <code>No such file or directory</code>, quoting the JSON back at you inside the error as if it had been read as a document, not a path — which reads as a parse failure on first glance but is actually a <em>file-not-found</em> on a path that happens to be a long JSON blob. Write the spec to a file and pass its path; that's the only form that resolves.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>2. Rules: a template kind, like roles</h2>
+    <p>A <strong>rule</strong> is a named, searchable property bound to files by glob — the same registry shape roles use (embedded built-ins, overridable at a user tier), and not crawl-specific: any role's mission can use the rules registry, the crawler is just its first consumer. darkmux ships three built-ins at <code>templates/builtin/rules/</code>:</p>
+    <table>
+      <tr><th>Rule</th><th>Kind</th><th>What it looks for</th></tr>
+      <tr><td><code>swallowed-error</code></td><td><code>site</code></td><td>A <code>catch</code>/<code>.catch(...)</code>/<code>void somePromise()</code> site where the failure is neither rethrown, logged, nor checked by the caller.</td></tr>
+      <tr><td><code>doc-contradicts-code</code></td><td><code>read</code></td><td>A doc comment or README claim the adjacent code visibly does not do.</td></tr>
+      <tr><td><code>stale-consumer</code></td><td><code>edge</code></td><td>A consumer's pinned dependency range excludes a library version whose imported symbols changed shape.</td></tr>
+    </table>
+    <p>The three <code>kind</code>s shape how a rule turns into work: <code>site</code> rules run a cheap mechanical prefilter (a regex) over the file set first, so the model only reads sites the prefilter flags, costing no tokens on files it never touches; <code>read</code> rules have no prefilter and ride the same read pass every other read rule shares, over whole files grouped up to <code>chunk_tokens</code>; <code>edge</code> rules fire on a dependency edge the workspace spec's own <code>edges</code> array declares. Here's the full shape of the <code>swallowed-error</code> rule, the <code>site</code> case:</p>
+    <pre><code>{
+  "id": "swallowed-error",
+  "kind": "site",
+  "title": "A failure is caught or discarded and nothing records that it happened",
+  "applies_to": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.mjs", "**/*.cjs"],
+  "exclude": ["**/node_modules/**", "**/dist/**", "**/build/**", "**/*.test.*", "**/*.spec.*"],
+  "prefilter": ["\\bcatch\\s*(\\(|\\{)", "\\.catch\\s*\\(", "^\\s*void\\s+[A-Za-z_$][\\w$.]*\\s*\\("],
+  "window": 30,
+  "match": "The site is a `catch` clause, a `.catch(...)` handler, or a `void somePromise()` statement, AND the failure that reaches it is neither rethrown, nor returned as an error value the caller checks, nor logged, nor counted, nor recorded anywhere the surrounding lines show.",
+  "no_match": "The handler rethrows or wraps and throws. The handler logs. A comment says why ignoring the failure is safe. Test code, generated code, or a `.d.ts`.",
+  "evidence": "The `catch`/`.catch`/`void` line, copied verbatim. `line` is where it appears.",
+  "why_hint": "Say what operation failed silently and what downstream code assumes about it."
+}</code></pre>
+    <p><code>match</code>/<code>no_match</code> are the positive and negative criteria the model is given verbatim; <code>evidence</code> and <code>why_hint</code> shape what a reported finding must cite. Author your own at <code>~/.darkmux/rules/&lt;id&gt;.json</code> — same shape, same registry, resolved ahead of the built-ins by id.</p>
+
+    <h3>Rule problems surface in <code>darkmux doctor</code></h3>
+    <p>Doctor loads the whole registry (not just one workspace's resolved subset) and reports count plus provenance. On this machine, with no user-tier rules yet, that line reads:</p>
+    <pre><code>✓ rules                  3 rule(s) loaded (3 built-in, no user tier)</code></pre>
+    <p>A malformed user-tier file, an empty <code>applies_to</code>, or a <code>site</code> rule with no <code>prefilter</code> would surface here as a named warning rather than a silent skip or a hard failure at launch time.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>3. Running a unit</h2>
+    <p>Add <code>--param limit=N</code> to actually dispatch instead of previewing:</p>
+    <pre><code>darkmux mission launch crawl --param workspace=/path/to/darkmux-self.json --param limit=1</code></pre>
+    <p>Dropping <code>--dry-run</code> mints a real mission, clones (or reuses) the source tree, and dispatches one unit per selected plan row to a local model — the same internal-runtime container path <code>darkmux dispatch</code> uses. <strong>A crawl unit is a real dispatch and can run for minutes</strong>: this page does not run one live (another job was already running one while this page was written), instead reading and scrubbing the records of a completed crawl mission straight from <code>~/.darkmux/flows/&lt;date&gt;.jsonl</code>.</p>
+
+    <h3>The record sequence</h3>
+    <p>Generic mission/dispatch bookends wrap the crawl-specific work, in this order for one unit:</p>
+    <pre><code>mission start          <span class="comment"># operator-tier: workspace, units_in_plan, units_selected, est_tokens</span>
+phase start
+step start
+dispatch start          <span class="comment"># local-tier: role=crawler, the assembled prompt, the model</span>
+dispatch.turn / dispatch.tool / dispatch.reasoning   <span class="comment"># the loop, repeated per turn</span>
+dispatch.rest           <span class="comment"># only when runtime.turn_delay_ms is set — see the knobs table below</span>
+step complete            <span class="comment"># findings, exclusions, wall_ms, rest_ms, per-unit token counts</span>
+dispatch complete        <span class="comment"># wall_ms, rests, total_turns, total_tools, total_tokens</span>
+<span class="comment"># ...repeated per selected unit...</span>
+mission close            <span class="comment"># units_completed/errored/skipped, stopped_by, tokens_per_hour</span></code></pre>
+    <p>Real records from a completed crawl mission (scrubbed of local paths and the machine id):</p>
+    <pre><code>{"action":"mission start","tier":"operator","mission_id":"crawl-1787979698-b5961a",
+ "payload":{"workspace":"darkmux-self","units_in_plan":70,"units_selected":2,
+            "est_tokens":15586,"sources":[{"id":"darkmux","sha":"86c2b27..."}]}}
+
+{"action":"dispatch.rest","tier":"local","mission_id":"crawl-1787979698-b5961a",
+ "payload":{"ms":2000,"turn":1,"rest_ms":2000,"rests":1,
+            "context":{"workspace":"darkmux-self","rule":"swallowed-error","unit":"u-0001"}}}
+
+{"action":"step complete","tier":"local","mission_id":"crawl-1787979698-b5961a",
+ "payload":{"unit":"u-0001","rule":["swallowed-error"],"result":"stop",
+            "findings":2,"exclusions":2,"prompt_tokens":657998,"completion_tokens":11719,
+            "wall_ms":265649,"rest_ms":34000}}
+
+{"action":"dispatch complete","tier":"local","mission_id":"crawl-1787979698-b5961a",
+ "payload":{"wall_ms":268865,"rest_ms":34000,"rests":17,"turn_delay_effective_ms":2000,
+            "exit_code":0,"result_class":"ok","total_turns":18,"total_tools":55,
+            "total_tokens":669717}}
+
+{"action":"mission close","tier":"operator","mission_id":"crawl-1787979698-b5961a",
+ "payload":{"units_in_plan":70,"units_selected":2,"units_not_run":68,
+            "units_completed":2,"units_errored":0,"findings":2,
+            "wall_ms":349707,"tokens_per_hour":7875514,"stopped_by":"limit",
+            "timeout_secs":900,"limit":2}}</code></pre>
+    <p>Note <code>dispatch.rest</code>'s <code>rest_ms</code>/<code>rests</code> riding alongside <code>wall_ms</code> unchanged in both <code>step complete</code> and <code>dispatch complete</code> — a rested run's wall clock is never misread as a slow model; subtract <code>rest_ms</code> yourself if you want model-only time. <code>stopped_by: "limit"</code> is <code>--param limit=2</code> doing its job: an honest early stop, not an error.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>4. Hooks: routing flow records to your own receiver</h2>
+    <p>Hooks are darkmux's fourth <code>FlowSink</code> kind: match a flow record against operator-configured rules and POST a match verbatim to a receiver you run. <strong>Loopback only</strong> — <code>validate_loopback_http_url</code> refuses anything else, checked both when the rule loads and again at every POST — so darkmux itself never reaches an external tracker; it hands matched records to a process on the same machine, and what that process does with them (relay, store, forward) is entirely up to you.</p>
+
+    <h3>The config block</h3>
+    <p><code>config.hooks</code>, same visible-defaults shape as <code>redis</code>/<code>audit</code>. This is the real block from a running machine (URLs are loopback, nothing else to scrub):</p>
+    <pre><code>{
+  "hooks": {
+    "enabled": true,
+    "rules": [
+      { "match": { "action": "dispatch.tool", "payload.tool_name": "report_finding", "payload.ok": true },
+        "http": "http://127.0.0.1:8790/events" },
+      { "match": { "action": "step *" },
+        "http": "http://127.0.0.1:8790/events" },
+      { "match": { "action": "mission *" },
+        "http": "http://127.0.0.1:8790/events" }
+    ]
+  }
+}</code></pre>
+    <p>Two fields the full schema also supports, <code>outbox_dir</code> and <code>max_outbox_mb</code>, are absent from this particular file — they're <code>Option</code> fields with defaults (<code>~/.darkmux/hooks</code>, 256 MiB) filled in at read time, and <code>darkmux doctor</code>/<code>flow status</code> below show the resolved values even though the file itself only sets <code>enabled</code> and <code>rules</code>.</p>
+
+    <h3>The match vocabulary</h3>
+    <p>A rule's <code>match</code> object ANDs together every key it names. Top-level fields: <code>action</code>, <code>session_id</code>, <code>mission_id</code>, <code>machine_id</code>, <code>category</code>, <code>level</code>. A glob suffix (<code>"step *"</code>, <code>"mission *"</code>) matches any action starting with that prefix. Past the top level, a <code>"payload.&lt;dotted.path&gt;"</code> key reaches into the record's own <code>payload</code> for an exact scalar match — the third rule above's <code>payload.tool_name</code>/<code>payload.ok</code> pair is how you subscribe to one specific tool call's outcome rather than an entire action glob. A key the payload doesn't carry never matches; there's no "absent means match" reading.</p>
+
+    <h3><code>hook.fired</code> / <code>hook.failed</code></h3>
+    <p>Every delivery attempt emits its own flow record — <code>hook.fired</code> on a 2xx, <code>hook.failed</code> once bounded retries give up. Real <code>hook.fired</code> record from the crawl mission above, showing the run's <code>step start</code> rule firing:</p>
+    <pre><code>{"action":"hook.fired","source":"hook","payload":{"rule_index":1,
+   "target_host":"127.0.0.1:8790","delivered_action":"step start","attempt":1}}</code></pre>
+    <p>A 2xx response can still carry a per-record rejection: if the receiver's JSON body reports <code>{"rejected": N}</code>, that count rides on the same <code>hook.fired</code> record as <code>payload.receiver_rejected</code> — the delivery is still consumed either way (at-least-once), but a receiver quietly refusing records inside a 200 is never silent:</p>
+    <pre><code>{"action":"hook.fired","source":"hook","payload":{"rule_index":0,
+   "target_host":"127.0.0.1:8790","delivered_action":"dispatch.tool",
+   "attempt":1,"receiver_rejected":1}}</code></pre>
+    <p><code>hook.failed</code> didn't fire in this environment's log — delivery has been succeeding — but it exists for the give-up path (a permanent 4xx/redirect, or retries exhausted against a down receiver) and carries the same <code>rule_index</code>/<code>target_host</code> shape plus the failure reason.</p>
+
+    <h3><code>darkmux flow status</code></h3>
+    <p>Real output (Redis section trimmed to the hooks-relevant lines; this machine also runs a Redis sink, irrelevant here):</p>
+    <pre><code>darkmux flow status — ⚠ warn
+  schema:       1.28.0
+  composition:  Tee([LocalFile, Redis, Hooks])
+  ...
+Hooks
+  enabled:      true
+  outbox_dir:   ~/.darkmux/hooks
+  #0: action=dispatch.tool, payload.ok=true, payload.tool_name="report_finding" -> http://127.0.0.1:8790/events
+      undelivered: 0
+      last delivery: 2026-08-29T05:04:41Z
+      last drainer heartbeat: 2026-08-29T15:06:14Z
+  #1: action=step * -> http://127.0.0.1:8790/events
+      undelivered: 0
+  #2: action=mission * -> http://127.0.0.1:8790/events
+      undelivered: 0</code></pre>
+    <p>Per rule: undelivered byte/line count, last successful delivery, and the background drainer's last heartbeat — enough to tell "quiet because there's nothing to send" from "stuck."</p>
+
+    <h3><code>darkmux flow drain</code></h3>
+    <p>Flushes every rule's outbox synchronously instead of waiting for the background drainer's own cadence. With nothing pending, real output is a one-liner:</p>
+    <pre><code>darkmux flow drain (all rules) — delivered: 0, failed: 0</code></pre>
+    <p><code>--file &lt;path&gt; --to &lt;url&gt;</code> drains a single stray outbox file whose owning rule was since removed or edited — <code>darkmux doctor</code> names any stray files it finds under the outbox dir.</p>
+
+    <h3>A minimal receiver</h3>
+    <p>You don't need the operator's own tracker to try this — any process that accepts a POST and returns 2xx works. Fifteen lines, tested against a real hook delivery while writing this page:</p>
+    <pre><code>import http from "node:http";
+
+http.createServer((req, res) => {
+  if (req.method !== "POST") { res.writeHead(405).end(); return; }
+  let body = "";
+  req.on("data", (chunk) => { body += chunk; });
+  req.on("end", () => {
+    const record = JSON.parse(body);
+    console.log(`[${record.action}] ${record.mission_id ?? record.session_id ?? ""}`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ rejected: 0 }));
+  });
+}).listen(8790, "127.0.0.1", () => {
+  console.log("listening on http://127.0.0.1:8790/events");
+});</code></pre>
+    <p>Run it (<code>node receiver.mjs</code>), point a hook rule's <code>http</code> at <code>http://127.0.0.1:8790/events</code>, and every matching flow record prints as it's delivered. The <code>{"rejected": N}</code> response body is optional — return a bare <code>200</code> and every delivery just reads as accepted.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>5. The knobs</h2>
+    <p>Names and defaults copied verbatim from <code>docs/ENVIRONMENT.md</code>:</p>
+    <table>
+      <tr><th>Env var</th><th>Default</th><th><code>config.json</code> field</th><th>What it does</th></tr>
+      <tr>
+        <td><code>DARKMUX_TURN_DELAY_MS</code></td>
+        <td><code>0</code></td>
+        <td><code>runtime.turn_delay_ms</code></td>
+        <td>Global inter-turn rest — the runtime sleeps this many milliseconds between turns only (never before the first, never after the last). Recorded as <code>rest_ms</code>/<code>rests</code> alongside an unchanged <code>wall_ms</code>. Clamped to at most half of <code>DARKMUX_INACTIVITY_TIMEOUT_SECONDS</code>, with a loud warning naming the clamp if it fires. Never applied to an agentic-remote dispatch.</td>
+      </tr>
+      <tr>
+        <td><code>DARKMUX_HOST_SAMPLER_INTERVAL_MS</code></td>
+        <td><code>5000</code></td>
+        <td><code>runtime.host_sampler_interval_ms</code></td>
+        <td>The serve daemon's continuous host sampler cadence — CPU/memory/thermal/GPU read in-process from kernel counters, zero model work, zero process spawns. Measured mean cost ~9.7&nbsp;ms per sample on an M5 Max. <code>0</code> disables it.</td>
+      </tr>
+      <tr>
+        <td><code>DARKMUX_HOOKS_ENABLED</code></td>
+        <td><code>false</code></td>
+        <td><code>hooks.enabled</code></td>
+        <td>The whole-feature gate for hooks. No per-rule env override exists — a rule is a structured object an env var can't carry; this only turns the feature as a whole on/off.</td>
+      </tr>
+      <tr>
+        <td><code>DARKMUX_HOOKS_MAX_OUTBOX_MB</code></td>
+        <td><code>256</code></td>
+        <td><code>hooks.max_outbox_mb</code></td>
+        <td>The hard cap, in MiB, on undelivered bytes a single rule's outbox may hold before further appends for that rule are dropped (counted, never silently lost). <code>0</code> disables the cap. Read once, live, at construction.</td>
+      </tr>
+    </table>
+  </div>
+</section>
+
+<nav class="page-nav wrap">
+  <a href="pr-flow.html" class="prev">
+    <span class="dir">‹ Previous</span>
+    <span class="title">PR-flow panel verbs</span>
+  </a>
+  <a href="index.html" class="next">
+    <span class="dir">Guide home ›</span>
+    <span class="title">Back to TOC</span>
+  </a>
+</nav>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/kstrat2001/darkmux">GitHub</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/DISCLAIMER.md">Disclaimer</a> ·
+      <a href="https://github.com/kstrat2001/darkmux/blob/main/LICENSE">MIT</a>
+    </div>
+    <div>
+      © Kain Osterholt · <a href="https://substack.com/@DarklyEnergized">Darkly Energized LLC</a>
+    </div>
+  </div>
+</footer>
+
+<script src="copy.js" defer></script>
+</body>
+</html>
