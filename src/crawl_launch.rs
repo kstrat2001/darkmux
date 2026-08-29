@@ -94,7 +94,14 @@ use std::path::{Path, PathBuf};
 const FINDING_FILE_KEY: &str = "file";
 
 /// Production entry point — called from `mission_launch::launch` when
-/// `config_id == "crawl"`.
+/// `config_id == "crawl"`. `--dry-run` (#1959, `darkmux mission launch
+/// crawl --dry-run`) reaches this the SAME way every other input does:
+/// `mission_launch::launch`'s CLI dispatch injects a synthetic `--param
+/// dry_run=true` onto `params` before routing here — no separate `bool`
+/// parameter on this function. `run` reads it via `bool_param` exactly
+/// like `no_fetch`/`plan_out`, so every existing test calling `run`
+/// directly (with no `"dry_run"` key at all) keeps its implicit "not a
+/// dry run" behavior unchanged.
 pub fn launch(input_file: Option<&Path>, params: &[String], timeout_seconds: Option<u32>) -> Result<i32> {
     let collected = mission_launch::collect_inputs(input_file, params)?;
     run(&collected, timeout_seconds, &mut |opts| crew::dispatch::dispatch(opts))
@@ -985,6 +992,26 @@ pub(crate) fn run(
         }
     }
 
+    // (#1959) `--dry-run`: resolve + plan (everything above this point),
+    // print the plan table, mint NOTHING, emit NO flow records, dispatch
+    // NOTHING. Writes nothing to disk unless `--param plan_out=<path>` is
+    // given — a dry run is read-only by default. Deliberately checked
+    // AFTER every validation above (rule ids resolve, plan sha/tree match
+    // the resolved sources) so a dry run surfaces the SAME loud failures a
+    // real run would, rather than optimistically skipping them.
+    if bool_param(collected, "dry_run") {
+        let plan_out = str_param(collected, "plan_out").map(PathBuf::from);
+        if let Some(op) = &plan_out {
+            if let Some(parent) = op.parent() {
+                std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+            }
+            let plan_json = serde_json::to_string_pretty(&the_plan)?;
+            std::fs::write(op, &plan_json).with_context(|| format!("writing plan to {}", op.display()))?;
+        }
+        print_plan_table(&the_plan, plan_out.as_deref());
+        return Ok(0);
+    }
+
     // (#1959 merge-gate finding 12) A zero-unit selection is easy to
     // produce by accident (a `--param units=` typo that happens to still
     // parse, an over-narrow filter) and easy to miss buried in a summary
@@ -1549,6 +1576,94 @@ pub(crate) fn run(
 
     // ── finalize (normal path) — disarms the guard ──────────────────────
     guard.close()
+}
+
+/// (#1959) Ported from the retired `darkmux crawl plan` CLI's own
+/// `print_plan_table` (deleted alongside the standalone verb — see
+/// `src/cli.rs`'s Crawl retirement commit) — renders `--dry-run`'s plan
+/// table. `out_path` is `Some` only when `--param plan_out=<path>` named a
+/// destination; `None` means the dry run wrote nothing (the default).
+fn print_plan_table(the_plan: &plan::Plan, out_path: Option<&Path>) {
+    println!("{}", style::header(&format!("darkmux mission launch crawl --dry-run — {}", the_plan.workspace)));
+    println!("{}", style::dim(&format!("planned_at: {}", the_plan.planned_at)));
+    match out_path {
+        Some(p) => println!("{}", style::dim(&format!("written to: {}", p.display()))),
+        None => println!("{}", style::dim("written to: (not written — pass --param plan_out=<path> to write)")),
+    }
+    println!();
+
+    println!("{}", style::header("sources"));
+    if the_plan.sources.is_empty() {
+        println!("  (no sources)");
+    } else {
+        for s in &the_plan.sources {
+            let short_sha = &s.sha[..s.sha.len().min(8)];
+            println!("  {:<16} {:<10} files_walked={}", s.id, short_sha, s.files_walked);
+        }
+    }
+    println!();
+
+    println!("{}", style::header("by rule"));
+    if the_plan.totals.by_rule.is_empty() {
+        println!("  (no rules matched anything)");
+    } else {
+        for (rule_id, t) in &the_plan.totals.by_rule {
+            let extent = match (t.sites, t.files) {
+                (Some(n), _) => format!("sites={n}"),
+                (_, Some(n)) => format!("files={n}"),
+                _ => "extent=0".to_string(),
+            };
+            // #1959 finding 17 (carried over from the retired CLI): a read
+            // unit shared with another active read rule contributes its
+            // est_tokens to EVERY rule sharing it — flag it so the
+            // per-rule sums visibly overlap totals.est_tokens instead of
+            // silently outrunning it.
+            let shared_marker = if t.shared { " (shared read pass)" } else { "" };
+            println!(
+                "  {:<24} units={:<4} {:<14} est_tokens={}{shared_marker}",
+                rule_id, t.units, extent, t.est_tokens
+            );
+        }
+    }
+    println!();
+
+    // The load-bearing line: a plan that matched nothing must say so
+    // loudly, not print an empty section that reads as success-by-silence.
+    println!(
+        "{}",
+        style::header(&format!("totals: {} units, {} est_tokens", the_plan.totals.units, the_plan.totals.est_tokens))
+    );
+
+    if the_plan.totals.skipped.is_empty() {
+        println!("  skipped: (none)");
+    } else {
+        let n = the_plan.totals.skipped.len();
+        let noun = if n == 1 { "file" } else { "files" };
+        println!("  skipped: {n} {noun}");
+        for s in &the_plan.totals.skipped {
+            println!("    {} — {}", s.file, s.reason);
+        }
+    }
+
+    if the_plan.totals.edges.is_empty() {
+        println!("  edges: (none)");
+    } else {
+        println!("  edges: {} checked", the_plan.totals.edges.len());
+        for e in &the_plan.totals.edges {
+            let admits = match e.range_admits {
+                Some(true) => "admits",
+                Some(false) => "STALE",
+                None => "unknown",
+            };
+            println!(
+                "    {} -> {} ({}) [{admits}]{}",
+                e.consumer,
+                e.library,
+                e.package,
+                e.note.as_ref().map(|n| format!(" — {n}")).unwrap_or_default()
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

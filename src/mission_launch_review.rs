@@ -754,6 +754,19 @@ pub(crate) fn launch(
     let diff_text = std::fs::read_to_string(&diff_file)
         .with_context(|| format!("reading diff_file {}", diff_file.display()))?;
 
+    // (#1959) `--dry-run`: resolve inputs/source/crew (cheap, no mint, no
+    // dispatch), print what would run, return without minting a Mission or
+    // running the graph. Checked BEFORE `from_envelope` handling too — a
+    // dry run of a synthesis-only replay is a contradiction the operator
+    // should never hit silently (it would just print the SAME resolved
+    // inputs and skip the file read, which is more confusing than useful),
+    // so `--dry-run --from-envelope` still routes through the normal
+    // report — the bundle count line honestly says "not computed" if the
+    // resolved source is a GitHub one either way.
+    if bool_input(&collected, "dry_run") {
+        return review_dry_run_report(config, &collected, &diff_file, &diff_text);
+    }
+
     let envelope_out = path_input(&collected, "envelope_out");
     let emit = path_input(&collected, "emit");
     let attribution = str_input(&collected, "attribution").map(str::to_string);
@@ -844,6 +857,65 @@ pub(crate) fn launch(
 /// a [`BundleBuildSpec`] the graph builder writes onto the bundle step's
 /// `Step.config`.
 ///
+/// (#1959) `--dry-run`'s report: resolve source + crew (cheap — no mint,
+/// no dispatch, no graph), print what would run, return 0. The bundle
+/// count is computed only for a `FileSource::Worktree` source (a local
+/// `build_bundles` pass — CPU-only, no network); a `GithubApi` source
+/// would need one API fetch per changed file, which is NOT cheap, so the
+/// report says so instead of paying that cost just to print a number.
+fn review_dry_run_report(
+    config: &MissionConfig,
+    collected: &BTreeMap<String, Value>,
+    diff_file: &Path,
+    diff_text: &str,
+) -> Result<i32> {
+    let case = derive_case_id(collected);
+    let source = resolve_source(collected)?;
+    let loaded = load_registry(str_input(collected, "profiles"))?;
+    let role_ids = declared_role_ids(config);
+    let overrides = collect_role_overrides(collected, &role_ids);
+    let resourcing = ReviewRoleStaffing {
+        passes: u32_input(collected, "passes")?,
+        request_changes: bool_input(collected, "request_changes"),
+    };
+    let crew = resolve_review_roles(&loaded.registry, config, &resourcing, &|role| {
+        if let Some(p) = overrides.get(role).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            darkmux_profiles::profiles::RoleBinding::Overridden(p.to_string())
+        } else if let Some(p) = darkmux_types::config_access::role_profile(role) {
+            darkmux_profiles::profiles::RoleBinding::Mapped(p)
+        } else {
+            darkmux_profiles::profiles::RoleBinding::Unmapped
+        }
+    })?;
+
+    println!("darkmux mission launch review --dry-run — nothing minted");
+    println!("  case_id = {case}");
+    println!("  diff_file = {}", diff_file.display());
+    match &source {
+        FileSource::Worktree(p) => println!("  source = worktree {}", p.display()),
+        FileSource::GithubApi { repo, head_sha, .. } => println!("  source = github {repo}@{head_sha}"),
+    }
+    println!("  crew = {}", crew_detail(&crew));
+
+    match &source {
+        FileSource::Worktree(_) => {
+            let bundle_set = build_bundles(&source, diff_text)?;
+            println!(
+                "  bundles = {} ({} file(s) considered, {} skipped)",
+                bundle_set.bundles.len(),
+                bundle_set.skip.files_considered,
+                bundle_set.skip.files_skipped.len()
+            );
+        }
+        FileSource::GithubApi { .. } => {
+            println!(
+                "  bundles = (not computed in dry-run — a GitHub API source needs a network                  fetch per changed file)"
+            );
+        }
+    }
+    Ok(0)
+}
+
 /// The `charges_file` (re-judge) side path is the ONE exception, and
 /// deliberately so: it mints no Mission and runs no graph at all (see this
 /// launcher's own module doc), so it is OUT OF SCOPE for the "no data

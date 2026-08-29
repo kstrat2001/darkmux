@@ -461,8 +461,14 @@ pub fn launch(
     // wouldn't just be ignored, it would silently derive a DIFFERENT
     // instance. Warn loudly; don't block (a config author may deliberately
     // accept undeclared pass-through values).
+    //
+    // (#1959) `dry_run` is exempt — it's a LAUNCHER-level flag (the CLI's
+    // `--dry-run`, injected as a synthetic param), not a config-declared
+    // input, same category as `mission_id` being launcher-supplied rather
+    // than operator-declared. Every config would otherwise warn on every
+    // dry run, since none of them declare it.
     for key in collected.keys() {
-        if !config.inputs.iter().any(|i| i.name == *key) {
+        if key != "dry_run" && !config.inputs.iter().any(|i| i.name == *key) {
             eprintln!(
                 "{}",
                 style::warn(&format!(
@@ -504,6 +510,17 @@ pub fn launch(
     // doesn't litter a half-launched instance on disk.
     if config_uses_coder_phase_kinds(config) {
         precheck_coder_phase_inputs(config, &collected)?;
+    }
+
+    // (#1959) `--dry-run`: everything above this point (config load,
+    // command-allowlist gate, semantic validation, panel-args injection,
+    // coder-phase input precheck) has already run — a dry run surfaces the
+    // SAME loud failures a real launch would. From here, mint NOTHING,
+    // emit NO flow records, dispatch NOTHING: print the resolved inputs
+    // and the task/step graph, then return.
+    if bool_param(&collected, "dry_run") {
+        print_dry_run_graph(config, &collected);
+        return Ok(0);
     }
 
     // Run id: minted fresh for THIS launch, never derived from inputs
@@ -1079,6 +1096,62 @@ pub fn launch(
         ),
     );
     Ok(exit_code)
+}
+
+fn bool_param(collected: &BTreeMap<String, serde_json::Value>, key: &str) -> bool {
+    match collected.get(key) {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+        }
+        _ => false,
+    }
+}
+
+/// (#1959) `--dry-run`'s report for any generic step-graph config
+/// (everything except `crawl`/`review`, which route to their own
+/// dedicated dry-run reports before this function's caller is even
+/// reached). Prints the resolved inputs, then the phase → task → step
+/// structure `config.phases` declares — the SAME document `interpret`
+/// would build a real graph from, just read and rendered instead of
+/// minted.
+fn print_dry_run_graph(config: &MissionConfig, collected: &BTreeMap<String, serde_json::Value>) {
+    println!("darkmux mission launch {} --dry-run — nothing minted", config.id);
+    println!("resolved inputs:");
+    if collected.is_empty() {
+        println!("  (none)");
+    } else {
+        for (k, v) in collected {
+            let rendered = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            println!("  {k} = {rendered}");
+        }
+    }
+    println!("graph:");
+    if config.phases.is_empty() {
+        println!("  (no phases)");
+        return;
+    }
+    for phase in &config.phases {
+        let label = phase.display_name.as_deref().unwrap_or(&phase.id);
+        println!("  phase {label} ({} task(s))", phase.tasks.len());
+        for task in &phase.tasks {
+            let task_label = task.display_name.as_deref().unwrap_or(&task.id);
+            let deps = if task.depends_on.is_empty() {
+                String::new()
+            } else {
+                format!(" depends_on={:?}", task.depends_on)
+            };
+            let reads = if task.reads.is_empty() { String::new() } else { format!(" reads={:?}", task.reads) };
+            let role = task.role_id.as_deref().map(|r| format!(" role={r}")).unwrap_or_default();
+            println!("    task {task_label}{role}{deps}{reads}");
+            for step in &task.steps {
+                println!("      step {} [{}]", step.id, step.kind);
+            }
+        }
+    }
 }
 
 /// Parse `--input <file.json>` (a flat object) and `--param key=value`
@@ -3243,6 +3316,46 @@ mod tests {
             !missions_dir.is_dir() || std::fs::read_dir(&missions_dir).unwrap().next().is_none(),
             "a missing-inputs bail must not mint anything"
         );
+        let _ = guard;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dry_run_mints_nothing_for_the_generic_step_graph_path() {
+        // (#1959) `coder-phase` names real inputs so the required-inputs
+        // gate above passes; `--dry-run` (a synthetic `dry_run=true`
+        // param, exactly what the CLI layer injects) must then resolve +
+        // validate everything a real launch would, print the graph, and
+        // mint NOTHING — no mission.json, no flow records.
+        let guard = LaunchTestGuard::new();
+        let exit = launch(
+            "coder-phase",
+            None,
+            &[
+                "workdir=/tmp/darkmux-dry-run-does-not-need-to-exist".to_string(),
+                "branch=feature/x".to_string(),
+                "base=main".to_string(),
+                "dry_run=true".to_string(),
+            ],
+            None,
+        )
+        .expect("a dry run must succeed even though workdir was never touched");
+        assert_eq!(exit, 0);
+        assert!(all_mission_ids().is_empty(), "a dry run must mint no mission");
+        let _ = guard;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dry_run_still_bails_on_a_missing_required_input_for_the_generic_step_graph_path() {
+        // (#1959) `--dry-run` short-circuits AFTER input validation, not
+        // before — the same missing-input bail a real launch would hit.
+        let guard = LaunchTestGuard::new();
+        let err = launch("coder-phase", None, &["dry_run=true".to_string()], None)
+            .expect_err("a dry run must still bail on missing required inputs");
+        let msg = err.to_string();
+        assert!(msg.contains("workdir"), "{msg}");
+        assert!(all_mission_ids().is_empty());
         let _ = guard;
     }
 

@@ -874,7 +874,16 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             start,
             ticket,
         } => mission_propose::propose(from_stdin, from_file.as_deref(), yes, start, ticket.as_deref()),
-        MissionCmd::Launch { config_id, input, params, timeout } => {
+        MissionCmd::Launch { config_id, input, params, timeout, dry_run } => {
+            // (#1959) `--dry-run` reaches every launch path (crawl,
+            // review, generic step-graph) the SAME way any other input
+            // does — a synthetic `--param dry_run=true` appended here,
+            // never a separate function parameter threaded through three
+            // different launcher signatures.
+            let mut params = params;
+            if dry_run {
+                params.push("dry_run=true".to_string());
+            }
             mission_launch::launch(&config_id, input.as_deref(), &params, timeout)
         }
         MissionCmd::AddPhase {

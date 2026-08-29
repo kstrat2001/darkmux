@@ -1508,3 +1508,77 @@ fn finding_rule_with_an_unmatched_pattern_keeps_the_first_rule_and_records_the_p
     assert_eq!(rule, "a");
     assert_eq!(unmatched.as_deref(), Some("zzz"));
 }
+
+// ── (#1959) --dry-run: mints nothing, dispatches nothing ───────────────
+
+#[test]
+#[serial_test::serial]
+fn dry_run_mints_nothing_and_dispatches_nothing() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let mut params = params_for(&fx);
+    params.insert("dry_run".to_string(), Value::Bool(true));
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    assert!(calls.borrow().is_empty(), "a dry run must never dispatch");
+    assert!(read_all_flow_records().is_empty(), "a dry run must emit no flow records");
+}
+
+#[test]
+#[serial_test::serial]
+fn dry_run_writes_no_plan_file_by_default() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let mut params = params_for(&fx);
+    params.insert("dry_run".to_string(), Value::Bool(true));
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    // (#1959) A dry run is read-only by default — it writes NOTHING unless
+    // the operator explicitly names a destination via `--param plan_out=`
+    // (the next test). No `plan.json` (or any other file) lands under the
+    // fixture's root as a side effect of just resolving+planning.
+    let default_plan_path = fx.root.path().join("plan.json");
+    assert!(!default_plan_path.exists(), "a dry run must not write a plan file unless plan_out is given");
+}
+
+#[test]
+#[serial_test::serial]
+fn dry_run_writes_the_plan_only_when_plan_out_is_given() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let plan_out = fx.root.path().join("my-plan.json");
+    let mut params = params_for(&fx);
+    params.insert("dry_run".to_string(), Value::Bool(true));
+    params.insert("plan_out".to_string(), Value::String(plan_out.to_string_lossy().to_string()));
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    assert!(plan_out.exists(), "plan_out names a destination — the plan must land there");
+    let plan: Value = serde_json::from_str(&std::fs::read_to_string(&plan_out).unwrap()).unwrap();
+    assert_eq!(plan["workspace"], "fixture");
+    assert!(calls.borrow().is_empty());
+    assert!(read_all_flow_records().is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn dry_run_still_bails_on_a_missing_required_input() {
+    // (#1959) A dry run still validates inputs before doing anything else
+    // — it short-circuits AFTER the plan resolves, not before the same
+    // loud failure a real run would hit.
+    let _guard = TestGuard::new();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let mut params: BTreeMap<String, Value> = BTreeMap::new();
+    params.insert("dry_run".to_string(), Value::Bool(true));
+    let err = run(&params, None, &mut dispatch).unwrap_err();
+    assert!(
+        err.to_string().contains("workspace"),
+        "{err}"
+    );
+}

@@ -604,6 +604,19 @@ pub(crate) enum MissionCmd {
         /// other config-less-graph default uses).
         #[arg(long)]
         timeout: Option<u32>,
+        /// (#1959) Resolve config + inputs, mint NOTHING, emit NO flow
+        /// records, dispatch NOTHING — print what would run and exit.
+        /// `crawl` prints the plan table (writes it to disk only when
+        /// `--param plan_out=<path>` names a destination); `review`
+        /// prints resolved inputs and, when the source is a local
+        /// worktree, the bundle count (a GitHub source says the count
+        /// isn't computed in dry-run — that would cost a network fetch
+        /// per changed file); every other config prints its task/step
+        /// graph after the same input validation a real launch runs, so
+        /// a missing required input still bails exactly as it would
+        /// without `--dry-run`.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
     /// Add a new Phase to an existing Mission mid-flight (#107).
     /// Operator-sovereign scope growth — alternative to either hand-
