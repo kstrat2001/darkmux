@@ -24,7 +24,7 @@ import { useRouteRecords } from "./hooks/useRouteRecords";
 import { useLiveMachines } from "./hooks/useLiveMachines";
 import { useLiveTail } from "./hooks/useLiveTail";
 import { computeMetaLines, readyParts } from "./lib/metaLine";
-import { humanMissionLabel, primaryReplayMission, replayMetaLines, replayMetaParts } from "./lib/replayMeta";
+import { primaryReplayMission, replayMetaLines, replayMetaParts, resolvedMissionLabel } from "./lib/replayMeta";
 import { ReadyHeadline } from "./components/ReadyHeadline";
 import { T, asRecordArray, firstRecordDate, localMachineUid, nameOf, todayUTC } from "./lib/flow";
 import { isLiveRoute, showsEventLog } from "./lib/route";
@@ -377,14 +377,15 @@ export function App() {
   // row used to carry for a playback route (see `routeChrome`'s own doc on
   // why that branch now returns an empty crumb instead). Desktop only —
   // the caller (below) omits the `label` prop entirely on a phone route, so
-  // `Scrubber` never has to make that call itself. `humanMissionLabel`
-  // returns `null` when the id carries no recognizable naming convention;
-  // this deliberately does NOT fall back to the raw id here (per the
-  // operator's later refinement: "the raw id lives only in the Machine
-  // info modal's playback row") — the transport shows the human label or
-  // nothing, never the id.
+  // `Scrubber` never has to make that call itself. `resolvedMissionLabel`
+  // (#2121) prefers a REAL title when the mission's own records carry one,
+  // falling back to `humanMissionLabel`'s id-derived heuristic — either way
+  // returns `null` when neither is available; this deliberately does NOT
+  // fall back to the raw id here (per the operator's earlier refinement:
+  // "the raw id lives only in the Machine info modal's playback row") —
+  // the transport shows a human label or nothing, never the id.
   const playbackMissionId = route.kind === "playback" ? primaryReplayMission(routeRecords.records) : null;
-  const playbackMissionLabel = playbackMissionId ? humanMissionLabel(playbackMissionId) : null;
+  const playbackMissionLabel = playbackMissionId ? resolvedMissionLabel(routeRecords.records, playbackMissionId) : null;
 
   useSyncHash(route);
 
