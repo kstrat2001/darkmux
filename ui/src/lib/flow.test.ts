@@ -7,6 +7,8 @@ import {
   localMachineUid,
   nameOf,
   buildFlowWindow,
+  liveSessionSet,
+  flowLiveSessions,
 } from "./flow";
 import { tokensOffMeter } from "../lenses/fleet/savings";
 import type { FlowRecord } from "../types/handwritten";
@@ -270,5 +272,69 @@ describe("nameOf recency", () => {
     const a = rec("not-a-date", "first");
     const b = rec("also-bad", "second");
     expect(nameOf([a, b], new Map(), UID)).toBe("first");
+  });
+});
+
+/**
+ * (#2123) Presence (`/fleet/sessions/live`, Redis-backed) only ever gets a
+ * beat from `dispatch.internal`'s own container-heartbeat thread
+ * (`crates/darkmux-crew/src/dispatch_internal.rs` — the ONE writer,
+ * grep-confirmed). A mission/review dispatch fanning out through
+ * `dispatch.map` (hosted/remote probe + judge seats — no container, no
+ * heartbeat) never writes a beat for ANY of its sessions. On a
+ * Redis-enabled multi-machine fleet (the operator's real topology — a
+ * Studio hub whose OWN `dispatch.internal` work keeps presence non-empty
+ * almost continuously), the pre-fix `liveSessionSet` treated ANY non-empty
+ * presence set as globally authoritative and never even looked at the
+ * flow-derived fallback — so a genuinely-live review mission's own session,
+ * never beaten, read as not-running. This is the fleet card's "0 running"
+ * / machine card stuck "idle" half of #2123 (the Runs-lens listing itself
+ * is a SEPARATE, server-side path — see `crates/darkmux-serve/src/runs.rs`'s
+ * `build_runs_2123_*` tests, which prove that side was already correct on
+ * main; the operator's daemon was almost certainly serving a stale binary
+ * built before an earlier session-liveness fix).
+ */
+describe("liveSessionSet — presence coverage is partial, not all-or-nothing (#2123)", () => {
+  const NOW = Date.parse("2026-08-29T16:07:30Z");
+
+  /** A review-shaped session: `dispatch start` a few minutes ago, no
+   * terminal record, fresh telemetry — exactly what `flowLiveSessions`
+   * needs to call it live. Uses the space-separated `darkmux-crew`/CLI
+   * vocabulary (`buildFlowWindow`/`normalizeRecords` is what dots it in
+   * production; these fixtures are ALREADY normalized, matching how every
+   * consumer of `flowWindow.data` actually receives them). */
+  const reviewSession: FlowRecord[] = [
+    { ts: "2026-08-29T15:46:31Z", session_id: "owner/repo@deadbeef", action: "dispatch.start" },
+    { ts: "2026-08-29T16:07:12Z", session_id: "owner/repo@deadbeef", action: "telemetry.process" },
+  ];
+
+  it("BEFORE the fix would have shadowed a genuinely-live session under unrelated presence (regression guard)", () => {
+    // Presence has a beat, but for a DIFFERENT session entirely — the
+    // Studio hub's own dispatch.internal work, not this machine's review
+    // mission.
+    const presence = new Set(["some-other-machines-dispatch-internal-session"]);
+    const result = liveSessionSet(reviewSession, presence, NOW, true);
+    expect(result.has("owner/repo@deadbeef")).toBe(true);
+    // Presence's own coverage must still be honored, not discarded.
+    expect(result.has("some-other-machines-dispatch-internal-session")).toBe(true);
+  });
+
+  it("still returns the flow-derived set untouched when presence is empty (Redis off/degraded)", () => {
+    const result = liveSessionSet(reviewSession, new Set(), NOW, true);
+    expect(result).toEqual(flowLiveSessions(reviewSession, NOW, true));
+  });
+
+  it("still returns presence untouched when the flow-derived fallback finds nothing live (e.g. everything already terminal)", () => {
+    const terminal: FlowRecord[] = [
+      { ts: "2026-08-29T15:46:31Z", session_id: "owner/repo@deadbeef", action: "dispatch.start" },
+      { ts: "2026-08-29T15:50:00Z", session_id: "owner/repo@deadbeef", action: "dispatch.complete" },
+    ];
+    const presence = new Set(["some-other-session"]);
+    expect(liveSessionSet(terminal, presence, NOW, true)).toEqual(presence);
+  });
+
+  it("replay mode stays presence-agnostic (flowLiveSessions itself gates off liveMode)", () => {
+    const presence = new Set(["a-replayed-session"]);
+    expect(liveSessionSet(reviewSession, presence, NOW, false)).toEqual(presence);
   });
 });

@@ -3885,6 +3885,131 @@ mod tests {
         );
     }
 
+    /// (#2123) An ACTIVE review mission whose per-step dispatches reuse the
+    /// SAME fixed session ids (`task-review-probe-mid-task` etc — #1918's
+    /// named reused-task-id defect) an OLDER, already-finished review
+    /// mission also used. Reproduces the operator's real report verbatim:
+    /// `review-1788018390-d47a61` had a `mission start` + `dispatch start`
+    /// x4 + `step start`/`step result` streaming continuously for 20+
+    /// minutes with NO `mission close`/`mission abort` yet, while an OLDER
+    /// mission (an hour earlier) had already run the exact same probe task
+    /// id to completion. The reused id makes that probe-step SessionAgg
+    /// `is_ambiguous()` (#1918) — this test locks in that `mission_to_run`
+    /// still reports `Running`, first in the list, off the mission's OTHER,
+    /// non-ambiguous session (the run-level dispatch bookend, keyed on the
+    /// unique commit sha in the real report) rather than silently vanishing
+    /// or reading Abandoned.
+    ///
+    /// (red-proved: deleting the fresh dispatch-level `telemetry.process`
+    /// record below flips this mission to `Abandoned` — confirmed live.)
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_2123_active_review_mission_survives_reused_step_session_ids() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let older = minimal_mission(
+            "review-1000000000-older",
+            vec![],
+            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpo".to_string(), origin: None }),
+        );
+        darkmux_crew::lifecycle::save_mission(&older).unwrap();
+
+        let active = minimal_mission(
+            "review-2000000000-active",
+            vec![],
+            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpn".to_string(), origin: None }),
+        );
+        darkmux_crew::lifecycle::save_mission(&active).unwrap();
+
+        let now = darkmux_flow::ts_utc_now();
+
+        write_day_file(
+            flows.path(),
+            &today(),
+            &[
+                // older mission — fully terminal, reusing the SAME probe
+                // task session id every review mission uses.
+                serde_json::json!({"ts":"2026-01-01T08:00:00Z","action":"mission start","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older","source":"mission_lifecycle"}),
+                serde_json::json!({"ts":"2026-01-01T08:00:01Z","action":"dispatch start","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","role":"review-probe-mid"}),
+                serde_json::json!({"ts":"2026-01-01T08:20:00Z","action":"dispatch complete","session_id":"task-review-probe-mid-task","mission_id":"review-1000000000-older","model":"m-old"}),
+                serde_json::json!({"ts":"2026-01-01T08:20:01Z","action":"mission close","session_id":"mission-review-1000000000-older","mission_id":"review-1000000000-older"}),
+                // active mission — mission-level bookend (its own unique
+                // session id, embeds the mission id — never reused) plus
+                // the run-level dispatch bookend (keyed on the commit sha in
+                // the real report — also never reused across missions) with
+                // fresh ("now") activity. Its PROBE step reuses the older
+                // mission's exact session id and gets no fresh activity of
+                // its own here — exactly the ambiguous, excluded-from-
+                // liveness shape the real report hit.
+                serde_json::json!({"ts":"2026-01-01T09:39:00Z","action":"mission start","session_id":"mission-review-2000000000-active","mission_id":"review-2000000000-active","source":"mission_lifecycle"}),
+                serde_json::json!({"ts":"2026-01-01T09:39:01Z","action":"dispatch start","session_id":"owner/repo@deadbeef","mission_id":"review-2000000000-active","role":"deep+diff-review+probe-mid","handle":"deep+diff-review+probe-mid"}),
+                serde_json::json!({"ts": now, "action":"telemetry.process","session_id":"owner/repo@deadbeef","mission_id":"review-2000000000-active"}),
+                serde_json::json!({"ts":"2026-01-01T09:39:02Z","action":"step start","session_id":"task-review-probe-mid-task","mission_id":"review-2000000000-active","role":"review-probe-mid"}),
+            ],
+        );
+
+        let runs = build_runs(flows.path(), None, &[]);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+
+        let active_run =
+            runs.iter().find(|r| r.id == "review-2000000000-active").expect("active mission row present");
+        assert_eq!(
+            active_run.status,
+            RunStatus::Running,
+            "an active mission with a live dispatch-level session must read Running, not vanish or read Abandoned: {active_run:?}"
+        );
+        assert_eq!(active_run.kind, RunKind::Mission);
+        assert!(active_run.tracked);
+
+        // (#2123 gate) The active row must sort AHEAD of the older,
+        // terminal one — the client (`runsFiltered`/`runActivity`,
+        // ui/src/lenses/runs/format.ts) sorts by
+        // `updated_ts||completed_ts||started_ts` descending, so this is the
+        // server-side half of "renders FIRST".
+        let older_run = runs.iter().find(|r| r.id == "review-1000000000-older").unwrap();
+        let active_key = active_run.updated_ts.or(active_run.completed_ts).or(active_run.started_ts).unwrap();
+        let older_key = older_run.updated_ts.or(older_run.completed_ts).or(older_run.started_ts).unwrap();
+        assert!(
+            active_key > older_key,
+            "the active mission must rank newer than the older, closed one: active={active_key} older={older_key}"
+        );
+    }
+
+    /// (#2123) The SAME mission as above, once it later gets a `mission
+    /// close` (the happy-path finalize, not the operator's actual `mission
+    /// abort` — both terminals are covered elsewhere; this one locks in
+    /// that a close transitions the row out of Running once the mission
+    /// record itself is finalized).
+    #[test]
+    #[serial_test::serial]
+    fn build_runs_2123_active_review_mission_reads_complete_after_mission_close() {
+        let _g = CrewGuard::new();
+        let flows = TempDir::new().unwrap();
+
+        let mut mission = minimal_mission(
+            "review-2000000000-active",
+            vec![],
+            Some(MissionSpec { config_id: "review".to_string(), inputs_fingerprint: "fpn".to_string(), origin: None }),
+        );
+        mission.status = MissionStatus::Finalized;
+        mission.finalized_ts = Some(now_unix());
+        darkmux_crew::lifecycle::save_mission(&mission).unwrap();
+        // `MissionStatus::Finalized` reads its outcome off the envelope
+        // (`mission_run_status`'s own doc) — Clean is what a real
+        // happy-path `mission finalize` writes.
+        let env = MissionEnvelope::new("review-2000000000-active", MissionOutcomeStatus::Clean, &[]);
+        darkmux_crew::envelope::finalize_mission(&env);
+
+        let runs = build_runs(flows.path(), None, &[]);
+        let row = runs.iter().find(|r| r.id == "review-2000000000-active").expect("row present after close");
+        assert_eq!(row.status, RunStatus::Complete, "{row:?}");
+        assert_eq!(
+            row.updated_ts, row.completed_ts,
+            "a closed mission's sort key is its completion time, not its start — so it sorts by WHEN it finished"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn build_runs_includes_an_untracked_ghost_alongside_a_tracked_mission() {
