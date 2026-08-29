@@ -462,3 +462,86 @@ describe("EventLogColumn — pushDetail mode", () => {
     expect(document.querySelector('[data-act="rec"]')).not.toBeNull();
   });
 });
+
+// ── (#2108, operator finding — phone divider + one-tap expand) ──
+//
+// The split bar is re-enabled on the phone-width layout (no longer
+// `display:none` there) with the SAME Pointer Event drag handlers desktop
+// already has, plus a grip + an "Expand"/"Show list" control. These
+// exercise the real component, not the CSS that makes it TALL on a
+// phone (jsdom performs no layout) — see `PhoneDrawer.test.tsx`'s own
+// stylesheet-content tests for that half.
+describe("EventLogColumn — phone divider + one-tap expand (#2108)", () => {
+  function drag(el: Element, startY: number, endY: number) {
+    fireEvent.pointerDown(el, { clientY: startY, pointerId: 1 });
+    fireEvent.pointerMove(el, { clientY: endY, pointerId: 1 });
+    fireEvent.pointerUp(el, { clientY: endY, pointerId: 1 });
+  }
+
+  it("the divider bar is present with its touch-drag handlers, and dragging it resizes the pane", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible />);
+    const split = document.querySelector('[data-act="eventlog-split"]')!;
+    expect(split).not.toBeNull();
+    expect(document.querySelector(".eventlog__split-grip")).not.toBeNull();
+    const detail = document.querySelector("#detail") as HTMLElement;
+    const before = detail.style.flexBasis;
+    drag(split, 300, 100); // drag up — grows the pane
+    expect(detail.style.flexBasis).not.toBe(before);
+  });
+
+  it("dragging the divider persists the ratio to localStorage, scoped by paneId", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible paneId="phone-drawer" />);
+    const split = document.querySelector('[data-act="eventlog-split"]')!;
+    drag(split, 300, 100);
+    expect(window.localStorage.getItem("dmux.eventlog.detailpct.phone-drawer")).not.toBeNull();
+  });
+
+  it("re-mounting with a persisted ratio for this paneId restores it", () => {
+    window.localStorage.setItem("dmux.eventlog.detailpct.phone-drawer", "55");
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible paneId="phone-drawer" />);
+    const detail = document.querySelector("#detail") as HTMLElement;
+    expect(detail.style.flexBasis).toBe("55%");
+  });
+
+  it("the Expand control toggles the pane to fill the sheet and the list to a 1-row strip showing the selected record, then back", () => {
+    const records = [rec({ session_id: "s1", handle: "rec-1" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+
+    const expandBtn = document.querySelector('[data-act="eventlog-expand"]')!;
+    expect(expandBtn.textContent).toBe("Expand");
+    expect(document.querySelector('[data-act="eventlog-list-strip"]')).toBeNull();
+    expect(document.querySelector("#logbody")).not.toBeNull();
+
+    fireEvent.click(expandBtn);
+
+    // Expanded: pane fills (no inline flexBasis — the CSS class takes
+    // over), list collapses to a 1-row strip showing the selected record.
+    const detail = document.querySelector("#detail") as HTMLElement;
+    expect(detail.className).toContain("eventlog__detail--expanded");
+    expect(detail.style.flexBasis).toBe("");
+    expect(document.querySelector("#logbody")).toBeNull();
+    const strip = document.querySelector('[data-act="eventlog-list-strip"]')!;
+    expect(strip).not.toBeNull();
+    expect(strip.querySelector('[data-act="rec-strip"]')).not.toBeNull();
+    expect(expandBtn.textContent).toBe("Show list");
+
+    fireEvent.click(document.querySelector('[data-act="eventlog-expand"]')!);
+
+    // Back: full list restored, pane back to its ratio.
+    expect(document.querySelector("#logbody")).not.toBeNull();
+    expect(document.querySelector('[data-act="eventlog-list-strip"]')).toBeNull();
+    expect(detail.className).not.toContain("eventlog__detail--expanded");
+  });
+
+  it("tapping Expand does not ALSO start a drag on the bar underneath it", () => {
+    render(<EventLogColumn scopeLabel="fleet" records={[rec({ session_id: "s1" })]} visible />);
+    const detail = document.querySelector("#detail") as HTMLElement;
+    const before = detail.style.flexBasis;
+    fireEvent.click(document.querySelector('[data-act="eventlog-expand"]')!);
+    // The pane switched to expanded mode (flexBasis cleared), not to some
+    // arbitrary dragged value — proving no stray drag state leaked in.
+    expect(detail.style.flexBasis).toBe("");
+    expect(before).not.toBe("");
+  });
+});

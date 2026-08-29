@@ -1,8 +1,29 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { PhoneDrawer } from "./PhoneDrawer";
 import { EventLogColumn } from "./EventLogColumn";
 import type { FlowRecord } from "../types/handwritten";
+
+function readStylesheet(): string {
+  return readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "../styles.css"),
+    "utf-8",
+  );
+}
+
+/** Extracts one `selector { ... }` rule's body — the FIRST match, source
+ * order. jsdom performs no real layout, so reading the stylesheet's own
+ * text is how several `#2108` tests verify a CSS claim (a token, a
+ * threshold, a property) without needing a real browser. */
+function ruleBody(css: string, selector: string): string {
+  const escaped = selector.replace(/[.#]/g, "\\$&");
+  const match = css.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
+  if (!match) throw new Error(`no rule found for ${selector}`);
+  return match[1];
+}
 
 const NOOP_MACHINE_TAB = {
   body: <div data-act="stub-machine-body">stats</div>,
@@ -160,7 +181,7 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("dragging the handle up resizes the open sheet and persists the height for the ACTIVE tab only", () => {
+  it("dragging the handle up resizes the open sheet and persists the SHARED height (not per-tab)", () => {
     render(
       <PhoneDrawer
         machineTab={NOOP_MACHINE_TAB}
@@ -180,13 +201,11 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     const sheet = document.querySelector(
       '[data-act="phone-drawer"]',
     ) as HTMLElement;
-    expect(sheet.style.height).not.toBe("50vh"); // moved off the default
+    expect(sheet.style.height).not.toBe("88vh"); // moved off the default
+    // (#2108, operator correction) ONE shared key now, not per-tab.
     expect(
-      window.localStorage.getItem("dmux.phone-drawer.height.machine"),
+      window.localStorage.getItem("dmux.phone-drawer.height"),
     ).not.toBeNull();
-    expect(
-      window.localStorage.getItem("dmux.phone-drawer.height.events"),
-    ).toBeNull();
   });
 
   it("a drag that ends near the closed position snaps the drawer shut instead of leaving a sliver", () => {
@@ -202,14 +221,13 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
       document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
     );
     const handle = document.querySelector('[data-act="phone-drawer-handle"]')!;
-    // Open at the default 50vh, then drag DOWN past the close-snap floor.
+    // Open at the default 88vh, then drag DOWN past the close-snap floor.
     drag(handle, 200, 900);
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("re-opening a tab restores its own previously persisted height, independent of the other tab", () => {
-    window.localStorage.setItem("dmux.phone-drawer.height.machine", "30");
-    window.localStorage.setItem("dmux.phone-drawer.height.events", "80");
+  it("re-opening EITHER tab restores the ONE shared persisted height", () => {
+    window.localStorage.setItem("dmux.phone-drawer.height", "30");
     render(
       <PhoneDrawer
         machineTab={NOOP_MACHINE_TAB}
@@ -232,7 +250,9 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     sheet = document.querySelector(
       '[data-act="phone-drawer"]',
     ) as HTMLElement;
-    expect(sheet.style.height).toBe("80vh");
+    // (#2108, operator's core ask) Switching tabs while open must NEVER
+    // change the sheet's height — one shared value, not a per-tab one.
+    expect(sheet.style.height).toBe("30vh");
   });
 
   // (#2108, operator correction — reverted from the earlier "every row
@@ -731,5 +751,60 @@ describe("PhoneDrawer — onMachineOpenChange (#2107, #1833)", () => {
         document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
       ),
     ).not.toThrow();
+  });
+});
+
+// ── (#2108, operator finding — real device screenshot) stylesheet-content
+//    tests. jsdom performs no real layout, so these read the actual CSS
+//    source rather than a jsdom-computed style — the genuinely verifiable
+//    claim for each of these five phone-sheet fixes. ──────────────────────
+describe("PhoneDrawer — stylesheet checks (#2108)", () => {
+  it("the backdrop DIMS the page (a real scrim, not transparent) and starts below the masthead", () => {
+    const css = readStylesheet();
+    const rule = ruleBody(css, ".phone-drawer__backdrop");
+    expect(rule).not.toMatch(/background:\s*transparent/);
+    expect(rule).toMatch(/background:\s*rgba\(0,\s*0,\s*0,\s*0\.45\)/);
+    // Starts at a fixed offset (clears the masthead), not `inset: 0`.
+    expect(rule).toMatch(/top:\s*64px/);
+    expect(rule).not.toMatch(/inset:\s*0/);
+  });
+
+  it("the backdrop fades in via a keyframe animation (plays on mount, unlike a transition)", () => {
+    const css = readStylesheet();
+    const rule = ruleBody(css, ".phone-drawer__backdrop");
+    expect(rule).toMatch(/animation:\s*phone-drawer-backdrop-in/);
+    expect(css).toMatch(/@keyframes phone-drawer-backdrop-in/);
+  });
+
+  it("the sheet body reserves padding for the iOS home-indicator safe area", () => {
+    const css = readStylesheet();
+    const rule = ruleBody(css, ".phone-drawer__body");
+    expect(rule).toMatch(/padding-bottom:\s*calc\(16px \+ env\(safe-area-inset-bottom, 0px\)\)/);
+  });
+
+  it("the detail pane's font-size is bumped to >= 14px on the narrow render, not the app's smaller default", () => {
+    const css = readStylesheet();
+    const match = css.match(/@media \(max-width: 768px\) \{\s*\.rv \{\s*font-size:\s*(\d+)px;\s*line-height:\s*([\d.]+);/);
+    expect(match, "the phone-width .rv font-size override must exist").not.toBeNull();
+    expect(Number(match![1])).toBeGreaterThanOrEqual(14);
+    expect(Number(match![2])).toBeGreaterThanOrEqual(1.4);
+  });
+
+  it("the sheet root and its tab bar resolve the SAME background token, distinct from the page background token", () => {
+    const css = readStylesheet();
+    const sheetRule = ruleBody(css, ".phone-drawer");
+    expect(sheetRule).toMatch(/background:\s*var\(--surface\)/);
+    // `.phone-drawer__bar` carries no background of its OWN any more — it
+    // shows the sheet's `--surface` through it, which is the actual fix
+    // (one elevated surface for the whole card, not two competing ones).
+    const barMatch = css.match(/\.phone-drawer__bar\s*\{([^}]*)\}/);
+    expect(barMatch, "the phone-drawer__bar rule must exist").not.toBeNull();
+    expect(barMatch![1]).not.toMatch(/background:/);
+    // `--surface` is genuinely a DIFFERENT token from `--bg` (the page
+    // background), not an alias — the whole point of the fix.
+    expect(css).toMatch(/--surface:\s*#[0-9a-fA-F]+;/);
+    const bgMatch = css.match(/--bg:\s*(#[0-9a-fA-F]+);/);
+    const surfaceMatch = css.match(/--surface:\s*(#[0-9a-fA-F]+);/);
+    expect(bgMatch![1]).not.toBe(surfaceMatch![1]);
   });
 });

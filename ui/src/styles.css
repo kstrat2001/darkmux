@@ -45,6 +45,15 @@
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     "Liberation Mono", "DejaVu Sans Mono", monospace, "Apple Color Emoji";
   --bg: #0b0e14;
+  /* (#2108, operator diagnosis — phone drawer surface) One step ABOVE
+     `--bg` — the elevated-panel color `.eventlog` already used
+     (hardcoded, pre-token, as `#10141f`) for any surface that needs to
+     read as a distinct LAYER above the page rather than a continuation of
+     it. A token (not a repeated hex) so every such surface stays in sync,
+     and so a future light theme has exactly one place to redefine it —
+     "theme-aware" here means token-based, not that a light palette exists
+     yet (this app is `color-scheme: dark` only today). */
+  --surface: #10141f;
   --fg: #e6e8ee;
   --dim: #8b93a7;
   --accent: #4fd1c5;
@@ -675,7 +684,7 @@ body {
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--border);
-  background: #10141f;
+  background: var(--surface);
 }
 
 /* (#1066) The collapse control + the collapsed rail.
@@ -895,9 +904,23 @@ body {
   overflow-wrap: anywhere;
   font: calc(11px * var(--fs-scale))/1.5 var(--font-mono);
 }
+/* (#2108, operator finding — phone divider) A VISIBLE boundary between
+   the list and the pane, not just a resize handle — the old bare 7px bar
+   read as "no divider at all" on a phone, a mess. `display:flex` so the
+   grip + "Expand" button (`EventLogColumn.tsx`'s own JSX) lay out inside
+   it; desktop keeps the thin 7px bar (its own override below), the phone
+   form is the TALL one (28px painted, 44px hit area via `::after`, same
+   technique `.nav-tab`'s own mobile fix already uses). Re-enabling this
+   at ≤768px (below) is a real feature restore, not new machinery: the
+   SAME Pointer Event handlers `EventLogColumn.tsx` already has for
+   desktop's drag-to-resize now run here too — one mechanism, not two. */
 .eventlog__split {
   height: 7px;
   flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
   background: var(--border);
   cursor: row-resize;
   touch-action: none;
@@ -906,11 +929,46 @@ body {
   background: var(--accent);
   opacity: 0.6;
 }
+.eventlog__split-grip {
+  width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--dim);
+  pointer-events: none;
+}
+.eventlog__expand {
+  display: none;
+}
 @media (max-width: 768px) {
-  /* the row-resize handle isn't useful when stacked, matching legacy's own
-     `.split{display:none}` mobile rule (viewer.html:679). */
   .eventlog__split {
-    display: none;
+    height: 28px;
+    background: var(--border);
+  }
+  .eventlog__split::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 44px;
+    transform: translateY(-50%);
+  }
+  .eventlog__expand {
+    display: inline-flex;
+    align-items: center;
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    padding: 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--accent);
+    font: 600 calc(10px * var(--fs-scale))/1 var(--font-mono);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    cursor: pointer;
   }
 }
 .eventlog__list {
@@ -919,6 +977,23 @@ body {
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+}
+/* (#2108, operator finding — one-tap expand) The pane fills the sheet
+   body; the list collapses to a 1-row strip beside it. `.eventlog__detail`
+   normally sizes via the INLINE `flexBasis: detailPct%` style
+   (`EventLogColumn.tsx`) — expanded, that inline style is omitted and
+   this class takes over instead. */
+.eventlog__detail--expanded {
+  flex: 1 1 auto;
+}
+.eventlog__liststrip {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  border-top: 1px solid var(--border);
+}
+.eventlog__rec--strip {
+  border-bottom: none;
+  cursor: default;
 }
 .eventlog__head {
   flex: none;
@@ -2613,6 +2688,28 @@ body {
 .rv__bool.on { color: var(--good, #4ade80); }
 .rv__chip { display: inline-block; padding: 0 6px; border-radius: 4px;
             background: rgba(255,255,255,.06); color: var(--fg); font-size: calc(11px * var(--fs-scale)); }
+
+/* (#2108, operator finding — detail text too small on a phone) A flat
+   15px/1.4, NOT `--fs-scale`-multiplied like the rest of this block —
+   the ask was a literal 14-15px floor regardless of the app's own type
+   multiplier, matching the list row's own effective size. `.rv__row`
+   wraps and `.rv__key` drops its fixed 116px column so a long field name
+   at this size stacks label-over-value instead of truncating or forcing
+   the row to overflow. */
+@media (max-width: 768px) {
+  .rv {
+    font-size: 15px;
+    line-height: 1.4;
+  }
+  .rv__row {
+    flex-wrap: wrap;
+  }
+  .rv__key {
+    width: auto;
+    flex: 1 1 100%;
+    white-space: normal;
+  }
+}
 
 .rv__ctx { margin-bottom: 8px; }
 .rv__constants { margin-bottom: 8px; }
@@ -5366,23 +5463,53 @@ body {
   .app-shell {
     padding-bottom: calc(58px + env(safe-area-inset-bottom, 0px));
   }
-  /* (operator finding, phone install review) A transparent full-viewport
-     tap-catcher, sitting just BEHIND `.phone-drawer` (lower z-index) —
-     while the drawer is open, a tap anywhere outside the sheet/bar/handle
-     dismisses it instead of reaching the page underneath. No visible
-     dimming: the sheet's own opaque background is already the visual cue
-     that the page is "behind" something. */
+  /* (operator finding, real-device review) A DIMMED tap-catcher, sitting
+     just BEHIND `.phone-drawer` (lower z-index) — while the drawer is
+     open, a tap anywhere outside the sheet/bar/handle dismisses it
+     instead of reaching the page underneath. A transparent scrim didn't
+     read as modal at all; a real semi-opaque dim, fading in with the
+     slide, is what makes the sheet read as a sheet. `top: 64px` (not
+     `inset: 0`) is a deliberate exception, per operator correction: the
+     masthead (logo, ⓘ, day picker, LIVE) stays at full brightness above
+     the scrim — the same clearance offset the retired `.machine-pill`
+     used for the identical reason ("clears the masthead's own single
+     row"). */
   .phone-drawer__backdrop {
     position: fixed;
-    inset: 0;
+    top: 64px;
+    left: 0;
+    right: 0;
+    bottom: 0;
     z-index: 79;
-    background: transparent;
+    background: rgba(0, 0, 0, 0.45);
+    animation: phone-drawer-backdrop-in 220ms ease-out;
     /* (iOS scroll-lock fix) A non-passive `touchmove` listener also
        `preventDefault()`s (`PhoneDrawer.tsx`'s own effect) — this rule is
        the CSS half, so a drag-select/rubber-band gesture never even
        reaches the browser's default scroll handling on this layer. */
     touch-action: none;
   }
+  /* A `@keyframes` animation (not a `transition`) plays on MOUNT — the
+     backdrop is conditionally mounted (`{open && <div .../>}`), and a
+     transition needs a state change AFTER mount to animate, which a
+     freshly-mounted element never gets on its first frame. */
+  @keyframes phone-drawer-backdrop-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  /* (#2108, operator diagnosis — real screenshot) The handle+tab bar were
+     painted at `--bg` (the PAGE color) while the events body beneath used
+     the lighter `#10141f` surface — where the sheet overlapped the lens
+     tab row, there was no visible edge at all, and the sheet read as
+     starting lower than it actually did. ONE elevated surface (`--surface`
+     token, `:root`'s own doc) for the WHOLE sheet — bar and body alike —
+     fixes that at the source rather than patching each region. The 1px
+     top border (kept) plus a soft upward shadow give the sheet a real top
+     edge independent of the scrim behind it. */
   .phone-drawer {
     position: fixed;
     left: 0;
@@ -5391,9 +5518,10 @@ body {
     z-index: 80;
     display: flex;
     flex-direction: column;
-    background: var(--bg, #0b0b0d);
+    background: var(--surface);
     border-top: 1px solid var(--border);
     border-radius: 16px 16px 0 0;
+    box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.5);
     overflow: hidden;
     /* Closed height — just enough for the handle+tabs bar below, nothing
        more (there is no content mounted to show anyway). `PhoneDrawer.tsx`
@@ -5415,18 +5543,31 @@ body {
        a touch here must never scroll the page behind it either. */
     touch-action: none;
   }
+  /* (#2108, operator finding — iOS home-indicator safe area) ONE place
+     for the safe-area reservation, shared by BOTH tabs — a tap/scroll at
+     the very bottom of either tab's content used to reach the iOS home
+     indicator's OWN gesture zone instead of the content, since nothing
+     stopped short of the sheet's raw edge. `padding-bottom` here (not on
+     each tab's own content separately — `.phone-drawer__panel` below
+     used to carry an identical padding of its own; consolidated to avoid
+     two mechanisms for the one concern) shrinks the space BOTH tabs
+     render into, so whatever fills it (`.phone-drawer__panel`'s
+     `overflow-y:auto`, `EventLogColumn`'s own list/pane scroll regions)
+     naturally stops above the reserved strip rather than scrolling under
+     it. */
   .phone-drawer__body {
     flex: 1;
     min-height: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
   }
   .phone-drawer__panel {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 12px 16px calc(16px + env(safe-area-inset-bottom, 0px));
+    padding: 12px 16px 0;
     /* (iOS scroll-lock fix) Reaching the top/bottom of the panel's own
        scroll must not chain into the page behind the (now `position:
        fixed`) body — this is the ONE scrollable region inside the sheet
@@ -5457,11 +5598,9 @@ body {
      changing its actual element order would move desktop's layout too,
      and this component's DOM shape is a real reuse contract, not just
      this one caller's). The split handle keeps a middle order so it
-     still visually sits between the two when it IS shown — it isn't
-     here: the existing `@media (max-width:768px) { .eventlog__split {
-     display:none } }` rule below already hides the drag handle at this
-     width, leaving the pane at its default `detailPct` split (~38/62,
-     i.e. the instructed "~40/60"). */
+     still visually sits between the two — it's re-enabled at this width
+     now (the `.eventlog__split` rule above, `@media (max-width:768px)`),
+     not hidden, so the operator can touch-drag the ratio here directly. */
   .phone-drawer__body .eventlog__list {
     order: 1;
   }
@@ -5544,6 +5683,9 @@ body {
   .machine-drawer,
   .phone-drawer {
     transition: none !important;
+  }
+  .phone-drawer__backdrop {
+    animation: none !important;
   }
 }
 

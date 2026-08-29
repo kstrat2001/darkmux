@@ -156,6 +156,36 @@ function collapseKeyFor(pane: string): string {
   return `dmux.eventlog.collapsed.${pane}`;
 }
 
+/** (#2108, operator finding — phone divider persistence) The split ratio
+ * between the list and the detail pane, per `paneId` — same scoping
+ * reason `collapseKeyFor` above already has (the App-level mainstay and a
+ * lens's own pane must not overwrite each other's choice). `localStorage`,
+ * not `sessionStorage` like the collapse flag: a resize is a deliberate
+ * layout preference worth keeping across a refresh, matching
+ * `lib/drawerStorage.ts`'s own persistence for the phone drawer's height. */
+function detailPctKeyFor(pane: string): string {
+  return `dmux.eventlog.detailpct.${pane}`;
+}
+
+function loadDetailPct(pane: string): number {
+  try {
+    const raw = window.localStorage.getItem(detailPctKeyFor(pane));
+    const n = raw === null ? NaN : Number(raw);
+    if (Number.isFinite(n) && n >= MIN_DETAIL_PCT && n <= MAX_DETAIL_PCT) return n;
+  } catch {
+    // storage unavailable — fall through to the default
+  }
+  return DEFAULT_DETAIL_PCT;
+}
+
+function persistDetailPct(pane: string, pct: number): void {
+  try {
+    window.localStorage.setItem(detailPctKeyFor(pane), String(Math.round(pct)));
+  } catch {
+    // storage unavailable — the ratio just won't survive a refresh
+  }
+}
+
 export function EventLogColumn({
   records,
   visible,
@@ -319,7 +349,19 @@ export function EventLogColumn({
   };
 
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const [detailPct, setDetailPct] = useState(DEFAULT_DETAIL_PCT);
+  // (#2108, operator finding — phone divider persistence) Initialized
+  // from `paneId`-scoped storage, not always `DEFAULT_DETAIL_PCT` — see
+  // `loadDetailPct`'s own doc.
+  const [detailPct, setDetailPct] = useState(() => loadDetailPct(paneId));
+  // (#2108, operator finding — "Expand" / "Show list") The pane fills the
+  // sheet body and the list collapses to a 1-row strip showing the
+  // selected record; toggled from the split bar's own control (or a
+  // double-tap on it). Session-only (not persisted) — it's a momentary
+  // reading mode, not a layout preference like `detailPct`.
+  const [expanded, setExpanded] = useState(false);
+  function toggleExpanded() {
+    setExpanded((e) => !e);
+  }
   // (#2107 tabbed-drawer packet) `pushDetail`-only: whether the pushed
   // detail SCREEN is showing (vs the list). Deliberately separate from
   // `follow`/`selectedKey` — `follow` mode keeps re-selecting the newest
@@ -387,13 +429,18 @@ export function EventLogColumn({
     });
   }
 
-  // `.split` drag-to-resize — pointer events (not mouse-only) so it works
-  // on the phone-width layout too, even though `.eventlog__split` is
-  // display:none there (mirrors legacy's own "the row-resize handle isn't
-  // useful when stacked" call, viewer.html:679).
+  // `.split` drag-to-resize — Pointer Events (not mouse-only), so this
+  // works identically on desktop AND, since #2108, on the phone-width
+  // layout too — the OLD `display:none` at ≤768px is gone; this is the
+  // SAME mechanism `PhoneDrawer.tsx`'s own handle drag uses (Pointer
+  // Events, not Touch Events), re-enabled here rather than inventing a
+  // second one, per the operator's own instruction.
   function onSplitPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     dragRef.current = { startY: e.clientY, startPct: detailPct };
-    e.currentTarget.setPointerCapture(e.pointerId);
+    // (#2108) `?.` — jsdom (this suite's test environment) doesn't
+    // implement Pointer Capture at all; `PhoneDrawer.tsx`'s own handle
+    // drag already guards the same call the same way.
+    e.currentTarget.setPointerCapture?.(e.pointerId);
   }
   function onSplitPointerMove(e: React.PointerEvent<HTMLDivElement>) {
     const drag = dragRef.current;
@@ -406,7 +453,15 @@ export function EventLogColumn({
   }
   function onSplitPointerUp(e: React.PointerEvent<HTMLDivElement>) {
     dragRef.current = null;
-    e.currentTarget.releasePointerCapture(e.pointerId);
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    // (#2108) Persist the RELEASED ratio — a functional update so this
+    // reads the latest `detailPct` rather than whatever was in scope when
+    // this handler was created, matching `PhoneDrawer.tsx`'s own
+    // functional-update pattern for the same class of drag-release save.
+    setDetailPct((pct) => {
+      persistDetailPct(paneId, pct);
+      return pct;
+    });
   }
 
   const q = filters.q.length > 0;
@@ -497,7 +552,11 @@ export function EventLogColumn({
               Omitted entirely in `pushDetail` mode — that layout replaces
               this split with the pushed screen above instead. */}
           {!pushDetail && (
-            <div className={`eventlog__detail${follow && selected ? " following" : ""}`} id="detail" style={{ flexBasis: `${detailPct}%` }}>
+            <div
+              className={`eventlog__detail${follow && selected ? " following" : ""}${expanded ? " eventlog__detail--expanded" : ""}`}
+              id="detail"
+              style={expanded ? undefined : { flexBasis: `${detailPct}%` }}
+            >
               {/* (operator) No "selected event" title. It was static chrome
                   competing with the record's own headline — `RecordView` already
                   leads with the action in accent colour, so the label was a second
@@ -511,15 +570,40 @@ export function EventLogColumn({
               </div>
             </div>
           )}
+          {/* (#2108, operator finding — phone divider) A visible, TOUCH-
+              DRAGGABLE bar between the list and the pane — the SAME Pointer
+              Event handlers desktop's drag-to-resize already has, no
+              longer hidden at ≤768px (`styles.css`'s own doc on why one
+              mechanism, not two). The grip is a purely visual affordance;
+              the "Expand"/"Show list" button is the one-tap reading mode
+              (#2108's own "innovative" ask) — its own `onPointerDown`
+              stops propagation so tapping it doesn't ALSO start a drag on
+              the bar underneath it. */}
           {!pushDetail && (
             <div
               className="eventlog__split"
               id="split"
+              data-act="eventlog-split"
               title="drag to resize"
               onPointerDown={onSplitPointerDown}
               onPointerMove={onSplitPointerMove}
               onPointerUp={onSplitPointerUp}
-            />
+            >
+              <div className="eventlog__split-grip" aria-hidden="true" />
+              <button
+                type="button"
+                className="eventlog__expand"
+                data-act="eventlog-expand"
+                aria-label={expanded ? "show the event list" : "expand the detail pane"}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleExpanded();
+                }}
+              >
+                {expanded ? "Show list" : "Expand"}
+              </button>
+            </div>
           )}
           <div className="eventlog__list">
         <div className="eventlog__head">
@@ -611,6 +695,31 @@ export function EventLogColumn({
             </span>
           </div>
         </div>
+        {/* (#2108, operator finding — one-tap expand) Expanded, the list
+            collapses to a 1-ROW STRIP showing just the selected record —
+            the pane above fills the rest of the sheet. Collapsing back
+            (`toggleExpanded`, the split bar's own button) restores the
+            full list untouched; nothing about the list's own row markup
+            changes between the two states. */}
+        {expanded ? (
+          <div className="eventlog__liststrip" data-act="eventlog-list-strip">
+            {selected ? (
+              <div
+                className="eventlog__rec sel eventlog__rec--strip"
+                data-act="rec-strip"
+              >
+                <span className="eventlog__rectime">{clk(Date.parse(selected.ts))}</span>{" "}
+                <ActivityIcon act={activityOf(selected)} />
+                <span className="eventlog__ractivity">{activityOf(selected)}</span>
+                {recordDetail(selected) ? (
+                  <span className="preview-text"> · {recordDetail(selected)}</span>
+                ) : null}
+              </div>
+            ) : (
+              <div className="eventlog__none">no record selected</div>
+            )}
+          </div>
+        ) : (
         <div id="logbody" className="eventlog__body">
           {visibleRecs.length ? (
             visibleRecs.map((r) => {
@@ -666,6 +775,7 @@ export function EventLogColumn({
             </div>
           )}
         </div>
+        )}
           </div>
         </>
       )}

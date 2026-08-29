@@ -57,14 +57,18 @@
  * front of the page, so a tap anywhere outside the sheet DISMISSES it
  * instead of reaching whatever button/link happened to be under it.
  *
- * **Tap/drag semantics on the handle** (spec, #2107 packet brief):
- * - tapping a CLOSED tab opens the drawer to that tab, at its own
+ * **Tap/drag semantics on the handle** (spec, #2107 packet brief; height
+ * behavior revised #2108, operator correction — see `lib/drawerStorage.ts`'s
+ * own doc for the full "why"):
+ * - tapping a CLOSED tab opens the drawer to that tab, at the ONE shared
  *   remembered height (`lib/drawerStorage.ts`, default `DEFAULT_OPEN_PCT`
- *   when nothing is stored yet).
- * - tapping the ACTIVE tab while open closes the drawer (its height stays
+ *   when nothing is stored yet) — the SAME height for either tab, not a
+ *   per-tab lookup.
+ * - tapping the ACTIVE tab while open closes the drawer (the height stays
  *   remembered for next time — nothing is persisted on a mere close).
- * - tapping the OTHER tab while open switches to it, snapping the sheet to
- *   THAT tab's own remembered height (not the current tab's).
+ * - tapping the OTHER tab while open switches to it WITHOUT touching the
+ *   height at all — the sheet's height/transform never change on a tab
+ *   switch, so the slide transition never replays for one.
  * - tapping the handle (no real drag, see `TAP_SLOP_PX`) closes when open,
  *   opens to the active tab when closed.
  * - dragging the handle live-resizes the sheet between `MIN_OPEN_PCT` and
@@ -93,6 +97,7 @@ import {
   saveDrawerHeightPct,
   type DrawerTabId,
 } from "../lib/drawerStorage";
+
 
 /** vh used the first time a tab is ever opened (nothing stored yet).
  * (#2108, operator finding) Raised from a half-sheet (50) to most of the
@@ -163,8 +168,14 @@ export function PhoneDrawer({
 }) {
   const [open, setOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<DrawerTabId>("machine");
+  // (#2108, operator correction) ONE shared height for BOTH tabs, not
+  // per-tab — a real-device review found switching tabs while open
+  // visibly resized the sheet (and replayed the slide transition)
+  // whenever the two tabs' stored heights differed, which read as a
+  // glitch. `lib/drawerStorage.ts`'s own doc has the full story; this
+  // state is never re-derived from `activeTab` again after mount.
   const [openPct, setOpenPct] = useState<number>(
-    () => loadDrawerHeightPct("machine") ?? DEFAULT_OPEN_PCT,
+    () => loadDrawerHeightPct() ?? DEFAULT_OPEN_PCT,
   );
   const [dragging, setDragging] = useState(false);
   const dragRef = useRef<{
@@ -182,9 +193,12 @@ export function PhoneDrawer({
     setOpen(false);
   }
 
+  // `openPct` is DELIBERATELY untouched here — opening (either tab, from
+  // closed) keeps whatever height is already set (the persisted/dragged
+  // value, or `DEFAULT_OPEN_PCT` on a fresh session). See this file's own
+  // doc on why the height stopped being a per-tab lookup.
   function openTab(tab: DrawerTabId) {
     setActiveTab(tab);
-    setOpenPct(loadDrawerHeightPct(tab) ?? DEFAULT_OPEN_PCT);
     setOpen(true);
   }
 
@@ -197,8 +211,11 @@ export function PhoneDrawer({
       close();
       return;
     }
+    // Switching tabs while open: ONLY `activeTab` changes. `openPct` is
+    // NOT touched — this is the actual fix (see this file's own doc) —
+    // so the sheet's height/transform stay exactly as they were, and the
+    // slide transition never replays.
     setActiveTab(tab);
-    setOpenPct(loadDrawerHeightPct(tab) ?? DEFAULT_OPEN_PCT);
   }
 
   // (#2107, #1833) Report "is the Machine tab open" up to `MachineDrawer`
@@ -330,7 +347,7 @@ export function PhoneDrawer({
         setOpen(false);
         return drag.startPct > 0 ? drag.startPct : DEFAULT_OPEN_PCT;
       }
-      saveDrawerHeightPct(activeTab, pct);
+      saveDrawerHeightPct(pct);
       return pct;
     });
   }
