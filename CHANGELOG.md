@@ -88,6 +88,25 @@ run is never misread as a slow model.
   two-column band, the viewer's tab favicon is the two-input glyph.
 - **Crawl finding records carry one rule id** ([#2103](https://github.com/kstrat2001/darkmux/pull/2103)); a receiver's per-record rejection is surfaced as `hook.fired.receiver_rejected`.
 - **Docs**: the home page hands the brand off from the hero to the nav bar on scroll, and the guide header is one row on phones ([#2115](https://github.com/kstrat2001/darkmux/pull/2115)).
+- **Release-candidate fixes, found by the operator on real devices** ([#2134](https://github.com/kstrat2001/darkmux/pull/2134)):
+  the playback transport is the instrument (no label, no record counter, the
+  track takes the row; the mission title lives in Machine info's playback row,
+  [#2120](https://github.com/kstrat2001/darkmux/issues/2120)); the demo speaks
+  for itself (machines named Studio / Workstation / Mini, a real mission
+  title, re-shot marketing screenshots, [#2121](https://github.com/kstrat2001/darkmux/issues/2121));
+  gauges color by band, amber from 80% and red from 95%
+  ([#2122](https://github.com/kstrat2001/darkmux/issues/2122)); the filters
+  dialog is wide and grouped on desktop ([#2116](https://github.com/kstrat2001/darkmux/issues/2116));
+  an active mission now counts as running on the fleet card and the runs lens
+  (presence was treated as all-or-nothing, [#2123](https://github.com/kstrat2001/darkmux/issues/2123));
+  the fleet timeline keys spans by (session, mission) so review missions that
+  reuse step ids no longer draw one twenty-hour bar
+  ([#2125](https://github.com/kstrat2001/darkmux/issues/2125)); the review
+  launcher writes its terminal record and reaps its children on SIGTERM and
+  SIGINT ([#2124](https://github.com/kstrat2001/darkmux/issues/2124)); a
+  bundler plugin that declines a diff falls back to the built-in bundler
+  instead of failing the review ([#2119](https://github.com/kstrat2001/darkmux/issues/2119));
+  a flaky mission-isolation e2e is stable ([#2117](https://github.com/kstrat2001/darkmux/issues/2117)).
 
 ### Schema
 
