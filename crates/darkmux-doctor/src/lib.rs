@@ -1859,35 +1859,36 @@ fn check_host_sampler_interval() -> Check {
 /// Costs ~120 ms total (a one-time probe construction plus two samples);
 /// `doctor` is a diagnostic command, not a hot path.
 fn check_host_probe() -> Check {
-    let name = "host probe";
     let mut probe = darkmux_crew::host_probe::HostProbe::new();
     let _seed = probe.sample();
     std::thread::sleep(std::time::Duration::from_millis(50));
     let s = probe.sample();
-    let src = probe.sources();
+    describe_host_probe(probe.sources(), s.cost_ms)
+}
 
-    let resolved: Vec<&str> = [
+/// Render [`check_host_probe`]'s verdict from an already-taken reading.
+///
+/// Split out so every degradation combination is testable — most notably
+/// "IOReport did not load", which on a healthy Apple Silicon machine cannot
+/// be produced by running the real probe, and which is precisely the
+/// combination worth pinning: a private framework whose path has already
+/// moved once between macOS releases will move again. Pure.
+fn describe_host_probe(
+    src: darkmux_crew::host_probe::HostProbeSources,
+    cost_ms: u64,
+) -> Check {
+    let name = "host probe";
+    let all = [
         ("mach", src.mach),
         ("ioreport", src.ioreport),
         ("freq-tables", src.freq_tables),
         ("thermal", src.thermal),
         ("ioreg-gpu", src.ioreg_gpu),
-    ]
-    .into_iter()
-    .filter_map(|(n, ok)| ok.then_some(n))
-    .collect();
-    let missing: Vec<&str> = [
-        ("mach", src.mach),
-        ("ioreport", src.ioreport),
-        ("freq-tables", src.freq_tables),
-        ("thermal", src.thermal),
-        ("ioreg-gpu", src.ioreg_gpu),
-    ]
-    .into_iter()
-    .filter_map(|(n, ok)| (!ok).then_some(n))
-    .collect();
+    ];
+    let resolved: Vec<&str> = all.iter().filter_map(|(n, ok)| ok.then_some(*n)).collect();
+    let missing: Vec<&str> = all.iter().filter_map(|(n, ok)| (!ok).then_some(*n)).collect();
 
-    let cost = format!("{}ms/sample", s.cost_ms);
+    let cost = format!("{cost_ms}ms/sample");
     if resolved.is_empty() {
         return Check {
             name: name.into(),
@@ -1910,7 +1911,7 @@ fn check_host_probe() -> Check {
     };
     // Anything short of mach is a real gap worth surfacing — without tick
     // counters there is no CPU figure at all. A missing IOReport is a
-    // property of the host, reported without alarm.
+    // property of the host, reported without alarm but always NAMED.
     let status = if src.mach { Status::Pass } else { Status::Warn };
     Check {
         name: name.into(),
@@ -5583,6 +5584,97 @@ mod tests {
             "the observer's own cost is part of the report: {}",
             check.message
         );
+        // Apple Silicon + IOReport is the configuration darkmux is marketed
+        // for, so a build where the IOReport half silently stopped resolving
+        // must FAIL here rather than quietly reporting null power forever.
+        // If this fires on a future macOS, the framework moved again — see
+        // `host_probe::ioreport::IOREPORT_PATHS`.
+        // Substring-matching `"ioreport"` alone would ALSO match the
+        // "unavailable: ioreport" clause, so assert on the clause itself:
+        // on Apple Silicon every source is expected to resolve, and a build
+        // where one silently stopped must fail here rather than reporting
+        // null power forever. If this fires on a new macOS, the framework
+        // moved again — see `host_probe::ioreport::IOREPORT_PATHS`.
+        assert!(
+            !check.message.contains("unavailable"),
+            "every host source is expected to resolve on Apple Silicon: {}",
+            check.message
+        );
+        for src in ["ioreport", "freq-tables", "thermal", "ioreg-gpu"] {
+            assert!(
+                check.message.contains(src),
+                "`{src}` must be named among the resolved sources: {}",
+                check.message
+            );
+        }
+    }
+
+    /// The degradation combinations the live probe cannot produce on a
+    /// healthy Mac — and the ones most worth pinning, since a private
+    /// framework whose path has already moved once will move again. Pure, so
+    /// they run on every platform.
+    #[test]
+    fn describe_host_probe_names_a_missing_ioreport_rather_than_hiding_it() {
+        let src = darkmux_crew::host_probe::HostProbeSources {
+            mach: true,
+            ioreport: false,
+            freq_tables: false,
+            thermal: true,
+            ioreg_gpu: true,
+        };
+        let check = describe_host_probe(src, 3);
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "a host without IOReport still reports cpu/mem/gpu"
+        );
+        assert!(
+            check.message.contains("unavailable: ioreport, freq-tables"),
+            "the operator must be able to tell 'this Mac has no IOReport' from 'darkmux forgot \
+             to read it': {}",
+            check.message
+        );
+        assert!(check.message.contains("mach"), "{}", check.message);
+        assert!(check.hint.is_some(), "a missing source comes with an explanation");
+    }
+
+    #[test]
+    fn describe_host_probe_warns_when_nothing_resolved() {
+        let check = describe_host_probe(darkmux_crew::host_probe::HostProbeSources::default(), 0);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("no host sources resolved"), "{}", check.message);
+    }
+
+    #[test]
+    fn describe_host_probe_warns_when_mach_itself_is_missing() {
+        // Without tick counters there is no CPU figure at all — a real gap
+        // even when every other source is fine.
+        let src = darkmux_crew::host_probe::HostProbeSources {
+            mach: false,
+            ioreport: true,
+            freq_tables: true,
+            thermal: true,
+            ioreg_gpu: true,
+        };
+        let check = describe_host_probe(src, 4);
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("unavailable: mach"), "{}", check.message);
+    }
+
+    #[test]
+    fn describe_host_probe_omits_the_unavailable_clause_when_all_resolved() {
+        let src = darkmux_crew::host_probe::HostProbeSources {
+            mach: true,
+            ioreport: true,
+            freq_tables: true,
+            thermal: true,
+            ioreg_gpu: true,
+        };
+        let check = describe_host_probe(src, 9);
+        assert_eq!(check.status, Status::Pass);
+        assert!(!check.message.contains("unavailable"), "{}", check.message);
+        assert!(check.message.contains("9ms/sample"), "{}", check.message);
+        assert!(check.hint.is_none(), "nothing missing ⇒ nothing to explain");
     }
 
     // ─── (#2107, #1833) check_host_sampler_interval — resolved state + provenance ─

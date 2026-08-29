@@ -733,8 +733,38 @@ mod tests {
         for v in [s.mem_pct, s.gpu_pct].into_iter().flatten() {
             assert!(v <= 100, "percent field out of range: {v}");
         }
+        // Apple Silicon + IOReport is the configuration darkmux is marketed
+        // for. Asserting the sources RESOLVED — not merely that they didn't
+        // crash — is what makes this test fail if the IOReport half silently
+        // stops loading (a private framework whose path has already moved
+        // once between macOS releases). Without these, breaking
+        // `IOREPORT_PATHS` leaves the whole suite green while every power
+        // and frequency number goes permanently null.
+        let src = probe.sources();
+        assert!(src.mach, "mach counters are always available on macOS");
+        assert!(
+            src.ioreport,
+            "IOReport did not load — if this fires on a new macOS, the framework moved again; \
+             see `ioreport::IOREPORT_PATHS`"
+        );
+        assert!(src.freq_tables, "the pmgr DVFS frequency tables did not resolve");
+        assert!(src.thermal, "ProcessInfo.thermalState did not resolve");
+        assert!(src.ioreg_gpu, "the IOAccelerator IORegistry node did not resolve");
+        assert!(
+            s.power.is_some(),
+            "IOReport resolved, so the Energy Model rails must produce a reading"
+        );
+        assert!(
+            s.gpu_mhz.is_some(),
+            "IOReport + freq tables resolved, so the GPU perf state must produce a frequency"
+        );
+
         let clusters = s.cpu_clusters.as_ref().expect("hw.perflevelN is reported on Apple Silicon");
         assert!(!clusters.is_empty(), "cpu_clusters is null when empty, never an empty vec");
+        assert!(
+            clusters.iter().any(|c| c.mhz.is_some()),
+            "at least one perf-level cluster must match an IOReport group and get a frequency"
+        );
         for c in clusters {
             assert!(c.cores > 0, "a reported cluster has cores");
             if let Some(pct) = c.pct {
