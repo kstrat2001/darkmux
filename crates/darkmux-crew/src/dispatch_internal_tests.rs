@@ -3322,6 +3322,139 @@
         assert_eq!(records[1]["payload"]["rests"], 2);
     }
 
+    // ─── #1959 (revised) record_context rides every tailer record ─────
+
+    /// `DispatchOpts::record_context` (threaded to `TailerState` via
+    /// `with_record_context`) merges under `payload.context` on EVERY
+    /// record the tailer emits for this dispatch — proven here against a
+    /// `dispatch.tool` record for a `report_finding` call, but the merge
+    /// itself (`merge_record_context`) is called from `emit`/`emit_telemetry`
+    /// unconditionally, not gated on tool name.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn record_context_merges_under_payload_context_on_a_tool_completed_record() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-context".into(),
+            "crawler".into(),
+            "darkmux:qwen3.6".into(),
+        )
+        .with_record_context(Some(serde_json::json!({
+            "workspace": "finhero",
+            "source": "finsys-core",
+            "sha": "abc123",
+            "rule": ["swallowed-error"],
+            "unit": "u-0001",
+        })));
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"report_finding","args":"{\"file\":\"a.rs\"}","result":"Recorded. 1 finding(s) so far, 39 remaining in this run's budget.","ok":true}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-context" && v["action"] == "dispatch.tool")
+            .expect("a dispatch.tool record for the report_finding call");
+
+        assert_eq!(record["payload"]["context"]["workspace"], "finhero");
+        assert_eq!(record["payload"]["context"]["source"], "finsys-core");
+        assert_eq!(record["payload"]["context"]["sha"], "abc123");
+        assert_eq!(record["payload"]["context"]["unit"], "u-0001");
+        // The record's OWN fields survive alongside the merged context —
+        // the merge adds a key, it never replaces the payload.
+        assert_eq!(record["payload"]["tool_name"], "report_finding");
+    }
+
+    /// The other half of the same contract: `record_context: None` (every
+    /// caller that doesn't set `DispatchOpts::record_context`) must leave
+    /// NO `context` key at all — not `null`, not an empty object. A caller
+    /// that never opted in must see byte-identical payloads to before this
+    /// feature existed.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn no_record_context_means_no_context_key_at_all() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        // No `.with_record_context(...)` — the default `None`.
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-no-context".into(),
+            "crawler".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"tool.completed","seq":1,"tool_seq":0,"tool_name":"read","args":"{}","result":"ok","ok":true}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-no-context" && v["action"] == "dispatch.tool")
+            .expect("a dispatch.tool record");
+
+        assert!(
+            record["payload"].as_object().unwrap().get("context").is_none(),
+            "no record_context set — payload must carry no `context` key at all: {:?}",
+            record["payload"]
+        );
+    }
+
     // ─── #557 slice 2 detector telemetry ──────────────────────────────
 
     /// The pure mapping helper: a `dispatch.cycle.suspected` event →
@@ -3501,6 +3634,7 @@
                 "darkmux:qwen3.6".into(),
                 Some("pre-1.0-compat-sweep".into()),
                 Some("s694".into()),
+                None,
             );
             guard.open(crate::dispatch::build_dispatch_record_with_payload(
                 darkmux_flow::Level::Info,
@@ -3561,6 +3695,7 @@
                 "darkmux:qwen3.6".into(),
                 None,
                 None,
+                None,
             );
             guard.open(crate::dispatch::build_dispatch_record_with_payload(
                 darkmux_flow::Level::Info,
@@ -3619,6 +3754,7 @@
                 "sess-panic".into(),
                 "darkmux:qwen3.6".into(),
                 Some("pre-1.0-compat-sweep".into()),
+                None,
                 None,
             );
             guard.open(crate::dispatch::build_dispatch_record_with_payload(

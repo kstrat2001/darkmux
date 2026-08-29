@@ -1393,6 +1393,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
     };
     let opts = crew::dispatch::DispatchOpts {
         workspace_read_only: false,
+        record_context: None,
         role_id: role,
         message,
         session_id,

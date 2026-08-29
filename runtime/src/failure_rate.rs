@@ -234,6 +234,23 @@ pub fn classify_outcome(tool_name: &str, result: &str) -> ToolOutcome {
         return ToolOutcome::Failed { reason: "no such tool".to_string() };
     }
 
+    // (#1959) `report_finding` is the "future tool that returns
+    // `Ok(error-shaped-text)`" this doc's own comment anticipates.
+    // `execute_report_finding` (runtime/src/tools/mod.rs) NEVER returns
+    // `Err` — a model-facing tool that errors reads to the model as "this
+    // tool is broken" and gets abandoned (see that function's own doc) —
+    // so its rejection text has to be classified here from the reply's
+    // own prefix instead of via the generic error marker above. A
+    // REJECTED/NOT-RECORDED finding is a citation that did not verify
+    // against real source, or a malformed/incomplete call — a genuinely
+    // failed tool call, not proof-of-work like a bash red test. `ok:
+    // false` on the trajectory record follows from that, and a hook rule
+    // matching `{"payload.tool_name": "report_finding", "payload.ok":
+    // true}` sees only the ACCEPTED ones.
+    if tool_name == "report_finding" && (result.starts_with("REJECTED:") || result.starts_with("NOT RECORDED")) {
+        return ToolOutcome::Failed { reason: "the finding's citation did not verify".to_string() };
+    }
+
     if tool_name == "bash" {
         if let Some(rest) = result.strip_prefix("exit: ") {
             let code_token = rest.split_whitespace().next().unwrap_or("");
@@ -391,6 +408,41 @@ mod tests {
     fn failure_when_unknown_tool_dispatch() {
         let r = "tool 'wibble' is not available in this runtime. known tools: echo, bash, ...";
         assert!(!classify_outcome("wibble", r).tool_worked());
+    }
+
+    // ─── (#1959) report_finding: REJECTED/NOT RECORDED are Failed ─────
+
+    #[test]
+    fn report_finding_rejected_citation_is_failed() {
+        let r = "REJECTED: `evidence` was empty. Copy the source line verbatim \
+                  from the file and call again. This did not count against your budget.";
+        assert!(matches!(classify_outcome("report_finding", r), ToolOutcome::Failed { .. }));
+        assert!(!classify_outcome("report_finding", r).tool_worked());
+    }
+
+    #[test]
+    fn report_finding_not_recorded_malformed_args_is_failed() {
+        let r = "NOT RECORDED — I could not read those arguments. This tool takes exactly \
+                  these five keys: ...";
+        assert!(matches!(classify_outcome("report_finding", r), ToolOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn report_finding_recorded_is_ok() {
+        let r = "Recorded. 3 finding(s) so far, 37 remaining in this run's budget. \
+                  Continue examining the scope; report the next one when you find it.";
+        assert_eq!(classify_outcome("report_finding", r), ToolOutcome::Ok);
+        assert!(classify_outcome("report_finding", r).tool_worked());
+    }
+
+    /// The prefix check is exact — a REJECTED reply from a DIFFERENT tool
+    /// (hypothetically) or plain prose that merely mentions the word must
+    /// not be misclassified. Guards against a future broadening of the
+    /// match to `.contains("REJECTED")`.
+    #[test]
+    fn report_finding_classification_is_scoped_to_this_tool_name() {
+        let r = "REJECTED: `evidence` was empty.";
+        assert_eq!(classify_outcome("some-other-tool", r), ToolOutcome::Ok);
     }
 
     #[test]

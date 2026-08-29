@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.25.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.26.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -425,6 +425,49 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.25.0";
 //           happened) and from the operator's raw configured value
 //           (`dispatch.start`'s `turn_delay_ms`). `null` when unknowable.
 //           Additive payload field, same rule as the rest of this version.
+//   1.26.0 (#1959, revised): the 1.24.0 `crawl.*` action family
+//           (`crawl.mission.started/completed`, `crawl.unit.started/
+//           completed`, `crawl.finding`) is RETIRED — never shipped past
+//           this repo's own history, so this is a removal, not a
+//           deprecation window. The crawl launcher mints a real Mission/
+//           Phase/Task/Step (it always did), so it now uses the GENERIC
+//           lifecycle actions every other mission uses instead of its own
+//           bespoke vocabulary: `mission start`/`mission close` (payload
+//           gains `workspace`, `units_in_plan`, `units_selected`,
+//           `est_tokens`, `sources` on start; `units_completed/errored/
+//           skipped/not_run`, `findings`, `prompt_tokens`,
+//           `completion_tokens`, `wall_ms`, `tokens_per_hour`,
+//           `stopped_by`, `model` on close) and `step start`/`step
+//           complete`/`step error` (payload gains `workspace`, `unit`,
+//           `source`, `sha`, `rule`, `kind`, `est_tokens`, `sites`/`files`
+//           on start; `result`, `findings`, `prompt_tokens`,
+//           `completion_tokens`, `wall_ms`, `model` on the terminal).
+//           `crawl.finding` is retired outright with NO replacement
+//           action — a finding is never a special record; the runtime
+//           classifies a REJECTED/NOT-RECORDED `report_finding` reply as a
+//           FAILED tool call (`payload.ok: false` on the ordinary
+//           `dispatch.tool` record an accepted OR rejected call already
+//           produces), and a hook rule subscribes to the accepted subset
+//           via a new payload-predicate match (`"payload.tool_name":
+//           "report_finding", "payload.ok": true` — see `HookMatch::
+//           payload_predicates`, config schema unaffected: predicates ride
+//           the existing `#[serde(flatten)] extras` map, no new field).
+//           `DispatchOpts::record_context` (a caller-supplied JSON object
+//           — the crawl launcher's `workspace`/`source`/`sha`/`rule`/
+//           `unit`, `None` for every other caller) merges under
+//           `payload.context` on EVERY record this dispatch's flow-record
+//           surface emits — the bookends (`dispatch start`/`dispatch
+//           complete`/`dispatch error`) and every tailer-emitted record
+//           (`dispatch.tool`, `dispatch.turn`, `telemetry.*`, …) alike —
+//           so a consumer never has to special-case one action to find
+//           provenance the runtime itself has no concept of. Minor +
+//           additive on the FLOW side (new optional payload keys on
+//           existing generic actions; `crawl.*`'s removal is a vocabulary
+//           retirement, not a schema-breaking field/struct change — older
+//           readers simply stop seeing those five action strings). The
+//           ledger written to `<workspace root>/runs/<mission>/
+//           ledger.jsonl` at readback is UNCHANGED by any of this — it was
+//           never part of the flow-record schema.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

@@ -675,6 +675,7 @@ mod tests {
     fn local_opts(role_id: &str) -> DispatchOpts {
         DispatchOpts {
             workspace_read_only: false,
+            record_context: None,
             role_id: role_id.to_string(),
             message: "hi".to_string(),
             session_id: None,

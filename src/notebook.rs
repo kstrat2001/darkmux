@@ -162,6 +162,7 @@ pub fn draft_entry(opts: &DraftOptions) -> Result<DraftReport> {
 fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Result<String> {
     let opts = DispatchOpts {
         workspace_read_only: false,
+        record_context: None,
         role_id: role.to_string(),
         message: prompt.to_string(),
         session_id: Some(session_id.to_string()),

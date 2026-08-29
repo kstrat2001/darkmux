@@ -789,11 +789,22 @@ impl<'a> DispatchBookendGuard<'a> {
         model: String,
         mission_id: Option<String>,
         phase_id: Option<String>,
+        // (#1959) Same provenance merge as every other record this
+        // dispatch's flow-record surface emits — see `merge_record_context`'s
+        // doc. `None` for every caller that doesn't set
+        // `DispatchOpts::record_context`.
+        record_context: Option<serde_json::Value>,
     ) -> Self {
         let on_abort = move |_id: &str, _kind: &str| {
             // Best-effort, same as every other emit on this path: a
             // flow-sink write problem must not mask the original error
             // propagating out.
+            let mut payload = serde_json::json!({
+                "runtime": "internal",
+                "result_class": "error",
+                "error": "dispatch terminated before completion (early return or panic)",
+            });
+            merge_record_context(&mut payload, &record_context);
             crate::dispatch::build_dispatch_record_with_payload(
                 darkmux_flow::Level::Error,
                 "dispatch error",
@@ -802,11 +813,7 @@ impl<'a> DispatchBookendGuard<'a> {
                 Some(&model),
                 mission_id.as_deref(),
                 phase_id.as_deref(),
-                Some(serde_json::json!({
-                    "runtime": "internal",
-                    "result_class": "error",
-                    "error": "dispatch terminated before completion (early return or panic)",
-                })),
+                Some(payload),
             )
         };
         Self { inner: darkmux_flow::BookendGuard::new(sink, on_abort) }
@@ -2516,6 +2523,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     if let Some(label) = &remote_endpoint_raw_label {
         dispatch_start_payload["endpoint"] = serde_json::json!(label);
     }
+    // (#1959) Provenance the runtime can't derive on its own (the crawl
+    // launcher's workspace/source/sha/rule/unit) — see `merge_record_context`'s
+    // own doc. A no-op for every caller that leaves `DispatchOpts::record_context`
+    // unset.
+    merge_record_context(&mut dispatch_start_payload, &opts.record_context);
     // (#717, #1230 Packet 0) Emit dispatch.start THROUGH the bookend guard's
     // `open()` — arms it, so any `?`-return or panic before the clean
     // `dispatch.complete` below emits a `dispatch.error` terminal so the
@@ -2533,6 +2545,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         model.clone(),
         mission_id.clone(),
         phase_id.clone(),
+        opts.record_context.clone(),
     );
     bookend.open(crate::dispatch::build_dispatch_record_with_payload(
         darkmux_flow::Level::Info,
@@ -2826,6 +2839,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let phase_id = phase_id.clone();
         let step_id = step_id.clone();
         let inactivity_deadline = Arc::clone(&inactivity_deadline);
+        let record_context = opts.record_context.clone();
         thread::spawn(move || {
             run_tailer(
                 out_dir,
@@ -2839,6 +2853,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 inactivity_deadline,
                 inactivity_secs,
                 compaction_threshold,
+                record_context,
             )
         })
     };
@@ -3100,6 +3115,8 @@ let host_peaks = sampler_handle.join().unwrap_or_default();
     if let Some(label) = &remote_endpoint_raw_label {
         dispatch_complete_payload["endpoint"] = serde_json::json!(label);
     }
+    // (#1959) Same provenance merge as `dispatch_start_payload` above.
+    merge_record_context(&mut dispatch_complete_payload, &opts.record_context);
     let (action, level) = if exit_code == 0 {
         ("dispatch complete", darkmux_flow::Level::Info)
     } else {
@@ -3698,6 +3715,7 @@ fn run_tailer(
     inactivity_deadline: Arc<Mutex<Instant>>,
     inactivity_secs: u64,
     compaction_threshold: Option<u32>,
+    record_context: Option<serde_json::Value>,
 ) -> TrajectorySummary {
     let trajectory_path = out_dir
         .join(".darkmux-runtime")
@@ -3712,7 +3730,8 @@ fn run_tailer(
     )
     .with_mission(mission_id, phase_id)
     .with_step(step_id)
-    .with_compaction_threshold(compaction_threshold);
+    .with_compaction_threshold(compaction_threshold)
+    .with_record_context(record_context);
 
     loop {
         state.poll_and_emit();
@@ -3906,6 +3925,28 @@ fn drain_complete_lines_from_bytes(pending: &mut Vec<u8>) -> Vec<String> {
     out
 }
 
+/// (#1959, revised — no `dispatch.finding` action; `record_context` rides
+/// EVERY tailer/bookend record instead) Merge `record_context` under
+/// `payload.context` — provenance a dispatch caller supplied (the crawl
+/// launcher's `workspace`/`source`/`sha`/`rule`/`unit`) that no runtime
+/// signal can derive on its own. Applied uniformly wherever a flow record
+/// leaves this dispatch's surface: the `dispatch start`/`dispatch
+/// complete`/`dispatch error` bookends (call sites in `dispatch()`) and
+/// every `TailerState`-emitted record (`dispatch.tool`, `dispatch.turn`,
+/// `dispatch.checkpoint`, `telemetry.*`, …, via `emit`/`emit_telemetry`).
+/// One nested key so it can never collide with a record's own top-level
+/// fields. A `None` context, a non-object context, or a non-object payload
+/// are each a no-op — never a partial/corrupted merge.
+fn merge_record_context(payload: &mut serde_json::Value, record_context: &Option<serde_json::Value>) {
+    let Some(ctx) = record_context else { return };
+    if !ctx.is_object() {
+        return;
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("context".to_string(), ctx.clone());
+    }
+}
+
 /// any partial-line tail bytes carried across polls, and the last
 /// heartbeat instant for rate limiting.
 struct TailerState {
@@ -3960,6 +4001,13 @@ struct TailerState {
     /// record so the viewer can draw the trigger line. `None` in tests / when
     /// no window is configured.
     compaction_threshold: Option<u32>,
+    /// (#1959 flow-record vocabulary retirement) `DispatchOpts::record_context`
+    /// forwarded from the call site — provenance the runtime cannot know
+    /// (e.g. the crawl launcher's `workspace`/`source`/`sha`/`rule`/`unit`),
+    /// merged into every `dispatch.finding` record this dispatch's
+    /// `report_finding` tool calls produce. `None` for every caller that
+    /// doesn't set `DispatchOpts::record_context` — a complete no-op.
+    record_context: Option<serde_json::Value>,
 }
 
 impl TailerState {
@@ -3987,7 +4035,18 @@ impl TailerState {
             inactivity_deadline: Some(inactivity_deadline),
             inactivity_secs,
             compaction_threshold: None,
+            record_context: None,
         }
+    }
+
+    /// (#1959 flow-record vocabulary retirement) Forward
+    /// `DispatchOpts::record_context` so `dispatch.finding` records can
+    /// carry provenance the runtime itself has no concept of. Builder-style,
+    /// same pattern as `with_step`/`with_compaction_threshold`; only
+    /// production `run_tailer` opts in.
+    fn with_record_context(mut self, record_context: Option<serde_json::Value>) -> Self {
+        self.record_context = record_context;
+        self
     }
 
     /// (#714) Stamp the phase → mission this dispatch belongs to so the
@@ -4044,6 +4103,7 @@ impl TailerState {
             inactivity_deadline: None,
             inactivity_secs: 600,
             compaction_threshold: None,
+            record_context: None,
         }
     }
 
@@ -4443,6 +4503,7 @@ impl TailerState {
 
     fn emit(&self, action: &str, level: darkmux_flow::Level, mut payload: serde_json::Value) {
         self.stamp_step_id(&mut payload);
+        merge_record_context(&mut payload, &self.record_context);
         let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
             level,
             action,
@@ -4473,6 +4534,7 @@ impl TailerState {
     /// (`"detector"`, `"runtime"`, …) the observability viewer keys on.
     fn emit_telemetry(&self, source: &str, action: &str, mut payload: serde_json::Value) {
         self.stamp_step_id(&mut payload);
+        merge_record_context(&mut payload, &self.record_context);
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
             action,

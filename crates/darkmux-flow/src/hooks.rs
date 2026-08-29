@@ -146,7 +146,30 @@ pub fn hook_match(m: &HookMatch, record: &FlowRecord) -> bool {
             return false;
         }
     }
+    // (#1959) Payload predicates — `"payload.tool_name": "report_finding"`
+    // etc. on the wire. Every predicate must resolve AND match exactly; a
+    // record with no payload at all, or missing the named key, fails
+    // every predicate (never treated as "no opinion, so it passes").
+    for (path, expected) in m.payload_predicates() {
+        let actual = record.payload.as_ref().and_then(|p| payload_value_at(p, path));
+        if actual != Some(expected) {
+            return false;
+        }
+    }
     true
+}
+
+/// Walk a dot-separated path (`"tool_name"`, `"detections.count"`) into a
+/// JSON value, returning the leaf if every segment resolves through a JSON
+/// object. `None` at the first segment that doesn't exist, isn't an
+/// object, or (for the final segment) isn't present — there is no
+/// "partial path matches" reading.
+fn payload_value_at<'a>(payload: &'a serde_json::Value, dotted_path: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = payload;
+    for seg in dotted_path.split('.') {
+        cur = cur.as_object()?.get(seg)?;
+    }
+    Some(cur)
 }
 
 // ─── URL policy (loopback-only) ────────────────────────────────────────
@@ -605,6 +628,16 @@ fn describe_match(m: &HookMatch) -> String {
     }
     if let Some(v) = &m.level {
         parts.push(format!("level={v}"));
+    }
+    // (#1959) Payload predicates, sorted by path for a deterministic
+    // rendering regardless of the underlying JSON map's iteration order.
+    let mut payload_parts: Vec<(String, String)> = m
+        .payload_predicates()
+        .map(|(path, v)| (path.to_string(), v.to_string()))
+        .collect();
+    payload_parts.sort();
+    for (path, v) in payload_parts {
+        parts.push(format!("payload.{path}={v}"));
     }
     parts.join(", ")
 }
@@ -2023,6 +2056,104 @@ mod tests {
         assert!(hook_match(&HookMatch { category: Some("telemetry".to_string()), ..Default::default() }, &r));
         assert!(hook_match(&HookMatch { level: Some("warn".to_string()), ..Default::default() }, &r));
         assert!(!hook_match(&HookMatch { category: Some("work".to_string()), ..Default::default() }, &r));
+    }
+
+    // ─── (#1959) HookMatch payload predicates ──────────────────────────
+
+    fn payload_match(pairs: &[(&str, serde_json::Value)]) -> HookMatch {
+        let mut extras = serde_json::Map::new();
+        for (k, v) in pairs {
+            extras.insert(format!("payload.{k}"), v.clone());
+        }
+        HookMatch { extras, ..Default::default() }
+    }
+
+    #[test]
+    fn payload_predicate_matches_on_tool_name() {
+        let mut r = record("dispatch.tool");
+        r.payload = Some(serde_json::json!({"tool_name": "report_finding", "ok": true}));
+        let m = payload_match(&[("tool_name", serde_json::json!("report_finding"))]);
+        assert!(hook_match(&m, &r));
+
+        let m = payload_match(&[("tool_name", serde_json::json!("bash"))]);
+        assert!(!hook_match(&m, &r));
+    }
+
+    #[test]
+    fn payload_predicate_distinguishes_ok_true_from_ok_false() {
+        let mut r = record("dispatch.tool");
+        r.payload = Some(serde_json::json!({"tool_name": "report_finding", "ok": true}));
+        assert!(hook_match(&payload_match(&[("ok", serde_json::json!(true))]), &r));
+        assert!(!hook_match(&payload_match(&[("ok", serde_json::json!(false))]), &r));
+
+        r.payload = Some(serde_json::json!({"tool_name": "report_finding", "ok": false}));
+        assert!(hook_match(&payload_match(&[("ok", serde_json::json!(false))]), &r));
+        assert!(!hook_match(&payload_match(&[("ok", serde_json::json!(true))]), &r));
+    }
+
+    #[test]
+    fn payload_predicate_on_a_missing_key_never_matches() {
+        let mut r = record("dispatch.tool");
+        r.payload = Some(serde_json::json!({"tool_name": "report_finding"}));
+        // `outcome` isn't in this payload at all.
+        assert!(!hook_match(&payload_match(&[("outcome", serde_json::json!("ok"))]), &r));
+
+        // Nor does a record with no payload whatsoever.
+        r.payload = None;
+        assert!(!hook_match(&payload_match(&[("tool_name", serde_json::json!("report_finding"))]), &r));
+    }
+
+    #[test]
+    fn payload_predicate_resolves_a_nested_dotted_path() {
+        let mut r = record("dispatch.tool");
+        r.payload = Some(serde_json::json!({"tool_name": "read", "detections": {"count": 3}}));
+        assert!(hook_match(&payload_match(&[("detections.count", serde_json::json!(3))]), &r));
+        assert!(!hook_match(&payload_match(&[("detections.count", serde_json::json!(4))]), &r));
+        // A path that tries to walk THROUGH a non-object segment fails cleanly.
+        assert!(!hook_match(&payload_match(&[("tool_name.nested", serde_json::json!("x"))]), &r));
+    }
+
+    #[test]
+    fn describe_match_renders_payload_predicates_sorted() {
+        let m = HookMatch {
+            action: Some("dispatch.tool".to_string()),
+            extras: {
+                let mut e = serde_json::Map::new();
+                e.insert("payload.tool_name".to_string(), serde_json::json!("report_finding"));
+                e.insert("payload.ok".to_string(), serde_json::json!(true));
+                e
+            },
+            ..Default::default()
+        };
+        let desc = describe_match(&m);
+        assert!(desc.contains("action=dispatch.tool"), "{desc}");
+        assert!(desc.contains("payload.ok=true"), "{desc}");
+        assert!(desc.contains("payload.tool_name=\"report_finding\""), "{desc}");
+        // Sorted by path: "ok" before "tool_name".
+        assert!(desc.find("payload.ok").unwrap() < desc.find("payload.tool_name").unwrap(), "{desc}");
+    }
+
+    #[test]
+    fn payload_predicate_combines_with_action_and_every_other_field_anded() {
+        let mut r = record("dispatch.tool");
+        r.payload = Some(serde_json::json!({"tool_name": "report_finding", "ok": true}));
+        let m = HookMatch {
+            action: Some("dispatch.tool".to_string()),
+            extras: {
+                let mut e = serde_json::Map::new();
+                e.insert("payload.tool_name".to_string(), serde_json::json!("report_finding"));
+                e.insert("payload.ok".to_string(), serde_json::json!(true));
+                e
+            },
+            ..Default::default()
+        };
+        assert!(hook_match(&m, &r));
+
+        // Change the action alone — payload predicates still match, but the
+        // AND with `action` must still fail the whole thing.
+        let mut m2 = m.clone();
+        m2.action = Some("dispatch.turn".to_string());
+        assert!(!hook_match(&m2, &r));
     }
 
     #[test]

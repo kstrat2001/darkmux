@@ -614,6 +614,23 @@ fn emit_mission_transition_record_with_reasoning(
     action: &str,
     reasoning: Option<&str>,
 ) {
+    emit_mission_transition_record_with_reasoning_and_payload(mission_id, action, reasoning, None);
+}
+
+/// (#1959) Payload-carrying variant — lets a caller that mints a mission
+/// with its own numbers (the crawl launcher's `workspace`/`units_in_plan`/
+/// `units_selected`/`est_tokens`/`sources` on start;
+/// `units_completed`/`errored`/`skipped`/`not_run`/`findings`/tokens/
+/// `stopped_by`/`model` on close) put them on the SAME `mission start`/
+/// `mission close` record every other mission emits, instead of a
+/// second, bespoke record beside it. Every existing caller routes through
+/// the 3-arg wrapper above with `payload: None` — behavior unchanged.
+fn emit_mission_transition_record_with_reasoning_and_payload(
+    mission_id: &str,
+    action: &str,
+    reasoning: Option<&str>,
+    payload: Option<serde_json::Value>,
+) {
     let _ = flow::record(FlowRecord {
         ts: flow::ts_utc_now(),
         level: Level::Info,
@@ -632,7 +649,7 @@ fn emit_mission_transition_record_with_reasoning(
         machine_uid: None,
         prev_hash: None,
         hash: None,
-        payload: None,
+        payload,
         work_id: None,
         attempt: None,
     });
@@ -925,6 +942,17 @@ pub fn mission_start(id: &str) -> Result<Mission> {
 }
 
 pub fn mission_start_with_reasoning(id: &str, reasoning: Option<&str>) -> Result<Mission> {
+    mission_start_with_reasoning_and_payload(id, reasoning, None)
+}
+
+/// (#1959) Payload-carrying variant — see
+/// `emit_mission_transition_record_with_reasoning_and_payload`'s doc. The
+/// crawl launcher's own caller.
+pub fn mission_start_with_reasoning_and_payload(
+    id: &str,
+    reasoning: Option<&str>,
+    payload: Option<serde_json::Value>,
+) -> Result<Mission> {
     let mut mission = load_mission(id)?;
     match mission.status {
         MissionStatus::Active if mission.started_ts.is_some() => {
@@ -939,7 +967,7 @@ pub fn mission_start_with_reasoning(id: &str, reasoning: Option<&str>) -> Result
     mission.status = MissionStatus::Active;
     mission.started_ts = Some(now_unix());
     save_json(&mission_path(id), &mission)?;
-    emit_mission_transition_record_with_reasoning(id, "mission start", reasoning);
+    emit_mission_transition_record_with_reasoning_and_payload(id, "mission start", reasoning, payload);
     Ok(mission)
 }
 
@@ -974,6 +1002,19 @@ pub fn mission_terminal_with_reasoning(
     terminal: MissionStatus,
     reasoning: Option<&str>,
 ) -> Result<Mission> {
+    mission_terminal_with_reasoning_and_payload(id, terminal, reasoning, None)
+}
+
+/// (#1959) Payload-carrying variant — see
+/// `emit_mission_transition_record_with_reasoning_and_payload`'s doc. The
+/// crawl launcher's own caller (via `mission_close_with_reasoning`'s
+/// terminal-status-Finalized shape).
+pub fn mission_terminal_with_reasoning_and_payload(
+    id: &str,
+    terminal: MissionStatus,
+    reasoning: Option<&str>,
+    payload: Option<serde_json::Value>,
+) -> Result<Mission> {
     debug_assert!(
         matches!(terminal, MissionStatus::Finalized | MissionStatus::Aborted),
         "only Finalized/Aborted are terminals"
@@ -996,7 +1037,7 @@ pub fn mission_terminal_with_reasoning(
     } else {
         "mission close"
     };
-    emit_mission_transition_record_with_reasoning(id, action, reasoning);
+    emit_mission_transition_record_with_reasoning_and_payload(id, action, reasoning, payload);
     Ok(mission)
 }
 
@@ -1249,6 +1290,13 @@ mod tests {
                 prev_crew,
                 prev_flows,
             }
+        }
+
+        /// (#1959) The flows dir this guard pointed `DARKMUX_FLOWS_DIR`
+        /// at — for a test that needs to read back what `flow::record`
+        /// actually wrote.
+        fn flows_path(&self) -> &std::path::Path {
+            self._tmp_flows.path()
         }
     }
 
@@ -2040,6 +2088,91 @@ mod tests {
                 && line.contains("\"source\":\"mission_lifecycle\"")
         });
         assert!(found, "expected a `phase added` flow record, got:\n{raw}");
+    }
+
+    // ─── (#1959) payload-carrying mission start/close ──────────────────
+
+    /// Read every flow record for `action` off the guard's flows dir,
+    /// parsed as JSON.
+    fn records_with_action(guard: &CrewGuard, action: &str) -> Vec<serde_json::Value> {
+        let day = darkmux_flow::day_utc_now();
+        let path = guard.flows_path().join(format!("{day}.jsonl"));
+        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        raw.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["action"] == action)
+            .collect()
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn mission_start_with_payload_carries_it_on_the_mission_start_record() {
+        let g = CrewGuard::new();
+        seed_mission("m-crawl-1", MissionStatus::Active);
+        mission_start_with_reasoning_and_payload(
+            "m-crawl-1",
+            Some("launched from `darkmux mission launch crawl`"),
+            Some(serde_json::json!({
+                "workspace": "finhero",
+                "units_in_plan": 12,
+                "units_selected": 8,
+                "est_tokens": 40000,
+                "sources": [{"id": "app", "sha": "abc123"}],
+            })),
+        )
+        .unwrap();
+
+        let records = records_with_action(&g, "mission start");
+        assert_eq!(records.len(), 1, "{records:?}");
+        let payload = &records[0]["payload"];
+        assert_eq!(payload["workspace"], "finhero");
+        assert_eq!(payload["units_in_plan"], 12);
+        assert_eq!(payload["units_selected"], 8);
+        assert_eq!(payload["sources"][0]["id"], "app");
+    }
+
+    /// The un-payloaded 2-arg wrapper every OTHER caller uses must still
+    /// emit a record with no `payload` key at all — no behavior change.
+    #[serial_test::serial]
+    #[test]
+    fn mission_start_without_payload_emits_no_payload_key() {
+        let g = CrewGuard::new();
+        seed_mission("m-plain-1", MissionStatus::Active);
+        mission_start_with_reasoning("m-plain-1", None).unwrap();
+
+        let records = records_with_action(&g, "mission start");
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(records[0].as_object().unwrap().get("payload").is_none() || records[0]["payload"].is_null());
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn mission_terminal_with_payload_carries_it_on_the_mission_close_record() {
+        let g = CrewGuard::new();
+        seed_mission("m-crawl-2", MissionStatus::Active);
+        mission_terminal_with_reasoning_and_payload(
+            "m-crawl-2",
+            MissionStatus::Finalized,
+            Some("crawl stopped_by=done"),
+            Some(serde_json::json!({
+                "units_completed": 8,
+                "units_errored": 0,
+                "units_skipped": 0,
+                "units_not_run": 4,
+                "findings": 3,
+                "stopped_by": "done",
+                "model": "darkmux:qwen3.6",
+            })),
+        )
+        .unwrap();
+
+        let records = records_with_action(&g, "mission close");
+        assert_eq!(records.len(), 1, "{records:?}");
+        let payload = &records[0]["payload"];
+        assert_eq!(payload["units_completed"], 8);
+        assert_eq!(payload["findings"], 3);
+        assert_eq!(payload["stopped_by"], "done");
+        assert_eq!(payload["model"], "darkmux:qwen3.6");
     }
 }
 

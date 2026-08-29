@@ -2633,7 +2633,20 @@ mod tests {
         //           (one per `runtime.rest` trajectory event, live on the
         //           flow stream). Additive payload fields + one new
         //           action value, no struct change. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.25.0");
+        //   1.26.0 (#1959, revised): RETIRED the 1.24.0 `crawl.*` action
+        //           family — the crawl launcher now uses the generic
+        //           `mission start`/`mission close`/`step start`/`step
+        //           complete`/`step error` actions with additive payload
+        //           keys (`workspace`, `unit`, `source`, `sha`, `rule`,
+        //           `est_tokens`, `findings`, …). `crawl.finding` has no
+        //           replacement action: a rejected `report_finding` reply
+        //           now classifies as a FAILED tool call (`payload.ok:
+        //           false` on the ordinary `dispatch.tool` record), and
+        //           `DispatchOpts::record_context` merges caller-supplied
+        //           provenance under `payload.context` on every record a
+        //           dispatch's flow-record surface emits. See schema.rs's
+        //           fuller changelog entry.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.26.0");
     }
 
     #[test]

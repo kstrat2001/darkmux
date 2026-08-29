@@ -627,12 +627,21 @@ pub struct HookMatch {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub machine_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub category: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub level: Option<String>,
+    /// (#1959) Every OTHER top-level key on the wire lands here —
+    /// including the payload predicates this struct doesn't declare a
+    /// typed field for: `"payload.tool_name"`, `"payload.ok"`, or a
+    /// deeper `"payload.detections.count"`, each a literal DOTTED KEY
+    /// (never a nested `{"payload": {...}}` object — `#[serde(flatten)]`
+    /// permits exactly one flattened field per struct, so a genuinely
+    /// nested second field would collide with this one). See
+    /// [`HookMatch::payload_predicates`] for the accessor that reads
+    /// them back out.
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 impl HookMatch {
-    /// True when every field is `None` — the "matches nothing" state a
-    /// half-filled-in rule leaves. `darkmux doctor` uses this to warn.
+    /// True when every field is `None`/empty — the "matches nothing" state
+    /// a half-filled-in rule leaves. `darkmux doctor` uses this to warn.
     pub fn is_empty(&self) -> bool {
         self.action.is_none()
             && self.session_id.is_none()
@@ -640,6 +649,21 @@ impl HookMatch {
             && self.machine_id.is_none()
             && self.category.is_none()
             && self.level.is_none()
+            && self.payload_predicates().next().is_none()
+    }
+
+    /// (#1959) Every `"payload.<dotted path>"` key on this match, with the
+    /// `payload.` prefix stripped — the exact-match predicates
+    /// `hooks::hook_match` evaluates against a record's OWN `payload`
+    /// field, e.g. `{"action": "dispatch.tool", "payload.tool_name":
+    /// "report_finding", "payload.ok": true}` yields `("tool_name",
+    /// "report_finding")` and `("ok", true)`. A remaining `extras` key that
+    /// does NOT start with `payload.` is unrelated forward-compat overflow
+    /// and is not a predicate — see the struct doc.
+    pub fn payload_predicates(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+        self.extras
+            .iter()
+            .filter_map(|(k, v)| k.strip_prefix("payload.").map(|rest| (rest, v)))
     }
 }
 

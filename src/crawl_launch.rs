@@ -1178,6 +1178,17 @@ pub(crate) fn run(
             step_id: Some(step_id.clone()),
             system_prompt_override: None,
             workspace_read_only: true,
+            // (#1959 flow-record vocabulary retirement) Provenance the
+            // runtime cannot know — merged by the host tailer into every
+            // `dispatch.finding` record this unit's dispatch produces (see
+            // `dispatch_internal.rs`'s `"tool.completed"` handler).
+            record_context: Some(json!({
+                "workspace": manifest.name,
+                "source": source,
+                "sha": sha,
+                "rule": rule_ids,
+                "unit": unit.id(),
+            })),
         };
 
         let dispatch_outcome = dispatch_fn(opts);

@@ -43,6 +43,28 @@ Every `DARKMUX_*` var below is the **top tier** of `env > config.json > built-in
 | `DARKMUX_HOOKS_ENABLED` | `false` | (#2093) The whole-feature gate for `hooks` — darkmux's fourth `FlowSink` kind: match a flow record against operator-configured rules (`config.hooks.rules`) and POST a match verbatim to a **loopback-only** receiver (`validate_loopback_http_url` refuses anything else, at rule-load AND again at every POST). Enqueue, never block: `write()` only appends to a local per-rule outbox file (flock'd, mirroring the audit sink); a background drainer thread does the actual HTTP delivery with bounded retries + exponential backoff, so a down receiver never stalls a dispatch. Delivery is **at-least-once** — a crash/kill between a successful POST and the cursor write that records it can redeliver the same line once the process comes back. The outbox is durable across restarts and self-compacts (rewrites down to just its undelivered tail) once its delivered prefix crosses an **8 MiB built-in constant**, not a tunable. Inspect with `darkmux flow status` (per-rule undelivered count, last delivery, dropped-append/cursor-write-failure/stalled state); flush the queue synchronously with `darkmux flow drain` (or `--file <path> --to <url>` for a stray outbox whose owning rule was since removed). There is deliberately NO per-rule env override — a rule is a structured object an env var can't carry; this gate only turns the feature as a whole on/off. |
 | `DARKMUX_HOOKS_MAX_OUTBOX_MB` | `256` | (#2093) The hard cap, in MiB, on UNDELIVERED bytes a single hook rule's outbox may hold before further appends for that rule are dropped (counted, never silently lost — `darkmux flow status`/`doctor` surface the running total). `0` disables the cap. Read once, live, at `HookSink` construction — a running sink doesn't re-poll it mid-dispatch. |
 
+**Payload predicates (#1959).** A `hooks.rules[].match` entry can go past the top-level fields (`action`/`session_id`/`mission_id`/`machine_id`/`category`/`level`) into a record's own `payload`, via one or more `"payload.<dotted path>"` keys — each an exact match against a JSON scalar, AND'd with each other and with every other field on the same `match`. A key the record's payload doesn't carry (missing, or the payload isn't even an object) never matches — there's no "absent means match" reading. This is how an external tracker subscribes to a SPECIFIC shape of tool call rather than an entire `action` glob. Example — every ACCEPTED `report_finding` call, whichever mission emitted it:
+
+```json
+{
+  "hooks": {
+    "enabled": true,
+    "rules": [
+      {
+        "match": {
+          "action": "dispatch.tool",
+          "payload.tool_name": "report_finding",
+          "payload.ok": true
+        },
+        "http": "http://127.0.0.1:8790/events"
+      }
+    ]
+  }
+}
+```
+
+A rejected citation (a wrong line number, an unresolvable path, a budget already spent) is a FAILED tool call — `report_finding`'s own reply text (`REJECTED: …` / `NOT RECORDED — …`) is classified by the runtime the same way any other tool's failure is, so `payload.ok` is `false` for it and the rule above never fires on it. The record's `payload.context` (present only when the dispatching caller — e.g. the crawl launcher — set `DispatchOpts::record_context`) carries provenance the tool call itself can't know: `workspace`, `source`, `sha`, `rule`, `unit`.
+
 **env → `config.json` field** (the override-tier var → its durable config home):
 
 | Env var | `config.json` field |

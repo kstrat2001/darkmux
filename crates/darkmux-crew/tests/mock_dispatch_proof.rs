@@ -190,6 +190,7 @@ fn run_mock_dispatch(
     let session_id = format!("mock-model-proof-{}-{}", std::process::id(), port);
     let opts = DispatchOpts {
         workspace_read_only: false,
+        record_context: None,
         role_id: "analyst".to_string(),
         message: message.to_string(),
         session_id: Some(session_id.clone()),
