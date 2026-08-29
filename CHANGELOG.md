@@ -12,6 +12,109 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.4.0] - 2026-08-30
+
+The crawler becomes a mission, and the machine tells you what it is doing.
+
+Crawling a codebase against a rule set is now just the crawler role's work as
+a mission: a **workspace spec** names the sources and the file filters, rules
+are a template kind, and `mission launch crawl --dry-run` previews the plan.
+Every finding, step, and mission record can be routed anywhere through
+**hooks**, an event-agnostic flow sink that POSTs matching records to a
+loopback receiver; this release's first receiver is a small local issue
+tracker. Underneath, darkmux now reads the Apple Silicon host properly: a
+~7 ms **host probe** (mach ticks, IOReport power and clocks, thermal state)
+replaces a `top` shell-out that cost ~780 ms per sample and reported a
+since-boot average as "current CPU"; the daemon keeps a ten-minute ring and
+the viewer shows thermal state, power per rail, and CPU clusters in a
+**Machine info** modal and a new phone **bottom sheet** with the event log.
+`runtime.turn_delay_ms` rests the GPU between turns, recorded so a rested
+run is never misread as a slow model.
+
+### Added
+
+- **Workspace spec + rules kind + crawl mission** ([#2108](https://github.com/kstrat2001/darkmux/pull/2108), [#2096](https://github.com/kstrat2001/darkmux/pull/2096), [#2098](https://github.com/kstrat2001/darkmux/pull/2098), [#2099](https://github.com/kstrat2001/darkmux/pull/2099); part of [#1959](https://github.com/kstrat2001/darkmux/issues/1959)).
+  No `crawl` verb and no "corpus": the manifest is a generic workspace spec
+  mission input (`sources` + `include`/`exclude`, materialized as read-only
+  worktrees under `<root>/workspaces/<name>`), rules live under
+  `templates/builtin/rules/` with a user tier at `~/.darkmux/rules/`, and
+  the launcher (`templates/builtin/mission-configs/crawl.json`) dispatches one
+  unit per (source, rule) with `record_context` on every record. Crawl
+  records are the generic `mission start/close` and `step start/complete`
+  vocabulary, not a private `crawl.*` one.
+
+- **Hooks: a flow sink that POSTs matching records to a loopback receiver** ([#2097](https://github.com/kstrat2001/darkmux/pull/2097), [#2103](https://github.com/kstrat2001/darkmux/pull/2103), closes [#2093](https://github.com/kstrat2001/darkmux/issues/2093)).
+  `config.hooks.rules[]` match any record (`action`, `category`, dotted
+  `payload.*` predicates) and deliver it over HTTP to `127.0.0.1` only
+  (userinfo refused, no redirects); an outbox and cursor per rule survive a
+  receiver outage, `flow status` shows delivery state, and `flow drain`
+  flushes it. Hooks observe; they never dispatch.
+
+- **`runtime.turn_delay_ms`: rest the GPU between inference turns** ([#2097](https://github.com/kstrat2001/darkmux/pull/2097), closes [#2094](https://github.com/kstrat2001/darkmux/issues/2094)).
+  A global inter-turn sleep on every local dispatch, recorded as
+  `dispatch.rest` (`rest_ms`, `rests`, `turn_delay_effective_ms`) and
+  counted as proof-of-work for the inactivity watchdog; `wall_ms` stays wall
+  time. Never applied to agentic-remote dispatches; clamped against the
+  inactivity timeout.
+
+- **Apple Silicon host probe** ([#2108](https://github.com/kstrat2001/darkmux/pull/2108), part of [#2107](https://github.com/kstrat2001/darkmux/issues/2107) and [#1833](https://github.com/kstrat2001/darkmux/issues/1833)).
+  `host_probe/` reads CPU as mach tick deltas (a true mean over the interval,
+  per cluster by `hw.perflevel`), power per rail and cluster/GPU MHz from
+  IOReport (loaded at runtime, degrades to null), GPU busy and memory from
+  IOKit in-process, thermal state from `ProcessInfo` and the CPU speed limit
+  from `IOPMCopyCPUPowerStatus`. About 7 ms per sample. The daemon samples
+  every `runtime.host_sampler_interval_ms` (5 s) into a ten-minute ring
+  served as `load` on `GET /machine/resources`; `dispatch complete` records
+  carry `host.thermal`, `host.power`, and `host.energy_mwh` (flow schema
+  1.28.0, additive). `darkmux doctor` names which sources resolved and the
+  measured cost.
+
+- **Machine info modal and the phone bottom sheet** ([#2108](https://github.com/kstrat2001/darkmux/pull/2108)).
+  The masthead ⓘ opens a Machine info modal (gauges with avg/max, thermal
+  pill, power per rail, CPU cluster tiles); phones get a tabbed sheet
+  (Machine info | Events) anchored under the masthead with the event log's
+  list, a row tap that pushes the record's detail, and follow mode that
+  always shows the list. The Machine lens renders the same block plus its
+  own depth.
+
+### Fixed
+
+- **The CPU column was never a measurement** ([#2108](https://github.com/kstrat2001/darkmux/pull/2108)).
+  `top -l 1` blocked ~780 ms per sample and its first sample is a since-boot
+  average, so every earlier `host.cpu.*` value was a lifetime smoothing. Gone.
+- **Fleet lens: the summary row is back on the tab row** (regression against
+  the 2026-08-27 screenshot), the machine lens no longer repeats the machine
+  name above its own breadcrumb, hero token figures no longer collide in the
+  two-column band, the viewer's tab favicon is the two-input glyph.
+- **Crawl finding records carry one rule id** ([#2103](https://github.com/kstrat2001/darkmux/pull/2103)); a receiver's per-record rejection is surfaced as `hook.fired.receiver_rejected`.
+- **Docs**: the home page hands the brand off from the hero to the nav bar on scroll, and the guide header is one row on phones ([#2115](https://github.com/kstrat2001/darkmux/pull/2115)).
+- **Release-candidate fixes, found by the operator on real devices** ([#2134](https://github.com/kstrat2001/darkmux/pull/2134)):
+  the playback transport is the instrument (no label, no record counter, the
+  track takes the row; the mission title lives in Machine info's playback row,
+  [#2120](https://github.com/kstrat2001/darkmux/issues/2120)); the demo speaks
+  for itself (machines named Studio / Workstation / Mini, a real mission
+  title, re-shot marketing screenshots, [#2121](https://github.com/kstrat2001/darkmux/issues/2121));
+  gauges color by band, amber from 80% and red from 95%
+  ([#2122](https://github.com/kstrat2001/darkmux/issues/2122)); the filters
+  dialog is wide and grouped on desktop ([#2116](https://github.com/kstrat2001/darkmux/issues/2116));
+  an active mission now counts as running on the fleet card and the runs lens
+  (presence was treated as all-or-nothing, [#2123](https://github.com/kstrat2001/darkmux/issues/2123));
+  the fleet timeline keys spans by (session, mission) so review missions that
+  reuse step ids no longer draw one twenty-hour bar
+  ([#2125](https://github.com/kstrat2001/darkmux/issues/2125)); the review
+  launcher writes its terminal record and reaps its children on SIGTERM and
+  SIGINT ([#2124](https://github.com/kstrat2001/darkmux/issues/2124)); a
+  bundler plugin that declines a diff falls back to the built-in bundler
+  instead of failing the review ([#2119](https://github.com/kstrat2001/darkmux/issues/2119));
+  a flaky mission-isolation e2e is stable ([#2117](https://github.com/kstrat2001/darkmux/issues/2117)).
+
+### Schema
+
+- `FLOW_SCHEMA_VERSION` 1.22 → 1.28 (hook records; generic mission/step crawl payloads; `dispatch.rest`; workspace vocabulary; host thermal/power/energy). All additive.
+- `CONFIG_SCHEMA_VERSION` 1.11 → 1.14 (`hooks`, `runtime.turn_delay_ms`, `runtime.host_sampler_interval_ms`).
+
+[3.4.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.4.0
+
 ## [3.3.0] - 2026-08-28
 
 The demo plays a real mission, and playback rides on every route.
