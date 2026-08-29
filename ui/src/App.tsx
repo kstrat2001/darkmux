@@ -492,7 +492,7 @@ export function App() {
             `tests/parity/next-parity.spec.ts`'s machine-lens goldens are
             updated to match — see that file's own `normalizeMachineCrumb`
             doc for the byte-parity side of this call. */}
-        {route.kind !== "machine" && crumb !== "" && (
+        {route.kind !== "machine" && (
           <header className={`app-shell__crumb${route.kind === "playback" ? " is-replay" : ""}`} id="crumb">
             {crumb}
           </header>

@@ -147,6 +147,14 @@ body {
   padding: 0;
   border-top: none;
 }
+/* (#2120/#2121, operator) An EMPTY crumb (fleet, console, playback) still
+   mounts as a fixture point for tests and the e2e walks, but must not take a
+   flex slot in the sticky row: with flex 1 1 auto it ate a third of the row
+   after the playback transport. React renders no text node for "", so the
+   element is :empty and collapses. */
+.app-shell__sticky .app-shell__crumb:empty {
+  display: none;
+}
 
 .app-shell__navtabs {
   /* (operator, 2026-08-28) Uniform cells on every width: `grid-auto-columns:
