@@ -57,7 +57,7 @@
 
 import {
   T,
-  sessionsOn,
+  sessionRunsOn,
   dispatchRec,
   dispatchEnd,
   dispatchErrored,
@@ -85,7 +85,16 @@ export const ACTIVITY_WINDOW_PRESETS: { label: string; minutes: number }[] = [
 export const DEFAULT_ACTIVITY_WINDOW_MIN = 1440;
 
 export interface TimelineBar {
+  /** The session id — still the click-through target (`#dispatch=<sid>`,
+   * `FleetLens.tsx`) and the `data-arg` shown to the operator, unchanged.
+   * NOT guaranteed unique within a lane on its own (#2125) — a review
+   * mission's reused step session id can produce two bars sharing this
+   * value, one per mission; use `key` for anything requiring uniqueness. */
   sid: string;
+  /** (#2125) `sid` plus its mission id when it has one — the actual unique
+   * identity of ONE bar. Always distinct across bars in the same lane,
+   * unlike `sid` alone. Use this for React `key`s / dedup, never `sid`. */
+  key: string;
   leftPct: number;
   widthPct: number;
   cls: "run" | "done" | "canceled" | "err";
@@ -150,8 +159,19 @@ export function buildActivityTimeline(
 
   const lanes: TimelineLane[] = uids.map((m) => {
     const bars: TimelineBar[] = [];
-    for (const sid of sessionsOn(data, m)) {
-      const s = dispatchRec(data, sid, "start");
+    // (#2125) `sessionRunsOn` — NOT `sessionsOn` — yields one entry per
+    // (session_id, mission_id) pair, not per bare session_id. A review
+    // mission's per-step session id (`task-review-probe-mid-task` etc) is a
+    // FIXED string reused by every review run; two DIFFERENT missions
+    // sharing one entry here would let `dispatchRec`/`dispatchEnd`/`sessEnd`
+    // below (unscoped `Array.find`) pair one mission's start with a
+    // DIFFERENT mission's terminal/abort — measured live as a single
+    // 20-hour "canceled" span for a mission that actually ran 23 minutes.
+    // `missionId` threaded through every lookup below scopes each one to
+    // its OWN mission's records; `undefined` (a session with no mission at
+    // all) preserves the exact prior session-id-only behavior.
+    for (const { sessionId: sid, missionId } of sessionRunsOn(data, m)) {
+      const s = dispatchRec(data, sid, "start", missionId);
       // (#1869) `T(s.ts) > playheadT` — restores legacy's
       // `if(!s||T(s.ts)>state.t)return"";`. A session that hasn't started
       // yet as of the PLAYHEAD (not the axis ceiling) must not draw a bar at
@@ -159,27 +179,28 @@ export function buildActivityTimeline(
       // (there's nothing to close) and defaults to "running", drawing a
       // phantom sliver at the track's right edge.
       if (!s || T(s.ts) > playheadT) continue;
-      const term = dispatchEnd(data, sid);
-      const e = sessEnd(data, sid);
+      const term = dispatchEnd(data, sid, missionId);
+      const e = sessEnd(data, sid, missionId);
       const closeCands = [term ? T(term.ts) : null, e ? T(e.ts) : null].filter((x): x is number => x != null);
       const closeTs = closeCands.length ? Math.min(...closeCands) : null;
       // (#857) `done` = not currently running, through the SHARED
       // `sessionRunning` — live keys on presence, replay on the close-edge at
       // the playhead. (#1800 P2: this was `!liveSet.has(sid)`, the live arm
       // inlined, which read every session of a replayed day as running.)
-      const done = !sessionRunning(data, liveSet, sid, liveMode, playheadT);
+      const done = !sessionRunning(data, liveSet, sid, liveMode, playheadT, missionId);
       const errored = done && dispatchErrored(term);
       const killed = dispatchKilled(term);
       const clean = done && !!term && !dispatchErrored(term);
       const lbl = statusLabel({ open: !done, errored, killed, clean });
       const cls: TimelineBar["cls"] = !done ? "run" : errored ? "err" : clean ? "done" : "canceled";
-      const end = !done ? playheadT : closeTs != null ? closeTs : lastTs(data, sid) || playheadT;
+      const end = !done ? playheadT : closeTs != null ? closeTs : lastTs(data, sid, missionId) || playheadT;
       if (end < tlMin) continue; // ended entirely before the window
       const cst = Math.max(T(s.ts), tlMin); // clip a straddling start to the window edge
       const widthPct = Math.max(0.6, pct(end) - pct(cst));
       const leftPct = Math.max(0, Math.min(pct(cst), 100 - widthPct)); // never spill past the right edge
       const role = (s.handle || "").replace(/^darkmux\//, "");
-      bars.push({ sid, leftPct, widthPct, cls, title: `${role} · ${sid} · ${lbl}` });
+      const key = missionId ? `${sid}\x1f${missionId}` : sid;
+      bars.push({ sid, key, leftPct, widthPct, cls, title: `${role} · ${sid} · ${lbl}` });
     }
     return { uid: m, name: nameOf(data, liveMachines, m), bars };
   });

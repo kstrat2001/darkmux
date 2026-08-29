@@ -228,3 +228,86 @@ describe("buildActivityTimeline — replay (liveMode = false)", () => {
     expect(tl.playheadPct).toBe(0);
   });
 });
+
+/**
+ * (#2125) A review mission's per-step session id is a FIXED string
+ * (`task-review-probe-low-task` etc, `session_id::task(&step.task_id)` —
+ * `crates/darkmux-crew/src/step_kinds/builtins.rs::DispatchMapStepKind`),
+ * reused verbatim by every review run. The operator's real report: an
+ * OLDER review mission ran that exact step to completion ~17h before a
+ * NEWER one started, and the newer mission's abort got matched against the
+ * OLDER mission's `dispatch.start` — one 20-hour "canceled" bar where two
+ * short, correctly-bounded ones belonged. `sessionRunsOn` (keyed on
+ * (session_id, mission_id), not session_id alone) plus `missionId` threaded
+ * into `dispatchRec`/`dispatchEnd`/`sessEnd` is the fix under test.
+ */
+describe("buildActivityTimeline — reused step session ids across missions (#2125)", () => {
+  const uids = ["m1"];
+  const REUSED_SID = "task-review-probe-low-task";
+  const data: FlowRecord[] = [
+    // Older mission (~17h ago): ran the SAME step id to a clean completion.
+    rec({
+      machine_uid: "m1",
+      session_id: REUSED_SID,
+      mission_id: "review-older",
+      action: "dispatch.start",
+      ts: iso(-1020),
+      handle: "review-probe-low",
+    }),
+    rec({ machine_uid: "m1", session_id: REUSED_SID, mission_id: "review-older", action: "dispatch.complete", ts: iso(-1000) }),
+    // Newer mission (~23 min ago): the SAME step id, a DIFFERENT mission —
+    // started recently and got aborted (dispatch.error) shortly after.
+    rec({
+      machine_uid: "m1",
+      session_id: REUSED_SID,
+      mission_id: "review-newer",
+      action: "dispatch.start",
+      ts: iso(-23),
+      handle: "review-probe-low",
+    }),
+    rec({ machine_uid: "m1", session_id: REUSED_SID, mission_id: "review-newer", action: "dispatch.error", ts: iso(-20) }),
+  ];
+
+  it("draws TWO separate bars, not one span stretching across both missions", () => {
+    const tl = buildActivityTimeline(data, new Map(), uids, new Set(), TMAX, TMAX, 1440);
+    const bars = tl.lanes[0].bars.filter((b) => b.sid === REUSED_SID);
+    expect(bars).toHaveLength(2);
+  });
+
+  it("gives each bar its OWN mission's start/end, not a cross-mission blend", () => {
+    const tl = buildActivityTimeline(data, new Map(), uids, new Set(), TMAX, TMAX, 1440);
+    const bars = tl.lanes[0].bars.filter((b) => b.sid === REUSED_SID);
+    const widths = bars.map((b) => b.widthPct).sort((a, b) => a - b);
+    // Both spans are short (~20 min / 17h-worth would be wildly wider) —
+    // the widest of the two must still be a small fraction of the 24h
+    // window, not the ~17h span a cross-mission match would draw.
+    const windowMs = 1440 * 60000;
+    const seventeenHoursPct = ((17 * 60 * 60000) / windowMs) * 100;
+    for (const w of widths) {
+      expect(w).toBeLessThan(seventeenHoursPct / 2);
+    }
+  });
+
+  it("each bar carries a distinct React key even though sid is shared", () => {
+    const tl = buildActivityTimeline(data, new Map(), uids, new Set(), TMAX, TMAX, 1440);
+    const bars = tl.lanes[0].bars.filter((b) => b.sid === REUSED_SID);
+    expect(new Set(bars.map((b) => b.key)).size).toBe(2);
+  });
+
+  it("the older mission's bar reads 'done' (clean complete), the newer's reads 'err' (aborted) — not both 'canceled' off a blended close-edge", () => {
+    const tl = buildActivityTimeline(data, new Map(), uids, new Set(), TMAX, TMAX, 1440);
+    const bars = tl.lanes[0].bars.filter((b) => b.sid === REUSED_SID);
+    const classes = bars.map((b) => b.cls).sort();
+    expect(classes).toEqual(["done", "err"]);
+  });
+
+  it("a session with NO mission_id at all keeps its exact prior (unscoped) behavior", () => {
+    const bare: FlowRecord[] = [
+      rec({ machine_uid: "m1", session_id: "bare-1", action: "dispatch.start", ts: iso(-10) }),
+      rec({ machine_uid: "m1", session_id: "bare-1", action: "dispatch.complete", ts: iso(-5) }),
+    ];
+    const tl = buildActivityTimeline(bare, new Map(), uids, new Set(), TMAX, TMAX, 1440);
+    expect(tl.lanes[0].bars).toHaveLength(1);
+    expect(tl.lanes[0].bars[0].key).toBe("bare-1");
+  });
+});

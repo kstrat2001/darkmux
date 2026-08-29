@@ -427,14 +427,57 @@ export function sessionsOn(data: FlowRecord[], m: string): string[] {
   return [...new Set(data.filter((r) => uidOf(r) === m && r.session_id).map((r) => r.session_id as string))];
 }
 
-/** `dispatch()` — viewer.html:1125. */
-export function dispatchRec(data: FlowRecord[], sid: string, act: string): FlowRecord | undefined {
-  return data.find((r) => r.session_id === sid && r.action === "dispatch." + act);
+/** One machine's (session_id, mission_id) PAIR — the fleet timeline's own
+ * unit of a "bar" (#2125). `sessionsOn` above dedups on `session_id` alone,
+ * which review missions violate on purpose: `dispatch.map`'s per-item
+ * session id is `session_id::task(&step.task_id)` — a FIXED string per
+ * review config (`task-review-probe-mid-task` etc), reused verbatim by
+ * every review run (`crates/darkmux-crew/src/step_kinds/
+ * builtins.rs::DispatchMapStepKind::dispatch_session_id`, and the
+ * server-side `#1918` doc names the same defect). Two DIFFERENT review
+ * missions on the same machine therefore share one `session_id` but carry
+ * DIFFERENT `mission_id`s — `sessionsOn`'s plain string-set collapses them
+ * into ONE entry, so `dispatchRec`/`dispatchEnd` (unscoped `Array.find`)
+ * paired whichever mission's `dispatch start` happened to come first with
+ * whichever mission's terminal/abort happened to come first, drawing one
+ * bar spanning both missions' real spans — measured live as a 20-hour
+ * "canceled" span for a mission that actually ran 23 minutes.
+ *
+ * `missionId` is `undefined` for a session that never carried one (a bare
+ * `dispatch --profile` outside any mission) — those keep behaving exactly
+ * as `sessionsOn` always has, since there is nothing to disambiguate. */
+export interface MachineSessionRun {
+  sessionId: string;
+  missionId?: string;
+}
+export function sessionRunsOn(data: FlowRecord[], m: string): MachineSessionRun[] {
+  const seen = new Set<string>();
+  const out: MachineSessionRun[] = [];
+  for (const r of data) {
+    if (uidOf(r) !== m || !r.session_id) continue;
+    const missionId = r.mission_id || undefined;
+    const key = `${r.session_id}\x1f${missionId ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ sessionId: r.session_id, missionId });
+  }
+  return out;
+}
+
+/** `dispatch()` — viewer.html:1125. `missionId` (#2125), when given, scopes
+ * the match to records naming that mission — see `sessionRunsOn`'s own doc
+ * for why a bare `session_id` match is unsafe for a review-shaped session.
+ * `undefined` (every pre-existing caller) preserves the exact prior
+ * session_id-only behavior. */
+export function dispatchRec(data: FlowRecord[], sid: string, act: string, missionId?: string): FlowRecord | undefined {
+  return data.find(
+    (r) => r.session_id === sid && r.action === "dispatch." + act && (missionId === undefined || r.mission_id === missionId),
+  );
 }
 
 /** `dispatchEnd()` — viewer.html:1131. */
-export function dispatchEnd(data: FlowRecord[], sid: string): FlowRecord | undefined {
-  return dispatchRec(data, sid, "complete") ?? dispatchRec(data, sid, "error");
+export function dispatchEnd(data: FlowRecord[], sid: string, missionId?: string): FlowRecord | undefined {
+  return dispatchRec(data, sid, "complete", missionId) ?? dispatchRec(data, sid, "error", missionId);
 }
 
 /** `dispatchErrored()` — viewer.html:1132. */
@@ -444,9 +487,12 @@ export const dispatchErrored = (rec: FlowRecord | undefined): boolean => !!rec &
 export const dispatchKilled = (rec: FlowRecord | undefined): boolean =>
   dispatchErrored(rec) && (rec?.payload as { exit_code?: number } | undefined)?.exit_code === 137;
 
-/** `sessEnd()` — viewer.html:1149. */
-export function sessEnd(data: FlowRecord[], sid: string): FlowRecord | undefined {
-  return data.find((r) => r.session_id === sid && r.action === "session.end");
+/** `sessEnd()` — viewer.html:1149. `missionId` (#2125) — see `dispatchRec`'s
+ * own doc. */
+export function sessEnd(data: FlowRecord[], sid: string, missionId?: string): FlowRecord | undefined {
+  return data.find(
+    (r) => r.session_id === sid && r.action === "session.end" && (missionId === undefined || r.mission_id === missionId),
+  );
 }
 
 /** `sessionCloseEdge()` — viewer.html:1171-1175. The EARLIEST of the dispatch
@@ -454,10 +500,14 @@ export function sessEnd(data: FlowRecord[], sid: string): FlowRecord | undefined
  * where does its bar end" decision goes through here rather than bare
  * `dispatchEnd`: a session whose ONLY terminal is `session.end` (abandoned,
  * hard-killed, shipped without a clean complete) must read as ENDED, not
- * in-flight to the playhead. */
-export function sessionCloseEdge(data: FlowRecord[], sid: string): FlowRecord | undefined {
-  const c = dispatchEnd(data, sid);
-  const e = sessEnd(data, sid);
+ * in-flight to the playhead.
+ *
+ * (#2125) `missionId`, threaded straight through — an abort closes only ITS
+ * OWN mission's open steps; a bare `mission_id`-less lookup would let a
+ * SIBLING mission's abort (or `session.end`) close this one's bar too. */
+export function sessionCloseEdge(data: FlowRecord[], sid: string, missionId?: string): FlowRecord | undefined {
+  const c = dispatchEnd(data, sid, missionId);
+  const e = sessEnd(data, sid, missionId);
   if (c && e) return T(c.ts) <= T(e.ts) ? c : e;
   return c ?? e;
 }
@@ -472,16 +522,25 @@ export function sessionCloseEdge(data: FlowRecord[], sid: string): FlowRecord | 
  *
  * (#1800 P2) Before this, the port had only the live arm, because `/next` had
  * no historical route that reached it. A replay asking presence about a past
- * day is the "confidently wrong" failure `FleetLens`'s own doc names. */
+ * day is the "confidently wrong" failure `FleetLens`'s own doc names.
+ *
+ * (#2125) `missionId` narrows the REPLAY arm's close-edge lookup only — the
+ * live arm still keys on bare presence (`liveSet.has(sid)`), which has no
+ * mission dimension to disambiguate: presence is a session-id set, full
+ * stop, and `dispatch.map`'s hosted seats never write to it at all (see
+ * `liveSessionSet`'s own #2123 doc) — so live mode's cross-mission
+ * collision risk, if any, lives entirely in that separate, already-fixed
+ * gap, not here. */
 export function sessionRunning(
   data: FlowRecord[],
   liveSet: Set<string>,
   sid: string,
   liveMode: boolean,
   t: number,
+  missionId?: string,
 ): boolean {
   if (liveMode) return liveSet.has(sid);
-  const close = sessionCloseEdge(data, sid);
+  const close = sessionCloseEdge(data, sid, missionId);
   return !(close && T(close.ts) <= t);
 }
 
@@ -540,16 +599,49 @@ export function flowLiveSessions(data: FlowRecord[], nowMs: number, liveMode = t
   return out;
 }
 
-/** `liveSessionSet()` — viewer.html:1373-1379. Redis presence when it has
- * ANY beat (authoritative), else the flow-derived fallback. */
+/** `liveSessionSet()` — viewer.html:1373-1379, widened (#2123). Legacy (and
+ * this port until now) treated Redis presence as all-or-nothing: ANY beat
+ * anywhere in the fleet made the WHOLE presence set authoritative, and the
+ * flow-derived fallback below was never even consulted. That was safe only
+ * under an assumption that stopped holding once darkmux grew more than one
+ * dispatch path: `darkmux:session-presence:<sid>` is refreshed by
+ * `dispatch.internal`'s own container-heartbeat thread
+ * (`crates/darkmux-crew/src/dispatch_internal.rs`) — the ONE writer, grep-
+ * confirmed. A mission/review dispatch that fans out through `dispatch.map`
+ * (hosted/remote probe + judge seats, no container, no heartbeat thread —
+ * see `crates/darkmux-crew/src/step_kinds/builtins.rs::DispatchMapStepKind`)
+ * never writes a beat AT ALL, for any of its sessions.
+ *
+ * On a Redis-enabled multi-machine fleet (`config.redis.enabled`, the
+ * fleet-topology default — Studio hub + laptop peer), presence is near-never
+ * EMPTY: the hub's own `dispatch.internal` work keeps `liveSessionIds`
+ * non-zero pretty much continuously. Before this fix that non-zero-but-
+ * elsewhere set silently WON over the flow-derived fallback, so a live
+ * review mission's own sessions — never beaten, always absent from
+ * presence — read as not-running on every machine in the fleet: the fleet
+ * card's "0 running" and a machine card stuck on "idle" while LM Studio
+ * burned tokens (#2123's reported symptom).
+ *
+ * The fix: UNION rather than either/or. Presence still answers instantly
+ * and cheaply for whatever it DOES cover (`dispatch.internal` work); the
+ * flow-derived heuristic — already correct and already exercised whenever
+ * Redis is off entirely — fills in exactly the sessions presence has no
+ * opinion about, rather than being shadowed by an unrelated beat elsewhere
+ * in the fleet. `flowLiveSessions` already gates itself off in replay mode
+ * (`liveMode=false` returns `new Set()`), so a replay's presence-agnostic
+ * contract is unchanged by this — it still reads only from `liveSessionIds`,
+ * which is itself always empty in replay (`useLiveSessionIds`'s `enabled`
+ * gate). */
 export function liveSessionSet(
   data: FlowRecord[],
   liveSessionIds: Set<string>,
   nowMs: number,
   liveMode = true,
 ): Set<string> {
-  if (liveSessionIds.size) return liveSessionIds;
-  return flowLiveSessions(data, nowMs, liveMode);
+  const flowDerived = flowLiveSessions(data, nowMs, liveMode);
+  if (!liveSessionIds.size) return flowDerived;
+  if (!flowDerived.size) return liveSessionIds;
+  return new Set([...liveSessionIds, ...flowDerived]);
 }
 
 /** One row of the machine lens's runs list — the fields `recentRow()`
@@ -639,11 +731,13 @@ export function buildMachineRuns(
 
 /** `lastTs()` — viewer.html:1187. A session's last recorded activity —
  * where an orphan's timeline bar ends when it aged out of presence with no
- * close-edge (so the bar stops at its last sign of life, not at "now"). */
-export function lastTs(data: FlowRecord[], sid: string): number {
+ * close-edge (so the bar stops at its last sign of life, not at "now").
+ * `missionId` (#2125) narrows to one mission's own activity — see
+ * `dispatchRec`'s own doc; `undefined` preserves the exact prior behavior. */
+export function lastTs(data: FlowRecord[], sid: string, missionId?: string): number {
   let m = 0;
   for (const r of data) {
-    if (r.session_id === sid) {
+    if (r.session_id === sid && (missionId === undefined || r.mission_id === missionId)) {
       const t = T(r.ts);
       if (t > m) m = t;
     }

@@ -613,7 +613,7 @@ export function FleetLens({
                     happened for. */}
                 {lane.bars.map((bar) => (
                   <div
-                    key={bar.sid}
+                    key={bar.key}
                     className={`sbar ${bar.cls}`}
                     style={{ left: `${bar.leftPct}%`, width: `${bar.widthPct}%` }}
                     title={bar.title}
