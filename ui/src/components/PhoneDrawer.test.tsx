@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { PhoneDrawer } from "./PhoneDrawer";
+import { EventLogColumn } from "./EventLogColumn";
 import type { FlowRecord } from "../types/handwritten";
 
 const NOOP_MACHINE_TAB = {
@@ -118,10 +119,9 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
       document.querySelector('[data-act="phone-drawer-panel-machine"]'),
     ).toBeNull();
     expect(document.querySelector(".eventlog")).not.toBeNull();
-    // (#2108) The Events tab now renders `inlineDetail` — each record's
-    // OWN full detail stacked inline, not the row-list `.eventlog__rec`
-    // shape (that's `EventLogColumn`'s non-inline mode).
-    expect(document.querySelectorAll(".eventlog__inlinerec")).toHaveLength(2);
+    // (#2108, operator correction) The Events tab is the plain default
+    // EventLogColumn — the row-list, same shape as the desktop column.
+    expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(2);
   });
 
   it("tapping the handle closes the open drawer", () => {
@@ -235,16 +235,31 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     expect(sheet.style.height).toBe("80vh");
   });
 
-  // (#2108, operator finding) The Events tab, at its new 85-90vh open
-  // height, has real room — a drill-in tap is no longer needed. Each
-  // record renders its OWN full detail (the same `RecordView` a click
-  // used to open) inline, stacked, newest first.
-  it("Events tab renders each record's payload fields inline, with no click", () => {
-    const withPayload: FlowRecord = {
-      ...record(1),
-      payload: { tool_name: "grep", args_chars: 42 },
-    } as FlowRecord;
-    const events = { ...NO_EVENTS, records: [withPayload] };
+  // (#2108, operator correction — reverted from the earlier "every row
+  // expanded inline" attempt, which was unreadable) The Events tab is the
+  // SAME list + detail-pane split the desktop events column already has.
+  // Tapping a row shows that record in the pane, right here in the sheet
+  // — no route change, no drill-in navigation, no separate card. The pane
+  // is empty/placeholder until a row is tapped.
+  it("the pane is empty/placeholder until a row is tapped (no records yet)", () => {
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-events"]')!,
+    );
+    expect(document.querySelector(".eventlog__none")).not.toBeNull();
+  });
+
+  it("tapping a row populates the detail pane inside the sheet — no per-row expanded payload in the list", () => {
+    const older: FlowRecord = { ...record(1), payload: { tool_name: "grep", args_chars: 42 } } as FlowRecord;
+    const newer: FlowRecord = { ...record(2), payload: { tool_name: "ls", args_chars: 3 } } as FlowRecord;
+    const events = { ...NO_EVENTS, records: [older, newer] };
     render(
       <PhoneDrawer
         machineTab={NOOP_MACHINE_TAB}
@@ -256,17 +271,66 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-events"]')!,
     );
-    // No click on the record itself — the payload is already rendered.
-    const recs = document.querySelectorAll('[data-act="eventlog-inline-rec"]');
-    expect(recs).toHaveLength(1);
+    const rows = document.querySelectorAll('[data-act="rec"]');
+    // Newest-first: `newer` (handle "rec-2", the row's own `title`
+    // attribute — hover provenance, not visible row text) renders first.
+    // Neither row carries its expanded payload — only the row's own short
+    // preview line, exactly like the desktop column's rows.
+    expect(rows[0].getAttribute("title")).toBe("rec-2");
+    expect(rows[1].getAttribute("title")).toBe("rec-1");
+    rows.forEach((row) => {
+      expect(row.textContent).not.toContain("tool name");
+    });
+    // `follow` mode (the desktop pane's own default) already shows the
+    // newest record's detail — tapping the OLDER row is the real proof
+    // that a tap changes what the pane shows, in the sheet.
+    fireEvent.click(rows[1]);
+    const pane = document.querySelector(".eventlog__detailbody")!;
     // `RecordView`'s own key rendering replaces underscores with spaces
     // (`Row`'s `.rv__key`) — asserting on ITS actual output, not a guess.
-    expect(recs[0].textContent).toContain("tool name");
-    expect(recs[0].textContent).toContain("grep");
-    expect(recs[0].textContent).toContain("args chars");
-    // The OLD click-to-push interaction is gone from this surface.
-    expect(document.querySelector('[data-act="rec"]')).toBeNull();
+    expect(pane.textContent).toContain("tool name");
+    expect(pane.textContent).toContain("grep");
+    expect(pane.textContent).toContain("args chars");
+    // Confirms the pane actually SWITCHED to the tapped (older) record,
+    // not merely appended to whatever `follow` mode had shown before.
+    expect(pane.textContent).not.toContain("rec-2");
+    expect(pane.textContent).toContain("rec-1");
+    // In the sheet — no navigation, no push screen, no hash change.
     expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
+    expect(window.location.hash).toBe("");
+  });
+
+  it("the list rows render identically to the desktop column's rows (same classes, same content)", () => {
+    const recs = [record(1), record(2)];
+    const events = { ...NO_EVENTS, records: recs };
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={events}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-events"]')!,
+    );
+    const sheetRows = [...document.querySelectorAll('[data-act="rec"]')];
+
+    // The SAME `EventLogColumn`, mounted plainly (App.tsx's own desktop
+    // call shape — no `pushDetail`, no phone-specific prop at all).
+    const desktop = render(
+      <EventLogColumn scopeLabel="fleet" records={recs} visible />,
+    );
+    const desktopRows = [
+      ...desktop.container.querySelectorAll('[data-act="rec"]'),
+    ];
+
+    expect(sheetRows.length).toBe(2);
+    expect(sheetRows.length).toBe(desktopRows.length);
+    sheetRows.forEach((row, i) => {
+      expect(row.className).toBe(desktopRows[i].className);
+      expect(row.textContent).toBe(desktopRows[i].textContent);
+    });
   });
 
   it("the sheet's open height is at least 85% of the viewport on first open (844px viewport)", () => {

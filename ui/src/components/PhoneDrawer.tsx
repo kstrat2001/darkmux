@@ -451,6 +451,24 @@ export function PhoneDrawer({
                 {machineTab.body}
               </div>
             ) : (
+              // (#2108, operator correction) The events tab is the SAME
+              // list + detail-pane split the desktop events column uses —
+              // not a drill-in push, not every row's detail expanded
+              // inline (both tried, both wrong: a route change/back button
+              // for something that should stay ON the sheet; an unreadable
+              // wall of expanded records). Tapping a row selects it and
+              // shows its detail in the pane, right here in the sheet — no
+              // navigation. `styles.css`'s `.phone-drawer__body .eventlog`
+              // block reorders the pane BELOW the list (desktop's own
+              // order is pane-above-list) and sizes it via the SAME
+              // `detailPct` split state the desktop column already has
+              // (default ~38/62, i.e. the instructed "~40/60"; not
+              // draggable on a phone — the resize handle's existing
+              // `@media (max-width:768px) { .eventlog__split { display:
+              // none } }` rule already hides it here, same as it always
+              // has for a stacked-width `EventLogColumn`). Neither
+              // `pushDetail` nor `inlineDetail` — this is `EventLogColumn`
+              // at its plain default.
               <EventLogColumn
                 paneId="phone-drawer"
                 scopeLabel={events.scopeLabel}
@@ -460,7 +478,6 @@ export function PhoneDrawer({
                 error={events.error}
                 historical={events.historical}
                 serverTruncated={events.serverTruncated}
-                inlineDetail
               />
             ))}
         </div>

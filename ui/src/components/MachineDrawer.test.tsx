@@ -523,9 +523,10 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
       document.querySelector('[data-act="phone-drawer-tab-events"]')!,
     );
     expect(document.querySelector(".eventlog")).not.toBeNull();
-    // (#2108) The phone drawer's Events tab is `inlineDetail` now — each
-    // record's own full detail stacked inline, not `.eventlog__rec` rows.
-    expect(document.querySelectorAll(".eventlog__inlinerec")).toHaveLength(1);
+    // (#2108) The phone drawer's Events tab is the plain default
+    // EventLogColumn (list + detail pane, tap-to-select) — same row
+    // rendering as the desktop column.
+    expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1);
     // Only ONE events pane exists — `MachineDrawer` never ALSO renders the
     // desktop pill/dialog while in the phone skin.
     expect(

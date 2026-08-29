@@ -1097,32 +1097,9 @@ body {
   flex: 1;
   overflow: auto;
   padding: 6px 12px 8px;
-}
-/* (#2108, `inlineDetail`) Each record's own full `RecordView`, stacked,
-   instead of one-line rows — the list itself still owns the ONE scroll
-   region (`overscroll-behavior: contain` so reaching its top/bottom
-   doesn't chain into the page/sheet behind it); a single oversized
-   record gets its OWN capped scroll below instead of stretching the
-   whole list. */
-.eventlog__body--inline {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  overscroll-behavior: contain;
-}
-.eventlog__inlinerec {
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px 10px;
-  background: rgba(255, 255, 255, 0.02);
-  /* A record with an unusually large payload (a long tool-call arg
-     string, a big raw JSON blob) caps here rather than growing the
-     whole list — its OWN scroll, contained so it doesn't leak into the
-     list's scroll above it. The cap is generous (a `vh` unit, not a
-     fixed px) so it scales with the sheet's own 85-90vh open height
-     instead of clipping at an arbitrary small number on a tall phone. */
-  max-height: 50vh;
-  overflow-y: auto;
+  /* (#2108) This is the ONE scroll region the list itself owns — reaching
+     its top/bottom must not chain into the sheet/page behind it. Harmless
+     on desktop (nothing behind it to chain into). */
   overscroll-behavior: contain;
 }
 .eventlog__rec {
@@ -5449,6 +5426,34 @@ body {
   }
   .phone-drawer__body .eventlog__list {
     min-height: 0;
+  }
+  /* (#2108, operator correction) Desktop's own column is pane-above-list
+     (`.eventlog`'s plain `flex-direction: column`, source order: detail,
+     split, list) — the operator wants the sheet to read list-on-top,
+     pane-below instead. Reordered here via `order` rather than touching
+     `EventLogColumn.tsx`'s own DOM (shared with the desktop column;
+     changing its actual element order would move desktop's layout too,
+     and this component's DOM shape is a real reuse contract, not just
+     this one caller's). The split handle keeps a middle order so it
+     still visually sits between the two when it IS shown — it isn't
+     here: the existing `@media (max-width:768px) { .eventlog__split {
+     display:none } }` rule below already hides the drag handle at this
+     width, leaving the pane at its default `detailPct` split (~38/62,
+     i.e. the instructed "~40/60"). */
+  .phone-drawer__body .eventlog__list {
+    order: 1;
+  }
+  .phone-drawer__body .eventlog__split {
+    order: 2;
+  }
+  .phone-drawer__body .eventlog__detail {
+    order: 3;
+  }
+  /* The pane is the SECOND scroll region inside the sheet (the list above
+     it is the first) — its own top/bottom must not chain into the list's
+     scroll or the (now `position: fixed`) page behind it either. */
+  .phone-drawer__body .eventlog__detailbody {
+    overscroll-behavior: contain;
   }
   .phone-drawer__handle {
     display: flex;
