@@ -1582,3 +1582,37 @@ fn dry_run_still_bails_on_a_missing_required_input() {
         "{err}"
     );
 }
+
+// ── (#1959) one-shot --param source=/--param rule= synthesizes a spec ──
+
+#[test]
+#[serial_test::serial]
+fn one_shot_source_and_rule_synthesizes_a_workspace_and_dispatches() {
+    let _guard = TestGuard::new();
+    let workdir = TempDir::new().unwrap();
+    let app = workdir.path().join("app1");
+    let body = "function f() {\n  try {\n    g();\n  }\n  catch (e) {\n    void 0;\n  }\n}\n";
+    init_source_repo(&app, "x.ts", body);
+
+    let mut params: BTreeMap<String, Value> = BTreeMap::new();
+    params.insert("source".to_string(), Value::String(app.to_string_lossy().to_string()));
+    params.insert("rule".to_string(), Value::String("swallowed-error".to_string()));
+
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(calls.borrow().len(), 1, "the one-shot single source must produce exactly one dispatch");
+
+    let records = read_all_flow_records();
+    let started = records.iter().find(|r| r["action"] == "mission start").unwrap();
+    // (#1959) `one_shot_workspace_name` sanitizes the source's basename —
+    // "app1" here — into "one-shot-app1", proving the CLI-level
+    // --param source=/--param rule= inputs actually reached
+    // `synthesize_one_shot_spec` rather than being silently ignored (a
+    // `workspace` param was never given at all in this test).
+    assert_eq!(started["payload"]["workspace"], Value::String("one-shot-app1".to_string()));
+}
