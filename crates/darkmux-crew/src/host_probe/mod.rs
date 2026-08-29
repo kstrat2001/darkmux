@@ -477,14 +477,18 @@ fn attach_cluster_mhz(
     if clusters.is_empty() || cluster_mhz.is_empty() {
         return;
     }
-    // BTreeMap iteration is sorted, so `keys`/`sizes` are index-aligned and
-    // deterministic across samples.
+    // BTreeMap iteration is sorted, so `keys`/`sizes`/`mean_mhz` are
+    // index-aligned and deterministic across samples. `mean_mhz` feeds
+    // `assign_groups_to_levels`'s same-core-count tie-break (#2108 review
+    // finding — matching by count alone silently swapped Performance's and
+    // Efficiency's MHz on a chip whose perf levels have equal core counts).
     let keys: Vec<&String> = cluster_cores.keys().collect();
     let sizes: Vec<usize> = keys.iter().map(|k| cluster_cores[*k]).collect();
+    let mean_mhz: Vec<u32> = keys.iter().map(|k| cluster_mhz.get(*k).copied().unwrap_or(0)).collect();
     let level_cores: Vec<usize> = clusters.iter().map(|c| c.cores).collect();
     for (c, g) in clusters
         .iter_mut()
-        .zip(ioreport::assign_groups_to_levels(&sizes, &level_cores))
+        .zip(ioreport::assign_groups_to_levels(&sizes, &mean_mhz, &level_cores))
     {
         c.mhz = g.and_then(|i| cluster_mhz.get(keys[i]).copied());
     }
@@ -735,6 +739,28 @@ mod tests {
         attach_cluster_mhz(&mut clusters, &mhz, &cores);
         assert_eq!(clusters[0].mhz, Some(3000));
         assert_eq!(clusters[1].mhz, None, "no 4-core IOReport group ⇒ no frequency claim");
+    }
+
+    // (#2108 review finding) A hypothetical 4-Performance + 4-Efficiency
+    // chip: both perf levels have the SAME core count, so IOReport's two
+    // matching groups (ECPU, PCPU — both count 4) can't be told apart by
+    // count alone. Before the fix, `attach_cluster_mhz` matched by count in
+    // `cluster_cores`' BTreeMap-sorted (alphabetical) order, so ECPU (which
+    // sorts before PCPU) always won the FIRST cluster asking, regardless of
+    // tier — silently giving the Performance cluster Efficiency's 1200 MHz
+    // instead of Performance's own 3000 MHz.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn attach_cluster_mhz_tie_breaks_equal_counts_by_mean_mhz() {
+        let mut clusters = vec![
+            CpuCluster { name: "Performance".into(), cores: 4, pct: Some(10), mhz: None },
+            CpuCluster { name: "Efficiency".into(), cores: 4, pct: Some(5), mhz: None },
+        ];
+        let mhz = BTreeMap::from([("ECPU".to_string(), 1200u32), ("PCPU".to_string(), 3000)]);
+        let cores = BTreeMap::from([("ECPU".to_string(), 4usize), ("PCPU".to_string(), 4)]);
+        attach_cluster_mhz(&mut clusters, &mhz, &cores);
+        assert_eq!(clusters[0].mhz, Some(3000), "Performance must get PCPU's 3000 MHz, not ECPU's 1200");
+        assert_eq!(clusters[1].mhz, Some(1200), "Efficiency gets what's left: ECPU's 1200 MHz");
     }
 
     #[test]

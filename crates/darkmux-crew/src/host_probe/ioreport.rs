@@ -208,25 +208,68 @@ pub fn gpu_freq_table(props: &[(String, Vec<u8>)]) -> Vec<u32> {
 /// collapses those back together, and the resulting group sizes are then
 /// matched to each level's core count.
 ///
-/// `groups` must be sorted for determinism (the caller uses a `BTreeMap`).
-/// Returns, per level, the index into `groups` that serves it — `None` when
-/// no unused group has that level's exact core count, which degrades that
-/// cluster's `mhz` to null rather than attaching another cluster's number.
-/// Pure.
+/// **Core count alone is not a unique key on a chip whose perf levels have
+/// equal core counts** (e.g. a hypothetical 4-Performance + 4-Efficiency
+/// part) — matching by count only, in `groups`' BTreeMap-sorted (i.e.
+/// alphabetical, NOT tier) order, silently assigned whichever
+/// same-sized group's NAME happened to sort first to the FIRST level
+/// asking, regardless of which tier either one actually was. On a chip
+/// with `groups = {ECPU: 4 → 1200 MHz, PCPU: 4 → 3000 MHz}` (alphabetical:
+/// ECPU before PCPU) and `levels = [Performance(4), Efficiency(4)]`, the
+/// Performance cluster silently got ECPU's 1200 MHz instead of PCPU's
+/// 3000 MHz.
+///
+/// `levels` is already given in TIER order (index 0 = highest-performance
+/// tier — see [`crate::host_probe::mach_cpu::PerfLevel`]), and a
+/// higher-performance cluster always clocks at or above a
+/// lower-performance one, so a same-count tie is broken by matching the
+/// HIGHEST-mean-MHz unused candidate to the EARLIEST (highest-tier) level
+/// asking for that count. A genuine tie in BOTH count and mean MHz can't be
+/// told apart this way — left `None` rather than guessed, same as an
+/// unmatched count.
+///
+/// `groups`/`group_mean_mhz` must be sorted the same way and index-aligned
+/// (the caller uses a `BTreeMap`, so both come from the same sorted key
+/// iteration). Returns, per level, the index into `groups` that serves it —
+/// `None` when no unused group has that level's exact core count, or when
+/// the tie-break above can't disambiguate, which degrades that cluster's
+/// `mhz` to null rather than attaching another cluster's number. Pure.
 pub fn assign_groups_to_levels(
     group_sizes: &[usize],
+    group_mean_mhz: &[u32],
     level_cores: &[usize],
 ) -> Vec<Option<usize>> {
     let mut used = vec![false; group_sizes.len()];
     level_cores
         .iter()
         .map(|want| {
-            let idx = group_sizes
+            let mut candidates: Vec<usize> = group_sizes
                 .iter()
                 .enumerate()
-                .position(|(i, n)| !used[i] && n == want)?;
-            used[idx] = true;
-            Some(idx)
+                .filter(|(i, n)| !used[*i] && *n == want)
+                .map(|(i, _)| i)
+                .collect();
+            match candidates.len() {
+                0 => None,
+                1 => {
+                    let idx = candidates[0];
+                    used[idx] = true;
+                    Some(idx)
+                }
+                _ => {
+                    // Highest mean MHz first — matches the earliest
+                    // (highest-tier) level asking for this count.
+                    candidates.sort_by(|&a, &b| group_mean_mhz[b].cmp(&group_mean_mhz[a]));
+                    if group_mean_mhz[candidates[0]] == group_mean_mhz[candidates[1]] {
+                        // A genuine tie in both count and clock — cannot
+                        // disambiguate, leave unassigned rather than guess.
+                        return None;
+                    }
+                    let idx = candidates[0];
+                    used[idx] = true;
+                    Some(idx)
+                }
+            }
         })
         .collect()
 }
@@ -882,20 +925,45 @@ mod tests {
     #[test]
     fn groups_map_to_perf_levels_by_core_count() {
         // This machine: groups {MCPU: 12, PCPU: 6} (BTreeMap order → MCPU
-        // first), levels [Super(6), Performance(12)].
-        let got = assign_groups_to_levels(&[12, 6], &[6, 12]);
+        // first), levels [Super(6), Performance(12)]. Counts alone
+        // disambiguate here (6 ≠ 12), so mean MHz is irrelevant.
+        let got = assign_groups_to_levels(&[12, 6], &[3200, 4200], &[6, 12]);
         assert_eq!(got, vec![Some(1), Some(0)], "Super→PCPU(6), Performance→MCPU(12)");
     }
 
+    // (#2108 review finding) A hypothetical 4-Performance + 4-Efficiency
+    // chip: two IOReport groups tie on core count, so matching by count
+    // ALONE can't tell them apart — the original bug matched whichever
+    // same-sized group's NAME sorted first (alphabetical BTreeMap order),
+    // regardless of tier, silently swapping Performance's and Efficiency's
+    // MHz. BTreeMap-sorted group order is alphabetical → keys = [ECPU,
+    // PCPU], sizes = [4, 4], mean_mhz = [1200, 3000]. `levels` is tier
+    // order: [Performance(4), Efficiency(4)] (index 0 = highest tier). The
+    // fix ties-break by mean MHz: the highest-tier level must get the
+    // highest-clocked candidate.
     #[test]
     fn groups_with_equal_counts_are_consumed_once_each() {
-        let got = assign_groups_to_levels(&[4, 4], &[4, 4]);
-        assert_eq!(got, vec![Some(0), Some(1)], "each group serves exactly one level");
+        let got = assign_groups_to_levels(&[4, 4], &[1200, 3000], &[4, 4]);
+        assert_eq!(
+            got,
+            vec![Some(1), Some(0)],
+            "Performance(4) ← PCPU(3000 MHz), Efficiency(4) ← ECPU(1200 MHz), not the reverse"
+        );
+    }
+
+    #[test]
+    fn groups_with_equal_count_and_equal_mhz_are_left_unassigned() {
+        // Count ties AND the clocks tie too — no signal left to
+        // disambiguate. Guessing would be wrong half the time; `None`
+        // degrades both clusters' mhz to null instead, same as an
+        // unmatched count.
+        let got = assign_groups_to_levels(&[4, 4], &[1200, 1200], &[4, 4]);
+        assert_eq!(got, vec![None, None], "an exact count+clock tie can't be told apart");
     }
 
     #[test]
     fn a_level_with_no_matching_group_gets_none() {
-        let got = assign_groups_to_levels(&[12], &[6, 12]);
+        let got = assign_groups_to_levels(&[12], &[3200], &[6, 12]);
         assert_eq!(got, vec![None, Some(0)], "the unmatched level degrades to null mhz");
     }
 
