@@ -43,6 +43,7 @@ import {
   simpleBand,
   angleForPct,
 } from "./Meter";
+import { InlineOrCells, type InlineOrCellsItem } from "./InlineOrCells";
 import { COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "./Meter";
 import { aggregateHostSamples, type HostAggregate } from "../lib/hostStats";
 import { resolveDrawerScope } from "../lib/machineDrawerScope";
@@ -176,7 +177,18 @@ function thermalSeverityClass(state: ThermalState): string {
  * a question thermal/power/clusters don't have (they're never scoped to a
  * dispatch on the wire), so mission/dispatch routes render these rows too
  * whenever the daemon itself is reachable. */
-function HostExtras({ load }: { load: MachineLoad | null }) {
+function HostExtras({
+  load,
+  isMobile,
+}: {
+  load: MachineLoad | null;
+  /** (#2108, operator finding — wrap fix) Threaded down from
+   * `useMachineStatsContent`'s own `isMobile` input so the dotted-list
+   * rows below can switch to `InlineOrCells`' cell-grid form at the same
+   * breakpoint the rest of the drawer/lens uses. See that component's
+   * own doc for why a phrase must never break mid-item. */
+  isMobile: boolean;
+}) {
   if (load === null) return null;
   const { thermal, power_mw, cpu_clusters } = load.now;
   const windowThermal = load.window.thermal;
@@ -184,17 +196,57 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
   const energyLine = fmtEnergyMwh(load.window.energy_mwh);
   const gpuMhz = load.now.gpu_mhz;
   const gpuMem = fmtGpuMemBytes(load.now.gpu_mem_bytes);
-  const gpuExtraLine =
-    gpuMhz !== null || gpuMem !== null
-      ? [gpuMhz !== null ? `${Math.round(gpuMhz)} MHz` : null, gpuMem]
-          .filter(Boolean)
-          .join(" · ")
-      : null;
+  const gpuExtraItems: InlineOrCellsItem[] = [
+    gpuMhz !== null
+      ? { cellLabel: "MHz", cellValue: `${Math.round(gpuMhz)}`, inline: `${Math.round(gpuMhz)} MHz` }
+      : null,
+    gpuMem !== null ? { cellLabel: "memory", cellValue: gpuMem, inline: gpuMem } : null,
+  ].filter((x): x is InlineOrCellsItem => x !== null);
+
+  const powerTotalItems: InlineOrCellsItem[] = power_mw
+    ? [
+        { cellLabel: "now", cellValue: fmtMw(power_mw.total) ?? "—", inline: `${fmtMw(power_mw.total)} now` },
+        ...(windowPower
+          ? [
+              {
+                cellLabel: "avg",
+                cellValue: fmtMw(windowPower.total.mean) ?? "—",
+                inline: `${fmtMw(windowPower.total.mean)} avg`,
+              },
+              {
+                cellLabel: "p95",
+                cellValue: fmtMw(windowPower.total.p95) ?? "—",
+                inline: `${fmtMw(windowPower.total.p95)} p95`,
+              },
+              {
+                cellLabel: "max",
+                cellValue: fmtMw(windowPower.total.max) ?? "—",
+                inline: `${fmtMw(windowPower.total.max)} max`,
+              },
+            ]
+          : []),
+      ]
+    : [];
+  const channelItems: InlineOrCellsItem[] = power_mw
+    ? [
+        fmtMw(power_mw.cpu) !== null
+          ? { cellLabel: "CPU", cellValue: fmtMw(power_mw.cpu)!, inline: `CPU ${fmtMw(power_mw.cpu)}` }
+          : null,
+        fmtMw(power_mw.gpu) !== null
+          ? { cellLabel: "GPU", cellValue: fmtMw(power_mw.gpu)!, inline: `GPU ${fmtMw(power_mw.gpu)}` }
+          : null,
+        fmtMw(power_mw.ane) !== null
+          ? { cellLabel: "ANE", cellValue: fmtMw(power_mw.ane)!, inline: `ANE ${fmtMw(power_mw.ane)}` }
+          : null,
+      ].filter((x): x is InlineOrCellsItem => x !== null)
+    : [];
 
   return (
     <>
-      {gpuExtraLine && (
-        <div className="machine-drawer__gpu-extra">GPU {gpuExtraLine}</div>
+      {gpuExtraItems.length > 0 && (
+        <div className="machine-drawer__gpu-extra">
+          GPU <InlineOrCells items={gpuExtraItems} isMobile={isMobile} />
+        </div>
       )}
       {thermal && (
         <div className="thermal-row">
@@ -210,7 +262,21 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
           )}
           {windowThermal && (
             <div className="thermal-row__window">
-              {`worst ${fmtThermalState(windowThermal.worst_state)} · ${fmtAboveNominal(windowThermal.above_nominal_ms)} above nominal`}
+              <InlineOrCells
+                items={[
+                  {
+                    cellLabel: "worst",
+                    cellValue: fmtThermalState(windowThermal.worst_state),
+                    inline: `worst ${fmtThermalState(windowThermal.worst_state)}`,
+                  },
+                  {
+                    cellLabel: "above nominal",
+                    cellValue: fmtAboveNominal(windowThermal.above_nominal_ms),
+                    inline: `${fmtAboveNominal(windowThermal.above_nominal_ms)} above nominal`,
+                  },
+                ]}
+                isMobile={isMobile}
+              />
             </div>
           )}
         </div>
@@ -220,25 +286,13 @@ function HostExtras({ load }: { load: MachineLoad | null }) {
           {power_mw && (
             <div className="dialog__kv">
               <b>Power</b>
-              <span>
-                {fmtMw(power_mw.total)} now
-                {windowPower &&
-                  ` · ${fmtMw(windowPower.total.mean)} avg · ${fmtMw(windowPower.total.p95)} p95 · ${fmtMw(windowPower.total.max)} max`}
-              </span>
+              <InlineOrCells items={powerTotalItems} isMobile={isMobile} />
             </div>
           )}
           {power_mw && (
             <div className="dialog__kv">
               <b>Channels</b>
-              <span>
-                {[
-                  fmtMw(power_mw.cpu) && `CPU ${fmtMw(power_mw.cpu)}`,
-                  fmtMw(power_mw.gpu) && `GPU ${fmtMw(power_mw.gpu)}`,
-                  fmtMw(power_mw.ane) && `ANE ${fmtMw(power_mw.ane)}`,
-                ]
-                  .filter(Boolean)
-                  .join(" · ")}
-              </span>
+              <InlineOrCells items={channelItems} isMobile={isMobile} />
             </div>
           )}
           {energyLine && (
@@ -374,6 +428,16 @@ export interface MachineStatsInput {
    * the caller — which DOES know whether it's currently showing this
    * content — has to say so explicitly rather than the hook guessing. */
   isOpen: boolean;
+  /** (#2108, operator finding — wrap fix) Whether the caller's own
+   * surface is currently rendering the PHONE chrome — the same
+   * `useIsMobile` breakpoint `MachineDrawer.tsx` already measures for its
+   * own dialog/phone-drawer split, threaded down here so this shared body
+   * can switch its own dotted-list rows (header line, thermal window,
+   * power total/channels, the GPU MHz/memory line) to `InlineOrCells`'
+   * cell-grid form at the SAME breakpoint, rather than re-measuring
+   * `window.innerWidth` a second time in a hook that's already handed a
+   * `nowMsOverride` for testability. */
+  isMobile: boolean;
   /** Test-only override — production omits this and the hook ticks its
    * own clock (see [[useTickingNow]]). */
   nowMsOverride?: number;
@@ -394,6 +458,7 @@ export function useMachineStatsContent({
   specs,
   liveStatus,
   isOpen,
+  isMobile,
   nowMsOverride,
 }: MachineStatsInput): MachineStatsContent {
   const tickedNow = useTickingNow(5000);
@@ -468,7 +533,7 @@ export function useMachineStatsContent({
   // right now" is orthogonal to "what did THIS dispatch use." Each row
   // hides independently on its own null field — see this module's own
   // `HostExtras` doc.
-  const hostExtras = <HostExtras load={daemonLoad} />;
+  const hostExtras = <HostExtras load={daemonLoad} isMobile={isMobile} />;
 
   const meters = (
     <div className="meter-row">
@@ -528,11 +593,35 @@ export function useMachineStatsContent({
     ? `last sample ${relAgoFrom(nowMs, scope.lastKnown.ts)} — CPU ${fmtPct(scope.lastKnown.point.cpu ?? null)} · GPU ${fmtPct(scope.lastKnown.point.gpu ?? null)} · MEM ${fmtPct(scope.lastKnown.point.mem ?? null)}`
     : null;
 
+  // (#2108, operator finding — wrap fix) "MacBook-Pro · Apple M5 Max ·
+  // 128 GB · darkmux 3.3.0 (ea3caf27)" wrapped after "128 GB ·" on a
+  // phone. Mobile stacks TWO lines with no separators instead — machine
+  // name, then hardware (which keeps its own short internal " · ", e.g.
+  // "Apple M5 Max · 128 GB" — that one doesn't wrap on its own) — and
+  // drops the version line entirely rather than trying to fit a third
+  // fact: it's already the `build` row in the "about" kv block below,
+  // so nothing is lost, only de-duplicated. Desktop keeps the single
+  // dotted `headerLine` unchanged.
+  const identityBlock = isMobile ? (
+    (machineName || hardware) && (
+      <div className="machine-drawer__identity machine-drawer__identity--mobile">
+        {machineName && (
+          <div className="machine-drawer__identity-line">{machineName}</div>
+        )}
+        {hardware && (
+          <div className="machine-drawer__identity-line">{hardware}</div>
+        )}
+      </div>
+    )
+  ) : (
+    headerLine && (
+      <div className="machine-drawer__identity">{headerLine}</div>
+    )
+  );
+
   const statsBody = (
     <>
-      {headerLine && (
-        <div className="machine-drawer__identity">{headerLine}</div>
-      )}
+      {identityBlock}
       <div className="machine-drawer__scope">{scopeLabel}</div>
       {samplerCostLine && (
         <div className="machine-drawer__sampler-cost">{samplerCostLine}</div>

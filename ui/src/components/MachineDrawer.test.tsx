@@ -523,7 +523,9 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
       document.querySelector('[data-act="phone-drawer-tab-events"]')!,
     );
     expect(document.querySelector(".eventlog")).not.toBeNull();
-    expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(1);
+    // (#2108) The phone drawer's Events tab is `inlineDetail` now — each
+    // record's own full detail stacked inline, not `.eventlog__rec` rows.
+    expect(document.querySelectorAll(".eventlog__inlinerec")).toHaveLength(1);
     // Only ONE events pane exists — `MachineDrawer` never ALSO renders the
     // desktop pill/dialog while in the phone skin.
     expect(
@@ -869,8 +871,13 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     openDesktop();
 
     // GPU row extras — MHz + in-use memory, joined onto the GPU reading.
+    // Scoped container query, not `getByText` with the full string: the
+    // text is split between a bare "GPU " text node and the nested
+    // `<InlineOrCells>` span (desktop), which `getByText` won't bridge.
     await waitFor(() =>
-      expect(screen.getByText("GPU 1296 MHz · 912.0 MB")).toBeInTheDocument(),
+      expect(
+        document.querySelector(".machine-drawer__gpu-extra")?.textContent,
+      ).toBe("GPU 1296 MHz · 912.0 MB"),
     );
 
     // Thermal: state pill (title-cased) + speed limit (< 100%) + window
@@ -948,8 +955,177 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     );
     await waitFor(() => expect(screen.getByText("Fair")).toBeInTheDocument());
     expect(screen.getByText("Super")).toBeInTheDocument();
+    // Phone chrome renders the CELL GRID (InlineOrCells' mobile branch),
+    // not the desktop's joined dotted text — see the dedicated
+    // "wrap fix" describe block below for the row-level proof; this test
+    // only needs to confirm the SAME facts reached this surface too.
+    const channelsGrid = [
+      ...document.querySelectorAll(".dialog__kv"),
+    ].find((kv) => kv.querySelector("b")?.textContent === "Channels");
+    expect(channelsGrid).toBeTruthy();
     expect(
-      screen.getByText("CPU 5.2 W · GPU 3.4 W · ANE 400 mW"),
-    ).toBeInTheDocument();
+      channelsGrid!.querySelector('[data-act="inline-or-cells"]'),
+    ).not.toBeNull();
+    expect(channelsGrid!.textContent).toContain("CPU");
+    expect(channelsGrid!.textContent).toContain("5.2 W");
+    expect(channelsGrid!.textContent).toContain("ANE");
+  });
+
+  // ── (#2108, operator finding — wrap fix) dotted lists that become cell
+  //    grids on narrow viewports. Real-phone review found several rows in
+  //    `machineStatsContent.tsx` wrapping MID-ITEM at ~390px: the power
+  //    total ("15.0 W / p95" split across two lines), the channels row
+  //    ("ANE" pushed onto its own broken line), and the identity header
+  //    (wrapping after "128 GB ·"). `InlineOrCells.test.tsx` proves the
+  //    shared component itself; these prove the WIRING — that the real
+  //    hook/prop thread actually switches these specific rows at the real
+  //    breakpoint, reusing THIS describe block's own `FULL_LOAD`/
+  //    `stubFetch`. ──
+
+  it("mobile: the identity header stacks TWO lines with no separators and drops the version", () => {
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-version";
+    meta.content = "3.3.0 (ea3caf27)";
+    document.head.appendChild(meta);
+    const flowWindow = [
+      {
+        ts: "2026-01-01T00:00:00Z",
+        machine_uid: "self-uid",
+        machine_id: "MacBook-Pro",
+      },
+    ];
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={flowWindow}
+        localUid="self-uid"
+        liveMachines={new Map()}
+        specs={{
+          darkmux_version: "3.3.0 (ea3caf27)",
+          flow_schema_version: "1.27.0",
+          machine_id: "MacBook-Pro",
+          os: "macOS",
+          ram_total_bytes: 137438953472,
+          ram_free_for_ai_bytes: null,
+          cpu_brand: "Apple M5 Max",
+          loaded_models: [],
+          lms_unreachable: false,
+          utility_model: null,
+          redis_url_redacted: null,
+          generated_at_ms: NOW,
+        }}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        isMobileOverride={true}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    const identity = document.querySelector(
+      ".machine-drawer__identity--mobile",
+    )!;
+    expect(identity).not.toBeNull();
+    const lines = identity.querySelectorAll(
+      ".machine-drawer__identity-line",
+    );
+    expect(lines.length).toBe(2);
+    expect(lines[0].textContent).toBe("MacBook-Pro");
+    expect(lines[1].textContent).toBe("Apple M5 Max · 128 GB");
+    // The version is dropped from this form — it's already the `build`
+    // row in the about kv block below, nothing is lost.
+    expect(identity.textContent).not.toContain("3.3.0");
+
+    // Desktop keeps the SINGLE dotted line, version included — unchanged
+    // from before this packet.
+    document.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
+  });
+
+  it("desktop: the identity header stays the single dotted line with the version, no --mobile modifier", () => {
+    const meta = document.createElement("meta");
+    meta.name = "darkmux-version";
+    meta.content = "3.3.0 (ea3caf27)";
+    document.head.appendChild(meta);
+    const flowWindow = [
+      { ts: "2026-01-01T00:00:00Z", machine_uid: "self-uid", machine_id: "MacBook-Pro" },
+    ];
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={flowWindow}
+        localUid="self-uid"
+        liveMachines={new Map()}
+        specs={{
+          darkmux_version: "3.3.0 (ea3caf27)",
+          flow_schema_version: "1.27.0",
+          machine_id: "MacBook-Pro",
+          os: "macOS",
+          ram_total_bytes: 137438953472,
+          ram_free_for_ai_bytes: null,
+          cpu_brand: "Apple M5 Max",
+          loaded_models: [],
+          lms_unreachable: false,
+          utility_model: null,
+          redis_url_redacted: null,
+          generated_at_ms: NOW,
+        }}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    expect(
+      document.querySelector(".machine-drawer__identity--mobile"),
+    ).toBeNull();
+    const identity = document.querySelector(".machine-drawer__identity")!;
+    expect(identity.textContent).toBe(
+      "MacBook-Pro · Apple M5 Max · 128 GB · darkmux 3.3.0 (ea3caf27)",
+    );
+  });
+
+  it("mobile: power total, channels, thermal window, and GPU lines each render as a nowrap cell grid", async () => {
+    stubFetch(FULL_LOAD);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        isMobileOverride={true}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    await waitFor(() =>
+      expect(
+        document.querySelectorAll('[data-act="inline-or-cells"]').length,
+      ).toBeGreaterThan(0),
+    );
+    // power total (4 cells: now/avg/p95/max), channels (3: CPU/GPU/ANE),
+    // thermal window (2: worst/above nominal), GPU MHz+memory (2).
+    const grids = document.querySelectorAll('[data-act="inline-or-cells"]');
+    expect(grids.length).toBe(4);
+    grids.forEach((grid) => {
+      const values = grid.querySelectorAll(".inline-or-cells__cell-value");
+      expect(values.length).toBeGreaterThan(0);
+      values.forEach((v) => {
+        expect(v.className).toContain("inline-or-cells__cell-value");
+      });
+    });
+    // No dotted-list joined string anywhere on this surface any more.
+    expect(
+      screen.queryByText("9.0 W now · 7.8 W avg · 9.2 W p95 · 11.0 W max"),
+    ).toBeNull();
+    expect(screen.queryByText("worst Serious · 45s above nominal")).toBeNull();
   });
 });

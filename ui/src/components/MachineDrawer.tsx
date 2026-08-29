@@ -151,6 +151,7 @@ export function MachineDrawer({
     specs,
     liveStatus,
     isOpen: isStatsSurfaceOpen,
+    isMobile,
     nowMsOverride,
   });
 
@@ -180,7 +181,7 @@ export function MachineDrawer({
   // dialog shell itself, which stays reachable/openable exactly as before
   // via `dialogManager`'s shared `#imodalbg` id.
   return (
-    <Dialog id="imodalbg" titleId="machine-stats-title" title="Machine stats">
+    <Dialog id="imodalbg" titleId="machine-info-title" title="Machine info">
       {body}
     </Dialog>
   );
