@@ -226,6 +226,29 @@
     align-items: center;
     gap: 20px;
   }
+  /* Large-title hand-off: on load the hero lockup is the only brand on
+     screen — the whole nav bar is held above the viewport (out of flow, so the
+     hero starts at the top) until the lockup scrolls away, then it slides down
+     as an overlay, and back out when the user returns to the top. Gated on the
+     `js-brand` class so a no-JS load keeps the nav in flow and visible.
+     Reduced-motion users get the swap without the slide. */
+  html.js-brand .homenav {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 50;
+    opacity: 0;
+    transform: translateY(-100%);
+    transition: opacity .28s ease, transform .28s ease;
+    pointer-events: none;
+  }
+  html.js-brand .homenav--branded {
+    opacity: 1;
+    transform: none;
+    pointer-events: auto;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html.js-brand .homenav { transition: none; transform: none; }
+  }
   .homenav__brand {
     display: inline-flex;
     align-items: center;
@@ -729,6 +752,18 @@
 </div>
 
 <script>
+// Large-title hand-off (see the html.js-brand .homenav CSS): show the nav
+// bar only once the hero lockup has scrolled out of view.
+(function () {
+  var nav = document.querySelector('.homenav');
+  var lockup = document.querySelector('.hero-lockup');
+  if (!nav || !lockup || !('IntersectionObserver' in window)) return;
+  document.documentElement.classList.add('js-brand');
+  new IntersectionObserver(function (entries) {
+    nav.classList.toggle('homenav--branded', !entries[0].isIntersecting);
+  }, { rootMargin: '0px', threshold: 0 }).observe(lockup);
+})();
+
   // Copy-to-clipboard for install commands. One delegated listener (no inline
   // handlers); each `.copy-btn` carries its exact command in `data-copy`. The
   // commands are static page content, so there is no untrusted input here.

@@ -405,6 +405,12 @@ footer a:hover { color: var(--accent); }
 
   /* Topnav already wraps; tighten visual weight */
   .topnav { padding: 14px 0; }
+  /* One row on phones: the `/ guide` crumb wrapped the links onto a second,
+     right-aligned row and left a hole under the wordmark. The page heading
+     already names the section and the Guide link is marked current, so the
+     crumb is redundant here; forbid the wrap so brand and links share the row. */
+  .topnav .wrap { flex-wrap: nowrap; }
+  .topnav .crumbs { display: none; }
   .topnav .links { gap: 12px; font-size: 13px; }
 
   footer { padding: 24px 0 36px; }
