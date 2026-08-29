@@ -5731,18 +5731,24 @@ fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
 #[test]
 fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape() {
     use crate::host_probe::{HostExtraAt, PowerSample, ThermalSample};
-    let extras = crate::host_probe::reduce_host_extras(&[
-        HostExtraAt {
-            at_ms: 0,
-            power: Some(PowerSample { cpu_mw: 1000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
-            thermal: Some(ThermalSample { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
-        },
-        HostExtraAt {
-            at_ms: 3_600_000,
-            power: Some(PowerSample { cpu_mw: 3000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
-            thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
-        },
-    ]);
+    // `None`: this test is about envelope SHAPE (the #2107/#2108 additive
+    // contract below), not the sleep-gap cap — that's covered by its own
+    // tests in host_probe::mod.rs and darkmux-serve's host_sampler.rs.
+    let extras = crate::host_probe::reduce_host_extras(
+        &[
+            HostExtraAt {
+                at_ms: 0,
+                power: Some(PowerSample { cpu_mw: 1000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                thermal: Some(ThermalSample { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
+            },
+            HostExtraAt {
+                at_ms: 3_600_000,
+                power: Some(PowerSample { cpu_mw: 3000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
+            },
+        ],
+        None,
+    );
     let stats = super::reduce_host_stats(&worked_samples());
     let out = super::enrich_envelope_with_summary(
         r#"{"result":"stop"}"#.to_string(),

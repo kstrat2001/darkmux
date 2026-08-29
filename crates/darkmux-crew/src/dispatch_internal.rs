@@ -3685,7 +3685,11 @@ const TAILER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// trace), and each tick shells out to `docker stats --no-stream` (a
 /// ~1s blocking call) — a tighter cadence would just stack docker calls
 /// without adding resolution.
-const TELEMETRY_SAMPLE_INTERVAL: Duration = Duration::from_millis(2000);
+const TELEMETRY_SAMPLE_INTERVAL: Duration = Duration::from_millis(TELEMETRY_SAMPLE_INTERVAL_MS);
+/// Same cadence as [`TELEMETRY_SAMPLE_INTERVAL`], as a plain `u64` — feeds
+/// `reduce_host_extras`'s sleep-gap cap (#2108 review finding), which wants
+/// milliseconds, not a `Duration`.
+const TELEMETRY_SAMPLE_INTERVAL_MS: u64 = 2000;
 
 /// Granularity at which the sampler re-checks its stop flag while waiting
 /// out a `TELEMETRY_SAMPLE_INTERVAL`. Mirrors the watchdog's 500ms poll:
@@ -3981,14 +3985,17 @@ fn run_telemetry_sampler(
             if stop_flag.load(Ordering::SeqCst) {
                 // Teardown mid-interval: return what was observed, never a
                 // default. A killed or short dispatch still has real stats.
-                return (reduce_host_stats(&raw), reduce_host_extras(&extras));
+                return (
+                    reduce_host_stats(&raw),
+                    reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)),
+                );
             }
             let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
             thread::sleep(nap);
             slept += nap;
         }
     }
-    (reduce_host_stats(&raw), reduce_host_extras(&extras))
+    (reduce_host_stats(&raw), reduce_host_extras(&extras, Some(TELEMETRY_SAMPLE_INTERVAL_MS)))
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,

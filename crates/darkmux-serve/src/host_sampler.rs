@@ -82,6 +82,15 @@ struct RingEntry {
 #[derive(Clone)]
 pub(crate) struct HostSamplerRing {
     inner: Arc<Mutex<VecDeque<RingEntry>>>,
+    /// The sampler thread's configured cadence in ms — `0` until [`spawn`]
+    /// sets it (or forever, for a ring [`spawn`] never ran against). Feeds
+    /// [`reduce_host_extras`]'s sleep-gap cap: `snapshot` reads this and
+    /// passes it through as `Some`/`None` so a laptop that slept for hours
+    /// between two ring entries can't bill the whole gap at the pre-sleep
+    /// reading (#2108 review finding). An `AtomicU64`, not a plain field, so
+    /// every clone of this `Arc`-backed ring sees the same value the
+    /// sampler thread stored, without a second lock.
+    configured_interval_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// `mean`/`p95`/`max` — the ROUTE's wire names for one metric's window
@@ -116,7 +125,10 @@ fn power_now_json(p: &PowerSample) -> serde_json::Value {
 
 impl HostSamplerRing {
     pub(crate) fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY))) }
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::with_capacity(RING_CAPACITY))),
+            configured_interval_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
     }
 
     fn push(&self, entry: RingEntry) {
@@ -148,6 +160,16 @@ impl HostSamplerRing {
                 ..Default::default()
             },
         });
+    }
+
+    /// Test-only: set the cadence [`spawn`] would otherwise record, without
+    /// actually spawning a sampler thread. Needed to exercise
+    /// `snapshot`'s sleep-gap cap (`reduce_host_extras`'s
+    /// `configured_interval_ms`) against a scripted ring built with
+    /// `push`/`push_for_test` directly.
+    #[cfg(test)]
+    pub(crate) fn set_configured_interval_for_test(&self, ms: u64) {
+        self.configured_interval_ms.store(ms, Ordering::Relaxed);
     }
 
     /// The `load` block for `GET /machine/resources` (host-sample-shape v2 —
@@ -189,7 +211,15 @@ impl HostSamplerRing {
                 thermal: e.sample.thermal.clone(),
             })
             .collect();
-        let ex = reduce_host_extras(&extras);
+        // `0` means "spawn never configured this ring" (a `push_for_test`-
+        // only ring in a test, or a snapshot taken before `spawn` ran) —
+        // translated to `None` so the sleep-gap cap has nothing to guess a
+        // cadence from.
+        let configured_interval_ms = match self.configured_interval_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(ms),
+        };
+        let ex = reduce_host_extras(&extras, configured_interval_ms);
         // `unwrap`s below are safe: `raw` is non-empty because `latest`
         // (from `g.back()?` above) proved the ring holds at least one entry.
         let span_ms = raw.last().unwrap().at_ms.saturating_sub(raw.first().unwrap().at_ms);
@@ -284,6 +314,10 @@ pub(crate) fn spawn(
     if interval_ms == 0 {
         return None;
     }
+    // `snapshot`'s sleep-gap cap (`reduce_host_extras`) reads this back —
+    // recorded here, once, rather than re-resolved from config on every
+    // request.
+    ring.configured_interval_ms.store(interval_ms, Ordering::Relaxed);
     let interval = Duration::from_millis(interval_ms);
     Some(std::thread::spawn(move || {
         let mut probe = HostProbe::new();
@@ -386,6 +420,13 @@ mod tests {
     #[test]
     fn snapshot_carries_the_2108_blocks_when_the_probe_read_them() {
         let ring = HostSamplerRing::new();
+        // A real daemon ring always has this set — `spawn` is the only
+        // production path that populates the ring with real probe reads,
+        // and it records the cadence before the first sample lands. Setting
+        // it here makes this test representative of what `snapshot`
+        // actually returns in production, including the sleep-gap cap
+        // below (#2108 review finding).
+        ring.set_configured_interval_for_test(5000);
         let mk = |at_ms: u64| RingEntry {
             at_ms,
             sample: HostSampleFull {
@@ -412,7 +453,9 @@ mod tests {
             },
         };
         ring.push(mk(0));
-        // Exactly one hour apart, so the energy integral is a round number.
+        // A full hour apart — far past the 5000ms cadence's 3x/15000ms cap,
+        // deliberately: this pins that the cap engages, not the pre-fix
+        // "held continuously for the whole gap" arithmetic.
         ring.push(mk(3_600_000));
 
         let v = ring.snapshot().expect("samples present");
@@ -435,9 +478,13 @@ mod tests {
         assert_eq!(v["window"]["power_mw"]["total"]["max"], 1230);
         assert_eq!(v["window"]["thermal"]["worst_state"], "nominal");
         assert_eq!(v["window"]["thermal"]["min_cpu_speed_limit_pct"], 100);
-        // 1230 mW held for exactly one hour → 1230 mWh.
+        // (#2108 review finding) 1230 mW held for the FULL one-hour gap
+        // would be 1230 mWh — that was the bug: a left-Riemann sum with no
+        // cap bills a sleep/wake gap as if the pre-sleep reading held
+        // throughout. Capped at 3x the 5000ms cadence (15000ms):
+        // 1230 * 15000 / 3.6e6 = 5.125 mWh.
         let e = v["window"]["energy_mwh"].as_f64().expect("energy");
-        assert!((e - 1230.0).abs() < 0.001, "got {e}");
+        assert!((e - 5.125).abs() < 0.001, "got {e}, expected the capped 5.125 mWh, not 1230");
     }
 
     #[test]

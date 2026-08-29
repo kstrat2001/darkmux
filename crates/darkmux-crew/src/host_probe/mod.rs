@@ -199,6 +199,14 @@ fn reduce_mw(vals: &[f64]) -> MwStats {
     }
 }
 
+/// A pair's dt is capped at this multiple of the configured cadence before
+/// it feeds any left-Riemann sum. `3` gives normal jitter (a slow tick, a
+/// GC pause, a couple of dropped samples) plenty of room while still
+/// catching the failure this guards against: a laptop sleep/wake, a daemon
+/// restart, or any other multi-minute-or-longer gap between two ring
+/// entries. See [`reduce_host_extras`]'s doc for the bug this closes.
+const MAX_GAP_CADENCE_MULTIPLE: u64 = 3;
+
 /// Reduce a sample series' power + thermal readings.
 ///
 /// Pure and independently testable — a scripted list of [`HostExtraAt`] in,
@@ -207,7 +215,25 @@ fn reduce_mw(vals: &[f64]) -> MwStats {
 /// two are applied to the same sample series by the same callers, and a
 /// divergence in convention between them would surface as two numbers on one
 /// screen that disagree for no visible reason.
-pub fn reduce_host_extras(raw: &[HostExtraAt]) -> HostExtras {
+///
+/// `configured_interval_ms` is the sampler's OWN configured cadence (never
+/// derived from `raw` itself — a derived "typical gap" is exactly the
+/// statistic a single huge outlier would corrupt). It bounds how much
+/// elapsed time any ONE consecutive pair may contribute to a left-Riemann
+/// sum, at [`MAX_GAP_CADENCE_MULTIPLE`]× the cadence. Without this cap, a
+/// laptop that slept for 8 hours between two ring entries billed the ENTIRE
+/// sleep gap at whatever power/thermal reading was captured the instant
+/// before sleep — `energy_mwh` and `above_nominal_ms` both silently
+/// inherited hours of a reading that was never actually sustained. `None`
+/// (cadence unknown — e.g. a ring the sampler thread never configured) skips
+/// the cap entirely rather than guessing one.
+pub fn reduce_host_extras(raw: &[HostExtraAt], configured_interval_ms: Option<u64>) -> HostExtras {
+    let cap_ms = configured_interval_ms.map(|c| c.saturating_mul(MAX_GAP_CADENCE_MULTIPLE));
+    let capped_gap = |a: u64, b: u64| -> u64 {
+        let gap = b.saturating_sub(a);
+        cap_ms.map_or(gap, |cap| gap.min(cap))
+    };
+
     let cpu: Vec<f64> = raw.iter().filter_map(|s| s.power.map(|p| p.cpu_mw)).collect();
     let gpu: Vec<f64> = raw.iter().filter_map(|s| s.power.map(|p| p.gpu_mw)).collect();
     let total: Vec<f64> = raw
@@ -225,13 +251,15 @@ pub fn reduce_host_extras(raw: &[HostExtraAt]) -> HostExtras {
     // assumption between two point-in-time measurements. mW × ms / 3.6e6 =
     // mWh. A trailing sample with no successor contributes nothing (it has
     // no measured interval to attribute), which undercounts a window cut off
-    // mid-spike rather than overcounting one that wasn't.
+    // mid-spike rather than overcounting one that wasn't. Each pair's gap is
+    // capped (see `capped_gap`) so a sleep/wake or restart between two
+    // entries can't bill hours of pre-sleep power as if it held throughout.
     let energy_mwh = power.is_some().then(|| {
         let joules: f64 = raw
             .windows(2)
             .filter_map(|w| {
                 let p = w[0].power?;
-                let gap = w[1].at_ms.saturating_sub(w[0].at_ms) as f64;
+                let gap = capped_gap(w[0].at_ms, w[1].at_ms) as f64;
                 Some(p.total_mw() * gap / 3.6e6)
             })
             .sum();
@@ -249,6 +277,8 @@ pub fn reduce_host_extras(raw: &[HostExtraAt]) -> HostExtras {
             .max_by_key(|t| thermal_severity(&t.state))
             .map(|t| t.state.clone())
             .unwrap_or_else(|| "nominal".to_string());
+        // Same cap as the energy sum above — a sleep/wake gap must not bill
+        // hours of "above nominal" from a single pre-sleep reading.
         let above_nominal_ms: u64 = raw
             .windows(2)
             .filter(|w| {
@@ -256,7 +286,7 @@ pub fn reduce_host_extras(raw: &[HostExtraAt]) -> HostExtras {
                     .as_ref()
                     .is_some_and(|t| t.state != "nominal")
             })
-            .map(|w| w[1].at_ms.saturating_sub(w[0].at_ms))
+            .map(|w| capped_gap(w[0].at_ms, w[1].at_ms))
             .sum();
         let min_cpu_speed_limit_pct = raw
             .iter()
@@ -584,7 +614,7 @@ mod tests {
 
     #[test]
     fn empty_series_reduces_to_all_none() {
-        let x = reduce_host_extras(&[]);
+        let x = reduce_host_extras(&[], None);
         assert_eq!(x, HostExtras::default());
         assert!(x.power.is_none() && x.thermal.is_none() && x.energy_mwh.is_none());
     }
@@ -596,7 +626,7 @@ mod tests {
             at(1000, p(3000.0, 20.0, 0.0), None),
             at(2000, p(2000.0, 30.0, 0.0), None),
         ];
-        let w = reduce_host_extras(&raw).power.expect("power measured");
+        let w = reduce_host_extras(&raw, None).power.expect("power measured");
         assert_eq!(w.cpu.mean_mw, Some(2000.0));
         assert_eq!(w.cpu.max_mw, Some(3000));
         assert_eq!(w.cpu.p95_mw, Some(3000), "nearest-rank on 3 samples is the max");
@@ -610,7 +640,7 @@ mod tests {
     fn energy_is_left_riemann_over_measured_gaps() {
         // 3600 mW held for 1000 ms → 3600 * 1000 / 3.6e6 = 1.0 mWh.
         let raw = vec![at(0, p(3600.0, 0.0, 0.0), None), at(1000, p(0.0, 0.0, 0.0), None)];
-        let e = reduce_host_extras(&raw).energy_mwh.expect("energy measured");
+        let e = reduce_host_extras(&raw, None).energy_mwh.expect("energy measured");
         assert!((e - 1.0).abs() < 1e-9, "got {e}");
     }
 
@@ -621,7 +651,7 @@ mod tests {
             at(0, p(1000.0, 0.0, 0.0), None),
             at(1111, p(0.0, 0.0, 0.0), None),
         ];
-        let e = reduce_host_extras(&raw).energy_mwh.expect("energy");
+        let e = reduce_host_extras(&raw, None).energy_mwh.expect("energy");
         assert_eq!(
             e, 0.309,
             "no sampler at a 1-5s cadence justifies more than microwatt-hour precision"
@@ -632,25 +662,69 @@ mod tests {
     fn energy_ignores_a_trailing_sample_with_no_successor() {
         // One sample alone bounds no interval → 0 mWh, not a fabricated one.
         let raw = vec![at(0, p(3600.0, 0.0, 0.0), None)];
-        assert_eq!(reduce_host_extras(&raw).energy_mwh, Some(0.0));
+        assert_eq!(reduce_host_extras(&raw, None).energy_mwh, Some(0.0));
     }
 
     #[test]
     fn energy_uses_the_measured_gap_not_a_nominal_cadence() {
         // Same power, a 2x longer gap → 2x the energy.
-        let a = reduce_host_extras(&[
-            at(0, p(3600.0, 0.0, 0.0), None),
-            at(1000, p(0.0, 0.0, 0.0), None),
-        ])
+        let a = reduce_host_extras(
+            &[at(0, p(3600.0, 0.0, 0.0), None), at(1000, p(0.0, 0.0, 0.0), None)],
+            None,
+        )
         .energy_mwh
         .unwrap();
-        let b = reduce_host_extras(&[
-            at(0, p(3600.0, 0.0, 0.0), None),
-            at(2000, p(0.0, 0.0, 0.0), None),
-        ])
+        let b = reduce_host_extras(
+            &[at(0, p(3600.0, 0.0, 0.0), None), at(2000, p(0.0, 0.0, 0.0), None)],
+            None,
+        )
         .energy_mwh
         .unwrap();
         assert!((b - 2.0 * a).abs() < 1e-9, "{b} should be 2x {a}");
+    }
+
+    // (#2108 review finding) A laptop sleeping for hours between two ring
+    // entries is exactly the shape a left-Riemann sum can't tell apart from
+    // "the pre-sleep reading held continuously the whole time" — these three
+    // tests pin the cap that closes it.
+    #[test]
+    fn energy_caps_a_gap_that_outruns_the_configured_cadence() {
+        // Configured cadence 5000 ms → cap at 3x = 15000 ms. Without the
+        // cap, this pair would report 3600 * 28_800_000 / 3.6e6 = 28800 mWh
+        // — 8 hours of "held continuously" from one pre-sleep reading.
+        let eight_hours_ms = 8 * 60 * 60 * 1000;
+        let raw = vec![
+            at(0, p(3600.0, 0.0, 0.0), None),
+            at(eight_hours_ms, p(0.0, 0.0, 0.0), None),
+        ];
+        let e = reduce_host_extras(&raw, Some(5000)).energy_mwh.expect("energy measured");
+        assert_eq!(e, 15.0, "capped at 3x the 5000ms cadence (15000ms), not the 8-hour gap");
+    }
+
+    #[test]
+    fn energy_is_uncapped_when_the_cadence_is_unknown() {
+        // `None` (a ring the sampler thread never configured — e.g. a
+        // `push_for_test`-only ring in a test) skips the cap entirely,
+        // rather than guessing a cadence from data a single huge gap would
+        // itself corrupt.
+        let eight_hours_ms = 8 * 60 * 60 * 1000;
+        let raw = vec![
+            at(0, p(3600.0, 0.0, 0.0), None),
+            at(eight_hours_ms, p(0.0, 0.0, 0.0), None),
+        ];
+        let e = reduce_host_extras(&raw, None).energy_mwh.expect("energy measured");
+        assert_eq!(e, 28800.0, "no configured cadence ⇒ no cap");
+    }
+
+    #[test]
+    fn thermal_above_nominal_caps_a_sleep_gap_too() {
+        // Same cap, same reasoning, the OTHER left-Riemann sum in this
+        // function — a pre-sleep "serious" reading must not bill 8 hours of
+        // "above nominal" against a machine that was actually asleep.
+        let eight_hours_ms = 8 * 60 * 60 * 1000;
+        let raw = vec![at(0, None, t("serious", 62)), at(eight_hours_ms, None, t("nominal", 100))];
+        let w = reduce_host_extras(&raw, Some(5000)).thermal.expect("thermal measured");
+        assert_eq!(w.above_nominal_ms, 15_000, "capped, not the full 8-hour sleep gap");
     }
 
     #[test]
@@ -660,7 +734,7 @@ mod tests {
             at(1000, None, t("serious", 62)),
             at(2000, None, t("fair", 80)),
         ];
-        let w = reduce_host_extras(&raw).thermal.expect("thermal measured");
+        let w = reduce_host_extras(&raw, None).thermal.expect("thermal measured");
         assert_eq!(w.worst_state, "serious");
         assert_eq!(w.min_cpu_speed_limit_pct, 62);
         // Left-Riemann: the `serious` sample at 1000 holds until 2000.
@@ -673,7 +747,7 @@ mod tests {
             at(0, None, t("critical", 50)),
             at(1000, None, t("unknown-9", 100)),
         ];
-        let w = reduce_host_extras(&raw).thermal.expect("thermal measured");
+        let w = reduce_host_extras(&raw, None).thermal.expect("thermal measured");
         assert_eq!(
             w.worst_state, "unknown-9",
             "a state this build doesn't know is not evidence that nothing was wrong"
@@ -683,7 +757,7 @@ mod tests {
     #[test]
     fn thermal_absent_from_every_sample_reduces_to_none() {
         let raw = vec![at(0, p(1.0, 1.0, 1.0), None), at(1000, p(1.0, 1.0, 1.0), None)];
-        let x = reduce_host_extras(&raw);
+        let x = reduce_host_extras(&raw, None);
         assert!(x.thermal.is_none(), "no thermal source ⇒ no thermal block");
         assert!(x.power.is_some(), "…but power still reduces");
     }
@@ -691,7 +765,7 @@ mod tests {
     #[test]
     fn power_absent_from_every_sample_reduces_to_none() {
         let raw = vec![at(0, None, t("nominal", 100)), at(1000, None, t("nominal", 100))];
-        let x = reduce_host_extras(&raw);
+        let x = reduce_host_extras(&raw, None);
         assert!(x.power.is_none() && x.energy_mwh.is_none());
         assert!(x.thermal.is_some());
     }
@@ -704,7 +778,7 @@ mod tests {
             at(1000, p(2000.0, 0.0, 0.0), None),
             at(2000, p(2000.0, 0.0, 0.0), None),
         ];
-        let w = reduce_host_extras(&raw).power.expect("power measured");
+        let w = reduce_host_extras(&raw, None).power.expect("power measured");
         assert_eq!(w.cpu.mean_mw, Some(2000.0), "the null sample must not drag the mean to 1333");
     }
 
