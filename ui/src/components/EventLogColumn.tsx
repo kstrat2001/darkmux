@@ -563,29 +563,34 @@ export function EventLogColumn({
           sets `pushedDetailOpen`), never via `follow`'s passive
           re-selection — see `pushedDetailOpen`'s own doc above.
 
-          Two additions over the #2107 original: `.eventlog__back` now
-          reads as a real full-width bar (≥44px tall, the Apple
-          tap-target floor) rather than a small text link — the
-          coordinator's own ask, "a clear back control ... that returns
-          to the list at the same scroll position" (the scroll-position
-          half is `listBodyRef`/`savedScrollRef`'s own doc above, not
-          CSS) — and the SAME one-row strip summary
-          (`.eventlog__rec--strip`) the retired expand mode used to show,
-          so the pushed screen still names WHICH record it's showing
-          without scrolling up into `EventDetail`'s own body to find the
-          timestamp again. */}
+          (#2108, operator finding — real phone, round 5) The separate
+          `.eventlog__back` bar this comment used to describe wasted a
+          whole row — REMOVED. The one-row strip summary
+          (`.eventlog__rec--strip`, the SAME one the retired expand mode
+          used to show) is now the back control itself: `role="button"`,
+          a real ≥44px tap target (`.eventlog__rec--stripback`'s own
+          CSS), an accessible name naming what tapping it DOES ("Back to
+          list", not just describing the strip), and a leading muted
+          ‹ glyph in the row's own left gutter (where `.sel`'s accent
+          bar already lives) so the affordance is discoverable without a
+          separate row. `eventlog__rec--stripback` is a SEPARATE class
+          from `eventlog__rec--strip` deliberately: the split/expand
+          mode's own strip (below, `!pushDetail` branch) reuses
+          `--strip`'s visual shape but is NOT a back control and must
+          not gain the chevron/tap-target/pressed-state treatment meant
+          only for this one. */}
       {pushDetail && pushedDetailOpen && selected ? (
         <div className="eventlog__pushed" data-act="eventlog-pushed">
-          <button
-            type="button"
-            className="eventlog__back"
-            data-act="eventlog-back"
-            aria-label="back to the event list"
+          <div
+            className="eventlog__rec sel eventlog__rec--strip eventlog__rec--stripback"
+            data-act="rec-strip"
+            role="button"
+            tabIndex={0}
+            aria-label="Back to list"
             onClick={() => setPushedDetailOpen(false)}
+            onKeyDown={onActivateKeyDown(() => setPushedDetailOpen(false))}
           >
-            {"\u2039"} list
-          </button>
-          <div className="eventlog__rec sel eventlog__rec--strip" data-act="rec-strip">
+            <span className="eventlog__stripback-icon" aria-hidden="true">{"\u2039"}</span>
             <span className="eventlog__rectime">{clk(Date.parse(selected.ts))}</span>{" "}
             <ActivityIcon act={activityOf(selected)} />
             <span className="eventlog__ractivity">{activityOf(selected)}</span>

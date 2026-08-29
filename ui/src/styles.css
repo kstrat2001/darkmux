@@ -1090,31 +1090,56 @@ body {
   flex: 1;
   min-height: 0;
 }
-/* A real bar, not a small text link — the operator's own ask ("a clear
-   back control ... ≥44 px tall"). `min-height: 44px` is the Apple
-   tap-target floor this codebase uses everywhere else a control needs
-   one (`.nav-tab`, `.phone-drawer__tab`); this one's PAINTED at that
-   height too (not just an invisible `::after` hit-area), since it's the
-   sheet's own "you are in detail, tap here to leave" affordance and
-   should read as one at a glance. */
-.eventlog__back {
-  flex: none;
+/* (#2108, operator finding — real phone, round 5) The strip itself IS
+   the back control now — no separate `.eventlog__back` bar (removed;
+   it wasted a whole row). `.eventlog__rec--strip`'s own base rule
+   (above) already reads `border-bottom: none; cursor: default` for the
+   split/expand mode's non-interactive strip; this modifier OVERRIDES
+   both for the pushed-detail screen's variant, which really is
+   clickable. `min-height: 44px` is the Apple tap-target floor this
+   codebase uses everywhere else a control needs one (`.nav-tab`,
+   `.phone-drawer__tab`); `padding-left` clears room for the chevron
+   glyph in the row's own left "gutter" (where `.sel`'s 2px accent bar
+   already lives — `.eventlog__rec.sel`'s own rule, not overridden
+   here) without it colliding with the timestamp.
+
+   Compound selector `.eventlog__rec.eventlog__rec--stripback`, not the
+   bare modifier class — a real bug, caught in the WebKit screenshot
+   (the chevron painted OVER the timestamp, not beside it): this rule
+   sits BEFORE `.eventlog__rec`'s own base rule (below) in the file, and
+   `padding-left` vs the base rule's `padding: 5px 6px` shorthand are
+   equal specificity as bare classes, so source order decided the
+   winner — the LATER base rule, not this one, meaning the 26px never
+   actually applied. The compound selector's higher specificity wins
+   regardless of where either rule sits, so this can't silently regress
+   again if something gets reordered above it. */
+.eventlog__rec.eventlog__rec--stripback {
+  cursor: pointer;
+  min-height: 44px;
   display: flex;
   align-items: center;
-  gap: 6px;
-  min-height: 44px;
-  padding: 0 12px;
-  border: none;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--accent);
-  font: 600 calc(12px * var(--fs-scale))/1 var(--font-mono);
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  cursor: pointer;
+  padding-left: 26px;
+  position: relative;
 }
-.eventlog__back:hover {
-  color: var(--fg);
+/* A real pressed state, not the incidental `:hover`/`.sel` flash the
+   strip had before it did anything on tap (the operator's own finding:
+   "tapping it flashes the active style but does nothing" — now it does
+   something, and the flash is a deliberate response to that, not a
+   leftover). Distinct from `.sel`'s own `#1a2030` background so a tap
+   reads as a discrete press, not a re-selection. */
+.eventlog__rec.eventlog__rec--stripback:active {
+  background: #232a3d;
+}
+.eventlog__stripback-icon {
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--dim);
+  font-weight: 700;
+  font-size: calc(14px * var(--fs-scale));
+  line-height: 1;
+  pointer-events: none;
 }
 /* The record card's own scroll region — the ONLY one inside the pushed
    screen (the strip above it is fixed, `flex: none`, via the shared

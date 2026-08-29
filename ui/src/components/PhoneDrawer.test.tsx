@@ -338,14 +338,16 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     const pushed = document.querySelector('[data-act="eventlog-pushed"]');
     expect(pushed).not.toBeNull();
     expect(document.querySelector('[data-act="rec"]')).toBeNull();
-    // The one-row strip at the top names WHICH record this is.
+    // The one-row strip at the top names WHICH record this is — and IS
+    // the back control (round 5, operator finding: a separate bar
+    // "wastes a row"; removed). Real, ≥44px control — checked here on
+    // role/label; its painted height is a stylesheet-body concern,
+    // covered by this file's own stylesheet-check tests below.
     const strip = document.querySelector('[data-act="rec-strip"]')!;
     expect(strip.textContent).toContain("note");
-    // The back control is a real, ≥44px control — checked here on
-    // PRESENCE + label; its painted height is a stylesheet-body concern,
-    // covered by this file's own stylesheet-check tests below.
-    const back = document.querySelector('[data-act="eventlog-back"]')!;
-    expect(back.getAttribute("aria-label")).toBe("back to the event list");
+    expect(strip.getAttribute("role")).toBe("button");
+    expect(strip.getAttribute("aria-label")).toBe("Back to list");
+    expect(document.querySelector('[data-act="eventlog-back"]')).toBeNull();
     // `RecordView`'s own key rendering replaces underscores with spaces
     // (`Row`'s `.rv__key`) — asserting on ITS actual output, not a guess.
     const pane = document.querySelector(".eventlog__detailbody--pushed")!;
@@ -356,8 +358,8 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     expect(pane.textContent).toContain("rec-1");
     // No navigation, no hash change — this stays ON the sheet.
     expect(window.location.hash).toBe("");
-    // Tapping back returns to the list, and the pushed screen is gone.
-    fireEvent.click(back);
+    // Tapping the strip returns to the list, and the pushed screen is gone.
+    fireEvent.click(strip);
     expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
     expect(document.querySelectorAll('[data-act="rec"]').length).toBe(2);
   });
@@ -384,9 +386,9 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     fireEvent.click(document.querySelectorAll('[data-act="rec"]')[1]);
     expect(document.querySelector('[data-act="eventlog-pushed"]')).not.toBeNull();
     // The follow control isn't even in the DOM on the pushed screen (see
-    // the test below) — going BACK is what proves it was actually
-    // cleared, not just hidden.
-    fireEvent.click(document.querySelector('[data-act="eventlog-back"]')!);
+    // the test below) — tapping the strip BACK to the list is what
+    // proves it was actually cleared, not just hidden.
+    fireEvent.click(document.querySelector('[data-act="rec-strip"]')!);
     expect(document.getElementById("follow")!.className).not.toContain(" on");
   });
 
@@ -412,10 +414,11 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     );
     fireEvent.click(document.querySelectorAll('[data-act="rec"]')[1]);
     expect(document.querySelector('[data-act="eventlog-pushed"]')).not.toBeNull();
-    // No follow control, no filter row — just the strip, back, and body.
+    // No follow control, no filter row — just the strip (itself the back
+    // control, round 5) and the body.
     expect(document.getElementById("follow")).toBeNull();
     expect(document.querySelector(".eventlog__search")).toBeNull();
-    fireEvent.click(document.querySelector('[data-act="eventlog-back"]')!);
+    fireEvent.click(document.querySelector('[data-act="rec-strip"]')!);
     expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
     // Tapping a row turned follow off (matching desktop's own
     // `selectRecord`); going back doesn't turn it back on.
@@ -438,7 +441,7 @@ describe("PhoneDrawer (#2107 tabbed-drawer packet)", () => {
     // Tap an older row first: turns follow off (per the test above) and
     // scrolls the list, simulating a mid-read position.
     fireEvent.click(document.querySelectorAll('[data-act="rec"]')[1]);
-    fireEvent.click(document.querySelector('[data-act="eventlog-back"]')!);
+    fireEvent.click(document.querySelector('[data-act="rec-strip"]')!);
     (document.getElementById("logbody") as HTMLElement).scrollTop = 120;
     expect(document.getElementById("follow")!.className).not.toContain(" on");
     fireEvent.click(document.getElementById("follow")!);

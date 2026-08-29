@@ -391,10 +391,12 @@ describe("EventLogColumn", () => {
   });
 });
 
-// ── (#2107 tabbed-drawer packet) `pushDetail` — the phone drawer's Events
-// tab interaction model: selecting a record replaces the list with a
-// full-height detail SCREEN carrying a back button, instead of the default
-// split (detail-above-list) layout. ─────────────────────────────────────
+// ── (#2107 tabbed-drawer packet, restyled #2108 round 5) `pushDetail` —
+// the phone drawer's Events tab interaction model: selecting a record
+// replaces the list with a full-height detail SCREEN. The selected-record
+// strip at its top IS the back control (a separate `.eventlog__back` bar
+// was tried and removed — the operator's own finding, "wastes a row").
+// ───────────────────────────────────────────────────────────────────────
 
 describe("EventLogColumn — pushDetail mode", () => {
   it("shows the list, not the split detail/list layout, when nothing is selected yet", () => {
@@ -405,7 +407,7 @@ describe("EventLogColumn — pushDetail mode", () => {
     expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
   });
 
-  it("selecting a record replaces the list with a full-height detail screen carrying a back button", () => {
+  it("selecting a record replaces the list with a full-height detail screen — the strip IS the back control, no separate bar", () => {
     const records = [rec({ session_id: "s1" })];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
     fireEvent.click(document.querySelector('[data-act="rec"]')!);
@@ -413,18 +415,32 @@ describe("EventLogColumn — pushDetail mode", () => {
     expect(pushed).not.toBeNull();
     expect(pushed!.textContent).toContain("s1");
     expect(document.querySelector('[data-act="rec"]')).toBeNull();
-    expect(document.querySelector('[data-act="eventlog-back"]')).not.toBeNull();
+    expect(document.querySelector('[data-act="eventlog-back"]')).toBeNull();
+    const strip = document.querySelector('[data-act="rec-strip"]')!;
+    expect(strip).not.toBeNull();
+    expect(strip.getAttribute("role")).toBe("button");
+    expect(strip.getAttribute("aria-label")).toBe("Back to list");
+    expect(strip.getAttribute("tabindex")).toBe("0");
   });
 
-  it("the back button returns to the list, and the record stays highlighted as selected", () => {
+  it("tapping the strip returns to the list, and the record stays highlighted as selected", () => {
     const records = [rec({ session_id: "s1" })];
     render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
     fireEvent.click(document.querySelector('[data-act="rec"]')!);
-    fireEvent.click(document.querySelector('[data-act="eventlog-back"]')!);
+    fireEvent.click(document.querySelector('[data-act="rec-strip"]')!);
     expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
     const row = document.querySelector('[data-act="rec"]')!;
     expect(row).not.toBeNull();
     expect(row.className).toMatch(/\bsel\b/);
+  });
+
+  it("the strip is keyboard-activatable (Enter/Space), same as any other row", () => {
+    const records = [rec({ session_id: "s1" })];
+    render(<EventLogColumn scopeLabel="fleet" records={records} visible pushDetail />);
+    fireEvent.click(document.querySelector('[data-act="rec"]')!);
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).not.toBeNull();
+    fireEvent.keyDown(document.querySelector('[data-act="rec-strip"]')!, { key: "Enter" });
+    expect(document.querySelector('[data-act="eventlog-pushed"]')).toBeNull();
   });
 
   it("omits the collapse rail entirely — collapsing a drawer TAB makes no sense", () => {
