@@ -6257,7 +6257,7 @@ mod tests {
         // [#2093]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 40 + darkmux_eureka::all_rules().len();
+        let expected = 41 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
