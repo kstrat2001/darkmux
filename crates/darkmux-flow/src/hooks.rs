@@ -287,7 +287,7 @@ fn outbox_paths(outbox_dir: &Path, key: &str) -> (PathBuf, PathBuf) {
 
 /// Sibling of `outbox_paths`' pair — where the rule's last-terminal-outcome
 /// (success or give-up; never an ordinary retry) is recorded, for `darkmux
-/// doctor` and `darkmux flow hooks status`'s "last delivery ts / last
+/// doctor` and `darkmux flow status`'s "last delivery ts / last
 /// error" columns. Same naming scheme, different suffix.
 fn last_status_path(outbox_dir: &Path, key: &str) -> PathBuf {
     outbox_dir.join(format!("{key}.last"))
@@ -297,7 +297,7 @@ fn last_status_path(outbox_dir: &Path, key: &str) -> PathBuf {
 /// heartbeat timestamp, rewritten every drainer poll cycle regardless of
 /// whether that rule had pending work. Cross-process visible (unlike
 /// `HookSink::drainer_alive()`, which only reflects the CALLING process's
-/// own in-memory thread handle) — a SEPARATE `flow hooks status`/`doctor`
+/// own in-memory thread handle) — a SEPARATE `flow status`/`doctor`
 /// invocation reads this to tell "drainer cycling" from "drainer dead"
 /// for a `HookSink` running in a different process. Best-effort, no
 /// atomic rename: a torn write here just gets overwritten next cycle
@@ -320,7 +320,7 @@ fn drain_lock_path(outbox_dir: &Path, key: &str) -> PathBuf {
 
 /// (#2093 merge-gate finding 9) Sibling of `outbox_paths`' pair — where
 /// the LIVE `dropped_appends` counter is persisted, so a SEPARATE process
-/// invocation (`darkmux doctor`, `darkmux flow hooks status`) can see
+/// invocation (`darkmux doctor`, `darkmux flow status`) can see
 /// drops a currently- or previously-running dispatch process counted
 /// in-memory. Plain text, same shape as the `.cursor` file.
 fn dropped_appends_path(outbox_dir: &Path, key: &str) -> PathBuf {
@@ -379,7 +379,7 @@ struct LastStatus {
     /// (fix-round finding 1) Consecutive cursor-write failures against
     /// this rule's `.cursor` file — the same counter `SinkInfo` exposes
     /// live (`rule{idx}_cursor_write_failures`), persisted here so a
-    /// SEPARATE `darkmux doctor` / `flow hooks status` process
+    /// SEPARATE `darkmux doctor` / `flow status` process
     /// invocation can see it too. Lenient-on-read: absent in a sidecar
     /// written before this field existed, defaults to 0.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
@@ -457,7 +457,7 @@ fn read_last_status(path: &Path) -> Option<LastStatus> {
 /// / cursor / last-status file paths it owns. `HookSink::new` builds these
 /// (and refuses the WHOLE sink on the first invalid rule);
 /// `summarize_configured_rules` builds an unvalidated variant for read-only
-/// introspection (doctor, `flow hooks status`) that never bails.
+/// introspection (doctor, `flow status`) that never bails.
 #[derive(Debug, Clone)]
 pub struct ResolvedRule {
     pub index: usize,
@@ -509,8 +509,7 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
 }
 
 /// (fix-round finding 8) Non-blocking probe: which of `rules`' drain
-/// locks are held by ANOTHER process/thread right now. `flow hooks
-/// drain` uses this, after a bounded wait comes up short, to tell "a
+/// locks are held by ANOTHER process/thread right now. `flow drain` uses this, after a bounded wait comes up short, to tell "a
 /// live dispatch process's own drainer is already working this rule" —
 /// a specific, actionable reason — from an ordinary down/slow receiver.
 /// Best-effort and inherently racy (a drain lock is only held for the
@@ -529,7 +528,7 @@ pub fn rules_with_drain_lock_held_elsewhere(rules: &[HookRule], outbox_dir: &Pat
 }
 
 /// A read-only summary of one configured rule, for `darkmux doctor` and
-/// `darkmux flow hooks status` — never bails (an invalid URL is reported
+/// `darkmux flow status` — never bails (an invalid URL is reported
 /// AS a field, not an error), and never touches the network.
 #[derive(Debug, Clone)]
 pub struct HookRuleSummary {
@@ -552,7 +551,7 @@ pub struct HookRuleSummary {
     /// (#2093 merge-gate finding 9) Writes refused for this rule so far —
     /// either the hard cap (finding 5) or an outbox append failure.
     /// Read from the PERSISTED counter (`dropped_appends_path`), so this
-    /// is visible from a separate `darkmux doctor` / `flow hooks status`
+    /// is visible from a separate `darkmux doctor` / `flow status`
     /// process invocation, not just a live in-process `HookSink`.
     pub dropped_appends: u64,
     /// (fix-round finding 1) Consecutive cursor-write failures against
@@ -611,7 +610,7 @@ fn describe_match(m: &HookMatch) -> String {
 }
 
 /// Build a read-only summary of every configured rule — used by
-/// `darkmux doctor` and `darkmux flow hooks status`. Unlike
+/// `darkmux doctor` and `darkmux flow status`. Unlike
 /// `resolve_rules`, this never bails: an invalid URL shows up as
 /// `is_loopback: false` rather than an error, so the caller can report ALL
 /// rules' problems at once instead of stopping at the first.
@@ -821,8 +820,7 @@ fn next_pending_line(outbox_path: &Path, cursor: u64) -> Option<(String, u64)> {
 }
 
 /// Count of fully-committed (newline-terminated) lines at or after
-/// `cursor` — the "undelivered" count `darkmux doctor` / `flow hooks
-/// status` report.
+/// `cursor` — the "undelivered" count `darkmux doctor` / `flow status` report.
 ///
 /// (#2093 merge-gate finding 5) Streams through a `BufReader` in fixed-
 /// size chunks rather than `read_to_string`-ing the whole tail into one
@@ -1095,7 +1093,7 @@ struct RuleRuntime {
     /// counter) Appends refused for this rule — either because its
     /// undelivered bytes were already over `hooks.max_outbox_mb` (finding
     /// 5), or because the outbox append itself failed (finding 9, e.g. an
-    /// unwritable/full disk). Surfaced by `flow hooks status` and
+    /// unwritable/full disk). Surfaced by `flow status` and
     /// `doctor`; never reset — a monotonically growing count across the
     /// process lifetime is the honest shape for "how much did we lose."
     dropped_appends: AtomicU64,
@@ -1606,8 +1604,7 @@ impl HookSink {
     ///
     /// (fix-round finding 3) This reads an in-process `JoinHandle` — it
     /// is surfaced in `SinkInfo`/`flow status --json` for THIS process's
-    /// own `HookSink` only. A separate `darkmux doctor`/`flow hooks
-    /// status` invocation (a different process) cannot observe it and
+    /// own `HookSink` only. A separate `darkmux doctor`/`flow status` invocation (a different process) cannot observe it and
     /// falls back to `HookRuleSummary::last_drainer_heartbeat` instead —
     /// a per-rule timestamp the drainer rewrites every poll cycle
     /// (`heartbeat_path`), which IS cross-process visible.
@@ -2860,7 +2857,7 @@ mod tests {
 
         // (#2093 merge-gate finding 9) The drop must be visible to a
         // SEPARATE process invocation, not just this in-process counter
-        // — `summarize_configured_rules` (what `flow hooks status` /
+        // — `summarize_configured_rules` (what `flow status` /
         // `doctor` actually call) reads it fresh from disk.
         let summaries = summarize_configured_rules(&rules, tmp.path());
         assert_eq!(summaries[0].dropped_appends, 1, "cross-process visible via the persisted counter");
@@ -2983,7 +2980,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let receiver = HookReceiver::start();
         // A stray outbox: no config rule owns this key any more — seeded
-        // directly, exactly as `darkmux doctor`/`flow hooks status` would
+        // directly, exactly as `darkmux doctor`/`flow status` would
         // find one left behind by a removed rule.
         let outbox_path = tmp.path().join("127.0.0.1-9999-deadbeefdeadbeef.outbox.jsonl");
         std::fs::write(&outbox_path, "{\"action\":\"work.a\"}\n{\"action\":\"work.b\"}\n").unwrap();

@@ -575,7 +575,7 @@ pub struct HooksConfig {
     /// exists precisely so it doesn't have to), but without a ceiling an
     /// indefinitely-down receiver turns "buffer while down" into
     /// "consume disk without bound." Past this cap, new records for that
-    /// rule are dropped (counted, surfaced in `flow hooks status` and
+    /// rule are dropped (counted, surfaced in `flow status` and
     /// `doctor`, and named in a rate-limited `hook.failed`) rather than
     /// grown further — other rules and every other sink are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_outbox_mb: Option<u64>,

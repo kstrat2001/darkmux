@@ -1621,7 +1621,7 @@ fn build_hooks_check(
             status: Status::Warn,
             message: format!("{} outbox file(s) belong to no currently-configured rule: {}", stray.len(), details.join(", ")),
             hint: Some(
-                "A rule was removed or edited since these were written. `darkmux flow hooks drain --file <path> \
+                "A rule was removed or edited since these were written. `darkmux flow drain --file <path> \
                  --to <loopback url>` delivers a stray file's undelivered lines before you delete it; once \
                  undelivered is 0, it (and its sibling sidecars) are safe to remove."
                     .into(),
