@@ -4,10 +4,11 @@ import {
   screen,
   fireEvent,
   waitFor,
+  act,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MachineDrawer } from "./MachineDrawer";
-import { closeOpenModal } from "../lib/dialogManager";
+import { closeOpenModal, openModalEl } from "../lib/dialogManager";
 import type { FlowRecord } from "../types/handwritten";
 
 const proc = (
@@ -91,12 +92,22 @@ afterEach(() => {
   closeOpenModal({ restore: false });
 });
 
-function pill() {
-  return screen.getByRole("button", { name: MACHINE_INFO_LABEL });
+/** (#2108, operator finding) There is no in-component desktop trigger any
+ * more — `MachineDrawer.tsx` on desktop now renders ONLY `<Dialog
+ * id="imodalbg">`, no button of its own. Every desktop test in this file
+ * that used to `fireEvent.click(pill())` now opens the SAME shared
+ * `dialogManager` store directly, the way the masthead's own ⓘ
+ * (`Masthead.tsx`, not rendered by these component-level tests) actually
+ * does it in the real app. Wrapped in `act` since this mutates external
+ * store state outside any React event handler React itself dispatched. */
+function openDesktop() {
+  act(() => {
+    openModalEl("imodalbg");
+  });
 }
 
 describe("MachineDrawer (#2107)", () => {
-  it("renders the pill as a static 'Machine info' label, closed by default — no live number even with samples present", () => {
+  it("(#2108) renders no floating trigger of its own on desktop — the masthead ⓘ is the only affordance", () => {
     const rolling = [proc("2026-01-01T00:19:00Z", 10, 68, 20)];
     render(
       <MachineDrawer
@@ -111,12 +122,15 @@ describe("MachineDrawer (#2107)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    expect(pill()).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: MACHINE_INFO_LABEL }),
+    ).toBeNull();
+    expect(document.querySelector('[data-act="machine-drawer-pill"]')).toBeNull();
     expect(screen.queryByText(/GPU 68%/)).toBeNull();
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("opens the dialog on pill click and shows all three meters", () => {
+  it("opens on the shared dialog store and shows all three meters", () => {
     const rolling = [proc("2026-01-01T00:19:00Z", 10, 68, 20)];
     render(
       <MachineDrawer
@@ -131,7 +145,7 @@ describe("MachineDrawer (#2107)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByText("CPU")).toBeInTheDocument();
     expect(screen.getByText("GPU")).toBeInTheDocument();
@@ -176,7 +190,7 @@ describe("MachineDrawer (#2107)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     fireEvent.click(document.querySelector("#imodalbg .dialog__close")!);
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -196,7 +210,7 @@ describe("MachineDrawer (#2107)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     fireEvent.click(document.getElementById("imodalbg")!);
     expect(screen.queryByRole("dialog")).toBeNull();
   });
@@ -215,29 +229,8 @@ describe("MachineDrawer (#2107)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     fireEvent.keyDown(document, { key: "Escape" });
-    expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
-  it("clicking the pill again while open closes it (toggle)", () => {
-    render(
-      <MachineDrawer
-        route={{ kind: "fleet" }}
-        routeRecords={[]}
-        flowWindow={[]}
-        localUid={null}
-        nowMsOverride={NOW}
-        liveMachines={new Map()}
-        specs={null}
-        liveStatus="live"
-        {...EMPTY_EVENTLOG}
-      />,
-    );
-    const p = pill();
-    fireEvent.click(p);
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
-    fireEvent.click(p);
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
@@ -256,7 +249,7 @@ describe("MachineDrawer (#2107)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     expect(screen.getByText("this mission")).toBeInTheDocument();
     expect(
       document.querySelector('[data-meter="gpu"] .meter-now')?.textContent,
@@ -301,7 +294,7 @@ describe("MachineDrawer (#2107)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     // Scoped to the identity line specifically — "MacBook-Pro" and
     // "M5 Max" also appear in the about section's own machine/hardware
     // rows below it, which would make an unscoped `getByText` ambiguous.
@@ -325,8 +318,41 @@ describe("MachineDrawer (#2107)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     expect(document.querySelector(".machine-drawer__identity")).toBeNull();
+  });
+
+  // (#2108, operator finding) The external links row (github/guide/
+  // articles/home) is REMOVED from the about section — neither surface
+  // shows it any more.
+  it("(#2108) does not render the external links row", () => {
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    expect(screen.queryByText("links")).toBeNull();
+    expect(
+      document.querySelector('a[href="https://github.com/kstrat2001/darkmux"]'),
+    ).toBeNull();
+    expect(
+      document.querySelector('a[href="https://darkmux.com/guide/"]'),
+    ).toBeNull();
+    expect(
+      document.querySelector('a[href="https://darklyenergized.substack.com"]'),
+    ).toBeNull();
+    expect(
+      document.querySelector('a[href="https://darkmux.com/"]'),
+    ).toBeNull();
   });
 });
 
@@ -351,7 +377,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     expect(screen.getByText("daemon does not sample yet")).toBeInTheDocument();
     expect(document.querySelector(".meter-row")).toBeNull();
   });
@@ -377,7 +403,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     expect(screen.getByText(/last sample 1h ago/)).toBeInTheDocument();
     expect(screen.getByText(/CPU 40%/)).toBeInTheDocument();
     expect(screen.getByText(/GPU 55%/)).toBeInTheDocument();
@@ -399,7 +425,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     expect(screen.queryByText(/idle ·/)).toBeNull();
     expect(document.querySelector(".meter-row")).not.toBeNull();
   });
@@ -521,9 +547,12 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
       />,
     );
     expect(document.querySelector('[data-act="phone-drawer-bar"]')).toBeNull();
+    // (#2108, operator finding) No floating trigger on desktop any more —
+    // just the dialog shell (openable via `dialogManager`, same as the
+    // masthead's own ⓘ), never the phone bar.
     expect(
       document.querySelector('[data-act="machine-drawer-pill"]'),
-    ).not.toBeNull();
+    ).toBeNull();
   });
 });
 
@@ -565,24 +594,37 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     messages: [],
     cache_ttl_ms: 2000,
     load: {
-      now: { cpu_pct: 12, mem_pct: 34, gpu_pct: 56, sampled_at_ms: 4000 },
+      now: {
+        sampled_at_ms: 4000,
+        sampler_cost_ms: 4.2,
+        cpu_pct: 12,
+        cpu_clusters: null,
+        mem_pct: 34,
+        gpu_pct: 56,
+        gpu_mhz: null,
+        gpu_mem_bytes: null,
+        thermal: null,
+        power_mw: null,
+      },
       window: {
-        cpu: { mean_pct: 10, p95_pct: 15, max_pct: 20 },
-        mem: { mean_pct: 30, p95_pct: 35, max_pct: 40 },
-        gpu: { mean_pct: 50, p95_pct: 55, max_pct: 60 },
         samples: 3,
         interval_ms: 2000,
         span_ms: 90_000, // 90s — under 10 min, so the label must say "2 min", not "10 min"
+        cpu_pct: { mean: 10, p95: 15, max: 20 },
+        mem_pct: { mean: 30, p95: 35, max: 40 },
+        gpu_pct: { mean: 50, p95: 55, max: 60 },
+        power_mw: null,
+        thermal: null,
+        energy_mwh: null,
       },
-      sampler_cost_ms_mean: 4.2,
     },
   };
 
-  function stubDaemonFetch() {
+  function stubDaemonFetch(payload: unknown = RESOURCES_WITH_LOAD) {
     const fetchMock = vi.fn((url: string) => {
       if (String(url) === "/machine/resources") {
         return Promise.resolve(
-          new Response(JSON.stringify(RESOURCES_WITH_LOAD), { status: 200 }),
+          new Response(JSON.stringify(payload), { status: 200 }),
         );
       }
       return Promise.reject(new Error(`unexpected fetch in this test: ${url}`));
@@ -591,7 +633,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     return fetchMock;
   }
 
-  it("closed: zero fetches — the pill shows the static label with no network activity", () => {
+  it("closed: zero fetches — no dialog open, no network activity", () => {
     const fetchMock = stubDaemonFetch();
     render(
       <MachineDrawer
@@ -606,7 +648,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    expect(pill()).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -629,7 +671,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     expect(
       screen.queryByText("daemon does not sample yet"),
     ).toBeInTheDocument(); // pre-resolve
@@ -659,7 +701,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
     // 90_000ms span → 2 minutes, not the ring's 10-minute ceiling.
     await waitFor(() =>
       expect(
@@ -689,7 +731,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
         {...EMPTY_EVENTLOG}
       />,
     );
-    fireEvent.click(pill());
+    openDesktop();
 
     // The body's `now` reading is overridden to the daemon's 56%, even
     // though the mission's own last sample was GPU 55%.
@@ -703,5 +745,211 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     // avg/max stay the mission's OWN dispatch-derived numbers (55, the
     // single sample's own value), not the daemon's window (50/60).
     expect(screen.getByText(/55% avg/)).toBeInTheDocument();
+  });
+});
+
+// ── (#2108, host-sample-shape v2) thermal/power/CPU-cluster rows ──────────
+//
+// `HostExtras` (`machineStatsContent.tsx`) reads `daemonLoad.now`/`.window`
+// directly — independent of `agg`/`isIdle` — so these rows render off the
+// SAME single resolved `/machine/resources` fetch the CPU/GPU/MEM meters
+// already use above. Exercised through BOTH the desktop dialog and the
+// phone drawer's Machine tab, since both render the exact same
+// `useMachineStatsContent` body (see that hook's own doc).
+describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", () => {
+  const FULL_LOAD = {
+    schema_version: "1",
+    generated_at_ms: 1,
+    gather_ms: 1,
+    limit_bytes: 1,
+    limit_source: "test",
+    pool: { capacity_bytes: 1, used_bytes: 1, available_bytes: 1, free_bytes: 1 },
+    pressure: { swap_used_bytes: 0, compressor_bytes: 0, margin_percent: 90, red: false },
+    models: [],
+    machine: { potential_bytes: 1, unpriced_models: 0, current_bytes: 1, state: "green" },
+    attribution: "test",
+    messages: [],
+    cache_ttl_ms: 2000,
+    load: {
+      now: {
+        sampled_at_ms: 4000,
+        sampler_cost_ms: 4.2,
+        cpu_pct: 12,
+        cpu_clusters: [
+          { name: "Super", cores: 6, pct: 46, mhz: 4400 },
+          { name: "Performance", cores: 12, pct: 22, mhz: 3400 },
+          { name: "Efficiency", cores: 4, pct: 9, mhz: 2100 },
+        ],
+        mem_pct: 34,
+        gpu_pct: 56,
+        gpu_mhz: 1296,
+        gpu_mem_bytes: 912_000_000,
+        thermal: { state: "fair", cpu_speed_limit_pct: 87 },
+        power_mw: { cpu: 5200, gpu: 3400, ane: 400, total: 9000 },
+      },
+      window: {
+        samples: 3,
+        interval_ms: 2000,
+        span_ms: 90_000,
+        cpu_pct: { mean: 10, p95: 15, max: 20 },
+        mem_pct: { mean: 30, p95: 35, max: 40 },
+        gpu_pct: { mean: 50, p95: 55, max: 60 },
+        power_mw: {
+          total: { mean: 7800, p95: 9200, max: 11000 },
+          gpu: { mean: 2600, p95: 3600, max: 4200 },
+          cpu: { mean: 4700, p95: 5300, max: 6200 },
+        },
+        thermal: {
+          worst_state: "serious",
+          above_nominal_ms: 45_000,
+          min_cpu_speed_limit_pct: 80,
+        },
+        energy_mwh: 1289,
+      },
+    },
+  };
+
+  const NULL_LOAD = {
+    ...FULL_LOAD,
+    load: {
+      now: {
+        sampled_at_ms: 4000,
+        sampler_cost_ms: 4.2,
+        cpu_pct: 12,
+        cpu_clusters: null,
+        mem_pct: 34,
+        gpu_pct: 56,
+        gpu_mhz: null,
+        gpu_mem_bytes: null,
+        thermal: null,
+        power_mw: null,
+      },
+      window: {
+        samples: 3,
+        interval_ms: 2000,
+        span_ms: 90_000,
+        cpu_pct: { mean: 10, p95: 15, max: 20 },
+        mem_pct: { mean: 30, p95: 35, max: 40 },
+        gpu_pct: { mean: 50, p95: 55, max: 60 },
+        power_mw: null,
+        thermal: null,
+        energy_mwh: null,
+      },
+    },
+  };
+
+  function stubFetch(payload: unknown) {
+    const fetchMock = vi.fn((url: string) => {
+      if (String(url) === "/machine/resources") {
+        return Promise.resolve(
+          new Response(JSON.stringify(payload), { status: 200 }),
+        );
+      }
+      return Promise.reject(new Error(`unexpected fetch in this test: ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  it("renders every new row with correct formatting when every field is present (desktop dialog)", async () => {
+    stubFetch(FULL_LOAD);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+
+    // GPU row extras — MHz + in-use memory, joined onto the GPU reading.
+    await waitFor(() =>
+      expect(screen.getByText("GPU 1296 MHz · 912.0 MB")).toBeInTheDocument(),
+    );
+
+    // Thermal: state pill (title-cased) + speed limit (< 100%) + window
+    // worst-state/above-nominal line.
+    expect(screen.getByText("Fair")).toBeInTheDocument();
+    expect(screen.getByText("CPU speed limit 87%")).toBeInTheDocument();
+    expect(
+      screen.getByText("worst Serious · 45s above nominal"),
+    ).toBeInTheDocument();
+
+    // Power: total now/avg/p95/max in W (≥1000 mW), per-channel row, and
+    // the window energy total in Wh (energy_mwh ≥ 1000).
+    expect(
+      screen.getByText("9.0 W now · 7.8 W avg · 9.2 W p95 · 11.0 W max"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("CPU 5.2 W · GPU 3.4 W · ANE 400 mW"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("1.29 Wh")).toBeInTheDocument();
+
+    // CPU clusters: one row per cluster — name, core count, pct, MHz.
+    expect(screen.getByText("Super")).toBeInTheDocument();
+    expect(screen.getByText("Performance")).toBeInTheDocument();
+    expect(screen.getByText("Efficiency")).toBeInTheDocument();
+    expect(screen.getByText(/6 cores/)).toBeInTheDocument();
+    expect(screen.getByText(/4400 MHz/)).toBeInTheDocument();
+  });
+
+  it("hides every new row when every new field is null — no layout the operator has to scroll past", async () => {
+    const fetchMock = stubFetch(NULL_LOAD);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    // Wait for the resolved poll (the existing CPU/GPU/MEM meters still
+    // render off it) before asserting on what it did NOT add.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(document.querySelector(".meter-row")).not.toBeNull(),
+    );
+    expect(document.querySelector(".thermal-row")).toBeNull();
+    expect(document.querySelector(".power-block")).toBeNull();
+    expect(document.querySelector(".cluster-block")).toBeNull();
+    expect(document.querySelector(".machine-drawer__gpu-extra")).toBeNull();
+  });
+
+  it("the phone drawer's Machine tab renders the SAME host-extras rows as the desktop dialog", async () => {
+    stubFetch(FULL_LOAD);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        isMobileOverride={true}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    await waitFor(() => expect(screen.getByText("Fair")).toBeInTheDocument());
+    expect(screen.getByText("Super")).toBeInTheDocument();
+    expect(
+      screen.getByText("CPU 5.2 W · GPU 3.4 W · ANE 400 mW"),
+    ).toBeInTheDocument();
   });
 });

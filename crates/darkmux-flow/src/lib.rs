@@ -2654,7 +2654,13 @@ mod tests {
         //           `peak_cpu_pct`/`peak_mem_pct` are kept as aliases for
         //           one release. Additive; no struct/field REMOVAL. See
         //           schema.rs's fuller changelog entry.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.27.0");
+        //   1.28.0 (#2108): `dispatch.complete`'s `host` envelope block
+        //           gains `power` (`{cpu,gpu,total}` × `{mean_mw, peak_mw}`),
+        //           `thermal` (`{worst_state, above_nominal_ms,
+        //           min_cpu_speed_limit_pct}`) and `energy_mwh`, from the
+        //           in-process host probe. Additive; every 1.27.0 field is
+        //           byte-identical. See schema.rs.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.28.0");
     }
 
     #[test]

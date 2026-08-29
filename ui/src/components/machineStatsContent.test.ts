@@ -13,16 +13,29 @@ const DISPATCH_AGG: HostAggregate = {
 };
 
 const LOAD: MachineLoad = {
-  now: { cpu_pct: 11, mem_pct: 22, gpu_pct: 33, sampled_at_ms: 4000 },
+  now: {
+    sampled_at_ms: 4000,
+    sampler_cost_ms: 6.3,
+    cpu_pct: 11,
+    cpu_clusters: null,
+    mem_pct: 22,
+    gpu_pct: 33,
+    gpu_mhz: null,
+    gpu_mem_bytes: null,
+    thermal: null,
+    power_mw: null,
+  },
   window: {
-    cpu: { mean_pct: 12.5, p95_pct: 15, max_pct: 20 },
-    mem: { mean_pct: 42.5, p95_pct: 45, max_pct: 50 },
-    gpu: { mean_pct: 62.5, p95_pct: 65, max_pct: 70 },
     samples: 5,
     interval_ms: 2000,
     span_ms: 8000,
+    cpu_pct: { mean: 12.5, p95: 15, max: 20 },
+    mem_pct: { mean: 42.5, p95: 45, max: 50 },
+    gpu_pct: { mean: 62.5, p95: 65, max: 70 },
+    power_mw: null,
+    thermal: null,
+    energy_mwh: null,
   },
-  sampler_cost_ms_mean: 6.3,
 };
 
 describe("effectiveHostAggregate (#2107, #1833)", () => {
@@ -54,7 +67,7 @@ describe("effectiveHostAggregate (#2107, #1833)", () => {
   it("a metric the daemon never read (null now) still overrides — absence is a real claim, not silently kept from the dispatch side", () => {
     const partialLoad: MachineLoad = {
       ...LOAD,
-      now: { cpu_pct: null, mem_pct: 22, gpu_pct: 33, sampled_at_ms: 4000 },
+      now: { ...LOAD.now, cpu_pct: null },
     };
     const agg = effectiveHostAggregate(true, DISPATCH_AGG, partialLoad);
     expect(agg.cpu.now).toBeNull();

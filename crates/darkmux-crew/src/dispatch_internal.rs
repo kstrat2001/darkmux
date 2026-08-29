@@ -2985,7 +2985,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // panicked sampler thread degrades to "no more samples", not a
     // failed dispatch).
     sampler_stop.store(true, Ordering::SeqCst);
-    let host_stats = sampler_handle.join().unwrap_or_default();
+    let (host_stats, host_extras) = sampler_handle.join().unwrap_or_default();
 
     // (#638) The container has exited — the session is no longer running.
     // Stop the liveness heartbeat and DELete its key so the live view drops
@@ -3047,7 +3047,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
-    let stdout = enrich_envelope_with_summary(stdout, &trajectory_summary, &host_stats, &host_out);
+    let stdout =
+        enrich_envelope_with_summary(stdout, &trajectory_summary, &host_stats, &host_extras, &host_out);
 
     // (#782) Read the runtime's token totals from metrics.json now the
     // container has exited. Best-effort — zero totals on any read failure
@@ -3236,6 +3237,7 @@ fn enrich_envelope_with_summary(
     stdout: String,
     summary: &TrajectorySummary,
     stats: &HostStats,
+    extras: &HostExtras,
     out_dir: &std::path::Path,
 ) -> String {
     let trimmed = stdout.trim();
@@ -3264,6 +3266,12 @@ fn enrich_envelope_with_summary(
     // stay at the TOP LEVEL as aliases for one release in case a reader
     // still looks there (the pre-#2107 shape); they read straight off the
     // same nested `cpu.peak_pct`/`mem.peak_pct`, so the two can't drift.
+    //
+    // (#2108) `power`/`thermal`/`energy_mwh` join them when the host probe
+    // could read those sources. They answer a question the percentages
+    // can't: a dispatch that ran at 40% CPU the whole way while the kernel
+    // held the speed cap at 62% was not a comfortable run, and the wall
+    // clock alone never says so.
     fn metric_json(m: &MetricStats) -> serde_json::Value {
         serde_json::json!({
             "peak_pct": m.peak_pct,
@@ -3272,20 +3280,55 @@ fn enrich_envelope_with_summary(
             "above_80_ms": m.above_80_ms,
         })
     }
+    // (#2108) A power rail's window reduction. `mean_mw`/`peak_mw` mirror
+    // the `mean_pct`/`peak_pct` naming above rather than the ROUTE's
+    // `mean`/`max` — this is the ENVELOPE's vocabulary, and inside it a
+    // number's unit is part of its name.
+    fn power_json(m: &MwStats) -> serde_json::Value {
+        serde_json::json!({ "mean_mw": m.mean_mw, "peak_mw": m.max_mw })
+    }
     if stats.samples > 0 {
-        obj.insert(
-            "host".into(),
-            serde_json::json!({
-                "cpu": metric_json(&stats.cpu),
-                "mem": metric_json(&stats.mem),
-                "gpu": metric_json(&stats.gpu),
-                "samples": stats.samples,
-                "sample_interval_ms": stats.sample_interval_ms,
-                // Deprecated top-level aliases — see the comment above.
-                "peak_cpu_pct": stats.cpu.peak_pct,
-                "peak_mem_pct": stats.mem.peak_pct,
-            }),
-        );
+        let mut host = serde_json::json!({
+            "cpu": metric_json(&stats.cpu),
+            "mem": metric_json(&stats.mem),
+            "gpu": metric_json(&stats.gpu),
+            "samples": stats.samples,
+            "sample_interval_ms": stats.sample_interval_ms,
+            // Deprecated top-level aliases — see the comment above.
+            "peak_cpu_pct": stats.cpu.peak_pct,
+            "peak_mem_pct": stats.mem.peak_pct,
+        });
+        // (#2108) Power, thermal and energy — each present only when the
+        // probe actually read that source on this host, for the same reason
+        // the whole `host` block is present only when the sampler ran: an
+        // absent block says "not measured", a zeroed one would say
+        // "measured, and idle". Purely ADDITIVE to the #2107 shape above.
+        if let Some(obj) = host.as_object_mut() {
+            if let Some(p) = &extras.power {
+                obj.insert(
+                    "power".into(),
+                    serde_json::json!({
+                        "cpu": power_json(&p.cpu),
+                        "gpu": power_json(&p.gpu),
+                        "total": power_json(&p.total),
+                    }),
+                );
+            }
+            if let Some(t) = &extras.thermal {
+                obj.insert(
+                    "thermal".into(),
+                    serde_json::json!({
+                        "worst_state": t.worst_state,
+                        "above_nominal_ms": t.above_nominal_ms,
+                        "min_cpu_speed_limit_pct": t.min_cpu_speed_limit_pct,
+                    }),
+                );
+            }
+            if let Some(e) = extras.energy_mwh {
+                obj.insert("energy_mwh".into(), serde_json::json!(e));
+            }
+        }
+        obj.insert("host".into(), host);
     }
     // (#1959) What a crawl actually FOUND. The envelope carried a converged
     // dispatch and no way to tell a run that reported twelve findings from one
@@ -3343,6 +3386,7 @@ fn read_findings_summary(out_dir: &std::path::Path) -> Option<serde_json::Value>
 // dispatch-scoped sampler uses — one peak/mean/p95/duty algorithm, not two
 // that could silently drift apart. See that module for the full docs; the
 // names/behavior are unchanged, only the home moved.
+use crate::host_probe::{reduce_host_extras, HostExtraAt, HostExtras, MwStats};
 use crate::telemetry_sampler::{reduce_host_stats, HostSampleAt, HostStats, MetricStats};
 // `reduce_metric` itself isn't called directly in this file (only via
 // `reduce_host_stats` above) — the direct-call tests in
@@ -3810,13 +3854,24 @@ fn run_telemetry_sampler(
     model: String,
     mission_id: Option<String>,
     phase_id: Option<String>,
-) -> HostStats {
+) -> (HostStats, HostExtras) {
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
     // reduction only needs the gaps BETWEEN samples, and a relative clock
     // makes `reduce_host_stats` testable with plain integers instead of
     // `SystemTime`.
     let started = Instant::now();
     let mut raw: Vec<HostSampleAt> = Vec::new();
+    // (#2108) The power/thermal half of the same series, reduced by
+    // `reduce_host_extras` at the end exactly as `raw` is by
+    // `reduce_host_stats`. Kept as a SECOND list rather than widening
+    // `HostSampleAt` so the cpu/mem/gpu reduction the envelope has emitted
+    // since #2107 stays byte-identical.
+    let mut extras: Vec<HostExtraAt> = Vec::new();
+    // A probe PRIVATE to this dispatch: `cpu_pct` and every power rail are
+    // counter deltas, so a probe of our own gives deltas that line up with
+    // this sampler's own 2s cadence rather than with whoever sampled last.
+    // Construction is ~80-100ms once; each sample is ~5-10ms.
+    let mut probe = crate::host_probe::HostProbe::new();
     let emit = |source: &str, action: &str, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
@@ -3864,16 +3919,16 @@ fn run_telemetry_sampler(
             }
         }
 
-        // Host system load — CPU / RAM / GPU utilization%. Inference runs in
-        // LMStudio (off-container), so the load worth watching is the HOST's,
-        // not the runtime container's (which idles waiting on the model and
-        // reads ~0 — the wrong-question problem, #814/#1064). Each read is
-        // best-effort and unprivileged; a tick emits whichever of the three
-        // succeed (a failed field is simply omitted from the payload).
-        // `sample_host` is the shared mechanism (#1247 doctrine surface) —
-        // `darkmux-lab`'s review driver samples through the same function.
-        let sample = crate::telemetry_sampler::sample_host();
-        if sample.cpu.is_some() || sample.mem.is_some() || sample.gpu.is_some() {
+        // Host system load — CPU / RAM / GPU utilization%, plus (#2108) the
+        // per-cluster frequency, power and thermal state the same probe
+        // reads for free. Inference runs in LMStudio (off-container), so the
+        // load worth watching is the HOST's, not the runtime container's
+        // (which idles waiting on the model and reads ~0 — the
+        // wrong-question problem, #814/#1064). Each read is best-effort and
+        // unprivileged; a tick emits whichever fields succeed.
+        let sample = probe.sample();
+        let at_ms = started.elapsed().as_millis() as u64;
+        if sample.cpu_pct.is_some() || sample.mem_pct.is_some() || sample.gpu_pct.is_some() {
             // (#2107) Record the raw reading, timestamped against this
             // sampler's own clock. The REDUCTION (peak/mean/p95/duty) is a
             // pure fold over `raw` computed once at the end
@@ -3882,19 +3937,19 @@ fn run_telemetry_sampler(
             // logic has exactly one implementation, shared with the unit
             // tests that drive it directly.
             raw.push(HostSampleAt {
-                at_ms: started.elapsed().as_millis() as u64,
-                cpu: sample.cpu,
-                mem: sample.mem,
-                gpu: sample.gpu,
+                at_ms,
+                cpu: sample.cpu_pct,
+                mem: sample.mem_pct,
+                gpu: sample.gpu_pct,
             });
             let mut payload = serde_json::Map::new();
-            if let Some(c) = sample.cpu {
+            if let Some(c) = sample.cpu_pct {
                 payload.insert("cpu".into(), c.into());
             }
-            if let Some(m) = sample.mem {
+            if let Some(m) = sample.mem_pct {
                 payload.insert("mem".into(), m.into());
             }
-            if let Some(g) = sample.gpu {
+            if let Some(g) = sample.gpu_pct {
                 payload.insert("gpu".into(), g.into());
             }
             emit(
@@ -3902,6 +3957,20 @@ fn run_telemetry_sampler(
                 "telemetry.process",
                 serde_json::Value::Object(payload),
             );
+        }
+        // (#2108) Recorded on EVERY tick, including one where cpu/mem/gpu
+        // all failed: a tick that read power but not utilization is still a
+        // power measurement, and `reduce_host_extras` skips the `None`s
+        // rather than zeroing them. Deliberately NOT emitted as a flow
+        // record — the live telemetry stream's `{cpu,mem,gpu}` payload is a
+        // viewer contract, and widening it is a schema change with no
+        // consumer yet; the reduction reaches the envelope instead.
+        if sample.power.is_some() || sample.thermal.is_some() {
+            extras.push(HostExtraAt {
+                at_ms,
+                power: sample.power,
+                thermal: sample.thermal.clone(),
+            });
         }
 
         // Wait out the sample interval, but poll the stop flag every
@@ -3912,14 +3981,14 @@ fn run_telemetry_sampler(
             if stop_flag.load(Ordering::SeqCst) {
                 // Teardown mid-interval: return what was observed, never a
                 // default. A killed or short dispatch still has real stats.
-                return reduce_host_stats(&raw);
+                return (reduce_host_stats(&raw), reduce_host_extras(&extras));
             }
             let nap = SAMPLER_POLL_INTERVAL.min(TELEMETRY_SAMPLE_INTERVAL - slept);
             thread::sleep(nap);
             slept += nap;
         }
     }
-    reduce_host_stats(&raw)
+    (reduce_host_stats(&raw), reduce_host_extras(&extras))
 }
 
 /// State machine for tailing `trajectory.jsonl`. Tracks the file offset,

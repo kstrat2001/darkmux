@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.27.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.28.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -492,6 +492,28 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.27.0";
 //           new field on the FLOW record itself; `payload.host` on `step
 //           complete`/`step error` was always a legal free-form key under
 //           the existing `payload` blob).
+//   1.28.0 (#2108): `dispatch.complete`'s `host` block (same carrier as
+//           1.27.0 — the `--json` envelope's payload) gains `host.power`,
+//           `host.thermal` and `host.energy_mwh`, from the in-process host
+//           probe that replaced the sampler's `top`/`vm_stat`/`sysctl`/
+//           `ioreg` shell-outs. `host.power.{cpu,gpu,total}` each carry
+//           `{mean_mw, peak_mw}` (IOReport `Energy Model` counter deltas);
+//           `host.thermal` carries `{worst_state, above_nominal_ms,
+//           min_cpu_speed_limit_pct}` (`ProcessInfo.thermalState` +
+//           `IOPMCopyCPUPowerStatus`); `host.energy_mwh` is the integral of
+//           total power over the dispatch. They answer a question the
+//           percentages cannot: a dispatch that ran at 40% CPU the whole way
+//           while the kernel held the speed cap at 62% was not a comfortable
+//           run, and neither the wall clock nor the utilization figure says
+//           so. Purely ADDITIVE — every 1.27.0 field is byte-identical and a
+//           reader that ignores the new keys is unaffected. Each of the
+//           three is present only when the probe actually READ that source
+//           on this host (Apple Silicon; IOReport reachable), for the same
+//           reason `host` itself is present only when the sampler ran: an
+//           absent block says "not measured", a zeroed one would say
+//           "measured, and idle". No new field on the FLOW record itself,
+//           and no struct change, so prior AuditFileSink chains survive
+//           without rotation.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

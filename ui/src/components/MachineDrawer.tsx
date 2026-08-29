@@ -10,12 +10,17 @@
  * pill everywhere" design actively broken on a phone: the pill floated
  * OVER page content and collided with the masthead's own TODAY/LIVE badge.
  *
- * - **Desktop (>768px):** a small `machine · GPU 68%` pill PLUS the
- *   masthead's own ⓘ affordance (`Masthead.tsx`) both open the SAME
- *   dialog — literally the shared `<Dialog id="imodalbg">` shell
- *   (`Dialog.tsx`/`lib/dialogManager.ts`) every other dialog in this app
- *   (Filters, Notes) already uses, rather than a bespoke modal of this
- *   component's own.
+ * - **Desktop (>768px):** the masthead's own ⓘ affordance (`Masthead.tsx`)
+ *   is now the ONLY desktop trigger — it opens the shared
+ *   `<Dialog id="imodalbg">` shell (`Dialog.tsx`/`lib/dialogManager.ts`)
+ *   every other dialog in this app (Filters, Notes) already uses. This
+ *   component used to ALSO render its own floating `machine · GPU 68%`/
+ *   `Machine info` pill as a second desktop trigger for the same dialog;
+ *   the operator found a second floating affordance for the exact same
+ *   action redundant once the ⓘ existed, so that pill is removed — this
+ *   component now renders ONLY `<Dialog>` on desktop, no visible trigger
+ *   of its own. The dialog itself, its content, and its close/backdrop/
+ *   Escape behavior are unchanged; only the extra button is gone.
  * - **Phone (≤768px):** the tabbed bottom drawer (#2107 tabbed-drawer
  *   packet) — `PhoneDrawer.tsx`. This component only DECIDES that the
  *   phone skin is active and hands `PhoneDrawer` the two panels it hosts:
@@ -54,11 +59,7 @@
  */
 import { useState } from "react";
 import { Dialog } from "./Dialog";
-import {
-  openModalEl,
-  closeOpenModal,
-  useOpenModalId,
-} from "../lib/dialogManager";
+import { useOpenModalId } from "../lib/dialogManager";
 import { useMachineStatsContent } from "./machineStatsContent";
 import { PhoneDrawer } from "./PhoneDrawer";
 import { useIsMobile } from "../hooks/useIsMobile";
@@ -173,23 +174,14 @@ export function MachineDrawer({
     );
   }
 
+  // (#2108, operator finding) No desktop trigger of this component's own
+  // any more — the masthead's own ⓘ (`Masthead.tsx`) is the sole desktop
+  // affordance for this dialog now; this component only renders the
+  // dialog shell itself, which stays reachable/openable exactly as before
+  // via `dialogManager`'s shared `#imodalbg` id.
   return (
-    <>
-      <button
-        type="button"
-        className="machine-pill"
-        data-act="machine-drawer-pill"
-        aria-haspopup="dialog"
-        aria-expanded={desktopOpen}
-        onClick={() =>
-          desktopOpen ? closeOpenModal() : openModalEl("imodalbg")
-        }
-      >
-        Machine info
-      </button>
-      <Dialog id="imodalbg" titleId="machine-stats-title" title="Machine stats">
-        {body}
-      </Dialog>
-    </>
+    <Dialog id="imodalbg" titleId="machine-stats-title" title="Machine stats">
+      {body}
+    </Dialog>
   );
 }

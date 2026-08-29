@@ -36,7 +36,13 @@
  * both call sites for no reason.
  */
 import { useEffect, useMemo, useState } from "react";
-import { Meter, compactMeterProps, fmtPct } from "./Meter";
+import {
+  Meter,
+  compactMeterProps,
+  fmtPct,
+  simpleBand,
+  angleForPct,
+} from "./Meter";
 import { COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "./Meter";
 import { aggregateHostSamples, type HostAggregate } from "../lib/hostStats";
 import { resolveDrawerScope } from "../lib/machineDrawerScope";
@@ -52,6 +58,7 @@ import type {
   MachineLoad,
   MachineSpecs,
   PresenceBeat,
+  ThermalState,
 } from "../types/handwritten";
 
 /** Re-render on a light interval so the rolling 10-minute window keeps
@@ -97,6 +104,186 @@ function Kv({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** (#2108, host-sample-shape v2) `mW` below 1000, `W` at one decimal from
+ * 1000 up — matches the spec's own "W with one decimal for ≥1000 mW, mW
+ * below" instruction. `null` (unmeasured channel) returns `null`, never a
+ * zeroed placeholder — the caller hides the row instead. */
+function fmtMw(mw: number | null): string | null {
+  if (mw === null) return null;
+  return mw >= 1000 ? `${(mw / 1000).toFixed(1)} W` : `${Math.round(mw)} mW`;
+}
+
+/** `energy_mwh` (milliwatt-hours) → "Energy (window)" — `Wh` at two
+ * decimals once the reading crosses 1000 mWh, `mWh` (rounded) below. */
+function fmtEnergyMwh(mwh: number | null): string | null {
+  if (mwh === null) return null;
+  return mwh >= 1000
+    ? `${(mwh / 1000).toFixed(2)} Wh`
+    : `${Math.round(mwh)} mWh`;
+}
+
+/** `gpu_mem_bytes` → `GB` at one decimal from 1 GB up, `MB` (one decimal)
+ * below — the GPU's in-use system memory is typically tens to low
+ * hundreds of MB, but a heavy workload can cross into GB. */
+function fmtGpuMemBytes(bytes: number | null): string | null {
+  if (bytes === null) return null;
+  return bytes >= 1_000_000_000
+    ? `${(bytes / 1_000_000_000).toFixed(1)} GB`
+    : `${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
+/** `above_nominal_ms` (the window's time spent above the nominal thermal
+ * state) → a short human duration. `0` reads as "0s" rather than being
+ * hidden — a genuinely-zero reading is a real claim ("never left
+ * nominal"), distinct from the field being entirely absent. */
+function fmtAboveNominal(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+  return `${Math.round(ms / 60_000)} min`;
+}
+
+/** Title-cases a `ThermalState` for display — "nominal" → "Nominal". An
+ * unrecognized future state (the `| string` fallback on the type) still
+ * renders readably rather than throwing. */
+function fmtThermalState(state: ThermalState): string {
+  return state.length === 0 ? state : state[0].toUpperCase() + state.slice(1);
+}
+
+/** Semantic color bucket per the spec: nominal reads quiet (no alarm
+ * color), fair is a caution (`--warn`), serious/critical are both the
+ * same "this needs attention" severity (`--bad`) — matching this file's
+ * existing three-bucket severity convention elsewhere in the app
+ * (`is-ok`/`is-warn`/`is-bad`). An unrecognized state falls back to the
+ * quiet/nominal treatment rather than alarming on something unknown. */
+function thermalSeverityClass(state: ThermalState): string {
+  if (state === "fair") return "thermal-pill--fair";
+  if (state === "serious" || state === "critical") return "thermal-pill--bad";
+  return "thermal-pill--nominal";
+}
+
+/** (#2108, host-sample-shape v2) The thermal/power/CPU-cluster rows —
+ * host-level readings the daemon's continuous sampler produces
+ * independently of any one dispatch, extracted into its own component so
+ * `useMachineStatsContent`'s body stays readable. Every field is
+ * independently optional (see `MachineLoad`'s own doc); each row hides
+ * itself the instant its own source data is null rather than the whole
+ * block gating on one field — a host that reports thermal but not power
+ * still gets a thermal row. `null` `load` (daemon not sampling, closed
+ * surface, or a pre-v2 daemon) renders nothing at all.
+ *
+ * Deliberately reads `load.now`/`load.window` DIRECTLY rather than going
+ * through `effectiveHostAggregate`'s dispatch/daemon merge — that merge
+ * exists to answer "what did THIS dispatch's own CPU/GPU/MEM look like,"
+ * a question thermal/power/clusters don't have (they're never scoped to a
+ * dispatch on the wire), so mission/dispatch routes render these rows too
+ * whenever the daemon itself is reachable. */
+function HostExtras({ load }: { load: MachineLoad | null }) {
+  if (load === null) return null;
+  const { thermal, power_mw, cpu_clusters } = load.now;
+  const windowThermal = load.window.thermal;
+  const windowPower = load.window.power_mw;
+  const energyLine = fmtEnergyMwh(load.window.energy_mwh);
+  const gpuMhz = load.now.gpu_mhz;
+  const gpuMem = fmtGpuMemBytes(load.now.gpu_mem_bytes);
+  const gpuExtraLine =
+    gpuMhz !== null || gpuMem !== null
+      ? [gpuMhz !== null ? `${Math.round(gpuMhz)} MHz` : null, gpuMem]
+          .filter(Boolean)
+          .join(" · ")
+      : null;
+
+  return (
+    <>
+      {gpuExtraLine && (
+        <div className="machine-drawer__gpu-extra">GPU {gpuExtraLine}</div>
+      )}
+      {thermal && (
+        <div className="thermal-row">
+          <span
+            className={`thermal-pill ${thermalSeverityClass(thermal.state)}`}
+          >
+            {fmtThermalState(thermal.state)}
+          </span>
+          {thermal.cpu_speed_limit_pct < 100 && (
+            <span className="thermal-row__limit">
+              {`CPU speed limit ${Math.round(thermal.cpu_speed_limit_pct)}%`}
+            </span>
+          )}
+          {windowThermal && (
+            <div className="thermal-row__window">
+              {`worst ${fmtThermalState(windowThermal.worst_state)} · ${fmtAboveNominal(windowThermal.above_nominal_ms)} above nominal`}
+            </div>
+          )}
+        </div>
+      )}
+      {(power_mw || energyLine) && (
+        <div className="power-block">
+          {power_mw && (
+            <div className="dialog__kv">
+              <b>Power</b>
+              <span>
+                {fmtMw(power_mw.total)} now
+                {windowPower &&
+                  ` · ${fmtMw(windowPower.total.mean)} avg · ${fmtMw(windowPower.total.p95)} p95 · ${fmtMw(windowPower.total.max)} max`}
+              </span>
+            </div>
+          )}
+          {power_mw && (
+            <div className="dialog__kv">
+              <b>Channels</b>
+              <span>
+                {[
+                  fmtMw(power_mw.cpu) && `CPU ${fmtMw(power_mw.cpu)}`,
+                  fmtMw(power_mw.gpu) && `GPU ${fmtMw(power_mw.gpu)}`,
+                  fmtMw(power_mw.ane) && `ANE ${fmtMw(power_mw.ane)}`,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </span>
+            </div>
+          )}
+          {energyLine && (
+            <div className="dialog__kv">
+              <b>Energy (window)</b>
+              <span>{energyLine}</span>
+            </div>
+          )}
+        </div>
+      )}
+      {cpu_clusters && cpu_clusters.length > 0 && (
+        <div className="cluster-block">
+          <div className="cluster-block__title">CPU clusters</div>
+          <div className="meter-row">
+            {cpu_clusters.map((c) => (
+              <div className="cluster-tile" key={c.name}>
+                <Meter
+                  wrapperClassName="mm-gauge mm-gauge--compact"
+                  width={COMPACT_METER_WIDTH}
+                  height={COMPACT_METER_HEIGHT}
+                  ariaLabel={`${c.name}: ${fmtPct(c.pct)}`}
+                  label={c.name}
+                  numerals={{ now: c.pct, avg: null, max: null }}
+                  hideAvgMax
+                  bands={simpleBand(
+                    "mm-gauge-fill-compact",
+                    "var(--accent, var(--good))",
+                    c.pct,
+                  )}
+                  needleAngleDeg={c.pct == null ? undefined : angleForPct(c.pct)}
+                />
+                <div className="cluster-tile__caption">
+                  {c.mhz !== null
+                    ? `${c.cores} cores · ${Math.round(c.mhz)} MHz`
+                    : `${c.cores} cores`}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 /** (#2107, #1833) Merge the daemon's continuous `load` reading with the
  * route-scoped per-dispatch aggregate into the ONE `HostAggregate` the
  * meters render — a pure function so the merge rule is unit-testable
@@ -133,21 +320,21 @@ export function effectiveHostAggregate(
   return {
     cpu: {
       now: load.now.cpu_pct,
-      avg: load.window.cpu.mean_pct,
-      high: load.window.cpu.max_pct,
-      p95: load.window.cpu.p95_pct,
+      avg: load.window.cpu_pct.mean,
+      high: load.window.cpu_pct.max,
+      p95: load.window.cpu_pct.p95,
     },
     mem: {
       now: load.now.mem_pct,
-      avg: load.window.mem.mean_pct,
-      high: load.window.mem.max_pct,
-      p95: load.window.mem.p95_pct,
+      avg: load.window.mem_pct.mean,
+      high: load.window.mem_pct.max,
+      p95: load.window.mem_pct.p95,
     },
     gpu: {
       now: load.now.gpu_pct,
-      avg: load.window.gpu.mean_pct,
-      high: load.window.gpu.max_pct,
-      p95: load.window.gpu.p95_pct,
+      avg: load.window.gpu_pct.mean,
+      high: load.window.gpu_pct.max,
+      p95: load.window.gpu_pct.p95,
     },
     count: load.window.samples,
   };
@@ -270,8 +457,18 @@ export function useMachineStatsContent({
       : scope.scopeLabel;
   const samplerCostLine =
     !isMissionOrDispatch && daemonLoad != null
-      ? `sampler cost ${Math.round(daemonLoad.sampler_cost_ms_mean * 10) / 10} ms/sample`
+      ? `sampler cost ${Math.round(daemonLoad.now.sampler_cost_ms * 10) / 10} ms/sample`
       : null;
+
+  // (#2108, host-sample-shape v2) Thermal/power/CPU-cluster rows are host
+  // readings, not scoped to any one dispatch — they render off the raw
+  // `daemonLoad` directly (never `agg`/`isIdle`, which are the
+  // dispatch-vs-daemon MERGE this hook already does for CPU/GPU/MEM), so
+  // they show on a mission/dispatch route too: "what is the HOST doing
+  // right now" is orthogonal to "what did THIS dispatch use." Each row
+  // hides independently on its own null field — see this module's own
+  // `HostExtras` doc.
+  const hostExtras = <HostExtras load={daemonLoad} />;
 
   const meters = (
     <div className="meter-row">
@@ -350,6 +547,7 @@ export function useMachineStatsContent({
       ) : (
         meters
       )}
+      {hostExtras}
     </>
   );
 
@@ -367,35 +565,6 @@ export function useMachineStatsContent({
       <Kv label="mode" value={modeText(route)} />
       <Kv label="machine" value={aboutMachine} />
       <Kv label="hardware" value={aboutHardware} />
-      <div className="dialog__rule" />
-      <div className="dialog__kv">
-        <b>links</b>
-        <span>
-          <a
-            href="https://github.com/kstrat2001/darkmux"
-            target="_blank"
-            rel="noopener"
-          >
-            github
-          </a>{" "}
-          ·{" "}
-          <a href="https://darkmux.com/guide/" target="_blank" rel="noopener">
-            guide
-          </a>{" "}
-          ·{" "}
-          <a
-            href="https://darklyenergized.substack.com"
-            target="_blank"
-            rel="noopener"
-          >
-            articles
-          </a>{" "}
-          ·{" "}
-          <a href="https://darkmux.com/" target="_blank" rel="noopener">
-            home
-          </a>
-        </span>
-      </div>
     </div>
   );
 

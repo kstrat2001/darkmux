@@ -5425,6 +5425,7 @@ fn a_detection_reaches_the_envelope() {
         r#"{"result":"stop"}"#.to_string(),
         &summary_with(vec![det.clone()]),
         &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5441,6 +5442,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
         r#"{"result":"stop"}"#.to_string(),
         &summary_with(vec![]),
         &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5467,6 +5469,7 @@ fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
         r#"{"result":"stop"}"#.to_string(),
         s,
         &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
@@ -5547,6 +5550,7 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
         &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5567,6 +5571,7 @@ fn enrichment_does_not_duplicate_the_runtime_metrics_block() {
         r#"{"result":"stop","metrics":{"turns":1}}"#.to_string(),
         &s,
         &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5581,7 +5586,13 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
     let s = summary_with(vec![serde_json::json!({"kind":"cycle"})]);
     for raw in ["plain model output", "", "{ not json"] {
         assert_eq!(
-            super::enrich_envelope_with_summary(raw.to_string(), &s, &super::HostStats::default(), no_findings_dir()),
+            super::enrich_envelope_with_summary(
+                raw.to_string(),
+                &s,
+                &super::HostStats::default(),
+                &no_extras(),
+                no_findings_dir(),
+            ),
             raw,
             "the non-json path must pass through verbatim: {raw:?}"
         );
@@ -5691,6 +5702,7 @@ fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
         &stats,
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5717,6 +5729,78 @@ fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
 }
 
 #[test]
+fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape() {
+    use crate::host_probe::{HostExtraAt, PowerSample, ThermalSample};
+    let extras = crate::host_probe::reduce_host_extras(&[
+        HostExtraAt {
+            at_ms: 0,
+            power: Some(PowerSample { cpu_mw: 1000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+            thermal: Some(ThermalSample { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
+        },
+        HostExtraAt {
+            at_ms: 3_600_000,
+            power: Some(PowerSample { cpu_mw: 3000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+            thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
+        },
+    ]);
+    let stats = super::reduce_host_stats(&worked_samples());
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &stats,
+        &extras,
+        no_findings_dir(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["host"]["power"]["cpu"]["peak_mw"], 3000);
+    assert_eq!(v["host"]["power"]["cpu"]["mean_mw"], 2000.0);
+    assert_eq!(v["host"]["power"]["gpu"]["mean_mw"], 100.0);
+    assert_eq!(v["host"]["power"]["total"]["peak_mw"], 3100);
+    assert_eq!(v["host"]["thermal"]["worst_state"], "serious");
+    assert_eq!(v["host"]["thermal"]["min_cpu_speed_limit_pct"], 62);
+    // 1100 mW held for exactly one hour → 1100 mWh (left-Riemann: the FIRST
+    // sample's power holds until the second).
+    let e = v["host"]["energy_mwh"].as_f64().expect("energy");
+    assert!((e - 1100.0).abs() < 0.001, "got {e}: {out}");
+
+    // ADDITIVE only: every #2107 field is byte-identical to what the same
+    // stats produce with no extras at all.
+    let without = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &stats,
+        &no_extras(),
+        no_findings_dir(),
+    );
+    let w: serde_json::Value = serde_json::from_str(&without).unwrap();
+    for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms", "peak_cpu_pct", "peak_mem_pct"] {
+        assert_eq!(v["host"][key], w["host"][key], "#2108 must not move `host.{key}`");
+    }
+}
+
+#[test]
+fn a_host_without_power_or_thermal_sources_omits_those_blocks() {
+    // The non-Apple-Silicon case, and the "IOReport unavailable" case: the
+    // cpu/mem/gpu reduction still lands, and the blocks the probe could not
+    // read are ABSENT rather than zeroed.
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &super::TrajectorySummary::default(),
+        &super::reduce_host_stats(&worked_samples()),
+        &no_extras(),
+        no_findings_dir(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["host"]["cpu"]["peak_pct"].is_number(), "the #2107 block still lands");
+    for key in ["power", "thermal", "energy_mwh"] {
+        assert!(
+            v["host"].get(key).is_none(),
+            "`host.{key}` must be absent (not measured), never zeroed: {out}"
+        );
+    }
+}
+
+#[test]
 fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
     // A dispatch too short to sample, or one where sampling failed, must not
     // claim it observed an idle machine. Absent means "not measured".
@@ -5724,6 +5808,7 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
         &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5741,6 +5826,14 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
 // The findings were also never copied into the lab run dir, so the run's
 // durable artifact recorded that work happened and not what it produced.
 // ---------------------------------------------------------------
+
+/// (#2108) The "this host reported no power/thermal source" extras — the
+/// state every pre-#2108 assertion in this file was implicitly written
+/// against, so the #2107 `host` block's shape stays pinned by tests that say
+/// nothing about power. The #2108 fields get their own tests below.
+fn no_extras() -> crate::host_probe::HostExtras {
+    crate::host_probe::HostExtras::default()
+}
 
 /// A path with no `findings.jsonl` under it — the shape every non-crawler
 /// dispatch has, and the reason the block must be absent rather than zeroed.
@@ -5767,6 +5860,7 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
         &super::HostStats::default(),
+        &no_extras(),
         td.path(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5786,6 +5880,7 @@ fn a_trailing_newline_is_not_a_finding() {
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
         &super::HostStats::default(),
+        &no_extras(),
         td.path(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -5803,6 +5898,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         r#"{"result":"stop"}"#.to_string(),
         &super::TrajectorySummary::default(),
         &super::HostStats::default(),
+        &no_extras(),
         no_findings_dir(),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
