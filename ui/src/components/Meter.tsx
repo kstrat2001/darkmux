@@ -59,13 +59,21 @@ export const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
 /** Track/band stroke width, in viewBox units — the VRAM dial's original. */
 const STROKE_W = 11;
 
-/** The compact-meter render size (CPU/GPU/MEM) — the SAME `viewBox`
- * (`0 0 240 170`) as VRAM's 300×212, scaled down so three fit one row in
- * the ~340-360px content width the machine drawer/lens have at a 390px
+/** The compact-meter render size (CPU/GPU/MEM, and #2108's CPU-cluster
+ * tiles) — the SAME `viewBox` (`0 0 240 170`) as VRAM's 300×212, scaled
+ * down so three (or, with clusters, several more) fit one row in the
+ * ~340-360px content width the machine drawer/lens have at a 390px
  * viewport. Aspect-locked to the viewBox (240:170 ≈ 1.412) so nothing
- * distorts. */
-export const COMPACT_METER_WIDTH = 112;
-export const COMPACT_METER_HEIGHT = 79;
+ * distorts.
+ *
+ * Shrunk 112×79 → 100×70 in #2108 (operator finding, typography pass):
+ * the `avg · max` line needs to stay on one line (`white-space: nowrap`)
+ * at three tiles across on a 390px phone, and the instruction was
+ * explicit — "if the grid cannot fit that at the current gauge width,
+ * shrink the gauge, not the text." A few px narrower per tile buys the
+ * row the margin `nowrap` needs. */
+export const COMPACT_METER_WIDTH = 100;
+export const COMPACT_METER_HEIGHT = 70;
 
 export interface MeterGradient {
   id: string;
@@ -150,6 +158,11 @@ export interface MeterProps {
    * exclusive with `children` by convention — a caller supplies one or
    * the other. */
   numerals?: MeterNumerals;
+  /** (#2108) Suppress the `avg · max` line even when `numerals` is
+   * present — for a caller whose reading has no window-average concept
+   * (a CPU cluster's own per-core %). Every existing caller omits this
+   * and keeps the line, all-null included; see that line's own doc. */
+  hideAvgMax?: boolean;
   /** Extra SVG content drawn last, before `</svg>` closes — VRAM's
    * odometer digit group + its two text labels. The one thing that isn't
    * shared core (see this module's own doc). */
@@ -230,6 +243,7 @@ export function Meter({
   needleAngleDeg,
   label,
   numerals,
+  hideAvgMax,
   children,
 }: MeterProps) {
   return (
@@ -305,20 +319,40 @@ export function Meter({
         <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
         {children}
       </svg>
-      {label && <div className="meter-label">{label}</div>}
-      {/* (phone feedback, 2026-08-29) Two SHORT lines, not one long one —
-          `now` big (the reading that matters at a glance), `avg · max`
-          small underneath. Three meters' worth of the old single-line
-          "— · — avg · — max" collided into one unreadable run at a 390px
-          viewport; stacking removes the collision without needing the
-          three tiles to claim more horizontal room than `.meter-row`'s
-          own wrap already gives them. */}
-      {numerals && (
-        <div className="meter-numbers">
-          <div className="meter-now">{fmtPct(numerals.now)}</div>
-          <div className="meter-avgmax">
-            {fmtPct(numerals.avg)} avg <span className="meter-sep">·</span> {fmtPct(numerals.max)} max
-          </div>
+      {/* (#2108, operator finding — typography pass) Label + the CURRENT
+          value share ONE row directly under the gauge ("CPU 17%"), a few
+          px below the arc — not the ~50px gap the previous stacked
+          label-then-numerals layout left (the arc's own drawn track ends
+          well above the SVG's bottom edge; `.meter-caption`'s negative
+          `margin-top`, in `styles.css`, pulls the row up into that empty
+          space rather than reserving it as visual gap). `.meter-label` and
+          `.meter-now` keep their OWN pre-existing class names — only the
+          wrapping row changed — so every existing query against either
+          class (`.meter-now`'s textContent, `getByText("CPU")`, …) still
+          resolves the same node it always did. */}
+      {(label || numerals) && (
+        <div className="meter-caption">
+          {label && <div className="meter-label">{label}</div>}
+          {numerals && <div className="meter-now">{fmtPct(numerals.now)}</div>}
+        </div>
+      )}
+      {/* (phone feedback, 2026-08-29; nowrap restored #2108) `avg · max`
+          on its OWN short line below the caption row. `white-space:
+          nowrap` + `font-variant-numeric: tabular-nums` (styles.css) keep
+          it from ever wrapping — the 2026-08-29 fix that dropped `nowrap`
+          traded a wrap for an overflow collision; #2108 fixes the actual
+          cause (the compact gauge/tile were too wide for three side by
+          side on a 390px phone) by SHRINKING the gauge
+          (`COMPACT_METER_WIDTH`/`COMPACT_METER_HEIGHT`) rather than
+          re-introducing wrapping text. `hideAvgMax` (#2108, new — CPU
+          clusters) opts a caller with no such window concept out of the
+          line entirely, rather than rendering a bare "— avg · — max" no
+          caller wants; every EXISTING numerals caller (CPU/GPU/MEM) omits
+          the prop and keeps this line exactly as before, including the
+          all-null "— avg · — max" case. */}
+      {numerals && !hideAvgMax && (
+        <div className="meter-avgmax">
+          {fmtPct(numerals.avg)} avg <span className="meter-sep">·</span> {fmtPct(numerals.max)} max
         </div>
       )}
     </div>

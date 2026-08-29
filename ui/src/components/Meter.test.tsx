@@ -1,4 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { render, screen } from "@testing-library/react";
 import { Meter, angleForPct, avgMaxTicks, compactMeterProps, fmtPct, simpleBand } from "./Meter";
 
@@ -134,8 +137,82 @@ describe("Meter — the default numeral readout", () => {
 
   it("renders no numeral row at all when `numerals` is omitted — VRAM's own case", () => {
     const { container } = render(<Meter wrapperClassName="mm-gauge" ariaLabel="test" bands={[]} />);
-    expect(container.querySelector(".meter-numbers")).toBeNull();
+    expect(container.querySelector(".meter-caption")).toBeNull();
     expect(container.querySelector(".meter-label")).toBeNull();
+  });
+});
+
+// ── (#2108, operator finding — typography pass) the caption row + nowrap
+//    window line. The gap between the arc and its caption was ~50px
+//    (label stacked ABOVE a separate numerals block); label + the current
+//    value now share ONE row directly under the gauge, and the avg/max
+//    line below it must never wrap at three-across on a 390px phone. ─────
+
+describe("Meter — caption row + nowrap window line (#2108)", () => {
+  it("label and the current value render inside the SAME row element, directly under the gauge", () => {
+    const { container } = render(
+      <Meter wrapperClassName="mm-gauge" ariaLabel="test" bands={[]} label="CPU" numerals={{ now: 17, avg: 25, max: 51 }} />,
+    );
+    const caption = container.querySelector(".meter-caption")!;
+    expect(caption).not.toBeNull();
+    const label = caption.querySelector(".meter-label")!;
+    const value = caption.querySelector(".meter-now")!;
+    expect(label).not.toBeNull();
+    expect(value).not.toBeNull();
+    // Both are children of the SAME row — not siblings split across two
+    // separate wrapper elements the way the pre-#2108 layout had them.
+    expect(label.parentElement).toBe(caption);
+    expect(value.parentElement).toBe(caption);
+    expect(label.textContent).toBe("CPU");
+    expect(value.textContent).toBe("17%");
+  });
+
+  it("a label-only caller (no numerals — VRAM's own case elsewhere) still gets the caption row", () => {
+    const { container } = render(
+      <Meter wrapperClassName="mm-gauge" ariaLabel="test" bands={[]} label="Super" />,
+    );
+    const caption = container.querySelector(".meter-caption")!;
+    expect(caption).not.toBeNull();
+    expect(caption.querySelector(".meter-label")!.textContent).toBe("Super");
+    expect(caption.querySelector(".meter-now")).toBeNull();
+  });
+
+  it("`hideAvgMax` suppresses the avg/max line even though `numerals` is present (CPU clusters have no window concept)", () => {
+    const { container } = render(
+      <Meter
+        wrapperClassName="mm-gauge"
+        ariaLabel="test"
+        bands={[]}
+        label="Super"
+        numerals={{ now: 46, avg: null, max: null }}
+        hideAvgMax
+      />,
+    );
+    expect(container.querySelector(".meter-caption .meter-now")!.textContent).toBe("46%");
+    expect(container.querySelector(".meter-avgmax")).toBeNull();
+  });
+
+  it("omitting `hideAvgMax` keeps the avg/max line exactly as before, including the all-null case", () => {
+    const { container } = render(
+      <Meter wrapperClassName="mm-gauge" ariaLabel="test" bands={[]} numerals={{ now: null, avg: null, max: null }} />,
+    );
+    expect(container.querySelector(".meter-avgmax")!.textContent?.replace(/\s+/g, " ").trim()).toBe("— avg · — max");
+  });
+
+  // The stylesheet itself, not a jsdom-computed style — jsdom's test
+  // environment never loads `styles.css` as a real stylesheet, so
+  // `getComputedStyle` can't answer "does this rule say nowrap". Reading
+  // the source is the actual verifiable claim: the `.meter-avgmax` rule
+  // block genuinely specifies `white-space: nowrap` and tabular numerals,
+  // not just that the class name is present in the DOM.
+  it("the `.meter-avgmax` stylesheet rule specifies white-space: nowrap and tabular-nums", () => {
+    const cssPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "../styles.css");
+    const css = readFileSync(cssPath, "utf-8");
+    const match = css.match(/\.meter-avgmax\s*\{([^}]*)\}/);
+    expect(match).not.toBeNull();
+    const rule = match![1];
+    expect(rule).toMatch(/white-space:\s*nowrap/);
+    expect(rule).toMatch(/font-variant-numeric:\s*tabular-nums/);
   });
 });
 
