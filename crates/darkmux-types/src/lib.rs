@@ -13,6 +13,8 @@ pub mod flock;
 #[cfg(unix)]
 pub mod interrupt;
 pub mod paths;
+#[cfg(unix)]
+pub mod proc_group;
 pub mod residency_lease;
 pub mod session_id;
 pub mod size;

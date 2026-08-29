@@ -86,6 +86,7 @@
 use crate::crew;
 use crate::mission_launch;
 use crate::pr_review;
+use crate::review_finalize_guard::{self, ReviewFinalizeGuard};
 use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::MissionConfig;
 use darkmux_crew::dispatch::build_dispatch_record_with_payload;
@@ -704,7 +705,13 @@ fn review_result_to_mission_envelope(
 /// sign-off gate (unlike `coder-phase`), so this always drives the mission
 /// to a terminal status — see [`review_result_to_mission_envelope`]'s doc
 /// for the status decision.
-fn finalize_review_mission(mission_id: &str, phase_ids: &[&str], result: &Result<ReviewEnvelope>) {
+///
+/// `pub(crate)` (#2124): [`crate::review_finalize_guard::ReviewFinalizeGuard`]
+/// calls this directly (both its normal-path `close()` and its abort-path
+/// `Drop`) so there is exactly ONE place that ever writes a review
+/// mission's terminal record, whether the run finished normally, errored,
+/// panicked, or was cut short by SIGTERM/SIGINT.
+pub(crate) fn finalize_review_mission(mission_id: &str, phase_ids: &[&str], result: &Result<ReviewEnvelope>) {
     let envelope = review_result_to_mission_envelope(mission_id, phase_ids, result);
     crew::envelope::finalize_mission(&envelope);
 }
@@ -929,6 +936,16 @@ fn run_dispatch(
     timeout_seconds: u32,
     spec_origin: crew::types::MissionSpecOrigin,
 ) -> Result<ReviewEnvelope> {
+    // (#2124) Installed unconditionally, ahead of everything else this
+    // function does — including the `charges_file` re-judge side path,
+    // which spawns remote `curl` children of its own even though it mints
+    // no Mission. `pgid` is used only by the graph path's own
+    // `ReviewFinalizeGuard` below (the re-judge path has no mission to
+    // finalize and today accepts the pre-#2124 signal behavior — see this
+    // launcher's own module doc on why that path is out of scope for this
+    // fix), but arming here means BOTH paths' process group is isolated
+    // from the moment any dispatch could start, not just the graph one.
+    let pgid = review_finalize_guard::arm();
     let case = derive_case_id(collected);
 
     let source = resolve_source(collected)?;
@@ -1399,7 +1416,6 @@ fn run_dispatch(
         // cheap, idempotent final reconcile every other `run_step_graph`
         // caller also keeps.
         let phase_id_of_step_for_persist = graph.phase_id_of_step.clone();
-        let mission_id_for_status = mission_id.clone();
         let mission_id_for_steps = mission_id.clone();
         let mission_id_for_persist = mission_id.clone();
         let crew_name_for_closure = crew_name_for_bookends.clone();
@@ -1416,111 +1432,163 @@ fn run_dispatch(
         ];
         let mut closed_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        let result = with_dispatch_bookends(
-            &mut emitter,
-            &case_id_for_bookends,
-            &crew_name_for_bookends,
-            model_for_bookends.as_deref(),
-            // (#1508 /runs gate finding, must-fix 1) Stamp the freshly-
-            // minted `mission_id` onto this run's dispatch bookends — a
-            // default review launch previously carried `mission_id: None`
-            // here, making the review's own case-string-keyed flow session
-            // unrecoverable from the Mission record's read side (`/runs`
-            // synthesized a spurious untracked ghost for every review run).
-            Some(mission_id.as_str()),
-            dispatch_start_extra,
-            move |emitter| {
-                run_review_graph(
-                    &ctx,
-                    &crew_name_for_closure,
-                    mode,
-                    fingerprint_val,
-                    staffing,
-                    graph,
-                    emitter,
-                    // (#1397) Durably persist each step at ITS OWN
-                    // transition (Running at dispatch, Complete/Error at
-                    // completion) — the review pipeline runs through the
-                    // SAME `run_step_graph` call the crew scheduler's other
-                    // callers use, so it gets the identical mid-run
-                    // observability fix: a graph page opened while a probe
-                    // is still dispatching reads that step's real `Running`
-                    // status instead of the pre-run `Planned` snapshot.
-                    &mut |step| {
-                        let phase_id = phase_id_of_step_for_persist
-                            .get(&step.id)
-                            .map(String::as_str)
-                            .unwrap_or(&report_phase_id_for_persist);
-                        let was_new = mission_launch::lazy_start_phase_for_step(
-                            &mission_id_for_persist,
-                            phase_id,
-                            step.status,
-                            &mut started_phases,
-                        );
-                        // (#1620) A phase becoming live is the signal that the
-                        // bands before it are over — phases are strictly
-                        // sequential (#1341), so reaching this one means the
-                        // earlier ones' work is done. Close them at their EARNED
-                        // outcome now, instead of leaving every touched phase
-                        // `Running` until the whole mission finalizes and
-                        // reconciles them in bulk (which made the board read
-                        // `0/3` for the entire run, then jump to `3/3`).
-                        if was_new {
-                            mission_launch::lazy_close_prior_phases(
-                                &mission_id_for_persist,
-                                &phase_order_for_persist,
-                                phase_id,
-                                &mut closed_phases,
-                            );
-                        }
-                        // (F2, gate remediation) Warn, never silently
-                        // swallow — same dim-warning parity as
-                        // `mission_launch.rs`/`coder_phase.rs`'s persist
-                        // closures: a disk-full mid-review would otherwise
-                        // freeze the graph page with zero operator signal.
-                        if let Err(e) = crew::lifecycle::save_step(&mission_id_for_persist, phase_id, step) {
-                            eprintln!(
-                                "{}",
-                                style::dim(&format!(
-                                    "mission launch review: step persist warning (transition): {e:#}"
-                                ))
-                            );
-                        }
-                    },
-                )
-                .map(|(env, steps)| {
-                    for (step_id, step) in &steps {
-                        let phase_id = phase_id_of_step
-                            .get(step_id)
-                            .map(String::as_str)
-                            .unwrap_or(&report_phase_id_for_closure);
-                        // (F2) Same dim-warning parity as the transition
-                        // persist above and `mission_launch.rs`'s own
-                        // post-run reconcile loop.
-                        if let Err(e) = crew::lifecycle::save_step(&mission_id_for_steps, phase_id, step) {
-                            eprintln!(
-                                "{}",
-                                style::dim(&format!(
-                                    "mission launch review: step persist warning: {e:#}"
-                                ))
-                            );
-                        }
-                    }
-                    env
-                })
-            },
+        // (#2124) Armed here, right after the mint above succeeded — every
+        // exit from this point on (the normal `close()` call at the bottom
+        // of this block, an early `?`-return this function doesn't
+        // currently have but might grow, a panic that unwinds past this
+        // point, or a caught SIGTERM/SIGINT) leaves a matching mission
+        // terminal record behind. See `review_finalize_guard`'s own module
+        // doc for why the dispatch below runs on a supervised worker
+        // thread rather than inline.
+        let mut guard = ReviewFinalizeGuard::new(
+            mission_id.clone(),
+            vec![investigate_phase_id.clone(), adjudicate_phase_id.clone(), report_phase_id.clone()],
+            pgid,
         );
+
+        // (#2124) `with_dispatch_bookends`/`run_review_graph` is ONE
+        // blocking, synchronous call — there is no seam inside it (or
+        // inside the generic `run_step_graph` it drives) to check an
+        // interrupt flag mid-run. Running it on its own thread and
+        // supervising from here is what makes a SIGTERM/SIGINT arriving
+        // mid-probe (the exact #2124 repro) actually interruptible: the
+        // supervisor loop below polls the interrupt flag independently of
+        // whatever step the worker happens to be blocked in.
+        let dispatch_worker = std::thread::spawn(move || -> Result<ReviewEnvelope> {
+            with_dispatch_bookends(
+                &mut emitter,
+                &case_id_for_bookends,
+                &crew_name_for_bookends,
+                model_for_bookends.as_deref(),
+                // (#1508 /runs gate finding, must-fix 1) Stamp the freshly-
+                // minted `mission_id` onto this run's dispatch bookends — a
+                // default review launch previously carried `mission_id: None`
+                // here, making the review's own case-string-keyed flow session
+                // unrecoverable from the Mission record's read side (`/runs`
+                // synthesized a spurious untracked ghost for every review run).
+                Some(mission_id.as_str()),
+                dispatch_start_extra,
+                move |emitter| {
+                    run_review_graph(
+                        &ctx,
+                        &crew_name_for_closure,
+                        mode,
+                        fingerprint_val,
+                        staffing,
+                        graph,
+                        emitter,
+                        // (#1397) Durably persist each step at ITS OWN
+                        // transition (Running at dispatch, Complete/Error at
+                        // completion) — the review pipeline runs through the
+                        // SAME `run_step_graph` call the crew scheduler's other
+                        // callers use, so it gets the identical mid-run
+                        // observability fix: a graph page opened while a probe
+                        // is still dispatching reads that step's real `Running`
+                        // status instead of the pre-run `Planned` snapshot.
+                        &mut |step| {
+                            let phase_id = phase_id_of_step_for_persist
+                                .get(&step.id)
+                                .map(String::as_str)
+                                .unwrap_or(&report_phase_id_for_persist);
+                            let was_new = mission_launch::lazy_start_phase_for_step(
+                                &mission_id_for_persist,
+                                phase_id,
+                                step.status,
+                                &mut started_phases,
+                            );
+                            // (#1620) A phase becoming live is the signal that the
+                            // bands before it are over — phases are strictly
+                            // sequential (#1341), so reaching this one means the
+                            // earlier ones' work is done. Close them at their EARNED
+                            // outcome now, instead of leaving every touched phase
+                            // `Running` until the whole mission finalizes and
+                            // reconciles them in bulk (which made the board read
+                            // `0/3` for the entire run, then jump to `3/3`).
+                            if was_new {
+                                mission_launch::lazy_close_prior_phases(
+                                    &mission_id_for_persist,
+                                    &phase_order_for_persist,
+                                    phase_id,
+                                    &mut closed_phases,
+                                );
+                            }
+                            // (F2, gate remediation) Warn, never silently
+                            // swallow — same dim-warning parity as
+                            // `mission_launch.rs`/`coder_phase.rs`'s persist
+                            // closures: a disk-full mid-review would otherwise
+                            // freeze the graph page with zero operator signal.
+                            if let Err(e) = crew::lifecycle::save_step(&mission_id_for_persist, phase_id, step) {
+                                eprintln!(
+                                    "{}",
+                                    style::dim(&format!(
+                                        "mission launch review: step persist warning (transition): {e:#}"
+                                    ))
+                                );
+                            }
+                        },
+                    )
+                    .map(|(env, steps)| {
+                        for (step_id, step) in &steps {
+                            let phase_id = phase_id_of_step
+                                .get(step_id)
+                                .map(String::as_str)
+                                .unwrap_or(&report_phase_id_for_closure);
+                            // (F2) Same dim-warning parity as the transition
+                            // persist above and `mission_launch.rs`'s own
+                            // post-run reconcile loop.
+                            if let Err(e) = crew::lifecycle::save_step(&mission_id_for_steps, phase_id, step) {
+                                eprintln!(
+                                    "{}",
+                                    style::dim(&format!(
+                                        "mission launch review: step persist warning: {e:#}"
+                                    ))
+                                );
+                            }
+                        }
+                        env
+                    })
+                },
+            )
+        });
+
+        // (#2124) Poll BOTH the interrupt flag and the worker's own
+        // completion on a short timer — this is the "checked between
+        // steps" checkpoint for this launcher, at poll-tick granularity
+        // rather than graph-step granularity (see `review_finalize_guard`'s
+        // module doc for why). A productive run never observes anything
+        // here beyond the worker finishing first.
+        let poll_interval = std::time::Duration::from_millis(150);
+        while !dispatch_worker.is_finished() && !darkmux_types::interrupt::is_set() {
+            std::thread::sleep(poll_interval);
+        }
+        let result: Result<ReviewEnvelope> = if darkmux_types::interrupt::is_set() && !dispatch_worker.is_finished() {
+            // The worker is still running — almost certainly blocked
+            // inside a synchronous `curl`/`docker` child. Joining here
+            // would block on exactly the call this fix exists to escape,
+            // so the handle is deliberately abandoned: `guard.close` below
+            // still writes a real terminal record, then reaps whatever
+            // that worker's child process was, once the record is durable.
+            Err(anyhow!(
+                "mission launch review: interrupted by signal (SIGINT/SIGTERM) before the \
+                 review pipeline finished"
+            ))
+        } else {
+            match dispatch_worker.join() {
+                Ok(result) => result,
+                Err(panic_payload) => Err(anyhow!(
+                    "mission launch review: the review dispatch thread panicked: {}",
+                    review_finalize_guard::panic_message(&*panic_payload)
+                )),
+            }
+        };
 
         // The Mission/Phases minted above start life Active/Running and,
         // without this, never reach a terminal status regardless of
-        // outcome — every review, clean or errored, would be left
-        // permanently "stuck" in `darkmux mission status`.
-        let phase_ids = [
-            investigate_phase_id.as_str(),
-            adjudicate_phase_id.as_str(),
-            report_phase_id.as_str(),
-        ];
-        finalize_review_mission(&mission_id_for_status, &phase_ids, &result);
+        // outcome — every review, clean, errored, or signal-interrupted,
+        // would be left permanently "stuck" in `darkmux mission status`.
+        // (#2124) `guard.close` also reaps this run's process group when
+        // `result` reflects a caught signal — see its own doc.
+        guard.close(&result);
 
         result
     };

@@ -2145,6 +2145,290 @@ fn pr_review_run_no_profile_binding_or_default_errors_loudly() {
         .stderr(predicate::str::contains("default_profile"));
 }
 
+// ─── #2124: SIGTERM mid-probe leaves a terminal record + no orphaned curl ──
+
+/// A tiny local server that ACCEPTS every connection and never responds —
+/// makes a review probe's remote `curl` call (`darkmux-crew`'s
+/// `remote_chat_attempt`) hang exactly the way a live LLM endpoint that
+/// stopped answering would. Each accepted connection gets its own thread
+/// doing a blocking read with no timeout; that read returns (`Ok(0)`/`Err`)
+/// the instant the PEER's socket closes — i.e. the instant `curl` itself
+/// dies — which is what [`ReapProbe::wait_for_close`] below waits on. This
+/// is a more precise proof of reaping than polling `ps`/`pgrep` for a
+/// process that might not exist yet: it observes the OS actually tearing
+/// the connection down, not just a name disappearing from a process list.
+struct HangingStubServer {
+    port: u16,
+    accepted_rx: std::sync::mpsc::Receiver<()>,
+    closed_rx: std::sync::mpsc::Receiver<()>,
+}
+
+impl HangingStubServer {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding the stub listener");
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel::<()>();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = accepted_tx.send(());
+                let closed_tx = closed_tx.clone();
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = [0u8; 1];
+                    // Blocks until the peer closes (curl dies) or sends a
+                    // byte (never happens — this server never writes a
+                    // response, so curl never gets anything back that
+                    // would make it close on its own before its `-m`
+                    // bound, which this test's SIGTERM preempts).
+                    let _ = stream.read(&mut buf);
+                    let _ = closed_tx.send(());
+                });
+            }
+        });
+        Self { port, accepted_rx, closed_rx }
+    }
+
+    /// Block until curl has actually connected — the precise "now it's
+    /// mid-probe" signal this test sends SIGTERM against, in place of a
+    /// fixed sleep that would either race a slow CI runner or waste time
+    /// on a fast one.
+    fn wait_for_a_connection(&self, timeout: std::time::Duration) -> bool {
+        self.accepted_rx.recv_timeout(timeout).is_ok()
+    }
+
+    /// Block until SOME accepted connection's read returned — i.e. some
+    /// `curl` this test's review dispatch spawned has been torn down.
+    fn wait_for_a_connection_to_close(&self, timeout: std::time::Duration) -> bool {
+        self.closed_rx.recv_timeout(timeout).is_ok()
+    }
+}
+
+fn hanging_endpoint_profiles_json(port: u16) -> String {
+    format!(
+        r#"{{
+            "profiles": {{
+                "hang": {{
+                    "models": [
+                        {{"id": "stub-model", "n_ctx": 8000, "endpoint": {{"url": "http://127.0.0.1:{port}"}}}}
+                    ]
+                }}
+            }},
+            "default_profile": "hang"
+        }}"#
+    )
+}
+
+/// (#2124) `kill <pid>` (SIGTERM) on a `mission launch review` blocked
+/// mid-probe (a real `curl` call to an endpoint that never answers) must:
+/// exit within 5s, leave a `mission close` flow record naming the signal,
+/// leave the mission `finalized` with every phase `abandoned` (never stuck
+/// `active`), and leave no `curl` process still holding the stub
+/// connection open. Reproduces the exact scenario from the issue: `kill
+/// <pid>` on a real review launch, mid-probe, previously left the mission
+/// `active` forever with the `curl` child running past the parent's death.
+#[test]
+fn mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl() {
+    let stub = HangingStubServer::start();
+
+    let home = TempDir::new().unwrap();
+    // (#661/Beat-33 flattened layout) `DARKMUX_HOME` alone puts missions at
+    // `<home>/missions` directly (`crew::loader::missions_dir` — no `crew/`
+    // nesting), but flow records do NOT follow `DARKMUX_HOME` at all
+    // (`config_access::flows_dir` resolves independently via
+    // `DARKMUX_FLOWS_DIR` > config > `~/.darkmux/flows`, and a `cargo test`
+    // build's own default is a SHARED `/tmp/darkmux-test-isolated/flows` —
+    // isolating it here avoids colliding with any other test in this same
+    // binary run). Both set explicitly so this test never depends on which
+    // default each one happens to fall back to.
+    let flows = TempDir::new().unwrap();
+    let worktree = TempDir::new().unwrap();
+    fs::create_dir_all(worktree.path().join("src")).unwrap();
+    // A one-line change INSIDE a function body — `build_bundles`'s TS
+    // extraction unit is the enclosing function, not a bare top-level
+    // `const` (a diff touching only top-level statements, like
+    // `pr_review_run_diff()` elsewhere in this file, produces ZERO
+    // bundles and short-circuits to a degenerate envelope before any
+    // probe ever dispatches — proven nothing about SIGTERM handling; this
+    // fixture is deliberately function-shaped so a real probe dispatch
+    // actually happens). The worktree file holds the POST-change content;
+    // `pr.diff` describes the same edit as a unified diff.
+    fs::write(
+        worktree.path().join("src/x.ts"),
+        "function computeB(a) {\n  const b = 2;\n  return a + b;\n}\n",
+    )
+    .unwrap();
+    let diff_path = worktree.path().join("pr.diff");
+    fs::write(
+        &diff_path,
+        "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,4 +1,4 @@\n function computeB(a) {\n-  const b = 1;\n+  const b = 2;\n   return a + b;\n }\n",
+    )
+    .unwrap();
+    let profiles_path = worktree.path().join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_darkmux"))
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .args([
+            "mission",
+            "launch",
+            "review",
+            "--param",
+            &format!("worktree={}", worktree.path().to_str().unwrap()),
+            "--param",
+            &format!("diff_file={}", diff_path.to_str().unwrap()),
+            "--param",
+            &format!("profiles={}", profiles_path.to_str().unwrap()),
+            // Every declared review role routed at the same hanging
+            // endpoint — the FIRST one dispatched is enough to reproduce
+            // "mid-probe", but naming all of them means this test doesn't
+            // silently stop proving anything if the probe roster changes.
+            "--param",
+            "review-probe-high=hang",
+            "--param",
+            "review-probe-mid=hang",
+            "--param",
+            "review-probe-low=hang",
+            "--param",
+            "review-judge=hang",
+            "--param",
+            "review-verify=hang",
+            // Comfortably longer than this test's own 5s reap bound — the
+            // signal must be what ends the run, not curl's own `-m`.
+            "--timeout",
+            "60",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning darkmux mission launch review");
+    let pid = child.id();
+
+    // Wait for the precise "now it's mid-probe" signal — curl actually
+    // connecting to the stub — rather than a fixed sleep that would either
+    // race a slow CI runner (mint + bundle + crew resolution before the
+    // first probe dispatch) or waste time on a fast one. A generous bound:
+    // this is proving SIGTERM handling, not probe dispatch latency.
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "the review dispatch never reached a probe call to the stub server within 20s — \
+         something upstream of SIGTERM handling broke (mint, bundling, or crew resolution)"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the review launcher must still be running (blocked on the hanging probe) before SIGTERM"
+    );
+
+    let kill_status = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("running kill -TERM");
+    assert!(kill_status.success(), "kill -TERM itself must succeed");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mission launch review did not exit within 5s of SIGTERM (#2124 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!exit_status.success(), "a signal-interrupted review must not exit 0");
+
+    // The stub server's per-connection reader must observe curl's socket
+    // closing — proof the process-group reap actually reached the child,
+    // not just that the PARENT died (an orphaned `curl` would leave this
+    // hanging until ITS OWN `-m` bound, far past this wait).
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "no `curl` connection to the stub server was ever torn down — a child process survived \
+         the parent (#2124 regression)"
+    );
+
+    // Secondary corroboration via the process table: `remote_chat_attempt`
+    // (crates/darkmux-crew/src/dispatch_internal.rs) always spawns curl as
+    // `curl -sS -m <t> -K <tmp-path>`, where `<tmp-path>` is named
+    // `darkmux-remote-<pid>-<n>.curl` — a distinctive `-f`-matchable
+    // fragment regardless of the port curl was told to hit (the URL lives
+    // INSIDE that config file, never in argv). A brief settle delay covers
+    // the OS's own process-table teardown after SIGKILL.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let pgrep = std::process::Command::new("pgrep").args(["-f", "darkmux-remote-"]).output();
+    if let Ok(out) = pgrep {
+        let survivors = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            survivors.trim().is_empty(),
+            "a darkmux review-dispatch curl process is still running after the parent exited: {survivors}"
+        );
+    } // `pgrep` missing entirely (non-macOS/Linux CI image) — the socket-close proof above already covers this.
+
+    // The mission itself: exactly one was minted under this isolated
+    // DARKMUX_HOME, so no id needs to be captured from the child's own
+    // output — read whichever one is there. `<home>/missions` directly
+    // (the flattened post-Beat-33 layout — `crew::loader::missions_dir`),
+    // not `<home>/crew/missions`.
+    let missions_dir = home.path().join("missions");
+    let mission_id = fs::read_dir(&missions_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", missions_dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .next()
+        .expect("exactly one mission must have been minted");
+
+    let mission_json: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(missions_dir.join(&mission_id).join("mission.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        mission_json["status"], "finalized",
+        "an interrupted review must reach a terminal mission status, never stay active: {mission_json}"
+    );
+
+    let phases_dir = missions_dir.join(&mission_id).join("phases");
+    let mut saw_a_phase = false;
+    for entry in fs::read_dir(&phases_dir).unwrap().filter_map(|e| e.ok()) {
+        let phase_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap();
+        assert_eq!(
+            phase_json["status"], "abandoned",
+            "a signal-interrupted run must abandon its phases, never complete one: {phase_json}"
+        );
+        saw_a_phase = true;
+    }
+    assert!(saw_a_phase, "the mint must have produced at least one phase to check");
+
+    // The flow record: `mission close`, carrying the signal in its reason
+    // — the "mission close with reason: signal" vocabulary #2124 asks for
+    // (see `review_finalize_guard.rs`'s own doc for why this reuses
+    // `finalize_review_mission`'s existing `mission close`/Finalized path
+    // rather than inventing a separate `mission abort`/Aborted one — the
+    // SAME choice `crawl_launch.rs`'s `CrawlFinalizeGuard` already made for
+    // an interrupted crawl).
+    let mut found_mission_close = false;
+    for entry in fs::read_dir(flows.path()).unwrap_or_else(|e| panic!("reading {}: {e}", flows.path().display())) {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        for line in fs::read_to_string(&path).unwrap().lines() {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if record["action"] == "mission close" && record["mission_id"] == mission_id {
+                found_mission_close = true;
+                let reasoning = record["reasoning"].as_str().unwrap_or_default();
+                assert!(
+                    reasoning.to_lowercase().contains("signal"),
+                    "the mission close record's reason must name the signal: {reasoning}"
+                );
+            }
+        }
+    }
+    assert!(found_mission_close, "expected a `mission close` flow record for {mission_id}");
+}
+
 // ─── review-bench --funnel flag plumbing (#1222 Phase B packet 7) ─────────
 //
 // The funnel condition's real dispatch path needs a live LMStudio + a real
