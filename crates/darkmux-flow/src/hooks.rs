@@ -945,7 +945,13 @@ const CURSOR_WRITE_STALL_THRESHOLD: u64 = 3;
 const CURSOR_WRITE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 enum DeliveryOutcome {
-    Success,
+    /// Delivered (2xx). `receiver_rejected` is the receiver's own
+    /// per-record rejection count when its JSON body reported one
+    /// (`{"rejected": N}`, the local tracker's contract); a 200 with
+    /// rejections is still CONSUMED (at-least-once, the line advances) but
+    /// the count rides on `hook.fired` so it is never silent (#1959 live
+    /// loop: every finding was refused inside a 200 and nothing said so).
+    Success { receiver_rejected: Option<u64> },
     ClientError,
     /// (#2093 merge-gate finding 2) A 3xx response — the receiver telling
     /// us to go elsewhere, which we refuse rather than follow. Treated as
@@ -1000,7 +1006,15 @@ fn try_post(url: &str, body: &str) -> DeliveryOutcome {
                 // ureq only returns `Ok` for 2xx/3xx by default; any other
                 // status here would already have been `Err(Status(..))`
                 // below. Treat conservatively as success only for 2xx.
-                DeliveryOutcome::Success
+                // Read at most 64 KiB of the body (a receiver cannot make us
+                // buffer a 100 MB reply) and pull a `rejected` count if the
+                // body is JSON that carries one.
+                let mut buf = String::new();
+                let _ = std::io::Read::take(resp.into_reader(), 65_536).read_to_string(&mut buf);
+                let receiver_rejected = serde_json::from_str::<serde_json::Value>(&buf)
+                    .ok()
+                    .and_then(|v| v.get("rejected").and_then(serde_json::Value::as_u64));
+                DeliveryOutcome::Success { receiver_rejected }
             }
         }
         Err(ureq::Error::Status(code, _resp)) if is_retryable_client_status(code) => DeliveryOutcome::RetryableFailure,
@@ -1045,7 +1059,7 @@ pub fn drain_stray_file(outbox_path: &Path, to_url: &str) -> Result<StrayDrainRe
     let mut result = StrayDrainResult::default();
     while let Some((line, new_cursor)) = next_pending_line(outbox_path, cursor) {
         match try_post(to_url, &line) {
-            DeliveryOutcome::Success => {
+            DeliveryOutcome::Success { .. } => {
                 result.delivered += 1;
                 cursor = new_cursor;
                 write_cursor(&cursor_path, cursor)?;
@@ -1197,6 +1211,19 @@ fn emit_hook_record(
     attempt: u32,
     error: Option<&str>,
 ) {
+    emit_hook_record_with(report_sink, success, rt, delivered_line, attempt, error, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_hook_record_with(
+    report_sink: &dyn FlowSink,
+    success: bool,
+    rt: &RuleRuntime,
+    delivered_line: &str,
+    attempt: u32,
+    error: Option<&str>,
+    receiver_rejected: Option<u64>,
+) {
     let rule = &rt.rule;
     // (fix-round finding 5) Lenient on read: a delivered line that IS
     // valid JSON but carries no `action` field (not a real flow record —
@@ -1228,6 +1255,9 @@ fn emit_hook_record(
     }
     if let Some(e) = error {
         payload["error"] = serde_json::Value::String(e.to_string());
+    }
+    if let Some(n) = receiver_rejected.filter(|n| *n > 0) {
+        payload["receiver_rejected"] = serde_json::Value::from(n);
     }
 
     let action = if success { "hook.fired" } else { "hook.failed" };
@@ -1388,7 +1418,7 @@ fn drainer_loop(
                 continue;
             }
             match try_post(&rt.rule.url, &line) {
-                DeliveryOutcome::Success => {
+                DeliveryOutcome::Success { receiver_rejected } => {
                     let attempt = {
                         let mut c = rt.attempt_count.lock().unwrap();
                         *c += 1;
@@ -1396,7 +1426,13 @@ fn drainer_loop(
                     };
                     advance_cursor(rt, new_cursor);
                     write_last_status(rt, true, None);
-                    emit_hook_record(report_sink.as_ref(), true, rt, &line, attempt, None);
+                    if let Some(n) = receiver_rejected.filter(|n| *n > 0) {
+                        eprintln!(
+                            "flow::HookSink: receiver at {} accepted the request but rejected {n} record(s) inside it — see hook.fired.receiver_rejected",
+                            rt.rule.url
+                        );
+                    }
+                    emit_hook_record_with(report_sink.as_ref(), true, rt, &line, attempt, None, receiver_rejected);
                 }
                 DeliveryOutcome::ClientError => {
                     let attempt = {
@@ -1714,6 +1750,7 @@ pub mod test_receiver {
         received: Arc<Mutex<Vec<String>>>,
         statuses: Arc<Mutex<VecDeque<u16>>>,
         redirect_location: Arc<Mutex<Option<String>>>,
+        response_body: Arc<Mutex<Option<String>>>,
         stop: Arc<AtomicBool>,
         handle: Option<JoinHandle<()>>,
     }
@@ -1756,6 +1793,8 @@ pub mod test_receiver {
             let thread_received = received.clone();
             let thread_statuses = statuses.clone();
             let thread_redirect_location = redirect_location.clone();
+            let response_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let thread_response_body = response_body.clone();
             let thread_stop = stop.clone();
             let handle = std::thread::spawn(move || {
                 loop {
@@ -1764,7 +1803,7 @@ pub mod test_receiver {
                     }
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            let _ = handle_one(stream, &thread_received, &thread_statuses, &thread_redirect_location);
+                            let _ = handle_one(stream, &thread_received, &thread_statuses, &thread_redirect_location, &thread_response_body);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1774,7 +1813,7 @@ pub mod test_receiver {
                 }
             });
 
-            Self { addr, received, statuses, redirect_location, stop, handle: Some(handle) }
+            Self { addr, received, statuses, redirect_location, response_body, stop, handle: Some(handle) }
         }
 
         /// Queue a sequence of HTTP status codes to return, one per
@@ -1786,6 +1825,13 @@ pub mod test_receiver {
 
         /// When a queued status is 3xx, answer with this `Location` header
         /// — for tests proving a redirect is refused rather than followed.
+        /// Answer every 2xx with this body (a receiver reporting per-record
+        /// results, e.g. `{"rejected": 1}`).
+        pub fn with_response_body(self, body: &str) -> Self {
+            *self.response_body.lock().unwrap() = Some(body.to_string());
+            self
+        }
+
         pub fn with_redirect_location(self, location: &str) -> Self {
             *self.redirect_location.lock().unwrap() = Some(location.to_string());
             self
@@ -1823,6 +1869,7 @@ pub mod test_receiver {
         received: &Arc<Mutex<Vec<String>>>,
         statuses: &Arc<Mutex<VecDeque<u16>>>,
         redirect_location: &Arc<Mutex<Option<String>>>,
+        response_body: &Arc<Mutex<Option<String>>>,
     ) -> std::io::Result<()> {
         stream.set_nonblocking(false)?;
         let mut reader = BufReader::new(stream.try_clone()?);
@@ -1872,7 +1919,11 @@ pub mod test_receiver {
         } else {
             String::new()
         };
-        let resp = format!("HTTP/1.1 {status} {reason}\r\n{location_header}Content-Length: 0\r\nConnection: close\r\n\r\n");
+        let body_out = if (200..300).contains(&status) { response_body.lock().unwrap().clone().unwrap_or_default() } else { String::new() };
+        let resp = format!(
+            "HTTP/1.1 {status} {reason}\r\n{location_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_out}",
+            body_out.len()
+        );
         stream.write_all(resp.as_bytes())?;
         stream.flush()?;
         Ok(())
@@ -3324,4 +3375,43 @@ mod tests {
             enabled_elapsed.as_micros() as f64 / n as f64,
         );
     }
+    // (#1959 live loop) A receiver that answers 200 but rejects records
+    // per-record inside the body (`{"rejected": N}`) must not read as a clean
+    // delivery: `hook.fired` carries `receiver_rejected` so the rejection is
+    // visible on the stream instead of only in the receiver's own logs.
+    #[test]
+    fn hook_fired_surfaces_a_receivers_per_record_rejection_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start()
+            .with_response_body(r#"{"ok":true,"accepted":0,"rejected":1,"results":[{"ok":false,"error":"rule must be a string"}]}"#);
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(wait_until(
+            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"),
+            Duration::from_secs(3)
+        ));
+        let fired = capture.0.lock().unwrap().iter().find(|r| r.action == "hook.fired").cloned().unwrap();
+        let rejected = fired.payload.as_ref().and_then(|p| p.get("receiver_rejected")).and_then(|v| v.as_u64());
+        assert_eq!(rejected, Some(1), "{fired:?}");
+        drop(sink);
+    }
+
 }

@@ -1422,3 +1422,34 @@ fn limit_zero_selects_nothing_and_completes_cleanly() {
     assert_eq!(completed["payload"]["units_completed"], 0);
     assert_eq!(completed["payload"]["stopped_by"], "limit");
 }
+
+// (#1959, found by the first hooks-enabled live loop) A finding's `rule` must
+// be ONE rule id — the pattern the model reported it under — never the unit's
+// whole rule list. The receiver keys identity on it and refused every finding
+// from a read unit because `rule` arrived as an array.
+#[test]
+fn finding_rule_is_the_reported_pattern_when_the_unit_carries_several_rules() {
+    let ids = vec!["doc-contradicts-code".to_string(), "style-guide".to_string()];
+    let (rule, unmatched) = super::finding_rule_for(Some("style-guide"), &ids);
+    assert_eq!(rule, "style-guide");
+    assert!(unmatched.is_none());
+    // Case-insensitive match on what the model typed.
+    let (rule, _) = super::finding_rule_for(Some("Doc-Contradicts-Code"), &ids);
+    assert_eq!(rule, "doc-contradicts-code");
+}
+
+#[test]
+fn finding_rule_on_a_single_rule_unit_is_that_rule_whatever_the_pattern_says() {
+    let ids = vec!["swallowed-error".to_string()];
+    let (rule, unmatched) = super::finding_rule_for(Some("something else"), &ids);
+    assert_eq!(rule, "swallowed-error");
+    assert!(unmatched.is_none(), "a single-rule unit has nothing to disambiguate");
+}
+
+#[test]
+fn finding_rule_with_an_unmatched_pattern_keeps_the_first_rule_and_records_the_pattern() {
+    let ids = vec!["a".to_string(), "b".to_string()];
+    let (rule, unmatched) = super::finding_rule_for(Some("zzz"), &ids);
+    assert_eq!(rule, "a");
+    assert_eq!(unmatched.as_deref(), Some("zzz"));
+}
