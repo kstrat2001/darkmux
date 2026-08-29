@@ -489,6 +489,18 @@ mod tests {
         assert!(warnings[0].contains("2.0"), "{warnings:?}");
     }
 
+    /// (#1959) Moved from the retired `crawl::manifest`'s own test of the
+    /// same name — no twin existed here. The other half of the mismatch
+    /// test above: a MATCHING major produces no warning at all.
+    #[test]
+    fn schema_version_matching_major_is_silent() {
+        let json = minimal_spec_json(); // schema_version: "1.0"
+        let dir = TempDir::new().unwrap();
+        let path = write(&dir, "workspace.json", &json.to_string());
+        let (_, warnings) = WorkspaceSpec::load(&path).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
     // ── effective_include / effective_exclude defaults ──
 
     #[test]
