@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { PhoneDrawer } from "./PhoneDrawer";
 import type { FlowRecord } from "../types/handwritten";
@@ -434,6 +434,132 @@ describe("PhoneDrawer — modal behavior while open (#2107, #1833)", () => {
     // SEPARATE element from the page content, so clicking it structurally
     // cannot dispatch to a different, unrelated node.
     expect(behindClick).not.toHaveBeenCalled();
+  });
+});
+
+// ── (operator finding, iOS Safari Home Screen install) `overflow: hidden`
+//    on <body> is ignored by iOS Safari — a drag on the open drawer still
+//    scrolled the page behind it. The iOS-proof form pins <body> via
+//    `position: fixed` at its current scroll offset and restores +
+//    re-scrolls to that exact offset on close, covering every exit path
+//    (tab close, unmount-while-open) through one effect keyed on `open`.
+describe("PhoneDrawer — iOS scroll lock (operator finding)", () => {
+  afterEach(() => {
+    // Belt-and-braces: a failing assertion mid-test must not leave a real
+    // fixed body bleeding into a LATER test's `document.body`.
+    document.body.style.position = "";
+    document.body.style.top = "";
+    document.body.style.left = "";
+    document.body.style.right = "";
+    document.body.style.width = "";
+    document.body.style.overflow = "";
+  });
+
+  it("opening pins the body at its current scroll offset (position: fixed, negative top) and restores + scrolls back on close", () => {
+    const scrollToSpy = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    Object.defineProperty(window, "scrollY", {
+      configurable: true,
+      value: 240,
+    });
+
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    expect(document.body.style.position).not.toBe("fixed");
+
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    expect(document.body.style.position).toBe("fixed");
+    expect(document.body.style.top).toBe("-240px");
+    expect(document.body.style.width).toBe("100%");
+    expect(document.body.style.overflow).toBe("hidden");
+
+    // Closing (active-tab re-tap) restores the styles AND scrolls back to
+    // the exact offset that was saved on open.
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    expect(document.body.style.position).not.toBe("fixed");
+    expect(document.body.style.top).toBe("");
+    expect(scrollToSpy).toHaveBeenCalledWith(0, 240);
+
+    scrollToSpy.mockRestore();
+  });
+
+  it("unmounting WHILE open still restores the body — no path leaves it stuck fixed", () => {
+    const scrollToSpy = vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+    Object.defineProperty(window, "scrollY", {
+      configurable: true,
+      value: 80,
+    });
+
+    const { unmount } = render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    expect(document.body.style.position).toBe("fixed");
+
+    unmount();
+    expect(document.body.style.position).not.toBe("fixed");
+    expect(scrollToSpy).toHaveBeenCalledWith(0, 80);
+
+    scrollToSpy.mockRestore();
+  });
+
+  // (Self-QA gate mutation self-check, per the task brief) Removing the
+  // restore half of the effect's cleanup — mirrored here by asserting
+  // against a build that never runs it — must fail this test; see the
+  // PR's own report for the mutate/observe-fail/restore transcript. This
+  // test is the one that would catch that regression.
+  it("does not leave the body permanently fixed after close (regression guard)", () => {
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    expect(document.body.style.position).toBe("");
+  });
+
+  it("the backdrop blocks a touchmove from reaching the page (non-passive preventDefault)", () => {
+    render(
+      <PhoneDrawer
+        machineTab={NOOP_MACHINE_TAB}
+        events={NO_EVENTS}
+        liveStatus="live"
+        route={{ kind: "fleet" }}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    const backdrop = document.querySelector(
+      '[data-act="phone-drawer-backdrop"]',
+    )!;
+    const event = new Event("touchmove", { cancelable: true, bubbles: true });
+    backdrop.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
   });
 });
 

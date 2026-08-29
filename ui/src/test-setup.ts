@@ -14,6 +14,16 @@ if (typeof globalThis.ResizeObserver === "undefined") {
   };
 }
 
+// jsdom's `window.scrollTo` is a stub that logs "Not implemented" to the
+// console rather than doing anything (`PhoneDrawer.tsx`'s iOS scroll-lock
+// effect calls it on every close, so every test that opens and closes
+// that drawer would otherwise spam this warning on every run). A no-op is
+// the right test-environment shape here too — a test that cares WHICH
+// arguments it was called with still overrides this via `vi.spyOn`.
+if (typeof window !== "undefined") {
+  window.scrollTo = () => {};
+}
+
 // (#2027) Storage is per-test state, and nothing was clearing it.
 //
 // Once the event log began persisting filters and its collapse choice to

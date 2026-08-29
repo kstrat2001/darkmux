@@ -174,6 +174,10 @@ export function PhoneDrawer({
     startOpen: boolean;
     moved: boolean;
   } | null>(null);
+  // (iOS scroll-lock fix) The backdrop's own non-passive `touchmove`
+  // listener needs a real DOM node to attach to — see that effect's own
+  // doc below.
+  const backdropRef = useRef<HTMLDivElement | null>(null);
 
   function close() {
     setOpen(false);
@@ -212,12 +216,49 @@ export function PhoneDrawer({
   // original spec had it (that graduated threshold is retired; scroll is
   // locked for the drawer's entire open lifetime now, matching the
   // backdrop's own "modal the instant it's open" treatment below).
+  //
+  // (iOS scroll-lock fix, operator finding — a real iOS Safari Home Screen
+  // web app install) `overflow: hidden` on `<body>` alone is IGNORED by
+  // iOS Safari: a drag on the open sheet still scrolled the page BEHIND
+  // it, worse than having no lock at all (the touch visually passed
+  // through the front layer). The iOS-proof form pins the body via
+  // `position: fixed` at its CURRENT scroll offset — `top` carries the
+  // negative of that offset so nothing visually jumps — and restores both
+  // the styles and the exact scroll position on close via
+  // `window.scrollTo`. `overflow: hidden` stays alongside it (harmless,
+  // and still what non-iOS browsers key their own lock behavior off).
+  //
+  // A SINGLE effect keyed on `open` covers every exit path uniformly: the
+  // cleanup function below fires on close (tab re-tap, Escape, backdrop
+  // click — all just flip `open` to `false`) AND on unmount (a route
+  // change while the drawer happens to be open), so body can never be
+  // left stuck `position: fixed` with no matching restore.
   useEffect(() => {
     if (!open) return undefined;
-    const prevOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    const body = document.body;
+    const scrollY = window.scrollY || window.pageYOffset || 0;
+    const prev = {
+      position: body.style.position,
+      top: body.style.top,
+      left: body.style.left,
+      right: body.style.right,
+      width: body.style.width,
+      overflow: body.style.overflow,
+    };
+    body.style.position = "fixed";
+    body.style.top = `-${scrollY}px`;
+    body.style.left = "0";
+    body.style.right = "0";
+    body.style.width = "100%";
+    body.style.overflow = "hidden";
     return () => {
-      document.body.style.overflow = prevOverflow;
+      body.style.position = prev.position;
+      body.style.top = prev.top;
+      body.style.left = prev.left;
+      body.style.right = prev.right;
+      body.style.width = prev.width;
+      body.style.overflow = prev.overflow;
+      window.scrollTo(0, scrollY);
     };
   }, [open]);
 
@@ -229,6 +270,26 @@ export function PhoneDrawer({
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  // (iOS scroll-lock fix) React attaches its own synthetic `onTouchMove` as
+  // a PASSIVE native listener (the framework's default for touch/wheel
+  // events since React 17), so a JSX `onTouchMove={...}` handler on the
+  // backdrop cannot reliably `preventDefault()` a scroll/rubber-band
+  // gesture — the browser has already committed to scrolling by the time
+  // the passive handler runs. A manually-attached NATIVE listener with
+  // `{ passive: false }` is the only way to actually block it; `open` is
+  // in the deps because the backdrop itself is conditionally MOUNTED
+  // (`{open && <div ... />}` below), so this re-attaches every time a new
+  // backdrop node appears.
+  useEffect(() => {
+    const el = backdropRef.current;
+    if (!el) return undefined;
+    const onTouchMove = (e: TouchEvent) => {
+      e.preventDefault();
+    };
+    el.addEventListener("touchmove", onTouchMove, { passive: false });
+    return () => el.removeEventListener("touchmove", onTouchMove);
   }, [open]);
 
   function onHandlePointerDown(e: React.PointerEvent) {
@@ -292,6 +353,7 @@ export function PhoneDrawer({
           content happened to be underneath. */}
       {open && (
         <div
+          ref={backdropRef}
           className="phone-drawer__backdrop"
           data-act="phone-drawer-backdrop"
           aria-hidden="true"
