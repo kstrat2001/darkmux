@@ -1141,6 +1141,32 @@ body {
   line-height: 1;
   pointer-events: none;
 }
+/* (#2108 review finding 6, WebKit-proven) `.preview-text` has no
+   white-space/overflow rules of its own (the list-row usage above renders
+   fine wrapped or not), so a long record's preview wrapped onto a second
+   line inside the back-control strip — `.eventlog__rec.eventlog__rec--
+   stripback` is `display:flex; align-items:center` with a `min-height`
+   floor, not a fixed height, so nothing stopped the row from growing to
+   fit the wrapped text (measured: row height 44px, `scrollHeight` 51px,
+   the wrapped `preview-text` itself 58px tall) — clipped, not truncated,
+   by `.phone-drawer__body`'s own `overflow:hidden` one level up. This is
+   a back CONTROL, not a detail view (the full text is one tap away, in
+   the pane right below it); single-line ellipsis is correct here even
+   though the ordinary list-row `.preview-text` usage is left wrapping.
+   `min-width: 0` is required alongside `overflow:hidden` because this
+   span is a direct flex-item child of the row — flex items default to
+   `min-width: auto`, which refuses to shrink below the text's own
+   intrinsic (unwrapped) width and would otherwise widen the row instead
+   of truncating. `flex: 1 1 auto` lets it claim the row's remaining
+   width (after the icon/timestamp/activity siblings) rather than
+   collapsing to its shortest content. */
+.eventlog__rec.eventlog__rec--stripback .preview-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
 /* The record card's own scroll region — the ONLY one inside the pushed
    screen (the strip above it is fixed, `flex: none`, via the shared
    `.eventlog__rec` rules). */
