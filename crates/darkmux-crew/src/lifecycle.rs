@@ -2126,7 +2126,7 @@ mod tests {
             "m-crawl-1",
             Some("launched from `darkmux mission launch crawl`"),
             Some(serde_json::json!({
-                "workspace": "finhero",
+                "workspace": "acme",
                 "units_in_plan": 12,
                 "units_selected": 8,
                 "est_tokens": 40000,
@@ -2138,7 +2138,7 @@ mod tests {
         let records = records_with_action(&g, "mission start");
         assert_eq!(records.len(), 1, "{records:?}");
         let payload = &records[0]["payload"];
-        assert_eq!(payload["workspace"], "finhero");
+        assert_eq!(payload["workspace"], "acme");
         assert_eq!(payload["units_in_plan"], 12);
         assert_eq!(payload["units_selected"], 8);
         assert_eq!(payload["sources"][0]["id"], "app");

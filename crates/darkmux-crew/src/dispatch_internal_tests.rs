@@ -3349,8 +3349,8 @@
             "darkmux:qwen3.6".into(),
         )
         .with_record_context(Some(serde_json::json!({
-            "workspace": "finhero",
-            "source": "finsys-core",
+            "workspace": "acme",
+            "source": "acme-core",
             "sha": "abc123",
             "rule": ["swallowed-error"],
             "unit": "u-0001",
@@ -3385,8 +3385,8 @@
             .find(|v| v["session_id"] == "sess-context" && v["action"] == "dispatch.tool")
             .expect("a dispatch.tool record for the report_finding call");
 
-        assert_eq!(record["payload"]["context"]["workspace"], "finhero");
-        assert_eq!(record["payload"]["context"]["source"], "finsys-core");
+        assert_eq!(record["payload"]["context"]["workspace"], "acme");
+        assert_eq!(record["payload"]["context"]["source"], "acme-core");
         assert_eq!(record["payload"]["context"]["sha"], "abc123");
         assert_eq!(record["payload"]["context"]["unit"], "u-0001");
         // The record's OWN fields survive alongside the merged context —

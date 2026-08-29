@@ -1291,12 +1291,12 @@ mod tests {
         let rec = step_lifecycle_record_with_payload(
             &step,
             "step start",
-            Some(json!({"workspace": "finhero", "unit": "u-0001", "source": "app", "sha": "abc123"})),
+            Some(json!({"workspace": "acme", "unit": "u-0001", "source": "app", "sha": "abc123"})),
         );
         assert_eq!(rec.action, "step start");
         assert!(STEP_LIFECYCLE_ACTIONS.contains(&rec.action.as_str()));
         let payload = rec.payload.expect("payload set");
-        assert_eq!(payload["workspace"], "finhero");
+        assert_eq!(payload["workspace"], "acme");
         assert_eq!(payload["unit"], "u-0001");
         // mission_id is deliberately None here — the caller stamps it
         // (see the function's own doc); this test pins that it does NOT

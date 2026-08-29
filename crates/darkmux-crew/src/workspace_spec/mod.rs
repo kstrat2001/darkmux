@@ -118,7 +118,7 @@ pub struct EdgeSpec {
 pub struct WorkspaceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
-    /// Defaults to the spec file's stem (`finhero.json` -> `"finhero"`)
+    /// Defaults to the spec file's stem (`acme.json` -> `"acme"`)
     /// when absent — see [`WorkspaceSpec::load`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -362,9 +362,9 @@ mod tests {
         let mut json = minimal_spec_json();
         json.as_object_mut().unwrap().remove("name");
         let dir = TempDir::new().unwrap();
-        let path = write(&dir, "finhero.json", &json.to_string());
+        let path = write(&dir, "acme.json", &json.to_string());
         let (s, _) = WorkspaceSpec::load(&path).unwrap();
-        assert_eq!(s.name.as_deref(), Some("finhero"));
+        assert_eq!(s.name.as_deref(), Some("acme"));
     }
 
     #[test]
