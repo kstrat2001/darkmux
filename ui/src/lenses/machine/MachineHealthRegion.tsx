@@ -27,6 +27,7 @@ import {
 } from "./machineGauge";
 import { memBytes, reclaimableNote } from "../../lib/format";
 import { attributionLine, DAEMON_UNREACHABLE_MESSAGE, LOADING_MESSAGE, limitDescription, notLocalMessage, overPriceHint, stampLine, STALE_BANNER_TEXT } from "./memoryLedgerLines";
+import { Meter, CX, type MeterBand, type MeterTick } from "../../components/Meter";
 import type { MachineResources, MachineResourcesModel } from "../../types/handwritten";
 
 /**
@@ -67,11 +68,10 @@ import type { MachineResources, MachineResourcesModel } from "../../types/handwr
  */
 
 // ── The gauge (SVG semicircle hero) ─────────────────────────────────────
-
-const CX = 120;
-const CY = 120;
-const R = 86;
-const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
+//
+// `CX`/`CY`/`R`/`HALF_ARC_D` now live in `../../components/Meter` — the
+// shared dial geometry every caller (this one included) draws from. See
+// that file's own doc for the extraction's full reasoning.
 
 /** The arc ramp's gradient id. One gauge renders per page, so a fixed id is
  * safe; it is named rather than generated so the same string can be asserted
@@ -173,141 +173,94 @@ function Gauge({ resources, stale }: { resources: MachineResources; stale: boole
     .filter(Boolean)
     .join(" ");
 
+  // (extraction packet) Every VRAM-specific decoration this dial draws,
+  // handed to the shared `<Meter>` as data rather than inline JSX — see
+  // that component's own doc for the full reasoning. The RENDER OUTPUT
+  // this produces is byte-identical to the pre-extraction JSX; only where
+  // the markup is now assembled moved.
+  const bands: MeterBand[] = [
+    // ONE STACKED BAND, in scale order: darkmux from 0, everything else on
+    // top of it ending at the needle, then darkmux's committed growth
+    // beyond. Stacking is what restores ADDITIVITY — this page's question
+    // is "will it fit", which is a sum, and two concentric rings could show
+    // every part but never the total. It also makes `other` visible at
+    // last: as a span between darkmux's end and the needle, its derivedness
+    // is self-evident, where as an undrawn gap between two radii it was
+    // simply missing.
+    { className: "mm-gauge-val", stroke: `url(#${RAMP_ID})`, lengthPct: band.darkmux.lengthPct, alwaysRender: true },
+    { className: "mm-gauge-other", stroke: `url(#${RAMP_ID})`, lengthPct: band.other.lengthPct, startPct: band.other.startPct },
+    { className: "mm-gauge-growth", lengthPct: band.growth.lengthPct, hatchedDasharray: hatchedSegmentDash(band.growth.startPct, band.growth.lengthPct) },
+  ];
+  const ticks: MeterTick[] = geo.ticks.map((t, i) => ({
+    pct: t.pct,
+    label: t.label,
+    labelX: TICK_LABEL_XY[i][0],
+    labelY: TICK_LABEL_XY[i][1],
+  }));
+
   return (
-    <div className="mm-gauge">
-      <svg width="300" height="212" viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
-        {/* The color ramp lives across the arc's SWEEP, not in any figure
-            about the machine — laid across the arc's bounding box in user
-            space so it is independent of how much of the arc is filled. */}
-        <defs>
-          <linearGradient id={RAMP_ID} gradientUnits="userSpaceOnUse" x1={CX - R} y1={0} x2={CX + R} y2={0}>
-            {gaugeRampStops().map((s) => (
-              <stop key={s.offset} offset={s.offset} stopColor={s.color} />
-            ))}
-          </linearGradient>
-        </defs>
-        <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={11} pathLength={100} />
-        {/* ONE STACKED BAND, in scale order: darkmux from 0, everything
-            else on top of it ending at the needle, then darkmux's committed
-            growth beyond. Stacking is what restores ADDITIVITY — this page's
-            question is "will it fit", which is a sum, and two concentric
-            rings could show every part but never the total. It also makes
-            `other` visible at last: as a span between darkmux's end and the
-            needle, its derivedness is self-evident, where as an undrawn gap
-            between two radii it was simply missing. */}
-        <path
-          className="mm-gauge-val"
-          stroke={`url(#${RAMP_ID})`}
-          d={HALF_ARC_D}
-          fill="none"
-          strokeWidth={11}
-          pathLength={100}
-          strokeDasharray={`${band.darkmux.lengthPct} 100`}
-        />
-        {band.other.lengthPct > 0 && (
-          <path
-            className="mm-gauge-other"
-            stroke={`url(#${RAMP_ID})`}
-            d={HALF_ARC_D}
-            fill="none"
-            strokeWidth={11}
-            pathLength={100}
-            strokeDasharray={`${band.other.lengthPct} 100`}
-            strokeDashoffset={-band.other.startPct}
-          />
+    <Meter
+      wrapperClassName="mm-gauge"
+      ariaLabel={ariaLabel}
+      gradient={{ id: RAMP_ID, stops: gaugeRampStops() }}
+      bands={bands}
+      ticks={ticks}
+      scaleWord={geo.scaleWord}
+      redline={{ lit }}
+      needleAngleDeg={band.needleAngleDeg}
+    >
+      {/* Seven-segment, drawn as polygons in the SAME cell geometry the
+          boxed odometer used, so the figure still centers on the hub and
+          the unit still sits where it sat. `currentColor` keeps color
+          with the CSS (`.mm-gauge-center-val`) rather than moving it into
+          the component — the glyph form is what changed here, not the
+          palette. */}
+      <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
+        {odo.cells.map((c, i) =>
+          isSevenSegDot(c.ch) ? (
+            <circle
+              key={i}
+              className="mm-gauge-odo-cell"
+              cx={c.x + c.w / 2}
+              cy={ODO_TOP + ODO_H - 3.5}
+              r={1.7}
+              fill="currentColor"
+            />
+          ) : (
+            <g
+              key={i}
+              className="mm-gauge-odo-cell"
+              transform={`translate(${c.x} ${ODO_TOP}) scale(${c.w / SEVEN_SEG_CELL.w} ${ODO_H / SEVEN_SEG_CELL.h})`}
+            >
+              {sevenSegmentPolygons(c.ch).map((sg, j) => (
+                <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
+              ))}
+            </g>
+          ),
         )}
-        {band.growth.lengthPct > 0 && (
-          <path
-            className="mm-gauge-growth"
-            d={HALF_ARC_D}
-            fill="none"
-            strokeWidth={11}
-            pathLength={100}
-            strokeDasharray={hatchedSegmentDash(band.growth.startPct, band.growth.lengthPct)}
-          />
-        )}
-        {geo.ticks.map((t) => (
-          <line key={t.pct} className="mm-gauge-tick" x1={30} y1={CY} x2={38} y2={CY} transform={`rotate(${t.pct * 1.8} ${CX} ${CY})`} />
-        ))}
-        {geo.ticks.map((t, i) => (
-          <text key={t.pct} className="mm-gauge-scale-label" x={TICK_LABEL_XY[i][0]} y={TICK_LABEL_XY[i][1]} textAnchor="middle">
-            {t.label}
-          </text>
-        ))}
-        <text className="mm-gauge-scale-word" x={220} y={146} textAnchor="middle">
-          {geo.scaleWord}
+        <text className="mm-gauge-center-unit" x={CX + odo.width / 2 + 5} y={ODO_BASELINE} textAnchor="start">
+          {centerVal.unit}
         </text>
-        <path
-          className={`mm-gauge-redline${lit ? " lit" : ""}`}
-          d={HALF_ARC_D}
-          fill="none"
-          strokeWidth={11}
-          pathLength={100}
-          strokeDasharray="2.5 100"
-          strokeDashoffset="-97.5"
-        />
-        {/* The needle is deliberately UNCOLORED by state. It used to carry
-            `is-${stateCls}`, which on a real machine means `is-unknown` — a dim
-            gray needle over a dim gray fill, permanently (provenance finding
-            1). Position is the needle's whole job; the fill beside it now
-            carries the how-full channel and the lamps carry the verdict, so a
-            third, permanently-gray encoding of the same question is subtraction
-            rather than information. */}
-        <line className="mm-gauge-needle" x1={CX} y1={CY} x2={42} y2={CY} transform={`rotate(${band.needleAngleDeg} ${CX} ${CY})`} />
-        <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
-        <g className={`mm-gauge-center-val${lit ? " lit" : ""}`}>
-          {/* Seven-segment, drawn as polygons in the SAME cell geometry the
-              boxed odometer used, so the figure still centers on the hub and
-              the unit still sits where it sat. `currentColor` keeps color
-              with the CSS (`.mm-gauge-center-val`) rather than moving it into
-              the component — the glyph form is what changed here, not the
-              palette. */}
-          {odo.cells.map((c, i) =>
-            isSevenSegDot(c.ch) ? (
-              <circle
-                key={i}
-                className="mm-gauge-odo-cell"
-                cx={c.x + c.w / 2}
-                cy={ODO_TOP + ODO_H - 3.5}
-                r={1.7}
-                fill="currentColor"
-              />
-            ) : (
-              <g
-                key={i}
-                className="mm-gauge-odo-cell"
-                transform={`translate(${c.x} ${ODO_TOP}) scale(${c.w / SEVEN_SEG_CELL.w} ${ODO_H / SEVEN_SEG_CELL.h})`}
-              >
-                {sevenSegmentPolygons(c.ch).map((sg, j) => (
-                  <polygon key={j} points={sg.points} fill="currentColor" opacity={sg.lit ? 1 : SEVEN_SEG_GHOST} />
-                ))}
-              </g>
-            ),
-          )}
-          <text className="mm-gauge-center-unit" x={CX + odo.width / 2 + 5} y={ODO_BASELINE} textAnchor="start">
-            {centerVal.unit}
-          </text>
-        </g>
-        {/* Rendered only when there IS a reason — see `gaugeFaceCaption`.
-            The slot exists to name which disjunct put the machine in Red,
-            beneath the reading where the eye already is; in every other
-            state it used to say `IN USE`, restating the one thing a needle
-            over a 0→LIMIT scale cannot fail to communicate. */}
-        {/* The readout's own subject label. `IN USE` was deleted as noise when
-            the dial had ONE subject and the caption restated the obvious.
-            With a machine ring and a darkmux ring on one face, naming which
-            one the big number belongs to is no longer restatement — it is the
-            difference between two readings. */}
-        <text className="mm-gauge-readout-label" x={CX} y={164} textAnchor="middle">
-          MACHINE USED
+      </g>
+      {/* Rendered only when there IS a reason — see `gaugeFaceCaption`.
+          The slot exists to name which disjunct put the machine in Red,
+          beneath the reading where the eye already is; in every other
+          state it used to say `IN USE`, restating the one thing a needle
+          over a 0→LIMIT scale cannot fail to communicate. */}
+      {/* The readout's own subject label. `IN USE` was deleted as noise when
+          the dial had ONE subject and the caption restated the obvious.
+          With a machine ring and a darkmux ring on one face, naming which
+          one the big number belongs to is no longer restatement — it is the
+          difference between two readings. */}
+      <text className="mm-gauge-readout-label" x={CX} y={164} textAnchor="middle">
+        MACHINE USED
+      </text>
+      {faceCaption && (
+        <text className="mm-gauge-center-caption" x={CX} y={176} textAnchor="middle">
+          {faceCaption}
         </text>
-        {faceCaption && (
-          <text className="mm-gauge-center-caption" x={CX} y={176} textAnchor="middle">
-            {faceCaption}
-          </text>
-        )}
-      </svg>
-    </div>
+      )}
+    </Meter>
   );
 }
 

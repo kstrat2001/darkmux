@@ -2,7 +2,6 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { LiveStatusBadge, PlaybackModeBadge } from "./LiveStatusBadge";
 import { CatalogPanel } from "../lenses/catalog/CatalogPanel";
-import { AboutDialog } from "./AboutDialog";
 import { openModalEl } from "../lib/dialogManager";
 import { isLiveRoute, type Route } from "../lib/route";
 import { todayUTC } from "../lib/flow";
@@ -25,7 +24,6 @@ import { injectedMeta } from "../lib/injectedMeta";
 import markUrl from "../brand/mark-trapezoid-out.svg";
 import { getSource } from "../lib/source";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
-import type { MachineSpecs } from "../types/handwritten";
 
 /**
  * The masthead (`.top`, viewer.html:802-816) — brand, build-identifier chip,
@@ -50,8 +48,14 @@ import type { MachineSpecs } from "../types/handwritten";
  * the trigger for `#imodalbg` (viewer.html:1132, the build/status snapshot
  * dialog) — this component's `verbadge` is a real `data-act="about"` button
  * (only when it has content: an empty chip has nothing to show a dialog
- * about, matching legacy's own `if(vb&&verMeta)` gate) rendering
- * `AboutDialog`, restored now that the shared dialog/focus machinery exists
+ * about, matching legacy's own `if(vb&&verMeta)` gate). (#2107 "one
+ * modal" packet) `AboutDialog` itself is RETIRED — the dialog this opens
+ * is now `MachineDrawer.tsx`'s own `<Dialog id="imodalbg">`, which folds
+ * the same build/schema/connection/mode/links fields into its lower
+ * "about" section rather than keeping a second, separately-triggered
+ * dialog. This component's OWN job here is unchanged: fire
+ * `openModalEl("imodalbg")` and get out of the way — it does not know or
+ * care which component renders that id.
  * to hold it.
  *
  * **The catalog trigger (legacy's `#srcbadge`, "today"/a specific date,
@@ -111,15 +115,10 @@ import type { MachineSpecs } from "../types/handwritten";
 export function Masthead({
   route,
   liveStatus,
-  specs = null,
   replayDate = null,
 }: {
   route: Route;
   liveStatus: LiveTailStatus;
-  /** Passed through to `AboutDialog` for its "machine"/"hardware" rows —
-   *  optional (defaults to `null`) so every existing caller/test that
-   *  doesn't pass it is unaffected; only a live route ever reads it. */
-  specs?: MachineSpecs | null;
   /** The day a daemon dispatch/mission page belongs to, once the shell has
    * derived it from the records; `null` until then (the chip reads "RESULT"
    * meanwhile) and on every other route. */
@@ -193,7 +192,6 @@ export function Masthead({
       ) : (
         <span className="masthead__ver" id="verbadge" />
       )}
-      <AboutDialog route={route} liveStatus={liveStatus} specs={specs} />
       {getSource().kind === "static" ? (
         // (#1801) No `<CatalogPanel>` here — see this component's own doc
         // for why a static build gets inert text instead of a button that

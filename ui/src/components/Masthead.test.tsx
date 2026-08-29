@@ -1,16 +1,15 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { render, screen, fireEvent, within } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Masthead } from "./Masthead";
 import type { Route } from "../lib/route";
-import { closeOpenModal } from "../lib/dialogManager";
-import type { MachineSpecs } from "../types/handwritten";
+import { closeOpenModal, getOpenId } from "../lib/dialogManager";
 
-function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live", specs: MachineSpecs | null = null, replayDate: string | null = null) {
+function renderMasthead(route: Route, liveStatus: "live" | "reconnecting" = "live", replayDate: string | null = null) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <Masthead route={route} liveStatus={liveStatus} specs={specs} replayDate={replayDate} />
+      <Masthead route={route} liveStatus={liveStatus} replayDate={replayDate} />
     </QueryClientProvider>,
   );
 }
@@ -119,7 +118,16 @@ describe("Masthead — about modal (#1640)", () => {
     document.head.appendChild(meta2);
   }
 
-  it("#verbadge is a real data-act=\"about\" button when it has content, and opens #imodalbg", () => {
+  it("#verbadge is a real data-act=\"about\" button when it has content, and fires openModalEl(\"imodalbg\")", () => {
+    // (#2107 "one modal" packet) This dialog's CONTENT (build/schema/
+    // connection/mode/machine/hardware/links) moved to
+    // `MachineDrawer.test.tsx` — `AboutDialog`, the sole former renderer of
+    // `#imodalbg`, is retired, and Masthead alone (no `<MachineDrawer>`
+    // mounted in this file's render tree) has nothing left to open. This
+    // test keeps only what is genuinely THIS component's own job: the
+    // button exists with the right affordances and calls the shared
+    // trigger — `getOpenId()` is dialogManager's own state, provable
+    // without needing a dialog mounted to observe it.
     injectVersionMetas();
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     renderMasthead({ kind: "fleet" });
@@ -127,19 +135,9 @@ describe("Masthead — about modal (#1640)", () => {
     expect(verbadge.tagName).toBe("BUTTON");
     expect(verbadge.getAttribute("data-act")).toBe("about");
 
-    expect(document.getElementById("imodalbg")!.style.display).toBe("none");
+    expect(getOpenId()).toBeNull();
     fireEvent.click(verbadge);
-    expect(document.getElementById("imodalbg")!.style.display).toBe("flex");
-    expect(screen.getByText("about · darkmux")).toBeInTheDocument();
-    expect(screen.getByText("2.7.0 (abc1234)")).toBeInTheDocument();
-    expect(screen.getByText("1.16")).toBeInTheDocument();
-    // The four external links legacy's modal footer carries — scoped to the
-    // dialog body since the masthead's OWN topnav also has links with these
-    // same accessible names.
-    const dialogLinks = within(document.getElementById("infobody")!);
-    for (const label of ["github", "guide", "articles", "home"]) {
-      expect(dialogLinks.getByRole("link", { name: label })).toBeInTheDocument();
-    }
+    expect(getOpenId()).toBe("imodalbg");
     vi.unstubAllGlobals();
   });
 
@@ -149,30 +147,6 @@ describe("Masthead — about modal (#1640)", () => {
     const verbadge = document.getElementById("verbadge")!;
     expect(verbadge.tagName).toBe("SPAN");
     expect(verbadge.getAttribute("data-act")).toBeNull();
-    vi.unstubAllGlobals();
-  });
-
-  it("shows the machine/hardware rows on a live route when specs are available, and omits them on a replay", () => {
-    injectVersionMetas();
-    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
-    const specs = {
-      darkmux_version: "2.7.0",
-      flow_schema_version: "1.16",
-      machine_id: "MacBook-Pro",
-      os: "macOS",
-      ram_total_bytes: 137438953472, // 128 GiB
-      ram_free_for_ai_bytes: null,
-      cpu_brand: "Apple M5 Max",
-      loaded_models: [],
-      lms_unreachable: false,
-      utility_model: null,
-      redis_url_redacted: null,
-      generated_at_ms: 0,
-    };
-    renderMasthead({ kind: "fleet" }, "live", specs);
-    fireEvent.click(document.getElementById("verbadge")!);
-    expect(screen.getByText("MacBook-Pro")).toBeInTheDocument();
-    expect(screen.getByText(/Apple M5 Max/)).toBeInTheDocument();
     vi.unstubAllGlobals();
   });
 });
@@ -216,7 +190,7 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     expect(unknown.container.querySelector(".catalog-toggle")?.textContent).toBe("RESULT");
     expect(unknown.container.querySelector("#modebadge")).toBeNull();
     unknown.unmount();
-    const known = renderMasthead({ kind: "mission", missionId: "m1" } as never, "live", null, "2026-08-07");
+    const known = renderMasthead({ kind: "mission", missionId: "m1" } as never, "live", "2026-08-07");
     expect(known.container.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07");
     expect(known.container.querySelector("#modebadge")?.textContent).toMatch(/playback/i);
     vi.unstubAllGlobals();

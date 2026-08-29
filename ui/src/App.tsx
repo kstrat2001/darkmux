@@ -347,7 +347,7 @@ export function App() {
           to live on this line) now lives there instead. Precedes
           `.app-shell__crumbbar`, matching legacy's DOM order (`.top` before
           `.crumbbar`). */}
-      <Masthead route={displayRoute} liveStatus={liveStatus} specs={specs} replayDate={route.kind === "playback" ? null : replayDate} />
+      <Masthead route={displayRoute} liveStatus={liveStatus} replayDate={route.kind === "playback" ? null : replayDate} />
       {/* (#2107) Global machine-stats pill/drawer — a SIBLING of `<Masthead>`,
           not a child of it, so it can never touch that component's own
           byte-parity-golden DOM (see `Masthead.tsx`'s doc). Fixed-position
@@ -364,6 +364,7 @@ export function App() {
         localUid={localUid}
         liveMachines={liveMachines}
         specs={specs}
+        liveStatus={liveStatus}
       />
       {/* (#2071) The sticky block: the tab strip plus, while a day is loaded,
           the playback transport. Operator decision: sticky row, tabs

@@ -25,6 +25,12 @@ import type { ProcSamplePoint } from "./hostStats";
 export const DRAWER_ROLLING_WINDOW_MS = 10 * 60 * 1000;
 export const DRAWER_ROLLING_SCOPE_LABEL = "last 10 min";
 
+/** How far back `findLastKnownSample` will look for a stray older reading
+ * before giving up and reporting "never measured" rather than "measured
+ * ages ago" — a genuinely day(s)-old record from a stale flow file
+ * shouldn't be reported as if it just happened to be quiet. */
+const LAST_KNOWN_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+
 function isTelemetryProcessRecord(r: FlowRecord): boolean {
   return r.action === "telemetry.process" || (r.category === "telemetry" && r.source === "process");
 }
@@ -41,9 +47,25 @@ function toPoint(r: FlowRecord): ProcSamplePoint {
   return { cpu: num(f?.cpu), mem: num(f?.mem), gpu: num(f?.gpu) };
 }
 
+export interface LastKnownSample {
+  point: ProcSamplePoint;
+  /** The sample's own timestamp, in ms — formatted by the caller (e.g.
+   * `lib/format.ts::relAgoFrom(nowMs, ts)`) rather than pre-rendered here,
+   * so this module stays pure data, no locale/wording decisions. */
+  ts: number;
+}
+
 export interface DrawerScope {
   scopeLabel: string;
   samples: ProcSamplePoint[];
+  /** (#2107 phone feedback) Set only when `samples` is empty on the
+   * ROLLING branch — a dashboard reading "— avg — max" three times over
+   * with no other information is not a state, it is a missing one. `null`
+   * on the mission/dispatch branch always (that scope IS the dispatch's
+   * own full record set already — there is no separate "last known"
+   * outside it) and on the rolling branch when nothing was ever seen for
+   * this machine within the lookback window either. */
+  lastKnown: LastKnownSample | null;
 }
 
 /** The rolling-last-10-minutes slice, scoped to one machine uid (or
@@ -60,6 +82,26 @@ export function rollingWindowSamples(records: FlowRecord[], uid: string | null, 
     .map(toPoint);
 }
 
+/** The single most recent `telemetry.process` sample for `uid` anywhere in
+ * `records`, regardless of the rolling window's 10-minute cutoff — the
+ * sampler only runs DURING a dispatch (#557/#1064's own doc), so an idle
+ * machine's rolling window is legitimately empty most of the time, and
+ * "no reading in the last 10 min" is a very different claim from "never
+ * measured at all". Bounded by `LAST_KNOWN_LOOKBACK_MS` so a genuinely
+ * stale record doesn't get reported as if it just happened. */
+export function findLastKnownSample(records: FlowRecord[], uid: string | null, nowMs: number): LastKnownSample | null {
+  let best: { r: FlowRecord; ts: number } | null = null;
+  for (const r of records) {
+    if (!isTelemetryProcessRecord(r)) continue;
+    if (uid != null && uidOf(r) !== uid) continue;
+    const ts = T(r.ts);
+    if (!Number.isFinite(ts) || ts > nowMs) continue;
+    if (nowMs - ts > LAST_KNOWN_LOOKBACK_MS) continue;
+    if (best == null || ts > best.ts) best = { r, ts };
+  }
+  return best ? { point: toPoint(best.r), ts: best.ts } : null;
+}
+
 export function resolveDrawerScope(
   route: Route,
   routeRecords: FlowRecord[],
@@ -72,7 +114,13 @@ export function resolveDrawerScope(
     return {
       scopeLabel: route.kind === "mission" ? "this mission" : "this dispatch",
       samples: scoped.map(toPoint),
+      lastKnown: null,
     };
   }
-  return { scopeLabel: DRAWER_ROLLING_SCOPE_LABEL, samples: rollingWindowSamples(rollingWindow, localUid, nowMs) };
+  const samples = rollingWindowSamples(rollingWindow, localUid, nowMs);
+  return {
+    scopeLabel: DRAWER_ROLLING_SCOPE_LABEL,
+    samples,
+    lastKnown: samples.length === 0 ? findLastKnownSample(rollingWindow, localUid, nowMs) : null,
+  };
 }

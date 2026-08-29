@@ -1,133 +1,326 @@
 /**
- * (#2107, #1833) A generic 0-100% semicircle needle meter — CPU/GPU/MEM
- * utilization, anywhere a plain percent gauge is needed.
+ * (#2107, #1833, extraction packet) The ONE semicircle needle gauge — the
+ * shared core the machine lens's VRAM pressure dial (`MachineHealthRegion
+ * .tsx`'s `Gauge`) and the CPU/GPU/MEM meters (`MachineDrawer.tsx`,
+ * `MachineLens.tsx`'s live-load section) both render through.
  *
- * This is a NEW, small component, not an extraction of
- * `lenses/machine/MachineHealthRegion.tsx`'s `<Gauge>` (the VRAM pressure
- * dial). That dial is genuinely bespoke to VRAM: stacked darkmux/other/
- * committed BANDS, hatched growth extension, a color ramp keyed to a
- * machine-specific scale (`resolveGaugeScale`), a seven-segment odometer
- * readout — none of which has a meaning for "what percent of the CPU is
- * busy". Forcing reuse would mean either dragging VRAM-shaped generality
- * into every CPU/GPU/MEM reading, or literally copying ~130 lines of
- * band/hatch/odometer SVG under a "shared" label that would immediately
- * drift the moment either dial changed. The one piece that IS genuinely
- * shared is the geometry primitive both dials reduce to — a percent maps
- * to an angle across a 180° sweep (`machineGauge.ts`'s own
- * `needleAngleDeg = pct * 1.8`, reproduced here as `angleForPct` so the
- * two dials draw from the same formula without either importing the
- * other's VRAM-specific code). `MachineHealthRegion.tsx` is untouched by
- * this file — its own goldens are unaffected.
+ * History: the first cut of this component (pre-extraction) was a second,
+ * SMALLER gauge implementation living beside the VRAM dial's own — two
+ * pieces of SVG geometry answering "draw a semicircle with a needle",
+ * styled and maintained independently. The operator's own framing: "That
+ * meter as a reuse component seems like a nice thing to have. Then its
+ * style can be maintained in one place." A second component was the
+ * opposite of that, so this packet deleted it and extracted the VRAM
+ * dial's OWN geometry into this file instead — `MachineHealthRegion.tsx`'s
+ * `Gauge` is now a thin caller that computes VRAM-specific data (through
+ * the SAME unchanged pure functions in `machineGauge.ts`) and hands it to
+ * `<Meter>`; every CPU/GPU/MEM caller hands it a much smaller prop set.
  *
- * Three readings render on one arc: `now` (the needle), `avg` and `max`
- * (two static tick marks on the arc), plus the three numbers spelled out
- * underneath — the sighted glance and the numeric fallback answer the same
- * question two ways, same discipline `MachineHealthRegion`'s own aria rules
- * follow (color/position is never the ONLY channel).
+ * **Literally one geometry, not two skins.** `CX`/`CY`/`R`/the arc path/
+ * the tick positions/the needle length/the hub radius are the VRAM dial's
+ * ORIGINAL numbers, unchanged, and every caller — VRAM included — draws
+ * from them. What differs per instance is only the outer `width`/`height`
+ * (SVG scales the same `viewBox` uniformly), which bands/ticks/redline/
+ * gradient/center-content it supplies, and its own CSS-driven color
+ * treatment via each band's own `className`. This is what makes the
+ * extraction verifiable: `MachineHealthRegion.tsx`'s own DOM-structural
+ * tests (exact class names, exact `transform`/`stroke`/`d` attribute
+ * values) pass byte-identical against this file with ZERO changes to
+ * those tests — the proof the move changed nothing for the VRAM caller.
+ *
+ * **The needle, arc/bands, and numerals are the shared core.** The dial
+ * (needle + bands + track) is always drawn by this component; a numeral
+ * READOUT is too — by DEFAULT the plain `now · avg avg · max max` row every
+ * compact CPU/GPU/MEM meter needs (`numerals`/`label` props), rendered
+ * below the dial inside this SAME component rather than duplicated by each
+ * caller. VRAM's seven-segment odometer is the one thing that genuinely
+ * ISN'T shared — a wholly different rendering technique (digit-cell
+ * polygons, not text) — so it rides the `children` slot INSTEAD of
+ * `numerals`/`label` (the two are mutually exclusive by convention: a
+ * caller supplies one or the other, never both). Everything else VRAM-only
+ * — the color-ramp `gradient`, `ticks` with drawn labels, the `scaleWord`
+ * corner label, the `redline` threshold arc — is an optional prop a
+ * compact caller simply omits.
  */
+import type { ReactNode } from "react";
 
-/** `pct * 1.8` — the same 180°-sweep angle formula
- * `lenses/machine/machineGauge.ts`'s `computeGaugeGeometry` uses
- * (`needleAngleDeg = pct * 1.8`), reproduced rather than imported so this
- * component has no dependency on that VRAM-specific module. */
-function angleForPct(pct: number): number {
-  return Math.max(0, Math.min(100, pct)) * 1.8;
+/** The dial's own local coordinate system, in `viewBox` units — the VRAM
+ * dial's ORIGINAL numbers (`MachineHealthRegion.tsx`, pre-extraction),
+ * unchanged. Exported because `MachineHealthRegion.tsx` still needs `CX`
+ * for the odometer layout it passes as `children`. */
+export const CX = 120;
+export const CY = 120;
+export const R = 86;
+
+/** The half-circle track, drawn once and shared by every band/track path —
+ * literally the VRAM dial's original constant. */
+export const HALF_ARC_D = `M 34 120 A ${R} ${R} 0 0 1 206 120`;
+
+/** Track/band stroke width, in viewBox units — the VRAM dial's original. */
+const STROKE_W = 11;
+
+/** The compact-meter render size (CPU/GPU/MEM) — the SAME `viewBox`
+ * (`0 0 240 170`) as VRAM's 300×212, scaled down so three fit one row in
+ * the ~340-360px content width the machine drawer/lens have at a 390px
+ * viewport. Aspect-locked to the viewBox (240:170 ≈ 1.412) so nothing
+ * distorts. */
+export const COMPACT_METER_WIDTH = 112;
+export const COMPACT_METER_HEIGHT = 79;
+
+export interface MeterGradient {
+  id: string;
+  stops: Array<{ offset: number | string; color: string }>;
 }
 
-const CX = 60;
-const CY = 58;
-const R = 46;
-// A flat half-circle track, drawn once and shared by every tick/needle
-// rotation below — same `pathLength=100` convention `MachineHealthRegion`'s
-// own arc uses, so `stroke-dasharray`/`strokeDashoffset` percentages read
-// the same way here.
-const HALF_ARC_D = `M ${CX - R} ${CY} A ${R} ${R} 0 0 1 ${CX + R} ${CY}`;
+export interface MeterBand {
+  className: string;
+  /** A literal CSS color, or `url(#<gradient.id>)` to paint from the
+   * `gradient` prop. Omitted for a hatched band (its color comes from CSS
+   * via `className` — matching VRAM's original `growth` band JSX, which
+   * carried no `stroke` prop at all). */
+  stroke?: string;
+  lengthPct: number;
+  /** Where along the arc this band starts, 0-100. Default 0. Ignored when
+   * `hatchedDasharray` is set — the hatch pattern already encodes start. */
+  startPct?: number;
+  /** Precomputed via `hatchedSegmentDash(startPct, lengthPct)` — lives on
+   * the band rather than being computed by `Meter` itself so this shared
+   * component never has to import the VRAM-specific `machineGauge.ts`
+   * (a layering inversion). Presence marks the band hatched. */
+  hatchedDasharray?: string;
+  /** Draw even when `lengthPct` is 0 — VRAM's darkmux band always drew,
+   * empty or not, so an empty reading doesn't change the DOM shape. Every
+   * other band (VRAM's `other`/`growth`, every CPU/GPU/MEM band) is
+   * omitted entirely at `lengthPct <= 0`. */
+  alwaysRender?: boolean;
+}
+
+export interface MeterTick {
+  pct: number;
+  className?: string;
+  /** Present only for VRAM's hand-placed scale labels (`TICK_LABEL_XY`);
+   * a compact meter's avg/max marks carry no label — the numbers are
+   * spelled out in the `numerals` row instead. */
+  label?: string;
+  labelX?: number;
+  labelY?: number;
+}
+
+/** The default, plain numeral readout every compact CPU/GPU/MEM meter
+ * uses — `now`/`avg`/`max` (or `high`, the drawer's own vocabulary; the
+ * label under each number is the caller's to name via `numeralLabels`). */
+export interface MeterNumerals {
+  now: number | null;
+  avg: number | null;
+  max: number | null;
+}
 
 export interface MeterProps {
-  label: string;
-  /** Latest reading, 0-100. `null` draws no needle (never measured yet). */
-  now: number | null;
-  /** Mean over the meter's window. `null` draws no avg mark. */
-  avg: number | null;
-  /** Max over the meter's window. `null` draws no max mark. */
-  max: number | null;
-  /** Shown under the numbers, e.g. "last 10 min" or "this mission". */
-  scopeLabel?: string;
+  /** `"mm-gauge"` for every current caller — ONE wrapper class, so the
+   * geometry-level CSS (track/needle/hub/tick color, font) lives in ONE
+   * place regardless of which dial is rendering. A band's OWN color is
+   * carried by that band's own `className`/`stroke`, never by this. */
+  wrapperClassName: string;
+  /** Rendered box size — the SAME `viewBox="0 0 240 170"` scales
+   * uniformly to whatever `width`/`height` a caller asks for. Defaults to
+   * the VRAM dial's own historical box (300×212) so that caller passes
+   * neither and gets byte-identical output. */
+  width?: number;
+  height?: number;
+  ariaLabel: string;
+  gradient?: MeterGradient;
+  bands: MeterBand[];
+  ticks?: MeterTick[];
+  scaleWord?: string;
+  /** The threshold redline arc — VRAM only. Always drawn (never absent)
+   * once this prop is present at all; `lit` toggles the `.lit` class,
+   * matching the pre-extraction unconditional-path-with-toggled-class
+   * shape exactly. A compact meter omits this prop and gets no redline
+   * element at all. */
+  redline?: { lit: boolean };
+  /** Omit for "no reading yet" — draws no needle, matching this app's
+   * absence-never-zero rule (a `0`-angle needle would assert a real
+   * reading of 0%, not "unmeasured"). */
+  needleAngleDeg?: number;
+  /** A short label ABOVE the numeral row, e.g. "CPU" — compact meters
+   * only; VRAM names its subject via `children`'s own text labels
+   * instead. */
+  label?: string;
+  /** The default numeral readout, rendered BELOW the dial. Mutually
+   * exclusive with `children` by convention — a caller supplies one or
+   * the other. */
+  numerals?: MeterNumerals;
+  /** Extra SVG content drawn last, before `</svg>` closes — VRAM's
+   * odometer digit group + its two text labels. The one thing that isn't
+   * shared core (see this module's own doc). */
+  children?: ReactNode;
 }
 
-function fmtPct(v: number | null): string {
+/** `%d%` — every caller (the dial's own numerals, VRAM's aria narrative
+ * text elsewhere) rounds identically through this one function. `null`
+ * stays `—`, never coerced to 0 (absence is a different claim). */
+export function fmtPct(v: number | null): string {
   return v === null ? "—" : `${Math.round(v)}%`;
 }
 
-/** One meter — CPU, GPU, or MEM. Pure presentational; the caller resolves
- * which window (mission/dispatch samples vs a rolling 10-minute tail) the
- * `now`/`avg`/`max` numbers describe. */
-export function Meter({ label, now, avg, max, scopeLabel }: MeterProps) {
-  const ariaLabel = [
-    `${label}: `,
-    now === null ? "no reading yet" : `now ${fmtPct(now)}`,
-    avg === null ? "" : `, average ${fmtPct(avg)}`,
-    max === null ? "" : `, max ${fmtPct(max)}`,
-    scopeLabel ? `, over ${scopeLabel}` : "",
-  ]
-    .filter(Boolean)
-    .join("");
+/** `pct * 1.8` — the dial's own 180°-sweep angle formula (matches
+ * `machineGauge.ts`'s `computeGaugeGeometry`'s `needleAngleDeg = pct *
+ * 1.8` exactly, since both draw on the SAME geometry this file now owns).
+ * Clamped: a bad reading must not swing the needle past either end of the
+ * arc. Exported for compact callers building their own `needleAngleDeg`
+ * from a raw percent (VRAM's own `band.needleAngleDeg` already comes
+ * pre-computed off `computeBandGeometry`, so `Gauge` doesn't need this). */
+export function angleForPct(pct: number): number {
+  return Math.max(0, Math.min(100, pct)) * 1.8;
+}
 
+/** A compact meter's single fill band — `now` percent, 0-100, clamped.
+ * `null` (no reading yet) yields NO band at all, matching the same
+ * absence-never-zero rule the needle already follows. */
+export function simpleBand(className: string, stroke: string, now: number | null): MeterBand[] {
+  if (now === null) return [];
+  return [{ className, stroke, lengthPct: Math.max(0, Math.min(100, now)) }];
+}
+
+/** A compact meter's avg/max marks — small unlabeled ticks on the arc, the
+ * SAME radial-mark geometry VRAM's own scale ticks use, just without a
+ * drawn label (the numbers are spelled out in the `numerals` row
+ * instead). Either or both may be absent. */
+export function avgMaxTicks(avg: number | null, max: number | null): MeterTick[] {
+  const out: MeterTick[] = [];
+  if (avg !== null) out.push({ pct: Math.max(0, Math.min(100, avg)), className: "mm-gauge-tick mm-gauge-tick-avg" });
+  if (max !== null) out.push({ pct: Math.max(0, Math.min(100, max)), className: "mm-gauge-tick mm-gauge-tick-max" });
+  return out;
+}
+
+/** Bundles EVERYTHING a compact CPU/GPU/MEM caller needs into one prop
+ * spread — `bands`/`ticks`/`needleAngleDeg`/`numerals`/`label` — so the
+ * "how do I feed a plain now/avg/max reading into `<Meter>`" logic lives
+ * in exactly ONE place rather than being re-derived at each of the two
+ * call sites (`MachineDrawer.tsx`, `MachineLens.tsx`'s live-load section).
+ * `className`/`stroke` are the fill band's own CSS treatment — every
+ * current caller passes the SAME `"mm-gauge-fill-compact"` / accent color,
+ * kept as parameters rather than hardcoded here in case a future caller
+ * genuinely needs its own color. */
+export function compactMeterProps(
+  label: string,
+  className: string,
+  stroke: string,
+  m: { now: number | null; avg: number | null; high: number | null },
+): Pick<MeterProps, "label" | "bands" | "ticks" | "needleAngleDeg" | "numerals"> {
+  return {
+    label,
+    bands: simpleBand(className, stroke, m.now),
+    ticks: avgMaxTicks(m.avg, m.high),
+    needleAngleDeg: m.now == null ? undefined : angleForPct(m.now),
+    numerals: { now: m.now, avg: m.avg, max: m.high },
+  };
+}
+
+export function Meter({
+  wrapperClassName,
+  width = 300,
+  height = 212,
+  ariaLabel,
+  gradient,
+  bands,
+  ticks = [],
+  scaleWord,
+  redline,
+  needleAngleDeg,
+  label,
+  numerals,
+  children,
+}: MeterProps) {
   return (
-    <div className="meter" data-meter={label.toLowerCase()}>
-      <svg width="120" height="70" viewBox="0 0 120 70" role="img" aria-label={ariaLabel}>
-        <path className="meter-track" d={HALF_ARC_D} fill="none" strokeWidth={7} pathLength={100} />
-        {now !== null && (
+    <div className={wrapperClassName} data-meter={label ? label.toLowerCase() : undefined}>
+      <svg width={width} height={height} viewBox="0 0 240 170" role="img" aria-label={ariaLabel}>
+        {gradient && (
+          <defs>
+            <linearGradient id={gradient.id} gradientUnits="userSpaceOnUse" x1={CX - R} y1={0} x2={CX + R} y2={0}>
+              {gradient.stops.map((s) => (
+                <stop key={s.offset} offset={s.offset} stopColor={s.color} />
+              ))}
+            </linearGradient>
+          </defs>
+        )}
+        <path className="mm-gauge-track" d={HALF_ARC_D} fill="none" strokeWidth={STROKE_W} pathLength={100} />
+        {bands
+          .filter((b) => b.alwaysRender || b.lengthPct > 0)
+          .map((b) => (
+            <path
+              key={b.className}
+              className={b.className}
+              stroke={b.stroke}
+              d={HALF_ARC_D}
+              fill="none"
+              strokeWidth={STROKE_W}
+              pathLength={100}
+              strokeDasharray={b.hatchedDasharray ?? `${b.lengthPct} 100`}
+              strokeDashoffset={b.hatchedDasharray ? undefined : b.startPct ? -b.startPct : undefined}
+            />
+          ))}
+        {ticks.map((t, i) => (
+          <line
+            // Index, not `t.pct` — a compact meter's avg/max ticks can
+            // legitimately land on the SAME percent (e.g. a single-sample
+            // window, where avg === max), which collided as a duplicate
+            // React key when keyed by value alone.
+            key={i}
+            className={t.className ?? "mm-gauge-tick"}
+            x1={30}
+            y1={CY}
+            x2={38}
+            y2={CY}
+            transform={`rotate(${t.pct * 1.8} ${CX} ${CY})`}
+          />
+        ))}
+        {ticks
+          .map((t, i) => ({ t, i }))
+          .filter(({ t }) => t.label != null && t.labelX != null && t.labelY != null)
+          .map(({ t, i }) => (
+            <text key={i} className="mm-gauge-scale-label" x={t.labelX} y={t.labelY} textAnchor="middle">
+              {t.label}
+            </text>
+          ))}
+        {scaleWord && (
+          <text className="mm-gauge-scale-word" x={220} y={146} textAnchor="middle">
+            {scaleWord}
+          </text>
+        )}
+        {redline && (
           <path
-            className="meter-fill"
+            className={`mm-gauge-redline${redline.lit ? " lit" : ""}`}
             d={HALF_ARC_D}
             fill="none"
-            strokeWidth={7}
+            strokeWidth={STROKE_W}
             pathLength={100}
-            strokeDasharray={`${Math.max(0, Math.min(100, now))} 100`}
+            strokeDasharray="2.5 100"
+            strokeDashoffset="-97.5"
           />
         )}
-        {avg !== null && (
-          <line
-            className="meter-mark meter-mark-avg"
-            x1={CX - R - 3}
-            y1={CY}
-            x2={CX - R + 3}
-            y2={CY}
-            transform={`rotate(${angleForPct(avg)} ${CX} ${CY})`}
-          />
+        {needleAngleDeg != null && (
+          <line className="mm-gauge-needle" x1={CX} y1={CY} x2={42} y2={CY} transform={`rotate(${needleAngleDeg} ${CX} ${CY})`} />
         )}
-        {max !== null && (
-          <line
-            className="meter-mark meter-mark-max"
-            x1={CX - R - 3}
-            y1={CY}
-            x2={CX - R + 3}
-            y2={CY}
-            transform={`rotate(${angleForPct(max)} ${CX} ${CY})`}
-          />
-        )}
-        {now !== null && (
-          <line
-            className="meter-needle"
-            x1={CX}
-            y1={CY}
-            x2={CX - R + 8}
-            y2={CY}
-            transform={`rotate(${angleForPct(now)} ${CX} ${CY})`}
-          />
-        )}
-        <circle className="meter-hub" cx={CX} cy={CY} r={3} />
+        <circle className="mm-gauge-hub" cx={CX} cy={CY} r={5} />
+        {children}
       </svg>
-      <div className="meter-label">{label}</div>
-      <div className="meter-numbers">
-        <span className="meter-now">{fmtPct(now)}</span>
-        <span className="meter-sep">·</span>
-        <span className="meter-avg">{fmtPct(avg)} avg</span>
-        <span className="meter-sep">·</span>
-        <span className="meter-max">{fmtPct(max)} max</span>
-      </div>
-      {scopeLabel && <div className="meter-scope">{scopeLabel}</div>}
+      {label && <div className="meter-label">{label}</div>}
+      {/* (phone feedback, 2026-08-29) Two SHORT lines, not one long one —
+          `now` big (the reading that matters at a glance), `avg · max`
+          small underneath. Three meters' worth of the old single-line
+          "— · — avg · — max" collided into one unreadable run at a 390px
+          viewport; stacking removes the collision without needing the
+          three tiles to claim more horizontal room than `.meter-row`'s
+          own wrap already gives them. */}
+      {numerals && (
+        <div className="meter-numbers">
+          <div className="meter-now">{fmtPct(numerals.now)}</div>
+          <div className="meter-avgmax">
+            {fmtPct(numerals.avg)} avg <span className="meter-sep">·</span> {fmtPct(numerals.max)} max
+          </div>
+        </div>
+      )}
     </div>
   );
 }

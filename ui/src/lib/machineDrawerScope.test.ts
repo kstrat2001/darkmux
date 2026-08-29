@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveDrawerScope, DRAWER_ROLLING_SCOPE_LABEL } from "./machineDrawerScope";
+import { resolveDrawerScope, findLastKnownSample, DRAWER_ROLLING_SCOPE_LABEL } from "./machineDrawerScope";
 import type { FlowRecord } from "../types/handwritten";
 
 const proc = (ts: string, cpu: number, machine_uid?: string): FlowRecord => ({
@@ -56,5 +56,52 @@ describe("resolveDrawerScope (#2107)", () => {
     const rolling = [proc("2026-01-01T00:09:00Z", 99, "peer-machine")];
     const s = resolveDrawerScope({ kind: "runs", runsKind: "all", run: null, machine: null }, [], rolling, null, now);
     expect(s.samples.map((p) => p.cpu)).toEqual([99]);
+  });
+});
+
+describe("lastKnown (#2107 phone feedback)", () => {
+  it("is null on the mission/dispatch branch even when samples is empty", () => {
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1" }, [], [], null, 0);
+    expect(s.samples).toEqual([]);
+    expect(s.lastKnown).toBeNull();
+  });
+
+  it("is null on the rolling branch when the window has real samples", () => {
+    const now = Date.parse("2026-01-01T00:10:00Z");
+    const rolling = [proc("2026-01-01T00:09:00Z", 50)];
+    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, null, now);
+    expect(s.samples.length).toBe(1);
+    expect(s.lastKnown).toBeNull();
+  });
+
+  it("finds the most recent sample outside the 10-minute window when the window itself is empty", () => {
+    const now = Date.parse("2026-01-01T01:00:00Z");
+    const rolling = [
+      proc("2026-01-01T00:00:00Z", 30), // 1h ago — outside the 10-min window
+      proc("2026-01-01T00:20:00Z", 70), // 40 min ago — still outside, but MORE recent
+    ];
+    const s = resolveDrawerScope({ kind: "fleet" }, [], rolling, null, now);
+    expect(s.samples).toEqual([]);
+    expect(s.lastKnown?.point.cpu).toBe(70);
+    expect(s.lastKnown?.ts).toBe(Date.parse("2026-01-01T00:20:00Z"));
+  });
+
+  it("respects the machine uid filter the same way the rolling window does", () => {
+    const now = Date.parse("2026-01-01T01:00:00Z");
+    const rolling = [proc("2026-01-01T00:00:00Z", 99, "peer-machine"), proc("2026-01-01T00:00:00Z", 40, "this-machine")];
+    const found = findLastKnownSample(rolling, "this-machine", now);
+    expect(found?.point.cpu).toBe(40);
+  });
+
+  it("gives up past the lookback window rather than reporting an ancient stray record", () => {
+    const now = Date.parse("2026-01-03T00:00:00Z");
+    const rolling = [proc("2026-01-01T00:00:00Z", 40)]; // 2 days ago
+    expect(findLastKnownSample(rolling, null, now)).toBeNull();
+  });
+
+  it("is null when nothing was ever seen at all", () => {
+    const now = Date.parse("2026-01-01T01:00:00Z");
+    const s = resolveDrawerScope({ kind: "fleet" }, [], [], null, now);
+    expect(s.lastKnown).toBeNull();
   });
 });

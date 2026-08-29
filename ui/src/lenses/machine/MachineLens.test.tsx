@@ -193,16 +193,16 @@ describe("MachineLens", () => {
 
     const section = document.querySelector(".mm-live-section")!;
     const tile = (metric: string) => section.querySelector(`[data-meter="${metric}"]`)!;
+    const avgmax = (metric: string) => tile(metric).querySelector(".meter-avgmax")!.textContent?.replace(/\s+/g, " ").trim();
     // cpu: [40, 80] — now (last) 80, avg 60, max 80.
     expect(tile("cpu").querySelector(".meter-now")!.textContent).toBe("80%");
-    expect(tile("cpu").querySelector(".meter-avg")!.textContent).toBe("60% avg");
-    expect(tile("cpu").querySelector(".meter-max")!.textContent).toBe("80% max");
+    expect(avgmax("cpu")).toBe("60% avg · 80% max");
     // mem: [20, 50] — now 50, avg 35, max 50.
     expect(tile("mem").querySelector(".meter-now")!.textContent).toBe("50%");
-    expect(tile("mem").querySelector(".meter-avg")!.textContent).toBe("35% avg");
+    expect(avgmax("mem")).toBe("35% avg · 50% max");
     // gpu: [60, 90] — now 90, avg 75, max 90.
     expect(tile("gpu").querySelector(".meter-now")!.textContent).toBe("90%");
-    expect(tile("gpu").querySelector(".meter-avg")!.textContent).toBe("75% avg");
+    expect(avgmax("gpu")).toBe("75% avg · 90% max");
     // The peer's 999s must never appear anywhere in this section.
     expect(section.textContent).not.toContain("999");
     // The VRAM gauge is untouched by this section — still rendered, same as

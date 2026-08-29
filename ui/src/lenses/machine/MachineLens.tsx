@@ -5,14 +5,15 @@ import { queryKeys, MACHINE_MEM_POLL_MS } from "../../lib/queryKeys";
 import { useFlowWindow } from "../../hooks/useFlowWindow";
 import { useLiveMachines } from "../../hooks/useLiveMachines";
 import { localMachineUid, nameOf } from "../../lib/flow";
+import { relAgoFrom } from "../../lib/format";
 import { specOf } from "../fleet/cards";
 import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
 import { getSource } from "../../lib/source";
-import { Meter } from "../../components/Meter";
+import { Meter, compactMeterProps, fmtPct, COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "../../components/Meter";
 import { aggregateHostSamples } from "../../lib/hostStats";
-import { rollingWindowSamples } from "../../lib/machineDrawerScope";
+import { rollingWindowSamples, findLastKnownSample } from "../../lib/machineDrawerScope";
 import type { MachineSpecs, MachineResources } from "../../types/handwritten";
 
 /** The health region's state vocabulary, verbatim from `/machine/resources`
@@ -196,9 +197,15 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
   // (`lib/machineDrawerScope.ts`, `lib/hostStats.ts`), scoped to
   // `targetUid` so a drilled-into remote machine's card reads ITS load,
   // not always the local box's.
-  const liveAgg = useMemo(
-    () => aggregateHostSamples(rollingWindowSamples(flowWindow.data, targetUid, nowMs)),
-    [flowWindow.data, targetUid, nowMs],
+  const liveSamples = useMemo(() => rollingWindowSamples(flowWindow.data, targetUid, nowMs), [flowWindow.data, targetUid, nowMs]);
+  const liveAgg = useMemo(() => aggregateHostSamples(liveSamples), [liveSamples]);
+  // (phone feedback, 2026-08-29) Same idle+last-known treatment the global
+  // drawer uses (`MachineDrawer.tsx`'s own doc) — three dashed meters is
+  // not a state, and the sampler only runs during a dispatch, so an idle
+  // machine's rolling window is legitimately empty most of the time.
+  const liveLastKnown = useMemo(
+    () => (liveSamples.length === 0 ? findLastKnownSample(flowWindow.data, targetUid, nowMs) : null),
+    [liveSamples, flowWindow.data, targetUid, nowMs],
   );
   // Identity is the UID, never the display name. This compared
   // `nameOf(targetUid) === specs.machine_id`, which asks whether the label we
@@ -393,11 +400,40 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
           doing" in place, without a click. */}
       <div className="mm-live-section">
         <div className="mm-live-section__title">live load · last 10 min</div>
-        <div className="meter-row">
-          <Meter label="CPU" now={liveAgg.cpu.now} avg={liveAgg.cpu.avg} max={liveAgg.cpu.high} />
-          <Meter label="GPU" now={liveAgg.gpu.now} avg={liveAgg.gpu.avg} max={liveAgg.gpu.high} />
-          <Meter label="MEM" now={liveAgg.mem.now} avg={liveAgg.mem.avg} max={liveAgg.mem.high} />
-        </div>
+        {liveSamples.length === 0 ? (
+          <div className="machine-drawer__idle">
+            <div className="machine-drawer__idle-line">idle · no samples in the last 10 min</div>
+            {liveLastKnown && (
+              <div className="machine-drawer__lastknown">
+                {`last sample ${relAgoFrom(nowMs, liveLastKnown.ts)} — CPU ${fmtPct(liveLastKnown.point.cpu ?? null)} · GPU ${fmtPct(liveLastKnown.point.gpu ?? null)} · MEM ${fmtPct(liveLastKnown.point.mem ?? null)}`}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="meter-row">
+            <Meter
+              wrapperClassName="mm-gauge mm-gauge--compact"
+              width={COMPACT_METER_WIDTH}
+              height={COMPACT_METER_HEIGHT}
+              ariaLabel="CPU: last 10 min"
+              {...compactMeterProps("CPU", "mm-gauge-fill-compact", "var(--accent, var(--good))", liveAgg.cpu)}
+            />
+            <Meter
+              wrapperClassName="mm-gauge mm-gauge--compact"
+              width={COMPACT_METER_WIDTH}
+              height={COMPACT_METER_HEIGHT}
+              ariaLabel="GPU: last 10 min"
+              {...compactMeterProps("GPU", "mm-gauge-fill-compact", "var(--accent, var(--good))", liveAgg.gpu)}
+            />
+            <Meter
+              wrapperClassName="mm-gauge mm-gauge--compact"
+              width={COMPACT_METER_WIDTH}
+              height={COMPACT_METER_HEIGHT}
+              ariaLabel="MEM: last 10 min"
+              {...compactMeterProps("MEM", "mm-gauge-fill-compact", "var(--accent, var(--good))", liveAgg.mem)}
+            />
+          </div>
+        )}
       </div>
 
       {/* (#1809, finishing #1508 step 4) The `RUNS ON <MACHINE>` list —

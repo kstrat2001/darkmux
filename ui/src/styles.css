@@ -4906,41 +4906,47 @@ body {
   margin-bottom: 12px;
 }
 
-/* ── (#2107, #1833) Meter — the generic CPU/GPU/MEM semicircle gauge ──────
+/* ── (#2107, #1833, extraction packet) The compact CPU/GPU/MEM dial ──────
    Used by the global machine drawer/modal AND the machine lens's own
-   live-stats section. Sized to a ~100px flex basis so three fit one row at
-   a 390px viewport with room for gaps and container padding; below that
-   they wrap 2-then-1 rather than overflow (`.meter-row`'s `flex-wrap`). */
-.meter {
+   live-stats section. Draws through the SAME `<Meter>` component and the
+   SAME `.mm-gauge-track`/`.mm-gauge-needle`/`.mm-gauge-hub`/`.mm-gauge-tick`
+   rules the VRAM pressure dial uses (`MachineHealthRegion.tsx`) — this
+   block only adds what a COMPACT instance needs on top: its own smaller
+   flex sizing, its own fill color (`.mm-gauge-fill-compact` — VRAM's own
+   bands paint from its ramp gradient instead), and its own avg/max tick
+   colors. There is no separate "meter" gauge stylesheet any more; see
+   `components/Meter.tsx`'s own doc for why. Sized to a ~100px flex basis
+   so three fit one row at a 390px viewport with room for gaps and
+   container padding; below that they wrap 2-then-1 rather than overflow
+   (`.meter-row`'s `flex-wrap`). */
+.mm-gauge--compact {
   display: flex;
   flex-direction: column;
   align-items: center;
   flex: 1 1 100px;
-  min-width: 100px;
+  /* (visual bug, 2026-08-29) `white-space: nowrap` on `.meter-avgmax`
+     plus a flex item's default content-based min-width meant the tile's
+     own intrinsic width could exceed its 100px flex basis, so three
+     tiles' avg/max lines ran together into one unreadable smear at a
+     390px viewport ("9% avg · 50% max64% avg..."). `min-width: 0` lets
+     the tile actually SHRINK to the row's available space instead of
+     being pushed wide by its own text; `.meter-avgmax` (below) drops the
+     `nowrap` so long text wraps within the tile instead of overflowing
+     it either way. */
+  min-width: 0;
+  max-width: 130px;
   gap: 2px;
 }
-.meter svg {
+.mm-gauge--compact svg {
   display: block;
 }
-.meter-track {
-  stroke: var(--border);
-}
-.meter-fill {
+.mm-gauge-fill-compact {
   stroke: var(--accent, var(--good));
 }
-.meter-needle {
-  stroke: var(--fg);
-  stroke-width: 2;
-  stroke-linecap: round;
-}
-.meter-hub {
-  fill: var(--fg);
-}
-.meter-mark {
+.mm-gauge--compact .mm-gauge-tick-avg {
   stroke: var(--dim);
-  stroke-width: 2;
 }
-.meter-mark-max {
+.mm-gauge--compact .mm-gauge-tick-max {
   stroke: var(--warn);
 }
 .meter-label {
@@ -4950,21 +4956,23 @@ body {
   color: var(--dim);
   margin-top: 2px;
 }
+/* (#2107 phone feedback) Two SHORT lines instead of one long one — `now`
+   big, `avg · max` small underneath. Three meters' single-line readout
+   collided into one unreadable run at a 390px viewport; stacking removes
+   the collision without the tiles needing more horizontal room than
+   `.meter-row`'s own wrap already gives them. Tabular numerals throughout
+   so neither line jitters as live values tick over (operator: "no layout
+   shift as values change"). */
 .meter-numbers {
-  font: 600 calc(12px * var(--fs-scale))/1.3 var(--font-mono);
-  /* Fixed-width numerals so the row doesn't reflow/jitter as live values
-     tick over (operator: "no layout shift as values change"). */
   font-variant-numeric: tabular-nums;
-  display: flex;
-  align-items: baseline;
-  gap: 4px;
-  white-space: nowrap;
+  text-align: center;
 }
 .meter-now {
+  font: 700 calc(15px * var(--fs-scale))/1.2 var(--font-mono);
   color: var(--fg);
 }
-.meter-avg,
-.meter-max {
+.meter-avgmax {
+  font: 500 calc(9px * var(--fs-scale))/1.3 var(--font-mono);
   color: var(--dim);
 }
 .meter-sep {
@@ -4976,18 +4984,25 @@ body {
   margin-top: 1px;
 }
 
-/* ── (#2107) The global machine drawer/modal ───────────────────────────── */
+/* ── (#2107) The global machine drawer — desktop pill/modal ─────────────── */
 
 /* A FIXED-position overlay pill, not a child of `<Masthead>` — deliberately.
    `<Masthead>`'s own DOM is byte-parity-golden-protected
    (`tests/parity/lib/extract-lens.js`'s `extractTopbarText`), and this pill
    is mounted as a sibling in `App.tsx` precisely so adding it can never
-   touch that surface. Visible on every route, closed or open. Tabular
-   numerals so the live GPU% doesn't jitter the pill's width every ~2s
-   tick. */
+   touch that surface. DESKTOP ONLY (phone feedback, 2026-08-29): a real
+   phone test found this pill, at its original `top:10px`, sitting directly
+   on top of the masthead's own TODAY/LIVE badge — a floating overlay has
+   no way to know what the page underneath happens to render at that
+   Y-coordinate. `top: 64px` clears the masthead's own single row entirely
+   (a fixed offset, not a measured one — precise enough for a small pill
+   that only needs to clear ONE known region, where the mobile case below
+   just removes the pill outright rather than chasing exact masthead
+   height). Tabular numerals so the live GPU% doesn't jitter the pill's
+   width every ~2s tick. */
 .machine-pill {
   position: fixed;
-  top: 10px;
+  top: 64px;
   right: 12px;
   z-index: 80;
   display: inline-flex;
@@ -5018,8 +5033,10 @@ body {
   background: rgba(0, 0, 0, 0.5);
   z-index: 90;
 }
-/* Desktop: a centered modal. Mobile (≤768px, below) overrides this into a
-   bottom sheet. */
+/* Desktop: a centered modal, header fixed + body scrolling independently
+   (`.machine-drawer__body`) so a tall reading (many meters, or the idle +
+   last-known lines) never pushes the close button off-screen. Mobile
+   (≤768px, below) overrides this into a bottom sheet. */
 .machine-drawer {
   position: fixed;
   z-index: 91;
@@ -5027,13 +5044,19 @@ body {
   left: 50%;
   transform: translate(-50%, -50%);
   width: min(520px, calc(100vw - 32px));
-  max-height: min(70vh, 560px);
-  overflow-y: auto;
+  max-height: min(75vh, 620px);
+  display: flex;
+  flex-direction: column;
   background: var(--bg, #0b0b0d);
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 16px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  transition: transform 0.2s ease, max-height 0.2s ease;
+}
+.machine-drawer__body {
+  overflow-y: auto;
+  min-height: 0;
 }
 .machine-drawer__handle {
   display: none;
@@ -5043,6 +5066,7 @@ body {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 10px;
+  flex: 0 0 auto;
 }
 .machine-drawer__title {
   font: 600 calc(13px * var(--fs-scale))/1.3 var(--font-mono);
@@ -5074,6 +5098,21 @@ body {
   color: var(--dim);
   margin-bottom: 12px;
 }
+/* (phone feedback) The idle state — replaces the three dashed meters when
+   there is nothing to show, rather than rendering them anyway. */
+.machine-drawer__idle {
+  padding: 6px 0 4px;
+}
+.machine-drawer__idle-line {
+  font: 600 calc(12px * var(--fs-scale))/1.4 var(--font-mono);
+  color: var(--dim);
+}
+.machine-drawer__lastknown {
+  margin-top: 4px;
+  font: 500 calc(11px * var(--fs-scale))/1.4 var(--font-mono);
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
 .meter-row {
   display: flex;
   flex-wrap: wrap;
@@ -5081,10 +5120,60 @@ body {
   justify-content: space-around;
 }
 
+/* ── (phone feedback, 2026-08-29) The phone bottom bar + sheet ───────────
+   Replaces the floating pill ENTIRELY below 768px — no overlay of any
+   kind sits over page content on a phone. The bar is laid out IN FLOW
+   (fixed to the viewport bottom, but `.app-shell` reserves its height via
+   `padding-bottom` below), the same discipline a native app's own tab bar
+   follows. `env(safe-area-inset-bottom)` keeps it clear of an iPhone's
+   home indicator. */
 @media (max-width: 768px) {
+  .machine-pill {
+    display: none;
+  }
+  .app-shell {
+    padding-bottom: calc(44px + env(safe-area-inset-bottom, 0px));
+  }
+  .machine-bottombar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 80;
+    height: calc(44px + env(safe-area-inset-bottom, 0px));
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    background: var(--bg, #0b0b0d);
+    border-top: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .machine-bottombar__handle-bar {
+    width: 32px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--border);
+  }
+  .machine-bottombar__numbers {
+    font: 600 calc(11px * var(--fs-scale))/1 var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+    white-space: nowrap;
+  }
+
   /* Phones: a bottom sheet instead of a centered modal — same content,
      different chrome. `translateY` transition (see MachineDrawer.tsx's
-     inline transform), respecting `prefers-reduced-motion` there. */
+     inline transform during a drag), respecting `prefers-reduced-motion`
+     below. Sized to CONTENT up to `max-height`, never a fixed height — a
+     short idle reading doesn't drag a nearly-empty sheet up to 85vh, and
+     a genuinely tall one scrolls internally (`.machine-drawer__body`)
+     rather than clipping the meters' own bottom labels off the viewport
+     edge (the exact defect a real phone test caught: the pull handle did
+     nothing because there was no taller state to reveal AND no scroll to
+     reach it). */
   .machine-drawer {
     top: auto;
     left: 0;
@@ -5092,16 +5181,22 @@ body {
     bottom: 0;
     transform: none;
     width: 100%;
-    max-height: 75vh;
+    max-height: 85vh;
     border-radius: 16px 16px 0 0;
     border-bottom: none;
-    padding: 8px 16px 20px;
+    padding: 8px 16px calc(20px + env(safe-area-inset-bottom, 0px));
+  }
+  /* The drag-to-expand snap (`MachineDrawer.tsx`'s handle `touchmove`). */
+  .machine-drawer--full {
+    max-height: 92vh;
   }
   .machine-drawer__handle {
     display: flex;
     justify-content: center;
     padding: 6px 0 10px;
     cursor: pointer;
+    flex: 0 0 auto;
+    touch-action: none;
   }
   .machine-drawer__handle-bar {
     width: 36px;
