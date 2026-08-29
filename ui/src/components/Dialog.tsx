@@ -52,6 +52,7 @@ export function Dialog({
   titleId,
   title,
   wide,
+  className,
   children,
   footer,
 }: {
@@ -59,8 +60,16 @@ export function Dialog({
   titleId: string;
   title: ReactNode;
   /** Notes is wider than Filters/About in legacy (`.nmodal`, viewer.html:574
-   *  — prose reads better wide; the checkbox grid and the kv rows don't). */
+   *  — prose reads better wide). Fixed at `.dialog--wide`'s own 540px. */
   wide?: boolean;
+  /** (#2116) An extra class appended after `wide`'s own, so a caller can
+   * add its OWN width rule without widening every `.dialog` (About,
+   * Machine info) or coupling to Notes' fixed 540px. `FiltersDialog` is
+   * the first user — the activity facet can run to ~40 checkboxes on a
+   * busy day, which needs `min(90vw, 720px)` on desktop and its own
+   * multi-column grid; About and Machine info stay short kv lists that
+   * never wanted the extra room. */
+  className?: string;
   children: ReactNode;
   footer?: ReactNode;
 }) {
@@ -95,7 +104,12 @@ export function Dialog({
       }}
     >
       {open ? (
-        <div className={`dialog${wide ? " dialog--wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={titleId}>
+        <div
+          className={`dialog${wide ? " dialog--wide" : ""}${className ? ` ${className}` : ""}`}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={titleId}
+        >
           <div className="dialog__head">
             <span id={titleId}>{title}</span>
             <button type="button" className="dialog__close" ref={closeRef} aria-label="close" onClick={() => closeOpenModal()}>

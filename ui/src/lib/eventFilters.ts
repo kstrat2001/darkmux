@@ -122,12 +122,45 @@ export interface Facets {
  * excluded on that facet. Every current producer emits a category, so this
  * changes nothing observable today; it is a blank checkbox nobody could name
  * being dropped rather than faithfully reproduced. */
+/** The namespace prefix of a raw activity string — `"mission.start"` →
+ * `"mission"`, `"telemetry.process"` → `"telemetry"`, a prefix-less value
+ * → itself. Used only to GROUP `sortUnmappedActivities`' output; never
+ * shown — the checkbox label stays the full string. */
+function activityPrefixOf(a: string): string {
+  const i = a.indexOf(".");
+  return i === -1 ? a : a.slice(0, i);
+}
+
+/** (#2116) `ACT_ORDER` names ~22 activities `activityOf()` recognizes by
+ * branch; a busy day's flow can carry `r.action` strings it doesn't (a new
+ * `mission.*`/`phase.*`/`step.*`/`dispatch.*`/`hook.*` record kind —
+ * `activityOf`'s own fallback, `return a || "other"`, passes the RAW
+ * action straight through). Those used to land in `[...acts]`'s bare
+ * `Set`-iteration order — first-seen, effectively arbitrary — which is
+ * exactly what turned the activity facet into an unscannable ~40-item
+ * scramble once #2116's own filters-dialog layout gave it room to be
+ * scanned at all. Grouping by namespace prefix (alphabetical within a
+ * group, for a deterministic order regardless of which record happened to
+ * stream in first) puts every `mission.*` together, every `hook.*`
+ * together, and so on — the same grouping `ACT_ORDER` already gives the
+ * KNOWN activities, extended to the ones it doesn't yet name. */
+export function sortUnmappedActivities(values: string[]): string[] {
+  return [...values].sort((a, b) => {
+    const pa = activityPrefixOf(a);
+    const pb = activityPrefixOf(b);
+    if (pa !== pb) return pa.localeCompare(pb);
+    return a.localeCompare(b);
+  });
+}
+
 export function computeFacets(records: FlowRecord[]): Facets {
   const cat = [...new Set(records.map((r) => r.category).filter((v): v is string => v != null))];
   const tier = [...new Set(records.map((r) => r.tier).filter((v): v is string => v != null))];
   const src = [...new Set(records.map((r) => r.source).filter((v): v is string => v != null))];
   const acts = new Set(records.map(activityOf));
-  const act = ACT_ORDER.filter((a) => acts.has(a)).concat([...acts].filter((a) => !ACT_ORDER.includes(a)));
+  const act = ACT_ORDER.filter((a) => acts.has(a)).concat(
+    sortUnmappedActivities([...acts].filter((a) => !ACT_ORDER.includes(a))),
+  );
   return { act, cat, tier, src };
 }
 

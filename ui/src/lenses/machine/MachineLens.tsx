@@ -12,7 +12,15 @@ import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
 import { getSource } from "../../lib/source";
 import { useIsMobile } from "../../hooks/useIsMobile";
-import { Meter, compactMeterProps, fmtPct, COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "../../components/Meter";
+import {
+  Meter,
+  compactMeterProps,
+  fmtPct,
+  COMPACT_METER_WIDTH,
+  COMPACT_METER_HEIGHT,
+  MEM_WARN_AT,
+  MEM_CRITICAL_AT,
+} from "../../components/Meter";
 import { aggregateHostSamples } from "../../lib/hostStats";
 import { rollingWindowSamples, findLastKnownSample } from "../../lib/machineDrawerScope";
 import { useMachineStatsContent } from "../../components/machineStatsContent";
@@ -491,6 +499,8 @@ export function MachineLens({
               width={COMPACT_METER_WIDTH}
               height={COMPACT_METER_HEIGHT}
               ariaLabel="MEM: last 10 min"
+              warnAt={MEM_WARN_AT}
+              criticalAt={MEM_CRITICAL_AT}
               {...compactMeterProps("MEM", "mm-gauge-fill-compact", "var(--accent, var(--good))", liveAgg.mem)}
             />
           </div>
