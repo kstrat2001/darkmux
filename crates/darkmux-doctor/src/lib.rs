@@ -5562,6 +5562,15 @@ mod tests {
     /// probe's own live test is: on any other platform every source is
     /// legitimately unavailable and these assertions would be vacuous.
     /// `#[serial]` because it measures the machine.
+    ///
+    /// The IOReport-dependent assertions (`ioreport`/`freq-tables`/
+    /// `ioreg-gpu` named as resolved, no `"unavailable"` clause) are gated
+    /// behind `DARKMUX_EXPECT_IOREPORT=1` — a GitHub-hosted macOS runner's
+    /// VM genuinely has no IOReport channels / `pmgr` IORegistry node (a
+    /// fact about the VM, not a regression), which panicked this test on
+    /// every macOS CI run (#2108). `mach`/`thermal` stay unconditional: both
+    /// resolve fine in that VM. Documented as a test-only knob in
+    /// docs/ENVIRONMENT.md.
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[serial_test::serial]
@@ -5580,32 +5589,39 @@ mod tests {
             check.message
         );
         assert!(
+            check.message.contains("thermal"),
+            "ProcessInfo.thermalState resolves in CI too: {}",
+            check.message
+        );
+        assert!(
             check.message.contains("ms/sample"),
             "the observer's own cost is part of the report: {}",
             check.message
         );
-        // Apple Silicon + IOReport is the configuration darkmux is marketed
-        // for, so a build where the IOReport half silently stopped resolving
-        // must FAIL here rather than quietly reporting null power forever.
-        // If this fires on a future macOS, the framework moved again — see
-        // `host_probe::ioreport::IOREPORT_PATHS`.
-        // Substring-matching `"ioreport"` alone would ALSO match the
-        // "unavailable: ioreport" clause, so assert on the clause itself:
-        // on Apple Silicon every source is expected to resolve, and a build
-        // where one silently stopped must fail here rather than reporting
-        // null power forever. If this fires on a new macOS, the framework
-        // moved again — see `host_probe::ioreport::IOREPORT_PATHS`.
-        assert!(
-            !check.message.contains("unavailable"),
-            "every host source is expected to resolve on Apple Silicon: {}",
-            check.message
-        );
-        for src in ["ioreport", "freq-tables", "thermal", "ioreg-gpu"] {
+        if std::env::var("DARKMUX_EXPECT_IOREPORT").as_deref() == Ok("1") {
+            // Apple Silicon + IOReport is the configuration darkmux is
+            // marketed for, so a build where the IOReport half silently
+            // stopped resolving must FAIL here rather than quietly
+            // reporting null power forever. If this fires on a future
+            // macOS, the framework moved again — see
+            // `host_probe::ioreport::IOREPORT_PATHS`.
+            // Substring-matching `"ioreport"` alone would ALSO match the
+            // "unavailable: ioreport" clause, so assert on the clause
+            // itself: on Apple Silicon every source is expected to
+            // resolve, and a build where one silently stopped must fail
+            // here rather than reporting null power forever.
             assert!(
-                check.message.contains(src),
-                "`{src}` must be named among the resolved sources: {}",
+                !check.message.contains("unavailable"),
+                "every host source is expected to resolve on Apple Silicon: {}",
                 check.message
             );
+            for src in ["ioreport", "freq-tables", "ioreg-gpu"] {
+                assert!(
+                    check.message.contains(src),
+                    "`{src}` must be named among the resolved sources: {}",
+                    check.message
+                );
+            }
         }
     }
 
