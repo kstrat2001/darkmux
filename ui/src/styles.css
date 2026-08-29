@@ -281,41 +281,43 @@ body {
   opacity: 0.85;
 }
 
-/* (#1613/#1614 precedent, `tests/e2e/chrome-order.spec.js`) At phone width
-   the crumbbar reads BROADEST-SCOPE-FIRST: global status (`#meta`) above
-   the tab selector above the per-tab crumb — `order`, not just wrapping,
-   since a document-order assertion can't catch a CSS-only regression here
-   (see that spec's own comment). Tab ORDER within `.app-shell__navtabs`
-   itself is untouched — only these three outer regions reflow. */
+/* (#2108, operator finding — desktop tab-row fold) `#crumb` moved from
+   `.app-shell__crumbbar` into `.app-shell__sticky` (`App.tsx`'s own doc on
+   that move) — on desktop it now shares the tabs' row for free (the
+   sticky container is already `display:flex; flex-wrap:wrap;`). This rule
+   is the phone-only exception: give crumb back its OWN row (matching the
+   pre-move visual, "phones keep two rows") rather than letting it wrap
+   ragged beside a half-empty tab strip.
+
+   (Supersedes an OLDER order-based reflow here, #1613/#1614 precedent,
+   `tests/e2e/chrome-order.spec.js` — that block assumed `#crumb`/`#meta`/
+   `.app-shell__navtabs` were all siblings of ONE flex container, true
+   before the #2071 sticky-block packet split navtabs out into its own
+   `.app-shell__sticky`. The e2e spec was updated for #2071 (asserts
+   `tabs.y < meta.y` directly, no `order` involved) and that block went
+   dead without anyone noticing — CSS `order` silently doing nothing to
+   elements that are no longer siblings. Deleted rather than "fixed" since
+   `#meta` isn't moving and doesn't need reordering; the surviving rules
+   below are new, not a repair of the old ones.) */
 @media (max-width: 768px) {
+  .app-shell__crumb {
+    flex: 1 1 100%;
+  }
   .app-shell__crumbbar {
     gap: 6px 8px;
   }
-  .app-shell__meta {
-    order: -1;
-    flex: 1 1 100%;
-    margin-left: 0;
-    text-align: left;
-  }
+  /* (operator, on the phone, 2026-08-28) Uniform-width tabs filling the
+     row: sized by their labels, RUNS was the slim one and the strip sat
+     ragged against the full-width transport under it. Equal cells line
+     up with the content edges, center by construction, and widen each
+     tap target from ~70px to a quarter of the row. */
   .app-shell__navtabs {
-    order: 0;
-    /* (operator, on the phone, 2026-08-28) Uniform-width tabs filling the
-       row: sized by their labels, RUNS was the slim one and the strip sat
-       ragged against the full-width transport under it. Equal cells line
-       up with the content edges, center by construction, and widen each
-       tap target from ~70px to a quarter of the row. */
     display: grid;
     width: 100%;
   }
   .app-shell__navtabs .nav-tab {
     justify-content: center;
     text-align: center;
-  }
-  .app-shell__crumb {
-    order: 1;
-    flex: 1 1 auto;
-    overflow-x: auto;
-    white-space: nowrap;
   }
   /* (#2073) Measured at 390px: the replay meta line laid out 510px wide
      under `white-space: pre` and clipped the date and time range mid-word.
@@ -2069,8 +2071,28 @@ body {
    and shrank when it finished — on every event during playback. A fixed
    grid makes the row count a property of the layout, not of the digits.
    Placed AFTER the base `.savrow` rule above on purpose: same specificity,
-   so source order is what lets it win. */
-@media (max-width: 768px) {
+   so source order is what lets it win.
+
+   (#2108, operator finding — "hero local/cloud figure collision", the
+   viewport-vs-container mismatch) WIDENED from `768px` to `1180px`, a
+   real computed number, not a round guess: `.eventlog` is a FIXED `380px`
+   side panel (styles.css) that shows whenever the viewport is ABOVE the
+   768px mobile breakpoint (`App.tsx`'s `isMobile`), and `.app-shell__stage`
+   carries `32px` of its own horizontal padding — so at any viewport in
+   (768px, 1180px], the STAGE's actual rendered width is BELOW 768px
+   (`viewport - 380 - 32`) even though the raw viewport says "desktop".
+   `.savrow`'s old `max-width:768px` query keyed off the VIEWPORT, so in
+   that whole band it stayed in flex-row mode inside a container narrower
+   than it assumed, and the local/cloud/unattributed tiles collided against
+   `.savclasses`' chips rather than cleanly wrapping. `1180px` is the
+   viewport width at which the stage's OWN content area first reaches
+   768px again (`768 + 380 + 32`), so the grid now covers exactly the
+   squeezed band — real CSS container queries would key off the stage's
+   own width directly and are the principled long-term fix, but aren't
+   verifiable in this suite (jsdom performs no layout); this computed
+   viewport-side proxy is testable and correct for the ONE sibling
+   (`.eventlog`) that currently does the squeezing. */
+@media (max-width: 1180px) {
   .savrow {
     display: grid;
     /* `minmax(0, 1fr)`, not `1fr`: a bare `1fr` track cannot shrink below

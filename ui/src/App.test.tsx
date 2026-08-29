@@ -921,6 +921,19 @@ describe("App", () => {
     return meta;
   }
 
+  it("(#2108, operator finding — desktop tab-row fold) #crumb lives inside .app-shell__sticky now (folded into the tab row); #meta stays behind in .app-shell__crumbbar, unmoved", async () => {
+    window.location.hash = "#lens=runs";
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".app-shell__navtabs")).toBeTruthy());
+    const crumb = document.querySelector("#crumb")!;
+    expect(crumb.closest(".app-shell__sticky")).toBeTruthy();
+    expect(crumb.closest(".app-shell__crumbbar")).toBeNull();
+    const meta = document.querySelector("#meta")!;
+    expect(meta.closest(".app-shell__crumbbar")).toBeTruthy();
+    expect(meta.closest(".app-shell__sticky")).toBeNull();
+  });
+
   it("(#2071) a live daemon route renders no transport — nothing to scrub", async () => {
     window.location.hash = "#lens=runs";
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));

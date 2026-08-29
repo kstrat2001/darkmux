@@ -411,14 +411,29 @@ export function App() {
             totalCount={transport.totalCount}
           />
         ) : null}
-      </div>
-      <div className="app-shell__crumbbar">
+        {/* (#2108, operator finding — desktop tab-row fold) `#crumb` moved
+            HERE from its old home in `.app-shell__crumbbar` below — on
+            desktop it now reads on the SAME row as the tabs ("subtitle
+            folded into the tab row"), a real DOM move (not a CSS trick),
+            safe for parity since the extractor selects `#crumb` BY ID
+            regardless of parent (this file's own module doc, Packet 1.5).
+            `#meta` stays behind in `.app-shell__crumbbar`, UNCHANGED — the
+            #2071 sticky packet's own operator decision ("masthead, crumb
+            AND meta line scroll away") named crumb specifically as
+            scrolling content; folding crumb into the tabs supersedes that
+            HALF of the decision (crumb is now sticky too, deliberately —
+            it identifies WHERE you are, same as the tabs beside it), but
+            meta (session/timing info) keeps scrolling away exactly as
+            before. `styles.css`'s mobile override puts crumb back on its
+            OWN row below the tabs — "phones keep two rows". */}
         {/* (#2073) `is-replay`: on a playback route the crumb repeats the
             meta line's own lead (`◆ <mission>`); the narrow stylesheet drops
             this copy, where a phone has no room for the same name twice. */}
         <header className={`app-shell__crumb${route.kind === "playback" ? " is-replay" : ""}`} id="crumb">
           {crumb}
         </header>
+      </div>
+      <div className="app-shell__crumbbar">
         <div className="app-shell__meta" id="meta">
           {/* `whiteSpace: "pre"` — the idle headline's literal double space
               before "· last run" (see `metaLine.ts`'s module doc) is an

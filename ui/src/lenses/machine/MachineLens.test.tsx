@@ -136,11 +136,15 @@ describe("MachineLens", () => {
       liveMachines: [{ machine_uid: "remote-uid", display_name: "studio", schema_version: "1", beat_ts_ms: 1, specs: "M1 Max · 32 GB" }],
     });
     renderMachine("remote-uid");
-    // `label` is interpolated as a bare text node beside its `<button>`/text
-    // siblings in `.machine-lens__hdr` (no wrapping element of its own), so
-    // an EXACT-match query can't isolate it — a substring regex against the
-    // header's combined text is the reliable form here.
-    await waitFor(() => expect(screen.getByText(/machine · studio/)).toBeInTheDocument());
+    // (#2108, operator finding) The machine NAME is no longer repeated in
+    // this in-page header — `#crumb` (App.tsx, folded into the desktop tab
+    // row) already states it. The header keeps "fleet › machine" plus the
+    // hardware spec.
+    await waitFor(() =>
+      expect(document.querySelector(".machine-lens__hdr")?.textContent).toBe(
+        "fleet › machine — M1 Max · 32 GB",
+      ),
+    );
     expect(screen.getByText(/residency \/ RAM not reported from here — local-probe only/i)).toBeInTheDocument();
     expect(screen.getByText(/View the machine page on studio directly/i)).toBeInTheDocument();
     expect(screen.queryByText(/limit source/i)).not.toBeInTheDocument();
@@ -210,13 +214,22 @@ describe("MachineLens", () => {
     expect(screen.getByText(/limit source/i)).toBeInTheDocument();
   });
 
-  it("an unrecognized/stale uid degrades gracefully — names the raw uid, links to its (empty) runs lens, never crashes", async () => {
+  it("an unrecognized/stale uid degrades gracefully — links to its (empty) runs lens by the raw uid, never crashes", async () => {
     mockMachineFetch({ specs: { machine_id: "MacBook-Pro", cpu_brand: "M5 Max" } });
     renderMachine("totally-unknown-uid-nobody-has-ever-seen");
-    await waitFor(() => expect(screen.getByText(/machine · totally-unknown-uid-nobody-has-ever-seen/)).toBeInTheDocument());
+    // (#2108, operator finding) No name to show (unrecognized uid, no
+    // display name resolved) and no hardware spec either — the header
+    // degrades to plain "fleet › machine", never a crash or a stale label.
+    await waitFor(() =>
+      expect(document.querySelector(".machine-lens__hdr")?.textContent).toBe(
+        "fleet › machine",
+      ),
+    );
     // (#1809) The old "no runs recorded for this machine" hint text is gone
     // with the runs list itself — a stale uid still gets a real, honestly
     // zero-count link out (never a crash, never a stale-looking count).
+    // The raw uid survives HERE, in the link's own href, even though the
+    // header above no longer names it.
     const link = screen.getByRole("link", { name: /runs on/i });
     expect(link).toHaveAttribute("href", "#lens=runs&machine=totally-unknown-uid-nobody-has-ever-seen");
     expect(screen.getByText(/not reported from here/i)).toBeInTheDocument();

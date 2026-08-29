@@ -357,8 +357,15 @@ export function MachineLens({
         <button type="button" className="machine-lens__back" onClick={() => { location.hash = ""; }}>
           fleet
         </button>
-        {" › machine · "}
-        {label}
+        {/* (#2108, operator finding) The machine NAME is dropped from this
+            in-page header — `#crumb` (App.tsx's own `routeChrome`, now
+            folded into the desktop tab row, see that file's own doc)
+            already states it for the machine route
+            (`crumb: targetMachineName ?? "this machine"`), so repeating it
+            here a second time was pure redundancy once the two sit in the
+            same glance. The hardware spec stays — `#crumb` never carries
+            it, only the name. */}
+        {" › machine"}
         {spec ? ` — ${spec}` : ""}
       </div>
 
