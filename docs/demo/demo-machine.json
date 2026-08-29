@@ -8,16 +8,41 @@
     "limit_bytes": 274877906944,
     "limit_source": "physical_pool",
     "load": {
-      "now": { "cpu_pct": 22, "mem_pct": 46, "gpu_pct": 68, "sampled_at_ms": 1787897595280 },
-      "window": {
-        "cpu": { "mean_pct": 19.4, "p95_pct": 27, "max_pct": 27 },
-        "mem": { "mean_pct": 44.8, "p95_pct": 47, "max_pct": 47 },
-        "gpu": { "mean_pct": 61.2, "p95_pct": 71, "max_pct": 71 },
-        "samples": 120,
-        "interval_ms": 5000,
-        "span_ms": 595000
+      "now": {
+        "sampled_at_ms": 1787897595280,
+        "sampler_cost_ms": 3.1,
+        "cpu_pct": 22,
+        "cpu_clusters": [
+          { "name": "Super", "cores": 6, "pct": 46, "mhz": 4400 },
+          { "name": "Performance", "cores": 12, "pct": 22, "mhz": 3400 },
+          { "name": "Efficiency", "cores": 4, "pct": 9, "mhz": 2100 }
+        ],
+        "mem_pct": 46,
+        "gpu_pct": 68,
+        "gpu_mhz": 1296,
+        "gpu_mem_bytes": 912000000,
+        "thermal": { "state": "nominal", "cpu_speed_limit_pct": 100 },
+        "power_mw": { "cpu": 5200, "gpu": 3400, "ane": 400, "total": 9000 }
       },
-      "sampler_cost_ms_mean": 3.1
+      "window": {
+        "samples": 120,
+        "span_ms": 595000,
+        "interval_ms": 5000,
+        "cpu_pct": { "mean": 19.4, "p95": 27, "max": 27 },
+        "gpu_pct": { "mean": 61.2, "p95": 71, "max": 71 },
+        "mem_pct": { "mean": 44.8, "p95": 47, "max": 47 },
+        "power_mw": {
+          "total": { "mean": 7800, "p95": 9200, "max": 11000 },
+          "gpu": { "mean": 2600, "p95": 3600, "max": 4200 },
+          "cpu": { "mean": 4700, "p95": 5300, "max": 6200 }
+        },
+        "thermal": {
+          "worst_state": "nominal",
+          "above_nominal_ms": 0,
+          "min_cpu_speed_limit_pct": 100
+        },
+        "energy_mwh": 1289
+      }
     },
     "machine": {
       "current_bytes": 127834497549,

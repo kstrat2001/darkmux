@@ -409,39 +409,106 @@ export interface MachineResources {
   load?: MachineLoad;
 }
 
-/** #2107, #1833 — one metric's window reduction as the daemon sampler's
- * `load.window` block reports it. Field names deliberately differ from the
- * Rust-side `MetricStats` (`peak_pct` there, `max_pct` here) — this is the
- * ROUTE's own wire contract, not a re-export of the internal reduction
- * type; the internal `peak_pct`/`mean_pct`/`p95_pct` naming FEEDS these
- * numbers (never re-derived), but the wire shape is whatever
- * `/machine/resources` actually promises callers. */
+/** #2107, #1833, #2108 (host-sample-shape v2) — one metric's window
+ * reduction as the daemon sampler's `load.window` block reports it. Field
+ * names deliberately differ from the Rust-side `MetricStats` (`peak_pct`
+ * there, `max` here) — this is the ROUTE's own wire contract, not a
+ * re-export of the internal reduction type; the internal
+ * `peak_pct`/`mean_pct`/`p95_pct` naming FEEDS these numbers (never
+ * re-derived), but the wire shape is whatever `/machine/resources`
+ * actually promises callers. */
 export interface MachineLoadMetric {
-  mean_pct: number | null;
-  p95_pct: number | null;
-  max_pct: number | null;
+  mean: number | null;
+  p95: number | null;
+  max: number | null;
 }
 
+/** One `hw.perflevelN` entry (Apple Silicon perf-level cluster — "Super" /
+ * "Performance" / "Efficiency" on current hardware). `name`/`cores` are
+ * always present when the cluster itself is reported; `pct`/`mhz` are
+ * null when IOReport is unavailable on this host. */
+export interface CpuCluster {
+  name: string;
+  cores: number;
+  pct: number | null;
+  mhz: number | null;
+}
+
+/** `ProcessInfo.thermalState` vocabulary, verbatim — kept as a union with
+ * a `string` fallback (matching this file's own convention elsewhere,
+ * e.g. `machine.state`) so a future macOS-added state doesn't fail to
+ * parse, it just falls through styling as unrecognized. */
+export type ThermalState = "nominal" | "fair" | "serious" | "critical" | string;
+
+export interface MachineThermalNow {
+  state: ThermalState;
+  /** `pmset -g therm CPU_Speed_Limit` — 100 when no limit is in effect. */
+  cpu_speed_limit_pct: number;
+}
+
+export interface MachineThermalWindow {
+  worst_state: ThermalState;
+  above_nominal_ms: number;
+  min_cpu_speed_limit_pct: number;
+}
+
+export interface MachinePowerNow {
+  cpu: number;
+  gpu: number;
+  ane: number;
+  total: number;
+}
+
+export interface MachinePowerWindow {
+  total: MachineLoadMetric;
+  gpu: MachineLoadMetric;
+  cpu: MachineLoadMetric;
+}
+
+/** #2108 (host-sample-shape v2) — `GET /machine/resources`'s `load` block.
+ * Every field except `now.sampled_at_ms` and `now.sampler_cost_ms` is
+ * OPTIONAL/null — absent when the source isn't available on this host/
+ * macOS version (older hardware, IOReport unreachable, `pmset` missing).
+ * Consumers render what is present and hide the rest; absence is never
+ * coerced to a zeroed placeholder (this file's own absence-never-zero
+ * convention). Source: `crates/darkmux-serve/src/host_sampler.rs`. */
 export interface MachineLoad {
   now: {
+    sampled_at_ms: number;
+    /** The probe's own wall cost for THIS sample — the observer-cost
+     * self-stamp (CLAUDE.md "the observer must not join the observed").
+     * Replaces the pre-v2 top-level `sampler_cost_ms_mean` running
+     * average with a per-sample figure. */
+    sampler_cost_ms: number;
     cpu_pct: number | null;
+    /** One entry per `hw.perflevelN` (Apple Silicon perf-level cluster) —
+     * null when the host has none to report (older Intel Macs, or the
+     * probe couldn't enumerate perf levels), never an empty array standing
+     * in for "not measured". */
+    cpu_clusters: CpuCluster[] | null;
     mem_pct: number | null;
     gpu_pct: number | null;
-    sampled_at_ms: number;
+    /** IOReport GPU perf-state, null if absent. */
+    gpu_mhz: number | null;
+    /** ioreg "In use system memory". */
+    gpu_mem_bytes: number | null;
+    thermal: MachineThermalNow | null;
+    power_mw: MachinePowerNow | null;
   };
   window: {
-    cpu: MachineLoadMetric;
-    mem: MachineLoadMetric;
-    gpu: MachineLoadMetric;
     samples: number;
+    span_ms: number;
     /** MEASURED mean gap between samples, not the nominal configured
      * cadence — `null` when fewer than two samples have landed. */
     interval_ms: number | null;
-    span_ms: number;
+    cpu_pct: MachineLoadMetric;
+    gpu_pct: MachineLoadMetric;
+    mem_pct: MachineLoadMetric;
+    power_mw: MachinePowerWindow | null;
+    thermal: MachineThermalWindow | null;
+    /** ∫ total power over the window, in milliwatt-hours. */
+    energy_mwh: number | null;
   };
-  /** The sampler's own measured mean gather cost — the observer-cost
-   * self-stamp (CLAUDE.md "the observer must not join the observed"). */
-  sampler_cost_ms_mean: number;
 }
 
 /** `GET /fleet/sessions/live` — `axum::Json(Vec<LiveSessionBeat>)`, the
