@@ -11,6 +11,7 @@ import { utilityModelId } from "./memoryLedgerLines";
 import { MachineHealthRegion } from "./MachineHealthRegion";
 import { advanceResidency, residencyChangedThisPoll, type ResidencyRowView, type ResidencyState } from "./machineGauge";
 import { getSource } from "../../lib/source";
+import { useIsMobile } from "../../hooks/useIsMobile";
 import { Meter, compactMeterProps, fmtPct, COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "../../components/Meter";
 import { aggregateHostSamples } from "../../lib/hostStats";
 import { rollingWindowSamples, findLastKnownSample } from "../../lib/machineDrawerScope";
@@ -130,8 +131,21 @@ export function lineClass(line: string): string | undefined {
  * OLD runs list for its live-vs-ended status labels — is gone along with
  * that list; nothing on this page needs session liveness anymore.
  */
-export function MachineLens({ uid: routeUid }: { uid: string | null }) {
+export function MachineLens({
+  uid: routeUid,
+  isMobileOverride,
+}: {
+  uid: string | null;
+  /** (#2108, operator finding) Test-only override for the "runs on
+   * <machine> →" link's mobile full-width treatment below — production
+   * omits this and measures `window.innerWidth` via `useIsMobile` (the
+   * SAME 768px breakpoint the drawer/health-region key their own mobile
+   * forms off). */
+  isMobileOverride?: boolean;
+}) {
   const nowMs = Date.now();
+  const measuredIsMobile = useIsMobile();
+  const isMobile = isMobileOverride ?? measuredIsMobile;
 
   // (#1801) A daemon-less build has nothing to poll. `App.tsx` gates its own
   // copies of these on `isLiveRoute(route)` and states the rule in place:
@@ -453,18 +467,38 @@ export function MachineLens({ uid: routeUid }: { uid: string | null }) {
           activatable for free, and consistent with every other cross-lens
           hop in this file (`NavChrome`'s own tabs use the same direct
           hash-write pattern). */}
-      {targetUid != null && (
-        <a
-          className="machine-lens__runslink"
-          href={`#lens=runs&machine=${encodeURIComponent(targetUid)}`}
-          onClick={(e) => {
-            e.preventDefault();
-            location.hash = `lens=runs&machine=${encodeURIComponent(targetUid)}`;
-          }}
-        >
-          runs on {label} →
-        </a>
-      )}
+      {targetUid != null &&
+        (isMobile ? (
+          // (#2108, operator finding) The mobile full-width form needs TWO
+          // flex items — the label and the arrow — so `justify-content:
+          // space-between` (styles.css's `--mobile` rule) has something to
+          // pin apart; a single text run (desktop's own form, below) is
+          // ONE anonymous flex item with nothing to distribute against.
+          // Neither span is `aria-hidden` — the accessible name stays
+          // "runs on <machine> →", arrow included, exactly like desktop.
+          <a
+            className="machine-lens__runslink machine-lens__runslink--mobile"
+            href={`#lens=runs&machine=${encodeURIComponent(targetUid)}`}
+            onClick={(e) => {
+              e.preventDefault();
+              location.hash = `lens=runs&machine=${encodeURIComponent(targetUid)}`;
+            }}
+          >
+            <span>runs on {label}</span>
+            <span>→</span>
+          </a>
+        ) : (
+          <a
+            className="machine-lens__runslink"
+            href={`#lens=runs&machine=${encodeURIComponent(targetUid)}`}
+            onClick={(e) => {
+              e.preventDefault();
+              location.hash = `lens=runs&machine=${encodeURIComponent(targetUid)}`;
+            }}
+          >
+            runs on {label} →
+          </a>
+        ))}
 
     </div>
   );

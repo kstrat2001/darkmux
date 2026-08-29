@@ -393,11 +393,11 @@ describe("MachineLens — the utility tier is a row badge, not a card", () => {
   });
 });
 
-function renderMachineLens() {
+function renderMachineLens(isMobileOverride?: boolean) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MachineLens uid={null} />
+      <MachineLens uid={null} isMobileOverride={isMobileOverride} />
     </QueryClientProvider>,
   );
 }
@@ -515,5 +515,26 @@ describe("MachineLens — the runs-lens link (#1809)", () => {
     await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
     expect(container.querySelector(".machine-lens__run")).toBeNull();
     expect(screen.queryByText(/RUNS ON/)).not.toBeInTheDocument();
+  });
+
+  // (#2108, operator finding) On a phone this control sat at roughly half
+  // the card's width with dead space beside it. On a narrow viewport it
+  // gets the `--mobile` full-width/48px-touch-target class, and the
+  // accessible name — arrow included — stays exactly what it was.
+  it("gets the full-width mobile class on a narrow viewport, keeping the same accessible name", async () => {
+    mockMachineRunsFetch(3);
+    renderMachineLens(true);
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    expect(link.className).toMatch(/\bmachine-lens__runslink--mobile\b/);
+    expect(link.className).toMatch(/\bmachine-lens__runslink\b/);
+    expect(link.textContent).toBe("runs on MacBook-Pro→");
+  });
+
+  it("stays the plain desktop class (no --mobile modifier) when not on a narrow viewport", async () => {
+    mockMachineRunsFetch(3);
+    renderMachineLens(false);
+    const link = await screen.findByRole("link", { name: /runs on MacBook-Pro/i });
+    expect(link.className).not.toMatch(/--mobile/);
+    expect(link.textContent).toBe("runs on MacBook-Pro →");
   });
 });
