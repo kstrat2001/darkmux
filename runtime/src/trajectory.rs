@@ -458,6 +458,27 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.reasoning_bound.not_applied — fires ONCE per dispatch, the
+    /// first time a call that carried real dispatchable output (an answer
+    /// or tool calls) produces no reasoning region at all, cumulative over
+    /// every turn so far. (#2164) A fresh turn's first call carries the
+    /// `REASONING_CHECKPOINT_INTERVAL` bound only once the dispatch has
+    /// proven, on some earlier call, that the model reasons — this event
+    /// is the run record's explanation for why that stopped happening (or
+    /// never started): the model this dispatch is talking to does not
+    /// appear to emit a thinking region, so the reasoning check-in interval
+    /// is not being applied to fresh turns' first calls; only the answer
+    /// bound (`max_tokens_per_call`) is. Observability-only — nothing
+    /// about the dispatch's behavior changes when this fires; it explains a
+    /// decision the runtime already made.
+    pub fn append_reasoning_bound_not_applied(&mut self, seq: u32) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.reasoning_bound.not_applied",
+            "seq": seq,
+            "ts": unix_ms(),
+        }));
+    }
+
     /// dispatch.feedback.injected — fires when the runtime injects one
     /// or more synthetic system messages into the next-turn prompt as
     /// model-facing telemetry (cycle warnings, tool-failure cascades,
