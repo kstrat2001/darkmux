@@ -18,12 +18,16 @@
 //!
 //! **Breaker (#2109):** at `critical`, or when `cpu_speed_limit_pct` drops
 //! below `min_cpu_speed_limit_pct`, write the pace file with
-//! `reason: "thermal-critical"` and — for a crawl mission — drop the
-//! crawl's `STOP` file so no further unit gets dispatched. **Never kills
-//! the container.** The in-flight unit pauses at its next turn boundary
-//! with its checkpoint persisted (#2114); resume is the operator's call
-//! (`darkmux dispatch --resume`). Once tripped, the governor goes
-//! terminal — it does not un-pause itself on recovery.
+//! `reason: "thermal-critical", expires: false` and — for a crawl mission —
+//! drop the crawl's `STOP` file so no further unit gets dispatched. **Never
+//! kills the container.** The in-flight unit pauses at its next turn
+//! boundary with its checkpoint persisted (#2114); resume is the operator's
+//! call (`darkmux dispatch --resume`). Once tripped, the governor goes
+//! terminal — it does not un-pause itself on recovery, and (per finding 2
+//! of the #2110/#2109 review) it does not need to keep re-stamping
+//! `written_at_ms` either: `expires: false` tells the runtime's staleness
+//! ceiling to never apply to this pause, so a stale timestamp can't make
+//! the unit resume on a still-critical machine.
 //!
 //! **Pace file location (operator correction during #2110/#2109 review):**
 //! NOT under the mounted `/workspace` — crawl units mount that read-only,
@@ -32,14 +36,20 @@
 //! **out-dir** instead (`host_out`, mounted at `/darkmux-out`; see
 //! `dispatch_internal.rs`'s `apply_volume_mounts`), same home as
 //! `.prompt.txt` and the trajectory. Container path: `/darkmux-out/pace.json`.
-//! The runtime-side reader (`runtime/src/pace.rs`) is being moved to read
-//! from there in a parallel #2139 fixer; this module only needs to write to
-//! the matching HOST path, `<host_out>/pace.json`.
+//! The runtime-side reader (`runtime/src/pace.rs`) reads from there —
+//! `pace_file_path_matches_runtime_out_base` below is the conformance test
+//! that keeps the two literal join expressions in sync.
 //!
 //! Every write stamps `written_at_ms` (epoch millis) so the runtime's
-//! immortal-container guard can treat a pause older than `max_pause_ms` as
-//! expired — a host process that dies mid-pause must not strand a
-//! dispatch resting forever on a stale file.
+//! staleness guard (`PaceFile::is_expired`, `runtime/src/pace.rs`) can
+//! treat a pause older than `max_pause_ms` as expired — a host process
+//! that dies mid-pause must not strand a dispatch resting forever on a
+//! stale file. The ordinary governor pause (`reason: "thermal"`) is
+//! subject to that ceiling; the breaker's `thermal-critical` stop opts out
+//! via `expires: false` (above). A gap in OS thermal readings while paused
+//! (`thermal_sample` returns `None` mid-episode) is treated as "time
+//! passed, no new information" rather than frozen accounting or a stale
+//! stamp — see `on_sample`'s `None` arm (finding 3 of the same review).
 
 use crate::host_probe::thermal::THERMAL_STATES;
 use crate::host_probe::ThermalSample;
@@ -56,32 +66,48 @@ fn severity(state: &str) -> usize {
 }
 
 /// `<host_out>/pace.json` — mounted into the container at
-/// `/darkmux-out/pace.json`.
+/// `/darkmux-out/pace.json`. MUST match the runtime-side join in
+/// `runtime/src/pace.rs`'s `pace_file_path`
+/// (`out_dir.join("pace.json")`) — `pace_file_path_matches_runtime_out_base`
+/// below is the conformance test that keeps the two in sync.
 pub fn pace_file_path(host_out: &Path) -> PathBuf {
     host_out.join("pace.json")
 }
 
 /// Shape written to the pace file. Mirrors `runtime/src/pace.rs`'s
-/// `PaceFile` fields (`pause`/`reason`/`state`) plus `written_at_ms` (new,
-/// this packet) — the runtime-side reader tolerates unknown/extra fields on
-/// deserialize (no `deny_unknown_fields`), so this is forward-compatible
-/// with the pre-`written_at_ms` reader and additive for the one being
-/// updated in parallel.
+/// `PaceFile` fields (`pause`/`reason`/`state`/`written_at_ms`/`expires`) —
+/// the runtime-side reader tolerates unknown/extra fields on deserialize
+/// (no `deny_unknown_fields`), so this stays forward-compatible with any
+/// future additive field on that side. `expires` is omitted (not `null`)
+/// when `None` — the ordinary governor pause doesn't opt out of the
+/// staleness ceiling, so it writes the same shape a pre-`expires` reader
+/// already tolerated.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct GovernorPaceFile {
     pause: bool,
     reason: &'static str,
     state: String,
     written_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires: Option<bool>,
 }
 
 fn now_epoch_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-fn write_pace_file(host_out: &Path, pause: bool, reason: &'static str, state: &str) {
-    let pace =
-        GovernorPaceFile { pause, reason, state: state.to_string(), written_at_ms: now_epoch_ms() };
+/// `expires: Some(false)` for the breaker's `thermal-critical` stop (opts
+/// out of the runtime's `max_pause_ms` staleness ceiling — finding 2 of
+/// the #2110/#2109 review); `None` for every ordinary governor pause/resume
+/// write, which stays subject to that ceiling.
+fn write_pace_file(host_out: &Path, pause: bool, reason: &'static str, state: &str, expires: Option<bool>) {
+    let pace = GovernorPaceFile {
+        pause,
+        reason,
+        state: state.to_string(),
+        written_at_ms: now_epoch_ms(),
+        expires,
+    };
     // Best-effort — a failed write is observability/pacing, never fatal to
     // the dispatch itself (mirrors every other sampler-adjacent write in
     // `dispatch_internal.rs`).
@@ -195,11 +221,24 @@ pub struct ThermalGovernor {
     /// ms the state has continuously held at/below `resume_at` while
     /// paused (resets to 0 the moment it rises back above `resume_at`).
     resume_hold_accum_ms: u64,
+    /// (finding 3) Last thermal state name from a real `Some` sample —
+    /// only ever set from `on_sample`'s `Some` arm, so it's populated by
+    /// the time `Paused`/`Broken` is reachable (both require at least one
+    /// prior `Some` to enter). Used to keep the pace file's `state` field
+    /// and the breaker's `STOP`/event state meaningful on a tick where the
+    /// OS thermal reading itself came back `None`.
+    last_known_state: String,
 }
 
 impl ThermalGovernor {
     pub fn new(config: ThermalGovernorConfig) -> Self {
-        Self { config, state: State::Idle, pause_episode_ms: 0, resume_hold_accum_ms: 0 }
+        Self {
+            config,
+            state: State::Idle,
+            pause_episode_ms: 0,
+            resume_hold_accum_ms: 0,
+            last_known_state: String::new(),
+        }
     }
 
     /// Feed one thermal sample. `elapsed_ms` is the wall time since the
@@ -221,9 +260,55 @@ impl ThermalGovernor {
         stop_file: Option<&Path>,
     ) -> Option<ThermalEvent> {
         if !self.config.enabled || self.state == State::Broken {
+            // Broken is terminal and its pace file write already carries
+            // `expires: false` (see the breaker writes below) — the
+            // runtime's staleness ceiling never applies to it, so there's
+            // nothing to keep fresh here (finding 2 of the #2110/#2109
+            // review; superseded the earlier "re-stamp every N ticks" plan
+            // once `expires` landed on the runtime side).
             return None;
         }
-        let thermal = thermal?;
+
+        // (finding 3) A missing OS thermal reading is "time passed, no new
+        // information" — NOT evidence of recovery, and NOT nothing. Only
+        // matters while actively `Paused`: accumulate the elapsed time into
+        // the episode (so `max_pause_ms` escalation still fires on a
+        // machine that stays hot through a reading gap), reset the resume
+        // hold (a gap is not a continuous hold at/below `resume_at`), and
+        // re-stamp the pace file with the last known state so a real
+        // reading gap can't let `written_at_ms` go stale and trip the
+        // runtime's staleness ceiling mid-pause. `Idle` has nothing to
+        // accumulate; a `None` there is simply a no-op tick.
+        let thermal = match thermal {
+            Some(t) => {
+                self.last_known_state = t.state.clone();
+                t
+            }
+            None => {
+                if self.state == State::Paused {
+                    self.pause_episode_ms = self.pause_episode_ms.saturating_add(elapsed_ms);
+                    self.resume_hold_accum_ms = 0;
+                    write_pace_file(host_out, true, "thermal", &self.last_known_state, None);
+                    if self.pause_episode_ms >= self.config.max_pause_ms {
+                        self.state = State::Broken;
+                        write_pace_file(
+                            host_out,
+                            true,
+                            "thermal-critical",
+                            &self.last_known_state,
+                            Some(false),
+                        );
+                        if let Some(stop) = stop_file {
+                            write_stop_file(stop);
+                        }
+                        return Some(ThermalEvent::Breaker {
+                            state: self.last_known_state.clone(),
+                        });
+                    }
+                }
+                return None;
+            }
+        };
 
         let sev = severity(&thermal.state);
         let is_breaker_condition = sev >= severity("critical")
@@ -231,7 +316,7 @@ impl ThermalGovernor {
 
         if is_breaker_condition {
             self.state = State::Broken;
-            write_pace_file(host_out, true, "thermal-critical", &thermal.state);
+            write_pace_file(host_out, true, "thermal-critical", &thermal.state, Some(false));
             if let Some(stop) = stop_file {
                 write_stop_file(stop);
             }
@@ -244,7 +329,7 @@ impl ThermalGovernor {
                     self.state = State::Paused;
                     self.pause_episode_ms = 0;
                     self.resume_hold_accum_ms = 0;
-                    write_pace_file(host_out, true, "thermal", &thermal.state);
+                    write_pace_file(host_out, true, "thermal", &thermal.state, None);
                     Some(ThermalEvent::Paused { state: thermal.state.clone() })
                 } else {
                     None
@@ -271,12 +356,12 @@ impl ThermalGovernor {
                     self.state = State::Idle;
                     self.pause_episode_ms = 0;
                     self.resume_hold_accum_ms = 0;
-                    write_pace_file(host_out, false, "thermal", &thermal.state);
+                    write_pace_file(host_out, false, "thermal", &thermal.state, None);
                     return Some(ThermalEvent::Resumed { state: thermal.state.clone() });
                 }
                 if self.pause_episode_ms >= self.config.max_pause_ms {
                     self.state = State::Broken;
-                    write_pace_file(host_out, true, "thermal-critical", &thermal.state);
+                    write_pace_file(host_out, true, "thermal-critical", &thermal.state, Some(false));
                     if let Some(stop) = stop_file {
                         write_stop_file(stop);
                     }
@@ -419,6 +504,12 @@ mod tests {
         assert!(stop.exists(), "breaker must drop the crawl STOP file");
         let pace = read_pace(dir.path());
         assert_eq!(pace["reason"], serde_json::json!("thermal-critical"));
+        assert_eq!(
+            pace["expires"],
+            serde_json::json!(false),
+            "(finding 2) breaker stop must opt out of the runtime's staleness ceiling — a stale \
+             written_at_ms must not resume the unit on a still-critical machine"
+        );
 
         // Terminal: further samples, even nominal, do nothing more.
         assert_eq!(gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None), None);
@@ -432,6 +523,8 @@ mod tests {
         let ev = gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
         assert_eq!(ev, Some(ThermalEvent::Breaker { state: "critical".to_string() }));
         assert!(stop.exists());
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["expires"], serde_json::json!(false));
     }
 
     #[test]
@@ -444,6 +537,135 @@ mod tests {
         let ev = gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
         assert_eq!(ev, Some(ThermalEvent::Breaker { state: "nominal".to_string() }));
         assert!(stop.exists());
+    }
+
+    #[test]
+    fn ordinary_pause_and_resume_writes_omit_expires() {
+        // The ordinary governor pause/resume stays subject to the runtime's
+        // default staleness ceiling — `expires` must be ABSENT (not
+        // `false`), matching every pre-`expires` pace file.
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        let pace = read_pace(dir.path());
+        assert!(pace.get("expires").is_none(), "ordinary pause must not set expires: {pace}");
+    }
+
+    // ── finding 3: a missing OS thermal reading mid-pause ──
+
+    #[test]
+    fn none_reading_while_paused_accumulates_toward_max_pause_and_trips_the_breaker() {
+        // (#2140 review finding 3) `let thermal = thermal?;` used to bail
+        // out BEFORE touching any accounting on a `None` sample, freezing
+        // `pause_episode_ms` for as long as OS thermal readings kept
+        // coming back empty — so a machine that stayed hot through a
+        // reading gap could pause forever without ever escalating to the
+        // breaker. This proves the breaker fires from None-tick elapsed
+        // time ALONE, with no intervening real reading.
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut cfg = cfg();
+        cfg.max_pause_ms = 10_000;
+        let mut gov = ThermalGovernor::new(cfg);
+
+        // Seed with one real "serious" reading — enters Paused.
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), Some(&stop));
+
+        // 4 ticks of a MISSING reading = 8000ms more elapsed, total 8000ms
+        // — not yet at the 10000ms ceiling.
+        for _ in 0..4 {
+            let ev = gov.on_sample(None, 2000, dir.path(), Some(&stop));
+            assert_eq!(ev, None, "not yet at max_pause_ms");
+        }
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["pause"], serde_json::json!(true), "still paused through the reading gap");
+        assert_eq!(pace["state"], serde_json::json!("serious"), "state carries the last known reading");
+        assert!(
+            pace["written_at_ms"].as_u64().unwrap() > 0,
+            "stamp still refreshed on a None tick, not frozen"
+        );
+        assert!(!stop.exists());
+
+        // One more None tick crosses 10000ms — breaker fires without ever
+        // seeing another real reading.
+        let ev = gov.on_sample(None, 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, Some(ThermalEvent::Breaker { state: "serious".to_string() }));
+        assert!(stop.exists(), "breaker must fire from accumulated None-tick elapsed time alone");
+        let pace = read_pace(dir.path());
+        assert_eq!(pace["reason"], serde_json::json!("thermal-critical"));
+        assert_eq!(pace["expires"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn none_reading_while_paused_resets_the_resume_hold() {
+        // A reading gap is NOT evidence of recovery — it must not count
+        // toward (or preserve) a continuous resume_at hold, matching the
+        // "still hot" reset the Some(above-resume_at) branch already
+        // applies.
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+
+        // 58s of "fair" (just under the 60s hold)...
+        for _ in 0..29 {
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None);
+        }
+        // ...then one None tick — must reset the hold clock, same as a
+        // tick back above resume_at would.
+        assert_eq!(gov.on_sample(None, 2000, dir.path(), None), None);
+
+        // Even 58 more seconds of "fair" must NOT be enough to resume,
+        // because the hold restarted at the None tick above.
+        for _ in 0..29 {
+            assert_eq!(gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None), None);
+        }
+        assert_eq!(
+            gov.on_sample(Some(&sample("fair", 100)), 2000, dir.path(), None),
+            Some(ThermalEvent::Resumed { state: "fair".to_string() }),
+            "resume only after a FRESH continuous 60s hold following the None-tick reset"
+        );
+    }
+
+    #[test]
+    fn none_reading_while_idle_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gov = ThermalGovernor::new(cfg());
+        assert_eq!(gov.on_sample(None, 2000, dir.path(), None), None);
+        assert!(!pace_file_path(dir.path()).exists(), "no pace file — Idle has nothing to accumulate");
+    }
+
+    // ── finding 1: host/runtime pace-file location conformance ──
+
+    /// (#2140 review finding 1) `thermal_governor.rs`'s `pace_file_path`
+    /// and `runtime/src/pace.rs`'s `pace_file_path` must join the SAME
+    /// literal file name onto their root — the runtime crate is not a
+    /// workspace member and cannot depend on `darkmux-crew` (or vice
+    /// versa), so there is no shared type to enforce this at compile time.
+    /// This reads the runtime source at test time and asserts the join
+    /// literal is still `"pace.json"` — a rename on either side that isn't
+    /// mirrored on the other breaks this test instead of silently going
+    /// inert (exactly what shipped in the earlier stacked-but-inert state
+    /// this finding caught).
+    #[test]
+    fn pace_file_path_matches_runtime_out_base() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let runtime_pace_rs = manifest_dir.join("../../runtime/src/pace.rs");
+        let source = std::fs::read_to_string(&runtime_pace_rs)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", runtime_pace_rs.display()));
+        assert!(
+            source.contains(r#"out_dir.join("pace.json")"#),
+            "runtime/src/pace.rs's pace_file_path must join \"pace.json\" onto its out_dir root \
+             to match crates/darkmux-crew/src/thermal_governor.rs's host-side pace_file_path \
+             (host_out.join(\"pace.json\")) — got:\n{source}"
+        );
+        // The host side, asserted the same way for symmetry — if this ever
+        // drifts from `host_out.join("pace.json")` the two literals no
+        // longer describe the same file even though this crate's own
+        // `pace_file_path` still compiles fine.
+        assert_eq!(
+            pace_file_path(std::path::Path::new("/darkmux-out")),
+            std::path::PathBuf::from("/darkmux-out/pace.json")
+        );
     }
 
     #[test]

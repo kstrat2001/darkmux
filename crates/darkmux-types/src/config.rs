@@ -362,9 +362,11 @@ pub struct RuntimeBehaviorConfig {
 /// `strict_selection`/`check_updates`, not `redis`/`audit`).
 ///
 /// **Governor (#2110):** on each host thermal sample, when the OS-reported
-/// state is at or above `pause_at`, the host writes
-/// `<workspace>/.darkmux/pace.json` (`runtime/src/pace.rs`'s schema, #2114)
-/// with `pause: true, reason: "thermal", state: "<state>"` — the in-flight
+/// state is at or above `pause_at`, the host writes `<out_dir>/pace.json`
+/// (the mounted `/darkmux-out` bookkeeping dir, NOT `/workspace` — a crawl
+/// unit mounts that read-only and a coder run's workspace is the
+/// operator's own repo tree; `runtime/src/pace.rs`'s schema, #2114) with
+/// `pause: true, reason: "thermal", state: "<state>"` — the in-flight
 /// dispatch rests at its next turn boundary. The pause clears
 /// (`pause: false`) once the state has held at or below `resume_at` for
 /// `resume_hold_ms` continuously (hysteresis — no flapping on a state that's
