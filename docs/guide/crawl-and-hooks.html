@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Crawl a codebase against your rules, and route what it finds · darkmux user guide</title>
-<meta name="description" content="Run darkmux's local-model crawler against a named workspace and rule set, and route the flow records it emits to your own tracker via loopback-only hooks.">
+<meta name="description" content="Run darkmux's local-model crawler against a named workspace and rule set, and route the flow records it emits to your own tracker via loopback or tailnet hooks.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -33,7 +33,7 @@
     <div class="label">10 <span class="dot">·</span> advanced</div>
     <h1>Crawl a codebase against your rules, and route what it finds</h1>
 <p class="note"><strong>Beta.</strong> The crawl mission and hooks shipped in 3.4.0 as a public beta: the pieces on this page run and are exercised on darkmux's own code every day, but the mission inputs and the hook record shapes may still change between minor releases without a deprecation period. Mechanical coverage accounting and typed hook kinds are not built yet.</p>
-    <p class="lede">A <strong>crawl</strong> (#1959) is a mission like any other: point it at real source trees, name the rules you want checked, and a local model reads bounded slices of code and reports findings through <code>report_finding</code>. Everything the crawl does streams as ordinary flow records, so the last piece is routing: <strong>hooks</strong> (#2093) match those records against operator rules and POST the matches to your own loopback receiver — no external tracker knows darkmux exists, and darkmux never leaves loopback to reach one.</p>
+    <p class="lede">A <strong>crawl</strong> (#1959) is a mission like any other: point it at real source trees, name the rules you want checked, and a local model reads bounded slices of code and reports findings through <code>report_finding</code>. Everything the crawl does streams as ordinary flow records, so the last piece is routing: <strong>hooks</strong> (#2093) match those records against operator rules and POST the matches to your own receiver — loopback on the same machine, or another machine on your own tailnet (#2135 option 2). No external tracker knows darkmux exists, and darkmux never leaves that boundary to reach one.</p>
   </div>
 </header>
 
@@ -176,7 +176,7 @@ mission close            <span class="comment"># units_completed/errored/skipped
 <section>
   <div class="wrap">
     <h2>4. Hooks: routing flow records to your own receiver</h2>
-    <p>Hooks are darkmux's fourth <code>FlowSink</code> kind: match a flow record against operator-configured rules and POST a match verbatim to a receiver you run. <strong>Loopback only</strong> — <code>validate_loopback_http_url</code> refuses anything else, checked both when the rule loads and again at every POST — so darkmux itself never reaches an external tracker; it hands matched records to a process on the same machine, and what that process does with them (relay, store, forward) is entirely up to you.</p>
+    <p>Hooks are darkmux's fourth <code>FlowSink</code> kind: match a flow record against operator-configured rules and POST a match verbatim to a receiver you run. <strong>Loopback, or your tailnet — nothing else.</strong> A rule's <code>http</code> target is accepted when it's loopback (<code>127.0.0.1</code>/<code>[::1]</code>/<code>localhost</code>) OR a genuine Tailscale address (an IPv4 in <code>100.64.0.0/10</code>, or a hostname ending in <code>.ts.net</code>) — <code>validate_hook_target_url</code> refuses everything else, checked both when the rule loads and again at every POST. There's no config flag to flip: the URL itself is the decision (a loopback receiver, or a receiver on another machine in the SAME tailnet), and <code>darkmux doctor</code>/<code>flow status</code> show each rule's resolved target kind (<code>loopback</code>/<code>tailnet</code>) so the choice stays visible. darkmux never reaches an external tracker outside that boundary; a tailnet target still requires <code>http://</code> (WireGuard already encrypts and authenticates the peer, so TLS on top buys nothing), and an external (non-tailnet) receiver is a later packet that will require <code>https://</code> plus a mandatory signature.</p>
 
     <h3>The config block</h3>
     <p><code>config.hooks</code>, same visible-defaults shape as <code>redis</code>/<code>audit</code>. This is the real block from a running machine (URLs are loopback, nothing else to scrub):</p>
@@ -206,7 +206,31 @@ mission close            <span class="comment"># units_completed/errored/skipped
     <pre><code>{"action":"hook.fired","source":"hook","payload":{"rule_index":0,
    "target_host":"127.0.0.1:8790","delivered_action":"dispatch.tool",
    "attempt":1,"receiver_rejected":1}}</code></pre>
-    <p><code>hook.failed</code> didn't fire in this environment's log — delivery has been succeeding — but it exists for the give-up path (a permanent 4xx/redirect, or retries exhausted against a down receiver) and carries the same <code>rule_index</code>/<code>target_host</code> shape plus the failure reason.</p>
+    <p><code>hook.failed</code> didn't fire in this environment's log — delivery has been succeeding — but it exists for the give-up path (a permanent 4xx/redirect, or retries exhausted against a down receiver) and carries the same <code>rule_index</code>/<code>target_host</code> shape plus the failure reason. Both records also carry <code>delivery_id</code> — the SAME id the delivery attempt carried on the wire (below), so a record here correlates directly with the HTTP request your receiver actually saw.</p>
+
+    <h3>Delivery headers</h3>
+    <p>Every delivery — loopback or tailnet — carries the same set of headers, whether or not the rule is signed:</p>
+    <table>
+      <tr><th>Header</th><th>Value</th></tr>
+      <tr><td><code>X-Darkmux-Delivery</code></td><td>A UUID-v4-shaped id, deterministically derived from the exact outbox line — every RETRY of the same undelivered line carries the SAME id (the "delivery attempt group"), and it's also stamped as <code>delivery_id</code> on the corresponding <code>hook.fired</code>/<code>hook.failed</code> record.</td></tr>
+      <tr><td><code>X-Darkmux-Event</code></td><td>The record's own <code>action</code> field (e.g. <code>dispatch.tool</code>, <code>step start</code>).</td></tr>
+      <tr><td><code>X-Darkmux-Machine-Id</code> / <code>X-Darkmux-Machine-Uid</code></td><td>The machine that PRODUCED the record — from the record's own <code>machine_id</code>/<code>machine_uid</code> fields.</td></tr>
+      <tr><td><code>X-Darkmux-Sender</code></td><td>THIS host's own <code>machine_id</code> — the machine POSTing. Distinct from <code>X-Darkmux-Machine-Id</code> on purpose: a fleet hub relaying another machine's record would otherwise be indistinguishable from that record's origin.</td></tr>
+      <tr><td><code>X-Darkmux-Timestamp</code></td><td>Unix milliseconds at send time.</td></tr>
+      <tr><td><code>X-Darkmux-Signature</code></td><td>Present ONLY when the rule names a <code>signing_secret_keychain_item</code>: <code>sha256=&lt;hex HMAC-SHA256&gt;</code> over the literal string <code>"&lt;timestamp&gt;.&lt;raw body bytes&gt;"</code>, using the value of <code>X-Darkmux-Timestamp</code> as-is. Absent on an unsigned rule — never a placeholder or empty value.</td></tr>
+    </table>
+    <p>The secret itself is never in <code>config.json</code> or a log — only the macOS Keychain item NAME is: <code>signing_secret_keychain_item</code> per rule, read via <code>security find-generic-password -a $USER -s &lt;item&gt; -w</code> at construction. Non-macOS (or a portable override on any platform): set <code>DARKMUX_HOOK_SECRET_&lt;rule-index&gt;</code> instead (e.g. <code>DARKMUX_HOOK_SECRET_0</code> for <code>rules[0]</code>) — that env var wins over the Keychain item whenever it's set. Signing is optional inside a loopback receiver on the SAME machine; <code>darkmux doctor</code> warns when a TAILNET target has no secret configured (fine inside the tailnet, since WireGuard already authenticates the peer — but the receiver then has no way to attribute the record's sender beyond the body itself).</p>
+    <pre><code>{
+  "hooks": {
+    "enabled": true,
+    "rules": [
+      { "match": { "action": "step *" },
+        "http": "http://100.101.102.103:8790/events",
+        "signing_secret_keychain_item": "darkmux-hook-crawl-tracker" }
+    ]
+  }
+}</code></pre>
+    <p>(Keychain item, on the sending machine: <code>security add-generic-password -a $USER -s darkmux-hook-crawl-tracker -w</code>, then paste the shared secret.)</p>
 
     <h3><code>darkmux flow status</code></h3>
     <p>Real output (Redis section trimmed to the hooks-relevant lines; this machine also runs a Redis sink, irrelevant here):</p>
@@ -282,6 +306,12 @@ http.createServer((req, res) => {
         <td><code>256</code></td>
         <td><code>hooks.max_outbox_mb</code></td>
         <td>The hard cap, in MiB, on undelivered bytes a single rule's outbox may hold before further appends for that rule are dropped (counted, never silently lost). <code>0</code> disables the cap. Read once, live, at construction.</td>
+      </tr>
+      <tr>
+        <td><code>DARKMUX_HOOK_SECRET_&lt;rule-index&gt;</code></td>
+        <td>unset</td>
+        <td>— (a secret; never config.json)</td>
+        <td>A rule's HMAC-SHA256 signing secret, verbatim — e.g. <code>DARKMUX_HOOK_SECRET_0</code> for <code>rules[0]</code>. Wins over that rule's <code>signing_secret_keychain_item</code> whenever set, on every platform (the portable / non-macOS path). Never logged.</td>
       </tr>
     </table>
   </div>

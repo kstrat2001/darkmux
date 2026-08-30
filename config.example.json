@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.16",
+  "schema_version": "1.17",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",

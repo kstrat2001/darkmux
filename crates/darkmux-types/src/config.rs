@@ -103,7 +103,11 @@ use std::path::Path;
 // cadence); `0` disables the periodic curve without touching the sampler
 // itself (thermal governor + `host_window` summary are unaffected). Minor
 // bump, same lenient-read reasoning.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.16";
+// 1.17 (#2135 option 2): additive per-rule
+// `hooks.rules[].signing_secret_keychain_item` (a Keychain item NAME, never
+// the secret itself) — the HMAC-SHA256 secret a rule signs its tailnet/
+// loopback deliveries with. Minor bump, same lenient-read reasoning.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.17";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -708,11 +712,14 @@ pub struct HookRule {
     /// Renamed `match` on the wire (a Rust keyword) — see `HookMatch`.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "match")]
     pub r#match: Option<HookMatch>,
-    /// The loopback-only target URL a matching record is POSTed to
-    /// (`Content-Type: application/json`, body = the record verbatim).
-    /// Refused at config load (the whole hooks sink degrades, loudly) when
-    /// the host isn't `127.0.0.1` / `::1` / `localhost` — a token-bearing
-    /// remote hook is a later packet (#2093's own "out of scope").
+    /// The target URL a matching record is POSTed to (`Content-Type:
+    /// application/json`, body = the record verbatim). Accepted by URL
+    /// policy alone (#2135 option 2) — either loopback (`127.0.0.1`,
+    /// `[::1]`, `localhost`) or a genuine Tailscale address (an IPv4 in
+    /// `100.64.0.0/10`, or a hostname ending in `.ts.net`, MagicDNS).
+    /// Refused at config load (the whole hooks sink degrades, loudly)
+    /// when the host is neither — a token-bearing remote (non-tailnet)
+    /// hook is a later packet (#2093's own "out of scope").
     ///
     /// **Delivery is AT-LEAST-ONCE, not exactly-once** (#2093 merge-gate
     /// finding 13): the cursor advances only AFTER a successful POST, so
@@ -724,6 +731,18 @@ pub struct HookRule {
     /// construction, so a redelivered `hook.fired`/matched record is a
     /// safe no-op for it, not a duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub http: Option<String>,
+    /// (#2135 option 2) The name of a macOS Keychain generic-password
+    /// item (`security add-generic-password -a $USER -s <item> -w`)
+    /// holding the HMAC-SHA256 secret this rule signs its deliveries
+    /// with. The secret NEVER lives in config or in a log line — only
+    /// this item NAME does. When set, every delivery for this rule
+    /// carries `X-Darkmux-Signature: sha256=<hex hmac>`; when absent,
+    /// deliveries go out unsigned (fine inside a trusted loopback or
+    /// tailnet, `darkmux doctor` warns for a tailnet target). Non-macOS:
+    /// set `DARKMUX_HOOK_SECRET_<RULE-INDEX>` instead (e.g.
+    /// `DARKMUX_HOOK_SECRET_0` for `rules[0]`) — that env var, when set,
+    /// wins over this field on every platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub signing_secret_keychain_item: Option<String>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 

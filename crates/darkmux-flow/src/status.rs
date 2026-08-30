@@ -576,8 +576,8 @@ pub fn format_status_human(status: &FlowStatus) -> String {
             if r.is_empty_match {
                 flags.push("EMPTY MATCH");
             }
-            if !r.is_loopback {
-                flags.push("NON-LOOPBACK URL");
+            if !r.is_loopback && !r.is_tailnet {
+                flags.push("URL REFUSED");
             }
             if r.stalled {
                 flags.push("STALLED");
@@ -637,6 +637,12 @@ pub struct HookRuleStatus {
     pub match_desc: String,
     pub url: String,
     pub is_loopback: bool,
+    /// (#2135 option 2) True for a genuine Tailscale target
+    /// (`100.64.0.0/10` or `*.ts.net`) — NOT loopback.
+    pub is_tailnet: bool,
+    /// (#2135 option 2) True when this rule signs its deliveries
+    /// (`signing_secret_keychain_item` configured).
+    pub signed: bool,
     pub is_empty_match: bool,
     pub undelivered: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -685,6 +691,8 @@ pub fn build_hooks_status(
                 match_desc: s.match_desc,
                 url: s.url,
                 is_loopback: s.is_loopback,
+                is_tailnet: s.is_tailnet,
+                signed: s.signed,
                 is_empty_match: s.is_empty_match,
                 undelivered: s.undelivered,
                 last_delivery_ts: s.last_delivery_ts,
@@ -727,6 +735,7 @@ mod hooks_status_tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let status = build_hooks_status(true, tmp.path(), &rules);
@@ -745,6 +754,7 @@ mod hooks_status_tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let hooks = build_hooks_status(true, tmp.path(), &rules);

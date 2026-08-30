@@ -1528,9 +1528,26 @@ fn build_hooks_check(
             flags.push("EMPTY MATCH — matches nothing".to_string());
             rule_status = Status::Warn;
         }
-        if !s.is_loopback {
-            flags.push("NON-LOOPBACK URL — refused at load".to_string());
+        // (#2135 option 2) A URL satisfying NEITHER the loopback nor the
+        // tailnet policy is what `HookSink::new` refuses the whole sink
+        // over — a valid tailnet rule (`is_tailnet: true`) is NOT this
+        // case and must not read as broken.
+        if s.is_refused {
+            flags.push("URL REFUSED — neither loopback nor a Tailscale address; refused at load".to_string());
             rule_status = Status::Fail;
+        }
+        // (#2135 option 2) An unsigned TAILNET target is fine inside the
+        // tailnet (WireGuard already authenticates + encrypts the peer),
+        // but the receiver has no way to attribute the record's sender
+        // beyond the body itself — worth a Warn, not a Fail.
+        if s.is_tailnet && !s.signed {
+            flags.push(
+                "TAILNET TARGET, UNSIGNED — attribution is unsigned; fine inside the tailnet, required beyond it"
+                    .to_string(),
+            );
+            if rule_status == Status::Pass {
+                rule_status = Status::Warn;
+            }
         }
         // (#2093 merge-gate finding 9) A rule that's been dropping writes
         // (over the outbox cap, or an append failure) is a Warn — not a
@@ -1580,7 +1597,20 @@ fn build_hooks_check(
         }
 
         let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
-        let message = format!("{} -> {} (undelivered: {}){flag_str}", s.match_desc, s.url, s.undelivered);
+        // (#2135 option 2) `loopback`/`tailnet`/`refused` + `signed`/
+        // `unsigned` — the visibility the operator's design asked for in
+        // place of a config gate: the URL is the decision, this row is
+        // what makes it legible.
+        let target_kind = if s.is_loopback {
+            "loopback"
+        } else if s.is_tailnet {
+            "tailnet"
+        } else {
+            "refused"
+        };
+        let signed = if s.signed { "signed" } else { "unsigned" };
+        let message =
+            format!("{} -> {} [{target_kind}, {signed}] (undelivered: {}){flag_str}", s.match_desc, s.url, s.undelivered);
         overview_lines.push(format!("  #{}: {message}", s.index));
         rule_checks.push(Check {
             name: format!("hooks.rule.{}", s.index),
@@ -5635,12 +5665,19 @@ mod tests {
             HookRule {
                 r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:8790/events".to_string()),
+                signing_secret_keychain_item: None,
                 extras: Default::default(),
             },
-            HookRule { r#match: None, http: Some("http://127.0.0.1:9000/x".to_string()), extras: Default::default() },
+            HookRule {
+                r#match: None,
+                http: Some("http://127.0.0.1:9000/x".to_string()),
+                signing_secret_keychain_item: None,
+                extras: Default::default(),
+            },
             HookRule {
                 r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
                 http: Some("http://10.0.0.5:8790/x".to_string()),
+                signing_secret_keychain_item: None,
                 extras: Default::default(),
             },
         ];
@@ -5658,12 +5695,53 @@ mod tests {
         let empty_match = checks.iter().find(|c| c.name == "hooks.rule.1").unwrap();
         assert_eq!(empty_match.status, Status::Warn, "{}", empty_match.message);
         assert!(empty_match.message.contains("EMPTY MATCH"), "{}", empty_match.message);
-        assert!(!empty_match.message.contains("NON-LOOPBACK"), "rule 1's own flags only: {}", empty_match.message);
+        assert!(!empty_match.message.contains("REFUSED"), "rule 1's own flags only: {}", empty_match.message);
 
-        let non_loopback = checks.iter().find(|c| c.name == "hooks.rule.2").unwrap();
-        assert_eq!(non_loopback.status, Status::Fail, "{}", non_loopback.message);
-        assert!(non_loopback.message.contains("NON-LOOPBACK"), "{}", non_loopback.message);
-        assert!(!non_loopback.message.contains("EMPTY MATCH"), "rule 2's own flags only: {}", non_loopback.message);
+        // 10.0.0.5 is neither loopback nor a Tailscale address (not in
+        // 100.64.0.0/10, no `.ts.net` suffix) — refused (#2135 option 2).
+        let refused = checks.iter().find(|c| c.name == "hooks.rule.2").unwrap();
+        assert_eq!(refused.status, Status::Fail, "{}", refused.message);
+        assert!(refused.message.contains("URL REFUSED"), "{}", refused.message);
+        assert!(!refused.message.contains("EMPTY MATCH"), "rule 2's own flags only: {}", refused.message);
+    }
+
+    /// (#2135 option 2) A tailnet target (`100.64.0.0/10`) is accepted by
+    /// URL policy alone — no config gate — and is NOT the `is_refused`
+    /// case a plain non-tailnet non-loopback host is. Unsigned (no
+    /// `signing_secret_keychain_item`) still Warns.
+    #[test]
+    fn hooks_check_accepts_tailnet_target_and_warns_when_unsigned() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://100.101.102.103:8790/events".to_string()),
+            signing_secret_keychain_item: None,
+            extras: Default::default(),
+        }];
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
+        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert_eq!(rule.status, Status::Warn, "{}", rule.message);
+        assert!(!rule.message.contains("URL REFUSED"), "a valid tailnet target is not refused: {}", rule.message);
+        assert!(rule.message.contains("[tailnet, unsigned]"), "{}", rule.message);
+        assert!(rule.message.contains("TAILNET TARGET, UNSIGNED"), "{}", rule.message);
+    }
+
+    /// (#2135 option 2) The same tailnet target, but signed — no Warn.
+    #[test]
+    fn hooks_check_tailnet_target_signed_is_pass() {
+        use darkmux_types::config::{HookMatch, HookRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some("http://100.101.102.103:8790/events".to_string()),
+            signing_secret_keychain_item: Some("darkmux-hook-0".to_string()),
+            extras: Default::default(),
+        }];
+        let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
+        let rule = checks.iter().find(|c| c.name == "hooks.rule.0").unwrap();
+        assert_eq!(rule.status, Status::Pass, "{}", rule.message);
+        assert!(rule.message.contains("[tailnet, signed]"), "{}", rule.message);
     }
 
     /// (#2093 merge-gate finding 17) A rule matching `telemetry.*` (or the
@@ -5678,11 +5756,13 @@ mod tests {
             HookRule {
                 r#match: Some(HookMatch { action: Some("telemetry.tokens".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:8790/a".to_string()),
+                signing_secret_keychain_item: None,
                 extras: Default::default(),
             },
             HookRule {
                 r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:8790/b".to_string()),
+                signing_secret_keychain_item: None,
                 extras: Default::default(),
             },
         ];
@@ -5707,6 +5787,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         // A stray file belonging to a rule that's since been removed from
@@ -5726,6 +5807,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let checks = build_hooks_check(true, "config.json", &rules, tmp.path());

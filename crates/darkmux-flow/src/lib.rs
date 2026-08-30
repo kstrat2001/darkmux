@@ -7,6 +7,7 @@
 //! atomically prepends a schema header so partial-file recovery is possible.
 
 pub mod daemon_probe;
+pub(crate) mod hmac_sha256;
 pub mod hooks;
 pub mod presence;
 pub mod presence_reconciler;
@@ -736,6 +737,67 @@ pub fn serve_token() -> Option<RawServeToken> {
 /// middleware toggle, the startup banner, and `darkmux doctor`. (#881)
 pub fn serve_token_present() -> bool {
     serve_token().is_some()
+}
+
+// ── (#2135 option 2) hook delivery signing secret ───────────────────────
+// Same doctrine as the Redis password / serve token above, with one twist:
+// the Keychain ITEM NAME is per-rule config (`HookRule::signing_secret_
+// keychain_item`), not a fixed constant, so there's no single `OnceLock`-
+// cached item to read — each rule's secret is read once, at `resolve_rules`
+// time (which itself runs rarely — once per `HookSink` construction).
+
+/// Opaque wrapper for a hook rule's HMAC signing secret. Same redaction
+/// discipline as `RawServeToken`: `Debug`/`Display` never print the raw
+/// bytes, only `expose_for_hmac` does (a verbose name so accidental use is
+/// visible in review).
+#[derive(Clone)]
+pub struct RawHookSecret(String);
+
+impl std::fmt::Debug for RawHookSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RawHookSecret(***)")
+    }
+}
+impl std::fmt::Display for RawHookSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+impl RawHookSecret {
+    pub fn new(secret: String) -> Self {
+        Self(secret)
+    }
+    /// The raw secret bytes, for HMAC signing. Verbose name so accidental
+    /// use is visible in review (mirrors `RawRedisUrl::expose_for_probe`).
+    pub fn expose_for_hmac(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_hook_secret(item: &str) -> Option<String> {
+    read_optional_keychain_secret(item)
+}
+#[cfg(not(target_os = "macos"))]
+fn keychain_hook_secret(_item: &str) -> Option<String> {
+    None
+}
+
+/// Resolve rule `rule_index`'s HMAC signing secret:
+///   1. `env(DARKMUX_HOOK_SECRET_<rule_index>)` verbatim (trimmed,
+///      empty-filtered) — the portable/non-macOS path, wins on every
+///      platform when set (mirrors `serve_token`'s env-first tiering);
+///   2. else, when `keychain_item` names one, the macOS Keychain item of
+///      that name (non-macOS → `None`, same as the Redis/serve-token
+///      Keychain reads);
+///   3. else `None` — this rule's deliveries go out unsigned.
+pub fn hook_signing_secret(rule_index: usize, keychain_item: Option<&str>) -> Option<RawHookSecret> {
+    let env_key = format!("DARKMUX_HOOK_SECRET_{rule_index}");
+    if let Some(tok) = std::env::var(&env_key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        return Some(RawHookSecret::new(tok));
+    }
+    let item = keychain_item.filter(|s| !s.trim().is_empty())?;
+    keychain_hook_secret(item).map(RawHookSecret::new)
 }
 
 /// Redis Streams-backed flow sink. Each `write` XADDs the record's
