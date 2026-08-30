@@ -162,6 +162,17 @@ pub(crate) fn apply_volume_mounts(args: &mut Vec<String>, workspace: &Path, host
 pub(crate) const PROMPT_FILE_NAME: &str = ".prompt.txt";
 const PROMPT_FILE_CONTAINER_PATH: &str = "/darkmux-out/.prompt.txt";
 
+/// (#2114) Container-relative path to a resumed dispatch's checkpoint.
+/// `runtime/src/checkpoint.rs` writes checkpoints ONLY at
+/// `<workspace>/.darkmux/checkpoint.json` — nowhere else — so a resumed
+/// dispatch that mounts the SAME `config.workspace` (the ordinary case:
+/// re-dispatching against the workspace a killed container was already
+/// working in) sees its own prior checkpoint at this fixed container path
+/// with no extra mount. NOTE: like `PROMPT_FILE_CONTAINER_PATH` above,
+/// this embeds the `/workspace` mount literal from `apply_volume_mounts` —
+/// if that mount point ever changes, this must change too.
+const RESUME_CHECKPOINT_CONTAINER_PATH: &str = "/workspace/.darkmux/checkpoint.json";
+
 
 /// (#703) Inject the host-cached static runtime binary into an operator
 /// image: bind-mount it read-only at `/darkmux-runtime` and override the
@@ -524,6 +535,16 @@ pub struct DockerRunConfig {
     /// preserves the existing read-write mount for every caller that
     /// doesn't set it.
     pub workspace_read_only: bool,
+    /// (#2114) When true, pass `--resume <RESUME_CHECKPOINT_CONTAINER_PATH>`
+    /// to the runtime — this dispatch reloads the checkpoint the SAME
+    /// `workspace` already carries (`.darkmux/checkpoint.json`, written by a
+    /// prior, interrupted dispatch against this workspace) instead of
+    /// starting from `system_prompt`/`message`. `false` (the default for
+    /// every existing caller) preserves the pre-#2114 fresh-start behavior.
+    /// The CALLER verifies the checkpoint actually exists before setting
+    /// this — the runtime fails loudly (exit 2) rather than silently
+    /// starting fresh on a missing/corrupt one.
+    pub resume_checkpoint: bool,
 }
 
 /// (#842) Build the complete `docker` command from a prepared config: the
@@ -630,6 +651,15 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     // wrote it to `<host_out>/.prompt.txt` before this runs.
     args.push("--prompt-file".to_string());
     args.push(PROMPT_FILE_CONTAINER_PATH.to_string());
+
+    // (#2114) Resume: the checkpoint lives inside `config.workspace` itself
+    // (see `RESUME_CHECKPOINT_CONTAINER_PATH`'s doc), already visible at
+    // this fixed container path once `apply_volume_mounts` above binds it —
+    // no extra mount needed.
+    if config.resume_checkpoint {
+        args.push("--resume".to_string());
+        args.push(RESUME_CHECKPOINT_CONTAINER_PATH.to_string());
+    }
 
     // Host-side override of the container's local-brain base URL (mock-model
     // harness). Emitted whenever set — even alongside `remote_chat_url` below,
@@ -2734,6 +2764,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             agentic_pm.is_some(),
         ),
         inactivity_timeout_seconds: darkmux_types::config_access::inactivity_timeout_seconds(),
+        // (#2114) `dispatch --resume` CLI plumbing (DispatchOpts →
+        // caller-decided true) is a follow-up; this call site always
+        // starts fresh for now.
+        resume_checkpoint: false,
         remote_chat_url: agentic_pm
             .as_ref()
             .and_then(|pm| pm.endpoint.as_ref())
