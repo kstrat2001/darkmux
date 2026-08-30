@@ -382,6 +382,11 @@ impl StepKind for DispatchInternalStepKind {
             .get("preserve_dispatch_result")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // (#2114 follow-up) `--resume-from <dir>` threaded through the
+        // crew-of-one graph's step config (`DispatchAsCrewOfOne::build_graph`)
+        // — see that fn's own doc for why the CLI's `DispatchOpts` isn't
+        // forwarded wholesale.
+        let resume_from = config_str(step, "resume_from").map(std::path::PathBuf::from);
 
         let opts = DispatchOpts {
             workspace_read_only: false,
@@ -408,6 +413,7 @@ impl StepKind for DispatchInternalStepKind {
             // config-overridden off the `step-<id>` default the viewer maps.
             step_id: Some(step.id.clone()),
             system_prompt_override: None,
+            resume_from,
         };
         let result =
             dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;

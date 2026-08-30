@@ -53,6 +53,11 @@
       "name": "plan_out",
       "description": "(#1959) Path to write the full plan JSON to, on a `--dry-run` invocation. Absent means a dry run writes nothing — read-only by default.",
       "required": false
+    },
+    {
+      "name": "resume",
+      "description": "(#2114 follow-up) A PRIOR crawl mission id to resume. Pass the SAME `workspace`/`rules`/`source`/`rule`/`plan` inputs as the original launch — this only changes what happens to each selected unit: a unit the prior mission's `envelope.json` shows completed (`result: \"stop\"`) is skipped entirely; a unit that didn't complete but has a checkpoint at its recorded `out_dir` resumes from it (`--resume`, at most one re-executed tool call); a unit with no usable checkpoint (or no record at all — the launcher process itself died before recording one) is re-run fresh. Bails loudly if the named mission's `envelope.json` can't be found/read.",
+      "required": false
     }
   ],
   "phases": []

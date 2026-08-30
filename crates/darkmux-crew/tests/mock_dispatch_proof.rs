@@ -191,6 +191,7 @@ fn run_mock_dispatch(
     let opts = DispatchOpts {
         workspace_read_only: false,
         record_context: None,
+        resume_from: None,
         role_id: "analyst".to_string(),
         message: message.to_string(),
         session_id: Some(session_id.clone()),

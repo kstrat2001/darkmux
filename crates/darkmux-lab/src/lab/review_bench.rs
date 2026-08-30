@@ -753,6 +753,7 @@ fn dispatch_case(
     let d = DispatchOpts {
         workspace_read_only: false,
         record_context: None,
+        resume_from: None,
         role_id: role_id.to_string(),
         message: prompt.to_string(),
         session_id: Some(session_id),

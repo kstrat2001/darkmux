@@ -185,6 +185,16 @@ pub(crate) enum Cmd {
         /// No effect on container-path dispatches (local or agentic-remote).
         #[arg(long, value_name = "N")]
         max_completion_tokens: Option<u32>,
+        /// (#2114 follow-up) Resume a checkpointed dispatch from a prior out
+        /// dir (the `/darkmux-out` mount, `$TMPDIR/darkmux-out-<role>-*`);
+        /// at most one tool call is re-executed. The named dir must contain
+        /// a `checkpoint.json` written by a prior, interrupted dispatch of
+        /// this same role — darkmux refuses to run (never silently starts
+        /// fresh) when it's missing or doesn't parse as one. The prior dir
+        /// is left untouched; this dispatch gets its own fresh out dir and
+        /// its own run record.
+        #[arg(long = "resume-from", value_name = "DIR")]
+        resume_from: Option<std::path::PathBuf>,
     },
     /// Run pre-flight diagnostic checks. Verifies the local setup (profile
     /// registry, LMStudio, models, runtime, RAM, power) and reports

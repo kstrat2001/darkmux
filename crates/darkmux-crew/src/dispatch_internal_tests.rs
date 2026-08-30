@@ -1842,6 +1842,114 @@
         );
     }
 
+    // ─── #2114 follow-up: stage_resume_checkpoint (the --resume-from trigger) ──
+
+    /// A minimal, structurally-valid checkpoint body — just enough to pass
+    /// `stage_resume_checkpoint`'s sanity check (object, numeric
+    /// `schema_version`, array `messages`). Not a real `RunCheckpoint` (this
+    /// crate has no access to that type — see `stage_resume_checkpoint`'s
+    /// own doc); the runtime is the one authority on full schema validity.
+    fn sample_checkpoint_json() -> String {
+        serde_json::json!({
+            "schema_version": 2,
+            "messages": [],
+            "turns": 1,
+            "total_prompt_tokens": 0,
+            "total_completion_tokens": 0,
+            "compactions": 0,
+            "rest_ms": 0,
+            "rests": 0,
+            "pending_hand_back": null,
+            "pending_tool_calls": null,
+            "pending_tool_calls_seq_base": 0,
+            "written_at_unix_ms": 0,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn stage_resume_checkpoint_copies_a_valid_checkpoint_into_the_new_out_dir() {
+        let prior = TempDir::new().unwrap();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        let new_out = TempDir::new().unwrap();
+
+        stage_resume_checkpoint(prior.path(), new_out.path()).unwrap();
+
+        let staged = std::fs::read_to_string(new_out.path().join(CHECKPOINT_FILENAME)).unwrap();
+        assert_eq!(staged, sample_checkpoint_json(), "staged checkpoint must be a byte-identical copy");
+        // The prior dir's own copy is untouched — it stays behind as evidence.
+        assert!(prior.path().join(CHECKPOINT_FILENAME).is_file());
+    }
+
+    #[test]
+    fn stage_resume_checkpoint_missing_file_errors_and_copies_nothing() {
+        let prior = TempDir::new().unwrap(); // no checkpoint.json written
+        let new_out = TempDir::new().unwrap();
+
+        let err = stage_resume_checkpoint(prior.path(), new_out.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RESUME CHECKPOINT NOT FOUND"),
+            "expected a named RESUME CHECKPOINT NOT FOUND error, got: {err:#}"
+        );
+        assert!(
+            !new_out.path().join(CHECKPOINT_FILENAME).exists(),
+            "no container should ever see a checkpoint that was never validated"
+        );
+    }
+
+    #[test]
+    fn stage_resume_checkpoint_invalid_json_errors_and_copies_nothing() {
+        let prior = TempDir::new().unwrap();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), "not json at all {{{").unwrap();
+        let new_out = TempDir::new().unwrap();
+
+        let err = stage_resume_checkpoint(prior.path(), new_out.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RESUME CHECKPOINT INVALID"),
+            "expected a named RESUME CHECKPOINT INVALID error, got: {err:#}"
+        );
+        assert!(!new_out.path().join(CHECKPOINT_FILENAME).exists());
+    }
+
+    #[test]
+    fn stage_resume_checkpoint_wrong_shape_errors_and_copies_nothing() {
+        // Valid JSON, but missing the checkpoint schema's required keys —
+        // e.g. some unrelated JSON file that happened to be at this path.
+        let prior = TempDir::new().unwrap();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), r#"{"hello": "world"}"#).unwrap();
+        let new_out = TempDir::new().unwrap();
+
+        let err = stage_resume_checkpoint(prior.path(), new_out.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RESUME CHECKPOINT INVALID"),
+            "expected a named RESUME CHECKPOINT INVALID error, got: {err:#}"
+        );
+        assert!(!new_out.path().join(CHECKPOINT_FILENAME).exists());
+    }
+
+    /// End-to-end through `dispatch`'s own construction site: a caller that
+    /// sets `DispatchOpts::resume_from` to a dir with NO checkpoint gets a
+    /// named error and — the mutation-tested guard — the container is never
+    /// spawned for it. Exercised via `stage_resume_checkpoint` directly
+    /// (the same function `dispatch` calls right after allocating its own
+    /// fresh `host_out`, before anything else touches it) rather than a
+    /// live `dispatch()` call, which would require a real docker/LMStudio
+    /// environment this unit test suite doesn't have.
+    #[test]
+    fn stage_resume_checkpoint_is_the_only_gate_before_the_copy_lands() {
+        let prior = TempDir::new().unwrap();
+        // Deliberately truncated write (simulates a killed writer) — valid
+        // JSON syntax is required by `stage_resume_checkpoint`'s sanity
+        // check, but here the whole file is empty, which fails at the
+        // `serde_json::from_str` step, not the schema-shape step.
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), "").unwrap();
+        let new_out = TempDir::new().unwrap();
+
+        let err = stage_resume_checkpoint(prior.path(), new_out.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("RESUME CHECKPOINT INVALID"));
+        assert!(!new_out.path().join(CHECKPOINT_FILENAME).exists());
+    }
+
     // ─── #2114 finding 4: DARKMUX_MAX_PAUSE_MS forwarding ────────
 
     #[test]

@@ -1864,3 +1864,96 @@ fn a_unit_with_a_resolvable_sha_dispatches_unchanged() {
         assert_ne!(sha, "", "a resolvable unit's step start must never carry an empty sha");
     }
 }
+
+// ── (#2114 follow-up) `--param resume=<mission-id>` planning ────────────
+//
+// Pure planning tests — no dispatch, no filesystem beyond a bare
+// `checkpoint_exists` fake. `plan_unit_resume` reads a fixture prior
+// mission's `envelope.json` `units` array (`CrawlStats::per_unit_rows`
+// shape) and decides skip / resume / fresh per unit.
+
+#[test]
+fn plan_unit_resume_skips_a_unit_that_completed_last_time() {
+    let prior_rows = vec![json!({
+        "unit": "u-0001",
+        "result": "stop",
+        "out_dir": "/tmp/darkmux-out-crawler-111",
+    })];
+    let action = plan_unit_resume("u-0001", &prior_rows, |_| true);
+    assert_eq!(action, UnitResumeAction::Skip);
+}
+
+#[test]
+fn plan_unit_resume_resumes_a_unit_that_aborted_with_a_checkpoint() {
+    let prior_rows = vec![json!({
+        "unit": "u-0002",
+        "result": "timeout",
+        "out_dir": "/tmp/darkmux-out-crawler-222",
+    })];
+    let action = plan_unit_resume("u-0002", &prior_rows, |dir| {
+        dir == Path::new("/tmp/darkmux-out-crawler-222")
+    });
+    assert_eq!(action, UnitResumeAction::Resume(PathBuf::from("/tmp/darkmux-out-crawler-222")));
+}
+
+#[test]
+fn plan_unit_resume_reruns_fresh_when_out_dir_recorded_but_no_checkpoint() {
+    let prior_rows = vec![json!({
+        "unit": "u-0003",
+        "result": "error",
+        "out_dir": "/tmp/darkmux-out-crawler-333",
+    })];
+    // checkpoint_exists always false — killed before the first turn boundary.
+    let action = plan_unit_resume("u-0003", &prior_rows, |_| false);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+#[test]
+fn plan_unit_resume_reruns_fresh_when_unit_has_no_row_at_all() {
+    // Simulates the launcher process itself dying before `per_unit_rows.push`
+    // ever ran for this unit — no row, so nothing to look up.
+    let prior_rows = vec![json!({
+        "unit": "some-other-unit",
+        "result": "stop",
+        "out_dir": "/tmp/darkmux-out-crawler-999",
+    })];
+    let action = plan_unit_resume("u-0004", &prior_rows, |_| true);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+#[test]
+fn plan_unit_resume_reruns_fresh_when_out_dir_is_absent_from_the_row() {
+    // A row can exist (the dispatch call returned) with a null out_dir
+    // (the dispatch itself errored before returning a DispatchResult).
+    let prior_rows = vec![json!({
+        "unit": "u-0005",
+        "result": "error",
+        "out_dir": null,
+    })];
+    let action = plan_unit_resume("u-0005", &prior_rows, |_| true);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+/// The three-unit fixture named in the task: one completed, one
+/// aborted-with-checkpoint, one aborted-without-checkpoint — verifying the
+/// full skip / resume / fresh triage from a single prior-mission fixture in
+/// one assertion pass.
+#[test]
+fn plan_unit_resume_full_fixture_skip_resume_fresh() {
+    let prior_rows = vec![
+        json!({ "unit": "completed-1", "result": "stop", "out_dir": "/tmp/out-completed-1" }),
+        json!({ "unit": "aborted-with-checkpoint", "result": "timeout", "out_dir": "/tmp/out-aborted-ckpt" }),
+        json!({ "unit": "aborted-without-checkpoint", "result": "error", "out_dir": "/tmp/out-aborted-nockpt" }),
+    ];
+    let checkpoint_exists = |dir: &Path| dir == Path::new("/tmp/out-aborted-ckpt");
+
+    assert_eq!(plan_unit_resume("completed-1", &prior_rows, checkpoint_exists), UnitResumeAction::Skip);
+    assert_eq!(
+        plan_unit_resume("aborted-with-checkpoint", &prior_rows, checkpoint_exists),
+        UnitResumeAction::Resume(PathBuf::from("/tmp/out-aborted-ckpt"))
+    );
+    assert_eq!(
+        plan_unit_resume("aborted-without-checkpoint", &prior_rows, checkpoint_exists),
+        UnitResumeAction::Fresh
+    );
+}

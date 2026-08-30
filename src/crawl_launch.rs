@@ -866,6 +866,56 @@ fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32>
     })
 }
 
+/// (#2114 follow-up) `--param resume=<mission-id>`'s per-unit verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnitResumeAction {
+    /// The unit completed cleanly in the prior mission — nothing to do.
+    Skip,
+    /// The unit didn't complete last time, but its recorded out dir has a
+    /// checkpoint — dispatch it with `DispatchOpts::resume_from` set to
+    /// this dir.
+    Resume(PathBuf),
+    /// Either the unit never even started last time (no row at all — the
+    /// launcher process itself died before recording one), or it started
+    /// but left no usable checkpoint (killed before the first turn
+    /// boundary, or its `out_dir` was never recorded). Run it fresh, same
+    /// as if `--param resume=` had never named this mission.
+    Fresh,
+}
+
+/// (#2114 follow-up) Decide ONE unit's `--param resume=<mission-id>`
+/// verdict from a prior mission's `envelope.json` `units` array
+/// (`CrawlStats::per_unit_rows`, one JSON object per unit that got far
+/// enough to be recorded — see that struct's own doc). Pure: the caller
+/// supplies `checkpoint_exists` (production: `dir.join("checkpoint.json").is_file()`)
+/// so tests can fake the filesystem instead of building real dirs.
+///
+/// A unit is looked up by its `unit` field in `prior_rows`; a unit with no
+/// matching row (interrupted before `per_unit_rows.push` ever ran for it)
+/// is `Fresh` — there's no recorded `out_dir` to even check for a
+/// checkpoint, so it's indistinguishable from "ran and left none."
+pub(crate) fn plan_unit_resume(
+    unit_id: &str,
+    prior_rows: &[Value],
+    checkpoint_exists: impl Fn(&Path) -> bool,
+) -> UnitResumeAction {
+    let Some(row) = prior_rows.iter().find(|r| r.get("unit").and_then(Value::as_str) == Some(unit_id)) else {
+        return UnitResumeAction::Fresh;
+    };
+    if row.get("result").and_then(Value::as_str) == Some("stop") {
+        return UnitResumeAction::Skip;
+    }
+    let Some(out_dir) = row.get("out_dir").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+        return UnitResumeAction::Fresh;
+    };
+    let out_dir = PathBuf::from(out_dir);
+    if checkpoint_exists(&out_dir) {
+        UnitResumeAction::Resume(out_dir)
+    } else {
+        UnitResumeAction::Fresh
+    }
+}
+
 // ── the launcher itself ─────────────────────────────────────────────────
 
 /// The testable core. `dispatch_fn` is `crew::dispatch::dispatch` in
@@ -888,6 +938,12 @@ pub(crate) fn run(
     let limit = usize_param(collected, "limit")?;
     let no_fetch = bool_param(collected, "no_fetch");
     let timeout = timeout_seconds.unwrap_or(600);
+    // (#2114 follow-up) The trigger for a crawl-scoped resume — a PRIOR
+    // crawl mission id whose `envelope.json` this run cross-references
+    // per unit (`plan_unit_resume`). Same plan inputs (`workspace`/
+    // `rules`/`source`/`rule`/`plan`) as the original launch still apply;
+    // `resume` only changes what happens to each SELECTED unit.
+    let resume_param = str_param(collected, "resume").map(str::to_string);
 
     let (wspec, wspec_warnings): (WorkspaceSpec, Vec<String>) = match (&workspace_path, &source_one_shot) {
         (Some(wp), _) => WorkspaceSpec::load(wp)
@@ -977,7 +1033,7 @@ pub(crate) fn run(
             .with_context(|| format!("planning workspace '{manifest_name}'"))?,
     };
 
-    let (selected, truncated) = select_units(&the_plan, units_filter.as_deref(), limit)?;
+    let (mut selected, truncated) = select_units(&the_plan, units_filter.as_deref(), limit)?;
 
     // ── validate every selected unit's rule ids resolve BEFORE minting a
     //    mission (#1959 merge-gate finding 1a). A stale `--param plan=`
@@ -1126,6 +1182,57 @@ pub(crate) fn run(
     let kill_file = crawl_root.join("STOP");
     let runs_dir = crawl_root.join("runs").join(&mission_id);
     let ledger_path = runs_dir.join("ledger.jsonl");
+
+    // (#2114 follow-up) `--param resume=<mission-id>`: cross-reference this
+    // run's selection against a PRIOR crawl mission's `envelope.json`
+    // BEFORE any Step is minted for this new mission, so a completed unit
+    // never gets a fresh (redundant) step at all. `resume_from_by_unit`
+    // is consumed per-unit at dispatch time below.
+    let mut resume_from_by_unit: BTreeMap<String, PathBuf> = BTreeMap::new();
+    if let Some(prior_mission_id) = &resume_param {
+        let prior_envelope_path = crawl_root.join("runs").join(prior_mission_id).join("envelope.json");
+        let prior_rows: Vec<Value> = std::fs::read_to_string(&prior_envelope_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.get("units").cloned())
+            .and_then(|v| v.as_array().cloned())
+            .ok_or_else(|| {
+                anyhow!(
+                    "darkmux mission launch crawl: --param resume={prior_mission_id} — no \
+                     readable envelope.json with a `units` array at {} (unknown mission id, or \
+                     the prior run never got far enough to write one)",
+                    prior_envelope_path.display()
+                )
+            })?;
+        let mut resume_skipped = 0usize;
+        let mut resume_resumed = 0usize;
+        let mut resume_fresh = 0usize;
+        selected.retain(|u| {
+            match plan_unit_resume(u.id(), &prior_rows, |dir| dir.join(darkmux_crew::dispatch_internal::CHECKPOINT_FILENAME).is_file()) {
+                UnitResumeAction::Skip => {
+                    resume_skipped += 1;
+                    false
+                }
+                UnitResumeAction::Resume(dir) => {
+                    resume_resumed += 1;
+                    resume_from_by_unit.insert(u.id().to_string(), dir);
+                    true
+                }
+                UnitResumeAction::Fresh => {
+                    resume_fresh += 1;
+                    true
+                }
+            }
+        });
+        eprintln!(
+            "{}",
+            style::dim(&format!(
+                "darkmux mission launch crawl: --param resume={prior_mission_id} — {resume_skipped} \
+                 unit(s) already completed (skipped), {resume_resumed} resumed from checkpoint, \
+                 {resume_fresh} re-run fresh (no usable checkpoint)"
+            ))
+        );
+    }
 
     let spec = MissionSpec {
         config_id: "crawl".to_string(),
@@ -1516,6 +1623,11 @@ pub(crate) fn run(
             step_id: Some(step_id.clone()),
             system_prompt_override: None,
             workspace_read_only: true,
+            // (#2114 follow-up) Set only for a unit `--param resume=`
+            // planned as `UnitResumeAction::Resume` above; every other
+            // unit (no `--param resume=`, or planned Fresh/never named)
+            // dispatches exactly as before.
+            resume_from: resume_from_by_unit.get(unit.id()).cloned(),
             // (#1959 flow-record vocabulary retirement) Provenance the
             // runtime cannot know — merged by the host tailer under
             // `payload.context` on every record this unit's dispatch
@@ -1573,6 +1685,15 @@ pub(crate) fn run(
             .and_then(|res| res.out_dir.as_deref())
             .map(count_rejected_report_findings)
             .unwrap_or(0);
+        // (#2114 follow-up) This unit's host out dir (the `/darkmux-out`
+        // mount) — recorded into `per_unit_rows` below so a LATER
+        // `--param resume=<this-mission-id>` can find a checkpoint here
+        // for any unit that didn't complete cleanly. `None` when the
+        // dispatch call itself errored before returning a `DispatchResult`
+        // (nothing to record) — `plan_unit_resume` treats an absent
+        // `out_dir` the same as "no checkpoint": re-run fresh.
+        let unit_out_dir: Option<PathBuf> =
+            dispatch_outcome.as_ref().ok().and_then(|res| res.out_dir.clone());
         if let Ok(res) = &dispatch_outcome {
             if let Some(out_dir) = &res.out_dir {
                 let findings_path = out_dir.join(".darkmux-runtime").join("findings.jsonl");
@@ -1728,6 +1849,11 @@ pub(crate) fn run(
             // `envelope.json`'s per-unit rows stay a fixed, tool-parseable
             // shape.
             "host": host,
+            // (#2114 follow-up) This unit's host out dir — `null` when the
+            // dispatch call itself errored before returning one. A later
+            // `--param resume=<this-mission-id>` reads this back via
+            // `plan_unit_resume`.
+            "out_dir": unit_out_dir.as_ref().map(|p| p.display().to_string()),
         }));
 
         #[cfg(unix)]

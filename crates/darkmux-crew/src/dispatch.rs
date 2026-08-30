@@ -306,6 +306,21 @@ pub struct DispatchOpts {
     /// rather than corrupting the payload shape — see
     /// `dispatch_internal::merge_record_context`'s own doc).
     pub record_context: Option<serde_json::Value>,
+    /// (#2114 follow-up) A PRIOR dispatch's host out dir (the
+    /// `/darkmux-out` mount, `$TMPDIR/darkmux-out-<role>-<unix_micros>`)
+    /// to resume from. `Some(dir)` is the trigger `resume_checkpoint`
+    /// itself never was: `dispatch_internal::dispatch` verifies
+    /// `<dir>/checkpoint.json` exists and parses before doing anything
+    /// else, COPIES it into THIS dispatch's own (fresh) host out dir —
+    /// the old dir is left untouched as evidence, this dispatch gets its
+    /// own trajectory/run record — then sets
+    /// `DockerRunConfig::resume_checkpoint = true` so `--resume` reaches
+    /// the container. `None` (every existing caller) preserves the
+    /// fresh-start behavior exactly. See `dispatch_internal`'s
+    /// `stage_resume_checkpoint` for the validate-then-copy mechanics and
+    /// the `resumed_from` provenance this stamps into the dispatch's flow
+    /// records.
+    pub resume_from: Option<PathBuf>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime

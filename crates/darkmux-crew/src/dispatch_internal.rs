@@ -180,6 +180,104 @@ const PROMPT_FILE_CONTAINER_PATH: &str = "/darkmux-out/.prompt.txt";
 /// this must change too.
 const RESUME_CHECKPOINT_CONTAINER_PATH: &str = "/darkmux-out/checkpoint.json";
 
+/// (#2114 follow-up) Checkpoint filename `runtime/src/checkpoint.rs` writes
+/// under a dispatch's `host_out` (see `RESUME_CHECKPOINT_CONTAINER_PATH`'s
+/// own doc for the container-side mount path). Named once here so
+/// `stage_resume_checkpoint` and its tests don't hand-duplicate the literal.
+/// `pub` (not `pub(crate)`) so `src/crawl_launch.rs`'s `--param resume=`
+/// planner — a different crate — can probe `<out_dir>/checkpoint.json`
+/// without re-typing the literal.
+pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
+
+/// (#2114 follow-up) `DispatchOpts::resume_from`'s host-side mechanics: this
+/// is what actually TRIGGERS a resume — the checkpoint-carrying `--resume`
+/// argv flag has existed since #2114 finding 3, but nothing constructed a
+/// `DockerRunConfig` with `resume_checkpoint: true` until this landed.
+///
+/// Validates that `resume_from` (a PRIOR dispatch's `host_out`) names a
+/// real, parseable checkpoint, then COPIES it into `new_host_out` — THIS
+/// dispatch's own fresh out dir — so the container's `--resume
+/// /darkmux-out/checkpoint.json` mount (bound at `new_host_out` via
+/// `apply_volume_mounts`) finds it. Never reuses `resume_from` as the
+/// mount source directly: this dispatch is a NEW run record with its own
+/// trajectory, and `resume_from` stays untouched as forensic evidence
+/// (matches the "host_out is never cleaned, even on error" contract —
+/// see `AutoWorkspaceCleanup`'s own doc for the sibling `workspace`
+/// cleanup this does NOT extend to).
+///
+/// Deliberately does NOT deserialize into `runtime::checkpoint::RunCheckpoint`
+/// — `runtime/` is a separate crate, built into the Docker image and NOT
+/// linked against this one (same boundary `apply_volume_mounts`'s doc
+/// describes for the duplicated `/darkmux-out` literal), so this crate has
+/// no access to that type. Instead this does a light schema sanity check
+/// (object shape, numeric `schema_version`, array `messages`) — enough to
+/// catch "not a checkpoint at all" (empty file, truncated write, some
+/// unrelated JSON) before the container ever spawns. The runtime remains
+/// the one authority on schema-version *compatibility*
+/// (`checkpoint::read_checkpoint` exits the container 2 on a real
+/// version mismatch); this function only rules out "not a checkpoint".
+///
+/// Fails LOUD — a distinctly-worded, greppable error — on anything short
+/// of a valid checkpoint. Never silently starts the dispatch fresh under
+/// a name that looked like a resume.
+pub(crate) fn stage_resume_checkpoint(resume_from: &Path, new_host_out: &Path) -> Result<()> {
+    let src = resume_from.join(CHECKPOINT_FILENAME);
+    if !src.is_file() {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT NOT FOUND — expected {} to \
+             exist (no checkpoint.json under --resume-from {}); this \
+             dispatch cannot resume. darkmux never silently starts a \
+             dispatch fresh under a name that looked like a resume — pass \
+             a --resume-from dir that actually has a checkpoint, or drop \
+             --resume-from to start fresh on purpose.",
+            src.display(),
+            resume_from.display()
+        );
+    }
+    let contents = fs::read_to_string(&src)
+        .with_context(|| format!("reading resume checkpoint at {}", src.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+        anyhow!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} is not valid \
+             JSON ({e}); refusing to resume from a file that isn't a real \
+             checkpoint",
+            src.display()
+        )
+    })?;
+    let obj = value.as_object().ok_or_else(|| {
+        anyhow!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
+             parse as a darkmux checkpoint (top level is not a JSON \
+             object)",
+            src.display()
+        )
+    })?;
+    if !obj.get("schema_version").is_some_and(|v| v.is_u64()) {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
+             parse as a darkmux checkpoint (missing or non-numeric \
+             `schema_version`)",
+            src.display()
+        );
+    }
+    if !obj.get("messages").is_some_and(|v| v.is_array()) {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
+             parse as a darkmux checkpoint (missing or non-array \
+             `messages`)",
+            src.display()
+        );
+    }
+    let dest = new_host_out.join(CHECKPOINT_FILENAME);
+    fs::copy(&src, &dest).with_context(|| {
+        format!(
+            "copying resume checkpoint from {} to {}",
+            src.display(),
+            dest.display()
+        )
+    })?;
+    Ok(())
+}
 
 /// (#703) Inject the host-cached static runtime binary into an operator
 /// image: bind-mount it read-only at `/darkmux-runtime` and override the
@@ -2592,6 +2690,20 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         host_out.display()
     );
 
+    // (#2114 follow-up) `--resume-from <dir>` trigger: validate + stage the
+    // PRIOR dispatch's checkpoint into THIS dispatch's fresh `host_out`
+    // before anything else touches it. Fails loud (never silently starts
+    // fresh) — see `stage_resume_checkpoint`'s own doc.
+    if let Some(resume_from) = opts.resume_from.as_ref() {
+        stage_resume_checkpoint(resume_from, &host_out)
+            .context("darkmux dispatch --resume-from")?;
+        eprintln!(
+            "darkmux dispatch: resuming from checkpoint at {} (staged into {})",
+            resume_from.display(),
+            host_out.display()
+        );
+    }
+
     // (#386) Write the user message to a file in the (already-mounted) out-dir
     // and hand the runtime `--prompt-file` instead of `--prompt <text>`, so a
     // substantial brief never lands on the `docker run` command line — where it
@@ -2653,6 +2765,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // container's brain is actually remote.
     if let Some(label) = &remote_endpoint_raw_label {
         dispatch_start_payload["endpoint"] = serde_json::json!(label);
+    }
+    // (#2114 follow-up) Resume provenance the viewer/flow log render —
+    // names the SOURCE dir (the prior dispatch's host_out), distinct from
+    // this dispatch's own `out_dir` (recorded elsewhere on the result).
+    // Absence ⇒ this dispatch started fresh, same convention as `endpoint`
+    // above.
+    if let Some(resume_from) = &opts.resume_from {
+        dispatch_start_payload["resumed_from"] = serde_json::json!(resume_from.display().to_string());
     }
     // (#1959) Provenance the runtime can't derive on its own (the crawl
     // launcher's workspace/source/sha/rule/unit) — see `merge_record_context`'s
@@ -2851,10 +2971,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // runtime.thermal.max_pause_ms exists — see max_pause_ms_env's own
         // doc.
         max_pause_ms_env: Some(darkmux_types::config_access::thermal_max_pause_ms()),
-        // (#2114) `dispatch --resume` CLI plumbing (DispatchOpts →
-        // caller-decided true) is a follow-up; this call site always
-        // starts fresh for now.
-        resume_checkpoint: false,
+        // (#2114 follow-up) The trigger: `stage_resume_checkpoint` above
+        // already verified + staged the checkpoint into `host_out` when
+        // `opts.resume_from` is `Some` — this just tells the container to
+        // reload it.
+        resume_checkpoint: opts.resume_from.is_some(),
         remote_chat_url: agentic_pm
             .as_ref()
             .and_then(|pm| pm.endpoint.as_ref())
@@ -3358,6 +3479,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // rather than the start record.
     if let Some(label) = &remote_endpoint_raw_label {
         dispatch_complete_payload["endpoint"] = serde_json::json!(label);
+    }
+    // (#2114 follow-up) Same field, same reason as `dispatch_start_payload`.
+    if let Some(resume_from) = &opts.resume_from {
+        dispatch_complete_payload["resumed_from"] = serde_json::json!(resume_from.display().to_string());
     }
     // (#1959) Same provenance merge as `dispatch_start_payload` above.
     merge_record_context(&mut dispatch_complete_payload, &opts.record_context);
