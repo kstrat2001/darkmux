@@ -970,6 +970,12 @@ pub fn run(
         feedback_templates,
         response_format,
         &out_dir,
+        // (v3 checkpoint schema, security audit) `run()` has no role
+        // concept of its own (see this fn's own doc — its 35+ callers
+        // never touch resume) — a fixed literal is fine since it never
+        // resumes (`None` below) and this test-only path's own
+        // checkpoint-write assertions don't inspect `role_id`.
+        "test-role",
         None,
         &RealSleeper,
     );
@@ -1017,6 +1023,14 @@ pub fn run_resumable(
     // either produces a checkpoint write failure or an untracked file in
     // the operator's checkout.
     out_dir: &std::path::Path,
+    // (v3 checkpoint schema, security audit) The role id THIS run is
+    // dispatched as — stamped into every `checkpoint.json` write so a
+    // LATER `--resume-from` can refuse, host-side, to resume a checkpoint
+    // recorded under a different role. Never validated here (the runtime
+    // has no concept of "which role is more permissive than which"); the
+    // host does that comparison entirely (`dispatch_internal::stage_
+    // resume_checkpoint`). See `checkpoint::RunCheckpoint::role_id`'s doc.
+    role_id: &str,
     // (#2114) `Some` when this dispatch is resuming a prior checkpoint
     // (`--resume <path>` / `DARKMUX_RESUME_CHECKPOINT`) — `initial_messages`
     // is then IGNORED in favor of the checkpoint's own message history.
@@ -1038,6 +1052,7 @@ pub fn run_resumable(
         feedback_templates,
         response_format,
         out_dir,
+        role_id,
         resume_from,
         &RealSleeper,
     )
@@ -1079,6 +1094,9 @@ fn run_with_sleeper(
     response_format: Option<serde_json::Value>,
     // (#2114) See `run_resumable`'s doc on the same two params.
     out_dir: &std::path::Path,
+    // (v3 checkpoint schema, security audit) See `run_resumable`'s doc on
+    // the same param.
+    role_id: &str,
     resume_from: Option<checkpoint::RunCheckpoint>,
     // (#2094) Injectable rest sleeper — see [`TurnSleeper`]'s own doc.
     sleeper: &dyn TurnSleeper,
@@ -1380,6 +1398,7 @@ fn run_with_sleeper(
             let remaining_is_empty = remaining.is_empty();
             let snapshot = checkpoint::RunCheckpoint {
                 schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+                role_id: role_id.to_string(),
                 messages: messages.clone(),
                 turns,
                 total_prompt_tokens,
@@ -1734,6 +1753,7 @@ fn run_with_sleeper(
             };
             let snapshot = checkpoint::RunCheckpoint {
                 schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+                role_id: role_id.to_string(),
                 messages: messages.clone(),
                 turns,
                 total_prompt_tokens,
@@ -2531,6 +2551,7 @@ fn run_with_sleeper(
                     let remaining_is_empty = remaining.is_empty();
                     let mid_turn_snapshot = checkpoint::RunCheckpoint {
                         schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+                        role_id: role_id.to_string(),
                         messages: messages.clone(),
                         turns,
                         total_prompt_tokens,
@@ -3873,7 +3894,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -3949,7 +3970,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), None, &sleeper,
+            tmp.path(), "test-role", None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok even though it paused mid-run");
 
@@ -4055,6 +4076,7 @@ mod tests {
 
         let resume_checkpoint = checkpoint::RunCheckpoint {
             schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
             messages: vec![
                 Message::system("test"),
                 Message::user("read x.txt"),
@@ -4101,7 +4123,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), Some(resume_checkpoint), &sleeper,
+            tmp.path(), "test-role", Some(resume_checkpoint), &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok even though it paused mid-run");
 
@@ -4151,7 +4173,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), None, &RealSleeper,
+            tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect("2-turn scripted dispatch (tool call, then stop) returns Ok");
 
@@ -4231,6 +4253,7 @@ mod tests {
         // assistant(tool_calls) + tool_result, twice.
         let resume_checkpoint = checkpoint::RunCheckpoint {
             schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
             messages: vec![
                 Message::system("test"),
                 Message::user("read x.txt"),
@@ -4254,7 +4277,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), Some(resume_checkpoint), &RealSleeper,
+            tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
 
@@ -4337,6 +4360,7 @@ mod tests {
         // names the two that never got to run.
         let resume_checkpoint = checkpoint::RunCheckpoint {
             schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
             messages: vec![
                 Message::system("test"),
                 Message::user("read x.txt"),
@@ -4360,7 +4384,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), Some(resume_checkpoint), &RealSleeper,
+            tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
 
@@ -4456,6 +4480,7 @@ mod tests {
         // call_2 must log as tool_seq 1, call_3 as tool_seq 2.
         let resume_checkpoint = checkpoint::RunCheckpoint {
             schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
             messages: vec![
                 Message::system("test"),
                 Message::user("read x.txt"),
@@ -4477,7 +4502,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), Some(resume_checkpoint), &RealSleeper,
+            tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
@@ -4581,6 +4606,7 @@ mod tests {
 
         let resume_checkpoint = checkpoint::RunCheckpoint {
             schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
             messages: vec![
                 Message::system("test"),
                 Message::user("read x.txt"),
@@ -4615,7 +4641,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), Some(resume_checkpoint), &sleeper,
+            tmp.path(), "test-role", Some(resume_checkpoint), &sleeper,
         )
         .expect("resumed dispatch returns Ok even though it paused before catch-up");
 
@@ -4708,6 +4734,7 @@ mod tests {
         // once the catch-up pass appends its own two results.
         let resume_checkpoint = checkpoint::RunCheckpoint {
             schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
             messages: vec![
                 Message::system("test"),                                    // 0
                 Message::user("read x.txt"),                                // 1
@@ -4733,7 +4760,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), Some(resume_checkpoint), &RealSleeper,
+            tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
 
@@ -4765,7 +4792,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
 
@@ -4806,7 +4833,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("single-turn dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -4901,7 +4928,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, Some(40), std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
+            Some(100), None, None, Some(40), std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("checkpoint-continuation scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -8097,6 +8124,7 @@ mod tests {
 
         let resume_checkpoint = checkpoint::RunCheckpoint {
             schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            role_id: "test-role".to_string(),
             messages: checkpoint_messages,
             turns: 2,
             total_prompt_tokens: 200,
@@ -8115,7 +8143,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-primary", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), Some(resume_checkpoint), &RealSleeper,
+            tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("bail should produce Ok with EscalationTriggered, not Err");
 

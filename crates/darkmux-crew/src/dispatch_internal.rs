@@ -220,7 +220,26 @@ pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
 /// Fails LOUD — a distinctly-worded, greppable error — on anything short
 /// of a valid checkpoint. Never silently starts the dispatch fresh under
 /// a name that looked like a resume.
-pub(crate) fn stage_resume_checkpoint(resume_from: &Path, new_host_out: &Path) -> Result<()> {
+///
+/// (Security audit, #2114 resume follow-up) `expected_role_id` is the
+/// role THIS dispatch is about to run as (`opts.role_id`). The checkpoint
+/// schema (v3+) carries a `role_id` field the runtime stamps on every
+/// write; refused HERE, before the container even spawns, when it
+/// doesn't match — the cheap, fast-fail host-side leg of a three-part
+/// defense against a checkpoint recorded under a different (possibly
+/// more permissive) role. The other two legs are runtime-side:
+/// `checkpoint::validate_for_resume` refuses a pending tool call outside
+/// the resuming run's own tool allowlist, and refuses a checkpoint whose
+/// system message doesn't byte-match the fresh one THIS run was launched
+/// with. `/darkmux-out` stays read-write even when `/workspace` is `:ro`
+/// (crawl-kind dispatches), so a prompt-injected model could otherwise
+/// shape — or, with a file-write tool reaching that mount, outright
+/// forge — what a later `--resume-from` blindly replays.
+pub(crate) fn stage_resume_checkpoint(
+    resume_from: &Path,
+    new_host_out: &Path,
+    expected_role_id: &str,
+) -> Result<()> {
     let src = resume_from.join(CHECKPOINT_FILENAME);
     if !src.is_file() {
         bail!(
@@ -266,6 +285,25 @@ pub(crate) fn stage_resume_checkpoint(resume_from: &Path, new_host_out: &Path) -
              parse as a darkmux checkpoint (missing or non-array \
              `messages`)",
             src.display()
+        );
+    }
+    // (Security audit, #2114 resume follow-up) Refuse a resume whose
+    // recorded role differs from the resuming role — see this fn's own
+    // doc for the threat this closes. A missing/non-string `role_id` is
+    // ALSO refused (never treated as "no role, so anything matches") —
+    // every checkpoint this runtime writes now stamps one (v3+ schema);
+    // its absence means either a stale pre-v3 file (already caught above
+    // by callers that check schema_version themselves) or something that
+    // didn't come from a genuine write_checkpoint call at all.
+    let checkpoint_role_id = obj.get("role_id").and_then(|v| v.as_str());
+    if checkpoint_role_id != Some(expected_role_id) {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT ROLE MISMATCH — {} was written for role `{}`, \
+             but this dispatch is running as role `{expected_role_id}`; refusing to resume a \
+             checkpoint under a different role (it may be more permissive than the one it was \
+             recorded under)",
+            src.display(),
+            checkpoint_role_id.unwrap_or("<missing>")
         );
     }
     let dest = new_host_out.join(CHECKPOINT_FILENAME);
@@ -546,6 +584,16 @@ pub struct DockerRunConfig {
     pub runtime_binary: Option<PathBuf>,
     /// The Docker image to run (operator-supplied or resolved darkmux image).
     pub image: String,
+    /// (Security audit, #2114 resume follow-up) The role id this dispatch
+    /// runs as — passed to the container as `--role-id`, unconditionally,
+    /// on EVERY dispatch (not just a resumed one), so the runtime can stamp
+    /// it into every `checkpoint.json` write. `stage_resume_checkpoint`
+    /// reads it back on a LATER `--resume-from` to refuse resuming a
+    /// checkpoint recorded under a different role — before the container
+    /// even spawns. Not secret (already visible in the container name and
+    /// flow records), so plain argv/`ps` visibility is fine, same as
+    /// `--model`.
+    pub role_id: String,
     /// Resolved model name for the runtime CLI.
     pub model: String,
     /// Full system prompt (preamble + role prompt, specialist roles only).
@@ -770,6 +818,12 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push("run".to_string());
     args.push("--model".to_string());
     args.push(config.model.clone());
+    // (Security audit, #2114 resume follow-up) Unconditional — every
+    // dispatch, resumed or not, stamps its role id into every
+    // checkpoint.json write, so a LATER --resume-from has something to
+    // check. See `DockerRunConfig::role_id`'s own doc.
+    args.push("--role-id".to_string());
+    args.push(config.role_id.clone());
     args.push("--system".to_string());
     args.push(config.system_prompt.clone());
     // (#1038) Role-declared output schema → runtime `--response-schema` →
@@ -2695,7 +2749,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // before anything else touches it. Fails loud (never silently starts
     // fresh) — see `stage_resume_checkpoint`'s own doc.
     if let Some(resume_from) = opts.resume_from.as_ref() {
-        stage_resume_checkpoint(resume_from, &host_out)
+        stage_resume_checkpoint(resume_from, &host_out, &opts.role_id)
             .context("darkmux dispatch --resume-from")?;
         eprintln!(
             "darkmux dispatch: resuming from checkpoint at {} (staged into {})",
@@ -2942,6 +2996,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             None
         },
         image: image.clone(),
+        role_id: opts.role_id.clone(),
         model: model.clone(),
         system_prompt: system_prompt.clone(),
         output_schema: role.output_schema.clone(),

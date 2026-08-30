@@ -1417,6 +1417,7 @@
                 "/home/op/.darkmux/runtime/darkmux-runtime",
             )),
             image: "rust:slim".to_string(),
+            role_id: "test-role".to_string(),
             model: "llama3-8b".to_string(),
             system_prompt: "You are a coding assistant.".to_string(),
             message: "Fix the bug in main.rs".to_string(),
@@ -1544,52 +1545,57 @@
         assert_eq!(argv[33], "run"); // runtime subcommand
         assert_eq!(argv[34], "--model");
         assert_eq!(argv[35], "llama3-8b");
-        assert_eq!(argv[36], "--system");
-        assert_eq!(argv[37], "You are a coding assistant.");
+        // (Security audit, #2114 resume follow-up) Unconditional, every
+        // dispatch — see `DockerRunConfig::role_id`'s own doc.
+        assert_eq!(argv[36], "--role-id");
+        assert_eq!(argv[37], "test-role");
+        assert_eq!(argv[38], "--system");
+        assert_eq!(argv[39], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[38], "--prompt-file");
-        assert_eq!(argv[39], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[40], "--prompt-file");
+        assert_eq!(argv[41], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[40], "--json");
+        assert_eq!(argv[42], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[41], "--allowed-tools");
-        assert_eq!(argv[42], "exec,edit");
+        assert_eq!(argv[43], "--allowed-tools");
+        assert_eq!(argv[44], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[43], "--compact-threshold-tokens");
-        assert_eq!(argv[44], "4096");
-        assert_eq!(argv[45], "--compactor-model");
-        assert_eq!(argv[46], "util-model");
-        assert_eq!(argv[47], "--compact-threshold-ratio");
-        assert_eq!(argv[48], "0.75");
-        assert_eq!(argv[49], "--context-window");
-        assert_eq!(argv[50], "32000");
-        assert_eq!(argv[51], "--compact-strategy");
-        assert_eq!(argv[52], "structured-slot");
-        assert_eq!(argv[53], "--bail-after-compactions");
-        assert_eq!(argv[54], "10");
-        assert_eq!(argv[55], "--compactor-custom-instructions");
-        assert_eq!(argv[56], "Be terse.");
+        assert_eq!(argv[45], "--compact-threshold-tokens");
+        assert_eq!(argv[46], "4096");
+        assert_eq!(argv[47], "--compactor-model");
+        assert_eq!(argv[48], "util-model");
+        assert_eq!(argv[49], "--compact-threshold-ratio");
+        assert_eq!(argv[50], "0.75");
+        assert_eq!(argv[51], "--context-window");
+        assert_eq!(argv[52], "32000");
+        assert_eq!(argv[53], "--compact-strategy");
+        assert_eq!(argv[54], "structured-slot");
+        assert_eq!(argv[55], "--bail-after-compactions");
+        assert_eq!(argv[56], "10");
+        assert_eq!(argv[57], "--compactor-custom-instructions");
+        assert_eq!(argv[58], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[57], "--feedback-templates-json");
+        assert_eq!(argv[59], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[58].contains("error"));
-        assert!(argv[58].contains("An error occurred"));
+        assert!(argv[60].contains("error"));
+        assert!(argv[60].contains("An error occurred"));
 
-        // Total arg count: 59 (0..=58) — 53 pre-#1548, +2 for
+        // Total arg count: 61 (0..=60) — 53 pre-#1548, +2 for
         // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
         // `-e DARKMUX_TURN_DELAY_MS=<ms>` (#2094), +2 for
-        // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` (#2094 finding 1).
-        assert_eq!(argv.len(), 59);
+        // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` (#2094 finding 1),
+        // +2 for `--role-id <id>` (security audit, #2114 resume follow-up).
+        assert_eq!(argv.len(), 61);
     }
 
     #[test]
@@ -1605,6 +1611,7 @@
             inject: false,
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
+            role_id: "test-role".to_string(),
             model: "default-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
@@ -1735,6 +1742,7 @@
             inject: false,
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
+            role_id: "test-role".to_string(),
             model: "default-model".to_string(),
             system_prompt: "Tool-less reviewer.".to_string(),
             message: "Review this.".to_string(),
@@ -1786,6 +1794,7 @@
             inject: false,
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
+            role_id: "test-role".to_string(),
             model: "m".to_string(),
             system_prompt: "role".to_string(),
             message: "msg".to_string(),
@@ -1850,8 +1859,17 @@
     /// crate has no access to that type — see `stage_resume_checkpoint`'s
     /// own doc); the runtime is the one authority on full schema validity.
     fn sample_checkpoint_json() -> String {
+        sample_checkpoint_json_for_role("coder")
+    }
+
+    /// (Security audit, #2114 resume follow-up) Same shape as
+    /// `sample_checkpoint_json`, with the `role_id` field parameterized so
+    /// role-mismatch tests can name a DIFFERENT role than the resuming
+    /// dispatch. Real checkpoints (schema v3+) always carry this field.
+    fn sample_checkpoint_json_for_role(role_id: &str) -> String {
         serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
+            "role_id": role_id,
             "messages": [],
             "turns": 1,
             "total_prompt_tokens": 0,
@@ -1873,7 +1891,7 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
         let new_out = TempDir::new().unwrap();
 
-        stage_resume_checkpoint(prior.path(), new_out.path()).unwrap();
+        stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap();
 
         let staged = std::fs::read_to_string(new_out.path().join(CHECKPOINT_FILENAME)).unwrap();
         assert_eq!(staged, sample_checkpoint_json(), "staged checkpoint must be a byte-identical copy");
@@ -1886,7 +1904,7 @@
         let prior = TempDir::new().unwrap(); // no checkpoint.json written
         let new_out = TempDir::new().unwrap();
 
-        let err = stage_resume_checkpoint(prior.path(), new_out.path()).unwrap_err();
+        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap_err();
         assert!(
             format!("{err:#}").contains("RESUME CHECKPOINT NOT FOUND"),
             "expected a named RESUME CHECKPOINT NOT FOUND error, got: {err:#}"
@@ -1903,7 +1921,7 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), "not json at all {{{").unwrap();
         let new_out = TempDir::new().unwrap();
 
-        let err = stage_resume_checkpoint(prior.path(), new_out.path()).unwrap_err();
+        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap_err();
         assert!(
             format!("{err:#}").contains("RESUME CHECKPOINT INVALID"),
             "expected a named RESUME CHECKPOINT INVALID error, got: {err:#}"
@@ -1919,7 +1937,7 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), r#"{"hello": "world"}"#).unwrap();
         let new_out = TempDir::new().unwrap();
 
-        let err = stage_resume_checkpoint(prior.path(), new_out.path()).unwrap_err();
+        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap_err();
         assert!(
             format!("{err:#}").contains("RESUME CHECKPOINT INVALID"),
             "expected a named RESUME CHECKPOINT INVALID error, got: {err:#}"
@@ -1945,9 +1963,76 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), "").unwrap();
         let new_out = TempDir::new().unwrap();
 
-        let err = stage_resume_checkpoint(prior.path(), new_out.path()).unwrap_err();
+        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap_err();
         assert!(format!("{err:#}").contains("RESUME CHECKPOINT INVALID"));
         assert!(!new_out.path().join(CHECKPOINT_FILENAME).exists());
+    }
+
+    // ─── security audit, #2114 resume follow-up: host-side role gate ──────
+
+    #[test]
+    fn stage_resume_checkpoint_refuses_a_checkpoint_written_for_a_different_role() {
+        let prior = TempDir::new().unwrap();
+        std::fs::write(
+            prior.path().join(CHECKPOINT_FILENAME),
+            sample_checkpoint_json_for_role("role-a"),
+        )
+        .unwrap();
+        let new_out = TempDir::new().unwrap();
+
+        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "role-b").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RESUME CHECKPOINT ROLE MISMATCH"),
+            "expected a named RESUME CHECKPOINT ROLE MISMATCH error, got: {err:#}"
+        );
+        assert!(
+            !new_out.path().join(CHECKPOINT_FILENAME).exists(),
+            "a role-mismatched checkpoint must never be staged for the container to see"
+        );
+    }
+
+    #[test]
+    fn stage_resume_checkpoint_refuses_a_checkpoint_with_no_role_id_at_all() {
+        // A hand-crafted / forged file could easily omit role_id even
+        // though it passes the schema_version + messages shape checks —
+        // absence must refuse, never "match anything".
+        let prior = TempDir::new().unwrap();
+        let body = serde_json::json!({
+            "schema_version": 3,
+            "messages": [],
+            "turns": 0,
+            "total_prompt_tokens": 0,
+            "total_completion_tokens": 0,
+            "compactions": 0,
+            "rest_ms": 0,
+            "rests": 0,
+            "pending_hand_back": null,
+            "pending_tool_calls": null,
+            "pending_tool_calls_seq_base": 0,
+            "written_at_unix_ms": 0,
+        })
+        .to_string();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), body).unwrap();
+        let new_out = TempDir::new().unwrap();
+
+        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap_err();
+        assert!(format!("{err:#}").contains("RESUME CHECKPOINT ROLE MISMATCH"));
+        assert!(!new_out.path().join(CHECKPOINT_FILENAME).exists());
+    }
+
+    #[test]
+    fn stage_resume_checkpoint_happy_path_same_role_resumes() {
+        let prior = TempDir::new().unwrap();
+        std::fs::write(
+            prior.path().join(CHECKPOINT_FILENAME),
+            sample_checkpoint_json_for_role("coder"),
+        )
+        .unwrap();
+        let new_out = TempDir::new().unwrap();
+
+        stage_resume_checkpoint(prior.path(), new_out.path(), "coder")
+            .expect("same-role resume must succeed");
+        assert!(new_out.path().join(CHECKPOINT_FILENAME).is_file());
     }
 
     // ─── #2114 finding 4: DARKMUX_MAX_PAUSE_MS forwarding ────────
@@ -2222,6 +2307,7 @@
             inject: false,
             runtime_binary: None,
             image: "darkmux-runtime:latest".to_string(),
+            role_id: "test-role".to_string(),
             model: "default-model".to_string(),
             system_prompt: "Basic role.".to_string(),
             message: "Hello world".to_string(),
