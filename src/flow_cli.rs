@@ -842,6 +842,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
 

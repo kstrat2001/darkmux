@@ -1,9 +1,44 @@
 //! Hooks — a fourth `FlowSink` kind (#2093): match a flow record against
-//! operator-configured rules, and POST a match verbatim to a loopback
-//! receiver. **Enqueue, never block**: `write()` only appends to a local
-//! outbox file (flock'd, mirroring `AuditFileSink`); a background drainer
-//! thread does the actual HTTP delivery with bounded retries, so a down
-//! receiver never stalls a dispatch.
+//! operator-configured rules, and POST a match verbatim to a receiver.
+//! **Enqueue, never block**: `write()` only appends to a local outbox file
+//! (flock'd, mirroring `AuditFileSink`); a background drainer thread does
+//! the actual HTTP delivery with bounded retries, so a down receiver never
+//! stalls a dispatch.
+//!
+//! # URL policy (#2135 option 2)
+//!
+//! A rule's `http` target is accepted by URL alone — no config gate: either
+//! loopback (`validate_loopback_http_url` — `127.0.0.1`/`[::1]`/`localhost`)
+//! or a genuine Tailscale address (`validate_tailnet_http_url` — an IPv4 in
+//! `100.64.0.0/10`, or a hostname ending in `.ts.net`), both re-validated
+//! (not merely cached) at every POST, not just at load. Everything else is
+//! refused outright, both at config load (the whole sink degrades, loudly)
+//! and by `darkmux doctor`'s per-rule row: an external (non-tailnet)
+//! receiver is a later packet and will require `https://` plus a mandatory
+//! signature, not merely a resolvable URL. `http://`, never `https://`, is
+//! required for BOTH policies — WireGuard already encrypts and
+//! authenticates a tailnet peer, so TLS on top of it buys nothing yet.
+//!
+//! # Delivery contract
+//!
+//! Every delivery — loopback or tailnet — carries `X-Darkmux-Delivery` (a
+//! UUID-v4-shaped id, deterministic per outbox LINE so every retry of the
+//! same undelivered line reuses the same id; also stamped as `delivery_id`
+//! on the corresponding `hook.fired`/`hook.failed`), `X-Darkmux-Event` (the
+//! record's `action`), `X-Darkmux-Machine-Id`/`X-Darkmux-Machine-Uid` (the
+//! machine that PRODUCED the record), `X-Darkmux-Sender` (THIS host's own
+//! machine id — the machine POSTing, deliberately distinct from
+//! `Machine-Id` so a relaying hub isn't mistaken for a record's origin),
+//! and `X-Darkmux-Timestamp` (unix ms). When a rule names a
+//! `signing_secret_keychain_item` (resolved via `crate::hook_signing_secret`
+//! — Keychain, or the portable `DARKMUX_HOOK_SECRET_<rule-index>` env
+//! override, which wins when set), every delivery ALSO carries
+//! `X-Darkmux-Signature: sha256=<hex HMAC-SHA256 over "<timestamp>.<raw
+//! body bytes>">` (see `crate::hmac_sha256`). No secret configured →
+//! deliveries go out unsigned; `darkmux doctor` warns for an unsigned
+//! TAILNET target specifically (fine inside the tailnet, required beyond
+//! it). See `docs/guide/crawl-and-hooks.html`'s "Delivery headers" table
+//! for the operator-facing version of this contract.
 //!
 //! # Loop prevention
 //!
@@ -243,6 +278,104 @@ pub fn validate_loopback_http_url(raw: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// (#2135 option 2) Which policy a hook target's URL satisfied — surfaced
+/// on `darkmux doctor`'s rows and stamped nowhere else (delivery behavior
+/// doesn't branch on this beyond re-validating it at POST time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookTargetKind {
+    Loopback,
+    Tailnet,
+}
+
+/// True for a real Tailscale IPv4 — the CGNAT range `100.64.0.0/10`
+/// (`100.64.0.0` through `100.127.255.255`) Tailscale assigns tailnet
+/// addresses from.
+fn is_tailnet_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000
+}
+
+/// True for a host that is a genuine Tailscale address: a `100.64.0.0/10`
+/// literal IPv4, or a MagicDNS hostname ending in `.ts.net`. Takes the
+/// ALREADY-lowercased `host_str()` `url::Url` produced, mirroring
+/// `validate_loopback_http_url`'s own canonicalization.
+fn is_tailnet_host(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return is_tailnet_ipv4(ip);
+    }
+    host.ends_with(".ts.net")
+}
+
+/// (#2135 option 2) The tailnet counterpart of `validate_loopback_http_url`
+/// — same shape, same checks (literal `http://` prefix, real `url::Url`
+/// parse, userinfo rejection, raw-authority-vs-canonical-host comparison),
+/// but the host allowlist is `is_tailnet_host` instead of the loopback
+/// three. `http://`, not `https://`, is still required: WireGuard already
+/// encrypts the wire between tailnet peers, so TLS on top buys nothing here
+/// — an `https://` tailnet target (or any OTHER remote host) is refused,
+/// same as everything outside this policy; that widening is a later packet.
+fn validate_tailnet_http_url(raw: &str) -> Result<()> {
+    if !raw.starts_with("http://") {
+        bail!(
+            "hook URL `{raw}` must literally start with `http://` (lowercase, no leading \
+             whitespace) — https for a tailnet target is a later packet, WireGuard already \
+             encrypts the wire"
+        );
+    }
+    let parsed = url::Url::parse(raw).with_context(|| format!("parsing hook URL `{raw}`"))?;
+    if parsed.scheme() != "http" {
+        bail!("hook URL `{raw}` must use http:// for a tailnet target");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some_and(|p| !p.is_empty()) {
+        bail!(
+            "hook URL `{raw}` may not carry userinfo (username/password) in its authority — \
+             `user@host` is refused unconditionally, regardless of what host follows"
+        );
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("hook URL `{raw}` has no host"))?
+        .to_ascii_lowercase();
+    if !is_tailnet_host(&host) {
+        bail!("hook URL `{raw}` targets non-tailnet host `{host}`");
+    }
+    let raw_host = raw_authority_host(raw)
+        .with_context(|| format!("hook URL `{raw}` has a malformed authority"))?;
+    if !raw_host.eq_ignore_ascii_case(&host) {
+        bail!(
+            "hook URL `{raw}` spells its host as `{raw_host}`, which is not the canonical form \
+             `{host}` — only the exact canonical spelling of a tailnet host is accepted, not an \
+             alternate notation that merely resolves to it"
+        );
+    }
+    Ok(())
+}
+
+/// (#2135 option 2) The FULL URL policy a hook rule's `http` target must
+/// satisfy — loopback (unconditionally, `validate_loopback_http_url`) OR a
+/// genuine Tailscale address (`validate_tailnet_http_url`). No config gate:
+/// the URL itself is the operator's decision, same as every other rule
+/// field — `darkmux doctor`'s per-rule row is what makes the choice
+/// visible (loopback/tailnet, signed/unsigned), not a flag that has to be
+/// flipped first. Any other non-loopback, non-tailnet host is refused
+/// outright — an external (non-tailnet) receiver is a later packet and
+/// will require https + a mandatory signature, not merely a URL that
+/// happens to resolve.
+pub fn validate_hook_target_url(raw: &str) -> Result<HookTargetKind> {
+    if validate_loopback_http_url(raw).is_ok() {
+        return Ok(HookTargetKind::Loopback);
+    }
+    if validate_tailnet_http_url(raw).is_ok() {
+        return Ok(HookTargetKind::Tailnet);
+    }
+    bail!(
+        "hook URL `{raw}` is neither a loopback target (127.0.0.1/[::1]/localhost) nor a genuine \
+         Tailscale address (an IPv4 in 100.64.0.0/10, or a hostname ending in `.ts.net`) — a \
+         remote receiver outside your tailnet is a later packet and will require https + a \
+         mandatory signature"
+    );
 }
 
 /// The literal `host[:port]` → `host` text `raw` uses in its authority,
@@ -495,13 +628,23 @@ pub struct ResolvedRule {
     /// (#2093 merge-gate finding 9) Where the live `dropped_appends`
     /// counter is persisted — see `dropped_appends_path`'s doc.
     pub dropped_appends_path: PathBuf,
+    /// (#2135 option 2) Which URL policy this rule's target satisfied —
+    /// re-validated (not merely cached) at every POST, same reasoning as
+    /// `try_post`'s existing loopback re-validation.
+    pub target_kind: HookTargetKind,
+    /// (#2135 option 2) This rule's resolved HMAC signing secret, when
+    /// `signing_secret_keychain_item` (or the `DARKMUX_HOOK_SECRET_<index>`
+    /// env override) named one — `None` means every delivery for this rule
+    /// goes out unsigned. Read ONCE here, at construction, same as the
+    /// Redis/serve-token Keychain reads.
+    pub signing_secret: Option<crate::RawHookSecret>,
 }
 
 /// Resolve + validate every rule against `outbox_dir`. Bails on the FIRST
-/// rule missing an `http` target or targeting a non-loopback host — the
-/// whole hooks sink is refused rather than silently dropping one bad rule,
-/// so a config mistake is loud at construction, not a quietly-smaller
-/// rule set.
+/// rule missing an `http` target or whose target satisfies neither the
+/// loopback nor the tailnet URL policy — the whole hooks sink is refused
+/// rather than silently dropping one bad rule, so a config mistake is loud
+/// at construction, not a quietly-smaller rule set.
 pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<ResolvedRule>> {
     let mut out = Vec::with_capacity(rules.len());
     for (index, r) in rules.iter().enumerate() {
@@ -510,13 +653,14 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
             .clone()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("hook rule #{index} has no `http` target"))?;
-        validate_loopback_http_url(&url).with_context(|| format!("hook rule #{index}"))?;
+        let target_kind = validate_hook_target_url(&url).with_context(|| format!("hook rule #{index}"))?;
         let match_ = r.r#match.clone().unwrap_or_default();
         let key = rule_key(&match_, &url);
         let (outbox_path, cursor_path) = outbox_paths(outbox_dir, &key);
         let last_status_path = last_status_path(outbox_dir, &key);
         let drain_lock_path = drain_lock_path(outbox_dir, &key);
         let dropped_appends_path = dropped_appends_path(outbox_dir, &key);
+        let signing_secret = crate::hook_signing_secret(index, r.signing_secret_keychain_item.as_deref());
         out.push(ResolvedRule {
             index,
             match_,
@@ -526,6 +670,8 @@ pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<Resolv
             last_status_path,
             drain_lock_path,
             dropped_appends_path,
+            target_kind,
+            signing_secret,
         });
     }
     Ok(out)
@@ -559,6 +705,23 @@ pub struct HookRuleSummary {
     pub match_desc: String,
     pub url: String,
     pub is_loopback: bool,
+    /// (#2135 option 2) True when the target is a genuine Tailscale
+    /// address (`100.64.0.0/10` or `*.ts.net`), NOT loopback. Mutually
+    /// exclusive with `is_loopback`; both `false` means the URL satisfies
+    /// neither policy and the rule is refused at load (see `is_refused`).
+    pub is_tailnet: bool,
+    /// (#2135 option 2) True when the target satisfies NEITHER policy —
+    /// the rule that `HookSink::new` refuses the whole sink over. Kept
+    /// distinct from `!is_loopback` (which used to mean this before the
+    /// tailnet policy existed) so a valid tailnet rule doesn't read as
+    /// broken.
+    pub is_refused: bool,
+    /// (#2135 option 2) True when this rule names a
+    /// `signing_secret_keychain_item` (or would resolve one via the
+    /// `DARKMUX_HOOK_SECRET_<index>` env override) — i.e. its deliveries
+    /// carry `X-Darkmux-Signature`. Config-presence only: this is a
+    /// summary for `doctor`/`flow status`, not a live Keychain probe.
+    pub signed: bool,
     pub is_empty_match: bool,
     pub outbox_path: PathBuf,
     pub cursor_path: PathBuf,
@@ -644,9 +807,9 @@ fn describe_match(m: &HookMatch) -> String {
 
 /// Build a read-only summary of every configured rule — used by
 /// `darkmux doctor` and `darkmux flow status`. Unlike
-/// `resolve_rules`, this never bails: an invalid URL shows up as
-/// `is_loopback: false` rather than an error, so the caller can report ALL
-/// rules' problems at once instead of stopping at the first.
+/// `resolve_rules`, this never bails: a URL satisfying neither policy
+/// shows up as `is_refused: true` rather than an error, so the caller can
+/// report ALL rules' problems at once instead of stopping at the first.
 pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<HookRuleSummary> {
     rules
         .iter()
@@ -654,7 +817,10 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
         .map(|(index, r)| {
             let m = r.r#match.clone().unwrap_or_default();
             let url = r.http.clone().unwrap_or_default();
-            let is_loopback = validate_loopback_http_url(&url).is_ok();
+            let target_kind = validate_hook_target_url(&url).ok();
+            let is_loopback = target_kind == Some(HookTargetKind::Loopback);
+            let is_tailnet = target_kind == Some(HookTargetKind::Tailnet);
+            let signed = r.signing_secret_keychain_item.as_ref().is_some_and(|s| !s.trim().is_empty());
             let key = rule_key(&m, &url);
             let (outbox_path, cursor_path) = outbox_paths(outbox_dir, &key);
             let cursor = read_cursor(&cursor_path);
@@ -668,6 +834,9 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
                 match_desc: describe_match(&m),
                 url,
                 is_loopback,
+                is_tailnet,
+                is_refused: target_kind.is_none(),
+                signed,
                 is_empty_match: m.is_empty(),
                 outbox_path,
                 cursor_path,
@@ -1004,7 +1173,68 @@ fn is_retryable_client_status(code: u16) -> bool {
     code == 429 || code == 408
 }
 
-fn try_post(url: &str, body: &str) -> DeliveryOutcome {
+// ─── (#2135 option 2) Delivery contract headers ────────────────────────
+
+/// The `X-Darkmux-*` headers stamped on EVERY POST — loopback and tailnet
+/// alike. `delivery_id` is documented in `delivery_id_for_line`'s own doc.
+struct DeliveryHeaders {
+    delivery_id: String,
+    event: String,
+    machine_id: Option<String>,
+    machine_uid: Option<String>,
+    sender: String,
+    timestamp_ms: u64,
+    /// The full `sha256=<hex>` header value, precomputed — `None` when
+    /// this rule has no signing secret configured.
+    signature: Option<String>,
+}
+
+/// A UUID-v4-SHAPED delivery id, deterministically derived from the exact
+/// outbox line being delivered. This is an ATTRIBUTION identifier, not a
+/// security token — the operator's contract calls for "a UUID v4 per
+/// delivery attempt group, same id across retries of the same line," and a
+/// content hash gives EXACTLY that with no extra state to persist: every
+/// retry re-reads the same undelivered line at the same cursor offset and
+/// so re-derives the same id, across process restarts too, without a
+/// side-table mapping lines to ids. BLAKE3 (already a dependency here) over
+/// the raw line bytes, truncated to 16 bytes, with the version/variant
+/// bits forced per RFC 4122 so it renders as a valid v4 UUID string.
+fn delivery_id_for_line(line: &str) -> String {
+    let hash = blake3::hash(line.as_bytes());
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&hash.as_bytes()[..16]);
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    )
+}
+
+/// Build this delivery's headers from the raw outbox `line` and its parsed
+/// JSON (`None` for a line that failed to parse — the quarantine path
+/// still stamps a `delivery_id`/`event`-less `hook.failed`). `event` /
+/// `machine_id` / `machine_uid` come from the RECORD itself (the machine
+/// that PRODUCED it); `sender` is THIS host's own machine id (the machine
+/// POSTing) — the two are deliberately different fields since a fleet hub
+/// forwarding another machine's record would otherwise be indistinguishable
+/// from the record's origin.
+fn build_delivery_headers(line: &str, parsed: Option<&serde_json::Value>, signing_secret: Option<&crate::RawHookSecret>) -> DeliveryHeaders {
+    let event = parsed.and_then(|v| v.get("action")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let machine_id = parsed.and_then(|v| v.get("machine_id")).and_then(|v| v.as_str()).map(str::to_string);
+    let machine_uid = parsed.and_then(|v| v.get("machine_uid")).and_then(|v| v.as_str()).map(str::to_string);
+    let sender = schema::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
+    let timestamp_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let delivery_id = delivery_id_for_line(line);
+    let signature = signing_secret.map(|secret| {
+        let signed_input = format!("{timestamp_ms}.{line}");
+        format!("sha256={}", crate::hmac_sha256::hmac_sha256_hex(secret.expose_for_hmac().as_bytes(), signed_input.as_bytes()))
+    });
+    DeliveryHeaders { delivery_id, event, machine_id, machine_uid, sender, timestamp_ms, signature }
+}
+
+fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome {
     // (#2093 merge-gate finding 1, belt-and-braces) Re-validate at POST
     // time — the URL was already validated at `resolve_rules` /
     // `HookSink::new`, but a future refactor that plumbs a URL through a
@@ -1012,18 +1242,34 @@ fn try_post(url: &str, body: &str) -> DeliveryOutcome {
     // network just because construction-time validation happened to run.
     // No listener is contacted when this fails: refused locally, treated
     // as a permanent (never-retried) failure like any other 4xx.
-    if let Err(e) = validate_loopback_http_url(url) {
+    if let Err(e) = validate_hook_target_url(url) {
         eprintln!("flow::HookSink: try_post refusing to send — URL failed re-validation: {e:#}");
         return DeliveryOutcome::ClientError;
     }
     // (#2093 merge-gate finding 2) Redirects are never followed — a
     // redirect target is the RECEIVER telling us to go elsewhere, and
-    // "elsewhere" is exactly the case `validate_loopback_http_url` exists
+    // "elsewhere" is exactly the case `validate_hook_target_url` exists
     // to gate. `ureq` with `redirects(0)` does NOT error on a 3xx; it
     // returns it as an `Ok` response with the 3xx status, so the status
     // must be checked on the `Ok` arm too, not just the `Err` arm.
     let agent = ureq::AgentBuilder::new().timeout(POST_TIMEOUT).redirects(0).build();
-    match agent.post(url).set("Content-Type", "application/json").send_string(body) {
+    let mut req = agent
+        .post(url)
+        .set("Content-Type", "application/json")
+        .set("X-Darkmux-Delivery", &headers.delivery_id)
+        .set("X-Darkmux-Event", &headers.event)
+        .set("X-Darkmux-Sender", &headers.sender)
+        .set("X-Darkmux-Timestamp", &headers.timestamp_ms.to_string());
+    if let Some(m) = &headers.machine_id {
+        req = req.set("X-Darkmux-Machine-Id", m);
+    }
+    if let Some(u) = &headers.machine_uid {
+        req = req.set("X-Darkmux-Machine-Uid", u);
+    }
+    if let Some(sig) = &headers.signature {
+        req = req.set("X-Darkmux-Signature", sig);
+    }
+    match req.send_string(body) {
         Ok(resp) => {
             let status = resp.status();
             if (300..400).contains(&status) {
@@ -1089,7 +1335,13 @@ pub fn drain_stray_file(outbox_path: &Path, to_url: &str) -> Result<StrayDrainRe
     let mut cursor = read_cursor(&cursor_path);
     let mut result = StrayDrainResult::default();
     while let Some((line, new_cursor)) = next_pending_line(outbox_path, cursor) {
-        match try_post(to_url, &line) {
+        let parsed: Option<serde_json::Value> = serde_json::from_str(&line).ok();
+        // (#2135 option 2) No signing secret here — a stray file's
+        // original rule (and whatever secret it named) no longer exists
+        // in current config by definition; this manual recovery path
+        // delivers unsigned, same as any other unconfigured rule.
+        let headers = build_delivery_headers(&line, parsed.as_ref(), None);
+        match try_post(to_url, &line, &headers) {
             DeliveryOutcome::Success { .. } => {
                 result.delivered += 1;
                 cursor = new_cursor;
@@ -1234,6 +1486,7 @@ fn reset_backoff(rt: &RuleRuntime) {
 /// Emit `hook.fired` (success) or `hook.failed` (give-up) through
 /// `report_sink`. Best-effort — a failure to emit is logged, never
 /// propagated (this runs on the drainer thread; nothing is waiting on it).
+#[allow(clippy::too_many_arguments)]
 fn emit_hook_record(
     report_sink: &dyn FlowSink,
     success: bool,
@@ -1241,8 +1494,9 @@ fn emit_hook_record(
     delivered_line: &str,
     attempt: u32,
     error: Option<&str>,
+    delivery_id: &str,
 ) {
-    emit_hook_record_with(report_sink, success, rt, delivered_line, attempt, error, None)
+    emit_hook_record_with(report_sink, success, rt, delivered_line, attempt, error, None, delivery_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1254,6 +1508,7 @@ fn emit_hook_record_with(
     attempt: u32,
     error: Option<&str>,
     receiver_rejected: Option<u64>,
+    delivery_id: &str,
 ) {
     let rule = &rt.rule;
     // (fix-round finding 5) Lenient on read: a delivered line that IS
@@ -1280,6 +1535,11 @@ fn emit_hook_record_with(
         // was blank", which is a different (and untrue) claim.
         "delivered_action": action_val.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
         "attempt": attempt,
+        // (#2135 option 2) The SAME delivery id this attempt carried on
+        // the wire as `X-Darkmux-Delivery` — lets a receiver (or an
+        // operator reading flow) correlate the record here with the HTTP
+        // request the receiver actually saw.
+        "delivery_id": delivery_id,
     });
     if let Some(h) = hash {
         payload["delivered_hash"] = serde_json::Value::String(h);
@@ -1433,6 +1693,12 @@ fn drainer_loop(
                 continue;
             };
             did_work = true;
+            // (#2135 option 2) Computed ONCE per line, deterministically
+            // from the line's own bytes — every retry of THIS exact
+            // undelivered line reuses the SAME delivery id (see
+            // `delivery_id_for_line`'s doc), and every terminal outcome
+            // below stamps it on the emitted `hook.fired`/`hook.failed`.
+            let delivery_id = delivery_id_for_line(&line);
             // (#2093 merge-gate finding 4) A line that isn't valid JSON —
             // most likely a torn fragment that `ensure_trailing_newline`
             // turned into its own complete-but-malformed line at
@@ -1440,15 +1706,16 @@ fn drainer_loop(
             // raw bytes, never silently drop them), advance the cursor
             // past it so it doesn't block every line after it forever,
             // and emit `hook.failed` naming the reason.
-            if serde_json::from_str::<serde_json::Value>(&line).is_err() {
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) else {
                 quarantine_line(&rt.rule.outbox_path, &line);
                 advance_cursor(rt, new_cursor);
                 let reason = "invalid outbox line";
                 write_last_status(rt, false, Some(reason));
-                emit_hook_record(report_sink.as_ref(), false, rt, &line, 1, Some(reason));
+                emit_hook_record(report_sink.as_ref(), false, rt, &line, 1, Some(reason), &delivery_id);
                 continue;
-            }
-            match try_post(&rt.rule.url, &line) {
+            };
+            let headers = build_delivery_headers(&line, Some(&parsed), rt.rule.signing_secret.as_ref());
+            match try_post(&rt.rule.url, &line, &headers) {
                 DeliveryOutcome::Success { receiver_rejected } => {
                     let attempt = {
                         let mut c = rt.attempt_count.lock().unwrap();
@@ -1463,7 +1730,7 @@ fn drainer_loop(
                             rt.rule.url
                         );
                     }
-                    emit_hook_record_with(report_sink.as_ref(), true, rt, &line, attempt, None, receiver_rejected);
+                    emit_hook_record_with(report_sink.as_ref(), true, rt, &line, attempt, None, receiver_rejected, &delivery_id);
                 }
                 DeliveryOutcome::ClientError => {
                     let attempt = {
@@ -1485,7 +1752,7 @@ fn drainer_loop(
                         advance_cursor(rt, new_cursor);
                         let reason = format!("4xx response, skipped after {client_errors} client-error attempts");
                         write_last_status(rt, false, Some(&reason));
-                        emit_hook_record(report_sink.as_ref(), false, rt, &line, attempt, Some(&reason));
+                        emit_hook_record(report_sink.as_ref(), false, rt, &line, attempt, Some(&reason), &delivery_id);
                     } else {
                         apply_backoff(rt);
                     }
@@ -1504,7 +1771,7 @@ fn drainer_loop(
                     advance_cursor(rt, new_cursor);
                     let reason = format!("redirect refused: {status} to {target_host}");
                     write_last_status(rt, false, Some(&reason));
-                    emit_hook_record(report_sink.as_ref(), false, rt, &line, attempt, Some(&reason));
+                    emit_hook_record(report_sink.as_ref(), false, rt, &line, attempt, Some(&reason), &delivery_id);
                 }
                 DeliveryOutcome::RetryableFailure => {
                     {
@@ -1778,6 +2045,11 @@ pub mod test_receiver {
     pub struct HookReceiver {
         pub addr: SocketAddr,
         received: Arc<Mutex<Vec<String>>>,
+        /// (#2135 option 2) Every request's headers, lowercased-key, in
+        /// arrival order alongside `received` — lets a test assert on the
+        /// `X-Darkmux-*` delivery contract headers a real receiver would
+        /// see, not just the body.
+        received_headers: Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>,
         statuses: Arc<Mutex<VecDeque<u16>>>,
         redirect_location: Arc<Mutex<Option<String>>>,
         response_body: Arc<Mutex<Option<String>>>,
@@ -1816,11 +2088,13 @@ pub mod test_receiver {
             listener.set_nonblocking(true).unwrap();
             let addr = listener.local_addr().unwrap();
             let received = Arc::new(Mutex::new(Vec::new()));
+            let received_headers = Arc::new(Mutex::new(Vec::new()));
             let statuses = Arc::new(Mutex::new(VecDeque::new()));
             let redirect_location = Arc::new(Mutex::new(None));
             let stop = Arc::new(AtomicBool::new(false));
 
             let thread_received = received.clone();
+            let thread_received_headers = received_headers.clone();
             let thread_statuses = statuses.clone();
             let thread_redirect_location = redirect_location.clone();
             let response_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -1833,7 +2107,14 @@ pub mod test_receiver {
                     }
                     match listener.accept() {
                         Ok((stream, _)) => {
-                            let _ = handle_one(stream, &thread_received, &thread_statuses, &thread_redirect_location, &thread_response_body);
+                            let _ = handle_one(
+                                stream,
+                                &thread_received,
+                                &thread_received_headers,
+                                &thread_statuses,
+                                &thread_redirect_location,
+                                &thread_response_body,
+                            );
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1843,7 +2124,7 @@ pub mod test_receiver {
                 }
             });
 
-            Self { addr, received, statuses, redirect_location, response_body, stop, handle: Some(handle) }
+            Self { addr, received, received_headers, statuses, redirect_location, response_body, stop, handle: Some(handle) }
         }
 
         /// Queue a sequence of HTTP status codes to return, one per
@@ -1879,6 +2160,12 @@ pub mod test_receiver {
         pub fn request_count(&self) -> usize {
             self.received.lock().unwrap().len()
         }
+
+        /// Every request's headers so far (lowercased keys), in arrival
+        /// order alongside `bodies()`.
+        pub fn headers(&self) -> Vec<std::collections::HashMap<String, String>> {
+            self.received_headers.lock().unwrap().clone()
+        }
     }
 
     impl Drop for HookReceiver {
@@ -1897,6 +2184,7 @@ pub mod test_receiver {
     fn handle_one(
         mut stream: TcpStream,
         received: &Arc<Mutex<Vec<String>>>,
+        received_headers: &Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>,
         statuses: &Arc<Mutex<VecDeque<u16>>>,
         redirect_location: &Arc<Mutex<Option<String>>>,
         response_body: &Arc<Mutex<Option<String>>>,
@@ -1909,6 +2197,7 @@ pub mod test_receiver {
             return Ok(());
         }
         let mut content_length: usize = 0;
+        let mut headers = std::collections::HashMap::new();
         loop {
             let mut header_line = String::new();
             reader.read_line(&mut header_line)?;
@@ -1918,12 +2207,16 @@ pub mod test_receiver {
             if let Some(v) = header_line.to_ascii_lowercase().strip_prefix("content-length:") {
                 content_length = v.trim().parse().unwrap_or(0);
             }
+            if let Some((name, value)) = header_line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
         }
         let mut body = vec![0u8; content_length];
         if content_length > 0 {
             reader.read_exact(&mut body)?;
         }
         received.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
+        received_headers.lock().unwrap().push(headers);
 
         let status = {
             let mut q = statuses.lock().unwrap();
@@ -2246,6 +2539,59 @@ mod tests {
         }
     }
 
+    // ─── (#2135 option 2) tailnet URL policy ───────────────────────────
+
+    #[test]
+    fn validate_hook_target_url_accepts_loopback() {
+        for raw in ["http://127.0.0.1:8790/events", "http://localhost:8790/x", "http://[::1]:8790/x"] {
+            assert_eq!(validate_hook_target_url(raw).unwrap(), HookTargetKind::Loopback, "{raw}");
+        }
+    }
+
+    #[test]
+    fn validate_hook_target_url_accepts_tailnet_ipv4_and_ts_net_hostname() {
+        for raw in [
+            "http://100.101.102.103:8790/events",
+            "http://100.64.0.0:8790/x",
+            "http://100.127.255.255:8790/x",
+            "http://foo.taild82cbb.ts.net:8790/x",
+            "http://FOO.TAILD82CBB.TS.NET:8790/x",
+        ] {
+            assert_eq!(validate_hook_target_url(raw).unwrap(), HookTargetKind::Tailnet, "{raw}");
+        }
+    }
+
+    #[test]
+    fn validate_hook_target_url_refuses_outside_the_tailnet_cgnat_range() {
+        // 100.63.x.x and 100.128.x.x sit just OUTSIDE 100.64.0.0/10 on
+        // either edge — must NOT be mistaken for tailnet addresses.
+        for raw in ["http://100.63.255.255:8790/x", "http://100.128.0.0:8790/x", "http://10.0.0.5:8790/x", "http://example.com/x"] {
+            assert!(validate_hook_target_url(raw).is_err(), "must be REFUSED: {raw}");
+        }
+    }
+
+    #[test]
+    fn validate_hook_target_url_refuses_https_for_a_tailnet_target() {
+        // WireGuard already encrypts the wire — https on top is a later
+        // packet, not silently upgraded-to or accepted.
+        let err = validate_hook_target_url("https://100.101.102.103:8790/x").unwrap_err();
+        assert!(format!("{err:#}").to_lowercase().contains("http"), "{err:#}");
+    }
+
+    #[test]
+    fn validate_hook_target_url_refuses_userinfo_on_a_tailnet_host() {
+        assert!(validate_hook_target_url("http://user:pass@100.101.102.103/x").is_err());
+    }
+
+    #[test]
+    fn validate_hook_target_url_refuses_alternate_ipv4_notation_for_a_tailnet_address() {
+        // Same raw-authority-vs-canonical-host defense `validate_loopback_
+        // http_url` has for 127.1/0.0.0.0 — an alternate notation that
+        // merely RESOLVES onto a tailnet address is not the blessed
+        // canonical spelling.
+        assert!(validate_hook_target_url("http://0144.0100.0.1/x").is_err(), "octal notation must be refused");
+    }
+
     #[test]
     fn last_status_summary_reflects_delivery_outcome() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2253,6 +2599,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
 
@@ -2283,6 +2630,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some("http://10.0.0.5:8790/x".to_string()),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         assert!(resolve_rules(&rules, tmp.path()).is_err());
@@ -2297,6 +2645,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -2319,6 +2668,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -2366,6 +2716,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
 
@@ -2409,6 +2760,131 @@ mod tests {
         assert_eq!(read_cursor(&sink.rules[0].rule.cursor_path), std::fs::read_to_string(&sink.rules[0].rule.outbox_path).unwrap().len() as u64);
     }
 
+    // ─── (#2135 option 2) delivery contract headers + signing ──────────
+
+    #[test]
+    // (#2135 option 2) Shares rule-index 0 with the signing test below,
+    // which mutates `DARKMUX_HOOK_SECRET_0` — serialized against it (same
+    // default `serial_test` group) so the two can't race on that env var.
+    #[serial_test::serial]
+    fn delivery_carries_the_contract_headers_and_no_signature_when_unsigned() {
+        // Defensive: a prior test's env mutation must never leak in — this
+        // rule is also index 0, and the env override wins regardless of
+        // whether THIS rule names a keychain item.
+        unsafe {
+            std::env::remove_var("DARKMUX_HOOK_SECRET_0");
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            extras: Default::default(),
+        }];
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+
+        let mut r = record("crawl.finding");
+        r.machine_id = Some("studio".to_string());
+        r.machine_uid = Some("uid-123".to_string());
+        sink.write(&r).unwrap();
+
+        assert!(wait_until(|| receiver.request_count() == 1, Duration::from_secs(3)));
+        let headers = receiver.headers();
+        let h = &headers[0];
+        assert!(h.contains_key("x-darkmux-delivery"), "{h:?}");
+        assert_eq!(h.get("x-darkmux-event").map(String::as_str), Some("crawl.finding"), "{h:?}");
+        assert_eq!(h.get("x-darkmux-machine-id").map(String::as_str), Some("studio"), "{h:?}");
+        assert_eq!(h.get("x-darkmux-machine-uid").map(String::as_str), Some("uid-123"), "{h:?}");
+        assert!(h.contains_key("x-darkmux-sender"), "{h:?}");
+        assert!(h.contains_key("x-darkmux-timestamp"), "{h:?}");
+        assert!(!h.contains_key("x-darkmux-signature"), "unsigned rule must not carry a signature: {h:?}");
+    }
+
+    #[test]
+    #[serial_test::serial] // mutates DARKMUX_HOOK_SECRET_0
+    fn delivery_carries_a_signature_the_receiver_can_recompute_when_signed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: Some("darkmux-hook-test-0".to_string()),
+            extras: Default::default(),
+        }];
+        let prev = std::env::var("DARKMUX_HOOK_SECRET_0").ok();
+        // The env override wins over the Keychain item on every platform
+        // (see `crate::hook_signing_secret`'s doc) — the portable path a
+        // sandboxed test can actually exercise without a real Keychain.
+        unsafe {
+            std::env::set_var("DARKMUX_HOOK_SECRET_0", "top-secret-key");
+        }
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+
+        sink.write(&record("crawl.finding")).unwrap();
+        assert!(wait_until(|| receiver.request_count() == 1, Duration::from_secs(3)));
+
+        let headers = receiver.headers();
+        let h = &headers[0];
+        let sig = h.get("x-darkmux-signature").expect("signed rule must carry X-Darkmux-Signature");
+        let ts = h.get("x-darkmux-timestamp").unwrap();
+        let body = &receiver.bodies()[0];
+        let expected = format!(
+            "sha256={}",
+            crate::hmac_sha256::hmac_sha256_hex(b"top-secret-key", format!("{ts}.{body}").as_bytes())
+        );
+        assert_eq!(sig, &expected, "receiver must be able to recompute the exact signature from timestamp + raw body");
+
+        drop(sink);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_HOOK_SECRET_0", v),
+                None => std::env::remove_var("DARKMUX_HOOK_SECRET_0"),
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_id_is_stable_across_retries_and_stamped_on_hook_fired() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start().with_status_sequence([500, 200]);
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            extras: Default::default(),
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+
+        sink.write(&record("crawl.finding")).unwrap();
+
+        assert!(wait_until(|| receiver.request_count() >= 2, Duration::from_secs(5)), "expected a retry after the 500");
+        let headers = receiver.headers();
+        let first_id = headers[0].get("x-darkmux-delivery").unwrap().clone();
+        let second_id = headers[1].get("x-darkmux-delivery").unwrap().clone();
+        assert_eq!(first_id, second_id, "same undelivered line — same delivery id across retries");
+
+        assert!(wait_until(|| capture.0.lock().unwrap().iter().any(|r| r.action == "hook.fired"), Duration::from_secs(3)));
+        let guard = capture.0.lock().unwrap();
+        let fired = guard.iter().find(|r| r.action == "hook.fired").unwrap();
+        assert_eq!(fired.payload.as_ref().unwrap()["delivery_id"], serde_json::Value::String(first_id));
+    }
+
     #[test]
     fn down_receiver_does_not_block_write() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2426,6 +2902,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(format!("http://{addr}/unreachable")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -2449,6 +2926,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
 
@@ -2491,6 +2969,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
 
@@ -2559,6 +3038,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -2596,6 +3076,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -2645,6 +3126,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -2690,6 +3172,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:1/unused".to_string()),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let rule = resolve_rules(&rules, tmp.path()).unwrap().into_iter().next().unwrap();
@@ -2741,6 +3224,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -2804,6 +3288,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(format!("http://{addr}/unreachable")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
 
@@ -2864,6 +3349,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -2941,6 +3427,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(format!("http://{addr}/unreachable")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
 
@@ -3011,6 +3498,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
@@ -3063,6 +3551,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
@@ -3189,6 +3678,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -3229,6 +3719,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -3253,6 +3744,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -3271,7 +3763,8 @@ mod tests {
         // this URL — if `try_post` tried to actually connect, it would
         // hang on connection refused / DNS, not return promptly.
         let start = Instant::now();
-        let outcome = try_post("http://evil.example.com/x", "{}");
+        let headers = build_delivery_headers("{}", None, None);
+        let outcome = try_post("http://evil.example.com/x", "{}", &headers);
         assert!(start.elapsed() < Duration::from_millis(500), "must refuse locally, never attempt the network");
         assert!(matches!(outcome, DeliveryOutcome::ClientError), "an invalid URL is a permanent, non-retryable failure");
     }
@@ -3285,6 +3778,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
@@ -3355,6 +3849,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(url),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -3434,11 +3929,13 @@ mod tests {
         let rule_a = HookRule {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/a".to_string()),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         };
         let rule_b = HookRule {
             r#match: Some(HookMatch { action: Some("dispatch.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/b".to_string()),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         };
         let a_first = resolve_rules(&[rule_a.clone(), rule_b.clone()], tmp.path()).unwrap();
@@ -3475,16 +3972,19 @@ mod tests {
             HookRule {
                 r#match: Some(HookMatch { action: Some("work.*".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:1/a".to_string()),
+                signing_secret_keychain_item: None,
                 extras: Default::default(),
             },
             HookRule {
                 r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:1/b".to_string()),
+                signing_secret_keychain_item: None,
                 extras: Default::default(),
             },
             HookRule {
                 r#match: Some(HookMatch { mission_id: Some("no-such-mission".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:1/c".to_string()),
+                signing_secret_keychain_item: None,
                 extras: Default::default(),
             },
         ];
@@ -3515,6 +4015,7 @@ mod tests {
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
         #[derive(Default)]
