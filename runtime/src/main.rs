@@ -143,6 +143,16 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // precedence every other runtime flag/env pair in this file follows).
     let mut resume_checkpoint_path: Option<String> =
         std::env::var("DARKMUX_RESUME_CHECKPOINT").ok();
+    // (v3 checkpoint schema, security audit, #2114 resume follow-up) The
+    // role id THIS dispatch is running as — host-supplied, since the
+    // runtime has no other way to know it. Stamped into every
+    // `checkpoint.json` write so a LATER `--resume-from` can refuse,
+    // host-side, to resume a checkpoint recorded under a different role
+    // (`dispatch_internal::stage_resume_checkpoint`). NOT required for a
+    // fresh (non-resuming) dispatch to run — an absent/empty value just
+    // means a future resume attempt's role comparison will (correctly)
+    // never match anything but another equally-unlabeled checkpoint.
+    let mut role_id: String = String::new();
     // (#1038) Raw JSON-schema string for the role's output, wrapped into an
     // LMStudio json_schema response_format before the loop. None ⇒ free-form.
     let mut response_schema: Option<String> = None;
@@ -334,6 +344,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     i += 2;
                 } else {
                     eprintln!("--resume requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--role-id" => {
+                if let Some(v) = args.get(i + 1) {
+                    role_id = v.clone();
+                    i += 2;
+                } else {
+                    eprintln!("--role-id requires a value");
                     return ExitCode::from(2);
                 }
             }
@@ -693,6 +712,43 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let full_catalog = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
     let tools = filter_tools_by_allowed(&full_catalog, allowed_tools.as_deref());
 
+    // (Security audit, #2114 resume follow-up) Refuses a CROSS-ROLE or
+    // CROSS-PROMPT resume — a checkpoint written under a different role,
+    // or a different system prompt than the one THIS run was launched
+    // with. It does NOT defend against a SAME-ROLE forgery: a resume
+    // replays `pending_tool_calls` verbatim (name checked against this
+    // run's own tool allowlist, arguments never validated), and restores
+    // every prior assistant/tool message from the file with zero
+    // validation at all. `/darkmux-out` stays read-write even when
+    // `/workspace` is `:ro` (crawl-kind dispatches), so a prompt-injected
+    // model can still get a same-role checkpoint's tool arguments — or
+    // its non-pending history — to say whatever it wants, and a later
+    // `--resume-from` under the SAME role replays it. Checkpoint
+    // integrity (making the file itself untamperable by the model it's
+    // checkpointing) is a follow-up: the real fix is uid separation
+    // between the runtime process and the tool-executing processes
+    // inside the container, so a tool call can never write the runtime's
+    // own checkpoint file. See `checkpoint::validate_for_resume`'s own
+    // doc for the full accounting, and `--resume-from`'s CLI help
+    // (`src/cli.rs`, host side) for the operator-facing version of this
+    // warning. The system-message comparison is against the fresh one
+    // main.rs just built, at `initial_messages[0]` (never the file's own
+    // claim) — compaction never rewrites it: `compaction::PRESERVE_HEAD`
+    // keeps index 0 untouched across every compaction generation. A
+    // THIRD leg (workspace mount-mode/path) is closed entirely host-side
+    // — this runtime process has no visibility into it at all; see
+    // `dispatch_internal::stage_resume_checkpoint`'s own doc.
+    if let Some(checkpoint) = &resume_from {
+        let allowed_tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        let fresh_system_message = initial_messages[0].content.as_deref().unwrap_or("");
+        if let Err(e) =
+            checkpoint::validate_for_resume(checkpoint, &allowed_tool_names, fresh_system_message)
+        {
+            eprintln!("--resume {}: {e:#}", resume_checkpoint_path.as_deref().unwrap_or(""));
+            return ExitCode::from(2);
+        }
+    }
+
     // Status lines go to stderr in JSON mode so stdout stays clean for
     // `jq`-style consumers. In human-readable mode they print to stdout
     // alongside the eventual final-message block.
@@ -791,6 +847,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         // out-dir mount, not the workspace — see `loop_runner::
         // run_resumable`'s doc on this param for why.
         Path::new(trajectory::RUNTIME_OUT_BASE),
+        &role_id,
         resume_from,
     );
 

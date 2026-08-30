@@ -180,6 +180,338 @@ const PROMPT_FILE_CONTAINER_PATH: &str = "/darkmux-out/.prompt.txt";
 /// this must change too.
 const RESUME_CHECKPOINT_CONTAINER_PATH: &str = "/darkmux-out/checkpoint.json";
 
+/// (#2114 follow-up) Checkpoint filename `runtime/src/checkpoint.rs` writes
+/// under a dispatch's `host_out` (see `RESUME_CHECKPOINT_CONTAINER_PATH`'s
+/// own doc for the container-side mount path). Named once here so
+/// `stage_resume_checkpoint` and its tests don't hand-duplicate the literal.
+/// `pub` (not `pub(crate)`) so `src/crawl_launch.rs`'s `--param resume=`
+/// planner — a different crate — can probe `<out_dir>/checkpoint.json`
+/// without re-typing the literal.
+pub const CHECKPOINT_FILENAME: &str = "checkpoint.json";
+
+/// (#2114 follow-up) `DispatchOpts::resume_from`'s host-side mechanics: this
+/// is what actually TRIGGERS a resume — the checkpoint-carrying `--resume`
+/// argv flag has existed since #2114 finding 3, but nothing constructed a
+/// `DockerRunConfig` with `resume_checkpoint: true` until this landed.
+///
+/// Validates that `resume_from` (a PRIOR dispatch's `host_out`) names a
+/// real, parseable checkpoint, then COPIES it into `new_host_out` — THIS
+/// dispatch's own fresh out dir — so the container's `--resume
+/// /darkmux-out/checkpoint.json` mount (bound at `new_host_out` via
+/// `apply_volume_mounts`) finds it. Never reuses `resume_from` as the
+/// mount source directly: this dispatch is a NEW run record with its own
+/// trajectory, and `resume_from` stays untouched as forensic evidence
+/// (matches the "host_out is never cleaned, even on error" contract —
+/// see `AutoWorkspaceCleanup`'s own doc for the sibling `workspace`
+/// cleanup this does NOT extend to).
+///
+/// Deliberately does NOT deserialize into `runtime::checkpoint::RunCheckpoint`
+/// — `runtime/` is a separate crate, built into the Docker image and NOT
+/// linked against this one (same boundary `apply_volume_mounts`'s doc
+/// describes for the duplicated `/darkmux-out` literal), so this crate has
+/// no access to that type. Instead this does a light schema sanity check
+/// (object shape, numeric `schema_version`, array `messages`) — enough to
+/// catch "not a checkpoint at all" (empty file, truncated write, some
+/// unrelated JSON) before the container ever spawns. The runtime remains
+/// the one authority on schema-version *compatibility*
+/// (`checkpoint::read_checkpoint` exits the container 2 on a real
+/// version mismatch); this function only rules out "not a checkpoint".
+///
+/// Fails LOUD — a distinctly-worded, greppable error — on anything short
+/// of a valid checkpoint. Never silently starts the dispatch fresh under
+/// a name that looked like a resume.
+///
+/// **What this closes, and what it does NOT (security audit, #2114 resume
+/// follow-up — read this before trusting a resume):** this function and
+/// `checkpoint::validate_for_resume` (runtime-side) together refuse a
+/// CROSS-ROLE or CROSS-PROMPT resume — a checkpoint written under a
+/// different role, a different system prompt, or a workspace this
+/// dispatch would mount more permissively than the run that wrote it.
+/// They do **NOT** defend against a SAME-ROLE forgery: a resume replays
+/// the checkpoint's `pending_tool_calls` verbatim (name checked against
+/// this run's tool allowlist, but the ARGUMENTS are never validated), and
+/// restores every prior assistant/tool message from the file with zero
+/// validation at all. `/darkmux-out` stays read-write even when
+/// `/workspace` is `:ro` (crawl-kind dispatches), so a prompt-injected
+/// model can still get a same-role checkpoint's tool arguments — or its
+/// non-pending history — to say whatever it wants, and a later
+/// `--resume-from` under the SAME role replays it. Checkpoint integrity
+/// (making the file itself untamperable by the model it's checkpointing)
+/// is a follow-up: the real fix is uid separation between the runtime
+/// process and the tool-executing processes inside the container, so a
+/// tool call can never write the runtime's own checkpoint file. Until
+/// that lands, `--resume-from` is an operator-explicit action on a
+/// same-role run the operator trusts, not a boundary against a
+/// compromised one — see `--resume-from`'s own CLI help.
+///
+/// (Security audit, #2114 resume follow-up) `expected_role_id` is the
+/// role THIS dispatch is about to run as (`opts.role_id`). The checkpoint
+/// schema (v3+) carries a `role_id` field the runtime stamps on every
+/// write; refused HERE, before the container even spawns, when it
+/// doesn't match. A schema version below 3 (no `role_id` field at all —
+/// written by a pre-fix runtime) is refused with a STALE-SCHEMA message
+/// rather than read as `role_id: "<missing>"`, which would otherwise
+/// misreport an honest version gap as a role mismatch.
+///
+/// `expected_workspace`/`expected_workspace_read_only` close the mount-mode
+/// escalation the audit also found live: a checkpoint written under a
+/// READ-ONLY workspace (a crawl-kind unit, `:ro` so the model can't touch
+/// the tree it's scanning) resumed under a READ-WRITE mount would hand a
+/// prompt-injected model write access it never had. The host has no
+/// free way to know the ORIGINAL run's mount mode from `resume_from`
+/// alone, so `write_resume_origin_meta` stamps it into every dispatch's
+/// OWN `host_out` at creation time (`RESUME_ORIGIN_FILENAME`); this reads
+/// it back from `resume_from` and refuses — never guesses — when it's
+/// missing, unparseable, names a different workspace path, or would
+/// upgrade a read-only origin to read-write.
+pub(crate) fn stage_resume_checkpoint(
+    resume_from: &Path,
+    new_host_out: &Path,
+    expected_role_id: &str,
+    expected_workspace: &Path,
+    expected_workspace_read_only: bool,
+) -> Result<()> {
+    let src = resume_from.join(CHECKPOINT_FILENAME);
+    if !src.is_file() {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT NOT FOUND — expected {} to \
+             exist (no checkpoint.json under --resume-from {}); this \
+             dispatch cannot resume. darkmux never silently starts a \
+             dispatch fresh under a name that looked like a resume — pass \
+             a --resume-from dir that actually has a checkpoint, or drop \
+             --resume-from to start fresh on purpose.",
+            src.display(),
+            resume_from.display()
+        );
+    }
+    let contents = fs::read_to_string(&src)
+        .with_context(|| format!("reading resume checkpoint at {}", src.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&contents).map_err(|e| {
+        anyhow!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} is not valid \
+             JSON ({e}); refusing to resume from a file that isn't a real \
+             checkpoint",
+            src.display()
+        )
+    })?;
+    let obj = value.as_object().ok_or_else(|| {
+        anyhow!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
+             parse as a darkmux checkpoint (top level is not a JSON \
+             object)",
+            src.display()
+        )
+    })?;
+    let schema_version = obj.get("schema_version").and_then(|v| v.as_u64());
+    if schema_version.is_none() {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
+             parse as a darkmux checkpoint (missing or non-numeric \
+             `schema_version`)",
+            src.display()
+        );
+    }
+    // (CONSIDER 6, security audit) A stale pre-v3 checkpoint (no `role_id`
+    // field at all — written by a runtime that predates this fix) gets its
+    // own honest message here, BEFORE the role check below would otherwise
+    // misreport it as `role_id: "<missing>"` — an honest version gap is not
+    // a role mismatch.
+    if schema_version.is_some_and(|v| v < 3) {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT STALE SCHEMA — {} has \
+             schema_version={} (this darkmux build writes/expects >= 3); \
+             it predates the role_id field this resume gate needs and \
+             cannot be safely resumed — start fresh instead.",
+            src.display(),
+            schema_version.unwrap_or(0)
+        );
+    }
+    if !obj.get("messages").is_some_and(|v| v.is_array()) {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT INVALID — {} does not \
+             parse as a darkmux checkpoint (missing or non-array \
+             `messages`)",
+            src.display()
+        );
+    }
+    // (Security audit, #2114 resume follow-up) Refuse a resume whose
+    // recorded role differs from the resuming role — see this fn's own
+    // doc for the threat this closes (and does NOT close). A missing/
+    // non-string `role_id` on a schema_version >= 3 checkpoint is ALSO
+    // refused (never treated as "no role, so anything matches") — every
+    // checkpoint a fixed runtime writes stamps one; its absence on a v3+
+    // file means something that didn't come from a genuine
+    // write_checkpoint call at all.
+    let checkpoint_role_id = obj.get("role_id").and_then(|v| v.as_str());
+    if checkpoint_role_id != Some(expected_role_id) {
+        bail!(
+            "darkmux dispatch: RESUME CHECKPOINT ROLE MISMATCH — {} was written for role `{}`, \
+             but this dispatch is running as role `{expected_role_id}`; refusing to resume a \
+             checkpoint under a different role (it may be more permissive than the one it was \
+             recorded under)",
+            src.display(),
+            checkpoint_role_id.unwrap_or("<missing>")
+        );
+    }
+    // (Security audit, #2114 resume follow-up) Workspace mount-mode + path
+    // gate — see this fn's own doc for the escalation this closes.
+    let origin_path = resume_from.join(RESUME_ORIGIN_FILENAME);
+    let origin_contents = fs::read_to_string(&origin_path).map_err(|e| {
+        anyhow!(
+            "darkmux dispatch: RESUME ORIGIN UNKNOWN — could not read {} ({e}); this host has \
+             no record of the workspace mount mode/path the checkpoint at {} was written \
+             under, and darkmux refuses to guess — resume only from a dir this host itself \
+             wrote the provenance file into",
+            origin_path.display(),
+            src.display()
+        )
+    })?;
+    let origin: serde_json::Value = serde_json::from_str(&origin_contents).map_err(|e| {
+        anyhow!(
+            "darkmux dispatch: RESUME ORIGIN UNKNOWN — {} is not valid JSON ({e}); refusing to \
+             resume without a trustworthy record of the original workspace mount",
+            origin_path.display()
+        )
+    })?;
+    let origin_workspace = origin.get("workspace").and_then(|v| v.as_str());
+    let origin_read_only = origin.get("workspace_read_only").and_then(|v| v.as_bool());
+    let (Some(origin_workspace), Some(origin_read_only)) = (origin_workspace, origin_read_only)
+    else {
+        bail!(
+            "darkmux dispatch: RESUME ORIGIN UNKNOWN — {} is missing `workspace` or \
+             `workspace_read_only`; refusing to resume without a trustworthy record of the \
+             original mount",
+            origin_path.display()
+        );
+    };
+    let expected_workspace_str = expected_workspace.display().to_string();
+    if origin_workspace != expected_workspace_str {
+        bail!(
+            "darkmux dispatch: RESUME WORKSPACE MISMATCH — the checkpoint at {} was written \
+             against workspace `{origin_workspace}`, but this dispatch's workspace is \
+             `{expected_workspace_str}`; refusing to resume against a different tree",
+            src.display()
+        );
+    }
+    if origin_read_only && !expected_workspace_read_only {
+        bail!(
+            "darkmux dispatch: RESUME WORKSPACE MOUNT ESCALATION — the checkpoint at {} was \
+             written with a READ-ONLY workspace mount, but this dispatch would mount \
+             `{expected_workspace_str}` READ-WRITE; refusing to grant a resumed dispatch write \
+             access the run that wrote the checkpoint never had",
+            src.display()
+        );
+    }
+    let dest = new_host_out.join(CHECKPOINT_FILENAME);
+    fs::copy(&src, &dest).with_context(|| {
+        format!(
+            "copying resume checkpoint from {} to {}",
+            src.display(),
+            dest.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// (Security audit, #2114 resume follow-up) Filename `write_resume_origin_meta`
+/// writes into EVERY dispatch's `host_out` at creation time, naming the
+/// workspace path + mount mode THIS run used — the host-held record
+/// `stage_resume_checkpoint` reads back from `resume_from` on a LATER
+/// resume attempt, so it never has to guess. Lives alongside
+/// `checkpoint.json` in the same out-dir (never copied forward into a
+/// resumed dispatch's own fresh `host_out` — only read in place from the
+/// PRIOR dir).
+pub(crate) const RESUME_ORIGIN_FILENAME: &str = "resume_origin.json";
+
+/// (Security audit, #2114 resume follow-up) Stamp this dispatch's
+/// workspace path + read-only mode into its own `host_out`, unconditionally
+/// — every dispatch writes this, not just ones that might later be resumed,
+/// since there's no way to know in advance which `host_out` an operator
+/// will later point `--resume-from` at. Best-effort: a write failure here
+/// doesn't fail this dispatch (matches `write_checkpoint`'s own
+/// "checkpoint bookkeeping never blocks the dispatch" convention in
+/// `loop_runner.rs`) — it just means a FUTURE resume attempt from this
+/// `host_out` will refuse with RESUME ORIGIN UNKNOWN rather than guess,
+/// which is the safe direction to fail in.
+pub(crate) fn write_resume_origin_meta(host_out: &Path, workspace: &Path, workspace_read_only: bool) {
+    let body = serde_json::json!({
+        "workspace": workspace.display().to_string(),
+        "workspace_read_only": workspace_read_only,
+    });
+    let path = host_out.join(RESUME_ORIGIN_FILENAME);
+    match serde_json::to_vec_pretty(&body) {
+        Ok(bytes) => {
+            if let Err(e) = fs::write(&path, bytes) {
+                eprintln!(
+                    "darkmux dispatch: ⚠ failed to write resume-origin metadata at {}: {e} \
+                     (a future --resume-from this dir will refuse rather than guess)",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("darkmux dispatch: ⚠ failed to serialize resume-origin metadata: {e}");
+        }
+    }
+}
+
+/// (#2153) Resolve this dispatch's host out dir. See
+/// `DispatchOpts::host_out`'s own doc for the crawl-launcher motivation.
+///
+/// - `Some(dir)`: the caller named an exact dir. Create it with
+///   `create_dir` — NOT `create_dir_all`, a caller-named path's parent is
+///   expected to already exist (e.g. the crawl launcher's own
+///   `runs/<mission>/units/` dir) — and lock it to `0o700`. An
+///   ALREADY-EXISTING dir at that path is refused outright rather than
+///   reused: `create_dir`'s own atomicity (one syscall, no separate
+///   exists-check window) is what closes the TOCTOU/symlink race a
+///   pre-named path would otherwise open (#2158) — something planted the
+///   dir (or a symlink) before this dispatch got there, and reusing it
+///   would mount an attacker- or leftover-controlled path into the
+///   container at `/darkmux-out`.
+/// - `None`: today's behavior — a fresh tempdir keyed off `role_id` and
+///   this dispatch's own unix-micros timestamp.
+///
+/// Plain-argument signature (not `&DispatchOpts`) so tests can exercise it
+/// without constructing a whole `DispatchOpts` — same pattern as
+/// `apply_volume_mounts`/`stage_resume_checkpoint`/`write_resume_origin_meta`
+/// above.
+fn resolve_host_out(host_out_override: Option<&Path>, role_id: &str, unix_micros: u128) -> Result<PathBuf> {
+    match host_out_override {
+        Some(dir) => {
+            match fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    bail!(
+                        "darkmux dispatch: caller-provided out-dir already exists — refusing to \
+                         reuse it: {} (a prior dispatch may still own it, or something else \
+                         created it first; never overwritten)",
+                        dir.display()
+                    );
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("creating caller-provided dispatch out-dir: {}", dir.display())
+                    });
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| {
+                    format!("setting permissions on dispatch out-dir: {}", dir.display())
+                })?;
+            }
+            Ok(dir.to_path_buf())
+        }
+        None => {
+            let host_out = std::env::temp_dir().join(format!("darkmux-out-{role_id}-{unix_micros}"));
+            fs::create_dir_all(&host_out)
+                .with_context(|| format!("creating dispatch out-dir: {}", host_out.display()))?;
+            Ok(host_out)
+        }
+    }
+}
 
 /// (#703) Inject the host-cached static runtime binary into an operator
 /// image: bind-mount it read-only at `/darkmux-runtime` and override the
@@ -448,6 +780,16 @@ pub struct DockerRunConfig {
     pub runtime_binary: Option<PathBuf>,
     /// The Docker image to run (operator-supplied or resolved darkmux image).
     pub image: String,
+    /// (Security audit, #2114 resume follow-up) The role id this dispatch
+    /// runs as — passed to the container as `--role-id`, unconditionally,
+    /// on EVERY dispatch (not just a resumed one), so the runtime can stamp
+    /// it into every `checkpoint.json` write. `stage_resume_checkpoint`
+    /// reads it back on a LATER `--resume-from` to refuse resuming a
+    /// checkpoint recorded under a different role — before the container
+    /// even spawns. Not secret (already visible in the container name and
+    /// flow records), so plain argv/`ps` visibility is fine, same as
+    /// `--model`.
+    pub role_id: String,
     /// Resolved model name for the runtime CLI.
     pub model: String,
     /// Full system prompt (preamble + role prompt, specialist roles only).
@@ -672,6 +1014,12 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push("run".to_string());
     args.push("--model".to_string());
     args.push(config.model.clone());
+    // (Security audit, #2114 resume follow-up) Unconditional — every
+    // dispatch, resumed or not, stamps its role id into every
+    // checkpoint.json write, so a LATER --resume-from has something to
+    // check. See `DockerRunConfig::role_id`'s own doc.
+    args.push("--role-id".to_string());
+    args.push(config.role_id.clone());
     args.push("--system".to_string());
     args.push(config.system_prompt.clone());
     // (#1038) Role-declared output schema → runtime `--response-schema` →
@@ -2584,13 +2932,39 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //     two concurrent dispatches never collide. Like the workspace,
     //     this is NOT auto-cleaned — the operator inspects
     //     trajectory.jsonl + metrics.json after the container exits.
-    let host_out = std::env::temp_dir().join(format!("darkmux-out-{}-{unix_micros}", opts.role_id));
-    fs::create_dir_all(&host_out)
-        .with_context(|| format!("creating dispatch out-dir: {}", host_out.display()))?;
+    //     (#2153) `opts.host_out` lets a caller name this dir up front —
+    //     see `resolve_host_out`'s own doc.
+    let host_out = resolve_host_out(opts.host_out.as_deref(), &opts.role_id, unix_micros)?;
     eprintln!(
         "darkmux dispatch: out-dir={} (runtime bookkeeping → /darkmux-out)",
         host_out.display()
     );
+
+    // (Security audit, #2114 resume follow-up) Stamp THIS dispatch's own
+    // workspace path/mount-mode into its own host_out, unconditionally —
+    // the host-held record a LATER --resume-from reads back rather than
+    // guessing. See `write_resume_origin_meta`'s own doc.
+    write_resume_origin_meta(&host_out, &workspace, opts.workspace_read_only);
+
+    // (#2114 follow-up) `--resume-from <dir>` trigger: validate + stage the
+    // PRIOR dispatch's checkpoint into THIS dispatch's fresh `host_out`
+    // before anything else touches it. Fails loud (never silently starts
+    // fresh) — see `stage_resume_checkpoint`'s own doc.
+    if let Some(resume_from) = opts.resume_from.as_ref() {
+        stage_resume_checkpoint(
+            resume_from,
+            &host_out,
+            &opts.role_id,
+            &workspace,
+            opts.workspace_read_only,
+        )
+        .context("darkmux dispatch --resume-from")?;
+        eprintln!(
+            "darkmux dispatch: resuming from checkpoint at {} (staged into {})",
+            resume_from.display(),
+            host_out.display()
+        );
+    }
 
     // (#386) Write the user message to a file in the (already-mounted) out-dir
     // and hand the runtime `--prompt-file` instead of `--prompt <text>`, so a
@@ -2653,6 +3027,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // container's brain is actually remote.
     if let Some(label) = &remote_endpoint_raw_label {
         dispatch_start_payload["endpoint"] = serde_json::json!(label);
+    }
+    // (#2114 follow-up) Resume provenance the viewer/flow log render —
+    // names the SOURCE dir (the prior dispatch's host_out), distinct from
+    // this dispatch's own `out_dir` (recorded elsewhere on the result).
+    // Absence ⇒ this dispatch started fresh, same convention as `endpoint`
+    // above.
+    if let Some(resume_from) = &opts.resume_from {
+        dispatch_start_payload["resumed_from"] = serde_json::json!(resume_from.display().to_string());
     }
     // (#1959) Provenance the runtime can't derive on its own (the crawl
     // launcher's workspace/source/sha/rule/unit) — see `merge_record_context`'s
@@ -2822,6 +3204,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             None
         },
         image: image.clone(),
+        role_id: opts.role_id.clone(),
         model: model.clone(),
         system_prompt: system_prompt.clone(),
         output_schema: role.output_schema.clone(),
@@ -2851,10 +3234,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         // runtime.thermal.max_pause_ms exists — see max_pause_ms_env's own
         // doc.
         max_pause_ms_env: Some(darkmux_types::config_access::thermal_max_pause_ms()),
-        // (#2114) `dispatch --resume` CLI plumbing (DispatchOpts →
-        // caller-decided true) is a follow-up; this call site always
-        // starts fresh for now.
-        resume_checkpoint: false,
+        // (#2114 follow-up) The trigger: `stage_resume_checkpoint` above
+        // already verified + staged the checkpoint into `host_out` when
+        // `opts.resume_from` is `Some` — this just tells the container to
+        // reload it.
+        resume_checkpoint: opts.resume_from.is_some(),
         remote_chat_url: agentic_pm
             .as_ref()
             .and_then(|pm| pm.endpoint.as_ref())
@@ -3358,6 +3742,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // rather than the start record.
     if let Some(label) = &remote_endpoint_raw_label {
         dispatch_complete_payload["endpoint"] = serde_json::json!(label);
+    }
+    // (#2114 follow-up) Same field, same reason as `dispatch_start_payload`.
+    if let Some(resume_from) = &opts.resume_from {
+        dispatch_complete_payload["resumed_from"] = serde_json::json!(resume_from.display().to_string());
     }
     // (#1959) Same provenance merge as `dispatch_start_payload` above.
     merge_record_context(&mut dispatch_complete_payload, &opts.record_context);
@@ -4087,15 +4475,18 @@ fn run_tailer(
 
 /// (N6 of the #2110/#2109 review) Best-effort removal of a leftover
 /// `pace.json` in this dispatch's out-dir, called BEFORE
-/// `run_telemetry_sampler`'s loop starts. Today `host_out` is always a
-/// fresh per-dispatch tempdir, so this is a no-op in the common case —
-/// but once #2114's `--resume` CLI flag ships and reuses a PRIOR
-/// dispatch's `host_out` (to see that dispatch's checkpoint, which now
-/// lives in the SAME out-dir pace.json does), a leftover pace.json from
-/// that earlier, possibly-still-paused dispatch would otherwise re-park
-/// this brand-new `ThermalGovernor` — which starts `Idle` and has never
-/// written anything itself — on data it never produced. An absent file
-/// (the common case) is not an error.
+/// `run_telemetry_sampler`'s loop starts. `host_out` is ALWAYS a fresh
+/// per-dispatch tempdir — including for a resumed dispatch (`--resume-from`,
+/// #2114 follow-up): `stage_resume_checkpoint` copies ONLY `checkpoint.json`
+/// from the PRIOR dispatch's out-dir into this dispatch's own fresh one; it
+/// never reuses the prior dir itself and never copies `pace.json`. So this
+/// is a no-op on every path today, resumed or not — kept as a defensive
+/// guard in case a future change ever lets a dispatch attach to an
+/// existing `host_out` directly (which #2114's actual `--resume-from`
+/// design deliberately does NOT do — see `stage_resume_checkpoint`'s own
+/// doc for why: a resumed dispatch is a NEW run record with its own
+/// trajectory, and the prior dir stays untouched as forensic evidence). An
+/// absent file (the common, and today the ONLY, case) is not an error.
 fn clear_stale_pace_file(host_out: &Path) {
     let _ = std::fs::remove_file(crate::thermal_governor::pace_file_path(host_out));
 }

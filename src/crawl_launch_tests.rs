@@ -1553,6 +1553,86 @@ fn interrupted_at_readback_reports_interrupted_not_error() {
     assert_eq!(mission_completed["payload"]["stopped_by"], "interrupted");
     assert_eq!(mission_completed["payload"]["units_errored"], 0, "an interrupted unit must not count as errored");
     assert_eq!(mission_completed["payload"]["units_completed"], 0, "an interrupted unit must not count as completed either");
+    // (#2153) The interrupted unit gets its OWN counter now, and it must
+    // NOT also inflate `units_not_run` — that counter is for units never
+    // even attempted, and this one demonstrably was (it has a real
+    // `out_dir`, asserted below via the envelope's per-unit row).
+    assert_eq!(mission_completed["payload"]["units_interrupted"], 1, "the interrupted unit must be counted");
+    assert_eq!(
+        mission_completed["payload"]["units_not_run"], 1,
+        "units_not_run counts only the SECOND unit (never dispatched at all), not the interrupted first one"
+    );
+
+    // (#2153) The exact bug this fix closes: an interrupted dispatch must
+    // still leave a resumable `out_dir` on its per-unit row — previously
+    // `null`, because the out dir was only ever learned from a
+    // SUCCESSFUL `DispatchResult`, which an interrupted dispatch (an
+    // `Err` return) never produces.
+    let mission_id = mission_id_from_records(&records);
+    let runs_dir = fx.root.path().join("runs").join(&mission_id);
+    let envelope: Value =
+        serde_json::from_str(&std::fs::read_to_string(runs_dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(envelope["units_interrupted"], 1, "envelope.json must carry the same counter: {envelope}");
+    let row = &envelope["units"][0];
+    assert_eq!(row["unit"], "u-0001");
+    assert_eq!(row["result"], "interrupted");
+    let out_dir = row["out_dir"].as_str().expect("an interrupted unit's row must carry a real out_dir, not null");
+    assert!(!out_dir.is_empty(), "out_dir must be a real path, not empty");
+    assert!(
+        std::path::Path::new(out_dir).starts_with(&runs_dir),
+        "the interrupted unit's out_dir must live under this mission's own run dir ({}), got {out_dir}",
+        runs_dir.display()
+    );
+}
+
+/// (#2153) The REAL production shape of "Ctrl-C while paused mid-
+/// dispatch": `dispatch_internal::dispatch`'s own SIGINT-during-wait
+/// branch returns `Err` — there is no `DispatchResult` at all to read an
+/// `out_dir` back from. Distinct from `interrupted_at_readback_reports_
+/// interrupted_not_error` above (whose scripted dispatch always returns
+/// `Ok`): this test scripts the dispatch itself to return `Err`, proving
+/// the launcher's OWN pre-minted out dir (recorded into the per-unit row
+/// BEFORE dispatch even runs, via `DispatchOpts::host_out`) survives even
+/// when nothing comes back from the call to read it from — the exact gap
+/// that left a real 72KB `checkpoint.json` on disk with `out_dir: null`
+/// in the mission envelope on the Studio (2026-08-30).
+#[test]
+#[serial_test::serial]
+fn a_unit_whose_dispatch_errors_while_interrupted_still_records_a_resumable_out_dir() {
+    let _guard = TestGuard::new();
+    let _interrupt_guard = InterruptFlagGuard::new();
+    let fx = two_source_fixture();
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit { err: true, ..Default::default() });
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {
+        darkmux_types::interrupt::simulate_sigint_for_test();
+    });
+
+    let code = run(&params_for(&fx), None, &mut dispatch).unwrap();
+    assert_eq!(code, 130, "an interrupted run must exit 130");
+
+    let records = read_all_flow_records();
+    let mission_id = mission_id_from_records(&records);
+    let runs_dir = fx.root.path().join("runs").join(&mission_id);
+    let envelope: Value =
+        serde_json::from_str(&std::fs::read_to_string(runs_dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(envelope["units_interrupted"], 1, "envelope: {envelope}");
+    assert_eq!(envelope["units_errored"], 0, "interrupted must not ALSO be counted as errored");
+    assert_eq!(
+        envelope["units_not_run"], 1,
+        "units_not_run counts only the never-dispatched second unit, not this interrupted one"
+    );
+    let row = &envelope["units"][0];
+    assert_eq!(row["result"], "interrupted");
+    let out_dir = row["out_dir"]
+        .as_str()
+        .expect("must carry a real out_dir even though the dispatch call itself returned Err");
+    assert!(
+        std::path::Path::new(out_dir).starts_with(&runs_dir),
+        "out_dir must live under this mission's own run dir ({}), got {out_dir}",
+        runs_dir.display()
+    );
 }
 
 // ── finding 9: watchdog timeout detection ───────────────────────────────
@@ -1863,4 +1943,361 @@ fn a_unit_with_a_resolvable_sha_dispatches_unchanged() {
         let sha = r["payload"]["sha"].as_str().expect("step start must still carry a sha");
         assert_ne!(sha, "", "a resolvable unit's step start must never carry an empty sha");
     }
+}
+
+// ── (#2114 follow-up) `--param resume=<mission-id>` planning ────────────
+//
+// Pure planning tests — no dispatch, no filesystem beyond a bare
+// `checkpoint_exists` fake. `plan_unit_resume` reads a fixture prior
+// mission's `envelope.json` `units` array (`CrawlStats::per_unit_rows`
+// shape) and decides skip / resume / fresh per unit. Every fixture row
+// below carries a `source`/`rule` matching what's passed in — the
+// MUST-FIX-3 shifted-id tests further down are the ones that deliberately
+// DON'T match.
+
+const FIXED_SOURCE: &str = "repo-a";
+fn fixed_rules() -> Vec<String> {
+    vec!["swallowed-error".to_string()]
+}
+
+#[test]
+fn plan_unit_resume_skips_a_unit_that_completed_last_time() {
+    let prior_rows = vec![json!({
+        "unit": "u-0001",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "stop",
+        "out_dir": "/tmp/darkmux-out-crawler-111",
+    })];
+    let action = plan_unit_resume("u-0001", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(action, UnitResumeAction::Skip);
+}
+
+#[test]
+fn plan_unit_resume_resumes_a_unit_that_aborted_with_a_checkpoint() {
+    let prior_rows = vec![json!({
+        "unit": "u-0002",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "timeout",
+        "out_dir": "/tmp/darkmux-out-crawler-222",
+    })];
+    let action = plan_unit_resume("u-0002", FIXED_SOURCE, &fixed_rules(), &prior_rows, |dir| {
+        dir == Path::new("/tmp/darkmux-out-crawler-222")
+    });
+    assert_eq!(action, UnitResumeAction::Resume(PathBuf::from("/tmp/darkmux-out-crawler-222")));
+}
+
+/// (#2153) An `"interrupted"` row — the label an operator-signal-cut
+/// dispatch's row now carries (see `a_unit_whose_dispatch_errors_while_
+/// interrupted_still_records_a_resumable_out_dir` in this same file) — is
+/// exactly as resumable as a `"timeout"`/`"error"` row: `plan_unit_resume`
+/// doesn't special-case the label, only whether the row's `out_dir` names
+/// a real checkpoint.
+#[test]
+fn plan_unit_resume_resumes_an_interrupted_row_with_a_checkpoint() {
+    let prior_rows = vec![json!({
+        "unit": "u-0003",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "interrupted",
+        "out_dir": "/tmp/darkmux-out-crawler-333-interrupted",
+    })];
+    let action = plan_unit_resume("u-0003", FIXED_SOURCE, &fixed_rules(), &prior_rows, |dir| {
+        dir == Path::new("/tmp/darkmux-out-crawler-333-interrupted")
+    });
+    assert_eq!(action, UnitResumeAction::Resume(PathBuf::from("/tmp/darkmux-out-crawler-333-interrupted")));
+}
+
+/// (#2153) A `"running"` row — the provisional label a unit's row carries
+/// if the whole launcher process died so hard mid-dispatch that the
+/// update-in-place at readback never ran at all (a crash harder than a
+/// caught signal, which DOES get a chance to update the row to
+/// `"interrupted"` before the process exits) — resumes the same way,
+/// per `plan_unit_resume`'s own doc: no separate branch for it, same
+/// generic out_dir/checkpoint check.
+#[test]
+fn plan_unit_resume_resumes_a_running_row_with_a_checkpoint() {
+    let prior_rows = vec![json!({
+        "unit": "u-0004",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "running",
+        "out_dir": "/tmp/darkmux-out-crawler-444-running",
+    })];
+    let action = plan_unit_resume("u-0004", FIXED_SOURCE, &fixed_rules(), &prior_rows, |dir| {
+        dir == Path::new("/tmp/darkmux-out-crawler-444-running")
+    });
+    assert_eq!(action, UnitResumeAction::Resume(PathBuf::from("/tmp/darkmux-out-crawler-444-running")));
+}
+
+/// (#2153) The `"running"` row's OTHER half: no checkpoint on disk yet
+/// (the dispatch died before the runtime ever wrote one) → `Fresh`, same
+/// as any other unresumable row.
+#[test]
+fn plan_unit_resume_reruns_fresh_when_a_running_row_has_no_checkpoint() {
+    let prior_rows = vec![json!({
+        "unit": "u-0005",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "running",
+        "out_dir": "/tmp/darkmux-out-crawler-555-running-no-ckpt",
+    })];
+    let action = plan_unit_resume("u-0005", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| false);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+#[test]
+fn plan_unit_resume_reruns_fresh_when_out_dir_recorded_but_no_checkpoint() {
+    let prior_rows = vec![json!({
+        "unit": "u-0003",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "error",
+        "out_dir": "/tmp/darkmux-out-crawler-333",
+    })];
+    // checkpoint_exists always false — killed before the first turn boundary.
+    let action = plan_unit_resume("u-0003", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| false);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+#[test]
+fn plan_unit_resume_reruns_fresh_when_unit_has_no_row_at_all() {
+    // Simulates the launcher process itself dying before `per_unit_rows.push`
+    // ever ran for this unit — no row, so nothing to look up.
+    let prior_rows = vec![json!({
+        "unit": "some-other-unit",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "stop",
+        "out_dir": "/tmp/darkmux-out-crawler-999",
+    })];
+    let action = plan_unit_resume("u-0004", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+#[test]
+fn plan_unit_resume_reruns_fresh_when_out_dir_is_absent_from_the_row() {
+    // A row can exist (the dispatch call returned) with a null out_dir
+    // (the dispatch itself errored before returning a DispatchResult).
+    let prior_rows = vec![json!({
+        "unit": "u-0005",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "error",
+        "out_dir": null,
+    })];
+    let action = plan_unit_resume("u-0005", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+/// The three-unit fixture named in the task: one completed, one
+/// aborted-with-checkpoint, one aborted-without-checkpoint — verifying the
+/// full skip / resume / fresh triage from a single prior-mission fixture in
+/// one assertion pass.
+#[test]
+fn plan_unit_resume_full_fixture_skip_resume_fresh() {
+    let prior_rows = vec![
+        json!({ "unit": "completed-1", "source": FIXED_SOURCE, "rule": fixed_rules(), "result": "stop", "out_dir": "/tmp/out-completed-1" }),
+        json!({ "unit": "aborted-with-checkpoint", "source": FIXED_SOURCE, "rule": fixed_rules(), "result": "timeout", "out_dir": "/tmp/out-aborted-ckpt" }),
+        json!({ "unit": "aborted-without-checkpoint", "source": FIXED_SOURCE, "rule": fixed_rules(), "result": "error", "out_dir": "/tmp/out-aborted-nockpt" }),
+    ];
+    let checkpoint_exists = |dir: &Path| dir == Path::new("/tmp/out-aborted-ckpt");
+
+    assert_eq!(
+        plan_unit_resume("completed-1", FIXED_SOURCE, &fixed_rules(), &prior_rows, checkpoint_exists),
+        UnitResumeAction::Skip
+    );
+    assert_eq!(
+        plan_unit_resume("aborted-with-checkpoint", FIXED_SOURCE, &fixed_rules(), &prior_rows, checkpoint_exists),
+        UnitResumeAction::Resume(PathBuf::from("/tmp/out-aborted-ckpt"))
+    );
+    assert_eq!(
+        plan_unit_resume("aborted-without-checkpoint", FIXED_SOURCE, &fixed_rules(), &prior_rows, checkpoint_exists),
+        UnitResumeAction::Fresh
+    );
+}
+
+// ── MUST FIX 3-i (merge-gate review): the positional id is not a safe
+//    join key across a re-plan — a NEW unit at an OLD unit's id must
+//    never inherit that old row's verdict.
+
+#[test]
+fn plan_unit_resume_a_shifted_id_with_a_different_source_never_skips_even_if_the_old_row_completed() {
+    // The OLD u-0007 (a different source) completed cleanly last time.
+    // The NEW plan's u-0007 is a DIFFERENT unit (different source) that
+    // happens to land at the same positional id after a re-plan. Matching
+    // on id alone would read this as "already done" and silently skip a
+    // unit that was never actually crawled — a coverage loss reported as
+    // complete.
+    let prior_rows = vec![json!({
+        "unit": "u-0007",
+        "source": "old-repo",
+        "rule": fixed_rules(),
+        "result": "stop",
+        "out_dir": "/tmp/out-old-u7",
+    })];
+    let action = plan_unit_resume("u-0007", "new-repo", &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(
+        action,
+        UnitResumeAction::Fresh,
+        "a shifted unit id with a different source must never read as Skip"
+    );
+}
+
+#[test]
+fn plan_unit_resume_a_shifted_id_with_a_different_source_never_resumes_the_old_checkpoint() {
+    // Same shift, but the OLD unit aborted with a checkpoint. Resuming it
+    // under the NEW unit's identity would label the OLD unit's findings
+    // with the NEW unit's source/rule — mislabeled data, not just a
+    // coverage gap.
+    let prior_rows = vec![json!({
+        "unit": "u-0009",
+        "source": "old-repo",
+        "rule": fixed_rules(),
+        "result": "timeout",
+        "out_dir": "/tmp/out-old-u9",
+    })];
+    let action = plan_unit_resume("u-0009", "new-repo", &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(
+        action,
+        UnitResumeAction::Fresh,
+        "a shifted unit id with a different source must never resume the old unit's checkpoint"
+    );
+}
+
+#[test]
+fn plan_unit_resume_a_shifted_id_with_a_different_rule_set_is_also_fresh() {
+    // Same source, but the rule BINDING shifted (e.g. --param rules=
+    // changed) — the row's own recorded rule set no longer matches what
+    // this plan bound this unit to.
+    let prior_rows = vec![json!({
+        "unit": "u-0011",
+        "source": FIXED_SOURCE,
+        "rule": vec!["some-other-rule".to_string()],
+        "result": "stop",
+        "out_dir": "/tmp/out-u11",
+    })];
+    let action = plan_unit_resume("u-0011", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+#[test]
+fn plan_unit_resume_rule_set_order_does_not_matter() {
+    // The row's `rule` array and this plan's `unit_rules` binding the
+    // SAME set in a different order must still match — order is an
+    // accident of JSON serialization, not a semantic difference.
+    let prior_rows = vec![json!({
+        "unit": "u-0012",
+        "source": FIXED_SOURCE,
+        "rule": vec!["rule-b".to_string(), "rule-a".to_string()],
+        "result": "stop",
+        "out_dir": "/tmp/out-u12",
+    })];
+    let action = plan_unit_resume(
+        "u-0012",
+        FIXED_SOURCE,
+        &["rule-a".to_string(), "rule-b".to_string()],
+        &prior_rows,
+        |_| true,
+    );
+    assert_eq!(action, UnitResumeAction::Skip);
+}
+
+// ── #2152 interaction (rebase, "confirm sha_unresolved rows plan as Fresh") ─
+
+#[test]
+fn plan_unit_resume_a_sha_unresolved_row_with_no_out_dir_plans_as_fresh() {
+    // #2152 added `sha_unresolved` as a per-unit result label for a unit
+    // whose source sha never resolved — that unit's dispatch never ran,
+    // so its row (if #2152's own accounting even wrote one) has no
+    // out_dir. Same bucket as any other never-dispatched unit: Fresh.
+    let prior_rows = vec![json!({
+        "unit": "u-0013",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "sha_unresolved",
+        "out_dir": null,
+    })];
+    let action = plan_unit_resume("u-0013", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+// ── MUST FIX 3-ii (merge-gate review): the whole-launch inputs fingerprint
+//    gate — refuse `--param resume=<id>` outright when this launch's own
+//    inputs (minus `resume` itself) don't bit-for-bit match the prior
+//    mission's recorded `spec.inputs_fingerprint`.
+
+#[test]
+#[serial_test::serial]
+fn resume_refuses_the_whole_launch_when_inputs_have_drifted() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    scripts.insert("u-0002".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts.clone(), &calls, |_| {});
+
+    let code = run(&params_for(&fx), None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    let mission_id = mission_id_from_records(&read_all_flow_records());
+
+    // Same workspace, but a DIFFERENT `limit` this time — a genuine input
+    // drift crawl's own re-plan/re-fetch makes meaningful (it can shift
+    // which unit lands at which positional id).
+    let mut drifted = params_for(&fx);
+    drifted.insert("limit".to_string(), Value::String("1".to_string()));
+    drifted.insert("resume".to_string(), Value::String(mission_id.clone()));
+
+    let mut dispatch2 = make_dispatch_fn(scripts, &calls, |_| {});
+    let err = run(&drifted, None, &mut dispatch2).unwrap_err();
+    assert!(
+        format!("{err:#}").contains(&mission_id),
+        "error should name the mission id being resumed: {err:#}"
+    );
+    assert!(
+        format!("{err:#}").to_lowercase().contains("fingerprint")
+            || format!("{err:#}").to_lowercase().contains("inputs"),
+        "expected an inputs/fingerprint-drift error, got: {err:#}"
+    );
+
+    // No SECOND mission was minted — the refusal happens before any Step
+    // (or even Mission) gets written.
+    let records = read_all_flow_records();
+    let mission_starts: Vec<&Value> = records.iter().filter(|r| r["action"] == "mission start").collect();
+    assert_eq!(mission_starts.len(), 1, "a refused resume must mint nothing: {records:#?}");
+}
+
+#[test]
+#[serial_test::serial]
+fn resume_with_unchanged_inputs_passes_the_fingerprint_gate() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    scripts.insert("u-0002".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts.clone(), &calls, |_| {});
+
+    let code = run(&params_for(&fx), None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    let mission_id = mission_id_from_records(&read_all_flow_records());
+
+    // Byte-identical params to the first launch, plus `resume=` naming it.
+    let mut same = params_for(&fx);
+    same.insert("resume".to_string(), Value::String(mission_id.clone()));
+
+    let mut dispatch2 = make_dispatch_fn(scripts, &calls, |_| {});
+    let code2 = run(&same, None, &mut dispatch2)
+        .expect("unchanged inputs must pass the fingerprint gate, not error");
+    assert_eq!(code2, 0);
+    // Both prior units completed "stop" last time — a MATCHING source/rule
+    // per-unit row for each, so both are skipped and 0 fresh dispatches
+    // happen on the resumed run.
+    assert_eq!(
+        calls.borrow().len(),
+        2,
+        "expected exactly the 2 calls from the FIRST run only, none new from the resume"
+    );
 }

@@ -144,6 +144,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             no_wait,
             image,
             max_completion_tokens,
+            resume_from,
         } => cmd_dispatch(DispatchInvocation {
             role,
             message,
@@ -159,6 +160,7 @@ fn run(cmd: Cmd) -> Result<i32> {
             no_wait,
             image,
             max_completion_tokens,
+            resume_from,
         }),
         Cmd::Doctor { verbose, probe } => cmd_doctor(verbose, probe),
         Cmd::Profile { sub } => cmd_profile(sub),
@@ -1334,6 +1336,7 @@ struct DispatchInvocation {
     no_wait: bool,
     image: Option<String>,
     max_completion_tokens: Option<u32>,
+    resume_from: Option<std::path::PathBuf>,
 }
 
 /// (#1426) `darkmux dispatch <role> [MESSAGE]` — the task-grain execution
@@ -1357,6 +1360,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         no_wait,
         image,
         max_completion_tokens,
+        resume_from,
     } = inv;
     // (#1426) Resolve the message in precedence order: positional MESSAGE >
     // `--message-from-file` > stdin. clap makes the positional and the file
@@ -1449,6 +1453,15 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         model_base_url_override: None,
         step_id: None, // (#1483) set on the graph-step path only
         system_prompt_override: None,
+        // (#2114 follow-up) `--resume-from <dir>` — the trigger for a
+        // checkpoint resume. `dispatch_internal::dispatch` verifies +
+        // stages the checkpoint; `None` (the default) preserves the
+        // fresh-start behavior.
+        resume_from,
+        // (#2153) No CLI surface for naming an exact out dir — a bare
+        // `dispatch` always gets a fresh tempdir. Only the crawl launcher
+        // sets this today.
+        host_out: None,
     };
     // (#1509) Route the LOCAL half of `dispatch_routed`'s routing decision
     // through the engine as a crew of one (a full Mission -> Phase ->

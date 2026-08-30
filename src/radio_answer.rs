@@ -843,6 +843,8 @@ pub fn dispatch_answerer_call_with(user_message: &str, overrides: &AnswererOverr
     let opts = crate::crew::dispatch::DispatchOpts {
         workspace_read_only: false,
         record_context: None,
+        resume_from: None,
+        host_out: None,
         role_id: "radio-host".to_string(),
         message: user_message.to_string(),
         session_id: None,

@@ -352,6 +352,13 @@ fn build_graph(opts: &DispatchOpts, mission_id: &str, session_id: &str) -> (Miss
     if let Some(max_tokens) = opts.max_completion_tokens {
         config["max_completion_tokens"] = serde_json::Value::from(max_tokens);
     }
+    // (#2114 follow-up) `--resume-from <dir>` — threaded into the step
+    // config the same way as every other optional `DispatchOpts` field
+    // here; read back by `DispatchInternalStepKind::run` in
+    // `step_kinds/builtins.rs`.
+    if let Some(resume_from) = &opts.resume_from {
+        config["resume_from"] = serde_json::Value::String(resume_from.display().to_string());
+    }
 
     let step = Step {
         id: step_id,
@@ -442,6 +449,8 @@ mod tests {
         DispatchOpts {
             workspace_read_only: false,
             record_context: None,
+            resume_from: None,
+            host_out: None,
             role_id: role.to_string(),
             message: message.to_string(),
             session_id: None,
@@ -685,6 +694,31 @@ mod tests {
         // doc — every existing mission/coder-phase/review caller never sets
         // this key; the crew-of-one graph always does.
         assert_eq!(step.config["preserve_dispatch_result"], true);
+    }
+
+    #[test]
+    fn build_graph_omits_resume_from_by_default() {
+        let opts = test_opts("coder", "hi");
+        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-1");
+        assert!(
+            step.config.get("resume_from").is_none(),
+            "no key at all, not a null, when `--resume-from` wasn't given: {:?}",
+            step.config
+        );
+    }
+
+    #[test]
+    fn build_graph_step_config_carries_resume_from() {
+        // (#2114 follow-up) The CLI's `--resume-from <dir>` must reach
+        // `DispatchInternalStepKind::run` (`step_kinds/builtins.rs`) through
+        // the step config, the same seam `max_completion_tokens` uses —
+        // `darkmux dispatch` routes through THIS crew-of-one graph, not a
+        // raw `DispatchOpts` handoff (see this fn's own doc).
+        let mut opts = test_opts("coder", "hi");
+        opts.resume_from = Some(std::path::PathBuf::from("/tmp/darkmux-out-coder-123456"));
+        let (_, _, _, step) = build_graph(&opts, "dispatch-coder-1-abc", "sess-1");
+
+        assert_eq!(step.config["resume_from"], "/tmp/darkmux-out-coder-123456");
     }
 
     #[test]

@@ -499,6 +499,8 @@ pub fn dispatch_router_call(message: &str) -> Result<String> {
     let opts = crate::crew::dispatch::DispatchOpts {
         workspace_read_only: false,
         record_context: None,
+        resume_from: None,
+        host_out: None,
         role_id: "radio-router".to_string(),
         message: message.to_string(),
         session_id: None,

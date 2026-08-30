@@ -306,6 +306,41 @@ pub struct DispatchOpts {
     /// rather than corrupting the payload shape — see
     /// `dispatch_internal::merge_record_context`'s own doc).
     pub record_context: Option<serde_json::Value>,
+    /// (#2114 follow-up) A PRIOR dispatch's host out dir (the
+    /// `/darkmux-out` mount, `$TMPDIR/darkmux-out-<role>-<unix_micros>`)
+    /// to resume from. `Some(dir)` is the trigger `resume_checkpoint`
+    /// itself never was: `dispatch_internal::dispatch` verifies
+    /// `<dir>/checkpoint.json` exists and parses before doing anything
+    /// else, COPIES it into THIS dispatch's own (fresh) host out dir —
+    /// the old dir is left untouched as evidence, this dispatch gets its
+    /// own trajectory/run record — then sets
+    /// `DockerRunConfig::resume_checkpoint = true` so `--resume` reaches
+    /// the container. `None` (every existing caller) preserves the
+    /// fresh-start behavior exactly. See `dispatch_internal`'s
+    /// `stage_resume_checkpoint` for the validate-then-copy mechanics and
+    /// the `resumed_from` provenance this stamps into the dispatch's flow
+    /// records.
+    pub resume_from: Option<PathBuf>,
+    /// (#2153) Caller-named host out dir (the `/darkmux-out` mount) to use
+    /// for THIS dispatch, instead of letting `dispatch_internal::dispatch`
+    /// mint its own fresh tempdir. `Some(dir)` is for a caller that needs
+    /// to know the out dir BEFORE the dispatch returns — the crawl
+    /// launcher is the one caller that sets this today: it mints
+    /// `<mission run dir>/units/<unit-id>/out` and records it into a
+    /// PROVISIONAL per-unit row before dispatching, so an interrupted or
+    /// hard-crashed dispatch (which returns an `Err` with no
+    /// `DispatchResult::out_dir` to read back) still leaves a resumable
+    /// `out_dir` on record — a fresh tempdir's path is otherwise only ever
+    /// learned from a SUCCESSFUL `DispatchResult`, which an interrupted
+    /// dispatch never produces. `dispatch_internal::dispatch` creates the
+    /// named dir with `create_dir` (never `create_dir_all` — a
+    /// caller-named path's parent must already exist) and `0o700`
+    /// permissions, and REFUSES with a named error if the dir already
+    /// exists rather than reusing it (closes the symlink/TOCTOU race a
+    /// pre-named, pre-existing path would otherwise open — #2158). `None`
+    /// (every existing caller) preserves the fresh-tempdir behavior
+    /// exactly.
+    pub host_out: Option<PathBuf>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime

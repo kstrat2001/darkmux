@@ -249,6 +249,8 @@ fn dispatch_compiler(input: &str, hint: Option<&str>) -> Result<String> {
     let opts = crate::crew::dispatch::DispatchOpts {
         workspace_read_only: false,
         record_context: None,
+        resume_from: None,
+        host_out: None,
         role_id: "mission-compiler".to_string(),
         message,
         session_id: None,
