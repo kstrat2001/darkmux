@@ -17,24 +17,21 @@
 //! NOT an error. A malformed file is ignored — logged once so a broken
 //! writer is visible without spamming stderr once per 2s poll.
 //!
-//! A pause is honored only while it's FRESH: `written_at_ms` older than
-//! `max_pause_ms` (default 900_000 / 15 min, override `DARKMUX_MAX_PAUSE_MS`)
-//! is treated as a stale/abandoned pace writer — see `PaceFile::is_expired`
-//! — so a killed or hung governor process can never make the container
-//! immortal (each rest increment resets the HOST'S inactivity deadline too,
-//! so an unbounded honored pause is an unbounded dodge of that watchdog).
-//!
-//! Shared contract with the thermal governor/breaker (#2110/#2109,
-//! `crates/darkmux-crew` — landing on its own branch, not yet on this
-//! one): a pace file may set `"expires": false` to mean "hold this pause
-//! until I explicitly lift it or remove the file" — the breaker writes
-//! this for a genuine `thermal-critical` stop, where an operator wants
-//! the dispatch parked indefinitely rather than falling through to a
-//! runaway request the moment `max_pause_ms` elapses. Default (field
-//! absent, or `true`) keeps the staleness ceiling above. `expires` is a
-//! property of THIS pause instruction, so it's read fresh off each poll
-//! the same as `pause`/`reason` — a governor can widen or narrow it on a
-//! later write without the runtime needing to restart.
+//! A pause is a HEARTBEAT, not a standing instruction: it is honored only
+//! while `written_at_ms` is fresher than `max_pause_ms` (default 900_000 /
+//! 15 min, override `DARKMUX_MAX_PAUSE_MS`) — see [`PaceFile::is_expired`].
+//! There is no separate "hold indefinitely" flag; a governor that wants
+//! the pause to keep holding just keeps RE-STAMPING `written_at_ms` while
+//! it wants the dispatch parked (the #2110/#2109 breaker's
+//! `thermal-critical` stop does this by re-writing the file on its own
+//! polling cadence, well inside `max_pause_ms`). A dead or hung writer
+//! stops re-stamping, the stamp ages past the ceiling, and the pause
+//! releases itself — "indefinite" is expressed as "someone keeps renewing
+//! it," never as a flag that opts out of the ceiling, so there is exactly
+//! ONE expiry rule and no way for a stuck writer to hold a dispatch
+//! forever by mistake. Each rest increment resets the HOST'S inactivity
+//! deadline too, so this ceiling is what stops an honored pause from
+//! being an unbounded dodge of that watchdog.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -57,17 +54,11 @@ pub struct PaceFile {
     /// hand-written pace file) is treated as fresh — the expiry guard only
     /// engages when a timestamp is actually present, so an operator's
     /// manual `{"pause": true}` isn't punished for omitting a field it
-    /// never knew about.
+    /// never knew about. A writer that wants the pause to keep holding
+    /// re-stamps this on each write — see the module doc's heartbeat
+    /// contract.
     #[serde(default)]
     pub written_at_ms: Option<u64>,
-    /// `false` disables the `max_pause_ms` staleness ceiling for THIS
-    /// pause — the breaker's `thermal-critical` stop sets this so the
-    /// dispatch stays parked until the file is explicitly resumed or
-    /// removed, not until a timer elapses. `None` (absent — every writer
-    /// before this contract, and the ordinary governor pause) behaves the
-    /// same as `Some(true)`: the ceiling applies.
-    #[serde(default)]
-    pub expires: Option<bool>,
 }
 
 impl PaceFile {
@@ -82,14 +73,11 @@ impl PaceFile {
     /// than `max_pause_ms` behind `now_ms`. A pace file with no timestamp
     /// never expires (see the field's own doc). Saturating on both sides
     /// so a clock skew (writer ahead of reader) can't underflow into a
-    /// false "expired". `expires: false` (the breaker's `thermal-critical`
-    /// stop) opts THIS pause out of the ceiling entirely — checked first,
-    /// so a stale-but-non-expiring pause never even evaluates the
-    /// timestamp.
+    /// false "expired". This is the ONLY expiry rule (#2114 finding N3) —
+    /// there is no per-reason override; a writer that wants to hold past
+    /// one poll interval re-stamps `written_at_ms`, it doesn't opt out of
+    /// this check.
     pub fn is_expired(&self, now_ms: u64, max_pause_ms: u64) -> bool {
-        if !self.expires.unwrap_or(true) {
-            return false;
-        }
         match self.written_at_ms {
             Some(written_at) => now_ms.saturating_sub(written_at) > max_pause_ms,
             None => false,
@@ -191,15 +179,13 @@ mod tests {
 
     #[test]
     fn reason_or_default_falls_back() {
-        let pace =
-            PaceFile { pause: true, reason: None, state: None, written_at_ms: None, expires: None };
+        let pace = PaceFile { pause: true, reason: None, state: None, written_at_ms: None };
         assert_eq!(pace.reason_or_default(), "paused");
     }
 
     #[test]
     fn no_timestamp_never_expires() {
-        let pace =
-            PaceFile { pause: true, reason: None, state: None, written_at_ms: None, expires: None };
+        let pace = PaceFile { pause: true, reason: None, state: None, written_at_ms: None };
         assert!(!pace.is_expired(1_000_000_000, 900_000));
     }
 
@@ -210,7 +196,6 @@ mod tests {
             reason: None,
             state: None,
             written_at_ms: Some(1_000_000_000),
-            expires: None,
         };
         assert!(!pace.is_expired(1_000_000_000 + 899_999, 900_000));
     }
@@ -222,7 +207,6 @@ mod tests {
             reason: None,
             state: None,
             written_at_ms: Some(1_000_000_000),
-            expires: None,
         };
         assert!(pace.is_expired(1_000_000_000 + 900_001, 900_000));
     }
@@ -236,53 +220,44 @@ mod tests {
             reason: None,
             state: None,
             written_at_ms: Some(2_000_000),
-            expires: None,
         };
         assert!(!pace.is_expired(1_000_000, 900_000));
     }
 
     #[test]
-    fn stale_stamp_with_expires_false_stays_paused() {
-        // (#2140 contract) The breaker's `thermal-critical` stop sets
-        // `expires: false` — a stale `written_at_ms` must NOT expire it.
+    fn a_fresh_re_stamp_keeps_it_paused_regardless_of_reason() {
+        // (#2114 finding N3) The heartbeat contract: there's no
+        // "hold indefinitely" flag — a governor that wants to keep the
+        // dispatch parked past one poll interval just re-writes
+        // `written_at_ms`. Simulate that: the SAME pause instruction,
+        // re-stamped just now, stays unexpired even though its ORIGINAL
+        // timestamp (not modeled here — only the latest stamp matters) may
+        // have been written long ago.
+        let pace = PaceFile {
+            pause: true,
+            reason: Some("thermal-critical".into()),
+            state: None,
+            written_at_ms: Some(5_000_000),
+        };
+        assert!(
+            !pace.is_expired(5_000_000 + 1_000, 900_000),
+            "a stamp re-written well inside max_pause_ms stays fresh, whatever the reason"
+        );
+    }
+
+    #[test]
+    fn a_stale_stamp_expires_regardless_of_reason() {
+        // Mirror of the test above: once nobody has re-stamped the file
+        // for longer than max_pause_ms, it expires — a
+        // `thermal-critical`-labeled pause gets NO special exemption, on
+        // purpose. Holding past the ceiling requires an active writer,
+        // not a reason string.
         let pace = PaceFile {
             pause: true,
             reason: Some("thermal-critical".into()),
             state: None,
             written_at_ms: Some(1_000_000_000),
-            expires: Some(false),
-        };
-        assert!(
-            !pace.is_expired(1_000_000_000 + 900_001, 900_000),
-            "expires:false holds the pause past max_pause_ms"
-        );
-    }
-
-    #[test]
-    fn stale_stamp_with_expires_true_is_expired() {
-        // Same staleness as the test above, but `expires: true` (the
-        // default-equivalent, spelled out) — the ceiling applies exactly
-        // like an absent `expires` field.
-        let pace = PaceFile {
-            pause: true,
-            reason: Some("thermal".into()),
-            state: None,
-            written_at_ms: Some(1_000_000_000),
-            expires: Some(true),
         };
         assert!(pace.is_expired(1_000_000_000 + 900_001, 900_000));
-    }
-
-    #[test]
-    fn valid_pause_file_with_expires_false_parses() {
-        let out_dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            pace_file_path(out_dir.path()),
-            r#"{"pause": true, "reason": "thermal-critical", "expires": false}"#,
-        )
-        .unwrap();
-        let mut reader = PaceReader::new();
-        let pace = reader.read(out_dir.path()).unwrap();
-        assert_eq!(pace.expires, Some(false));
     }
 }

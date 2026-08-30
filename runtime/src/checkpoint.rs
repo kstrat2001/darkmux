@@ -13,6 +13,11 @@
 //! operator's own repo tree. `--resume <path>` (or
 //! `DARKMUX_RESUME_CHECKPOINT`) reloads one of these instead of starting
 //! from the system prompt.
+//!
+//! **Resume's real guarantee:** at most ONE tool call may be re-executed
+//! on a resume — the one that was in flight at kill time (see
+//! `RunCheckpoint::pending_tool_calls`'s own doc for why). Every tool a
+//! role can call must be safe to run twice with the same arguments.
 
 use crate::lmstudio::{Message, ToolCall};
 use serde::{Deserialize, Serialize};
@@ -88,8 +93,22 @@ pub struct RunCheckpoint {
     /// result recorded before the write; this names what's left. `None`
     /// on a clean turn boundary or a #1221 hand-back boundary (neither
     /// has a tool-call batch in flight). A resume with this `Some` finishes
-    /// dispatching exactly these calls before requesting the next turn, so
-    /// a kill between tool N and tool N+1 of a turn never re-runs tool N.
+    /// dispatching exactly these calls before requesting the next turn.
+    ///
+    /// **The real guarantee (#2114 finding N2): a resume may re-execute AT
+    /// MOST ONE tool call — the one in flight at kill time.** Every
+    /// COMPLETED call's result is recorded (in `messages`) and stamped out
+    /// of `pending_tool_calls` before the next call starts, so a kill
+    /// between tool N and tool N+1 never re-runs tool N. But a kill WHILE
+    /// tool N is still executing (inside `dispatch(...)`, before its
+    /// result lands) catches it mid-flight: nothing was recorded for it
+    /// yet, so it's still the head of `pending_tool_calls` and DOES get
+    /// re-dispatched on resume. Every tool a role can call must therefore
+    /// be safe to run twice with the same arguments — this is not a new
+    /// requirement `checkpoint.rs` introduces, it's the same
+    /// idempotent-under-retry expectation the cycle/failure-rate detectors
+    /// already assume of the tool surface, just now also exercised by a
+    /// kill-and-resume instead of only by the model repeating itself.
     ///
     /// NOT covered by this pass: detector state (cycle/failure-rate/
     /// reasoning-loop windows), `checkpoints_used`/`stall_recoveries_used`,
@@ -99,6 +118,16 @@ pub struct RunCheckpoint {
     /// This is a scope cut, not an oversight; residue tracked on #2114.
     #[serde(default)]
     pub pending_tool_calls: Option<Vec<ToolCall>>,
+    /// (#2114 finding N6) The `tool_seq` the FIRST entry of
+    /// `pending_tool_calls` will get when it's dispatched — i.e. how many
+    /// of this turn's tool calls were already completed as of this write.
+    /// Without this, a resume's catch-up pass would renumber its calls
+    /// from 0, so the SAME call could show two different `tool_seq`
+    /// values across a kill-and-resume (once from the original run, once
+    /// from the catch-up) in `trajectory.jsonl`. Meaningless (left at 0)
+    /// when `pending_tool_calls` is `None`.
+    #[serde(default)]
+    pub pending_tool_calls_seq_base: u32,
     pub written_at_unix_ms: u64,
 }
 
@@ -191,6 +220,7 @@ mod tests {
             rests: 0,
             pending_hand_back: None,
             pending_tool_calls: None,
+            pending_tool_calls_seq_base: 0,
             written_at_unix_ms: unix_ms(),
         }
     }
