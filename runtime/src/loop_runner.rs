@@ -27,6 +27,7 @@ use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 
+use crate::bounds::{self, BoundKind, BoundRef};
 use crate::checkpoint;
 use crate::compaction;
 use crate::cycle_detector::{CycleDetector, CycleSignal};
@@ -867,6 +868,21 @@ impl TurnAccum {
 }
 
 
+/// (#2165) Which bound governed the request that just came back — derived
+/// from `sent_reasoning_bound`/`per_call_cap`, the two values the
+/// cap-selection block (~1803-1815) already resolves before every request.
+/// Emission sites downstream (salvage, intra-turn-stall recovery) call this
+/// instead of re-deriving the region, so the answer can never disagree with
+/// what was actually sent.
+fn active_bound(sent_reasoning_bound: bool, per_call_cap: u32) -> BoundRef {
+    let sources = bounds::bound_sources();
+    if sent_reasoning_bound {
+        BoundRef::new(BoundKind::ReasoningCheckpointInterval, per_call_cap as u64, sources.reasoning_checkpoint_interval)
+    } else {
+        BoundRef::new(BoundKind::MaxTokensPerCall, per_call_cap as u64, sources.max_tokens_per_call)
+    }
+}
+
 /// (#1221/#1123) The mechanics both non-checkpointable shapes share: drop the
 /// unusable response, spend one unit of the bounded recovery budget, record it,
 /// and nudge.
@@ -877,6 +893,7 @@ impl TurnAccum {
 /// the sixth call came back blank is precisely the bug this feature exists to
 /// end. A DEGENERATE accumulation is different: it is proven to be repeating,
 /// and handing it back guarantees more of it, so that path abandons it first.
+#[allow(clippy::too_many_arguments)]
 fn recover_intra_turn_stall(
     messages: &mut Vec<Message>,
     trajectory: &mut Trajectory,
@@ -884,6 +901,7 @@ fn recover_intra_turn_stall(
     completion_tokens: Option<u32>,
     stall_recoveries_used: &mut u32,
     nudge: &str,
+    bound: BoundRef,
 ) {
     messages.pop();
     *stall_recoveries_used = stall_recoveries_used.saturating_add(1);
@@ -892,6 +910,7 @@ fn recover_intra_turn_stall(
         completion_tokens,
         *stall_recoveries_used,
         MAX_STALL_RECOVERIES,
+        bound,
     );
     messages.push(Message::system(nudge));
 }
@@ -1285,6 +1304,17 @@ fn run_with_sleeper(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(600);
+    // (#2165) The host forwards a companion source var alongside the value
+    // above — same "value + tier" pairing every other host-forwarded knob
+    // uses. Absent (a manual `docker run` with no host wrapper) reads as
+    // built-in, matching the value default just above.
+    let inactivity_bound = BoundRef::new(
+        BoundKind::InactivityTimeout,
+        inactivity_budget_secs,
+        bounds::BoundSource::from_cli_str(
+            &std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE").unwrap_or_default(),
+        ),
+    );
     let mut last_proof_of_work = std::time::Instant::now();
     let mut inactivity_soft_warning_fired_in_window = false;
 
@@ -1614,10 +1644,10 @@ fn run_with_sleeper(
                 && elapsed_secs >= soft_threshold_secs
             {
                 eprintln!(
-                    "darkmux-runtime: ⚠ inactivity-approach — {}s of {}s budget elapsed \
-                     without a proof-of-work signal. Queueing soft warning before the \
-                     host-side hard kill.",
-                    elapsed_secs, inactivity_budget_secs
+                    "darkmux-runtime: ⚠ inactivity-approach — {}s elapsed without a \
+                     proof-of-work signal, approaching {}. Queueing soft warning before \
+                     the host-side hard kill.",
+                    elapsed_secs, inactivity_bound.describe()
                 );
                 feedback_injector
                     .queue_inactivity_approach(elapsed_secs, inactivity_budget_secs);
@@ -2213,17 +2243,23 @@ fn run_with_sleeper(
         if salvaged_per_turn_cap {
             let salvaged_count = count_well_formed_tool_calls(&assistant_message);
             let observed_tokens = this_turn_completion_tokens.unwrap_or(per_call_cap);
+            // (#2165) Which bound was actually hit — the #1221 reasoning
+            // check-in interval or `max_tokens_per_call` — so a remote
+            // reader never has to reconstruct it from memory of the design
+            // (the miss this whole feature exists to close).
+            let bound = active_bound(sent_reasoning_bound, per_call_cap);
             eprintln!(
                 "darkmux-runtime: ⚡ per-turn-cap salvage — completion_tokens=\
-                 {} hit cap {}; dispatching {} well-formed tool call(s) and \
+                 {} hit {}; dispatching {} well-formed tool call(s) and \
                  nudging the model to reduce per-call reasoning.",
-                observed_tokens, per_call_cap, salvaged_count
+                observed_tokens, bound.describe(), salvaged_count
             );
             trajectory.append_per_turn_cap_salvaged(
                 turns,
                 observed_tokens,
                 per_call_cap,
                 salvaged_count,
+                bound,
             );
             // (#1959) Only when the ANSWER budget was the thing that ran out.
             //
@@ -2451,11 +2487,13 @@ fn run_with_sleeper(
                         messages.pop();
                     }
                     stall_recoveries_used = stall_recoveries_used.saturating_add(1);
+                    let bound = active_bound(sent_reasoning_bound, per_call_cap);
                     trajectory.append_intra_turn_stall_recovered(
                         turns,
                         this_turn_completion_tokens,
                         stall_recoveries_used,
                         MAX_STALL_RECOVERIES,
+                        bound,
                     );
                     messages.push(Message::system(STALL_NUDGE_MESSAGE));
                     let kept = if useless { "Dropped the useless turn" } else { "KEPT the turn's work" };
@@ -2463,7 +2501,8 @@ fn run_with_sleeper(
                         "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} \
                          returned finish_reason=tool_calls with no tool_calls. {kept}, \
                          injected a nudge; budget \
-                         {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#1123/#1221)"
+                         {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used, hit {}. (#1123/#1221)",
+                        bound.describe()
                     );
                     continue;
                 }
@@ -3093,6 +3132,7 @@ fn run_with_sleeper(
                     // prefill is not abandoned, and the turn does not end.
                     // Probed live — a system message after a prefill does NOT
                     // break continuation, so the nudge can sit behind it.
+                    let bound = active_bound(sent_reasoning_bound, per_call_cap);
                     recover_intra_turn_stall(
                         &mut messages,
                         trajectory,
@@ -3100,13 +3140,15 @@ fn run_with_sleeper(
                         this_turn_completion_tokens,
                         &mut stall_recoveries_used,
                         STALL_NUDGE_MESSAGE,
+                        bound,
                     );
                     // Only a turn with nothing banked is a fresh start; one
                     // mid-accumulation keeps going, or the empty call would
                     // cost every checkpoint before it.
                     resuming_after_checkpoint = turn.has_prefill();
                     eprintln!(
-                        "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} hit                          the boundary with an EMPTY completion, so there is nothing to                          resume. Dropped the useless turn, injected a nudge; budget                          {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used. (#1123/#1221)"
+                        "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} hit                          the boundary with an EMPTY completion, so there is nothing to                          resume. Dropped the useless turn, injected a nudge; budget                          {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used, hit {}. (#1123/#1221)",
+                        bound.describe()
                     );
                 } else {
                     checkpoints_used = checkpoints_used.saturating_add(1);
@@ -3157,12 +3199,22 @@ fn run_with_sleeper(
                     // have cycled until context exhaustion. A conclude changes
                     // the DELIMITER, never the turn.
                     resuming_after_checkpoint = true;
+                    // (#2165) A checkpoint only ever fires on the reasoning
+                    // check-in interval — that IS what "checkpoint" means —
+                    // so this names that bound directly rather than reading
+                    // `sent_reasoning_bound`/`per_call_cap` back.
+                    let bound = BoundRef::new(
+                        BoundKind::ReasoningCheckpointInterval,
+                        reasoning_interval as u64,
+                        bounds::bound_sources().reasoning_checkpoint_interval,
+                    );
                     trajectory.append_checkpoint(
                         turns,
                         checkpoints_used,
                         this_turn_completion_tokens,
                         tail_ratio,
                         if degenerate { "conclude" } else { "continue" },
+                        bound,
                     );
                     // (#1221) The gate does exactly ONE thing: decide whether
                     // this slice is repeating. It imposes no limit of its own —
@@ -6909,6 +6961,154 @@ mod tests {
         assert!(
             salvaged_seen,
             "trajectory must record dispatch.per_turn_cap.salvaged when salvage fires"
+        );
+    }
+
+    /// (#2165) A turn ALWAYS starts in the reasoning region (`TurnAccum::
+    /// in_answer_region`'s own doc: "we cannot know whether it will think
+    /// until it answers"), so turn 1's first request — the exact scenario
+    /// `loop_salvages_tool_call_on_per_turn_cap_hit` above exercises — is
+    /// governed by the reasoning check-in interval, not `max_tokens_per_call`.
+    /// The salvage record's `bound` must name that, not a bare number a
+    /// remote reader has to reverse-engineer from memory of the design (the
+    /// miss #2165 exists to close).
+    #[test]
+    #[serial_test::serial]
+    fn salvage_record_names_the_reasoning_checkpoint_interval_bound() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("partial truncated content"),
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":50}",
+                    },
+                }])),
+                "length",
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("bound-provenance-reasoning").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(3), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("salvage must drive the loop (#479)");
+        assert!(outcome.turns >= 1);
+
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+        let salvaged: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("dispatch.per_turn_cap.salvaged"))
+            .collect();
+        assert!(!salvaged.is_empty(), "salvage record must exist");
+        let bound = &salvaged[0]["bound"];
+        assert_eq!(
+            bound["kind"], serde_json::json!("reasoning_checkpoint_interval"),
+            "turn 1's first request is governed by the reasoning check-in interval, got {bound:?}"
+        );
+        assert_eq!(bound["source"], serde_json::json!("built-in"), "no CLI source flag was set for this test");
+    }
+
+    /// (#2165) Once a checkpoint has classified the accumulation as plain
+    /// (non-reasoning) content — `TurnAccum::in_answer_region` flips true —
+    /// the SAME logical turn's next request is governed by
+    /// `max_tokens_per_call`, not the reasoning interval. A salvage on that
+    /// later request must name `max_tokens_per_call`, proving the region
+    /// switch (not just the built-in-vs-override split) reaches the record.
+    ///
+    /// Two mocks, mutually exclusive on whether the accumulating request
+    /// carries a checkpoint prefill (`"role":"assistant"` — absent on the
+    /// turn's first request, present once the checkpoint hands one back) —
+    /// the same keyed-mock trick `register_three_turn_tool_then_stop_script`
+    /// above uses.
+    #[test]
+    #[serial_test::serial]
+    fn salvage_record_names_the_max_tokens_per_call_bound_once_in_answer_region() {
+        let server = MockServer::start();
+        // Call 1 (no assistant message in history yet): plain content, no
+        // think-tags, no tool_calls, length-finish at the reasoning interval.
+        // No well-formed tool calls -> not salvaged; routes into the
+        // checkpoint arm, which absorbs it as ANSWER content (no reasoning
+        // markers) and hands back a prefill -> in_answer_region() flips true.
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"assistant\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(
+                Some("plain non-reasoning content, nothing repeats here at all"),
+                None,
+                "length",
+                100,
+                REASONING_CHECKPOINT_INTERVAL,
+            ));
+        });
+        // Call 2 (checkpoint prefill now in history): well-formed tool call
+        // at the (built-in) answer cap -> salvage fires under the ANSWER
+        // region's bound.
+        server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"assistant\"").count() >= 1
+            });
+            then.status(200).json_body(chat_response_json(
+                Some("partial truncated content"),
+                Some(serde_json::json!([{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":50}",
+                    },
+                }])),
+                "length",
+                140,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("bound-provenance-answer").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(4), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("salvage must drive the loop (#479)");
+        assert!(outcome.turns >= 1);
+
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+        let salvaged: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("dispatch.per_turn_cap.salvaged"))
+            .collect();
+        assert!(!salvaged.is_empty(), "salvage record must exist — got trajectory:\n{raw}");
+        let bound = &salvaged[0]["bound"];
+        assert_eq!(
+            bound["kind"], serde_json::json!("max_tokens_per_call"),
+            "the salvaged request followed a checkpoint that flipped the turn into the \
+             answer region, so the bound must name max_tokens_per_call, got {bound:?}"
         );
     }
 

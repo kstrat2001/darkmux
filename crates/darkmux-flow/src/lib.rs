@@ -2660,7 +2660,11 @@ mod tests {
         //           min_cpu_speed_limit_pct}`) and `energy_mwh`, from the
         //           in-process host probe. Additive; every 1.27.0 field is
         //           byte-identical. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.28.0");
+        //   1.29.0 (#2165): `dispatch start`'s payload (and the finished
+        //           envelope) gain `bounds` — the resolved runtime knobs
+        //           WITH provenance (`{value, source}` per knob). Additive;
+        //           same free-form `payload` blob. See schema.rs.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.29.0");
     }
 
     #[test]

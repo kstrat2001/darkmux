@@ -877,6 +877,95 @@
         assert_eq!(effective_turn_delay_ms(0, false), 0);
     }
 
+    // ─── #2165: resolved_runtime_bounds_json — the SAME block shared by
+    //     dispatch_start_payload["bounds"] and the envelope's own `bounds` ───
+    //
+    // (#811 test-isolation) darkmux-crew's dev-dependency on
+    // `darkmux-types/test-support` makes `config_access::config()` ALWAYS
+    // return the empty default in this crate's own test builds (see that
+    // feature's own doc) — so the CONFIG tier is structurally unreachable
+    // from here. The two tiers actually exercisable at this layer are ENV
+    // and BUILT-IN; the CONFIG tier's precedence is pinned instead by
+    // `darkmux-types::config_access`'s own `pick_parsed_with_source` /
+    // `*_with_source` tests, which construct it directly.
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_names_built_in_when_nothing_is_set() {
+        for k in [
+            "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL",
+            "DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL",
+            "DARKMUX_INACTIVITY_TIMEOUT_SECONDS",
+            "DARKMUX_RUNTIME_MAX_TURNS",
+            "DARKMUX_RUNTIME_MAX_TOKENS",
+            "DARKMUX_TURN_DELAY_MS",
+            "DARKMUX_FEEDBACK_INJECTION",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+        let bounds = resolved_runtime_bounds_json(0);
+        assert_eq!(
+            bounds["max_tokens_per_call"],
+            serde_json::json!({"value": null, "source": "built-in"}),
+            "an unset optional knob names built-in with a null value, not an absent field: {bounds}"
+        );
+        assert_eq!(
+            bounds["reasoning_checkpoint_interval_tokens"],
+            serde_json::json!({"value": null, "source": "built-in"})
+        );
+        assert_eq!(
+            bounds["inactivity_timeout_seconds"],
+            serde_json::json!({"value": 600, "source": "built-in"})
+        );
+        assert_eq!(bounds["max_turns"], serde_json::json!({"value": null, "source": "built-in"}));
+        assert_eq!(bounds["max_tokens"], serde_json::json!({"value": null, "source": "built-in"}));
+        assert_eq!(bounds["feedback_injection"], serde_json::json!({"value": true, "source": "built-in"}));
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_names_env_when_an_env_var_wins() {
+        for k in [
+            "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL",
+            "DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL",
+            "DARKMUX_INACTIVITY_TIMEOUT_SECONDS",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "4000") };
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", "500") };
+        unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "120") };
+        let bounds = resolved_runtime_bounds_json(0);
+        assert_eq!(bounds["max_tokens_per_call"], serde_json::json!({"value": 4000, "source": "env"}));
+        assert_eq!(
+            bounds["reasoning_checkpoint_interval_tokens"],
+            serde_json::json!({"value": 500, "source": "env"})
+        );
+        assert_eq!(
+            bounds["inactivity_timeout_seconds"],
+            serde_json::json!({"value": 120, "source": "env"})
+        );
+        for k in [
+            "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL",
+            "DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL",
+            "DARKMUX_INACTIVITY_TIMEOUT_SECONDS",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_turn_delay_ms_reflects_the_passed_in_effective_value() {
+        // The caller passes the AGENTIC-REMOTE-forced effective value (see
+        // this fn's own doc), not the raw configured one — pinning that the
+        // block never independently re-derives (and could disagree on) the
+        // override `dispatch_start_payload["turn_delay_ms"]` already applies.
+        let bounds = resolved_runtime_bounds_json(0);
+        assert_eq!(bounds["turn_delay_ms"]["value"], serde_json::json!(0));
+        let bounds = resolved_runtime_bounds_json(3000);
+        assert_eq!(bounds["turn_delay_ms"]["value"], serde_json::json!(3000));
+    }
+
     #[test]
     #[serial]
     fn config_path_reaches_dispatch_resolvers_not_just_env() {
@@ -1450,6 +1539,7 @@
             // complete-vector assertion below pins the forwarded
             // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` pair too.
             inactivity_timeout_seconds: 900,
+            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::Config,
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -1529,67 +1619,75 @@
         assert_eq!(argv[25], "-e");
         assert_eq!(argv[26], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900");
 
+        // 5e. (#2165) Verify the inactivity-timeout SOURCE env var is
+        // forwarded alongside the value — a distinct, non-default source
+        // (`Config`, not the built-in default) so this assertion actually
+        // pins forwarding rather than coincidentally matching a default.
+        assert_eq!(argv[27], "-e");
+        assert_eq!(argv[28], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=config");
+
         // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[27], "-v");
+        assert_eq!(argv[29], "-v");
         assert_eq!(
-            argv[28],
+            argv[30],
             "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
         );
-        assert_eq!(argv[29], "--entrypoint");
-        assert_eq!(argv[30], "/darkmux-runtime");
+        assert_eq!(argv[31], "--entrypoint");
+        assert_eq!(argv[32], "/darkmux-runtime");
 
         // 7. Verify `--` + image + runtime CLI args
-        assert_eq!(argv[31], "--");
-        assert_eq!(argv[32], "rust:slim"); // image
-        assert_eq!(argv[33], "run"); // runtime subcommand
-        assert_eq!(argv[34], "--model");
-        assert_eq!(argv[35], "llama3-8b");
-        assert_eq!(argv[36], "--system");
-        assert_eq!(argv[37], "You are a coding assistant.");
+        assert_eq!(argv[33], "--");
+        assert_eq!(argv[34], "rust:slim"); // image
+        assert_eq!(argv[35], "run"); // runtime subcommand
+        assert_eq!(argv[36], "--model");
+        assert_eq!(argv[37], "llama3-8b");
+        assert_eq!(argv[38], "--system");
+        assert_eq!(argv[39], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[38], "--prompt-file");
-        assert_eq!(argv[39], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[40], "--prompt-file");
+        assert_eq!(argv[41], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[40], "--json");
+        assert_eq!(argv[42], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[41], "--allowed-tools");
-        assert_eq!(argv[42], "exec,edit");
+        assert_eq!(argv[43], "--allowed-tools");
+        assert_eq!(argv[44], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[43], "--compact-threshold-tokens");
-        assert_eq!(argv[44], "4096");
-        assert_eq!(argv[45], "--compactor-model");
-        assert_eq!(argv[46], "util-model");
-        assert_eq!(argv[47], "--compact-threshold-ratio");
-        assert_eq!(argv[48], "0.75");
-        assert_eq!(argv[49], "--context-window");
-        assert_eq!(argv[50], "32000");
-        assert_eq!(argv[51], "--compact-strategy");
-        assert_eq!(argv[52], "structured-slot");
-        assert_eq!(argv[53], "--bail-after-compactions");
-        assert_eq!(argv[54], "10");
-        assert_eq!(argv[55], "--compactor-custom-instructions");
-        assert_eq!(argv[56], "Be terse.");
+        assert_eq!(argv[45], "--compact-threshold-tokens");
+        assert_eq!(argv[46], "4096");
+        assert_eq!(argv[47], "--compactor-model");
+        assert_eq!(argv[48], "util-model");
+        assert_eq!(argv[49], "--compact-threshold-ratio");
+        assert_eq!(argv[50], "0.75");
+        assert_eq!(argv[51], "--context-window");
+        assert_eq!(argv[52], "32000");
+        assert_eq!(argv[53], "--compact-strategy");
+        assert_eq!(argv[54], "structured-slot");
+        assert_eq!(argv[55], "--bail-after-compactions");
+        assert_eq!(argv[56], "10");
+        assert_eq!(argv[57], "--compactor-custom-instructions");
+        assert_eq!(argv[58], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[57], "--feedback-templates-json");
+        assert_eq!(argv[59], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[58].contains("error"));
-        assert!(argv[58].contains("An error occurred"));
+        assert!(argv[60].contains("error"));
+        assert!(argv[60].contains("An error occurred"));
 
-        // Total arg count: 59 (0..=58) — 53 pre-#1548, +2 for
+        // Total arg count: 61 (0..=60) — 53 pre-#1548, +2 for
         // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
         // `-e DARKMUX_TURN_DELAY_MS=<ms>` (#2094), +2 for
-        // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` (#2094 finding 1).
-        assert_eq!(argv.len(), 59);
+        // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` (#2094 finding 1), +2 for
+        // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=<tier>` (#2165).
+        assert_eq!(argv.len(), 61);
     }
 
     #[test]
@@ -1632,6 +1730,7 @@
             feedback_injection: false,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -1746,6 +1845,7 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -1797,6 +1897,7 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -2125,6 +2226,7 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -5510,6 +5612,7 @@ fn a_detection_reaches_the_envelope() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["detections"][0], det, "the firing must reach the caller: {out}");
@@ -5527,6 +5630,7 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v["detections"].is_array(), "must be present: {out}");
@@ -5554,6 +5658,7 @@ fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
 }
@@ -5635,6 +5740,7 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v.get("checkpoints").is_none(), "no boundary hit, no block: {out}");
@@ -5656,6 +5762,7 @@ fn enrichment_does_not_duplicate_the_runtime_metrics_block() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
@@ -5675,6 +5782,7 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
                 &super::HostStats::default(),
                 &no_extras(),
                 no_findings_dir(),
+                serde_json::json!({}),
             ),
             raw,
             "the non-json path must pass through verbatim: {raw:?}"
@@ -5787,6 +5895,7 @@ fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
         &stats,
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["cpu"]["peak_pct"], 95);
@@ -5839,6 +5948,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &stats,
         &extras,
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["power"]["cpu"]["peak_mw"], 3000);
@@ -5860,6 +5970,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &stats,
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let w: serde_json::Value = serde_json::from_str(&without).unwrap();
     for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms", "peak_cpu_pct", "peak_mem_pct"] {
@@ -5878,6 +5989,7 @@ fn a_host_without_power_or_thermal_sources_omits_those_blocks() {
         &super::reduce_host_stats(&worked_samples()),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v["host"]["cpu"]["peak_pct"].is_number(), "the #2107 block still lands");
@@ -5899,6 +6011,7 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(
@@ -5951,6 +6064,7 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
         &super::HostStats::default(),
         &no_extras(),
         td.path(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["findings"]["count"], 3, "the caller's next action turns on this: {out}");
@@ -5971,6 +6085,7 @@ fn a_trailing_newline_is_not_a_finding() {
         &super::HostStats::default(),
         &no_extras(),
         td.path(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["findings"]["count"], 1, "records, not lines: {out}");
@@ -5989,6 +6104,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(

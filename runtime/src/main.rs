@@ -34,6 +34,7 @@ mod checkpoint;
 mod loop_runner;
 mod pace;
 mod plain_text_tool_calls;
+mod bounds;
 mod budget_request;
 mod reasoning_loop;
 mod tool_result_prune;
@@ -236,6 +237,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // (`loop_runner::MAX_TOKENS_PER_CALL` = 10000).
     let mut max_tokens_per_call: Option<u32> = None;
     let mut reasoning_checkpoint_interval: Option<u32> = None;
+    // (#2165) Provenance for the two knobs above — which of
+    // `env(DARKMUX_RUNTIME_*)` / `config.json` / built-in resolved the
+    // value the host just forwarded. The host computes this via
+    // `darkmux_types::config_access`'s `_with_source` accessors (this crate
+    // can't depend on `darkmux-types` — see `runtime/Cargo.toml`'s doc) and
+    // passes it as a companion `--<flag>-source` flag. Unrecognized/absent
+    // falls to "built-in" via `BoundSource::from_cli_str`.
+    let mut max_tokens_per_call_source: Option<String> = None;
+    let mut reasoning_checkpoint_interval_source: Option<String> = None;
 
     // (#457 Step 2) Per-role feedback-template overrides. Dispatcher
     // serializes Role.feedback_templates to JSON; runtime parses into
@@ -514,6 +524,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     std::process::exit(2);
                 }
             }
+            "--reasoning-checkpoint-interval-source" => {
+                if let Some(v) = args.get(i + 1) {
+                    reasoning_checkpoint_interval_source = Some(v.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--reasoning-checkpoint-interval-source requires a value");
+                    std::process::exit(2);
+                }
+            }
             "--max-tokens-per-call" => {
                 if let Some(v) = args.get(i + 1) {
                     match v.parse::<u32>() {
@@ -530,6 +549,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     }
                 } else {
                     eprintln!("--max-tokens-per-call requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+            "--max-tokens-per-call-source" => {
+                if let Some(v) = args.get(i + 1) {
+                    max_tokens_per_call_source = Some(v.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--max-tokens-per-call-source requires a value");
                     return ExitCode::from(2);
                 }
             }
@@ -771,6 +799,17 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             "type": "json_schema",
             "json_schema": { "name": "role_output", "strict": true, "schema": schema }
         })
+    });
+    // (#2165) Stamp the resolved bound provenance ONCE, before the loop
+    // starts — every emission site downstream reads it back via
+    // `bounds::bound_sources()` rather than re-deriving it.
+    bounds::set_bound_sources(bounds::BoundSources {
+        reasoning_checkpoint_interval: bounds::BoundSource::from_cli_str(
+            reasoning_checkpoint_interval_source.as_deref().unwrap_or(""),
+        ),
+        max_tokens_per_call: bounds::BoundSource::from_cli_str(
+            max_tokens_per_call_source.as_deref().unwrap_or(""),
+        ),
     });
     let run_result = loop_runner::run_resumable(
         &client,

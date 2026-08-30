@@ -302,6 +302,10 @@ impl Trajectory {
     ///
     /// This record says what the HARNESS did, which is a different fact from
     /// what the model did, and belongs in a different event.
+    /// (#2165) `bound` names WHICH bound this checkpoint continuation
+    /// judged against + its provenance — a checkpoint only ever fires on
+    /// the reasoning check-in interval, so callers pass
+    /// `BoundKind::ReasoningCheckpointInterval`.
     pub fn append_checkpoint(
         &mut self,
         seq: u32,
@@ -309,6 +313,7 @@ impl Trajectory {
         slice_tokens: Option<u32>,
         tail_ratio: Option<f32>,
         verdict: &str,
+        bound: crate::bounds::BoundRef,
     ) {
         let slice = slice_tokens
             .map(serde_json::Value::from)
@@ -327,15 +332,20 @@ impl Trajectory {
             "slice_tokens": slice,
             "tail_ratio": ratio,
             "verdict": verdict,
+            "bound": bound,
         }));
     }
 
+    /// (#2165) `bound` names WHICH bound governed the request that stalled
+    /// (the reasoning check-in interval or the per-call cap, whichever
+    /// region was in force) + its provenance.
     pub fn append_intra_turn_stall_recovered(
         &mut self,
         seq: u32,
         completion_tokens: Option<u32>,
         recoveries_used: u32,
         recoveries_budget: u32,
+        bound: crate::bounds::BoundRef,
     ) {
         // The event's analytic purpose is to discriminate per-call-cap
         // stalls (completion_tokens ≈ MAX_TOKENS_PER_CALL) from
@@ -353,6 +363,7 @@ impl Trajectory {
             "completion_tokens": completion_tokens_value,
             "recoveries_used": recoveries_used,
             "recoveries_budget": recoveries_budget,
+            "bound": bound,
         }));
     }
 
@@ -419,12 +430,18 @@ impl Trajectory {
     /// discarded; the tool call is dispatched as if `finish_reason`
     /// had been `tool_calls`. Companion to the feedback nudge so the
     /// model knows what happened. (#479)
+    /// (#2165) `bound` names WHICH bound the cap that got salvaged was —
+    /// the reasoning check-in interval or `max_tokens_per_call`, whichever
+    /// region the salvaged turn was writing in — + its provenance. `cap`
+    /// stays the numeric value already carried above; `bound.value` mirrors
+    /// it so a consumer reading only `bound` still has the number.
     pub fn append_per_turn_cap_salvaged(
         &mut self,
         seq: u32,
         completion_tokens: u32,
         cap: u32,
         salvaged_tool_calls: usize,
+        bound: crate::bounds::BoundRef,
     ) {
         self.write_event(&serde_json::json!({
             "type": "dispatch.per_turn_cap.salvaged",
@@ -433,6 +450,7 @@ impl Trajectory {
             "completion_tokens": completion_tokens,
             "cap": cap,
             "salvaged_tool_calls": salvaged_tool_calls,
+            "bound": bound,
         }));
     }
 
