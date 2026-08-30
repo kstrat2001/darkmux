@@ -5715,7 +5715,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
-            http: Some("http://100.101.102.103:8790/events".to_string()),
+            http: Some("http://100.64.1.2:8790/events".to_string()),
             signing_secret_keychain_item: None,
             extras: Default::default(),
         }];
@@ -5734,7 +5734,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let rules = vec![HookRule {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
-            http: Some("http://100.101.102.103:8790/events".to_string()),
+            http: Some("http://100.64.1.2:8790/events".to_string()),
             signing_secret_keychain_item: Some("darkmux-hook-0".to_string()),
             extras: Default::default(),
         }];
