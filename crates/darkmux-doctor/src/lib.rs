@@ -1918,6 +1918,26 @@ fn check_thermal_governor() -> Check {
         };
     }
 
+    // (N2, final re-check) An explicit `0` doesn't achieve "disable"
+    // semantics — it's silently coerced to `1` by
+    // `thermal_speed_limit_hold_samples`'s own `.max(1)` floor (a naive
+    // `streak >= 0` would trip on EVERY sample instead, the opposite of
+    // disable). Warn so the operator knows their `0` didn't do what it
+    // looked like it would.
+    let speed_limit_hold_samples_raw =
+        darkmux_types::config_access::thermal_speed_limit_hold_samples_raw();
+    if speed_limit_hold_samples_raw == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: "runtime.thermal.speed_limit_hold_samples is 0 — coerced to 1 (trips on the                        first low sample). There is no way to disable this signal via 0; disable                        the thermal governor overall (runtime.thermal.enabled) if that's the intent."
+                .to_string(),
+            hint: Some(
+                "darkmux config set runtime.thermal.speed_limit_hold_samples 1".to_string(),
+            ),
+        };
+    }
+
     Check {
         name: name.into(),
         status: Status::Pass,
@@ -5976,6 +5996,29 @@ mod tests {
             match prev {
                 Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
                 None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn thermal_governor_warns_on_zero_speed_limit_hold_samples() {
+        // (N2, final re-check) An explicit 0 is silently coerced to 1 by
+        // the accessor (see thermal_speed_limit_hold_samples's own doc) —
+        // this must surface as a Warn so the operator knows their 0
+        // didn't achieve "disable" semantics.
+        let prev = std::env::var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "0") };
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("speed_limit_hold_samples"), "{}", check.message);
+        assert!(check.message.contains("coerced to 1"), "{}", check.message);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES"),
             }
         }
     }

@@ -25,8 +25,9 @@
 //! crawl mission — drop the crawl's `STOP` file so no further unit gets
 //! dispatched. **Never kills the container.** The in-flight unit pauses at
 //! its next turn boundary with its checkpoint persisted (#2114); resume is
-//! the operator's call (`darkmux dispatch --resume`). Once tripped, the
-//! governor goes terminal for DECISIONS — it does not un-pause itself on
+//! the operator's call once #2114's `--resume` CLI flag ships (not wired
+//! yet — see `dispatch_internal.rs`'s `resume_checkpoint` doc). Once
+//! tripped, the governor goes terminal for DECISIONS — it does not un-pause itself on
 //! recovery — but it does NOT go silent: see the heartbeat contract below.
 //!
 //! **Pace file location (operator correction during #2110/#2109 review):**
@@ -60,7 +61,7 @@ use crate::host_probe::thermal::THERMAL_STATES;
 use crate::host_probe::ThermalSample;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Severity rank of a thermal state name. An unrecognized name (a future
 /// macOS state this build doesn't know) ranks WORSE than `critical` —
@@ -268,8 +269,8 @@ enum State {
     Idle,
     Paused,
     /// Terminal for DECISIONS: the breaker tripped and the governor never
-    /// un-pauses itself on recovery — resume is out-of-band (the
-    /// operator's `darkmux dispatch --resume`). NOT terminal for the
+    /// un-pauses itself on recovery — resume is out-of-band, the
+    /// operator's call once #2114's `--resume` CLI flag ships. NOT terminal for the
     /// pace file's freshness: see the module doc's heartbeat contract —
     /// `on_sample` keeps re-stamping while `Broken`, just as while `Paused`.
     Broken,
@@ -301,8 +302,23 @@ pub struct ThermalGovernor {
     /// a full interval later, not immediately.
     ms_since_stamp: u64,
     /// (finding 7) Consecutive samples with `cpu_speed_limit_pct` below
-    /// the floor — reset to 0 the moment a sample reads at/above it.
+    /// the floor — reset to 0 the moment a sample reads at/above it, OR a
+    /// `None` reading arrives (N4 of the #2110/#2109 review: a missing
+    /// reading is not evidence the CPU is throttled, so it must not
+    /// preserve or extend a streak, matching `resume_hold_accum_ms`'s own
+    /// None-arm reset).
     speed_limit_low_streak: u32,
+    /// (N1 of the #2110/#2109 review) Wall-clock anchors for the LAST
+    /// actual pace-file write — an independent backstop against
+    /// `ms_since_stamp`'s tick-accounted math, which trusts the CALLER's
+    /// `elapsed_ms` argument. `Instant` catches a long BLOCKING tick
+    /// (e.g. `lms ps` stalling up to 30s inside one sampler iteration);
+    /// `SystemTime` catches a host SLEEP/WAKE wall-clock jump `Instant`
+    /// might not reflect. Set on construction (no write has happened yet,
+    /// so nothing is stale) and refreshed by `mark_stamped` alongside
+    /// every `ms_since_stamp` reset.
+    last_stamp_instant: Instant,
+    last_stamp_wall: SystemTime,
 }
 
 impl ThermalGovernor {
@@ -315,7 +331,36 @@ impl ThermalGovernor {
             last_known_state: String::new(),
             ms_since_stamp: 0,
             speed_limit_low_streak: 0,
+            last_stamp_instant: Instant::now(),
+            last_stamp_wall: SystemTime::now(),
         }
+    }
+
+    /// (N1) True once REAL time since the last pace-file write has
+    /// reached the heartbeat interval, independent of whatever
+    /// `elapsed_ms` the caller reported this tick. Takes the LARGER of
+    /// the `Instant`-based and `SystemTime`-based ages so either kind of
+    /// gap (a long blocking tick, or a wall-clock jump across a host
+    /// sleep) is caught — a clock that goes BACKWARD on either side reads
+    /// as 0 elapsed (not evidence of staleness, not underflowed into a
+    /// huge one).
+    fn real_age_past_interval(&self) -> bool {
+        let interval = self.restamp_interval_ms();
+        let by_instant = Instant::now().duration_since(self.last_stamp_instant).as_millis() as u64;
+        let by_wall = SystemTime::now()
+            .duration_since(self.last_stamp_wall)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        by_instant.max(by_wall) >= interval
+    }
+
+    /// Every site that just wrote a fresh pace file calls this instead of
+    /// hand-resetting `ms_since_stamp` — keeps the tick-accounted counter
+    /// and the two real-clock anchors (N1) from ever drifting apart.
+    fn mark_stamped(&mut self) {
+        self.ms_since_stamp = 0;
+        self.last_stamp_instant = Instant::now();
+        self.last_stamp_wall = SystemTime::now();
     }
 
     /// The heartbeat cadence: re-stamp at least this often while holding a
@@ -359,8 +404,8 @@ impl ThermalGovernor {
             // cf1b1993: no `expires` opt-out) would silently resume the
             // unit on a still-critical machine.
             self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
-            if self.ms_since_stamp >= self.restamp_interval_ms() {
-                self.ms_since_stamp = 0;
+            if self.ms_since_stamp >= self.restamp_interval_ms() || self.real_age_past_interval() {
+                self.mark_stamped();
                 write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
             }
             return None;
@@ -381,13 +426,20 @@ impl ThermalGovernor {
                 t
             }
             None => {
+                // (N4 of the #2110/#2109 review) A missing reading is not
+                // evidence the CPU is throttled — reset the consecutive
+                // low-sample streak unconditionally (Idle included, so a
+                // stale streak never survives into a later real reading),
+                // matching how the None arm already resets
+                // `resume_hold_accum_ms` rather than freezing or extending it.
+                self.speed_limit_low_streak = 0;
                 if self.state == State::Paused {
                     self.pause_episode_ms = self.pause_episode_ms.saturating_add(elapsed_ms);
                     self.resume_hold_accum_ms = 0;
                     self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
                     if self.pause_episode_ms >= self.config.max_pause_ms {
                         self.state = State::Broken;
-                        self.ms_since_stamp = 0;
+                        self.mark_stamped();
                         write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
                         if let Some(stop) = stop_file {
                             write_stop_file(stop);
@@ -396,8 +448,8 @@ impl ThermalGovernor {
                             state: self.last_known_state.clone(),
                         });
                     }
-                    if self.ms_since_stamp >= self.restamp_interval_ms() {
-                        self.ms_since_stamp = 0;
+                    if self.ms_since_stamp >= self.restamp_interval_ms() || self.real_age_past_interval() {
+                        self.mark_stamped();
                         write_pace_file(host_out, true, "thermal", &self.last_known_state);
                     }
                 }
@@ -416,11 +468,11 @@ impl ThermalGovernor {
             self.speed_limit_low_streak = 0;
         }
         let is_breaker_condition = sev >= severity("critical")
-            || self.speed_limit_low_streak >= self.config.speed_limit_hold_samples;
+            || self.speed_limit_low_streak >= self.config.speed_limit_hold_samples.max(1);
 
         if is_breaker_condition {
             self.state = State::Broken;
-            self.ms_since_stamp = 0;
+            self.mark_stamped();
             write_pace_file(host_out, true, "thermal-critical", &thermal.state);
             if let Some(stop) = stop_file {
                 write_stop_file(stop);
@@ -434,7 +486,7 @@ impl ThermalGovernor {
                     self.state = State::Paused;
                     self.pause_episode_ms = 0;
                     self.resume_hold_accum_ms = 0;
-                    self.ms_since_stamp = 0;
+                    self.mark_stamped();
                     write_pace_file(host_out, true, "thermal", &thermal.state);
                     Some(ThermalEvent::Paused { state: thermal.state.clone() })
                 } else {
@@ -463,13 +515,13 @@ impl ThermalGovernor {
                     self.state = State::Idle;
                     self.pause_episode_ms = 0;
                     self.resume_hold_accum_ms = 0;
-                    self.ms_since_stamp = 0;
+                    self.mark_stamped();
                     write_pace_file(host_out, false, "thermal", &thermal.state);
                     return Some(ThermalEvent::Resumed { state: thermal.state.clone() });
                 }
                 if self.pause_episode_ms >= self.config.max_pause_ms {
                     self.state = State::Broken;
-                    self.ms_since_stamp = 0;
+                    self.mark_stamped();
                     write_pace_file(host_out, true, "thermal-critical", &thermal.state);
                     if let Some(stop) = stop_file {
                         write_stop_file(stop);
@@ -479,8 +531,8 @@ impl ThermalGovernor {
                 // (finding 2, redesigned) Still paused, no transition this
                 // tick — heartbeat: re-stamp once the interval elapses so
                 // written_at_ms never goes stale mid-episode.
-                if self.ms_since_stamp >= self.restamp_interval_ms() {
-                    self.ms_since_stamp = 0;
+                if self.ms_since_stamp >= self.restamp_interval_ms() || self.real_age_past_interval() {
+                    self.mark_stamped();
                     write_pace_file(host_out, true, "thermal", &thermal.state);
                 }
                 None
@@ -689,6 +741,67 @@ mod tests {
     }
 
     #[test]
+    fn zero_speed_limit_hold_samples_does_not_trip_on_the_first_sample() {
+        // (N2, final re-check) speed_limit_hold_samples=0 must NOT mean
+        // "trip on every sample regardless of reading" — with a naive
+        // `streak >= hold_samples` comparison, 0 >= 0 is trivially true
+        // even before any low sample is ever seen, tripping the breaker
+        // unconditionally forever. Clamped to `.max(1)` at point of use:
+        // a configured 0 behaves like 1 (trips on the first REAL low
+        // sample), never on a sample that isn't low at all.
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut cfg = cfg();
+        cfg.speed_limit_hold_samples = 0;
+        let mut gov = ThermalGovernor::new(cfg);
+
+        // Nominal state, CPU NOT throttled — must not trip even with
+        // hold_samples=0, proving 0 doesn't mean "always breaker."
+        let ev = gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, None, "a non-low reading must never trip the breaker, even with hold_samples=0");
+        assert!(!stop.exists());
+
+        // A genuinely low reading DOES trip on the first sample (0 clamped to 1).
+        let ev = gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, Some(ThermalEvent::Breaker { state: "nominal".to_string() }));
+        assert!(stop.exists());
+    }
+
+    // ── N4 (final re-check): a None speed-limit reading resets the streak ──
+
+    #[test]
+    fn none_reading_resets_the_speed_limit_streak() {
+        // (N4) A missing OS reading is not evidence the CPU is throttled
+        // — it must reset the consecutive low-sample streak, matching how
+        // a None reading already resets resume_hold_accum_ms rather than
+        // freezing or (worse) silently preserving progress toward a trip.
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov = ThermalGovernor::new(cfg()); // speed_limit_hold_samples: 3
+
+        // Two low samples...
+        gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        // ...then a MISSING reading — must reset the streak, not just
+        // leave it frozen at 2 (which would let a single low sample right
+        // after the gap complete a 3-in-a-row that was never actually
+        // consecutive).
+        assert_eq!(gov.on_sample(None, 2000, dir.path(), Some(&stop)), None);
+
+        // Only ONE more low sample after the reset — must NOT trip,
+        // because the streak restarted at the None tick.
+        let ev = gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, None, "streak restarted after the None tick — only 1 consecutive low sample here");
+        assert!(!stop.exists());
+
+        // Two more low samples complete a genuine 3-in-a-row post-reset.
+        gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        let ev = gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, Some(ThermalEvent::Breaker { state: "nominal".to_string() }));
+        assert!(stop.exists());
+    }
+
+    #[test]
     fn critical_state_still_trips_immediately_ignoring_the_speed_limit_hold() {
         // The consecutive-sample requirement is scoped to the speed-limit
         // signal only — `critical` is a discrete OS-reported state and
@@ -773,6 +886,60 @@ mod tests {
             "written_at_ms must advance while Broken, not freeze at the trip-time write — a \
              silent writer would let the runtime's heartbeat ceiling expire the stop and resume \
              a still-critical machine"
+        );
+    }
+
+    // ── N1 (final re-check): real age, not accounted ticks ──
+
+    #[test]
+    fn a_single_large_elapsed_ms_tick_re_stamps_within_one_call() {
+        // (N1) dispatch_internal.rs now feeds the REAL elapsed time since
+        // the last sample, not a hardcoded constant — a slow tick (e.g.
+        // `lms ps` blocking up to 30s) reports that real gap as ONE big
+        // `elapsed_ms` value on its next call. The existing tick-accounted
+        // math must cross the restamp interval from that single value
+        // alone, not require several small ticks to accumulate past it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.max_pause_ms = 100_000; // restamp_interval_ms = 25_000
+        let mut gov = ThermalGovernor::new(cfg);
+
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        let first_stamp = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // ONE tick reporting a real 40s gap — must cross the 25s interval
+        // and re-stamp immediately, within this single call.
+        gov.on_sample(Some(&sample("serious", 100)), 40_000, dir.path(), None);
+        let restamped = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+        assert!(restamped > first_stamp, "a single large elapsed_ms tick must re-stamp within one call");
+    }
+
+    #[test]
+    fn real_wall_clock_gap_re_stamps_even_if_caller_under_reports_elapsed_ms() {
+        // (N1 backstop) The governor's OWN Instant/SystemTime-tracked age
+        // since the last write is independent ground truth — even if the
+        // `elapsed_ms` ARGUMENT stays tiny (simulating a caller regression
+        // that stops measuring real time correctly, or any future caller
+        // that doesn't feed real elapsed at all), a genuine wall-clock gap
+        // past the heartbeat interval still forces a re-stamp.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.max_pause_ms = 20; // restamp_interval_ms = (20/4).max(1) = 5
+        let mut gov = ThermalGovernor::new(cfg);
+
+        gov.on_sample(Some(&sample("serious", 100)), 1, dir.path(), None);
+        let first_stamp = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+
+        // Real sleep far past the 5ms interval, but the elapsed_ms
+        // ARGUMENT stays tiny — tick-accounted math alone (ms_since_stamp
+        // += 1) would never cross 5 on this argument.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        gov.on_sample(Some(&sample("serious", 100)), 1, dir.path(), None);
+        let restamped = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+        assert!(
+            restamped > first_stamp,
+            "real wall-clock age must force a re-stamp even when elapsed_ms under-reports it"
         );
     }
 

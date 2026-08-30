@@ -732,7 +732,24 @@ pub fn thermal_min_cpu_speed_limit_pct() -> u64 {
 /// mode than a few extra seconds of detection latency. Does NOT apply to
 /// the `critical` thermal-state check, which is a discrete OS-reported
 /// state and trips immediately as before. Default `3`.
+///
+/// (N2, final re-check) Clamped to `.max(1)`: a configured `0` would
+/// otherwise mean "trip on every sample regardless of the reading"
+/// (`streak >= 0` is trivially true before any low sample is ever seen) —
+/// the opposite of "disabled." `0` behaves like `1` instead: trips on the
+/// first genuinely low sample. See [`thermal_speed_limit_hold_samples_raw`]
+/// for the unclamped value `darkmux doctor` warns against.
 pub fn thermal_speed_limit_hold_samples() -> u32 {
+    thermal_speed_limit_hold_samples_raw().max(1)
+}
+
+/// The resolved `runtime.thermal.speed_limit_hold_samples` value WITHOUT
+/// the `.max(1)` floor — exists only so `darkmux doctor` can tell the
+/// operator their explicit `0` was silently coerced to `1` rather than
+/// achieving "disable" semantics (there is no way to fully disable this
+/// signal short of disabling the thermal governor overall). Every other
+/// caller wants [`thermal_speed_limit_hold_samples`], the clamped one.
+pub fn thermal_speed_limit_hold_samples_raw() -> u32 {
     let cfg = config()
         .runtime
         .as_ref()

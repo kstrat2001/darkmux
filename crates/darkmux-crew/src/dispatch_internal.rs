@@ -506,20 +506,20 @@ pub struct DockerRunConfig {
     /// — the runtime and the host disagreed about when "inactivity" starts.
     /// Always forwarded, matching the host's hard-kill value exactly.
     pub inactivity_timeout_seconds: u64,
-    /// (#2114 finding 4) Host's OWN `DARKMUX_MAX_PAUSE_MS`, forwarded
-    /// verbatim into the container as `-e DARKMUX_MAX_PAUSE_MS=<n>` when
-    /// set. Unlike `feedback_injection`/`turn_delay_ms`/
-    /// `inactivity_timeout_seconds` above, this is NOT resolved through
-    /// `darkmux_types::config_access` — there is no
-    /// `runtime.thermal.max_pause_ms` config field yet (the #2110/#2109
-    /// governor/breaker that would own it hasn't merged to main). Until
-    /// it does, this is a bare env-var pass-through: `None` means "the
-    /// host never set it," and the flag is simply omitted — the
-    /// container's own `pace::DEFAULT_MAX_PAUSE_MS` (900_000ms) applies,
-    /// same as an un-dockerized dispatch of the runtime binary. Revisit
-    /// once `runtime.thermal.max_pause_ms` exists: this field should
-    /// resolve through `config_access` the same way the others do,
-    /// always-forwarded rather than conditionally.
+    /// (#2114 finding 4, resolved #2110/#2109) Forwarded into the
+    /// container as `-e DARKMUX_MAX_PAUSE_MS=<n>` so the runtime's own
+    /// staleness ceiling (`runtime/src/pace.rs::max_pause_ms`) agrees with
+    /// the SAME value the host-side thermal governor
+    /// (`ThermalGovernorConfig::max_pause_ms`) uses to decide when a
+    /// stalled pause hands off to the breaker — both sides now resolve
+    /// from `darkmux_types::config_access::thermal_max_pause_ms()`
+    /// (`env(DARKMUX_THERMAL_MAX_PAUSE_MS) > config.runtime.thermal.
+    /// max_pause_ms > 900_000`), always forwarded rather than
+    /// conditionally (matching `feedback_injection`/`turn_delay_ms`/
+    /// `inactivity_timeout_seconds` above) now that the config field
+    /// exists. `Option` is kept for signature stability across call sites
+    /// that may not want to forward it, but the production call site
+    /// below always sets `Some`.
     pub max_pause_ms_env: Option<u64>,
     /// (#1187) When Some, this dispatch's "brain" is a remote OpenAI-compatible
     /// endpoint rather than local LMStudio — passed to the container as
@@ -649,10 +649,11 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
         config.inactivity_timeout_seconds
     ));
 
-    // (#2114 finding 4) Forward the host's OWN DARKMUX_MAX_PAUSE_MS, when
-    // set — see `max_pause_ms_env`'s own doc for why this is conditional
-    // rather than always-forwarded like the three vars above (no
-    // resolved config value exists yet to fall back to).
+    // (#2114 finding 4, resolved #2110/#2109) Forward the resolved
+    // runtime.thermal.max_pause_ms value — see `max_pause_ms_env`'s own
+    // doc. `Option` stays the argv-building contract (kept `if let` rather
+    // than unconditional, so a future non-production caller that leaves
+    // this `None` still gets the container's own DEFAULT_MAX_PAUSE_MS).
     if let Some(max_pause_ms) = config.max_pause_ms_env {
         args.push("-e".to_string());
         args.push(format!("DARKMUX_MAX_PAUSE_MS={max_pause_ms}"));
@@ -2799,9 +2800,10 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             agentic_pm.is_some(),
         ),
         inactivity_timeout_seconds: darkmux_types::config_access::inactivity_timeout_seconds(),
-        // (#2114 finding 4) Bare env pass-through — see `max_pause_ms_env`'s
-        // own doc for why this doesn't go through config_access yet.
-        max_pause_ms_env: std::env::var("DARKMUX_MAX_PAUSE_MS").ok().and_then(|s| s.parse().ok()),
+        // (#2110/#2109) Resolved through config_access now that
+        // runtime.thermal.max_pause_ms exists — see max_pause_ms_env's own
+        // doc.
+        max_pause_ms_env: Some(darkmux_types::config_access::thermal_max_pause_ms()),
         // (#2114) `dispatch --resume` CLI plumbing (DispatchOpts →
         // caller-decided true) is a follow-up; this call site always
         // starts fresh for now.
@@ -3914,6 +3916,21 @@ fn run_tailer(
     state.summary
 }
 
+/// (N6 of the #2110/#2109 review) Best-effort removal of a leftover
+/// `pace.json` in this dispatch's out-dir, called BEFORE
+/// `run_telemetry_sampler`'s loop starts. Today `host_out` is always a
+/// fresh per-dispatch tempdir, so this is a no-op in the common case —
+/// but once #2114's `--resume` CLI flag ships and reuses a PRIOR
+/// dispatch's `host_out` (to see that dispatch's checkpoint, which now
+/// lives in the SAME out-dir pace.json does), a leftover pace.json from
+/// that earlier, possibly-still-paused dispatch would otherwise re-park
+/// this brand-new `ThermalGovernor` — which starts `Idle` and has never
+/// written anything itself — on data it never produced. An absent file
+/// (the common case) is not an error.
+fn clear_stale_pace_file(host_out: &Path) {
+    let _ = std::fs::remove_file(crate::thermal_governor::pace_file_path(host_out));
+}
+
 /// (#557 slice 4 · #1064) Run the always-on lms + host-load telemetry
 /// sampler to completion. Loops until `stop_flag` is set (the main thread
 /// sets it after `wait_with_output()` returns), sampling the loaded-model
@@ -3979,6 +3996,10 @@ fn run_telemetry_sampler(
     // this sampler's own 2s cadence rather than with whoever sampled last.
     // Construction is ~80-100ms once; each sample is ~5-10ms.
     let mut probe = crate::host_probe::HostProbe::new();
+    // (N6 of the #2110/#2109 review) Clear any pace.json already sitting
+    // in this out-dir BEFORE the sampler's first tick — see
+    // `clear_stale_pace_file`'s own doc for why.
+    clear_stale_pace_file(&host_out);
     // (#2110/#2109) The thermal governor/breaker — see its module doc.
     // `stop_file` resolves once, up front: the crawl `STOP` path (if this
     // dispatch is a crawl unit) never changes mid-dispatch.
@@ -4022,6 +4043,17 @@ fn run_telemetry_sampler(
 
     let mut prev: Vec<darkmux_types::LoadedModel> = Vec::new();
     let mut seeded = false;
+    // (N1 of the #2110/#2109 review) The REAL wall-clock gap since the
+    // last thermal sample — NOT a hardcoded per-tick constant. A tick can
+    // block far longer than TELEMETRY_SAMPLE_INTERVAL_MS (the
+    // `lms list_loaded()` call above can stall up to ~30s), and the whole
+    // process can sleep/suspend between ticks — feeding a fixed 2000ms in
+    // either case would under-report real elapsed time to the governor's
+    // hysteresis/max-pause/heartbeat accounting, which could let a
+    // thermal-critical pause's written_at_ms go stale past what the
+    // runtime's own ceiling honors. `0` on the very first tick is correct
+    // (there is no "last sample" yet).
+    let mut prev_thermal_at_ms: u64 = 0;
 
     loop {
         if stop_flag.load(Ordering::SeqCst) {
@@ -4062,15 +4094,20 @@ fn run_telemetry_sampler(
         // unprivileged; a tick emits whichever fields succeed.
         let sample = probe.sample();
         let at_ms = started.elapsed().as_millis() as u64;
-        // (#2110/#2109) Feed this tick's thermal reading to the governor.
-        // `TELEMETRY_SAMPLE_INTERVAL_MS` is the elapsed-since-last-sample
-        // the hysteresis/max-pause accounting runs on — this loop's own
-        // cadence, so no separate clock is needed. Every state change
-        // (pause/resume/breaker) is a `dispatch.rest`-family flow record,
-        // so a slowed or stopped run is attributable on the flow stream.
+        // (N1 of the #2110/#2109 review) REAL elapsed since the last
+        // thermal tick, not TELEMETRY_SAMPLE_INTERVAL_MS — see
+        // `prev_thermal_at_ms`'s own doc above for why the constant was
+        // wrong. `saturating_sub` on two `started.elapsed()` reads is
+        // monotonic (never underflows) regardless of how long this
+        // iteration's earlier work (the lms diff above) took.
+        let thermal_elapsed_ms = at_ms.saturating_sub(prev_thermal_at_ms);
+        prev_thermal_at_ms = at_ms;
+        // Every state change (pause/resume/breaker) is a
+        // `dispatch.rest`-family flow record, so a slowed or stopped run
+        // is attributable on the flow stream.
         if let Some(event) = thermal_governor.on_sample(
             sample.thermal.as_ref(),
-            TELEMETRY_SAMPLE_INTERVAL_MS,
+            thermal_elapsed_ms,
             &host_out,
             thermal_stop_file.as_deref(),
         ) {
@@ -4091,15 +4128,29 @@ fn run_telemetry_sampler(
                     // crawl keep dispatching units past a tripped breaker.
                     if thermal_stop_file.is_none() {
                         if let Some(reason) = thermal_stop_unresolved_reason {
-                            emit(
-                                "thermal",
+                            // (N3, final re-check) Warn — this is an
+                            // operator-actionable gap, not routine
+                            // telemetry — through merge_record_context so
+                            // the crawl's own identifying fields (unit,
+                            // source, sha, rule) ride along, same as
+                            // `emit_rest` above.
+                            let mut payload = serde_json::json!({
+                                "stop_written": false,
+                                "reason": reason,
+                                "state": state,
+                            });
+                            merge_record_context(&mut payload, &record_context);
+                            let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
+                                darkmux_flow::Level::Warn,
                                 "thermal.stop_unresolved",
-                                serde_json::json!({
-                                    "stop_written": false,
-                                    "reason": reason,
-                                    "state": state,
-                                }),
-                            );
+                                "thermal",
+                                &role_id,
+                                &session_id,
+                                Some(&model),
+                                mission_id.as_deref(),
+                                phase_id.as_deref(),
+                                payload,
+                            ));
                         }
                     }
                 }

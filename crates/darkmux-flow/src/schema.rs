@@ -529,6 +529,22 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.28.0";
 //           action whose payload shape varies by writer (1.25.0 above),
 //           so this is the second shape under that umbrella, not a new
 //           contract.
+//   1.28.x (#2110/#2109 review finding 5, N3): a NEW action,
+//           `thermal.stop_unresolved` — Level::Warn (operator-actionable,
+//           not routine telemetry), `source: "thermal"`. Fires when the
+//           breaker trips on what looked like a crawl unit
+//           (`record_context` carried the crawl launcher's `unit`
+//           marker) but the STOP path could not be derived trustworthily
+//           (`workspace` missing or empty) — the breaker never writes a
+//           STOP at a guessed path, so this event is the operator's only
+//           signal that a crawl may keep dispatching units past a
+//           tripped breaker. Payload: `stop_written: false`, `reason`
+//           (why derivation failed), `state` (the OS thermal state that
+//           tripped the breaker), plus the usual `context` block merged
+//           in via `merge_record_context` (unit/source/sha/rule, when
+//           present). A brand-new action value under the same additive
+//           rule as every other entry in this history — no version bump,
+//           no struct change.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
