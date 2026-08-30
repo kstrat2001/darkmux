@@ -645,6 +645,119 @@ pub fn host_sampler_interval_ms() -> u64 {
     pick_parsed("DARKMUX_HOST_SAMPLER_INTERVAL_MS", cfg, Some(5000)).unwrap()
 }
 
+// ── Thermal governor + breaker (#2110/#2109) ──
+// `env(DARKMUX_THERMAL_*) > config.runtime.thermal.* > default`, mirroring
+// `turn_delay_ms`'s wiring. `enabled` defaults to `true` — see
+// `ThermalConfig`'s own doc for why this block is on-by-default rather than
+// following the redis/audit off-by-default convention.
+
+/// Whether the thermal governor + breaker are active at all.
+pub fn thermal_enabled() -> bool {
+    if let Some(s) = env_str("DARKMUX_THERMAL_ENABLED") {
+        return !matches!(s.as_str(), "0" | "false" | "no");
+    }
+    config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.thermal.as_ref())
+        .and_then(|t| t.enabled)
+        .unwrap_or(true)
+}
+
+/// OS thermal state at or above which the governor pauses. Default `"serious"`.
+pub fn thermal_pause_at() -> String {
+    env_str("DARKMUX_THERMAL_PAUSE_AT")
+        .or_else(|| {
+            config()
+                .runtime
+                .as_ref()
+                .and_then(|r| r.thermal.as_ref())
+                .and_then(|t| t.pause_at.clone())
+        })
+        .unwrap_or_else(|| "serious".to_string())
+}
+
+/// OS thermal state at or below which the governor is eligible to resume
+/// (after `thermal_resume_hold_ms`). Default `"fair"`.
+pub fn thermal_resume_at() -> String {
+    env_str("DARKMUX_THERMAL_RESUME_AT")
+        .or_else(|| {
+            config()
+                .runtime
+                .as_ref()
+                .and_then(|r| r.thermal.as_ref())
+                .and_then(|t| t.resume_at.clone())
+        })
+        .unwrap_or_else(|| "fair".to_string())
+}
+
+/// How long (ms) the state must hold at/below `thermal_resume_at()` before
+/// the governor clears the pause. Default `60000`.
+pub fn thermal_resume_hold_ms() -> u64 {
+    let cfg = config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.thermal.as_ref())
+        .and_then(|t| t.resume_hold_ms);
+    pick_parsed("DARKMUX_THERMAL_RESUME_HOLD_MS", cfg, Some(60_000)).unwrap()
+}
+
+/// Cap (ms) on one continuous pause episode before the governor hands off
+/// to the breaker. Default `900000` (15 minutes).
+pub fn thermal_max_pause_ms() -> u64 {
+    let cfg = config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.thermal.as_ref())
+        .and_then(|t| t.max_pause_ms);
+    pick_parsed("DARKMUX_THERMAL_MAX_PAUSE_MS", cfg, Some(900_000)).unwrap()
+}
+
+/// Breaker floor: `cpu_speed_limit_pct` below this triggers the breaker
+/// regardless of the named thermal state. Default `50`.
+pub fn thermal_min_cpu_speed_limit_pct() -> u64 {
+    let cfg = config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.thermal.as_ref())
+        .and_then(|t| t.min_cpu_speed_limit_pct);
+    pick_parsed("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", cfg, Some(50)).unwrap()
+}
+
+/// (#2110/#2109 review finding 7) How many CONSECUTIVE samples must read
+/// `cpu_speed_limit_pct` below the floor before the breaker trips on that
+/// signal — a lone sample below the floor is common noise (a brief DVFS
+/// dip under a short burst), and tripping the breaker (a terminal,
+/// operator-must-resume event) on one noisy reading is a worse failure
+/// mode than a few extra seconds of detection latency. Does NOT apply to
+/// the `critical` thermal-state check, which is a discrete OS-reported
+/// state and trips immediately as before. Default `3`.
+///
+/// (N2, final re-check) Clamped to `.max(1)`: a configured `0` would
+/// otherwise mean "trip on every sample regardless of the reading"
+/// (`streak >= 0` is trivially true before any low sample is ever seen) —
+/// the opposite of "disabled." `0` behaves like `1` instead: trips on the
+/// first genuinely low sample. See [`thermal_speed_limit_hold_samples_raw`]
+/// for the unclamped value `darkmux doctor` warns against.
+pub fn thermal_speed_limit_hold_samples() -> u32 {
+    thermal_speed_limit_hold_samples_raw().max(1)
+}
+
+/// The resolved `runtime.thermal.speed_limit_hold_samples` value WITHOUT
+/// the `.max(1)` floor — exists only so `darkmux doctor` can tell the
+/// operator their explicit `0` was silently coerced to `1` rather than
+/// achieving "disable" semantics (there is no way to fully disable this
+/// signal short of disabling the thermal governor overall). Every other
+/// caller wants [`thermal_speed_limit_hold_samples`], the clamped one.
+pub fn thermal_speed_limit_hold_samples_raw() -> u32 {
+    let cfg = config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.thermal.as_ref())
+        .and_then(|t| t.speed_limit_hold_samples);
+    pick_parsed("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", cfg, Some(3)).unwrap()
+}
+
 // ── Mission board (#1230 Packet 5) ──
 /// How many days an Active mission may sit with zero `Complete` phases
 /// before `darkmux mission status`'s drift detector flags it as stale.

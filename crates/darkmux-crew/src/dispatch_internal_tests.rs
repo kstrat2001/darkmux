@@ -1867,6 +1867,33 @@
         );
     }
 
+    // ─── N6 (final #2110/#2109 re-check): stale pace.json cleanup ───
+
+    #[test]
+    fn clear_stale_pace_file_removes_a_leftover_pace_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::thermal_governor::pace_file_path(dir.path()),
+            r#"{"pause": true, "reason": "thermal-critical"}"#,
+        )
+        .unwrap();
+        assert!(crate::thermal_governor::pace_file_path(dir.path()).exists());
+
+        clear_stale_pace_file(dir.path());
+
+        assert!(
+            !crate::thermal_governor::pace_file_path(dir.path()).exists(),
+            "a leftover pace.json from a prior dispatch must not survive into a new one's first tick"
+        );
+    }
+
+    #[test]
+    fn clear_stale_pace_file_is_a_no_op_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        clear_stale_pace_file(dir.path()); // must not panic — the common case
+        assert!(!crate::thermal_governor::pace_file_path(dir.path()).exists());
+    }
+
     // ─── #1187: agentic-remote argv emission ─────────────────────
 
     #[test]

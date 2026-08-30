@@ -163,6 +163,7 @@ pub fn run() -> DoctorReport {
         check_review_judge_exhaustion_policy(),
         check_turn_delay(),
         check_host_sampler_interval(),
+        check_thermal_governor(),
         check_host_probe(),
         checks_power::check_power_posture(),
         check_remote_endpoint_credentials(),
@@ -1838,6 +1839,112 @@ fn check_host_sampler_interval() -> Check {
         message: format!(
             "{ms}ms ({provenance}) — darkmux serve's daemon-side host sampler cadence for the \
              machine stats drawer"
+        ),
+        hint: None,
+    }
+}
+
+/// (#2110/#2109) Surface the resolved thermal-governor/breaker knobs with
+/// `enabled`'s provenance. Always Pass — this is informational (what the
+/// governor will do), never a gate; the on-machine state machine that
+/// actually watches thermal samples lives in
+/// `darkmux_crew::thermal_governor` and is exercised by its own tests, not
+/// by doctor.
+fn check_thermal_governor() -> Check {
+    let name = "runtime.thermal";
+    let env_raw = std::env::var("DARKMUX_THERMAL_ENABLED")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
+        .runtime
+        .and_then(|r| r.thermal)
+        .and_then(|t| t.enabled)
+        .is_some();
+    let provenance = if env_raw.is_some() {
+        "from DARKMUX_THERMAL_ENABLED env"
+    } else if cfg_set {
+        "from config.json"
+    } else {
+        "default"
+    };
+    let enabled = darkmux_types::config_access::thermal_enabled();
+    if !enabled {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("disabled ({provenance}) — no thermal pausing or breaking"),
+            hint: None,
+        };
+    }
+    let pause_at = darkmux_types::config_access::thermal_pause_at();
+    let resume_at = darkmux_types::config_access::thermal_resume_at();
+    let resume_hold_ms = darkmux_types::config_access::thermal_resume_hold_ms();
+    let max_pause_ms = darkmux_types::config_access::thermal_max_pause_ms();
+    let min_cpu = darkmux_types::config_access::thermal_min_cpu_speed_limit_pct();
+    let speed_limit_hold_samples = darkmux_types::config_access::thermal_speed_limit_hold_samples();
+
+    // (#2110/#2109 review finding 6) `darkmux config set` rejects an
+    // unrecognized thermal-state token going forward, but a hand-edited
+    // config.json or a value written before that validation existed can
+    // still carry one — and, per `Ty::ThermalState`'s own doc, a typo here
+    // silently INVERTS the governor's intent rather than erroring, so this
+    // is worth a loud Warn rather than folding into the Pass message above.
+    let states = darkmux_crew::host_probe::thermal::THERMAL_STATES;
+    let bad_pause_at = !states.contains(&pause_at.to_ascii_lowercase().as_str());
+    let bad_resume_at = !states.contains(&resume_at.to_ascii_lowercase().as_str());
+    if bad_pause_at || bad_resume_at {
+        let mut bad = Vec::new();
+        if bad_pause_at {
+            bad.push(format!("pause_at=`{pause_at}`"));
+        }
+        if bad_resume_at {
+            bad.push(format!("resume_at=`{resume_at}`"));
+        }
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "unrecognized thermal state: {} — valid: {}. An unrecognized pause_at silently \
+                 disables the governor's soft pause; an unrecognized resume_at defeats the \
+                 hysteresis hold and clears a pause almost immediately regardless of actual \
+                 temperature.",
+                bad.join(", "),
+                states.join(", ")
+            ),
+            hint: Some(format!(
+                "darkmux config set runtime.thermal.pause_at <{}>",
+                states.join("|")
+            )),
+        };
+    }
+
+    // (N2, final re-check) An explicit `0` doesn't achieve "disable"
+    // semantics — it's silently coerced to `1` by
+    // `thermal_speed_limit_hold_samples`'s own `.max(1)` floor (a naive
+    // `streak >= 0` would trip on EVERY sample instead, the opposite of
+    // disable). Warn so the operator knows their `0` didn't do what it
+    // looked like it would.
+    let speed_limit_hold_samples_raw =
+        darkmux_types::config_access::thermal_speed_limit_hold_samples_raw();
+    if speed_limit_hold_samples_raw == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: "runtime.thermal.speed_limit_hold_samples is 0 — coerced to 1 (trips on the                        first low sample). There is no way to disable this signal via 0; disable                        the thermal governor overall (runtime.thermal.enabled) if that's the intent."
+                .to_string(),
+            hint: Some(
+                "darkmux config set runtime.thermal.speed_limit_hold_samples 1".to_string(),
+            ),
+        };
+    }
+
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "enabled ({provenance}) — pause at `{pause_at}`, resume at `{resume_at}` held \
+             {resume_hold_ms}ms, breaker after {max_pause_ms}ms of one pause episode or \
+             {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct < {min_cpu}%"
         ),
         hint: None,
     }
@@ -5872,6 +5979,52 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn thermal_governor_warns_on_unrecognized_pause_at() {
+        // (#2110/#2109 review finding 6) A typo'd pause_at silently
+        // inverts the governor's intent (see Ty::ThermalState's doc in
+        // src/config_cmd.rs) — this must surface as a loud Warn, not fold
+        // silently into the informational Pass message.
+        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "seroius") };
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("seroius"), "{}", check.message);
+        assert!(check.message.contains("unrecognized thermal state"), "{}", check.message);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn thermal_governor_warns_on_zero_speed_limit_hold_samples() {
+        // (N2, final re-check) An explicit 0 is silently coerced to 1 by
+        // the accessor (see thermal_speed_limit_hold_samples's own doc) —
+        // this must surface as a Warn so the operator knows their 0
+        // didn't achieve "disable" semantics.
+        let prev = std::env::var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", "0") };
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("speed_limit_hold_samples"), "{}", check.message);
+        assert!(check.message.contains("coerced to 1"), "{}", check.message);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn viewer_link_base_returns_loopback_without_a_tty() {
         // No TTY -> no links are emitted at all, so there is nothing to
         // resolve and (critically) no `tailscale` subprocess to spawn. This
@@ -6711,13 +6864,14 @@ mod tests {
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
         // turn-delay [#2094] + host-sampler-interval [#2107, #1833] +
+        // thermal-governor [#2110/#2109] +
         // mission-envelope-readability [#1881] + hooks [#2093] +
         // rules [#1959] + host-probe [#2107] + power-posture [#2112,
         // battery/Low-Power-Mode/thermal-state/thermal-emergency]) + one
         // per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 45 + darkmux_eureka::all_rules().len();
+        let expected = 46 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

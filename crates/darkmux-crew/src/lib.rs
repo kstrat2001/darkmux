@@ -94,6 +94,8 @@ pub mod single_shot;
 // `scheduler::run_step_graph` dispatches through.
 pub mod step_kinds;
 pub mod telemetry_sampler;
+// (#2110/#2109) Host-side thermal governor + breaker — see the module doc.
+pub mod thermal_governor;
 pub mod types;
 // (#1959) A generic mission input: named sources materialized into a
 // read-only tree, filtered by include/exclude globs. Promoted out of the
