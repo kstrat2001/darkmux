@@ -97,7 +97,47 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// harmless, detected as stale by this bump, and rebuilt from the JSON
 /// source-of-truth (itself read-compat via `MissionStatus`'s `alias =
 /// "closed"` / `Mission::finalized_ts`'s `alias = "closed_ts"`).
-const SCHEMA_VERSION: i32 = 7;
+///
+/// Bumped 7 -> 8 (#2142): the `missions.status` CHECK constraint never
+/// widened to include `'aborted'` when `MissionStatus::Aborted` was added
+/// (#1463's KILL terminal, written by `darkmux mission abort`). Every
+/// rebuild on a store holding an aborted mission — any machine that had
+/// ever run `mission abort` — failed outright with `CHECK constraint
+/// failed`, which took `darkmux role list` (and everything else the
+/// derived index backs) down with it. The CHECK is now generated from
+/// `MISSION_STATUS_VALUES` (see its doc comment) instead of hand-widened,
+/// and a stale on-disk index built under the old, too-narrow CHECK needs
+/// this version bump to force a rebuild onto the fixed schema.
+const SCHEMA_VERSION: i32 = 8;
+
+/// Canonical wire-form values for every `MissionStatus` variant. Single
+/// source of truth for the `missions.status` CHECK constraint baked into
+/// [`rendered_schema_sql`] — a new `MissionStatus` variant now has exactly
+/// one place to add its wire string, and a test
+/// (`mission_status_values_cover_every_mission_status_variant`) fails loudly
+/// if this list and `mission_status_str`'s exhaustive match ever disagree.
+/// This is the fix for #2142: the constraint used to be a hand-widened SQL
+/// literal that silently fell behind the enum for the better part of a
+/// milestone.
+const MISSION_STATUS_VALUES: &[&str] = &["active", "finalized", "aborted", "paused"];
+
+/// Build the `IN (...)` list for the `missions.status` CHECK from
+/// [`MISSION_STATUS_VALUES`] — see that constant's doc comment.
+fn mission_status_check_sql() -> String {
+    MISSION_STATUS_VALUES
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// [`SCHEMA_SQL`] with `{MISSION_STATUS_LIST}` substituted from
+/// [`mission_status_check_sql`]. A plain `str::replace` rather than
+/// `format!` — the DDL below has no other `{}` placeholders, and this
+/// avoids escaping every literal brace in a few-hundred-line SQL template.
+fn rendered_schema_sql() -> String {
+    SCHEMA_SQL.replace("{MISSION_STATUS_LIST}", &mission_status_check_sql())
+}
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS source_files (
@@ -185,7 +225,7 @@ CREATE TABLE IF NOT EXISTS crew_members (
 CREATE TABLE IF NOT EXISTS missions (
     id           TEXT PRIMARY KEY,
     description  TEXT NOT NULL,
-    status       TEXT NOT NULL CHECK (status IN ('active','finalized','paused')),
+    status       TEXT NOT NULL CHECK (status IN ({MISSION_STATUS_LIST})),
     created_ts   INTEGER NOT NULL,
     started_ts   INTEGER,  -- Active transition; #95
     finalized_ts INTEGER,  -- Finalized transition (terminal); #95, renamed from closed_ts (#1463 lineage)
@@ -440,7 +480,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(&drop_sql)
         .context("dropping derived tables for a clean rebuild (#914)")?;
 
-    conn.execute_batch(SCHEMA_SQL)
+    conn.execute_batch(&rendered_schema_sql())
         .context("applying index schema")?;
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .context("setting user_version")?;
@@ -598,25 +638,53 @@ fn populate(conn: &mut Connection) -> Result<()> {
         }
     }
 
-    // Missions.
+    // Missions. A single mission's INSERT is NOT allowed to take down the
+    // whole rebuild (#2142): SQLite's default CHECK-constraint conflict
+    // resolution (ABORT) only unwinds the failing statement, not the open
+    // `tx`, so it's safe to warn and keep going rather than propagate the
+    // error. This is a second, independent line of defense on top of the
+    // generated CHECK above — the CHECK should never actually reject a
+    // status `mission_status_str` produced (that match is exhaustive and
+    // tested against the same `MISSION_STATUS_VALUES` the CHECK is built
+    // from), but a rebuild should survive even a mismatch neither of those
+    // guards caught, rather than take every role/skill/crew query down
+    // with it.
+    let mut skipped_mission_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for mission in &missions {
-        tx.execute(
+        let status_str = mission_status_str(mission.status);
+        let inserted = tx.execute(
             "INSERT INTO missions (id, description, status, created_ts, started_ts, finalized_ts, paused_ts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 mission.id,
                 mission.description,
-                mission_status_str(mission.status),
+                status_str,
                 mission.created_ts as i64,
                 mission.started_ts.map(|t| t as i64),
                 mission.finalized_ts.map(|t| t as i64),
                 mission.paused_ts.map(|t| t as i64),
             ],
-        )?;
+        );
+        if let Err(e) = inserted {
+            eprintln!(
+                "warning: failed to index mission '{}' (status \"{status_str}\"): {e} — \
+                 skipped, rebuild continuing (#2142)",
+                mission.id
+            );
+            skipped_mission_ids.insert(mission.id.as_str());
+        }
     }
 
-    // Phases.
+    // Phases. A phase belonging to a mission that was skipped above is also
+    // skipped — `phases.mission_id` has a deferred FK to `missions(id)`
+    // (checked at `tx.commit()`, see `defer_foreign_keys` above), so
+    // inserting it would only convert the earlier per-row mission warning
+    // into a hard commit-time FK failure that takes the whole rebuild down
+    // anyway (#2142).
     for phase in &phases {
+        if skipped_mission_ids.contains(phase.mission_id.as_str()) {
+            continue;
+        }
         // (#1341) `Phase` no longer carries `depends_on` — Phases are
         // strictly linear, ordered by `Mission.phase_ids` position; real
         // dependency data lives on `Task.depends_on` instead. The column
@@ -1343,6 +1411,102 @@ mod tests {
         fs::write(dir.join("mission.json"), json).unwrap();
     }
 
+    /// Like `write_mission` but with an explicit wire-form `status` (one of
+    /// `MISSION_STATUS_VALUES`) — used by #2142's regression test to seed
+    /// one mission per `MissionStatus` variant.
+    fn write_mission_with_status(crew_root: &Path, id: &str, status: &str) {
+        let dir = crew_root.join("missions").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let json = format!(
+            r#"{{
+              "id": "{id}",
+              "description": "mission in status {status}",
+              "status": "{status}",
+              "phase_ids": [],
+              "created_ts": 1700000000
+            }}"#
+        );
+        fs::write(dir.join("mission.json"), json).unwrap();
+    }
+
+    /// #2142 regression test. Pre-fix, this failed with `CHECK constraint
+    /// failed: status IN ('active','finalized','paused')` the moment a
+    /// mission carried `status: "aborted"` — the exact state written by
+    /// `darkmux mission abort` (#1463) on any machine that ever ran it.
+    /// Seeds one mission per `MissionStatus` variant and proves the
+    /// rebuild succeeds AND the derived `roles` table (what `darkmux role
+    /// list` reads) still comes back populated afterward — the live
+    /// symptom reported against this issue was an EMPTY `role list`, not
+    /// just a rebuild error.
+    #[serial_test::serial]
+    #[test]
+    fn rebuild_survives_every_mission_status_including_aborted() {
+        let guard = CrewDirGuard::new();
+        for (i, status) in MISSION_STATUS_VALUES.iter().enumerate() {
+            write_mission_with_status(guard.path(), &format!("m-{status}-{i}"), status);
+        }
+        let idx = guard.path().join("index.db");
+
+        rebuild_at(&idx).expect("rebuild must succeed on a store holding every mission status, aborted included (#2142)");
+
+        let conn = open_index(&idx).unwrap();
+        let mission_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM missions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            mission_count,
+            MISSION_STATUS_VALUES.len() as i64,
+            "every seeded mission — one per status — must be indexed, not silently dropped"
+        );
+        let role_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM roles", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            role_count > 0,
+            "darkmux role list reads this table — an aborted mission must not empty it (#2142)"
+        );
+    }
+
+    /// Drift guard for #2142: `mission_status_str`'s match is exhaustive
+    /// over `MissionStatus`, so it cannot silently skip a variant — but
+    /// nothing forced `MISSION_STATUS_VALUES` (and therefore the generated
+    /// `missions.status` CHECK) to stay in lockstep with it. This test
+    /// enumerates every `MissionStatus` variant explicitly, so adding a
+    /// new one without updating `MISSION_STATUS_VALUES` fails here loudly
+    /// instead of surfacing as a rebuild-time CHECK failure on whichever
+    /// operator's machine first writes the new status.
+    #[test]
+    fn mission_status_values_cover_every_mission_status_variant() {
+        let variants = [
+            MissionStatus::Active,
+            MissionStatus::Finalized,
+            MissionStatus::Aborted,
+            MissionStatus::Paused,
+        ];
+        let produced: Vec<&str> = variants.iter().map(|v| mission_status_str(*v)).collect();
+        assert_eq!(
+            produced, MISSION_STATUS_VALUES,
+            "MISSION_STATUS_VALUES has drifted from mission_status_str's exhaustive match — \
+             update MISSION_STATUS_VALUES (and, if a variant was added above, add it here too)"
+        );
+    }
+
+    /// The `missions.status` CHECK, once rendered, must actually enumerate
+    /// every value in `MISSION_STATUS_VALUES` — guards `rendered_schema_sql`
+    /// / `mission_status_check_sql` against a future refactor that changes
+    /// the substitution mechanics but silently narrows the list.
+    #[test]
+    fn rendered_schema_sql_check_contains_every_mission_status_value() {
+        let sql = rendered_schema_sql();
+        for status in MISSION_STATUS_VALUES {
+            assert!(
+                sql.contains(&format!("'{status}'")),
+                "missions.status CHECK is missing '{status}' — MISSION_STATUS_VALUES and the \
+                 rendered CHECK have drifted"
+            );
+        }
+    }
+
     fn write_phase(crew_root: &Path, id: &str, mission_id: &str, description: &str) {
         // Per-mission layout (#148): <crew_root>/missions/<mission_id>/phases/<id>.json
         let dir = crew_root.join("missions").join(mission_id).join("phases");
@@ -1748,6 +1912,10 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn rebuild_heals_stale_table_missing_a_column() {
+        // #2142: populate() reads missions/roles/etc from the real crew
+        // dir unless isolated — without this guard, `rebuild_at` pulls in
+        // whatever this MACHINE'S live ~/.darkmux happens to hold.
+        let _guard = CrewDirGuard::new();
         let tmp = TempDir::new().unwrap();
         let idx = tmp.path().join("stale.db");
         {
@@ -1792,6 +1960,9 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn rebuild_drops_vestigial_knowledge_table() {
+        // #2142: isolate from the live crew dir — see the sibling comment
+        // in `rebuild_heals_stale_table_missing_a_column`.
+        let _guard = CrewDirGuard::new();
         let tmp = TempDir::new().unwrap();
         let idx = tmp.path().join("vestigial.db");
         {
@@ -1842,6 +2013,9 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn ensure_fresh_rebuilds_when_populate_signal_absent() {
+        // #2142: isolate from the live crew dir — see the sibling comment
+        // in `rebuild_heals_stale_table_missing_a_column`.
+        let _guard = CrewDirGuard::new();
         let tmp = TempDir::new().unwrap();
         let idx = tmp.path().join("half.db");
         {
@@ -1912,6 +2086,9 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn derived_table_columns_match_versioned_snapshot() {
+        // #2142: isolate from the live crew dir — see the sibling comment
+        // in `rebuild_heals_stale_table_missing_a_column`.
+        let _guard = CrewDirGuard::new();
         let tmp = TempDir::new().unwrap();
         let idx = tmp.path().join("snap.db");
         rebuild_at(&idx).unwrap();
@@ -2048,6 +2225,9 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn rebuild_preserves_non_derived_runtime_state() {
+        // #2142: isolate from the live crew dir — see the sibling comment
+        // in `rebuild_heals_stale_table_missing_a_column`.
+        let _guard = CrewDirGuard::new();
         let tmp = TempDir::new().unwrap();
         let idx = tmp.path().join("preserve.db");
         rebuild_at(&idx).unwrap();
@@ -2085,6 +2265,9 @@ mod tests {
     #[serial_test::serial]
     #[test]
     fn fts_mirror_stays_consistent_across_repeated_rebuilds() {
+        // #2142: isolate from the live crew dir — see the sibling comment
+        // in `rebuild_heals_stale_table_missing_a_column`.
+        let _guard = CrewDirGuard::new();
         let tmp = TempDir::new().unwrap();
         let idx = tmp.path().join("fts.db");
         rebuild_at(&idx).unwrap();
