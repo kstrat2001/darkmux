@@ -2882,7 +2882,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // function's normal exit, and a leaked registration is a live hazard,
     // not just untidy bookkeeping.
     let container_child_pid = child.id();
-    let _container_child_registration = PidRegistration::new(container_child_pid);
+    let container_child_registration = PidRegistration::new(container_child_pid);
 
     // (#1187) Pipe the remote auth secret over stdin IMMEDIATELY after spawn —
     // before the trajectory tailer starts, before anything else runs. The
@@ -3074,7 +3074,24 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     };
 
     let output = match child.wait_with_output() {
-        Ok(o) => o,
+        Ok(o) => {
+            // (#2131 review round 2, F1) Deregister HERE — right after
+            // the child has been reaped — rather than letting
+            // `container_child_registration` live to the natural end of
+            // this function's scope. The ~280 lines of post-processing
+            // below (the interrupt check, envelope enrichment, the
+            // tailer/sampler joins) have no more use for this
+            // registration: the pid is dead the moment `wait_with_output`
+            // returns, and holding the registration open regardless just
+            // widens the window where the OS could recycle the pid
+            // number and a later `kill_all` would signal an unrelated
+            // process. The `Err` arm below doesn't need this — it
+            // returns immediately, and `container_child_registration`'s
+            // own `Drop` (RAII, from the spawn site) covers that exit
+            // path exactly the same way it covers every earlier `?`.
+            drop(container_child_registration);
+            o
+        }
         Err(e) => {
             // (#889) The wait itself failed — the container may still be
             // running (orphaned). The bare `?` here used to return before
@@ -3090,8 +3107,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             let _ = watchdog_handle.join();
             sampler_stop.store(true, Ordering::SeqCst);
             let _ = sampler_handle.join();
+            // (#2131 review round 2, F5) Same teardown the success path
+            // gives the tailer, further down — signal it to stop and
+            // join it before returning. Without this, a `wait_with_output`
+            // failure left the tailer thread leaked: its own loop only
+            // exits on `stop_flag` or a caught signal, neither of which
+            // this branch used to touch, so it polled `trajectory.jsonl`
+            // forever in the background.
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = tailer_handle.join();
             // (#2131 review round 2, NEW-2) No explicit deregister here —
-            // `_container_child_registration` (declared at the spawn
+            // `container_child_registration` (declared at the spawn
             // site) deregisters on Drop, which fires when this early
             // `return` unwinds the scope. See that guard's own doc for
             // why an explicit call at every exit path was the wrong
@@ -3139,9 +3165,11 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         if let Some(em) = session_emitter {
             em.stop();
         }
-        // (#2131 review round 2, NEW-2) `_container_child_registration`
-        // deregisters on Drop here too — see the wait-error branch's own
-        // note above.
+        // (#2131 review round 2, F1) `container_child_registration` is
+        // already deregistered by this point — this branch only runs
+        // after a SUCCESSFUL `wait_with_output`, which dropped it
+        // explicitly in the `Ok` arm above (the child is dead either
+        // way; there is nothing left to deregister here).
         return Err(anyhow!(
             "darkmux-runtime container dispatch interrupted by an operator signal \
              (SIGINT/SIGTERM/SIGHUP) — the container `{container_name}` was killed mid-run"

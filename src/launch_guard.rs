@@ -215,12 +215,14 @@ mod tests {
     /// with, so shelling out to the standard `kill(1)` utility is the
     /// dependency-free equivalent) after `arm()`, proving the installed
     /// handlers actually fire.
-    /// (#2131 review round 2, NEW-5) Panic-safe teardown for
+    /// (#2131 review round 2, NEW-5; round 4, F6) Panic-safe teardown for
     /// [`arm_installs_real_sigterm_and_sighup_handlers`] — `Drop` fires on
     /// EVERY exit from that test (a normal return, OR a failed
-    /// `assert!` unwinding mid-test), so a real SIGTERM/SIGHUP handler
-    /// this test installed on the real OS process never survives to
-    /// affect whichever test the harness runs next in the same process.
+    /// `assert!` unwinding mid-test), so the real SIGINT/SIGTERM/SIGHUP
+    /// handlers `arm()` installs on the real OS process (all three,
+    /// even though this test only SENDS itself a real SIGTERM/SIGHUP)
+    /// never survive to affect whichever test the harness runs next in
+    /// the same process.
     /// `darkmux_types::interrupt::restore_default_for_test`'s own doc
     /// explains why `reset_for_test` alone (already called at each
     /// checkpoint below) isn't enough — that only clears this module's

@@ -204,25 +204,29 @@ pub fn reset_for_test() {
     SIGHUP_COUNT.store(0, Ordering::SeqCst);
 }
 
-/// (#2131 review round 2, NEW-5) Test-only: restore SIGTERM and SIGHUP to
-/// their OS-default disposition. [`reset_for_test`] above only resets
-/// THIS module's own flag/counters — it never touches the real signal
-/// disposition, and neither do [`simulate_sigterm_for_test`]/
-/// [`simulate_sighup_for_test`] (they call the internal handler function
-/// directly, never `signal(2)`). A test that instead calls
-/// [`install_term`]/[`install_hup`] (or, one level up, `darkmux`'s own
-/// `launch_guard::arm`) to prove the REAL handler gets wired up needs
-/// this: `signal(2)` dispositions are process-wide and persist across
+/// (#2131 review round 2, NEW-5; round 4, F6) Test-only: restore SIGINT,
+/// SIGTERM, and SIGHUP to their OS-default disposition. [`reset_for_test`]
+/// above only resets THIS module's own flag/counters — it never touches
+/// the real signal disposition, and neither do [`simulate_sigint_for_test`]/
+/// [`simulate_sigterm_for_test`]/[`simulate_sighup_for_test`] (they call
+/// the internal handler function directly, never `signal(2)`). A test
+/// that instead calls [`install`]/[`install_term`]/[`install_hup`] (or,
+/// one level up, `darkmux`'s own `launch_guard::arm`, which calls all
+/// three together) to prove the REAL handler gets wired up needs this:
+/// `signal(2)` dispositions are process-wide and persist across
 /// `install*` calls until something changes them back, so skipping this
-/// would leave a custom SIGTERM/SIGHUP handler installed for every LATER
-/// test in the same test binary process, whether or not that test itself
-/// calls `install_term`/`install_hup` again. SIGINT deliberately
-/// excluded — no test in this codebase sends a REAL SIGINT to itself
-/// (unlike SIGTERM/SIGHUP, catching a genuine Ctrl-C mid test run would
-/// be actively disruptive), so there is nothing to restore there.
+/// would leave a custom handler installed for every LATER test in the
+/// same test binary process, whether or not that test itself calls
+/// `install`/`install_term`/`install_hup` again. All three signals are
+/// restored — even a test that only sends itself a real SIGTERM/SIGHUP
+/// (never a real SIGINT, which could be disruptive to send to a live
+/// test process) still installed a SIGINT handler as a side effect if it
+/// went through `arm()`, which always calls [`install`] alongside the
+/// other two.
 #[cfg(any(test, feature = "test-support"))]
 pub fn restore_default_for_test() {
     unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
         libc::signal(libc::SIGHUP, libc::SIG_DFL);
     }

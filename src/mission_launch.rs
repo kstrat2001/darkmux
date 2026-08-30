@@ -556,6 +556,23 @@ pub fn launch(
     crate::preflight::check_power_posture(params)?;
     let _sleep_assertion = darkmux_crew::sleep_assertion::SleepAssertion::hold(&format!("darkmux mission {config_id}"));
 
+    // (#2131 review round 4, F2) SIGINT + SIGTERM + SIGHUP — this launcher
+    // (generic graphs + coder-phase) previously installed no signal
+    // handling at all, the gap #2124 fixed for `mission_launch_review.rs`
+    // and #1959 fixed (SIGINT only) for `crawl_launch.rs`. Installed HERE
+    // — ahead of `mint_run_id` below, matching `mission_launch_review.rs`'s
+    // `run_dispatch`, which arms before ITS mint too — not merely ahead of
+    // the config-snapshot write / interpret / freeform-mint /
+    // executable-check work that follows the mint. `mint_run_id` itself is
+    // pure in-memory ID derivation (no disk I/O, so a signal caught inside
+    // it is harmless today regardless), but arming any later would make
+    // "is it safe to be here" a fact the reader has to re-derive from
+    // `mint_run_id`'s own implementation rather than something structurally
+    // true by placement — the SAME reasoning `mission_launch_review.rs`
+    // already applies. The flag is live well before the real-execution
+    // section (below) constructs this launcher's own `LaunchFinalizeGuard`.
+    crate::launch_guard::arm();
+
     // Run id: minted fresh for THIS launch, never derived from inputs
     // (#1503). AI work is non-deterministic, so two launches of the same
     // config with the same inputs are two DIFFERENT runs, not one to
@@ -602,17 +619,6 @@ pub fn launch(
                 return Err(e);
             }
         };
-
-    // (#2131) SIGINT + SIGTERM + SIGHUP — this launcher (generic graphs +
-    // coder-phase) previously installed no signal handling at all, the gap
-    // #2124 fixed for `mission_launch_review.rs` and #1959 fixed (SIGINT
-    // only) for `crawl_launch.rs`. Installed here, ahead of the
-    // config-snapshot write / interpret / freeform-mint / executable-check
-    // work below — all fast, local, non-dispatching I/O with their own
-    // existing `reconcile_and_finalize_on_error` coverage on failure — so
-    // the flag is live well before the real-execution section (below)
-    // constructs this launcher's own `LaunchFinalizeGuard`.
-    crate::launch_guard::arm();
 
     // (#1433 follow-up) The mission is now minted (Active, Planned phases) on
     // disk. Every fallible step from here to the scheduler is a strand window:
