@@ -1450,6 +1450,7 @@
             // complete-vector assertion below pins the forwarded
             // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` pair too.
             inactivity_timeout_seconds: 900,
+            max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1631,6 +1632,7 @@
             feedback_injection: false,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1744,6 +1746,7 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1794,6 +1797,7 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
@@ -1835,6 +1839,31 @@
         assert!(
             argv.windows(2).any(|w| w[0] == "--resume" && w[1] == "/darkmux-out/checkpoint.json"),
             "expected --resume /darkmux-out/checkpoint.json in argv: {argv:?}"
+        );
+    }
+
+    // ─── #2114 finding 4: DARKMUX_MAX_PAUSE_MS forwarding ────────
+
+    #[test]
+    fn build_docker_run_argv_omits_max_pause_ms_by_default() {
+        // base_argv_config() leaves max_pause_ms_env at None (the host
+        // never had DARKMUX_MAX_PAUSE_MS set) — the flag must be omitted
+        // entirely, not forwarded as some literal "None"/0/empty value.
+        let argv = build_docker_run_argv(&base_argv_config());
+        assert!(
+            !argv.iter().any(|a| a.starts_with("DARKMUX_MAX_PAUSE_MS=")),
+            "expected no DARKMUX_MAX_PAUSE_MS in argv when unset: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_docker_run_argv_forwards_max_pause_ms_when_set() {
+        let mut config = base_argv_config();
+        config.max_pause_ms_env = Some(120_000);
+        let argv = build_docker_run_argv(&config);
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-e" && w[1] == "DARKMUX_MAX_PAUSE_MS=120000"),
+            "expected -e DARKMUX_MAX_PAUSE_MS=120000 in argv: {argv:?}"
         );
     }
 
@@ -2069,6 +2098,7 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
             base_url_override: None,
