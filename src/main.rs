@@ -1458,6 +1458,10 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         // stages the checkpoint; `None` (the default) preserves the
         // fresh-start behavior.
         resume_from,
+        // (#2153) No CLI surface for naming an exact out dir — a bare
+        // `dispatch` always gets a fresh tempdir. Only the crawl launcher
+        // sets this today.
+        host_out: None,
     };
     // (#1509) Route the LOCAL half of `dispatch_routed`'s routing decision
     // through the engine as a crew of one (a full Mission -> Phase ->

@@ -1358,6 +1358,71 @@
         );
     }
 
+    // ─── #2153: resolve_host_out (caller-named out dir) ────────────────
+
+    #[test]
+    fn resolve_host_out_none_falls_back_to_a_fresh_tempdir_named_from_role_and_micros() {
+        let dir = resolve_host_out(None, "crawler", 424242).unwrap();
+        assert!(dir.is_dir(), "the fresh tempdir must exist");
+        assert!(
+            dir.file_name().unwrap().to_str().unwrap().starts_with("darkmux-out-crawler-424242"),
+            "unchanged naming convention: darkmux-out-<role>-<unix_micros>, got {}",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_host_out_some_creates_the_named_dir() {
+        let parent = TempDir::new().unwrap();
+        let named = parent.path().join("units").join("u-0002").join("out");
+        // `resolve_host_out` uses `create_dir`, not `create_dir_all` — the
+        // PARENT must already exist (the crawl launcher creates it via its
+        // own `create_dir_all` before calling this).
+        std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+        assert!(!named.exists(), "sanity: the dir itself must not exist yet");
+
+        let dir = resolve_host_out(Some(&named), "crawler", 1).unwrap();
+        assert_eq!(dir, named, "the caller-named dir is returned verbatim");
+        assert!(dir.is_dir(), "the caller-named dir must be created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_host_out_some_locks_the_dir_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = TempDir::new().unwrap();
+        let named = parent.path().join("out");
+
+        let dir = resolve_host_out(Some(&named), "crawler", 1).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "caller-provided out-dir must be locked to 0700");
+    }
+
+    #[test]
+    fn resolve_host_out_some_refuses_a_pre_existing_dir_rather_than_reusing_it() {
+        // (#2158) A dir already sitting at the caller-named path — a
+        // leftover from a prior run, or a planted symlink — must never be
+        // silently reused: `create_dir`'s own atomicity (one syscall, no
+        // separate exists-check window) is the TOCTOU fix, and this test
+        // proves the caller sees a named refusal rather than a mount into
+        // whatever was already there.
+        let parent = TempDir::new().unwrap();
+        let named = parent.path().join("out");
+        std::fs::create_dir_all(&named).unwrap();
+        // Prove the pre-existing dir is untouched evidence: drop a sentinel
+        // file that a wrongly-successful `resolve_host_out` call would have
+        // no reason to disturb, then assert it's still there after.
+        std::fs::write(named.join("sentinel.txt"), b"pre-existing").unwrap();
+
+        let err = resolve_host_out(Some(&named), "crawler", 1).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "expected a named 'already exists' refusal, got: {err:#}"
+        );
+        assert!(named.join("sentinel.txt").exists(), "the pre-existing dir must be left untouched");
+    }
+
     #[test]
     fn apply_runtime_injection_mounts_binary_and_overrides_entrypoint() {
         // (#703) Injecting into a non-default image: bind the static binary

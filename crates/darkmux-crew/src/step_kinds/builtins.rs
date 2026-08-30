@@ -414,6 +414,10 @@ impl StepKind for DispatchInternalStepKind {
             step_id: Some(step.id.clone()),
             system_prompt_override: None,
             resume_from,
+            // (#2153) `dispatch.internal` steps get a fresh tempdir, same
+            // as before — no crew-of-one graph step names an exact out
+            // dir today.
+            host_out: None,
         };
         let result =
             dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;

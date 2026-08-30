@@ -310,6 +310,7 @@ impl WorkJob {
             workspace_read_only: false,
             record_context: None,
             resume_from: None,
+            host_out: None,
             role_id: self.role_id,
             message: self.message,
             session_id: Some(self.session_id),

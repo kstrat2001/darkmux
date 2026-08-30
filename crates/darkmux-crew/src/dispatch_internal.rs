@@ -455,6 +455,63 @@ pub(crate) fn write_resume_origin_meta(host_out: &Path, workspace: &Path, worksp
     }
 }
 
+/// (#2153) Resolve this dispatch's host out dir. See
+/// `DispatchOpts::host_out`'s own doc for the crawl-launcher motivation.
+///
+/// - `Some(dir)`: the caller named an exact dir. Create it with
+///   `create_dir` — NOT `create_dir_all`, a caller-named path's parent is
+///   expected to already exist (e.g. the crawl launcher's own
+///   `runs/<mission>/units/` dir) — and lock it to `0o700`. An
+///   ALREADY-EXISTING dir at that path is refused outright rather than
+///   reused: `create_dir`'s own atomicity (one syscall, no separate
+///   exists-check window) is what closes the TOCTOU/symlink race a
+///   pre-named path would otherwise open (#2158) — something planted the
+///   dir (or a symlink) before this dispatch got there, and reusing it
+///   would mount an attacker- or leftover-controlled path into the
+///   container at `/darkmux-out`.
+/// - `None`: today's behavior — a fresh tempdir keyed off `role_id` and
+///   this dispatch's own unix-micros timestamp.
+///
+/// Plain-argument signature (not `&DispatchOpts`) so tests can exercise it
+/// without constructing a whole `DispatchOpts` — same pattern as
+/// `apply_volume_mounts`/`stage_resume_checkpoint`/`write_resume_origin_meta`
+/// above.
+fn resolve_host_out(host_out_override: Option<&Path>, role_id: &str, unix_micros: u128) -> Result<PathBuf> {
+    match host_out_override {
+        Some(dir) => {
+            match fs::create_dir(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    bail!(
+                        "darkmux dispatch: caller-provided out-dir already exists — refusing to \
+                         reuse it: {} (a prior dispatch may still own it, or something else \
+                         created it first; never overwritten)",
+                        dir.display()
+                    );
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("creating caller-provided dispatch out-dir: {}", dir.display())
+                    });
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| {
+                    format!("setting permissions on dispatch out-dir: {}", dir.display())
+                })?;
+            }
+            Ok(dir.to_path_buf())
+        }
+        None => {
+            let host_out = std::env::temp_dir().join(format!("darkmux-out-{role_id}-{unix_micros}"));
+            fs::create_dir_all(&host_out)
+                .with_context(|| format!("creating dispatch out-dir: {}", host_out.display()))?;
+            Ok(host_out)
+        }
+    }
+}
 
 /// (#703) Inject the host-cached static runtime binary into an operator
 /// image: bind-mount it read-only at `/darkmux-runtime` and override the
@@ -2875,9 +2932,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     //     two concurrent dispatches never collide. Like the workspace,
     //     this is NOT auto-cleaned — the operator inspects
     //     trajectory.jsonl + metrics.json after the container exits.
-    let host_out = std::env::temp_dir().join(format!("darkmux-out-{}-{unix_micros}", opts.role_id));
-    fs::create_dir_all(&host_out)
-        .with_context(|| format!("creating dispatch out-dir: {}", host_out.display()))?;
+    //     (#2153) `opts.host_out` lets a caller name this dir up front —
+    //     see `resolve_host_out`'s own doc.
+    let host_out = resolve_host_out(opts.host_out.as_deref(), &opts.role_id, unix_micros)?;
     eprintln!(
         "darkmux dispatch: out-dir={} (runtime bookkeeping → /darkmux-out)",
         host_out.display()

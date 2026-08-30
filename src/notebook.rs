@@ -164,6 +164,7 @@ fn dispatch_draft_via_internal(role: &str, prompt: &str, session_id: &str) -> Re
         workspace_read_only: false,
         record_context: None,
         resume_from: None,
+        host_out: None,
         role_id: role.to_string(),
         message: prompt.to_string(),
         session_id: Some(session_id.to_string()),

@@ -321,6 +321,26 @@ pub struct DispatchOpts {
     /// the `resumed_from` provenance this stamps into the dispatch's flow
     /// records.
     pub resume_from: Option<PathBuf>,
+    /// (#2153) Caller-named host out dir (the `/darkmux-out` mount) to use
+    /// for THIS dispatch, instead of letting `dispatch_internal::dispatch`
+    /// mint its own fresh tempdir. `Some(dir)` is for a caller that needs
+    /// to know the out dir BEFORE the dispatch returns — the crawl
+    /// launcher is the one caller that sets this today: it mints
+    /// `<mission run dir>/units/<unit-id>/out` and records it into a
+    /// PROVISIONAL per-unit row before dispatching, so an interrupted or
+    /// hard-crashed dispatch (which returns an `Err` with no
+    /// `DispatchResult::out_dir` to read back) still leaves a resumable
+    /// `out_dir` on record — a fresh tempdir's path is otherwise only ever
+    /// learned from a SUCCESSFUL `DispatchResult`, which an interrupted
+    /// dispatch never produces. `dispatch_internal::dispatch` creates the
+    /// named dir with `create_dir` (never `create_dir_all` — a
+    /// caller-named path's parent must already exist) and `0o700`
+    /// permissions, and REFUSES with a named error if the dir already
+    /// exists rather than reusing it (closes the symlink/TOCTOU race a
+    /// pre-named, pre-existing path would otherwise open — #2158). `None`
+    /// (every existing caller) preserves the fresh-tempdir behavior
+    /// exactly.
+    pub host_out: Option<PathBuf>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime

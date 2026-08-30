@@ -1553,6 +1553,86 @@ fn interrupted_at_readback_reports_interrupted_not_error() {
     assert_eq!(mission_completed["payload"]["stopped_by"], "interrupted");
     assert_eq!(mission_completed["payload"]["units_errored"], 0, "an interrupted unit must not count as errored");
     assert_eq!(mission_completed["payload"]["units_completed"], 0, "an interrupted unit must not count as completed either");
+    // (#2153) The interrupted unit gets its OWN counter now, and it must
+    // NOT also inflate `units_not_run` — that counter is for units never
+    // even attempted, and this one demonstrably was (it has a real
+    // `out_dir`, asserted below via the envelope's per-unit row).
+    assert_eq!(mission_completed["payload"]["units_interrupted"], 1, "the interrupted unit must be counted");
+    assert_eq!(
+        mission_completed["payload"]["units_not_run"], 1,
+        "units_not_run counts only the SECOND unit (never dispatched at all), not the interrupted first one"
+    );
+
+    // (#2153) The exact bug this fix closes: an interrupted dispatch must
+    // still leave a resumable `out_dir` on its per-unit row — previously
+    // `null`, because the out dir was only ever learned from a
+    // SUCCESSFUL `DispatchResult`, which an interrupted dispatch (an
+    // `Err` return) never produces.
+    let mission_id = mission_id_from_records(&records);
+    let runs_dir = fx.root.path().join("runs").join(&mission_id);
+    let envelope: Value =
+        serde_json::from_str(&std::fs::read_to_string(runs_dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(envelope["units_interrupted"], 1, "envelope.json must carry the same counter: {envelope}");
+    let row = &envelope["units"][0];
+    assert_eq!(row["unit"], "u-0001");
+    assert_eq!(row["result"], "interrupted");
+    let out_dir = row["out_dir"].as_str().expect("an interrupted unit's row must carry a real out_dir, not null");
+    assert!(!out_dir.is_empty(), "out_dir must be a real path, not empty");
+    assert!(
+        std::path::Path::new(out_dir).starts_with(&runs_dir),
+        "the interrupted unit's out_dir must live under this mission's own run dir ({}), got {out_dir}",
+        runs_dir.display()
+    );
+}
+
+/// (#2153) The REAL production shape of "Ctrl-C while paused mid-
+/// dispatch": `dispatch_internal::dispatch`'s own SIGINT-during-wait
+/// branch returns `Err` — there is no `DispatchResult` at all to read an
+/// `out_dir` back from. Distinct from `interrupted_at_readback_reports_
+/// interrupted_not_error` above (whose scripted dispatch always returns
+/// `Ok`): this test scripts the dispatch itself to return `Err`, proving
+/// the launcher's OWN pre-minted out dir (recorded into the per-unit row
+/// BEFORE dispatch even runs, via `DispatchOpts::host_out`) survives even
+/// when nothing comes back from the call to read it from — the exact gap
+/// that left a real 72KB `checkpoint.json` on disk with `out_dir: null`
+/// in the mission envelope on the Studio (2026-08-30).
+#[test]
+#[serial_test::serial]
+fn a_unit_whose_dispatch_errors_while_interrupted_still_records_a_resumable_out_dir() {
+    let _guard = TestGuard::new();
+    let _interrupt_guard = InterruptFlagGuard::new();
+    let fx = two_source_fixture();
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit { err: true, ..Default::default() });
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {
+        darkmux_types::interrupt::simulate_sigint_for_test();
+    });
+
+    let code = run(&params_for(&fx), None, &mut dispatch).unwrap();
+    assert_eq!(code, 130, "an interrupted run must exit 130");
+
+    let records = read_all_flow_records();
+    let mission_id = mission_id_from_records(&records);
+    let runs_dir = fx.root.path().join("runs").join(&mission_id);
+    let envelope: Value =
+        serde_json::from_str(&std::fs::read_to_string(runs_dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(envelope["units_interrupted"], 1, "envelope: {envelope}");
+    assert_eq!(envelope["units_errored"], 0, "interrupted must not ALSO be counted as errored");
+    assert_eq!(
+        envelope["units_not_run"], 1,
+        "units_not_run counts only the never-dispatched second unit, not this interrupted one"
+    );
+    let row = &envelope["units"][0];
+    assert_eq!(row["result"], "interrupted");
+    let out_dir = row["out_dir"]
+        .as_str()
+        .expect("must carry a real out_dir even though the dispatch call itself returned Err");
+    assert!(
+        std::path::Path::new(out_dir).starts_with(&runs_dir),
+        "out_dir must live under this mission's own run dir ({}), got {out_dir}",
+        runs_dir.display()
+    );
 }
 
 // ── finding 9: watchdog timeout detection ───────────────────────────────
@@ -1906,6 +1986,65 @@ fn plan_unit_resume_resumes_a_unit_that_aborted_with_a_checkpoint() {
         dir == Path::new("/tmp/darkmux-out-crawler-222")
     });
     assert_eq!(action, UnitResumeAction::Resume(PathBuf::from("/tmp/darkmux-out-crawler-222")));
+}
+
+/// (#2153) An `"interrupted"` row — the label an operator-signal-cut
+/// dispatch's row now carries (see `a_unit_whose_dispatch_errors_while_
+/// interrupted_still_records_a_resumable_out_dir` in this same file) — is
+/// exactly as resumable as a `"timeout"`/`"error"` row: `plan_unit_resume`
+/// doesn't special-case the label, only whether the row's `out_dir` names
+/// a real checkpoint.
+#[test]
+fn plan_unit_resume_resumes_an_interrupted_row_with_a_checkpoint() {
+    let prior_rows = vec![json!({
+        "unit": "u-0003",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "interrupted",
+        "out_dir": "/tmp/darkmux-out-crawler-333-interrupted",
+    })];
+    let action = plan_unit_resume("u-0003", FIXED_SOURCE, &fixed_rules(), &prior_rows, |dir| {
+        dir == Path::new("/tmp/darkmux-out-crawler-333-interrupted")
+    });
+    assert_eq!(action, UnitResumeAction::Resume(PathBuf::from("/tmp/darkmux-out-crawler-333-interrupted")));
+}
+
+/// (#2153) A `"running"` row — the provisional label a unit's row carries
+/// if the whole launcher process died so hard mid-dispatch that the
+/// update-in-place at readback never ran at all (a crash harder than a
+/// caught signal, which DOES get a chance to update the row to
+/// `"interrupted"` before the process exits) — resumes the same way,
+/// per `plan_unit_resume`'s own doc: no separate branch for it, same
+/// generic out_dir/checkpoint check.
+#[test]
+fn plan_unit_resume_resumes_a_running_row_with_a_checkpoint() {
+    let prior_rows = vec![json!({
+        "unit": "u-0004",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "running",
+        "out_dir": "/tmp/darkmux-out-crawler-444-running",
+    })];
+    let action = plan_unit_resume("u-0004", FIXED_SOURCE, &fixed_rules(), &prior_rows, |dir| {
+        dir == Path::new("/tmp/darkmux-out-crawler-444-running")
+    });
+    assert_eq!(action, UnitResumeAction::Resume(PathBuf::from("/tmp/darkmux-out-crawler-444-running")));
+}
+
+/// (#2153) The `"running"` row's OTHER half: no checkpoint on disk yet
+/// (the dispatch died before the runtime ever wrote one) → `Fresh`, same
+/// as any other unresumable row.
+#[test]
+fn plan_unit_resume_reruns_fresh_when_a_running_row_has_no_checkpoint() {
+    let prior_rows = vec![json!({
+        "unit": "u-0005",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "running",
+        "out_dir": "/tmp/darkmux-out-crawler-555-running-no-ckpt",
+    })];
+    let action = plan_unit_resume("u-0005", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| false);
+    assert_eq!(action, UnitResumeAction::Fresh);
 }
 
 #[test]
