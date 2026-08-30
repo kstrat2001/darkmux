@@ -18,6 +18,13 @@
 //! signature, not merely a resolvable URL. `http://`, never `https://`, is
 //! required for BOTH policies — WireGuard already encrypts and
 //! authenticates a tailnet peer, so TLS on top of it buys nothing yet.
+//! The two tailnet checks enforce different things: the IPv4 branch
+//! verifies the ADDRESS is in-range; the `.ts.net` branch verifies only a
+//! SUFFIX MATCH on the hostname string, with no DNS resolution (URL
+//! validation makes no network call) — see `is_tailnet_host`'s doc.
+//! **Known limit:** Tailscale's IPv6 range (`fd7a:115c:a1e0::/48`) is
+//! refused by this policy — only the IPv4 CGNAT range and `.ts.net`
+//! hostnames are accepted today.
 //!
 //! # Delivery contract
 //!
@@ -300,12 +307,22 @@ fn is_tailnet_ipv4(ip: std::net::Ipv4Addr) -> bool {
 /// True for a host that is a genuine Tailscale address: a `100.64.0.0/10`
 /// literal IPv4, or a MagicDNS hostname ending in `.ts.net`. Takes the
 /// ALREADY-lowercased `host_str()` `url::Url` produced, mirroring
-/// `validate_loopback_http_url`'s own canonicalization.
+/// `validate_loopback_http_url`'s own canonicalization. Note the two
+/// halves check different things: the IPv4 branch verifies the ADDRESS
+/// itself is in-range; the `.ts.net` branch verifies only the SUFFIX —
+/// there is no DNS resolution here (a network call has no place in URL
+/// validation), so a syntactically-valid `.ts.net` hostname that doesn't
+/// actually resolve, or resolves to something else, still passes. That's
+/// the same trust boundary MagicDNS itself relies on operators to police
+/// (the tailnet's own DNS, not this check) — accepted here as a policy
+/// choice, not an oversight. `host.len() > ".ts.net".len()` rejects the
+/// degenerate `.ts.net` itself (an empty subdomain, e.g. `http://.ts.net/x`)
+/// — a suffix with nothing in front of it names no machine.
 fn is_tailnet_host(host: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         return is_tailnet_ipv4(ip);
     }
-    host.ends_with(".ts.net")
+    host.len() > ".ts.net".len() && host.ends_with(".ts.net")
 }
 
 /// (#2135 option 2) The tailnet counterpart of `validate_loopback_http_url`
@@ -1144,6 +1161,7 @@ const CURSOR_WRITE_STALL_THRESHOLD: u64 = 3;
 /// per failed write.
 const CURSOR_WRITE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
+#[derive(Debug)]
 enum DeliveryOutcome {
     /// Delivered (2xx). `receiver_rejected` is the receiver's own
     /// per-record rejection count when its JSON body reported one
@@ -1211,22 +1229,77 @@ fn delivery_id_for_line(line: &str) -> String {
     )
 }
 
-/// Build this delivery's headers from the raw outbox `line` and its parsed
+/// (#2135 option 2, security review follow-up) The printable-ASCII subset
+/// `ureq` validates an HTTP header VALUE against at send time (tab
+/// `0x09`, space `0x20`, and the visible range `0x21..=0x7E`). Every
+/// header value built from record/config-derived text (a peer's
+/// `machine_id`, an `action` string, the operator's free-form
+/// `DARKMUX_MACHINE_ID`) is filtered through this BEFORE it reaches
+/// `.set()` — a byte outside the allowlist (a non-ASCII character in
+/// `crawl.café`, an en-dash, a stray CR/LF) becomes `_` rather than
+/// producing an `ErrorKind::BadHeader` at send time. This matters beyond
+/// hygiene: `try_post`'s classification below has NO way to distinguish
+/// "this exact line will never be postable" from an ordinary transient
+/// network failure without inspecting the error kind, so an unsanitized
+/// value that slips through would, absent this filter, retry the SAME
+/// undelivered line forever (`RetryableFailure` has no give-up threshold
+/// — `MAX_CLIENT_ERROR_ATTEMPTS` only counts `ClientError`), silently
+/// blocking every later record on that rule with no `hook.failed` ever
+/// emitted. CR/LF are never in the allowlist, so a header-injection
+/// attempt (a value crafted to smuggle an extra header line) is caught by
+/// the same filter, not a special case. Also caps length — a
+/// pathologically long operator-typo'd `machine_id` can't grow the
+/// request unboundedly.
+fn sanitize_header_value(raw: &str) -> String {
+    const MAX_HEADER_VALUE_LEN: usize = 256;
+    raw.chars()
+        .map(|c| {
+            let is_allowed = c.is_ascii() && {
+                let b = c as u32;
+                b == 0x09 || b == 0x20 || (0x21..=0x7E).contains(&b)
+            };
+            if is_allowed { c } else { '_' }
+        })
+        // Every char post-filter is a single ASCII byte, so char-count
+        // truncation here is also byte-count truncation of the result.
+        .take(MAX_HEADER_VALUE_LEN)
+        .collect()
+}
+
+/// Build this delivery's headers from the raw outbox `line`, its parsed
 /// JSON (`None` for a line that failed to parse — the quarantine path
-/// still stamps a `delivery_id`/`event`-less `hook.failed`). `event` /
-/// `machine_id` / `machine_uid` come from the RECORD itself (the machine
-/// that PRODUCED it); `sender` is THIS host's own machine id (the machine
-/// POSTing) — the two are deliberately different fields since a fleet hub
-/// forwarding another machine's record would otherwise be indistinguishable
-/// from the record's origin.
-fn build_delivery_headers(line: &str, parsed: Option<&serde_json::Value>, signing_secret: Option<&crate::RawHookSecret>) -> DeliveryHeaders {
-    let event = parsed.and_then(|v| v.get("action")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let machine_id = parsed.and_then(|v| v.get("machine_id")).and_then(|v| v.as_str()).map(str::to_string);
-    let machine_uid = parsed.and_then(|v| v.get("machine_uid")).and_then(|v| v.as_str()).map(str::to_string);
-    let sender = schema::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
+/// still stamps a `delivery_id`/`event`-less `hook.failed`), and its
+/// already-computed `delivery_id` (the caller owns this — see
+/// `delivery_id_for_line`'s doc; passed in rather than recomputed here so
+/// the hash runs exactly once per line, not once for the header and again
+/// for the `hook.fired`/`hook.failed` payload). `event` / `machine_id` /
+/// `machine_uid` come from the RECORD itself (the machine that PRODUCED
+/// it); `sender` is THIS host's own machine id (the machine POSTing) —
+/// the two are deliberately different fields since a fleet hub forwarding
+/// another machine's record would otherwise be indistinguishable from the
+/// record's origin. Every one of these four is sanitized via
+/// `sanitize_header_value` — see its doc for why.
+fn build_delivery_headers(
+    line: &str,
+    parsed: Option<&serde_json::Value>,
+    delivery_id: &str,
+    signing_secret: Option<&crate::RawHookSecret>,
+) -> DeliveryHeaders {
+    let event = sanitize_header_value(parsed.and_then(|v| v.get("action")).and_then(|v| v.as_str()).unwrap_or(""));
+    let machine_id =
+        parsed.and_then(|v| v.get("machine_id")).and_then(|v| v.as_str()).map(sanitize_header_value);
+    let machine_uid =
+        parsed.and_then(|v| v.get("machine_uid")).and_then(|v| v.as_str()).map(sanitize_header_value);
+    let sender = sanitize_header_value(&schema::resolve_machine_id().unwrap_or_else(|| "unknown".to_string()));
     let timestamp_ms =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-    let delivery_id = delivery_id_for_line(line);
+    // NOT sanitized: `delivery_id` is a BLAKE3-hash-derived hex/UUID
+    // string (already the allowlisted subset by construction) and the
+    // signature below is computed over the UNSANITIZED `line`/timestamp —
+    // signing the raw wire body, not the sanitized headers, is what lets
+    // a receiver verify the signature against the body it actually
+    // received.
+    let delivery_id = delivery_id.to_string();
     let signature = signing_secret.map(|secret| {
         let signed_input = format!("{timestamp_ms}.{line}");
         format!("sha256={}", crate::hmac_sha256::hmac_sha256_hex(secret.expose_for_hmac().as_bytes(), signed_input.as_bytes()))
@@ -1296,6 +1369,24 @@ fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome
         }
         Err(ureq::Error::Status(code, _resp)) if is_retryable_client_status(code) => DeliveryOutcome::RetryableFailure,
         Err(ureq::Error::Status(code, _resp)) if (400..500).contains(&code) => DeliveryOutcome::ClientError,
+        // (#2135 option 2, security review follow-up) `BadHeader` means a
+        // header VALUE this process built failed ureq's printable-ASCII
+        // validation at send time — `sanitize_header_value` in
+        // `build_delivery_headers` is the primary defense, but a value
+        // that reaches here unsanitized (a future header addition that
+        // forgets to sanitize, or a bug in the filter itself) must NOT
+        // fall through to `RetryableFailure`: this is a DETERMINISTIC,
+        // permanent failure — the exact same bytes produce the exact same
+        // error on every retry — and `RetryableFailure` has no give-up
+        // threshold (`MAX_CLIENT_ERROR_ATTEMPTS` only counts
+        // `ClientError`), so treating it as retryable would re-POST the
+        // same line forever and silently block every later record on
+        // this rule. Classifying it as `ClientError` routes it through
+        // the existing give-up path instead (bounded retries, then
+        // quarantine + a loud `hook.failed`). `Error::kind()` maps
+        // `Status` to `ErrorKind::HTTP`, so this arm only ever matches a
+        // genuine `Transport` failure of this kind.
+        Err(e) if e.kind() == ureq::ErrorKind::BadHeader => DeliveryOutcome::ClientError,
         Err(_) => DeliveryOutcome::RetryableFailure,
     }
 }
@@ -1340,7 +1431,8 @@ pub fn drain_stray_file(outbox_path: &Path, to_url: &str) -> Result<StrayDrainRe
         // original rule (and whatever secret it named) no longer exists
         // in current config by definition; this manual recovery path
         // delivers unsigned, same as any other unconfigured rule.
-        let headers = build_delivery_headers(&line, parsed.as_ref(), None);
+        let delivery_id = delivery_id_for_line(&line);
+        let headers = build_delivery_headers(&line, parsed.as_ref(), &delivery_id, None);
         match try_post(to_url, &line, &headers) {
             DeliveryOutcome::Success { .. } => {
                 result.delivered += 1;
@@ -1714,7 +1806,7 @@ fn drainer_loop(
                 emit_hook_record(report_sink.as_ref(), false, rt, &line, 1, Some(reason), &delivery_id);
                 continue;
             };
-            let headers = build_delivery_headers(&line, Some(&parsed), rt.rule.signing_secret.as_ref());
+            let headers = build_delivery_headers(&line, Some(&parsed), &delivery_id, rt.rule.signing_secret.as_ref());
             match try_post(&rt.rule.url, &line, &headers) {
                 DeliveryOutcome::Success { receiver_rejected } => {
                     let attempt = {
@@ -2846,6 +2938,127 @@ mod tests {
         }
     }
 
+    // ─── (#2135 option 2, security review follow-up) header-value safety ──
+
+    #[test]
+    fn sanitize_header_value_strips_non_ascii_and_control_bytes_keeps_the_rest() {
+        // Non-ASCII (café's `é`) and CR/LF are outside ureq's printable-
+        // ASCII allowlist (tab 0x09, space 0x20, 0x21..=0x7E) and become
+        // `_`; ordinary visible ASCII, spaces, and tabs pass through
+        // unchanged.
+        assert_eq!(sanitize_header_value("caf\u{e9}"), "caf_");
+        assert_eq!(sanitize_header_value("line1\r\nX-Injected: pwned"), "line1__X-Injected: pwned");
+        assert_eq!(sanitize_header_value("crawl.finding"), "crawl.finding");
+        assert_eq!(sanitize_header_value("with a tab\there"), "with a tab\there");
+        assert_eq!(sanitize_header_value("an en\u{2013}dash"), "an en_dash");
+    }
+
+    #[test]
+    fn sanitize_header_value_truncates_a_pathologically_long_value() {
+        let huge = "a".repeat(10_000);
+        let sanitized = sanitize_header_value(&huge);
+        assert_eq!(sanitized.len(), 256, "must cap at MAX_HEADER_VALUE_LEN, not grow the request unboundedly");
+    }
+
+    /// (MUST FIX 1/2) A record whose `machine_id` carries a non-ASCII
+    /// byte (an en-dash, an accented character — plausible on a peer
+    /// machine's operator-set hostname) must still deliver — the header
+    /// value is sanitized, not rejected wholesale. Without the sanitizer
+    /// in `build_delivery_headers`, ureq's send-time validation would
+    /// return `ErrorKind::BadHeader`, which — absent finding (b)'s
+    /// classification fix too — falls through to `RetryableFailure` (no
+    /// give-up threshold) and re-POSTs this exact line forever, silently
+    /// blocking every later record on the rule. Red-proved by hand:
+    /// commenting out the `sanitize_header_value` calls in
+    /// `build_delivery_headers` turns this from "delivers once, header
+    /// sanitized" into "never delivers, request_count stays 0" — restored
+    /// before commit.
+    #[test]
+    fn delivery_with_non_ascii_machine_id_sanitizes_the_header_and_still_delivers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            extras: Default::default(),
+        }];
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+
+        let mut r = record("crawl.finding");
+        // "café" with a combining accent, plus a literal en-dash — both
+        // outside the printable-ASCII allowlist.
+        r.machine_id = Some("caf\u{e9}\u{2013}peer".to_string());
+        sink.write(&r).unwrap();
+
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)), "must deliver, not hang forever");
+        // Give it several more poll cycles: if sanitization were missing,
+        // a BadHeader would (pre-fix (b)) retry the SAME line forever —
+        // request_count would keep climbing well past 1.
+        std::thread::sleep(POLL_INTERVAL * 5);
+        assert_eq!(receiver.request_count(), 1, "one clean delivery, never a redelivery storm");
+
+        let headers = receiver.headers();
+        let got = headers[0].get("x-darkmux-machine-id").expect("header must still be present, sanitized not dropped");
+        assert!(got.is_ascii(), "sanitized value must be pure ASCII: {got:?}");
+        assert!(!got.contains('\u{e9}') && !got.contains('\u{2013}'), "non-ASCII bytes must be replaced, not passed through: {got:?}");
+    }
+
+    /// (MUST FIX 2/2) A CR/LF embedded in a record field (simulating a
+    /// crafted `action`/`machine_id`) must never reach the wire as a
+    /// second header line — `sanitize_header_value` replaces both with
+    /// `_` before the value ever reaches `.set()`, so there is no
+    /// "smuggle an extra header" path to close per-header; the filter
+    /// closes it structurally.
+    #[test]
+    fn crlf_in_a_record_field_never_reaches_the_wire_as_an_injected_header() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            signing_secret_keychain_item: None,
+            extras: Default::default(),
+        }];
+        let report: Arc<dyn FlowSink> = Arc::new(NullSink);
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), report).unwrap();
+
+        let mut r = record("crawl.finding");
+        r.machine_id = Some("line1\r\nX-Injected: pwned".to_string());
+        sink.write(&r).unwrap();
+
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
+        let headers = receiver.headers();
+        assert!(!headers[0].contains_key("x-injected"), "CRLF must never split into a second header line: {:?}", headers[0]);
+        let got = headers[0].get("x-darkmux-machine-id").unwrap();
+        assert_eq!(got, "line1__X-Injected: pwned", "CR/LF replaced with `_`, everything else preserved as ONE value");
+    }
+
+    /// (MUST FIX 2/2, belt-and-braces) Independent of the sanitizer: even
+    /// a header value that somehow bypasses `sanitize_header_value` (a
+    /// future header addition that forgets to call it, or a bug in the
+    /// filter) must not be classified `RetryableFailure` when ureq
+    /// refuses to send it. `try_post` is exercised directly with a
+    /// hand-built `DeliveryHeaders` carrying a raw (unsanitized) CRLF —
+    /// this must resolve to `ClientError`, which is what routes into the
+    /// existing give-up path (bounded retries → quarantine + `hook.failed`)
+    /// instead of retrying the same unpostable line forever.
+    #[test]
+    fn try_post_classifies_a_malformed_header_value_as_client_error_not_retryable_forever() {
+        let receiver = HookReceiver::start();
+        let mut headers = build_delivery_headers("{}", None, &delivery_id_for_line("{}"), None);
+        headers.machine_id = Some("bad\r\nheader".to_string()); // deliberately bypasses the sanitizer
+        let outcome = try_post(&receiver.url("/events"), "{}", &headers);
+        assert!(
+            matches!(outcome, DeliveryOutcome::ClientError),
+            "a BadHeader transport error must be a PERMANENT failure (ClientError), never RetryableFailure — \
+             otherwise the give-up threshold (MAX_CLIENT_ERROR_ATTEMPTS, which only counts ClientError) never \
+             engages and the line is re-POSTed forever: {outcome:?}"
+        );
+        assert_eq!(receiver.request_count(), 0, "refused locally before ever reaching the network");
+    }
+
     #[test]
     fn delivery_id_is_stable_across_retries_and_stamped_on_hook_fired() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3763,7 +3976,7 @@ mod tests {
         // this URL — if `try_post` tried to actually connect, it would
         // hang on connection refused / DNS, not return promptly.
         let start = Instant::now();
-        let headers = build_delivery_headers("{}", None, None);
+        let headers = build_delivery_headers("{}", None, &delivery_id_for_line("{}"), None);
         let outcome = try_post("http://evil.example.com/x", "{}", &headers);
         assert!(start.elapsed() < Duration::from_millis(500), "must refuse locally, never attempt the network");
         assert!(matches!(outcome, DeliveryOutcome::ClientError), "an invalid URL is a permanent, non-retryable failure");

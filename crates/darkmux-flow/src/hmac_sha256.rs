@@ -144,4 +144,27 @@ mod tests {
         let hex = hmac_sha256_hex(key, data);
         assert_eq!(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
     }
+
+    /// RFC 4231 Test Case 6 — a 131-byte key, LONGER than SHA-256's 64-byte
+    /// block size, so `hmac_sha256` must hash the key down before using it
+    /// (the `key.len() > BLOCK` branch) — untested by cases 1/2, both of
+    /// which have keys shorter than one block.
+    #[test]
+    fn hmac_sha256_matches_rfc4231_test_case_6_key_longer_than_block_size() {
+        let key = [0xaau8; 131];
+        let data = b"Test Using Larger Than Block-Size Key - Hash Key First";
+        let hex = hmac_sha256_hex(&key, data);
+        assert_eq!(hex, "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    }
+
+    /// RFC 4231 Test Case 7 — the same over-block-size key as case 6, PLUS
+    /// data longer than one block too (multi-chunk SHA-256 compression on
+    /// both the key-hash and the inner/outer hashes).
+    #[test]
+    fn hmac_sha256_matches_rfc4231_test_case_7_key_and_data_longer_than_block_size() {
+        let key = [0xaau8; 131];
+        let data = b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.";
+        let hex = hmac_sha256_hex(&key, data);
+        assert_eq!(hex, "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2");
+    }
 }
