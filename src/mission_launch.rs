@@ -338,6 +338,24 @@ pub(crate) fn drained_telemetry(telemetry: &run_obs::HostTelemetrySampler, missi
         .collect()
 }
 
+/// (#2131 review round 2, item 5) RAII stop-signal for `launch`'s own
+/// child-reaping watchdog thread — `Drop` sets the shared flag, so it
+/// fires on EVERY exit from `launch` (an early `?`-return, a panic, or
+/// the normal fall-through at the bottom) without needing a store call at
+/// each of that function's several return points. Without this, the
+/// watchdog thread spawned per `launch()` call ran for the rest of the
+/// PROCESS's lifetime (an interrupted run's reaping `loop` never exited;
+/// a clean run's waiting `while` never got a reason to either) — harmless
+/// on a real one-shot-per-invocation CLI process, but ~25 unit tests each
+/// leaving a background thread spinning is real, avoidable waste.
+struct WatchdogStopGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for WatchdogStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub fn launch(
     config_id: &str,
     input_file: Option<&Path>,
@@ -538,6 +556,23 @@ pub fn launch(
     crate::preflight::check_power_posture(params)?;
     let _sleep_assertion = darkmux_crew::sleep_assertion::SleepAssertion::hold(&format!("darkmux mission {config_id}"));
 
+    // (#2131 review round 4, F2) SIGINT + SIGTERM + SIGHUP — this launcher
+    // (generic graphs + coder-phase) previously installed no signal
+    // handling at all, the gap #2124 fixed for `mission_launch_review.rs`
+    // and #1959 fixed (SIGINT only) for `crawl_launch.rs`. Installed HERE
+    // — ahead of `mint_run_id` below, matching `mission_launch_review.rs`'s
+    // `run_dispatch`, which arms before ITS mint too — not merely ahead of
+    // the config-snapshot write / interpret / freeform-mint /
+    // executable-check work that follows the mint. `mint_run_id` itself is
+    // pure in-memory ID derivation (no disk I/O, so a signal caught inside
+    // it is harmless today regardless), but arming any later would make
+    // "is it safe to be here" a fact the reader has to re-derive from
+    // `mint_run_id`'s own implementation rather than something structurally
+    // true by placement — the SAME reasoning `mission_launch_review.rs`
+    // already applies. The flag is live well before the real-execution
+    // section (below) constructs this launcher's own `LaunchFinalizeGuard`.
+    crate::launch_guard::arm();
+
     // Run id: minted fresh for THIS launch, never derived from inputs
     // (#1503). AI work is non-deterministic, so two launches of the same
     // config with the same inputs are two DIFFERENT runs, not one to
@@ -692,6 +727,112 @@ pub fn launch(
         return Ok(4);
     }
 
+    // (#2131) Armed here, right before real execution starts — every exit
+    // from this point on (an explicit `close()` call at one of this
+    // function's three known terminal points below, an early `?`-return, a
+    // panic that unwinds past this point, or a caught SIGTERM/SIGINT/
+    // SIGHUP) leaves a matching mission terminal record behind instead of
+    // a mission stuck `Active` forever. Deliberately NOT armed any earlier:
+    // the freeform-mint (`Ok(0)`, just above) and unexecutable-graph
+    // (`Ok(4)`, just above) returns both leave the mission Active ON
+    // PURPOSE (freeform: the operator finishes it by hand; unexecutable:
+    // nothing was dispatched to abandon) — arming before those would wrongly
+    // abort a mission neither return path intends to touch.
+    //
+    // The abort writer mirrors the existing pre-mint strand-window fallback
+    // this function already uses (`reconcile_and_finalize_on_error(...,
+    // &[], &mut no_steps, ...)`, e.g. the config-snapshot-write failure just
+    // above) — an aborted run's real `tasks`/`steps` state either isn't
+    // known yet (a panic before dispatch starts) or can't be trusted (a
+    // signal caught mid-dispatch, with the underlying call's children
+    // killed out from under it — see the watchdog below), so this always
+    // reconciles against an empty step set rather than guessing at partial
+    // progress.
+    let abort_mission_id = mission_id.clone();
+    let abort_config = config_owned.clone();
+    let abort_phase_ids = real_phase_ids.clone();
+    let abort_config_id = config_id.to_string();
+    let mut guard = crate::launch_guard::LaunchFinalizeGuard::new(move || {
+        let mut no_steps = BTreeMap::new();
+        reconcile_and_finalize_on_error(
+            &abort_mission_id,
+            &abort_config,
+            &abort_phase_ids,
+            &[],
+            &mut no_steps,
+            &anyhow!(
+                "mission launch {abort_config_id}: mission aborted — the launcher exited before \
+                 a terminal outcome was recorded (a signal, a panic, or an early return this \
+                 guard did not expect)"
+            ),
+        );
+    });
+    // (#2131) `run_step_graph` (below) is ONE blocking, synchronous call on
+    // THIS thread, with no polling seam of its own — the same shape
+    // `mission_launch_review.rs`'s dispatch had before #2124, which fixed
+    // it there with a supervised worker thread. That shape doesn't collapse
+    // cleanly onto this launcher's much larger surface (coder-phase's own
+    // gate machinery, the generic-graph persist/emit closures, and the
+    // shared `crew::gate::GateHandler` type all assume a single caller
+    // thread) without a much bigger, riskier rewrite than this fix
+    // warrants — deliberately scoped out (a follow-up, not silently
+    // dropped). Instead: a lightweight watchdog thread (no captures, so no
+    // `Send`/`'static` concerns at all) that reaps every registered child
+    // pid as soon as a signal is observed. Dispatch failures on this
+    // generic/coder-phase path never auto-retry (unlike the review funnel's
+    // judge stage), so killing the one blocking dispatch's child unblocks
+    // `run_step_graph` promptly instead of waiting out its own per-dispatch
+    // timeout; the loop keeps reaping (not just once) so a graph with more
+    // than one dispatching step can't outrun a single kill. This makes the
+    // response genuinely interruptible, just not to review's tighter
+    // poll-tick bound.
+    //
+    // (#2131 review round 2, MUST-FIX 2 — correction) At the time the
+    // paragraph above was written, this watchdog was a no-op for exactly
+    // the dispatch this launcher actually runs: a coder-phase/crawl step
+    // goes through `dispatch_internal.rs`'s docker/agentic container path,
+    // which registered NOTHING with `darkmux_types::child_registry` — so
+    // `kill_all` here had no pid to signal, and a caught SIGTERM was
+    // silently swallowed until the dispatch's own inactivity timeout (a
+    // second signal reproduced the pre-#2131 bug). Fixed at the source:
+    // `dispatch_internal.rs`'s container spawn site now registers its
+    // child pid, and its own trajectory tailer independently polls this
+    // SAME `interrupt::is_set()` flag and kills that pid on its own
+    // ~250ms cadence — so THIS watchdog is now a genuine backstop (a
+    // graph with more than one dispatching step, or a future dispatch
+    // path that registers a pid without its own poll seam) rather than
+    // the sole mechanism the paragraph above originally described it as.
+    //
+    // (#2131 review round 2, item 5) Bounded: `watchdog_stop` (set by
+    // `WatchdogStopGuard`'s `Drop`, above — fires on every exit from this
+    // function) is re-checked in BOTH loops below, so this thread exits
+    // once this `launch()` call is over instead of running for the rest
+    // of the process's lifetime. And skipped entirely under `cfg(test)` —
+    // `cfg!(test)` is true for the WHOLE crate whenever it's built by
+    // `cargo test` (not just inside `#[cfg(test)] mod tests`), so none of
+    // this module's ~25 unit tests that call `launch()` spin up a
+    // watchdog thread they have no use for.
+    let watchdog_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _watchdog_stop_guard = WatchdogStopGuard(Arc::clone(&watchdog_stop));
+    if !cfg!(test) {
+        let watchdog_stop = Arc::clone(&watchdog_stop);
+        std::thread::spawn(move || {
+            while !darkmux_types::interrupt::is_set() {
+                if watchdog_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            loop {
+                if watchdog_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
+
     // Real execution — start every real phase that has tasks, run the
     // scheduler against `registry` (built once, at the top of this function,
     // via `all_step_kinds` — see its own doc; the coder-phase kinds it
@@ -719,7 +860,22 @@ pub fn launch(
         ) {
             Ok(h) => Some(h),
             Err(e) => {
-                reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e);
+                // (#2131 review round 2, MUST-FIX 1) Routed through
+                // `guard.close`, matching the scheduler-error and
+                // failure-before-gate arms below — this call already
+                // writes the same informative terminal record `Drop`'s
+                // abort writer would, so `guard` must disarm here too.
+                // Without this, the still-armed guard's `Drop` ran the
+                // abort writer a SECOND time on unwind, and
+                // `finalize_mission` (inside `reconcile_and_finalize_on_error`)
+                // overwrote `envelope.json` unconditionally — clobbering the
+                // real registration error, the reconciled-step warning, and
+                // the completed/errored step detail with the generic
+                // "launcher exited before a terminal outcome was recorded"
+                // abort text.
+                guard.close(|| {
+                    reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e)
+                });
                 return Err(e);
             }
         }
@@ -960,10 +1116,16 @@ pub fn launch(
     // The failure is still surfaced to the caller (loud, non-zero exit); the
     // mission board just no longer lies about a dead run being active.
     if let Err(e) = graph_result {
-        reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e);
         // (#1877) Explicit close, not the Drop backstop — a scheduler
         // error is a KNOWN outcome with real error text worth carrying,
-        // same as `with_dispatch_bookends`'s own `Err` arm.
+        // same as `with_dispatch_bookends`'s own `Err` arm. (#2131) Now
+        // routed through `guard.close` so the `LaunchFinalizeGuard`
+        // armed above disarms here too — this call already wrote the
+        // SAME terminal record `Drop`'s abort writer would have, so this
+        // is the intentional, informative path, not the fallback.
+        guard.close(|| {
+            reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e)
+        });
         for sample in drained_telemetry(&telemetry, &mission_id) {
             bookend.emit_now(sample);
         }
@@ -986,6 +1148,11 @@ pub fn launch(
         // own (see `acp_panel::emit_cmd_audit`'s doc on why a failed
         // attempt is never silently dropped from the trail).
         emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), false);
+        // (#2131) The terminal record above is already durable — a no-op
+        // unless a signal was actually observed, in which case this reaps
+        // every child the watchdog above may not have caught yet and
+        // exits with the conventional signal-terminated code.
+        crate::launch_guard::reap_and_exit_on_signal();
         return Err(e);
     }
 
@@ -1011,7 +1178,20 @@ pub fn launch(
                 Err(e) => anyhow!("{e:#}"),
                 _ => anyhow!("coder dispatch failed before a reviewable gate (exit 1)"),
             };
-            reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e);
+            // (#2131) Disarms `guard` — this is a KNOWN failure-before-gate
+            // outcome with real error text, the same shape the scheduler-
+            // error branch above uses.
+            guard.close(|| {
+                reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &tasks, &mut steps, &e)
+            });
+        } else {
+            // (#2131) The gate WAS reached — the mission stays Active on
+            // purpose (operator sign-off is still pending; `mission
+            // finalize`/`mission abort` closes the loop later, per this
+            // function's own doc above). Disarm without writing anything —
+            // `Drop`'s abort writer must never abandon a mission that
+            // reached its gate cleanly.
+            guard.close(|| {});
         }
         // (#1685 QA MUST-FIX 2) `0` mirrors this function's own exit-code
         // doc above ("`0` — ... coder ran and QA came back clean/flags-only
@@ -1035,6 +1215,21 @@ pub fn launch(
         }
         bookend.close("dispatch", record);
         emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), success);
+        // (#2131) A no-op unless a signal was actually observed — see the
+        // scheduler-error branch above for what this does when one was.
+        //
+        // (#2131 review round 2, item 6) When a signal WAS observed AND
+        // the gate was reached (the `else` branch just above — `guard`
+        // disarmed WITHOUT writing anything), this still exits 130 with
+        // the mission left `Active` — on purpose, not a gap. The gate
+        // outcome is real, earned work (the operator's sign-off is
+        // genuinely still pending, signal or no signal); reaping +
+        // hard-exiting here does not un-earn it. `mission finalize` (or
+        // `mission abort`) is how the operator closes the loop from
+        // here regardless of whether THIS invocation ended by a signal
+        // or by simply returning after printing the gate banner — same
+        // as any other gated run.
+        crate::launch_guard::reap_and_exit_on_signal();
         return outcome;
     }
 
@@ -1043,7 +1238,8 @@ pub fn launch(
     // phase/mission status (Packet 2's own doctrine for gate-free work).
     let envelope = build_envelope(&mission_id, config, &real_phase_ids, &tasks, &steps);
     let status = envelope.status;
-    crew::envelope::finalize_mission(&envelope);
+    // (#2131) Disarms `guard` — the third and last known terminal point.
+    guard.close(|| crew::envelope::finalize_mission(&envelope));
 
     print_run_summary(&mission_id, &steps);
 
@@ -1110,6 +1306,8 @@ pub fn launch(
             }),
         ),
     );
+    // (#2131) A no-op unless a signal was actually observed.
+    crate::launch_guard::reap_and_exit_on_signal();
     Ok(exit_code)
 }
 
@@ -3501,6 +3699,132 @@ mod tests {
             Ok(_) => panic!("must bail without workdir/branch/base supplied"),
         };
         assert!(err.to_string().contains("workdir"), "{err}");
+        let _ = guard;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn register_coder_phase_kinds_err_arm_closes_the_guard_so_drop_never_clobbers_the_informative_envelope() {
+        // (#2131 review round 2, MUST-FIX 1 — regression proof) `launch()`'s
+        // `register_coder_phase_kinds` `Err` arm used to call
+        // `reconcile_and_finalize_on_error` directly and `return Err(e)`
+        // WITHOUT going through `guard.close` — the still-armed guard's
+        // `Drop` then ran the abort writer a SECOND time, and
+        // `finalize_mission` (inside `reconcile_and_finalize_on_error`)
+        // overwrites `envelope.json` unconditionally — the operator lost
+        // the real registration error in favor of the guard's generic
+        // "aborted before a terminal outcome was recorded" text. This test
+        // mirrors that exact arm against two separate mission instances:
+        // one exercising the buggy shape (reconcile called directly, guard
+        // left armed to Drop) to prove it clobbers, and one exercising the
+        // fixed shape (`guard.close(...)`, this function's own current
+        // code) to prove the informative envelope survives.
+        let guard = LaunchTestGuard::new();
+        let loaded = mission_config::load("coder-phase").unwrap();
+        let config = &loaded.config;
+        let collected: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        let registry = crew::step_kinds::StepKindRegistry::with_builtins();
+        register_coder_phase_step_kinds(&registry).unwrap();
+        let no_tasks: Vec<crew::types::Task> = vec![];
+
+        // ── Buggy shape: reconcile called directly, guard left armed. ──
+        {
+            let mission_id = mint_run_id("coder-phase").unwrap();
+            let real_phase_ids =
+                ensure_mission_and_phases_with_provenance(&mission_id, config, None, None).unwrap();
+            let mut steps = BTreeMap::new();
+            let abort_mission_id = mission_id.clone();
+            let abort_config = config.clone();
+            let abort_phase_ids = real_phase_ids.clone();
+            let armed_guard = crate::launch_guard::LaunchFinalizeGuard::new(move || {
+                let mut no_steps = BTreeMap::new();
+                reconcile_and_finalize_on_error(
+                    &abort_mission_id,
+                    &abort_config,
+                    &abort_phase_ids,
+                    &[],
+                    &mut no_steps,
+                    &anyhow!(
+                        "mission aborted — the launcher exited before a terminal outcome was recorded"
+                    ),
+                );
+            });
+            let err = match register_coder_phase_kinds(
+                &registry,
+                &mission_id,
+                config,
+                &real_phase_ids,
+                &collected,
+                600,
+                &mut steps,
+            ) {
+                Err(e) => e,
+                Ok(_) => panic!("must bail without workdir/branch/base supplied"),
+            };
+            // Pre-fix shape: reconcile runs with the REAL error, then the
+            // still-armed guard drops and its generic abort writer runs a
+            // second time on top of it.
+            reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &no_tasks, &mut steps, &err);
+            drop(armed_guard);
+
+            let persisted =
+                crew::lifecycle::load_envelope(&mission_id).unwrap().expect("envelope.json persisted");
+            assert!(
+                persisted.reason.as_deref().unwrap_or("").contains("before a terminal outcome was recorded"),
+                "demonstrates the regression: Drop's generic abort writer clobbers the informative \
+                 reconcile that ran just before it, got {:?}",
+                persisted.reason
+            );
+        }
+
+        // ── Fixed shape: guard.close(|| reconcile_and_finalize_on_error(...)). ──
+        {
+            let mission_id = mint_run_id("coder-phase").unwrap();
+            let real_phase_ids =
+                ensure_mission_and_phases_with_provenance(&mission_id, config, None, None).unwrap();
+            let mut steps = BTreeMap::new();
+            let abort_mission_id = mission_id.clone();
+            let abort_config = config.clone();
+            let abort_phase_ids = real_phase_ids.clone();
+            let mut fixed_guard = crate::launch_guard::LaunchFinalizeGuard::new(move || {
+                let mut no_steps = BTreeMap::new();
+                reconcile_and_finalize_on_error(
+                    &abort_mission_id,
+                    &abort_config,
+                    &abort_phase_ids,
+                    &[],
+                    &mut no_steps,
+                    &anyhow!(
+                        "mission aborted — the launcher exited before a terminal outcome was recorded"
+                    ),
+                );
+            });
+            let err = match register_coder_phase_kinds(
+                &registry,
+                &mission_id,
+                config,
+                &real_phase_ids,
+                &collected,
+                600,
+                &mut steps,
+            ) {
+                Err(e) => e,
+                Ok(_) => panic!("must bail without workdir/branch/base supplied"),
+            };
+            fixed_guard.close(|| {
+                reconcile_and_finalize_on_error(&mission_id, config, &real_phase_ids, &no_tasks, &mut steps, &err)
+            });
+            drop(fixed_guard); // already disarmed by close() — Drop is a no-op.
+
+            let persisted =
+                crew::lifecycle::load_envelope(&mission_id).unwrap().expect("envelope.json persisted");
+            assert!(
+                persisted.reason.as_deref().unwrap_or("").contains("no `workdir` input was supplied"),
+                "the fix: guard.close survives the informative reconcile instead of losing it to \
+                 Drop's generic text, got {:?}",
+                persisted.reason
+            );
+        }
         let _ = guard;
     }
 

@@ -6026,3 +6026,161 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert!(other.contains("exit 22") && other.contains("401"), "{other}");
         assert!(!other.contains("lms server start"), "an HTTP error is not a connection refusal: {other}");
     }
+
+    // ─── #2131 review round 2, MUST-FIX 2 — the container dispatch path ───
+    // is now interruptible: the docker spawn site registers its child pid
+    // (mirroring the hosted-curl path above) and the trajectory tailer's
+    // own poll loop checks `interrupt::is_set()` each tick, killing every
+    // registered child and returning promptly instead of running out the
+    // dispatch's own inactivity timeout.
+
+    #[test]
+    #[serial]
+    fn run_tailer_kills_registered_children_on_interrupt_and_returns_promptly() {
+        // A real integration proof of the tailer's own interrupt-check —
+        // the ONE poll point the docker/coder/crawl dispatch path has
+        // between spawning the container and the main thread's blocking
+        // `wait_with_output()` returning (`run_step_graph` gives it none
+        // of its own). No Docker or runtime image needed (unavailable in
+        // this sandbox; the release-gate doctrine reserves real-container
+        // runs for dogfood, not `cargo test`): a real OS child (`sleep
+        // 100` — a fake dispatch, standing in for the docker child the
+        // spawn site would otherwise register) is registered through the
+        // SAME `child_registry::register` call the spawn site now makes,
+        // and `interrupt::simulate_sigterm_for_test()` drives the SAME
+        // flag a real caught SIGTERM would. Asserts the child is actually
+        // dead — reaped, killed by signal — well within 5 seconds, not
+        // just that a flag flipped.
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::child_registry::reset_for_test();
+
+        let mut fake_dispatch_child = std::process::Command::new("sleep")
+            .arg("100")
+            .spawn()
+            .expect("spawning a real OS child (sleep) for this test");
+        let fake_pid = fake_dispatch_child.id();
+        darkmux_types::child_registry::register(fake_pid);
+
+        // Fire the SAME flag a real caught SIGTERM would set — BEFORE
+        // starting the tailer, so its first poll iteration already
+        // observes it (mirrors a signal arriving mid-dispatch, well
+        // before the container would exit on its own).
+        darkmux_types::interrupt::simulate_sigterm_for_test();
+        assert!(darkmux_types::interrupt::is_set(), "the simulated SIGTERM must set the flag");
+
+        let out_dir = TempDir::new().unwrap();
+        let inactivity_deadline = Arc::new(Mutex::new(Instant::now() + Duration::from_secs(600)));
+        let started = Instant::now();
+        let _summary = run_tailer(
+            out_dir.path().to_path_buf(),
+            "test-session".to_string(),
+            "coder".to_string(),
+            "test-model".to_string(),
+            None,
+            None,
+            None,
+            // stop_flag — deliberately never set. Only the interrupt
+            // check may end this loop; if that check is missing or
+            // broken, this call hangs (well past any sane test timeout)
+            // instead of silently passing.
+            Arc::new(AtomicBool::new(false)),
+            inactivity_deadline,
+            600,
+            None,
+            None,
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the tailer must observe the interrupt and return well within 5s, took {elapsed:?}"
+        );
+
+        // The registered child must actually be dead. `kill_all` sends
+        // SIGKILL by pid; reap it (avoiding a zombie) and check it died
+        // BY SIGNAL, not a normal exit (which would just mean `sleep`
+        // happened to be interruptible some other way, proving nothing
+        // about this code path).
+        let status = fake_dispatch_child.wait().expect("the killed child must be reapable");
+        assert!(
+            !status.success(),
+            "a `sleep 100` that exits within this test's wall-clock must have been KILLED, not \
+             finished naturally"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(darkmux_types::child_registry::SIGKILL),
+                "must die by SIGKILL — the signal `kill_all` sends"
+            );
+        }
+
+        darkmux_types::child_registry::deregister(fake_pid);
+        darkmux_types::interrupt::reset_for_test();
+        darkmux_types::child_registry::reset_for_test();
+    }
+
+    // (#2131 review round 2, NEW-1) `docker_kill_by_name` is the ONE place
+    // that stops a container by its deterministic name — shared now by the
+    // inactivity watchdog, the wait-error teardown, and the interrupt
+    // teardown, so a single test covers all three call sites at once.
+    // Before this fix, the interrupt branch killed only the registered
+    // `docker run` CLIENT pid, which does NOT stop the container (measured
+    // live: `docker ps` still showed it `Up` after `kill -9` on the CLI's
+    // pid). No real Docker/`docker ps` is available in this sandbox, so
+    // this is the mocked equivalent: a fake `docker` executable on `PATH`
+    // that records its own argv, standing in for the real `docker`
+    // binary this function shells out to.
+    #[test]
+    #[serial]
+    fn docker_kill_by_name_invokes_docker_kill_with_the_exact_container_name() {
+        let dir = TempDir::new().unwrap();
+        let record_path = dir.path().join("invoked-with.txt");
+        let fake_docker_path = dir.path().join("docker");
+        // A trivial shell script standing in for `docker`: writes its own
+        // argv (space-joined) to `record_path`, then exits 0 — enough to
+        // prove WHAT this function invokes without needing the real
+        // Docker CLI or daemon.
+        std::fs::write(
+            &fake_docker_path,
+            format!("#!/bin/sh\necho \"$@\" > {}\n", record_path.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_docker_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_docker_path, perms).unwrap();
+        }
+
+        let prev_path = std::env::var("PATH").ok();
+        // SAFETY: serialized via #[serial].
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.path().display(), prev_path.clone().unwrap_or_default()),
+            );
+        }
+
+        docker_kill_by_name("darkmux-test-container-2131");
+
+        // SAFETY: serialized via #[serial].
+        unsafe {
+            match &prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let recorded = std::fs::read_to_string(&record_path)
+            .expect("docker_kill_by_name must have invoked the fake `docker` on PATH");
+        assert_eq!(
+            recorded.trim(),
+            "kill darkmux-test-container-2131",
+            "must call `docker kill <exact container name>`, not some other subcommand or a \
+             different name"
+        );
+    }

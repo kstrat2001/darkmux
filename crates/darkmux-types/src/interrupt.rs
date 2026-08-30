@@ -11,7 +11,12 @@
 //! rather than being torn down mid-dispatch; #2124, `darkmux mission launch
 //! review` — a supervisor thread polls this flag while the pipeline runs on
 //! a worker thread, so a `kill <pid>` (SIGTERM) mid-probe still leaves a
-//! terminal mission record instead of an orphaned Active mission).
+//! terminal mission record instead of an orphaned Active mission; #2131
+//! generalized both of these — plus the third launcher, `darkmux mission
+//! launch` for generic graphs + coder-phase, which had NO signal handling
+//! at all before — onto one shared `darkmux`-crate guard,
+//! `launch_guard::LaunchFinalizeGuard`, and every launcher now installs
+//! ALL THREE signals via its `arm()`; see that module's own doc).
 //!
 //! **SIGHUP (#2124 pty-test finding).** `install_hup` exists because of a
 //! measured, NOT hypothetical failure mode: when `darkmux mission launch
@@ -32,8 +37,12 @@
 //! SIGINT, SIGTERM, and SIGHUP share ONE flag ([`INTERRUPTED`]) — a caller
 //! that wants "stop cleanly on any of them" polls [`is_set`] once,
 //! regardless of which signal arrived; a caller that only cares about one
-//! (crawl, SIGINT only) simply never calls [`install_term`]/
-//! [`install_hup`]. Each signal keeps its OWN escalation counter so the
+//! would simply never call [`install_term`]/[`install_hup`] — though as of
+//! #2131 every `darkmux mission launch` launcher (crawl included, which
+//! installed SIGINT only before that fix) calls all three via
+//! `launch_guard::arm()`, so this degrees-of-freedom note is aspirational
+//! for a FUTURE caller today, not a description of a current one. Each
+//! signal keeps its OWN escalation counter so the
 //! "two presses, then the OS default disposition comes back" escape hatch
 //! (see [`on_sigint`]'s doc) works independently per signal — a SIGINT
 //! then a SIGTERM is two DIFFERENT first deliveries, not one signal's
@@ -193,6 +202,34 @@ pub fn reset_for_test() {
     SIGINT_COUNT.store(0, Ordering::SeqCst);
     SIGTERM_COUNT.store(0, Ordering::SeqCst);
     SIGHUP_COUNT.store(0, Ordering::SeqCst);
+}
+
+/// (#2131 review round 2, NEW-5; round 4, F6) Test-only: restore SIGINT,
+/// SIGTERM, and SIGHUP to their OS-default disposition. [`reset_for_test`]
+/// above only resets THIS module's own flag/counters — it never touches
+/// the real signal disposition, and neither do [`simulate_sigint_for_test`]/
+/// [`simulate_sigterm_for_test`]/[`simulate_sighup_for_test`] (they call
+/// the internal handler function directly, never `signal(2)`). A test
+/// that instead calls [`install`]/[`install_term`]/[`install_hup`] (or,
+/// one level up, `darkmux`'s own `launch_guard::arm`, which calls all
+/// three together) to prove the REAL handler gets wired up needs this:
+/// `signal(2)` dispositions are process-wide and persist across
+/// `install*` calls until something changes them back, so skipping this
+/// would leave a custom handler installed for every LATER test in the
+/// same test binary process, whether or not that test itself calls
+/// `install`/`install_term`/`install_hup` again. All three signals are
+/// restored — even a test that only sends itself a real SIGTERM/SIGHUP
+/// (never a real SIGINT, which could be disruptive to send to a live
+/// test process) still installed a SIGINT handler as a side effect if it
+/// went through `arm()`, which always calls [`install`] alongside the
+/// other two.
+#[cfg(any(test, feature = "test-support"))]
+pub fn restore_default_for_test() {
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::signal(libc::SIGHUP, libc::SIG_DFL);
+    }
 }
 
 #[cfg(test)]
