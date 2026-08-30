@@ -2664,7 +2664,11 @@ mod tests {
         //           envelope) gain `bounds` — the resolved runtime knobs
         //           WITH provenance (`{value, source}` per knob). Additive;
         //           same free-form `payload` blob. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.29.0");
+        //   1.30.0 (2026-08-30 fleet-observability finding): `dispatch.rest`
+        //           gains `reason`/`state`; `dispatch.complete` (and the
+        //           envelope) gain `paced_rest_ms`. Additive; same
+        //           free-form `payload` blob. See schema.rs.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.30.0");
     }
 
     #[test]

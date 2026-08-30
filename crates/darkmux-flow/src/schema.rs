@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.29.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.30.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -563,6 +563,23 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.29.0";
 //           own start record. No struct/field change — same free-form
 //           `payload` blob every other richer action already uses; older
 //           readers ignore the new key.
+//   1.30.0 (2026-08-30 fleet-observability finding): `dispatch.rest` gains
+//           `reason` (always present now — `"turn_delay"` for a routine
+//           inter-turn rest, or the pace file's own operator/governor-
+//           supplied reason for a paced rest) and `state` (the pace file's
+//           OS thermal-state name, present only on a paced rest that
+//           carried one). Before this, a manual pace pause and a routine
+//           turn-delay rest were indistinguishable on the flow stream
+//           except by cadence (2000ms paced-poll increments vs the
+//           configured `turn_delay_ms`) — a fragile signal for a remote
+//           reader to reverse-engineer. `dispatch.complete`'s payload (and
+//           the finished envelope) gain `paced_rest_ms`: of `rest_ms`, the
+//           portion attributable to a paced rest, so a reader can separate
+//           "cool-down by policy" from "paused by operator/governor"
+//           without subtracting `turn_delay_effective_ms * rests`
+//           themselves. No struct/field change — same free-form `payload`
+//           blob every other richer action already uses; older readers
+//           ignore the new keys.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
