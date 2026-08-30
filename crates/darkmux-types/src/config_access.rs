@@ -742,6 +742,27 @@ pub fn host_sampler_interval_ms() -> u64 {
     pick_parsed("DARKMUX_HOST_SAMPLER_INTERVAL_MS", cfg, Some(5000)).unwrap()
 }
 
+/// (#2111) How many `dispatch_internal::run_telemetry_sampler` ticks (its
+/// 2s cadence) between `machine.telemetry` SAMPLE flow records — the
+/// periodic host-pressure curve (thermal/power/cpu/gpu/mem) a run-detail
+/// view can chart alongside `machine.thermal`'s TRANSITION events. Resolves
+/// `env(DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES) >
+/// config.runtime.telemetry_record_every_samples > 5` (≈10s at the
+/// sampler's 2s cadence) — mirrors `turn_delay_ms`'s wiring. `0` disables
+/// the periodic curve without touching the sampler thread itself: the
+/// thermal governor still reads every tick, and `dispatch complete`'s
+/// `host_window` summary is built from every sample regardless.
+pub fn telemetry_record_every_samples() -> u64 {
+    telemetry_record_every_samples_with_source().0
+}
+/// `telemetry_record_every_samples` plus WHICH tier resolved it.
+pub fn telemetry_record_every_samples_with_source() -> (u64, Source) {
+    let cfg = config().runtime.as_ref().and_then(|r| r.telemetry_record_every_samples);
+    let (v, s) =
+        pick_parsed_with_source("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", cfg, Some(5));
+    (v.unwrap(), s)
+}
+
 // ── Thermal governor + breaker (#2110/#2109) ──
 // `env(DARKMUX_THERMAL_*) > config.runtime.thermal.* > default`, mirroring
 // `turn_delay_ms`'s wiring. `enabled` defaults to `true` — see
@@ -1412,6 +1433,32 @@ mod tests {
         // An unparseable env value falls through (here, to the default).
         unsafe { std::env::set_var(k, "not-a-number") };
         assert_eq!(host_sampler_interval_ms(), 5000);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    // ── telemetry_record_every_samples (#2111): env > config > 5 default,
+    //    mirroring host_sampler_interval_ms's resolution exactly ──
+    #[serial_test::serial]
+    #[test]
+    fn telemetry_record_every_samples_env_overrides_then_default() {
+        let k = "DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k) };
+        // No env + the empty test config (#811) → the built-in 5-sample default.
+        assert_eq!(telemetry_record_every_samples(), 5);
+        unsafe { std::env::set_var(k, "10") };
+        assert_eq!(telemetry_record_every_samples(), 10, "env wins live");
+        // `0` is a real, honored value — the explicit disable.
+        unsafe { std::env::set_var(k, "0") };
+        assert_eq!(telemetry_record_every_samples(), 0, "0 disables the periodic curve");
+        // An unparseable env value falls through (here, to the default).
+        unsafe { std::env::set_var(k, "not-a-number") };
+        assert_eq!(telemetry_record_every_samples(), 5);
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

@@ -164,6 +164,7 @@ pub fn run() -> DoctorReport {
         check_turn_delay(),
         check_reasoning_checkpoint_interval(),
         check_host_sampler_interval(),
+        check_telemetry_record_every_samples(),
         check_generation_checkpoint_interval(),
         check_thermal_governor(),
         check_host_probe(),
@@ -1881,6 +1882,46 @@ fn check_host_sampler_interval() -> Check {
         message: format!(
             "{ms}ms ({provenance}) — darkmux serve's daemon-side host sampler cadence for the \
              machine stats drawer"
+        ),
+        hint: None,
+    }
+}
+
+/// (#2111) Surface the resolved `runtime.telemetry_record_every_samples`
+/// with provenance — how many dispatch-sampler ticks (2s cadence) between
+/// `machine.telemetry` periodic SAMPLE flow records, alongside
+/// `machine.thermal`'s TRANSITION events. Always Pass: `0` is an honest
+/// opt-out (the periodic curve simply isn't written; the sampler itself,
+/// the thermal governor, and `dispatch complete`'s `host_window` summary
+/// are all unaffected), not a defect — same shape as
+/// `check_host_sampler_interval`'s `0` case.
+fn check_telemetry_record_every_samples() -> Check {
+    let name = "runtime.telemetry_record_every_samples";
+    let (value, source) =
+        darkmux_types::config_access::telemetry_record_every_samples_with_source();
+    let provenance = source.as_str();
+    if value == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!(
+                "0 ({provenance}) — the periodic machine.telemetry curve is disabled; \
+                 machine.thermal transitions and dispatch complete's host_window are unaffected"
+            ),
+            hint: None,
+        };
+    }
+    // (#2111 review finding) Derived from the sampler's own constant
+    // rather than a hardcoded literal, so this message can't silently
+    // drift from the real tick if that constant ever changes.
+    let cadence_ms = value.saturating_mul(darkmux_crew::dispatch_internal::TELEMETRY_SAMPLE_INTERVAL_MS);
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "every {value} sample(s) ({provenance}) — the machine.telemetry periodic \
+             host-pressure curve's cadence (≈{}s at the dispatch sampler's own tick)",
+            cadence_ms / 1000
         ),
         hint: None,
     }
@@ -6081,6 +6122,57 @@ mod tests {
         }
     }
 
+    // ─── (#2111) check_telemetry_record_every_samples — resolved state + provenance ─
+
+    #[serial_test::serial]
+    #[test]
+    fn check_telemetry_record_every_samples_default_is_pass_and_names_5() {
+        let prev = std::env::var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES").ok();
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES") };
+        let check = check_telemetry_record_every_samples();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("every 5 sample"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_telemetry_record_every_samples_zero_is_pass_and_says_disabled() {
+        let prev = std::env::var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES").ok();
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", "0") };
+        let check = check_telemetry_record_every_samples();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("disabled"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_telemetry_record_every_samples_env_override_names_provenance() {
+        let prev = std::env::var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES").ok();
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", "10") };
+        let check = check_telemetry_record_every_samples();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("every 10 sample"), "{}", check.message);
+        assert!(check.message.contains("env"), "provenance named: {}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_TELEMETRY_RECORD_EVERY_SAMPLES"),
+            }
+        }
+    }
+
     // ─── (#2171 test e) check_generation_checkpoint_interval — resolved state ─
 
     #[serial_test::serial]
@@ -7277,6 +7369,7 @@ mod tests {
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
         // turn-delay [#2094] + reasoning-checkpoint-interval [#2165] +
         // host-sampler-interval [#2107, #1833] +
+        // telemetry-record-every-samples [#2111] +
         // generation-checkpoint-interval [#2171] +
         // thermal-governor [#2110/#2109] +
         // mission-envelope-readability [#1881] + hooks [#2093] +
@@ -7285,7 +7378,7 @@ mod tests {
         // per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 48 + darkmux_eureka::all_rules().len();
+        let expected = 49 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

@@ -38,14 +38,12 @@
 //! negligible" and "the cadence is what it claims" are both verifiable
 //! facts in the response, not assumptions.
 
-use darkmux_crew::host_probe::{
-    reduce_host_extras, HostExtraAt, HostProbe, HostSampleFull, MwStats, PowerSample, ThermalSample,
-};
+use darkmux_crew::host_probe::{reduce_host_extras, HostExtraAt, HostProbe, HostSampleFull, MwStats};
 use darkmux_crew::telemetry_sampler::{reduce_host_stats, HostSampleAt};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// 10 minutes of history at the default 5s cadence. The ring is capacity-
 /// bounded by ENTRY COUNT, not by wall-clock span — at a faster-than-default
@@ -106,21 +104,6 @@ fn metric_json(m: &darkmux_crew::telemetry_sampler::MetricStats) -> serde_json::
 /// The same wire shape for a power rail, in milliwatts.
 fn mw_json(m: &MwStats) -> serde_json::Value {
     serde_json::json!({ "mean": m.mean_mw, "p95": m.p95_mw, "max": m.max_mw })
-}
-
-fn thermal_now_json(t: &ThermalSample) -> serde_json::Value {
-    serde_json::json!({ "state": t.state, "cpu_speed_limit_pct": t.cpu_speed_limit_pct })
-}
-
-/// `now.power_mw`. `total` is emitted rather than left to the client so
-/// every consumer adds the rails the same way.
-fn power_now_json(p: &PowerSample) -> serde_json::Value {
-    serde_json::json!({
-        "cpu": p.cpu_mw.round() as i64,
-        "gpu": p.gpu_mw.round() as i64,
-        "ane": p.ane_mw.round() as i64,
-        "total": p.total_mw().round() as i64,
-    })
 }
 
 impl HostSamplerRing {
@@ -225,33 +208,13 @@ impl HostSamplerRing {
         let span_ms = raw.last().unwrap().at_ms.saturating_sub(raw.first().unwrap().at_ms);
         drop(g);
 
-        let s = &latest.sample;
-        let clusters = s.cpu_clusters.as_ref().map(|cs| {
-            cs.iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "name": c.name,
-                        "cores": c.cores,
-                        "pct": c.pct,
-                        "mhz": c.mhz,
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
-
+        // (#2111) The "now" shape is the shared `sample_full_json` mapping —
+        // the same one `dispatch_internal::run_telemetry_sampler` uses for
+        // the periodic `machine.telemetry` flow record's payload — so the
+        // two never independently drift on what a host reading's JSON shape
+        // means.
         Some(serde_json::json!({
-            "now": {
-                "sampled_at_ms": latest.at_ms,
-                "sampler_cost_ms": s.cost_ms,
-                "cpu_pct": s.cpu_pct,
-                "cpu_clusters": clusters,
-                "mem_pct": s.mem_pct,
-                "gpu_pct": s.gpu_pct,
-                "gpu_mhz": s.gpu_mhz,
-                "gpu_mem_bytes": s.gpu_mem_bytes,
-                "thermal": s.thermal.as_ref().map(thermal_now_json),
-                "power_mw": s.power.as_ref().map(power_now_json),
-            },
+            "now": darkmux_crew::host_probe::sample_full_json(&latest.sample, latest.at_ms),
             "window": {
                 "samples": stats.samples,
                 "span_ms": span_ms,
@@ -289,6 +252,99 @@ pub(crate) fn ring() -> &'static HostSamplerRing {
     RING.get_or_init(HostSamplerRing::new)
 }
 
+/// (#2111) Build a `machine.thermal` TRANSITION flow record. `Level::Warn`
+/// only when the state RISES into `serious` or `critical` — an
+/// operator-actionable event; every other transition (recovering, or a
+/// lateral move between non-elevated states) is `Level::Info`. No
+/// mission/session context (the daemon sampler runs independently of any
+/// dispatch); `machine_id`/`machine_uid` are left `None` so
+/// `darkmux_flow::record`'s write-time auto-stamp fills them from this
+/// machine's own provenance, the same as `machine.online`/`machine.offline`.
+fn build_thermal_transition_record(
+    from: &str,
+    to: &str,
+    sample: &HostSampleFull,
+    sampled_at_ms: u64,
+) -> darkmux_flow::FlowRecord {
+    use darkmux_crew::host_probe::thermal_severity;
+    let rising_into_elevated =
+        thermal_severity(to) > thermal_severity(from) && thermal_severity(to) >= thermal_severity("serious");
+    let level = if rising_into_elevated {
+        darkmux_flow::Level::Warn
+    } else {
+        darkmux_flow::Level::Info
+    };
+    let payload = serde_json::json!({
+        "from": from,
+        "to": to,
+        "cpu_speed_limit_pct": sample.thermal.as_ref().map(|t| t.cpu_speed_limit_pct),
+        "power_mw_total": sample.power.as_ref().map(|p| p.total_mw().round() as i64),
+        "sampled_at_ms": sampled_at_ms,
+    });
+    let display_name = darkmux_flow::resolve_machine_id().unwrap_or_else(|| "unknown".to_string());
+    darkmux_flow::FlowRecord {
+        ts: darkmux_flow::ts_utc_now(),
+        level,
+        category: darkmux_flow::Category::Machinery,
+        tier: darkmux_flow::Tier::Local,
+        stage: darkmux_flow::Stage::Dispatch,
+        action: "machine.thermal".to_string(),
+        handle: display_name,
+        phase_id: None,
+        session_id: None,
+        source: Some("host-sampler".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(payload),
+        work_id: None,
+        attempt: None,
+    }
+}
+
+/// (#2111) Pure edge detector: given the previously KNOWN thermal state (or
+/// `None` before any reading has landed) and this tick's own reading,
+/// decide whether a `machine.thermal` TRANSITION should fire, and what the
+/// known state becomes for the NEXT call. Testable without a probe, a ring,
+/// or a thread — `spawn`'s loop below is a thin, unit-untestable wrapper
+/// around this.
+///
+/// - `sample.thermal` absent (the probe couldn't read it this tick): no
+///   transition, and the known state is UNCHANGED — an absent reading is
+///   not evidence the state changed, or that it didn't.
+/// - No prior known state (daemon just started): this reading seeds the
+///   baseline SILENTLY. The first reading is never a "transition" — there
+///   is nothing to have transitioned FROM.
+/// - Same state as before: no emit, REGARDLESS of how much wall-clock
+///   elapsed since the prior tick — including across a sleep/wake gap the
+///   ring's own gap-capping logic (`reduce_host_extras`) would separately
+///   flag downstream. A state that reads the same on both sides of a gap
+///   never fires.
+/// - Different state: a genuine transition — emit, whether or not a gap
+///   preceded it. "The state actually differs" is the only condition that
+///   matters here.
+fn thermal_edge(
+    prev: Option<&str>,
+    sample: &HostSampleFull,
+    sampled_at_ms: u64,
+) -> (Option<String>, Option<darkmux_flow::FlowRecord>) {
+    let Some(t) = sample.thermal.as_ref() else {
+        return (prev.map(str::to_string), None);
+    };
+    match prev {
+        None => (Some(t.state.clone()), None),
+        Some(p) if p == t.state => (Some(t.state.clone()), None),
+        Some(p) => {
+            let rec = build_thermal_transition_record(p, &t.state, sample, sampled_at_ms);
+            (Some(t.state.clone()), Some(rec))
+        }
+    }
+}
+
 /// Spawn the daemon-side host sampler thread. `interval_ms` is the
 /// resolved `config_access::host_sampler_interval_ms()` cadence; `0`
 /// disables the sampler entirely and this returns `None` without spawning
@@ -321,16 +377,29 @@ pub(crate) fn spawn(
     let interval = Duration::from_millis(interval_ms);
     Some(std::thread::spawn(move || {
         let mut probe = HostProbe::new();
+        // (#2111) The known thermal state carried between ticks for
+        // `thermal_edge`'s edge detection — see that function's own doc.
+        let mut known_thermal_state: Option<String> = None;
         loop {
             if stop_flag.load(Ordering::SeqCst) {
                 break;
             }
 
             let sample = probe.sample();
-            let at_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            // (#2111 review finding) The shared epoch-ms read — the same
+            // one `dispatch_internal::run_telemetry_sampler` now uses for
+            // `machine.telemetry`'s `sampled_at_ms`, so a viewer strip
+            // charting both producers' records is comparing the same
+            // clock, not one producer's epoch against another's
+            // sampler-relative offset.
+            let at_ms = darkmux_crew::host_probe::epoch_ms_now();
+            // (#2111) Edge-detect BEFORE the sample moves into the ring —
+            // `thermal_edge` only borrows it.
+            let (next_state, transition) = thermal_edge(known_thermal_state.as_deref(), &sample, at_ms);
+            known_thermal_state = next_state;
+            if let Some(rec) = transition {
+                let _ = darkmux_flow::record(rec);
+            }
             // Best-effort like the dispatch-scoped sampler: a tick where
             // every field failed still gets recorded (with the probe's own
             // cost stamped) rather than skipped, since the cost of the
@@ -353,7 +422,7 @@ pub(crate) fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use darkmux_crew::host_probe::CpuCluster;
+    use darkmux_crew::host_probe::{CpuCluster, PowerSample, ThermalSample};
     use std::time::Instant;
 
     fn entry(at_ms: u64, cpu: u64, mem: u64, gpu: u64, cost_ms: u64) -> RingEntry {
@@ -533,5 +602,109 @@ mod tests {
             t0.elapsed() < Duration::from_secs(2),
             "teardown must be prompt (bounded by STOP_POLL_INTERVAL), not a full interval wait"
         );
+    }
+
+    // ─── (#2111) thermal_edge — pure edge detection ─────────────────────
+
+    fn thermal_sample(state: &str) -> HostSampleFull {
+        HostSampleFull {
+            thermal: Some(ThermalSample { state: state.to_string(), cpu_speed_limit_pct: 100 }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn thermal_edge_emits_only_on_real_transitions_with_correct_levels() {
+        // nominal (seeds the baseline, no emit) -> nominal (no-op) -> fair
+        // (Info: rising, but not into serious/critical) -> serious (Warn:
+        // rising INTO serious) -> nominal (Info: falling). Mirrors the
+        // original issue's acceptance criteria exactly (3 records from this
+        // sequence).
+        let sequence = ["nominal", "nominal", "fair", "serious", "nominal"];
+        let mut prev: Option<String> = None;
+        let mut records = Vec::new();
+        for (i, state) in sequence.iter().enumerate() {
+            let sample = thermal_sample(state);
+            let (next, rec) = thermal_edge(prev.as_deref(), &sample, i as u64 * 1000);
+            prev = next;
+            if let Some(r) = rec {
+                records.push(r);
+            }
+        }
+        assert_eq!(records.len(), 3, "expected exactly 3 transitions, got {records:?}");
+
+        let p0 = records[0].payload.as_ref().unwrap();
+        assert_eq!(p0["from"], "nominal");
+        assert_eq!(p0["to"], "fair");
+        assert!(matches!(records[0].level, darkmux_flow::Level::Info), "rising to fair is Info");
+
+        let p1 = records[1].payload.as_ref().unwrap();
+        assert_eq!(p1["from"], "fair");
+        assert_eq!(p1["to"], "serious");
+        assert!(matches!(records[1].level, darkmux_flow::Level::Warn), "rising INTO serious is Warn");
+
+        let p2 = records[2].payload.as_ref().unwrap();
+        assert_eq!(p2["from"], "serious");
+        assert_eq!(p2["to"], "nominal");
+        assert!(matches!(records[2].level, darkmux_flow::Level::Info), "falling back to nominal is Info");
+
+        for r in &records {
+            assert!(matches!(r.category, darkmux_flow::Category::Machinery));
+            assert!(matches!(r.tier, darkmux_flow::Tier::Local));
+            assert_eq!(r.action, "machine.thermal");
+            assert!(r.mission_id.is_none(), "no mission context — the daemon runs independently of any dispatch");
+            assert!(r.session_id.is_none());
+        }
+    }
+
+    #[test]
+    fn thermal_edge_first_reading_seeds_baseline_silently() {
+        let (next, rec) = thermal_edge(None, &thermal_sample("critical"), 0);
+        assert!(rec.is_none(), "the very first reading is never a transition");
+        assert_eq!(next.as_deref(), Some("critical"));
+    }
+
+    #[test]
+    fn thermal_edge_same_state_across_a_large_gap_emits_nothing() {
+        let (prev, seed_rec) = thermal_edge(None, &thermal_sample("nominal"), 0);
+        assert!(seed_rec.is_none());
+        // A sample taken a very long time later (simulating a sleep/wake
+        // gap) that reports the SAME state must not emit — live edge
+        // detection only cares whether the state differs; the ring's own
+        // gap-capping logic (`reduce_host_extras`) is a separate,
+        // retrospective concern over the reduced window, not this
+        // per-tick detector.
+        let (_next, rec) = thermal_edge(prev.as_deref(), &thermal_sample("nominal"), 3_600_000);
+        assert!(rec.is_none(), "same state across any gap must not emit a transition");
+    }
+
+    #[test]
+    fn thermal_edge_missing_reading_does_not_reset_baseline_or_emit() {
+        let (prev, _) = thermal_edge(None, &thermal_sample("fair"), 0);
+        assert_eq!(prev.as_deref(), Some("fair"));
+        let missing = HostSampleFull::default(); // thermal: None — probe read failure
+        let (prev2, rec) = thermal_edge(prev.as_deref(), &missing, 1000);
+        assert!(rec.is_none(), "an absent reading is not evidence of a transition");
+        assert_eq!(
+            prev2.as_deref(),
+            Some("fair"),
+            "known state stays unchanged when the probe couldn't read thermal this tick"
+        );
+    }
+
+    #[test]
+    fn thermal_edge_payload_carries_speed_limit_power_and_sampled_at() {
+        let (prev, _) = thermal_edge(None, &thermal_sample("nominal"), 0);
+        let sample = HostSampleFull {
+            thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
+            power: Some(PowerSample { cpu_mw: 1000.0, gpu_mw: 200.0, ane_mw: 30.0 }),
+            ..Default::default()
+        };
+        let (_next, rec) = thermal_edge(prev.as_deref(), &sample, 5000);
+        let rec = rec.expect("nominal -> serious is a real transition");
+        let payload = rec.payload.unwrap();
+        assert_eq!(payload["cpu_speed_limit_pct"], 62);
+        assert_eq!(payload["power_mw_total"], 1230);
+        assert_eq!(payload["sampled_at_ms"], 5000);
     }
 }

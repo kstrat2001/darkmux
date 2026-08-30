@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.30.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.31.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -580,6 +580,87 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.30.0";
 //           themselves. No struct/field change — same free-form `payload`
 //           blob every other richer action already uses; older readers
 //           ignore the new keys.
+//   1.31.0 (#2111): the "no blind runs" doctrine applied to the #2108
+//           probe. Two new action values, plus an additive payload field
+//           on the existing dispatch-lifecycle terminal:
+//
+//           `machine.thermal` (Category::Machinery, source
+//           `"host-sampler"`) — a TRANSITION record from `darkmux serve`'s
+//           daemon-side host sampler (`darkmux-serve::host_sampler`),
+//           edge-detected between consecutive ticks at the daemon
+//           sampler's own configured cadence (`runtime.
+//           host_sampler_interval_ms`, default 5s — NOT the dispatch
+//           sampler's separate 2s tick; the two sampler threads run at
+//           independent cadences). Payload `{from, to,
+//           cpu_speed_limit_pct, power_mw_total, sampled_at_ms}`.
+//           `Level::Warn` when the state RISES into `serious`/`critical`;
+//           `Level::Info` otherwise (recovering, or a lateral move). Fires
+//           only on a genuine state change — a steady sampler emits none,
+//           and the FIRST reading after daemon start (or after any gap,
+//           sleep/wake included) seeds the baseline silently rather than
+//           firing a transition from "unknown". No mission/session
+//           context (the daemon sampler runs independently of any
+//           dispatch); `machine_id`/`machine_uid` are the usual write-time
+//           auto-stamp.
+//
+//           `machine.telemetry` (Category::Telemetry, source `"host"`) —
+//           a periodic SAMPLE record from the DISPATCH-scoped sampler
+//           (`darkmux-crew::dispatch_internal::run_telemetry_sampler`,
+//           already running during every local dispatch to drive the
+//           thermal governor), emitted every Nth tick
+//           (`runtime.telemetry_record_every_samples`, default 5 ≈ 10s at
+//           this sampler's own 2s tick; `0` disables it) rather than on
+//           every tick, so the periodic curve costs a fraction of the
+//           tick cadence on the flow stream. Payload carries the FULL
+//           host reading — `thermal{state,cpu_speed_limit_pct}`,
+//           `power_mw{cpu,gpu,ane,total}`, `cpu_pct`,
+//           `cpu_clusters[]{name,cores,pct,mhz}`, `gpu_pct`, `gpu_mhz`,
+//           `gpu_mem_bytes`, `mem_pct`, `sampler_cost_ms`,
+//           `sampled_at_ms` (UNIX epoch ms — the same clock every
+//           `sampled_at_ms` producer uses, via the shared
+//           `host_probe::epoch_ms_now()`, so a strip charting this
+//           alongside `machine.thermal` compares like clocks), plus
+//           `prev_record_write_ms` when a PRIOR emission exists — the
+//           measured wall-clock of the previous `darkmux_flow::record()`
+//           call (CLAUDE.md "samplers stamp their own cost" applied to
+//           the record-write path, distinct from the probe read
+//           `sampler_cost_ms` already covers). Deliberately the PREVIOUS
+//           write's cost, not this one's: a record cannot measure its own
+//           write before that write has happened, so this stamps the
+//           last completed one rather than a build-only proxy mislabeled
+//           as "the write". Rides through `merge_record_context` like
+//           every other tailer-emitted telemetry record, so
+//           `mission_id`/`phase_id`/`payload.context` key it to the
+//           dispatch the same way `dispatch.tool` etc. do.
+//
+//           `dispatch complete`/`dispatch error`'s payload (and the
+//           `--json` envelope, alongside the existing nested `host` block
+//           from 1.27.0/1.28.0) gains `host_window` — a FLATTER,
+//           dispatch-summary shape distinct from `host`'s per-metric
+//           breakdown: `{thermal_worst_state, above_nominal_ms,
+//           min_cpu_speed_limit_pct, power_mw_total{mean,max,p95},
+//           energy_mwh, samples, span_ms}`, built from the exact same
+//           `HostStats`/`HostExtras` reduction `host` already uses (no
+//           duplicated math) — so a fleet reader watching the FLOW STREAM
+//           (not just the CLI's own `--json` stdout, which is all `host`
+//           ever reached) can answer "was this dispatch thermally
+//           comfortable" from the terminal record alone. Present only
+//           when the sampler took at least one sample, same "absent means
+//           not measured" convention as `host`. NOTE: `span_ms` is the
+//           UNCAPPED wall-clock span of the sample series, while
+//           `above_nominal_ms` (like `energy_mwh`) is derived through
+//           `reduce_host_extras`'s sleep-gap cap (`MAX_GAP_CADENCE_
+//           MULTIPLE`) — so their ratio is NOT "fraction of the dispatch
+//           spent above nominal" across a dispatch that suspended and
+//           resumed; it undercounts the capped gap on purpose (see
+//           `reduce_host_extras`'s own doc for why an uncapped duty figure
+//           there was the #2108 bug).
+//
+//           All three are additive: two new action values under the
+//           existing free-form `payload` blob, plus a new payload key on
+//           an existing action. Older readers ignore what they don't
+//           recognize; no struct/field change on `FlowRecord` itself, so
+//           prior AuditFileSink chains survive without rotation.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

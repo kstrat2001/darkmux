@@ -3736,61 +3736,29 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     let turn_delay_effective_ms = read_turn_delay_effective_ms(&host_out, rest);
 
     // 8. Emit dispatch.complete flow record with summary metadata.
-    let mut dispatch_complete_payload = serde_json::json!({
-        "runtime": "internal",
-        "wall_ms": wall_ms,
-        // (#2094) Surfaced NEXT TO wall_ms per the issue's own framing — a
-        // rested run's wall clock must never be misread as a slow model.
-        "rest_ms": rest.rest_ms,
-        "rests": rest.rests,
-        // (2026-08-30 fleet-observability finding) Of `rest_ms` above, the
-        // portion attributable to a PACED rest (a manual operator pause or
-        // the thermal governor) — separating "cool-down by policy" from
-        // "paused by operator/governor" so a reader doesn't have to
-        // subtract `turn_delay_effective_ms * rests` themselves to notice a
-        // dispatch spent real time paused, not just resting between turns.
-        // Live-tailer-only (see `TrajectorySummary::paced_rest_ms`'s own
-        // doc) — NOT reconciled against metrics.json the way `rest_ms`/
-        // `rests` are, so a crash-during-write race can undercount this
-        // ONE derived field without touching the totals it's derived from.
-        "paced_rest_ms": trajectory_summary.paced_rest_ms,
-        // (#2094 finding 8) null when unknowable (no metrics.json field
-        // AND zero rests) rather than a misleading 0.
-        "turn_delay_effective_ms": turn_delay_effective_ms,
-        "stdout_chars": stdout.chars().count(),
-        "stderr_chars": stderr.chars().count(),
-        // (#1042) On the error path, carry a bounded stderr TAIL so a failed
-        // dispatch is diagnosable from the flow stream alone (the internal
-        // path previously emitted only the char count — you couldn't see WHY
-        // it failed without shelling into the runner). null on success so
-        // clean records aren't bloated. Payload-additive — no FLOW_SCHEMA bump.
-        "stderr_excerpt": if exit_code == 0 {
-            None
-        } else {
-            Some(crate::dispatch::tail_excerpt(&stderr, crate::dispatch::STDERR_EXCERPT_MAX))
-        },
-        "exit_code": exit_code,
-        "result_class": if exit_code == 0 { "ok" } else { "error" },
-        "total_turns": trajectory_summary.turns,
-        "total_tools": trajectory_summary.tool_calls,
-        "total_compactions": trajectory_summary.compactions,
-        "prompt_tokens": tokens.prompt,
-        "completion_tokens": tokens.completion,
-        "total_tokens": tokens.total(),
-    });
-    // (#1187 follow-up) Same field, same reason as `dispatch_start_payload` —
-    // parity with `dispatch_remote`'s completion record, and needed by any
-    // future by-endpoint consumer (#1186) that reads the terminal record
-    // rather than the start record.
-    if let Some(label) = &remote_endpoint_raw_label {
-        dispatch_complete_payload["endpoint"] = serde_json::json!(label);
-    }
-    // (#2114 follow-up) Same field, same reason as `dispatch_start_payload`.
-    if let Some(resume_from) = &opts.resume_from {
-        dispatch_complete_payload["resumed_from"] = serde_json::json!(resume_from.display().to_string());
-    }
-    // (#1959) Same provenance merge as `dispatch_start_payload` above.
-    merge_record_context(&mut dispatch_complete_payload, &opts.record_context);
+    // (#2111 review finding) Built by a standalone, pure function —
+    // `build_dispatch_complete_payload` — rather than inline here, so
+    // `host_window` (and every other field) is independently testable
+    // without spinning a real container. Deleting the call to it, or
+    // deleting `host_window` from inside it, now turns a UNIT test red;
+    // before this extraction the insert lived inline in `dispatch()` and
+    // only the ENVELOPE path (`enrich_envelope_with_summary`) had test
+    // coverage — a deleted flow-record insert left the suite green.
+    let dispatch_complete_payload = build_dispatch_complete_payload(
+        wall_ms,
+        rest,
+        turn_delay_effective_ms,
+        &stdout,
+        &stderr,
+        exit_code,
+        &trajectory_summary,
+        tokens,
+        remote_endpoint_raw_label.as_deref(),
+        &host_stats,
+        &host_extras,
+        &opts.record_context,
+        opts.resume_from.as_deref(),
+    );
     let (action, level) = if exit_code == 0 {
         ("dispatch complete", darkmux_flow::Level::Info)
     } else {
@@ -4127,6 +4095,12 @@ fn enrich_envelope_with_summary(
             }
         }
         obj.insert("host".into(), host);
+        // (#2111) The flatter dispatch-summary shape — see
+        // `host_window_json`'s own doc for why it exists alongside `host`
+        // above rather than replacing it.
+        if let Some(hw) = host_window_json(stats, extras) {
+            obj.insert("host_window".into(), hw);
+        }
     }
     // (#1959) What a crawl actually FOUND. The envelope carried a converged
     // dispatch and no way to tell a run that reported twelve findings from one
@@ -4496,8 +4470,11 @@ const TAILER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TELEMETRY_SAMPLE_INTERVAL: Duration = Duration::from_millis(TELEMETRY_SAMPLE_INTERVAL_MS);
 /// Same cadence as [`TELEMETRY_SAMPLE_INTERVAL`], as a plain `u64` — feeds
 /// `reduce_host_extras`'s sleep-gap cap (#2108 review finding), which wants
-/// milliseconds, not a `Duration`.
-const TELEMETRY_SAMPLE_INTERVAL_MS: u64 = 2000;
+/// milliseconds, not a `Duration`. `pub` (#2111 review finding) so
+/// `darkmux doctor`'s `check_telemetry_record_every_samples` derives its
+/// "≈Ns" cadence message FROM this constant instead of a hardcoded literal
+/// that could silently drift from the sampler's real tick.
+pub const TELEMETRY_SAMPLE_INTERVAL_MS: u64 = 2000;
 
 /// Granularity at which the sampler re-checks its stop flag while waiting
 /// out a `TELEMETRY_SAMPLE_INTERVAL`. Mirrors the watchdog's 500ms poll:
@@ -4650,6 +4627,186 @@ fn run_tailer(
     state.summary
 }
 
+/// (#2111) Pure: whether tick number `sample_idx` (1-indexed — the first
+/// tick a sampler takes is `1`, not `0`) should emit a periodic
+/// `machine.telemetry` SAMPLE record, given the configured cadence
+/// `every` (`config_access::telemetry_record_every_samples()`). `every ==
+/// 0` means "disabled" — never emits, regardless of `sample_idx`. A
+/// 1-indexed counter means the very first tick is never itself a record
+/// (the periodic curve starts roughly `every` ticks in, not immediately),
+/// matching `machine.thermal`'s own "the first reading seeds silently"
+/// convention for the other new action this issue adds.
+fn should_record_machine_telemetry(sample_idx: u64, every: u64) -> bool {
+    every > 0 && sample_idx % every == 0
+}
+
+/// (#2111) Build one `machine.telemetry` SAMPLE flow record — the full
+/// host reading (`host_probe::sample_full_json`, shared with the daemon
+/// ring's `/machine/resources` `load.now` block) through
+/// `merge_record_context` so it keys to this dispatch's mission/step the
+/// same way every other tailer-emitted telemetry record does. Pure: no
+/// probe, no clock, no sampler thread — the cadence gate
+/// (`should_record_machine_telemetry`) and this payload/record shape are
+/// each independently testable without spinning the real sampler.
+#[allow(clippy::too_many_arguments)]
+fn build_machine_telemetry_record(
+    sample: &crate::host_probe::HostSampleFull,
+    sampled_at_ms: u64,
+    role_id: &str,
+    session_id: &str,
+    model: &str,
+    mission_id: Option<&str>,
+    phase_id: Option<&str>,
+    record_context: &Option<serde_json::Value>,
+) -> darkmux_flow::FlowRecord {
+    let mut payload = crate::host_probe::sample_full_json(sample, sampled_at_ms);
+    merge_record_context(&mut payload, record_context);
+    crate::dispatch::build_telemetry_record(
+        darkmux_flow::Level::Info,
+        "machine.telemetry",
+        "host",
+        role_id,
+        session_id,
+        Some(model),
+        mission_id,
+        phase_id,
+        payload,
+    )
+}
+
+/// (#2111) A compact host-pressure summary for `dispatch complete`/
+/// `dispatch error`'s FLOW RECORD payload (and the `--json` envelope,
+/// alongside the existing nested `host` block — see
+/// `enrich_envelope_with_summary`) — so a fleet reader watching the FLOW
+/// STREAM, not just the CLI's own stdout capture, can see "was this
+/// dispatch thermally comfortable" without parsing `host`'s per-metric
+/// breakdown. Reuses the SAME `HostStats`/`HostExtras` reduction `host` is
+/// built from — no duplicated math, only a flatter key set for a
+/// different consumer. `span_ms` is derived from `stats.samples` and
+/// `stats.sample_interval_ms` (both already the product of
+/// `reduce_host_stats`) rather than re-walking the raw sample series —
+/// the same arithmetic `reduce_host_stats` itself uses to derive
+/// `sample_interval_ms` from a span, run in reverse. `None` when the
+/// sampler never took a sample (`stats.samples == 0`) — an absent block
+/// says "not measured", never "measured, and idle".
+fn host_window_json(stats: &HostStats, extras: &HostExtras) -> Option<serde_json::Value> {
+    if stats.samples == 0 {
+        return None;
+    }
+    let span_ms = stats
+        .sample_interval_ms
+        .map(|iv| iv.saturating_mul((stats.samples.saturating_sub(1)) as u64))
+        .unwrap_or(0);
+    Some(serde_json::json!({
+        "thermal_worst_state": extras.thermal.as_ref().map(|t| t.worst_state.clone()),
+        "above_nominal_ms": extras.thermal.as_ref().map(|t| t.above_nominal_ms),
+        "min_cpu_speed_limit_pct": extras.thermal.as_ref().map(|t| t.min_cpu_speed_limit_pct),
+        "power_mw_total": extras.power.as_ref().map(|p| serde_json::json!({
+            "mean": p.total.mean_mw,
+            "max": p.total.max_mw,
+            "p95": p.total.p95_mw,
+        })),
+        "energy_mwh": extras.energy_mwh,
+        "samples": stats.samples,
+        "span_ms": span_ms,
+    }))
+}
+
+/// (#2111 review finding) The `dispatch complete`/`dispatch error` FLOW
+/// RECORD payload, pulled out of `dispatch()`'s body into its own pure
+/// function — given the pieces `dispatch()` already computed, build the
+/// payload once. Mirrors `enrich_envelope_with_summary`'s extraction for
+/// the same reason: before this, the payload (including the `host_window`
+/// insert) was built inline in `dispatch()`, which is not independently
+/// unit-testable without spinning a real container — a deleted
+/// `host_window` insert left the whole test suite green because nothing
+/// exercised this exact code path; only the SEPARATE envelope path
+/// (`enrich_envelope_with_summary`) had coverage. `host_stats`/
+/// `host_extras` feed the SAME `host_window_json` the envelope's `host`
+/// block is built from, so the flow record and the envelope can never
+/// independently drift on what "was this dispatch thermally comfortable"
+/// means. `record_context` merges last, matching every other
+/// tailer/bookend-emitted record's convention.
+#[allow(clippy::too_many_arguments)]
+fn build_dispatch_complete_payload(
+    wall_ms: u64,
+    rest: RestTotals,
+    turn_delay_effective_ms: Option<u64>,
+    stdout: &str,
+    stderr: &str,
+    exit_code: i32,
+    summary: &TrajectorySummary,
+    tokens: TokenTotals,
+    remote_endpoint_raw_label: Option<&str>,
+    host_stats: &HostStats,
+    host_extras: &HostExtras,
+    record_context: &Option<serde_json::Value>,
+    resume_from: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "runtime": "internal",
+        "wall_ms": wall_ms,
+        // (#2094) Surfaced NEXT TO wall_ms per the issue's own framing — a
+        // rested run's wall clock must never be misread as a slow model.
+        "rest_ms": rest.rest_ms,
+        "rests": rest.rests,
+        // (2026-08-30 fleet-observability finding) Of `rest_ms` above, the
+        // portion attributable to a PACED rest (a manual operator pause or
+        // the thermal governor) — separating "cool-down by policy" from
+        // "paused by operator/governor" so a reader doesn't have to
+        // subtract `turn_delay_effective_ms * rests` themselves to notice a
+        // dispatch spent real time paused, not just resting between turns.
+        // Live-tailer-only (see `TrajectorySummary::paced_rest_ms`'s own
+        // doc) — NOT reconciled against metrics.json the way `rest_ms`/
+        // `rests` are, so a crash-during-write race can undercount this
+        // ONE derived field without touching the totals it's derived from.
+        "paced_rest_ms": summary.paced_rest_ms,
+        // (#2094 finding 8) null when unknowable (no metrics.json field
+        // AND zero rests) rather than a misleading 0.
+        "turn_delay_effective_ms": turn_delay_effective_ms,
+        "stdout_chars": stdout.chars().count(),
+        "stderr_chars": stderr.chars().count(),
+        // (#1042) On the error path, carry a bounded stderr TAIL so a failed
+        // dispatch is diagnosable from the flow stream alone (the internal
+        // path previously emitted only the char count — you couldn't see WHY
+        // it failed without shelling into the runner). null on success so
+        // clean records aren't bloated. Payload-additive — no FLOW_SCHEMA bump.
+        "stderr_excerpt": if exit_code == 0 {
+            None
+        } else {
+            Some(crate::dispatch::tail_excerpt(stderr, crate::dispatch::STDERR_EXCERPT_MAX))
+        },
+        "exit_code": exit_code,
+        "result_class": if exit_code == 0 { "ok" } else { "error" },
+        "total_turns": summary.turns,
+        "total_tools": summary.tool_calls,
+        "total_compactions": summary.compactions,
+        "prompt_tokens": tokens.prompt,
+        "completion_tokens": tokens.completion,
+        "total_tokens": tokens.total(),
+    });
+    // (#1187 follow-up) Same field, same reason as `dispatch_start_payload` —
+    // parity with `dispatch_remote`'s completion record, and needed by any
+    // future by-endpoint consumer (#1186) that reads the terminal record
+    // rather than the start record.
+    if let Some(label) = remote_endpoint_raw_label {
+        payload["endpoint"] = serde_json::json!(label);
+    }
+    // (#2111) Same compact host-pressure summary as the envelope's
+    // `host_window` (`enrich_envelope_with_summary`) — reaching the FLOW
+    // RECORD too, not just the CLI's own `--json` stdout.
+    if let Some(hw) = host_window_json(host_stats, host_extras) {
+        payload["host_window"] = hw;
+    }
+    // (#1959) Same provenance merge as `dispatch_start_payload` above.
+    // (#2114 follow-up) Same field, same reason as `dispatch_start_payload`.
+    if let Some(rf) = resume_from {
+        payload["resumed_from"] = serde_json::json!(rf.display().to_string());
+    }
+    merge_record_context(&mut payload, record_context);
+    payload
+}
+
 /// (N6 of the #2110/#2109 review) Best-effort removal of a leftover
 /// `pace.json` in this dispatch's out-dir, called BEFORE
 /// `run_telemetry_sampler`'s loop starts. `host_out` is ALWAYS a fresh
@@ -4705,6 +4862,16 @@ fn clear_stale_pace_file(host_out: &Path) {
 /// runs only against a SUCCESSFUL probe), leaving `prev` untouched for
 /// the next tick — so a transient lms hiccup can't emit a flurry of
 /// spurious "unload" events.
+///
+/// (#2111) Every `darkmux_flow::record()` call this function makes —
+/// including the periodic `machine.telemetry` write — runs SYNCHRONOUSLY
+/// on this thread, the same one that drives the thermal governor's
+/// pause/resume timing. A slow sink write (a stalled Redis XADD, a
+/// contended local file) blocks the next governor tick, the same class of
+/// bounded-but-real latency the `list_loaded()` lms-ps stall already
+/// tolerates on this same loop. Bounded by whatever the active
+/// `FlowSink` bounds its own writes to — this function adds no timeout of
+/// its own.
 #[allow(clippy::too_many_arguments)]
 fn run_telemetry_sampler(
     stop_flag: Arc<AtomicBool>,
@@ -4777,6 +4944,20 @@ fn run_telemetry_sampler(
             payload,
         ));
     };
+
+    // (#2111) The periodic `machine.telemetry` curve's cadence, resolved
+    // ONCE up front — `env > config.json > 5` (≈10s at this sampler's 2s
+    // tick). `0` disables the periodic curve without touching anything
+    // else this sampler does (thermal governor, `host_window` reduction).
+    let telemetry_record_every_samples = darkmux_types::config_access::telemetry_record_every_samples();
+    let mut sample_idx: u64 = 0;
+    // (#2111 review finding) The MEASURED write duration of the PREVIOUS
+    // `machine.telemetry` emission — `None` until the first one has
+    // happened. A record cannot honestly report its OWN write cost (the
+    // write hasn't happened yet when the payload is built), so this stamps
+    // last time's measured cost instead of a build-only proxy mislabeled
+    // as "the write".
+    let mut prev_record_write_ms: Option<u64> = None;
 
     let mut prev: Vec<darkmux_types::LoadedModel> = Vec::new();
     let mut seeded = false;
@@ -4936,6 +5117,48 @@ fn run_telemetry_sampler(
                 power: sample.power,
                 thermal: sample.thermal.clone(),
             });
+        }
+
+        // (#2111) The periodic `machine.telemetry` curve — every Nth tick,
+        // never every tick (the observer-cost rule: the sample is ALREADY
+        // taken above for the governor + the `host`/`host_window`
+        // reduction; only the record WRITE is the added cost, and only on
+        // the ticks that actually emit).
+        sample_idx += 1;
+        if should_record_machine_telemetry(sample_idx, telemetry_record_every_samples) {
+            // (#2111 review finding) `at_ms` above is RELATIVE to this
+            // sampler's own start (`started.elapsed()`) — correct for the
+            // reduction math and the thermal governor's gap timing, but
+            // wrong for a flow record's `sampled_at_ms`: `machine.thermal`
+            // (the daemon sampler) and `/machine/resources` both stamp
+            // real UNIX epoch ms, so a relative offset here would read as
+            // 1970 next to either of them on a chart. `epoch_ms_now()` is
+            // the one shared wall-clock read every `sampled_at_ms`
+            // producer uses.
+            let sampled_at_epoch_ms = crate::host_probe::epoch_ms_now();
+            let mut rec = build_machine_telemetry_record(
+                &sample,
+                sampled_at_epoch_ms,
+                &role_id,
+                &session_id,
+                &model,
+                mission_id.as_deref(),
+                phase_id.as_deref(),
+                &record_context,
+            );
+            // (#2111 review finding, CLAUDE.md "samplers stamp their own
+            // cost") This record's OWN write hasn't happened yet — it
+            // can't honestly report its own cost — so it carries the
+            // PREVIOUS emission's measured write duration instead. `None`
+            // on the first emission (no previous write to report).
+            if let (Some(ms), Some(obj)) =
+                (prev_record_write_ms, rec.payload.as_mut().and_then(|p| p.as_object_mut()))
+            {
+                obj.insert("prev_record_write_ms".into(), serde_json::json!(ms));
+            }
+            let write_start = Instant::now();
+            let _ = darkmux_flow::record(rec);
+            prev_record_write_ms = Some(write_start.elapsed().as_millis() as u64);
         }
 
         // Wait out the sample interval, but poll the stop flag every

@@ -2668,7 +2668,12 @@ mod tests {
         //           gains `reason`/`state`; `dispatch.complete` (and the
         //           envelope) gain `paced_rest_ms`. Additive; same
         //           free-form `payload` blob. See schema.rs.
-        assert_eq!(FLOW_SCHEMA_VERSION, "1.30.0");
+        //   1.31.0 (#2111): new actions `machine.thermal` (daemon-sampler
+        //           TRANSITION events) and `machine.telemetry` (dispatch-
+        //           sampler periodic SAMPLE curve); `dispatch complete`/
+        //           `dispatch error` (and the envelope) gain `host_window`.
+        //           Additive; same free-form `payload` blob. See schema.rs.
+        assert_eq!(FLOW_SCHEMA_VERSION, "1.31.0");
     }
 
     #[test]
