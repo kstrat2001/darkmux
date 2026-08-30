@@ -62,6 +62,15 @@ fn describe(p: PowerPosture) -> Check {
         } else {
             facts.push(entry);
         }
+    } else if p.source.is_some() || p.low_power_mode.is_some() {
+        // (#2112 review NIT 8) Reachable on an Intel Mac (or any host
+        // where `thermal::sample` itself resolves nothing): the OVERALL
+        // "n/a" early-return above only fires when EVERY field is absent,
+        // so a machine with a readable power source but no readable
+        // thermal state would otherwise just silently omit thermal from
+        // the message — read as "nothing to report" rather than "this
+        // field didn't resolve".
+        facts.push("thermal: unreadable on this Mac".into());
     }
 
     if let Some(e) = &p.recent_thermal_emergency {
@@ -81,17 +90,29 @@ fn describe(p: PowerPosture) -> Check {
         format!("{} — {}", warnings.join("; "), facts.join("; "))
     };
 
+    // (#2112 review CONSIDER 5) Imperative remedies, not a description of
+    // what's slow — an operator reading `darkmux doctor` wants to know
+    // what to DO. No internal jargon ("ANE") in operator-facing text.
     let hint = (!warnings.is_empty()).then(|| {
-        let mut lines = vec![
-            "Sustained local-model dispatch on battery or under Low Power Mode is measurably \
-             slower (throttled CPU/GPU/ANE, roughly half throughput under Low Power Mode); a \
-             thermal state of fair or worse means the kernel is already capping CPU speed."
-                .to_string(),
-        ];
+        let mut remedies: Vec<&str> = Vec::new();
+        if matches!(p.source, Some(PowerSource::Battery)) {
+            remedies.push("plug in");
+        }
+        if p.low_power_mode == Some(true) {
+            remedies.push("turn Low Power Mode off");
+        }
+        if thermal_serious_or_worse {
+            remedies.push("let the machine cool before starting a long mission");
+        } else if p.thermal.as_ref().is_some_and(|t| t.state != "nominal") {
+            remedies.push("let the machine cool");
+        } else if p.recent_thermal_emergency.as_ref().is_some_and(|e| e.within_24h) {
+            remedies.push("improve airflow before a sustained mission — a thermal-emergency forced sleep happened within the last 24h");
+        }
+        let mut lines = vec![format!("{}.", remedies.join("; "))];
         if thermal_serious_or_worse {
             lines.push(
-                "A long mission (`mission launch`/`crawl`) refuses to start at `serious`/`critical` \
-                 thermal state unless `--force` is passed — this machine is there now."
+                "`mission launch`/`crawl` refuses to start at this thermal state unless \
+                 `--force` is passed."
                     .to_string(),
             );
         }
@@ -190,6 +211,43 @@ mod tests {
         let c = describe(p);
         assert_eq!(c.status, Status::Pass);
         assert!(c.message.contains(">24h ago"), "{}", c.message);
+    }
+
+    #[test]
+    fn thermal_unreadable_is_named_rather_than_silently_omitted() {
+        // (#2112 review NIT 8) Intel Mac / unreadable-thermal shape: other
+        // fields resolve, thermal specifically does not.
+        let mut p = base();
+        p.thermal = None;
+        let c = describe(p);
+        assert!(c.message.contains("thermal: unreadable on this Mac"), "{}", c.message);
+    }
+
+    #[test]
+    fn hint_text_is_imperative_and_names_no_jargon() {
+        let mut p = base();
+        p.source = Some(PowerSource::Battery);
+        p.low_power_mode = Some(true);
+        let c = describe(p);
+        let hint = c.hint.expect("warn carries a hint");
+        assert!(hint.contains("plug in"), "{hint}");
+        assert!(hint.contains("turn Low Power Mode off"), "{hint}");
+        assert!(!hint.to_ascii_lowercase().contains("ane"), "no ANE jargon: {hint}");
+    }
+
+    #[test]
+    fn an_emergency_only_warning_still_carries_a_non_empty_remedy() {
+        // Regression: current thermal nominal + AC power + LPM off, but a
+        // thermal emergency happened within 24h — this is the ONE warning
+        // combination where none of the other three remedy branches fire;
+        // the hint must not degrade to a bare ".".
+        let mut p = base();
+        p.recent_thermal_emergency =
+            Some(ThermalEmergency { at: "2026-08-29 23:16:05 +0800".into(), within_24h: true });
+        let c = describe(p);
+        let hint = c.hint.expect("warn carries a hint");
+        assert_ne!(hint.trim(), ".", "empty remedy list must not render as a bare period: {hint}");
+        assert!(hint.contains("airflow"), "{hint}");
     }
 
     #[test]

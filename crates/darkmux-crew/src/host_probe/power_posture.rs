@@ -107,10 +107,17 @@ pub fn parse_low_power_mode(pmset_g_text: &str) -> Option<bool> {
 }
 
 /// How many lines of `pmset -g log` the thermal-emergency scan walks,
-/// newest-first, before giving up. The log is chronological (oldest
-/// first); on a machine with weeks of uptime it can run past 100k lines,
-/// and the pre-flight question is only ever "did this happen recently" —
-/// far short of a full walk answers that.
+/// newest-first, before giving up, AND (#2112 review findings 2/6) the
+/// `tail -n` bound applied AT THE SPAWN itself (`imp::thermal_log_bounded`
+/// pipes `pmset -g log` through `tail -n THERMAL_LOG_LINE_CAP` via `sh
+/// -c`), not just in the in-memory scan below. `pmset -g log` generating
+/// its output is what's slow (~0.8s / tens of thousands of lines on a
+/// machine with more than a few days' uptime) — piping through `tail`
+/// doesn't shorten that generation — but it does stop an unbounded,
+/// multi-MB `String` from crossing back into this process every time. The
+/// log is chronological (oldest first); on a machine with weeks of uptime
+/// it can run past 100k lines, and the pre-flight question is only ever
+/// "did this happen recently" — far short of a full walk answers that.
 pub const THERMAL_LOG_LINE_CAP: usize = 20_000;
 
 /// The needle `pmset -g log` prints for a thermal-emergency forced sleep
@@ -125,11 +132,20 @@ const THERMAL_EMERGENCY_NEEDLE: &str = "thermal emergency";
 /// [`THERMAL_LOG_LINE_CAP`] lines from the end. Pure — the caller supplies
 /// `now` so this is exercised in tests without a real clock.
 pub fn find_recent_thermal_emergency(log_text: &str, now: SystemTime) -> Option<ThermalEmergency> {
-    let hit = log_text.lines().rev().take(THERMAL_LOG_LINE_CAP).find(|l| {
-        let lower = l.to_ascii_lowercase();
-        lower.contains(THERMAL_EMERGENCY_NEEDLE)
-    })?;
-    let at = timestamp_prefix(hit)?;
+    // (#2112 review finding 7) `.find(...)` + a single `timestamp_prefix`
+    // call on just that one line meant a matching line with NO parseable
+    // timestamp (a continuation/wrapped line, still containing the
+    // needle) silently swallowed the search — an older REAL emergency a
+    // few lines further back would never be reached. Walk every matching
+    // line, newest-first, and take the first one whose timestamp actually
+    // parses.
+    let at = log_text
+        .lines()
+        .rev()
+        .take(THERMAL_LOG_LINE_CAP)
+        .filter(|l| l.to_ascii_lowercase().contains(THERMAL_EMERGENCY_NEEDLE))
+        .filter_map(timestamp_prefix)
+        .next()?;
     let within_24h = seconds_since(&at, now).map(|secs| secs <= 24 * 3600).unwrap_or(false);
     Some(ThermalEmergency { at, within_24h })
 }
@@ -170,6 +186,7 @@ fn seconds_since(timestamp: &str, now: SystemTime) -> Option<u64> {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
+    use std::sync::OnceLock;
 
     fn run(cmd: &str, args: &[&str]) -> Option<String> {
         let out = Command::new(cmd).args(args).output().ok()?;
@@ -179,28 +196,88 @@ mod imp {
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// The `pmset -g log` read, bounded AT THE SPAWN (`tail -n
+    /// THERMAL_LOG_LINE_CAP`, piped via `sh -c` — `pmset` itself takes no
+    /// line-count flag) and cached for the lifetime of the process
+    /// (#2112 review finding 2): nothing about the log changes between two
+    /// reads seconds apart, so a second caller in the same process reuses
+    /// the first read rather than paying the ~0.8s spawn again.
+    fn thermal_log_bounded() -> Option<String> {
+        static CACHE: OnceLock<Option<String>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                let out = Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("pmset -g log | tail -n {THERMAL_LOG_LINE_CAP}"))
+                    .output()
+                    .ok()?;
+                if !out.status.success() {
+                    return None;
+                }
+                Some(String::from_utf8_lossy(&out.stdout).into_owned())
+            })
+            .clone()
+    }
+
+    /// Thermal severity as `checks_power.rs`/`preflight.rs` compute it:
+    /// position in `thermal::THERMAL_STATES` (nominal=0 ... critical=3),
+    /// an unrecognized state sorting past `critical`, `None` when there is
+    /// no thermal sample at all.
+    fn severity(thermal: &Option<ThermalSample>) -> Option<usize> {
+        thermal
+            .as_ref()
+            .map(|t| thermal::THERMAL_STATES.iter().position(|s| *s == t.state).unwrap_or(thermal::THERMAL_STATES.len()))
+    }
+
     /// One full power-posture reading — every field independently `None`
-    /// on a spawn failure or unparsed output. Costs roughly three `pmset`
-    /// process spawns (~10-20ms each) plus the in-process thermal read;
-    /// pre-flight/doctor-grade, not a hot path.
-    pub fn sample() -> PowerPosture {
+    /// on a spawn failure or unparsed output. Costs roughly two fast
+    /// `pmset` process spawns (~10-20ms each) plus the in-process thermal
+    /// read, PLUS the `pmset -g log` scan (~0.8s) only when
+    /// `always_scan_thermal_log` is true or the just-read thermal state is
+    /// already `fair` or worse.
+    fn sample_impl(always_scan_thermal_log: bool) -> PowerPosture {
         let ps_text = run("pmset", &["-g", "ps"]);
         let source = ps_text.as_deref().and_then(parse_power_source);
         let battery_pct = ps_text.as_deref().and_then(parse_battery_pct);
         let low_power_mode = run("pmset", &["-g"]).as_deref().and_then(parse_low_power_mode);
         let thermal = thermal::sample();
-        let recent_thermal_emergency =
-            run("pmset", &["-g", "log"]).and_then(|log| find_recent_thermal_emergency(&log, SystemTime::now()));
+        let should_scan_log = always_scan_thermal_log || severity(&thermal).map(|s| s >= 1).unwrap_or(false);
+        let recent_thermal_emergency = if should_scan_log {
+            thermal_log_bounded().and_then(|log| find_recent_thermal_emergency(&log, SystemTime::now()))
+        } else {
+            None
+        };
         PowerPosture { source, battery_pct, low_power_mode, thermal, recent_thermal_emergency }
+    }
+
+    /// `darkmux doctor`'s reading — always scans `pmset -g log`, since
+    /// doctor is a read-only report meant to name a recent thermal
+    /// emergency regardless of the CURRENT thermal state.
+    pub fn sample() -> PowerPosture {
+        sample_impl(true)
+    }
+
+    /// The mission/crawl pre-flight's reading (#2112 review finding 2) —
+    /// skips the ~0.8s `pmset -g log` scan unless the thermal state this
+    /// same call just read is already `fair` or worse, so a nominal
+    /// machine's pre-flight costs two fast pmset spawns, not three
+    /// (`darkmux doctor` keeps the always-on scan via [`sample`]).
+    pub fn sample_for_preflight() -> PowerPosture {
+        sample_impl(false)
     }
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::sample;
+pub use imp::{sample, sample_for_preflight};
 
 #[cfg(not(target_os = "macos"))]
 pub fn sample() -> PowerPosture {
     PowerPosture { source: None, battery_pct: None, low_power_mode: None, thermal: None, recent_thermal_emergency: None }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn sample_for_preflight() -> PowerPosture {
+    sample()
 }
 
 #[cfg(test)]
@@ -291,6 +368,20 @@ mod tests {
         // require "Entering Sleep" specifically.
         let only_ignored = "2026-08-28 02:36:45 +0800 ThermalEvent        \tIgnored DarkWake thermal emergency signal TCPKeepAlive=active\n";
         assert!(find_recent_thermal_emergency(only_ignored, SystemTime::now()).is_some());
+    }
+
+    #[test]
+    fn a_continuation_line_with_no_timestamp_does_not_hide_an_older_real_emergency() {
+        // (#2112 review finding 7) The NEWEST matching line has no
+        // parseable timestamp (a wrapped continuation line); the scan must
+        // fall through to the next-newest match rather than returning
+        // `None` for the whole search.
+        let log = "\
+2026-07-10 23:16:05 +0800 Sleep               \tEntering Sleep state due to 'Dark Wake Thermal Emergency': ...\n\
+                            continued thermal emergency detail with no leading timestamp\n";
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds_since_epoch_for_test("2026-07-10 23:16:05 +0800") + 60);
+        let found = find_recent_thermal_emergency(log, now).expect("must fall through to the timestamped match");
+        assert_eq!(found.at, "2026-07-10 23:16:05 +0800");
     }
 
     fn seconds_since_epoch_for_test(ts: &str) -> u64 {
