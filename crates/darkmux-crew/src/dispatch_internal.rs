@@ -2989,6 +2989,14 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         let model = model.clone();
         let mission_id = mission_id.clone();
         let phase_id = phase_id.clone();
+        // (#2110/#2109) The thermal governor/breaker rides this same
+        // sampler thread — it already reads `probe.sample().thermal` every
+        // tick, so no separate poller is needed. `host_out` is where the
+        // pace file lives (`<host_out>/pace.json`, mounted at
+        // `/darkmux-out`); `record_context` is how the breaker finds a
+        // crawl mission's `STOP` file, when this dispatch is a crawl unit.
+        let host_out_for_thermal = host_out.clone();
+        let record_context_for_thermal = opts.record_context.clone();
         thread::spawn(move || {
             run_telemetry_sampler(
                 sampler_stop,
@@ -2997,6 +3005,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
                 model,
                 mission_id,
                 phase_id,
+                host_out_for_thermal,
+                record_context_for_thermal,
             )
         })
     };
@@ -3903,6 +3913,7 @@ fn run_tailer(
 /// runs only against a SUCCESSFUL probe), leaving `prev` untouched for
 /// the next tick — so a transient lms hiccup can't emit a flurry of
 /// spurious "unload" events.
+#[allow(clippy::too_many_arguments)]
 fn run_telemetry_sampler(
     stop_flag: Arc<AtomicBool>,
     role_id: String,
@@ -3910,6 +3921,8 @@ fn run_telemetry_sampler(
     model: String,
     mission_id: Option<String>,
     phase_id: Option<String>,
+    host_out: PathBuf,
+    record_context: Option<serde_json::Value>,
 ) -> (HostStats, HostExtras) {
     // (#2107) Relative to THIS sampler's own start, not wall-clock — the
     // reduction only needs the gaps BETWEEN samples, and a relative clock
@@ -3928,6 +3941,27 @@ fn run_telemetry_sampler(
     // this sampler's own 2s cadence rather than with whoever sampled last.
     // Construction is ~80-100ms once; each sample is ~5-10ms.
     let mut probe = crate::host_probe::HostProbe::new();
+    // (#2110/#2109) The thermal governor/breaker — see its module doc.
+    // `stop_file` resolves once, up front: the crawl `STOP` path (if this
+    // dispatch is a crawl unit) never changes mid-dispatch.
+    let mut thermal_governor =
+        crate::thermal_governor::ThermalGovernor::new(crate::thermal_governor::ThermalGovernorConfig::from_env());
+    let thermal_stop_file =
+        crate::thermal_governor::stop_file_path_from_record_context(record_context.as_ref());
+    let emit_rest = |reason: &str, state: &str, pause: bool| {
+        let mut payload = serde_json::json!({ "reason": reason, "state": state, "pause": pause });
+        merge_record_context(&mut payload, &record_context);
+        let _ = darkmux_flow::record(crate::dispatch::build_dispatch_record_with_payload(
+            darkmux_flow::Level::Info,
+            "dispatch.rest",
+            &role_id,
+            &session_id,
+            Some(&model),
+            mission_id.as_deref(),
+            phase_id.as_deref(),
+            Some(payload),
+        ));
+    };
     let emit = |source: &str, action: &str, payload: serde_json::Value| {
         let _ = darkmux_flow::record(crate::dispatch::build_telemetry_record(
             darkmux_flow::Level::Info,
@@ -3984,6 +4018,30 @@ fn run_telemetry_sampler(
         // unprivileged; a tick emits whichever fields succeed.
         let sample = probe.sample();
         let at_ms = started.elapsed().as_millis() as u64;
+        // (#2110/#2109) Feed this tick's thermal reading to the governor.
+        // `TELEMETRY_SAMPLE_INTERVAL_MS` is the elapsed-since-last-sample
+        // the hysteresis/max-pause accounting runs on — this loop's own
+        // cadence, so no separate clock is needed. Every state change
+        // (pause/resume/breaker) is a `dispatch.rest`-family flow record,
+        // so a slowed or stopped run is attributable on the flow stream.
+        if let Some(event) = thermal_governor.on_sample(
+            sample.thermal.as_ref(),
+            TELEMETRY_SAMPLE_INTERVAL_MS,
+            &host_out,
+            thermal_stop_file.as_deref(),
+        ) {
+            match event {
+                crate::thermal_governor::ThermalEvent::Paused { state } => {
+                    emit_rest("thermal", &state, true);
+                }
+                crate::thermal_governor::ThermalEvent::Resumed { state } => {
+                    emit_rest("thermal", &state, false);
+                }
+                crate::thermal_governor::ThermalEvent::Breaker { state } => {
+                    emit_rest("thermal-critical", &state, true);
+                }
+            }
+        }
         if sample.cpu_pct.is_some() || sample.mem_pct.is_some() || sample.gpu_pct.is_some() {
             // (#2107) Record the raw reading, timestamped against this
             // sampler's own clock. The REDUCTION (peak/mean/p95/duty) is a

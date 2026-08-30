@@ -159,6 +159,7 @@ pub fn run() -> DoctorReport {
         check_review_judge_exhaustion_policy(),
         check_turn_delay(),
         check_host_sampler_interval(),
+        check_thermal_governor(),
         check_host_probe(),
         check_remote_endpoint_credentials(),
         check_env_masks_config(),
@@ -1833,6 +1834,55 @@ fn check_host_sampler_interval() -> Check {
         message: format!(
             "{ms}ms ({provenance}) — darkmux serve's daemon-side host sampler cadence for the \
              machine stats drawer"
+        ),
+        hint: None,
+    }
+}
+
+/// (#2110/#2109) Surface the resolved thermal-governor/breaker knobs with
+/// `enabled`'s provenance. Always Pass — this is informational (what the
+/// governor will do), never a gate; the on-machine state machine that
+/// actually watches thermal samples lives in
+/// `darkmux_crew::thermal_governor` and is exercised by its own tests, not
+/// by doctor.
+fn check_thermal_governor() -> Check {
+    let name = "runtime.thermal";
+    let env_raw = std::env::var("DARKMUX_THERMAL_ENABLED")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
+        .runtime
+        .and_then(|r| r.thermal)
+        .and_then(|t| t.enabled)
+        .is_some();
+    let provenance = if env_raw.is_some() {
+        "from DARKMUX_THERMAL_ENABLED env"
+    } else if cfg_set {
+        "from config.json"
+    } else {
+        "default"
+    };
+    let enabled = darkmux_types::config_access::thermal_enabled();
+    if !enabled {
+        return Check {
+            name: name.into(),
+            status: Status::Pass,
+            message: format!("disabled ({provenance}) — no thermal pausing or breaking"),
+            hint: None,
+        };
+    }
+    let pause_at = darkmux_types::config_access::thermal_pause_at();
+    let resume_at = darkmux_types::config_access::thermal_resume_at();
+    let resume_hold_ms = darkmux_types::config_access::thermal_resume_hold_ms();
+    let max_pause_ms = darkmux_types::config_access::thermal_max_pause_ms();
+    let min_cpu = darkmux_types::config_access::thermal_min_cpu_speed_limit_pct();
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "enabled ({provenance}) — pause at `{pause_at}`, resume at `{resume_at}` held \
+             {resume_hold_ms}ms, breaker after {max_pause_ms}ms of one pause episode or \
+             cpu_speed_limit_pct < {min_cpu}%"
         ),
         hint: None,
     }
@@ -6706,11 +6756,12 @@ mod tests {
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
         // turn-delay [#2094] + host-sampler-interval [#2107, #1833] +
+        // thermal-governor [#2110/#2109] +
         // mission-envelope-readability [#1881] + hooks [#2093] +
         // rules [#1959] + host-probe [#2107]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 44 + darkmux_eureka::all_rules().len();
+        let expected = 45 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

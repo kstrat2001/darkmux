@@ -88,7 +88,15 @@ use std::path::Path;
 // stats drawer's live `/machine/resources` `load` block (cpu/mem/gpu on a
 // fixed cadence, kept in an in-memory ring; no flow records). `0` disables
 // the sampler entirely. Minor bump, same lenient-read reasoning.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.14";
+// 1.15 (#2110/#2109): additive `runtime.thermal{}` block — the thermal
+// governor's pause/resume hysteresis thresholds (`pause_at`/`resume_at`/
+// `resume_hold_ms`/`max_pause_ms`) and the breaker's throttle floor
+// (`min_cpu_speed_limit_pct`), gated by `enabled` (default `true` — this is
+// hardware-safety behavior, not an opt-in integration, so it follows
+// `strict_selection`/`check_updates`'s always-on-unless-told-otherwise
+// convention rather than `redis`/`audit`'s off-by-default one). Minor
+// bump, same lenient-read reasoning.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.15";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -340,6 +348,60 @@ pub struct RuntimeBehaviorConfig {
     /// (`sampler_cost_ms_mean`) and the measured (not nominal) sample
     /// interval into the payload.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub host_sampler_interval_ms: Option<u64>,
+    /// (#2110/#2109) The thermal governor + breaker's tuning block. See
+    /// [`ThermalConfig`]'s own doc for the pause/resume/breaker semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub thermal: Option<ThermalConfig>,
+    #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#2110/#2109) The thermal governor's pace/breaker tuning — a **feature
+/// block gated by `enabled`**, same shape as `RedisConfig`/`AuditConfig`,
+/// but defaulting to **`enabled: true`**: unlike an optional integration
+/// with an external system, this is hardware-safety behavior on the
+/// operator's own machine, so `darkmux init` writes it already on (mirrors
+/// `strict_selection`/`check_updates`, not `redis`/`audit`).
+///
+/// **Governor (#2110):** on each host thermal sample, when the OS-reported
+/// state is at or above `pause_at`, the host writes
+/// `<workspace>/.darkmux/pace.json` (`runtime/src/pace.rs`'s schema, #2114)
+/// with `pause: true, reason: "thermal", state: "<state>"` — the in-flight
+/// dispatch rests at its next turn boundary. The pause clears
+/// (`pause: false`) once the state has held at or below `resume_at` for
+/// `resume_hold_ms` continuously (hysteresis — no flapping on a state that's
+/// bouncing right at the threshold). If a single pause episode runs past
+/// `max_pause_ms` without recovering, the governor hands off to the breaker
+/// instead of resting forever.
+///
+/// **Breaker (#2109):** at `critical`, or when `cpu_speed_limit_pct` drops
+/// below `min_cpu_speed_limit_pct`, the host writes the pace file with
+/// `pause: true, reason: "thermal-critical"` — the in-flight unit pauses
+/// with its checkpoint persisted (#2114), never killed — and, for a crawl
+/// mission, also drops the crawl's `STOP` file so no further unit gets
+/// dispatched. Resume is the operator's call (`darkmux dispatch --resume`);
+/// the breaker does not un-pause itself on recovery.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ThermalConfig {
+    /// The gate: `true`/absent → governor + breaker active; `false` → the
+    /// sampler still reads the OS thermal state (for telemetry) but never
+    /// writes the pace file or the crawl `STOP` file. Declared first.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub enabled: Option<bool>,
+    /// OS thermal state (`nominal`/`fair`/`serious`/`critical`) at or above
+    /// which the governor pauses. Default `"serious"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub pause_at: Option<String>,
+    /// OS thermal state at or below which the governor is eligible to
+    /// resume, once held for `resume_hold_ms`. Default `"fair"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub resume_at: Option<String>,
+    /// How long (ms) the state must hold at or below `resume_at`, continuously,
+    /// before the governor clears the pause. Default `60000` (60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub resume_hold_ms: Option<u64>,
+    /// Cap (ms) on one continuous pause episode before the governor hands
+    /// off to the breaker instead of resting indefinitely. Default `900000`
+    /// (15 minutes).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub max_pause_ms: Option<u64>,
+    /// Breaker floor: `cpu_speed_limit_pct` (from `IOPMCopyCPUPowerStatus`)
+    /// below this triggers the breaker even if the named thermal state
+    /// hasn't reached `critical` yet. Default `50`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub min_cpu_speed_limit_pct: Option<u64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -797,6 +859,19 @@ impl DarkmuxConfig {
                 // drawer's daemon-side sampler cadence, discoverable and
                 // one edit from `0` (disabled) or a tighter/looser value.
                 host_sampler_interval_ms: Some(5000),
+                // (#2110/#2109) Visible on-by-default block — see
+                // `ThermalConfig`'s own doc for why this defaults to
+                // `enabled: true` rather than the redis/audit off-by-default
+                // pattern.
+                thermal: Some(ThermalConfig {
+                    enabled: Some(true),
+                    pause_at: Some("serious".to_string()),
+                    resume_at: Some("fair".to_string()),
+                    resume_hold_ms: Some(60_000),
+                    max_pause_ms: Some(900_000),
+                    min_cpu_speed_limit_pct: Some(50),
+                    extras: Default::default(),
+                }),
                 extras: Default::default(),
             }),
             fleet: Some(FleetConfig {

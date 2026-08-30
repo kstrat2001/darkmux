@@ -113,6 +113,14 @@ const KEYS: &[(&str, Ty)] = &[
     // (#2107, #1833) Cadence of `darkmux serve`'s daemon-side continuous
     // host sampler feeding the machine stats drawer. `0` disables it.
     ("runtime.host_sampler_interval_ms", Ty::Uint),
+    // (#2110/#2109) The thermal governor + breaker's tuning block —
+    // see `ThermalConfig`'s own doc.
+    ("runtime.thermal.enabled", Ty::Bool),
+    ("runtime.thermal.pause_at", Ty::Str),
+    ("runtime.thermal.resume_at", Ty::Str),
+    ("runtime.thermal.resume_hold_ms", Ty::Uint),
+    ("runtime.thermal.max_pause_ms", Ty::Uint),
+    ("runtime.thermal.min_cpu_speed_limit_pct", Ty::Uint),
     ("fleet.mode", Ty::FleetMode),
     // (#1260) The per-execution remote token allowance for endpoint-staffed
     // crew seats (one pipeline stage = one execution). Tokens, never currency.
