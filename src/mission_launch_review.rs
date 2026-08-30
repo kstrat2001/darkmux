@@ -775,6 +775,19 @@ pub(crate) fn launch(
         return review_dry_run_report(config, &collected, &diff_file, &diff_text);
     }
 
+    // (#2112 review, second pass finding A) `review` routes through this
+    // DEDICATED launcher from `mission_launch::launch` BEFORE that
+    // function's own `#2112` pre-flight call — so without a call here, a
+    // review pipeline (long-running, many real dispatches) got NEITHER
+    // the thermal-refusal pre-flight NOR the held sleep assertion, the
+    // exact class of long unattended run this exists to protect. Placed
+    // after the `--dry-run` short-circuit above for the same reason
+    // `mission_launch::launch` moved its own call there: a dry run must
+    // never be refused on thermal grounds. See `src/preflight.rs` and
+    // `crates/darkmux-crew/src/sleep_assertion.rs`.
+    crate::preflight::check_power_posture(params)?;
+    let _sleep_assertion = darkmux_crew::sleep_assertion::SleepAssertion::hold(&format!("darkmux mission review {}", config.id));
+
     let envelope_out = path_input(&collected, "envelope_out");
     let emit = path_input(&collected, "emit");
     let attribution = str_input(&collected, "attribution").map(str::to_string);

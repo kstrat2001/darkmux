@@ -30,7 +30,9 @@ mod failure_rate;
 mod feedback;
 mod json_repair;
 mod lmstudio;
+mod checkpoint;
 mod loop_runner;
+mod pace;
 mod plain_text_tool_calls;
 mod budget_request;
 mod reasoning_loop;
@@ -132,6 +134,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let mut model: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut system: Option<String> = None;
+    // (#2114) Path to a `checkpoint.json` (under the out-dir mount,
+    // `/darkmux-out` in production) written by a prior,
+    // interrupted dispatch. When set, the loop reloads the checkpoint's
+    // message history instead of starting from `--system`/`--prompt` — see
+    // `checkpoint::read_checkpoint`. `--resume` takes precedence over the
+    // env var when both are present (flag wins, matching the CLI-over-env
+    // precedence every other runtime flag/env pair in this file follows).
+    let mut resume_checkpoint_path: Option<String> =
+        std::env::var("DARKMUX_RESUME_CHECKPOINT").ok();
     // (#1038) Raw JSON-schema string for the role's output, wrapped into an
     // LMStudio json_schema response_format before the loop. None ⇒ free-form.
     let mut response_schema: Option<String> = None;
@@ -316,6 +327,15 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             "--auth-header-stdin" => {
                 auth_header_stdin = true;
                 i += 1;
+            }
+            "--resume" => {
+                if let Some(v) = args.get(i + 1) {
+                    resume_checkpoint_path = Some(v.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--resume requires a value");
+                    return ExitCode::from(2);
+                }
             }
             "--no-stream" => {
                 streaming = false;
@@ -600,6 +620,25 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         Message::user(prompt),
     ];
 
+    // (#2114) Load the checkpoint (if `--resume`/`DARKMUX_RESUME_CHECKPOINT`
+    // named one) BEFORE the loop runs — `initial_messages` above is built
+    // unconditionally (the host always supplies `--system`/`--prompt`) but
+    // gets discarded by `loop_runner::run` in favor of the checkpoint's own
+    // history when `resume_from` is `Some`. A missing/corrupt checkpoint
+    // fails the dispatch loudly here, before anything else runs, rather
+    // than silently starting fresh under a name that looked like a resume.
+    let resume_from: Option<checkpoint::RunCheckpoint> = match &resume_checkpoint_path {
+        Some(path) => match checkpoint::read_checkpoint(Path::new(path)) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("--resume {path}: {e:#}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    let resumed_from_turn_index = resume_from.as_ref().map(|c| c.turns);
+
     // (#1187 audit finding) Build the compactor's client from `base_url`
     // BEFORE it's consumed below, and NEVER apply `--chat-url`/
     // `--auth-header-stdin` to it — the compactor always talks to local
@@ -733,7 +772,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             "json_schema": { "name": "role_output", "strict": true, "schema": schema }
         })
     });
-    let run_result = loop_runner::run(
+    let run_result = loop_runner::run_resumable(
         &client,
         &compactor_client,
         &model,
@@ -748,6 +787,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         reasoning_checkpoint_interval,
         feedback_templates,
         response_format,
+        // (#2114 finding 3) pace.json / checkpoint.json live in the
+        // out-dir mount, not the workspace — see `loop_runner::
+        // run_resumable`'s doc on this param for why.
+        Path::new(trajectory::RUNTIME_OUT_BASE),
+        resume_from,
     );
 
     let outcome = match run_result {
@@ -858,6 +902,18 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     serde_json::to_value(&o.failed_to_run)
                         .unwrap_or_else(|_| serde_json::json!([])),
                 );
+                // (#2114) `resumed_from`: path + the checkpoint's OWN turn
+                // index (where the dispatch resumed FROM, not `o.turns`
+                // which is where it ended up) — present only when this
+                // dispatch actually reloaded a checkpoint.
+                if let (Some(path), Some(turn_index)) =
+                    (&resume_checkpoint_path, resumed_from_turn_index)
+                {
+                    obj.insert(
+                        "resumed_from".into(),
+                        serde_json::json!({ "path": path, "turn_index": turn_index }),
+                    );
+                }
             }
             println!("{}", serde_json::to_string(&envelope).unwrap_or_else(|_| "{}".into()));
         } else {

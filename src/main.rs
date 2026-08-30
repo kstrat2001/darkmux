@@ -62,6 +62,10 @@ mod mission_status;
 mod run_list;
 mod mission_config_cli;
 mod coder_phase;
+// (#2112) Power-posture pre-flight — battery/Low-Power-Mode warnings + the
+// serious/critical-thermal refusal, called once from each long-mission
+// entry point (`mission_launch::launch`, `crawl_launch::launch`).
+mod preflight;
 // `darkmux mission launch crawl` (#1959 packet 2) — the crawl launcher,
 // a dedicated launcher alongside mission_launch_review for the same
 // reason: it needs execution shape the generic mission_config::interpret
@@ -879,15 +883,19 @@ fn cmd_mission(sub: MissionCmd) -> Result<i32> {
             start,
             ticket,
         } => mission_propose::propose(from_stdin, from_file.as_deref(), yes, start, ticket.as_deref()),
-        MissionCmd::Launch { config_id, input, params, timeout, dry_run } => {
+        MissionCmd::Launch { config_id, input, params, timeout, dry_run, force } => {
             // (#1959) `--dry-run` reaches every launch path (crawl,
             // review, generic step-graph) the SAME way any other input
             // does — a synthetic `--param dry_run=true` appended here,
             // never a separate function parameter threaded through three
-            // different launcher signatures.
+            // different launcher signatures. (#2112) `--force` rides the
+            // same mechanism for the power-posture pre-flight refusal.
             let mut params = params;
             if dry_run {
                 params.push("dry_run=true".to_string());
+            }
+            if force {
+                params.push("force=true".to_string());
             }
             mission_launch::launch(&config_id, input.as_deref(), &params, timeout)
         }
