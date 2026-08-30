@@ -32,7 +32,7 @@ use crate::compaction;
 use crate::cycle_detector::{CycleDetector, CycleSignal};
 use crate::failure_rate::{FailureCascadeSignal, FailureRateDetector};
 use crate::feedback::FeedbackInjector;
-use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message};
+use crate::lmstudio::{ChatRequest, ChunkAccumulator, LmStudioClient, Message, ToolCall};
 use crate::pace;
 use crate::plain_text_tool_calls::promote_plain_text_tool_calls;
 use crate::reasoning_loop::{ReasoningLoopDetector, ReasoningLoopSignal};
@@ -858,11 +858,24 @@ fn recover_intra_turn_stall(
 /// sleeper instead.
 ///
 /// (#2114) No longer `main.rs`'s entry point — production now calls
-/// [`run_resumable`], which takes the workspace root and an optional
+/// [`run_resumable`], which takes the out-dir root and an optional
 /// checkpoint explicitly. This one is `#[allow(dead_code)]` because
 /// nothing in the non-test binary calls it anymore, but it stays public
 /// and exercised because the bulk of this file's test suite still calls
 /// it and shouldn't have to care about a feature it isn't testing.
+///
+/// (#2114 finding 3) Each call gets its OWN fresh host tempdir as its
+/// out-dir rather than a hardcoded path: this fn only ever runs on the
+/// TEST host (never inside the container `main.rs` drives), where neither
+/// `/darkmux-out` nor the old `/workspace` exist as writable paths. Before
+/// this, every turn-boundary checkpoint write inside a `run()`-based test
+/// failed and logged — 1,230 "failed to write checkpoint" lines across the
+/// 124 tests that exercise this wrapper, noise that could mask a real
+/// failure. Hand-rolled (no `tempfile` — that crate is dev-only, and this
+/// fn compiles in the release binary) with a PID+nanos+counter suffix so
+/// parallel test threads (same PID) never collide; the dir is left behind
+/// in the OS temp root rather than cleaned up, same tradeoff `dispatch_
+/// internal.rs`'s `host_out` makes for a real dispatch's out-dir.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -881,6 +894,16 @@ pub fn run(
     feedback_templates: std::collections::BTreeMap<String, String>,
     response_format: Option<serde_json::Value>,
 ) -> Result<LoopOutcome> {
+    static TEST_OUT_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = TEST_OUT_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let out_dir = std::env::temp_dir().join(format!(
+        "darkmux-runtime-test-out-{}-{nanos}-{n}",
+        std::process::id()
+    ));
     run_with_sleeper(
         client,
         compactor_client,
@@ -896,8 +919,7 @@ pub fn run(
         reasoning_checkpoint_interval,
         feedback_templates,
         response_format,
-        std::path::Path::new("/workspace"),
-        std::path::Path::new(crate::trajectory::RUNTIME_OUT_BASE),
+        &out_dir,
         None,
         &RealSleeper,
     )
@@ -905,15 +927,14 @@ pub fn run(
 
 /// (#2114) Production entry point for a dispatch that may pause against a
 /// host-driven pace file and/or resume a prior checkpoint. Kept SEPARATE
-/// from [`run`] rather than adding these params there: `run`'s pre-#2114
-/// signature has 35+ call sites (mostly tests exercising unrelated
-/// behavior — compaction, feedback injection, cycle detection — that have
-/// no reason to learn about pace files or checkpoints), and every one of
-/// them would otherwise need a `Path::new("/workspace"),
-/// Path::new(trajectory::RUNTIME_OUT_BASE), None,` tacked onto its
-/// argument list for a feature it doesn't touch. `main.rs` (the only real
-/// caller that needs a non-default workspace root, out-dir root, or a
-/// resume) calls this one instead.
+/// from [`run`] rather than adding these two params there: `run`'s
+/// pre-#2114 signature has 35+ call sites (mostly tests exercising
+/// unrelated behavior — compaction, feedback injection, cycle detection —
+/// that have no reason to learn about pace files or checkpoints), and
+/// every one of them would otherwise need a `Path::new(trajectory::
+/// RUNTIME_OUT_BASE), None,` tacked onto its argument list for a feature
+/// it doesn't touch. `main.rs` (the only real caller that needs a
+/// non-default out-dir root or a resume) calls this one instead.
 #[allow(clippy::too_many_arguments)]
 pub fn run_resumable(
     client: &LmStudioClient,
@@ -930,15 +951,15 @@ pub fn run_resumable(
     reasoning_checkpoint_interval: Option<u32>,
     feedback_templates: std::collections::BTreeMap<String, String>,
     response_format: Option<serde_json::Value>,
-    // (#2114) Container workspace root — where `.darkmux/checkpoint.json`
-    // lives. Production is always `/workspace` (the Dockerfile WORKDIR, see
-    // `main.rs`); tests pass a tempdir.
-    workspace_root: &std::path::Path,
-    // (#2110/#2109 finding 1) Container out-dir root — where `pace.json`
-    // lives (mounted at `/darkmux-out` in production, SEPARATE from
-    // `/workspace`; see `pace.rs`'s module doc for why). Production is
-    // always `trajectory::RUNTIME_OUT_BASE`; tests pass a tempdir.
-    pace_out_root: &std::path::Path,
+    // (#2114 finding 3) Container out-dir root — where `pace.json` and
+    // `checkpoint.json` live. Production is always `/darkmux-out`
+    // (`trajectory::RUNTIME_OUT_BASE`, always mounted read-write — see
+    // `dispatch_internal::apply_volume_mounts`); tests pass a tempdir.
+    // Deliberately NOT `/workspace`: that mount is `:ro` for crawl-kind
+    // dispatches (#1959) and, when writable, is the operator's own repo —
+    // either produces a checkpoint write failure or an untracked file in
+    // the operator's checkout.
+    out_dir: &std::path::Path,
     // (#2114) `Some` when this dispatch is resuming a prior checkpoint
     // (`--resume <path>` / `DARKMUX_RESUME_CHECKPOINT`) — `initial_messages`
     // is then IGNORED in favor of the checkpoint's own message history.
@@ -959,8 +980,7 @@ pub fn run_resumable(
         reasoning_checkpoint_interval,
         feedback_templates,
         response_format,
-        workspace_root,
-        pace_out_root,
+        out_dir,
         resume_from,
         &RealSleeper,
     )
@@ -1000,9 +1020,8 @@ fn run_with_sleeper(
     // wrapped as json_schema). When set, every model turn is grammar-constrained
     // to that shape — local-model JSON malformation becomes impossible.
     response_format: Option<serde_json::Value>,
-    // (#2114) See `run_resumable`'s doc on these params.
-    workspace_root: &std::path::Path,
-    pace_out_root: &std::path::Path,
+    // (#2114) See `run_resumable`'s doc on the same two params.
+    out_dir: &std::path::Path,
     resume_from: Option<checkpoint::RunCheckpoint>,
     // (#2094) Injectable rest sleeper — see [`TurnSleeper`]'s own doc.
     sleeper: &dyn TurnSleeper,
@@ -1132,12 +1151,19 @@ fn run_with_sleeper(
     // 100% is the safety net for that case. Soft is best-effort
     // between-turn telemetry; hard is the unconditional kill.
     //
-    // (#887) Verified: the host watchdog resets its deadline only on
-    // proof-of-work (tool.completed + compaction), NOT on `model.partial`
-    // SSE chunks — so a within-turn hang or a proof-of-work-silent turn is
-    // bounded by the hard kill at 100%. A mid-stream SOFT nudge isn't
-    // actionable (can't inject into an in-progress generation), so this
-    // stays host-only by design.
+    // (#887, superseded by #1222 shakedown-3) #887 verified the host
+    // watchdog reset only on tool.completed + compaction, not on
+    // `model.partial`. #1222 shakedown-3 changed that: two legitimate
+    // long-reasoning dispatches were killed mid-generation because only
+    // those two signals reset the HOST's deadline, so `model.partial` is
+    // now a proof-of-work signal there too (`dispatch_internal.rs`'s
+    // `"model.partial"` heartbeat arm). #2114 finding 5 brings the
+    // runtime's OWN soft-inactivity clock in line — `run_streaming_turn`
+    // resets `last_proof_of_work` on every chunk it ingests, the same
+    // signal the host now trusts. A mid-stream SOFT nudge still isn't
+    // actionable (can't inject into an in-progress generation) — the
+    // reset just keeps the soft clock from drifting stale relative to the
+    // hard one, not a claim that a nudge could fire mid-stream.
     //
     // - soft threshold: `inactivity_soft_threshold_secs(budget)` — a
     //   linear 75% of the inactivity budget, floored so it's never zero
@@ -1162,12 +1188,20 @@ fn run_with_sleeper(
     let mut last_proof_of_work = std::time::Instant::now();
     let mut inactivity_soft_warning_fired_in_window = false;
 
-    // (#2114) Reads + parses `pace.json` (in the mounted out-dir) on demand (not once at
-    // startup like `turn_delay_ms` below — the pace file is meant to
-    // change mid-dispatch); tracks whether a malformed sighting has
-    // already been warned about so a broken writer doesn't spam stderr
-    // once per 2s poll.
+    // (#2114) Reads + parses `pace.json` on demand (not once at startup
+    // like `turn_delay_ms` below — the pace file is meant to change
+    // mid-dispatch); tracks whether a malformed sighting has already been
+    // warned about so a broken writer doesn't spam stderr once per 2s
+    // poll.
     let mut pace_reader = pace::PaceReader::new();
+    // (#2114 finding 4) Ceiling past which a held `pause: true` is treated
+    // as abandoned rather than honored forever — read once at startup,
+    // same pattern as `inactivity_budget_secs` above.
+    let max_pause_ms = pace::max_pause_ms();
+    // Edge-trigger so the staleness warning fires once per abandoned-pause
+    // episode, not once per turn boundary while the same stale file sits
+    // there.
+    let mut pace_expiry_warned = false;
 
     // (#2094) Global inter-turn rest — read once at startup, same pattern
     // as `inactivity_budget_secs` above (both are host-forwarded env vars
@@ -1209,6 +1243,80 @@ fn run_with_sleeper(
     let mut last_edited_path: Option<String> = None;
     let mut consecutive_same_file_edits: u32 = 0;
 
+    // (#2114 finding 2) A resumed dispatch whose checkpoint captured an
+    // IN-PROGRESS tool-call batch (a kill between tool N and tool N+1 of
+    // the same turn) finishes dispatching the REMAINING calls before the
+    // main loop ever requests a new completion — so a resume never
+    // re-runs a tool call whose result the checkpoint already recorded.
+    // `messages` (seeded above from the same checkpoint) already carries
+    // the assistant's tool_calls message plus every result recorded
+    // before the kill; this dispatches exactly what's left, appending
+    // results the same way the main loop's `tool_calls` arm does, and
+    // checkpointing after each one so a SECOND kill during this catch-up
+    // pass loses no more than the main loop's own per-tool checkpoint
+    // already guarantees.
+    //
+    // Deliberately NOT wired into the cycle/failure-rate/cadence
+    // detectors or the feedback-injection queue below — `RunCheckpoint::
+    // pending_tool_calls`'s own doc names detector state as reset-fresh
+    // on resume rather than restored. This is a resume-time catch-up
+    // pass, not a re-entry into the live loop's full bookkeeping; the gap
+    // is tracked residue on #2114, not an oversight.
+    if let Some(pending_calls) = resume_seed.as_ref().and_then(|c| c.pending_tool_calls.clone()) {
+        let total_pending = pending_calls.len();
+        for (idx, call) in pending_calls.iter().cloned().enumerate() {
+            let result = dispatch(&call.function.name, &call.function.arguments);
+            let outcome = crate::failure_rate::classify_outcome(&call.function.name, &result);
+            let tool_ok = outcome.tool_worked();
+            if let Some(reason) =
+                crate::failure_rate::classify_failed_to_run(&call.function.name, &result)
+            {
+                let command = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                    .ok()
+                    .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| call.function.arguments.clone());
+                failed_to_run.push(FailedExec { command, reason: reason.to_string() });
+            }
+            trajectory.append_tool_completed(
+                turns,
+                idx as u32,
+                &call.function.name,
+                &call.function.arguments,
+                &result,
+                &outcome,
+            );
+            if tool_ok {
+                last_proof_of_work = std::time::Instant::now();
+                inactivity_soft_warning_fired_in_window = false;
+            }
+            messages.push(Message::tool_result(call.id, call.function.name, result));
+
+            let remaining: Vec<ToolCall> = pending_calls[idx + 1..].to_vec();
+            let snapshot = checkpoint::RunCheckpoint {
+                schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+                messages: messages.clone(),
+                turns,
+                total_prompt_tokens,
+                total_completion_tokens,
+                compactions,
+                rest_ms,
+                rests,
+                pending_hand_back: None,
+                pending_tool_calls: if remaining.is_empty() { None } else { Some(remaining) },
+                written_at_unix_ms: checkpoint::unix_ms(),
+            };
+            if let Err(e) = checkpoint::write_checkpoint(out_dir, &snapshot) {
+                eprintln!(
+                    "darkmux-runtime: ⚠ failed to write checkpoint: {e} (continuing without one)"
+                );
+            }
+        }
+        eprintln!(
+            "darkmux-runtime: ▶ resumed mid-turn — dispatched the {total_pending} tool call(s) \
+             remaining from turn {turns} before requesting the next turn. (#2114)"
+        );
+    }
+
     loop {
         // (#2114) Sleep-safe deadline re-anchor. This runtime's
         // `last_proof_of_work: Instant` lives inside the Docker Desktop
@@ -1228,7 +1336,18 @@ fn run_with_sleeper(
         // repeated soft warnings once the loop resumes.
         {
             let elapsed_secs = last_proof_of_work.elapsed().as_secs();
-            if turns > 0 && is_suspected_sleep_wake_jump(elapsed_secs, inactivity_budget_secs) {
+            // (#2114 finding 5) Gated on `!inactivity_soft_warning_fired_
+            // in_window` — the doc above (and `is_suspected_sleep_wake_
+            // jump`'s own doc) already claims a genuine stall would have
+            // fired the smaller soft warning BEFORE reaching 2x the full
+            // budget, so a jump WITH the warning already fired is a real
+            // stall that simply never got its proof-of-work reset, not a
+            // suspected sleep/wake — re-anchoring that case would erase a
+            // legitimate stall signal instead of correcting a clock.
+            if turns > 0
+                && !inactivity_soft_warning_fired_in_window
+                && is_suspected_sleep_wake_jump(elapsed_secs, inactivity_budget_secs)
+            {
                 eprintln!(
                     "darkmux-runtime: ⚠ suspected host sleep/wake — {elapsed_secs}s elapsed \
                      since the last proof-of-work signal, more than 2x the {inactivity_budget_secs}s \
@@ -1382,46 +1501,27 @@ fn run_with_sleeper(
                 absorb_rest_into_soft_inactivity_clock(last_proof_of_work, turn_delay_ms);
         }
 
-        // (#2114) Host-driven pause file — checked at the SAME turn-boundary
-        // point as the rest above, under the SAME two guards (never before
-        // the first request; not mid #1221 continuation, which is the same
-        // logical turn resuming, not a boundary between turns). While
-        // `pace.json` holds `pause: true` the loop rests in
-        // BOUNDED ≤2s increments, re-reading the file each increment —
-        // never a single long sleep — so a pace flip from pause back to
-        // resume is picked up within one increment, and so a long pause
-        // never trips the inactivity detector: every increment is
-        // proof-of-work through the SAME `absorb_rest_into_soft_inactivity_clock`
-        // #2094's turn_delay rest uses.
-        if turns > 0 && !resuming_after_checkpoint {
-            const PACE_POLL_INCREMENT_MS: u64 = 2_000;
-            while let Some(pace) = pace_reader.read(pace_out_root) {
-                if !pace.pause {
-                    break;
-                }
-                let reason = pace.reason_or_default();
-                sleeper.sleep(PACE_POLL_INCREMENT_MS);
-                rest_ms = rest_ms.saturating_add(PACE_POLL_INCREMENT_MS);
-                rests = rests.saturating_add(1);
-                trajectory.append_paced_rest(turns, PACE_POLL_INCREMENT_MS, &reason);
-                (last_proof_of_work, inactivity_soft_warning_fired_in_window) =
-                    absorb_rest_into_soft_inactivity_clock(last_proof_of_work, PACE_POLL_INCREMENT_MS);
-            }
-        }
-
-        // (#2114) Turn-boundary checkpoint — persists enough state
-        // (messages, budget counters, compaction count, and any pending
-        // #1221 hand-back) that a killed container — forced host sleep,
-        // docker restart, a thermal breaker at the hard floor — can resume
-        // from here (`--resume <path>`) instead of restarting the whole
-        // dispatch. Written at every loop-top past the first request,
-        // INCLUDING mid-#1221-continuation boundaries: `pending_hand_back`
-        // captures the live accumulation on those, so a kill mid checkpoint-
-        // sequence still has something recent to resume from. Streaming
-        // (write-every-turn), not end-of-run — a killed container leaves the
-        // LAST completed one, never nothing. Best-effort: a write failure is
-        // logged and the dispatch continues (losing resumability, not
-        // progress).
+        // (#2114 finding 1) Turn-boundary checkpoint — persists enough
+        // state (messages, budget counters, compaction count, and any
+        // pending #1221 hand-back) that a killed container — forced host
+        // sleep, docker restart, a thermal breaker at the hard floor —
+        // can resume from here (`--resume <path>`) instead of restarting
+        // the whole dispatch. Written at every loop-top past the first
+        // request, INCLUDING mid-#1221-continuation boundaries:
+        // `pending_hand_back` captures the live accumulation on those, so
+        // a kill mid checkpoint-sequence still has something recent to
+        // resume from. Streaming (write-every-turn), not end-of-run — a
+        // killed container leaves the LAST completed one, never nothing.
+        // Best-effort: a write failure is logged and the dispatch
+        // continues (losing resumability, not progress).
+        //
+        // MUST run BEFORE the pace-file pause check below: while parked
+        // at a pause boundary N, the pause loop can hold for an arbitrary
+        // amount of real time, and a checkpoint written AFTER it would
+        // still be showing turn N-1's state for that whole window — a
+        // kill during a long pause would resume one turn behind where the
+        // dispatch actually is. Written first, the on-disk checkpoint is
+        // never stale while parked.
         if turns > 0 {
             let pending_hand_back = if resuming_after_checkpoint {
                 Some(checkpoint::PendingHandBack {
@@ -1444,12 +1544,66 @@ fn run_with_sleeper(
                 rest_ms,
                 rests,
                 pending_hand_back,
+                pending_tool_calls: None,
                 written_at_unix_ms: checkpoint::unix_ms(),
             };
-            if let Err(e) = checkpoint::write_checkpoint(workspace_root, &snapshot) {
+            if let Err(e) = checkpoint::write_checkpoint(out_dir, &snapshot) {
                 eprintln!(
                     "darkmux-runtime: ⚠ failed to write checkpoint: {e} (continuing without one)"
                 );
+            }
+        }
+
+        // (#2114 finding 8) Host-driven pause file — checked at the SAME
+        // turn-boundary point as the rest above, guarded only by
+        // `!resuming_after_checkpoint` (a #1221 continuation is the same
+        // logical turn resuming, not a boundary between turns) — NOT by
+        // `turns > 0`: a governor that wants the very first request held
+        // back (e.g. a thermal ceiling already tripped before this
+        // dispatch was even launched) can do so, the same as at any later
+        // boundary. While `pace.json` holds `pause: true` the loop rests
+        // in BOUNDED ≤2s increments, re-reading the file each increment —
+        // never a single long sleep — so a pace flip from pause back to
+        // resume is picked up within one increment, and so a long pause
+        // never trips the inactivity detector: every increment is
+        // proof-of-work through the SAME `absorb_rest_into_soft_inactivity_clock`
+        // #2094's turn_delay rest uses.
+        //
+        // (#2114 finding 4) A pause is honored only while FRESH: once
+        // `written_at_ms` falls more than `max_pause_ms` behind now, the
+        // loop stops honoring it (logs once, falls through to the next
+        // request) rather than resting forever — each rest increment
+        // resets the HOST-side inactivity deadline too (see
+        // `absorb_rest_into_soft_inactivity_clock`), so an unbounded
+        // honored pause would make the container immortal against its own
+        // watchdog. A killed or hung governor process can never hold a
+        // dispatch past this ceiling.
+        if !resuming_after_checkpoint {
+            const PACE_POLL_INCREMENT_MS: u64 = 2_000;
+            while let Some(pace) = pace_reader.read(out_dir) {
+                if !pace.pause {
+                    pace_expiry_warned = false;
+                    break;
+                }
+                if pace.is_expired(checkpoint::unix_ms(), max_pause_ms) {
+                    if !pace_expiry_warned {
+                        eprintln!(
+                            "darkmux-runtime: ⚠ pace file at {} has been paused past \
+                             max_pause_ms ({max_pause_ms}ms) — treating the pause as \
+                             abandoned and continuing. (#2114)",
+                            pace::pace_file_path(out_dir).display()
+                        );
+                        pace_expiry_warned = true;
+                    }
+                    break;
+                }
+                let reason = pace.reason_or_default();
+                sleeper.sleep(PACE_POLL_INCREMENT_MS);
+                rest_ms = rest_ms.saturating_add(PACE_POLL_INCREMENT_MS);
+                rests = rests.saturating_add(1);
+                trajectory.append_paced_rest(turns, PACE_POLL_INCREMENT_MS, &reason);
+                (last_proof_of_work, inactivity_soft_warning_fired_in_window) =
+                    absorb_rest_into_soft_inactivity_clock(last_proof_of_work, PACE_POLL_INCREMENT_MS);
             }
         }
 
@@ -1493,7 +1647,14 @@ fn run_with_sleeper(
         // not exist yet.
         let next_seq = if resuming_after_checkpoint { turns } else { turns + 1 };
         let mut response = if streaming {
-            run_streaming_turn(client, &request, next_seq, trajectory)?
+            run_streaming_turn(
+                client,
+                &request,
+                next_seq,
+                trajectory,
+                &mut last_proof_of_work,
+                &mut inactivity_soft_warning_fired_in_window,
+            )?
         } else {
             client.chat(&request)?
         };
@@ -1972,6 +2133,13 @@ fn run_with_sleeper(
                 // what each tool returned. Trajectory records each
                 // tool.completed event so the operator can see what
                 // ran post-dispatch.
+                //
+                // (#2114 finding 2) `calls_snapshot` stays around (the
+                // loop below consumes `calls` itself) so each iteration
+                // can compute exactly which calls are still UNDISPATCHED
+                // after it and stamp that onto a checkpoint — see the
+                // write at the bottom of this loop body.
+                let calls_snapshot = calls.clone();
                 for (tool_seq, call) in calls.into_iter().enumerate() {
                     // (#418) Record the call into the cycle detector
                     // BEFORE dispatch so the suspicion event lands
@@ -2157,6 +2325,41 @@ fn run_with_sleeper(
                         call.function.name,
                         result,
                     ));
+
+                    // (#2114 finding 2) Per-tool-result checkpoint. Written
+                    // after EVERY tool result, not just at the turn
+                    // boundary above `calls`'s dispatch loop — a kill
+                    // between tool N and tool N+1 of a multi-tool turn
+                    // previously lost N's completed result entirely (the
+                    // only checkpoint was the loop-top one, written before
+                    // this loop even started). `messages` here already
+                    // carries the assistant's tool_calls message plus
+                    // every result recorded so far; `pending_tool_calls`
+                    // names the calls from THIS turn not yet dispatched —
+                    // `None` once the last one lands, matching a clean
+                    // boundary. See the pre-loop resume block (top of
+                    // `run_with_sleeper`) for the other half: dispatching
+                    // exactly these calls, and none already recorded,
+                    // when a resumed checkpoint carries them.
+                    let remaining: Vec<ToolCall> = calls_snapshot[tool_seq + 1..].to_vec();
+                    let mid_turn_snapshot = checkpoint::RunCheckpoint {
+                        schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+                        messages: messages.clone(),
+                        turns,
+                        total_prompt_tokens,
+                        total_completion_tokens,
+                        compactions,
+                        rest_ms,
+                        rests,
+                        pending_hand_back: None,
+                        pending_tool_calls: if remaining.is_empty() { None } else { Some(remaining) },
+                        written_at_unix_ms: checkpoint::unix_ms(),
+                    };
+                    if let Err(e) = checkpoint::write_checkpoint(out_dir, &mid_turn_snapshot) {
+                        eprintln!(
+                            "darkmux-runtime: ⚠ failed to write checkpoint: {e} (continuing without one)"
+                        );
+                    }
                 }
 
                 // (#1391) Soft-trim OLD oversized tool-result bodies before the
@@ -2779,6 +2982,16 @@ fn run_streaming_turn(
     request: &ChatRequest,
     seq: u32,
     trajectory: &mut Trajectory,
+    // (#2114 finding 5) Mirrors the host watchdog's #1222 shakedown-3
+    // fix: a `model.partial` chunk is transport-level liveness (the
+    // model is actively delivering tokens — a wedged server/network
+    // still dies), so it resets the runtime's own soft-inactivity clock
+    // the same way tool.completed/compaction do. Before this, only the
+    // HOST reset on partials; the runtime's soft warning could still
+    // fire mid-stream on a long legitimate turn even though the host's
+    // hard kill wouldn't.
+    last_proof_of_work: &mut std::time::Instant,
+    inactivity_soft_warning_fired_in_window: &mut bool,
 ) -> Result<crate::lmstudio::ChatResponse> {
     let (system_chars, prompt_chars) = measure_request_context(&request.messages);
     trajectory.append_model_streaming_start(seq, system_chars, prompt_chars);
@@ -2798,6 +3011,8 @@ fn run_streaming_turn(
             cumulative,
             accumulator.has_tool_calls(),
         );
+        *last_proof_of_work = std::time::Instant::now();
+        *inactivity_soft_warning_fired_in_window = false;
     }
     let partial_count = accumulator.partial_count();
     let total_content = accumulator.content_bytes();
@@ -3467,7 +3682,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), tmp.path(), None, &sleeper,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -3499,12 +3714,12 @@ mod tests {
     /// `RecordingSleeper`.
     struct PaceFlippingSleeper {
         calls: std::cell::RefCell<Vec<u64>>,
-        workspace: std::path::PathBuf,
+        out_dir: std::path::PathBuf,
     }
     impl TurnSleeper for PaceFlippingSleeper {
         fn sleep(&self, ms: u64) {
             self.calls.borrow_mut().push(ms);
-            std::fs::write(pace::pace_file_path(&self.workspace), r#"{"pause": false}"#).unwrap();
+            std::fs::write(pace::pace_file_path(&self.out_dir), r#"{"pause": false}"#).unwrap();
         }
     }
 
@@ -3537,13 +3752,13 @@ mod tests {
 
         let sleeper = PaceFlippingSleeper {
             calls: std::cell::RefCell::new(Vec::new()),
-            workspace: tmp.path().to_path_buf(),
+            out_dir: tmp.path().to_path_buf(),
         };
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), tmp.path(), None, &sleeper,
+            tmp.path(), None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok even though it paused mid-run");
 
@@ -3571,6 +3786,135 @@ mod tests {
         assert_eq!(rest_events.len(), 1, "one paced-rest event for the one increment taken");
         assert_eq!(rest_events[0]["ms"], 2_000);
         assert_eq!(rest_events[0]["reason"], "thermal", "the pace file's reason is stamped on the event");
+    }
+
+    /// (#2114 finding 1) A sleeper that, on its FIRST call — i.e. while the
+    /// loop is INSIDE the pace-wait poll, still parked at the boundary —
+    /// reads `checkpoint.json` and asserts it already reflects THIS
+    /// boundary's turn count, not the previous one. If the checkpoint
+    /// write happens after the pace wait (the bug), a kill signal that
+    /// arrives while parked here — a real host SIGKILL, simulated by this
+    /// test just reading the file instead of exiting — would find either
+    /// no checkpoint at all or one a full turn behind. The second call
+    /// flips the pace file to `pause: false` so the dispatch can finish.
+    struct AssertCheckpointFreshWhileParkedSleeper {
+        calls: std::cell::RefCell<u32>,
+        out_dir: std::path::PathBuf,
+        expected_turns_while_parked: u32,
+    }
+    impl TurnSleeper for AssertCheckpointFreshWhileParkedSleeper {
+        fn sleep(&self, _ms: u64) {
+            let mut calls = self.calls.borrow_mut();
+            *calls += 1;
+            if *calls == 1 {
+                let checkpoint = checkpoint::read_checkpoint(&checkpoint::checkpoint_file_path(
+                    &self.out_dir,
+                ))
+                .expect(
+                    "(#2114 finding 1) a checkpoint must already be on disk while parked at \
+                     the pause boundary — a kill here must not lose a whole turn",
+                );
+                assert_eq!(
+                    checkpoint.turns, self.expected_turns_while_parked,
+                    "(#2114 finding 1) the on-disk checkpoint must reflect THIS boundary's \
+                     turn count, not a stale one written before the pace wait"
+                );
+                std::fs::write(
+                    pace::pace_file_path(&self.out_dir),
+                    r#"{"pause": false}"#,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn checkpoint_is_fresh_while_parked_at_a_pause_boundary() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        // A resumed dispatch (turns == 1 from the START, no request sent
+        // yet in THIS process) rather than a fresh 3-turn one: it puts the
+        // loop at a REAL post-turn-1 boundary on its very first iteration,
+        // so pausing there meaningfully exercises "does the on-disk
+        // checkpoint reflect turns==1" — a fresh dispatch paused before
+        // turn 1 would trivially have no checkpoint yet regardless of this
+        // fix, since nothing has happened.
+        let server = MockServer::start();
+        let tool_calls = serde_json::json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}" },
+        }]);
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 140, 5));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("pace-fresh-checkpoint").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let resume_checkpoint = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            messages: vec![
+                Message::system("test"),
+                Message::user("read x.txt"),
+                Message {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: Some(serde_json::from_value(tool_calls).unwrap()),
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                },
+                Message::tool_result("call_1", "read", "<turn 1 file contents>"),
+            ],
+            turns: 1,
+            total_prompt_tokens: 100,
+            total_completion_tokens: 20,
+            compactions: 0,
+            rest_ms: 0,
+            rests: 0,
+            pending_hand_back: None,
+            pending_tool_calls: None,
+            written_at_unix_ms: checkpoint::unix_ms(),
+        };
+
+        // Pause is already active when the dispatch starts — the resumed
+        // loop's FIRST iteration is already at the turns==1 boundary, so
+        // it parks there immediately, before ever writing a checkpoint IN
+        // THIS PROCESS. Nothing on disk yet is exactly the scenario a real
+        // kill-then-restart hits: the in-memory `resume_seed` is not
+        // itself a file on disk.
+        std::fs::write(
+            pace::pace_file_path(tmp.path()),
+            r#"{"pause": true, "reason": "thermal"}"#,
+        )
+        .unwrap();
+
+        let sleeper = AssertCheckpointFreshWhileParkedSleeper {
+            calls: std::cell::RefCell::new(0),
+            out_dir: tmp.path().to_path_buf(),
+            expected_turns_while_parked: 1,
+        };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            tmp.path(), Some(resume_checkpoint), &sleeper,
+        )
+        .expect("3-turn scripted dispatch returns Ok even though it paused mid-run");
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        assert_eq!(*sleeper.calls.borrow(), 1, "sanity: the sleeper's assertion actually ran");
     }
 
     #[test]
@@ -3615,7 +3959,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), tmp.path(), None, &RealSleeper,
+            tmp.path(), None, &RealSleeper,
         )
         .expect("2-turn scripted dispatch (tool call, then stop) returns Ok");
 
@@ -3710,13 +4054,14 @@ mod tests {
             rest_ms: 0,
             rests: 0,
             pending_hand_back: None,
+            pending_tool_calls: None,
             written_at_unix_ms: checkpoint::unix_ms(),
         };
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), tmp.path(), Some(resume_checkpoint), &RealSleeper,
+            tmp.path(), Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
 
@@ -3728,6 +4073,132 @@ mod tests {
         turn1_mock.assert_hits(0);
         turn2_mock.assert_hits(0);
         turn3_mock.assert_hits(1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resume_mid_turn_dispatches_only_the_undispatched_tool_calls() {
+        // (#2114 finding 2) A 3-tool turn killed after tool 1 must resume
+        // by dispatching ONLY tools 2 and 3 — never re-running tool 1,
+        // whose result the checkpoint already recorded.
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+        use httpmock::prelude::*;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let server = MockServer::start();
+        // A request shaped like the ORIGINAL turn 1 (no tool results yet)
+        // must NEVER land — proves the resume doesn't re-request the
+        // model for a turn it already has an assistant message for.
+        let original_turn1_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(Some("should not be reached"), None, "stop", 100, 5));
+        });
+        // The next real request comes only once ALL THREE tool results
+        // (the checkpoint's one plus the two the resume dispatches) are
+        // present.
+        let turn2_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 3
+            });
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 140, 5));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("resume-mid-turn").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let make_call = |id: &str, offset: u32| ToolCall {
+            id: id.to_string(),
+            kind: "function".into(),
+            function: crate::lmstudio::FunctionCall {
+                name: "read".into(),
+                arguments: format!("{{\"path\":\"/workspace/x.txt\",\"offset\":{offset},\"limit\":1}}"),
+            },
+            extra_content: None,
+        };
+        let call1 = make_call("call_1", 1);
+        let call2 = make_call("call_2", 2);
+        let call3 = make_call("call_3", 3);
+        let assistant_message = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![call1.clone(), call2.clone(), call3.clone()]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+
+        // Simulates a kill right after tool 1's result landed but before
+        // tools 2 and 3 ran: `messages` carries the assistant's 3-call
+        // turn plus exactly ONE tool result, and `pending_tool_calls`
+        // names the two that never got to run.
+        let resume_checkpoint = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            messages: vec![
+                Message::system("test"),
+                Message::user("read x.txt"),
+                assistant_message,
+                Message::tool_result("call_1", "read", "<call 1 result>"),
+            ],
+            turns: 1,
+            total_prompt_tokens: 100,
+            total_completion_tokens: 20,
+            compactions: 0,
+            rest_ms: 0,
+            rests: 0,
+            pending_hand_back: None,
+            pending_tool_calls: Some(vec![call2, call3]),
+            written_at_unix_ms: checkpoint::unix_ms(),
+        };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            tmp.path(), Some(resume_checkpoint), &RealSleeper,
+        )
+        .expect("resumed dispatch returns Ok");
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        original_turn1_mock.assert_hits(0);
+        turn2_mock.assert_hits(1);
+
+        let tool_results: Vec<&Message> =
+            outcome.messages.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(tool_results.len(), 3, "checkpoint's 1 + resumed 2 = 3, never 4");
+        let call_1_results = tool_results
+            .iter()
+            .filter(|m| m.tool_call_id.as_deref() == Some("call_1"))
+            .count();
+        assert_eq!(call_1_results, 1, "call_1 must NOT be re-dispatched and re-appended");
+        for id in ["call_2", "call_3"] {
+            assert_eq!(
+                tool_results.iter().filter(|m| m.tool_call_id.as_deref() == Some(id)).count(),
+                1,
+                "{id} must be dispatched exactly once during the resume catch-up pass"
+            );
+        }
+
+        // The checkpoint written after the LAST resumed tool call must show
+        // a clean boundary (no calls still pending) so a SUBSEQUENT kill
+        // wouldn't try to re-derive an already-finished batch.
+        let final_mid_turn_checkpoint =
+            checkpoint::read_checkpoint(&checkpoint::checkpoint_file_path(tmp.path())).unwrap();
+        assert!(
+            final_mid_turn_checkpoint.pending_tool_calls.is_none()
+                || final_mid_turn_checkpoint.turns > 1,
+            "either the last mid-turn checkpoint cleared pending_tool_calls, or a later \
+             clean-boundary checkpoint (turns > 1) has already superseded it"
+        );
     }
 
     #[test]
@@ -3754,7 +4225,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), tmp.path(), None, &sleeper,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
 
@@ -3795,7 +4266,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), tmp.path(), None, &sleeper,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
         )
         .expect("single-turn dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -3890,7 +4361,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, Some(40), std::collections::BTreeMap::new(), None, tmp.path(), tmp.path(), None, &sleeper,
+            Some(100), None, None, Some(40), std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
         )
         .expect("checkpoint-continuation scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");

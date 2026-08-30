@@ -1826,13 +1826,15 @@
     }
 
     #[test]
-    fn build_docker_run_argv_appends_resume_flag_pointing_at_the_workspace_checkpoint() {
+    fn build_docker_run_argv_appends_resume_flag_pointing_at_the_out_dir_checkpoint() {
+        // (#2114 finding 3) The checkpoint moved off `/workspace/.darkmux`
+        // onto the always-writable, never-`:ro` `/darkmux-out` mount.
         let mut config = base_argv_config();
         config.resume_checkpoint = true;
         let argv = build_docker_run_argv(&config);
         assert!(
-            argv.windows(2).any(|w| w[0] == "--resume" && w[1] == "/workspace/.darkmux/checkpoint.json"),
-            "expected --resume /workspace/.darkmux/checkpoint.json in argv: {argv:?}"
+            argv.windows(2).any(|w| w[0] == "--resume" && w[1] == "/darkmux-out/checkpoint.json"),
+            "expected --resume /darkmux-out/checkpoint.json in argv: {argv:?}"
         );
     }
 
