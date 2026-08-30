@@ -750,14 +750,26 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
     }
     // (#1221) Per-call cap override — E19: the built-in 10000 truncates
     // productive reasoning on thinking-family models; benches raise it.
-    if let Some(n) = darkmux_types::config_access::max_tokens_per_call() {
+    //
+    // (#2165) A companion `--max-tokens-per-call-source` flag rides
+    // alongside — the runtime can't tell env from config on its own (it
+    // only sees "did I get a CLI flag"), so the host, the ONE place that
+    // resolved the tier, forwards it. See `crate::bounds::BoundSource` on
+    // the runtime side for the consumer.
+    let (max_tokens_per_call, max_tokens_per_call_source) =
+        darkmux_types::config_access::max_tokens_per_call_with_source();
+    if let Some(n) = max_tokens_per_call {
         cmd.arg("--max-tokens-per-call").arg(n.to_string());
+        cmd.arg("--max-tokens-per-call-source").arg(max_tokens_per_call_source.as_str());
     }
     // (#1221) The reasoning check-in rate — a SEPARATE knob from the answer
     // bound above, because sampling a thought wants small and bounding an
-    // answer wants large.
-    if let Some(n) = darkmux_types::config_access::reasoning_checkpoint_interval_tokens() {
+    // answer wants large. (#2165) Same companion-source pattern as above.
+    let (reasoning_checkpoint_interval, reasoning_checkpoint_interval_source) =
+        darkmux_types::config_access::reasoning_checkpoint_interval_tokens_with_source();
+    if let Some(n) = reasoning_checkpoint_interval {
         cmd.arg("--reasoning-checkpoint-interval").arg(n.to_string());
+        cmd.arg("--reasoning-checkpoint-interval-source").arg(reasoning_checkpoint_interval_source.as_str());
     }
 }
 
@@ -848,6 +860,15 @@ pub struct DockerRunConfig {
     /// — the runtime and the host disagreed about when "inactivity" starts.
     /// Always forwarded, matching the host's hard-kill value exactly.
     pub inactivity_timeout_seconds: u64,
+    /// (#2165) WHICH tier resolved `inactivity_timeout_seconds` above —
+    /// forwarded into the container as
+    /// `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=<tier>`, the same
+    /// value/source-companion pattern the CLI-flag-carried knobs use (see
+    /// `apply_runtime_limit_flags`). The runtime reads it back at the same
+    /// site it reads the value (`runtime/src/loop_runner.rs`'s
+    /// `inactivity_bound`) so its soft-warning stderr line and the
+    /// inactivity-approach signal can name the tier, not just the number.
+    pub inactivity_timeout_seconds_source: darkmux_types::config_access::Source,
     /// (#2114 finding 4, resolved #2110/#2109) Forwarded into the
     /// container as `-e DARKMUX_MAX_PAUSE_MS=<n>` so the runtime's own
     /// staleness ceiling (`runtime/src/pace.rs::max_pause_ms`) agrees with
@@ -989,6 +1010,13 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
     args.push(format!(
         "DARKMUX_INACTIVITY_TIMEOUT_SECONDS={}",
         config.inactivity_timeout_seconds
+    ));
+    // (#2165) Companion source var — see `inactivity_timeout_seconds_source`'s
+    // own doc.
+    args.push("-e".to_string());
+    args.push(format!(
+        "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE={}",
+        config.inactivity_timeout_seconds_source.as_str()
     ));
 
     // (#2114 finding 4, resolved #2110/#2109) Forward the resolved
@@ -3020,6 +3048,16 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             darkmux_types::config_access::turn_delay_ms(),
             agentic_pm.is_some(),
         ),
+        // (#2165) The resolved runtime knobs WITH provenance — "the operator
+        // never has to wonder where a decision came from" applied to the
+        // runtime's own bounds. Same block rides on the envelope (see
+        // `enrich_envelope_with_summary`) — one producer, so a remote
+        // reader watching the flow stream and an operator reading the
+        // finished envelope can't disagree about what governed this run.
+        "bounds": resolved_runtime_bounds_json(effective_turn_delay_ms(
+            darkmux_types::config_access::turn_delay_ms(),
+            agentic_pm.is_some(),
+        )),
     });
     // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
@@ -3230,6 +3268,8 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             agentic_pm.is_some(),
         ),
         inactivity_timeout_seconds: darkmux_types::config_access::inactivity_timeout_seconds(),
+        inactivity_timeout_seconds_source:
+            darkmux_types::config_access::inactivity_timeout_seconds_with_source().1,
         // (#2110/#2109) Resolved through config_access now that
         // runtime.thermal.max_pause_ms exists — see max_pause_ms_env's own
         // doc.
@@ -3674,8 +3714,17 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // (#1955) The envelope is the orchestrator's only surface, so the
     // reduction lands here — after the tailer has finished and its
     // observations are final.
-    let stdout =
-        enrich_envelope_with_summary(stdout, &trajectory_summary, &host_stats, &host_extras, &host_out);
+    let stdout = enrich_envelope_with_summary(
+        stdout,
+        &trajectory_summary,
+        &host_stats,
+        &host_extras,
+        &host_out,
+        resolved_runtime_bounds_json(effective_turn_delay_ms(
+            darkmux_types::config_access::turn_delay_ms(),
+            agentic_pm.is_some(),
+        )),
+    );
 
     // (#782) Read the runtime's token totals from metrics.json now the
     // container has exited. Best-effort — zero totals on any read failure
@@ -3846,6 +3895,51 @@ fn rewrite_container_paths_for_host(stdout: String, host_out: &std::path::Path) 
     serde_json::to_string(&v).unwrap_or(stdout)
 }
 
+/// (#2165) The dispatch's resolved runtime bounds, WITH provenance, exactly
+/// as `darkmux_types::config_access` resolved them for THIS dispatch. Shared
+/// by `dispatch_start_payload["bounds"]` (emitted before the container
+/// spawns) and the envelope's own `bounds` block (`enrich_envelope_with_
+/// summary`, emitted after it exits) — one producer, so the two can't
+/// independently drift on what "the resolved knobs" means.
+///
+/// Absent optional knobs (`max_turns`/`max_tokens`, uncapped by default)
+/// stamp `value: null, source: "built-in"` rather than being omitted — an
+/// operator scanning the block for what bounded a run should never have to
+/// distinguish "not measured" from "not configured".
+///
+/// `effective_turn_delay_ms` is passed in rather than re-resolved here: the
+/// call site already computes the AGENTIC-REMOTE-forced value (`0` for a
+/// hosted-endpoint dispatch, matching `DockerRunConfig.turn_delay_ms` and
+/// the top-level `dispatch_start_payload["turn_delay_ms"]` stamp) via
+/// `effective_turn_delay_ms`, and this block must show the SAME number that
+/// actually governed the dispatch, not the un-forced configured one.
+fn resolved_runtime_bounds_json(effective_turn_delay_ms: u64) -> serde_json::Value {
+    fn vs(value: Option<serde_json::Value>, source: darkmux_types::config_access::Source) -> serde_json::Value {
+        serde_json::json!({
+            "value": value.unwrap_or(serde_json::Value::Null),
+            "source": source.as_str(),
+        })
+    }
+    let (max_tokens_per_call, s_mtpc) = darkmux_types::config_access::max_tokens_per_call_with_source();
+    let (reasoning_checkpoint_interval_tokens, s_rci) =
+        darkmux_types::config_access::reasoning_checkpoint_interval_tokens_with_source();
+    let (inactivity_timeout_seconds, s_inact) =
+        darkmux_types::config_access::inactivity_timeout_seconds_with_source();
+    let (max_turns, s_turns) = darkmux_types::config_access::max_turns_with_source();
+    let (max_tokens, s_tokens) = darkmux_types::config_access::max_tokens_with_source();
+    let (_turn_delay_ms, s_delay) = darkmux_types::config_access::turn_delay_ms_with_source();
+    let (feedback_injection, s_fi) = darkmux_types::config_access::feedback_injection_with_source();
+    serde_json::json!({
+        "max_tokens_per_call": vs(max_tokens_per_call.map(Into::into), s_mtpc),
+        "reasoning_checkpoint_interval_tokens": vs(reasoning_checkpoint_interval_tokens.map(Into::into), s_rci),
+        "inactivity_timeout_seconds": vs(Some(inactivity_timeout_seconds.into()), s_inact),
+        "max_turns": vs(max_turns.map(Into::into), s_turns),
+        "max_tokens": vs(max_tokens.map(Into::into), s_tokens),
+        "turn_delay_ms": vs(Some(effective_turn_delay_ms.into()), s_delay),
+        "feedback_injection": vs(Some(feedback_injection.into()), s_fi),
+    })
+}
+
 /// (#1955) Add the observed summary to a JSON envelope.
 ///
 /// The orchestrator's ONLY surface is this envelope, and it carried none of
@@ -3870,6 +3964,11 @@ fn enrich_envelope_with_summary(
     stats: &HostStats,
     extras: &HostExtras,
     out_dir: &std::path::Path,
+    // (#2165) The SAME `bounds` block `dispatch_start_payload` carries —
+    // built once at the call site (`resolved_runtime_bounds_json`) so the
+    // start record and the finished envelope can't independently drift on
+    // what "the resolved knobs" means.
+    bounds: serde_json::Value,
 ) -> String {
     let trimmed = stdout.trim();
     if !trimmed.starts_with('{') {
@@ -3887,6 +3986,7 @@ fn enrich_envelope_with_summary(
         "detections".into(),
         serde_json::Value::Array(summary.detections.clone()),
     );
+    obj.insert("bounds".into(), bounds);
     // Host pressure, reduced. Included only when the sampler actually ran —
     // an absent block says "not measured", which is honest, where a zeroed
     // one would read as "measured, and idle".

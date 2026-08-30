@@ -162,6 +162,7 @@ pub fn run() -> DoctorReport {
         check_gh_allowlist(),
         check_review_judge_exhaustion_policy(),
         check_turn_delay(),
+        check_reasoning_checkpoint_interval(),
         check_host_sampler_interval(),
         check_thermal_governor(),
         check_host_probe(),
@@ -1775,6 +1776,46 @@ fn check_turn_delay() -> Check {
         name: name.into(),
         status: Status::Pass,
         message: format!("{ms}ms ({provenance}) — rest between inference turns on every local dispatch"),
+        hint: None,
+    }
+}
+
+/// (#2165) Surface the resolved `runtime.reasoning_checkpoint_interval_tokens`
+/// with provenance — the #1221 mid-turn check-in rate the internal runtime
+/// samples a thought against, distinct from `runtime.max_tokens_per_call`
+/// (which bounds an ANSWER and wants to be LARGE; this one samples a
+/// THOUGHT and wants to be SMALL). Every other runtime knob the container
+/// receives already has a doctor row (`runtime.turn_delay_ms` above,
+/// `runtime.inactivity_timeout_seconds` folded into that check's `timeout_ms`
+/// read, `runtime.host_sampler_interval_ms`, `runtime.thermal.*`) — this one
+/// didn't, so a fresh dispatch's cap-hit stderr line ("hit the reasoning
+/// check-in interval (built-in 1000)", #2165) named a knob `doctor` couldn't
+/// confirm the resolved value or tier for.
+///
+/// Always Pass — informational, like `check_turn_delay`'s `0ms` case. There
+/// is no bad value here (the runtime clamps nothing, unlike the turn-delay/
+/// inactivity-timeout interaction), so this is a "know your own knobs" row,
+/// not a health gate.
+fn check_reasoning_checkpoint_interval() -> Check {
+    let name = "runtime.reasoning_checkpoint_interval_tokens";
+    let (value, source) =
+        darkmux_types::config_access::reasoning_checkpoint_interval_tokens_with_source();
+    let (shown, provenance) = match value {
+        Some(n) => (n, source.as_str()),
+        // `None` means the runtime's own built-in literal governs (
+        // `REASONING_CHECKPOINT_INTERVAL = 1000`, `runtime/src/loop_runner.rs`)
+        // — darkmux-doctor can't import the runtime crate (it's outside the
+        // workspace, see `runtime/Cargo.toml`'s own doc), so the built-in
+        // value is named here rather than re-derived from a shared constant.
+        None => (1000, "built-in"),
+    };
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "{shown} tokens ({provenance}) — how far the model reasons between the \
+             runtime's mid-turn check-ins (#1221)"
+        ),
         hint: None,
     }
 }
@@ -5668,6 +5709,42 @@ mod tests {
         }
     }
 
+    // ─── (#2165) check_reasoning_checkpoint_interval — resolved value + provenance ─
+
+    #[serial_test::serial]
+    #[test]
+    fn check_reasoning_checkpoint_interval_unset_is_pass_and_names_built_in() {
+        let prev = std::env::var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL").ok();
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL") };
+        let check = check_reasoning_checkpoint_interval();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("1000 tokens"), "{}", check.message);
+        assert!(check.message.contains("built-in"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_reasoning_checkpoint_interval_env_override_names_the_value_and_env() {
+        let prev = std::env::var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL").ok();
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", "500") };
+        let check = check_reasoning_checkpoint_interval();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("500 tokens"), "{}", check.message);
+        assert!(check.message.contains("env"), "provenance named: {}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL"),
+            }
+        }
+    }
+
     // ─── (#2108) check_host_probe — which sources resolved + the cost ──────
 
     /// Runs the REAL probe. macOS/aarch64-gated for the same reason the
@@ -6863,7 +6940,8 @@ mod tests {
         // binary-vs-source + runtime-image-freshness [#1461] + role-profiles
         // [#1475] + cmd-gate-allowlist [#1685] + unpriceable-residents
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
-        // turn-delay [#2094] + host-sampler-interval [#2107, #1833] +
+        // turn-delay [#2094] + reasoning-checkpoint-interval [#2165] +
+        // host-sampler-interval [#2107, #1833] +
         // thermal-governor [#2110/#2109] +
         // mission-envelope-readability [#1881] + hooks [#2093] +
         // rules [#1959] + host-probe [#2107] + power-posture [#2112,
@@ -6871,7 +6949,7 @@ mod tests {
         // per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 46 + darkmux_eureka::all_rules().len();
+        let expected = 47 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
