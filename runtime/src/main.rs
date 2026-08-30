@@ -134,7 +134,8 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let mut model: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut system: Option<String> = None;
-    // (#2114) Path to a `.darkmux/checkpoint.json` written by a prior,
+    // (#2114) Path to a `checkpoint.json` (under the out-dir mount,
+    // `/darkmux-out` in production) written by a prior,
     // interrupted dispatch. When set, the loop reloads the checkpoint's
     // message history instead of starting from `--system`/`--prompt` — see
     // `checkpoint::read_checkpoint`. `--resume` takes precedence over the
@@ -786,7 +787,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         reasoning_checkpoint_interval,
         feedback_templates,
         response_format,
-        Path::new("/workspace"),
+        // (#2114 finding 3) pace.json / checkpoint.json live in the
+        // out-dir mount, not the workspace — see `loop_runner::
+        // run_resumable`'s doc on this param for why.
+        Path::new(trajectory::RUNTIME_OUT_BASE),
         resume_from,
     );
 

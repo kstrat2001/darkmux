@@ -1,21 +1,33 @@
 //! Turn-boundary checkpoint (#2114).
 //!
 //! After each completed turn boundary (a full turn, or a #1221 reasoning-
-//! checkpoint hand-back — see `loop_runner`'s `resuming_after_checkpoint`)
-//! the loop writes `<workspace>/.darkmux/checkpoint.json` atomically (temp
-//! file + rename onto the same filesystem) so a killed container always
-//! leaves a checkpoint from its last completed boundary, never a torn
-//! write. `--resume <path>` (or `DARKMUX_RESUME_CHECKPOINT`) reloads one of
-//! these instead of starting from the system prompt.
+//! checkpoint hand-back — see `loop_runner`'s `resuming_after_checkpoint`),
+//! AND after each individual tool result within a turn (#2114 finding 2),
+//! the loop writes `<out_dir>/checkpoint.json` atomically (temp file +
+//! rename onto the same filesystem) so a killed container always leaves a
+//! checkpoint from its last completed step, never a torn write. `out_dir`
+//! is the container's `/darkmux-out` mount (`trajectory::RUNTIME_OUT_BASE`)
+//! — the same always-writable, never-`:ro` bookkeeping dir trajectory and
+//! findings already use, NOT `<workspace>/.darkmux`: `/workspace` is
+//! read-only for crawl-kind dispatches (#1959) and, when writable, is the
+//! operator's own repo tree. `--resume <path>` (or
+//! `DARKMUX_RESUME_CHECKPOINT`) reloads one of these instead of starting
+//! from the system prompt.
 
-use crate::lmstudio::Message;
+use crate::lmstudio::{Message, ToolCall};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Schema version for `RunCheckpoint`. Bump on a breaking field change so
 /// an older runtime resuming a newer checkpoint (or vice versa) fails
 /// loud at load time instead of silently misreading fields.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (#2114 finding 2) adds `pending_tool_calls` — v1 checkpoints have no
+/// way to represent an in-progress tool-call batch, so a v1 checkpoint
+/// resumed by a v2+ runtime would silently look like a clean turn
+/// boundary. Bumped rather than defaulted so that ambiguity fails loud
+/// instead of re-running (or losing) mid-turn tool calls.
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 
 /// (#1221) The reasoning-checkpoint hand-back pending on the turn in
 /// flight, if the checkpoint was written mid-continuation rather than at
@@ -43,12 +55,19 @@ pub struct PendingHandBack {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunCheckpoint {
     pub schema_version: u32,
-    /// Full conversation so far, in order — the tool-call cursor IS this
-    /// vector's length/contents; there's no separate index to drift from
-    /// it.
+    /// Full conversation so far, in order. On a CLEAN turn boundary
+    /// (`pending_tool_calls: None`, `pending_hand_back: None`) the
+    /// tool-call cursor IS this vector's length/contents — there's no
+    /// separate index to drift from it. Mid-turn (`pending_tool_calls:
+    /// Some`), the tail of this vector is the in-flight assistant message
+    /// followed by whichever of ITS tool results had completed as of this
+    /// write; `pending_tool_calls` names what's left.
     pub messages: Vec<Message>,
     /// Completed turns (model calls that advanced the loop's `turns`
-    /// counter; a #1221 hand-back continuation does NOT advance it).
+    /// counter; a #1221 hand-back continuation does NOT advance it). A
+    /// mid-turn checkpoint (`pending_tool_calls: Some`) still reports the
+    /// turn IN PROGRESS here — its model call already happened and
+    /// advanced this counter before any of that turn's tool calls ran.
     pub turns: u32,
     pub total_prompt_tokens: u32,
     pub total_completion_tokens: u32,
@@ -63,30 +82,68 @@ pub struct RunCheckpoint {
     /// continuation when this was written. `None` on a clean turn
     /// boundary (the common case).
     pub pending_hand_back: Option<PendingHandBack>,
+    /// (#2114 finding 2) Tool calls from the CURRENT turn's assistant
+    /// message that had not yet been dispatched as of this write —
+    /// `messages` already carries the assistant message plus every
+    /// result recorded before the write; this names what's left. `None`
+    /// on a clean turn boundary or a #1221 hand-back boundary (neither
+    /// has a tool-call batch in flight). A resume with this `Some` finishes
+    /// dispatching exactly these calls before requesting the next turn, so
+    /// a kill between tool N and tool N+1 of a turn never re-runs tool N.
+    ///
+    /// NOT covered by this pass: detector state (cycle/failure-rate/
+    /// reasoning-loop windows), `checkpoints_used`/`stall_recoveries_used`,
+    /// and queued-but-undrained feedback-injection signals are all reset
+    /// to fresh/empty on resume rather than restored — a resumed dispatch
+    /// gets a clean detector slate instead of the exact pre-kill state.
+    /// This is a scope cut, not an oversight; residue tracked on #2114.
+    #[serde(default)]
+    pub pending_tool_calls: Option<Vec<ToolCall>>,
     pub written_at_unix_ms: u64,
 }
 
-/// `<workspace>/.darkmux/checkpoint.json`.
-pub fn checkpoint_file_path(workspace: &Path) -> PathBuf {
-    workspace.join(".darkmux").join("checkpoint.json")
+/// `<out_dir>/checkpoint.json` — `out_dir` is the container's
+/// `/darkmux-out` mount in production (`trajectory::RUNTIME_OUT_BASE`), a
+/// tempdir in tests. See the module doc for why this moved off
+/// `<workspace>/.darkmux`.
+pub fn checkpoint_file_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("checkpoint.json")
 }
 
 /// Write atomically: serialize to a sibling temp file (named with this
-/// process's pid so two runtimes racing on the same mount can't collide),
-/// then `rename` over the real path. Rename is atomic on POSIX when both
-/// paths share a filesystem, which they do here (both under the same
-/// mounted `.darkmux` dir) — a reader never observes a partially-written
-/// checkpoint, and a container killed mid-write leaves the PREVIOUS
-/// complete checkpoint in place, never a torn one.
-pub fn write_checkpoint(workspace: &Path, checkpoint: &RunCheckpoint) -> std::io::Result<()> {
-    let dir = workspace.join(".darkmux");
-    std::fs::create_dir_all(&dir)?;
-    let final_path = checkpoint_file_path(workspace);
-    let tmp_path = dir.join(format!("checkpoint.json.tmp.{}", std::process::id()));
+/// process's pid AND a nanosecond timestamp — pid alone repeats across a
+/// container restart on the same mount, which is exactly the moment two
+/// writes are most likely to race), fsync the temp file's contents, then
+/// `rename` over the real path and fsync the containing directory so the
+/// rename itself survives a crash (a rename can be atomic yet still be
+/// lost from a directory entry that was never flushed). Rename is atomic
+/// on POSIX when both paths share a filesystem, which they do here (both
+/// under the same mounted out-dir) — a reader never observes a
+/// partially-written checkpoint, and a container killed mid-write leaves
+/// the PREVIOUS complete checkpoint in place, never a torn one.
+pub fn write_checkpoint(out_dir: &Path, checkpoint: &RunCheckpoint) -> std::io::Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    let final_path = checkpoint_file_path(out_dir);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = out_dir.join(format!("checkpoint.json.tmp.{}-{nanos}", std::process::id()));
     let body = serde_json::to_vec_pretty(checkpoint)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp_path, body)?;
+    {
+        let file = std::fs::File::create(&tmp_path)?;
+        use std::io::Write;
+        (&file).write_all(&body)?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp_path, &final_path)?;
+    if let Ok(dir_handle) = std::fs::File::open(out_dir) {
+        // Best-effort: fsyncing a directory handle isn't supported on
+        // every platform (notably Windows), so a failure here doesn't
+        // fail the write — the rename itself already landed.
+        let _ = dir_handle.sync_all();
+    }
     Ok(())
 }
 
@@ -133,26 +190,26 @@ mod tests {
             rest_ms: 0,
             rests: 0,
             pending_hand_back: None,
+            pending_tool_calls: None,
             written_at_unix_ms: unix_ms(),
         }
     }
 
     #[test]
     fn round_trips_through_write_and_read() {
-        let ws = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
         let checkpoint = sample();
-        write_checkpoint(ws.path(), &checkpoint).unwrap();
-        let loaded = read_checkpoint(&checkpoint_file_path(ws.path())).unwrap();
+        write_checkpoint(out_dir.path(), &checkpoint).unwrap();
+        let loaded = read_checkpoint(&checkpoint_file_path(out_dir.path())).unwrap();
         assert_eq!(loaded.turns, 1);
         assert_eq!(loaded.messages.len(), 2);
     }
 
     #[test]
     fn write_is_atomic_no_tmp_file_left_behind() {
-        let ws = tempfile::tempdir().unwrap();
-        write_checkpoint(ws.path(), &sample()).unwrap();
-        let dir = ws.path().join(".darkmux");
-        let entries: Vec<_> = std::fs::read_dir(&dir)
+        let out_dir = tempfile::tempdir().unwrap();
+        write_checkpoint(out_dir.path(), &sample()).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(out_dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
@@ -162,12 +219,34 @@ mod tests {
 
     #[test]
     fn read_rejects_mismatched_schema_version() {
-        let ws = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
         let mut checkpoint = sample();
         checkpoint.schema_version = 999;
-        write_checkpoint(ws.path(), &checkpoint).unwrap();
-        let err = read_checkpoint(&checkpoint_file_path(ws.path())).unwrap_err();
+        write_checkpoint(out_dir.path(), &checkpoint).unwrap();
+        let err = read_checkpoint(&checkpoint_file_path(out_dir.path())).unwrap_err();
         assert!(err.to_string().contains("schema_version"));
+    }
+
+    #[test]
+    fn pending_tool_calls_round_trips() {
+        use crate::lmstudio::{FunctionCall, ToolCall};
+        let out_dir = tempfile::tempdir().unwrap();
+        let mut checkpoint = sample();
+        checkpoint.pending_tool_calls = Some(vec![ToolCall {
+            id: "call_2".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: r#"{"command":"echo hi"}"#.into(),
+            },
+            extra_content: None,
+        }]);
+        write_checkpoint(out_dir.path(), &checkpoint).unwrap();
+        let loaded = read_checkpoint(&checkpoint_file_path(out_dir.path())).unwrap();
+        let pending = loaded.pending_tool_calls.expect("pending_tool_calls survives round-trip");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "call_2");
+        assert_eq!(pending[0].function.name, "bash");
     }
 
     #[test]
