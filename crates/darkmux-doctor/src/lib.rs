@@ -1911,13 +1911,17 @@ fn check_telemetry_record_every_samples() -> Check {
             hint: None,
         };
     }
+    // (#2111 review finding) Derived from the sampler's own constant
+    // rather than a hardcoded literal, so this message can't silently
+    // drift from the real tick if that constant ever changes.
+    let cadence_ms = value.saturating_mul(darkmux_crew::dispatch_internal::TELEMETRY_SAMPLE_INTERVAL_MS);
     Check {
         name: name.into(),
         status: Status::Pass,
         message: format!(
             "every {value} sample(s) ({provenance}) — the machine.telemetry periodic \
-             host-pressure curve's cadence (≈{}s at the 2s dispatch-sampler tick)",
-            value * 2
+             host-pressure curve's cadence (≈{}s at the dispatch sampler's own tick)",
+            cadence_ms / 1000
         ),
         hint: None,
     }

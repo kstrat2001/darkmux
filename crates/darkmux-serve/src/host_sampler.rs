@@ -43,7 +43,7 @@ use darkmux_crew::telemetry_sampler::{reduce_host_stats, HostSampleAt};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// 10 minutes of history at the default 5s cadence. The ring is capacity-
 /// bounded by ENTRY COUNT, not by wall-clock span — at a faster-than-default
@@ -252,35 +252,6 @@ pub(crate) fn ring() -> &'static HostSamplerRing {
     RING.get_or_init(HostSamplerRing::new)
 }
 
-/// Spawn the daemon-side host sampler thread. `interval_ms` is the
-/// resolved `config_access::host_sampler_interval_ms()` cadence; `0`
-/// disables the sampler entirely and this returns `None` without spawning
-/// anything (the "0 means hard off" convention shared with
-/// `remote.max_tokens_per_execution`). The returned thread runs until
-/// `stop_flag` is set, polling it every [`STOP_POLL_INTERVAL`] so shutdown
-/// is prompt rather than blocking for a full sample interval — the same
-/// teardown shape `dispatch_internal::run_telemetry_sampler` uses.
-///
-/// (#2108) The [`HostProbe`] is constructed INSIDE the thread and owned by
-/// it: the probe is stateful (CPU percent and every power rail are counter
-/// deltas), so a private probe gives this sampler deltas that line up with
-/// its own cadence rather than with whoever sampled last. Construction costs
-/// ~80-100 ms once; each subsequent sample is ~5-10 ms. The FIRST sample
-/// therefore carries no `cpu_pct` and no `power` — it is the one that seeds
-/// the deltas, and the drawer renders those two as "not measured" for that
-/// one tick.
-/// Severity rank for a thermal state name, per [`darkmux_crew::host_probe::
-/// thermal::THERMAL_STATES`]. An unrecognized name (a future macOS state
-/// this build doesn't know) ranks ABOVE `critical` — see the analogous
-/// `thermal_severity` in `host_probe/mod.rs` for the same reasoning: an
-/// unknown state must never silently read as `nominal`.
-fn thermal_severity(state: &str) -> usize {
-    darkmux_crew::host_probe::thermal::THERMAL_STATES
-        .iter()
-        .position(|s| *s == state)
-        .unwrap_or(darkmux_crew::host_probe::thermal::THERMAL_STATES.len())
-}
-
 /// (#2111) Build a `machine.thermal` TRANSITION flow record. `Level::Warn`
 /// only when the state RISES into `serious` or `critical` — an
 /// operator-actionable event; every other transition (recovering, or a
@@ -295,6 +266,7 @@ fn build_thermal_transition_record(
     sample: &HostSampleFull,
     sampled_at_ms: u64,
 ) -> darkmux_flow::FlowRecord {
+    use darkmux_crew::host_probe::thermal_severity;
     let rising_into_elevated =
         thermal_severity(to) > thermal_severity(from) && thermal_severity(to) >= thermal_severity("serious");
     let level = if rising_into_elevated {
@@ -373,6 +345,23 @@ fn thermal_edge(
     }
 }
 
+/// Spawn the daemon-side host sampler thread. `interval_ms` is the
+/// resolved `config_access::host_sampler_interval_ms()` cadence; `0`
+/// disables the sampler entirely and this returns `None` without spawning
+/// anything (the "0 means hard off" convention shared with
+/// `remote.max_tokens_per_execution`). The returned thread runs until
+/// `stop_flag` is set, polling it every [`STOP_POLL_INTERVAL`] so shutdown
+/// is prompt rather than blocking for a full sample interval — the same
+/// teardown shape `dispatch_internal::run_telemetry_sampler` uses.
+///
+/// (#2108) The [`HostProbe`] is constructed INSIDE the thread and owned by
+/// it: the probe is stateful (CPU percent and every power rail are counter
+/// deltas), so a private probe gives this sampler deltas that line up with
+/// its own cadence rather than with whoever sampled last. Construction costs
+/// ~80-100 ms once; each subsequent sample is ~5-10 ms. The FIRST sample
+/// therefore carries no `cpu_pct` and no `power` — it is the one that seeds
+/// the deltas, and the drawer renders those two as "not measured" for that
+/// one tick.
 pub(crate) fn spawn(
     interval_ms: u64,
     ring: HostSamplerRing,
@@ -397,10 +386,13 @@ pub(crate) fn spawn(
             }
 
             let sample = probe.sample();
-            let at_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            // (#2111 review finding) The shared epoch-ms read — the same
+            // one `dispatch_internal::run_telemetry_sampler` now uses for
+            // `machine.telemetry`'s `sampled_at_ms`, so a viewer strip
+            // charting both producers' records is comparing the same
+            // clock, not one producer's epoch against another's
+            // sampler-relative offset.
+            let at_ms = darkmux_crew::host_probe::epoch_ms_now();
             // (#2111) Edge-detect BEFORE the sample moves into the ring —
             // `thermal_edge` only borrows it.
             let (next_state, transition) = thermal_edge(known_thermal_state.as_deref(), &sample, at_ms);

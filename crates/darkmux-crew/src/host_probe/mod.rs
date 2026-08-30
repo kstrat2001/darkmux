@@ -118,11 +118,43 @@ pub struct HostProbeSources {
     pub ioreg_gpu: bool,
 }
 
+/// (#2111) The current wall-clock, as UNIX epoch milliseconds. Shared by
+/// every producer that stamps a `sampled_at_ms` a CONSUMER (a viewer strip
+/// charting `machine.thermal` transitions against `machine.telemetry`
+/// samples, say) will compare across producers — `darkmux-serve`'s daemon
+/// ring and `darkmux-crew`'s dispatch-scoped sampler both call this rather
+/// than each rolling its own clock read, so `sampled_at_ms` can never mean
+/// "epoch ms" from one producer and "elapsed since some sampler-local
+/// start" from another (the #2111 review finding this closes: the dispatch
+/// sampler was passing its `Instant`-relative offset here, so a thermal
+/// strip charting both producers read 1970 for one of them). `0` on the
+/// vanishingly rare clock-before-`UNIX_EPOCH` failure.
+///
+/// Distinct from a sampler's own `Instant`-relative clock (e.g.
+/// `run_telemetry_sampler`'s `started.elapsed()`), which stays relative on
+/// purpose for the REDUCTION math (`reduce_host_stats`/
+/// `reduce_host_extras` only need the gaps between samples, and a relative
+/// clock makes that math testable with plain integers, plus drives the
+/// thermal governor's own monotonic hysteresis timing). The two clocks
+/// serve different consumers: reduction math and governor timing want
+/// gaps; a flow record's `sampled_at_ms` wants a timestamp another
+/// producer's records can be compared against.
+pub fn epoch_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// (#2111) One host reading's full "now" JSON shape — every field
-/// [`HostSampleFull`] carries, plus the wall-clock it was taken at. Shared
-/// by TWO independent consumers so the mapping from `HostSampleFull` to
-/// wire JSON exists in exactly one place: `darkmux-serve`'s daemon-side
-/// ring (`/machine/resources`'s `load.now` block) and `darkmux-crew`'s
+/// [`HostSampleFull`] carries, plus the wall-clock it was taken at
+/// (`sampled_at_ms` — the caller MUST pass UNIX epoch ms, e.g. from
+/// [`epoch_ms_now`]; this function does not derive or validate it, so a
+/// caller that hands it a relative offset silently produces a record that
+/// LOOKS well-formed but lies about when the sample was taken). Shared by
+/// TWO independent consumers so the mapping from `HostSampleFull` to wire
+/// JSON exists in exactly one place: `darkmux-serve`'s daemon-side ring
+/// (`/machine/resources`'s `load.now` block) and `darkmux-crew`'s
 /// dispatch-scoped sampler (the periodic `machine.telemetry` flow record,
 /// #2111). A field the probe could not read serializes as JSON `null`,
 /// never a zero — "not measured" and "measured, and idle" are different
@@ -220,8 +252,12 @@ pub struct HostExtras {
 /// Severity rank for `worst_state` comparison. An UNRECOGNIZED state ranks
 /// above `critical`: a state this build doesn't know about is not evidence
 /// that nothing was wrong, and silently ranking it as `nominal` would let a
-/// future macOS state hide real thermal pressure.
-fn thermal_severity(state: &str) -> usize {
+/// future macOS state hide real thermal pressure. `pub` (#2111 review
+/// finding) so `darkmux-serve`'s `machine.thermal` edge detector
+/// (`host_sampler.rs`) shares this ranking rather than keeping its own
+/// duplicate — the two consumers can't independently drift on what counts
+/// as "rising into serious/critical".
+pub fn thermal_severity(state: &str) -> usize {
     thermal::THERMAL_STATES
         .iter()
         .position(|s| *s == state)
@@ -657,6 +693,26 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── (#2111) epoch_ms_now — the shared wall-clock read ─────────────────
+
+    #[test]
+    fn epoch_ms_now_is_within_a_second_of_system_time() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let got = epoch_ms_now();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            got >= before && got <= after + 1000,
+            "epoch_ms_now() must return real UNIX epoch ms, not a relative offset: \
+             before={before} got={got} after={after}"
+        );
+    }
 
     fn p(cpu: f64, gpu: f64, ane: f64) -> Option<PowerSample> {
         Some(PowerSample {

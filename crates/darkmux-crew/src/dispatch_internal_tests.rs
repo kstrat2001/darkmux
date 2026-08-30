@@ -7379,11 +7379,11 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["host_window"]["thermal_worst_state"], "serious");
         assert_eq!(v["host_window"]["min_cpu_speed_limit_pct"], 62);
-        // above_nominal_ms: the nominal→serious gap (8000ms) counts (the
-        // FIRST sample of the pair was non-nominal... wait — here the FIRST
-        // sample is nominal and the second is serious, so the window's
-        // "above nominal" duty is 0 by the left-Riemann convention (the
-        // sample that STARTS a gap must itself be non-nominal to count it).
+        // above_nominal_ms uses left-Riemann duty: a gap counts only when
+        // the sample that STARTS it is non-nominal. Here sample 0 (at
+        // t=0) IS nominal and sample 1 (at t=8000) is serious, so the
+        // nominal→serious gap contributes 0 — the elevated state hasn't
+        // been observed to persist for any measured interval yet.
         assert_eq!(v["host_window"]["above_nominal_ms"], 0);
         assert_eq!(v["host_window"]["samples"], 5);
         assert_eq!(v["host_window"]["span_ms"], 8000, "2000ms interval * 4 gaps across 5 samples");
@@ -7408,4 +7408,120 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("host_window").is_none(), "unsampled must omit host_window, never zero it");
+    }
+
+    // ─── (#2111 review finding) build_dispatch_complete_payload — host_window
+    //     reaches the FLOW RECORD, not just the envelope ─────────────────────
+
+    #[test]
+    fn build_dispatch_complete_payload_carries_host_window_on_success() {
+        use crate::host_probe::{HostExtraAt, PowerSample, ThermalSample};
+        let extras = crate::host_probe::reduce_host_extras(
+            &[
+                HostExtraAt {
+                    at_ms: 0,
+                    power: Some(PowerSample { cpu_mw: 1000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                    thermal: Some(ThermalSample { state: "nominal".into(), cpu_speed_limit_pct: 100 }),
+                },
+                HostExtraAt {
+                    at_ms: 8000,
+                    power: Some(PowerSample { cpu_mw: 3000.0, gpu_mw: 100.0, ane_mw: 0.0 }),
+                    thermal: Some(ThermalSample { state: "serious".into(), cpu_speed_limit_pct: 62 }),
+                },
+            ],
+            Some(2000),
+        );
+        let stats = super::reduce_host_stats(&worked_samples());
+        let payload = super::build_dispatch_complete_payload(
+            1000,
+            super::RestTotals { rest_ms: 200, rests: 1 },
+            Some(50),
+            "stdout-body",
+            "",
+            0,
+            &super::TrajectorySummary::default(),
+            super::TokenTotals { prompt: 10, completion: 20 },
+            None,
+            &stats,
+            &extras,
+            &None,
+            None,
+        );
+        assert_eq!(
+            payload["host_window"]["thermal_worst_state"], "serious",
+            "the FLOW RECORD payload must carry host_window, not just the envelope: {payload}"
+        );
+        assert_eq!(payload["host_window"]["min_cpu_speed_limit_pct"], 62);
+        assert_eq!(payload["host_window"]["samples"], 5);
+        assert_eq!(payload["wall_ms"], 1000);
+        assert_eq!(payload["result_class"], "ok");
+    }
+
+    #[test]
+    fn build_dispatch_complete_payload_carries_host_window_on_the_error_path_too() {
+        use crate::host_probe::{HostExtraAt, PowerSample, ThermalSample};
+        let extras = crate::host_probe::reduce_host_extras(
+            &[
+                HostExtraAt {
+                    at_ms: 0,
+                    power: Some(PowerSample { cpu_mw: 500.0, gpu_mw: 50.0, ane_mw: 0.0 }),
+                    thermal: Some(ThermalSample { state: "fair".into(), cpu_speed_limit_pct: 90 }),
+                },
+                HostExtraAt {
+                    at_ms: 2000,
+                    power: Some(PowerSample { cpu_mw: 600.0, gpu_mw: 60.0, ane_mw: 0.0 }),
+                    thermal: Some(ThermalSample { state: "critical".into(), cpu_speed_limit_pct: 40 }),
+                },
+            ],
+            Some(2000),
+        );
+        let stats = super::reduce_host_stats(&worked_samples());
+        let payload = super::build_dispatch_complete_payload(
+            500,
+            super::RestTotals::default(),
+            None,
+            "",
+            "boom: container crashed",
+            137,
+            &super::TrajectorySummary::default(),
+            super::TokenTotals::default(),
+            Some("azure/gpt-x"),
+            &stats,
+            &extras,
+            &None,
+            None,
+        );
+        assert_eq!(payload["result_class"], "error");
+        assert_eq!(payload["endpoint"], "azure/gpt-x");
+        assert_eq!(
+            payload["host_window"]["thermal_worst_state"], "critical",
+            "the ERROR payload must carry host_window too, not just the success path: {payload}"
+        );
+        assert!(
+            payload["stderr_excerpt"].is_string(),
+            "error path must carry a stderr excerpt: {payload}"
+        );
+    }
+
+    #[test]
+    fn build_dispatch_complete_payload_omits_host_window_when_unsampled() {
+        let payload = super::build_dispatch_complete_payload(
+            10,
+            super::RestTotals::default(),
+            None,
+            "",
+            "",
+            0,
+            &super::TrajectorySummary::default(),
+            super::TokenTotals::default(),
+            None,
+            &super::HostStats::default(),
+            &no_extras(),
+            &None,
+            None,
+        );
+        assert!(
+            payload.get("host_window").is_none(),
+            "unsampled must omit host_window on the FLOW RECORD too, never zero it"
+        );
     }
