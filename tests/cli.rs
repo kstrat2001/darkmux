@@ -2429,6 +2429,163 @@ fn mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl() {
     assert!(found_mission_close, "expected a `mission close` flow record for {mission_id}");
 }
 
+// ─── #2131: the shared LaunchFinalizeGuard, ported to crawl + generic ─────
+//
+// `crawl_launch.rs` gained the same `LaunchFinalizeGuard` + SIGTERM/SIGHUP
+// this file adds a live binary-level proof for below (the generic-graph/
+// coder-phase launcher), but does NOT get an equivalent live-dispatch
+// integration test here: crawl's role_id is hardcoded to `"crawler"`
+// (tool-granting), so its dispatch always goes through the agentic
+// `darkmux-runtime` CONTAINER path (`dispatch_internal.rs`'s docker spawn,
+// #2114's own concurrent surface) rather than the tool-less light
+// single-shot HOSTED path (a plain host `curl`) the test below exercises —
+// and that container path's child pid isn't registered into
+// `darkmux_types::child_registry` yet, so a real "no lingering container"
+// proof isn't reachable without either Docker + the runtime image
+// (unavailable in this environment; the release-gate doctrine reserves
+// that kind of real-container run for dogfood, not `cargo test`) or wiring
+// `child_registry` into the docker spawn site — deliberately left
+// untouched here per this task's own boundary. Crawl's coverage instead
+// rests on: `crawl_launch_tests.rs`'s
+// `a_panic_mid_loop_still_finalizes_via_the_raii_guard` (proves the
+// Drop-abort-writer shape survived the guard extraction) and
+// `interrupted_at_readback_reports_interrupted_not_error` (proves the
+// interrupt-flag read path), both passing unchanged against the shared
+// guard, plus `crate::launch_guard::arm()` replacing the old SIGINT-only
+// `darkmux_types::interrupt::install()` call (verified by `cargo check` +
+// the module's own doc). Follow-up: wire `child_registry` into the docker
+// spawn path, then add crawl's own live SIGTERM+reap test the same shape
+// as the one below.
+
+/// (#2131) `kill <pid>` (SIGTERM) on `mission launch <generic-graph-config>`
+/// blocked mid-dispatch (a real `curl` call to an endpoint that never
+/// answers) must: exit within 5s, leave the mission `finalized` with the
+/// phase `abandoned` (never stuck `active`), and leave no `curl` process
+/// still holding the stub connection open. This is the launcher #2131's own
+/// issue named as having NO guard at all before this PR — a minimal
+/// user-tier config with a single `dispatch.internal` step exercises the
+/// SAME generic-graph path `coder-phase` and every `mission propose`-built
+/// config also run through.
+#[test]
+fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
+    let stub = HangingStubServer::start();
+
+    let home = TempDir::new().unwrap();
+    let flows = TempDir::new().unwrap();
+
+    let profiles_path = home.path().join("profiles.json");
+    fs::write(&profiles_path, hanging_endpoint_profiles_json(stub.port)).unwrap();
+
+    let config_dir = home.path().join("mission-configs");
+    fs::create_dir_all(&config_dir).unwrap();
+    // (#2131) `review-judge` is deliberately TOOL-LESS
+    // (`tool_palette.allow: []`) — `dispatch_internal.rs` routes a
+    // tool-less role's remote dispatch through the light single-shot
+    // HOSTED path (a plain host-side `curl`, already `child_registry`-
+    // wired) rather than spinning up a `darkmux-runtime` container, which
+    // this test environment has neither Docker nor the image for. A
+    // tool-granting role (e.g. `crawler`) would instead need a real
+    // container.
+    let config_json = r#"{
+        "id": "sigterm-generic-test",
+        "name": "SIGTERM Generic Test",
+        "schema_version": "2.3",
+        "phases": [{
+            "id": "p1",
+            "tasks": [{
+                "id": "t1",
+                "steps": [{
+                    "id": "s1",
+                    "kind": "dispatch.internal",
+                    "config": { "role_id": "review-judge", "message": "hang please" }
+                }]
+            }]
+        }]
+    }"#;
+    fs::write(config_dir.join("sigterm-generic-test.json"), config_json).unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_darkmux"))
+        .env("DARKMUX_HOME", home.path())
+        .env("DARKMUX_FLOWS_DIR", flows.path())
+        .env("DARKMUX_PROFILES", &profiles_path)
+        .args(["mission", "launch", "sigterm-generic-test", "--timeout", "60"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawning darkmux mission launch sigterm-generic-test");
+    let pid = child.id();
+
+    assert!(
+        stub.wait_for_a_connection(std::time::Duration::from_secs(20)),
+        "the generic-graph dispatch never reached a dispatch call to the stub server within 20s"
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the generic launcher must still be running (blocked on the hanging dispatch) before SIGTERM"
+    );
+
+    let kill_status =
+        std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().expect("running kill -TERM");
+    assert!(kill_status.success(), "kill -TERM itself must succeed");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let exit_status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mission launch (generic) did not exit within 5s of SIGTERM (#2131 regression)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(!exit_status.success(), "a signal-interrupted generic-graph run must not exit 0");
+
+    assert!(
+        stub.wait_for_a_connection_to_close(std::time::Duration::from_secs(3)),
+        "no `curl` connection to the stub server was ever torn down — a child process survived \
+         the parent (#2131 regression)"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let pgrep = std::process::Command::new("pgrep").args(["-f", "darkmux-remote-"]).output();
+    if let Ok(out) = pgrep {
+        let survivors = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            survivors.trim().is_empty(),
+            "a darkmux generic-graph curl process is still running after the parent exited: {survivors}"
+        );
+    }
+
+    let missions_dir = home.path().join("missions");
+    let mission_id = fs::read_dir(&missions_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", missions_dir.display()))
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .next()
+        .expect("exactly one mission must have been minted");
+
+    let mission_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(missions_dir.join(&mission_id).join("mission.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        mission_json["status"], "finalized",
+        "an interrupted generic-graph run must reach a terminal mission status, never stay active: {mission_json}"
+    );
+
+    let phases_dir = missions_dir.join(&mission_id).join("phases");
+    let mut saw_a_phase = false;
+    for entry in fs::read_dir(&phases_dir).unwrap().filter_map(|e| e.ok()) {
+        let phase_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap();
+        assert_eq!(
+            phase_json["status"], "abandoned",
+            "a signal-interrupted generic-graph run must abandon its phase, never complete one: {phase_json}"
+        );
+        saw_a_phase = true;
+    }
+    assert!(saw_a_phase, "the mint must have produced at least one phase to check");
+}
+
 // ─── review-bench --funnel flag plumbing (#1222 Phase B packet 7) ─────────
 //
 // The funnel condition's real dispatch path needs a live LMStudio + a real

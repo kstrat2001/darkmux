@@ -86,7 +86,7 @@
 use crate::crew;
 use crate::mission_launch;
 use crate::pr_review;
-use crate::review_finalize_guard::{self, ReviewFinalizeGuard};
+use crate::launch_guard::{self, LaunchFinalizeGuard};
 use anyhow::{anyhow, bail, Context, Result};
 use crew::mission_config::MissionConfig;
 use darkmux_crew::dispatch::build_dispatch_record_with_payload;
@@ -706,11 +706,12 @@ fn review_result_to_mission_envelope(
 /// to a terminal status — see [`review_result_to_mission_envelope`]'s doc
 /// for the status decision.
 ///
-/// `pub(crate)` (#2124): [`crate::review_finalize_guard::ReviewFinalizeGuard`]
-/// calls this directly (both its normal-path `close()` and its abort-path
-/// `Drop`) so there is exactly ONE place that ever writes a review
-/// mission's terminal record, whether the run finished normally, errored,
-/// panicked, or was cut short by SIGTERM/SIGINT.
+/// `pub(crate)` (#2124, generalized #2131): [`run_dispatch`]'s
+/// `crate::launch_guard::LaunchFinalizeGuard` calls this directly (both its
+/// normal-path `close()`'s writer and its abort-path `Drop`'s writer) so
+/// there is exactly ONE place that ever writes a review mission's terminal
+/// record, whether the run finished normally, errored, panicked, or was
+/// cut short by SIGTERM/SIGINT/SIGHUP.
 pub(crate) fn finalize_review_mission(mission_id: &str, phase_ids: &[&str], result: &Result<ReviewEnvelope>) {
     let envelope = review_result_to_mission_envelope(mission_id, phase_ids, result);
     crew::envelope::finalize_mission(&envelope);
@@ -936,17 +937,17 @@ fn run_dispatch(
     timeout_seconds: u32,
     spec_origin: crew::types::MissionSpecOrigin,
 ) -> Result<ReviewEnvelope> {
-    // (#2124) Installed unconditionally, ahead of everything else this
-    // function does — including the `charges_file` re-judge side path,
-    // which spawns remote `curl` children of its own even though it mints
-    // no Mission. Only installs signal handlers (never touches this
-    // process's own group — see `review_finalize_guard`'s module doc for
-    // why an earlier version did and was proven wrong by a pty test): the
-    // re-judge path has no `ReviewFinalizeGuard` and no mission to
-    // finalize, so it still accepts the pre-#2124 signal behavior — see
-    // this launcher's own module doc on why that path is out of scope for
-    // this fix.
-    review_finalize_guard::arm();
+    // (#2124, generalized #2131) Installed unconditionally, ahead of
+    // everything else this function does — including the `charges_file`
+    // re-judge side path, which spawns remote `curl` children of its own
+    // even though it mints no Mission. Only installs signal handlers
+    // (never touches this process's own group — see
+    // `darkmux_types::child_registry`'s module doc for why an earlier
+    // version did and was proven wrong by a pty test): the re-judge path
+    // has no `LaunchFinalizeGuard` and no mission to finalize, so it still
+    // accepts the pre-#2124 signal behavior — see this launcher's own
+    // module doc on why that path is out of scope for this fix.
+    launch_guard::arm();
     let case = derive_case_id(collected);
 
     let source = resolve_source(collected)?;
@@ -1433,18 +1434,27 @@ fn run_dispatch(
         ];
         let mut closed_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        // (#2124) Armed here, right after the mint above succeeded — every
-        // exit from this point on (the normal `close()` call at the bottom
-        // of this block, an early `?`-return this function doesn't
-        // currently have but might grow, a panic that unwinds past this
-        // point, or a caught SIGTERM/SIGINT) leaves a matching mission
-        // terminal record behind. See `review_finalize_guard`'s own module
-        // doc for why the dispatch below runs on a supervised worker
-        // thread rather than inline.
-        let mut guard = ReviewFinalizeGuard::new(
-            mission_id.clone(),
-            vec![investigate_phase_id.clone(), adjudicate_phase_id.clone(), report_phase_id.clone()],
-        );
+        // (#2124, generalized #2131) Armed here, right after the mint above
+        // succeeded — every exit from this point on (the normal `close()`
+        // call at the bottom of this block, an early `?`-return this
+        // function doesn't currently have but might grow, a panic that
+        // unwinds past this point, or a caught SIGTERM/SIGINT/SIGHUP)
+        // leaves a matching mission terminal record behind. See
+        // `launch_guard`'s own module doc for why the dispatch below runs
+        // on a supervised worker thread rather than inline.
+        let mission_id_for_close = mission_id.clone();
+        let abort_mission_id = mission_id.clone();
+        let abort_phase_ids =
+            [investigate_phase_id.clone(), adjudicate_phase_id.clone(), report_phase_id.clone()];
+        let mut guard = LaunchFinalizeGuard::new(move || {
+            let err: Result<ReviewEnvelope> = Err(anyhow!(
+                "mission launch review: mission aborted — the launcher exited before a terminal \
+                 outcome was recorded (a signal, a panic, or an early return this guard did not \
+                 expect)"
+            ));
+            let phase_refs: Vec<&str> = abort_phase_ids.iter().map(String::as_str).collect();
+            finalize_review_mission(&abort_mission_id, &phase_refs, &err);
+        });
 
         // (#2124) `with_dispatch_bookends`/`run_review_graph` is ONE
         // blocking, synchronous call — there is no seam inside it (or
@@ -1554,8 +1564,8 @@ fn run_dispatch(
         // (#2124) Poll BOTH the interrupt flag and the worker's own
         // completion on a short timer — this is the "checked between
         // steps" checkpoint for this launcher, at poll-tick granularity
-        // rather than graph-step granularity (see `review_finalize_guard`'s
-        // module doc for why). A productive run never observes anything
+        // rather than graph-step granularity (see this module's own doc for
+        // why). A productive run never observes anything
         // here beyond the worker finishing first.
         let poll_interval = std::time::Duration::from_millis(150);
         while !dispatch_worker.is_finished() && !darkmux_types::interrupt::is_set() {
@@ -1577,7 +1587,7 @@ fn run_dispatch(
                 Ok(result) => result,
                 Err(panic_payload) => Err(anyhow!(
                     "mission launch review: the review dispatch thread panicked: {}",
-                    review_finalize_guard::panic_message(&*panic_payload)
+                    launch_guard::panic_message(&*panic_payload)
                 )),
             }
         };
@@ -1586,10 +1596,18 @@ fn run_dispatch(
         // without this, never reach a terminal status regardless of
         // outcome — every review, clean, errored, or signal-interrupted,
         // would be left permanently "stuck" in `darkmux mission status`.
-        // (#2124) `guard.close` also reaps this run's registered child
-        // pids (by number, never a process group — see its own doc) when
-        // `result` reflects a caught signal.
-        guard.close(&result);
+        guard.close(|| {
+            let phase_refs: Vec<&str> =
+                vec![investigate_phase_id.as_str(), adjudicate_phase_id.as_str(), report_phase_id.as_str()];
+            finalize_review_mission(&mission_id_for_close, &phase_refs, &result);
+        });
+        // (#2124, generalized #2131) The worker thread may still be blocked
+        // deep inside a `curl` child at this point — the terminal record
+        // just written above is already durable, so it's safe to reap
+        // every registered child pid and exit. A no-op when no signal was
+        // observed — a normal completion falls through to the
+        // rendering/exit-code work below unaffected.
+        launch_guard::reap_and_exit_on_signal();
 
         result
     };

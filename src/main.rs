@@ -69,10 +69,11 @@ mod coder_phase;
 mod crawl_launch;
 mod mission_launch;
 mod mission_launch_review;
-// (#2124) The review launcher's SIGTERM/SIGINT-aware finalize guard + child
-// reaping — see its own module doc for why this is separate from crawl's
-// (`CrawlFinalizeGuard`, in `crawl_launch.rs`) rather than shared.
-mod review_finalize_guard;
+// (#2131) The shared SIGINT/SIGTERM/SIGHUP-aware finalize guard + child
+// reaping used by all three `mission launch` launchers (review, crawl,
+// generic/coder-phase) — extracted from #2124/#2130's review-only
+// `review_finalize_guard.rs`, which this replaces.
+mod launch_guard;
 mod notebook;
 mod pr_review;
 pub use darkmux_lab::providers;
