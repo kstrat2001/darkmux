@@ -189,6 +189,52 @@ fn unit_kind(u: &Unit) -> &'static str {
     }
 }
 
+/// (#1959 continuation) Why a unit's source-tree sha failed to resolve —
+/// named so a unit's error record reads as an actual reason, not just
+/// "something went wrong". The presence-only pre-mint validation loop
+/// above (`the_plan.sources.iter().find(...)`) already bails the whole
+/// run when a selected unit names a source absent from `plan.sources`
+/// entirely; this covers the narrower case that guard does NOT check —
+/// an entry IS present but its own `sha` field is empty (a hand-edited or
+/// otherwise malformed `--param plan=` file) — and it's re-checked here,
+/// at the point of use, rather than trusted from a distant earlier loop,
+/// so a future refactor of either loop can't silently reopen the gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShaResolutionError {
+    NotInPlan { source_id: String },
+    Unresolvable { source_id: String, tree: PathBuf },
+}
+
+impl std::fmt::Display for ShaResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShaResolutionError::NotInPlan { source_id } => {
+                write!(f, "source '{source_id}' is not declared in the plan's sources list")
+            }
+            ShaResolutionError::Unresolvable { source_id, tree } => write!(
+                f,
+                "source '{source_id}' resolved to an empty sha for tree {} — the tree may not be \
+                 a git repository, `git rev-parse` may have failed against it, or the tree itself \
+                 may be missing",
+                tree.display()
+            ),
+        }
+    }
+}
+
+/// Never returns an empty string — `Ok` only when the plan's own record
+/// for `source_id` carries a non-empty `sha`. Callers must treat `Err` as
+/// "this unit cannot be dispatched", never fall back to `""`.
+fn resolve_unit_sha(the_plan: &Plan, source_id: &str) -> Result<String, ShaResolutionError> {
+    let Some(ps) = the_plan.sources.iter().find(|s| s.id == source_id) else {
+        return Err(ShaResolutionError::NotInPlan { source_id: source_id.to_string() });
+    };
+    if ps.sha.trim().is_empty() {
+        return Err(ShaResolutionError::Unresolvable { source_id: source_id.to_string(), tree: ps.tree.clone() });
+    }
+    Ok(ps.sha.clone())
+}
+
 /// Grouping key for the (source, rule) Task partition — a Read unit's
 /// multiple rules are joined sorted+deduped so two Read units bound to the
 /// exact same ruleset land in the same Task, matching `plan::plan`'s own
@@ -1337,7 +1383,6 @@ pub(crate) fn run(
         }
 
         let source = unit_source(unit).to_string();
-        let sha = the_plan.sources.iter().find(|s| s.id == source).map(|s| s.sha.clone()).unwrap_or_default();
         let rule_ids = unit_rules(unit);
         let kind = unit_kind(unit);
 
@@ -1350,6 +1395,73 @@ pub(crate) fn run(
         // the one record in the family you couldn't correlate to its
         // matching completion by session id alone.
         let session_id = format!("crawl-{mission_id}-{}", unit.id());
+
+        // (#1959 continuation) An empty/unresolvable sha must never reach
+        // a dispatch: every finding a unit reports is stamped with this
+        // sha (`DispatchOpts::record_context` below, and the ledger line
+        // below that), and the downstream tracker keys sightings on it —
+        // a dispatch under `sha: ""` would silently produce unversioned
+        // findings. The pre-mint validation loop above already refuses
+        // the WHOLE run for a source that's missing or has moved since a
+        // loaded plan was written; this is the point-of-use guard for the
+        // narrower case that loop doesn't check (a present entry whose
+        // own `sha` field is itself empty) — re-checked here rather than
+        // trusted from that earlier loop, so this unit alone is marked
+        // errored and the crawl continues with the rest, instead of
+        // either silently dispatching under `sha: ""` or the earlier loop
+        // needing to grow a matching special case.
+        let sha = match resolve_unit_sha(&the_plan, &source) {
+            Ok(sha) => sha,
+            Err(reason) => {
+                let reason_text = reason.to_string();
+                if let Ok(mut step) = crew::lifecycle::load_step(&mission_id, &phase_id, &step_id) {
+                    step.status = NodeStatus::Error;
+                    step.started_ts = Some(now_unix());
+                    step.completed_ts = Some(now_unix());
+                    step.output = Some("sha_unresolved".to_string());
+                    let _ = crew::lifecycle::save_step(&mission_id, &phase_id, &step);
+                    let _ = darkmux_flow::record(unit_step_record(
+                        &step,
+                        "step error",
+                        &mission_id,
+                        &session_id,
+                        json!({
+                            "workspace": manifest_name,
+                            "unit": unit.id(),
+                            "source": source,
+                            "rule": rule_ids,
+                            "kind": kind,
+                            "result": "sha_unresolved",
+                            "reason": reason_text,
+                            "findings": 0,
+                            "exclusions": 0,
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "wall_ms": 0,
+                            "rest_ms": 0,
+                        }),
+                        None,
+                    ));
+                }
+                {
+                    let mut s = stats.borrow_mut();
+                    s.units_errored += 1;
+                    s.per_unit_rows.push(json!({
+                        "unit": unit.id(),
+                        "source": source,
+                        "rule": rule_ids,
+                        "result": "sha_unresolved",
+                        "findings": 0,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "wall_ms": 0,
+                        "model": Value::Null,
+                        "host": Value::Null,
+                    }));
+                }
+                continue;
+            }
+        };
 
         let started_payload = match unit {
             Unit::Site { sites, .. } => json!({
