@@ -1,4 +1,4 @@
-import { useMemo, useRef, useEffect } from "react";
+import { useMemo, useRef, useEffect, useState, useCallback } from "react";
 import { useIsMobile } from "./hooks/useIsMobile";
 import { useHashRoute } from "./lib/useHashRoute";
 import { getSource } from "./lib/source";
@@ -188,8 +188,10 @@ export function App() {
   const dayRecords = day.records;
   const transport = usePlaybackTransport(dayRecords);
   // (#2071 review) Show the transport only where something on screen
-  // answers it. The mission lens takes no playhead and mounts its own log
-  // (`showsEventLog` excludes it), so play/pause there would move nothing.
+  // answers it. The mission lens takes no playhead — its own events fold
+  // is always the full historical set, never scoped to a scrubbed time
+  // (see `eventLogRecords`'s own mission branch above) — so play/pause
+  // there would move nothing.
   const transportShown = transport.active && route.kind !== "mission";
   // Lenses and the log scope to the playhead only once it has MOVED
   // (`transport.scrubbed`): at rest the playhead is the loaded day's end,
@@ -200,7 +202,23 @@ export function App() {
   // at the loaded day's end with `scrubbed` still true, and the cut would
   // return by the transport's own primary gesture (review finding).
   const playhead = transport.active && transport.scrubbed && transport.t < transport.tMax ? transport.t : null;
+  // (mainstay-unification finding) `MissionGraphLens` owns the mission
+  // events DATA pipeline (flow-mission + flow-today + live-tail, deduped,
+  // mission-scoped) and reports its result here via `onMissionEvents` —
+  // see that component's own doc for why the DISPLAY moved out to the
+  // shared/mainstay column instead of a second bespoke surface. `null`
+  // until the lens's first fold resolves (or whenever we're not even on a
+  // mission route); the mainstay-column render sites below treat that the
+  // same as "no records yet", never a thrown/undefined read.
+  const [missionEvents, setMissionEvents] = useState<{ records: FlowRecord[]; truncated: boolean } | null>(null);
+  const onMissionEvents = useCallback((records: FlowRecord[], truncated: boolean) => {
+    setMissionEvents({ records, truncated });
+  }, []);
   const eventLogRecords = useMemo(() => {
+    // Mission has no playhead concept (`transportShown` already excludes
+    // it below) — its own fold is always the full, historical record set,
+    // never scoped to a scrubbed time.
+    if (route.kind === "mission") return missionEvents?.records ?? [];
     if (playhead === null) return routeRecords.records;
     // A static build's runs/machine/console routes have no slice of their
     // own (the live window is empty there); the day's log, scoped to the
@@ -211,7 +229,7 @@ export function App() {
     // `!(ts > t)`, not `ts <= t`: a record with an unparseable `ts` stays
     // in the log, as it did before the transport scoped every route.
     return base.filter((r) => !(T(r.ts) > playhead));
-  }, [playhead, route.kind, routeRecords.records, source.kind, dayRecords]);
+  }, [route.kind, missionEvents, playhead, routeRecords.records, source.kind, dayRecords]);
   // (#2071) The sticky block's measured height feeds `--chrome-h`, the
   // offset the event log column sticks under on desktop. It used to be a
   // 97px constant that assumed the masthead + one chrome row.
@@ -372,6 +390,16 @@ export function App() {
     [replayMeta, displayRoute],
   );
   const { crumb, logscope } = routeChrome(route, targetMachineName);
+  // (mainstay-unification finding) `routeChrome` carries no mission
+  // `logscope` (`mission` STILL "carries none" there — that function's own
+  // doc — because the mission id is the natural scope label and belongs
+  // here, not duplicated into that lookup for one route). Mission's own
+  // records are ALWAYS a cross-day, cross-restart fold, never a rolling
+  // "last 24h" window — `historical: true` unconditionally, matching what
+  // `MissionGraphLens`'s own retired inline mount used to pass.
+  const eventLogScopeLabel = route.kind === "mission" ? route.missionId : logscope;
+  const eventLogHistorical = route.kind === "mission" ? true : routeRecords.historical;
+  const eventLogServerTruncated = route.kind === "mission" ? (missionEvents?.truncated ?? false) : false;
   // (#2120, operator finding — "reads like a variable name") The transport's
   // OWN mission label, replacing the raw-id `◆ <mission>` crumb the sticky
   // row used to carry for a playback route (see `routeChrome`'s own doc on
@@ -423,11 +451,12 @@ export function App() {
         specs={specs}
         liveStatus={liveStatus}
         eventLogRecords={eventLogRecords}
-        eventLogScopeLabel={logscope}
+        eventLogScopeLabel={eventLogScopeLabel}
         eventLogVisible={showsEventLog(route)}
         eventLogLoading={routeRecords.loading}
         eventLogError={routeRecords.error}
-        eventLogHistorical={routeRecords.historical}
+        eventLogHistorical={eventLogHistorical}
+        eventLogServerTruncated={eventLogServerTruncated}
       />
       {/* (#2071, superseded by #2108 rounds 1+2 below) Originally: sticky row
           holds only the tab strip + transport; the masthead, crumb and meta
@@ -596,17 +625,18 @@ export function App() {
               navigation: switching tabs remounts the boundary, which is the
               recovery an operator will reach for first. */}
           <LensErrorBoundary key={route.kind} name={route.kind}>
-            {renderRoute(route, playhead)}
+            {renderRoute(route, playhead, onMissionEvents)}
           </LensErrorBoundary>
         </main>
         {!isMobile && (
           <EventLogColumn
-            scopeLabel={logscope}
+            scopeLabel={eventLogScopeLabel}
             records={eventLogRecords}
             visible={showsEventLog(route)}
             loading={routeRecords.loading}
             error={routeRecords.error}
-            historical={routeRecords.historical}
+            historical={eventLogHistorical}
+            serverTruncated={eventLogServerTruncated}
           />
         )}
       </div>
@@ -706,12 +736,12 @@ function routeChrome(route: Route, targetMachineName: string | null): { crumb: s
     return { crumb: "", logscope: "fleet" };
   }
   if (route.kind === "mission") {
-    // `MissionGraphLens` (#1868) owns its own header + events pane — see
-    // that component's own doc. `#crumb`/`#logscope` at the App level carry
-    // nothing for this route (`showsEventLog` already excludes it, so
-    // `#logscope`'s value here is moot — kept empty rather than a stale
-    // "mission" string from the pre-#1868 daemon-less-static-summary era,
-    // since nothing renders it now).
+    // `MissionGraphLens` (#1868) owns its own header. Its events pane is
+    // retired though (mainstay-unification packet) — the App level now
+    // overrides this empty `logscope` with the mission id for the shared
+    // column (see `eventLogScopeLabel`'s own doc, above `routeChrome`'s call
+    // site). `#crumb` stays empty regardless: the mission header already
+    // names the mission, so a crumb would only repeat it.
     return { crumb: "", logscope: "" };
   }
   if (route.kind === "console") {
@@ -755,7 +785,11 @@ function earliestDate(records: FlowRecord[]): string | null {
   return Number.isFinite(min) ? new Date(min).toISOString().slice(0, 10) : null;
 }
 
-function renderRoute(route: Route, playhead: number | null) {
+function renderRoute(
+  route: Route,
+  playhead: number | null,
+  onMissionEvents: (events: FlowRecord[], srvTruncated: boolean) => void,
+) {
   switch (route.kind) {
     case "fleet":
       return <FleetLens />;
@@ -778,7 +812,7 @@ function renderRoute(route: Route, playhead: number | null) {
       // #1868: the mission-graph lens, folded in-place — see
       // `MissionGraphLens`'s own doc for the data sources and why this
       // replaces the earlier `MissionReplay` full-navigation stub.
-      return <MissionGraphLens missionId={route.missionId} />;
+      return <MissionGraphLens missionId={route.missionId} onEvents={onMissionEvents} />;
     case "playback":
       // (#1800 P2) A bare #<date> hash — a REAL historical render now: the
       // fleet hero over that day's records, with every one of legacy's

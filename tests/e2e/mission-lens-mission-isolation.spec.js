@@ -5,6 +5,15 @@
 // same as the standalone page) — only the DOM surface for the assertions
 // (the header meter, the events pane, the step-row status class) changed to
 // this port's own selectors.
+//
+// (mainstay-unification packet) The events-pane selectors (`.eventlog*`)
+// are UNSCOPED, not `.missionlens .eventlog*` — the lens reports its
+// scoped/deduped events upward (`onEvents`) instead of rendering its own
+// `EventLogColumn`; the scoping THIS SPEC exists to prove (a foreign
+// mission's records never leaking into m-a's own count/meter/step-status)
+// still happens inside `MissionGraphLens`'s own fold before it ever reports
+// upward — nothing about what's under test changed, only where the single
+// surviving `EventLogColumn` instance sits in the DOM.
 const { test, expect } = require('@playwright/test');
 
 const MISSION_ID = 'm-a';
@@ -44,7 +53,7 @@ async function open(page, records) {
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
   await expect(page.locator('.missionlens .mmeter')).toBeVisible();
-  await page.waitForSelector('.missionlens .eventlog');
+  await page.waitForSelector('.eventlog');
   return errors;
 }
 
@@ -67,8 +76,8 @@ test("a record stamped for a DIFFERENT mission does not move this mission's step
 
   // Exactly the three records stamped for m-a — the two mission-B rows are
   // excluded, even though they share s1's handle/session_id.
-  await expect(page.locator('.missionlens .eventlog__rec')).toHaveCount(3);
-  await expect(page.locator('.missionlens .eventlog__qcount')).toContainText('3 events');
+  await expect(page.locator('.eventlog__rec')).toHaveCount(3);
+  await expect(page.locator('.eventlog__qcount')).toContainText('3 events');
 
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });
@@ -110,9 +119,9 @@ test('a record with NO mission_id still correlates — the legacy path', async (
   const meter = (await page.locator('.missionlens .mmeter').innerText()).replace(/\s+/g, ' ');
   expect(meter, `meter read: ${meter}`).toContain('2.5k tok');
 
-  await expect(page.locator('.missionlens .eventlog__rec')).toHaveCount(3);
-  await expect(page.locator('.missionlens .eventlog__qcount')).toContainText('3 events');
-  await expect(page.locator('.missionlens .eventlog__empty')).toHaveCount(0);
+  await expect(page.locator('.eventlog__rec')).toHaveCount(3);
+  await expect(page.locator('.eventlog__qcount')).toContainText('3 events');
+  await expect(page.locator('.eventlog__empty')).toHaveCount(0);
 
   expect(errors, `uncaught: ${errors.join(' | ')}`).toEqual([]);
 });

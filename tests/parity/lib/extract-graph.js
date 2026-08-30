@@ -304,18 +304,20 @@ function headerFactsOf(fullGoldenText) {
  *    `getAttribute("title")` here, which is how the "subject" field
  *    survives into this extractor at all.
  *
- * Scoped to `.missionlens .eventlog__rec`, NOT a bare `.eventlog__rec` —
- * `EventLogColumn` is ALWAYS mounted at the App level too (never
- * conditionally unmounted, only CSS-hidden via its `visible` prop — see
- * that component's own doc), so on `#mission=<id>` there are genuinely TWO
- * `EventLogColumn` instances in the DOM at once: the App-level one
- * (`visible={showsEventLog(route)===false}` here, CSS-hidden but still
- * rendering the FLEET-WIDE window's rows) and this lens's own (visible,
- * mission-scoped). A bare selector caught both — measured live: 8 real rows
- * plus 50 (`LOG_CAP`) unrelated fleet-window rows from the hidden instance,
- * a real find while building this extractor, not a hypothetical. */
+ * A bare `.eventlog__rec` selector, NOT `.missionlens .eventlog__rec` —
+ * pre-mainstay-unification, `EventLogColumn` mounted TWICE on `#mission=<id>`
+ * (the always-mounted App-level instance, CSS-hidden and still carrying the
+ * FLEET-WIDE window's rows since `mission` was excluded from
+ * `showsEventLog`, plus this lens's own separate mission-scoped instance),
+ * so a bare selector caught 8 real rows plus 50 (`LOG_CAP`) unrelated
+ * fleet-window rows from the hidden one — a real find while building this
+ * extractor, not a hypothetical. `MissionGraphLens` no longer mounts its own
+ * `EventLogColumn` (it reports its scoped events upward via `onEvents`
+ * instead — see that component's own doc), so there is exactly ONE instance
+ * on the page again, same as every other route; the `.missionlens` scope is
+ * gone because the thing it used to exclude no longer exists. */
 async function extractPortEventsText(page) {
-  return page.$$eval(".missionlens .eventlog__rec", (els) =>
+  return page.$$eval(".eventlog__rec", (els) =>
     els.map((el) => {
       const timeEl = el.querySelector(".eventlog__rectime");
       const actEl = el.querySelector(".eventlog__ractivity");

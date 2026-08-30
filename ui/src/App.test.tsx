@@ -751,26 +751,25 @@ describe("App", () => {
   });
 
   /**
-   * (#1066 QA) The PR's central risk claim — "that would have shipped the
-   * double mount" — was guarded ONLY by a pure-function unit test on
-   * `showsEventLog`. That cannot catch a regression in the WIRING: changing
-   * `visible={showsEventLog(route)}` to `visible={true}` bypasses the
-   * function entirely and left all 1073 tests green.
+   * (#1066 QA history) This test used to assert the OPPOSITE — that the
+   * App-level column stayed HIDDEN on the mission route, because
+   * `MissionGraphLens` mounted a SECOND `EventLogColumn` of its own and two
+   * visible logs on one page would disagree about scope (#1868). That
+   * second mount is retired (operator finding, post-#2107/#2108): the phone
+   * drawer's Events tab has no route-specific escape hatch the way
+   * desktop's inline mission panel did, so mission being the one route
+   * still excluded from the mainstay column regressed into a real bug — a
+   * nonzero record count in the drawer's tab label with a genuinely BLANK
+   * body underneath. `MissionGraphLens` now reports its own scoped events
+   * upward (`onEvents`) instead of rendering them, so the App-level column
+   * is the ONLY display surface for mission too, same as every other route.
    *
-   * Asserts the App-level column is HIDDEN on the mission route, which is
-   * precisely what stops a second visible event log appearing beside the one
-   * `MissionGraphLens` owns.
-   *
-   * Deliberately NOT phrased as "no two visible columns". A first attempt was
-   * written that way and passed vacuously: instrumenting it showed only ONE
-   * column mounts here, because the mission lens's own pane needs graph data
-   * this fixture does not provide — so the assertion could not have failed.
-   * A true-but-unfailable assertion is worse than no test, and that exact
-   * shape is what let an earlier bug through today.
-   *
-   * Red-proven: `visible={true}` in App.tsx fails this.
+   * Kept red-provable the same way the original was: this fails if
+   * `eventLogVisible`/`showsEventLog` regresses back to hiding mission, AND
+   * if the mission-id scope label or the `historical` override stop
+   * threading through `App.tsx`'s own mission branch.
    */
-  it("keeps the App-level event log hidden on the mission route, so the lens's own pane stands alone", async () => {
+  it("shows the App-level event log on the mission route, scoped to the mission id, never claiming a rolling window", async () => {
     vi.stubGlobal("fetch", mockFleetLikeFetch());
     window.location.hash = "#mission=m1";
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -780,7 +779,14 @@ describe("App", () => {
       </QueryClientProvider>,
     );
     await waitFor(() => expect(document.querySelector(".eventlog")).toBeTruthy());
-    expect(document.querySelector(".eventlog")!.className).toMatch(/eventlog--hidden/);
+    expect(document.querySelector(".eventlog")!.className).not.toMatch(/eventlog--hidden/);
+    // `#logscope` is hidden markup (`EventLogColumn.tsx`'s own doc) but
+    // still carries the real `scopeLabel` text — the mission id here, not
+    // the empty string `routeChrome` returns for `mission`.
+    expect(document.getElementById("logscope")?.textContent).toBe("m1");
+    // Mission records are a cross-day fold, never a rolling live window —
+    // the header must not carry the "last Nh" suffix live routes get.
+    expect(document.querySelector(".eventlog__head h3")?.textContent).not.toMatch(/last \d+h/i);
   });
 
   // (#2072/#2073) Static-build tests run LAST: `useHashRoute` caches the parsed

@@ -273,17 +273,14 @@ describe("parseRoute", () => {
 // old rule was measured and right for its moment — which is what makes this
 // a deliberate divergence rather than a correction of a mistake.
 describe("showsEventLog", () => {
-  // (#1868) `mission` is the ONE remaining exclusion, and it is structural
-  // rather than parity: MissionGraphLens mounts its own EventLogColumn with
-  // mission-scoped records, so the App-level column must not also render —
-  // two event logs on one page, disagreeing about scope. This would hold even
-  // if legacy had never existed, which is exactly why it survives #1066.
-  const hidden: Route["kind"][] = ["mission"];
-  const shown: Route["kind"][] = ["fleet", "dispatch", "playback", "unknown", "runs", "console", "machine"];
-
-  it.each(hidden)("hides the event log on %s", (kind) => {
-    expect(showsEventLog({ kind } as Route)).toBe(false);
-  });
+  // (#1868's `mission` exclusion, RETIRED — see `showsEventLog`'s own doc)
+  // Mission used to be the one structural exception: MissionGraphLens mounted
+  // its own second EventLogColumn with mission-scoped records, so the
+  // App-level column had to stay off to avoid two logs disagreeing about
+  // scope. That lens now reports its scoped events UPWARD instead of
+  // rendering them itself, so there is exactly one display surface for every
+  // route again, mission included.
+  const shown: Route["kind"][] = ["fleet", "dispatch", "playback", "unknown", "runs", "console", "machine", "mission"];
 
   it.each(shown)("shows the event log on %s", (kind) => {
     expect(showsEventLog({ kind } as Route)).toBe(true);

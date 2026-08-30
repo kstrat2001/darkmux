@@ -96,11 +96,15 @@ test.describe("next-parity-graph: MissionGraphLens vs. the standalone page's fro
     await expect(async () => {
       expect(await page.locator(".react-flow__edge").count()).toBeGreaterThan(0);
     }).toPass({ timeout: 15000, intervals: [200] });
-    // The events pane is open by default at a desktop (non-narrow) width —
-    // see `MissionGraphLens.tsx`'s own `evOpen` initial-state doc, the same
-    // `!isNarrowViewport()` rule the standalone page used.
+    // (mainstay-unification packet) `MissionGraphLens` no longer mounts its
+    // own `EventLogColumn` — it reports its scoped events upward via
+    // `onEvents`, and `App.tsx` feeds the SAME shared/mainstay column every
+    // other route already uses (a desktop route's standalone mount, always
+    // visible now that mission is no longer excluded — see
+    // `lib/route.ts`'s `showsEventLog` doc). So the events pane lives
+    // OUTSIDE `.missionlens`'s own DOM subtree now; select it unscoped.
     await expect(async () => {
-      expect(await page.locator(".missionlens .eventlog__rec").count()).toBeGreaterThan(0);
+      expect(await page.locator(".eventlog__rec").count()).toBeGreaterThan(0);
     }).toPass({ timeout: 15000, intervals: [200] });
 
     // Pinned counts — same fixture, same expectations as packet 1's own
@@ -108,7 +112,7 @@ test.describe("next-parity-graph: MissionGraphLens vs. the standalone page's fro
     expect(await page.locator(".phasegroup").count(), "phasegroups (3 phase nodes)").toBe(3);
     expect(await page.locator(".mnode").count(), "mission nodes (5 task nodes)").toBe(5);
     expect(await extractEdgeCount(page), "react-flow edges").toBe(6);
-    expect(await page.locator(".missionlens .eventlog__rec").count(), "event rows (8 flow-mission records)").toBe(8);
+    expect(await page.locator(".eventlog__rec").count(), "event rows (8 flow-mission records)").toBe(8);
 
     const [phasegroups, nodes, edgeCount] = await Promise.all([
       extractPhaseGroupsText(page),
@@ -153,17 +157,20 @@ test.describe("next-parity-graph: MissionGraphLens vs. the standalone page's fro
       expect(await page.locator(".tlt-step").count()).toBeGreaterThan(0);
     }).toPass({ timeout: 15000, intervals: [200] });
 
-    // The events pane is CLOSED by default on a narrow viewport — click it
-    // open (same as packet 1's own capture test).
-    await page.getByTitle("mission events").click();
+    // (mainstay-unification packet) There is no more per-lens "mission
+    // events" toggle — `MissionGraphLens` reports its events upward instead
+    // of rendering its own pane (see the canvas test's own doc above). On a
+    // narrow viewport the mainstay column lives inside the phone drawer's
+    // Events tab, closed by default; open it the same way an operator would.
+    await page.locator('[data-act="phone-drawer-tab-events"]').click();
     await expect(async () => {
-      expect(await page.locator(".missionlens .eventlog__rec").count()).toBeGreaterThan(0);
+      expect(await page.locator(".eventlog__rec").count()).toBeGreaterThan(0);
     }).toPass({ timeout: 15000, intervals: [200] });
 
     expect(await page.locator(".tlphase").count(), "timeline phases").toBe(3);
     expect(await page.locator(".tltask").count(), "timeline tasks").toBe(5);
     expect(await page.locator(".tlt-step").count(), "timeline steps (all 5 tasks expanded, 1 step each)").toBe(5);
-    expect(await page.locator(".missionlens .eventlog__rec").count(), "event rows (8 flow-mission records)").toBe(8);
+    expect(await page.locator(".eventlog__rec").count(), "event rows (8 flow-mission records)").toBe(8);
 
     const nodes = await extractTimelineNodesText(page);
     const gotTimeline = `=== timeline ===\n${nodes.length ? nodes.join("\n") : "(none)"}\n\n`;

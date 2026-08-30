@@ -70,6 +70,12 @@
      belt-and-braces. */
   --good: #4ade80;
   --warn: #f0b429;
+  /* Between `--warn` (fair) and `--bad` (critical) for the thermal ladder's
+     "serious" step — previously bucketed with critical under `--bad`
+     (`thermalSeverityClass`'s old 3-bucket collapse), but the ladder shows
+     all 4 `ThermalState` values side by side, so "serious" needs its own
+     hue or the escalation from fair→serious→critical reads as fair→red→red. */
+  --severe: #f97316;
   --bad: #f56565;
   --accent-dim: #3aa89f;
 }
@@ -5592,31 +5598,98 @@ body {
   color: var(--dim);
   font-variant-numeric: tabular-nums;
 }
-.thermal-row {
-  margin-top: 12px;
+/* (operator finding — "hard to tell what starts and ends a section")
+   ONE shared section convention for every titled block in the host-extras
+   body — Thermal, Power, CPU clusters — so the reader gets a single
+   consistent signal for "a new section started here" instead of each
+   block inventing its own header treatment (a bold inline `<b>` label on
+   the same line as its value read as a totally different visual language
+   from Thermal's/Clusters' own uppercase title, which is exactly what made
+   the boundary between them illegible). `.hx-section` owns the spacing +
+   divider; `.hx-section__title` owns the label typography — apply BOTH to
+   every section, never just one. The GPU MHz/memory caption stays OUTSIDE
+   this system on purpose: it is a footnote to the meter row above it, not
+   a section of its own. */
+.hx-section {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
 }
-.thermal-pill {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px 8px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  font: 600 calc(10px * var(--fs-scale))/1.4 var(--font-mono);
+.hx-section__title {
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.08em;
+  font-size: calc(10px * var(--fs-scale));
+  font-weight: 600;
   color: var(--dim);
+  margin-bottom: 8px;
 }
-.thermal-pill--nominal {
+/* The DHS-alert-ladder-style severity scale (operator ask, replacing the
+   single floating pill): all 4 `ThermalState` steps render every time, so
+   "how far from nominal" reads relative to the whole scale, not just the
+   current value in isolation. The `color-mix` border/glow convention
+   already used elsewhere in this file (e.g. the ~3460-3471 badge rules)
+   drives the active step. */
+.thermal-ladder {
+  margin-bottom: 6px;
+}
+.thermal-ladder__steps {
+  display: flex;
+  gap: 5px;
+}
+.thermal-ladder__step {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  opacity: 0.4;
+  transition: opacity 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.thermal-ladder__step--active {
+  opacity: 1;
+}
+.thermal-ladder__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dim);
+  flex-shrink: 0;
+}
+.thermal-ladder__label {
+  font: 600 calc(9px * var(--fs-scale))/1.2 var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
   color: var(--dim);
-  border-color: var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.thermal-pill--fair {
-  color: var(--warn);
+.thermal-ladder__step--active .thermal-ladder__label {
+  color: var(--fg);
+}
+.thermal-ladder__step--nominal .thermal-ladder__dot { background: var(--good); }
+.thermal-ladder__step--fair .thermal-ladder__dot { background: var(--warn); }
+.thermal-ladder__step--serious .thermal-ladder__dot { background: var(--severe); }
+.thermal-ladder__step--critical .thermal-ladder__dot { background: var(--bad); }
+.thermal-ladder__step--nominal.thermal-ladder__step--active {
+  border-color: var(--good);
+  background: color-mix(in srgb, var(--good) 12%, transparent);
+}
+.thermal-ladder__step--fair.thermal-ladder__step--active {
   border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
 }
-.thermal-pill--bad {
-  color: var(--bad);
+.thermal-ladder__step--serious.thermal-ladder__step--active {
+  border-color: var(--severe);
+  background: color-mix(in srgb, var(--severe) 12%, transparent);
+}
+.thermal-ladder__step--critical.thermal-ladder__step--active {
   border-color: var(--bad);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--bad) 35%, transparent);
 }
 .thermal-row__limit {
   margin-left: 8px;
@@ -5629,18 +5702,8 @@ body {
   color: var(--dim);
   font-variant-numeric: tabular-nums;
 }
-.power-block {
-  margin-top: 12px;
-}
-.cluster-block {
-  margin-top: 12px;
-}
-.cluster-block__title {
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  font-size: calc(10px * var(--fs-scale));
-  color: var(--dim);
-  margin-bottom: 8px;
+.power-block .dialog__kv:first-child {
+  margin-top: 0;
 }
 /* (#2108) One compact tile per cluster, reusing the EXACT SAME
    `.meter-row`/`.mm-gauge--compact` treatment the CPU/GPU/MEM row above

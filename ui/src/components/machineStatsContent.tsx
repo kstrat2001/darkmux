@@ -152,16 +152,49 @@ function fmtThermalState(state: ThermalState): string {
   return state.length === 0 ? state : state[0].toUpperCase() + state.slice(1);
 }
 
-/** Semantic color bucket per the spec: nominal reads quiet (no alarm
- * color), fair is a caution (`--warn`), serious/critical are both the
- * same "this needs attention" severity (`--bad`) — matching this file's
- * existing three-bucket severity convention elsewhere in the app
- * (`is-ok`/`is-warn`/`is-bad`). An unrecognized state falls back to the
- * quiet/nominal treatment rather than alarming on something unknown. */
-function thermalSeverityClass(state: ThermalState): string {
-  if (state === "fair") return "thermal-pill--fair";
-  if (state === "serious" || state === "critical") return "thermal-pill--bad";
-  return "thermal-pill--nominal";
+/** The 4-step order the thermal ladder renders in, fixed left-to-right —
+ * `ProcessInfo.thermalState`'s entire vocabulary (`ThermalState`'s own
+ * doc), so this list is exhaustive for any real macOS reading. */
+const THERMAL_STEPS: ReadonlyArray<{
+  key: "nominal" | "fair" | "serious" | "critical";
+  label: string;
+}> = [
+  { key: "nominal", label: "Nominal" },
+  { key: "fair", label: "Fair" },
+  { key: "serious", label: "Serious" },
+  { key: "critical", label: "Critical" },
+];
+
+/** A DHS-alert-ladder-style severity scale, replacing the old single
+ * floating pill (operator finding: a lone pill has no visible "relative
+ * to what?" — you can't tell how close to critical "fair" is without the
+ * other 3 steps in view). All 4 steps render every time; the current
+ * state's step lights up (full opacity, its own hue, a glow at
+ * critical), the rest sit dimmed so the whole scale — and where "now"
+ * sits on it — is always visible. Unlike an unrecognized future state
+ * (the `ThermalState` type's `| string` fallback), which lights no step —
+ * the caller (`HostExtras`) names it in the section title it owns, since
+ * this component no longer renders its own (see that title's own doc for
+ * why). */
+function ThermalLadder({ state }: { state: ThermalState }) {
+  const activeIdx = THERMAL_STEPS.findIndex((s) => s.key === state);
+  return (
+    <div className="thermal-ladder">
+      <div className="thermal-ladder__steps">
+        {THERMAL_STEPS.map((step, i) => (
+          <div
+            key={step.key}
+            className={`thermal-ladder__step thermal-ladder__step--${step.key}${
+              i === activeIdx ? " thermal-ladder__step--active" : ""
+            }`}
+          >
+            <span className="thermal-ladder__dot" />
+            <span className="thermal-ladder__label">{step.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 /** (#2108, host-sample-shape v2) The thermal/power/CPU-cluster rows —
@@ -259,16 +292,26 @@ function HostExtras({
     <>
       {gpuExtraItems.length > 0 && (
         <div className="machine-drawer__gpu-extra">
-          GPU <InlineOrCells items={gpuExtraItems} isMobile={isMobile} />
+          {/* (operator finding — "GPU memory is wrapping") A single item
+              (MHz absent, only memory measured — the common case on this
+              hardware) went through `InlineOrCells`' mobile cell-grid path
+              regardless of count, which stacks a label ABOVE its value even
+              for one item. Combined with the "GPU " prefix text before it,
+              that read as three floating lines ("GPU" / "MEMORY" /
+              "23.8 MB") indistinguishable from real section headers. The
+              grid exists to stop a MULTI-item phrase breaking mid-item
+              (`InlineOrCells`' own doc) — a lone item has nothing to break
+              against, so it renders as plain inline text instead. */}
+          GPU {gpuExtraItems.length === 1 ? gpuExtraItems[0].inline : <InlineOrCells items={gpuExtraItems} isMobile={isMobile} />}
         </div>
       )}
       {thermal && (
-        <div className="thermal-row">
-          <span
-            className={`thermal-pill ${thermalSeverityClass(thermal.state)}`}
-          >
-            {fmtThermalState(thermal.state)}
-          </span>
+        <div className="thermal-row hx-section">
+          <div className="hx-section__title">
+            Thermal
+            {THERMAL_STEPS.every((s) => s.key !== thermal.state) && ` · ${fmtThermalState(thermal.state)}`}
+          </div>
+          <ThermalLadder state={thermal.state} />
           {thermal.cpu_speed_limit_pct < 100 && (
             <span className="thermal-row__limit">
               {`CPU speed limit ${Math.round(thermal.cpu_speed_limit_pct)}%`}
@@ -296,10 +339,11 @@ function HostExtras({
         </div>
       )}
       {(power_mw || energyLine) && (
-        <div className="power-block">
+        <div className="power-block hx-section">
+          <div className="hx-section__title">Power</div>
           {power_mw && (
             <div className="dialog__kv">
-              <b>Power</b>
+              <b>Total</b>
               <InlineOrCells items={powerTotalItems} isMobile={isMobile} />
             </div>
           )}
@@ -318,8 +362,8 @@ function HostExtras({
         </div>
       )}
       {cpu_clusters && cpu_clusters.length > 0 && (
-        <div className="cluster-block">
-          <div className="cluster-block__title">CPU clusters</div>
+        <div className="cluster-block hx-section">
+          <div className="hx-section__title">CPU clusters</div>
           <div className="meter-row">
             {cpu_clusters.map((c) => (
               <div className="cluster-tile" key={c.name}>

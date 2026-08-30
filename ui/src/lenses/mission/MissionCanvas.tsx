@@ -163,7 +163,29 @@ export function MissionCanvas({
     };
     fit();
     window.addEventListener("resize", fit);
-    return () => window.removeEventListener("resize", fit);
+    // (mainstay-unification packet, #2058 regression) `resize` alone missed
+    // a real case: `.missionlens .top`'s own height can change AFTER this
+    // effect's first measurement, with no window resize event to catch it —
+    // e.g. the live-tail status flipping from "live" to "reconnecting"
+    // shortly after mount lengthens the pill enough to wrap the header row.
+    // The canvas's own top shifts down, but the one-time height stays keyed
+    // to the OLD (higher) top — its bottom edge, and React Flow's controls
+    // pinned to it, then overflow the viewport by exactly however much the
+    // header grew. Observing the header row directly re-fits on ANY of its
+    // height changes, not just a viewport resize — `.top` is a plain
+    // sibling in this flex column, sized purely by its own content
+    // (`flex: 0 0 auto`), so setting the canvas's own height here can never
+    // feed back into `.top`'s size and loop.
+    const headerEl = el.closest(".missionlens")?.querySelector(":scope > .top");
+    let ro: ResizeObserver | undefined;
+    if (headerEl && typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(fit);
+      ro.observe(headerEl);
+    }
+    return () => {
+      window.removeEventListener("resize", fit);
+      ro?.disconnect();
+    };
   }, []);
   const layout = useMemo(() => computeLayout(graphNodes), [graphNodes]);
   const rfNodes = useMemo(() => toRfNodes(graphNodes, layout, metrics, now), [graphNodes, layout, metrics, now]);
