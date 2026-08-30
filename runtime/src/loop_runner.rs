@@ -668,6 +668,17 @@ impl TurnAccum {
     /// finely is the cheap mistake) and moves to the answer region once a
     /// checkpoint shows the output is plain content, or once a degeneracy
     /// verdict has closed the thought.
+    ///
+    /// (#2164) `false` here is ALSO what a brand-new, nothing-absorbed-yet
+    /// turn returns — this function cannot, by itself, tell "mid-thought
+    /// continuation" apart from "turn just began, unproven". That
+    /// distinction is NOT made inside `TurnAccum`: `absorb()` (and the
+    /// `is_reasoning` it sets) only ever runs for a turn that has already
+    /// been checkpointed at least once, so a turn that completes cleanly in
+    /// ONE call never touches this struct's reasoning state at all — the
+    /// dispatch-scoped "has this model ever reasoned" signal the per-call-cap
+    /// decision needs lives in the caller (`dispatch_has_reasoned`), derived
+    /// straight from each response's `per_turn_reasoning`, not from here.
     fn in_answer_region(&self) -> bool {
         self.think_closed || (!self.is_reasoning && !self.answer.is_empty())
     }
@@ -1133,6 +1144,31 @@ fn run_with_sleeper(
         },
         None => TurnAccum::default(),
     };
+    // (#2164) Dispatch-scoped: has this model shown a reasoning region on
+    // ANY call so far, across every turn. NOT part of `TurnAccum` — that
+    // struct's `is_reasoning` is only ever touched by `absorb()`, which
+    // itself only runs for a turn that has already been checkpointed once
+    // (see `in_answer_region`'s doc). A turn that completes cleanly in one
+    // call — the modal case — never reaches `absorb()` at all, so a
+    // TurnAccum-resident flag would stay false forever even for a model
+    // that reasons on every turn. This is derived directly from each
+    // response's extracted reasoning instead (see `per_turn_reasoning`
+    // below), independent of the region machine's own bookkeeping.
+    //
+    // Resume seeding is conservative, not exact: `PendingHandBack` carries
+    // only the RESUMING turn's own `is_reasoning`, not a dispatch-wide
+    // fact — a dispatch that reasoned on an earlier, already-CONCLUDED
+    // turn and later got checkpointed mid-ANSWER on a different turn would
+    // resume with this false, and pay one extra turn's answer-bound first
+    // call before re-proving itself. That is the same one-call lag #1221's
+    // own follow-up already measured as small; carrying the exact fact
+    // through the checkpoint file would need a schema bump for a rare
+    // resume-time edge case, so it is not done here.
+    let mut dispatch_has_reasoned: bool = resume_seed
+        .as_ref()
+        .and_then(|c| c.pending_hand_back.as_ref())
+        .map(|hb| hb.is_reasoning)
+        .unwrap_or(false);
     let tool_defs: Vec<_> = tools.iter().map(|t| t.to_tool_def()).collect();
     // Set of tool names the model is allowed to call. Drives the
     // plain-text-tool-call promoter (#406): any tool name in the
@@ -1165,6 +1201,13 @@ fn run_with_sleeper(
     // dispatch via `IntraTurnStallExhausted` so the operator/frontier
     // can intervene instead of burning more turns on the same stall.
     let mut stall_recoveries_used: u32 = 0;
+    // (#2164) One-shot latch: has the runtime already recorded, for THIS
+    // dispatch, that a call carrying real output produced no reasoning at
+    // all. Fires once, the first time it becomes true, so the run record
+    // explains why the reasoning check-in bound stopped applying to fresh
+    // turns' first calls — without repeating the same line on every later
+    // turn of a model that simply never reasons.
+    let mut no_reasoning_region_logged = false;
     // (#418) Per-dispatch cycle detector — warns on repeated tool
     // calls within a sliding window. Observability-only in the MVP;
     // bail-on-cycle is a follow-up if warn alone proves insufficient.
@@ -1800,10 +1843,31 @@ fn run_with_sleeper(
         // max_tokens 50, 50, 5000, 5000, so a non-reasoning turn was still
         // checkpointed at the small reasoning interval for one extra call,
         // which is exactly the case the split exists to prevent.
-        per_call_cap = if turn.in_answer_region() {
-            answer_max_tokens
-        } else {
+        //
+        // (#2164) `in_answer_region()` alone is not enough: it reads `false`
+        // for BOTH a genuine mid-thought continuation AND a brand-new turn
+        // that has absorbed nothing yet — the two are indistinguishable by
+        // that function alone. Applying the reasoning bound to the second
+        // case truncated a non-reasoning model's very first tool-call batch
+        // at the 1000-token check-in interval regardless of how large it
+        // was; the #479 salvage then dispatched only the well-formed prefix
+        // and nudged the model to "reduce its reasoning" — an instruction it
+        // was never disobeying. `dispatch_has_reasoned` breaks the tie: it
+        // is dispatch-scoped (updated every response, never reset), so a
+        // turn's first call carries the reasoning bound only once THIS
+        // dispatch has actually proven, on some earlier call, that it
+        // reasons. Before that — including the dispatch's very first call —
+        // the first call of every turn carries the answer bound instead,
+        // same as an already-answering turn does. A thinking model checks
+        // in one call later on its very first turn (the cost #1221's own
+        // follow-up measured as small); a non-reasoning model's tool-call
+        // batches are never capped by an interval meant to bound reasoning,
+        // not answers.
+        let carries_reasoning_bound = !turn.in_answer_region() && dispatch_has_reasoned;
+        per_call_cap = if carries_reasoning_bound {
             reasoning_interval
+        } else {
+            answer_max_tokens
         };
         // (#1959) Which bound this request carried, captured HERE.
         //
@@ -1812,7 +1876,13 @@ fn run_with_sleeper(
         // region state still describes the PREVIOUS turn. A first attempt read
         // `turn.writing_thought()` at the salvage site and silently never
         // suppressed anything.
-        let sent_reasoning_bound = !turn.in_answer_region();
+        let sent_reasoning_bound = carries_reasoning_bound;
+        // (#2164) The first time this dispatch sends a fresh turn's first
+        // call under the answer bound because it hasn't proven it reasons
+        // yet, and this dispatch has already produced at least one turn
+        // (so this genuinely reflects "no reasoning seen", not just "too
+        // early to know") — surfaced below, once, after the response comes
+        // back and confirms the call carried real output with no reasoning.
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -2024,6 +2094,40 @@ fn run_with_sleeper(
         if let Some(separate) = assistant_message.reasoning_content.as_deref() {
             per_turn_reasoning.push_str(separate);
         }
+        // (#2164) Dispatch-scoped "has this model ever reasoned" — the ONE
+        // place `dispatch_has_reasoned` is set, and it only ever moves
+        // false→true, never back. Two shapes count as reasoning: a
+        // completed block (`per_turn_reasoning`, already covers both the
+        // separate `reasoning_content` field and a closed inline `<think>`
+        // via `extract_think_blocks` above) and an INLINE block this call
+        // OPENED but has not closed yet (the truncated-mid-first-call
+        // shape `extract_think_blocks` deliberately skips, since it
+        // requires a matched pair — mirrors the same delimiter check
+        // `TurnAccum::absorb` uses for the identical shape on a
+        // continuation call).
+        if !per_turn_reasoning.trim().is_empty() {
+            dispatch_has_reasoned = true;
+        } else if let Some(content) = assistant_message.content.as_deref() {
+            let trimmed = content.trim_start();
+            let opener = crate::budget_request::THINK_OPEN.trim();
+            let closer = crate::budget_request::THINK_CLOSE.trim();
+            if trimmed.starts_with(opener) && trimmed.matches(opener).count() > trimmed.matches(closer).count() {
+                dispatch_has_reasoned = true;
+            }
+        }
+        // (#2164) Captured HERE, before salvage or any other mutation below
+        // clears `content` — whether THIS call produced real, dispatchable
+        // output (an answer or tool calls), independent of whether it also
+        // reasoned. Feeds the one-shot "this model emits no reasoning
+        // region" detector after the response is fully processed.
+        let call_had_dispatchable_output = assistant_message
+            .content
+            .as_deref()
+            .is_some_and(|c| !c.trim().is_empty())
+            || assistant_message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|t| !t.is_empty());
         // (#461) Feed the combined reasoning to the loop detector. The
         // detector skips empty / too-short reasoning internally so
         // turns without reasoning content don't pollute the window.
@@ -2194,6 +2298,28 @@ fn run_with_sleeper(
         }
 
         messages.push(assistant_message.clone());
+
+        // (#2164) One-shot detector: this dispatch has, cumulatively, never
+        // shown a reasoning region — and this call, which produced real
+        // dispatchable output, didn't either. Surfaced once so the run
+        // record explains why the reasoning check-in bound stops applying
+        // to fresh turns' first calls (`dispatch_has_reasoned` above),
+        // rather than leaving that inference to whoever reads the
+        // trajectory later.
+        if !no_reasoning_region_logged
+            && !dispatch_has_reasoned
+            && per_turn_reasoning.trim().is_empty()
+            && call_had_dispatchable_output
+        {
+            eprintln!(
+                "darkmux-runtime: this model has produced no reasoning region \
+                 in {turns} turn(s) so far — the reasoning check-in bound no \
+                 longer applies to a fresh turn's first call; only the answer \
+                 bound does. (#2164)"
+            );
+            trajectory.append_reasoning_bound_not_applied(turns);
+            no_reasoning_region_logged = true;
+        }
 
         match effective_finish_reason {
             "stop" => {
@@ -4858,12 +4984,23 @@ mod tests {
             "type": "function",
             "function": { "name": "read", "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}" },
         }]);
+        // (#2164) Turn 1 carries a small closed think block alongside its
+        // tool call so it demonstrates reasoning (`dispatch_has_reasoned`
+        // flips true from `per_turn_reasoning`) — otherwise turn 2's first
+        // call below would carry the ANSWER bound, not the 40-token
+        // reasoning interval this test's checkpoint scenario depends on.
         server.mock(move |when, then| {
             when.method(POST).path("/v1/chat/completions").matches(|req| {
                 let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
                 b.matches("\"role\":\"tool\"").count() == 0
             });
-            then.status(200).json_body(chat_response_json(None, Some(tool_calls.clone()), "tool_calls", 100, 20));
+            then.status(200).json_body(chat_response_json(
+                Some("<think>brief</think>"),
+                Some(tool_calls.clone()),
+                "tool_calls",
+                100,
+                20,
+            ));
         });
         // Call 2: turn 2's FIRST call — 1 "role":"tool" substring (turn 1's
         // tool result), and the continuation marker is NOT in the request
@@ -7365,6 +7502,50 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
         let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(10_000), Some(10_000), std::collections::BTreeMap::new(), None)
             .expect("clean single-turn dispatch");
+
+        captured.assert();
+        assert_eq!(outcome.turns, 1);
+    }
+
+    /// (#2164) `max_tokens_per_call` (the ANSWER bound) still bounds the
+    /// answer region — this fix does not widen or remove that cap, it only
+    /// stops a fresh turn's first call from carrying the SMALLER reasoning
+    /// check-in interval instead. `reasoning_checkpoint_interval` is set to
+    /// a deliberately DIFFERENT, much smaller value (100) than
+    /// `max_tokens_per_call` (3000) so this test can only pass if the
+    /// request actually carried the answer bound — a regression back to
+    /// "every fresh turn's first call carries the reasoning bound" would
+    /// send `max_tokens: 100` and this mock (keyed on 3000) would never
+    /// match, failing the dispatch outright.
+    #[test]
+    #[serial_test::serial]
+    fn max_tokens_per_call_bounds_the_answer_region_on_a_fresh_turns_first_call() {
+        let server = MockServer::start();
+        let captured = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"max_tokens\":3000");
+            then.status(200).json_body(chat_response_json(
+                Some("done"),
+                None,
+                "stop",
+                100,
+                10,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("answer-bound-first-call").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("hi")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, Some(3000), Some(100), std::collections::BTreeMap::new(), None,
+        )
+        .expect("a fresh turn's first call, sent under the answer bound, dispatches cleanly");
 
         captured.assert();
         assert_eq!(outcome.turns, 1);
