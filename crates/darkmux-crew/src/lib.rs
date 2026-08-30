@@ -81,6 +81,10 @@ pub mod run_record;
 // module doc.
 pub mod run_obs;
 pub mod select;
+// (#2112) The `PreventUserIdleSystemSleep` RAII assertion held for a
+// mission/crawl's life — see the module doc for why it does not override a
+// thermal-emergency sleep.
+pub mod sleep_assertion;
 // (#1230 Packet 2) Generic dependency-graph scheduler over `Step`/`Phase`
 // — see the module doc for the DependencyNode/is_ready/reachable/
 // run_step_graph shape.

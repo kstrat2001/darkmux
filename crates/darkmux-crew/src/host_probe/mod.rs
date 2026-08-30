@@ -36,6 +36,11 @@
 pub mod iokit;
 pub mod ioreport;
 pub mod mach_cpu;
+// (#2112) Pre-flight power posture — AC/battery + percent, Low Power Mode,
+// thermal state (reusing `thermal::sample`), and recent thermal-emergency
+// forced sleeps from `pmset -g log`. Read on demand (doctor + mission
+// pre-flight), not part of the periodic telemetry sampler above.
+pub mod power_posture;
 pub mod thermal;
 
 pub use thermal::ThermalSample;
