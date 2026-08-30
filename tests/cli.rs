@@ -2220,15 +2220,6 @@ fn hanging_endpoint_profiles_json(port: u16) -> String {
     )
 }
 
-/// (#2124) `kill <pid>` (SIGTERM) on a `mission launch review` blocked
-/// mid-probe (a real `curl` call to an endpoint that never answers) must:
-/// exit within 5s, leave a `mission close` flow record naming the signal,
-/// leave the mission `finalized` with every phase `abandoned` (never stuck
-/// `active`), and leave no `curl` process still holding the stub
-/// connection open. Reproduces the exact scenario from the issue: `kill
-/// <pid>` on a real review launch, mid-probe, previously left the mission
-/// `active` forever with the `curl` child running past the parent's death.
-
 /// Assert that no `curl` spawned by the darkmux child `pid` outlives it.
 /// Polls the process table for that child's own `darkmux-remote-<pid>-`
 /// config-file marker (see `remote_chat_attempt`) for up to 2s: the OS
@@ -2255,6 +2246,14 @@ fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
     );
 }
 
+/// (#2124) `kill <pid>` (SIGTERM) on a `mission launch review` blocked
+/// mid-probe (a real `curl` call to an endpoint that never answers) must:
+/// exit within 5s, leave a `mission close` flow record naming the signal,
+/// leave the mission `finalized` with every phase `abandoned` (never stuck
+/// `active`), and leave no `curl` process still holding the stub
+/// connection open. Reproduces the exact scenario from the issue: `kill
+/// <pid>` on a real review launch, mid-probe, previously left the mission
+/// `active` forever with the `curl` child running past the parent's death.
 #[test]
 fn mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl() {
     let stub = HangingStubServer::start();
@@ -2994,7 +2993,6 @@ fn review_bench_funnel_bundler_flag_reaches_external_bundles_and_fails_loud_per_
             .and(predicate::str::contains("empty bundle set")),
     );
 }
-
 
 /// `--envelope-out` pointed at a path whose parent directory doesn't exist
 /// must fail loudly (`std::fs::write` errors, wrapped by `.with_context`)
