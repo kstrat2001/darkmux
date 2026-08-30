@@ -201,7 +201,7 @@ These are emitted by the runtime's struggle-detectors and recovery paths (landed
 { "type": "dispatch.complete", "ts": <unix_ms>, "result": <str>, "wall_ms": <u128> }
 ```
 
-`result` discriminates terminal reason: `"stop"` (clean), `"max_turns"` (hit operator `--max-turns`), `"escalation_cumulative_tokens_exceeded"` (hit `--max-tokens`), `"escalation_intra_turn_stall_exhausted"` (stall budget exhausted), `"escalation_compaction_limit_reached"` (hit `bail_after_compactions`), `"error"`.
+`result` discriminates terminal reason: `"stop"` (clean), `"max_turns"` (hit operator `--max-turns`), `"escalation_cumulative_tokens_exceeded"` (hit `--max-tokens`), `"escalation_intra_turn_stall_exhausted"` (stall budget exhausted), `"escalation_generation_checkpoint_budget_exhausted"` (#2171 — a turn kept hitting the generation check-in without converging), `"escalation_compaction_limit_reached"` (hit `bail_after_compactions`), `"error"`.
 
 ## Naming-convention traps — gotchas worth memorizing
 

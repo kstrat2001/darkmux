@@ -53,6 +53,13 @@ use std::sync::OnceLock;
 #[serde(rename_all = "snake_case")]
 pub enum BoundKind {
     ReasoningCheckpointInterval,
+    /// (#2171 rebase onto #2165) Bounds any call that does NOT carry the
+    /// reasoning bound above — restores a check-in for non-thinking models,
+    /// which pre-#2171 carried `MaxTokensPerCall` (10000 by default) with
+    /// no check-in at all once #2164 gated the reasoning check-in on
+    /// `dispatch_has_reasoned`. See `runtime::loop_runner::
+    /// GENERATION_CHECKPOINT_INTERVAL`'s doc for the incident this fixes.
+    GenerationCheckpointInterval,
     MaxTokensPerCall,
     #[allow(dead_code)]
     MaxTurns,
@@ -68,6 +75,7 @@ impl BoundKind {
     fn label(self) -> &'static str {
         match self {
             BoundKind::ReasoningCheckpointInterval => "the reasoning check-in interval",
+            BoundKind::GenerationCheckpointInterval => "the generation check-in interval",
             BoundKind::MaxTokensPerCall => "the per-call token cap",
             BoundKind::MaxTurns => "the max-turns cap",
             BoundKind::MaxTokens => "the cumulative max-tokens cap",
@@ -146,6 +154,9 @@ impl BoundRef {
 pub struct BoundSources {
     pub reasoning_checkpoint_interval: BoundSource,
     pub max_tokens_per_call: BoundSource,
+    /// (#2171 rebase onto #2165) Same companion-source pattern, for the
+    /// generation check-in.
+    pub generation_checkpoint_interval: BoundSource,
 }
 
 static BOUND_SOURCES: OnceLock<BoundSources> = OnceLock::new();
@@ -185,6 +196,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(BoundKind::MaxTokensPerCall).unwrap(),
             serde_json::json!("max_tokens_per_call")
+        );
+        assert_eq!(
+            serde_json::to_value(BoundKind::GenerationCheckpointInterval).unwrap(),
+            serde_json::json!("generation_checkpoint_interval")
         );
         assert_eq!(serde_json::to_value(BoundKind::MaxTurns).unwrap(), serde_json::json!("max_turns"));
         assert_eq!(serde_json::to_value(BoundKind::MaxTokens).unwrap(), serde_json::json!("max_tokens"));
