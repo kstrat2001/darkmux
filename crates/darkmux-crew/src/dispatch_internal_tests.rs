@@ -1454,6 +1454,7 @@
             remote_needs_auth: false,
             base_url_override: None,
             workspace_read_only: false,
+            resume_checkpoint: false,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -1634,6 +1635,7 @@
             remote_needs_auth: false,
             base_url_override: None,
             workspace_read_only: false,
+            resume_checkpoint: false,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -1746,6 +1748,7 @@
             remote_needs_auth: false,
             base_url_override: None,
             workspace_read_only: false,
+            resume_checkpoint: false,
         };
 
         let argv = build_docker_run_argv(&config);
@@ -1795,6 +1798,7 @@
             remote_needs_auth: false,
             base_url_override: None,
             workspace_read_only: false,
+            resume_checkpoint: false,
         }
     }
 
@@ -1810,6 +1814,27 @@
         assert!(
             argv.windows(2).any(|w| w[0] == "-v" && w[1] == "/tmp/ws:/workspace:ro"),
             "expected -v /tmp/ws:/workspace:ro in argv: {argv:?}"
+        );
+    }
+
+    // ─── #2114: resume argv emission ──────────────────────────────
+
+    #[test]
+    fn build_docker_run_argv_omits_resume_flag_by_default() {
+        let argv = build_docker_run_argv(&base_argv_config());
+        assert!(!argv.contains(&"--resume".to_string()), "expected no --resume in argv: {argv:?}");
+    }
+
+    #[test]
+    fn build_docker_run_argv_appends_resume_flag_pointing_at_the_out_dir_checkpoint() {
+        // (#2114 finding 3) The checkpoint moved off `/workspace/.darkmux`
+        // onto the always-writable, never-`:ro` `/darkmux-out` mount.
+        let mut config = base_argv_config();
+        config.resume_checkpoint = true;
+        let argv = build_docker_run_argv(&config);
+        assert!(
+            argv.windows(2).any(|w| w[0] == "--resume" && w[1] == "/darkmux-out/checkpoint.json"),
+            "expected --resume /darkmux-out/checkpoint.json in argv: {argv:?}"
         );
     }
 
@@ -2048,6 +2073,7 @@
             remote_needs_auth: false,
             base_url_override: None,
             workspace_read_only: false,
+            resume_checkpoint: false,
         };
         let argv = build_docker_run_argv(&config);
         let cmd = docker_command_from_argv(&argv);

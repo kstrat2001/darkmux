@@ -370,6 +370,22 @@ impl Trajectory {
         }));
     }
 
+    /// (#2114) Same `runtime.rest` event `append_rest` writes, plus a
+    /// `reason` field — one event per bounded sleep increment the loop
+    /// takes while `.darkmux/pace.json` holds `pause: true`. Kept as a
+    /// distinct method (not an `Option<&str>` param bolted onto
+    /// `append_rest`) so the #2094 turn-delay call site's signature never
+    /// has to change for a feature it doesn't use.
+    pub fn append_paced_rest(&mut self, seq: u32, ms: u64, reason: &str) {
+        self.write_event(&serde_json::json!({
+            "type": "runtime.rest",
+            "seq": seq,
+            "ts": unix_ms(),
+            "ms": ms,
+            "reason": reason,
+        }));
+    }
+
     pub fn append_cycle_suspected(
         &mut self,
         seq: u32,
