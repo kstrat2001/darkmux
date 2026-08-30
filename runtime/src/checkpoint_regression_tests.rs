@@ -453,9 +453,37 @@ fn a_salvaged_mid_turn_does_not_fold_and_does_not_restore_cleared_content() {
 #[serial_test::serial]
 fn a_reasoning_checkpoint_dispatches_tools_without_nudging_the_model_to_think_less() {
     let server = MockServer::start();
+    // (#2164) Turn 1 is a PRIMING call that demonstrates reasoning (a closed
+    // think block) so `dispatch_has_reasoned` is true before the interesting turn —
+    // otherwise this dispatch's very first call would carry the ANSWER
+    // bound, not the 200-token reasoning interval this test is about, and
+    // completion_tokens=199 would read as context overflow instead of a
+    // checkpoint. Matched on 0 "role":"tool" substrings (nothing has
+    // executed yet); mutually exclusive with the mock below per this file's
+    // own convention.
+    let _priming = server.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions").matches(|req| {
+            let b = body_of(req);
+            b.matches("\"role\":\"tool\"").count() == 0
+        });
+        then.status(200).json_body(chat_response_json(
+            Some("<think>brief</think>"),
+            Some(serde_json::json!([{
+                "id": "c0",
+                "type": "function",
+                "function": { "name": "echo", "arguments": "{\"text\":\"priming\"}" }
+            }])),
+            "tool_calls",
+            100,
+            20,
+        ));
+    });
     // Cut at the 200-token reasoning interval, mid-thought, WITH a tool call.
     let _m = server.mock(|when, then| {
-        when.method(POST).path("/v1/chat/completions");
+        when.method(POST).path("/v1/chat/completions").matches(|req| {
+            let b = body_of(req);
+            b.matches("\"role\":\"tool\"").count() >= 1
+        });
         then.status(200).json_body(chat_response_json(
             Some("<think>\nstill working through the call graph"),
             Some(serde_json::json!([{
@@ -504,6 +532,138 @@ fn a_reasoning_checkpoint_dispatches_tools_without_nudging_the_model_to_think_le
         !nudged,
         "a routine reasoning check-in must not inject a 'reduce your reasoning' \
          nudge — that is the one instruction measured to cost real findings"
+    );
+}
+
+/// (#2164) RED-PROVE: a model with no thinking block (Devstral, most
+/// non-Qwen coders) emits a batch of tool calls immediately, on the very
+/// first call of turn 1. Before the fix, that call ALWAYS carried the
+/// `REASONING_CHECKPOINT_INTERVAL` bound (1000 tokens here) regardless of
+/// the model — `in_answer_region()` reads `false` at the start of EVERY
+/// turn, reasoning or not, because nothing has been absorbed yet — so a
+/// batch that legitimately needed more than 1000 completion tokens got
+/// truncated by darkmux's OWN cap, and the #479 salvage then dispatched
+/// only the well-formed prefix while nudging the model to "reduce its
+/// reasoning" — an instruction irrelevant to a model that never reasoned.
+/// Live case this mirrors (crawl-1788080514, Devstral-small-2): 21 tool
+/// calls emitted, only 10 salvaged.
+///
+/// The mock is keyed on the outgoing request's OWN `max_tokens` — not on
+/// call order — so this test is a genuine red-prove: on current main (pre-
+/// #2164) the first call always sends `max_tokens=1000` and hits the
+/// TRUNCATED branch below; post-fix it sends the large answer bound and
+/// hits the CLEAN branch. Confirmed by running this test against the
+/// pre-fix code: it fails with `tool_msgs == 10`, not 15, and the trajectory
+/// carries `dispatch.per_turn_cap.salvaged` instead of
+/// `dispatch.reasoning_bound.not_applied`.
+#[test]
+#[serial_test::serial]
+fn a_non_reasoning_models_first_call_is_not_capped_by_the_reasoning_interval() {
+    let server = MockServer::start();
+
+    // 15 well-formed tool calls totalling comfortably over 1000 completion
+    // tokens — the shape a real Devstral batch takes.
+    let full_calls: Vec<serde_json::Value> = (0..15)
+        .map(|i| {
+            serde_json::json!({
+                "id": format!("call_{i}"),
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "arguments": format!("{{\"text\":\"payload-{i}-{}\"}}", "x".repeat(60)),
+                },
+            })
+        })
+        .collect();
+
+    // The LMStudio-observed truncation shape (#1959's own doc comment): the
+    // cap lands mid-serialization, so the LAST call in a capped turn is
+    // truncated to malformed JSON while the rest stay well-formed.
+    let mut truncated_calls = full_calls.clone();
+    if let Some(last) = truncated_calls.last_mut() {
+        last["function"]["arguments"] = serde_json::json!("{\"text\":\"cut off mid-j");
+    }
+
+    // Whenever the outgoing request's `max_tokens` is <= 1000 — what a
+    // fresh turn's first call sent PRE-#2164 — serve the truncated,
+    // salvage-shaped response with a `length` finish at the cap.
+    server.mock(move |when, then| {
+        when.method(POST).path("/v1/chat/completions").matches(|req| {
+            let b = body_of(req);
+            let v: serde_json::Value = serde_json::from_str(&b).unwrap_or_default();
+            v.get("max_tokens").and_then(|m| m.as_u64()).map(|m| m <= 1000).unwrap_or(false)
+                && !b.contains("\"role\":\"tool\"")
+        });
+        then.status(200).json_body(chat_response_json(
+            None,
+            Some(serde_json::json!(truncated_calls.clone())),
+            "length",
+            100,
+            999,
+        ));
+    });
+    // Whenever it carries the large answer bound — the fixed behavior —
+    // serve the FULL clean batch with a `tool_calls` finish.
+    server.mock(move |when, then| {
+        when.method(POST).path("/v1/chat/completions").matches(|req| {
+            let b = body_of(req);
+            let v: serde_json::Value = serde_json::from_str(&b).unwrap_or_default();
+            v.get("max_tokens").and_then(|m| m.as_u64()).map(|m| m > 1000).unwrap_or(false)
+                && !b.contains("\"role\":\"tool\"")
+        });
+        then.status(200).json_body(chat_response_json(
+            None,
+            Some(serde_json::json!(full_calls.clone())),
+            "tool_calls",
+            100,
+            1200,
+        ));
+    });
+    // Once tool results are in the conversation, end the dispatch cleanly —
+    // this test is about turn 1's cap, not multi-turn behavior.
+    server.mock(move |when, then| {
+        when.method(POST).path("/v1/chat/completions").matches(|req| {
+            body_of(req).contains("\"role\":\"tool\"")
+        });
+        then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 200, 5));
+    });
+
+    let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+    let tmp = tempfile::Builder::new().prefix("no-reasoning-first-call").tempdir().unwrap();
+    let mut traj = Trajectory::open(tmp.path());
+    let initial = vec![Message::system("t"), Message::user("do the batch")];
+    let tools = [Tool::Echo];
+    let cfg = compaction::CompactionConfig::never_compact();
+
+    let outcome = run(
+        &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+        Some(3), None, Some(50_000), Some(1000), std::collections::BTreeMap::new(), None,
+    )
+    .expect("turn 1's batch dispatches cleanly");
+
+    let tool_msgs = outcome.messages.iter().filter(|m| m.role == "tool").count();
+    assert_eq!(
+        tool_msgs, 15,
+        "all 15 tool calls must dispatch — a non-reasoning model's first call must not \
+         be capped by the reasoning check-in interval (#2164)"
+    );
+
+    let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+    let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+    let events: Vec<serde_json::Value> =
+        raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    assert!(
+        !events
+            .iter()
+            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("dispatch.per_turn_cap.salvaged")),
+        "no salvage should have been needed — the first call must have carried the answer \
+         bound, not the reasoning check-in interval"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("dispatch.reasoning_bound.not_applied")),
+        "the one-shot detector must fire once turn 1 shows real output with no reasoning region"
     );
 }
 
