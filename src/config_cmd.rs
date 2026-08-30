@@ -112,6 +112,9 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.max_tokens", Ty::Uint),
     ("runtime.max_tokens_per_call", Ty::Uint),
     ("runtime.reasoning_checkpoint_interval_tokens", Ty::Uint),
+    // (#2171) The GENERATION check-in — bounds every call that does NOT
+    // carry the reasoning bound above, not just reasoning ones.
+    ("runtime.generation_checkpoint_interval_tokens", Ty::Uint),
     ("runtime.strict_selection", Ty::Bool),
     ("runtime.log_level", Ty::Str),
     ("runtime.feedback_injection", Ty::Bool),

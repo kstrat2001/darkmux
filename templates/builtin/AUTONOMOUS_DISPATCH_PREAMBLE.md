@@ -38,7 +38,7 @@ hours later, by which point dispatch context is gone.
 
 ## Working within a bounded dispatch
 
-This dispatch is bounded along four dimensions:
+This dispatch is bounded along five dimensions:
 
 - **Turn cap** — each chat-completion call counts as one turn. When
   you cross the cap, the dispatch terminates with
@@ -48,6 +48,12 @@ This dispatch is bounded along four dimensions:
   injects a nudge and retries, but the retry budget is finite.
   Hitting this cap repeatedly escalates via
   `escalation_intra_turn_stall_exhausted`.
+- **Per-call generation check-in** — a smaller, more frequent
+  checkpoint inside a single turn's content/tool-call emission. You
+  are not told when this fires — it is silent, the same as the
+  per-turn cap's checkpoints — but a turn that keeps re-hitting it
+  without converging escalates via
+  `escalation_generation_checkpoint_budget_exhausted`.
 - **Cumulative completion-token cap** — sum of all completion tokens
   (content + reasoning) across every turn. Crossing terminates via
   `escalation_cumulative_tokens_exceeded`.

@@ -119,6 +119,31 @@ const MAX_TOKENS_PER_CALL: u32 = 10_000;
 /// call, by which region the turn is in.
 const REASONING_CHECKPOINT_INTERVAL: u32 = 1000;
 
+/// (#2171) The GENERATION check-in — bounds every call that does NOT carry
+/// the reasoning bound above, not just reasoning ones. #2166 made the
+/// reasoning check-in apply only once a dispatch has proven it reasons
+/// (`dispatch_has_reasoned`); before that point every call — including a
+/// non-thinking model's entire dispatch — carried `MAX_TOKENS_PER_CALL`
+/// (10000) with NO check-in at all. Devstral (dense 24B, ~10-20 tok/s on an
+/// M1 Max) needed 8-16 minutes to exhaust that bound, longer than the
+/// default 600s inactivity budget, and LMStudio's tool-call parser buffered
+/// rather than streamed — zero chunks, so `last_proof_of_work` never reset
+/// and the host hard-killed the container at exit 137 with no envelope.
+/// Before #2164 the 1000-token reasoning check-in incidentally kept every
+/// call short enough to heartbeat; this restores that property for
+/// non-reasoning calls specifically, without reintroducing the "reduce your
+/// reasoning" nudge on a model that was never reasoning in the first place
+/// (that nudge stays gated on the REASONING bound — see `sent_reasoning_bound`
+/// at the cap-selection site).
+///
+/// Sized to fit a real tool-call batch (larger than the 1000-token thought
+/// sample, far smaller than the 10000-token answer ceiling it replaces as
+/// the effective per-call cap for non-reasoning calls).
+///
+/// Override: `DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL` env >
+/// `runtime.generation_checkpoint_interval_tokens` config > this default.
+const GENERATION_CHECKPOINT_INTERVAL: u32 = 4000;
+
 // (#457) Per-dispatch cumulative-completion-tokens cap — REMOVED as
 // a hardcoded constant. Now passed as `Option<u32>` to `run()` via
 // the `--max-tokens` runtime CLI flag; host derives the value from
@@ -240,6 +265,18 @@ pub enum EscalationReason {
     /// nudge isn't breaking the pattern, so the dispatch escalates
     /// rather than burn more turns on the same stall.
     IntraTurnStallExhausted,
+    /// (#2171) A turn kept hitting the GENERATION check-in
+    /// (`generation_checkpoint_interval_tokens`) more times than
+    /// `answer_max_tokens / generation_checkpoint_interval_tokens` allows.
+    /// Deliberately bounded, unlike the reasoning check-in's continuations
+    /// (which stay open-ended by design — see the comment at the
+    /// checkpoint-continuation site): a thought is expected to run long,
+    /// but a single answer/tool-call turn that never converges after
+    /// `answer_max_tokens` worth of generation-bound continuations is a
+    /// model that will not stop on its own, and the alternative is the
+    /// same unbounded-continuation shape the reasoning check-in already
+    /// tolerates for a region where it should NOT be tolerated.
+    GenerationCheckpointBudgetExhausted,
 }
 
 /// (#799) A bash tool invocation that **failed to run** — never executed —
@@ -868,16 +905,29 @@ impl TurnAccum {
 }
 
 
-/// (#2165) Which bound governed the request that just came back — derived
-/// from `sent_reasoning_bound`/`per_call_cap`, the two values the
-/// cap-selection block (~1803-1815) already resolves before every request.
-/// Emission sites downstream (salvage, intra-turn-stall recovery) call this
-/// instead of re-deriving the region, so the answer can never disagree with
-/// what was actually sent.
-fn active_bound(sent_reasoning_bound: bool, per_call_cap: u32) -> BoundRef {
+/// (#2165, revised #2171) Which bound governed the request that just came
+/// back — derived from `sent_reasoning_bound`/`sent_generation_bound`/
+/// `per_call_cap`, the values the cap-selection block already resolves
+/// before every request. Emission sites downstream (salvage, intra-turn-
+/// stall recovery, checkpoint continuation) call this instead of
+/// re-deriving the region, so the answer can never disagree with what was
+/// actually sent.
+///
+/// THREE-way, not two: #2171 added a GENERATION check-in
+/// (`generation_checkpoint_interval_tokens`) that bounds any call NOT
+/// carrying the reasoning bound, tighter than the raw answer bound
+/// (`max_tokens_per_call`). `sent_reasoning_bound` and
+/// `sent_generation_bound` are mutually exclusive by construction at the
+/// cap-selection site (the same `if/else if/else` that picks `per_call_cap`
+/// picks these two flags), so checking reasoning first, then generation,
+/// then falling through to the raw answer bound reproduces exactly the
+/// priority the cap-selection block already applied.
+fn active_bound(sent_reasoning_bound: bool, sent_generation_bound: bool, per_call_cap: u32) -> BoundRef {
     let sources = bounds::bound_sources();
     if sent_reasoning_bound {
         BoundRef::new(BoundKind::ReasoningCheckpointInterval, per_call_cap as u64, sources.reasoning_checkpoint_interval)
+    } else if sent_generation_bound {
+        BoundRef::new(BoundKind::GenerationCheckpointInterval, per_call_cap as u64, sources.generation_checkpoint_interval)
     } else {
         BoundRef::new(BoundKind::MaxTokensPerCall, per_call_cap as u64, sources.max_tokens_per_call)
     }
@@ -997,6 +1047,17 @@ pub fn run(
         max_cumulative_tokens,
         max_tokens_per_call,
         reasoning_checkpoint_interval,
+        // (#2171) `run()` is the test-only convenience wrapper — its own doc
+        // above already keeps its signature frozen against unrelated params
+        // (out_dir/resume_from). The generation check-in is the same shape:
+        // a neutral `u32::MAX` here means `min(answer_max_tokens, MAX) ==
+        // answer_max_tokens`, so every one of this wrapper's 120+ existing
+        // call sites keeps its pre-#2171 per-call-cap behavior unchanged. A
+        // test that wants to exercise the generation check-in itself calls
+        // `run_with_sleeper` directly (see the `_generation_checkpoint_*`
+        // tests) the same way the resume/pace tests already do for
+        // out_dir/resume_from.
+        Some(u32::MAX),
         feedback_templates,
         response_format,
         &out_dir,
@@ -1042,6 +1103,9 @@ pub fn run_resumable(
     max_cumulative_tokens: Option<u32>,
     max_tokens_per_call: Option<u32>,
     reasoning_checkpoint_interval: Option<u32>,
+    // (#2171) The GENERATION check-in — bounds every call that does NOT
+    // carry the reasoning bound. None = GENERATION_CHECKPOINT_INTERVAL.
+    generation_checkpoint_interval: Option<u32>,
     feedback_templates: std::collections::BTreeMap<String, String>,
     response_format: Option<serde_json::Value>,
     // (#2114 finding 3) Container out-dir root — where `pace.json` and
@@ -1079,6 +1143,7 @@ pub fn run_resumable(
         max_cumulative_tokens,
         max_tokens_per_call,
         reasoning_checkpoint_interval,
+        generation_checkpoint_interval,
         feedback_templates,
         response_format,
         out_dir,
@@ -1117,6 +1182,9 @@ fn run_with_sleeper(
     // None = REASONING_CHECKPOINT_INTERVAL. A separate knob from the answer
     // bound above because the two want opposite values — see the constants.
     reasoning_checkpoint_interval: Option<u32>,
+    // (#2171) The GENERATION check-in — bounds every call that does NOT
+    // carry the reasoning bound. None = GENERATION_CHECKPOINT_INTERVAL.
+    generation_checkpoint_interval: Option<u32>,
     feedback_templates: std::collections::BTreeMap<String, String>,
     // (#1038) Optional `response_format` envelope (the role's output_schema,
     // wrapped as json_schema). When set, every model turn is grammar-constrained
@@ -1150,10 +1218,61 @@ fn run_with_sleeper(
     let answer_max_tokens: u32 = max_tokens_per_call.unwrap_or(MAX_TOKENS_PER_CALL);
     let reasoning_interval: u32 =
         reasoning_checkpoint_interval.unwrap_or(REASONING_CHECKPOINT_INTERVAL);
+    // (#2171) The generation check-in. Only takes effect on a call that does
+    // NOT carry the reasoning bound, and only when it is actually tighter
+    // than the raw answer bound (an operator who sets it >= answer_max_tokens
+    // has effectively opted back out — see `capped_by_generation_interval`
+    // at the cap-selection site).
+    let generation_interval: u32 =
+        generation_checkpoint_interval.unwrap_or(GENERATION_CHECKPOINT_INTERVAL);
+    // (#2171, floor added on merge-gate review) How many GENERATION-bound
+    // continuations (never reasoning-bound ones — those stay deliberately
+    // open-ended, see the checkpoint-continuation site's own comment on why
+    // a THOUGHT gets no ceiling) a single turn may spend before the loop
+    // gives up and escalates.
+    //
+    // This is a NEW per-turn ceiling that did not exist before #2171: pre-
+    // #2171, a non-reasoning turn's answer/tool-call batch was capped ONCE,
+    // at `answer_max_tokens`, with no separate continuation budget — a
+    // length-finish at that cap went through the SAME open-ended checkpoint
+    // machinery the reasoning check-in uses (see `length_with_content_at_
+    // cap_keeps_the_turn_and_asks_for_a_conclusion`, which checkpoints seven
+    // times before the degeneracy gate ever catches it). #2171 lowers the
+    // per-call cap for that population to the smaller generation interval,
+    // which means the SAME turn now needs multiple continuations to reach
+    // the token budget it used to spend in one call — and an open-ended
+    // continuation budget for that population would recreate exactly the
+    // failure this PR exists to fix: a turn that keeps re-hitting a small
+    // cap forever, never producing a terminal outcome, is indistinguishable
+    // from the original inactivity-timeout hang from the operator's side —
+    // it just fails via MaxTurns/wall-clock instead of exit 137. A runaway
+    // must end SOMEWHERE, and unlike a reasoning check-in (where letting a
+    // thought run long is the point — degeneracy detection is the only
+    // backstop, by design), a generation-bound turn that cannot converge in
+    // a bounded number of check-ins is the pathology signal itself.
+    //
+    // `answer_max_tokens / generation_interval` alone (2 at the shipped
+    // defaults: 10000/4000) is too tight — it can starve a THINKING model's
+    // long final answer (an answer-region continuation still carries the
+    // generation bound once dispatch_has_reasoned is true and the turn has
+    // closed its thought) or a tool call whose JSON got cut mid-argument,
+    // either of which can legitimately need more than 2 tries to converge.
+    // `max(4, ...)` decouples the floor from the ratio: raising
+    // `max_tokens_per_call` without touching the generation interval no
+    // longer silently shrinks the number of tries available. `.max(1)` on
+    // the interval itself just guards a `0`-configured knob from a divide
+    // panic; `capped_by_generation_interval` at the cap-selection site is
+    // what actually gates whether this value is ever consulted.
+    let max_generation_continuations: u32 =
+        (answer_max_tokens / generation_interval.max(1)).max(4);
     // Assigned from the turn's region at the top of every iteration, before
     // the request that carries it is built; the length arm reads it back.
     let mut per_call_cap: u32;
     let mut checkpoints_used: u32 = 0;
+    // (#2171) Reset every time a FRESH turn begins (never on a checkpoint
+    // continuation of the same turn) — see the `turn.begin()` site. Counts
+    // only continuations that were themselves generation-bound.
+    let mut generation_continuations_this_turn: u32 = 0;
     // Set when the previous iteration handed a turn back as a prefill; read by
     // the turn counter so the resumed call is not counted as a new turn.
     // (#2114) A resume whose checkpoint carried a pending #1221 hand-back
@@ -1907,15 +2026,30 @@ fn run_with_sleeper(
         // turn's first call carries the reasoning bound only once THIS
         // dispatch has actually proven, on some earlier call, that it
         // reasons. Before that — including the dispatch's very first call —
-        // the first call of every turn carries the answer bound instead,
-        // same as an already-answering turn does. A thinking model checks
-        // in one call later on its very first turn (the cost #1221's own
-        // follow-up measured as small); a non-reasoning model's tool-call
-        // batches are never capped by an interval meant to bound reasoning,
-        // not answers.
+        // the first call of every turn carries the GENERATION bound instead
+        // (#2171 — `generation_checkpoint_interval_tokens`, tighter than the
+        // raw answer bound by default), same as an already-answering turn
+        // does. A thinking model checks in one call later on its very first
+        // turn (the cost #1221's own follow-up measured as small); a
+        // non-reasoning model's tool-call batches are never capped by an
+        // interval meant to bound reasoning, not answers — but they ARE
+        // capped by the generation check-in, and deliberately without the
+        // "reduce your reasoning" nudge that reasoning-bound cuts can carry
+        // (a model that was never reasoning has nothing to reduce — see
+        // `sent_generation_bound`'s use at the salvage nudge guard).
         let carries_reasoning_bound = !turn.in_answer_region() && dispatch_has_reasoned;
+        // (#2171) The GENERATION check-in applies to any call that does NOT
+        // carry the reasoning bound, but only when it is actually tighter
+        // than the raw answer bound — an operator who sets
+        // `generation_checkpoint_interval_tokens >= max_tokens_per_call` has
+        // effectively disabled it, and `per_call_cap` then falls through to
+        // `answer_max_tokens` exactly as it did before this feature existed.
+        let capped_by_generation_interval =
+            !carries_reasoning_bound && generation_interval < answer_max_tokens;
         per_call_cap = if carries_reasoning_bound {
             reasoning_interval
+        } else if capped_by_generation_interval {
+            generation_interval
         } else {
             answer_max_tokens
         };
@@ -1927,6 +2061,15 @@ fn run_with_sleeper(
         // `turn.writing_thought()` at the salvage site and silently never
         // suppressed anything.
         let sent_reasoning_bound = carries_reasoning_bound;
+        // (#2171) Same capture, for the generation bound — read by the
+        // salvage nudge guard (never nudge "reduce your reasoning" on a
+        // routine generation check-in) and by the trajectory records below.
+        let sent_generation_bound = capped_by_generation_interval;
+        // (#2171, superseded by #2165's `active_bound`) Which of the three
+        // bounds a cut names is now resolved via `active_bound(
+        // sent_reasoning_bound, sent_generation_bound, per_call_cap)` at
+        // each emission site, which also carries provenance (`BoundRef`) —
+        // no separate plain-string capture needed here.
         // (#2164) There is no separate `turns`-based guard here — the
         // detector below fires as soon as ONE call's response confirms it:
         // real dispatchable output produced with no reasoning at all. That
@@ -1990,6 +2133,10 @@ fn run_with_sleeper(
             // could reconstruct an answer from, so `main.rs` handed that markup
             // over as the deliverable. `begin` does both or neither.
             turn.begin(&mut messages);
+            // (#2171) A fresh turn gets a fresh generation-continuation
+            // budget — the cap bounds how long ONE turn may keep hitting the
+            // generation check-in, not the whole dispatch.
+            generation_continuations_this_turn = 0;
         }
 
         // (#406) Recover plain-text tool calls the model emitted in
@@ -2267,7 +2414,7 @@ fn run_with_sleeper(
             // check-in interval or `max_tokens_per_call` — so a remote
             // reader never has to reconstruct it from memory of the design
             // (the miss this whole feature exists to close).
-            let bound = active_bound(sent_reasoning_bound, per_call_cap);
+            let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
             eprintln!(
                 "darkmux-runtime: ⚡ per-turn-cap salvage — completion_tokens=\
                  {} hit {}; dispatching {} well-formed tool call(s) and \
@@ -2295,7 +2442,14 @@ fn run_with_sleeper(
             // where the same model uninterrupted found real ones. A nudge to
             // "reduce your reasoning" arriving every thousand tokens is that
             // same instruction on a loop.
-            if !sent_reasoning_bound {
+            //
+            // (#2171) `!sent_generation_bound` extends the same guard to the
+            // GENERATION check-in — a routine 4000-token generation
+            // check-in is exactly as silent to the model as a routine
+            // reasoning check-in always was. Telling a non-reasoning model
+            // to "reduce its reasoning" would be an instruction it was never
+            // disobeying, the same defect #2166 fixed for turn-1 calls.
+            if !sent_reasoning_bound && !sent_generation_bound {
                 feedback_injector
                     .queue_per_turn_cap_approach(observed_tokens, per_call_cap);
             }
@@ -2507,7 +2661,7 @@ fn run_with_sleeper(
                         messages.pop();
                     }
                     stall_recoveries_used = stall_recoveries_used.saturating_add(1);
-                    let bound = active_bound(sent_reasoning_bound, per_call_cap);
+                    let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
                     trajectory.append_intra_turn_stall_recovered(
                         turns,
                         this_turn_completion_tokens,
@@ -3153,7 +3307,7 @@ fn run_with_sleeper(
                     // prefill is not abandoned, and the turn does not end.
                     // Probed live — a system message after a prefill does NOT
                     // break continuation, so the nudge can sit behind it.
-                    let bound = active_bound(sent_reasoning_bound, per_call_cap);
+                    let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
                     recover_intra_turn_stall(
                         &mut messages,
                         trajectory,
@@ -3173,6 +3327,45 @@ fn run_with_sleeper(
                     );
                 } else {
                     checkpoints_used = checkpoints_used.saturating_add(1);
+                    // (#2171) The generation check-in's continuation budget —
+                    // deliberately NOT the same open-ended shape the reasoning
+                    // check-in gets (see the comment on `EscalationReason::
+                    // GenerationCheckpointBudgetExhausted`). Only a call that
+                    // was ITSELF generation-bound (`sent_generation_bound`)
+                    // draws from it; a reasoning-bound continuation of the
+                    // same turn (a thinking model that later starts writing
+                    // its answer) never does.
+                    if sent_generation_bound {
+                        generation_continuations_this_turn =
+                            generation_continuations_this_turn.saturating_add(1);
+                        if generation_continuations_this_turn > max_generation_continuations {
+                            eprintln!(
+                                "darkmux-runtime: escalation_triggered — turn {turns} hit the \
+                                 generation check-in ({generation_interval} tokens) \
+                                 {generation_continuations_this_turn} times, exceeding the \
+                                 budget of {max_generation_continuations} continuations \
+                                 (answer_max_tokens {answer_max_tokens} / \
+                                 generation_checkpoint_interval_tokens {generation_interval}). \
+                                 Emitting EscalationTriggered for frontier handoff with \
+                                 everything banked so far ATTACHED. (#2171)"
+                            );
+                            return Ok(LoopOutcome {
+                                final_answer: turn.pending_answer(),
+                                terminal_reason: TerminalReason::EscalationTriggered(
+                                    EscalationReason::GenerationCheckpointBudgetExhausted,
+                                ),
+                                messages,
+                                turns,
+                                total_prompt_tokens,
+                                total_completion_tokens,
+                                compactions,
+                                rest_ms,
+                                rests,
+                                turn_delay_effective_ms: turn_delay_ms,
+                                failed_to_run: failed_to_run.clone(),
+                            });
+                        }
+                    }
                     // Only judge while the thought is still open. After the
                     // close the accumulation is reasoning PLUS the answer being
                     // written, and its ratio stays low forever — judging it
@@ -3220,15 +3413,18 @@ fn run_with_sleeper(
                     // have cycled until context exhaustion. A conclude changes
                     // the DELIMITER, never the turn.
                     resuming_after_checkpoint = true;
-                    // (#2165) A checkpoint only ever fires on the reasoning
-                    // check-in interval — that IS what "checkpoint" means —
-                    // so this names that bound directly rather than reading
-                    // `sent_reasoning_bound`/`per_call_cap` back.
-                    let bound = BoundRef::new(
-                        BoundKind::ReasoningCheckpointInterval,
-                        reasoning_interval as u64,
-                        bounds::bound_sources().reasoning_checkpoint_interval,
-                    );
+                    // (#2165, revised #2171) Pre-#2171 a checkpoint
+                    // continuation only ever fired on the reasoning
+                    // check-in interval — "checkpoint" and "reasoning
+                    // check-in" were the same event. #2171 routes
+                    // GENERATION-bound cuts through this SAME continuation
+                    // machinery (a non-reasoning turn's prose/tool-call
+                    // batch that hits `generation_checkpoint_interval_tokens`
+                    // checkpoints exactly like a reasoning turn does), so a
+                    // checkpoint can now name either bound — `active_bound`
+                    // reads back whichever one THIS iteration's request
+                    // actually carried, same as the salvage site above.
+                    let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
                     trajectory.append_checkpoint(
                         turns,
                         checkpoints_used,
@@ -4115,7 +4311,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -4190,7 +4386,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok even though it paused mid-run");
@@ -4343,7 +4539,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok even though it paused mid-run");
@@ -4393,7 +4589,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect("2-turn scripted dispatch (tool call, then stop) returns Ok");
@@ -4497,7 +4693,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
@@ -4604,7 +4800,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
@@ -4722,7 +4918,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
@@ -4861,7 +5057,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &sleeper,
         )
         .expect("resumed dispatch returns Ok even though it paused before catch-up");
@@ -4980,7 +5176,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
@@ -5013,7 +5209,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
 
@@ -5054,7 +5250,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("single-turn dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -5160,7 +5356,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, Some(40), std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
+            Some(100), None, None, Some(40), Some(u32::MAX), std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("checkpoint-continuation scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -5175,6 +5371,263 @@ mod tests {
         );
         assert_eq!(outcome.rest_ms, 500);
         assert_eq!(outcome.rests, 1);
+    }
+
+    // ---------------------------------------------------------------
+    // (#2171) The GENERATION check-in — bounds every call that does NOT
+    // carry the reasoning bound, not just reasoning ones. Fixes the
+    // Devstral inactivity-timeout kill: pre-#2171 a non-thinking model's
+    // whole answer/tool-call turn carried the raw answer bound
+    // (10000 by default) with no check-in at all.
+    // ---------------------------------------------------------------
+
+    /// (#2171 test a) A non-thinking dispatch's first call — no reasoning
+    /// bound available (`dispatch_has_reasoned` starts false) — must carry
+    /// `max_tokens` at the SMALLER generation interval (4000), not the
+    /// larger answer bound (10000). The mock is KEYED on the request body
+    /// literally containing `"max_tokens":4000`; if the runtime sent
+    /// anything else the request would not match and `run_with_sleeper`
+    /// would return an `Err` (httpmock 404s an unmatched request), so
+    /// `.expect(..)` succeeding IS the assertion.
+    #[test]
+    #[serial_test::serial]
+    fn generation_bound_caps_the_request_below_the_answer_bound() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"max_tokens":4000}"#);
+            then.status(200).json_body(chat_response_json(
+                Some("a plain non-reasoning answer, well under the generation cap"),
+                None,
+                "stop",
+                100,
+                3000,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("gen-cap-request").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("say hi")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(3), None, Some(10_000), None, Some(4000),
+            std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect(
+            "the request must carry max_tokens=4000 (the generation interval) — an Err \
+             here means the mock never matched, i.e. some OTHER value was sent (#2171)",
+        );
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+    }
+
+    /// (#2171 test b) A non-thinking response that hits the GENERATION bound
+    /// with a well-formed tool call salvages exactly like #479 (reasoning
+    /// bound salvage already tests this shape) — but must NOT queue the
+    /// "reduce your reasoning" nudge, because the model was never
+    /// reasoning. Mirrors #2166's own turn-1 fix, applied to the new bound.
+    #[test]
+    #[serial_test::serial]
+    fn generation_bound_salvage_sends_no_reasoning_nudge() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("mid-prose reasoning-free narration that ran right up to the cap"),
+                Some(serde_json::json!([{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":50}",
+                    },
+                }])),
+                "length",
+                100,
+                // cap-1: the LIVE-observed LMStudio shape (stops before the
+                // token that would exceed) — see the salvage arm's own
+                // comment on `at_cap`'s tolerance match.
+                3999,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("gen-cap-salvage").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(3), None, Some(10_000), None, Some(4000),
+            std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("generation-bound salvage must drive the loop forward, not Err (#2171)");
+        assert!(outcome.turns >= 1);
+
+        for m in &outcome.messages {
+            if let Some(c) = &m.content {
+                assert!(
+                    !c.contains("Reduce reasoning length"),
+                    "a generation-bound salvage must never queue the reasoning-reduction \
+                     nudge — the model was never reasoning (#2171). Message: {c}"
+                );
+            }
+        }
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+        let salvaged: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("dispatch.per_turn_cap.salvaged"))
+            .collect();
+        assert!(!salvaged.is_empty(), "salvage record must exist — got trajectory:\n{raw}");
+        let bound = &salvaged[0]["bound"];
+        // (merge-gate review item 0) `max_tokens_per_call` was 10000 on this
+        // request; the record must name the SMALLER generation interval
+        // (4000) as the bound that actually fired, not the raw answer bound
+        // — proving `active_bound`'s three-way priority (reasoning >
+        // generation > answer) picked the right one.
+        assert_eq!(
+            bound["kind"], serde_json::json!("generation_checkpoint_interval"),
+            "the salvage record must name generation_checkpoint_interval as the bound, got {bound:?}"
+        );
+        assert_eq!(
+            bound["value"], serde_json::json!(4000),
+            "the bound's value must be the generation interval (4000), not max_tokens_per_call              (10000) — got {bound:?}"
+        );
+    }
+
+    /// (#2171 test c) #2166's own invariant must survive this change: once a
+    /// dispatch has PROVEN it reasons (turn 1 carries a closed `<think>`
+    /// block), turn 2's first call still carries the 1000-token REASONING
+    /// interval — not the 4000-token generation interval — even though the
+    /// generation knob is left at its production default (unset) the whole
+    /// time. Priority is: reasoning bound, then generation bound, then the
+    /// raw answer bound.
+    #[test]
+    #[serial_test::serial]
+    fn reasoning_bound_still_wins_over_the_generation_default() {
+        let server = MockServer::start();
+        let tool_calls = serde_json::json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\":\"/workspace/x.txt\",\"offset\":1,\"limit\":1}" },
+        }]);
+        // Turn 1: closed think block + tool call — proves this dispatch reasons.
+        server.mock(move |when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(
+                Some("<think>brief</think>"),
+                Some(tool_calls.clone()),
+                "tool_calls",
+                100,
+                20,
+            ));
+        });
+        // Turn 2's first call: must carry the REASONING interval (1000), not
+        // the generation default (4000) — keyed via json_body_partial.
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .json_body_partial(r#"{"max_tokens":1000}"#)
+                .matches(|req| {
+                    let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                    b.matches("\"role\":\"tool\"").count() == 1
+                });
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 120, 5));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("reasoning-wins").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("read x.txt")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(3), None, None, None, None,
+            std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect(
+            "turn 2's first call must carry max_tokens=1000 (the reasoning interval) — an \
+             Err here means it carried the generation default instead (#2171 regression)",
+        );
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        assert_eq!(outcome.turns, 2);
+    }
+
+    /// (#2171 test d, floor added on merge-gate review) A turn that keeps
+    /// hitting the GENERATION check-in past its continuation budget must
+    /// escalate with a NAMED reason rather than continuing forever —
+    /// deliberately NOT the same open-ended shape the reasoning check-in
+    /// gets. `max_tokens_per_call=2000`, `generation_checkpoint_interval=
+    /// 1000` → the naive ratio is 2000/1000=2, but the FLOOR
+    /// (`max(4, ratio)`) governs: the budget is 4 continuations, so the
+    /// 5th generation-bound cut is what exhausts it, and exactly 4
+    /// `dispatch.checkpoint` records must exist before the escalation —
+    /// proving the floor overrides the ratio rather than merely happening
+    /// not to matter here.
+    #[test]
+    #[serial_test::serial]
+    fn generation_checkpoint_budget_exhausts_at_the_floor_not_the_naive_ratio() {
+        let server = MockServer::start();
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                Some("prose that never converges and keeps re-hitting the cap"),
+                None,
+                "length",
+                100,
+                999,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("gen-budget-exhaust").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("write forever")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, Some(2000), None, Some(1000),
+            std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+        )
+        .expect("budget exhaustion is a clean EscalationTriggered outcome, not an Err (#2171)");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::GenerationCheckpointBudgetExhausted),
+            "exceeding the generation-continuation budget must name the reason, not loop \
+             forever or fall through to MaxTurns"
+        );
+        assert_eq!(
+            outcome.turns, 1,
+            "every hit is a continuation of the SAME logical turn — turns must not move"
+        );
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_file).expect("trajectory written");
+        let checkpoint_count = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["type"] == "dispatch.checkpoint")
+            .count();
+        assert_eq!(
+            checkpoint_count, 4,
+            "the floor (max(4, 2000/1000)=4), not the naive ratio (2), must govern — \
+             exactly 4 successful continuations before the 5th exhausts the budget"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -8574,7 +9027,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-primary", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("bail should produce Ok with EscalationTriggered, not Err");
@@ -8773,14 +9226,31 @@ mod tests {
             verdicts.iter().any(|v| v == "conclude"),
             "the gate must eventually SEE the repetition — verdicts were {verdicts:?}"
         );
-        // (#2165 CONSIDER item 5) A checkpoint only ever fires on the
-        // reasoning check-in interval — pin that every checkpoint record
-        // carries `bound.kind == "reasoning_checkpoint_interval"`, not just
-        // the salvage records.
+        // (#2165 CONSIDER item 5, corrected by the #2171 rebase) The
+        // original assertion here claimed "a checkpoint only ever fires on
+        // the reasoning check-in interval" and pinned every checkpoint
+        // record's `bound.kind` to `reasoning_checkpoint_interval`
+        // unconditionally. That was already inaccurate on #2165 alone: this
+        // very fixture proves it — the "this model has produced no
+        // reasoning region" line above confirms `dispatch_has_reasoned`
+        // never flips true, so `carries_reasoning_bound` is false for every
+        // call in this test, and the checkpoint-continuation machinery is
+        // reached via the ANSWER bound (`max_tokens_per_call=1000`), not the
+        // reasoning interval — #2165's own checkpoint-record site hardcoded
+        // `BoundKind::ReasoningCheckpointInterval` regardless, so the
+        // MISLABEL passed silently until this rebase replaced that hardcode
+        // with `active_bound(sent_reasoning_bound, sent_generation_bound,
+        // per_call_cap)`, which reads back whichever bound the request
+        // actually carried. The corrected assertion below is what this
+        // fixture was always actually exercising.
         for cp in &checkpoints {
             assert_eq!(
-                cp["bound"]["kind"], serde_json::json!("reasoning_checkpoint_interval"),
-                "every checkpoint record must name the reasoning check-in interval, got {cp:?}"
+                cp["bound"]["kind"], serde_json::json!("max_tokens_per_call"),
+                "every checkpoint record in this reasoning-free fixture must name the answer                  bound (max_tokens_per_call) it was actually governed by, got {cp:?}"
+            );
+            assert_eq!(
+                cp["bound"]["value"], serde_json::json!(1000),
+                "the answer bound this test set via max_tokens_per_call, got {cp:?}"
             );
         }
         // Exactly what main.rs does to produce the deliverable.

@@ -290,7 +290,9 @@
     #[test]
     fn embedded_preamble_carries_bounded_dispatch_prompt_engineering() {
         let preamble = AUTONOMOUS_DISPATCH_PREAMBLE;
-        // Four-bound enumeration — by concept, not value.
+        // Five-bound enumeration — by concept, not value. (#2171 added the
+        // per-call generation check-in as its own bound, alongside the
+        // pre-existing per-turn token cap.)
         assert!(
             preamble.contains("Turn cap"),
             "preamble must name the turn cap"
@@ -298,6 +300,10 @@
         assert!(
             preamble.contains("Per-turn token cap"),
             "preamble must name the per-turn cap"
+        );
+        assert!(
+            preamble.contains("Per-call generation check-in"),
+            "preamble must name the generation check-in (#2171)"
         );
         assert!(
             preamble.contains("Cumulative completion-token cap"),
@@ -316,6 +322,10 @@
         assert!(
             preamble.contains("escalation_intra_turn_stall_exhausted"),
             "preamble must name the intra-turn-stall escalation"
+        );
+        assert!(
+            preamble.contains("escalation_generation_checkpoint_budget_exhausted"),
+            "preamble must name the generation-checkpoint-budget escalation (#2171)"
         );
         assert!(
             preamble.contains("escalation_cumulative_tokens_exceeded"),

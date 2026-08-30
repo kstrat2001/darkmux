@@ -254,6 +254,13 @@ pub struct RuntimeBehaviorConfig {
     /// models, so benches raise it explicitly per run.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_tokens_per_call: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub reasoning_checkpoint_interval_tokens: Option<u32>,
+    /// (#2171) The GENERATION check-in — bounds every call that does NOT
+    /// carry the reasoning bound above, not just reasoning ones. Absent =
+    /// the runtime's built-in default (4000). See `loop_runner::
+    /// GENERATION_CHECKPOINT_INTERVAL`'s doc for the incident this fixes
+    /// (a non-thinking model's single 10000-token call outlasting the
+    /// inactivity watchdog).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub generation_checkpoint_interval_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub strict_selection: Option<bool>,
     // (#1311) Verbosity for the diagnostic surfaces. `"info"` (default) emits
     // the informative dispatch-liveness phase markers; `"debug"` additionally
@@ -812,7 +819,9 @@ impl DarkmuxConfig {
     /// - `dirs` — defaults are derived from the root (`<root>/flows`); there is
     ///   no fixed literal to write without freezing the derivation. The
     ///   discovery surface is `darkmux doctor` (resolved path, overridable).
-    /// - caps (`max_turns`/`max_tokens`/`max_tokens_per_call`), `default_role`,
+    /// - caps (`max_turns`/`max_tokens`/`max_tokens_per_call`/
+    ///   `reasoning_checkpoint_interval_tokens`/
+    ///   `generation_checkpoint_interval_tokens`), `default_role`,
     ///   `daemon_cors_origins` — absent is a real behavior (uncapped / the
     ///   runtime's built-in per-call default), not a value to default.
     ///
@@ -848,6 +857,7 @@ impl DarkmuxConfig {
                 max_tokens: None,
                 max_tokens_per_call: None,
                 reasoning_checkpoint_interval_tokens: None,
+                generation_checkpoint_interval_tokens: None,
                 strict_selection: Some(false),
                 log_level: Some("info".to_string()),
                 // (#1548) Now wired end-to-end (config_access accessor +
