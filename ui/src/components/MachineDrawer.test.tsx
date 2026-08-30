@@ -959,6 +959,80 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     expect(screen.getByText(/4400 MHz/)).toBeInTheDocument();
   });
 
+  /** (operator finding — "GPU memory is wrapping") A host with no IOReport
+   * GPU perf-state (`gpu_mhz: null`, common on this hardware) leaves the
+   * GPU-extra line with exactly ONE item (memory). `InlineOrCells`' mobile
+   * cell-grid mode stacks a label above its value regardless of item
+   * count, which read as three floating lines ("GPU" / "MEMORY" /
+   * "23.8 MB") on a phone — indistinguishable from real section headers.
+   * The fix bypasses `InlineOrCells` for a single item; this fixture is
+   * the exact case that was broken, on BOTH surfaces. */
+  const SINGLE_GPU_ITEM_LOAD = {
+    ...FULL_LOAD,
+    load: {
+      ...FULL_LOAD.load,
+      now: { ...FULL_LOAD.load.now, gpu_mhz: null, gpu_mem_bytes: 23_800_000 },
+    },
+  };
+
+  it("a single GPU-extra item (no MHz reading) renders as one inline line, not a stacked label/value (desktop dialog)", async () => {
+    stubFetch(SINGLE_GPU_ITEM_LOAD);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    openDesktop();
+    await waitFor(() =>
+      expect(
+        document.querySelector(".machine-drawer__gpu-extra")?.textContent,
+      ).toBe("GPU 23.8 MB"),
+    );
+    expect(
+      document.querySelector('.machine-drawer__gpu-extra [data-act="inline-or-cells"]'),
+    ).toBeNull();
+  });
+
+  it("a single GPU-extra item (no MHz reading) renders as one inline line on mobile too — the exact case that used to wrap into 3 lines", async () => {
+    stubFetch(SINGLE_GPU_ITEM_LOAD);
+    render(
+      <MachineDrawer
+        route={{ kind: "fleet" }}
+        routeRecords={[]}
+        flowWindow={[]}
+        localUid={null}
+        liveMachines={new Map()}
+        specs={null}
+        liveStatus="live"
+        nowMsOverride={NOW}
+        isMobileOverride={true}
+        {...EMPTY_EVENTLOG}
+      />,
+    );
+    fireEvent.click(
+      document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
+    );
+    await waitFor(() =>
+      expect(
+        document.querySelector(".machine-drawer__gpu-extra")?.textContent,
+      ).toBe("GPU 23.8 MB"),
+    );
+    // The bug: on mobile, a single item still went through `InlineOrCells`'
+    // cell-grid, producing a "MEMORY" cell label styled like a section
+    // header sitting above its value. No cell-grid at all for one item now.
+    expect(
+      document.querySelector('.machine-drawer__gpu-extra [data-act="inline-or-cells"]'),
+    ).toBeNull();
+  });
+
   it("hides every new row when every new field is null — no layout the operator has to scroll past", async () => {
     const fetchMock = stubFetch(NULL_LOAD);
     render(

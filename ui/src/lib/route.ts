@@ -265,15 +265,26 @@ export function isLiveRoute(route: Route): boolean {
  * shown (the fleet-like default) rather than inventing a hide rule with no
  * source to verify it against.
  *
- * `mission` (#1868) is a NEW exclusion this packet adds, with no legacy
+ * `mission` (#1868) WAS a NEW exclusion this packet added, with no legacy
  * analog to verify against (legacy's `#mission=<id>` was always a full
- * navigation away, past render — see `route.ts`'s own `mission` doc). Once
- * `MissionGraphLens` renders in-place, it owns its OWN events pane (fed by
- * `EventLogColumn` — same component, second call site — mission-scoped
- * records rather than the fleet window), so the App-level column must not
- * ALSO render alongside it; that would be two event logs on one page,
- * disagreeing about scope. */
-export function showsEventLog(route: Route): boolean {
+ * navigation away, past render — see `route.ts`'s own `mission` doc), for
+ * as long as `MissionGraphLens` rendered its OWN second `EventLogColumn`
+ * instance in-place, fed mission-scoped records — showing the App-level
+ * column too would have put two event logs on one page, disagreeing about
+ * scope.
+ *
+ * RETIRED (operator finding, post-#2107/#2108): once every OTHER route got
+ * the events column as "a collapsible mainstay on all tabs," `mission`
+ * being the one holdout with its own separate, collapsed-by-default events
+ * chrome stopped being a deliberate design choice and became the one route
+ * where the mainstay column — including the phone drawer's Events tab,
+ * which has no route-specific escape hatch the way desktop's inline
+ * `MissionGraphLens` panel did — silently rendered BLANK. `MissionGraphLens`
+ * now reports its already-correctly-scoped events UPWARD (its `onEvents`
+ * prop) instead of rendering them itself, so there is exactly ONE
+ * `EventLogColumn` display surface for every route, mission included, same
+ * as everywhere else. */
+export function showsEventLog(_route: Route): boolean {
   // (#1066) `runs`/`console`/`machine` no longer hide it. Those three were
   // parity with `viewer.html`'s `runs-mode`/`machine-mode` — measured, and
   // correct while that viewer still served users. It was DELETED in #1865,
@@ -282,13 +293,12 @@ export function showsEventLog(route: Route): boolean {
   // mainstay on all tabs." A pane the operator can collapse is strictly more
   // capable than one the route hides for them.
   //
-  // `mission` STAYS excluded, and this is not the same kind of rule.
-  // `MissionGraphLens` mounts its OWN instance of `EventLogColumn`, fed
-  // mission-scoped records; showing the App-level column too would put two
-  // event logs on one page disagreeing about scope (#1868). That is
-  // structural, not parity — it would still hold if legacy had never
-  // existed.
-  return route.kind !== "mission";
+  // `mission` no longer needs the #1868 exclusion — see this function's own
+  // doc above. Every route shows the mainstay column now; a route-specific
+  // `Route` argument stays in the signature (every call site passes one,
+  // and a future genuinely-structural exclusion would need it again) even
+  // though today's answer no longer depends on it.
+  return true;
 }
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;

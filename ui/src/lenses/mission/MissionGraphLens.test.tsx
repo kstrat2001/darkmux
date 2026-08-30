@@ -12,14 +12,21 @@ import type { FlowRecord } from "../../types/handwritten";
  *  tail's `flowTail` slot, owned by `useLiveTail` (mounted internally, no
  *  SSE test seam on this component) — the same way `useLiveTail` itself
  *  would via `queryClient.setQueryData`. See the `.mproc` readout tests. */
-function renderLens(missionId = "m1") {
+function renderLens(missionId = "m1", onEvents?: (events: FlowRecord[], srvTruncated: boolean) => void) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const result = render(
     <QueryClientProvider client={queryClient}>
-      <MissionGraphLens missionId={missionId} />
+      <MissionGraphLens missionId={missionId} onEvents={onEvents} />
     </QueryClientProvider>,
   );
   return { ...result, queryClient };
+}
+
+/** The last `onEvents(events, srvTruncated)` call — the lens fires it on
+ * every fold change (see that prop's own doc), so tests that only care
+ * about the SETTLED value read the most recent one rather than the first. */
+function lastEventsCall(spy: ReturnType<typeof vi.fn>): [FlowRecord[], boolean] | undefined {
+  return spy.mock.calls.at(-1) as [FlowRecord[], boolean] | undefined;
 }
 
 /** Seeds the live-tail cache slot `useLiveTail` writes into — the SAME
@@ -133,24 +140,39 @@ describe("MissionGraphLens", () => {
     expect(document.querySelector(".phasegroup")).toBeNull();
   });
 
-  it("the events toggle shows/hides the mission-scoped EventLogColumn", async () => {
-    mockFetch();
-    renderLens();
+  it("reports its scoped events upward via onEvents instead of rendering its own EventLogColumn (mainstay unification)", async () => {
+    // (post-#2107/#2108) The lens's own "events" toggle button and inline
+    // EventLogColumn are retired — see `MissionGraphLens.tsx`'s own doc.
+    // This asserts the replacement contract: no events chrome of its own,
+    // and the scoped fold reaches the caller via `onEvents`.
+    const onEvents = vi.fn();
+    mockFetch({
+      flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" }],
+    });
+    renderLens("m1", onEvents);
     await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
-    const evbtn = screen.getByTitle("mission events");
-    expect(document.querySelector(".eventlog")?.className).not.toMatch(/eventlog--hidden/);
-    fireEvent.click(evbtn);
-    expect(document.querySelector(".eventlog")?.className).toMatch(/eventlog--hidden/);
+    expect(screen.queryByTitle("mission events")).toBeNull();
+    expect(document.querySelector(".eventlog")).toBeNull();
+    await waitFor(() => expect(lastEventsCall(onEvents)?.[0]).toHaveLength(1));
+    expect(lastEventsCall(onEvents)?.[0][0].action).toBe("mission start");
+    expect(lastEventsCall(onEvents)?.[1]).toBe(false);
   });
 
-  it("renders the mission-scoped events newest-first, regardless of backfill fetch order", async () => {
+  it("reports the mission-scoped events in ASCENDING order via onEvents, regardless of backfill fetch order", async () => {
     // Regression coverage for a real bug caught while writing the parity
-    // harness: `EventLogColumn` (reused as this lens's events pane) expects
-    // ASCENDING input (`.slice(-LOG_CAP).reverse()` internally) — the same
-    // convention every OTHER caller of it already follows. This lens's own
-    // `events` derivation initially sorted descending (matching legacy's
-    // own array shape) and fed that straight in, which made the column
-    // show the OLDEST records instead of the newest.
+    // harness: `EventLogColumn` (this lens's events pane before the
+    // mainstay-unification packet, and still the mainstay column's own
+    // renderer today) expects ASCENDING input (`.slice(-LOG_CAP).reverse()`
+    // internally, which is what turns it back into newest-first for
+    // DISPLAY) — the same convention every OTHER caller of it already
+    // follows. This lens's own `events` derivation initially sorted
+    // descending (matching legacy's own array shape) and fed that straight
+    // in, which made the column show the OLDEST records instead of the
+    // newest. Asserted here on the pre-display array `onEvents` reports
+    // (ascending, oldest first — EventLogColumn's own reversal is what
+    // makes the rendered list newest-first), since this lens no longer
+    // renders the column itself.
+    const onEvents = vi.fn();
     mockFetch({
       flowMissionRecords: [
         { ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" },
@@ -158,10 +180,9 @@ describe("MissionGraphLens", () => {
         { ts: "2026-08-19T00:00:03Z", action: "mission close", handle: "m1", mission_id: "m1" },
       ],
     });
-    renderLens();
-    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(3));
-    const rows = [...document.querySelectorAll(".eventlog__ractivity")].map((el) => el.textContent);
-    expect(rows).toEqual(["mission close", "phase start", "mission start"]);
+    renderLens("m1", onEvents);
+    await waitFor(() => expect(lastEventsCall(onEvents)?.[0]).toHaveLength(3));
+    expect(lastEventsCall(onEvents)?.[0].map((r) => r.action)).toEqual(["mission start", "phase start", "mission close"]);
   });
 
   it("preserves the ORIGINAL backfill order among same-timestamp events, matching legacy's stable descending sort", async () => {
@@ -171,8 +192,13 @@ describe("MissionGraphLens", () => {
     // `.reverse()` is stable in the WRONG direction for tied timestamps
     // (caught live against the parity goldens, see MissionGraphLens.tsx's
     // own `events` doc for the two-reversals-cancel fix). Three records
-    // sharing one ts must render in their ORIGINAL array order, newest
-    // group first — not reversed relative to each other.
+    // sharing one ts must come out of the pre-display (ascending) array
+    // in the REVERSE of their original order — `EventLogColumn`'s own
+    // reversal is what turns that back into "original order, newest group
+    // first" for DISPLAY (the shape the DOM-based version of this test
+    // asserted before the mainstay-unification packet moved the render
+    // site out of this component).
+    const onEvents = vi.fn();
     mockFetch({
       flowMissionRecords: [
         { ts: "2026-08-19T00:00:01Z", action: "phase complete", handle: "investigate", mission_id: "m1" },
@@ -181,10 +207,9 @@ describe("MissionGraphLens", () => {
         { ts: "2026-08-19T00:00:01Z", action: "mission close", handle: "m1", mission_id: "m1" },
       ],
     });
-    renderLens();
-    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(4));
-    const subjects = [...document.querySelectorAll(".eventlog__rec")].map((el) => el.getAttribute("title"));
-    expect(subjects).toEqual(["investigate", "adjudicate", "report", "m1"]);
+    renderLens("m1", onEvents);
+    await waitFor(() => expect(lastEventsCall(onEvents)?.[0]).toHaveLength(4));
+    expect(lastEventsCall(onEvents)?.[0].map((r) => r.handle)).toEqual(["m1", "report", "adjudicate", "investigate"]);
   });
 
   it("never collapses two genuinely different records that happen to share ts+action+handle", async () => {
@@ -197,14 +222,15 @@ describe("MissionGraphLens", () => {
     // dedupes at all. Two sibling seats erroring in the same wall-clock
     // second, sharing a generic `handle`, collapsed into one — silently
     // dropping one seat's real tokens from the header meter.
+    const onEvents = vi.fn();
     mockFetch({
       flowMissionRecords: [
         { ts: "2026-08-19T00:00:01Z", action: "dispatch start", handle: "h", session_id: "step-a", mission_id: "m1", payload: {} },
         { ts: "2026-08-19T00:00:01Z", action: "dispatch start", handle: "h", session_id: "step-b", mission_id: "m1", payload: {} },
       ],
     });
-    renderLens();
-    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(2));
+    renderLens("m1", onEvents);
+    await waitFor(() => expect(lastEventsCall(onEvents)?.[0]).toHaveLength(2));
   });
 
   it("a daemon-less static build with NO published graph fixture shows an honest 'needs a daemon' notice, never attempts a fetch", () => {
@@ -297,34 +323,30 @@ describe("MissionGraphLens", () => {
     });
   });
 
-  it("discloses the SERVER's own truncated cap on the events pane when /flow-mission/:id reports truncated:true (proved failing pre-fix: an earlier port discarded this flag entirely)", async () => {
+  it("reports the SERVER's own truncated cap via onEvents when /flow-mission/:id reports truncated:true (proved failing pre-fix: an earlier port discarded this flag entirely)", async () => {
+    // Whether the mainstay column then shows a "+" for this is that
+    // component's own concern (`EventLogColumn.test.tsx`) — this only
+    // guards that the flag reaches `onEvents` at all, the handoff an
+    // earlier port silently dropped.
+    const onEvents = vi.fn();
     mockFetch({
       flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" }],
       flowMissionTruncated: true,
     });
-    renderLens();
-    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(1));
-    // A single record, well under EventLogColumn's own LOG_CAP (50) — the
-    // "1+" is the SERVER's cap, not the client display cap, and must show
-    // even when the client-side count isn't itself capped.
-    expect(document.querySelector(".eventlog__qcount")?.textContent).toMatch(/1\+ events/);
+    renderLens("m1", onEvents);
+    await waitFor(() => expect(lastEventsCall(onEvents)?.[0]).toHaveLength(1));
+    expect(lastEventsCall(onEvents)?.[1]).toBe(true);
   });
 
-  it("does NOT append the server-truncated '+' when /flow-mission/:id reports truncated:false", async () => {
+  it("does NOT report a server-truncated flag when /flow-mission/:id reports truncated:false", async () => {
+    const onEvents = vi.fn();
     mockFetch({
       flowMissionRecords: [{ ts: "2026-08-19T00:00:01Z", action: "mission start", handle: "m1", mission_id: "m1" }],
       flowMissionTruncated: false,
     });
-    renderLens();
-    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec").length).toBe(1));
-    expect(document.querySelector(".eventlog__qcount")?.textContent).toMatch(/^1 events$/);
-  });
-
-  it("the events pane header never claims a rolling 24h window — these are mission-scoped records, not the live window (#1868)", async () => {
-    mockFetch();
-    renderLens();
-    await waitFor(() => expect(document.querySelector(".eventlog__head h3")).not.toBeNull());
-    expect(document.querySelector(".eventlog__head h3")?.textContent).not.toMatch(/last \d+h/i);
+    renderLens("m1", onEvents);
+    await waitFor(() => expect(lastEventsCall(onEvents)?.[0]).toHaveLength(1));
+    expect(lastEventsCall(onEvents)?.[1]).toBe(false);
   });
 
   it("(#1483) shows the host-activity readout once a telemetry.process sample lands on the live tail", async () => {
