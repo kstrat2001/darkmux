@@ -1,11 +1,31 @@
 /**
- * The mission-graph lens (#1868) — folds `crates/darkmux-serve/assets/
- * mission-graph.html` (the standalone `/mission/:id/graph` page) into the
- * React port as `#mission=<id>`. Reads `graph.ts`/`timeline.ts` for the pure
- * logic; `MissionCanvas.tsx`/`MissionTimelineView.tsx` for the two body
- * renderers; `EventLogColumn` (shared with every other lens) for the events
- * pane — see this module's own data-source doc below for why there is still
- * only ONE event-log implementation and ONE SSE consumer in this app.
+ * The mission-graph lens (#1868, events display unified into the mainstay
+ * column — see the operator finding below) — folds `crates/darkmux-serve/
+ * assets/mission-graph.html` (the standalone `/mission/:id/graph` page)
+ * into the React port as `#mission=<id>`. Reads `graph.ts`/`timeline.ts` for
+ * the pure logic; `MissionCanvas.tsx`/`MissionTimelineView.tsx` for the two
+ * body renderers. This lens owns the mission-events DATA pipeline (see this
+ * module's own data-source doc below for why there is still only ONE SSE
+ * consumer in this app) but no longer renders its own `EventLogColumn` —
+ * it reports the scoped, deduped list via the `onEvents` prop instead, and
+ * `App.tsx` feeds it into the SAME shared/mainstay column every other route
+ * already uses.
+ *
+ * (operator finding, post-#2107/#2108) The `evOpen`/"events" toggle button
+ * and this lens's own inline `EventLogColumn` mount are RETIRED. They
+ * predate the tabbed-drawer packet that made the events column "a
+ * collapsible mainstay on all tabs" (`lib/route.ts`'s own `showsEventLog`
+ * doc) everywhere else — mission was the one route still carrying its own
+ * separate, collapsed-by-default events chrome, which regressed into a
+ * real bug once the mainstay column existed everywhere else too: the phone
+ * drawer's universal Events tab showed a nonzero record count (fed
+ * unscoped, route-generic records) but rendered BLANK for a mission route,
+ * because `showsEventLog` deliberately excluded `mission` to avoid two
+ * DIFFERENT-scope event logs disagreeing on one page (#1868's original
+ * concern) — leaving mobile with neither surface actually working. Lifting
+ * this lens's own already-correctly-scoped `events` upward instead of
+ * displaying them here resolves both at once: one display surface again,
+ * this time fed the right data everywhere.
  *
  * Data sources, and why each is a REUSED cache slot rather than a new fetch
  * pipeline:
@@ -53,7 +73,6 @@ import { queryKeys, RECONCILE_BACKSTOP_MS } from "../../lib/queryKeys";
 import { getSource } from "../../lib/source";
 import { useLiveTail } from "../../hooks/useLiveTail";
 import { asRecordArray, bodyTruncated, todayUTC } from "../../lib/flow";
-import { EventLogColumn } from "../../components/EventLogColumn";
 import { MissionCanvas } from "./MissionCanvas";
 import { MissionTimelineView } from "./MissionTimelineView";
 import {
@@ -255,7 +274,26 @@ function MeterEl({ tot }: { tot: ReturnType<typeof missionTotals> }) {
   );
 }
 
-export function MissionGraphLens({ missionId }: { missionId: string }) {
+export function MissionGraphLens({
+  missionId,
+  onEvents,
+}: {
+  missionId: string;
+  /** (#2107/#2108 mainstay unification) Reports this mission's own scoped,
+   * deduped, display-ordered event list every time it changes — `App.tsx`
+   * lifts it into the SAME shared/mainstay `EventLogColumn` every other
+   * route already uses (desktop's standalone mount, and the phone drawer's
+   * Events tab), rather than this lens rendering its own separate copy.
+   * `events`/`srvTruncated` stay computed HERE (this component still owns
+   * the mission-events data pipeline — the flow-mission/flow-today/live-tail
+   * fold below is unchanged), only the DISPLAY moved out. Optional so
+   * existing test call sites that don't care about events keep working.
+   * See the removed `evOpen`/`evbtn`/inline `<EventLogColumn>` this
+   * replaces — superseded now that the mainstay column can show a
+   * mission's events on its own, closing the "two event logs disagreeing
+   * about scope" gap #1868 used to require a second, bespoke surface for. */
+  onEvents?: (events: FlowRecord[], srvTruncated: boolean) => void;
+}) {
   const queryClient = useQueryClient();
   const source = getSource();
   const daemonBacked = source.kind === "daemon";
@@ -329,7 +367,6 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
 
   const [viewMode, setViewMode] = useState<"auto" | "canvas" | "timeline">("auto");
   const isMobile = useIsMobile();
-  const [evOpen, setEvOpen] = useState(() => !(typeof window !== "undefined" && isNarrowViewport(window.innerWidth)));
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [minimapOn, setMinimapOn] = useState(() => initMinimap());
   // (#1868) The mobile tap-to-open legend popover — `mission-graph.html`'s
@@ -432,6 +469,13 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
     scoped.sort((a, b) => (b.ts < a.ts ? -1 : b.ts > a.ts ? 1 : 0));
     return scoped.slice().reverse();
   }, [allRecords, idx, missionId]);
+
+  // Report this mission's own scoped events upward every time the fold
+  // produces a new list — see `onEvents`'s own doc on why the DISPLAY moved
+  // to the mainstay column while the data pipeline stays owned here.
+  useEffect(() => {
+    onEvents?.(events, srvTruncated);
+  }, [events, srvTruncated, onEvents]);
 
   const anyRunning = !!(
     graph &&
@@ -563,9 +607,6 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
             map
           </button>
         ) : null}
-        <button type="button" className={`evbtn${evOpen ? " on" : ""}`} title="mission events" onClick={() => setEvOpen(!evOpen)}>
-          events
-        </button>
         {/* (#1868) `.legbtn` — hidden above the ~700px breakpoint (CSS),
             visible only where `.legend` itself is hidden. A real `<button>`
             gets Tab/Enter/Space activation for free, matching every other
@@ -582,25 +623,6 @@ export function MissionGraphLens({ missionId }: { missionId: string }) {
         ) : (
           <MissionCanvas nodes={graph.nodes} edges={graph.edges} metrics={metrics} now={now} note={graph.note} minimapOn={minimapOn} />
         )}
-        <EventLogColumn
-          paneId="mission"
-          scopeLabel={graph.mission_id}
-          records={events}
-          visible={evOpen}
-          loading={false}
-          error={null}
-          // (#1868) `events` is this mission's own scoped fold across TWO
-          // backfill sources (`/flow-mission/:id` spanning every day the
-          // mission touched, `/flow/<today>` for step records the scheduler
-          // never stamps `mission_id` on) plus the live tail — never the
-          // rolling 24h live window `EventLogColumn`'s header otherwise
-          // claims. A mission that ran three days ago and is still
-          // finalizing today would have its header say "last 24h" over
-          // records selected by MISSION, not by TIME — the exact overclaim
-          // `historical` exists to prevent (see that prop's own doc).
-          historical
-          serverTruncated={srvTruncated}
-        />
       </div>
     </div>
   );
