@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.14",
+  "schema_version": "1.15",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -25,7 +25,16 @@
     "injected_context_fraction": 0.15,
     "acp_idle_exit_minutes": 30,
     "turn_delay_ms": 0,
-    "host_sampler_interval_ms": 5000
+    "host_sampler_interval_ms": 5000,
+    "thermal": {
+      "enabled": true,
+      "pause_at": "serious",
+      "resume_at": "fair",
+      "resume_hold_ms": 60000,
+      "max_pause_ms": 900000,
+      "min_cpu_speed_limit_pct": 50,
+      "speed_limit_hold_samples": 3
+    }
   },
   "fleet": {
     "mode": "standalone"
