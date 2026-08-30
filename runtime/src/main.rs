@@ -237,7 +237,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // (`loop_runner::MAX_TOKENS_PER_CALL` = 10000).
     let mut max_tokens_per_call: Option<u32> = None;
     let mut reasoning_checkpoint_interval: Option<u32> = None;
-    // (#2165) Provenance for the two knobs above — which of
+    // (#2171) Host derives from `DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL`.
+    // None = the built-in default (`loop_runner::GENERATION_CHECKPOINT_INTERVAL`
+    // = 4000).
+    let mut generation_checkpoint_interval: Option<u32> = None;
+    // (#2165) Provenance for the three knobs above — which of
     // `env(DARKMUX_RUNTIME_*)` / `config.json` / built-in resolved the
     // value the host just forwarded. The host computes this via
     // `darkmux_types::config_access`'s `_with_source` accessors (this crate
@@ -246,6 +250,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // falls to "built-in" via `BoundSource::from_cli_str`.
     let mut max_tokens_per_call_source: Option<String> = None;
     let mut reasoning_checkpoint_interval_source: Option<String> = None;
+    // (#2171 rebase onto #2165) Same companion-source pattern, for the
+    // generation check-in.
+    let mut generation_checkpoint_interval_source: Option<String> = None;
 
     // (#457 Step 2) Per-role feedback-template overrides. Dispatcher
     // serializes Role.feedback_templates to JSON; runtime parses into
@@ -533,6 +540,34 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     std::process::exit(2);
                 }
             }
+            "--generation-checkpoint-interval" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) if n > 0 => {
+                            generation_checkpoint_interval = Some(n);
+                            i += 2;
+                        }
+                        _ => {
+                            eprintln!(
+                                "--generation-checkpoint-interval requires a positive integer (got: {v})"
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--generation-checkpoint-interval requires a value");
+                    std::process::exit(2);
+                }
+            }
+            "--generation-checkpoint-interval-source" => {
+                if let Some(v) = args.get(i + 1) {
+                    generation_checkpoint_interval_source = Some(v.clone());
+                    i += 2;
+                } else {
+                    eprintln!("--generation-checkpoint-interval-source requires a value");
+                    std::process::exit(2);
+                }
+            }
             "--max-tokens-per-call" => {
                 if let Some(v) = args.get(i + 1) {
                     match v.parse::<u32>() {
@@ -810,6 +845,11 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         max_tokens_per_call: bounds::BoundSource::from_cli_str(
             max_tokens_per_call_source.as_deref().unwrap_or(""),
         ),
+        // (#2171 rebase onto #2165) Same companion-source pattern, for the
+        // generation check-in.
+        generation_checkpoint_interval: bounds::BoundSource::from_cli_str(
+            generation_checkpoint_interval_source.as_deref().unwrap_or(""),
+        ),
     });
     let run_result = loop_runner::run_resumable(
         &client,
@@ -824,6 +864,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         max_tokens,
         max_tokens_per_call,
         reasoning_checkpoint_interval,
+        generation_checkpoint_interval,
         feedback_templates,
         response_format,
         // (#2114 finding 3) pace.json / checkpoint.json live in the
@@ -867,6 +908,9 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             loop_runner::TerminalReason::EscalationTriggered(
                 loop_runner::EscalationReason::IntraTurnStallExhausted,
             ) => "escalation_intra_turn_stall_exhausted",
+            loop_runner::TerminalReason::EscalationTriggered(
+                loop_runner::EscalationReason::GenerationCheckpointBudgetExhausted,
+            ) => "escalation_generation_checkpoint_budget_exhausted",
         },
         None => "error",
     };

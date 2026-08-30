@@ -164,6 +164,7 @@ pub fn run() -> DoctorReport {
         check_turn_delay(),
         check_reasoning_checkpoint_interval(),
         check_host_sampler_interval(),
+        check_generation_checkpoint_interval(),
         check_thermal_governor(),
         check_host_probe(),
         checks_power::check_power_posture(),
@@ -1880,6 +1881,153 @@ fn check_host_sampler_interval() -> Check {
         message: format!(
             "{ms}ms ({provenance}) — darkmux serve's daemon-side host sampler cadence for the \
              machine stats drawer"
+        ),
+        hint: None,
+    }
+}
+
+/// (#2171) Surface the resolved `runtime.generation_checkpoint_interval_tokens`
+/// with provenance — the GENERATION check-in that bounds every dispatch call
+/// that does NOT carry the reasoning bound (`reasoning_checkpoint_interval_tokens`),
+/// not just reasoning ones. Fixes the Devstral inactivity-timeout kill: a
+/// non-thinking model's whole answer/tool-call turn used to carry the raw
+/// 10000-token answer bound with no check-in at all once #2164 gated the
+/// reasoning check-in on the dispatch having proven it reasons.
+///
+/// (merge-gate review, item 1) Unlike its siblings, this knob DOES have real
+/// too-high/too-low hazards, cross-checked against two OTHER resolved
+/// settings:
+///
+/// 1. `0` is not a "disabled" value — the runtime CLI rejects it outright
+///    (`--generation-checkpoint-interval` requires `n > 0`, `std::process::
+///    exit(2)`) — so setting it silently breaks EVERY dispatch rather than
+///    opting out of anything. The real off-switch is setting the interval
+///    at or above `max_tokens_per_call` (case 2), which the cap-selection
+///    logic already treats as "not actually the binding cap."
+/// 2. At or above `max_tokens_per_call` (the answer bound) means the
+///    generation check-in can never be the tighter cap — it's silently
+///    disabled, and the ORIGINAL failure this PR fixes (a non-thinking
+///    model's call outlasting the inactivity budget) is back.
+/// 3. A generation interval large enough that a single call could plausibly
+///    run silently (no streamed chunks — the LMStudio buffering shape
+///    that caused the #2171 incident) longer than the inactivity budget.
+///    `interval_tokens / 10 tok/s` is a CONSERVATIVE (slow) generation-rate
+///    floor — the #2171 incident measured Devstral at ~10-20 tok/s on an
+///    M1 Max, and a dense 70B on the same hardware runs slower still — so
+///    this warns before an operator's own hardware/model choice reproduces
+///    the incident even with the fix merged.
+fn check_generation_checkpoint_interval() -> Check {
+    let name = "runtime.generation_checkpoint_interval_tokens";
+    let env_raw = std::env::var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let env_parses = env_raw.as_deref().is_some_and(|s| s.trim().parse::<u32>().is_ok());
+    let cfg_set = darkmux_types::config::DarkmuxConfig::load_resolved()
+        .runtime
+        .and_then(|r| r.generation_checkpoint_interval_tokens)
+        .is_some();
+    let provenance = if env_parses {
+        "from DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL env"
+    } else if cfg_set {
+        "from config.json"
+    } else {
+        "default"
+    };
+    // (#2171) No runtime built-in constant is reachable from this crate (it
+    // lives in the separate, non-workspace `runtime/` crate) — 4000 is
+    // mirrored from `runtime::loop_runner::GENERATION_CHECKPOINT_INTERVAL`.
+    // Keep the two in sync by hand if that constant ever changes. 10000
+    // mirrors `runtime::loop_runner::MAX_TOKENS_PER_CALL` the same way —
+    // `max_tokens_per_call()` resolves `None` = that same built-in.
+    const RUNTIME_BUILTIN_DEFAULT: u32 = 4000;
+    const ANSWER_BOUND_BUILTIN_DEFAULT: u32 = 10_000;
+    // (merge-gate review, item 1) The conservative tokens/sec floor this
+    // knob is cross-checked against — see the fn doc's point 3.
+    const CONSERVATIVE_TOKENS_PER_SECOND: f64 = 10.0;
+    let tokens = darkmux_types::config_access::generation_checkpoint_interval_tokens()
+        .unwrap_or(RUNTIME_BUILTIN_DEFAULT);
+    if let Some(raw) = env_raw.as_deref() {
+        if !env_parses {
+            return Check {
+                name: name.into(),
+                status: Status::Warn,
+                message: format!(
+                    "DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL=`{raw}` is not a positive \
+                     integer; using {tokens} ({provenance})"
+                ),
+                hint: Some(
+                    "Set DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL to a positive integer \
+                     token count (e.g. `4000`), or unset it to fall through to config.json / \
+                     the default."
+                        .into(),
+                ),
+            };
+        }
+    }
+    if tokens == 0 {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "{tokens} ({provenance}) is not a valid interval — the runtime CLI rejects a \
+                 zero generation-checkpoint interval outright, so every dispatch that reaches \
+                 this value exits with code 2 before doing any work"
+            ),
+            hint: Some(
+                "0 is not an off-switch. To disable the generation check-in (fall back to the \
+                 raw answer bound), set `runtime.generation_checkpoint_interval_tokens` to a \
+                 value at or above `runtime.max_tokens_per_call` instead — e.g. match \
+                 `max_tokens_per_call` exactly."
+                    .into(),
+            ),
+        };
+    }
+    let answer_bound = darkmux_types::config_access::max_tokens_per_call()
+        .unwrap_or(ANSWER_BOUND_BUILTIN_DEFAULT);
+    if tokens >= answer_bound {
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "{tokens} tokens ({provenance}) is at or above `max_tokens_per_call` \
+                 ({answer_bound}) — the generation check-in can never be the tighter cap, so it \
+                 is silently disabled and every non-reasoning call reverts to carrying the raw \
+                 answer bound with no check-in, the exact shape the #2171 incident fixed"
+            ),
+            hint: Some(
+                "Lower `runtime.generation_checkpoint_interval_tokens` below \
+                 `runtime.max_tokens_per_call`, or raise `max_tokens_per_call` if the larger \
+                 answer budget is intentional and disabling the check-in is a deliberate choice."
+                    .into(),
+            ),
+        };
+    }
+    let inactivity_timeout_seconds = darkmux_types::config_access::inactivity_timeout_seconds();
+    let seconds_to_generate = tokens as f64 / CONSERVATIVE_TOKENS_PER_SECOND;
+    if seconds_to_generate >= inactivity_timeout_seconds as f64 {
+        let approx_seconds = seconds_to_generate.round() as u64;
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "{tokens} tokens ({provenance}) at a conservative {CONSERVATIVE_TOKENS_PER_SECOND:.0} \
+                 tok/s could take ~{approx_seconds}s to generate — at or above the \
+                 {inactivity_timeout_seconds}s inactivity budget (`runtime.\
+                 inactivity_timeout_seconds`)"
+            ),
+            hint: Some(format!(
+                "a single call may generate silently for ~{approx_seconds}s against an \
+                 {inactivity_timeout_seconds}s inactivity budget; lower the interval or raise \
+                 runtime.inactivity_timeout_seconds"
+            )),
+        };
+    }
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "{tokens} tokens ({provenance}) — the generation check-in bounding every dispatch \
+             call that doesn't carry the reasoning check-in"
         ),
         hint: None,
     }
@@ -5933,6 +6081,193 @@ mod tests {
         }
     }
 
+    // ─── (#2171 test e) check_generation_checkpoint_interval — resolved state ─
+
+    #[serial_test::serial]
+    #[test]
+    fn check_generation_checkpoint_interval_default_is_pass_and_names_4000() {
+        let prev = std::env::var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL").ok();
+        let prev_max = std::env::var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL").ok();
+        let prev_timeout = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL");
+            // (merge-gate review, item 1) Determinism: this test asserts
+            // Pass, which now also depends on the answer-bound + inactivity
+            // cross-checks — pin both to their built-in defaults so a
+            // machine with a custom config.json can't flip this Warn.
+            std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL");
+            std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        }
+        let check = check_generation_checkpoint_interval();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("4000"), "{}", check.message);
+        assert!(check.message.contains("default"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL"),
+            }
+            match prev_max {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL"),
+            }
+            match prev_timeout {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_generation_checkpoint_interval_env_override_names_provenance() {
+        let prev = std::env::var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL").ok();
+        let prev_max = std::env::var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL").ok();
+        let prev_timeout = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", "2500");
+            std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL");
+            std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        }
+        let check = check_generation_checkpoint_interval();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("2500"), "{}", check.message);
+        assert!(check.message.contains("env"), "provenance named: {}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL"),
+            }
+            match prev_max {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL"),
+            }
+            match prev_timeout {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
+    /// (merge-gate review, item 1) `0` is not an off-switch — the runtime
+    /// CLI rejects it and every dispatch that reaches it exits with code 2.
+    #[serial_test::serial]
+    #[test]
+    fn check_generation_checkpoint_interval_zero_warns_and_names_the_real_off_switch() {
+        let prev_gen = std::env::var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL").ok();
+        let prev_max = std::env::var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL").ok();
+        let prev_timeout = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe {
+            std::env::set_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", "0");
+            std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL");
+            std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        }
+        let check = check_generation_checkpoint_interval();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("exits with code 2") || check.message.contains("rejects"),
+            "must explain WHY 0 is dangerous, not just flag it: {}",
+            check.message
+        );
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("at or above") && hint.contains("max_tokens_per_call"),
+            "must name the REAL off-switch (>= max_tokens_per_call), not imply 0 works: {hint}"
+        );
+        unsafe {
+            match prev_gen {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL"),
+            }
+            match prev_max {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL"),
+            }
+            match prev_timeout {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
+    /// (merge-gate review, item 1) At or above `max_tokens_per_call`, the
+    /// generation check-in can never be the tighter cap — silently
+    /// disabled, reproducing the #2171 incident even with the fix merged.
+    #[serial_test::serial]
+    #[test]
+    fn check_generation_checkpoint_interval_at_or_above_max_tokens_per_call_warns_disabled() {
+        let prev_gen = std::env::var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL").ok();
+        let prev_max = std::env::var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL").ok();
+        let prev_timeout = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe {
+            // Equal, the boundary case (>=) — must still warn, not just >.
+            std::env::set_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", "5000");
+            std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "5000");
+            std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        }
+        let check = check_generation_checkpoint_interval();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("silently disabled"),
+            "must name the failure mode: {}",
+            check.message
+        );
+        unsafe {
+            match prev_gen {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL"),
+            }
+            match prev_max {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL"),
+            }
+            match prev_timeout {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
+    /// (merge-gate review, item 1) A generation interval that could plausibly
+    /// take longer than the inactivity budget to generate, at a conservative
+    /// 10 tok/s floor, must warn — this is the actual #2171 incident
+    /// reproduced with a slower model even after the fix ships.
+    #[serial_test::serial]
+    #[test]
+    fn check_generation_checkpoint_interval_close_to_inactivity_timeout_warns() {
+        let prev_gen = std::env::var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL").ok();
+        let prev_max = std::env::var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL").ok();
+        let prev_timeout = std::env::var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS").ok();
+        unsafe {
+            // 6000 tokens / 10 tok/s = 600s, >= a 300s inactivity budget.
+            std::env::set_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", "6000");
+            std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL"); // built-in 10000, well above 6000
+            std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "300");
+        }
+        let check = check_generation_checkpoint_interval();
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("300"), "{}", check.message);
+        let hint = check.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("inactivity budget") && hint.contains("runtime.inactivity_timeout_seconds"),
+            "hint must name both the danger AND the two knobs the operator can turn: {hint}"
+        );
+        unsafe {
+            match prev_gen {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL"),
+            }
+            match prev_max {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL"),
+            }
+            match prev_timeout {
+                Some(v) => std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", v),
+                None => std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS"),
+            }
+        }
+    }
+
     /// Mirrors `check_turn_delay_unparseable_env_warns_and_names_the_raw_value`
     /// — a set-but-garbage env var must not be silently reported as "from
     /// ... env" while the resolved value actually came from a lower tier.
@@ -6942,6 +7277,7 @@ mod tests {
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
         // turn-delay [#2094] + reasoning-checkpoint-interval [#2165] +
         // host-sampler-interval [#2107, #1833] +
+        // generation-checkpoint-interval [#2171] +
         // thermal-governor [#2110/#2109] +
         // mission-envelope-readability [#1881] + hooks [#2093] +
         // rules [#1959] + host-probe [#2107] + power-posture [#2112,
@@ -6949,7 +7285,7 @@ mod tests {
         // per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 47 + darkmux_eureka::all_rules().len();
+        let expected = 48 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

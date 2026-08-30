@@ -424,6 +424,24 @@ pub fn reasoning_checkpoint_interval_tokens_with_source() -> (Option<u32>, Sourc
     pick_parsed_with_source("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", cfg, None)
 }
 
+/// (#2171) The GENERATION check-in — bounds every call that does NOT carry
+/// the reasoning bound above, not just reasoning ones. `None` = the
+/// runtime's built-in `GENERATION_CHECKPOINT_INTERVAL` (4000).
+pub fn generation_checkpoint_interval_tokens() -> Option<u32> {
+    generation_checkpoint_interval_tokens_with_source().0
+}
+/// (#2171 rebase onto #2165) `generation_checkpoint_interval_tokens` plus
+/// WHICH tier resolved it — same `_with_source` pattern
+/// `reasoning_checkpoint_interval_tokens_with_source` uses, now that #2167
+/// (the sibling PR this rebases onto) has landed and the helper exists.
+pub fn generation_checkpoint_interval_tokens_with_source() -> (Option<u32>, Source) {
+    let cfg = config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.generation_checkpoint_interval_tokens);
+    pick_parsed_with_source("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", cfg, None)
+}
+
 // ── Remote (hosted-endpoint) dispatch (#1260/#1177) ──
 /// The per-EXECUTION remote token allowance — an execution is one pipeline
 /// stage (the review pipeline's probe pass, each judge pass, the verify pass; a bare
@@ -1268,6 +1286,27 @@ mod tests {
         );
         unsafe { std::env::set_var(k, "4000"); }
         assert_eq!(max_tokens_per_call_with_source(), (Some(4000), Source::Env));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn generation_checkpoint_interval_tokens_with_source_env_overrides_then_built_in() {
+        let k = "DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(
+            generation_checkpoint_interval_tokens_with_source(),
+            (None, Source::BuiltIn),
+            "unset everywhere → None, tagged built-in (the runtime's own literal default, 4000)"
+        );
+        unsafe { std::env::set_var(k, "2500"); }
+        assert_eq!(generation_checkpoint_interval_tokens_with_source(), (Some(2500), Source::Env));
         unsafe {
             match prev {
                 Some(v) => std::env::set_var(k, v),

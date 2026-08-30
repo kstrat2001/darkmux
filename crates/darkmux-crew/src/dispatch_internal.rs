@@ -410,6 +410,7 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
     warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_TURNS");
     warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_TOKENS");
     warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL");
+    warn_if_unparseable_u32("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL");
     if let Some(n) = darkmux_types::config_access::max_turns() {
         cmd.arg("--max-turns").arg(n.to_string());
     }
@@ -438,6 +439,19 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
     if let Some(n) = reasoning_checkpoint_interval {
         cmd.arg("--reasoning-checkpoint-interval").arg(n.to_string());
         cmd.arg("--reasoning-checkpoint-interval-source").arg(reasoning_checkpoint_interval_source.as_str());
+    }
+    // (#2171) The GENERATION check-in — bounds every call that does NOT
+    // carry the reasoning bound above, not just reasoning ones. Fixes the
+    // Devstral inactivity-timeout kill: pre-#2171 a non-thinking model's
+    // whole dispatch carried the 10000-token answer bound with no check-in
+    // at all once #2164 gated the reasoning check-in on `dispatch_has_reasoned`.
+    // (#2171 rebase onto #2165) Same companion-source pattern as its two
+    // siblings above.
+    let (generation_checkpoint_interval, generation_checkpoint_interval_source) =
+        darkmux_types::config_access::generation_checkpoint_interval_tokens_with_source();
+    if let Some(n) = generation_checkpoint_interval {
+        cmd.arg("--generation-checkpoint-interval").arg(n.to_string());
+        cmd.arg("--generation-checkpoint-interval-source").arg(generation_checkpoint_interval_source.as_str());
     }
 }
 
