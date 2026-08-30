@@ -365,6 +365,14 @@ pub fn launch(
         return crate::crawl_launch::launch(input_file, params, timeout_seconds);
     }
 
+    // (#2112) Power-posture pre-flight (warns on battery/Low Power Mode,
+    // refuses on serious/critical thermal unless `--force`) + a held
+    // `PreventUserIdleSystemSleep` assertion for this launch's lifetime,
+    // released automatically on every exit path via `Drop`. See
+    // `src/preflight.rs` and `crates/darkmux-crew/src/sleep_assertion.rs`.
+    crate::preflight::check_power_posture(params)?;
+    let _sleep_assertion = darkmux_crew::sleep_assertion::SleepAssertion::hold(&format!("darkmux mission {config_id}"));
+
     let loaded = mission_config::load(config_id).with_context(|| {
         format!(
             "loading mission config \"{config_id}\" — note: a user-tier copy \

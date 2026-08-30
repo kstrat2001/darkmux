@@ -103,6 +103,14 @@ const FINDING_FILE_KEY: &str = "file";
 /// directly (with no `"dry_run"` key at all) keeps its implicit "not a
 /// dry run" behavior unchanged.
 pub fn launch(input_file: Option<&Path>, params: &[String], timeout_seconds: Option<u32>) -> Result<i32> {
+    // (#2112) Power-posture pre-flight + a held sleep assertion for this
+    // crawl's lifetime — `mission_launch::launch` returns to
+    // `crawl_launch::launch` BEFORE its own copy of this check (see the
+    // `config_id == "crawl"` branch there), so crawl needs its own call
+    // rather than inheriting the generic path's. See `src/preflight.rs`.
+    crate::preflight::check_power_posture(params)?;
+    let _sleep_assertion = darkmux_crew::sleep_assertion::SleepAssertion::hold("darkmux mission crawl");
+
     let collected = mission_launch::collect_inputs(input_file, params)?;
     run(&collected, timeout_seconds, &mut |opts| crew::dispatch::dispatch(opts))
 }

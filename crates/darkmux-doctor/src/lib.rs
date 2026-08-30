@@ -16,6 +16,10 @@
 //! Checks are intentionally scoped to what darkmux can verify natively.
 
 use anyhow::Result;
+// (#2112) Battery / Low Power Mode / thermal-state / thermal-emergency
+// doctor check — see the module doc for why it shares `power_posture`'s
+// probe with the mission pre-flight rather than re-reading `pmset` itself.
+mod checks_power;
 use darkmux_eureka as eureka;
 use darkmux_hardware as hardware;
 use darkmux_heuristics as heuristics;
@@ -160,6 +164,7 @@ pub fn run() -> DoctorReport {
         check_turn_delay(),
         check_host_sampler_interval(),
         check_host_probe(),
+        checks_power::check_power_posture(),
         check_remote_endpoint_credentials(),
         check_env_masks_config(),
         check_binary_split_brain(),
@@ -6707,10 +6712,12 @@ mod tests {
         // [#1819] + review-judge-exhaustion-policy [#1876/#1877] +
         // turn-delay [#2094] + host-sampler-interval [#2107, #1833] +
         // mission-envelope-readability [#1881] + hooks [#2093] +
-        // rules [#1959] + host-probe [#2107]) + one per active eureka rule.
+        // rules [#1959] + host-probe [#2107] + power-posture [#2112,
+        // battery/Low-Power-Mode/thermal-state/thermal-emergency]) + one
+        // per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 44 + darkmux_eureka::all_rules().len();
+        let expected = 45 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 
