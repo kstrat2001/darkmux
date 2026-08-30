@@ -217,19 +217,38 @@ pub fn read_checkpoint(path: &Path) -> anyhow::Result<RunCheckpoint> {
     Ok(checkpoint)
 }
 
-/// (Security audit, #2114 resume follow-up) Refuse a loaded checkpoint
-/// whose CONTENT could have been shaped by a prompt-injected model rather
-/// than genuinely produced by THIS run's own history — `/darkmux-out`
-/// stays read-write even when `/workspace` is `:ro` (crawl-kind
-/// dispatches), so a role with any file-write tool reaching that mount
-/// could, in principle, forge or edit `checkpoint.json` outright, and even
-/// without that, the model's OWN legitimately-recorded tool calls are
-/// exactly what a resume blindly re-executes. `read_checkpoint` above only
-/// validates the SHAPE (parses, schema version matches); this validates
-/// SAFETY, against context this run actually has, not the file's own
-/// claims. Called from `main.rs` once `tools`/`initial_messages` are
-/// resolved — `read_checkpoint` alone stays callable standalone (tests,
-/// the "missing/corrupt" early-fail path) without needing that context.
+/// **What this closes, and what it does NOT (security audit, #2114 resume
+/// follow-up — read this before trusting a resume):** this refuses a
+/// CROSS-ROLE or CROSS-PROMPT resume — a checkpoint written under a
+/// different role, or a different system prompt than the one THIS run was
+/// launched with. It does **NOT** defend against a SAME-ROLE forgery: a
+/// resume replays `pending_tool_calls` verbatim (the NAME is checked
+/// against this run's own tool allowlist below, but the ARGUMENTS are
+/// never validated), and every prior assistant/tool message not in
+/// `pending_tool_calls` is restored from the file with zero validation at
+/// all. `/darkmux-out` stays read-write even when `/workspace` is `:ro`
+/// (crawl-kind dispatches), so a prompt-injected model can still shape —
+/// or, with a file-write tool reaching that mount, outright forge — a
+/// same-role checkpoint's tool arguments or its non-pending history, and a
+/// later `--resume-from` under the SAME role replays it unchanged.
+/// Checkpoint integrity (making the file itself untamperable by the model
+/// it's checkpointing) is a follow-up: the real fix is uid separation
+/// between the runtime process and the tool-executing processes inside
+/// the container, so a tool call can never write the runtime's own
+/// checkpoint file. Until that lands, `--resume-from` is an
+/// operator-explicit action on a same-role run the operator trusts, not a
+/// boundary against a compromised one — see `--resume-from`'s own CLI
+/// help (host side, `src/cli.rs`).
+///
+/// `read_checkpoint` above only validates the SHAPE (parses, schema
+/// version matches); this validates the cross-role/cross-prompt SAFETY
+/// this function actually can, against context this run has, never the
+/// file's own claims. Called from `main.rs` once `tools`/`initial_messages`
+/// are resolved — `read_checkpoint` alone stays callable standalone
+/// (tests, the "missing/corrupt" early-fail path) without needing that
+/// context. The host closes a THIRD leg (workspace mount-mode/path) that
+/// this runtime-side function has no visibility into at all — see
+/// `dispatch_internal::stage_resume_checkpoint`'s own doc.
 ///
 /// Two independent checks, BOTH must hold — never "fixes up" a failing
 /// checkpoint, only refuses outright:
@@ -239,15 +258,18 @@ pub fn read_checkpoint(path: &Path) -> anyhow::Result<RunCheckpoint> {
 ///    tool-allowlist, never the checkpoint's). Catches a checkpoint naming
 ///    a tool call this run never granted — most acutely a checkpoint
 ///    written under a MORE permissive role/tool set and resumed under a
-///    less permissive one.
+///    less permissive one. Does NOT validate the call's ARGUMENTS — see
+///    this fn's own top-level doc.
 /// 2. The checkpoint's own system message (`messages[0]`, `role ==
 ///    "system"`) must be BYTE-IDENTICAL to `fresh_system_message` — the
 ///    system prompt THIS run was launched with. Compaction never rewrites
 ///    index 0 (`compaction::PRESERVE_HEAD >= 1` keeps it in place across
 ///    every compaction generation), so this holds on every LEGITIMATE
-///    resume of the SAME role. Catches both a role swap (different role →
-///    different system prompt) and an outright forged/edited system
-///    message.
+///    resume of the SAME role. A mismatch is often BENIGN (the role's
+///    `.md` prompt was edited, `~/.darkmux/identity.md` changed, or this
+///    darkmux build differs from the one that wrote the checkpoint — see
+///    the refusal message below, which names both readings rather than
+///    asserting forgery).
 pub fn validate_for_resume(
     checkpoint: &RunCheckpoint,
     allowed_tool_names: &[&str],
@@ -273,9 +295,13 @@ pub fn validate_for_resume(
         .unwrap_or("");
     if checkpoint_system != fresh_system_message {
         anyhow::bail!(
-            "RESUME CHECKPOINT REFUSED — the checkpoint's system message is not byte-identical \
-             to this run's own system prompt; refusing to resume a checkpoint that may have \
-             been forged, edited, or written under a different role"
+            "RESUME CHECKPOINT REFUSED — the checkpoint's system message does not byte-match \
+             this run's own system prompt. This is often BENIGN: the role's .md prompt \
+             changed, ~/.darkmux/identity.md changed, or this darkmux build differs from the \
+             one that wrote the checkpoint — start the dispatch fresh instead of resuming. It \
+             can also mean the checkpoint was forged, edited, or written under a different \
+             role; if you did not expect the prompt to have changed, treat this checkpoint as \
+             untrusted rather than retrying the resume."
         );
     }
     Ok(())

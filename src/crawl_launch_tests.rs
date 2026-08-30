@@ -1870,16 +1870,26 @@ fn a_unit_with_a_resolvable_sha_dispatches_unchanged() {
 // Pure planning tests — no dispatch, no filesystem beyond a bare
 // `checkpoint_exists` fake. `plan_unit_resume` reads a fixture prior
 // mission's `envelope.json` `units` array (`CrawlStats::per_unit_rows`
-// shape) and decides skip / resume / fresh per unit.
+// shape) and decides skip / resume / fresh per unit. Every fixture row
+// below carries a `source`/`rule` matching what's passed in — the
+// MUST-FIX-3 shifted-id tests further down are the ones that deliberately
+// DON'T match.
+
+const FIXED_SOURCE: &str = "repo-a";
+fn fixed_rules() -> Vec<String> {
+    vec!["swallowed-error".to_string()]
+}
 
 #[test]
 fn plan_unit_resume_skips_a_unit_that_completed_last_time() {
     let prior_rows = vec![json!({
         "unit": "u-0001",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
         "result": "stop",
         "out_dir": "/tmp/darkmux-out-crawler-111",
     })];
-    let action = plan_unit_resume("u-0001", &prior_rows, |_| true);
+    let action = plan_unit_resume("u-0001", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| true);
     assert_eq!(action, UnitResumeAction::Skip);
 }
 
@@ -1887,10 +1897,12 @@ fn plan_unit_resume_skips_a_unit_that_completed_last_time() {
 fn plan_unit_resume_resumes_a_unit_that_aborted_with_a_checkpoint() {
     let prior_rows = vec![json!({
         "unit": "u-0002",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
         "result": "timeout",
         "out_dir": "/tmp/darkmux-out-crawler-222",
     })];
-    let action = plan_unit_resume("u-0002", &prior_rows, |dir| {
+    let action = plan_unit_resume("u-0002", FIXED_SOURCE, &fixed_rules(), &prior_rows, |dir| {
         dir == Path::new("/tmp/darkmux-out-crawler-222")
     });
     assert_eq!(action, UnitResumeAction::Resume(PathBuf::from("/tmp/darkmux-out-crawler-222")));
@@ -1900,11 +1912,13 @@ fn plan_unit_resume_resumes_a_unit_that_aborted_with_a_checkpoint() {
 fn plan_unit_resume_reruns_fresh_when_out_dir_recorded_but_no_checkpoint() {
     let prior_rows = vec![json!({
         "unit": "u-0003",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
         "result": "error",
         "out_dir": "/tmp/darkmux-out-crawler-333",
     })];
     // checkpoint_exists always false — killed before the first turn boundary.
-    let action = plan_unit_resume("u-0003", &prior_rows, |_| false);
+    let action = plan_unit_resume("u-0003", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| false);
     assert_eq!(action, UnitResumeAction::Fresh);
 }
 
@@ -1914,10 +1928,12 @@ fn plan_unit_resume_reruns_fresh_when_unit_has_no_row_at_all() {
     // ever ran for this unit — no row, so nothing to look up.
     let prior_rows = vec![json!({
         "unit": "some-other-unit",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
         "result": "stop",
         "out_dir": "/tmp/darkmux-out-crawler-999",
     })];
-    let action = plan_unit_resume("u-0004", &prior_rows, |_| true);
+    let action = plan_unit_resume("u-0004", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| true);
     assert_eq!(action, UnitResumeAction::Fresh);
 }
 
@@ -1927,10 +1943,12 @@ fn plan_unit_resume_reruns_fresh_when_out_dir_is_absent_from_the_row() {
     // (the dispatch itself errored before returning a DispatchResult).
     let prior_rows = vec![json!({
         "unit": "u-0005",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
         "result": "error",
         "out_dir": null,
     })];
-    let action = plan_unit_resume("u-0005", &prior_rows, |_| true);
+    let action = plan_unit_resume("u-0005", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| true);
     assert_eq!(action, UnitResumeAction::Fresh);
 }
 
@@ -1941,19 +1959,206 @@ fn plan_unit_resume_reruns_fresh_when_out_dir_is_absent_from_the_row() {
 #[test]
 fn plan_unit_resume_full_fixture_skip_resume_fresh() {
     let prior_rows = vec![
-        json!({ "unit": "completed-1", "result": "stop", "out_dir": "/tmp/out-completed-1" }),
-        json!({ "unit": "aborted-with-checkpoint", "result": "timeout", "out_dir": "/tmp/out-aborted-ckpt" }),
-        json!({ "unit": "aborted-without-checkpoint", "result": "error", "out_dir": "/tmp/out-aborted-nockpt" }),
+        json!({ "unit": "completed-1", "source": FIXED_SOURCE, "rule": fixed_rules(), "result": "stop", "out_dir": "/tmp/out-completed-1" }),
+        json!({ "unit": "aborted-with-checkpoint", "source": FIXED_SOURCE, "rule": fixed_rules(), "result": "timeout", "out_dir": "/tmp/out-aborted-ckpt" }),
+        json!({ "unit": "aborted-without-checkpoint", "source": FIXED_SOURCE, "rule": fixed_rules(), "result": "error", "out_dir": "/tmp/out-aborted-nockpt" }),
     ];
     let checkpoint_exists = |dir: &Path| dir == Path::new("/tmp/out-aborted-ckpt");
 
-    assert_eq!(plan_unit_resume("completed-1", &prior_rows, checkpoint_exists), UnitResumeAction::Skip);
     assert_eq!(
-        plan_unit_resume("aborted-with-checkpoint", &prior_rows, checkpoint_exists),
+        plan_unit_resume("completed-1", FIXED_SOURCE, &fixed_rules(), &prior_rows, checkpoint_exists),
+        UnitResumeAction::Skip
+    );
+    assert_eq!(
+        plan_unit_resume("aborted-with-checkpoint", FIXED_SOURCE, &fixed_rules(), &prior_rows, checkpoint_exists),
         UnitResumeAction::Resume(PathBuf::from("/tmp/out-aborted-ckpt"))
     );
     assert_eq!(
-        plan_unit_resume("aborted-without-checkpoint", &prior_rows, checkpoint_exists),
+        plan_unit_resume("aborted-without-checkpoint", FIXED_SOURCE, &fixed_rules(), &prior_rows, checkpoint_exists),
         UnitResumeAction::Fresh
+    );
+}
+
+// ── MUST FIX 3-i (merge-gate review): the positional id is not a safe
+//    join key across a re-plan — a NEW unit at an OLD unit's id must
+//    never inherit that old row's verdict.
+
+#[test]
+fn plan_unit_resume_a_shifted_id_with_a_different_source_never_skips_even_if_the_old_row_completed() {
+    // The OLD u-0007 (a different source) completed cleanly last time.
+    // The NEW plan's u-0007 is a DIFFERENT unit (different source) that
+    // happens to land at the same positional id after a re-plan. Matching
+    // on id alone would read this as "already done" and silently skip a
+    // unit that was never actually crawled — a coverage loss reported as
+    // complete.
+    let prior_rows = vec![json!({
+        "unit": "u-0007",
+        "source": "old-repo",
+        "rule": fixed_rules(),
+        "result": "stop",
+        "out_dir": "/tmp/out-old-u7",
+    })];
+    let action = plan_unit_resume("u-0007", "new-repo", &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(
+        action,
+        UnitResumeAction::Fresh,
+        "a shifted unit id with a different source must never read as Skip"
+    );
+}
+
+#[test]
+fn plan_unit_resume_a_shifted_id_with_a_different_source_never_resumes_the_old_checkpoint() {
+    // Same shift, but the OLD unit aborted with a checkpoint. Resuming it
+    // under the NEW unit's identity would label the OLD unit's findings
+    // with the NEW unit's source/rule — mislabeled data, not just a
+    // coverage gap.
+    let prior_rows = vec![json!({
+        "unit": "u-0009",
+        "source": "old-repo",
+        "rule": fixed_rules(),
+        "result": "timeout",
+        "out_dir": "/tmp/out-old-u9",
+    })];
+    let action = plan_unit_resume("u-0009", "new-repo", &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(
+        action,
+        UnitResumeAction::Fresh,
+        "a shifted unit id with a different source must never resume the old unit's checkpoint"
+    );
+}
+
+#[test]
+fn plan_unit_resume_a_shifted_id_with_a_different_rule_set_is_also_fresh() {
+    // Same source, but the rule BINDING shifted (e.g. --param rules=
+    // changed) — the row's own recorded rule set no longer matches what
+    // this plan bound this unit to.
+    let prior_rows = vec![json!({
+        "unit": "u-0011",
+        "source": FIXED_SOURCE,
+        "rule": vec!["some-other-rule".to_string()],
+        "result": "stop",
+        "out_dir": "/tmp/out-u11",
+    })];
+    let action = plan_unit_resume("u-0011", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+#[test]
+fn plan_unit_resume_rule_set_order_does_not_matter() {
+    // The row's `rule` array and this plan's `unit_rules` binding the
+    // SAME set in a different order must still match — order is an
+    // accident of JSON serialization, not a semantic difference.
+    let prior_rows = vec![json!({
+        "unit": "u-0012",
+        "source": FIXED_SOURCE,
+        "rule": vec!["rule-b".to_string(), "rule-a".to_string()],
+        "result": "stop",
+        "out_dir": "/tmp/out-u12",
+    })];
+    let action = plan_unit_resume(
+        "u-0012",
+        FIXED_SOURCE,
+        &["rule-a".to_string(), "rule-b".to_string()],
+        &prior_rows,
+        |_| true,
+    );
+    assert_eq!(action, UnitResumeAction::Skip);
+}
+
+// ── #2152 interaction (rebase, "confirm sha_unresolved rows plan as Fresh") ─
+
+#[test]
+fn plan_unit_resume_a_sha_unresolved_row_with_no_out_dir_plans_as_fresh() {
+    // #2152 added `sha_unresolved` as a per-unit result label for a unit
+    // whose source sha never resolved — that unit's dispatch never ran,
+    // so its row (if #2152's own accounting even wrote one) has no
+    // out_dir. Same bucket as any other never-dispatched unit: Fresh.
+    let prior_rows = vec![json!({
+        "unit": "u-0013",
+        "source": FIXED_SOURCE,
+        "rule": fixed_rules(),
+        "result": "sha_unresolved",
+        "out_dir": null,
+    })];
+    let action = plan_unit_resume("u-0013", FIXED_SOURCE, &fixed_rules(), &prior_rows, |_| true);
+    assert_eq!(action, UnitResumeAction::Fresh);
+}
+
+// ── MUST FIX 3-ii (merge-gate review): the whole-launch inputs fingerprint
+//    gate — refuse `--param resume=<id>` outright when this launch's own
+//    inputs (minus `resume` itself) don't bit-for-bit match the prior
+//    mission's recorded `spec.inputs_fingerprint`.
+
+#[test]
+#[serial_test::serial]
+fn resume_refuses_the_whole_launch_when_inputs_have_drifted() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    scripts.insert("u-0002".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts.clone(), &calls, |_| {});
+
+    let code = run(&params_for(&fx), None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    let mission_id = mission_id_from_records(&read_all_flow_records());
+
+    // Same workspace, but a DIFFERENT `limit` this time — a genuine input
+    // drift crawl's own re-plan/re-fetch makes meaningful (it can shift
+    // which unit lands at which positional id).
+    let mut drifted = params_for(&fx);
+    drifted.insert("limit".to_string(), Value::String("1".to_string()));
+    drifted.insert("resume".to_string(), Value::String(mission_id.clone()));
+
+    let mut dispatch2 = make_dispatch_fn(scripts, &calls, |_| {});
+    let err = run(&drifted, None, &mut dispatch2).unwrap_err();
+    assert!(
+        format!("{err:#}").contains(&mission_id),
+        "error should name the mission id being resumed: {err:#}"
+    );
+    assert!(
+        format!("{err:#}").to_lowercase().contains("fingerprint")
+            || format!("{err:#}").to_lowercase().contains("inputs"),
+        "expected an inputs/fingerprint-drift error, got: {err:#}"
+    );
+
+    // No SECOND mission was minted — the refusal happens before any Step
+    // (or even Mission) gets written.
+    let records = read_all_flow_records();
+    let mission_starts: Vec<&Value> = records.iter().filter(|r| r["action"] == "mission start").collect();
+    assert_eq!(mission_starts.len(), 1, "a refused resume must mint nothing: {records:#?}");
+}
+
+#[test]
+#[serial_test::serial]
+fn resume_with_unchanged_inputs_passes_the_fingerprint_gate() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    scripts.insert("u-0002".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts.clone(), &calls, |_| {});
+
+    let code = run(&params_for(&fx), None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    let mission_id = mission_id_from_records(&read_all_flow_records());
+
+    // Byte-identical params to the first launch, plus `resume=` naming it.
+    let mut same = params_for(&fx);
+    same.insert("resume".to_string(), Value::String(mission_id.clone()));
+
+    let mut dispatch2 = make_dispatch_fn(scripts, &calls, |_| {});
+    let code2 = run(&same, None, &mut dispatch2)
+        .expect("unchanged inputs must pass the fingerprint gate, not error");
+    assert_eq!(code2, 0);
+    // Both prior units completed "stop" last time — a MATCHING source/rule
+    // per-unit row for each, so both are skipped and 0 fresh dispatches
+    // happen on the resumed run.
+    assert_eq!(
+        calls.borrow().len(),
+        2,
+        "expected exactly the 2 calls from the FIRST run only, none new from the resume"
     );
 }

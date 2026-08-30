@@ -1885,13 +1885,36 @@
         .to_string()
     }
 
+    /// Default fixture workspace path/mode used by every test below that
+    /// isn't specifically exercising the workspace-mismatch/escalation
+    /// gate — both the "origin" file and the resuming dispatch's own
+    /// expected values default to this SAME path/mode, so they match by
+    /// construction and the workspace gate is a no-op for those tests.
+    const FIXTURE_WORKSPACE: &str = "/tmp/darkmux-test-ws";
+
+    /// (Security audit, #2114 resume follow-up) Writes the
+    /// `RESUME_ORIGIN_FILENAME` provenance file `write_resume_origin_meta`
+    /// writes in production, so tests exercising the happy path (or the
+    /// workspace gate specifically) don't have to hand-roll the JSON.
+    fn write_origin(dir: &std::path::Path, workspace: &str, read_only: bool) {
+        write_resume_origin_meta(dir, std::path::Path::new(workspace), read_only);
+    }
+
     #[test]
     fn stage_resume_checkpoint_copies_a_valid_checkpoint_into_the_new_out_dir() {
         let prior = TempDir::new().unwrap();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), sample_checkpoint_json()).unwrap();
+        write_origin(prior.path(), FIXTURE_WORKSPACE, false);
         let new_out = TempDir::new().unwrap();
 
-        stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap();
+        stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false,
+        )
+        .unwrap();
 
         let staged = std::fs::read_to_string(new_out.path().join(CHECKPOINT_FILENAME)).unwrap();
         assert_eq!(staged, sample_checkpoint_json(), "staged checkpoint must be a byte-identical copy");
@@ -1904,7 +1927,14 @@
         let prior = TempDir::new().unwrap(); // no checkpoint.json written
         let new_out = TempDir::new().unwrap();
 
-        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap_err();
+        let err = stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("RESUME CHECKPOINT NOT FOUND"),
             "expected a named RESUME CHECKPOINT NOT FOUND error, got: {err:#}"
@@ -1921,7 +1951,14 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), "not json at all {{{").unwrap();
         let new_out = TempDir::new().unwrap();
 
-        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap_err();
+        let err = stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("RESUME CHECKPOINT INVALID"),
             "expected a named RESUME CHECKPOINT INVALID error, got: {err:#}"
@@ -1937,7 +1974,14 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), r#"{"hello": "world"}"#).unwrap();
         let new_out = TempDir::new().unwrap();
 
-        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap_err();
+        let err = stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("RESUME CHECKPOINT INVALID"),
             "expected a named RESUME CHECKPOINT INVALID error, got: {err:#}"
@@ -1963,7 +2007,14 @@
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), "").unwrap();
         let new_out = TempDir::new().unwrap();
 
-        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap_err();
+        let err = stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("RESUME CHECKPOINT INVALID"));
         assert!(!new_out.path().join(CHECKPOINT_FILENAME).exists());
     }
@@ -1978,9 +2029,17 @@
             sample_checkpoint_json_for_role("role-a"),
         )
         .unwrap();
+        write_origin(prior.path(), FIXTURE_WORKSPACE, false);
         let new_out = TempDir::new().unwrap();
 
-        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "role-b").unwrap_err();
+        let err = stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "role-b",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("RESUME CHECKPOINT ROLE MISMATCH"),
             "expected a named RESUME CHECKPOINT ROLE MISMATCH error, got: {err:#}"
@@ -2013,11 +2072,62 @@
         })
         .to_string();
         std::fs::write(prior.path().join(CHECKPOINT_FILENAME), body).unwrap();
+        write_origin(prior.path(), FIXTURE_WORKSPACE, false);
         let new_out = TempDir::new().unwrap();
 
-        let err = stage_resume_checkpoint(prior.path(), new_out.path(), "coder").unwrap_err();
+        let err = stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("RESUME CHECKPOINT ROLE MISMATCH"));
         assert!(!new_out.path().join(CHECKPOINT_FILENAME).exists());
+    }
+
+    #[test]
+    fn stage_resume_checkpoint_refuses_a_stale_pre_v3_checkpoint() {
+        // (CONSIDER 6, security audit) A v2 checkpoint has no `role_id` at
+        // all — must read as STALE SCHEMA, never as a role mismatch
+        // (`role_id: "<missing>"` would misreport an honest version gap).
+        let prior = TempDir::new().unwrap();
+        let body = serde_json::json!({
+            "schema_version": 2,
+            "messages": [],
+            "turns": 0,
+            "total_prompt_tokens": 0,
+            "total_completion_tokens": 0,
+            "compactions": 0,
+            "rest_ms": 0,
+            "rests": 0,
+            "pending_hand_back": null,
+            "pending_tool_calls": null,
+            "pending_tool_calls_seq_base": 0,
+            "written_at_unix_ms": 0,
+        })
+        .to_string();
+        std::fs::write(prior.path().join(CHECKPOINT_FILENAME), body).unwrap();
+        write_origin(prior.path(), FIXTURE_WORKSPACE, false);
+        let new_out = TempDir::new().unwrap();
+
+        let err = stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RESUME CHECKPOINT STALE SCHEMA"),
+            "expected a named STALE SCHEMA error, got: {err:#}"
+        );
+        assert!(
+            !format!("{err:#}").contains("ROLE MISMATCH"),
+            "a version gap must never read as a role mismatch: {err:#}"
+        );
     }
 
     #[test]
@@ -2028,10 +2138,126 @@
             sample_checkpoint_json_for_role("coder"),
         )
         .unwrap();
+        write_origin(prior.path(), FIXTURE_WORKSPACE, false);
         let new_out = TempDir::new().unwrap();
 
-        stage_resume_checkpoint(prior.path(), new_out.path(), "coder")
-            .expect("same-role resume must succeed");
+        stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false,
+        )
+        .expect("same-role resume must succeed");
+        assert!(new_out.path().join(CHECKPOINT_FILENAME).is_file());
+    }
+
+    // ─── security audit, #2114 resume follow-up: host-side workspace gate ─
+
+    #[test]
+    fn stage_resume_checkpoint_refuses_with_no_origin_record_at_all() {
+        // A checkpoint dir from BEFORE this fix (write_resume_origin_meta
+        // didn't exist yet) has no resume_origin.json — refuse, never guess.
+        let prior = TempDir::new().unwrap();
+        std::fs::write(
+            prior.path().join(CHECKPOINT_FILENAME),
+            sample_checkpoint_json_for_role("coder"),
+        )
+        .unwrap();
+        // Deliberately no write_origin() call.
+        let new_out = TempDir::new().unwrap();
+
+        let err = stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RESUME ORIGIN UNKNOWN"),
+            "expected a named RESUME ORIGIN UNKNOWN error, got: {err:#}"
+        );
+        assert!(!new_out.path().join(CHECKPOINT_FILENAME).exists());
+    }
+
+    #[test]
+    fn stage_resume_checkpoint_refuses_a_different_workspace_path() {
+        let prior = TempDir::new().unwrap();
+        std::fs::write(
+            prior.path().join(CHECKPOINT_FILENAME),
+            sample_checkpoint_json_for_role("coder"),
+        )
+        .unwrap();
+        write_origin(prior.path(), "/tmp/original-tree", false);
+        let new_out = TempDir::new().unwrap();
+
+        let err = stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new("/tmp/a-different-tree"),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RESUME WORKSPACE MISMATCH"),
+            "expected a named RESUME WORKSPACE MISMATCH error, got: {err:#}"
+        );
+        assert!(!new_out.path().join(CHECKPOINT_FILENAME).exists());
+    }
+
+    #[test]
+    fn stage_resume_checkpoint_refuses_upgrading_a_read_only_origin_to_read_write() {
+        // The escalation the audit named: a crawl-kind unit's workspace was
+        // :ro (the model couldn't write it); resuming read-write would hand
+        // it write access it never had.
+        let prior = TempDir::new().unwrap();
+        std::fs::write(
+            prior.path().join(CHECKPOINT_FILENAME),
+            sample_checkpoint_json_for_role("crawler"),
+        )
+        .unwrap();
+        write_origin(prior.path(), FIXTURE_WORKSPACE, true); // origin was read-only
+        let new_out = TempDir::new().unwrap();
+
+        let err = stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "crawler",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            false, // this dispatch would mount read-write
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RESUME WORKSPACE MOUNT ESCALATION"),
+            "expected a named RESUME WORKSPACE MOUNT ESCALATION error, got: {err:#}"
+        );
+        assert!(!new_out.path().join(CHECKPOINT_FILENAME).exists());
+    }
+
+    #[test]
+    fn stage_resume_checkpoint_allows_downgrading_a_read_write_origin_to_read_only() {
+        // The opposite direction is safe (strictly MORE restrictive than
+        // the original run) and must not be refused.
+        let prior = TempDir::new().unwrap();
+        std::fs::write(
+            prior.path().join(CHECKPOINT_FILENAME),
+            sample_checkpoint_json_for_role("coder"),
+        )
+        .unwrap();
+        write_origin(prior.path(), FIXTURE_WORKSPACE, false); // origin was read-write
+        let new_out = TempDir::new().unwrap();
+
+        stage_resume_checkpoint(
+            prior.path(),
+            new_out.path(),
+            "coder",
+            std::path::Path::new(FIXTURE_WORKSPACE),
+            true, // this dispatch mounts read-only — strictly safer
+        )
+        .expect("downgrading to a stricter mount must be allowed");
         assert!(new_out.path().join(CHECKPOINT_FILENAME).is_file());
     }
 

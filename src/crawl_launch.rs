@@ -894,14 +894,52 @@ pub(crate) enum UnitResumeAction {
 /// matching row (interrupted before `per_unit_rows.push` ever ran for it)
 /// is `Fresh` — there's no recorded `out_dir` to even check for a
 /// checkpoint, so it's indistinguishable from "ran and left none."
+///
+/// (MUST FIX 3-i, merge-gate review) The positional `unit_id` (e.g.
+/// `u-0007`) is NOT by itself a safe join key across a re-plan — crawl
+/// RE-PLANS and RE-FETCHES on every launch (workspace_spec::materialize),
+/// so the source set / tree / rule bindings can shift between the
+/// original launch and a `--param resume=` launch, and a NEW unit can
+/// land at the exact positional id an OLD, unrelated unit held. Matching
+/// on id alone would either silently SKIP a genuinely new unit (the old
+/// row's `result: "stop"` reads as "already done" — coverage loss
+/// reported as complete) or RESUME the old unit's checkpoint under the
+/// new unit's identity (findings mislabeled with the wrong source/rule).
+/// `unit_source`/`unit_rules` are THIS run's plan values for `unit_id`
+/// (`crate::crawl_launch::unit_source`/`unit_rules` at the call site);
+/// the row's own `source`/`rule` fields (rule set order-independent) must
+/// match BOTH before the row is trusted for Skip or Resume at all — any
+/// mismatch degrades to `Fresh`, same as no row at all. The mission-level
+/// `inputs_fingerprint` check at the call site (MUST FIX 3-ii) is the
+/// broader, cheaper guard that refuses the WHOLE launch on ANY input
+/// drift; this per-unit check is the belt for the case a fingerprint
+/// still matched (or `--param plan=` in effect) but this ONE unit's
+/// resolved source/rule still doesn't line up with what the row recorded.
 pub(crate) fn plan_unit_resume(
     unit_id: &str,
+    unit_source: &str,
+    unit_rules: &[String],
     prior_rows: &[Value],
     checkpoint_exists: impl Fn(&Path) -> bool,
 ) -> UnitResumeAction {
     let Some(row) = prior_rows.iter().find(|r| r.get("unit").and_then(Value::as_str) == Some(unit_id)) else {
         return UnitResumeAction::Fresh;
     };
+    let row_source = row.get("source").and_then(Value::as_str);
+    if row_source != Some(unit_source) {
+        return UnitResumeAction::Fresh;
+    }
+    let mut row_rules: Vec<String> = row
+        .get("rule")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    row_rules.sort();
+    let mut expected_rules: Vec<String> = unit_rules.to_vec();
+    expected_rules.sort();
+    if row_rules != expected_rules {
+        return UnitResumeAction::Fresh;
+    }
     if row.get("result").and_then(Value::as_str) == Some("stop") {
         return UnitResumeAction::Skip;
     }
@@ -1190,6 +1228,57 @@ pub(crate) fn run(
     // is consumed per-unit at dispatch time below.
     let mut resume_from_by_unit: BTreeMap<String, PathBuf> = BTreeMap::new();
     if let Some(prior_mission_id) = &resume_param {
+        // (MUST FIX 3-ii, merge-gate review) Refuse the WHOLE resume launch
+        // outright when this launch's inputs (everything the operator
+        // passed via --param, EXCEPT `resume` itself) don't match the
+        // prior mission's own recorded `spec.inputs_fingerprint` bit for
+        // bit. Crawl RE-PLANS and RE-FETCHES on every launch — a
+        // different `workspace`/`rules`/`source`/`rule`/`plan`/`units`/
+        // `limit`/`no_fetch` can shift which positional unit id means
+        // what, and the per-unit source/rule check below only catches
+        // that AT THE UNIT level; this catches it before minting
+        // anything at all, with one clear reason instead of N confusing
+        // per-unit "resumed the wrong thing" surprises.
+        let prior_mission_path = crew::lifecycle::mission_path(prior_mission_id);
+        let prior_mission_json: Value = std::fs::read_to_string(&prior_mission_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .ok_or_else(|| {
+                anyhow!(
+                    "darkmux mission launch crawl: --param resume={prior_mission_id} — could \
+                     not read/parse {} (unknown mission id?); cannot verify this launch's \
+                     inputs match the prior one",
+                    prior_mission_path.display()
+                )
+            })?;
+        let prior_fingerprint = prior_mission_json
+            .get("spec")
+            .and_then(|s| s.get("inputs_fingerprint"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow!(
+                    "darkmux mission launch crawl: --param resume={prior_mission_id} — {} has \
+                     no spec.inputs_fingerprint to compare against",
+                    prior_mission_path.display()
+                )
+            })?
+            .to_string();
+        let mut collected_without_resume = collected.clone();
+        collected_without_resume.remove("resume");
+        let this_fingerprint = mission_launch::spec_fingerprint(&collected_without_resume)?;
+        if this_fingerprint != prior_fingerprint {
+            bail!(
+                "darkmux mission launch crawl: --param resume={prior_mission_id} — this \
+                 launch's inputs (workspace/rules/source/rule/plan/units/limit/no_fetch) do \
+                 NOT match mission {prior_mission_id}'s own recorded inputs (fingerprint \
+                 {this_fingerprint} vs {prior_fingerprint}). A resume must use the EXACT same \
+                 plan inputs as the mission it's resuming — crawl re-plans and re-fetches on \
+                 every launch, so different inputs can shift which unit id means what. Re-run \
+                 with the same --param values as the original launch, or omit --param resume= \
+                 to launch fresh."
+            );
+        }
+
         let prior_envelope_path = crawl_root.join("runs").join(prior_mission_id).join("envelope.json");
         let prior_rows: Vec<Value> = std::fs::read_to_string(&prior_envelope_path)
             .ok()
@@ -1208,7 +1297,13 @@ pub(crate) fn run(
         let mut resume_resumed = 0usize;
         let mut resume_fresh = 0usize;
         selected.retain(|u| {
-            match plan_unit_resume(u.id(), &prior_rows, |dir| dir.join(darkmux_crew::dispatch_internal::CHECKPOINT_FILENAME).is_file()) {
+            match plan_unit_resume(
+                u.id(),
+                unit_source(u),
+                &unit_rules(u),
+                &prior_rows,
+                |dir| dir.join(darkmux_crew::dispatch_internal::CHECKPOINT_FILENAME).is_file(),
+            ) {
                 UnitResumeAction::Skip => {
                     resume_skipped += 1;
                     false

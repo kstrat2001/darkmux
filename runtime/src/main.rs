@@ -712,21 +712,32 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     let full_catalog = [Tool::Search, Tool::Read, Tool::Edit, Tool::Write, Tool::Bash];
     let tools = filter_tools_by_allowed(&full_catalog, allowed_tools.as_deref());
 
-    // (Security audit, #2114 resume follow-up) `/darkmux-out` stays
-    // read-write even when `/workspace` is `:ro` (crawl-kind dispatches),
-    // so a prompt-injected model — via its OWN legitimately-recorded
-    // pending_tool_calls, or an outright forged/edited checkpoint.json if
-    // it has any file-write tool reaching that mount — could shape what a
-    // LATER `--resume-from` blindly replays, possibly under a different
-    // role, image, or a read-write workspace than the one that wrote it.
-    // Refuse the whole resume (never "fix up" the checkpoint) unless BOTH
-    // hold: every pending tool call names a tool THIS run actually
-    // granted, and the checkpoint's own system message is byte-identical
-    // to the system prompt THIS run was launched with (never trust the
-    // file's own claim — compare against the fresh one main.rs just
-    // built, at `initial_messages[0]`, which compaction never rewrites:
-    // `compaction::PRESERVE_HEAD` keeps index 0 untouched across every
-    // compaction generation).
+    // (Security audit, #2114 resume follow-up) Refuses a CROSS-ROLE or
+    // CROSS-PROMPT resume — a checkpoint written under a different role,
+    // or a different system prompt than the one THIS run was launched
+    // with. It does NOT defend against a SAME-ROLE forgery: a resume
+    // replays `pending_tool_calls` verbatim (name checked against this
+    // run's own tool allowlist, arguments never validated), and restores
+    // every prior assistant/tool message from the file with zero
+    // validation at all. `/darkmux-out` stays read-write even when
+    // `/workspace` is `:ro` (crawl-kind dispatches), so a prompt-injected
+    // model can still get a same-role checkpoint's tool arguments — or
+    // its non-pending history — to say whatever it wants, and a later
+    // `--resume-from` under the SAME role replays it. Checkpoint
+    // integrity (making the file itself untamperable by the model it's
+    // checkpointing) is a follow-up: the real fix is uid separation
+    // between the runtime process and the tool-executing processes
+    // inside the container, so a tool call can never write the runtime's
+    // own checkpoint file. See `checkpoint::validate_for_resume`'s own
+    // doc for the full accounting, and `--resume-from`'s CLI help
+    // (`src/cli.rs`, host side) for the operator-facing version of this
+    // warning. The system-message comparison is against the fresh one
+    // main.rs just built, at `initial_messages[0]` (never the file's own
+    // claim) — compaction never rewrites it: `compaction::PRESERVE_HEAD`
+    // keeps index 0 untouched across every compaction generation. A
+    // THIRD leg (workspace mount-mode/path) is closed entirely host-side
+    // — this runtime process has no visibility into it at all; see
+    // `dispatch_internal::stage_resume_checkpoint`'s own doc.
     if let Some(checkpoint) = &resume_from {
         let allowed_tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         let fresh_system_message = initial_messages[0].content.as_deref().unwrap_or("");
