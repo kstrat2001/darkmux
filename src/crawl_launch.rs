@@ -67,7 +67,9 @@
 //! runs to its own completion or its own `--timeout`, never torn down
 //! partway through — there is no mechanism here that could interrupt a
 //! live container mid-dispatch, and this launcher doesn't try to build
-//! one. Same shape for SIGINT.
+//! one. Same shape for SIGINT/SIGTERM/SIGHUP (#2131 added SIGTERM/SIGHUP
+//! alongside the pre-existing SIGINT handling — the flag is still only
+//! ever checked BETWEEN units).
 
 use crate::crew;
 use crate::mission_launch;
@@ -708,62 +710,14 @@ struct FinalizeCtx {
     units_filter: Option<String>,
 }
 
-/// RAII guard mirroring `darkmux-crew`'s `DispatchBookendGuard`: armed for
-/// the duration of the per-unit loop, so an early `?`-return (today, only
-/// `build_message`'s rule lookup — see finding 1a for why that's
-/// unreachable in production, and this module's tests for a panic-
-/// injection proof of the same safety net) or a panic still leaves a
-/// matching `mission close` record, a written envelope, and a
-/// non-`Active` mission behind — never a mission stuck `Active` with the
-/// counts accumulated so far silently lost. `close()` (the normal
-/// end-of-loop path) disarms the guard so `Drop` never double-finalizes.
-struct CrawlFinalizeGuard<'a> {
-    armed: bool,
-    stats: &'a RefCell<CrawlStats>,
-    ctx: FinalizeCtx,
-}
-
-impl<'a> CrawlFinalizeGuard<'a> {
-    fn new(stats: &'a RefCell<CrawlStats>, ctx: FinalizeCtx) -> Self {
-        Self { armed: true, stats, ctx }
-    }
-
-    /// The normal end-of-loop path.
-    fn close(&mut self) -> Result<i32> {
-        self.armed = false;
-        finalize_crawl(self.stats, &self.ctx)
-    }
-}
-
-impl Drop for CrawlFinalizeGuard<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.stats.borrow_mut().stopped_by = "error";
-        // Best-effort, same as every other lifecycle call in this module: a
-        // `Drop` can't propagate a `Result`, and this guard IS the last-
-        // resort finalize — there's nowhere further to report a failure
-        // to. (CONSIDER 4) Not a silent `let _ = ...` though: the table
-        // above already reached the operator regardless, but a swallowed
-        // envelope-write failure here would otherwise leave NO trace at
-        // all that the write itself never landed — name the path so it's
-        // at least visible on stderr.
-        if let Err(e) = finalize_crawl(self.stats, &self.ctx) {
-            eprintln!(
-                "{}",
-                style::warn(&format!(
-                    "darkmux mission launch crawl: finalize on the abort path failed writing {} — {e:#}",
-                    self.ctx.runs_dir.join("envelope.json").display()
-                ))
-            );
-        }
-    }
-}
-
-/// Shared finalize logic for both the normal end-of-loop path
-/// ([`CrawlFinalizeGuard::close`]) and the abort path
-/// ([`CrawlFinalizeGuard`]'s `Drop`): transitions the phase to its correct
+/// (#2131) Finalize/abort machinery now runs through the shared
+/// `crate::launch_guard::LaunchFinalizeGuard` — see this module's own call
+/// site for how the abort-path writer mirrors what this module's own
+/// bespoke `CrawlFinalizeGuard` (retired here) used to do directly.
+///
+/// Shared finalize logic for both the normal end-of-loop path (the
+/// guard's `close()` writer) and the abort path (the guard's `Drop`
+/// writer): transitions the phase to its correct
 /// terminal (finding 3), closes the mission (the generic `mission close`
 /// record, carrying this run's own numbers in its payload — see this
 /// module's "flow records" section), prints the summary table, and
@@ -1317,8 +1271,9 @@ pub(crate) fn run(
         return Err(e);
     }
 
-    #[cfg(unix)]
-    darkmux_types::interrupt::install();
+    // (#2131) SIGINT + SIGTERM + SIGHUP, same as the other two launchers —
+    // this used to be SIGINT-only (`darkmux_types::interrupt::install()`).
+    crate::launch_guard::arm();
 
     let stats = RefCell::new(CrawlStats {
         stopped_by: if truncated { "limit" } else { "done" },
@@ -1332,24 +1287,39 @@ pub(crate) fn run(
         per_unit_rows: Vec::new(),
         first_model: None,
     });
-    // (finding 1b) Armed here, before the loop starts — see the guard's
-    // own doc for what "armed" guarantees on an early return or panic.
-    let mut guard = CrawlFinalizeGuard::new(
-        &stats,
-        FinalizeCtx {
-            mission_id: mission_id.clone(),
-            phase_id: phase_id.clone(),
-            workspace_name: manifest_name.clone(),
-            units_in_plan,
-            units_selected,
-            runs_dir: runs_dir.clone(),
-            ledger_path: ledger_path.clone(),
-            timeout_secs: timeout,
-            limit,
-            plan_path: plan_path.clone(),
-            units_filter: units_filter.clone(),
-        },
-    );
+    let ctx = FinalizeCtx {
+        mission_id: mission_id.clone(),
+        phase_id: phase_id.clone(),
+        workspace_name: manifest_name.clone(),
+        units_in_plan,
+        units_selected,
+        runs_dir: runs_dir.clone(),
+        ledger_path: ledger_path.clone(),
+        timeout_secs: timeout,
+        limit,
+        plan_path: plan_path.clone(),
+        units_filter: units_filter.clone(),
+    };
+    // (finding 1b, generalized #2131) Armed here, before the loop starts —
+    // an early `?`-return, a panic, or a caught SIGTERM/SIGINT/SIGHUP that
+    // reaches `Drop` still armed means `finalize_crawl` never ran normally;
+    // this abort writer mirrors what the old `CrawlFinalizeGuard::drop`
+    // did, best-effort (a `Drop` can't propagate a `Result`, and this guard
+    // IS the last-resort finalize — there's nowhere further to report a
+    // failure to; not a silent swallow though, an envelope-write failure
+    // here still reaches stderr).
+    let mut guard = crate::launch_guard::LaunchFinalizeGuard::new(|| {
+        stats.borrow_mut().stopped_by = "error";
+        if let Err(e) = finalize_crawl(&stats, &ctx) {
+            eprintln!(
+                "{}",
+                style::warn(&format!(
+                    "darkmux mission launch crawl: finalize on the abort path failed writing {} — {e:#}",
+                    ctx.runs_dir.join("envelope.json").display()
+                ))
+            );
+        }
+    });
 
     for (i, unit) in selected.iter().enumerate() {
         if kill_file.exists() {
@@ -1658,7 +1628,7 @@ pub(crate) fn run(
     }
 
     // ── finalize (normal path) — disarms the guard ──────────────────────
-    guard.close()
+    guard.close(|| finalize_crawl(&stats, &ctx))
 }
 
 /// (#1959) Ported from the retired `darkmux crawl plan` CLI's own

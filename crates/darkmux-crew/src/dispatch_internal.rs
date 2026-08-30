@@ -1646,10 +1646,12 @@ fn remote_chat_attempt(
             .spawn()
             .context("spawning curl for hosted dispatch")?;
         // (#2124) Registered the moment the child exists — BEFORE the
-        // blocking wait below — so a signal-interrupted launcher
-        // (`darkmux mission launch review`'s `ReviewFinalizeGuard`) can
-        // reap this EXACT pid on an interrupted run without touching this
-        // process's own process group. `spawn()` + `wait_with_output()`
+        // blocking wait below — so a signal-interrupted launcher (any of
+        // the three `mission launch` launchers share this guard as of
+        // #2131's `launch_guard::LaunchFinalizeGuard`, generalized from
+        // the review-only `ReviewFinalizeGuard` this comment used to
+        // name) can reap this EXACT pid on an interrupted run without
+        // touching this process's own process group. `spawn()` + `wait_with_output()`
         // in place of the old single `.output()` call is what opens the
         // window to register the pid before the blocking wait — see
         // `darkmux_types::child_registry`'s own module doc for why a
@@ -2225,6 +2227,51 @@ pub fn dispatch_local_single_shot(opts: DispatchOpts) -> Result<DispatchResult> 
         session_id,
         out_dir: None,
     })
+}
+
+/// (#2131 review round 2, NEW-2) RAII wrapper around one `child_registry`
+/// registration — `Drop` deregisters unconditionally, so an early `?`
+/// return or a panic between registering the container child's pid
+/// (`dispatch`, right after `cmd.spawn()`) and the point its wait normally
+/// completes can no longer leak the registration. A leaked pid is worse
+/// than a missed deregister: once THIS process's child has exited and the
+/// OS recycles the pid number, a later `kill_all` (an armed launcher's
+/// watchdog, or the trajectory tailer's own interrupt check) would signal
+/// an unrelated process that happens to have reused it. Holding the guard
+/// alive for the pid's whole registered lifetime — rather than pairing
+/// explicit `register`/`deregister` calls by hand at every exit path —
+/// makes that structurally impossible instead of a discipline every new
+/// early return has to remember.
+struct PidRegistration(u32);
+
+impl PidRegistration {
+    fn new(pid: u32) -> Self {
+        darkmux_types::child_registry::register(pid);
+        Self(pid)
+    }
+}
+
+impl Drop for PidRegistration {
+    fn drop(&mut self) {
+        darkmux_types::child_registry::deregister(self.0);
+    }
+}
+
+/// Best-effort `docker kill <name>` — the ONE place that knows how darkmux
+/// stops a container by its deterministic name, shared by the inactivity
+/// watchdog, the `wait_with_output()` error teardown, and the interrupt
+/// teardown (#2131 review round 2, NEW-1 — before this, the interrupt
+/// branch killed only the registered `docker run` CLIENT pid, which does
+/// NOT stop the container: `docker run` in attached/foreground mode
+/// cannot forward an unforwardable `SIGKILL` to it, so the container ran
+/// on, orphaned, while the error text falsely claimed it had been killed
+/// — measured live via `docker ps` still showing it `Up`). Fire-and-forget:
+/// a failure (docker not running, the container already gone) is silently
+/// swallowed, matching every call site's prior behavior — there is
+/// nowhere left to report it to at a teardown point, and the caller
+/// (`dispatch`) still returns its own real error either way.
+fn docker_kill_by_name(container_name: &str) {
+    let _ = Command::new("docker").args(["kill", container_name]).output();
 }
 
 pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
@@ -2850,6 +2897,22 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
     let mut child = cmd.spawn().context("spawning darkmux-runtime container")?;
 
+    // (#2131 review round 2, MUST-FIX 2 / NEW-2) Registered the moment
+    // the child exists — mirrors the hosted-curl path's own
+    // register/deregister bracket above (~1594/1596). Before this, the
+    // docker/coder/crawl dispatch path registered NOTHING, so
+    // `darkmux_types::child_registry::kill_all` (armed launchers'
+    // watchdogs, and the trajectory tailer's own interrupt check just
+    // below) had no pid to signal — a caught SIGTERM/SIGINT/SIGHUP on a
+    // coder-phase or crawl run was silently swallowed until the
+    // dispatch's own inactivity timeout. Held as a `PidRegistration`
+    // guard (its own doc explains why) rather than paired explicit
+    // register/deregister calls — several `?` returns follow before this
+    // function's normal exit, and a leaked registration is a live hazard,
+    // not just untidy bookkeeping.
+    let container_child_pid = child.id();
+    let container_child_registration = PidRegistration::new(container_child_pid);
+
     // (#1187) Pipe the remote auth secret over stdin IMMEDIATELY after spawn —
     // before the trajectory tailer starts, before anything else runs. The
     // container's startup code blocks reading stdin until this write (and
@@ -3000,9 +3063,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // Mark timeout BEFORE the kill so the post-wait detection
             // sees the flag, then SIGKILL the container.
             timeout_fired.store(true, Ordering::SeqCst);
-            let _ = Command::new("docker")
-                .args(["kill", &container_name])
-                .output();
+            docker_kill_by_name(&container_name);
         })
     };
 
@@ -3052,7 +3113,24 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     };
 
     let output = match child.wait_with_output() {
-        Ok(o) => o,
+        Ok(o) => {
+            // (#2131 review round 2, F1) Deregister HERE — right after
+            // the child has been reaped — rather than letting
+            // `container_child_registration` live to the natural end of
+            // this function's scope. The ~280 lines of post-processing
+            // below (the interrupt check, envelope enrichment, the
+            // tailer/sampler joins) have no more use for this
+            // registration: the pid is dead the moment `wait_with_output`
+            // returns, and holding the registration open regardless just
+            // widens the window where the OS could recycle the pid
+            // number and a later `kill_all` would signal an unrelated
+            // process. The `Err` arm below doesn't need this — it
+            // returns immediately, and `container_child_registration`'s
+            // own `Drop` (RAII, from the spawn site) covers that exit
+            // path exactly the same way it covers every earlier `?`.
+            drop(container_child_registration);
+            o
+        }
         Err(e) => {
             // (#889) The wait itself failed — the container may still be
             // running (orphaned). The bare `?` here used to return before
@@ -3064,15 +3142,78 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // threads — plus a best-effort `docker kill` by the
             // deterministic container name, then surface the wait error.
             watchdog_done.store(true, Ordering::SeqCst);
-            let _ = Command::new("docker")
-                .args(["kill", &container_name])
-                .output();
+            docker_kill_by_name(&container_name);
             let _ = watchdog_handle.join();
             sampler_stop.store(true, Ordering::SeqCst);
             let _ = sampler_handle.join();
+            // (#2131 review round 2, F5) Same teardown the success path
+            // gives the tailer, further down — signal it to stop and
+            // join it before returning. Without this, a `wait_with_output`
+            // failure left the tailer thread leaked: its own loop only
+            // exits on `stop_flag` or a caught signal, neither of which
+            // this branch used to touch, so it polled `trajectory.jsonl`
+            // forever in the background.
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = tailer_handle.join();
+            // (#2131 review round 2, NEW-2) No explicit deregister here —
+            // `container_child_registration` (declared at the spawn
+            // site) deregisters on Drop, which fires when this early
+            // `return` unwinds the scope. See that guard's own doc for
+            // why an explicit call at every exit path was the wrong
+            // shape (a leaked registration on a future `?` return this
+            // function grows).
             return Err(e).context("waiting for darkmux-runtime container");
         }
     };
+
+    // (#2131 review round 2, NEW-1 / NEW-4) The trajectory tailer polls
+    // this SAME flag every poll tick and, on catching a signal, kills
+    // this dispatch's registered child pid (see the tailer loop's own
+    // comment) — which is the DOCKER CLI PROCESS, not the container.
+    // `docker run` in attached/foreground mode does not forward a
+    // SIGKILL to the container it's running (SIGKILL can't be caught or
+    // proxied at all, unlike SIGTERM); killing just the CLI unblocks
+    // THIS wait (its stdout/stderr pipes close when the process dies)
+    // but otherwise leaves the container running, orphaned under
+    // dockerd. Measured live: `docker ps` still showed the container
+    // `Up` after `kill -9` on the CLI's own pid; `--rm` never fired.
+    // (NEW-1) So: explicitly `docker kill` the container by its
+    // deterministic name here too — the SAME call the inactivity
+    // watchdog and the wait-error branch just above already make — so
+    // the error text below ("the container ... was killed") is actually
+    // true, not just a claim about the CLI wrapper.
+    //
+    // (NEW-4) Gated on `!output.status.success()` — `interrupt::is_set()`
+    // is STICKY (that module's own doc: "one flag, set once, never
+    // cleared"), so a signal that arrived at ANY point during this
+    // dispatch — including one this run had nothing to do with, or one
+    // that arrived in the race window right as the container was
+    // finishing cleanly on its own — would otherwise turn a genuinely
+    // CLEAN exit-0 result into a discarded "interrupted" error. Prefer
+    // the real result on a clean exit: fall through to normal envelope
+    // parsing below instead, and let the LAUNCHER decide what a
+    // signal-observed-but-clean-exit run means — its own guard already
+    // reads this same global flag independently.
+    if darkmux_types::interrupt::is_set() && !output.status.success() {
+        watchdog_done.store(true, Ordering::SeqCst);
+        docker_kill_by_name(&container_name);
+        let _ = watchdog_handle.join();
+        sampler_stop.store(true, Ordering::SeqCst);
+        let _ = sampler_handle.join();
+        let _ = tailer_handle.join();
+        if let Some(em) = session_emitter {
+            em.stop();
+        }
+        // (#2131 review round 2, F1) `container_child_registration` is
+        // already deregistered by this point — this branch only runs
+        // after a SUCCESSFUL `wait_with_output`, which dropped it
+        // explicitly in the `Ok` arm above (the child is dead either
+        // way; there is nothing left to deregister here).
+        return Err(anyhow!(
+            "darkmux-runtime container dispatch interrupted by an operator signal \
+             (SIGINT/SIGTERM/SIGHUP) — the container `{container_name}` was killed mid-run"
+        ));
+    }
 
     // Tell the watchdog we're done so it doesn't fire spuriously after
     // a natural exit. Best-effort join (it's a kill-only thread —
@@ -3908,6 +4049,34 @@ fn run_tailer(
             // Final flush — pick up anything written between the last
             // sleep tick and the container's exit signal.
             state.poll_and_emit();
+            break;
+        }
+        // (#2131 review round 2, MUST-FIX 2) This is the ONE poll point
+        // the docker/coder/crawl dispatch path has between spawning the
+        // container and the main thread's blocking `wait_with_output()`
+        // returning — `run_step_graph` gives it none of its own (unlike
+        // crawl's plain sequential loop). A caught SIGINT/SIGTERM/SIGHUP
+        // (`launch_guard::arm()` — every launcher installs it before
+        // dispatching) sets this flag; kill the container's registered
+        // child pid right here (the spawn site above registered it —
+        // the SAME `kill_all` an armed launcher's own watchdog would
+        // otherwise have nothing to signal) so the main thread's blocking
+        // wait unblocks within one poll tick instead of running out its
+        // own inactivity deadline (the ACTUAL container is stopped by the
+        // main thread's own `docker kill` once the wait unblocks — see
+        // that branch's doc for why killing just this pid can't do that
+        // itself).
+        if darkmux_types::interrupt::is_set() {
+            // (#2131 review round 2, NEW-3) Flush BEFORE breaking — the
+            // clean-stop path above does the same, and there is no reason
+            // this path shouldn't: whatever the runtime already wrote to
+            // `trajectory.jsonl` up to this exact instant is real,
+            // already-happened work, and skipping this read would throw
+            // it away for free. The container is about to be killed
+            // either way; that doesn't make the last poll tick's data
+            // stale.
+            state.poll_and_emit();
+            darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
             break;
         }
         thread::sleep(TAILER_POLL_INTERVAL);

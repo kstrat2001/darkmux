@@ -43,8 +43,10 @@ use std::sync::Mutex;
 static CHILDREN: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 
 /// Re-exported so callers outside this crate (`darkmux`'s own
-/// `review_finalize_guard`) can name the signal [`kill_all`] sends without
-/// taking their own direct `libc` dependency just for one constant.
+/// `launch_guard` — renamed from `review_finalize_guard` in #2131, which
+/// generalized this guard from review-only to all three `mission launch`
+/// launchers) can name the signal [`kill_all`] sends without taking their
+/// own direct `libc` dependency just for one constant.
 pub const SIGKILL: i32 = libc::SIGKILL;
 
 /// Register a just-spawned child pid. Call BEFORE blocking on it (a
