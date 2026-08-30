@@ -12,7 +12,6 @@
 
 use crate::{Check, Status};
 use darkmux_crew::host_probe::power_posture::{self, PowerPosture, PowerSource};
-use darkmux_crew::host_probe::thermal;
 
 pub fn check_power_posture() -> Check {
     describe(power_posture::sample())
@@ -53,9 +52,14 @@ fn describe(p: PowerPosture) -> Check {
 
     let mut thermal_serious_or_worse = false;
     if let Some(t) = &p.thermal {
-        let severity = thermal::THERMAL_STATES.iter().position(|s| *s == t.state);
-        let fair_or_worse = severity.map(|i| i >= 1).unwrap_or(true); // unrecognized state ⇒ treat as worse
-        thermal_serious_or_worse = severity.map(|i| i >= 2).unwrap_or(true);
+        // (#2112 review, second pass finding F) Severity computed ONCE,
+        // in `power_posture::severity` — see that function's doc for the
+        // `None` policy. `p.thermal` is `Some` in this branch, so `sev`
+        // is never actually `None` here; the `unwrap_or(true)` below is
+        // the same conservative default the shared function documents.
+        let sev = power_posture::severity(&p);
+        let fair_or_worse = sev.map(|i| i >= 1).unwrap_or(true);
+        thermal_serious_or_worse = sev.map(|i| i >= 2).unwrap_or(true);
         let entry = format!("thermal {} (cap {}%)", t.state, t.cpu_speed_limit_pct);
         if fair_or_worse {
             warnings.push(entry);
@@ -105,7 +109,15 @@ fn describe(p: PowerPosture) -> Check {
             remedies.push("let the machine cool before starting a long mission");
         } else if p.thermal.as_ref().is_some_and(|t| t.state != "nominal") {
             remedies.push("let the machine cool");
-        } else if p.recent_thermal_emergency.as_ref().is_some_and(|e| e.within_24h) {
+        }
+        // (#2112 review, second pass finding E) Independent of the
+        // thermal branch above, not an `else if` on it — a recent
+        // emergency on a machine that's since cooled to exactly `fair`
+        // (or is currently `serious`/`critical` for an UNRELATED reason)
+        // must still get the airflow remedy; the old `else if` chain
+        // silently dropped it whenever the "let the machine cool" arm had
+        // already fired.
+        if p.recent_thermal_emergency.as_ref().is_some_and(|e| e.within_24h) {
             remedies.push("improve airflow before a sustained mission — a thermal-emergency forced sleep happened within the last 24h");
         }
         let mut lines = vec![format!("{}.", remedies.join("; "))];
@@ -247,6 +259,23 @@ mod tests {
         let c = describe(p);
         let hint = c.hint.expect("warn carries a hint");
         assert_ne!(hint.trim(), ".", "empty remedy list must not render as a bare period: {hint}");
+        assert!(hint.contains("airflow"), "{hint}");
+    }
+
+    #[test]
+    fn the_airflow_remedy_survives_alongside_the_cool_down_remedy() {
+        // (#2112 review, second pass finding E) Regression for the `else
+        // if` chain bug: thermal at `fair` (which fires the "let the
+        // machine cool" arm) AND a recent thermal emergency must BOTH
+        // show up — the airflow remedy must not be dropped just because
+        // the cool-down remedy already fired.
+        let mut p = base();
+        p.thermal = Some(ThermalSample { state: "fair".into(), cpu_speed_limit_pct: 80 });
+        p.recent_thermal_emergency =
+            Some(ThermalEmergency { at: "2026-08-29 23:16:05 +0800".into(), within_24h: true });
+        let c = describe(p);
+        let hint = c.hint.expect("warn carries a hint");
+        assert!(hint.contains("let the machine cool"), "{hint}");
         assert!(hint.contains("airflow"), "{hint}");
     }
 

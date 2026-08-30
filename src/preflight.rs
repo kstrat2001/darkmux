@@ -28,7 +28,7 @@
 //! deferred.
 
 use anyhow::{bail, Result};
-use darkmux_crew::host_probe::{power_posture, thermal};
+use darkmux_crew::host_probe::power_posture;
 use darkmux_types::style;
 
 /// Read a `force=true` entry out of a launcher's raw `--param key=value`
@@ -72,14 +72,11 @@ fn evaluate(p: &power_posture::PowerPosture, force: bool) -> Result<()> {
         eprintln!("{}", style::warn("Low Power Mode is on — local inference throughput is roughly halved"));
     }
 
-    // Position in THERMAL_STATES: nominal=0, fair=1, serious=2,
-    // critical=3. An unrecognized state (a future macOS addition) sorts
-    // past `critical` rather than being read as nominal — same posture
-    // `checks_power.rs::describe` takes for the doctor-side reading.
-    let severity = p
-        .thermal
-        .as_ref()
-        .map(|t| thermal::THERMAL_STATES.iter().position(|s| *s == t.state).unwrap_or(thermal::THERMAL_STATES.len()));
+    // (#2112 review, second pass finding F) Severity computed ONCE, in
+    // `power_posture::severity` — see that function's doc for the `None`
+    // policy this call relies on (`None` reads as "don't refuse" below,
+    // via `.unwrap_or(0)`).
+    let severity = power_posture::severity(p);
     if let (Some(t), Some(sev)) = (&p.thermal, severity) {
         if sev >= 1 {
             eprintln!(
@@ -89,6 +86,19 @@ fn evaluate(p: &power_posture::PowerPosture, force: bool) -> Result<()> {
         }
     }
 
+    // (#2112 review, second pass finding D) `p.recent_thermal_emergency`
+    // is only ever populated when `power_posture::sample_for_preflight`
+    // decided to scan (#2112 review finding 2: always for `darkmux
+    // doctor`, or when this SAME reading's thermal is already `fair` or
+    // worse, or the machine is on battery/Low Power Mode — see that
+    // function's own doc). Below `fair`, on AC, with Low Power Mode off,
+    // it is NOT scanned here — the stated trade-off: a thermal emergency
+    // that happened recently on a machine that has since cooled and is
+    // otherwise healthy is reported by `darkmux doctor` (which always
+    // scans), not by this launch pre-flight. That's deliberate: the
+    // pre-flight's job is "is starting a long mission safe RIGHT NOW",
+    // and a cooled, plugged-in, full-power machine answers "yes" without
+    // needing the ~0.8s scan to confirm it.
     if let Some(e) = &p.recent_thermal_emergency {
         if e.within_24h {
             eprintln!(
@@ -220,19 +230,25 @@ mod tests {
         assert!(msg.contains("mission propose --start"), "{msg}");
     }
 
-    // ── #2112 review finding 1: the two long-running entry points
-    //    (`mission_launch::launch`, `crawl_launch::launch`) must each
-    //    still call `check_power_posture` AND hold a `SleepAssertion` —
-    //    wiring a behavioral test can't reach without spawning a real
-    //    dispatch/crawl (forbidden for this pass), so this is a physical
-    //    source check instead (same posture as CLAUDE.md's StepKind-
-    //    tiering enforcement: a fact a fresh reader — human OR test — can
-    //    verify directly, not just a comment that can silently drift).
-    //    Deleting either call at either entry point makes THIS go red. ──
+    // ── #2112 review finding 1 (+ second-pass finding A): the three
+    //    long-running entry points (`mission_launch::launch`,
+    //    `crawl_launch::launch`, `mission_launch_review::launch` — the
+    //    LAST one is reached via `mission_launch::launch`'s OWN
+    //    dedicated-launcher routing for `config_uses_review_kinds`,
+    //    BEFORE `mission_launch::launch`'s own #2112 call site, so review
+    //    needs its own call the same way crawl does) must each still
+    //    call `check_power_posture` AND hold a `SleepAssertion` — wiring
+    //    a behavioral test can't reach without spawning a real
+    //    dispatch/crawl/review (forbidden for this pass), so this is a
+    //    physical source check instead (same posture as CLAUDE.md's
+    //    StepKind-tiering enforcement: a fact a fresh reader — human OR
+    //    test — can verify directly, not just a comment that can
+    //    silently drift). Deleting either call at any entry point makes
+    //    THIS go red. ──
     #[test]
-    fn both_long_running_entry_points_call_the_preflight_and_hold_a_sleep_assertion() {
+    fn all_long_running_entry_points_call_the_preflight_and_hold_a_sleep_assertion() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        for path in ["src/mission_launch.rs", "src/crawl_launch.rs"] {
+        for path in ["src/mission_launch.rs", "src/crawl_launch.rs", "src/mission_launch_review.rs"] {
             let text = std::fs::read_to_string(root.join(path)).expect("read source");
             assert!(
                 text.contains("preflight::check_power_posture(params)"),

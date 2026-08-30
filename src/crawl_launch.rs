@@ -108,6 +108,18 @@ pub fn launch(input_file: Option<&Path>, params: &[String], timeout_seconds: Opt
     // `crawl_launch::launch` BEFORE its own copy of this check (see the
     // `config_id == "crawl"` branch there), so crawl needs its own call
     // rather than inheriting the generic path's. See `src/preflight.rs`.
+    //
+    // (#2112 review, second pass) KNOWN GAP, deliberately not fixed here:
+    // unlike `mission_launch::launch`'s own call (moved past its
+    // `--dry-run` short-circuit) and `mission_launch_review::launch`'s
+    // (same), this call sits BEFORE `run`'s `--dry-run` check
+    // (`bool_param(collected, "dry_run")`, deep inside `run` — after
+    // workspace materialization/planning, not reachable from `launch`
+    // without restructuring `run`'s own control flow). So `darkmux
+    // mission launch crawl --dry-run` can still be refused on thermal
+    // grounds today. Fixing it properly means threading the dry-run
+    // check (or the whole pre-flight) into `run` itself — a real
+    // restructure, follow-up work, not a line-move.
     crate::preflight::check_power_posture(params)?;
     let _sleep_assertion = darkmux_crew::sleep_assertion::SleepAssertion::hold("darkmux mission crawl");
 

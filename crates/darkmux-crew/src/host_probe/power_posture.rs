@@ -57,6 +57,29 @@ pub struct PowerPosture {
     pub recent_thermal_emergency: Option<ThermalEmergency>,
 }
 
+/// Thermal severity, exactly once (#2112 review, second pass finding F —
+/// `preflight.rs` and `checks_power.rs` each had their own copy of this
+/// position lookup). Position in [`thermal::THERMAL_STATES`] (nominal=0,
+/// fair=1, serious=2, critical=3); an unrecognized state (a future macOS
+/// addition) sorts PAST `critical` rather than reading as nominal — the
+/// conservative default every caller wants.
+///
+/// **The `None` policy, stated once so no caller has to re-derive it:**
+/// `None` means there is no thermal sample at all (unreadable — e.g. an
+/// Intel Mac, or a spawn failure), which is a DIFFERENT case from
+/// "recognized but past critical." No signal is not evidence of severity.
+/// A caller gating a REFUSAL on severity therefore reads `None` as "don't
+/// refuse" (`severity(p).unwrap_or(0) >= floor`); a caller deciding
+/// whether it's worth the ~0.8s `pmset -g log` scan reads `None` as "no
+/// known severity to scan for" (`severity(p).map(|s| s >= 1).unwrap_or
+/// (false)`). Both read the SAME `Option`, just with an opposite-sign
+/// default for an opposite-sign question.
+pub fn severity(p: &PowerPosture) -> Option<usize> {
+    p.thermal
+        .as_ref()
+        .map(|t| thermal::THERMAL_STATES.iter().position(|s| *s == t.state).unwrap_or(thermal::THERMAL_STATES.len()))
+}
+
 /// `pmset -g ps`'s first line names the source in single quotes.
 pub fn parse_power_source(ps_text: &str) -> Option<PowerSource> {
     let first = ps_text.lines().next()?;
@@ -206,48 +229,65 @@ mod imp {
         static CACHE: OnceLock<Option<String>> = OnceLock::new();
         CACHE
             .get_or_init(|| {
+                // (#2112 review, second pass finding B) Without `set -o
+                // pipefail`, `sh -c "pmset -g log | tail -n N"` reports
+                // `tail`'s exit status, not `pmset`'s — a missing/broken
+                // `pmset` still lets the pipeline exit 0 (`tail` on empty
+                // stdin succeeds), so a real spawn FAILURE would silently
+                // read as "no log, no emergency" rather than "unknown."
+                // `pipefail` makes the pipeline fail if EITHER stage
+                // fails. Empty-but-successful output is ALSO treated as
+                // `None`: a real `pmset -g log` always prints at least its
+                // "PM ASL data store" header line, so empty stdout means
+                // the read didn't really happen, not that the log is
+                // genuinely empty.
                 let out = Command::new("sh")
                     .arg("-c")
-                    .arg(format!("pmset -g log | tail -n {THERMAL_LOG_LINE_CAP}"))
+                    .arg(format!("set -o pipefail; pmset -g log | tail -n {THERMAL_LOG_LINE_CAP}"))
                     .output()
                     .ok()?;
                 if !out.status.success() {
                     return None;
                 }
-                Some(String::from_utf8_lossy(&out.stdout).into_owned())
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
             })
             .clone()
-    }
-
-    /// Thermal severity as `checks_power.rs`/`preflight.rs` compute it:
-    /// position in `thermal::THERMAL_STATES` (nominal=0 ... critical=3),
-    /// an unrecognized state sorting past `critical`, `None` when there is
-    /// no thermal sample at all.
-    fn severity(thermal: &Option<ThermalSample>) -> Option<usize> {
-        thermal
-            .as_ref()
-            .map(|t| thermal::THERMAL_STATES.iter().position(|s| *s == t.state).unwrap_or(thermal::THERMAL_STATES.len()))
     }
 
     /// One full power-posture reading — every field independently `None`
     /// on a spawn failure or unparsed output. Costs roughly two fast
     /// `pmset` process spawns (~10-20ms each) plus the in-process thermal
     /// read, PLUS the `pmset -g log` scan (~0.8s) only when
-    /// `always_scan_thermal_log` is true or the just-read thermal state is
-    /// already `fair` or worse.
+    /// `always_scan_thermal_log` is true, the just-read thermal state is
+    /// already `fair` or worse, or (#2112 review, second pass finding D)
+    /// thermal reads nominal/unknown but the machine is ALREADY
+    /// compromised another way (on battery, or Low Power Mode) — cheap
+    /// (two pmset spawns already happened either way) and rare (most
+    /// launches are neither), and it's exactly the case where an
+    /// unnoticed recent thermal emergency is worth surfacing even though
+    /// the CURRENT thermal reading alone wouldn't have triggered the scan.
     fn sample_impl(always_scan_thermal_log: bool) -> PowerPosture {
         let ps_text = run("pmset", &["-g", "ps"]);
         let source = ps_text.as_deref().and_then(parse_power_source);
         let battery_pct = ps_text.as_deref().and_then(parse_battery_pct);
         let low_power_mode = run("pmset", &["-g"]).as_deref().and_then(parse_low_power_mode);
         let thermal = thermal::sample();
-        let should_scan_log = always_scan_thermal_log || severity(&thermal).map(|s| s >= 1).unwrap_or(false);
-        let recent_thermal_emergency = if should_scan_log {
+        let mut posture = PowerPosture { source, battery_pct, low_power_mode, thermal, recent_thermal_emergency: None };
+        let should_scan_log = always_scan_thermal_log
+            || severity(&posture).map(|s| s >= 1).unwrap_or(false)
+            || matches!(posture.source, Some(PowerSource::Battery))
+            || posture.low_power_mode == Some(true);
+        posture.recent_thermal_emergency = if should_scan_log {
             thermal_log_bounded().and_then(|log| find_recent_thermal_emergency(&log, SystemTime::now()))
         } else {
             None
         };
-        PowerPosture { source, battery_pct, low_power_mode, thermal, recent_thermal_emergency }
+        posture
     }
 
     /// `darkmux doctor`'s reading — always scans `pmset -g log`, since
@@ -390,5 +430,60 @@ mod tests {
             .output()
             .expect("date must parse the fixture timestamp");
         String::from_utf8_lossy(&out.stdout).trim().parse().expect("date printed a number")
+    }
+
+    #[test]
+    fn severity_ranks_every_named_state_and_treats_unrecognized_as_past_critical() {
+        let at = |state: &str| {
+            severity(&PowerPosture {
+                source: None,
+                battery_pct: None,
+                low_power_mode: None,
+                thermal: Some(ThermalSample { state: state.into(), cpu_speed_limit_pct: 100 }),
+                recent_thermal_emergency: None,
+            })
+        };
+        assert_eq!(at("nominal"), Some(0));
+        assert_eq!(at("fair"), Some(1));
+        assert_eq!(at("serious"), Some(2));
+        assert_eq!(at("critical"), Some(3));
+        assert_eq!(at("apocalyptic"), Some(4), "unrecognized state must sort PAST critical, not be dropped");
+    }
+
+    #[test]
+    fn severity_is_none_when_there_is_no_thermal_sample_at_all() {
+        let p = PowerPosture { source: None, battery_pct: None, low_power_mode: None, thermal: None, recent_thermal_emergency: None };
+        assert_eq!(severity(&p), None, "unreadable thermal (e.g. Intel Mac) must not read as any known severity");
+    }
+
+    // (#2112 review, second pass finding B) Direct proof of the shell
+    // construct `imp::thermal_log_bounded` relies on — exercised here
+    // rather than against the private function itself, since this is
+    // characterizing `sh`'s own pipefail semantics, not this crate's
+    // logic.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pipefail_makes_a_missing_upstream_command_fail_the_whole_pipeline() {
+        let missing_cmd = "definitely-not-a-real-command-darkmux-2112-review";
+
+        let without_pipefail = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{missing_cmd} | tail -n 1"))
+            .output()
+            .expect("sh must run");
+        assert!(
+            without_pipefail.status.success(),
+            "sanity: without pipefail, `tail` on empty stdin succeeds even though the upstream command doesn't exist"
+        );
+
+        let with_pipefail = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -o pipefail; {missing_cmd} | tail -n 1"))
+            .output()
+            .expect("sh must run");
+        assert!(
+            !with_pipefail.status.success(),
+            "pipefail must propagate the missing upstream command's failure through the pipeline"
+        );
     }
 }
