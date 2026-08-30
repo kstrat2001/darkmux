@@ -201,4 +201,91 @@ mod tests {
         let value = guard.close(|| 42i32);
         assert_eq!(value, 42);
     }
+
+    /// (#2131 review round 2, MUST-FIX 4 — cheap but real) Nothing pinned
+    /// that [`arm`] actually WIRES UP SIGTERM/SIGHUP — every other test
+    /// exercising them (this crate's own, plus `darkmux_types::interrupt`'s)
+    /// calls `simulate_sigterm_for_test`/`simulate_sighup_for_test`, which
+    /// invoke the handler function DIRECTLY and would stay green even if
+    /// `arm()` had never called `install_term()`/`install_hup()` at all —
+    /// exactly the gap that let reverting `crawl_launch.rs` to SIGINT-only
+    /// leave 44/44 tests green. This test sends REAL OS signals (via
+    /// `kill -TERM`/`kill -HUP` against this process's own pid — the root
+    /// `darkmux` binary crate has no direct `libc` dependency to `raise(2)`
+    /// with, so shelling out to the standard `kill(1)` utility is the
+    /// dependency-free equivalent) after `arm()`, proving the installed
+    /// handlers actually fire.
+    #[test]
+    #[serial_test::serial]
+    fn arm_installs_real_sigterm_and_sighup_handlers() {
+        darkmux_types::interrupt::reset_for_test();
+        arm();
+        let pid = std::process::id().to_string();
+
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-TERM", &pid])
+                .status()
+                .expect("kill(1) must be runnable in this test environment")
+                .success(),
+            "kill -TERM must succeed sending a real signal to this process"
+        );
+        assert!(
+            wait_for_interrupt(),
+            "arm() must install a REAL SIGTERM handler — is_set() never flipped after a real \
+             SIGTERM was delivered"
+        );
+        darkmux_types::interrupt::reset_for_test();
+
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-HUP", &pid])
+                .status()
+                .expect("kill(1) must be runnable in this test environment")
+                .success(),
+            "kill -HUP must succeed sending a real signal to this process"
+        );
+        assert!(
+            wait_for_interrupt(),
+            "arm() must install a REAL SIGHUP handler — is_set() never flipped after a real \
+             SIGHUP was delivered"
+        );
+        darkmux_types::interrupt::reset_for_test();
+    }
+
+    /// A real signal lands asynchronously — `kill(1)` exiting only means
+    /// the OS accepted the request, not that this process has run the
+    /// handler yet. Poll briefly instead of asserting immediately.
+    fn wait_for_interrupt() -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if darkmux_types::interrupt::is_set() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        darkmux_types::interrupt::is_set()
+    }
+
+    // (#2131 review round 2, MUST-FIX 3 — ported from the retired
+    // `review_finalize_guard.rs`'s own test module, deleted, unported, by
+    // #2131's extraction; `panic_message` itself moved here unchanged.)
+
+    #[test]
+    fn panic_message_reads_a_str_payload() {
+        let payload: Box<dyn Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(&*payload), "boom");
+    }
+
+    #[test]
+    fn panic_message_reads_a_string_payload() {
+        let payload: Box<dyn Any + Send> = Box::new("boom".to_string());
+        assert_eq!(panic_message(&*payload), "boom");
+    }
+
+    #[test]
+    fn panic_message_names_an_unrecognized_payload_honestly() {
+        let payload: Box<dyn Any + Send> = Box::new(42i32);
+        assert_eq!(panic_message(&*payload), "unknown panic payload");
+    }
 }

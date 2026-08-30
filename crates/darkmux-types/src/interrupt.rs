@@ -11,7 +11,12 @@
 //! rather than being torn down mid-dispatch; #2124, `darkmux mission launch
 //! review` — a supervisor thread polls this flag while the pipeline runs on
 //! a worker thread, so a `kill <pid>` (SIGTERM) mid-probe still leaves a
-//! terminal mission record instead of an orphaned Active mission).
+//! terminal mission record instead of an orphaned Active mission; #2131
+//! generalized both of these — plus the third launcher, `darkmux mission
+//! launch` for generic graphs + coder-phase, which had NO signal handling
+//! at all before — onto one shared `darkmux`-crate guard,
+//! `launch_guard::LaunchFinalizeGuard`, and every launcher now installs
+//! ALL THREE signals via its `arm()`; see that module's own doc).
 //!
 //! **SIGHUP (#2124 pty-test finding).** `install_hup` exists because of a
 //! measured, NOT hypothetical failure mode: when `darkmux mission launch
@@ -32,8 +37,12 @@
 //! SIGINT, SIGTERM, and SIGHUP share ONE flag ([`INTERRUPTED`]) — a caller
 //! that wants "stop cleanly on any of them" polls [`is_set`] once,
 //! regardless of which signal arrived; a caller that only cares about one
-//! (crawl, SIGINT only) simply never calls [`install_term`]/
-//! [`install_hup`]. Each signal keeps its OWN escalation counter so the
+//! would simply never call [`install_term`]/[`install_hup`] — though as of
+//! #2131 every `darkmux mission launch` launcher (crawl included, which
+//! installed SIGINT only before that fix) calls all three via
+//! `launch_guard::arm()`, so this degrees-of-freedom note is aspirational
+//! for a FUTURE caller today, not a description of a current one. Each
+//! signal keeps its OWN escalation counter so the
 //! "two presses, then the OS default disposition comes back" escape hatch
 //! (see [`on_sigint`]'s doc) works independently per signal — a SIGINT
 //! then a SIGTERM is two DIFFERENT first deliveries, not one signal's

@@ -1580,10 +1580,12 @@ fn remote_chat_attempt(
             .spawn()
             .context("spawning curl for hosted dispatch")?;
         // (#2124) Registered the moment the child exists — BEFORE the
-        // blocking wait below — so a signal-interrupted launcher
-        // (`darkmux mission launch review`'s `ReviewFinalizeGuard`) can
-        // reap this EXACT pid on an interrupted run without touching this
-        // process's own process group. `spawn()` + `wait_with_output()`
+        // blocking wait below — so a signal-interrupted launcher (any of
+        // the three `mission launch` launchers share this guard as of
+        // #2131's `launch_guard::LaunchFinalizeGuard`, generalized from
+        // the review-only `ReviewFinalizeGuard` this comment used to
+        // name) can reap this EXACT pid on an interrupted run without
+        // touching this process's own process group. `spawn()` + `wait_with_output()`
         // in place of the old single `.output()` call is what opens the
         // window to register the pid before the blocking wait — see
         // `darkmux_types::child_registry`'s own module doc for why a
@@ -2776,6 +2778,19 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
 
     let mut child = cmd.spawn().context("spawning darkmux-runtime container")?;
 
+    // (#2131 review round 2, MUST-FIX 2) Registered the moment the child
+    // exists — mirrors the hosted-curl path's own register/deregister
+    // bracket above (~1594/1596). Before this, the docker/coder/crawl
+    // dispatch path registered NOTHING, so `darkmux_types::child_registry::
+    // kill_all` (armed launchers' watchdogs, and the trajectory tailer's
+    // own interrupt check just below) had no pid to signal — a caught
+    // SIGTERM/SIGINT/SIGHUP on a coder-phase or crawl run was silently
+    // swallowed until the dispatch's own inactivity timeout. Deregistered
+    // once this exact pid has been reaped, at both places
+    // `child.wait_with_output()` returns (below).
+    let container_child_pid = child.id();
+    darkmux_types::child_registry::register(container_child_pid);
+
     // (#1187) Pipe the remote auth secret over stdin IMMEDIATELY after spawn —
     // before the trajectory tailer starts, before anything else runs. The
     // container's startup code blocks reading stdin until this write (and
@@ -2986,9 +3001,44 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             let _ = watchdog_handle.join();
             sampler_stop.store(true, Ordering::SeqCst);
             let _ = sampler_handle.join();
+            // (#2131 review round 2, MUST-FIX 2) The child has been
+            // reaped (unsuccessfully) either way — deregister the pid
+            // registered at spawn.
+            darkmux_types::child_registry::deregister(container_child_pid);
             return Err(e).context("waiting for darkmux-runtime container");
         }
     };
+
+    // (#2131 review round 2, MUST-FIX 2) The child has been reaped —
+    // mirrors the hosted-curl path's own register/deregister bracket
+    // (~1594/1596).
+    darkmux_types::child_registry::deregister(container_child_pid);
+
+    // (#2131 review round 2, MUST-FIX 2) The trajectory tailer polls this
+    // SAME flag every poll tick and, on catching a signal, already killed
+    // this dispatch's registered child (see the tailer loop's own
+    // comment) — which is very likely why this blocking wait just
+    // unblocked. A signal caught here is a genuine interruption, not an
+    // ordinary container failure: surfaced as its own named error so the
+    // caller's scheduler-error handling — and, through it, the
+    // launcher's finalize guard (`launch_guard::LaunchFinalizeGuard`,
+    // armed by every launcher before dispatching) — records an honest
+    // "interrupted by a signal" reason instead of a generic non-zero-exit
+    // message. Same teardown shape as the wait-error branch just above.
+    if darkmux_types::interrupt::is_set() {
+        watchdog_done.store(true, Ordering::SeqCst);
+        let _ = watchdog_handle.join();
+        sampler_stop.store(true, Ordering::SeqCst);
+        let _ = sampler_handle.join();
+        let _ = tailer_handle.join();
+        if let Some(em) = session_emitter {
+            em.stop();
+        }
+        return Err(anyhow!(
+            "darkmux-runtime container dispatch interrupted by an operator signal \
+             (SIGINT/SIGTERM/SIGHUP) — the container `{container_name}` was killed mid-run"
+        ));
+    }
 
     // Tell the watchdog we're done so it doesn't fire spuriously after
     // a natural exit. Best-effort join (it's a kill-only thread —
@@ -3824,6 +3874,25 @@ fn run_tailer(
             // Final flush — pick up anything written between the last
             // sleep tick and the container's exit signal.
             state.poll_and_emit();
+            break;
+        }
+        // (#2131 review round 2, MUST-FIX 2) This is the ONE poll point
+        // the docker/coder/crawl dispatch path has between spawning the
+        // container and the main thread's blocking `wait_with_output()`
+        // returning — `run_step_graph` gives it none of its own (unlike
+        // crawl's plain sequential loop). A caught SIGINT/SIGTERM/SIGHUP
+        // (`launch_guard::arm()` — every launcher installs it before
+        // dispatching) sets this flag; kill the container's registered
+        // child pid right here (the spawn site above registered it —
+        // the SAME `kill_all` an armed launcher's own watchdog would
+        // otherwise have nothing to signal) so the main thread's blocking
+        // wait unblocks within one poll tick instead of running out its
+        // own inactivity deadline. Breaks this loop WITHOUT the final
+        // flush the clean-stop path above does — the container is being
+        // killed, not finishing normally, so there is nothing more to
+        // read.
+        if darkmux_types::interrupt::is_set() {
+            darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
             break;
         }
         thread::sleep(TAILER_POLL_INTERVAL);
