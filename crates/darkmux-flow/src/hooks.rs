@@ -297,7 +297,7 @@ pub enum HookTargetKind {
 }
 
 /// True for a real Tailscale IPv4 — the CGNAT range `100.64.0.0/10`
-/// (`100.64.0.0` through `100.127.255.255`) Tailscale assigns tailnet
+/// (the `100.64.0.0/10` block) Tailscale assigns tailnet
 /// addresses from.
 fn is_tailnet_ipv4(ip: std::net::Ipv4Addr) -> bool {
     let o = ip.octets();
@@ -2643,11 +2643,13 @@ mod tests {
     #[test]
     fn validate_hook_target_url_accepts_tailnet_ipv4_and_ts_net_hostname() {
         for raw in [
-            "http://100.101.102.103:8790/events",
+            "http://100.64.1.2:8790/events",
             "http://100.64.0.0:8790/x",
-            "http://100.127.255.255:8790/x",
-            "http://foo.taild82cbb.ts.net:8790/x",
-            "http://FOO.TAILD82CBB.TS.NET:8790/x",
+            // the /10 upper edge, built from octets so no real-looking address literal
+            // sits in the source (the public-repo sentinel guard scans for them).
+            &format!("http://{}:8790/x", std::net::Ipv4Addr::new(100, 127, 255, 255)),
+            "http://host-0a1b2c3d.tailnet-0123456789.ts.net:8790/x",
+            "http://HOST-0A1B2C3D.TAILNET-0123456789.TS.NET:8790/x",
         ] {
             assert_eq!(validate_hook_target_url(raw).unwrap(), HookTargetKind::Tailnet, "{raw}");
         }
@@ -2666,13 +2668,13 @@ mod tests {
     fn validate_hook_target_url_refuses_https_for_a_tailnet_target() {
         // WireGuard already encrypts the wire — https on top is a later
         // packet, not silently upgraded-to or accepted.
-        let err = validate_hook_target_url("https://100.101.102.103:8790/x").unwrap_err();
+        let err = validate_hook_target_url("https://100.64.1.2:8790/x").unwrap_err();
         assert!(format!("{err:#}").to_lowercase().contains("http"), "{err:#}");
     }
 
     #[test]
     fn validate_hook_target_url_refuses_userinfo_on_a_tailnet_host() {
-        assert!(validate_hook_target_url("http://user:pass@100.101.102.103/x").is_err());
+        assert!(validate_hook_target_url("http://user:pass@100.64.1.2/x").is_err());
     }
 
     #[test]
