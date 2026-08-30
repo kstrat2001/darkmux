@@ -215,10 +215,30 @@ mod tests {
     /// with, so shelling out to the standard `kill(1)` utility is the
     /// dependency-free equivalent) after `arm()`, proving the installed
     /// handlers actually fire.
+    /// (#2131 review round 2, NEW-5) Panic-safe teardown for
+    /// [`arm_installs_real_sigterm_and_sighup_handlers`] — `Drop` fires on
+    /// EVERY exit from that test (a normal return, OR a failed
+    /// `assert!` unwinding mid-test), so a real SIGTERM/SIGHUP handler
+    /// this test installed on the real OS process never survives to
+    /// affect whichever test the harness runs next in the same process.
+    /// `darkmux_types::interrupt::restore_default_for_test`'s own doc
+    /// explains why `reset_for_test` alone (already called at each
+    /// checkpoint below) isn't enough — that only clears this module's
+    /// flag/counters, never the actual `signal(2)` disposition.
+    struct RestoreSignalsGuard;
+
+    impl Drop for RestoreSignalsGuard {
+        fn drop(&mut self) {
+            darkmux_types::interrupt::restore_default_for_test();
+            darkmux_types::interrupt::reset_for_test();
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn arm_installs_real_sigterm_and_sighup_handlers() {
         darkmux_types::interrupt::reset_for_test();
+        let _restore = RestoreSignalsGuard;
         arm();
         let pid = std::process::id().to_string();
 
@@ -250,7 +270,9 @@ mod tests {
             "arm() must install a REAL SIGHUP handler — is_set() never flipped after a real \
              SIGHUP was delivered"
         );
-        darkmux_types::interrupt::reset_for_test();
+        // `_restore`'s `Drop` (below, at end of scope) does the final
+        // `reset_for_test` + the real `restore_default_for_test` this
+        // NEW-5 fix is for.
     }
 
     /// A real signal lands asynchronously — `kill(1)` exiting only means

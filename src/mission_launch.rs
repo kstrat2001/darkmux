@@ -338,6 +338,24 @@ pub(crate) fn drained_telemetry(telemetry: &run_obs::HostTelemetrySampler, missi
         .collect()
 }
 
+/// (#2131 review round 2, item 5) RAII stop-signal for `launch`'s own
+/// child-reaping watchdog thread — `Drop` sets the shared flag, so it
+/// fires on EVERY exit from `launch` (an early `?`-return, a panic, or
+/// the normal fall-through at the bottom) without needing a store call at
+/// each of that function's several return points. Without this, the
+/// watchdog thread spawned per `launch()` call ran for the rest of the
+/// PROCESS's lifetime (an interrupted run's reaping `loop` never exited;
+/// a clean run's waiting `while` never got a reason to either) — harmless
+/// on a real one-shot-per-invocation CLI process, but ~25 unit tests each
+/// leaving a background thread spinning is real, avoidable waste.
+struct WatchdogStopGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for WatchdogStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub fn launch(
     config_id: &str,
     input_file: Option<&Path>,
@@ -763,15 +781,36 @@ pub fn launch(
     // graph with more than one dispatching step, or a future dispatch
     // path that registers a pid without its own poll seam) rather than
     // the sole mechanism the paragraph above originally described it as.
-    std::thread::spawn(|| {
-        while !darkmux_types::interrupt::is_set() {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        loop {
-            darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    });
+    //
+    // (#2131 review round 2, item 5) Bounded: `watchdog_stop` (set by
+    // `WatchdogStopGuard`'s `Drop`, above — fires on every exit from this
+    // function) is re-checked in BOTH loops below, so this thread exits
+    // once this `launch()` call is over instead of running for the rest
+    // of the process's lifetime. And skipped entirely under `cfg(test)` —
+    // `cfg!(test)` is true for the WHOLE crate whenever it's built by
+    // `cargo test` (not just inside `#[cfg(test)] mod tests`), so none of
+    // this module's ~25 unit tests that call `launch()` spin up a
+    // watchdog thread they have no use for.
+    let watchdog_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _watchdog_stop_guard = WatchdogStopGuard(Arc::clone(&watchdog_stop));
+    if !cfg!(test) {
+        let watchdog_stop = Arc::clone(&watchdog_stop);
+        std::thread::spawn(move || {
+            while !darkmux_types::interrupt::is_set() {
+                if watchdog_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            loop {
+                if watchdog_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                darkmux_types::child_registry::kill_all(darkmux_types::child_registry::SIGKILL);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
 
     // Real execution — start every real phase that has tasks, run the
     // scheduler against `registry` (built once, at the top of this function,
@@ -1157,6 +1196,18 @@ pub fn launch(
         emit_launch_cmd_audit(config, &collected, &mission_id, gate_confirmed.get(), success);
         // (#2131) A no-op unless a signal was actually observed — see the
         // scheduler-error branch above for what this does when one was.
+        //
+        // (#2131 review round 2, item 6) When a signal WAS observed AND
+        // the gate was reached (the `else` branch just above — `guard`
+        // disarmed WITHOUT writing anything), this still exits 130 with
+        // the mission left `Active` — on purpose, not a gap. The gate
+        // outcome is real, earned work (the operator's sign-off is
+        // genuinely still pending, signal or no signal); reaping +
+        // hard-exiting here does not un-earn it. `mission finalize` (or
+        // `mission abort`) is how the operator closes the loop from
+        // here regardless of whether THIS invocation ended by a signal
+        // or by simply returning after printing the gate banner — same
+        // as any other gated run.
         crate::launch_guard::reap_and_exit_on_signal();
         return outcome;
     }

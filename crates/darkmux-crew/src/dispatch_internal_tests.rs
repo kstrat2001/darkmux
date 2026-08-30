@@ -6065,3 +6065,66 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         darkmux_types::interrupt::reset_for_test();
         darkmux_types::child_registry::reset_for_test();
     }
+
+    // (#2131 review round 2, NEW-1) `docker_kill_by_name` is the ONE place
+    // that stops a container by its deterministic name — shared now by the
+    // inactivity watchdog, the wait-error teardown, and the interrupt
+    // teardown, so a single test covers all three call sites at once.
+    // Before this fix, the interrupt branch killed only the registered
+    // `docker run` CLIENT pid, which does NOT stop the container (measured
+    // live: `docker ps` still showed it `Up` after `kill -9` on the CLI's
+    // pid). No real Docker/`docker ps` is available in this sandbox, so
+    // this is the mocked equivalent: a fake `docker` executable on `PATH`
+    // that records its own argv, standing in for the real `docker`
+    // binary this function shells out to.
+    #[test]
+    #[serial]
+    fn docker_kill_by_name_invokes_docker_kill_with_the_exact_container_name() {
+        let dir = TempDir::new().unwrap();
+        let record_path = dir.path().join("invoked-with.txt");
+        let fake_docker_path = dir.path().join("docker");
+        // A trivial shell script standing in for `docker`: writes its own
+        // argv (space-joined) to `record_path`, then exits 0 — enough to
+        // prove WHAT this function invokes without needing the real
+        // Docker CLI or daemon.
+        std::fs::write(
+            &fake_docker_path,
+            format!("#!/bin/sh\necho \"$@\" > {}\n", record_path.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_docker_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_docker_path, perms).unwrap();
+        }
+
+        let prev_path = std::env::var("PATH").ok();
+        // SAFETY: serialized via #[serial].
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.path().display(), prev_path.clone().unwrap_or_default()),
+            );
+        }
+
+        docker_kill_by_name("darkmux-test-container-2131");
+
+        // SAFETY: serialized via #[serial].
+        unsafe {
+            match &prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        let recorded = std::fs::read_to_string(&record_path)
+            .expect("docker_kill_by_name must have invoked the fake `docker` on PATH");
+        assert_eq!(
+            recorded.trim(),
+            "kill darkmux-test-container-2131",
+            "must call `docker kill <exact container name>`, not some other subcommand or a \
+             different name"
+        );
+    }

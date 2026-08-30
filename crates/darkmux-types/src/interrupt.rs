@@ -204,6 +204,30 @@ pub fn reset_for_test() {
     SIGHUP_COUNT.store(0, Ordering::SeqCst);
 }
 
+/// (#2131 review round 2, NEW-5) Test-only: restore SIGTERM and SIGHUP to
+/// their OS-default disposition. [`reset_for_test`] above only resets
+/// THIS module's own flag/counters — it never touches the real signal
+/// disposition, and neither do [`simulate_sigterm_for_test`]/
+/// [`simulate_sighup_for_test`] (they call the internal handler function
+/// directly, never `signal(2)`). A test that instead calls
+/// [`install_term`]/[`install_hup`] (or, one level up, `darkmux`'s own
+/// `launch_guard::arm`) to prove the REAL handler gets wired up needs
+/// this: `signal(2)` dispositions are process-wide and persist across
+/// `install*` calls until something changes them back, so skipping this
+/// would leave a custom SIGTERM/SIGHUP handler installed for every LATER
+/// test in the same test binary process, whether or not that test itself
+/// calls `install_term`/`install_hup` again. SIGINT deliberately
+/// excluded — no test in this codebase sends a REAL SIGINT to itself
+/// (unlike SIGTERM/SIGHUP, catching a genuine Ctrl-C mid test run would
+/// be actively disruptive), so there is nothing to restore there.
+#[cfg(any(test, feature = "test-support"))]
+pub fn restore_default_for_test() {
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::signal(libc::SIGHUP, libc::SIG_DFL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
