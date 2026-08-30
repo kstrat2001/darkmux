@@ -619,6 +619,12 @@ pub(crate) enum MissionCmd {
         /// without `--dry-run`.
         #[arg(long = "dry-run")]
         dry_run: bool,
+        /// (#2112) Start anyway when the pre-flight power-posture check
+        /// finds the machine at `serious`/`critical` thermal state — the
+        /// one condition that pre-flight refuses outright. Battery power
+        /// and Low Power Mode only warn and never need this flag.
+        #[arg(long)]
+        force: bool,
     },
     /// Add a new Phase to an existing Mission mid-flight (#107).
     /// Operator-sovereign scope growth — alternative to either hand-

@@ -523,6 +523,21 @@ pub fn launch(
         return Ok(0);
     }
 
+    // (#2112 review CONSIDER 3) Power-posture pre-flight (warns on
+    // battery/Low Power Mode, refuses on serious/critical thermal unless
+    // `--force`) + a held `PreventUserIdleSystemSleep` assertion for this
+    // launch's lifetime, released automatically on every exit path via
+    // `Drop`. See `src/preflight.rs` and
+    // `crates/darkmux-crew/src/sleep_assertion.rs`. Deliberately placed
+    // AFTER config load, the command-allowlist gate, semantic validation,
+    // and the `--dry-run` short-circuit above (moved here from
+    // immediately after the `config_id == "crawl"` routing check) — a
+    // typo'd config id now reports "no such config", and `--dry-run`
+    // never gets refused on thermal grounds, since neither one is about
+    // to do any sustained work this pre-flight exists to protect.
+    crate::preflight::check_power_posture(params)?;
+    let _sleep_assertion = darkmux_crew::sleep_assertion::SleepAssertion::hold(&format!("darkmux mission {config_id}"));
+
     // Run id: minted fresh for THIS launch, never derived from inputs
     // (#1503). AI work is non-deterministic, so two launches of the same
     // config with the same inputs are two DIFFERENT runs, not one to
