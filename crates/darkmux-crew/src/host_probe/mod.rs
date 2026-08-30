@@ -118,6 +118,50 @@ pub struct HostProbeSources {
     pub ioreg_gpu: bool,
 }
 
+/// (#2111) One host reading's full "now" JSON shape — every field
+/// [`HostSampleFull`] carries, plus the wall-clock it was taken at. Shared
+/// by TWO independent consumers so the mapping from `HostSampleFull` to
+/// wire JSON exists in exactly one place: `darkmux-serve`'s daemon-side
+/// ring (`/machine/resources`'s `load.now` block) and `darkmux-crew`'s
+/// dispatch-scoped sampler (the periodic `machine.telemetry` flow record,
+/// #2111). A field the probe could not read serializes as JSON `null`,
+/// never a zero — "not measured" and "measured, and idle" are different
+/// claims, and downstream consumers render them differently.
+pub fn sample_full_json(s: &HostSampleFull, sampled_at_ms: u64) -> serde_json::Value {
+    let clusters = s.cpu_clusters.as_ref().map(|cs| {
+        cs.iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "cores": c.cores,
+                    "pct": c.pct,
+                    "mhz": c.mhz,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    serde_json::json!({
+        "sampled_at_ms": sampled_at_ms,
+        "sampler_cost_ms": s.cost_ms,
+        "cpu_pct": s.cpu_pct,
+        "cpu_clusters": clusters,
+        "mem_pct": s.mem_pct,
+        "gpu_pct": s.gpu_pct,
+        "gpu_mhz": s.gpu_mhz,
+        "gpu_mem_bytes": s.gpu_mem_bytes,
+        "thermal": s.thermal.as_ref().map(|t| serde_json::json!({
+            "state": t.state,
+            "cpu_speed_limit_pct": t.cpu_speed_limit_pct,
+        })),
+        "power_mw": s.power.as_ref().map(|p| serde_json::json!({
+            "cpu": p.cpu_mw.round() as i64,
+            "gpu": p.gpu_mw.round() as i64,
+            "ane": p.ane_mw.round() as i64,
+            "total": p.total_mw().round() as i64,
+        })),
+    })
+}
+
 // ── Window reduction ───────────────────────────────────────────────────────
 
 /// One metric's window reduction in milliwatts. Mirrors

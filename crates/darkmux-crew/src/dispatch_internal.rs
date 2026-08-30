@@ -3789,6 +3789,12 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     if let Some(resume_from) = &opts.resume_from {
         dispatch_complete_payload["resumed_from"] = serde_json::json!(resume_from.display().to_string());
     }
+    // (#2111) Same compact host-pressure summary as the envelope's
+    // `host_window` (`enrich_envelope_with_summary`) — reaching the FLOW
+    // RECORD too, not just the CLI's own `--json` stdout.
+    if let Some(hw) = host_window_json(&host_stats, &host_extras) {
+        dispatch_complete_payload["host_window"] = hw;
+    }
     // (#1959) Same provenance merge as `dispatch_start_payload` above.
     merge_record_context(&mut dispatch_complete_payload, &opts.record_context);
     let (action, level) = if exit_code == 0 {
@@ -4127,6 +4133,12 @@ fn enrich_envelope_with_summary(
             }
         }
         obj.insert("host".into(), host);
+        // (#2111) The flatter dispatch-summary shape — see
+        // `host_window_json`'s own doc for why it exists alongside `host`
+        // above rather than replacing it.
+        if let Some(hw) = host_window_json(stats, extras) {
+            obj.insert("host_window".into(), hw);
+        }
     }
     // (#1959) What a crawl actually FOUND. The envelope carried a converged
     // dispatch and no way to tell a run that reported twelve findings from one
@@ -4650,6 +4662,91 @@ fn run_tailer(
     state.summary
 }
 
+/// (#2111) Pure: whether tick number `sample_idx` (1-indexed — the first
+/// tick a sampler takes is `1`, not `0`) should emit a periodic
+/// `machine.telemetry` SAMPLE record, given the configured cadence
+/// `every` (`config_access::telemetry_record_every_samples()`). `every ==
+/// 0` means "disabled" — never emits, regardless of `sample_idx`. A
+/// 1-indexed counter means the very first tick is never itself a record
+/// (the periodic curve starts roughly `every` ticks in, not immediately),
+/// matching `machine.thermal`'s own "the first reading seeds silently"
+/// convention for the other new action this issue adds.
+fn should_record_machine_telemetry(sample_idx: u64, every: u64) -> bool {
+    every > 0 && sample_idx % every == 0
+}
+
+/// (#2111) Build one `machine.telemetry` SAMPLE flow record — the full
+/// host reading (`host_probe::sample_full_json`, shared with the daemon
+/// ring's `/machine/resources` `load.now` block) through
+/// `merge_record_context` so it keys to this dispatch's mission/step the
+/// same way every other tailer-emitted telemetry record does. Pure: no
+/// probe, no clock, no sampler thread — the cadence gate
+/// (`should_record_machine_telemetry`) and this payload/record shape are
+/// each independently testable without spinning the real sampler.
+#[allow(clippy::too_many_arguments)]
+fn build_machine_telemetry_record(
+    sample: &crate::host_probe::HostSampleFull,
+    sampled_at_ms: u64,
+    role_id: &str,
+    session_id: &str,
+    model: &str,
+    mission_id: Option<&str>,
+    phase_id: Option<&str>,
+    record_context: &Option<serde_json::Value>,
+) -> darkmux_flow::FlowRecord {
+    let mut payload = crate::host_probe::sample_full_json(sample, sampled_at_ms);
+    merge_record_context(&mut payload, record_context);
+    crate::dispatch::build_telemetry_record(
+        darkmux_flow::Level::Info,
+        "machine.telemetry",
+        "host",
+        role_id,
+        session_id,
+        Some(model),
+        mission_id,
+        phase_id,
+        payload,
+    )
+}
+
+/// (#2111) A compact host-pressure summary for `dispatch complete`/
+/// `dispatch error`'s FLOW RECORD payload (and the `--json` envelope,
+/// alongside the existing nested `host` block — see
+/// `enrich_envelope_with_summary`) — so a fleet reader watching the FLOW
+/// STREAM, not just the CLI's own stdout capture, can see "was this
+/// dispatch thermally comfortable" without parsing `host`'s per-metric
+/// breakdown. Reuses the SAME `HostStats`/`HostExtras` reduction `host` is
+/// built from — no duplicated math, only a flatter key set for a
+/// different consumer. `span_ms` is derived from `stats.samples` and
+/// `stats.sample_interval_ms` (both already the product of
+/// `reduce_host_stats`) rather than re-walking the raw sample series —
+/// the same arithmetic `reduce_host_stats` itself uses to derive
+/// `sample_interval_ms` from a span, run in reverse. `None` when the
+/// sampler never took a sample (`stats.samples == 0`) — an absent block
+/// says "not measured", never "measured, and idle".
+fn host_window_json(stats: &HostStats, extras: &HostExtras) -> Option<serde_json::Value> {
+    if stats.samples == 0 {
+        return None;
+    }
+    let span_ms = stats
+        .sample_interval_ms
+        .map(|iv| iv.saturating_mul((stats.samples.saturating_sub(1)) as u64))
+        .unwrap_or(0);
+    Some(serde_json::json!({
+        "thermal_worst_state": extras.thermal.as_ref().map(|t| t.worst_state.clone()),
+        "above_nominal_ms": extras.thermal.as_ref().map(|t| t.above_nominal_ms),
+        "min_cpu_speed_limit_pct": extras.thermal.as_ref().map(|t| t.min_cpu_speed_limit_pct),
+        "power_mw_total": extras.power.as_ref().map(|p| serde_json::json!({
+            "mean": p.total.mean_mw,
+            "max": p.total.max_mw,
+            "p95": p.total.p95_mw,
+        })),
+        "energy_mwh": extras.energy_mwh,
+        "samples": stats.samples,
+        "span_ms": span_ms,
+    }))
+}
+
 /// (N6 of the #2110/#2109 review) Best-effort removal of a leftover
 /// `pace.json` in this dispatch's out-dir, called BEFORE
 /// `run_telemetry_sampler`'s loop starts. `host_out` is ALWAYS a fresh
@@ -4777,6 +4874,13 @@ fn run_telemetry_sampler(
             payload,
         ));
     };
+
+    // (#2111) The periodic `machine.telemetry` curve's cadence, resolved
+    // ONCE up front — `env > config.json > 5` (≈10s at this sampler's 2s
+    // tick). `0` disables the periodic curve without touching anything
+    // else this sampler does (thermal governor, `host_window` reduction).
+    let telemetry_record_every_samples = darkmux_types::config_access::telemetry_record_every_samples();
+    let mut sample_idx: u64 = 0;
 
     let mut prev: Vec<darkmux_types::LoadedModel> = Vec::new();
     let mut seeded = false;
@@ -4936,6 +5040,39 @@ fn run_telemetry_sampler(
                 power: sample.power,
                 thermal: sample.thermal.clone(),
             });
+        }
+
+        // (#2111) The periodic `machine.telemetry` curve — every Nth tick,
+        // never every tick (the observer-cost rule: the sample is ALREADY
+        // taken above for the governor + the `host`/`host_window`
+        // reduction; only the record WRITE is the added cost, and only on
+        // the ticks that actually emit).
+        sample_idx += 1;
+        if should_record_machine_telemetry(sample_idx, telemetry_record_every_samples) {
+            let build_start = Instant::now();
+            let mut rec = build_machine_telemetry_record(
+                &sample,
+                at_ms,
+                &role_id,
+                &session_id,
+                &model,
+                mission_id.as_deref(),
+                phase_id.as_deref(),
+                &record_context,
+            );
+            // (#2111, CLAUDE.md "samplers stamp their own cost") The probe
+            // read's own cost already rides in `sampler_cost_ms`
+            // (`sample_full_json`); this measures the SEPARATE cost of
+            // building + merging THIS record — the observability write's
+            // own added cost, stamped into the record it describes rather
+            // than assumed negligible.
+            if let Some(obj) = rec.payload.as_mut().and_then(|p| p.as_object_mut()) {
+                obj.insert(
+                    "record_cost_ms".into(),
+                    serde_json::json!(build_start.elapsed().as_millis() as u64),
+                );
+            }
+            let _ = darkmux_flow::record(rec);
         }
 
         // Wait out the sample interval, but poll the stop flag every

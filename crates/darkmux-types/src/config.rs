@@ -96,7 +96,14 @@ use std::path::Path;
 // `strict_selection`/`check_updates`'s always-on-unless-told-otherwise
 // convention rather than `redis`/`audit`'s off-by-default one). Minor
 // bump, same lenient-read reasoning.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.15";
+// 1.16 (#2111): additive `runtime.telemetry_record_every_samples` — how
+// many dispatch-sampler ticks between `machine.telemetry` SAMPLE records
+// (the periodic host-pressure curve alongside `machine.thermal`'s
+// TRANSITION events). Visible default `5` (≈10s at the sampler's 2s
+// cadence); `0` disables the periodic curve without touching the sampler
+// itself (thermal governor + `host_window` summary are unaffected). Minor
+// bump, same lenient-read reasoning.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.16";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -358,6 +365,17 @@ pub struct RuntimeBehaviorConfig {
     /// (#2110/#2109) The thermal governor + breaker's tuning block. See
     /// [`ThermalConfig`]'s own doc for the pause/resume/breaker semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub thermal: Option<ThermalConfig>,
+    /// (#2111) How many dispatch-sampler ticks (the 2s
+    /// `dispatch_internal::run_telemetry_sampler` cadence) between
+    /// `machine.telemetry` SAMPLE flow records — the periodic host-pressure
+    /// curve (thermal/power/cpu/gpu/mem) a run-detail view can chart
+    /// alongside `machine.thermal`'s TRANSITION events. Default `5` (≈10s).
+    /// `0` disables the periodic curve entirely without touching the
+    /// sampler thread itself: the thermal governor still reads every tick
+    /// (it has to, for pause/resume timing), and `dispatch complete`'s
+    /// `host_window` summary is built from every sample regardless — only
+    /// the per-tick flow record is silenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub telemetry_record_every_samples: Option<u64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -891,6 +909,11 @@ impl DarkmuxConfig {
                     speed_limit_hold_samples: Some(3),
                     extras: Default::default(),
                 }),
+                // (#2111) Visible `5` — the periodic machine.telemetry
+                // curve's cadence in dispatch-sampler TICKS, discoverable
+                // and one edit from `0` (disabled) or a tighter/looser
+                // value.
+                telemetry_record_every_samples: Some(5),
                 extras: Default::default(),
             }),
             fleet: Some(FleetConfig {
