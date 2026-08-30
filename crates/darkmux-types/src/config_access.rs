@@ -85,6 +85,47 @@ fn pick_parsed<T: FromStr + Copy>(env_key: &str, cfg: Option<T>, default: Option
         .or(default)
 }
 
+/// (#2165) Which tier of `env > config.json > built-in default` a resolved
+/// setting's value actually came from — the provenance half of "the operator
+/// never has to wonder where a decision came from" (#44). Every accessor
+/// below has a name-matched `<accessor>_with_source()` sibling that returns
+/// this alongside the value, for the record/envelope/doctor surfaces that
+/// need to SHOW the tier, not just resolve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    BuiltIn,
+    Config,
+    Env,
+}
+
+impl Source {
+    /// The wire string this tier renders as everywhere a record/envelope/
+    /// doctor row names it: `"built-in"` | `"config"` | `"env"`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Source::BuiltIn => "built-in",
+            Source::Config => "config",
+            Source::Env => "env",
+        }
+    }
+}
+
+/// `pick_parsed`'s sibling that also reports WHICH tier won. Pure + testable
+/// like `pick_parsed` — the only difference is the second return value.
+fn pick_parsed_with_source<T: FromStr + Copy>(
+    env_key: &str,
+    cfg: Option<T>,
+    default: Option<T>,
+) -> (Option<T>, Source) {
+    if let Some(v) = env_str(env_key).and_then(|s| s.parse::<T>().ok()) {
+        return (Some(v), Source::Env);
+    }
+    if let Some(v) = cfg {
+        return (Some(v), Source::Config);
+    }
+    (default, Source::BuiltIn)
+}
+
 /// The **override tier** for a directory setting: `env > config tier
 /// (tilde-expanded)`, or `None` when neither is set. The caller then supplies
 /// its own default — used where one env var overrides two *different* derived
@@ -316,8 +357,17 @@ pub fn hooks_max_outbox_mb() -> u64 {
 
 // ── Runtime behavior ──
 pub fn inactivity_timeout_seconds() -> u64 {
+    inactivity_timeout_seconds_with_source().0
+}
+/// (#2165) `inactivity_timeout_seconds` plus WHICH tier resolved it — the
+/// host forwards both the value AND this tier into the container (a
+/// companion `DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE` env var, mirroring
+/// the value var's own forwarding) so the runtime's soft-warning stderr line
+/// and any future bound-hit record can name it, not just the number.
+pub fn inactivity_timeout_seconds_with_source() -> (u64, Source) {
     let cfg = config().runtime.as_ref().and_then(|r| r.inactivity_timeout_seconds);
-    pick_parsed("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", cfg, Some(600)).unwrap()
+    let (v, s) = pick_parsed_with_source("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", cfg, Some(600));
+    (v.unwrap(), s)
 }
 /// (#1276) Bounded model-load/unload phase for gestalt host-port calls —
 /// consumed by `darkmux_profiles::gestalt_host::resolved_load_deadline`,
@@ -328,18 +378,30 @@ pub fn model_load_timeout_seconds() -> u64 {
     pick_parsed("DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS", cfg, Some(600)).unwrap()
 }
 pub fn max_turns() -> Option<u32> {
+    max_turns_with_source().0
+}
+/// (#2165) `max_turns` plus WHICH tier resolved it.
+pub fn max_turns_with_source() -> (Option<u32>, Source) {
     let cfg = config().runtime.as_ref().and_then(|r| r.max_turns);
-    pick_parsed("DARKMUX_RUNTIME_MAX_TURNS", cfg, None)
+    pick_parsed_with_source("DARKMUX_RUNTIME_MAX_TURNS", cfg, None)
 }
 pub fn max_tokens() -> Option<u32> {
+    max_tokens_with_source().0
+}
+/// (#2165) `max_tokens` plus WHICH tier resolved it.
+pub fn max_tokens_with_source() -> (Option<u32>, Source) {
     let cfg = config().runtime.as_ref().and_then(|r| r.max_tokens);
-    pick_parsed("DARKMUX_RUNTIME_MAX_TOKENS", cfg, None)
+    pick_parsed_with_source("DARKMUX_RUNTIME_MAX_TOKENS", cfg, None)
 }
 /// (#1221) Per-call completion-token cap override. `None` = the runtime's
 /// built-in default (`MAX_TOKENS_PER_CALL` = 10000).
 pub fn max_tokens_per_call() -> Option<u32> {
+    max_tokens_per_call_with_source().0
+}
+/// (#2165) `max_tokens_per_call` plus WHICH tier resolved it.
+pub fn max_tokens_per_call_with_source() -> (Option<u32>, Source) {
     let cfg = config().runtime.as_ref().and_then(|r| r.max_tokens_per_call);
-    pick_parsed("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", cfg, None)
+    pick_parsed_with_source("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", cfg, None)
 }
 
 /// (#1221) How far the model reasons between the runtime's mid-turn check-ins.
@@ -350,11 +412,16 @@ pub fn max_tokens_per_call() -> Option<u32> {
 /// They were briefly one number, which is wrong for whichever job it is not
 /// tuned for.
 pub fn reasoning_checkpoint_interval_tokens() -> Option<u32> {
+    reasoning_checkpoint_interval_tokens_with_source().0
+}
+/// (#2165) `reasoning_checkpoint_interval_tokens` plus WHICH tier resolved
+/// it.
+pub fn reasoning_checkpoint_interval_tokens_with_source() -> (Option<u32>, Source) {
     let cfg = config()
         .runtime
         .as_ref()
         .and_then(|r| r.reasoning_checkpoint_interval_tokens);
-    pick_parsed("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", cfg, None)
+    pick_parsed_with_source("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", cfg, None)
 }
 
 // ── Remote (hosted-endpoint) dispatch (#1260/#1177) ──
@@ -616,10 +683,17 @@ pub fn check_updates() -> bool {
 /// own reader (whose falsy set this mirrors) sees the resolved tier, not just
 /// a host-side env override.
 pub fn feedback_injection() -> bool {
+    feedback_injection_with_source().0
+}
+/// (#2165) `feedback_injection` plus WHICH tier resolved it.
+pub fn feedback_injection_with_source() -> (bool, Source) {
     if let Some(s) = env_str("DARKMUX_FEEDBACK_INJECTION") {
-        return !matches!(s.as_str(), "0" | "off" | "false" | "no");
+        return (!matches!(s.as_str(), "0" | "off" | "false" | "no"), Source::Env);
     }
-    config().runtime.as_ref().and_then(|r| r.feedback_injection).unwrap_or(true)
+    match config().runtime.as_ref().and_then(|r| r.feedback_injection) {
+        Some(v) => (v, Source::Config),
+        None => (true, Source::BuiltIn),
+    }
 }
 
 /// (#2094) The global inter-turn rest, in milliseconds, the internal
@@ -630,8 +704,13 @@ pub fn feedback_injection() -> bool {
 /// configured value at or above the inactivity timeout rather than
 /// honoring it verbatim (see `runtime/src/loop_runner.rs`).
 pub fn turn_delay_ms() -> u64 {
+    turn_delay_ms_with_source().0
+}
+/// (#2165) `turn_delay_ms` plus WHICH tier resolved it.
+pub fn turn_delay_ms_with_source() -> (u64, Source) {
     let cfg = config().runtime.as_ref().and_then(|r| r.turn_delay_ms);
-    pick_parsed("DARKMUX_TURN_DELAY_MS", cfg, Some(0)).unwrap()
+    let (v, s) = pick_parsed_with_source("DARKMUX_TURN_DELAY_MS", cfg, Some(0));
+    (v.unwrap(), s)
 }
 
 /// (#2107, #1833) Cadence, in milliseconds, of `darkmux serve`'s daemon-side
@@ -1121,6 +1200,97 @@ mod tests {
         unsafe { std::env::set_var(k, "not-a-number"); }
         assert_eq!(pick_parsed::<u64>(k, Some(120), Some(600)), Some(120)); // unparseable env → cfg
         unsafe { std::env::remove_var(k); }
+    }
+
+    // ── pick_parsed_with_source (#2165): same precedence as pick_parsed,
+    //    plus WHICH tier won ──
+    #[serial_test::serial]
+    #[test]
+    fn pick_parsed_with_source_names_the_winning_tier() {
+        let k = "DARKMUX_TEST_PICK_PARSED_SOURCE";
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(pick_parsed_with_source::<u64>(k, None, Some(600)), (Some(600), Source::BuiltIn));
+        assert_eq!(pick_parsed_with_source::<u64>(k, Some(120), Some(600)), (Some(120), Source::Config));
+        unsafe { std::env::set_var(k, "90"); }
+        assert_eq!(pick_parsed_with_source::<u64>(k, Some(120), Some(600)), (Some(90), Source::Env));
+        // unparseable env falls through to cfg, same as pick_parsed.
+        unsafe { std::env::set_var(k, "not-a-number"); }
+        assert_eq!(pick_parsed_with_source::<u64>(k, Some(120), Some(600)), (Some(120), Source::Config));
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(pick_parsed_with_source::<u64>(k, None, None), (None, Source::BuiltIn));
+    }
+
+    #[test]
+    fn source_as_str_matches_the_spec_strings() {
+        assert_eq!(Source::BuiltIn.as_str(), "built-in");
+        assert_eq!(Source::Config.as_str(), "config");
+        assert_eq!(Source::Env.as_str(), "env");
+    }
+
+    // ── representative `_with_source` accessors honor the env layer live,
+    //    same property `redis_stream_env_override_wins_live` below pins for
+    //    the value-only accessors (#2165) ──
+    #[serial_test::serial]
+    #[test]
+    fn inactivity_timeout_seconds_with_source_env_overrides_then_built_in() {
+        let k = "DARKMUX_INACTIVITY_TIMEOUT_SECONDS";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(
+            inactivity_timeout_seconds_with_source(),
+            (600, Source::BuiltIn),
+            "no env, empty test config → the built-in default, tagged built-in"
+        );
+        unsafe { std::env::set_var(k, "120"); }
+        assert_eq!(
+            inactivity_timeout_seconds_with_source(),
+            (120, Source::Env),
+            "env override wins the value AND the source"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn max_tokens_per_call_with_source_env_overrides_then_built_in() {
+        let k = "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(
+            max_tokens_per_call_with_source(),
+            (None, Source::BuiltIn),
+            "unset everywhere → None, tagged built-in (the runtime's own literal default)"
+        );
+        unsafe { std::env::set_var(k, "4000"); }
+        assert_eq!(max_tokens_per_call_with_source(), (Some(4000), Source::Env));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn feedback_injection_with_source_env_overrides_then_built_in() {
+        let k = "DARKMUX_FEEDBACK_INJECTION";
+        let prev = std::env::var(k).ok();
+        unsafe { std::env::remove_var(k); }
+        assert_eq!(feedback_injection_with_source(), (true, Source::BuiltIn));
+        unsafe { std::env::set_var(k, "0"); }
+        assert_eq!(feedback_injection_with_source(), (false, Source::Env));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     // ── representative accessor honors the env layer live (the override

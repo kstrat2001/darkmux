@@ -877,6 +877,228 @@
         assert_eq!(effective_turn_delay_ms(0, false), 0);
     }
 
+    // ─── MUST FIX 3 (merge-gate review of #2165): pin the two `bounds`
+    //     WIRING sites — deleting either insertion failed no test before
+    //     this. `dispatch_start_payload_json` below covers the first
+    //     (`dispatch()`'s real construction was un-unit-testable before the
+    //     #2165 review extracted it into this pure fn); the
+    //     `enrich_envelope_with_summary` tests further down cover the
+    //     second (`obj.insert("bounds", …)`).
+
+    #[test]
+    #[serial]
+    fn dispatch_start_payload_json_carries_the_bounds_key_with_the_expected_shape() {
+        let prev = std::env::var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL").ok();
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL") };
+
+        let payload = dispatch_start_payload_json(
+            "darkmux-runtime:latest",
+            "read x.txt",
+            "system prompt",
+            std::path::Path::new("/tmp/ws"),
+            false,
+        );
+
+        // The wiring itself: this key would be ABSENT entirely if the
+        // `"bounds": resolved_runtime_bounds_json(is_agentic_remote)` line
+        // were ever deleted from `dispatch_start_payload_json` — proving
+        // this assertion actually exercises the insertion, not just the
+        // helper's own internal logic (already pinned by the
+        // `resolved_runtime_bounds_json_*` tests below).
+        assert!(payload.get("bounds").is_some(), "dispatch_start_payload must carry a bounds key: {payload}");
+        assert_eq!(
+            payload["bounds"]["max_tokens_per_call"],
+            serde_json::json!({"value": null, "source": "built-in"}),
+            "bounds must be the SAME shape resolved_runtime_bounds_json produces: {payload}"
+        );
+        // The rest of the payload survives the extraction unchanged —
+        // pinning the refactor didn't silently drop or rename a field.
+        assert_eq!(payload["runtime"], serde_json::json!("internal"));
+        assert_eq!(payload["image"], serde_json::json!("darkmux-runtime:latest"));
+        assert_eq!(payload["prompt_chars"], serde_json::json!("read x.txt".chars().count()));
+        assert_eq!(payload["workspace"], serde_json::json!("/tmp/ws"));
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL"),
+            }
+        }
+    }
+
+    /// The agentic-remote half of the same wiring: `is_agentic_remote=true`
+    /// must reach `bounds.turn_delay_ms`'s `forced-agentic-remote` shape
+    /// (MUST FIX 2) through this real call path, not just through
+    /// `resolved_runtime_bounds_json` called directly.
+    #[test]
+    fn dispatch_start_payload_json_forces_turn_delay_ms_for_agentic_remote() {
+        let payload = dispatch_start_payload_json(
+            "darkmux-runtime:latest",
+            "msg",
+            "sys",
+            std::path::Path::new("/tmp/ws"),
+            true,
+        );
+        assert_eq!(payload["bounds"]["turn_delay_ms"]["source"], serde_json::json!("forced-agentic-remote"));
+        assert_eq!(payload["turn_delay_ms"], serde_json::json!(0), "the top-level stamp is also forced");
+    }
+
+    // ─── #2165: resolved_runtime_bounds_json — the SAME block shared by
+    //     dispatch_start_payload["bounds"] and the envelope's own `bounds` ───
+    //
+    // (#811 test-isolation) darkmux-crew's dev-dependency on
+    // `darkmux-types/test-support` makes `config_access::config()` ALWAYS
+    // return the empty default in this crate's own test builds (see that
+    // feature's own doc) — so the CONFIG tier is structurally unreachable
+    // from here. The two tiers actually exercisable at this layer are ENV
+    // and BUILT-IN; the CONFIG tier's precedence is pinned instead by
+    // `darkmux-types::config_access`'s own `pick_parsed_with_source` /
+    // `*_with_source` tests, which construct it directly.
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_names_built_in_when_nothing_is_set() {
+        for k in [
+            "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL",
+            "DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL",
+            "DARKMUX_INACTIVITY_TIMEOUT_SECONDS",
+            "DARKMUX_RUNTIME_MAX_TURNS",
+            "DARKMUX_RUNTIME_MAX_TOKENS",
+            "DARKMUX_TURN_DELAY_MS",
+            "DARKMUX_FEEDBACK_INJECTION",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+        let bounds = resolved_runtime_bounds_json(false);
+        assert_eq!(
+            bounds["max_tokens_per_call"],
+            serde_json::json!({"value": null, "source": "built-in"}),
+            "an unset optional knob names built-in with a null value, not an absent field: {bounds}"
+        );
+        assert_eq!(
+            bounds["reasoning_checkpoint_interval_tokens"],
+            serde_json::json!({"value": null, "source": "built-in"})
+        );
+        assert_eq!(
+            bounds["inactivity_timeout_seconds"],
+            serde_json::json!({"value": 600, "source": "built-in"})
+        );
+        assert_eq!(bounds["max_turns"], serde_json::json!({"value": null, "source": "built-in"}));
+        assert_eq!(bounds["max_tokens"], serde_json::json!({"value": null, "source": "built-in"}));
+        assert_eq!(bounds["feedback_injection"], serde_json::json!({"value": true, "source": "built-in"}));
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_names_env_when_an_env_var_wins() {
+        for k in [
+            "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL",
+            "DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL",
+            "DARKMUX_INACTIVITY_TIMEOUT_SECONDS",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "4000") };
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", "500") };
+        unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "120") };
+        let bounds = resolved_runtime_bounds_json(false);
+        assert_eq!(bounds["max_tokens_per_call"], serde_json::json!({"value": 4000, "source": "env"}));
+        assert_eq!(
+            bounds["reasoning_checkpoint_interval_tokens"],
+            serde_json::json!({"value": 500, "source": "env"})
+        );
+        assert_eq!(
+            bounds["inactivity_timeout_seconds"],
+            serde_json::json!({"value": 120, "source": "env"})
+        );
+        for k in [
+            "DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL",
+            "DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL",
+            "DARKMUX_INACTIVITY_TIMEOUT_SECONDS",
+        ] {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_turn_delay_ms_passes_through_for_a_local_dispatch() {
+        let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
+        unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "3000") };
+        let bounds = resolved_runtime_bounds_json(false);
+        assert_eq!(
+            bounds["turn_delay_ms"],
+            serde_json::json!({"value": 3000, "source": "env"}),
+            "a LOCAL dispatch's turn_delay_ms row is the plain {{value, source}} shape, \
+             same as every other knob — got {bounds}"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_TURN_DELAY_MS", v),
+                None => std::env::remove_var("DARKMUX_TURN_DELAY_MS"),
+            }
+        }
+    }
+
+    /// MUST FIX 2 (merge-gate review): `turn_delay_ms`'s provenance was
+    /// decorative — the row paired the FORCED effective value (`0` for
+    /// agentic-remote) with the CONFIGURED value's source, so a dispatch
+    /// with `config.runtime.turn_delay_ms: 5000` that also happened to be
+    /// agentic-remote rendered `{"value": 0, "source": "config"}` — a
+    /// source that resolved a DIFFERENT number than the one shown. Fixed:
+    /// when forced, `source` becomes the literal `"forced-agentic-remote"`
+    /// tier and `configured_value` carries what the operator's own knob
+    /// actually resolved to (with its real source, nested), so the row
+    /// stays self-explaining instead of silently going quiet about the
+    /// configured value.
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_turn_delay_ms_is_self_explaining_when_forced_agentic_remote() {
+        let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
+        unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "5000") };
+        let bounds = resolved_runtime_bounds_json(true);
+        assert_eq!(
+            bounds["turn_delay_ms"],
+            serde_json::json!({
+                "value": 0,
+                "source": "forced-agentic-remote",
+                "configured_value": {"value": 5000, "source": "env"},
+            }),
+            "the row must show the forced 0 AND the configured 5000 it overrode, not just the \
+             forced value paired with the configured value's source — got {bounds}"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_TURN_DELAY_MS", v),
+                None => std::env::remove_var("DARKMUX_TURN_DELAY_MS"),
+            }
+        }
+    }
+
+    /// Even at the built-in default (`0`, no rest configured), an
+    /// agentic-remote dispatch still gets the `forced-agentic-remote`
+    /// shape — the override applies regardless of what it overrode.
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_turn_delay_ms_forced_shape_holds_even_at_the_default() {
+        let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
+        unsafe { std::env::remove_var("DARKMUX_TURN_DELAY_MS") };
+        let bounds = resolved_runtime_bounds_json(true);
+        assert_eq!(
+            bounds["turn_delay_ms"],
+            serde_json::json!({
+                "value": 0,
+                "source": "forced-agentic-remote",
+                "configured_value": {"value": 0, "source": "built-in"},
+            }),
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_TURN_DELAY_MS", v),
+                None => std::env::remove_var("DARKMUX_TURN_DELAY_MS"),
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn config_path_reaches_dispatch_resolvers_not_just_env() {
@@ -1516,6 +1738,7 @@
             // complete-vector assertion below pins the forwarded
             // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` pair too.
             inactivity_timeout_seconds: 900,
+            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::Config,
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -1595,72 +1818,80 @@
         assert_eq!(argv[25], "-e");
         assert_eq!(argv[26], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS=900");
 
+        // 5e. (#2165) Verify the inactivity-timeout SOURCE env var is
+        // forwarded alongside the value — a distinct, non-default source
+        // (`Config`, not the built-in default) so this assertion actually
+        // pins forwarding rather than coincidentally matching a default.
+        assert_eq!(argv[27], "-e");
+        assert_eq!(argv[28], "DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=config");
+
         // 6. Verify runtime injection (non-default image)
-        assert_eq!(argv[27], "-v");
+        assert_eq!(argv[29], "-v");
         assert_eq!(
-            argv[28],
+            argv[30],
             "/home/op/.darkmux/runtime/darkmux-runtime:/darkmux-runtime:ro"
         );
-        assert_eq!(argv[29], "--entrypoint");
-        assert_eq!(argv[30], "/darkmux-runtime");
+        assert_eq!(argv[31], "--entrypoint");
+        assert_eq!(argv[32], "/darkmux-runtime");
 
         // 7. Verify `--` + image + runtime CLI args
-        assert_eq!(argv[31], "--");
-        assert_eq!(argv[32], "rust:slim"); // image
-        assert_eq!(argv[33], "run"); // runtime subcommand
-        assert_eq!(argv[34], "--model");
-        assert_eq!(argv[35], "llama3-8b");
+        assert_eq!(argv[33], "--");
+        assert_eq!(argv[34], "rust:slim"); // image
+        assert_eq!(argv[35], "run"); // runtime subcommand
+        assert_eq!(argv[36], "--model");
+        assert_eq!(argv[37], "llama3-8b");
         // (Security audit, #2114 resume follow-up) Unconditional, every
         // dispatch — see `DockerRunConfig::role_id`'s own doc.
-        assert_eq!(argv[36], "--role-id");
-        assert_eq!(argv[37], "test-role");
-        assert_eq!(argv[38], "--system");
-        assert_eq!(argv[39], "You are a coding assistant.");
+        assert_eq!(argv[38], "--role-id");
+        assert_eq!(argv[39], "test-role");
+        assert_eq!(argv[40], "--system");
+        assert_eq!(argv[41], "You are a coding assistant.");
         // (#386) The message goes via the out-dir mount, not argv — argv carries
         // the constant `--prompt-file <container path>`, never the brief itself.
-        assert_eq!(argv[40], "--prompt-file");
-        assert_eq!(argv[41], "/darkmux-out/.prompt.txt");
+        assert_eq!(argv[42], "--prompt-file");
+        assert_eq!(argv[43], "/darkmux-out/.prompt.txt");
         assert!(
             !argv.iter().any(|a| a == "Fix the bug in main.rs"),
             "the message must NOT appear anywhere in the docker argv (#386): {argv:?}"
         );
 
         // 8. Verify json flag
-        assert_eq!(argv[42], "--json");
+        assert_eq!(argv[44], "--json");
 
         // 9. Verify allowed tools
-        assert_eq!(argv[43], "--allowed-tools");
-        assert_eq!(argv[44], "exec,edit");
+        assert_eq!(argv[45], "--allowed-tools");
+        assert_eq!(argv[46], "exec,edit");
 
         // 10. Verify compaction flags — flag names must match the runtime's
         // accepted set verbatim (an unknown flag exits the container with 2).
-        assert_eq!(argv[45], "--compact-threshold-tokens");
-        assert_eq!(argv[46], "4096");
-        assert_eq!(argv[47], "--compactor-model");
-        assert_eq!(argv[48], "util-model");
-        assert_eq!(argv[49], "--compact-threshold-ratio");
-        assert_eq!(argv[50], "0.75");
-        assert_eq!(argv[51], "--context-window");
-        assert_eq!(argv[52], "32000");
-        assert_eq!(argv[53], "--compact-strategy");
-        assert_eq!(argv[54], "structured-slot");
-        assert_eq!(argv[55], "--bail-after-compactions");
-        assert_eq!(argv[56], "10");
-        assert_eq!(argv[57], "--compactor-custom-instructions");
-        assert_eq!(argv[58], "Be terse.");
+        assert_eq!(argv[47], "--compact-threshold-tokens");
+        assert_eq!(argv[48], "4096");
+        assert_eq!(argv[49], "--compactor-model");
+        assert_eq!(argv[50], "util-model");
+        assert_eq!(argv[51], "--compact-threshold-ratio");
+        assert_eq!(argv[52], "0.75");
+        assert_eq!(argv[53], "--context-window");
+        assert_eq!(argv[54], "32000");
+        assert_eq!(argv[55], "--compact-strategy");
+        assert_eq!(argv[56], "structured-slot");
+        assert_eq!(argv[57], "--bail-after-compactions");
+        assert_eq!(argv[58], "10");
+        assert_eq!(argv[59], "--compactor-custom-instructions");
+        assert_eq!(argv[60], "Be terse.");
 
         // 11. Verify feedback templates JSON
-        assert_eq!(argv[59], "--feedback-templates-json");
+        assert_eq!(argv[61], "--feedback-templates-json");
         // The JSON value should contain the error template
-        assert!(argv[60].contains("error"));
-        assert!(argv[60].contains("An error occurred"));
+        assert!(argv[62].contains("error"));
+        assert!(argv[62].contains("An error occurred"));
 
         // Total arg count: 61 (0..=60) — 53 pre-#1548, +2 for
         // `-e DARKMUX_FEEDBACK_INJECTION=<v>`, +2 for
         // `-e DARKMUX_TURN_DELAY_MS=<ms>` (#2094), +2 for
         // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<n>` (#2094 finding 1),
-        // +2 for `--role-id <id>` (security audit, #2114 resume follow-up).
-        assert_eq!(argv.len(), 61);
+        // +2 for `--role-id <id>` (security audit, #2114 resume follow-up), +2 for
+        // `-e DARKMUX_INACTIVITY_TIMEOUT_SECONDS_SOURCE=<tier>` (#2165).
+        assert_eq!(argv.len(), 63);
     }
 
     #[test]
@@ -1704,6 +1935,7 @@
             feedback_injection: false,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -1819,6 +2051,7 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -1871,6 +2104,7 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -2610,6 +2844,7 @@
             feedback_injection: true,
             turn_delay_ms: 0,
             inactivity_timeout_seconds: 600,
+            inactivity_timeout_seconds_source: darkmux_types::config_access::Source::BuiltIn,
             max_pause_ms_env: None,
             remote_chat_url: None,
             remote_needs_auth: false,
@@ -3890,6 +4125,88 @@
         assert_eq!(records[1]["payload"]["rests"], 2);
     }
 
+    /// (2026-08-30 fleet-observability finding) A manual pace pause (a
+    /// paced `runtime.rest` event carrying `reason`/`state`) and a plain
+    /// turn-delay rest were indistinguishable on the flow stream except by
+    /// cadence. This pins that `handle_event` forwards `reason` and `state`
+    /// verbatim onto `dispatch.rest`'s payload, and that ONLY the paced
+    /// event accumulates into `paced_rest_ms` (a plain rest, or a legacy
+    /// event with no `reason` at all, does not).
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn handle_event_runtime_rest_forwards_reason_and_state_and_tracks_paced_rest_ms() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-paced-rest".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        // 1: a legacy plain rest with no `reason` field at all (an older
+        // runtime image) -> defaults to "turn_delay", not paced.
+        state.handle_event(r#"{"type":"runtime.rest","seq":1,"ts":1,"ms":500}"#);
+        // 2: an explicit plain turn-delay rest.
+        state.handle_event(r#"{"type":"runtime.rest","seq":2,"ts":2,"ms":500,"reason":"turn_delay"}"#);
+        // 3: a paced rest with a governor-supplied reason + state.
+        state.handle_event(
+            r#"{"type":"runtime.rest","seq":3,"ts":3,"ms":2000,"reason":"thermal","state":"critical"}"#,
+        );
+        // 4: a paced rest with no state (a hand-written pace.json).
+        state.handle_event(r#"{"type":"runtime.rest","seq":4,"ts":4,"ms":2000,"reason":"paused"}"#);
+
+        assert_eq!(
+            state.summary.paced_rest_ms, 4000,
+            "only events 3 and 4 (reason != turn_delay) count as paced"
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["session_id"] == "sess-paced-rest" && v["action"] == "dispatch.rest")
+            .collect();
+        assert_eq!(records.len(), 4);
+
+        assert_eq!(records[0]["payload"]["reason"], "turn_delay", "legacy no-reason event defaults");
+        assert!(records[0]["payload"].get("state").is_none(), "no state key when the event carries none");
+
+        assert_eq!(records[1]["payload"]["reason"], "turn_delay");
+
+        assert_eq!(records[2]["payload"]["reason"], "thermal");
+        assert_eq!(records[2]["payload"]["state"], "critical");
+
+        assert_eq!(records[3]["payload"]["reason"], "paused");
+        assert!(records[3]["payload"].get("state").is_none(), "no state key on the event -> no state key on the payload");
+    }
+
     // ─── #1959 (revised) record_context rides every tailer record ─────
 
     /// `DispatchOpts::record_context` (threaded to `TailerState` via
@@ -4069,6 +4386,212 @@
         assert!(
             detail.contains("unknown tokens"),
             "null completion_tokens must render as 'unknown'; got {detail:?}"
+        );
+    }
+
+    // ─── #2165 bound provenance forwarded onto the flow stream ────────
+
+    /// MUST FIX 1 (merge-gate review): the miss #2165 exists to close
+    /// happened on the flow stream / envelope, not `trajectory.jsonl` — a
+    /// remote reader over the tailnet reads flow records. This pins that
+    /// `detector_telemetry_payload` forwards the runtime's `bound` field
+    /// VERBATIM for `dispatch.per_turn_cap.salvaged`, and that `detail`
+    /// names the kind + provenance in words instead of a bare number.
+    #[test]
+    fn detector_telemetry_payload_forwards_bound_for_per_turn_cap_salvaged() {
+        let event = serde_json::json!({
+            "type": "dispatch.per_turn_cap.salvaged",
+            "seq": 3,
+            "completion_tokens": 999,
+            "cap": 1000,
+            "salvaged_tool_calls": 2,
+            "bound": {"kind": "reasoning_checkpoint_interval", "value": 1000, "source": "built-in"},
+        });
+        let payload = detector_telemetry_payload("dispatch.per_turn_cap.salvaged", &event)
+            .expect("maps per-turn-cap");
+        assert_eq!(
+            payload["bound"],
+            serde_json::json!({"kind": "reasoning_checkpoint_interval", "value": 1000, "source": "built-in"}),
+            "the runtime's bound must forward verbatim onto the flow payload"
+        );
+        let detail = payload["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("the reasoning check-in interval") && detail.contains("built-in 1000"),
+            "detail must name the KIND and provenance in words, not just a bare number; got {detail:?}"
+        );
+    }
+
+    /// Sibling of the test above for `max_tokens_per_call` — proves the
+    /// wording actually discriminates between the two kinds (the exact
+    /// #2165 miss: "hit cap 1000" could have been either).
+    #[test]
+    fn detector_telemetry_payload_forwards_bound_for_per_turn_cap_salvaged_max_tokens_per_call() {
+        let event = serde_json::json!({
+            "type": "dispatch.per_turn_cap.salvaged",
+            "seq": 5,
+            "completion_tokens": 3999,
+            "cap": 4000,
+            "salvaged_tool_calls": 1,
+            "bound": {"kind": "max_tokens_per_call", "value": 4000, "source": "config"},
+        });
+        let payload = detector_telemetry_payload("dispatch.per_turn_cap.salvaged", &event)
+            .expect("maps per-turn-cap");
+        let detail = payload["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("the per-call token cap") && detail.contains("config 4000"),
+            "detail must name max_tokens_per_call's kind + config provenance; got {detail:?}"
+        );
+    }
+
+    /// Same forwarding for `dispatch.intra_turn_stall.recovered`.
+    #[test]
+    fn detector_telemetry_payload_forwards_bound_for_intra_turn_stall_recovered() {
+        let event = serde_json::json!({
+            "type": "dispatch.intra_turn_stall.recovered",
+            "seq": 6,
+            "completion_tokens": 500,
+            "recoveries_used": 1,
+            "recoveries_budget": 2,
+            "bound": {"kind": "max_tokens_per_call", "value": 10000, "source": "env"},
+        });
+        let payload = detector_telemetry_payload("dispatch.intra_turn_stall.recovered", &event)
+            .expect("maps intra-turn-stall");
+        assert_eq!(
+            payload["bound"],
+            serde_json::json!({"kind": "max_tokens_per_call", "value": 10000, "source": "env"}),
+        );
+        let detail = payload["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("the per-call token cap") && detail.contains("env 10000"),
+            "got {detail:?}"
+        );
+    }
+
+    /// Backward compat: an older runtime image (pre-#2165) never stamps
+    /// `bound` on its trajectory events. `detector_telemetry_payload` must
+    /// degrade to the pre-#2165 generic wording rather than panicking or
+    /// producing a broken sentence — flow records are lenient-on-read.
+    #[test]
+    fn detector_telemetry_payload_falls_back_to_legacy_wording_when_bound_absent() {
+        let event = serde_json::json!({
+            "type": "dispatch.per_turn_cap.salvaged",
+            "seq": 3,
+            "completion_tokens": 999,
+            "cap": 1000,
+            "salvaged_tool_calls": 2,
+        });
+        let payload = detector_telemetry_payload("dispatch.per_turn_cap.salvaged", &event)
+            .expect("maps per-turn-cap even without a bound field");
+        assert!(payload.get("bound").is_none(), "no bound field on the event -> none on the payload");
+        let detail = payload["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("salvaged at the per-call cap"),
+            "must degrade to the pre-#2165 wording, got {detail:?}"
+        );
+    }
+
+    /// MUST FIX 1's other half: the SAME payload `detector_telemetry_payload`
+    /// builds also feeds `self.summary.detections` (pushed at the
+    /// `handle_event` call site), which the finished envelope's
+    /// `detections` array carries verbatim (`enrich_envelope_with_summary`).
+    /// Proves `bound` survives that hop too, not just the live flow record.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn handle_event_per_turn_cap_salvaged_carries_bound_into_the_detections_summary() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-bound-detections".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.per_turn_cap.salvaged","seq":1,"ts":1,"completion_tokens":999,"cap":1000,"salvaged_tool_calls":1,"bound":{"kind":"reasoning_checkpoint_interval","value":1000,"source":"built-in"}}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        assert_eq!(state.summary.detections.len(), 1, "one detection recorded");
+        assert_eq!(
+            state.summary.detections[0]["bound"],
+            serde_json::json!({"kind": "reasoning_checkpoint_interval", "value": 1000, "source": "built-in"}),
+            "bound must survive into the envelope-bound detections summary, not just the live flow record"
+        );
+    }
+
+    /// MUST FIX 1's third projection: `dispatch.checkpoint`'s own payload
+    /// (built inline, NOT through `detector_telemetry_payload`) must ALSO
+    /// forward `bound` — checkpoints are not detector firings, so they need
+    /// their own assertion.
+    #[test]
+    #[serial] // (#1882) reaches emit() -> darkmux_flow::record(); DARKMUX_FLOWS_DIR tempdir
+    fn handle_event_dispatch_checkpoint_forwards_bound() {
+        let tmp = TempDir::new().unwrap();
+        let prev_redis = std::env::var("DARKMUX_REDIS_URL").ok();
+        let prev = std::env::var("DARKMUX_FLOWS_DIR").ok();
+        unsafe {
+            std::env::remove_var("DARKMUX_REDIS_URL");
+            std::env::set_var("DARKMUX_FLOWS_DIR", tmp.path());
+        }
+
+        let traj_path = tmp.path().join("trajectory.jsonl");
+        let mut state = TailerState::new_for_test(
+            traj_path,
+            "sess-checkpoint-bound".into(),
+            "coder".into(),
+            "darkmux:qwen3.6".into(),
+        );
+        state.handle_event(
+            r#"{"type":"dispatch.checkpoint","seq":1,"ts":1,"checkpoint":1,"slice_tokens":900,"tail_ratio":0.1,"verdict":"continue","bound":{"kind":"reasoning_checkpoint_interval","value":1000,"source":"config"}}"#,
+        );
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_FLOWS_DIR", v),
+                None => std::env::remove_var("DARKMUX_FLOWS_DIR"),
+            }
+            match prev_redis {
+                Some(v) => std::env::set_var("DARKMUX_REDIS_URL", v),
+                None => std::env::remove_var("DARKMUX_REDIS_URL"),
+            }
+        }
+
+        let day_file = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("trajectory.jsonl")
+            })
+            .expect("a flow day-file should have been written");
+
+        let contents = std::fs::read_to_string(&day_file).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["session_id"] == "sess-checkpoint-bound" && v["action"] == "dispatch.checkpoint")
+            .expect("dispatch.checkpoint record must exist");
+        assert_eq!(
+            record["payload"]["bound"],
+            serde_json::json!({"kind": "reasoning_checkpoint_interval", "value": 1000, "source": "config"}),
+            "dispatch.checkpoint's payload must forward the runtime's bound verbatim"
         );
     }
 
@@ -5995,6 +6518,7 @@ fn a_detection_reaches_the_envelope() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["detections"][0], det, "the firing must reach the caller: {out}");
@@ -6012,10 +6536,39 @@ fn a_clean_run_reports_an_empty_array_not_an_absent_field() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v["detections"].is_array(), "must be present: {out}");
     assert_eq!(v["detections"].as_array().unwrap().len(), 0);
+}
+
+/// MUST FIX 3 (merge-gate review of #2165): `obj.insert("bounds", bounds)`
+/// was unpinned — every other `enrich_envelope_with_summary` test in this
+/// file passes `serde_json::json!({})` as the `bounds` arg, so deleting the
+/// insert line failed nothing. Passes a DISTINCTIVE, non-empty value (never
+/// the shape `resolved_runtime_bounds_json` would actually produce) so this
+/// assertion could only pass if the caller's `bounds` argument genuinely
+/// made it into the envelope, not some other field coincidentally matching.
+#[test]
+fn bounds_argument_survives_into_the_envelope() {
+    let distinctive_bounds = serde_json::json!({
+        "max_tokens_per_call": {"value": 4000, "source": "config"},
+        "__test_marker": "bounds-survival-proof",
+    });
+    let out = super::enrich_envelope_with_summary(
+        r#"{"result":"stop"}"#.to_string(),
+        &summary_with(vec![]),
+        &super::HostStats::default(),
+        &no_extras(),
+        no_findings_dir(),
+        distinctive_bounds.clone(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v["bounds"], distinctive_bounds,
+        "the bounds argument must reach the envelope verbatim under the \"bounds\" key: {out}"
+    );
 }
 
 fn summary_over_ratios(ratios: &[f64], concluded: u32) -> super::TrajectorySummary {
@@ -6039,6 +6592,7 @@ fn checkpoint_block(s: &super::TrajectorySummary) -> serde_json::Value {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     serde_json::from_str::<serde_json::Value>(&out).unwrap()["checkpoints"].clone()
 }
@@ -6120,6 +6674,7 @@ fn a_dispatch_that_never_checkpointed_omits_the_block() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v.get("checkpoints").is_none(), "no boundary hit, no block: {out}");
@@ -6141,6 +6696,7 @@ fn enrichment_does_not_duplicate_the_runtime_metrics_block() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(
@@ -6160,6 +6716,7 @@ fn non_envelope_stdout_is_untouched_by_enrichment() {
                 &super::HostStats::default(),
                 &no_extras(),
                 no_findings_dir(),
+                serde_json::json!({}),
             ),
             raw,
             "the non-json path must pass through verbatim: {raw:?}"
@@ -6272,6 +6829,7 @@ fn host_stats_reach_the_envelope_nested_by_metric_with_top_level_aliases() {
         &stats,
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["cpu"]["peak_pct"], 95);
@@ -6324,6 +6882,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &stats,
         &extras,
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["host"]["power"]["cpu"]["peak_mw"], 3000);
@@ -6345,6 +6904,7 @@ fn power_thermal_and_energy_reach_the_envelope_without_disturbing_the_2107_shape
         &stats,
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let w: serde_json::Value = serde_json::from_str(&without).unwrap();
     for key in ["cpu", "mem", "gpu", "samples", "sample_interval_ms", "peak_cpu_pct", "peak_mem_pct"] {
@@ -6363,6 +6923,7 @@ fn a_host_without_power_or_thermal_sources_omits_those_blocks() {
         &super::reduce_host_stats(&worked_samples()),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(v["host"]["cpu"]["peak_pct"].is_number(), "the #2107 block still lands");
@@ -6384,6 +6945,7 @@ fn an_unsampled_run_omits_the_host_block_rather_than_reporting_zero() {
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(
@@ -6436,6 +6998,7 @@ fn the_envelope_reports_how_many_findings_the_crawl_recorded() {
         &super::HostStats::default(),
         &no_extras(),
         td.path(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["findings"]["count"], 3, "the caller's next action turns on this: {out}");
@@ -6456,6 +7019,7 @@ fn a_trailing_newline_is_not_a_finding() {
         &super::HostStats::default(),
         &no_extras(),
         td.path(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["findings"]["count"], 1, "records, not lines: {out}");
@@ -6474,6 +7038,7 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         &super::HostStats::default(),
         &no_extras(),
         no_findings_dir(),
+    serde_json::json!({}),
     );
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(

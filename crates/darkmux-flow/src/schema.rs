@@ -77,7 +77,7 @@ pub fn is_dispatch_terminal(action: &str) -> bool {
     is_dispatch_complete(action) || is_dispatch_error(action)
 }
 
-pub const FLOW_SCHEMA_VERSION: &str = "1.28.0";
+pub const FLOW_SCHEMA_VERSION: &str = "1.30.0";
 // Version history:
 //   1.2.0 — added optional `model` (#106)
 //   1.3.0 — added optional `reasoning` + `mission_id`; new Stage::TierDecision (#136)
@@ -545,6 +545,41 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.28.0";
 //           present). A brand-new action value under the same additive
 //           rule as every other entry in this history — no version bump,
 //           no struct change.
+//   1.29.0 (#2165): `dispatch start`'s payload gains `bounds` — the
+//           resolved runtime knobs WITH provenance (`max_tokens_per_call`,
+//           `reasoning_checkpoint_interval_tokens`, `inactivity_timeout_
+//           seconds`, `max_turns`, `max_tokens`, `turn_delay_ms`,
+//           `feedback_injection`), each `{value, source}` where `source`
+//           is `"built-in"` / `"config"` / `"env"`. The finished envelope
+//           (the `--json` stdout payload the orchestrator reads) gains the
+//           SAME `bounds` block, built by the same producer
+//           (`resolved_runtime_bounds_json` in `dispatch_internal.rs`) so
+//           the start record and the finished run can't independently
+//           drift on what "the resolved knobs" means. Answers the #2165
+//           miss directly: a remote reader watching the flow stream no
+//           longer has to reconstruct from memory of the design whether a
+//           cap-hit stderr line named an operator override or a built-in
+//           default — the same information now rides on the dispatch's
+//           own start record. No struct/field change — same free-form
+//           `payload` blob every other richer action already uses; older
+//           readers ignore the new key.
+//   1.30.0 (2026-08-30 fleet-observability finding): `dispatch.rest` gains
+//           `reason` (always present now — `"turn_delay"` for a routine
+//           inter-turn rest, or the pace file's own operator/governor-
+//           supplied reason for a paced rest) and `state` (the pace file's
+//           OS thermal-state name, present only on a paced rest that
+//           carried one). Before this, a manual pace pause and a routine
+//           turn-delay rest were indistinguishable on the flow stream
+//           except by cadence (2000ms paced-poll increments vs the
+//           configured `turn_delay_ms`) — a fragile signal for a remote
+//           reader to reverse-engineer. `dispatch.complete`'s payload (and
+//           the finished envelope) gain `paced_rest_ms`: of `rest_ms`, the
+//           portion attributable to a paced rest, so a reader can separate
+//           "cool-down by policy" from "paused by operator/governor"
+//           without subtracting `turn_delay_effective_ms * rests`
+//           themselves. No struct/field change — same free-form `payload`
+//           blob every other richer action already uses; older readers
+//           ignore the new keys.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
