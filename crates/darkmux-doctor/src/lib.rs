@@ -1876,6 +1876,42 @@ fn check_thermal_governor() -> Check {
     let resume_hold_ms = darkmux_types::config_access::thermal_resume_hold_ms();
     let max_pause_ms = darkmux_types::config_access::thermal_max_pause_ms();
     let min_cpu = darkmux_types::config_access::thermal_min_cpu_speed_limit_pct();
+
+    // (#2110/#2109 review finding 6) `darkmux config set` rejects an
+    // unrecognized thermal-state token going forward, but a hand-edited
+    // config.json or a value written before that validation existed can
+    // still carry one — and, per `Ty::ThermalState`'s own doc, a typo here
+    // silently INVERTS the governor's intent rather than erroring, so this
+    // is worth a loud Warn rather than folding into the Pass message above.
+    let states = darkmux_crew::host_probe::thermal::THERMAL_STATES;
+    let bad_pause_at = !states.contains(&pause_at.to_ascii_lowercase().as_str());
+    let bad_resume_at = !states.contains(&resume_at.to_ascii_lowercase().as_str());
+    if bad_pause_at || bad_resume_at {
+        let mut bad = Vec::new();
+        if bad_pause_at {
+            bad.push(format!("pause_at=`{pause_at}`"));
+        }
+        if bad_resume_at {
+            bad.push(format!("resume_at=`{resume_at}`"));
+        }
+        return Check {
+            name: name.into(),
+            status: Status::Warn,
+            message: format!(
+                "unrecognized thermal state: {} — valid: {}. An unrecognized pause_at silently \
+                 disables the governor's soft pause; an unrecognized resume_at defeats the \
+                 hysteresis hold and clears a pause almost immediately regardless of actual \
+                 temperature.",
+                bad.join(", "),
+                states.join(", ")
+            ),
+            hint: Some(format!(
+                "darkmux config set runtime.thermal.pause_at <{}>",
+                states.join("|")
+            )),
+        };
+    }
+
     Check {
         name: name.into(),
         status: Status::Pass,
@@ -5914,6 +5950,29 @@ mod tests {
     // covered separately below.
     //
     // `#[serial]`: mutates the process-global colorize override and env.
+
+    #[test]
+    #[serial_test::serial]
+    fn thermal_governor_warns_on_unrecognized_pause_at() {
+        // (#2110/#2109 review finding 6) A typo'd pause_at silently
+        // inverts the governor's intent (see Ty::ThermalState's doc in
+        // src/config_cmd.rs) — this must surface as a loud Warn, not fold
+        // silently into the informational Pass message.
+        let prev = std::env::var("DARKMUX_THERMAL_PAUSE_AT").ok();
+        unsafe { std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", "seroius") };
+
+        let check = check_thermal_governor();
+        assert_eq!(check.status, Status::Warn);
+        assert!(check.message.contains("seroius"), "{}", check.message);
+        assert!(check.message.contains("unrecognized thermal state"), "{}", check.message);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_THERMAL_PAUSE_AT", v),
+                None => std::env::remove_var("DARKMUX_THERMAL_PAUSE_AT"),
+            }
+        }
+    }
 
     #[test]
     #[serial_test::serial]

@@ -514,6 +514,21 @@ pub const FLOW_SCHEMA_VERSION: &str = "1.28.0";
 //           "measured, and idle". No new field on the FLOW record itself,
 //           and no struct change, so prior AuditFileSink chains survive
 //           without rotation.
+//   1.28.x (#2110/#2109): the thermal governor/breaker's dispatch.rest
+//           records now carry a SECOND payload shape alongside the
+//           1.25.0 rest-episode one (`ms`/`turn`/`rest_ms`/`rests`):
+//           `reason` (`"thermal"` for an ordinary governor pause/resume,
+//           `"thermal-critical"` for the breaker), `state` (the OS
+//           thermal state name that triggered the write), and `pause`
+//           (`true`/`false`) — the thermal governor's own event, not a
+//           per-poll-increment rest. Same additive rule as every action
+//           value already documented in this history: an unfamiliar key
+//           under the existing free-form `payload` blob, ignored by a
+//           reader that doesn't recognize it. No struct/field change, no
+//           version bump — `dispatch.rest` was already documented as an
+//           action whose payload shape varies by writer (1.25.0 above),
+//           so this is the second shape under that umbrella, not a new
+//           contract.
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]

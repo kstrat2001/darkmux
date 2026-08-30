@@ -54,6 +54,21 @@ enum Ty {
     Float,
     /// A string constrained to the `FleetMode` token set (#933).
     FleetMode,
+    /// (#2110/#2109 review finding 6) A string constrained to
+    /// `darkmux_crew::host_probe::thermal::THERMAL_STATES`
+    /// (`nominal`/`fair`/`serious`/`critical`) — `runtime.thermal.pause_at`
+    /// / `.resume_at`. Without this, a typo (`"seroius"`) silently parsed
+    /// as `Ty::Str`, and `severity()`'s `unwrap_or(THERMAL_STATES.len())`
+    /// ranks an unrecognized name WORSE than `critical` — inverting either
+    /// knob's intent with no error anywhere in the path: a typo'd
+    /// `pause_at` makes `sev >= severity(pause_at)` (4) all but
+    /// unreachable for any real OS reading, silently disabling the
+    /// governor's soft pause (the breaker's own hardcoded `"critical"`
+    /// check is unaffected); a typo'd `resume_at` makes
+    /// `sev <= severity(resume_at)` (4) true for every reading, so the
+    /// hysteresis hold fills up regardless of actual temperature and the
+    /// pause clears almost immediately even on a machine still hot.
+    ThermalState,
     /// (#1685) Comma-separated list of non-empty, trimmed strings, coerced
     /// to a JSON array — `darkmux config set cmd.allowed pr-list,pr-merge`.
     /// REPLACES the whole array (there is no incremental add); an empty
@@ -116,8 +131,8 @@ const KEYS: &[(&str, Ty)] = &[
     // (#2110/#2109) The thermal governor + breaker's tuning block —
     // see `ThermalConfig`'s own doc.
     ("runtime.thermal.enabled", Ty::Bool),
-    ("runtime.thermal.pause_at", Ty::Str),
-    ("runtime.thermal.resume_at", Ty::Str),
+    ("runtime.thermal.pause_at", Ty::ThermalState),
+    ("runtime.thermal.resume_at", Ty::ThermalState),
     ("runtime.thermal.resume_hold_ms", Ty::Uint),
     ("runtime.thermal.max_pause_ms", Ty::Uint),
     ("runtime.thermal.min_cpu_speed_limit_pct", Ty::Uint),
@@ -396,6 +411,17 @@ fn parse_value(ty: Ty, raw: &str) -> Result<Value> {
             // Store the canonical lowercase token regardless of the input casing.
             Value::String(mode.as_str().to_string())
         }
+        Ty::ThermalState => {
+            let lower = raw.trim().to_ascii_lowercase();
+            let states = darkmux_crew::host_probe::thermal::THERMAL_STATES;
+            if !states.contains(&lower.as_str()) {
+                bail!(
+                    "invalid thermal state `{raw}` — valid: {}",
+                    states.join(", ")
+                );
+            }
+            Value::String(lower)
+        }
         Ty::StrList => Value::Array(
             raw.split(',')
                 .map(str::trim)
@@ -661,6 +687,26 @@ mod tests {
     }
 
     #[test]
+    fn thermal_state_typo_is_rejected_not_silently_stored() {
+        // (#2110/#2109 review finding 6) A typo used to parse cleanly as
+        // Ty::Str and silently invert the governor's intent (see
+        // Ty::ThermalState's own doc). This proves it's now rejected.
+        let f = tmp();
+        let err = set_at(f.path(), "runtime.thermal.pause_at", "seroius").unwrap_err().to_string();
+        assert!(err.contains("invalid thermal state"), "{err}");
+        assert!(err.contains("serious"), "error should list valid values: {err}");
+    }
+
+    #[test]
+    fn thermal_state_accepts_valid_tokens_case_insensitively() {
+        let f = tmp();
+        set_at(f.path(), "runtime.thermal.pause_at", "SERIOUS").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.pause_at").unwrap().contains("serious"));
+        set_at(f.path(), "runtime.thermal.resume_at", "fair").unwrap();
+        assert!(get_at(f.path(), "runtime.thermal.resume_at").unwrap().contains("fair"));
+    }
+
+    #[test]
     fn get_reports_value_or_unset() {
         let f = tmp();
         set_at(f.path(), "machine_id", "studio").unwrap();
@@ -723,6 +769,8 @@ mod tests {
                 Ty::Float => serde_json::json!(0.5),
                 // a valid FleetMode token doubles as the generic string sentinel
                 Ty::Str | Ty::FleetMode => Value::String("standalone".into()),
+                // a valid THERMAL_STATES token, same reasoning as FleetMode above
+                Ty::ThermalState => Value::String("nominal".into()),
                 Ty::StrList => serde_json::json!(["sentinel"]),
                 // An empty array is valid JSON that parses cleanly to an
                 // empty `Vec<HookRule>` — sufficient to prove the KEY
