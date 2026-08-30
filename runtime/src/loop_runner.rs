@@ -421,7 +421,7 @@ fn honor_pace_pause(
             *pace_expiry_warned = false;
             break;
         }
-        if pace.is_expired(checkpoint::unix_ms(), max_pause_ms) {
+        if pace_reader.pause_is_expired(&pace, checkpoint::unix_ms(), max_pause_ms) {
             if !*pace_expiry_warned {
                 eprintln!(
                     "darkmux-runtime: ⚠ pace file at {} has been paused past \
@@ -1468,6 +1468,45 @@ fn run_with_sleeper(
                 "darkmux-runtime: compacted after the resume catch-up pass ({before_count} → \
                  {after_count} messages) before the first post-resume request. (#2114)"
             );
+
+            // (#2114 finding 1) Resume-compaction parity with the main
+            // loop's `tool_calls` arm (~:2680-2722): a compaction here is
+            // the SAME event with the SAME consequences, whichever site
+            // triggered it. Queue the same post-compaction feedback nudge,
+            // reset proof-of-work + the soft-warning flag the same way,
+            // and run the SAME `bail_after_compactions` escalation check
+            // — without this, a resume that immediately compacts past the
+            // operator's bound would silently send one more request
+            // instead of escalating to the frontier the way a live
+            // (never-killed) run in the identical position would.
+            feedback_injector.queue_post_compaction(turns);
+            last_proof_of_work = std::time::Instant::now();
+            inactivity_soft_warning_fired_in_window = false;
+            if let Some(bail) = compaction_cfg.bail_after_compactions {
+                if compactions >= bail {
+                    eprintln!(
+                        "darkmux-runtime: escalation_triggered — \
+                         compactions ({compactions}) reached bail_after_compactions ({bail}) \
+                         during resume catch-up; emitting EscalationTriggered terminal for \
+                         frontier handoff instead of requesting the next turn. (#2114)"
+                    );
+                    return Ok(LoopOutcome {
+                        final_answer: turn.pending_answer(),
+                        terminal_reason: TerminalReason::EscalationTriggered(
+                            EscalationReason::CompactionLimitReached,
+                        ),
+                        messages,
+                        turns,
+                        total_prompt_tokens,
+                        total_completion_tokens,
+                        compactions,
+                        rest_ms,
+                        rests,
+                        turn_delay_effective_ms: turn_delay_ms,
+                        failed_to_run: failed_to_run.clone(),
+                    });
+                }
+            }
         }
 
         eprintln!(
@@ -4356,6 +4395,232 @@ mod tests {
             "either the last mid-turn checkpoint cleared pending_tool_calls, or a later \
              clean-boundary checkpoint (turns > 1) has already superseded it"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resume_catch_up_preserves_tool_seq_continuity_in_trajectory() {
+        // (#2114 finding N6) trajectory.jsonl's tool_seq numbering for a
+        // resumed call must pick up exactly where the killed run left off
+        // (pending_tool_calls_seq_base), not restart from 0 — otherwise
+        // the SAME tool call shows two different tool_seq values across a
+        // kill-and-resume: whatever the original run logged before the
+        // kill, and then 0 again from the catch-up pass.
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+        use httpmock::prelude::*;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let server = MockServer::start();
+        let _turn2_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 3
+            });
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 140, 5));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("resume-tool-seq").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let make_call = |id: &str, offset: u32| ToolCall {
+            id: id.to_string(),
+            kind: "function".into(),
+            function: crate::lmstudio::FunctionCall {
+                name: "read".into(),
+                arguments: format!("{{\"path\":\"/workspace/x.txt\",\"offset\":{offset},\"limit\":1}}"),
+            },
+            extra_content: None,
+        };
+        let call1 = make_call("call_1", 1);
+        let call2 = make_call("call_2", 2);
+        let call3 = make_call("call_3", 3);
+        let assistant_message = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![call1.clone(), call2.clone(), call3.clone()]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+
+        // Same shape as the sibling mid-turn-resume test: killed after
+        // call_1 (tool_seq 0, already logged by the ORIGINAL — now dead —
+        // process before this checkpoint was taken). seq_base=1 says
+        // call_2 must log as tool_seq 1, call_3 as tool_seq 2.
+        let resume_checkpoint = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            messages: vec![
+                Message::system("test"),
+                Message::user("read x.txt"),
+                assistant_message,
+                Message::tool_result("call_1", "read", "<call 1 result>"),
+            ],
+            turns: 1,
+            total_prompt_tokens: 100,
+            total_completion_tokens: 20,
+            compactions: 0,
+            rest_ms: 0,
+            rests: 0,
+            pending_hand_back: None,
+            pending_tool_calls: Some(vec![call2, call3]),
+            pending_tool_calls_seq_base: 1,
+            written_at_unix_ms: checkpoint::unix_ms(),
+        };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            tmp.path(), Some(resume_checkpoint), &RealSleeper,
+        )
+        .expect("resumed dispatch returns Ok");
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+
+        drop(traj);
+        let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
+        let body = std::fs::read_to_string(&traj_file).unwrap();
+        let tool_completed_events: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &serde_json::Value| v["type"] == "tool.completed")
+            .collect();
+        assert_eq!(
+            tool_completed_events.len(),
+            2,
+            "exactly the two catch-up-dispatched calls (call_1's tool.completed was logged \
+             by the ORIGINAL process, not this resumed one)"
+        );
+        assert_eq!(
+            tool_completed_events[0]["tool_seq"], 1,
+            "call_2 (index 1 of the original 3-call turn) must log as tool_seq 1, not 0"
+        );
+        assert_eq!(
+            tool_completed_events[1]["tool_seq"], 2,
+            "call_3 (index 2 of the original 3-call turn) must log as tool_seq 2"
+        );
+    }
+
+    /// (#2114 finding N7) A sleeper that, on its FIRST call — i.e. while
+    /// the resume catch-up pass is honoring an active pace pause BEFORE
+    /// dispatching anything — asserts that NO tool.completed event has
+    /// landed in trajectory.jsonl yet. If the catch-up dispatched its
+    /// calls before checking pace, this sleeper's first invocation would
+    /// already be racing against (or arriving strictly after) a live
+    /// tool dispatch. The second call flips pace off so the dispatch can
+    /// finish.
+    struct AssertNoToolDispatchedWhileParkedSleeper {
+        calls: std::cell::RefCell<u32>,
+        out_dir: std::path::PathBuf,
+    }
+    impl TurnSleeper for AssertNoToolDispatchedWhileParkedSleeper {
+        fn sleep(&self, _ms: u64) {
+            let mut calls = self.calls.borrow_mut();
+            *calls += 1;
+            if *calls == 1 {
+                let traj_path = self.out_dir.join(".darkmux-runtime").join("trajectory.jsonl");
+                if let Ok(body) = std::fs::read_to_string(&traj_path) {
+                    assert!(
+                        !body.contains("\"type\":\"tool.completed\""),
+                        "(#2114 finding N7) a tool was dispatched before the pace pause was \
+                         honored: {body}"
+                    );
+                }
+                std::fs::write(pace::pace_file_path(&self.out_dir), r#"{"pause": false}"#).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resume_catch_up_honors_pace_before_dispatching_the_first_pending_call() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+        use httpmock::prelude::*;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let server = MockServer::start();
+        let _turn2_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 140, 5));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("resume-pace-first").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let make_call = |id: &str, offset: u32| ToolCall {
+            id: id.to_string(),
+            kind: "function".into(),
+            function: crate::lmstudio::FunctionCall {
+                name: "read".into(),
+                arguments: format!("{{\"path\":\"/workspace/x.txt\",\"offset\":{offset},\"limit\":1}}"),
+            },
+            extra_content: None,
+        };
+        let call1 = make_call("call_1", 1);
+        let call2 = make_call("call_2", 2);
+        let assistant_message = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![call1.clone(), call2.clone()]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+
+        let resume_checkpoint = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            messages: vec![
+                Message::system("test"),
+                Message::user("read x.txt"),
+                assistant_message,
+                Message::tool_result("call_1", "read", "<call 1 result>"),
+            ],
+            turns: 1,
+            total_prompt_tokens: 100,
+            total_completion_tokens: 20,
+            compactions: 0,
+            rest_ms: 0,
+            rests: 0,
+            pending_hand_back: None,
+            pending_tool_calls: Some(vec![call2]),
+            pending_tool_calls_seq_base: 1,
+            written_at_unix_ms: checkpoint::unix_ms(),
+        };
+
+        // Pause is already active — the catch-up's FIRST call (call_2)
+        // must not dispatch until this pace is honored/lifted.
+        std::fs::write(
+            pace::pace_file_path(tmp.path()),
+            r#"{"pause": true, "reason": "thermal"}"#,
+        )
+        .unwrap();
+
+        let sleeper = AssertNoToolDispatchedWhileParkedSleeper {
+            calls: std::cell::RefCell::new(0),
+            out_dir: tmp.path().to_path_buf(),
+        };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            tmp.path(), Some(resume_checkpoint), &sleeper,
+        )
+        .expect("resumed dispatch returns Ok even though it paused before catch-up");
+
+        assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+        assert_eq!(*sleeper.calls.borrow(), 1, "sanity: the sleeper's assertion actually ran");
     }
 
     #[test]
@@ -7730,6 +7995,139 @@ mod tests {
             outcome.compactions >= 1,
             "compaction still fires; bail just doesn't kick in"
         );
+    }
+
+    /// (#2114 finding 1) Resume-compaction parity: a checkpoint whose
+    /// `compactions` already sits at `bail_after_compactions - 1` must
+    /// escalate the INSTANT the resume catch-up pass's own compaction
+    /// check pushes it over the bound — the same as a live (never-killed)
+    /// dispatch would at the identical count. Before this fix, the resume
+    /// catch-up's compaction path didn't run the `bail_after_compactions`
+    /// check at all, so it would silently issue one MORE request past the
+    /// operator's bound instead of escalating to the frontier.
+    #[test]
+    #[serial_test::serial]
+    fn resume_catch_up_compaction_honors_bail_after_compactions() {
+        use crate::lmstudio::{LmStudioClient, Message};
+        use crate::tools::Tool;
+        use crate::trajectory::Trajectory;
+
+        std::env::remove_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS");
+        std::env::remove_var("DARKMUX_TURN_DELAY_MS");
+
+        let cfg = compaction::CompactionConfig {
+            // Low enough that the resume catch-up's local chars/4 estimate
+            // trips it unconditionally once the message-count floor (7) is
+            // met — isolates the bail check from needing a precise token
+            // count.
+            threshold_tokens: 1,
+            compactor_model: "test-compactor".to_string(),
+            threshold_ratio: None,
+            context_window: None,
+            strategy: compaction::CompactionStrategy::Narrative,
+            bail_after_compactions: Some(1),
+            custom_instructions: None,
+        };
+
+        let server = MockServer::start();
+        // Must NEVER be hit — escalating means the resume never reaches
+        // the main loop's first post-resume request at all.
+        let primary_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-primary\"");
+            then.status(200).json_body(chat_response_json(Some("should not be reached"), None, "stop", 100, 5));
+        });
+        let compactor_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("\"model\":\"test-compactor\"");
+            then.status(200).json_body(chat_response_json(
+                Some(
+                    "Summary: the assistant repeatedly issued a read tool call against the \
+                     workspace file and inspected the returned contents. No decisions were \
+                     finalized and no files were modified. The next concrete action is to \
+                     continue reading and then act on what the file contains.",
+                ),
+                None,
+                "stop",
+                500,
+                30,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("resume-bail").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let tools = [Tool::Read];
+
+        let make_call = |id: &str, offset: u32| ToolCall {
+            id: id.to_string(),
+            kind: "function".into(),
+            function: crate::lmstudio::FunctionCall {
+                name: "read".into(),
+                arguments: format!("{{\"path\":\"/workspace/x.txt\",\"offset\":{offset},\"limit\":1}}"),
+            },
+            extra_content: None,
+        };
+        let c1 = make_call("call_1", 1);
+        let c2 = make_call("call_2", 2);
+        let assistant_turn = Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![c1.clone(), c2.clone()]),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        };
+        // (#1389) Padding so the compacted middle clears the min-reduction
+        // guard, same rationale as the sibling bail tests above — a
+        // single-message middle can't shrink 20% against a summary of
+        // comparable length, so this needs SEVERAL padding messages
+        // (matching the pattern the sibling bail tests already use), not
+        // just one.
+        let pad = "context detail that occupies transcript space ".repeat(6);
+        let mut checkpoint_messages = vec![Message::system("test system"), Message::user(format!("seed: {pad}"))];
+        for i in 0..3 {
+            checkpoint_messages.push(Message::user(format!("padding user {i}: {pad}")));
+            checkpoint_messages.push(Message::assistant(format!("padding assistant {i}: {pad}")));
+        }
+        checkpoint_messages.push(assistant_turn);
+        checkpoint_messages.push(Message::tool_result("call_1", "read", "<call 1 result>"));
+
+        let resume_checkpoint = checkpoint::RunCheckpoint {
+            schema_version: checkpoint::CHECKPOINT_SCHEMA_VERSION,
+            messages: checkpoint_messages,
+            turns: 2,
+            total_prompt_tokens: 200,
+            total_completion_tokens: 40,
+            // (#2114 finding 1 test) bail_after_compactions - 1: the
+            // catch-up's own compaction is the ONE that crosses the bound.
+            compactions: 0,
+            rest_ms: 0,
+            rests: 0,
+            pending_hand_back: None,
+            pending_tool_calls: Some(vec![c2]),
+            pending_tool_calls_seq_base: 1,
+            written_at_unix_ms: checkpoint::unix_ms(),
+        };
+
+        let outcome = run_with_sleeper(
+            &client, &client, "test-primary", vec![], &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+            tmp.path(), Some(resume_checkpoint), &RealSleeper,
+        )
+        .expect("bail should produce Ok with EscalationTriggered, not Err");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::CompactionLimitReached),
+            "the resume catch-up's own compaction must escalate at the bound, not just the \
+             main loop's"
+        );
+        assert_eq!(outcome.compactions, 1, "the bound-crossing compaction is counted");
+        assert_eq!(compactor_mock.hits(), 1, "exactly one compactor call, during catch-up");
+        primary_mock.assert_hits(0);
     }
 
     // ===== (#414 PR A) Length-finish stall recovery tests =====
