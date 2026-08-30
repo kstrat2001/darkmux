@@ -2239,17 +2239,16 @@ fn hanging_endpoint_profiles_json(port: u16) -> String {
 fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
     let marker = format!("darkmux-remote-{pid}-");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let mut survivors = String::new();
-    loop {
+    let survivors = loop {
         let Ok(out) = std::process::Command::new("pgrep").args(["-f", &marker]).output() else {
             return; // no `pgrep` on this image — the socket-close proof already covers it
         };
-        survivors = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let survivors = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if survivors.is_empty() || std::time::Instant::now() >= deadline {
-            break;
+            break survivors;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    };
     assert!(
         survivors.is_empty(),
         "a darkmux {label} curl process is still running after the parent exited: {survivors}"
