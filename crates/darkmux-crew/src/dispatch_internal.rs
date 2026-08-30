@@ -506,6 +506,21 @@ pub struct DockerRunConfig {
     /// — the runtime and the host disagreed about when "inactivity" starts.
     /// Always forwarded, matching the host's hard-kill value exactly.
     pub inactivity_timeout_seconds: u64,
+    /// (#2114 finding 4) Host's OWN `DARKMUX_MAX_PAUSE_MS`, forwarded
+    /// verbatim into the container as `-e DARKMUX_MAX_PAUSE_MS=<n>` when
+    /// set. Unlike `feedback_injection`/`turn_delay_ms`/
+    /// `inactivity_timeout_seconds` above, this is NOT resolved through
+    /// `darkmux_types::config_access` — there is no
+    /// `runtime.thermal.max_pause_ms` config field yet (the #2110/#2109
+    /// governor/breaker that would own it hasn't merged to main). Until
+    /// it does, this is a bare env-var pass-through: `None` means "the
+    /// host never set it," and the flag is simply omitted — the
+    /// container's own `pace::DEFAULT_MAX_PAUSE_MS` (900_000ms) applies,
+    /// same as an un-dockerized dispatch of the runtime binary. Revisit
+    /// once `runtime.thermal.max_pause_ms` exists: this field should
+    /// resolve through `config_access` the same way the others do,
+    /// always-forwarded rather than conditionally.
+    pub max_pause_ms_env: Option<u64>,
     /// (#1187) When Some, this dispatch's "brain" is a remote OpenAI-compatible
     /// endpoint rather than local LMStudio — passed to the container as
     /// `--chat-url`. Set for a role whose tool_palette grants at least one
@@ -633,6 +648,15 @@ pub fn build_docker_run_argv(config: &DockerRunConfig) -> Vec<String> {
         "DARKMUX_INACTIVITY_TIMEOUT_SECONDS={}",
         config.inactivity_timeout_seconds
     ));
+
+    // (#2114 finding 4) Forward the host's OWN DARKMUX_MAX_PAUSE_MS, when
+    // set — see `max_pause_ms_env`'s own doc for why this is conditional
+    // rather than always-forwarded like the three vars above (no
+    // resolved config value exists yet to fall back to).
+    if let Some(max_pause_ms) = config.max_pause_ms_env {
+        args.push("-e".to_string());
+        args.push(format!("DARKMUX_MAX_PAUSE_MS={max_pause_ms}"));
+    }
 
     // Runtime binary injection (non-default images only)
     if config.inject {
@@ -2775,6 +2799,9 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             agentic_pm.is_some(),
         ),
         inactivity_timeout_seconds: darkmux_types::config_access::inactivity_timeout_seconds(),
+        // (#2114 finding 4) Bare env pass-through — see `max_pause_ms_env`'s
+        // own doc for why this doesn't go through config_access yet.
+        max_pause_ms_env: std::env::var("DARKMUX_MAX_PAUSE_MS").ok().and_then(|s| s.parse().ok()),
         // (#2114) `dispatch --resume` CLI plumbing (DispatchOpts →
         // caller-decided true) is a follow-up; this call site always
         // starts fresh for now.
