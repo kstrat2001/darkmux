@@ -438,7 +438,7 @@ fn honor_pace_pause(
         sleeper.sleep(PACE_POLL_INCREMENT_MS);
         *rest_ms = rest_ms.saturating_add(PACE_POLL_INCREMENT_MS);
         *rests = rests.saturating_add(1);
-        trajectory.append_paced_rest(turns, PACE_POLL_INCREMENT_MS, &reason);
+        trajectory.append_paced_rest(turns, PACE_POLL_INCREMENT_MS, &reason, pace.state.as_deref());
         (*last_proof_of_work, *inactivity_soft_warning_fired_in_window) =
             absorb_rest_into_soft_inactivity_clock(*last_proof_of_work, PACE_POLL_INCREMENT_MS);
     }
@@ -6964,20 +6964,55 @@ mod tests {
         );
     }
 
-    /// (#2165) A turn ALWAYS starts in the reasoning region (`TurnAccum::
-    /// in_answer_region`'s own doc: "we cannot know whether it will think
-    /// until it answers"), so turn 1's first request — the exact scenario
-    /// `loop_salvages_tool_call_on_per_turn_cap_hit` above exercises — is
-    /// governed by the reasoning check-in interval, not `max_tokens_per_call`.
-    /// The salvage record's `bound` must name that, not a bare number a
-    /// remote reader has to reverse-engineer from memory of the design (the
-    /// miss #2165 exists to close).
+    /// (#2165, redesigned post-#2164) Post-#2164, a FRESH turn's first
+    /// request carries the reasoning bound only once `dispatch_has_reasoned`
+    /// is true — never on the dispatch's very first call (see
+    /// `carries_reasoning_bound`'s own doc at the cap-selection site). So
+    /// this test primes the dispatch with a turn that demonstrates
+    /// reasoning (a closed think block, dispatched cleanly via
+    /// `finish_reason=tool_calls`, matching the SAME priming pattern
+    /// `checkpoint_regression_tests.rs`'s
+    /// `a_reasoning_checkpoint_dispatches_tools_without_nudging_the_model_to_think_less`
+    /// uses) before the turn under test — turn 2's first request, which now
+    /// DOES carry the reasoning bound because `dispatch_has_reasoned` is
+    /// true and the turn has absorbed nothing yet. The salvage record's
+    /// `bound` must name that, not a bare number a remote reader has to
+    /// reverse-engineer from memory of the design (the miss #2165 exists to
+    /// close).
     #[test]
     #[serial_test::serial]
     fn salvage_record_names_the_reasoning_checkpoint_interval_bound() {
         let server = MockServer::start();
+        // Priming turn (0 "role":"tool" in the accumulating request body):
+        // demonstrates reasoning via a closed think block, dispatches
+        // cleanly (finish_reason=tool_calls, not length) so it does NOT
+        // itself salvage or checkpoint — it exists ONLY to flip
+        // `dispatch_has_reasoned` true before the scenario under test.
+        let _priming = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(
+                Some("<think>brief</think>"),
+                Some(serde_json::json!([{
+                    "id": "c0",
+                    "type": "function",
+                    "function": { "name": "echo", "arguments": "{\"text\":\"priming\"}" }
+                }])),
+                "tool_calls",
+                100,
+                20,
+            ));
+        });
+        // Turn 2's first request (>=1 "role":"tool" now in history, from
+        // the priming turn's own dispatched result): carries the reasoning
+        // bound (dispatch_has_reasoned=true, fresh turn) and hits it.
         let _mock = server.mock(|when, then| {
-            when.method(POST).path("/v1/chat/completions");
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() >= 1
+            });
             then.status(200).json_body(chat_response_json(
                 Some("partial truncated content"),
                 Some(serde_json::json!([{
@@ -6998,12 +7033,12 @@ mod tests {
         let tmp = tempfile::Builder::new().prefix("bound-provenance-reasoning").tempdir().unwrap();
         let mut traj = Trajectory::open(tmp.path());
         let initial = vec![Message::system("test"), Message::user("read x.txt")];
-        let tools = [Tool::Read];
+        let tools = [Tool::Echo, Tool::Read];
         let cfg = compaction::CompactionConfig::never_compact();
 
         let outcome = run(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(3), None, None, None, std::collections::BTreeMap::new(), None,
+            Some(4), None, None, None, std::collections::BTreeMap::new(), None,
         )
         .expect("salvage must drive the loop (#479)");
         assert!(outcome.turns >= 1);
@@ -7015,57 +7050,29 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("dispatch.per_turn_cap.salvaged"))
             .collect();
-        assert!(!salvaged.is_empty(), "salvage record must exist");
+        assert!(!salvaged.is_empty(), "salvage record must exist — got trajectory:\n{raw}");
         let bound = &salvaged[0]["bound"];
         assert_eq!(
             bound["kind"], serde_json::json!("reasoning_checkpoint_interval"),
-            "turn 1's first request is governed by the reasoning check-in interval, got {bound:?}"
+            "turn 2's first request, after a priming turn proved reasoning, is governed by \
+             the reasoning check-in interval, got {bound:?}"
         );
         assert_eq!(bound["source"], serde_json::json!("built-in"), "no CLI source flag was set for this test");
     }
 
-    /// (#2165) Once a checkpoint has classified the accumulation as plain
-    /// (non-reasoning) content — `TurnAccum::in_answer_region` flips true —
-    /// the SAME logical turn's next request is governed by
-    /// `max_tokens_per_call`, not the reasoning interval. A salvage on that
-    /// later request must name `max_tokens_per_call`, proving the region
-    /// switch (not just the built-in-vs-override split) reaches the record.
-    ///
-    /// Two mocks, mutually exclusive on whether the accumulating request
-    /// carries a checkpoint prefill (`"role":"assistant"` — absent on the
-    /// turn's first request, present once the checkpoint hands one back) —
-    /// the same keyed-mock trick `register_three_turn_tool_then_stop_script`
-    /// above uses.
+    /// (#2165, post-#2164) Post-#2164, the DEFAULT case is the answer bound
+    /// on a fresh turn's first request — no priming, no region flip needed.
+    /// This is now the simpler counterpart to the reasoning test above (the
+    /// two tests' shapes have effectively swapped relative to pre-#2164):
+    /// the dispatch's very first call, with `dispatch_has_reasoned` still
+    /// false, carries `max_tokens_per_call`, not the reasoning interval —
+    /// mirroring `loop_salvages_tool_call_on_per_turn_cap_hit` above.
     #[test]
     #[serial_test::serial]
     fn salvage_record_names_the_max_tokens_per_call_bound_once_in_answer_region() {
         let server = MockServer::start();
-        // Call 1 (no assistant message in history yet): plain content, no
-        // think-tags, no tool_calls, length-finish at the reasoning interval.
-        // No well-formed tool calls -> not salvaged; routes into the
-        // checkpoint arm, which absorbs it as ANSWER content (no reasoning
-        // markers) and hands back a prefill -> in_answer_region() flips true.
-        server.mock(|when, then| {
-            when.method(POST).path("/v1/chat/completions").matches(|req| {
-                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
-                b.matches("\"role\":\"assistant\"").count() == 0
-            });
-            then.status(200).json_body(chat_response_json(
-                Some("plain non-reasoning content, nothing repeats here at all"),
-                None,
-                "length",
-                100,
-                REASONING_CHECKPOINT_INTERVAL,
-            ));
-        });
-        // Call 2 (checkpoint prefill now in history): well-formed tool call
-        // at the (built-in) answer cap -> salvage fires under the ANSWER
-        // region's bound.
-        server.mock(|when, then| {
-            when.method(POST).path("/v1/chat/completions").matches(|req| {
-                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
-                b.matches("\"role\":\"assistant\"").count() >= 1
-            });
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
             then.status(200).json_body(chat_response_json(
                 Some("partial truncated content"),
                 Some(serde_json::json!([{
@@ -7107,9 +7114,10 @@ mod tests {
         let bound = &salvaged[0]["bound"];
         assert_eq!(
             bound["kind"], serde_json::json!("max_tokens_per_call"),
-            "the salvaged request followed a checkpoint that flipped the turn into the \
-             answer region, so the bound must name max_tokens_per_call, got {bound:?}"
+            "the dispatch's very first call, before dispatch_has_reasoned is ever true, \
+             carries the answer bound, got {bound:?}"
         );
+        assert_eq!(bound["source"], serde_json::json!("built-in"), "no CLI source flag was set for this test");
     }
 
     /// (#1221) The per-call cap override reaches the whole loop: with
@@ -8717,10 +8725,13 @@ mod tests {
         // attached. Same terminal as before, reached without destroying data.
         let traj_file = tmp.path().join(".darkmux-runtime").join("trajectory.jsonl");
         let traj = std::fs::read_to_string(&traj_file).expect("trajectory written");
-        let verdicts: Vec<String> = traj
+        let checkpoints: Vec<serde_json::Value> = traj
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .filter(|e| e["type"] == "dispatch.checkpoint")
+            .collect();
+        let verdicts: Vec<String> = checkpoints
+            .iter()
             .filter_map(|e| e["verdict"].as_str().map(str::to_string))
             .collect();
         let continues = verdicts.iter().filter(|v| *v == "continue").count();
@@ -8734,6 +8745,16 @@ mod tests {
             verdicts.iter().any(|v| v == "conclude"),
             "the gate must eventually SEE the repetition — verdicts were {verdicts:?}"
         );
+        // (#2165 CONSIDER item 5) A checkpoint only ever fires on the
+        // reasoning check-in interval — pin that every checkpoint record
+        // carries `bound.kind == "reasoning_checkpoint_interval"`, not just
+        // the salvage records.
+        for cp in &checkpoints {
+            assert_eq!(
+                cp["bound"]["kind"], serde_json::json!("reasoning_checkpoint_interval"),
+                "every checkpoint record must name the reasoning check-in interval, got {cp:?}"
+            );
+        }
         // Exactly what main.rs does to produce the deliverable.
         let delivered = outcome
             .final_answer
@@ -9026,6 +9047,14 @@ mod tests {
                 assert_eq!(
                     v.get("recoveries_budget").and_then(|x| x.as_u64()),
                     Some(MAX_STALL_RECOVERIES as u64),
+                );
+                // (#2165 CONSIDER item 5) This is the dispatch's very first
+                // call (`dispatch_has_reasoned` still false) — it carries
+                // the answer bound, not the reasoning interval.
+                assert_eq!(
+                    v.get("bound").and_then(|b| b.get("kind")).cloned(),
+                    Some(serde_json::json!("max_tokens_per_call")),
+                    "the dispatch's very first call carries the answer bound, got {v:?}"
                 );
             }
         }

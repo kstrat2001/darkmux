@@ -372,28 +372,53 @@ impl Trajectory {
     /// sleep duration AFTER clamping (see `loop_runner.rs`'s clamp logic),
     /// so a consumer summing `ms` across every `runtime.rest` event gets
     /// exactly `Metrics.rest_ms`.
+    ///
+    /// (2026-08-30 fleet-observability finding) `reason` is always
+    /// `"turn_delay"` — every OTHER cause of a `runtime.rest` event routes
+    /// through [`Self::append_paced_rest`] instead, which carries its own
+    /// operator/governor-supplied reason. Before this, a plain turn-delay
+    /// rest and a manual pace pause were indistinguishable on the fleet
+    /// flow stream except by cadence (this one polls once per rest, at the
+    /// configured `turn_delay_ms`; a paced rest polls every 2000ms while
+    /// held) — a fragile, undocumented signal for a remote reader to have
+    /// to reverse-engineer.
     pub fn append_rest(&mut self, seq: u32, ms: u64) {
         self.write_event(&serde_json::json!({
             "type": "runtime.rest",
             "seq": seq,
             "ts": unix_ms(),
             "ms": ms,
+            "reason": "turn_delay",
         }));
     }
 
-    /// (#2114) Same `runtime.rest` event `append_rest` writes, plus a
-    /// `reason` field — one event per bounded sleep increment the loop
-    /// takes while `.darkmux/pace.json` holds `pause: true`. Kept as a
-    /// distinct method (not an `Option<&str>` param bolted onto
-    /// `append_rest`) so the #2094 turn-delay call site's signature never
-    /// has to change for a feature it doesn't use.
-    pub fn append_paced_rest(&mut self, seq: u32, ms: u64, reason: &str) {
+    /// (#2114) Same `runtime.rest` event `append_rest` writes, but with the
+    /// operator/governor-supplied `reason` (`.darkmux/pace.json`'s own
+    /// `reason` field, or `PaceFile::reason_or_default`'s `"paused"`
+    /// fallback) instead of the fixed `"turn_delay"` — one event per bounded
+    /// sleep increment the loop takes while the pace file holds `pause:
+    /// true`. Kept as a distinct method (not an `Option<&str>` param bolted
+    /// onto `append_rest`) so the #2094 turn-delay call site's signature
+    /// never has to change for a feature it doesn't use.
+    ///
+    /// (2026-08-30 fleet-observability finding) `state` is the pace file's
+    /// own `state` field (`PaceFile::state`, e.g. an OS thermal-state name
+    /// when the thermal governor wrote the pause) — forwarded alongside
+    /// `reason` so a remote reader can distinguish "the operator paused
+    /// this by hand" from "the thermal governor paused this, and here is
+    /// which state tripped it" without cross-referencing pace.json, which
+    /// the flow stream has no access to. `None` (a hand-written pace file,
+    /// or a writer that never set `state`) serializes to JSON `null` rather
+    /// than omitting the key — the reader should never have to distinguish
+    /// "not asked" from "genuinely unknown."
+    pub fn append_paced_rest(&mut self, seq: u32, ms: u64, reason: &str, state: Option<&str>) {
         self.write_event(&serde_json::json!({
             "type": "runtime.rest",
             "seq": seq,
             "ts": unix_ms(),
             "ms": ms,
             "reason": reason,
+            "state": state,
         }));
     }
 
@@ -889,7 +914,35 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(parsed["type"], "runtime.rest");
             assert_eq!(parsed["ms"], 500);
+            // (2026-08-30 fleet-observability finding) A plain turn-delay
+            // rest must name itself as such — before this, it carried no
+            // `reason` at all, indistinguishable on the flow stream from a
+            // paced rest except by cadence.
+            assert_eq!(parsed["reason"], "turn_delay");
         }
+    }
+
+    /// (2026-08-30 fleet-observability finding) `append_paced_rest` forwards
+    /// BOTH `reason` and `state` — the pace file's own governor-supplied
+    /// fields — verbatim onto the event, and `state` serializes to JSON
+    /// `null` (not an absent key) when the pace file never set one.
+    #[test]
+    fn append_paced_rest_forwards_reason_and_state() {
+        let ws = tempfile::Builder::new().prefix("traj-paced-rest").tempdir().unwrap();
+        let mut t = Trajectory::open(ws.path());
+        t.append_paced_rest(1, 2000, "thermal", Some("critical"));
+        t.append_paced_rest(2, 2000, "paused", None);
+        drop(t);
+
+        let traj_file = ws.path().join(TRAJECTORY_SUBDIR).join(TRAJECTORY_FILE);
+        let body = fs::read_to_string(&traj_file).unwrap();
+        let lines: Vec<serde_json::Value> =
+            body.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["reason"], "thermal");
+        assert_eq!(lines[0]["state"], "critical");
+        assert_eq!(lines[1]["reason"], "paused");
+        assert_eq!(lines[1]["state"], serde_json::Value::Null, "no state -> JSON null, not an absent key");
     }
 
     #[test]
