@@ -1763,3 +1763,104 @@ fn one_shot_source_and_rule_synthesizes_a_workspace_and_dispatches() {
     // `workspace` param was never given at all in this test).
     assert_eq!(started["payload"]["workspace"], Value::String("one-shot-app1".to_string()));
 }
+
+// ── #1959 continuation: an empty/unresolvable sha must never reach a
+//    dispatch ───────────────────────────────────────────────────────────
+//
+// The pre-mint validation loop (finding 3, above) already refuses the
+// WHOLE run when a selected unit's source is missing from `plan.sources`
+// entirely, or (for a loaded `--param plan=`) when its sha has drifted
+// from the freshly-materialized tree. Neither of those checks asks
+// whether a PRESENT entry's own `sha` field is itself empty — a plan file
+// hand-edited (or produced by a future schema mismatch) with `"sha": ""`
+// sails through both unvalidated. `resolve_unit_sha` is the point-of-use
+// guard for exactly that case; these tests exercise it directly (a
+// synthetic `Plan`, no fixture repo needed) rather than through `run()`,
+// since — with both pre-mint checks left exactly as they are — there is
+// no reachable `run()`-level input that gets an empty-sha unit this far
+// without one of them already bailing the whole mission first. That's the
+// point: this guard is the point-of-use backstop, not the only thing
+// standing between an operator and `sha: ""`.
+
+fn plan_source(id: &str, sha: &str, tree: &std::path::Path) -> plan::PlanSource {
+    plan::PlanSource {
+        id: id.to_string(),
+        sha: sha.to_string(),
+        git_ref: "main".to_string(),
+        tree: tree.to_path_buf(),
+        files_walked: 0,
+        out_of_scope: 0,
+    }
+}
+
+fn plan_with_one_source(sha: &str, tree: &std::path::Path) -> Plan {
+    Plan {
+        schema_version: plan::PLAN_SCHEMA_VERSION.to_string(),
+        workspace: "fixture".to_string(),
+        planned_at: "2026-01-01T00:00:00Z".to_string(),
+        sources: vec![plan_source("app1", sha, tree)],
+        units: Vec::new(),
+        totals: plan::Totals::default(),
+    }
+}
+
+#[test]
+fn resolve_unit_sha_errors_on_an_empty_sha_naming_the_tree_and_reason() {
+    let not_a_git_tree = TempDir::new().unwrap();
+    let the_plan = plan_with_one_source("", not_a_git_tree.path());
+
+    let err = resolve_unit_sha(&the_plan, "app1").expect_err("an empty sha must never resolve");
+    let msg = err.to_string();
+    assert!(msg.contains("app1"), "error must name the source: {msg}");
+    assert!(msg.contains(&not_a_git_tree.path().display().to_string()), "error must name the tree: {msg}");
+    assert!(
+        msg.contains("git repository") && msg.contains("rev-parse") && msg.contains("missing"),
+        "error must name why (not a git repo / rev-parse failed / tree missing): {msg}"
+    );
+}
+
+#[test]
+fn resolve_unit_sha_errors_when_the_source_is_absent_from_the_plan() {
+    let tree = TempDir::new().unwrap();
+    let the_plan = plan_with_one_source("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", tree.path());
+
+    let err = resolve_unit_sha(&the_plan, "app-never-declared").expect_err("an absent source must never resolve");
+    assert!(err.to_string().contains("app-never-declared"), "{err}");
+}
+
+#[test]
+fn resolve_unit_sha_returns_the_plan_sha_unchanged_when_resolvable() {
+    let tree = TempDir::new().unwrap();
+    let the_plan = plan_with_one_source("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", tree.path());
+
+    let sha = resolve_unit_sha(&the_plan, "app1").expect("a non-empty sha must resolve");
+    assert_eq!(sha, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+}
+
+// ── integration: a unit with a resolvable sha dispatches exactly as
+//    before this change ─────────────────────────────────────────────────
+
+#[test]
+#[serial_test::serial]
+fn a_unit_with_a_resolvable_sha_dispatches_unchanged() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut scripts = BTreeMap::new();
+    scripts.insert("u-0001".to_string(), ScriptedUnit::default());
+    scripts.insert("u-0002".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    let code = run(&params_for(&fx), None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string(), "u-0002".to_string()], "both units still dispatch");
+
+    let records = read_all_flow_records();
+    let closed = records.iter().find(|r| r["action"] == "mission close").unwrap();
+    assert_eq!(closed["payload"]["units_errored"], 0, "a resolvable sha must never count as errored");
+    assert_eq!(closed["payload"]["units_completed"], 2);
+    for r in records.iter().filter(|r| r["action"] == "step start") {
+        let sha = r["payload"]["sha"].as_str().expect("step start must still carry a sha");
+        assert_ne!(sha, "", "a resolvable unit's step start must never carry an empty sha");
+    }
+}
