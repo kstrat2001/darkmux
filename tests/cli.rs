@@ -2220,6 +2220,32 @@ fn hanging_endpoint_profiles_json(port: u16) -> String {
     )
 }
 
+/// Assert that no `curl` spawned by the darkmux child `pid` outlives it.
+/// Polls the process table for that child's own `darkmux-remote-<pid>-`
+/// config-file marker (see `remote_chat_attempt`) for up to 2s: the OS
+/// tears the table down asynchronously after SIGKILL, and instrumented
+/// (coverage) builds are slower than a fixed settle delay allows for.
+/// Scoped to `pid` so a sibling test's live curl is never mistaken for a
+/// survivor of this one.
+fn assert_no_surviving_remote_curl(pid: u32, label: &str) {
+    let marker = format!("darkmux-remote-{pid}-");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let survivors = loop {
+        let Ok(out) = std::process::Command::new("pgrep").args(["-f", &marker]).output() else {
+            return; // no `pgrep` on this image — the socket-close proof already covers it
+        };
+        let survivors = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if survivors.is_empty() || std::time::Instant::now() >= deadline {
+            break survivors;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(
+        survivors.is_empty(),
+        "a darkmux {label} curl process is still running after the parent exited: {survivors}"
+    );
+}
+
 /// (#2124) `kill <pid>` (SIGTERM) on a `mission launch review` blocked
 /// mid-probe (a real `curl` call to an endpoint that never answers) must:
 /// exit within 5s, leave a `mission close` flow record naming the signal,
@@ -2355,17 +2381,13 @@ fn mission_launch_review_sigterm_mid_probe_finalizes_and_reaps_curl() {
     // `curl -sS -m <t> -K <tmp-path>`, where `<tmp-path>` is named
     // `darkmux-remote-<pid>-<n>.curl` — a distinctive `-f`-matchable
     // fragment regardless of the port curl was told to hit (the URL lives
-    // INSIDE that config file, never in argv). A brief settle delay covers
-    // the OS's own process-table teardown after SIGKILL.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let pgrep = std::process::Command::new("pgrep").args(["-f", "darkmux-remote-"]).output();
-    if let Ok(out) = pgrep {
-        let survivors = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            survivors.trim().is_empty(),
-            "a darkmux review-dispatch curl process is still running after the parent exited: {survivors}"
-        );
-    } // `pgrep` missing entirely (non-macOS/Linux CI image) — the socket-close proof above already covers this.
+    // INSIDE that config file, never in argv). The `<pid>` is THIS test's
+    // darkmux child — matching on the bare prefix would also see the sibling
+    // SIGTERM test's still-live curl when cargo runs them concurrently
+    // (that cross-match failed both tests together on main's coverage job).
+    // `pgrep` missing entirely (non-macOS/Linux CI image) — the socket-close
+    // proof above already covers this.
+    assert_no_surviving_remote_curl(child.id(), "review-dispatch");
 
     // The mission itself: exactly one was minted under this isolated
     // DARKMUX_HOME, so no id needs to be captured from the child's own
@@ -2547,15 +2569,7 @@ fn mission_launch_generic_sigterm_mid_dispatch_finalizes_and_reaps_curl() {
          the parent (#2131 regression)"
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let pgrep = std::process::Command::new("pgrep").args(["-f", "darkmux-remote-"]).output();
-    if let Ok(out) = pgrep {
-        let survivors = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            survivors.trim().is_empty(),
-            "a darkmux generic-graph curl process is still running after the parent exited: {survivors}"
-        );
-    }
+    assert_no_surviving_remote_curl(child.id(), "generic-graph");
 
     let missions_dir = home.path().join("missions");
     let mission_id = fs::read_dir(&missions_dir)
@@ -2979,7 +2993,6 @@ fn review_bench_funnel_bundler_flag_reaches_external_bundles_and_fails_loud_per_
             .and(predicate::str::contains("empty bundle set")),
     );
 }
-
 
 /// `--envelope-out` pointed at a path whose parent directory doesn't exist
 /// must fail loudly (`std::fs::write` errors, wrapped by `.with_context`)
