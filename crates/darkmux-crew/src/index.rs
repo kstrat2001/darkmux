@@ -888,13 +888,35 @@ pub fn rebuild() -> Result<()> {
 }
 
 /// Ensure the derived index at `path` exists and matches the current
-/// `SCHEMA_VERSION`, rebuilding from manifests if it is missing, stale, or
-/// unreadable. The index is derived state (the JSON manifests under the crew
-/// root are the source of truth), so an on-demand rebuild is always safe and
-/// recoverable — this is what lets the `role` / `crew` read-verbs work
-/// without a manual `darkmux crew index rebuild`. (#914)
+/// `SCHEMA_VERSION` AND `darkmux_version`, rebuilding from manifests if it is
+/// missing, stale, or unreadable. The index is derived state (the JSON
+/// manifests under the crew root are the source of truth), so an on-demand
+/// rebuild is always safe and recoverable — this is what lets the `role` /
+/// `crew` read-verbs work without a manual `darkmux crew index rebuild`.
+/// (#914)
+///
+/// **The `darkmux_version` check (#2144):** builtin manifests (`role`,
+/// `skill`, ...) are embedded in the binary, not scanned from disk —
+/// `populate()`'s `source_files` table deliberately only walks the
+/// operator's user-side manifests, so per-file mtime/hash drift detection
+/// can never see a builtin change. `SCHEMA_VERSION` alone doesn't cover this
+/// gap either: it versions the DB's *table shape*, not *which builtin ids
+/// are embedded* — a release that adds a brand-new builtin role (e.g. the
+/// crawler role, #2098) ships with the SAME `SCHEMA_VERSION` as the release
+/// before it. Without this check, upgrading the binary (`brew upgrade`,
+/// `cargo install --path .`) while a `role list`/`role show`-populated
+/// `index.db` from the OLD binary already sits on disk left the new builtin
+/// invisible forever — `schema_version` still matched, so the index read as
+/// "fresh" and the lazy rebuild never fired, even though the persisted
+/// row set was minted by a binary that never embedded the new role.
+/// `populate()` already stamps `meta_kv.darkmux_version` with
+/// `CARGO_PKG_VERSION` on every successful rebuild (originally for
+/// `crew index status`'s drift hint) — this just wires that same signal into
+/// the freshness gate so the auto-rebuild path benefits from it too.
 pub fn ensure_fresh_index(path: &Path) -> Result<()> {
-    let fresh = path.exists() && populated_schema_version(path) == Some(SCHEMA_VERSION);
+    let fresh = path.exists()
+        && populated_schema_version(path) == Some(SCHEMA_VERSION)
+        && populated_darkmux_version(path).as_deref() == Some(env!("CARGO_PKG_VERSION"));
     if !fresh {
         rebuild_at(path)?;
     }
@@ -922,6 +944,22 @@ fn populated_schema_version(path: &Path) -> Option<i32> {
         )
         .ok()?;
     raw.parse::<i32>().ok()
+}
+
+/// Read the darkmux binary version recorded by the last *successful*
+/// `populate` — the `meta_kv.darkmux_version` row — or `None` if it's
+/// absent/unreadable. Sibling of [`populated_schema_version`]; see
+/// `ensure_fresh_index`'s doc comment (#2144) for why the freshness gate
+/// needs both. `None` is treated as stale by callers, same as the schema
+/// counterpart.
+fn populated_darkmux_version(path: &Path) -> Option<String> {
+    let conn = Connection::open(path).ok()?;
+    conn.query_row(
+        "SELECT value FROM meta_kv WHERE key = 'darkmux_version'",
+        [],
+        |r| r.get(0),
+    )
+    .ok()
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -2045,6 +2083,63 @@ mod tests {
             role_count > 0,
             "ensure_fresh_index must rebuild from builtin manifests, not trust the stale header"
         );
+    }
+
+    /// (#2144) An index.db minted by an OLDER binary — same `SCHEMA_VERSION`
+    /// (adding a builtin role doesn't change the DB's table shape) but a
+    /// lower `darkmux_version` — is what a real `brew upgrade`/
+    /// `cargo install` leaves on disk: the new binary embeds a role the old
+    /// one didn't (the crawler role, #2098), but the persisted `roles` table
+    /// still reflects the old binary's builtin set. `ensure_fresh_index`
+    /// must notice the version drift and rebuild so `role show`'s lookup
+    /// path resolves EVERY id in `loader::builtin_roles_ids()`, not just the
+    /// subset the index happened to be populated with.
+    ///
+    /// Red-proved: before the `darkmux_version` check was wired into
+    /// `ensure_fresh_index`'s freshness gate, this failed — the stale index
+    /// (schema_version matching, darkmux_version stale) read as "fresh" and
+    /// `crawler` stayed missing from `roles` forever.
+    #[serial_test::serial]
+    #[test]
+    fn ensure_fresh_index_picks_up_new_builtin_role_after_binary_upgrade() {
+        let guard = CrewDirGuard::new();
+        let idx = index_path(guard.path());
+
+        // Build a fully current index first (this is what any rebuild does,
+        // regardless of which binary ran it).
+        rebuild_at(&idx).unwrap();
+
+        // Now roll it back to look like it was minted by an OLDER binary
+        // that pre-dates the crawler builtin role: drop the crawler role's
+        // row and stamp an old `darkmux_version`, leaving `schema_version`
+        // untouched (a new builtin role does not bump the table shape).
+        {
+            let conn = open_index(&idx).unwrap();
+            conn.execute("DELETE FROM roles WHERE id = 'crawler'", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE meta_kv SET value = '0.0.0-old-binary' WHERE key = 'darkmux_version'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // `role show`'s exact lookup path: ensure_fresh_index() then a
+        // SELECT by id against the reopened index.
+        ensure_fresh_index(&idx).unwrap();
+        let conn = open_index(&idx).unwrap();
+        for id in loader::builtin_roles_ids() {
+            let found: Option<String> = conn
+                .query_row("SELECT id FROM roles WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .unwrap();
+            assert!(
+                found.is_some(),
+                "builtin role '{id}' missing after ensure_fresh_index following a binary upgrade"
+            );
+        }
     }
 
     fn write_mission_with_started_ts(crew_root: &std::path::Path, id: &str) {
