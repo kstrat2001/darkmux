@@ -510,11 +510,18 @@ fn a_reasoning_checkpoint_dispatches_tools_without_nudging_the_model_to_think_le
     )
     .expect("a reasoning checkpoint carrying tool calls returns Ok");
 
-    // The tool calls DID get dispatched — salvage is doing its job.
-    let tool_msgs = o.messages.iter().filter(|m| m.role == "tool").count();
+    // The tool call from the CHECKPOINT-CUT turn (id "c1") DID get
+    // dispatched — salvage is doing its job. Checked by id, not just
+    // `tool_msgs > 0` (#2164 review): the priming turn's own "c0" tool call
+    // also dispatches and would satisfy a bare count check on its own,
+    // before the scenario under test ever runs.
+    let has_c1_result = o
+        .messages
+        .iter()
+        .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("c1"));
     assert!(
-        tool_msgs > 0,
-        "well-formed tool calls cut at the check-in interval must still be dispatched"
+        has_c1_result,
+        "the well-formed tool call cut at the check-in interval must still be dispatched"
     );
 
     // But nothing told the model to think less.
@@ -659,11 +666,102 @@ fn a_non_reasoning_models_first_call_is_not_capped_by_the_reasoning_interval() {
         "no salvage should have been needed — the first call must have carried the answer \
          bound, not the reasoning check-in interval"
     );
+    let not_applied_count = events
+        .iter()
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("dispatch.reasoning_bound.not_applied"))
+        .count();
+    assert_eq!(
+        not_applied_count, 1,
+        "the detector is a ONE-SHOT latch: turn 1 shows real output with no reasoning and \
+         fires it, but turn 2's conclude (also non-reasoning, also real output) must NOT \
+         fire it again — got {not_applied_count} occurrences"
+    );
+}
+
+/// (#2164 review) RED-PROVE: `dispatch_has_reasoned` must see reasoning
+/// carried in the SEPARATE `reasoning_content` field, not just an inline
+/// `<think>` block — on a `tool_calls` (or `stop`) finish, not only on
+/// `length`. `promote_terminal_reasoning` unconditionally clears
+/// `reasoning_content` for every finish reason except `length`, and it runs
+/// BEFORE `per_turn_reasoning` is assembled — so reading
+/// `assistant_message.reasoning_content` at that later point sees `None`
+/// even though the model plainly reasoned. Sibling to
+/// `a_non_reasoning_models_first_call_is_not_capped_by_the_reasoning_interval`
+/// above (which covers the inline-`<think>` shape); this one covers the
+/// separate-field shape (Qwen 3.x / DeepSeek).
+///
+/// Turn 1 reasons via `reasoning_content` and ALSO carries a tool call,
+/// finishing `tool_calls` — exactly the shape the review probe named. Turn
+/// 2's mock is keyed on the outgoing request's `max_tokens`, matching ONLY
+/// the reasoning interval (100), distinct from the much larger answer bound
+/// (5000): if `dispatch_has_reasoned` failed to see turn 1's reasoning, turn
+/// 2 would carry `max_tokens:5000` instead, this mock would never match,
+/// and `run()` would return `Err` (httpmock's unmatched-request 404).
+#[test]
+#[serial_test::serial]
+fn a_separate_field_reasoning_turn_is_seen_even_when_it_also_dispatches_tools() {
+    let server = MockServer::start();
+
+    let mut turn1_body = chat_response_json(
+        None,
+        Some(serde_json::json!([{
+            "id": "c1",
+            "type": "function",
+            "function": { "name": "echo", "arguments": "{\"text\":\"x\"}" }
+        }])),
+        "tool_calls",
+        100,
+        50,
+    );
+    turn1_body["choices"][0]["message"]["reasoning_content"] =
+        serde_json::json!("working through it: check the file exists, then read it");
+    server.mock(move |when, then| {
+        when.method(POST).path("/v1/chat/completions").matches(|req| {
+            !body_of(req).contains("\"role\":\"tool\"")
+        });
+        then.status(200).json_body(turn1_body.clone());
+    });
+
+    // Turn 2's first call — keyed on the REASONING bound (100), not the
+    // answer bound (5000). Only matches if `dispatch_has_reasoned` is true.
+    let turn2 = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/chat/completions")
+            .body_contains("\"role\":\"tool\"")
+            .body_contains("\"max_tokens\":100");
+        then.status(200).json_body(chat_response_json(Some("done"), None, "stop", 150, 5));
+    });
+
+    let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+    let tmp = tempfile::Builder::new().prefix("separate-field-reasoning").tempdir().unwrap();
+    let mut traj = Trajectory::open(tmp.path());
+    let initial = vec![Message::system("t"), Message::user("go")];
+    let tools = [Tool::Echo];
+    let cfg = compaction::CompactionConfig::never_compact();
+
+    let outcome = run(
+        &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+        Some(3), None, Some(5000), Some(100), std::collections::BTreeMap::new(), None,
+    )
+    .expect(
+        "turn 2 must carry the reasoning bound (max_tokens:100) — an Err here means it went \
+         out under the answer bound instead, i.e. dispatch_has_reasoned missed turn 1's \
+         separate-field reasoning (#2164 review)",
+    );
+
+    turn2.assert();
+    assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
+
+    let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+    let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+    let events: Vec<serde_json::Value> =
+        raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     assert!(
-        events
+        !events
             .iter()
             .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("dispatch.reasoning_bound.not_applied")),
-        "the one-shot detector must fire once turn 1 shows real output with no reasoning region"
+        "the model DID reason (via reasoning_content) — the 'no reasoning region' detector \
+         must not fire"
     );
 }
 

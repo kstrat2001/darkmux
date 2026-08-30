@@ -1897,12 +1897,20 @@ fn run_with_sleeper(
         // `turn.writing_thought()` at the salvage site and silently never
         // suppressed anything.
         let sent_reasoning_bound = carries_reasoning_bound;
-        // (#2164) The first time this dispatch sends a fresh turn's first
-        // call under the answer bound because it hasn't proven it reasons
-        // yet, and this dispatch has already produced at least one turn
-        // (so this genuinely reflects "no reasoning seen", not just "too
-        // early to know") — surfaced below, once, after the response comes
-        // back and confirms the call carried real output with no reasoning.
+        // (#2164) There is no separate `turns`-based guard here — the
+        // detector below fires as soon as ONE call's response confirms it:
+        // real dispatchable output produced with no reasoning at all. That
+        // can be this dispatch's very first call (a non-reasoning model's
+        // turn 1, the modal case this fix targets) and is not gated on
+        // having "already produced a turn" first. What DOES prevent a
+        // false positive on a genuinely thinking model is upstream of this
+        // point, not a turns count: `dispatch_has_reasoned` (and, via it,
+        // the detector's own `!dispatch_has_reasoned` condition below) is
+        // computed from THIS call's own response — including reasoning
+        // carried in the separate `reasoning_content` field, which
+        // `promote_terminal_reasoning` strips before this line but returns
+        // to its caller for exactly this reason. See the detector's
+        // firing site below for the actual condition.
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -2012,9 +2020,19 @@ fn run_with_sleeper(
         // thinking models put their whole answer there. promote_terminal_reasoning
         // does the promotion (terminal turns only) and then performs the #406
         // strip, so the invariant above still holds for tool-call turns.
+        //
+        // (#2164) Its return value is the ONLY place `reasoning_content` is
+        // still visible after this call for a tool_calls/stop turn — the
+        // strip above wipes `choice.message.reasoning_content` before
+        // `per_turn_reasoning` is assembled below, so a caller reading the
+        // message field after this point sees nothing. Captured here and
+        // folded into `dispatch_has_reasoned`'s decision alongside
+        // `per_turn_reasoning`.
+        let mut separate_field_reasoning_before_strip: Option<String> = None;
         if let Some(choice) = response.choices.first_mut() {
             let finish = choice.finish_reason.clone();
-            promote_terminal_reasoning(&mut choice.message, &finish);
+            separate_field_reasoning_before_strip =
+                promote_terminal_reasoning(&mut choice.message, &finish);
         }
 
         // (#414 PR A) Capture this turn's completion-token count BEFORE
@@ -2116,16 +2134,26 @@ fn run_with_sleeper(
         }
         // (#2164) Dispatch-scoped "has this model ever reasoned" — the ONE
         // place `dispatch_has_reasoned` is set, and it only ever moves
-        // false→true, never back. Two shapes count as reasoning: a
-        // completed block (`per_turn_reasoning`, already covers both the
-        // separate `reasoning_content` field and a closed inline `<think>`
-        // via `extract_think_blocks` above) and an INLINE block this call
-        // OPENED but has not closed yet (the truncated-mid-first-call
-        // shape `extract_think_blocks` deliberately skips, since it
-        // requires a matched pair — mirrors the same delimiter check
+        // false→true, never back. Three shapes count as reasoning: a
+        // completed block (`per_turn_reasoning`, covers a closed inline
+        // `<think>` via `extract_think_blocks` above, PLUS the separate
+        // `reasoning_content` field on the ONE finish reason — "length" —
+        // where `promote_terminal_reasoning` does not strip it before this
+        // point runs); the separate `reasoning_content` field on every
+        // OTHER finish reason, which `promote_terminal_reasoning` already
+        // cleared from `assistant_message` before this line, so it can only
+        // be read from `separate_field_reasoning_before_strip` — the value
+        // captured at that call site, before the strip; and an INLINE block
+        // this call OPENED but has not closed yet (the truncated-mid-
+        // first-call shape `extract_think_blocks` deliberately skips, since
+        // it requires a matched pair — mirrors the same delimiter check
         // `TurnAccum::absorb` uses for the identical shape on a
         // continuation call).
-        if !per_turn_reasoning.trim().is_empty() {
+        if !per_turn_reasoning.trim().is_empty()
+            || separate_field_reasoning_before_strip
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+        {
             dispatch_has_reasoned = true;
         } else if let Some(content) = assistant_message.content.as_deref() {
             let trimmed = content.trim_start();
@@ -3441,7 +3469,21 @@ fn resolve_finish_reason(
     }
 }
 
-fn promote_terminal_reasoning(msg: &mut Message, finish_reason: &str) {
+/// (#2164) Returns the `reasoning_content` this call captured BEFORE any
+/// promotion or stripping happened — including on a turn where the strip
+/// below is about to wipe it. A caller that needs to know whether THIS
+/// response reasoned at all (e.g. `dispatch_has_reasoned`) MUST read this
+/// return value, not `msg.reasoning_content` after the call returns: for a
+/// terminal `tool_calls`/`stop` turn, `reasoning_content` has already been
+/// cleared to `None` by the time this function returns, and the field never
+/// makes it into `per_turn_reasoning` (assembled later, downstream of this
+/// call) at all. Found live during #2164 review: a probe with
+/// `reasoning_content` + tool calls + `finish_reason: "tool_calls"` sent
+/// turn 2 out under the ANSWER bound and fired the "no reasoning region"
+/// detector — for a model that DID reason, because the field was already
+/// gone by the time anything downstream looked for it.
+fn promote_terminal_reasoning(msg: &mut Message, finish_reason: &str) -> Option<String> {
+    let captured_before_strip = msg.reasoning_content.clone();
     let has_tools = msg.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
     let content_empty = msg.content.as_deref().map_or(true, |c| c.trim().is_empty());
     if !has_tools && content_empty && finish_reason != "length" {
@@ -3467,6 +3509,7 @@ fn promote_terminal_reasoning(msg: &mut Message, finish_reason: &str) {
     if finish_reason != "length" {
         msg.reasoning_content = None;
     }
+    captured_before_strip
 }
 
 fn assistant_message_has_well_formed_tool_calls(msg: &Message) -> bool {
