@@ -136,6 +136,7 @@ const KEYS: &[(&str, Ty)] = &[
     ("runtime.thermal.resume_hold_ms", Ty::Uint),
     ("runtime.thermal.max_pause_ms", Ty::Uint),
     ("runtime.thermal.min_cpu_speed_limit_pct", Ty::Uint),
+    ("runtime.thermal.speed_limit_hold_samples", Ty::Uint),
     ("fleet.mode", Ty::FleetMode),
     // (#1260) The per-execution remote token allowance for endpoint-staffed
     // crew seats (one pipeline stage = one execution). Tokens, never currency.

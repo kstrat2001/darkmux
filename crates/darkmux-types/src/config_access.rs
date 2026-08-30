@@ -724,6 +724,23 @@ pub fn thermal_min_cpu_speed_limit_pct() -> u64 {
     pick_parsed("DARKMUX_THERMAL_MIN_CPU_SPEED_LIMIT_PCT", cfg, Some(50)).unwrap()
 }
 
+/// (#2110/#2109 review finding 7) How many CONSECUTIVE samples must read
+/// `cpu_speed_limit_pct` below the floor before the breaker trips on that
+/// signal — a lone sample below the floor is common noise (a brief DVFS
+/// dip under a short burst), and tripping the breaker (a terminal,
+/// operator-must-resume event) on one noisy reading is a worse failure
+/// mode than a few extra seconds of detection latency. Does NOT apply to
+/// the `critical` thermal-state check, which is a discrete OS-reported
+/// state and trips immediately as before. Default `3`.
+pub fn thermal_speed_limit_hold_samples() -> u32 {
+    let cfg = config()
+        .runtime
+        .as_ref()
+        .and_then(|r| r.thermal.as_ref())
+        .and_then(|t| t.speed_limit_hold_samples);
+    pick_parsed("DARKMUX_THERMAL_SPEED_LIMIT_HOLD_SAMPLES", cfg, Some(3)).unwrap()
+}
+
 // ── Mission board (#1230 Packet 5) ──
 /// How many days an Active mission may sit with zero `Complete` phases
 /// before `darkmux mission status`'s drift detector flags it as stale.

@@ -3959,6 +3959,12 @@ fn run_telemetry_sampler(
         crate::thermal_governor::ThermalGovernor::new(crate::thermal_governor::ThermalGovernorConfig::from_env());
     let thermal_stop_file =
         crate::thermal_governor::stop_file_path_from_record_context(record_context.as_ref());
+    // (#2110/#2109 review finding 5) `Some(reason)` only when this dispatch
+    // looked crawl-shaped but the STOP path above came back `None` because
+    // derivation failed (not because this simply isn't a crawl dispatch) —
+    // see `stop_file_unresolved_reason`'s own doc for the distinction.
+    let thermal_stop_unresolved_reason =
+        crate::thermal_governor::stop_file_unresolved_reason(record_context.as_ref());
     let emit_rest = |reason: &str, state: &str, pause: bool| {
         let mut payload = serde_json::json!({ "reason": reason, "state": state, "pause": pause });
         merge_record_context(&mut payload, &record_context);
@@ -4050,6 +4056,25 @@ fn run_telemetry_sampler(
                 }
                 crate::thermal_governor::ThermalEvent::Breaker { state } => {
                     emit_rest("thermal-critical", &state, true);
+                    // (#2110/#2109 review finding 5) The breaker tripped on
+                    // what looked like a crawl unit, but there was no
+                    // trustworthy STOP path to write — never write one at
+                    // a guessed path (thermal_governor.rs never did); make
+                    // the gap LOUD instead of a silent no-op that lets the
+                    // crawl keep dispatching units past a tripped breaker.
+                    if thermal_stop_file.is_none() {
+                        if let Some(reason) = thermal_stop_unresolved_reason {
+                            emit(
+                                "thermal",
+                                "thermal.stop_unresolved",
+                                serde_json::json!({
+                                    "stop_written": false,
+                                    "reason": reason,
+                                    "state": state,
+                                }),
+                            );
+                        }
+                    }
                 }
             }
         }

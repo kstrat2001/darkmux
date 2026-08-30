@@ -17,17 +17,17 @@
 //! resting forever.
 //!
 //! **Breaker (#2109):** at `critical`, or when `cpu_speed_limit_pct` drops
-//! below `min_cpu_speed_limit_pct`, write the pace file with
-//! `reason: "thermal-critical", expires: false` and — for a crawl mission —
-//! drop the crawl's `STOP` file so no further unit gets dispatched. **Never
-//! kills the container.** The in-flight unit pauses at its next turn
-//! boundary with its checkpoint persisted (#2114); resume is the operator's
-//! call (`darkmux dispatch --resume`). Once tripped, the governor goes
-//! terminal — it does not un-pause itself on recovery, and (per finding 2
-//! of the #2110/#2109 review) it does not need to keep re-stamping
-//! `written_at_ms` either: `expires: false` tells the runtime's staleness
-//! ceiling to never apply to this pause, so a stale timestamp can't make
-//! the unit resume on a still-critical machine.
+//! below `min_cpu_speed_limit_pct` for `speed_limit_hold_samples`
+//! CONSECUTIVE samples (finding 7 of the #2110/#2109 review — a lone
+//! sample below the floor is noise, not a sustained condition; the
+//! `critical` state check is unaffected and still trips immediately),
+//! write the pace file with `reason: "thermal-critical"` and — for a
+//! crawl mission — drop the crawl's `STOP` file so no further unit gets
+//! dispatched. **Never kills the container.** The in-flight unit pauses at
+//! its next turn boundary with its checkpoint persisted (#2114); resume is
+//! the operator's call (`darkmux dispatch --resume`). Once tripped, the
+//! governor goes terminal for DECISIONS — it does not un-pause itself on
+//! recovery — but it does NOT go silent: see the heartbeat contract below.
 //!
 //! **Pace file location (operator correction during #2110/#2109 review):**
 //! NOT under the mounted `/workspace` — crawl units mount that read-only,
@@ -40,16 +40,21 @@
 //! `pace_file_path_matches_runtime_out_base` below is the conformance test
 //! that keeps the two literal join expressions in sync.
 //!
-//! Every write stamps `written_at_ms` (epoch millis) so the runtime's
-//! staleness guard (`PaceFile::is_expired`, `runtime/src/pace.rs`) can
-//! treat a pause older than `max_pause_ms` as expired — a host process
-//! that dies mid-pause must not strand a dispatch resting forever on a
-//! stale file. The ordinary governor pause (`reason: "thermal"`) is
-//! subject to that ceiling; the breaker's `thermal-critical` stop opts out
-//! via `expires: false` (above). A gap in OS thermal readings while paused
+//! **Heartbeat contract (redesigned #2114 cf1b1993, superseding this
+//! module's earlier `expires: false` flag):** the runtime honors a pause
+//! only while `written_at_ms` is fresher than `max_pause_ms` — there is
+//! NO per-reason opt-out, a `thermal-critical` stop gets no exemption from
+//! the ceiling, only an ACTIVE WRITER does. "Indefinite" is expressed as
+//! "someone keeps renewing it," never as a flag. So both `Paused` and
+//! `Broken` re-stamp the pace file on a cadence well inside `max_pause_ms`
+//! (every `max_pause_ms / 4` of elapsed time — see
+//! `ThermalGovernor::restamp_interval_ms`) for as long as the state holds,
+//! not just on transition. A gap in OS thermal readings while paused
 //! (`thermal_sample` returns `None` mid-episode) is treated as "time
 //! passed, no new information" rather than frozen accounting or a stale
 //! stamp — see `on_sample`'s `None` arm (finding 3 of the same review).
+//! Pace-file writes are atomic (tmp file + rename) so the runtime's poll
+//! never observes a partially-written file.
 
 use crate::host_probe::thermal::THERMAL_STATES;
 use crate::host_probe::ThermalSample;
@@ -75,45 +80,55 @@ pub fn pace_file_path(host_out: &Path) -> PathBuf {
 }
 
 /// Shape written to the pace file. Mirrors `runtime/src/pace.rs`'s
-/// `PaceFile` fields (`pause`/`reason`/`state`/`written_at_ms`/`expires`) —
-/// the runtime-side reader tolerates unknown/extra fields on deserialize
-/// (no `deny_unknown_fields`), so this stays forward-compatible with any
-/// future additive field on that side. `expires` is omitted (not `null`)
-/// when `None` — the ordinary governor pause doesn't opt out of the
-/// staleness ceiling, so it writes the same shape a pre-`expires` reader
-/// already tolerated.
+/// `PaceFile` fields (`pause`/`reason`/`state`/`written_at_ms`) exactly —
+/// there is deliberately no `expires` field: #2114's cf1b1993 replaced
+/// that flag with a pure heartbeat contract (see this module's doc), so
+/// writing an `expires` key here would be dead data the runtime no longer
+/// reads. The runtime-side reader tolerates unknown/extra fields on
+/// deserialize (no `deny_unknown_fields`), so this stays forward-compatible
+/// regardless.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct GovernorPaceFile {
     pause: bool,
     reason: &'static str,
     state: String,
     written_at_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expires: Option<bool>,
 }
 
 fn now_epoch_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
-/// `expires: Some(false)` for the breaker's `thermal-critical` stop (opts
-/// out of the runtime's `max_pause_ms` staleness ceiling — finding 2 of
-/// the #2110/#2109 review); `None` for every ordinary governor pause/resume
-/// write, which stays subject to that ceiling.
-fn write_pace_file(host_out: &Path, pause: bool, reason: &'static str, state: &str, expires: Option<bool>) {
-    let pace = GovernorPaceFile {
-        pause,
-        reason,
-        state: state.to_string(),
-        written_at_ms: now_epoch_ms(),
-        expires,
-    };
+/// (#2110/#2109 review nit) Atomic write: a temp file in the SAME
+/// directory (so the rename is same-filesystem, hence atomic on both APFS
+/// and common Linux filesystems) followed by `rename` onto the real path.
+/// Without this, the runtime's poll (`PaceReader::read`, on its own ~2s
+/// cadence, fully independent of this writer's cadence) could observe a
+/// truncated or half-written JSON file mid-write and treat it as
+/// malformed — logged once, harmless, but a needless false alarm on every
+/// governor tick if the two cadences ever raced. `write` + `rename` is the
+/// same pattern `checkpoint.rs` already uses for its own pace-adjacent
+/// out-dir writes.
+fn write_pace_file(host_out: &Path, pause: bool, reason: &'static str, state: &str) {
+    let pace =
+        GovernorPaceFile { pause, reason, state: state.to_string(), written_at_ms: now_epoch_ms() };
     // Best-effort — a failed write is observability/pacing, never fatal to
     // the dispatch itself (mirrors every other sampler-adjacent write in
     // `dispatch_internal.rs`).
     let _ = std::fs::create_dir_all(host_out);
-    if let Ok(json) = serde_json::to_string(&pace) {
-        let _ = std::fs::write(pace_file_path(host_out), json);
+    let Ok(json) = serde_json::to_string(&pace) else { return };
+    let final_path = pace_file_path(host_out);
+    // Unique per-write tmp name (pid + epoch-ns) — the sampler thread is
+    // the only writer for a given dispatch, but a unique name means a
+    // failed/aborted write from an EARLIER tick can never collide with
+    // this one's tmp file if cleanup ever slips.
+    let tmp_path = host_out.join(format!(
+        ".pace.json.tmp.{}.{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    ));
+    if std::fs::write(&tmp_path, &json).is_ok() {
+        let _ = std::fs::rename(&tmp_path, &final_path);
     }
 }
 
@@ -131,8 +146,13 @@ fn write_pace_file(host_out: &Path, pause: bool, reason: &'static str, state: &s
 /// **Known gap, documented rather than guessed at:** a crawl spec with an
 /// explicit `root:` override reuses `materialized.root` instead (see
 /// `WorkspaceSpec::resolved_root()`) and is NOT reconstructable from
-/// `record_context` alone. Widen if a consumer needs it — same "not yet,
-/// but named" shape as #1352's other documented narrowings.
+/// `record_context` alone — this function has no signal that would let it
+/// tell "default root, safe to derive" apart from "root: override,
+/// this derivation would be a GUESS." That gap is unchanged by finding 5
+/// below; it stays a documented limitation, not a guessed write (this
+/// function still only derives the one formula it can stand behind).
+/// Widen if a consumer needs it — same "not yet, but named" shape as
+/// #1352's other documented narrowings.
 ///
 /// Only fires when `record_context` carries BOTH `workspace` (the manifest
 /// name) and `unit` — the crawl launcher's own vocabulary — so a non-crawl
@@ -153,6 +173,39 @@ pub fn stop_file_path_from_record_context(
     Some(root.join("crawl").join(manifest_name).join("STOP"))
 }
 
+/// (#2110/#2109 review finding 5) Companion to
+/// [`stop_file_path_from_record_context`] — distinguishes the two reasons
+/// that function can return `None`:
+///
+/// - This dispatch simply isn't crawl-shaped (`record_context` absent, or
+///   missing the crawl launcher's `unit` marker) — nothing to stop, no
+///   warning warranted. Returns `None` here too.
+/// - This dispatch IS crawl-shaped (`unit` present) but the STOP path
+///   could not be derived — `workspace` missing, not a string, or empty.
+///   Returns `Some(reason)`: the breaker tripped on a crawl unit and had
+///   no trustworthy path to tell the crawl to stop, which is exactly the
+///   "silent failure that poisons the next crawl" this finding exists to
+///   surface. The caller (`dispatch_internal.rs`) turns this into a
+///   distinguishable `stop_written: false` warning event rather than let
+///   the crawl keep dispatching units past a tripped breaker with no
+///   trace of why the STOP never landed.
+///
+/// Does NOT cover the `root:`-override gap documented on the sibling
+/// function — that gap has no signal in `record_context` to detect at
+/// all, so it can't be distinguished from "derivation succeeded" here
+/// either. Only the two MECHANICALLY DECIDABLE cases above are covered.
+pub fn stop_file_unresolved_reason(record_context: Option<&serde_json::Value>) -> Option<&'static str> {
+    let ctx = record_context?.as_object()?;
+    if !ctx.contains_key("unit") {
+        return None;
+    }
+    match ctx.get("workspace").and_then(|v| v.as_str()) {
+        Some(name) if !name.trim().is_empty() => None,
+        Some(_) => Some("record_context.workspace is present but empty"),
+        None => Some("record_context.workspace is missing or not a string"),
+    }
+}
+
 fn write_stop_file(stop_file: &Path) {
     if let Some(parent) = stop_file.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -162,7 +215,11 @@ fn write_stop_file(stop_file: &Path) {
 
 /// One state change the governor made this tick — the caller (the sampler
 /// loop in `dispatch_internal.rs`) turns each into a `dispatch.rest`-family
-/// flow record so a slowed or stopped run is attributable.
+/// flow record so a slowed or stopped run is attributable. The periodic
+/// heartbeat re-stamp (see the module doc) is NOT an event — it changes
+/// nothing observable about the dispatch's pacing, only keeps the existing
+/// pause file fresh, so it doesn't fire a `dispatch.rest` record on every
+/// re-stamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThermalEvent {
     /// Paused for thermal pacing (`reason: "thermal"`).
@@ -170,7 +227,8 @@ pub enum ThermalEvent {
     /// Resumed after the hysteresis hold (`reason: "thermal"`, `pause: false`).
     Resumed { state: String },
     /// Breaker tripped (`reason: "thermal-critical"`) — max pause exceeded,
-    /// `critical` state, or the CPU speed-limit floor.
+    /// `critical` state, or the CPU speed-limit floor held for
+    /// `speed_limit_hold_samples` consecutive samples.
     Breaker { state: String },
 }
 
@@ -183,6 +241,10 @@ pub struct ThermalGovernorConfig {
     pub resume_hold_ms: u64,
     pub max_pause_ms: u64,
     pub min_cpu_speed_limit_pct: u64,
+    /// (finding 7) Consecutive samples below `min_cpu_speed_limit_pct`
+    /// required before the breaker trips on that signal. Does NOT apply
+    /// to the `critical` state check.
+    pub speed_limit_hold_samples: u32,
 }
 
 impl ThermalGovernorConfig {
@@ -196,6 +258,7 @@ impl ThermalGovernorConfig {
             resume_hold_ms: darkmux_types::config_access::thermal_resume_hold_ms(),
             max_pause_ms: darkmux_types::config_access::thermal_max_pause_ms(),
             min_cpu_speed_limit_pct: darkmux_types::config_access::thermal_min_cpu_speed_limit_pct(),
+            speed_limit_hold_samples: darkmux_types::config_access::thermal_speed_limit_hold_samples(),
         }
     }
 }
@@ -204,9 +267,11 @@ impl ThermalGovernorConfig {
 enum State {
     Idle,
     Paused,
-    /// Terminal: the breaker tripped. The governor stops touching the pace
-    /// file / STOP file for the rest of this dispatch's lifetime — resume
-    /// is out-of-band (the operator's `darkmux dispatch --resume`).
+    /// Terminal for DECISIONS: the breaker tripped and the governor never
+    /// un-pauses itself on recovery — resume is out-of-band (the
+    /// operator's `darkmux dispatch --resume`). NOT terminal for the
+    /// pace file's freshness: see the module doc's heartbeat contract —
+    /// `on_sample` keeps re-stamping while `Broken`, just as while `Paused`.
     Broken,
 }
 
@@ -228,6 +293,16 @@ pub struct ThermalGovernor {
     /// and the breaker's `STOP`/event state meaningful on a tick where the
     /// OS thermal reading itself came back `None`.
     last_known_state: String,
+    /// ms accumulated since the pace file's `written_at_ms` was last
+    /// refreshed — drives the heartbeat re-stamp cadence (module doc)
+    /// while `Paused` or `Broken`. Reset to 0 on every write, including
+    /// state-transition writes (pause start, resume, breaker trip) — those
+    /// already produce a fresh stamp, so the next periodic re-stamp is due
+    /// a full interval later, not immediately.
+    ms_since_stamp: u64,
+    /// (finding 7) Consecutive samples with `cpu_speed_limit_pct` below
+    /// the floor — reset to 0 the moment a sample reads at/above it.
+    speed_limit_low_streak: u32,
 }
 
 impl ThermalGovernor {
@@ -238,7 +313,19 @@ impl ThermalGovernor {
             pause_episode_ms: 0,
             resume_hold_accum_ms: 0,
             last_known_state: String::new(),
+            ms_since_stamp: 0,
+            speed_limit_low_streak: 0,
         }
+    }
+
+    /// The heartbeat cadence: re-stamp at least this often while holding a
+    /// pause, well inside `max_pause_ms` so a normal sampler-cadence jitter
+    /// (or one slow tick) can never accidentally cross the runtime's
+    /// expiry ceiling between two real writes. `.max(1)` guards a
+    /// pathological `max_pause_ms` of 0..3 from producing a zero interval
+    /// (which would busy-restamp every tick — harmless but wasteful).
+    fn restamp_interval_ms(&self) -> u64 {
+        (self.config.max_pause_ms / 4).max(1)
     }
 
     /// Feed one thermal sample. `elapsed_ms` is the wall time since the
@@ -251,7 +338,9 @@ impl ThermalGovernor {
     /// dispatch, where there is no "further unit" concept to stop.
     ///
     /// Returns the event that fired this tick, if any (pause / resume /
-    /// breaker are mutually exclusive per tick — at most one fires).
+    /// breaker are mutually exclusive per tick — at most one fires). A
+    /// periodic heartbeat re-stamp while `Paused`/`Broken` writes the pace
+    /// file but is NOT an event (see `ThermalEvent`'s own doc).
     pub fn on_sample(
         &mut self,
         thermal: Option<&ThermalSample>,
@@ -259,13 +348,21 @@ impl ThermalGovernor {
         host_out: &Path,
         stop_file: Option<&Path>,
     ) -> Option<ThermalEvent> {
-        if !self.config.enabled || self.state == State::Broken {
-            // Broken is terminal and its pace file write already carries
-            // `expires: false` (see the breaker writes below) — the
-            // runtime's staleness ceiling never applies to it, so there's
-            // nothing to keep fresh here (finding 2 of the #2110/#2109
-            // review; superseded the earlier "re-stamp every N ticks" plan
-            // once `expires` landed on the runtime side).
+        if !self.config.enabled {
+            return None;
+        }
+
+        if self.state == State::Broken {
+            // (finding 2, redesigned for the heartbeat contract) Broken is
+            // terminal for DECISIONS but must keep re-stamping — without
+            // an active writer the runtime's pure expiry rule (#2114
+            // cf1b1993: no `expires` opt-out) would silently resume the
+            // unit on a still-critical machine.
+            self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
+            if self.ms_since_stamp >= self.restamp_interval_ms() {
+                self.ms_since_stamp = 0;
+                write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
+            }
             return None;
         }
 
@@ -275,10 +372,9 @@ impl ThermalGovernor {
         // the episode (so `max_pause_ms` escalation still fires on a
         // machine that stays hot through a reading gap), reset the resume
         // hold (a gap is not a continuous hold at/below `resume_at`), and
-        // re-stamp the pace file with the last known state so a real
-        // reading gap can't let `written_at_ms` go stale and trip the
-        // runtime's staleness ceiling mid-pause. `Idle` has nothing to
-        // accumulate; a `None` there is simply a no-op tick.
+        // let the periodic heartbeat re-stamp still fire on its own
+        // cadence. `Idle` has nothing to accumulate; a `None` there is
+        // simply a no-op tick.
         let thermal = match thermal {
             Some(t) => {
                 self.last_known_state = t.state.clone();
@@ -288,16 +384,11 @@ impl ThermalGovernor {
                 if self.state == State::Paused {
                     self.pause_episode_ms = self.pause_episode_ms.saturating_add(elapsed_ms);
                     self.resume_hold_accum_ms = 0;
-                    write_pace_file(host_out, true, "thermal", &self.last_known_state, None);
+                    self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
                     if self.pause_episode_ms >= self.config.max_pause_ms {
                         self.state = State::Broken;
-                        write_pace_file(
-                            host_out,
-                            true,
-                            "thermal-critical",
-                            &self.last_known_state,
-                            Some(false),
-                        );
+                        self.ms_since_stamp = 0;
+                        write_pace_file(host_out, true, "thermal-critical", &self.last_known_state);
                         if let Some(stop) = stop_file {
                             write_stop_file(stop);
                         }
@@ -305,18 +396,32 @@ impl ThermalGovernor {
                             state: self.last_known_state.clone(),
                         });
                     }
+                    if self.ms_since_stamp >= self.restamp_interval_ms() {
+                        self.ms_since_stamp = 0;
+                        write_pace_file(host_out, true, "thermal", &self.last_known_state);
+                    }
                 }
                 return None;
             }
         };
 
         let sev = severity(&thermal.state);
+        // (finding 7) The speed-limit floor requires N CONSECUTIVE
+        // low samples; a single low reading is common DVFS noise. The
+        // `critical` state check is untouched — a discrete OS-reported
+        // state trips immediately, same as before.
+        if thermal.cpu_speed_limit_pct < self.config.min_cpu_speed_limit_pct {
+            self.speed_limit_low_streak = self.speed_limit_low_streak.saturating_add(1);
+        } else {
+            self.speed_limit_low_streak = 0;
+        }
         let is_breaker_condition = sev >= severity("critical")
-            || thermal.cpu_speed_limit_pct < self.config.min_cpu_speed_limit_pct;
+            || self.speed_limit_low_streak >= self.config.speed_limit_hold_samples;
 
         if is_breaker_condition {
             self.state = State::Broken;
-            write_pace_file(host_out, true, "thermal-critical", &thermal.state, Some(false));
+            self.ms_since_stamp = 0;
+            write_pace_file(host_out, true, "thermal-critical", &thermal.state);
             if let Some(stop) = stop_file {
                 write_stop_file(stop);
             }
@@ -329,7 +434,8 @@ impl ThermalGovernor {
                     self.state = State::Paused;
                     self.pause_episode_ms = 0;
                     self.resume_hold_accum_ms = 0;
-                    write_pace_file(host_out, true, "thermal", &thermal.state, None);
+                    self.ms_since_stamp = 0;
+                    write_pace_file(host_out, true, "thermal", &thermal.state);
                     Some(ThermalEvent::Paused { state: thermal.state.clone() })
                 } else {
                     None
@@ -337,6 +443,7 @@ impl ThermalGovernor {
             }
             State::Paused => {
                 self.pause_episode_ms = self.pause_episode_ms.saturating_add(elapsed_ms);
+                self.ms_since_stamp = self.ms_since_stamp.saturating_add(elapsed_ms);
                 if sev <= severity(&self.config.resume_at) {
                     self.resume_hold_accum_ms = self.resume_hold_accum_ms.saturating_add(elapsed_ms);
                 } else {
@@ -356,16 +463,25 @@ impl ThermalGovernor {
                     self.state = State::Idle;
                     self.pause_episode_ms = 0;
                     self.resume_hold_accum_ms = 0;
-                    write_pace_file(host_out, false, "thermal", &thermal.state, None);
+                    self.ms_since_stamp = 0;
+                    write_pace_file(host_out, false, "thermal", &thermal.state);
                     return Some(ThermalEvent::Resumed { state: thermal.state.clone() });
                 }
                 if self.pause_episode_ms >= self.config.max_pause_ms {
                     self.state = State::Broken;
-                    write_pace_file(host_out, true, "thermal-critical", &thermal.state, Some(false));
+                    self.ms_since_stamp = 0;
+                    write_pace_file(host_out, true, "thermal-critical", &thermal.state);
                     if let Some(stop) = stop_file {
                         write_stop_file(stop);
                     }
                     return Some(ThermalEvent::Breaker { state: thermal.state.clone() });
+                }
+                // (finding 2, redesigned) Still paused, no transition this
+                // tick — heartbeat: re-stamp once the interval elapses so
+                // written_at_ms never goes stale mid-episode.
+                if self.ms_since_stamp >= self.restamp_interval_ms() {
+                    self.ms_since_stamp = 0;
+                    write_pace_file(host_out, true, "thermal", &thermal.state);
                 }
                 None
             }
@@ -390,6 +506,7 @@ mod tests {
             resume_hold_ms: 60_000,
             max_pause_ms: 900_000,
             min_cpu_speed_limit_pct: 50,
+            speed_limit_hold_samples: 3,
         }
     }
 
@@ -418,6 +535,7 @@ mod tests {
         assert_eq!(pace["reason"], serde_json::json!("thermal"));
         assert_eq!(pace["state"], serde_json::json!("serious"));
         assert!(pace["written_at_ms"].as_u64().unwrap() > 0, "written_at_ms must be stamped");
+        assert!(pace.get("expires").is_none(), "expires must never be written (#2114 cf1b1993)");
     }
 
     #[test]
@@ -504,14 +622,11 @@ mod tests {
         assert!(stop.exists(), "breaker must drop the crawl STOP file");
         let pace = read_pace(dir.path());
         assert_eq!(pace["reason"], serde_json::json!("thermal-critical"));
-        assert_eq!(
-            pace["expires"],
-            serde_json::json!(false),
-            "(finding 2) breaker stop must opt out of the runtime's staleness ceiling — a stale \
-             written_at_ms must not resume the unit on a still-critical machine"
-        );
+        assert!(pace.get("expires").is_none());
 
-        // Terminal: further samples, even nominal, do nothing more.
+        // Terminal for decisions: further samples, even nominal, produce
+        // no NEW event — but the heartbeat below proves the pace file
+        // itself keeps getting re-stamped.
         assert_eq!(gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), None), None);
     }
 
@@ -523,32 +638,142 @@ mod tests {
         let ev = gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
         assert_eq!(ev, Some(ThermalEvent::Breaker { state: "critical".to_string() }));
         assert!(stop.exists());
-        let pace = read_pace(dir.path());
-        assert_eq!(pace["expires"], serde_json::json!(false));
+    }
+
+    // ── finding 7: speed-limit breaker needs N consecutive low samples ──
+
+    #[test]
+    fn low_cpu_speed_limit_needs_consecutive_samples_before_tripping() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov = ThermalGovernor::new(cfg()); // speed_limit_hold_samples: 3
+
+        // "nominal" state, CPU throttled below the floor — but only ONE
+        // sample so far. Must NOT trip yet.
+        let ev = gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, None, "a single low sample is noise, not a sustained condition");
+        assert!(!stop.exists());
+
+        // A second low sample — still short of the 3-sample hold.
+        let ev = gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, None);
+        assert!(!stop.exists());
+
+        // A third CONSECUTIVE low sample crosses the hold.
+        let ev = gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, Some(ThermalEvent::Breaker { state: "nominal".to_string() }));
+        assert!(stop.exists(), "breaker must fire on the 3rd consecutive low sample");
     }
 
     #[test]
-    fn low_cpu_speed_limit_trips_the_breaker_even_at_nominal_state() {
+    fn low_cpu_speed_limit_streak_resets_on_a_single_good_sample() {
         let dir = tempfile::tempdir().unwrap();
         let stop = dir.path().join("STOP");
         let mut gov = ThermalGovernor::new(cfg());
-        // "nominal" state, but the CPU is throttled below the floor —
-        // the breaker must fire on the speed-limit signal alone.
+
+        // Two low samples...
+        gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
+        // ...then ONE good sample resets the streak — this is the
+        // assertion that fails red if the streak isn't reset on a
+        // non-low reading.
+        let ev = gov.on_sample(Some(&sample("nominal", 100)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, None);
+
+        // Two MORE low samples (only 2 consecutive since the reset) must
+        // still not trip.
+        gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
         let ev = gov.on_sample(Some(&sample("nominal", 30)), 2000, dir.path(), Some(&stop));
-        assert_eq!(ev, Some(ThermalEvent::Breaker { state: "nominal".to_string() }));
+        assert_eq!(ev, None, "streak restarted after the good sample — only 2 consecutive here");
+        assert!(!stop.exists());
+    }
+
+    #[test]
+    fn critical_state_still_trips_immediately_ignoring_the_speed_limit_hold() {
+        // The consecutive-sample requirement is scoped to the speed-limit
+        // signal only — `critical` is a discrete OS-reported state and
+        // must keep tripping on the FIRST sample, same as before finding 7.
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut gov = ThermalGovernor::new(cfg());
+        let ev = gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, Some(ThermalEvent::Breaker { state: "critical".to_string() }));
         assert!(stop.exists());
     }
 
     #[test]
-    fn ordinary_pause_and_resume_writes_omit_expires() {
-        // The ordinary governor pause/resume stays subject to the runtime's
-        // default staleness ceiling — `expires` must be ABSENT (not
-        // `false`), matching every pre-`expires` pace file.
+    fn ordinary_pause_and_resume_writes_never_carry_expires() {
         let dir = tempfile::tempdir().unwrap();
         let mut gov = ThermalGovernor::new(cfg());
         gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
         let pace = read_pace(dir.path());
         assert!(pace.get("expires").is_none(), "ordinary pause must not set expires: {pace}");
+    }
+
+    // ── finding 2 (redesigned): heartbeat re-stamp while Paused/Broken ──
+
+    #[test]
+    fn paused_re_stamps_written_at_ms_periodically_not_only_on_pause_start() {
+        // (#2140 review finding 2, redesigned after #2114 cf1b1993 removed
+        // `expires` in favor of a pure heartbeat: EVERY pause, thermal or
+        // otherwise, is honored only while written_at_ms stays fresh — so
+        // a writer that only stamps once at pause-start and then goes
+        // silent for the rest of a long episode would let the runtime
+        // expire the pause mid-episode on a machine that never actually
+        // cooled.) max_pause_ms=10_000 -> restamp_interval_ms=2_500 (10s/4).
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = cfg();
+        cfg.max_pause_ms = 10_000;
+        let mut gov = ThermalGovernor::new(cfg);
+
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None);
+        let first_stamp = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+
+        // 1000ms of "fair-but-not-enough-to-resume" ticks... actually stay
+        // at "serious" so no resume/breaker transition fires, and drive
+        // exactly to the 2500ms restamp boundary (2000 + 2000 = 4000 >=
+        // 2500 crosses it on the 2nd tick after the seed).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None); // ms_since_stamp=2000
+        let mid_stamp = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+        assert_eq!(mid_stamp, first_stamp, "not yet at the 2500ms restamp interval");
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        gov.on_sample(Some(&sample("serious", 100)), 2000, dir.path(), None); // ms_since_stamp=4000 >= 2500
+        let restamped = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+        assert!(
+            restamped > first_stamp,
+            "written_at_ms must advance once the heartbeat interval elapses, not stay pinned to \
+             the pause-start stamp for the whole episode"
+        );
+    }
+
+    #[test]
+    fn broken_re_stamps_written_at_ms_periodically() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("STOP");
+        let mut cfg = cfg();
+        cfg.max_pause_ms = 10_000; // restamp_interval_ms = 2_500
+        let mut gov = ThermalGovernor::new(cfg);
+
+        gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        let first_stamp = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let ev = gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        assert_eq!(ev, None, "Broken produces no further EVENT — only the heartbeat write");
+        let mid_stamp = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+        assert_eq!(mid_stamp, first_stamp, "not yet at the 2500ms restamp interval");
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        gov.on_sample(Some(&sample("critical", 100)), 2000, dir.path(), Some(&stop));
+        let restamped = read_pace(dir.path())["written_at_ms"].as_u64().unwrap();
+        assert!(
+            restamped > first_stamp,
+            "written_at_ms must advance while Broken, not freeze at the trip-time write — a \
+             silent writer would let the runtime's heartbeat ceiling expire the stop and resume \
+             a still-critical machine"
+        );
     }
 
     // ── finding 3: a missing OS thermal reading mid-pause ──
@@ -580,10 +805,6 @@ mod tests {
         let pace = read_pace(dir.path());
         assert_eq!(pace["pause"], serde_json::json!(true), "still paused through the reading gap");
         assert_eq!(pace["state"], serde_json::json!("serious"), "state carries the last known reading");
-        assert!(
-            pace["written_at_ms"].as_u64().unwrap() > 0,
-            "stamp still refreshed on a None tick, not frozen"
-        );
         assert!(!stop.exists());
 
         // One more None tick crosses 10000ms — breaker fires without ever
@@ -593,7 +814,6 @@ mod tests {
         assert!(stop.exists(), "breaker must fire from accumulated None-tick elapsed time alone");
         let pace = read_pace(dir.path());
         assert_eq!(pace["reason"], serde_json::json!("thermal-critical"));
-        assert_eq!(pace["expires"], serde_json::json!(false));
     }
 
     #[test]
@@ -634,7 +854,7 @@ mod tests {
         assert!(!pace_file_path(dir.path()).exists(), "no pace file — Idle has nothing to accumulate");
     }
 
-    // ── finding 1: host/runtime pace-file location conformance ──
+    // ── finding 1: host/runtime pace-file location + shape conformance ──
 
     /// (#2140 review finding 1) `thermal_governor.rs`'s `pace_file_path`
     /// and `runtime/src/pace.rs`'s `pace_file_path` must join the SAME
@@ -645,7 +865,11 @@ mod tests {
     /// literal is still `"pace.json"` — a rename on either side that isn't
     /// mirrored on the other breaks this test instead of silently going
     /// inert (exactly what shipped in the earlier stacked-but-inert state
-    /// this finding caught).
+    /// this finding caught). Also asserts the runtime source no longer
+    /// mentions an `expires` field (#2114 cf1b1993's heartbeat redesign) —
+    /// if the runtime ever re-adds one, this drifts against the (correct,
+    /// unmodified) `GovernorPaceFile` shape above until it's reconciled by
+    /// hand, rather than silently mismatching again.
     #[test]
     fn pace_file_path_matches_runtime_out_base() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -657,6 +881,13 @@ mod tests {
             "runtime/src/pace.rs's pace_file_path must join \"pace.json\" onto its out_dir root \
              to match crates/darkmux-crew/src/thermal_governor.rs's host-side pace_file_path \
              (host_out.join(\"pace.json\")) — got:\n{source}"
+        );
+        assert!(
+            !source.contains("pub expires"),
+            "runtime/src/pace.rs must not carry an `expires` field — #2114 cf1b1993 replaced it \
+             with a pure heartbeat contract; this crate's GovernorPaceFile intentionally has no \
+             `expires` field to match. If the runtime re-adds one, reconcile both sides by hand \
+             rather than let this test go silently inert."
         );
         // The host side, asserted the same way for symmetry — if this ever
         // drifts from `host_out.join("pace.json")` the two literals no
@@ -721,5 +952,45 @@ mod tests {
     #[test]
     fn stop_file_path_none_when_absent() {
         assert_eq!(stop_file_path_from_record_context(None), None);
+    }
+
+    // ── finding 5: distinguishable warning when the STOP path can't be derived ──
+
+    #[test]
+    fn stop_file_unresolved_reason_none_for_non_crawl_dispatch() {
+        // Not crawl-shaped at all — nothing to warn about, and this must
+        // agree with stop_file_path_from_record_context's own None here.
+        let ctx = serde_json::json!({ "workspace": "my-manifest" });
+        assert_eq!(stop_file_unresolved_reason(Some(&ctx)), None);
+        assert_eq!(stop_file_unresolved_reason(None), None);
+    }
+
+    #[test]
+    fn stop_file_unresolved_reason_none_when_derivation_succeeds() {
+        let ctx = serde_json::json!({ "workspace": "my-manifest", "unit": "unit-1" });
+        assert!(stop_file_path_from_record_context(Some(&ctx)).is_some());
+        assert_eq!(
+            stop_file_unresolved_reason(Some(&ctx)),
+            None,
+            "derivation succeeded — no warning, and the two functions must agree"
+        );
+    }
+
+    #[test]
+    fn stop_file_unresolved_reason_some_when_crawl_shaped_but_workspace_missing() {
+        let ctx = serde_json::json!({ "unit": "unit-1" });
+        assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None, "sibling still returns None");
+        assert!(
+            stop_file_unresolved_reason(Some(&ctx)).is_some(),
+            "but THIS function must distinguish it as a crawl-shaped dispatch with no derivable \
+             path, not silently the same as a non-crawl dispatch"
+        );
+    }
+
+    #[test]
+    fn stop_file_unresolved_reason_some_when_workspace_empty() {
+        let ctx = serde_json::json!({ "workspace": "   ", "unit": "unit-1" });
+        assert_eq!(stop_file_path_from_record_context(Some(&ctx)), None);
+        assert!(stop_file_unresolved_reason(Some(&ctx)).is_some());
     }
 }

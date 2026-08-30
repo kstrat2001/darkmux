@@ -404,6 +404,12 @@ pub struct ThermalConfig {
     /// below this triggers the breaker even if the named thermal state
     /// hasn't reached `critical` yet. Default `50`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub min_cpu_speed_limit_pct: Option<u64>,
+    /// (#2110/#2109 review finding 7) Consecutive samples below
+    /// `min_cpu_speed_limit_pct` required before the breaker trips on that
+    /// signal — a lone sample below the floor is noise (a brief DVFS dip),
+    /// not a sustained condition. Does NOT apply to the `critical` state
+    /// check, which still trips immediately. Default `3`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub speed_limit_hold_samples: Option<u32>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -872,6 +878,7 @@ impl DarkmuxConfig {
                     resume_hold_ms: Some(60_000),
                     max_pause_ms: Some(900_000),
                     min_cpu_speed_limit_pct: Some(50),
+                    speed_limit_hold_samples: Some(3),
                     extras: Default::default(),
                 }),
                 extras: Default::default(),

@@ -1876,6 +1876,7 @@ fn check_thermal_governor() -> Check {
     let resume_hold_ms = darkmux_types::config_access::thermal_resume_hold_ms();
     let max_pause_ms = darkmux_types::config_access::thermal_max_pause_ms();
     let min_cpu = darkmux_types::config_access::thermal_min_cpu_speed_limit_pct();
+    let speed_limit_hold_samples = darkmux_types::config_access::thermal_speed_limit_hold_samples();
 
     // (#2110/#2109 review finding 6) `darkmux config set` rejects an
     // unrecognized thermal-state token going forward, but a hand-edited
@@ -1918,7 +1919,7 @@ fn check_thermal_governor() -> Check {
         message: format!(
             "enabled ({provenance}) — pause at `{pause_at}`, resume at `{resume_at}` held \
              {resume_hold_ms}ms, breaker after {max_pause_ms}ms of one pause episode or \
-             cpu_speed_limit_pct < {min_cpu}%"
+             {speed_limit_hold_samples} consecutive samples with cpu_speed_limit_pct < {min_cpu}%"
         ),
         hint: None,
     }
