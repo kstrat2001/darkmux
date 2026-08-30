@@ -17,11 +17,16 @@
 //! scope, released on every exit path (early return, `?`, panic-unwind)
 //! without the caller having to remember a matching release call.
 
-use std::ffi::{c_char, c_void, CString};
-
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::*;
+    // (CI finding, ubuntu build) These FFI types are macOS-only IOKit/CF
+    // plumbing — imported HERE, inside the already-`#[cfg(target_os =
+    // "macos")]`-gated module, not at file top-level, so a non-macOS
+    // build (Linux CI, `cargo check --target x86_64-unknown-linux-gnu`)
+    // never sees them as unused. Mirrors `host_probe/thermal.rs`'s own
+    // pattern: every macOS-only import lives inside its gated `mod imp`,
+    // never at the file's unconditional top level.
+    use std::ffi::{c_char, c_void, CString};
 
     type CFStringRef = *const c_void;
     type IoReturn = i32;
