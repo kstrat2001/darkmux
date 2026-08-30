@@ -1,11 +1,20 @@
 //! Host-driven pause file (#2114).
 //!
-//! Between turns the loop checks `<workspace>/.darkmux/pace.json`. While it
-//! holds `pause: true` the loop rests in bounded increments rather than
+//! Between turns the loop checks `<out_dir>/pace.json` (the mounted
+//! bookkeeping out-dir, `/darkmux-out` in production — see
+//! `trajectory::RUNTIME_OUT_BASE`, NOT the workspace: a crawl unit mounts
+//! `/workspace` read-only, and a coder run's workspace is the operator's
+//! own repo tree — the wrong place for darkmux's own bookkeeping). While
+//! it holds `pause: true` the loop rests in bounded increments rather than
 //! exiting, re-reading the file each increment, so a host-side pause (the
 //! thermal governor, #2110) never looks like a stall to the runtime's own
 //! inactivity clock — each increment counts as proof-of-work the same way
 //! #2094's `turn_delay_ms` rest does.
+//!
+//! **Host-side writer:** `crates/darkmux-crew/src/thermal_governor.rs`'s
+//! `pace_file_path` — the two must agree on the literal file name + dir;
+//! `darkmux-crew`'s `pace_file_path_matches_runtime_out_base` conformance
+//! test reads this file's source and asserts it.
 //!
 //! Absent file = the overwhelmingly common case (no pause active) and is
 //! NOT an error. A malformed file is ignored — logged once so a broken
@@ -14,7 +23,7 @@
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-/// Shape of `.darkmux/pace.json`. All fields optional/defaulted so a
+/// Shape of `<out_dir>/pace.json`. All fields optional/defaulted so a
 /// partial or forward-compat file still parses.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PaceFile {
@@ -35,9 +44,13 @@ impl PaceFile {
     }
 }
 
-/// `<workspace>/.darkmux/pace.json`.
-pub fn pace_file_path(workspace: &Path) -> PathBuf {
-    workspace.join(".darkmux").join("pace.json")
+/// `<out_dir>/pace.json` — mounted into the container at
+/// `/darkmux-out/pace.json` in production
+/// (`crate::trajectory::RUNTIME_OUT_BASE`). MUST match the host-side
+/// `pace_file_path` in `crates/darkmux-crew/src/thermal_governor.rs`; see
+/// that module's doc comment.
+pub fn pace_file_path(out_dir: &Path) -> PathBuf {
+    out_dir.join("pace.json")
 }
 
 /// Tracks whether we've already warned about a malformed pace file, so the
@@ -56,8 +69,8 @@ impl PaceReader {
     /// common no-pause case) and "malformed" (ignored, logged once) —
     /// callers can't and don't need to distinguish the two: either way
     /// there's no pause instruction to act on.
-    pub fn read(&mut self, workspace: &Path) -> Option<PaceFile> {
-        let path = pace_file_path(workspace);
+    pub fn read(&mut self, out_dir: &Path) -> Option<PaceFile> {
+        let path = pace_file_path(out_dir);
         let contents = std::fs::read_to_string(&path).ok()?;
         match serde_json::from_str::<PaceFile>(&contents) {
             Ok(pace) => {
@@ -95,7 +108,6 @@ mod tests {
     #[test]
     fn valid_pause_file_parses() {
         let ws = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(ws.path().join(".darkmux")).unwrap();
         std::fs::write(
             pace_file_path(ws.path()),
             r#"{"pause": true, "reason": "thermal", "state": "hot"}"#,
@@ -111,7 +123,6 @@ mod tests {
     #[test]
     fn malformed_file_is_ignored_not_fatal() {
         let ws = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(ws.path().join(".darkmux")).unwrap();
         std::fs::write(pace_file_path(ws.path()), "{not json").unwrap();
         let mut reader = PaceReader::new();
         assert_eq!(reader.read(ws.path()), None);

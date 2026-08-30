@@ -787,6 +787,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         feedback_templates,
         response_format,
         Path::new("/workspace"),
+        Path::new(trajectory::RUNTIME_OUT_BASE),
         resume_from,
     );
 

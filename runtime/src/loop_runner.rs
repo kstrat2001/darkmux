@@ -897,6 +897,7 @@ pub fn run(
         feedback_templates,
         response_format,
         std::path::Path::new("/workspace"),
+        std::path::Path::new(crate::trajectory::RUNTIME_OUT_BASE),
         None,
         &RealSleeper,
     )
@@ -904,14 +905,15 @@ pub fn run(
 
 /// (#2114) Production entry point for a dispatch that may pause against a
 /// host-driven pace file and/or resume a prior checkpoint. Kept SEPARATE
-/// from [`run`] rather than adding these two params there: `run`'s
-/// pre-#2114 signature has 35+ call sites (mostly tests exercising
-/// unrelated behavior — compaction, feedback injection, cycle detection —
-/// that have no reason to learn about pace files or checkpoints), and
-/// every one of them would otherwise need a `Path::new("/workspace"),
-/// None,` tacked onto its argument list for a feature it doesn't touch.
-/// `main.rs` (the only real caller that needs a non-default workspace root
-/// or a resume) calls this one instead.
+/// from [`run`] rather than adding these params there: `run`'s pre-#2114
+/// signature has 35+ call sites (mostly tests exercising unrelated
+/// behavior — compaction, feedback injection, cycle detection — that have
+/// no reason to learn about pace files or checkpoints), and every one of
+/// them would otherwise need a `Path::new("/workspace"),
+/// Path::new(trajectory::RUNTIME_OUT_BASE), None,` tacked onto its
+/// argument list for a feature it doesn't touch. `main.rs` (the only real
+/// caller that needs a non-default workspace root, out-dir root, or a
+/// resume) calls this one instead.
 #[allow(clippy::too_many_arguments)]
 pub fn run_resumable(
     client: &LmStudioClient,
@@ -928,10 +930,15 @@ pub fn run_resumable(
     reasoning_checkpoint_interval: Option<u32>,
     feedback_templates: std::collections::BTreeMap<String, String>,
     response_format: Option<serde_json::Value>,
-    // (#2114) Container workspace root — where `.darkmux/pace.json` and
-    // `.darkmux/checkpoint.json` live. Production is always `/workspace`
-    // (the Dockerfile WORKDIR, see `main.rs`); tests pass a tempdir.
+    // (#2114) Container workspace root — where `.darkmux/checkpoint.json`
+    // lives. Production is always `/workspace` (the Dockerfile WORKDIR, see
+    // `main.rs`); tests pass a tempdir.
     workspace_root: &std::path::Path,
+    // (#2110/#2109 finding 1) Container out-dir root — where `pace.json`
+    // lives (mounted at `/darkmux-out` in production, SEPARATE from
+    // `/workspace`; see `pace.rs`'s module doc for why). Production is
+    // always `trajectory::RUNTIME_OUT_BASE`; tests pass a tempdir.
+    pace_out_root: &std::path::Path,
     // (#2114) `Some` when this dispatch is resuming a prior checkpoint
     // (`--resume <path>` / `DARKMUX_RESUME_CHECKPOINT`) — `initial_messages`
     // is then IGNORED in favor of the checkpoint's own message history.
@@ -953,6 +960,7 @@ pub fn run_resumable(
         feedback_templates,
         response_format,
         workspace_root,
+        pace_out_root,
         resume_from,
         &RealSleeper,
     )
@@ -992,8 +1000,9 @@ fn run_with_sleeper(
     // wrapped as json_schema). When set, every model turn is grammar-constrained
     // to that shape — local-model JSON malformation becomes impossible.
     response_format: Option<serde_json::Value>,
-    // (#2114) See `run`'s doc on the same two params.
+    // (#2114) See `run_resumable`'s doc on these params.
     workspace_root: &std::path::Path,
+    pace_out_root: &std::path::Path,
     resume_from: Option<checkpoint::RunCheckpoint>,
     // (#2094) Injectable rest sleeper — see [`TurnSleeper`]'s own doc.
     sleeper: &dyn TurnSleeper,
@@ -1153,7 +1162,7 @@ fn run_with_sleeper(
     let mut last_proof_of_work = std::time::Instant::now();
     let mut inactivity_soft_warning_fired_in_window = false;
 
-    // (#2114) Reads + parses `.darkmux/pace.json` on demand (not once at
+    // (#2114) Reads + parses `pace.json` (in the mounted out-dir) on demand (not once at
     // startup like `turn_delay_ms` below — the pace file is meant to
     // change mid-dispatch); tracks whether a malformed sighting has
     // already been warned about so a broken writer doesn't spam stderr
@@ -1377,7 +1386,7 @@ fn run_with_sleeper(
         // point as the rest above, under the SAME two guards (never before
         // the first request; not mid #1221 continuation, which is the same
         // logical turn resuming, not a boundary between turns). While
-        // `.darkmux/pace.json` holds `pause: true` the loop rests in
+        // `pace.json` holds `pause: true` the loop rests in
         // BOUNDED ≤2s increments, re-reading the file each increment —
         // never a single long sleep — so a pace flip from pause back to
         // resume is picked up within one increment, and so a long pause
@@ -1386,7 +1395,7 @@ fn run_with_sleeper(
         // #2094's turn_delay rest uses.
         if turns > 0 && !resuming_after_checkpoint {
             const PACE_POLL_INCREMENT_MS: u64 = 2_000;
-            while let Some(pace) = pace_reader.read(workspace_root) {
+            while let Some(pace) = pace_reader.read(pace_out_root) {
                 if !pace.pause {
                     break;
                 }
@@ -3458,7 +3467,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), tmp.path(), None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -3484,10 +3493,10 @@ mod tests {
         assert_eq!(rest_events, 2, "one runtime.rest trajectory event per rest");
     }
 
-    /// (#2114) A sleeper that, on its SECOND call, flips
-    /// `.darkmux/pace.json` to `pause: false` — simulating a governor
-    /// rewriting the file WHILE the loop is inside a poll increment's
-    /// sleep. Records every call like `RecordingSleeper`.
+    /// (#2114) A sleeper that, on its SECOND call, flips `pace.json` to
+    /// `pause: false` — simulating a governor rewriting the file WHILE the
+    /// loop is inside a poll increment's sleep. Records every call like
+    /// `RecordingSleeper`.
     struct PaceFlippingSleeper {
         calls: std::cell::RefCell<Vec<u64>>,
         workspace: std::path::PathBuf,
@@ -3520,7 +3529,6 @@ mod tests {
         let cfg = compaction::CompactionConfig::never_compact();
 
         // Pause is already active when the dispatch starts.
-        std::fs::create_dir_all(tmp.path().join(".darkmux")).unwrap();
         std::fs::write(
             pace::pace_file_path(tmp.path()),
             r#"{"pause": true, "reason": "thermal"}"#,
@@ -3535,7 +3543,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), None, &sleeper,
+            tmp.path(), tmp.path(), None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok even though it paused mid-run");
 
@@ -3607,7 +3615,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), None, &RealSleeper,
+            tmp.path(), tmp.path(), None, &RealSleeper,
         )
         .expect("2-turn scripted dispatch (tool call, then stop) returns Ok");
 
@@ -3708,7 +3716,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
             Some(100), None, None, None, std::collections::BTreeMap::new(), None,
-            tmp.path(), Some(resume_checkpoint), &RealSleeper,
+            tmp.path(), tmp.path(), Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
 
@@ -3746,7 +3754,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), tmp.path(), None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
 
@@ -3787,7 +3795,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None, tmp.path(), tmp.path(), None, &sleeper,
         )
         .expect("single-turn dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -3882,7 +3890,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, Some(40), std::collections::BTreeMap::new(), None, tmp.path(), None, &sleeper,
+            Some(100), None, None, Some(40), std::collections::BTreeMap::new(), None, tmp.path(), tmp.path(), None, &sleeper,
         )
         .expect("checkpoint-continuation scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
