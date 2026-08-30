@@ -6,6 +6,14 @@
 // SAME `recordInMission` filter still apply — only the rendering surface
 // changed.
 //
+// (mainstay-unification packet) Selectors are UNSCOPED `.eventlog*`, not
+// `.missionlens .eventlog*` — the lens no longer mounts its own
+// `EventLogColumn`; it reports its scoped events upward via `onEvents`, and
+// `App.tsx` feeds the same shared/mainstay column every other route uses.
+// There is exactly one instance on the page again (outside `.missionlens`'s
+// own DOM subtree), same as the parity suite's own retarget
+// (`tests/parity/lib/extract-graph.js`).
+//
 // One behavior is named-and-narrowed rather than ported verbatim: the
 // original's cap-disclosure test asserted "events · 250 of N" (the
 // standalone page's own `EVENTS_CAP`). `EventLogColumn` already has the
@@ -69,13 +77,13 @@ test('EVENTS pane backfills existing mission records on load (not live-stream-on
 
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
 
-  await page.waitForSelector('.missionlens .eventlog');
-  await expect(page.locator('.missionlens .eventlog__empty')).toHaveCount(0);
-  await expect(page.locator('.missionlens .eventlog__rec')).toHaveCount(3);
-  await expect(page.locator('.missionlens .eventlog__qcount')).toContainText('3 events');
+  await page.waitForSelector('.eventlog');
+  await expect(page.locator('.eventlog__empty')).toHaveCount(0);
+  await expect(page.locator('.eventlog__rec')).toHaveCount(3);
+  await expect(page.locator('.eventlog__qcount')).toContainText('3 events');
   // The unrelated record was filtered out by `recordInMission` — its handle
   // never appears as a row's `title` (this port's own subject attribute).
-  const titles = await page.$$eval('.missionlens .eventlog__rec', (els) => els.map((e) => e.getAttribute('title')));
+  const titles = await page.$$eval('.eventlog__rec', (els) => els.map((e) => e.getAttribute('title')));
   expect(titles).not.toContain('not-in-this-mission');
 
   expect(pageErrors).toEqual([]);
@@ -104,9 +112,9 @@ test('records from a PRIOR day still backfill — the cross-day case', async ({ 
 
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
 
-  await expect(page.locator('.missionlens .eventlog__rec')).toHaveCount(2);
-  await expect(page.locator('.missionlens .eventlog')).not.toContainText('no events');
-  const titles = await page.$$eval('.missionlens .eventlog__rec', (els) => els.map((e) => e.getAttribute('title')));
+  await expect(page.locator('.eventlog__rec')).toHaveCount(2);
+  await expect(page.locator('.eventlog')).not.toContainText('no events');
+  const titles = await page.$$eval('.eventlog__rec', (els) => els.map((e) => e.getAttribute('title')));
   expect(titles).toContain('phase-a');
 
   // (#1868) The header must NOT claim a rolling "last 24h" window over
@@ -115,7 +123,7 @@ test('records from a PRIOR day still backfill — the cross-day case', async ({ 
   // precisely to drop that suffix for a fetched slice; passing it `false`
   // here (an earlier version of the port did) would have this exact
   // contradiction on screen: "events last 24h" over a 3-day-old record.
-  await expect(page.locator('.missionlens .eventlog__head h3')).not.toContainText(/last \d+h/i);
+  await expect(page.locator('.eventlog__head h3')).not.toContainText(/last \d+h/i);
 
   expect(pageErrors).toEqual([]);
 });
@@ -144,8 +152,8 @@ test("the events pane discloses its cap instead of printing it as a total (Event
 
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
 
-  await expect(page.locator('.missionlens .eventlog__qcount')).toContainText(`50 of ${N} events`);
-  await expect(page.locator('.missionlens .eventlog__rec')).toHaveCount(50);
+  await expect(page.locator('.eventlog__qcount')).toContainText(`50 of ${N} events`);
+  await expect(page.locator('.eventlog__rec')).toHaveCount(50);
   expect(pageErrors).toEqual([]);
 });
 
@@ -171,15 +179,15 @@ test('a live-streamed record appends without duplicating a backfilled one', asyn
   });
 
   await page.goto(`/index-live.html#mission=${MISSION_ID}`);
-  await page.waitForSelector('.missionlens .eventlog');
+  await page.waitForSelector('.eventlog');
 
   // Final state: X once (deduped across live+backfill), plus Y (live) and Z
   // (backfill) — three distinct rows, not four.
-  await expect(page.locator('.missionlens .eventlog__rec')).toHaveCount(3);
-  const titles = await page.$$eval('.missionlens .eventlog__rec', (els) => els.map((e) => e.getAttribute('title')));
+  await expect(page.locator('.eventlog__rec')).toHaveCount(3);
+  const titles = await page.$$eval('.eventlog__rec', (els) => els.map((e) => e.getAttribute('title')));
   expect(titles.filter((t) => t === 'step-1')).toHaveLength(1);
   expect(titles).toContain('task-1');
-  await expect(page.locator('.missionlens .eventlog__rec', { hasText: 'step complete' })).toHaveCount(1);
+  await expect(page.locator('.eventlog__rec', { hasText: 'step complete' })).toHaveCount(1);
 
   expect(pageErrors).toEqual([]);
 });
