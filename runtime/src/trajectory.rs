@@ -460,6 +460,16 @@ impl Trajectory {
     /// region the salvaged turn was writing in — + its provenance. `cap`
     /// stays the numeric value already carried above; `bound.value` mirrors
     /// it so a consumer reading only `bound` still has the number.
+    ///
+    /// (#2169 merge-gate CONSIDER 6) `salvaged_tool_calls` counts JSON
+    /// well-formedness ONLY (#479's own filter) — it does NOT mean that
+    /// many calls actually reached `tools::dispatch`. A salvaged batch
+    /// also passes through the SAME name-allowlist partition every other
+    /// turn's calls do; a call counted here can still turn out to be
+    /// invalid-name or ungranted. Reconcile against the same turn's
+    /// `dispatch.tool.malformed_names` event(s) (matching `seq`):
+    /// `salvaged_tool_calls` minus the sum of that turn's malformed
+    /// `count` fields is what was actually dispatched.
     pub fn append_per_turn_cap_salvaged(
         &mut self,
         seq: u32,
@@ -502,12 +512,20 @@ impl Trajectory {
     /// event rides into flow records and eventually an HTTP-header-
     /// bearing hook delivery (#2178's sanitizer covers that transport;
     /// this event carries an already-clean value into it).
+    ///
+    /// (merge-gate MUST FIX 1) `reason` discriminates the TWO distinct
+    /// causes a bucket of these can have — `"not_a_tool"` (no darkmux tool
+    /// is named this) or `"real_tool_not_granted"` (a real darkmux tool
+    /// this dispatch's role wasn't granted). One event fires per
+    /// reason-bucket per turn, never merged — see
+    /// `loop_runner::handle_invalid_tool_calls`'s doc for why.
     pub fn append_malformed_tool_names(
         &mut self,
         seq: u32,
         count: u32,
         model: &str,
         sample_name_prefix: &str,
+        reason: &str,
     ) {
         self.write_event(&serde_json::json!({
             "type": "dispatch.tool.malformed_names",
@@ -516,6 +534,7 @@ impl Trajectory {
             "count": count,
             "model": model,
             "sample_name_prefix": sample_name_prefix,
+            "reason": reason,
         }));
     }
 

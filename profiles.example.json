@@ -33,7 +33,7 @@
     },
 
     "devstral": {
-      "description": "Review pipeline — probe seat, plain draws. Dense wide-instruct model, no reasoning trace. (#2169) The Devstral-2 line under LM Studio's Mistral tool-call parser has been observed emitting structured tool_calls whose `name` is model content sliced around its own [TOOL_CALLS] marker; darkmux partitions these out before dispatch and coalesces them into one feedback message + a malformed_tool_names detector rather than executing each — not a reason to avoid this profile, but a known LM Studio + this model-family interaction worth naming when a run's telemetry shows the detector firing.",
+      "description": "Review pipeline — probe seat, plain draws. Dense wide-instruct model, no reasoning trace. (#2169) The observed case this issue was filed for was `mistralai/devstral-small-2-2512` — a DIFFERENT id from the `devstral-small-2507` pinned below; whether 2507 shares the same LM Studio Mistral-parser interaction (structured tool_calls whose `name` is model content sliced around its own [TOOL_CALLS] marker) is unconfirmed. Either way darkmux never executes a call like that regardless of which Devstral id produced it — partitioned + coalesced via the `malformed_tool_names` detector rather than dispatched. Not a reason to avoid this profile; worth knowing if that detector fires in a run's telemetry.",
       "models": [
         { "id": "mistralai/devstral-small-2507", "n_ctx": 32000 }
       ]

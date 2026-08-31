@@ -290,9 +290,10 @@
     #[test]
     fn embedded_preamble_carries_bounded_dispatch_prompt_engineering() {
         let preamble = AUTONOMOUS_DISPATCH_PREAMBLE;
-        // Five-bound enumeration — by concept, not value. (#2171 added the
+        // Six-bound enumeration — by concept, not value. (#2171 added the
         // per-call generation check-in as its own bound, alongside the
-        // pre-existing per-turn token cap.)
+        // pre-existing per-turn token cap. #2169 merge-gate finding 4
+        // added the malformed-tool-call-names bound.)
         assert!(
             preamble.contains("Turn cap"),
             "preamble must name the turn cap"
@@ -308,6 +309,10 @@
         assert!(
             preamble.contains("Cumulative completion-token cap"),
             "preamble must name the cumulative-token cap"
+        );
+        assert!(
+            preamble.contains("Malformed tool-call names"),
+            "preamble must name the malformed-tool-call-names bound (#2169)"
         );
         assert!(
             preamble.contains("Wall-clock deadline"),
@@ -330,6 +335,10 @@
         assert!(
             preamble.contains("escalation_cumulative_tokens_exceeded"),
             "preamble must name the cumulative-tokens escalation"
+        );
+        assert!(
+            preamble.contains("escalation_malformed_tool_calls"),
+            "preamble must name the malformed-tool-calls escalation (#2169)"
         );
         // Floor-not-ceiling framing — the key prompt-engineering move
         // that guards against Parkinson's-law expansion.

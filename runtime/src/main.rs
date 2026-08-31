@@ -968,6 +968,10 @@ fn run_dispatch(args: &[String]) -> ExitCode {
             loop_runner::TerminalReason::EscalationTriggered(
                 loop_runner::EscalationReason::GenerationCheckpointBudgetExhausted,
             ) => "escalation_generation_checkpoint_budget_exhausted",
+            // (#2169 merge-gate finding 4)
+            loop_runner::TerminalReason::EscalationTriggered(
+                loop_runner::EscalationReason::MalformedToolCallsExhausted,
+            ) => "escalation_malformed_tool_calls",
         },
         None => "error",
     };
