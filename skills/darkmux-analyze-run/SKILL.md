@@ -183,8 +183,14 @@ These are emitted by the runtime's struggle-detectors and recovery paths (landed
 { "type": "dispatch.per_turn_cap.salvaged", "seq": <turn>, "ts": <ms>, "completion_tokens": <int>, "cap": <int>, "salvaged_tool_calls": <int> }
   # turn hit MAX_TOKENS_PER_CALL (10000) on finish_reason=length but well-formed tool calls survived; truncated content discarded, calls dispatched anyway (#479)
 
-{ "type": "dispatch.intra_turn_stall.recovered", "seq": <turn>, "ts": <ms>, "completion_tokens": <int>|null, "recoveries_used": <int>, "recoveries_budget": <int> }
-  # finish_reason=length with no content AND no tool calls (runaway reasoning); useless turn dropped, nudge injected, retried. completion_tokens≈cap ⇒ per-call-cap stall; well below ⇒ context-overflow stall (#414)
+{ "type": "dispatch.intra_turn_stall.recovered", "seq": <turn>, "ts": <ms>, "completion_tokens": <int>|null, "recoveries_used": <int>, "recoveries_budget": <int>, "bound": {"kind": <str>, "value": <int>, "source": <str>} }
+  # finish_reason=length with no content AND no tool calls (GENUINE runaway reasoning — a turn cut at a bound while still writing); useless turn dropped, nudge injected, retried. completion_tokens≈cap ⇒ per-call-cap stall; well below ⇒ context-overflow stall (#414). `bound` names which cap governed the request (#2165).
+
+{ "type": "dispatch.empty_tool_calls.recovered", "seq": <turn>, "ts": <ms>, "completion_tokens": <int>|null, "recoveries_used": <int>, "recoveries_budget": <int>, "bound": {"kind": <str>, "value": <int>, "source": <str>} }
+  # finish_reason=tool_calls with an EMPTY tool_calls array — NOT runaway reasoning, a protocol-shaped model/parser miss (same Devstral+LMStudio parser family as #2169/#2182); useless turn dropped, nudge injected, retried, same bounded budget as its sibling above but its OWN kind + escalation reason (#2190)
+
+{ "type": "dispatch.escalation.triggered", "seq": <turn>, "ts": <ms>, "reason": <str>, "model": <str>, "prompt_tokens": <int> }
+  # fires once, at the exact moment ANY EscalationTriggered terminal fires. `reason` is the same string `dispatch.complete`'s `result` carries; `model`/`prompt_tokens` answer "which model, at what context, stopped producing calls" without joining telemetry.lms + telemetry.context by hand (#2190)
 
 { "type": "tool_call.promoted", "seq": <turn>, "ts": <ms>, "source": "content"|"reasoning", "format": "bracket"|"harmony"|"xml", "promoted_call_count": <int> }
   # LMStudio didn't extract tool_calls; runtime recovered them from plain-text markup and rerouted to the tool path. Each one is a model wire-format failure the runtime caught (#406)
@@ -201,7 +207,7 @@ These are emitted by the runtime's struggle-detectors and recovery paths (landed
 { "type": "dispatch.complete", "ts": <unix_ms>, "result": <str>, "wall_ms": <u128> }
 ```
 
-`result` discriminates terminal reason: `"stop"` (clean), `"max_turns"` (hit operator `--max-turns`), `"escalation_cumulative_tokens_exceeded"` (hit `--max-tokens`), `"escalation_intra_turn_stall_exhausted"` (stall budget exhausted), `"escalation_generation_checkpoint_budget_exhausted"` (#2171 — a turn kept hitting the generation check-in without converging), `"escalation_compaction_limit_reached"` (hit `bail_after_compactions`), `"escalation_malformed_tool_calls"` (#2169 — 3 consecutive turns with no successfully dispatched tool call, every name either not a real tool or a real tool the role wasn't granted), `"error"`.
+`result` discriminates terminal reason: `"stop"` (clean), `"max_turns"` (hit operator `--max-turns`), `"escalation_cumulative_tokens_exceeded"` (hit `--max-tokens`), `"escalation_intra_turn_stall_exhausted"` (GENUINE runaway-reasoning stall budget exhausted — a turn cut at a bound while still writing), `"escalation_empty_tool_calls"` (#2190 — the SAME bounded budget exhausted, but for `finish_reason=tool_calls` with an empty array; a protocol-shaped miss, not a reasoning loop — operator-tunable via `runtime.max_stall_recoveries`, default 2), `"escalation_generation_checkpoint_budget_exhausted"` (#2171 — a turn kept hitting the generation check-in without converging), `"escalation_compaction_limit_reached"` (hit `bail_after_compactions`), `"escalation_malformed_tool_calls"` (#2169 — 3 consecutive turns with no successfully dispatched tool call, every name either not a real tool or a real tool the role wasn't granted), `"error"`.
 
 ## Naming-convention traps — gotchas worth memorizing
 

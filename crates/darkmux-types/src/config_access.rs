@@ -464,6 +464,19 @@ pub fn generation_checkpoint_interval_tokens_with_source() -> (Option<u32>, Sour
     pick_parsed_with_source("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL", cfg, None)
 }
 
+/// (#2190) Per-dispatch budget for intra-turn stall recoveries — how many
+/// times the runtime drops a useless turn (empty `tool_calls`, or a
+/// runaway-reasoning cut) and nudges before escalating out of local-tier.
+/// `None` = the runtime's built-in `MAX_STALL_RECOVERIES` (2).
+pub fn max_stall_recoveries() -> Option<u32> {
+    max_stall_recoveries_with_source().0
+}
+/// (#2190) `max_stall_recoveries` plus WHICH tier resolved it.
+pub fn max_stall_recoveries_with_source() -> (Option<u32>, Source) {
+    let cfg = config().runtime.as_ref().and_then(|r| r.max_stall_recoveries);
+    pick_parsed_with_source("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES", cfg, None)
+}
+
 // ── Remote (hosted-endpoint) dispatch (#1260/#1177) ──
 /// The per-EXECUTION remote token allowance — an execution is one pipeline
 /// stage (the review pipeline's probe pass, each judge pass, the verify pass; a bare
