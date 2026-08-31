@@ -238,7 +238,7 @@ describe("MachineDrawer (#2107)", () => {
     const missionRecords = [proc("2026-01-01T00:00:00Z", 30, 55, 40)];
     render(
       <MachineDrawer
-        route={{ kind: "mission", missionId: "m1" }}
+        route={{ kind: "mission", missionId: "m1", stepId: null }}
         routeRecords={missionRecords}
         flowWindow={[]}
         localUid={null}
@@ -466,7 +466,7 @@ describe("MachineDrawer — idle state (no samples)", () => {
     const missionRecords = [proc("2026-01-01T00:00:00Z", 30, 55, 40)];
     render(
       <MachineDrawer
-        route={{ kind: "mission", missionId: "m1" }}
+        route={{ kind: "mission", missionId: "m1", stepId: null }}
         routeRecords={missionRecords}
         flowWindow={[]}
         localUid={null}
@@ -775,7 +775,7 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
 
     render(
       <MachineDrawer
-        route={{ kind: "mission", missionId: "m1" }}
+        route={{ kind: "mission", missionId: "m1", stepId: null }}
         routeRecords={missionRecords}
         flowWindow={[]}
         localUid={null}

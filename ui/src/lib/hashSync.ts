@@ -144,7 +144,25 @@ export function canonicalHash(route: Route): string | null {
       p.set("dispatch", route.dispatchId);
       return p.toString();
     }
-    case "mission":
+    case "mission": {
+      // (#2189, step drill-in) `mission=<id>` is still written DIRECTLY by
+      // its callers (`CatalogPanel`/`RunsBoard`/`sessionRun.ts` --
+      // `location.hash = "mission=<id>"`, a real navigation) -- that
+      // assignment IS the canonical form for a bare mission visit, same as
+      // this module's own doc says. What's NEW is `stepId`: a genuine
+      // derived-state param layered on top, same shape `run` was for the
+      // runs lens before `LabRunDetail` gave it a destination (see this
+      // file's module doc, the `run` paragraph) -- so it earns a place in
+      // the canonical hash now that step selection has a real destination
+      // (the mainstay events column, scoped). Selecting/clearing a step
+      // calls `writeHash(canonicalHash(...))` directly (mirrors
+      // `RunsBoard`'s `openLabRun`/`closeLabRun`), which goes through
+      // `replaceState` -- no history spam per step tap.
+      const p = new URLSearchParams();
+      p.set("mission", route.missionId);
+      if (route.stepId) p.set("step", route.stepId);
+      return p.toString();
+    }
     case "unknown":
       return null;
     case "playback":

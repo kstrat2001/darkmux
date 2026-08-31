@@ -77,6 +77,7 @@ import { MissionCanvas } from "./MissionCanvas";
 import { MissionTimelineView } from "./MissionTimelineView";
 import {
   applyRecordToMetrics,
+  buildStepHeaderFields,
   fmtTok,
   foldFlowRecords,
   indexGraph,
@@ -85,8 +86,10 @@ import {
   recordInMission,
   seedMetricsFromGraph,
   statusRank,
+  type GraphStep,
   type MetricsMap,
   type MissionGraph,
+  type StepHeaderField,
 } from "./graph";
 import { initMinimap, isNarrowViewport, persistMinimap, timelineActive } from "./timeline";
 import type { FlowRecord } from "../../types/handwritten";
@@ -277,6 +280,9 @@ function MeterEl({ tot }: { tot: ReturnType<typeof missionTotals> }) {
 export function MissionGraphLens({
   missionId,
   onEvents,
+  selectedStepId = null,
+  onSelectStep,
+  onStepHeader,
 }: {
   missionId: string;
   /** (#2107/#2108 mainstay unification) Reports this mission's own scoped,
@@ -293,6 +299,21 @@ export function MissionGraphLens({
    * mission's events on its own, closing the "two event logs disagreeing
    * about scope" gap #1868 used to require a second, bespoke surface for. */
   onEvents?: (events: FlowRecord[], srvTruncated: boolean) => void;
+  /** (#2189, step drill-in) `route.stepId` — App.tsx owns the route/hash,
+   * this lens only reads the selection back to highlight the right row/
+   * node and to auto-expand the owning task in the timeline renderer (a
+   * deep link into a collapsed task must still show the selected step). */
+  selectedStepId?: string | null;
+  /** (#2189) Fired when a node/row is clicked — App.tsx writes the new
+   * `step=` hash param (`writeHash(canonicalHash(...))`, mirroring
+   * `RunsBoard`'s own lab-run drill-in — see `hashSync.ts`'s `mission`
+   * case doc); this lens never touches `location.hash` itself. */
+  onSelectStep?: (stepId: string) => void;
+  /** (#2189) Reports the selected step's header-block fields upward every
+   * time the fold that derives them changes, `null` when no step is
+   * selected — same "data pipeline stays here, display moves to the
+   * mainstay column" split `onEvents` already uses. */
+  onStepHeader?: (fields: StepHeaderField[] | null) => void;
 }) {
   const queryClient = useQueryClient();
   const source = getSource();
@@ -477,12 +498,53 @@ export function MissionGraphLens({
     onEvents?.(events, srvTruncated);
   }, [events, srvTruncated, onEvents]);
 
+  // (#2189, step drill-in) The selected `GraphStep` (for its static
+  // fields — label/kind/status/model) and the task node that owns it (to
+  // auto-expand the timeline renderer's card on a deep link into a
+  // collapsed task — see `MissionTimelineView.tsx`'s own doc on why an
+  // `open` task is required for its steps to render at all).
+  const [selectedStep, ownerTaskId] = useMemo((): [GraphStep | null, string | null] => {
+    if (!selectedStepId || !graph) return [null, null];
+    for (const n of graph.nodes) {
+      const found = (n.steps || []).find((s) => s.id === selectedStepId);
+      if (found) return [found, n.id];
+    }
+    return [null, null];
+  }, [selectedStepId, graph]);
+
+  useEffect(() => {
+    if (ownerTaskId) setExpanded((prev) => (prev[ownerTaskId] ? prev : { ...prev, [ownerTaskId]: true }));
+  }, [ownerTaskId]);
+
+  // `step_id` equality against this mission's own already-deduped `events`
+  // — the SAME scoping rule App.tsx applies to the mainstay column's
+  // `records` prop (see that file's own doc), recomputed here only for the
+  // header block's "findings"/"detectors"/"source"/"rule"/"sha" scan
+  // (`buildStepHeaderFields`'s own doc) — not a second fetch, a second pure
+  // filter of the one record set this lens already holds.
+  const selectedStepRecords = useMemo(() => {
+    if (!selectedStepId) return [];
+    return events.filter((r) => r.payload && r.payload.step_id === selectedStepId);
+  }, [events, selectedStepId]);
+
   const anyRunning = !!(
     graph &&
     graph.nodes.some((n) => n.status === "running" || (n.steps || []).some((s) => s.status === "running"))
   );
   const now = useNow(anyRunning);
   const proc = useProcReadout(flowTailQuery.data);
+
+  // Needs `now` (elapsed time for a still-running step) — computed here,
+  // after `now` itself, rather than beside `selectedStep`/`selectedStepRecords`
+  // above.
+  const stepHeaderFields = useMemo(() => {
+    if (!selectedStep) return null;
+    return buildStepHeaderFields(selectedStep, metrics, now, selectedStepRecords);
+  }, [selectedStep, metrics, now, selectedStepRecords]);
+
+  useEffect(() => {
+    onStepHeader?.(stepHeaderFields);
+  }, [stepHeaderFields, onStepHeader]);
 
   function refresh() {
     void queryClient.invalidateQueries({ queryKey: queryKeys.missionGraph(missionId) });
@@ -619,9 +681,28 @@ export function MissionGraphLens({
       </div>
       <div className="body missionlens__body">
         {useTimeline ? (
-          <MissionTimelineView nodes={graph.nodes} edges={graph.edges} metrics={metrics} now={now} note={graph.note} expanded={expanded} onToggleTask={toggleTask} />
+          <MissionTimelineView
+            nodes={graph.nodes}
+            edges={graph.edges}
+            metrics={metrics}
+            now={now}
+            note={graph.note}
+            expanded={expanded}
+            onToggleTask={toggleTask}
+            selectedStepId={selectedStepId}
+            onSelectStep={onSelectStep}
+          />
         ) : (
-          <MissionCanvas nodes={graph.nodes} edges={graph.edges} metrics={metrics} now={now} note={graph.note} minimapOn={minimapOn} />
+          <MissionCanvas
+            nodes={graph.nodes}
+            edges={graph.edges}
+            metrics={metrics}
+            now={now}
+            note={graph.note}
+            minimapOn={minimapOn}
+            selectedStepId={selectedStepId}
+            onSelectStep={onSelectStep}
+          />
         )}
       </div>
     </div>

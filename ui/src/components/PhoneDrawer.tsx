@@ -177,6 +177,9 @@ export interface PhoneDrawerEventsTab {
   error: { status: number | null; message: string } | null;
   historical: boolean;
   serverTruncated: boolean;
+  /** (#2189, step drill-in) See `EventLogColumn`'s own `headerExtra` doc --
+   * threaded straight through to this tab's own mount below. */
+  headerExtra?: ReactNode;
 }
 
 export function PhoneDrawer({
@@ -591,6 +594,7 @@ export function PhoneDrawer({
                 error={events.error}
                 historical={events.historical}
                 serverTruncated={events.serverTruncated}
+                headerExtra={events.headerExtra}
                 pushDetail
               />
             ))}

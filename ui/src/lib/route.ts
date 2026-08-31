@@ -175,7 +175,19 @@ export type Route =
    * placeholder name, back when this route only recognized the shape and
    * deferred rendering to the standalone page) now that it renders for
    * real. */
-  | { kind: "mission"; missionId: string }
+  /** `stepId` (#2189, step drill-in) -- the optional selected step within
+   * this mission, read via `step=` with the SAME dual hash/search
+   * precedence every other named param uses (`get()`, below) -- no second
+   * precedence rule invented for this one param (a past bug had two params
+   * obeying opposite rules; see `get()`'s own doc). `null` is "no step
+   * selected", the pre-existing behavior: every `#mission=<id>` hash this
+   * app already emits still parses to `stepId: null` and renders
+   * identically to before this field existed. An open string, same
+   * precedent as `dispatch.dispatchId`/`machine.uid` above -- step ids are
+   * server-derived identifiers with no closed set to validate against
+   * here; an unresolvable step degrades gracefully (the lens just never
+   * finds a matching `GraphStep`), not validated at parse time. */
+  | { kind: "mission"; missionId: string; stepId: string | null }
   /** A bare `#<date>` hash (or `?date=<date>`, its query-string form) —
    * `viewer.html`'s `targetDate()` fallback. Distinct from `fleet`: legacy's
    * `boot()` computes `live = date===todayUTC()`, which is false for any
@@ -396,7 +408,12 @@ export function parseRoute(): Route {
 
   const mission = get("mission");
   if (mission) {
-    return { kind: "mission", missionId: mission };
+    // (#2189) `step` -- SAME dual hash/search precedence as `get()` gives
+    // every other named param (search wins over hash when both are
+    // present). No bespoke precedence for this one param -- see the
+    // `stepId` field's own doc on the `mission` Route variant.
+    const step = get("step");
+    return { kind: "mission", missionId: mission, stepId: step ? step : null };
   }
 
   // (#1974) `dispatch=` is canonical; `session=` is the one-release alias.

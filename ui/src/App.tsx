@@ -5,7 +5,7 @@ import { getSource } from "./lib/source";
 import { useDay } from "./hooks/useDay";
 import { usePlaybackTransport } from "./hooks/usePlaybackTransport";
 import { Scrubber } from "./lenses/catalog/Scrubber";
-import { useSyncHash } from "./lib/hashSync";
+import { useSyncHash, writeHash, canonicalHash } from "./lib/hashSync";
 import { FleetLens } from "./lenses/fleet/FleetLens";
 import { LensPlaceholder } from "./components/LensPlaceholder";
 import { NavChrome } from "./components/NavChrome";
@@ -17,6 +17,8 @@ import { MachineLens } from "./lenses/machine/MachineLens";
 import { RunsBoard } from "./lenses/runs/RunsBoard";
 import { ConsolePanel } from "./lenses/console/ConsolePanel";
 import { MissionGraphLens } from "./lenses/mission/MissionGraphLens";
+import { StepHeaderBlock } from "./lenses/mission/StepHeaderBlock";
+import type { StepHeaderField } from "./lenses/mission/graph";
 import { SessionReplay } from "./lenses/catalog/SessionReplay";
 import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
@@ -214,11 +216,54 @@ export function App() {
   const onMissionEvents = useCallback((records: FlowRecord[], truncated: boolean) => {
     setMissionEvents({ records, truncated });
   }, []);
+  // (#2189, step drill-in) `route.stepId` — App.tsx owns the route/hash, so
+  // the WRITE lives here too: a click on a node/row calls this, which
+  // writes the canonical `mission=<id>&step=<id>` (or drops `step` on
+  // clear) via `writeHash(canonicalHash(...))`, mirroring `RunsBoard`'s own
+  // `openLabRun`/`closeLabRun` — see `hashSync.ts`'s `mission` case doc.
+  // `MissionGraphLens` never touches `location.hash` itself; it only reads
+  // the selection back (to highlight) and calls this on a click.
+  const onSelectStep = useCallback(
+    (stepId: string | null) => {
+      if (route.kind !== "mission") return;
+      writeHash(canonicalHash({ kind: "mission", missionId: route.missionId, stepId }));
+    },
+    [route],
+  );
+  // (#2189) The selected step's header-block fields, reported by
+  // `MissionGraphLens` — `null` whenever no step is selected (mirrors
+  // `missionEvents`'s own "null until the lens's first fold resolves"
+  // convention).
+  const [stepHeaderFields, setStepHeaderFields] = useState<StepHeaderField[] | null>(null);
+  const onStepHeader = useCallback((fields: StepHeaderField[] | null) => {
+    setStepHeaderFields(fields);
+  }, []);
+  const selectedMissionStepId = route.kind === "mission" ? route.stepId : null;
+  // (#2189) The small block rendered ABOVE the mainstay events column on
+  // BOTH surfaces (desktop's inline mount and the phone drawer's Events
+  // tab) — `null` unless a step is actually selected AND its fields have
+  // resolved, so a step selected an instant before the graph/metrics fold
+  // catches up never flashes an empty block (`EventLogColumn`'s own
+  // `headerExtra` doc). `missionId` is read from `route` directly (never
+  // undefined here — `selectedMissionStepId` is non-null only on a
+  // `mission` route).
+  const stepHeaderExtra =
+    selectedMissionStepId && stepHeaderFields && route.kind === "mission" ? (
+      <StepHeaderBlock missionId={route.missionId} fields={stepHeaderFields} onBack={() => onSelectStep(null)} />
+    ) : null;
   const eventLogRecords = useMemo(() => {
     // Mission has no playhead concept (`transportShown` already excludes
     // it below) — its own fold is always the full, historical record set,
     // never scoped to a scrubbed time.
-    if (route.kind === "mission") return missionEvents?.records ?? [];
+    if (route.kind === "mission") {
+      const all = missionEvents?.records ?? [];
+      // (#2189) `step_id` EQUALITY, same rule `buildStepHeaderFields`'s own
+      // doc names — the mainstay column scopes to exactly this step's own
+      // records when one is selected, never a re-fetch (one source of
+      // records, filtered here, at the point they're handed to the
+      // column — see #2189's own issue text).
+      return route.stepId ? all.filter((r) => r.payload && r.payload.step_id === route.stepId) : all;
+    }
     if (playhead === null) return routeRecords.records;
     // A static build's runs/machine/console routes have no slice of their
     // own (the live window is empty there); the day's log, scoped to the
@@ -229,7 +274,7 @@ export function App() {
     // `!(ts > t)`, not `ts <= t`: a record with an unparseable `ts` stays
     // in the log, as it did before the transport scoped every route.
     return base.filter((r) => !(T(r.ts) > playhead));
-  }, [route.kind, missionEvents, playhead, routeRecords.records, source.kind, dayRecords]);
+  }, [route.kind, selectedMissionStepId, missionEvents, playhead, routeRecords.records, source.kind, dayRecords]);
   // (#2071) The sticky block's measured height feeds `--chrome-h`, the
   // offset the event log column sticks under on desktop. It used to be a
   // 97px constant that assumed the masthead + one chrome row.
@@ -397,7 +442,11 @@ export function App() {
   // records are ALWAYS a cross-day, cross-restart fold, never a rolling
   // "last 24h" window — `historical: true` unconditionally, matching what
   // `MissionGraphLens`'s own retired inline mount used to pass.
-  const eventLogScopeLabel = route.kind === "mission" ? route.missionId : logscope;
+  // (#2189) Step-scoped filter-picks/persistence key — appends the step id
+  // so a step's own remembered filter picks (`EventLogColumn`'s own
+  // `storedFilterPicks`) don't collide with the whole mission's.
+  const eventLogScopeLabel =
+    route.kind === "mission" ? (route.stepId ? `${route.missionId}:${route.stepId}` : route.missionId) : logscope;
   const eventLogHistorical = route.kind === "mission" ? true : routeRecords.historical;
   const eventLogServerTruncated = route.kind === "mission" ? (missionEvents?.truncated ?? false) : false;
   // (#2120, operator finding — "reads like a variable name") The transport's
@@ -457,6 +506,7 @@ export function App() {
         eventLogError={routeRecords.error}
         eventLogHistorical={eventLogHistorical}
         eventLogServerTruncated={eventLogServerTruncated}
+        eventLogHeaderExtra={stepHeaderExtra}
       />
       {/* (#2071, superseded by #2108 rounds 1+2 below) Originally: sticky row
           holds only the tab strip + transport; the masthead, crumb and meta
@@ -625,7 +675,7 @@ export function App() {
               navigation: switching tabs remounts the boundary, which is the
               recovery an operator will reach for first. */}
           <LensErrorBoundary key={route.kind} name={route.kind}>
-            {renderRoute(route, playhead, onMissionEvents)}
+            {renderRoute(route, playhead, onMissionEvents, onSelectStep, onStepHeader)}
           </LensErrorBoundary>
         </main>
         {!isMobile && (
@@ -637,6 +687,7 @@ export function App() {
             error={routeRecords.error}
             historical={eventLogHistorical}
             serverTruncated={eventLogServerTruncated}
+            headerExtra={stepHeaderExtra}
           />
         )}
       </div>
@@ -789,6 +840,8 @@ function renderRoute(
   route: Route,
   playhead: number | null,
   onMissionEvents: (events: FlowRecord[], srvTruncated: boolean) => void,
+  onSelectStep: (stepId: string | null) => void,
+  onStepHeader: (fields: StepHeaderField[] | null) => void,
 ) {
   switch (route.kind) {
     case "fleet":
@@ -812,7 +865,15 @@ function renderRoute(
       // #1868: the mission-graph lens, folded in-place — see
       // `MissionGraphLens`'s own doc for the data sources and why this
       // replaces the earlier `MissionReplay` full-navigation stub.
-      return <MissionGraphLens missionId={route.missionId} onEvents={onMissionEvents} />;
+      return (
+        <MissionGraphLens
+          missionId={route.missionId}
+          onEvents={onMissionEvents}
+          selectedStepId={route.stepId}
+          onSelectStep={onSelectStep}
+          onStepHeader={onStepHeader}
+        />
+      );
     case "playback":
       // (#1800 P2) A bare #<date> hash — a REAL historical render now: the
       // fleet hero over that day's records, with every one of legacy's
