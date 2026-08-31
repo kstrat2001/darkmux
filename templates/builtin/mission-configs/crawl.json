@@ -40,6 +40,16 @@
       "required": false
     },
     {
+      "name": "max_sites_per_unit",
+      "description": "(#2190) Cap on how many sites a `site`-kind unit may hold before the planner starts a new one — the planner already caps on `max_est_tokens_per_unit` too, whichever binds first. Absent means the built-in default (40), so a launch with no override plans byte-identically to before this knob existed. A model whose per-turn tool loop stalls on a large unit's read batch (empty `finish_reason=tool_calls`, e.g. #2190) is a signal to shrink this — smaller units mean a smaller first-turn prompt. Must be a positive integer; `0` or a non-numeric value is refused at param-parse time.",
+      "required": false
+    },
+    {
+      "name": "max_est_tokens_per_unit",
+      "description": "(#2190) Companion to `max_sites_per_unit`: cap on a `site`-kind unit's estimated token total (the same `est_tokens` heuristic the plan table already reports), whichever of the two caps binds first. Absent means the built-in default (16,000). Must be a positive integer; `0` or a non-numeric value is refused at param-parse time.",
+      "required": false
+    },
+    {
       "name": "no_fetch",
       "description": "Resolve sources against the mirror as-is, without `git fetch`ing first — fully offline against whatever's already mirrored. A `git` source with no mirror yet REFUSES instead of cloning; a `path` source's first clone is local-filesystem-only and is exempt.",
       "required": false

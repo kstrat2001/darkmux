@@ -34,11 +34,37 @@ pub const MAX_FILE_BYTES: u64 = 512 * 1024;
 
 /// `site`/`edge` grouping caps — see `crate::crawl::plan`'s module docs and
 /// the packet-1 spec: "at most 40 sites or ~16,000 estimated tokens,
-/// whichever first".
+/// whichever first". These are the DEFAULTS `PlanParams::default()`
+/// resolves to; an operator overrides either via `--param
+/// max_sites_per_unit=`/`--param max_est_tokens_per_unit=` on `mission
+/// launch crawl` (#2190) — see `src/crawl_launch.rs`.
 pub const MAX_SITES_PER_UNIT: usize = 40;
 pub const MAX_SITE_TOKENS_PER_UNIT: usize = 16_000;
 /// Edge units cap at 80 sites (spilling into more units beyond that).
+/// Not yet operator-settable (#2190 scoped to `site`-kind units only —
+/// the mechanism observed live was a `site` unit's read batch; edge units
+/// stalling the same way is untested).
 pub const MAX_EDGE_SITES_PER_UNIT: usize = 80;
+
+/// (#2190) Operator-controllable unit-sizing knobs for `site`-kind units —
+/// how many sites (count and/or estimated tokens) `collect_site_units`
+/// packs into one unit before starting a new one, "whichever binds
+/// first" (unchanged semantics from the hard-coded constants this
+/// replaces). `PlanParams::default()` resolves to exactly
+/// `MAX_SITES_PER_UNIT`/`MAX_SITE_TOKENS_PER_UNIT`, so `plan()` (which
+/// always uses the default) produces byte-identical plans to before this
+/// existed — `plan_with_params` is the only way to override either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanParams {
+    pub max_sites_per_unit: usize,
+    pub max_est_tokens_per_unit: usize,
+}
+
+impl Default for PlanParams {
+    fn default() -> Self {
+        Self { max_sites_per_unit: MAX_SITES_PER_UNIT, max_est_tokens_per_unit: MAX_SITE_TOKENS_PER_UNIT }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Site {
@@ -354,6 +380,14 @@ fn next_unit_id(seq: &mut usize) -> String {
 /// include/exclude (`SourceFiles::matching`, unchanged) — a file must
 /// pass both.
 pub fn plan(materialized: &Materialized, rules: &[Rule]) -> Result<Plan> {
+    plan_with_params(materialized, rules, PlanParams::default())
+}
+
+/// (#2190) Same as `plan`, with operator-overridable `site`-unit sizing.
+/// `plan(m, r)` is exactly `plan_with_params(m, r, PlanParams::default())`
+/// — the two are byte-identical for a fixed input, which is the
+/// regression this split exists to make checkable.
+pub fn plan_with_params(materialized: &Materialized, rules: &[Rule], params: PlanParams) -> Result<Plan> {
     // (#1959) Seed `skipped` from what `workspace_spec::materialize`
     // already found (symlinks, files excluded by the spec's own
     // include/exclude) — the file-size/read-error skips below are still
@@ -380,7 +414,7 @@ pub fn plan(materialized: &Materialized, rules: &[Rule]) -> Result<Plan> {
     for rule in rules.iter().filter(|r| r.kind == RuleKind::Site) {
         for source in &materialized.sources {
             let files = files_by_id.get_mut(&source.id).expect("source resolved");
-            units.extend(collect_site_units(rule, source, files, &mut skipped, &mut unit_seq)?);
+            units.extend(collect_site_units(rule, source, files, &mut skipped, &mut unit_seq, &params)?);
         }
     }
 
@@ -629,6 +663,7 @@ fn collect_site_units(
     files: &mut SourceFiles,
     skipped: &mut Vec<SkippedEntry>,
     unit_seq: &mut usize,
+    params: &PlanParams,
 ) -> Result<Vec<Unit>> {
     if rule.prefilter.is_empty() {
         return Ok(Vec::new());
@@ -665,8 +700,8 @@ fn collect_site_units(
     let mut cur_sites: Vec<Site> = Vec::new();
     let mut cur_tokens = 0usize;
     for (site, tok) in batch {
-        let would_exceed_count = cur_sites.len() + 1 > MAX_SITES_PER_UNIT;
-        let would_exceed_tokens = !cur_sites.is_empty() && cur_tokens + tok > MAX_SITE_TOKENS_PER_UNIT;
+        let would_exceed_count = cur_sites.len() + 1 > params.max_sites_per_unit;
+        let would_exceed_tokens = !cur_sites.is_empty() && cur_tokens + tok > params.max_est_tokens_per_unit;
         if !cur_sites.is_empty() && (would_exceed_count || would_exceed_tokens) {
             out.push(Unit::Site {
                 id: next_unit_id(unit_seq),
@@ -1222,7 +1257,7 @@ mod tests {
         let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
         let source = resolved("app", dir.path());
         let mut seq = 1usize;
-        let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
+        let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq, &PlanParams::default()).unwrap();
         assert_eq!(units.len(), 1, "{units:?}");
         let Unit::Site { sites, .. } = &units[0] else { panic!("expected site unit") };
         assert_eq!(sites.len(), 2, "{sites:?}");
@@ -1245,12 +1280,91 @@ mod tests {
         let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
         let source = resolved("app", dir.path());
         let mut seq = 1usize;
-        let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
+        let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq, &PlanParams::default()).unwrap();
         assert_eq!(units.len(), 2, "expected a 40 + 1 split: {units:?}");
         let Unit::Site { sites: s0, .. } = &units[0] else { panic!() };
         let Unit::Site { sites: s1, .. } = &units[1] else { panic!() };
         assert_eq!(s0.len(), 40);
         assert_eq!(s1.len(), 1);
+    }
+
+    /// (#2190) Write `n` well-separated `catch` sites into one file — the
+    /// shared fixture for every `PlanParams`-sizing test below.
+    fn write_n_catch_sites(dir: &Path, n: usize) {
+        let mut lines = Vec::new();
+        for _ in 0..n {
+            lines.push("catch (e) {}".to_string());
+            for _ in 0..12 {
+                lines.push(String::new());
+            }
+        }
+        fs::write(dir.join("x.ts"), lines.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn site_grouping_respects_operator_max_sites_per_unit() {
+        // (#2190) 25 sites at a cap of 6 must split ceil(25/6) = 5 units:
+        // sizes 6,6,6,6,1 — proving the operator-supplied cap actually
+        // binds, not just the built-in 40.
+        let dir = TempDir::new().unwrap();
+        write_n_catch_sites(dir.path(), 25);
+
+        let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
+        let source = resolved("app", dir.path());
+        let mut seq = 1usize;
+        let params = PlanParams { max_sites_per_unit: 6, max_est_tokens_per_unit: MAX_SITE_TOKENS_PER_UNIT };
+        let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq, &params).unwrap();
+        assert_eq!(units.len(), 5, "expected ceil(25/6)=5 units: {units:?}");
+        let sizes: Vec<usize> = units
+            .iter()
+            .map(|u| match u {
+                Unit::Site { sites, .. } => sites.len(),
+                _ => panic!("expected site unit"),
+            })
+            .collect();
+        assert_eq!(sizes, vec![6, 6, 6, 6, 1]);
+    }
+
+    #[test]
+    fn site_grouping_cap_larger_than_site_count_yields_one_unit() {
+        // (#2190) A cap that exceeds the actual site count must not split
+        // at all — one unit holding everything.
+        let dir = TempDir::new().unwrap();
+        write_n_catch_sites(dir.path(), 5);
+
+        let mut skipped = Vec::new();
+        let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
+        let source = resolved("app", dir.path());
+        let mut seq = 1usize;
+        let params = PlanParams { max_sites_per_unit: 1000, max_est_tokens_per_unit: MAX_SITE_TOKENS_PER_UNIT };
+        let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq, &params).unwrap();
+        assert_eq!(units.len(), 1, "{units:?}");
+        let Unit::Site { sites, .. } = &units[0] else { panic!("expected site unit") };
+        assert_eq!(sites.len(), 5);
+    }
+
+    #[test]
+    fn plan_with_default_params_matches_plan_byte_identical() {
+        // (#2190) The key regression: `plan()` (no override) must produce
+        // EXACTLY what `plan_with_params(.., PlanParams::default())`
+        // produces — an operator who never passes `--param
+        // max_sites_per_unit=`/`--param max_est_tokens_per_unit=` sees no
+        // behavior change from before this knob existed.
+        let dir = TempDir::new().unwrap();
+        write_n_catch_sites(dir.path(), 45); // > 40, so the default cap actually bites
+        fs::write(dir.path().join("README.md"), "docs\n").unwrap();
+
+        let sources = vec![resolved("app", dir.path())];
+        let materialized = materialized_for(sources, Vec::new());
+        let rules = vec![site_rule(), read_rule()];
+
+        let out1 = plan(&materialized, &rules).unwrap();
+        let out2 = plan_with_params(&materialized, &rules, PlanParams::default()).unwrap();
+        let units1 = serde_json::to_value(&out1.units).unwrap();
+        let units2 = serde_json::to_value(&out2.units).unwrap();
+        assert_eq!(units1, units2);
+        assert_eq!(serde_json::to_value(&out1.totals).unwrap(), serde_json::to_value(&out2.totals).unwrap());
     }
 
     #[test]
@@ -1363,7 +1477,7 @@ mod tests {
         let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
         let source = resolved("app", dir.path());
         let mut seq = 1usize;
-        let _ = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
+        let _ = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq, &PlanParams::default()).unwrap();
         let reasons: Vec<&str> = skipped.iter().map(|s| s.reason.as_str()).collect();
         assert!(reasons.iter().any(|r| r.contains("exceeds")), "{reasons:?}");
         assert!(reasons.iter().any(|r| r.contains("UTF-8")), "{reasons:?}");
@@ -1770,7 +1884,7 @@ mod tests {
         let mut files = SourceFiles::new(dir.path(), walk_all(dir.path(), "app").0);
         let source = resolved("app", dir.path());
         let mut seq = 1usize;
-        let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq).unwrap();
+        let units = collect_site_units(&site_rule(), &source, &mut files, &mut skipped, &mut seq, &PlanParams::default()).unwrap();
         let files_hit: Vec<&str> = units
             .iter()
             .flat_map(|u| match u {
