@@ -274,6 +274,56 @@ http.createServer((req, res) => {
   console.log("listening on http://127.0.0.1:8790/events");
 });</code></pre>
     <p>Run it (<code>node receiver.mjs</code>), point a hook rule's <code>http</code> at <code>http://127.0.0.1:8790/events</code>, and every matching flow record prints as it's delivered. The <code>{"rejected": N}</code> response body is optional — return a bare <code>200</code> and every delivery just reads as accepted.</p>
+
+    <h3>Transforms: reshaping a record for someone else's API</h3>
+    <p>A raw flow record is darkmux's own shape. A real external tracker — Jira, a ticketing API, anything you don't control — wants ITS shape. A <code>transform</code> is a <a href="https://jqlang.org/">jq</a> filter, evaluated in-process (<a href="https://github.com/01mf02/jaq">jaq</a>, pure Rust, no C bindings, no subprocess) at DELIVERY time — record in, request body out. It's a pure function on purpose: no filesystem, no network, no Keychain access from inside the filter itself. Two independent knobs on a rule: <code>transform</code> (the shape) and the destination (<code>http</code> + <code>headers</code>, or <code>file</code> — below) — only the destination ever touches a credential.</p>
+    <p><code>transform</code> is a NAME, resolved inside <code>&lt;outbox_dir&gt;/adapters/</code> (normally <code>~/.darkmux/hooks/adapters/</code>) — never a path. A bare filename only; <code>/</code>, <code>\</code>, <code>..</code>, or an absolute string are refused when the rule loads. Absent <code>transform</code> is today's behavior, byte-identical: the record delivered verbatim. The adapter's TEXT is read once at load time and cached — a hand-edited adapter file takes effect on the next config reload, not mid-run; <code>doctor</code>/<code>flow status</code> re-read + re-hash the file live, so a hot edit can show a different hash there than the one actually driving a running sink.</p>
+    <p><strong>Reality check before the example: <code>http</code>'s URL policy is UNCHANGED by this packet.</strong> <code>validate_hook_target_url</code> still accepts loopback or a genuine tailnet address ONLY, and still requires the literal <code>http://</code> scheme — an <code>https://your-site.atlassian.net/...</code> target is refused at load, same as before, whole sink down if any rule names one. This packet adds <code>headers</code> (so a rule that already targets a receiver you can reach — loopback, or something on YOUR tailnet — can carry auth) and the <code>file</code> transport (so you can develop + verify an adapter's shape with zero network at all). Reaching a genuine external SaaS endpoint over real <code>https</code> is still refused, pending a separate later packet that pairs it with a MANDATORY signature. The example below targets a tracker reachable on your tailnet (a self-hosted Jira/OpenProject/whatever instance, or an echo receiver) — swap the host for your own tailnet address:</p>
+    <pre><code>{ "match": { "action": "dispatch.tool", "payload.tool_name": "report_finding", "payload.ok": true },
+  "http": "http://100.64.1.2:8080/rest/api/3/issue",
+  "headers": {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Authorization": { "keychain_item": "darkmux-hook-jira" }
+  },
+  "transform": "jira-issue.jq" }</code></pre>
+    <p><code>headers</code> is a name -&gt; value map: a plain string is sent as-is; <code>{"keychain_item": "..."}</code> resolves a macOS Keychain generic-password item at delivery time and sends ITS value — the item holds the COMPLETE header value (<code>Basic &lt;base64(email:api-token)&gt;</code>, <code>Bearer &lt;token&gt;</code>, whatever the receiver wants), never a raw token darkmux formats itself, so this stays scheme-agnostic. A Keychain-resolved value never appears in a flow record, a log line, <code>doctor</code> output, or a <code>file</code>-transport dump — those all print <code>"&lt;redacted&gt;"</code> instead. <code>attribution_headers: false</code> on a rule drops the <code>X-Darkmux-*</code> set entirely, for a receiver that rejects unknown headers — useful today on a self-hosted tailnet tracker; load-bearing once a real external target lands.</p>
+    <p><code>~/.darkmux/hooks/adapters/jira-issue.jq</code> — ordinary jq, building Jira's nested <code>fields</code> shape:</p>
+    <pre><code>{
+  fields: {
+    project: { key: "OPS" },
+    summary: ("crawl finding: " + .payload.tool_name),
+    description: {
+      type: "doc", version: 1,
+      content: [{ type: "paragraph",
+                  content: [{ type: "text", text: (.payload.evidence // "") }] }]
+    },
+    issuetype: { name: "Bug" }
+  }
+}</code></pre>
+    <p>A transform must produce EXACTLY ONE output that's either a JSON object (serialized compactly, becomes the request body) or a string (its raw bytes become the body — for a non-JSON receiver). Anything else — a jq syntax error, a runtime error (<code>error("...")</code>), a timeout, an oversize output, zero or more-than-one output values, or a bare number/array/null result — is a TERMINAL failure for that line: quarantined, <code>hook.failed</code> carries a bounded excerpt of the error, and the line is never retried (a bad adapter is a construction bug, not a transient one). Two bounds, both visible <code>config.json</code> knobs under <code>hooks</code>: <code>jq_timeout_ms</code> (default 5000 — wall-clock, compile + run) and <code>jq_max_output_bytes</code> (default 1048576 — the produced body's byte length).</p>
+
+    <h4>Three testing tiers</h4>
+    <ol>
+      <li><strong>Adapter alone, no darkmux involved.</strong> Fixtures come free from the flow log: <code>jq -c 'select(.payload.tool_name=="report_finding")' ~/.darkmux/flows/&lt;date&gt;.jsonl | head -1 | jq -f ~/.darkmux/hooks/adapters/jira-issue.jq</code>. jaq isn't byte-for-byte jq on every edge — test with a real <code>jq</code> binary here, since that's the ground truth an adapter author reasons against.</li>
+      <li><strong><code>file</code> transport — darkmux involved, no network.</strong> A rule names <code>file</code> instead of <code>http</code> (exactly one of the two; both or neither is refused at load): each matching delivery writes ONE JSON file into that directory — <code>{delivery_id, target_would_be, headers, body}</code>, secret header values redacted, file mode <code>0o600</code> — and emits <code>hook.dry_run</code> (informational) instead of <code>hook.fired</code>, advancing the cursor same as a real delivery.
+        <pre><code>{ "match": { "action": "dispatch.tool", "payload.tool_name": "report_finding" },
+  "file": "~/darkmux-hook-dryrun",
+  "transform": "jira-issue.jq" }</code></pre>
+      </li>
+      <li><strong>The full path, against a local echo receiver</strong> — the fifteen-line Node receiver above, or the real remote endpoint once you trust the shape.</li>
+    </ol>
+
+    <h4><code>darkmux doctor</code></h4>
+    <p>A rule naming a <code>transform</code> gets an extra clause on its row: the adapter name, whether it exists + parses, and its BLAKE3 content hash (first 16 hex chars) — so a silently-edited adapter is visible without diffing the file by hand. A missing or unparseable adapter is a load-time refusal SCOPED TO THAT RULE — the rest of the sink (every other rule) keeps running, unlike a bad <code>http</code> URL, which still refuses the whole sink.</p>
+    <pre><code>#0: payload.tool_name="report_finding" -> http://100.64.1.2:8080/rest/api/3/issue [tailnet, unsigned], transform: jira-issue.jq (sha256:a1b2c3d4e5f6a7b8) (undelivered: 0)</code></pre>
+
+    <h4>Honest limits</h4>
+    <ul>
+      <li><strong>At-least-once is not idempotent.</strong> Jira's create-issue endpoint has no idempotency key — a lost response can duplicate an issue. The stable <code>delivery_id</code> can be written into a searchable custom field by the adapter itself, but true check-then-create needs a SECOND request (does this delivery_id already exist? if not, create) — that's a multi-request integration, which exceeds what a pure jq filter can do by design. It's the <code>cmd</code> transport's job (a later, separately-gated packet), not this one's.</li>
+      <li><strong>jaq is not byte-for-byte jq on every edge case.</strong> Test adapters against jaq itself (tier 1 above uses the system <code>jq</code> as ground truth, but the actual delivery path runs jaq) if a filter leans on an obscure builtin.</li>
+      <li><strong>Multi-request integrations exceed jq by design.</strong> A transform is <code>record -&gt; body</code>, one function, one output — not a workflow.</li>
+    </ul>
   </div>
 </section>
 

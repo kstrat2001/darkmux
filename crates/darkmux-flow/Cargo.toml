@@ -48,6 +48,20 @@ ureq = { version = "2.10", default-features = false }
 # shipped first and missed userinfo-confusion and fragment-confusion
 # bypasses.
 url = "2.5"
+# #2183 — hook transforms: a jq filter (record -> request body), pure and
+# in-process (no C bindings, no filesystem/network access from inside the
+# filter itself — see hook_transform.rs's module doc for why jq). Pinned
+# exact versions (verified on crates.io at add time): jaq-core 3.1.1 (the
+# filter engine, data-type-generic as of 3.x), jaq-std 3.0.3 (`map`, `keys`,
+# ... the named filters an adapter can call), jaq-json 2.0.3 (the JSON
+# `Val` type + parser the 3.x data-generic core needs — NOT named in the
+# issue's own dep list, but required by the 3.x API shape; see the PR body
+# for the exact API used). Deliberately the LIBRARY crates only, never the
+# `jaq` binary crate — see hook_transform.rs's module doc for why exec is a
+# transport concern, not a transform one.
+jaq-core = "=3.1.1"
+jaq-std = "=3.0.3"
+jaq-json = "=2.0.3"
 
 [dev-dependencies]
 tempfile = "3.10"

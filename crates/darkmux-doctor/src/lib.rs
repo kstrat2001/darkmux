@@ -1449,14 +1449,13 @@ struct StrayOutbox {
 const HOOK_SIDECAR_SUFFIXES: &[&str] = &[".cursor", ".last", ".dropped", ".drain.lock", ".outbox.jsonl.quarantine"];
 
 fn stray_outbox_files(rules: &[darkmux_types::config::HookRule], outbox_dir: &std::path::Path) -> Vec<StrayOutbox> {
-    let current_keys: std::collections::HashSet<String> = rules
-        .iter()
-        .map(|r| {
-            let m = r.r#match.clone().unwrap_or_default();
-            let url = r.http.clone().unwrap_or_default();
-            darkmux_flow::hooks::rule_key(&m, &url)
-        })
-        .collect();
+    // (#2183) Reuse `summarize_configured_rules`'s OWN key derivation
+    // (`.key`) rather than recomputing `rule_key` by hand from `r.http`
+    // alone — a `file`-transport rule has no `http`, so hand-rolling this
+    // from `r.http.unwrap_or_default()` would key every `file` rule on
+    // the empty string and misreport its real outbox as stray.
+    let current_keys: std::collections::HashSet<String> =
+        darkmux_flow::hooks::summarize_configured_rules(rules, outbox_dir).into_iter().map(|s| s.key).collect();
     let Ok(entries) = std::fs::read_dir(outbox_dir) else {
         return Vec::new();
     };
@@ -1596,21 +1595,47 @@ fn build_hooks_check(
             worst = Status::Fail;
         }
 
+        // (#2183) A `transform` that failed to load is a load-time
+        // refusal SCOPED TO THIS RULE (`HookSink::new` disables just this
+        // rule, the rest of the sink keeps running) — Fail here too, so
+        // the row that's actually broken is the one operator sees red,
+        // without the whole `hooks` check reading as catastrophic.
+        let transform_suffix = match (&s.transform_name, &s.transform_status) {
+            (Some(name), Some(Ok(hash))) => format!(", transform: {name} (sha256:{hash})"),
+            (Some(name), Some(Err(reason))) => {
+                flags.push(format!("TRANSFORM `{name}` FAILED TO LOAD — {reason}"));
+                rule_status = Status::Fail;
+                format!(", transform: {name} [FAILED]")
+            }
+            _ => String::new(),
+        };
+        if worst == Status::Pass && rule_status != Status::Pass {
+            worst = rule_status;
+        } else if rule_status == Status::Fail {
+            worst = Status::Fail;
+        }
+
         let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join("; ")) };
         // (#2135 option 2) `loopback`/`tailnet`/`refused` + `signed`/
         // `unsigned` — the visibility the operator's design asked for in
         // place of a config gate: the URL is the decision, this row is
-        // what makes it legible.
-        let target_kind = if s.is_loopback {
+        // what makes it legible. (#2183) `file` names the no-network
+        // testing-tier transport instead — there's no URL policy or
+        // signature to report for it.
+        let target_kind = if s.is_file {
+            "file"
+        } else if s.is_loopback {
             "loopback"
         } else if s.is_tailnet {
             "tailnet"
         } else {
             "refused"
         };
-        let signed = if s.signed { "signed" } else { "unsigned" };
-        let message =
-            format!("{} -> {} [{target_kind}, {signed}] (undelivered: {}){flag_str}", s.match_desc, s.url, s.undelivered);
+        let signed = if s.is_file { "n/a" } else if s.signed { "signed" } else { "unsigned" };
+        let message = format!(
+            "{} -> {} [{target_kind}, {signed}]{transform_suffix} (undelivered: {}){flag_str}",
+            s.match_desc, s.url, s.undelivered
+        );
         overview_lines.push(format!("  #{}: {message}", s.index));
         rule_checks.push(Check {
             name: format!("hooks.rule.{}", s.index),
@@ -5666,18 +5691,30 @@ mod tests {
                 r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:8790/events".to_string()),
                 signing_secret_keychain_item: None,
+                file: None,
+                transform: None,
+                headers: None,
+                attribution_headers: None,
                 extras: Default::default(),
             },
             HookRule {
                 r#match: None,
                 http: Some("http://127.0.0.1:9000/x".to_string()),
                 signing_secret_keychain_item: None,
+                file: None,
+                transform: None,
+                headers: None,
+                attribution_headers: None,
                 extras: Default::default(),
             },
             HookRule {
                 r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
                 http: Some("http://10.0.0.5:8790/x".to_string()),
                 signing_secret_keychain_item: None,
+                file: None,
+                transform: None,
+                headers: None,
+                attribution_headers: None,
                 extras: Default::default(),
             },
         ];
@@ -5717,6 +5754,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://100.64.1.2:8790/events".to_string()),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
@@ -5736,6 +5777,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://100.64.1.2:8790/events".to_string()),
             signing_secret_keychain_item: Some("darkmux-hook-0".to_string()),
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let checks = build_hooks_check(true, "config.json", &rules, tmp.path());
@@ -5757,12 +5802,20 @@ mod tests {
                 r#match: Some(HookMatch { action: Some("telemetry.tokens".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:8790/a".to_string()),
                 signing_secret_keychain_item: None,
+                file: None,
+                transform: None,
+                headers: None,
+                attribution_headers: None,
                 extras: Default::default(),
             },
             HookRule {
                 r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:8790/b".to_string()),
                 signing_secret_keychain_item: None,
+                file: None,
+                transform: None,
+                headers: None,
+                attribution_headers: None,
                 extras: Default::default(),
             },
         ];
@@ -5788,6 +5841,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         // A stray file belonging to a rule that's since been removed from
@@ -5808,6 +5865,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let checks = build_hooks_check(true, "config.json", &rules, tmp.path());

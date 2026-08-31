@@ -736,6 +736,10 @@ mod hooks_status_tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let status = build_hooks_status(true, tmp.path(), &rules);
@@ -755,6 +759,10 @@ mod hooks_status_tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/events".to_string()),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let hooks = build_hooks_status(true, tmp.path(), &rules);

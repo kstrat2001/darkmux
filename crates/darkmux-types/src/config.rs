@@ -107,7 +107,21 @@ use std::path::Path;
 // `hooks.rules[].signing_secret_keychain_item` (a Keychain item NAME, never
 // the secret itself) — the HMAC-SHA256 secret a rule signs its tailnet/
 // loopback deliveries with. Minor bump, same lenient-read reasoning.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.17";
+// 1.18 (#2183): additive per-rule `hooks.rules[].transform` (a jq adapter
+// NAME, resolved inside `~/.darkmux/hooks/adapters/`), `hooks.rules[]
+// .headers` (a name -> literal-string-or-`{keychain_item}` map — auth
+// headers for a non-tailnet target), `hooks.rules[].file` (a directory —
+// the no-network `file` transport, mutually exclusive with `http`), and
+// `hooks.rules[].attribution_headers` (opt the `X-Darkmux-*` headers out,
+// since a SaaS endpoint may reject unknown headers); plus block-level
+// `hooks.jq_timeout_ms` / `hooks.jq_max_output_bytes` (the transform's
+// wall-clock + output-size bounds). Minor bump, same lenient-read
+// reasoning as every other additive block — an older binary's config with
+// these keys still loads (`extras` overflow); an older binary reading a
+// rule that names ONLY `transform`/`headers`/`file` with no `http` simply
+// sees a rule its own `resolve_rules` refuses at load (no `http`), same as
+// any other misconfigured rule today.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.18";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
@@ -703,7 +717,32 @@ pub struct HooksConfig {
     /// `doctor`, and named in a rate-limited `hook.failed`) rather than
     /// grown further — other rules and every other sink are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_outbox_mb: Option<u64>,
+    /// (#2183) Wall-clock cap, in milliseconds, on ONE `transform`
+    /// evaluation (compile + run). A jq filter that never terminates
+    /// (`def rec: rec; rec`) is bounded here rather than hanging the
+    /// drainer — see `hook_transform::apply_transform`'s doc. Visible
+    /// default `5000` (5s).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub jq_timeout_ms: Option<u64>,
+    /// (#2183) Hard cap, in bytes, on a `transform`'s produced body. An
+    /// adapter that builds an unbounded string (`"x" * 10000000`) is a
+    /// TERMINAL failure past this cap, not a giant POST. Visible default
+    /// `1048576` (1 MiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub jq_max_output_bytes: Option<u64>,
     #[serde(flatten)] pub extras: serde_json::Map<String, serde_json::Value>,
+}
+
+/// (#2183) One `headers` map entry's value: either a plain (non-secret)
+/// literal string, or a reference to a macOS Keychain generic-password
+/// item holding the COMPLETE header value (`Basic <base64(...)>`, `Bearer
+/// <token>`, `X-Api-Key: <key>` — darkmux stays scheme-agnostic; the item
+/// holds whatever string the header needs, never a raw token darkmux
+/// would have to format itself). `#[serde(untagged)]` — a bare JSON string
+/// is `Literal`; an object with a `keychain_item` key is `Keychain`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HeaderValue {
+    Literal(String),
+    Keychain { keychain_item: String },
 }
 
 /// One hook rule: a predicate (`match`) plus an HTTP outcome (`http`).
@@ -731,6 +770,42 @@ pub struct HookRule {
     /// construction, so a redelivered `hook.fired`/matched record is a
     /// safe no-op for it, not a duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub http: Option<String>,
+    /// (#2183) The no-network testing tier: a directory a matching
+    /// delivery writes ONE JSON file into (`{delivery_id, target_would_be,
+    /// headers, body}`, secret header values redacted) instead of
+    /// POSTing — `hook.dry_run` instead of `hook.fired`. Mutually
+    /// exclusive with `http`: a rule naming BOTH, or NEITHER, is a
+    /// load-time refusal (`resolve_rules`) — a rule must have exactly one
+    /// destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub file: Option<String>,
+    /// (#2183) The NAME of a jq adapter (e.g. `"jira-issue.jq"`), resolved
+    /// inside `~/.darkmux/hooks/adapters/` — never a path (`/`, `\`, `..`,
+    /// or an absolute string are refused at load AND at delivery). Absent
+    /// → today's behavior, the record verbatim (byte-identical). Applied
+    /// at DELIVERY time, not enqueue — the outbox keeps raw records, so a
+    /// corrected adapter re-drains the SAME lines. See
+    /// `hook_transform`'s module doc for the full design.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub transform: Option<String>,
+    /// (#2183) Extra headers this rule's `http` deliveries carry, name ->
+    /// literal string or `{"keychain_item": "..."}`. This is what makes a
+    /// non-tailnet (external, `https`) target real — an auth header a
+    /// SaaS receiver requires. Every value is sanitized the same way the
+    /// `X-Darkmux-*` headers already are (`sanitize_header_value`); a
+    /// Keychain-resolved value is NEVER written to a flow record, a log
+    /// line, `doctor` output, or the `file` transport's dump — those
+    /// render `"<redacted>"` instead. Ignored on a `file`-transport rule
+    /// (nothing goes on the wire — the dump shows literal headers as
+    /// configured and `"<redacted>"` for Keychain ones, same redaction
+    /// rule, no actual header is ever "sent").
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub headers: Option<BTreeMap<String, HeaderValue>>,
+    /// (#2183) `false` drops the `X-Darkmux-Delivery`/`-Event`/`-Sender`/
+    /// `-Timestamp`/`-Machine-Id`/`-Machine-Uid`/`-Signature` attribution
+    /// headers from this rule's deliveries — a SaaS endpoint may reject
+    /// unknown headers. Absent/`true` → today's behavior (every delivery
+    /// carries them). No effect on a `file`-transport rule (the dump
+    /// always shows what WOULD have gone on the wire, attribution headers
+    /// included, since there's no receiver to reject them).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub attribution_headers: Option<bool>,
     /// (#2135 option 2) The name of a macOS Keychain generic-password
     /// item (`security add-generic-password -a $USER -s <item> -w`)
     /// holding the HMAC-SHA256 secret this rule signs its deliveries
@@ -986,6 +1061,11 @@ impl DarkmuxConfig {
                 outbox_dir: Some("~/.darkmux/hooks".to_string()),
                 rules: Some(Vec::new()),
                 max_outbox_mb: Some(256),
+                // (#2183) Visible by design (this project's config
+                // philosophy — `init` writes the common knobs the
+                // operator would otherwise have to know to add by hand).
+                jq_timeout_ms: Some(5_000),
+                jq_max_output_bytes: Some(1_048_576),
                 extras: Default::default(),
             }),
             extras: Default::default(),

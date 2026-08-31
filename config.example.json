@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.17",
+  "schema_version": "1.18",
   "machine_id": "my-machine",
   "lms_bin": "lms",
   "lmstudio_url": "http://localhost:1234",
@@ -64,7 +64,9 @@
     "enabled": false,
     "outbox_dir": "~/.darkmux/hooks",
     "rules": [],
-    "max_outbox_mb": 256
+    "max_outbox_mb": 256,
+    "jq_timeout_ms": 5000,
+    "jq_max_output_bytes": 1048576
   },
   "role_profiles": {}
 }

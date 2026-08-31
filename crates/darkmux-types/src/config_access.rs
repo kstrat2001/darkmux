@@ -354,6 +354,28 @@ pub fn hooks_max_outbox_mb() -> u64 {
     let cfg = config().hooks.as_ref().and_then(|h| h.max_outbox_mb);
     pick_parsed("DARKMUX_HOOKS_MAX_OUTBOX_MB", cfg, Some(256)).unwrap()
 }
+/// (#2183) Where jq hook adapters live — always `<hooks_outbox_dir>/adapters`,
+/// so an operator who relocates `hooks.outbox_dir` gets their adapters
+/// relocated with it. No separate config field / env var: this is a fixed
+/// convention (the issue's own spec — "resolved inside
+/// `~/.darkmux/hooks/adapters/`"), not an independent knob.
+pub fn hooks_adapters_dir() -> std::path::PathBuf {
+    hooks_outbox_dir().join("adapters")
+}
+/// (#2183) The wall-clock cap, in milliseconds, on one `transform`
+/// evaluation (compile + run): `env(DARKMUX_HOOKS_JQ_TIMEOUT_MS)` >
+/// `config.hooks.jq_timeout_ms` > built-in default `5000` (5s).
+pub fn hooks_jq_timeout_ms() -> u64 {
+    let cfg = config().hooks.as_ref().and_then(|h| h.jq_timeout_ms);
+    pick_parsed("DARKMUX_HOOKS_JQ_TIMEOUT_MS", cfg, Some(5_000)).unwrap()
+}
+/// (#2183) The hard cap, in bytes, on a `transform`'s produced body:
+/// `env(DARKMUX_HOOKS_JQ_MAX_OUTPUT_BYTES)` > `config.hooks.jq_max_output_bytes`
+/// > built-in default `1048576` (1 MiB).
+pub fn hooks_jq_max_output_bytes() -> u64 {
+    let cfg = config().hooks.as_ref().and_then(|h| h.jq_max_output_bytes);
+    pick_parsed("DARKMUX_HOOKS_JQ_MAX_OUTPUT_BYTES", cfg, Some(1_048_576)).unwrap()
+}
 
 // ── Runtime behavior ──
 pub fn inactivity_timeout_seconds() -> u64 {
