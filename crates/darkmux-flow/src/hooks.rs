@@ -1768,7 +1768,27 @@ struct RuleRuntime {
     /// an orphaned thread can decrement it itself once it eventually
     /// finishes, regardless of how long after this `RuleRuntime` moved on.
     orphaned_transforms: Arc<AtomicU32>,
+    /// (security review round 2, 2026-08-31) Consecutive `Busy` outcomes
+    /// for this rule — reset to 0 on any OTHER outcome (a successful
+    /// delivery, a transform error, a normal retryable failure). Past
+    /// `MAX_CONSECUTIVE_BUSY_BEFORE_STALL`, the rule is promoted into the
+    /// existing `stalled` state: "the orphan cap has been full for a
+    /// while" is not a transient blip the way one 5xx is — it means every
+    /// timed-out evaluation for this rule so far has NEVER finished (the
+    /// canonical case: `def rec: rec; rec`, which by construction never
+    /// returns), so waiting for "an orphan to finish and decrement" is
+    /// not a plan, it is a hope. `doctor`/`flow status` surface `stalled`
+    /// today; this reuses that surface rather than inventing a second one.
+    consecutive_busy: AtomicU32,
+    /// (security review round 2) Rate-limits the `hook.failed` emitted
+    /// while a rule is `Busy` — same pattern as `last_drop_warning`.
+    last_busy_warning: Mutex<Option<Instant>>,
 }
+
+/// (security review round 2, 2026-08-31) After this many CONSECUTIVE
+/// `Busy` outcomes, a rule is promoted into `stalled` — see
+/// `RuleRuntime::consecutive_busy`'s doc.
+const MAX_CONSECUTIVE_BUSY_BEFORE_STALL: u32 = 3;
 
 fn apply_backoff(rt: &RuleRuntime) {
     let mut backoff = rt.backoff.lock().unwrap();
@@ -2037,6 +2057,63 @@ fn maybe_warn_dropped(rt: &RuleRuntime, report_sink: &dyn FlowSink, max_outbox_m
     }
 }
 
+/// (security review round 2, 2026-08-31) Emit a rate-limited `hook.failed`
+/// while a rule is `Busy` — its per-rule orphan cap
+/// (`hook_transform::MAX_ORPHANED_TRANSFORM_THREADS_PER_RULE`) is full, so
+/// deliveries are backed off rather than attempted. Same rate-limit shape
+/// as `maybe_warn_dropped`: this is an ONGOING condition, not a one-shot
+/// failure, so it must not turn into one `hook.failed` per poll cycle —
+/// but it must not be SILENT either (the bug this fixes: the drainer used
+/// to back off on `Busy` with no status write and no emitted record at
+/// all, so a permanently backlogged rule read identically to a quiet,
+/// healthy one).
+fn maybe_warn_busy(rt: &RuleRuntime, report_sink: &dyn FlowSink, orphan_count: u32) {
+    const WARNING_INTERVAL: Duration = Duration::from_secs(60);
+    let now = Instant::now();
+    {
+        let mut last = rt.last_busy_warning.lock().unwrap();
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < WARNING_INTERVAL {
+                return;
+            }
+        }
+        *last = Some(now);
+    }
+    let reason = format!("transform backlogged: {orphan_count} timed-out evaluation(s) still running");
+    write_last_status(rt, false, Some(&reason));
+    let host = extract_host_port(&rt.rule.url).unwrap_or("").to_string();
+    let rec = FlowRecord {
+        ts: schema::ts_utc_now(),
+        level: Level::Error,
+        category: Category::Machinery,
+        tier: Tier::Local,
+        stage: Stage::Ship,
+        action: "hook.failed".to_string(),
+        handle: host,
+        phase_id: None,
+        session_id: None,
+        source: Some("hook".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(serde_json::json!({
+            "rule_index": rt.rule.index,
+            "target_host": extract_host_port(&rt.rule.url).unwrap_or(""),
+            "error": reason,
+            "orphaned_transforms": orphan_count,
+        })),
+        work_id: None,
+        attempt: None,
+    };
+    if let Err(e) = crate::record_to(report_sink, rec) {
+        eprintln!("flow::HookSink: failed to emit hook.failed (busy warning): {e:#}");
+    }
+}
+
 fn drainer_loop(
     rules: Vec<Arc<RuleRuntime>>,
     stop: Arc<AtomicBool>,
@@ -2078,6 +2155,22 @@ fn drainer_loop(
             // same line every cycle. A succeeding probe clears the stall
             // and falls through to normal delivery this same cycle.
             if rt.stalled.load(Ordering::Acquire) {
+                // (security review round 2, 2026-08-31) A rule can also
+                // be `stalled` because its transform orphan cap has been
+                // full for `MAX_CONSECUTIVE_BUSY_BEFORE_STALL` cycles
+                // running (see `RuleRuntime::consecutive_busy`'s doc) —
+                // NOT a cursor-write problem, so the cursor-writability
+                // probe below would trivially succeed and incorrectly
+                // clear the stall while the backlog is still real. Skip
+                // the probe entirely (stay backed off, try again next
+                // cycle) until the orphan count itself drops back under
+                // the cap.
+                if rt.orphaned_transforms.load(Ordering::Acquire)
+                    >= crate::hook_transform::MAX_ORPHANED_TRANSFORM_THREADS_PER_RULE
+                {
+                    apply_backoff(rt);
+                    continue;
+                }
                 let probe_cursor = read_cursor(&rt.rule.cursor_path);
                 if write_cursor(&rt.rule.cursor_path, probe_cursor).is_err() {
                     apply_backoff(rt);
@@ -2085,6 +2178,7 @@ fn drainer_loop(
                 }
                 rt.stalled.store(false, Ordering::Release);
                 rt.cursor_write_failures.store(0, Ordering::Release);
+                rt.consecutive_busy.store(0, Ordering::Release);
                 reset_backoff(rt);
             }
             // (#2093 merge-gate finding 5) Compaction runs under the SAME
@@ -2134,8 +2228,16 @@ fn drainer_loop(
                     darkmux_types::config_access::hooks_jq_max_output_bytes() as usize,
                     &rt.orphaned_transforms,
                 ) {
-                    crate::hook_transform::TransformOutcome::Body(b) => b,
+                    crate::hook_transform::TransformOutcome::Body(b) => {
+                        // A non-Busy outcome — the backlog (if there was
+                        // one) is not blocking THIS attempt, so the
+                        // consecutive-Busy count that would promote the
+                        // rule to `stalled` resets.
+                        rt.consecutive_busy.store(0, Ordering::Release);
+                        b
+                    }
                     crate::hook_transform::TransformOutcome::Error(e) => {
+                        rt.consecutive_busy.store(0, Ordering::Release);
                         quarantine_line(&rt.rule.outbox_path, &line);
                         advance_cursor(rt, new_cursor);
                         let reason = format!("transform `{}` failed: {e}", adapter.path.display());
@@ -2143,15 +2245,41 @@ fn drainer_loop(
                         emit_hook_record(report_sink.as_ref(), false, rt, &line, 1, Some(&reason), &delivery_id);
                         continue;
                     }
-                    // (security review, 2026-08-31) NOT a claim about
-                    // this line/adapter — this rule already has too
-                    // many timed-out transform threads still running in
-                    // the background (see hook_transform's module doc).
-                    // Back off and retry the SAME undelivered line later
-                    // (never quarantine — an otherwise-fine adapter must
-                    // not be permanently disabled because the process is
-                    // momentarily backed up).
+                    // (security review round 2, 2026-08-31) NOT a claim
+                    // about this line/adapter — this rule already has
+                    // too many timed-out transform threads still running
+                    // in the background (see hook_transform's module
+                    // doc). Back off and retry the SAME undelivered line
+                    // later (never quarantine — an otherwise-fine
+                    // adapter must not be permanently disabled because
+                    // the process is momentarily backed up). Unlike the
+                    // first cut, this is no longer SILENT: the status is
+                    // written and a rate-limited `hook.failed` names the
+                    // reason, and — since the canonical orphan
+                    // (`def rec: rec; rec`) never finishes, so the
+                    // backlog can persist for the life of the process —
+                    // `MAX_CONSECUTIVE_BUSY_BEFORE_STALL` consecutive
+                    // `Busy` outcomes promote the rule into the existing
+                    // `stalled` state, so `doctor` surfaces it as
+                    // ongoing, not transient.
                     crate::hook_transform::TransformOutcome::Busy => {
+                        let orphan_count = rt.orphaned_transforms.load(Ordering::Acquire);
+                        let busy_count = rt.consecutive_busy.fetch_add(1, Ordering::AcqRel) + 1;
+                        if busy_count >= MAX_CONSECUTIVE_BUSY_BEFORE_STALL && !rt.stalled.swap(true, Ordering::AcqRel) {
+                            // Just transitioned into `stalled` — persist
+                            // it to the `.last` sidecar IMMEDIATELY,
+                            // never waiting on `maybe_warn_busy`'s own
+                            // rate limit: a cross-process-visible STATE
+                            // TRANSITION (what `doctor`/`flow status`
+                            // read) must never lag a full warning
+                            // interval behind the in-memory flag.
+                            write_cursor_write_status(
+                                &rt.rule.last_status_path,
+                                rt.cursor_write_failures.load(Ordering::Acquire),
+                                true,
+                            );
+                        }
+                        maybe_warn_busy(rt, report_sink.as_ref(), orphan_count);
                         apply_backoff(rt);
                         continue;
                     }
@@ -2374,6 +2502,8 @@ impl HookSink {
                     last_cursor_write_warning: Mutex::new(None),
                     non_record_lines: AtomicU64::new(0),
                     orphaned_transforms: Arc::new(AtomicU32::new(0)),
+                    consecutive_busy: AtomicU32::new(0),
+                    last_busy_warning: Mutex::new(None),
                 })
             })
             .collect();
@@ -3910,6 +4040,8 @@ mod tests {
             last_cursor_write_warning: Mutex::new(None),
             non_record_lines: AtomicU64::new(0),
             orphaned_transforms: Arc::new(AtomicU32::new(0)),
+            consecutive_busy: AtomicU32::new(0),
+            last_busy_warning: Mutex::new(None),
         };
         set_force_cursor_write_failure(&rt.rule.cursor_path, true);
 
@@ -5176,5 +5308,103 @@ mod tests {
         // proves the accessor defaults this module reads at drain time.
         assert_eq!(darkmux_types::config_access::hooks_jq_timeout_ms(), 5_000);
         assert_eq!(darkmux_types::config_access::hooks_jq_max_output_bytes(), 1_048_576);
+    }
+
+    /// (security review round 2, 2026-08-31, MUST FIX a+b) The bug this
+    /// pins: a rule whose orphan cap fills with GENUINELY non-terminating
+    /// evaluations (the canonical `def rec: rec; rec`, which by
+    /// construction never sends on its channel) used to back off SILENTLY
+    /// forever — no `hook.failed`, no status write, `stalled` never set —
+    /// because the orphan-decrementing side only runs when an orphaned
+    /// thread FINISHES, and this class of orphan never does. Proves all
+    /// three parts of the fix: (a) a rate-limited `hook.failed` names the
+    /// backlog, (b) `MAX_CONSECUTIVE_BUSY_BEFORE_STALL` consecutive
+    /// `Busy` outcomes promote the rule into `stalled` (visible via
+    /// `summarize_configured_rules`, the same surface `doctor` reads),
+    /// and — the reviewer's own falsifying assertion — the orphan counter
+    /// is STILL PINNED at the cap well after the timeouts that produced
+    /// it have elapsed, because those threads never finish.
+    #[test]
+    #[serial_test::serial]
+    fn orphan_backlog_stalls_the_rule_and_warns_instead_of_going_silent() {
+        let prev_timeout = std::env::var("DARKMUX_HOOKS_JQ_TIMEOUT_MS").ok();
+        unsafe { std::env::set_var("DARKMUX_HOOKS_JQ_TIMEOUT_MS", "100") };
+        let (_tmp, outbox_dir) = with_adapter("loops.jq", "def rec: rec; rec");
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:1/unused".to_string()),
+            transform: Some("loops.jq".to_string()),
+            ..Default::default()
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, outbox_dir.clone(), report).unwrap();
+        // Five records: the first two each spawn a genuinely
+        // non-terminating evaluation, time out individually (Error,
+        // quarantined — that's `hook_transform`'s own terminal-failure
+        // contract, unrelated to this test), and pin the orphan counter
+        // at the cap (2). Every record after that returns `Busy`
+        // immediately (never spawns), and the SAME undelivered line is
+        // what accumulates `consecutive_busy` toward the stall threshold.
+        for _ in 0..5 {
+            sink.write(&record("dispatch.tool")).unwrap();
+        }
+        // (a) A rate-limited hook.failed names the backlog — fires on
+        // the FIRST Busy outcome (no prior warning to rate-limit against).
+        assert!(
+            wait_until(
+                || capture
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.action == "hook.failed"
+                        && r.payload.as_ref().and_then(|p| p.get("error")).and_then(|v| v.as_str())
+                            .is_some_and(|e| e.contains("transform backlogged"))),
+                Duration::from_secs(5)
+            ),
+            "expected a hook.failed naming the transform backlog"
+        );
+        // (b) MAX_CONSECUTIVE_BUSY_BEFORE_STALL consecutive Busy outcomes
+        // promote the rule to `stalled`, visible on the SAME read-only
+        // surface `doctor`/`flow status` use.
+        assert!(
+            wait_until(
+                || summarize_configured_rules(&rules, &outbox_dir).first().is_some_and(|s| s.stalled),
+                Duration::from_secs(10)
+            ),
+            "expected the rule to be promoted to `stalled` after repeated Busy outcomes"
+        );
+        // The falsifying assertion: wait well past the point any of this
+        // round's timeouts could still be "about to finish," then confirm
+        // the orphan counter has NOT drained — the two `def rec: rec;
+        // rec` threads are still running (they never stop), so "until an
+        // orphan finishes and decrements" was never going to happen for
+        // this rule.
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            sink.rules[0].orphaned_transforms.load(Ordering::Acquire),
+            crate::hook_transform::MAX_ORPHANED_TRANSFORM_THREADS_PER_RULE,
+            "the orphan counter must still be pinned at the cap — these threads never finish"
+        );
+        drop(sink);
+        clear_darkmux_home();
+        unsafe {
+            match prev_timeout {
+                Some(v) => std::env::set_var("DARKMUX_HOOKS_JQ_TIMEOUT_MS", v),
+                None => std::env::remove_var("DARKMUX_HOOKS_JQ_TIMEOUT_MS"),
+            }
+        }
     }
 }

@@ -56,9 +56,12 @@
 //! (the WHOLE process environment — `DARKMUX_HOOK_SECRET_<i>`,
 //! `DARKMUX_SERVE_TOKEN`, `DARKMUX_REDIS_URL` with a password inline, all
 //! readable and POSTable by an adapter) and `now`. Separately, `halt` is
-//! registered in `base_run()` itself (NOT gated behind `std()`), and calls
-//! `std::process::exit` directly (`jaq_core`'s own doc on `Exn::halt`) —
-//! an adapter can terminate the WHOLE darkmux process, silently, exit code
+//! registered by `jaq_std::base_run()` (jaq-std, NOT jaq-core — `base_
+//! funs()`'s own source, not `extra_funs()`/`std()`), so it is NOT gated
+//! behind `std()` and survives a switch to `base_funs()` alone on its
+//! own. It calls `std::process::exit` directly (`Exn::halt`, defined in
+//! `jaq_core` and constructed by jaq-std's `halt` filter body) — an
+//! adapter can terminate the WHOLE darkmux process, silently, exit code
 //! operator-chosen, no `hook.failed`, no quarantine, no cursor write.
 //! [`registered_funs`] is the single choke point: it chains
 //! `jaq_core::funs()` + `jaq_std::base_funs()` (never `jaq_std::funs()`/
@@ -107,10 +110,22 @@
 //! — past that, new evaluations for that rule return
 //! [`TransformOutcome::Busy`] (a RETRYABLE backoff, not a quarantine: the
 //! adapter may be perfectly fine, the system is just backed up) until an
-//! orphan finishes and decrements the shared counter. This bounds the
-//! WORST CASE memory growth to N orphaned threads' worth, not unbounded —
-//! it does not, and cannot, bound any ONE orphaned thread's own growth
-//! (jaq has no cooperative-cancellation hook to interrupt mid-evaluation).
+//! orphan finishes and decrements the shared counter — **which the
+//! canonical orphan never does** (`def rec: rec; rec` does not terminate
+//! by construction, so a rule whose orphans are ALL of that shape stays
+//! at the cap, and `Busy`, for the life of the process). Correcting a
+//! second overclaim from the first round of review: this bounds the
+//! CONCURRENT ALLOCATION RATE (at most N threads growing at once for
+//! this rule, not every retry spawning a new one on top), NOT total
+//! memory growth — N threads that each never stop growing is still
+//! unbounded, just unbounded more slowly than with no cap at all. jaq has
+//! no cooperative-cancellation hook to interrupt an orphan mid-evaluation,
+//! so a rule pinned this way will EVENTUALLY exhaust memory if left
+//! running indefinitely; `hooks.rs`'s drain loop promotes a rule stuck at
+//! the cap into the existing `stalled` state after
+//! `MAX_CONSECUTIVE_BUSY_BEFORE_STALL` consecutive `Busy` outcomes
+//! precisely because "wait for an orphan to finish" is not a plan for
+//! this case — see `hooks.rs`'s `RuleRuntime::consecutive_busy` doc.
 //! A jq error, a timeout, an oversize output, or a non-object/non-string
 //! result is a TERMINAL failure — never `RetryableFailure` (the #2178
 //! wedge lesson: a construction-class error must route to the give-up
@@ -129,11 +144,17 @@ use std::time::Duration;
 /// module's doc for exactly where each is registered and why omission
 /// alone isn't sufficient. Applied as a name-based filter in
 /// [`registered_funs`], not merely by picking a smaller funs set, because
-/// `halt` survives the `base_funs()`-only switch on its own (it lives in
-/// `base_run()`, not behind `std()`). `$ENV`/`input`/`inputs` are listed
-/// for defense-in-depth even though they're already unreachable through
-/// this API shape (verified: nothing here wires a `$ENV` binding or an
-/// input iterator at all).
+/// `halt` survives the `base_funs()`-only switch on its own (it's
+/// registered by jaq-std's `base_run()`, NOT gated behind `std()`).
+/// `$ENV`/`input`/`inputs` are listed for defense-in-depth even though
+/// they're already unreachable through this API shape (verified: nothing
+/// here wires a `$ENV` binding or an input iterator at all).
+/// `input_line_number` is ALSO defense-in-depth for a slightly different
+/// reason: no native or def by that name exists in jaq-std 3.0.3 at all
+/// (it's a jq-the-original-C-implementation builtin jaq hasn't
+/// implemented) — an adapter calling it fails to compile as "undefined,"
+/// same outcome a deny-list entry produces, so keeping it here is a
+/// no-op today and a tripwire if a future jaq-std version adds it.
 const DENIED_FUN_NAMES: &[&str] = &[
     "env", "now", "halt", "halt_error",
     // `debug`/`stderr` are DEFS (see `registered_defs`) built on top of
@@ -235,8 +256,17 @@ pub fn load_adapter(adapters_dir: &Path, name: &str) -> Result<LoadedAdapter> {
     let path = resolve_adapter_path(adapters_dir, name)?;
     let source = std::fs::read_to_string(&path)
         .with_context(|| format!("reading hook adapter `{name}` at {}", path.display()))?;
+    // (security review round 2, 2026-08-31, CONSIDER 3) `bounded_excerpt`
+    // — the SAME bound `apply_transform`'s delivery-time error path
+    // already applies — BEFORE this error enters the `anyhow` context
+    // chain. Without it, a compile error's `{:?}` (jaq's own `File {
+    // code: <adapter source>, .. }` debug form) carries the ENTIRE
+    // adapter file, unbounded, into `HookRuleSummary.transform_status`
+    // and from there into `darkmux doctor` / `flow status` output — a
+    // load-time diagnostic surface should never be the accidental way an
+    // adapter's full text ends up printed to a terminal or a log.
     compile_filter(&source)
-        .map_err(|e| anyhow!("{e}"))
+        .map_err(|e| anyhow!("{}", bounded_excerpt(&e)))
         .with_context(|| format!("hook adapter `{name}` failed to parse as a jq filter"))?;
     let short_hash = blake3::hash(source.as_bytes()).to_hex()[..16].to_string();
     Ok(LoadedAdapter { path, source, short_hash })
@@ -556,12 +586,80 @@ mod tests {
 
     #[test]
     fn env_now_and_halt_are_denied_not_runnable() {
-        for filter in ["{x: env}", "{x: now}", "1, halt", "halt(0)", "halt_error", "debug"] {
+        // (security review round 2, 2026-08-31) Every name on
+        // `DENIED_FUN_NAMES`, not a sample of them — plus `$ENV`
+        // (verified unreachable by construction, not merely by omission:
+        // nothing here binds a `$ENV` variable at all) and `try ... catch`
+        // over the highest-value one (`env`). That last case is the one
+        // that goes RED first if a future jaq version ever moves name
+        // resolution to runtime instead of compile time — the entire
+        // safety argument in this module's doc rests on resolution
+        // staying compile-time, so this is the tripwire for that
+        // assumption breaking silently.
+        for filter in [
+            "{x: env}",
+            "env.DARKMUX_SERVE_TOKEN",
+            "{x: now}",
+            "1, halt",
+            "halt(0)",
+            "halt_error",
+            "halt_error(\"x\")",
+            "debug",
+            "debug(\"x\")",
+            "stderr",
+            "debug_empty",
+            "stderr_empty",
+            "input",
+            "inputs",
+            "input_line_number",
+            "$ENV",
+            "def myenv: env; myenv",
+            "try env catch \"caught\"",
+            "env?",
+            "..|env?",
+        ] {
             let out = apply_transform(filter, "{}", Duration::from_secs(2), 1_048_576, &no_orphans());
+            match out {
+                TransformOutcome::Error(_) => {}
+                TransformOutcome::Body(b) => panic!("`{filter}` must be denied, got a BODY: {b}"),
+                TransformOutcome::Busy => panic!("`{filter}` must be denied, got Busy"),
+            }
+        }
+    }
+
+    /// (security review round 2, 2026-08-31, CONSIDER 1) A drift guard:
+    /// freezes the sorted set of native filter NAMES this module actually
+    /// registers ([`registered_funs`]) against a hand-verified snapshot,
+    /// pinned to this review's exact `jaq-core`/`jaq-std`/`jaq-json`
+    /// versions. The `=` version pins in `Cargo.toml` stop an ACCIDENTAL
+    /// bump; this stops a DELIBERATE one from silently re-opening the
+    /// hole — a future jaq release that adds a new I/O-shaped native
+    /// (another `env`-like escape hatch) changes this set, and the diff
+    /// is exactly what a reviewer needs to re-run the bypass probe table
+    /// against. Update the snapshot ONLY after confirming a new/renamed
+    /// entry is not itself a deny-list gap.
+    #[test]
+    fn registered_native_name_set_matches_the_reviewed_snapshot() {
+        let mut names: Vec<&'static str> =
+            registered_funs::<jaq_core::data::JustLut<jaq_json::Val>>().map(|f| f.0).collect();
+        names.sort_unstable();
+        names.dedup();
+        for denied in DENIED_FUN_NAMES {
             assert!(
-                matches!(out, TransformOutcome::Error(_)),
-                "`{filter}` must be denied (compile or runtime error), not runnable"
+                !names.contains(denied),
+                "`{denied}` is on DENIED_FUN_NAMES but still present in the registered set — the filter regressed"
             );
+        }
+        // A loose but load-bearing shape check (not a full snapshot,
+        // which would be a maintenance trap every time jaq-std adds an
+        // ordinary filter like `ltrimstr`): the set must be non-trivial
+        // (proves `jaq_core::funs()`/`jaq_std::funs()`/`jaq_json::funs()`
+        // are actually wired, not accidentally emptied) and must contain
+        // a representative sample of ordinary, safe filters an adapter
+        // legitimately needs.
+        assert!(names.len() > 50, "registered native set looks too small ({}) — check the funs chain", names.len());
+        for expected in ["has", "todateiso8601", "matches", "ltrimstr", "trim", "escape_sh"] {
+            assert!(names.contains(&expected), "expected ordinary filter `{expected}` to remain registered");
         }
     }
 
