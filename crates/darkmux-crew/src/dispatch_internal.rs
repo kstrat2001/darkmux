@@ -4174,6 +4174,22 @@ use crate::telemetry_sampler::reduce_metric;
 struct TrajectorySummary {
     turns: u32,
     tool_calls: u32,
+    /// (#2169) Of `tool_calls` above, the subset that DISPATCHED and came
+    /// back `ok: false` — a real tool that ran (or tried to) and reported
+    /// failure. Kept separate from `tool_calls_invalid_name` below so
+    /// "84 ok / 0 failed / 48 malformed" reads as three distinct numbers:
+    /// a call counted here reached `tools::dispatch`; one counted below
+    /// never did.
+    tool_calls_failed: u32,
+    /// (#2169) Structured tool calls whose `name` was never in the
+    /// runtime's allowlist (Devstral 2 + LM Studio's Mistral parser
+    /// slicing model content at `[TOOL_CALLS]` into the name field is the
+    /// observed cause). These never reach `tools::dispatch` — they never
+    /// increment `tool_calls` or `tool_calls_failed` above — so this is
+    /// the ONLY place they're counted. Summed from each turn's coalesced
+    /// `dispatch.tool.malformed_names` event's `count` field, not counted
+    /// one-by-one (the runtime never emits one event per invalid call).
+    tool_calls_invalid_name: u32,
     compactions: u32,
     heartbeats: u32,
     /// (#2094 finding 2) Live running sum/count of the `runtime.rest`
@@ -4780,6 +4796,19 @@ fn build_dispatch_complete_payload(
         "result_class": if exit_code == 0 { "ok" } else { "error" },
         "total_turns": summary.turns,
         "total_tools": summary.tool_calls,
+        // (#2169, payload-additive — no FLOW_SCHEMA bump, same precedent as
+        // `stderr_excerpt` above) Separates what `total_tools` always
+        // conflated: a dispatched call that came back `ok: false`
+        // (`tool_calls_failed`) from a structured call whose `name` was
+        // never a real tool and so never dispatched at all
+        // (`tool_calls_invalid_name`). Reading "84 ok / 0 failed / 48
+        // malformed" off a run now takes `total_tools - tool_calls_failed`
+        // for ok, `tool_calls_failed` for failed, and
+        // `tool_calls_invalid_name` for the model-content-sliced-into-name
+        // pattern — instead of the pre-#2169 shape where all three were
+        // one undifferentiated number.
+        "tool_calls_failed": summary.tool_calls_failed,
+        "tool_calls_invalid_name": summary.tool_calls_invalid_name,
         "total_compactions": summary.compactions,
         "prompt_tokens": tokens.prompt,
         "completion_tokens": tokens.completion,
@@ -5535,6 +5564,15 @@ impl TailerState {
                     .get("ok")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
+                // (#2169) A dispatched-and-failed call is a DIFFERENT
+                // bucket from an invalid-name call that never dispatched
+                // at all (`tool_calls_invalid_name`, incremented in the
+                // detector-event arm above). Both used to be
+                // indistinguishable inside the single `total_tools`
+                // count.
+                if !tool_ok {
+                    self.summary.tool_calls_failed = self.summary.tool_calls_failed.saturating_add(1);
+                }
                 if tool_ok {
                     if let Some(deadline) = &self.inactivity_deadline {
                         let new_deadline =
@@ -5733,7 +5771,21 @@ impl TailerState {
             | "dispatch.reasoning_loop.suspected"
             | "dispatch.tool.repeated_failure"
             | "dispatch.intra_turn_stall.recovered"
-            | "dispatch.per_turn_cap.salvaged" => {
+            | "dispatch.per_turn_cap.salvaged"
+            | "dispatch.tool.malformed_names" => {
+                // (#2169) Live running total — a call the model produced with
+                // a non-tool `name` never dispatches, so it can't reach
+                // `tool.completed`/`self.summary.tool_calls` at all. This is
+                // the ONLY place that bucket gets counted, kept separate from
+                // `tool_calls_failed` below so "84 ok / 0 failed / 48
+                // malformed" reads as three distinct numbers, not one
+                // undifferentiated failure count.
+                if event_type == "dispatch.tool.malformed_names" {
+                    self.summary.tool_calls_invalid_name = self
+                        .summary
+                        .tool_calls_invalid_name
+                        .saturating_add(event.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32);
+                }
                 if let Some(payload) = detector_telemetry_payload(event_type, &event) {
                     // (#1955) Same payload to the envelope. One producer, so
                     // the viewer and the orchestrator cannot disagree about
@@ -5995,6 +6047,20 @@ fn detector_telemetry_payload(
                 ),
             )
         }
+        "dispatch.tool.malformed_names" => {
+            let count = u64_field("count");
+            let model = str_field("model");
+            let sample = str_field("sample_name_prefix");
+            (
+                "malformed_tool_names",
+                "warn",
+                format!(
+                    "{count} tool call(s) this turn carried a `name` that is not a real \
+                     tool (model={model}, sample=\"{sample}\") — never dispatched, \
+                     coalesced into one feedback message (#2169)"
+                ),
+            )
+        }
         _ => return None,
     };
 
@@ -6008,6 +6074,24 @@ fn detector_telemetry_payload(
         "severity": severity,
         "detail": detail,
     });
+
+    // (#2169) The issue's own spec names these three fields explicitly
+    // (`{kind, count, model, sample_name_prefix}`), riding alongside the
+    // `detail` string above rather than only inside it — a consumer
+    // aggregating "how many malformed calls this dispatch" or filtering by
+    // model shouldn't have to parse the human-readable sentence. `model`
+    // also already rides on the FlowRecord's own top-level `model` field
+    // (every `emit_telemetry` call stamps `Some(&self.model)`); repeating
+    // it in the payload keeps this event self-describing on its own,
+    // matching how `tool_name`/`failure_count` are both in `detail` AND
+    // implicitly the record's `handle`/`session_id` for the sibling
+    // detectors above.
+    if event_type == "dispatch.tool.malformed_names" {
+        payload["count"] = event.get("count").cloned().unwrap_or(serde_json::json!(0));
+        payload["model"] = event.get("model").cloned().unwrap_or(serde_json::Value::Null);
+        payload["sample_name_prefix"] =
+            event.get("sample_name_prefix").cloned().unwrap_or(serde_json::Value::Null);
+    }
 
     // (#994 engagement-context capture) Key the firing to the file it happened
     // in, so this *caution* can later be retrieved for the same file and fed

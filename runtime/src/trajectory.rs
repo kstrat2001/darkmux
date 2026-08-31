@@ -479,6 +479,46 @@ impl Trajectory {
         }));
     }
 
+    /// dispatch.tool.malformed_names — fires ONCE per turn where the
+    /// model's structured `tool_calls` carried one or more names that
+    /// are not in the runtime's allowlist (#2169). Observed live:
+    /// Devstral 2 quoting its own generated code around LM Studio's
+    /// Mistral `[TOOL_CALLS]` marker, which the parser slices such
+    /// that the preceding text becomes the call's `name` — 48 in one
+    /// turn, each of which pre-#2169 was dispatched, failed with
+    /// "tool doesn't exist", and burned a tool message. Post-#2169
+    /// none of them are dispatched; this event is the ONLY trace of
+    /// the whole turn's malformed batch, so `count` names how many
+    /// were coalesced.
+    ///
+    /// `model` is the dispatch's model id, forwarded so the run record
+    /// names the MODEL (not the tool layer) as the source of the
+    /// pattern — the whole point of #2169 is that this reads as a
+    /// model finding, not a broken-tools finding.
+    ///
+    /// `sample_name_prefix` is one representative offending name,
+    /// already sanitized by `loop_runner::sanitize_sample_name_prefix`
+    /// (≤ 40 chars, header-safe printable ASCII, no newlines) — this
+    /// event rides into flow records and eventually an HTTP-header-
+    /// bearing hook delivery (#2178's sanitizer covers that transport;
+    /// this event carries an already-clean value into it).
+    pub fn append_malformed_tool_names(
+        &mut self,
+        seq: u32,
+        count: u32,
+        model: &str,
+        sample_name_prefix: &str,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.tool.malformed_names",
+            "seq": seq,
+            "ts": unix_ms(),
+            "count": count,
+            "model": model,
+            "sample_name_prefix": sample_name_prefix,
+        }));
+    }
+
     /// dispatch.reasoning_loop.suspected — fires when the runtime's
     /// reasoning-loop detector (#461) flags that the same normalized
     /// reasoning content has appeared `count` times in a sliding window

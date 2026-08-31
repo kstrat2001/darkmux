@@ -4421,6 +4421,76 @@
         );
     }
 
+    // ─── #2169 malformed structured tool-call names ────────────────────
+
+    /// `dispatch.tool.malformed_names` → `{kind:"malformed_tool_names",
+    /// severity:"warn", detail:<non-empty>, count, model,
+    /// sample_name_prefix}` — the issue's own spec names `count`/`model`/
+    /// `sample_name_prefix` as explicit payload fields (not just words
+    /// inside `detail`), so a consumer aggregating or filtering by model
+    /// doesn't have to parse the sentence.
+    #[test]
+    fn detector_telemetry_payload_maps_malformed_tool_names_event() {
+        let event = serde_json::json!({
+            "type": "dispatch.tool.malformed_names",
+            "seq": 4,
+            "count": 5,
+            "model": "mistralai/devstral-small-2-2512",
+            "sample_name_prefix": "} catch (error) { --- [TOOL_CALLS]",
+        });
+        let payload = detector_telemetry_payload("dispatch.tool.malformed_names", &event)
+            .expect("maps malformed_tool_names");
+        assert_eq!(payload["kind"], "malformed_tool_names");
+        assert_eq!(payload["severity"], "warn");
+        assert_eq!(payload["count"], 5);
+        assert_eq!(payload["model"], "mistralai/devstral-small-2-2512");
+        assert_eq!(payload["sample_name_prefix"], "} catch (error) { --- [TOOL_CALLS]");
+        let detail = payload["detail"].as_str().expect("detail is a string");
+        assert!(
+            detail.contains('5') && detail.contains("mistralai/devstral-small-2-2512"),
+            "detail must weave in count + model; got {detail:?}"
+        );
+    }
+
+    /// The `tool.completed`/`dispatch.tool.malformed_names` event pair
+    /// accumulates into TWO SEPARATE `TrajectorySummary` counters — a
+    /// dispatched-and-failed call increments `tool_calls_failed`; a
+    /// coalesced malformed-names event's `count` increments
+    /// `tool_calls_invalid_name` — and a malformed-name call never
+    /// touches `tool_calls`/`tool_calls_failed` at all (it never
+    /// produces its own `tool.completed` event, by construction — the
+    /// runtime never dispatches it).
+    #[test]
+    #[serial] // reaches emit_telemetry() -> darkmux_flow::record() via poll_and_emit()
+    fn handle_event_malformed_tool_names_and_tool_failure_accumulate_separately() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("trajectory.jsonl");
+        let mut state = fixture_state(path.clone());
+
+        let lines = "\
+            {\"type\":\"tool.completed\",\"tool_seq\":1,\"tool_name\":\"read\",\"ok\":true}\n\
+            {\"type\":\"tool.completed\",\"tool_seq\":2,\"tool_name\":\"bash\",\"ok\":false}\n\
+            {\"type\":\"dispatch.tool.malformed_names\",\"seq\":1,\"count\":5,\"model\":\"devstral\",\"sample_name_prefix\":\"bogus\"}\n";
+        std::fs::write(&path, lines).unwrap();
+        state.poll_and_emit();
+
+        assert_eq!(state.summary.tool_calls, 2, "total_tools counts only DISPATCHED calls");
+        assert_eq!(
+            state.summary.tool_calls_failed, 1,
+            "exactly the one dispatched-and-failed call, never the 5 malformed ones"
+        );
+        assert_eq!(
+            state.summary.tool_calls_invalid_name, 5,
+            "the coalesced event's count lands here, not in tool_calls/tool_calls_failed"
+        );
+        // Also lands in the envelope's `detections` array via the shared
+        // producer (#1955) — same payload the flow record carries.
+        assert!(
+            state.summary.detections.iter().any(|d| d["kind"] == "malformed_tool_names"),
+            "must also reach the envelope's detections array"
+        );
+    }
+
     /// Sibling of the test above for `max_tokens_per_call` — proves the
     /// wording actually discriminates between the two kinds (the exact
     /// #2165 miss: "hit cap 1000" could have been either).

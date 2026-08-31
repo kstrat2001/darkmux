@@ -20,5 +20,6 @@
   "escalation_contract": "bail-with-explanation",
   "feedback_templates": {
     "cycle_suspected": "[darkmux-runtime] You've called `{tool_name}` {count} times in {window_size} turns with the same arguments. You are re-reading ground you have already covered. Move to a file in your scope you have not opened yet, or stop and report your coverage."
-  }
+  },
+  "_model_choice_note": "(#2169) Devstral 2 (mistralai/devstral-*) under LM Studio's Mistral tool-call parser has been observed emitting structured tool_calls whose `name` is model content sliced around its own `[TOOL_CALLS]` marker — 48 in one crawl turn. darkmux never dispatches these post-#2169 (partitioned + coalesced into one feedback message + a `malformed_tool_names` detector), so a Devstral-staffed crawler no longer burns its tool budget on them, but a turn that produces a batch still costs the coalesced-feedback round trip. Other tested models for this role family have not shown the pattern — name the model actually staffed when characterizing crawl behavior, rather than assuming this is universal."
 }

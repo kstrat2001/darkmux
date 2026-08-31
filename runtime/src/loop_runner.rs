@@ -2681,6 +2681,25 @@ fn run_with_sleeper(
                     continue;
                 }
 
+                // (#2169) Partition BEFORE any dispatch: a structured
+                // call whose `name` isn't a real tool is never executed,
+                // never checkpointed as pending, and never reaches the
+                // cycle/failure-rate detectors. See
+                // `partition_tool_calls_by_name`'s doc for why this has
+                // to happen here (before `calls_snapshot`) rather than
+                // inside the dispatch loop below, and for how this
+                // composes with #479's per-turn-cap salvage.
+                let (calls, invalid_calls) = partition_tool_calls_by_name(calls, &allowed_tool_names);
+                handle_malformed_tool_calls(
+                    &invalid_calls,
+                    &allowed_tool_names,
+                    model,
+                    turns,
+                    trajectory,
+                    &mut feedback_injector,
+                    &mut messages,
+                );
+
                 // Dispatch each call; append a `tool` message per
                 // result so the next request shows the model exactly
                 // what each tool returned. Trajectory records each
@@ -3807,6 +3826,145 @@ fn count_well_formed_tool_calls(msg: &Message) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+// ─── (#2169) malformed structured tool-call names ──────────────────────
+
+/// The `tool` role message body every invalid-name call's `tool_call_id`
+/// gets. The OpenAI-compatible chat-completions protocol LM Studio
+/// implements requires exactly one `tool` message per id in the
+/// assistant's `tool_calls` array — omitting one for calls that get
+/// coalesced into a single feedback note is rejected by the endpoint on
+/// the NEXT request (a missing tool_call_id reference). Rather than
+/// repeat the full "N tool call(s) carried names that are not tools…"
+/// text N times (which is the shape #2169 exists to STOP — one turn was
+/// observed producing 48 near-duplicate error strings), every invalid
+/// call gets this short constant body; the ONE synthetic feedback
+/// message queued alongside it (`FeedbackInjector::queue_malformed_tool_names`)
+/// carries the real explanation + the tool list, and is what the model
+/// actually reads to correct course. This is the "one message per id
+/// with a short constant body" option named in PR #2169's description —
+/// `Message::tool_result` already builds exactly this shape, so no new
+/// message constructor was needed.
+const MALFORMED_TOOL_CALL_RESULT_BODY: &str =
+    "[darkmux-runtime] not executed — this call's name is not a real tool. \
+     See the system note this turn for the full explanation and the list of \
+     tools you can actually call.";
+
+/// Sanitize a malformed tool-call `name` before any part of it rides into
+/// a trajectory event (and from there, a flow record, and potentially an
+/// HTTP header on a hook delivery — #2178's `sanitize_header_value` in
+/// `darkmux-flow` filters the SAME allowlist at that later boundary; this
+/// is the same idea applied at the point of origin so the value is
+/// already clean by the time it reaches any downstream sink). Model
+/// output is untrusted content — Devstral's sliced-`[TOOL_CALLS]` name
+/// has been observed carrying newlines and arbitrary punctuation from
+/// quoted code.
+///
+/// Allowlist: tab, space, and the visible ASCII range `0x21..=0x7E` —
+/// anything else (including CR/LF) becomes `_`. Capped at 40 chars: enough
+/// to recognize the pattern (a snippet of quoted code, the `[TOOL_CALLS]`
+/// marker itself), never enough to leak the model's full generation into
+/// telemetry.
+fn sanitize_sample_name_prefix(raw: &str) -> String {
+    const MAX_LEN: usize = 40;
+    raw.chars()
+        .map(|c| {
+            let is_allowed = c.is_ascii() && {
+                let b = c as u32;
+                b == 0x09 || b == 0x20 || (0x21..=0x7E).contains(&b)
+            };
+            if is_allowed {
+                c
+            } else {
+                '_'
+            }
+        })
+        // Every char post-filter is a single ASCII byte, so char-count
+        // truncation here is also byte-count truncation of the result.
+        .take(MAX_LEN)
+        .collect()
+}
+
+/// Partition a turn's structured tool calls into (dispatchable,
+/// invalid-name) BEFORE any of them reach `tools::dispatch` (#2169).
+///
+/// Structured `tool_calls` come back from LM Studio's API already
+/// parsed — unlike the plain-text promoter (`plain_text_tool_calls.rs`),
+/// which validates every name against `allowed_tool_names` before it
+/// ever becomes a `ToolCall`, nothing upstream of this point checks a
+/// STRUCTURED call's name. Devstral 2 quoting its own generated code
+/// around LM Studio's Mistral `[TOOL_CALLS]` marker produces exactly
+/// this: well-formed JSON `arguments`, a `name` that is a slice of the
+/// model's own text. Pre-#2169 each one was dispatched, failed with
+/// "tool '<name>' is not available in this runtime", and burned a tool
+/// message + a consecutive-failure-detector data point. Partitioning
+/// here — before `calls_snapshot` is captured, before the dispatch loop,
+/// before the cycle/failure-rate detectors ever see a call — means an
+/// invalid-name call can never reach `tools::dispatch`, never reach
+/// `FailureRateDetector::record`/`CycleDetector::record` (so it cannot
+/// contribute to the #419 consecutive-failure cascade), and never gets
+/// checkpointed as a "pending" call a resume would replay.
+///
+/// Applies uniformly to every source of a turn's `calls`: an organic
+/// `finish_reason=tool_calls` response, AND a #479 per-turn-cap salvage
+/// (salvage sets `assistant_message.tool_calls` to the well-formed-JSON
+/// subset via `retain_well_formed_tool_calls`, then routes through the
+/// SAME `"tool_calls"` match arm this partition lives in) — salvage
+/// filters on JSON well-formedness, this filters on name membership; the
+/// two are orthogonal and a salvaged batch gets both.
+fn partition_tool_calls_by_name(
+    calls: Vec<ToolCall>,
+    allowed_tool_names: &HashSet<String>,
+) -> (Vec<ToolCall>, Vec<ToolCall>) {
+    calls.into_iter().partition(|c| allowed_tool_names.contains(&c.function.name))
+}
+
+/// Handle a turn's invalid-name tool calls (#2169): never dispatch them,
+/// coalesce into ONE synthetic feedback message queued for the model's
+/// NEXT turn (same queue-now/drain-next-iteration pattern every other
+/// detector signal in this file uses), emit ONE
+/// `dispatch.tool.malformed_names` trajectory event naming the model (so
+/// the run record reads as a model finding, not a broken-tools finding),
+/// and satisfy the OpenAI-protocol requirement of one `tool` role message
+/// per `tool_call_id` with `MALFORMED_TOOL_CALL_RESULT_BODY`'s short
+/// constant body. No-op when `invalid` is empty (the common case — every
+/// call site passes the partition's second half unconditionally).
+#[allow(clippy::too_many_arguments)]
+fn handle_malformed_tool_calls(
+    invalid: &[ToolCall],
+    allowed_tool_names: &HashSet<String>,
+    model: &str,
+    turns: u32,
+    trajectory: &mut Trajectory,
+    feedback_injector: &mut FeedbackInjector,
+    messages: &mut Vec<Message>,
+) {
+    if invalid.is_empty() {
+        return;
+    }
+    let count = invalid.len() as u32;
+    // One representative name is enough to recognize the pattern; the
+    // trajectory event's `count` already names how many there were.
+    let sample_name_prefix = sanitize_sample_name_prefix(&invalid[0].function.name);
+    eprintln!(
+        "darkmux-runtime: ⚠ malformed tool names — {count} structured tool call(s) this \
+         turn carried a `name` that is not a real tool (model={model}, sample=\"{sample_name_prefix}\"); \
+         none dispatched, coalesced into one feedback message. (#2169)"
+    );
+    trajectory.append_malformed_tool_names(turns, count, model, &sample_name_prefix);
+
+    let mut tool_names: Vec<&str> = allowed_tool_names.iter().map(String::as_str).collect();
+    tool_names.sort_unstable();
+    feedback_injector.queue_malformed_tool_names(count as usize, &tool_names.join(", "));
+
+    for call in invalid {
+        messages.push(Message::tool_result(
+            call.id.clone(),
+            call.function.name.clone(),
+            MALFORMED_TOOL_CALL_RESULT_BODY,
+        ));
+    }
 }
 
 /// (#465) Extract the `path` field from a tool call's JSON arguments —
@@ -7442,6 +7600,314 @@ mod tests {
             salvaged_seen,
             "trajectory must record dispatch.per_turn_cap.salvaged when salvage fires"
         );
+    }
+
+    // ─── (#2169) malformed structured tool-call names ──────────────────
+
+    fn malformed_call(id: &str, bogus_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": bogus_name,
+                "arguments": "{}",
+            },
+        })
+    }
+
+    fn valid_read_call(id: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": "read",
+                "arguments": format!("{{\"path\":\"{path}\",\"offset\":1,\"limit\":10}}"),
+            },
+        })
+    }
+
+    /// Issue #2169's own test. A turn carries 3 valid `read` calls and 5
+    /// structured calls whose `name` is model content sliced out of a
+    /// `[TOOL_CALLS]` marker (the observed Devstral 2 + LM Studio shape).
+    /// Only the 3 valid calls dispatch; the 5 invalid ones are coalesced
+    /// into exactly one feedback message and one trajectory detector
+    /// event naming the model, never becoming 5 separate tool.completed
+    /// "doesn't exist" failures.
+    #[test]
+    #[serial_test::serial]
+    fn malformed_tool_call_names_are_never_dispatched_and_coalesced() {
+        let server = MockServer::start();
+        let mut calls = vec![
+            valid_read_call("call_ok_1", "/workspace/a.txt"),
+            valid_read_call("call_ok_2", "/workspace/b.txt"),
+            valid_read_call("call_ok_3", "/workspace/c.txt"),
+        ];
+        for i in 0..5 {
+            calls.push(malformed_call(
+                &format!("call_bad_{i}"),
+                &format!("}} catch (error) {{ log(error) }} --- [TOOL_CALLS]bogus_{i}"),
+            ));
+        }
+        // First turn: the mixed valid/invalid batch above. Second turn
+        // (request body now carries `role:tool` messages): a clean stop,
+        // so the run terminates deterministically instead of relying on
+        // MAX_TURNS.
+        let _turn1 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::Value::Array(calls.clone())),
+                "tool_calls",
+                100,
+                50,
+            ));
+        });
+        let _turn2 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() > 0
+            });
+            then.status(200)
+                .json_body(chat_response_json(Some("done"), None, "stop", 150, 10));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("malformed-tool-names").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("do things")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client,
+            &client,
+            "devstral-test",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(5),
+            None,
+            None,
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("malformed-name calls must not error the dispatch (#2169)");
+
+        assert!(
+            matches!(outcome.terminal_reason, TerminalReason::Stop),
+            "the turn must progress to a clean stop, not stall or escalate: {:?}",
+            outcome.terminal_reason
+        );
+
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+        let events: Vec<serde_json::Value> =
+            raw.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+
+        // Exactly 3 executed — never 8, never 5 "doesn't exist" failures.
+        let tool_completed =
+            events.iter().filter(|v| v["type"] == "tool.completed").count();
+        assert_eq!(
+            tool_completed, 3,
+            "only the 3 valid calls should ever be dispatched; invalid-name calls must \
+             never reach tools::dispatch"
+        );
+
+        // Exactly one coalesced detector event for the whole turn's batch,
+        // naming the model and carrying the count.
+        let malformed_events: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|v| v["type"] == "dispatch.tool.malformed_names")
+            .collect();
+        assert_eq!(
+            malformed_events.len(),
+            1,
+            "5 invalid-name calls in ONE turn must coalesce into exactly ONE detector event, \
+             got: {malformed_events:?}"
+        );
+        assert_eq!(malformed_events[0]["count"], 5);
+        assert_eq!(malformed_events[0]["model"], "devstral-test");
+        let prefix = malformed_events[0]["sample_name_prefix"].as_str().unwrap();
+        assert!(prefix.chars().count() <= 40, "sample_name_prefix must be capped at 40 chars: {prefix:?}");
+        assert!(!prefix.contains('\n'), "sample_name_prefix must have newlines stripped: {prefix:?}");
+
+        // One feedback-injection event on turn 2's request (drained at the
+        // top of the NEXT loop iteration, same as every other detector
+        // signal in this file).
+        let feedback_injected = events.iter().any(|v| {
+            v["type"] == "dispatch.feedback.injected"
+                && v["signal_kinds"].to_string().contains("malformed_tool_names")
+        });
+        assert!(
+            feedback_injected,
+            "exactly one coalesced feedback message must be queued and drained next turn"
+        );
+    }
+
+    /// (#419 interaction) Invalid-name calls must never reach the
+    /// consecutive-failure cascade detector. Three calls sharing the
+    /// SAME bogus name+args (a signature that WOULD trip
+    /// `DEFAULT_WARN_THRESHOLD` (3) if dispatched) ride in one turn
+    /// alongside a valid call. Red-proved by temporarily removing the
+    /// partition call site — see PR #2169's description for the mutation
+    /// evidence.
+    #[test]
+    #[serial_test::serial]
+    fn malformed_tool_call_names_do_not_advance_the_consecutive_failure_counter() {
+        let server = MockServer::start();
+        let bogus_name = "} catch (error) { --- [TOOL_CALLS]same bogus name every time";
+        let mut calls = vec![valid_read_call("call_ok_1", "/workspace/a.txt")];
+        for i in 0..3 {
+            // Identical name+args each time — the exact signature the
+            // cascade detector keys on.
+            calls.push(malformed_call(&format!("call_bad_{i}"), bogus_name));
+        }
+        let _turn1 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::Value::Array(calls.clone())),
+                "tool_calls",
+                100,
+                50,
+            ));
+        });
+        let _turn2 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() > 0
+            });
+            then.status(200)
+                .json_body(chat_response_json(Some("done"), None, "stop", 150, 10));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("malformed-no-cascade").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("do things")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        run(
+            &client,
+            &client,
+            "devstral-test",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(5),
+            None,
+            None,
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("must not error");
+
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+        let cascade_fired = raw.lines().any(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap_or_default();
+            v.get("type").and_then(|t| t.as_str()) == Some("dispatch.tool.repeated_failure")
+        });
+        assert!(
+            !cascade_fired,
+            "3 invalid-name calls sharing a signature must NOT trip the #419 cascade \
+             detector — they must never reach FailureRateDetector::record at all"
+        );
+    }
+
+    /// A turn whose tool_calls are ENTIRELY invalid names must still
+    /// progress to the next turn rather than stall — no valid calls to
+    /// dispatch, but the loop must still push tool-result messages for
+    /// every id, queue the coalesced feedback, and send the next request.
+    #[test]
+    #[serial_test::serial]
+    fn a_turn_of_only_invalid_tool_calls_still_progresses() {
+        let server = MockServer::start();
+        let calls = vec![
+            malformed_call("call_bad_1", "} catch (error) { --- [TOOL_CALLS]one"),
+            malformed_call("call_bad_2", "} catch (error) { --- [TOOL_CALLS]two"),
+        ];
+        let _turn1 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() == 0
+            });
+            then.status(200).json_body(chat_response_json(
+                None,
+                Some(serde_json::Value::Array(calls.clone())),
+                "tool_calls",
+                100,
+                50,
+            ));
+        });
+        let _turn2 = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions").matches(|req| {
+                let b = req.body.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
+                b.matches("\"role\":\"tool\"").count() > 0
+            });
+            then.status(200)
+                .json_body(chat_response_json(Some("done"), None, "stop", 150, 10));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("malformed-all-invalid").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("do things")];
+        let tools = [Tool::Read];
+        let cfg = compaction::CompactionConfig::never_compact();
+
+        let outcome = run(
+            &client,
+            &client,
+            "devstral-test",
+            initial,
+            &tools,
+            &mut traj,
+            false,
+            &cfg,
+            Some(5),
+            None,
+            None,
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("an all-invalid turn must not error");
+
+        assert!(
+            matches!(outcome.terminal_reason, TerminalReason::Stop),
+            "an all-invalid-name turn must still progress to turn 2's clean stop, not stall: {:?}",
+            outcome.terminal_reason
+        );
+        assert_eq!(outcome.turns, 2, "the loop must advance past the all-invalid turn");
+    }
+
+    #[test]
+    fn sanitize_sample_name_prefix_caps_length_and_strips_newlines_and_control_bytes() {
+        let raw = "line one\nline two\r\nwith a tab\tand a bell\u{7}and \u{e9}accent";
+        let out = sanitize_sample_name_prefix(raw);
+        assert!(out.chars().count() <= 40, "must cap at 40 chars: {out:?}");
+        assert!(!out.contains('\n'), "newlines must be stripped: {out:?}");
+        assert!(!out.contains('\r'), "carriage returns must be stripped: {out:?}");
+        assert!(out.is_ascii(), "must be pure printable ASCII: {out:?}");
+    }
+
+    #[test]
+    fn sanitize_sample_name_prefix_passes_ordinary_text_through() {
+        assert_eq!(sanitize_sample_name_prefix("hello_world-123"), "hello_world-123");
     }
 
     /// (#2165, redesigned post-#2164) Post-#2164, a FRESH turn's first
