@@ -159,6 +159,22 @@ fn usize_param(collected: &BTreeMap<String, Value>, key: &str) -> Result<Option<
     }
 }
 
+/// (#2190) Same as `usize_param`, but additionally refuses zero — for
+/// unit-sizing knobs where zero is not a meaningful budget (there is no
+/// such thing as a 0-site or 0-token unit; that's not "plan nothing", it's
+/// a broken cap). Distinct from `limit`, where `0` is a real, deliberately
+/// honored "select nothing" value — this helper is NOT used for `limit`.
+/// A non-numeric value already gets a named error from `usize_param`
+/// itself (via its `with_context`/`bail!` above); this only adds the zero
+/// check on top, so both failure shapes are refused loudly at param PARSE
+/// time, before any planning happens.
+fn positive_usize_param(collected: &BTreeMap<String, Value>, key: &str) -> Result<Option<usize>> {
+    match usize_param(collected, key)? {
+        Some(0) => bail!("--param {key}=0 is not a valid unit-sizing cap (must be a positive integer)"),
+        other => Ok(other),
+    }
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1006,6 +1022,32 @@ pub(crate) fn run(
     let limit = usize_param(collected, "limit")?;
     let no_fetch = bool_param(collected, "no_fetch");
     let timeout = timeout_seconds.unwrap_or(600);
+    // (#2190) Operator-overridable `site`-unit sizing caps — absent means
+    // `PlanParams::default()`, i.e. today's hard-coded
+    // `MAX_SITES_PER_UNIT`/`MAX_SITE_TOKENS_PER_UNIT`, so a launch with
+    // neither param plans byte-identically to before this knob existed.
+    // Rejected at parse time (not silently clamped) when zero or
+    // non-numeric — see `positive_usize_param`.
+    let max_sites_per_unit = positive_usize_param(collected, "max_sites_per_unit")?;
+    let max_est_tokens_per_unit = positive_usize_param(collected, "max_est_tokens_per_unit")?;
+    let plan_params = plan::PlanParams {
+        max_sites_per_unit: max_sites_per_unit.unwrap_or(plan::MAX_SITES_PER_UNIT),
+        max_est_tokens_per_unit: max_est_tokens_per_unit.unwrap_or(plan::MAX_SITE_TOKENS_PER_UNIT),
+    };
+    // A sizing override on a LOADED plan (`--param plan=`) has nothing to
+    // act on — the plan's unit boundaries were already fixed when it was
+    // written. Loud rather than silently ignored (operator sovereignty).
+    if plan_path.is_some() && (max_sites_per_unit.is_some() || max_est_tokens_per_unit.is_some()) {
+        eprintln!(
+            "{}",
+            style::warn(
+                "darkmux mission launch crawl: --param max_sites_per_unit=/--param \
+                 max_est_tokens_per_unit= has no effect together with --param plan= — the loaded \
+                 plan's unit boundaries are already fixed; drop --param plan= to plan fresh with \
+                 this cap"
+            )
+        );
+    }
     // (#2114 follow-up) The trigger for a crawl-scoped resume — a PRIOR
     // crawl mission id whose `envelope.json` this run cross-references
     // per unit (`plan_unit_resume`). Same plan inputs (`workspace`/
@@ -1097,7 +1139,7 @@ pub(crate) fn run(
 
             loaded_plan
         }
-        None => plan::plan(&materialized, &rules_vec)
+        None => plan::plan_with_params(&materialized, &rules_vec, plan_params)
             .with_context(|| format!("planning workspace '{manifest_name}'"))?,
     };
 
@@ -1198,7 +1240,7 @@ pub(crate) fn run(
             let plan_json = serde_json::to_string_pretty(&the_plan)?;
             std::fs::write(op, &plan_json).with_context(|| format!("writing plan to {}", op.display()))?;
         }
-        print_plan_table(&the_plan, plan_out.as_deref());
+        print_plan_table(&the_plan, plan_out.as_deref(), &plan_params);
         return Ok(0);
     }
 
@@ -2066,18 +2108,33 @@ pub(crate) fn run(
     guard.close(|| finalize_crawl(&stats, &ctx))
 }
 
+/// (#2190) The dry-run table's effective-unit-sizing line, factored out of
+/// `print_plan_table` so it's directly assertable in a test without
+/// capturing process stdout.
+fn unit_sizing_line(plan_params: &plan::PlanParams) -> String {
+    format!(
+        "unit sizing: max_sites_per_unit={} max_est_tokens_per_unit={}",
+        plan_params.max_sites_per_unit, plan_params.max_est_tokens_per_unit
+    )
+}
+
 /// (#1959) Ported from the retired `darkmux crawl plan` CLI's own
 /// `print_plan_table` (deleted alongside the standalone verb — see
 /// `src/cli.rs`'s Crawl retirement commit) — renders `--dry-run`'s plan
 /// table. `out_path` is `Some` only when `--param plan_out=<path>` named a
 /// destination; `None` means the dry run wrote nothing (the default).
-fn print_plan_table(the_plan: &plan::Plan, out_path: Option<&Path>) {
+fn print_plan_table(the_plan: &plan::Plan, out_path: Option<&Path>, plan_params: &plan::PlanParams) {
     println!("{}", style::header(&format!("darkmux mission launch crawl --dry-run — {}", the_plan.workspace)));
     println!("{}", style::dim(&format!("planned_at: {}", the_plan.planned_at)));
     match out_path {
         Some(p) => println!("{}", style::dim(&format!("written to: {}", p.display()))),
         None => println!("{}", style::dim("written to: (not written — pass --param plan_out=<path> to write)")),
     }
+    // (#2190) The effective site-unit sizing caps this plan was built
+    // against — visible even when the operator passed neither override
+    // (the defaults), so "what will each unit look like" is answerable
+    // from the table BEFORE dispatching, not discovered live mid-crawl.
+    println!("{}", style::dim(&unit_sizing_line(plan_params)));
     println!();
 
     println!("{}", style::header("sources"));

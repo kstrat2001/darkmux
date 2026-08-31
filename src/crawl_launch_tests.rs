@@ -201,6 +201,38 @@ fn two_source_fixture() -> Fixture {
     Fixture { _workdir: workdir, root, spec_path }
 }
 
+/// (#2190) One source, `n` well-separated `catch` sites — for tests that
+/// need the DEFAULT plan to land in ONE unit (so an operator's
+/// `max_sites_per_unit` cap is the only thing that can split it further).
+/// The embedded `swallowed-error` rule's real `window` is 30 (unlike this
+/// module's other fixture, which never exercises it), so hits are spaced
+/// well past `2*window+1` lines apart to guarantee `merge_windows` never
+/// coalesces two of them into one site.
+fn multi_catch_fixture(n: usize) -> Fixture {
+    let workdir = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let app = workdir.path().join("app");
+    let mut body = String::new();
+    for i in 0..n {
+        body.push_str(&format!("function f{i}() {{\n  try {{\n    g();\n  }}\n  catch (e) {{\n    void 0;\n  }}\n}}\n"));
+        for _ in 0..80 {
+            body.push('\n');
+        }
+    }
+    init_source_repo(&app, "x.ts", &body);
+
+    let manifest = serde_json::json!({
+        "name": "fixture",
+        "root": root.path().to_string_lossy(),
+        "sources": [{"id": "app", "path": app.to_string_lossy(), "ref": "main"}],
+        "rules": ["swallowed-error"]
+    });
+    let spec_path = workdir.path().join("workspace.json");
+    std::fs::write(&spec_path, manifest.to_string()).unwrap();
+
+    Fixture { _workdir: workdir, root, spec_path }
+}
+
 fn params_for(fx: &Fixture) -> BTreeMap<String, Value> {
     let mut m = BTreeMap::new();
     m.insert("workspace".to_string(), Value::String(fx.spec_path.to_string_lossy().to_string()));
@@ -1808,6 +1840,88 @@ fn dry_run_still_bails_on_a_missing_required_input() {
         err.to_string().contains("workspace"),
         "{err}"
     );
+}
+
+// ── (#2190) operator-controllable unit sizing ───────────────────────────
+
+#[test]
+#[serial_test::serial]
+fn max_sites_per_unit_zero_is_refused_at_param_parse_time() {
+    // (#2190) Zero is not a meaningful cap — must be refused loudly,
+    // named by the offending param, BEFORE any workspace resolution or
+    // planning happens (not silently clamped to 1, not silently ignored).
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let mut params = params_for(&fx);
+    params.insert("max_sites_per_unit".to_string(), Value::String("0".to_string()));
+    let err = run(&params, None, &mut dispatch).unwrap_err();
+    assert!(err.to_string().contains("max_sites_per_unit"), "{err}");
+    assert!(calls.borrow().is_empty(), "a refused param must never reach dispatch");
+}
+
+#[test]
+#[serial_test::serial]
+fn max_est_tokens_per_unit_non_numeric_is_refused_at_param_parse_time() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+    let mut params = params_for(&fx);
+    params.insert("max_est_tokens_per_unit".to_string(), Value::String("not-a-number".to_string()));
+    let err = run(&params, None, &mut dispatch).unwrap_err();
+    assert!(err.to_string().contains("max_est_tokens_per_unit"), "{err}");
+    assert!(calls.borrow().is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn dry_run_plan_reflects_operator_max_sites_per_unit_override() {
+    // (#2190) End-to-end: an operator override on `--param
+    // max_sites_per_unit=` must actually reach the planner and change the
+    // written plan's unit boundaries — not just parse cleanly. Uses a
+    // 3-site single-source fixture so the DEFAULT cap (40) leaves it as
+    // ONE unit — a cap=1 override is the only thing that can split it,
+    // so 3 units in the written plan proves the override actually bound.
+    let _guard = TestGuard::new();
+    let fx = multi_catch_fixture(3);
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(BTreeMap::new(), &calls, |_| {});
+
+    // Baseline: no override — must plan to exactly one unit.
+    let baseline_out = fx.root.path().join("baseline-plan.json");
+    let mut baseline_params = params_for(&fx);
+    baseline_params.insert("dry_run".to_string(), Value::Bool(true));
+    baseline_params.insert("plan_out".to_string(), Value::String(baseline_out.to_string_lossy().to_string()));
+    let code = run(&baseline_params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    let baseline_plan: Value = serde_json::from_str(&std::fs::read_to_string(&baseline_out).unwrap()).unwrap();
+    assert_eq!(baseline_plan["units"].as_array().unwrap().len(), 1, "{baseline_plan}");
+
+    // Override: max_sites_per_unit=1 must split the same 3 sites into 3 units.
+    let capped_out = fx.root.path().join("capped-plan.json");
+    let mut params = params_for(&fx);
+    params.insert("dry_run".to_string(), Value::Bool(true));
+    params.insert("plan_out".to_string(), Value::String(capped_out.to_string_lossy().to_string()));
+    params.insert("max_sites_per_unit".to_string(), Value::String("1".to_string()));
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    let plan: Value = serde_json::from_str(&std::fs::read_to_string(&capped_out).unwrap()).unwrap();
+    assert_eq!(plan["units"].as_array().unwrap().len(), 3, "{plan}");
+    assert!(calls.borrow().is_empty(), "a dry run must never dispatch");
+}
+
+#[test]
+fn unit_sizing_line_names_both_effective_caps() {
+    // (#2190) The dry-run table's header line — the operator-visible
+    // surface for "what will each unit look like" before dispatching.
+    let default_line = unit_sizing_line(&plan::PlanParams::default());
+    assert_eq!(default_line, "unit sizing: max_sites_per_unit=40 max_est_tokens_per_unit=16000");
+
+    let overridden = plan::PlanParams { max_sites_per_unit: 6, max_est_tokens_per_unit: 3000 };
+    let line = unit_sizing_line(&overridden);
+    assert_eq!(line, "unit sizing: max_sites_per_unit=6 max_est_tokens_per_unit=3000");
 }
 
 // ── (#1959) one-shot --param source=/--param rule= synthesizes a spec ──
