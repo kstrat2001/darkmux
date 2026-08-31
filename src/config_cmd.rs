@@ -189,6 +189,11 @@ const KEYS: &[(&str, Ty)] = &[
     ("hooks.enabled", Ty::Bool),
     ("hooks.outbox_dir", Ty::Str),
     ("hooks.rules", Ty::Json),
+    // (#2183) jq transform bounds — a runaway or oversized adapter output is a
+    // TERMINAL per-line failure, so both caps are operator-tunable like every other
+    // hooks knob rather than living only in code.
+    ("hooks.jq_timeout_ms", Ty::Uint),
+    ("hooks.jq_max_output_bytes", Ty::Uint),
     // (#2093 merge-gate finding 5) The hard cap on undelivered bytes per
     // rule, in MiB — see `HooksConfig::max_outbox_mb`'s own doc.
     ("hooks.max_outbox_mb", Ty::Uint),
