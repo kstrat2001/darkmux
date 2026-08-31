@@ -78,6 +78,26 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// (#2183) Expand a leading `~` to the user's home directory for a
+/// `hooks.rules[].file` directory value — the same behavior
+/// `darkmux_types::paths::expand_tilde` gives `hooks.outbox_dir`, but that
+/// helper is `pub(crate)` to `darkmux-types` (only `config_access` may
+/// call it), so this is a small local copy rather than a new public API
+/// surface on `darkmux-types` for one field. Pass-through for any other
+/// shape; returns the input unchanged if no home dir is available.
+fn expand_tilde_dir(s: &str) -> PathBuf {
+    if let Some(stripped) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped);
+        }
+    } else if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(s)
+}
+
 // ─── Match predicate ──────────────────────────────────────────────────
 
 /// A small glob matcher for `HookMatch::action`: `*` matches within a
@@ -647,51 +667,125 @@ pub struct ResolvedRule {
     pub dropped_appends_path: PathBuf,
     /// (#2135 option 2) Which URL policy this rule's target satisfied —
     /// re-validated (not merely cached) at every POST, same reasoning as
-    /// `try_post`'s existing loopback re-validation.
-    pub target_kind: HookTargetKind,
+    /// `try_post`'s existing loopback re-validation. (#2183) `None` for a
+    /// `file`-transport rule — there is no URL policy to satisfy.
+    pub target_kind: Option<HookTargetKind>,
     /// (#2135 option 2) This rule's resolved HMAC signing secret, when
     /// `signing_secret_keychain_item` (or the `DARKMUX_HOOK_SECRET_<index>`
     /// env override) named one — `None` means every delivery for this rule
     /// goes out unsigned. Read ONCE here, at construction, same as the
     /// Redis/serve-token Keychain reads.
     pub signing_secret: Option<crate::RawHookSecret>,
+    /// (#2183) `Some(dir)` for a `file`-transport rule (mutually exclusive
+    /// with `target_kind`/real delivery) — see `resolve_rules`'s refusal
+    /// of a rule naming BOTH `http` and `file`, or NEITHER.
+    pub file_dir: Option<PathBuf>,
+    /// (#2183) This rule's load-time-validated `transform` adapter, when
+    /// `transform` names one. `None` → today's behavior, the record
+    /// delivered verbatim.
+    pub transform: Option<Arc<crate::hook_transform::LoadedAdapter>>,
+    /// (#2183) This rule's resolved `headers`, in the SAME order as
+    /// configured (a `BTreeMap` on the wire, so already name-sorted —
+    /// deterministic delivery + test assertions). Each entry's `1` is
+    /// `None` when a Keychain reference failed to resolve — dropped at
+    /// delivery (see `resolve_hook_header_value`'s doc), never sent.
+    pub headers: Vec<(String, bool, Option<crate::RawHookSecret>)>,
+    /// (#2183) Whether this rule's deliveries carry the `X-Darkmux-*`
+    /// attribution headers — `headers.attribution_headers`, default `true`.
+    pub attribution_headers: bool,
 }
 
 /// Resolve + validate every rule against `outbox_dir`. Bails on the FIRST
-/// rule missing an `http` target or whose target satisfies neither the
-/// loopback nor the tailnet URL policy — the whole hooks sink is refused
-/// rather than silently dropping one bad rule, so a config mistake is loud
-/// at construction, not a quietly-smaller rule set.
+/// rule missing a destination (`http` XOR `file`), whose `http` target
+/// satisfies neither the loopback nor the tailnet URL policy, or whose
+/// `transform` names an adapter that doesn't exist / doesn't parse — the
+/// whole hooks sink is refused rather than silently dropping one bad rule,
+/// so a config mistake is loud at construction, not a quietly-smaller rule
+/// set. (#2183's own scoping: an adapter failure is documented as a
+/// "load-time refusal for that RULE only" — that promise is kept by
+/// `HookSink::new`, which is expected to construct rule-by-rule and treat
+/// one bad rule's `resolve_rules` error as dropping only that rule; this
+/// function itself stays fail-fast-on-first-error, matching every other
+/// rule validation here (URL, empty-http), so a caller wanting per-rule
+/// isolation resolves rules one at a time — see `HookSink::new`.)
 pub fn resolve_rules(rules: &[HookRule], outbox_dir: &Path) -> Result<Vec<ResolvedRule>> {
     let mut out = Vec::with_capacity(rules.len());
     for (index, r) in rules.iter().enumerate() {
-        let url = r
-            .http
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("hook rule #{index} has no `http` target"))?;
-        let target_kind = validate_hook_target_url(&url).with_context(|| format!("hook rule #{index}"))?;
-        let match_ = r.r#match.clone().unwrap_or_default();
-        let key = rule_key(&match_, &url);
-        let (outbox_path, cursor_path) = outbox_paths(outbox_dir, &key);
-        let last_status_path = last_status_path(outbox_dir, &key);
-        let drain_lock_path = drain_lock_path(outbox_dir, &key);
-        let dropped_appends_path = dropped_appends_path(outbox_dir, &key);
-        let signing_secret = crate::hook_signing_secret(index, r.signing_secret_keychain_item.as_deref());
-        out.push(ResolvedRule {
-            index,
-            match_,
-            url,
-            outbox_path,
-            cursor_path,
-            last_status_path,
-            drain_lock_path,
-            dropped_appends_path,
-            target_kind,
-            signing_secret,
-        });
+        out.push(resolve_one_rule(index, r, outbox_dir)?);
     }
     Ok(out)
+}
+
+/// Resolve + validate exactly one rule — split out of `resolve_rules` so a
+/// caller (`HookSink::new`) can isolate one bad rule's refusal from the
+/// rest of the sink (#2183's "load-time refusal for that RULE only").
+pub fn resolve_one_rule(index: usize, r: &HookRule, outbox_dir: &Path) -> Result<ResolvedRule> {
+    let http = r.http.clone().filter(|s| !s.trim().is_empty());
+    let file = r.file.clone().filter(|s| !s.trim().is_empty());
+    let (url, target_kind, file_dir) = match (&http, &file) {
+        (Some(_), Some(_)) => {
+            bail!("hook rule #{index} names BOTH `http` and `file` — a rule needs exactly one destination")
+        }
+        (None, None) => {
+            bail!("hook rule #{index} has no destination — set exactly one of `http` or `file`")
+        }
+        (Some(u), None) => {
+            let target_kind = validate_hook_target_url(u).with_context(|| format!("hook rule #{index}"))?;
+            (u.clone(), Some(target_kind), None)
+        }
+        (None, Some(dir)) => {
+            let expanded = expand_tilde_dir(dir);
+            // A synthetic, never-dialed pseudo-URL — used ONLY for
+            // `rule_key`/outbox-file naming and `HookRuleSummary.url`'s
+            // display, exactly as `extract_host_port` already expects a
+            // `host[:port]`-shaped tail; never passed to `try_post` (file
+            // rules never call it) or re-validated as a real URL.
+            (format!("file://{}", expanded.display()), None, Some(expanded))
+        }
+    };
+    let match_ = r.r#match.clone().unwrap_or_default();
+    let key = rule_key(&match_, &url);
+    let (outbox_path, cursor_path) = outbox_paths(outbox_dir, &key);
+    let last_status_path = last_status_path(outbox_dir, &key);
+    let drain_lock_path = drain_lock_path(outbox_dir, &key);
+    let dropped_appends_path = dropped_appends_path(outbox_dir, &key);
+    let signing_secret = crate::hook_signing_secret(index, r.signing_secret_keychain_item.as_deref());
+    let transform = match &r.transform {
+        Some(name) if !name.trim().is_empty() => {
+            let adapters_dir = darkmux_types::config_access::hooks_adapters_dir();
+            let loaded = crate::hook_transform::load_adapter(&adapters_dir, name)
+                .with_context(|| format!("hook rule #{index}'s `transform`"))?;
+            Some(Arc::new(loaded))
+        }
+        _ => None,
+    };
+    let headers = r
+        .headers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, v)| {
+            let (is_secret, value) = crate::resolve_hook_header_value(&v);
+            (name, is_secret, value)
+        })
+        .collect();
+    let attribution_headers = r.attribution_headers.unwrap_or(true);
+    Ok(ResolvedRule {
+        index,
+        match_,
+        url,
+        outbox_path,
+        cursor_path,
+        last_status_path,
+        drain_lock_path,
+        dropped_appends_path,
+        target_kind,
+        signing_secret,
+        file_dir,
+        transform,
+        headers,
+        attribution_headers,
+    })
 }
 
 /// (fix-round finding 8) Non-blocking probe: which of `rules`' drain
@@ -784,6 +878,21 @@ pub struct HookRuleSummary {
     /// belongs to no current rule (a rule since removed from config, or
     /// — before this fix — the artifact of an index-based reassignment).
     pub key: String,
+    /// (#2183) `true` for a `file`-transport rule — `url` then carries the
+    /// synthetic `file://<dir>` display form (see `resolve_one_rule`'s
+    /// doc), never a real HTTP target; `is_loopback`/`is_tailnet` are both
+    /// `false` and `is_refused` is `false` (a valid `file` rule is not a
+    /// URL-policy failure).
+    pub is_file: bool,
+    /// (#2183) The rule's `transform` NAME, when set.
+    pub transform_name: Option<String>,
+    /// (#2183) `Some(Ok(short_hash))` when `transform_name` is set and the
+    /// adapter exists + parses (the hash makes a silently-changed adapter
+    /// visible); `Some(Err(reason))` when it's set but failed to load
+    /// (missing file, or doesn't parse as jq) — this is the load-time
+    /// refusal `darkmux doctor` surfaces per-rule; `None` when no
+    /// `transform` is configured.
+    pub transform_status: Option<std::result::Result<String, String>>,
 }
 
 fn describe_match(m: &HookMatch) -> String {
@@ -833,10 +942,23 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
         .enumerate()
         .map(|(index, r)| {
             let m = r.r#match.clone().unwrap_or_default();
-            let url = r.http.clone().unwrap_or_default();
-            let target_kind = validate_hook_target_url(&url).ok();
-            let is_loopback = target_kind == Some(HookTargetKind::Loopback);
-            let is_tailnet = target_kind == Some(HookTargetKind::Tailnet);
+            let http = r.http.clone().filter(|s| !s.trim().is_empty());
+            let file = r.file.clone().filter(|s| !s.trim().is_empty());
+            let is_file = file.is_some() && http.is_none();
+            // (#2183) Both-or-neither is a load-time refusal (see
+            // `resolve_one_rule`); a summary never bails, so that state
+            // renders as `is_refused` here too, same as a bad URL.
+            let both_or_neither = (http.is_some() && file.is_some()) || (http.is_none() && file.is_none());
+            let url = if is_file {
+                let expanded = expand_tilde_dir(file.as_deref().unwrap_or_default());
+                format!("file://{}", expanded.display())
+            } else {
+                http.clone().unwrap_or_default()
+            };
+            let target_kind = if is_file { None } else { validate_hook_target_url(&url).ok() };
+            let is_loopback = !is_file && target_kind == Some(HookTargetKind::Loopback);
+            let is_tailnet = !is_file && target_kind == Some(HookTargetKind::Tailnet);
+            let is_refused = both_or_neither || (!is_file && target_kind.is_none());
             let signed = r.signing_secret_keychain_item.as_ref().is_some_and(|s| !s.trim().is_empty());
             let key = rule_key(&m, &url);
             let (outbox_path, cursor_path) = outbox_paths(outbox_dir, &key);
@@ -846,13 +968,20 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
             let dropped_appends = read_dropped_appends(&dropped_appends_path(outbox_dir, &key));
             let last_drainer_heartbeat = fs::read_to_string(heartbeat_path(&cursor_path)).ok();
             let quarantined_lines = undelivered_line_count(&quarantine_path(&outbox_path), 0);
+            let transform_name = r.transform.clone().filter(|s| !s.trim().is_empty());
+            let transform_status = transform_name.as_deref().map(|name| {
+                let adapters_dir = darkmux_types::config_access::hooks_adapters_dir();
+                crate::hook_transform::load_adapter(&adapters_dir, name)
+                    .map(|a| a.short_hash)
+                    .map_err(|e| format!("{e:#}"))
+            });
             HookRuleSummary {
                 index,
                 match_desc: describe_match(&m),
                 url,
                 is_loopback,
                 is_tailnet,
-                is_refused: target_kind.is_none(),
+                is_refused,
                 signed,
                 is_empty_match: m.is_empty(),
                 outbox_path,
@@ -866,6 +995,9 @@ pub fn summarize_configured_rules(rules: &[HookRule], outbox_dir: &Path) -> Vec<
                 last_drainer_heartbeat,
                 quarantined_lines,
                 key,
+                is_file,
+                transform_name,
+                transform_status,
             }
         })
         .collect()
@@ -1205,6 +1337,20 @@ struct DeliveryHeaders {
     /// The full `sha256=<hex>` header value, precomputed — `None` when
     /// this rule has no signing secret configured.
     signature: Option<String>,
+    /// (#2183) Whether the `X-Darkmux-*` attribution headers above are
+    /// actually sent — `hooks.rules[].attribution_headers`, default
+    /// `true`. `false` for a SaaS receiver that rejects unknown headers.
+    attribution: bool,
+    /// (#2183) This rule's configured `headers`, resolved + sanitized,
+    /// ready for `.set()` on the wire — a Keychain reference that failed
+    /// to resolve is simply ABSENT here (dropped, never sent empty).
+    extra: Vec<(String, String)>,
+    /// (#2183) The SAME set, for a diagnostic surface (a flow record, a
+    /// `file`-transport dump, `doctor`) — a header whose config value was
+    /// a `{"keychain_item": ...}` reference renders as `"<redacted>"`
+    /// here regardless of whether it actually resolved; a literal header
+    /// renders its real (sanitized) value, same as what's on the wire.
+    extra_redacted: Vec<(String, String)>,
 }
 
 /// A UUID-v4-SHAPED delivery id, deterministically derived from the exact
@@ -1279,11 +1425,14 @@ fn sanitize_header_value(raw: &str) -> String {
 /// another machine's record would otherwise be indistinguishable from the
 /// record's origin. Every one of these four is sanitized via
 /// `sanitize_header_value` — see its doc for why.
+#[allow(clippy::too_many_arguments)]
 fn build_delivery_headers(
     line: &str,
     parsed: Option<&serde_json::Value>,
     delivery_id: &str,
     signing_secret: Option<&crate::RawHookSecret>,
+    extra_headers: &[(String, bool, Option<crate::RawHookSecret>)],
+    attribution: bool,
 ) -> DeliveryHeaders {
     let event = sanitize_header_value(parsed.and_then(|v| v.get("action")).and_then(|v| v.as_str()).unwrap_or(""));
     let machine_id =
@@ -1304,7 +1453,39 @@ fn build_delivery_headers(
         let signed_input = format!("{timestamp_ms}.{line}");
         format!("sha256={}", crate::hmac_sha256::hmac_sha256_hex(secret.expose_for_hmac().as_bytes(), signed_input.as_bytes()))
     });
-    DeliveryHeaders { delivery_id, event, machine_id, machine_uid, sender, timestamp_ms, signature }
+    // (#2183) `extra`/`extra_redacted` are built in lockstep — the SAME
+    // name list, so a diagnostic surface can always be trusted to name
+    // every header this rule configured even when a Keychain reference
+    // dropped it from the wire set.
+    let mut extra = Vec::with_capacity(extra_headers.len());
+    let mut extra_redacted = Vec::with_capacity(extra_headers.len());
+    for (name, is_secret, value) in extra_headers {
+        if *is_secret {
+            extra_redacted.push((name.clone(), "<redacted>".to_string()));
+        }
+        if let Some(v) = value {
+            let sanitized = sanitize_header_value(v.expose_for_hmac());
+            extra.push((name.clone(), sanitized.clone()));
+            if !*is_secret {
+                extra_redacted.push((name.clone(), sanitized));
+            }
+        }
+        // `is_secret && value.is_none()`: an unresolved Keychain
+        // reference — already recorded in `extra_redacted` above,
+        // deliberately ABSENT from `extra` (never sent).
+    }
+    DeliveryHeaders {
+        delivery_id,
+        event,
+        machine_id,
+        machine_uid,
+        sender,
+        timestamp_ms,
+        signature,
+        attribution,
+        extra,
+        extra_redacted,
+    }
 }
 
 fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome {
@@ -1326,21 +1507,34 @@ fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome
     // returns it as an `Ok` response with the 3xx status, so the status
     // must be checked on the `Ok` arm too, not just the `Err` arm.
     let agent = ureq::AgentBuilder::new().timeout(POST_TIMEOUT).redirects(0).build();
-    let mut req = agent
-        .post(url)
-        .set("Content-Type", "application/json")
-        .set("X-Darkmux-Delivery", &headers.delivery_id)
-        .set("X-Darkmux-Event", &headers.event)
-        .set("X-Darkmux-Sender", &headers.sender)
-        .set("X-Darkmux-Timestamp", &headers.timestamp_ms.to_string());
-    if let Some(m) = &headers.machine_id {
-        req = req.set("X-Darkmux-Machine-Id", m);
+    let mut req = agent.post(url).set("Content-Type", "application/json");
+    // (#2183) `attribution_headers: false` drops every `X-Darkmux-*`
+    // header — a SaaS receiver may reject unknown headers.
+    if headers.attribution {
+        req = req
+            .set("X-Darkmux-Delivery", &headers.delivery_id)
+            .set("X-Darkmux-Event", &headers.event)
+            .set("X-Darkmux-Sender", &headers.sender)
+            .set("X-Darkmux-Timestamp", &headers.timestamp_ms.to_string());
+        if let Some(m) = &headers.machine_id {
+            req = req.set("X-Darkmux-Machine-Id", m);
+        }
+        if let Some(u) = &headers.machine_uid {
+            req = req.set("X-Darkmux-Machine-Uid", u);
+        }
+        if let Some(sig) = &headers.signature {
+            req = req.set("X-Darkmux-Signature", sig);
+        }
     }
-    if let Some(u) = &headers.machine_uid {
-        req = req.set("X-Darkmux-Machine-Uid", u);
-    }
-    if let Some(sig) = &headers.signature {
-        req = req.set("X-Darkmux-Signature", sig);
+    // (#2183) This rule's configured `headers` — literal values pass
+    // through, Keychain-resolved values arrive here already resolved (and
+    // sanitized); an unresolved Keychain reference is simply absent from
+    // `extra`. An operator-named header always wins over an attribution
+    // header of the SAME name (`.set()` overwrites, and `extra` is
+    // applied last) — deliberate: the operator's own `headers` entry is a
+    // more specific instruction than the default attribution set.
+    for (name, value) in &headers.extra {
+        req = req.set(name, value);
     }
     match req.send_string(body) {
         Ok(resp) => {
@@ -1391,6 +1585,75 @@ fn try_post(url: &str, body: &str, headers: &DeliveryHeaders) -> DeliveryOutcome
     }
 }
 
+/// (#2183) Write `bytes` to `path` with mode `0o600` on POSIX (owner
+/// read/write only — the #2156 lesson: outbox files are world-readable
+/// today, and a `file`-transport dump can carry a literal header value or
+/// sensitive record content, so this one starts out right). Non-POSIX:
+/// plain write, no mode (matches this crate's existing POSIX-only carve
+/// -outs, e.g. `AuditFileSink`).
+fn write_owner_only_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("opening {} for owner-only write", path.display()))?;
+        file.write_all(bytes).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+/// (#2183) The `file` transport — the no-network testing tier. Writes
+/// ONE JSON file per delivery into `dir`: `{delivery_id,
+/// target_would_be, headers, body}`. `target_would_be` is `rule.url`'s
+/// synthetic `file://<dir>` form's ORIGINAL intent inverted — callers
+/// pass the rule's true configured `file` directory display string, not
+/// a URL, since there IS no URL for this transport (naming kept for
+/// wire-shape clarity, matching what an operator reads in the dump).
+/// `headers` renders the SAME redacted view `doctor`/flow records use —
+/// a Keychain-resolved header value NEVER appears here, even though this
+/// path never touches the network at all.
+fn write_file_delivery(dir: &Path, delivery_id: &str, target_would_be: &str, headers: &DeliveryHeaders, body: &str) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("creating file-transport dir {}", dir.display()))?;
+    let mut headers_obj = serde_json::Map::new();
+    if headers.attribution {
+        headers_obj.insert("X-Darkmux-Delivery".to_string(), serde_json::Value::String(headers.delivery_id.clone()));
+        headers_obj.insert("X-Darkmux-Event".to_string(), serde_json::Value::String(headers.event.clone()));
+        headers_obj.insert("X-Darkmux-Sender".to_string(), serde_json::Value::String(headers.sender.clone()));
+        headers_obj
+            .insert("X-Darkmux-Timestamp".to_string(), serde_json::Value::String(headers.timestamp_ms.to_string()));
+        if let Some(m) = &headers.machine_id {
+            headers_obj.insert("X-Darkmux-Machine-Id".to_string(), serde_json::Value::String(m.clone()));
+        }
+        if let Some(u) = &headers.machine_uid {
+            headers_obj.insert("X-Darkmux-Machine-Uid".to_string(), serde_json::Value::String(u.clone()));
+        }
+        if let Some(sig) = &headers.signature {
+            headers_obj.insert("X-Darkmux-Signature".to_string(), serde_json::Value::String(sig.clone()));
+        }
+    }
+    for (name, value) in &headers.extra_redacted {
+        headers_obj.insert(name.clone(), serde_json::Value::String(value.clone()));
+    }
+    let dump = serde_json::json!({
+        "delivery_id": delivery_id,
+        "target_would_be": target_would_be,
+        "headers": headers_obj,
+        "body": body,
+    });
+    let bytes = serde_json::to_vec_pretty(&dump).context("serializing file-transport dump")?;
+    let path = dir.join(format!("{delivery_id}.json"));
+    write_owner_only_file(&path, &bytes)
+}
+
 /// (fix-round finding 6) Outcome of `drain_stray_file`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StrayDrainResult {
@@ -1432,7 +1695,7 @@ pub fn drain_stray_file(outbox_path: &Path, to_url: &str) -> Result<StrayDrainRe
         // in current config by definition; this manual recovery path
         // delivers unsigned, same as any other unconfigured rule.
         let delivery_id = delivery_id_for_line(&line);
-        let headers = build_delivery_headers(&line, parsed.as_ref(), &delivery_id, None);
+        let headers = build_delivery_headers(&line, parsed.as_ref(), &delivery_id, None, &[], true);
         match try_post(to_url, &line, &headers) {
             DeliveryOutcome::Success { .. } => {
                 result.delivered += 1;
@@ -1675,6 +1938,46 @@ fn emit_hook_record_with(
     }
 }
 
+/// (#2183) Emit `hook.dry_run` (Info) for a successful `file`-transport
+/// write — the `file` transport's counterpart to `emit_hook_record`'s
+/// `hook.fired`, distinct action so a consumer never confuses "actually
+/// delivered" with "wrote a would-have-been dump to disk."
+fn emit_dry_run_record(report_sink: &dyn FlowSink, rt: &RuleRuntime, delivered_line: &str, delivery_id: &str, dump_path: &Path) {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(delivered_line).ok();
+    let action_val = parsed.as_ref().and_then(|v| v.get("action")).and_then(|v| v.as_str()).map(str::to_string);
+    let payload = serde_json::json!({
+        "rule_index": rt.rule.index,
+        "delivered_action": action_val.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+        "delivery_id": delivery_id,
+        "dump_path": dump_path.display().to_string(),
+    });
+    let rec = FlowRecord {
+        ts: schema::ts_utc_now(),
+        level: Level::Info,
+        category: Category::Machinery,
+        tier: Tier::Local,
+        stage: Stage::Ship,
+        action: "hook.dry_run".to_string(),
+        handle: rt.rule.url.clone(),
+        phase_id: None,
+        session_id: None,
+        source: Some("hook".to_string()),
+        model: None,
+        reasoning: None,
+        mission_id: None,
+        machine_id: None,
+        machine_uid: None,
+        prev_hash: None,
+        hash: None,
+        payload: Some(payload),
+        work_id: None,
+        attempt: None,
+    };
+    if let Err(e) = crate::record_to(report_sink, rec) {
+        eprintln!("flow::HookSink: failed to emit hook.dry_run: {e:#}");
+    }
+}
+
 /// (#2093 merge-gate finding 5) Emit a rate-limited `hook.failed` naming
 /// the total drop count for this rule — at most once per minute, so a
 /// receiver that's been down for hours doesn't turn every dropped write
@@ -1806,8 +2109,73 @@ fn drainer_loop(
                 emit_hook_record(report_sink.as_ref(), false, rt, &line, 1, Some(reason), &delivery_id);
                 continue;
             };
-            let headers = build_delivery_headers(&line, Some(&parsed), &delivery_id, rt.rule.signing_secret.as_ref());
-            match try_post(&rt.rule.url, &line, &headers) {
+            // (#2183) Apply this rule's `transform`, if configured —
+            // evaluated at DELIVERY time (never enqueue), so the outbox
+            // keeps raw records and a corrected adapter re-drains the
+            // SAME lines (see hook_transform's module doc). A jq error,
+            // timeout, oversize output, or a non-object/non-string
+            // result is TERMINAL: quarantine + `hook.failed`, never
+            // `RetryableFailure` (the #2178 wedge lesson — a
+            // construction-class error must route to the give-up path,
+            // not retry an unfixable line forever).
+            let body: String = if let Some(adapter) = &rt.rule.transform {
+                match crate::hook_transform::apply_transform(
+                    &adapter.source,
+                    &line,
+                    Duration::from_millis(darkmux_types::config_access::hooks_jq_timeout_ms()),
+                    darkmux_types::config_access::hooks_jq_max_output_bytes() as usize,
+                ) {
+                    crate::hook_transform::TransformOutcome::Body(b) => b,
+                    crate::hook_transform::TransformOutcome::Error(e) => {
+                        quarantine_line(&rt.rule.outbox_path, &line);
+                        advance_cursor(rt, new_cursor);
+                        let reason = format!("transform `{}` failed: {e}", adapter.path.display());
+                        write_last_status(rt, false, Some(&reason));
+                        emit_hook_record(report_sink.as_ref(), false, rt, &line, 1, Some(&reason), &delivery_id);
+                        continue;
+                    }
+                }
+            } else {
+                line.clone()
+            };
+            // (#2183) Sign/derive-metadata-headers-from `parsed` (the TRUE
+            // record — so `hook.fired`'s attribution stays tied to what
+            // actually happened), but pass `&body` as the signed payload:
+            // the signature must cover what's ACTUALLY on the wire, not
+            // the pre-transform record, or a receiver verifying against
+            // the body it received would never match.
+            let headers = build_delivery_headers(
+                &body,
+                Some(&parsed),
+                &delivery_id,
+                rt.rule.signing_secret.as_ref(),
+                &rt.rule.headers,
+                rt.rule.attribution_headers,
+            );
+            // (#2183) The `file` transport — no network, ever. Mutually
+            // exclusive with `http` at load time (`resolve_one_rule`), so
+            // exactly one of `file_dir`/a real `try_post` call applies.
+            if let Some(dir) = &rt.rule.file_dir {
+                match write_file_delivery(dir, &delivery_id, &rt.rule.url, &headers, &body) {
+                    Ok(()) => {
+                        advance_cursor(rt, new_cursor);
+                        write_last_status(rt, true, None);
+                        let dump_path = dir.join(format!("{delivery_id}.json"));
+                        emit_dry_run_record(report_sink.as_ref(), rt, &line, &delivery_id, &dump_path);
+                    }
+                    Err(e) => {
+                        // A write failure (unwritable dir, full disk) is
+                        // the `file` transport's counterpart of a
+                        // transient network failure — back off and retry,
+                        // never quarantine (the RECORD is fine; the
+                        // destination is momentarily unwritable).
+                        eprintln!("flow::HookSink: file-transport write to {} failed: {e:#}", dir.display());
+                        apply_backoff(rt);
+                    }
+                }
+                continue;
+            }
+            match try_post(&rt.rule.url, &body, &headers) {
                 DeliveryOutcome::Success { receiver_rejected } => {
                     let attempt = {
                         let mut c = rt.attempt_count.lock().unwrap();
@@ -1923,7 +2291,40 @@ impl HookSink {
     /// `hook.fired`/`hook.failed` records land — see the module doc for why
     /// it's a snapshot of the OTHER sinks, not this one.
     pub fn new(rules: &[HookRule], outbox_dir: PathBuf, report_sink: Arc<dyn FlowSink>) -> Result<Self> {
-        let resolved = resolve_rules(rules, &outbox_dir)?;
+        // (#2183) Resolved rule-by-rule (not the batch `resolve_rules`)
+        // so a `transform` that fails to load can be isolated to THAT
+        // rule alone — "a missing or unparseable adapter is a load-time
+        // refusal for that RULE only (the rest of the sink still
+        // works)" is the issue's own spec, deliberately narrower than
+        // every OTHER validation failure here (a bad/missing
+        // destination), which still refuses the WHOLE sink, unchanged
+        // pre-#2183 behavior (see `resolve_rules_refuses_on_first_non_
+        // loopback`).
+        let mut resolved = Vec::with_capacity(rules.len());
+        for (index, r) in rules.iter().enumerate() {
+            match resolve_one_rule(index, r, &outbox_dir) {
+                Ok(rr) => resolved.push(rr),
+                Err(e) => {
+                    let destination_ok = {
+                        let http = r.http.clone().filter(|s| !s.trim().is_empty());
+                        let file = r.file.clone().filter(|s| !s.trim().is_empty());
+                        match (&http, &file) {
+                            (Some(u), None) => validate_hook_target_url(u).is_ok(),
+                            (None, Some(_)) => true,
+                            _ => false,
+                        }
+                    };
+                    if destination_ok && r.transform.as_ref().is_some_and(|t| !t.trim().is_empty()) {
+                        eprintln!(
+                            "flow::HookSink: rule #{index} disabled — its `transform` failed to load; the rest of \
+                             the sink still works: {e:#}"
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
         // (#2093 merge-gate finding 4) Fix up a torn trailing line BEFORE
         // this process's drainer (or any appender) touches the file — see
         // `ensure_trailing_newline`'s doc. Best-effort: a failure here
@@ -2370,6 +2771,21 @@ mod tests {
         }
     }
 
+    /// (#2183) A `FlowSink` for tests that need a valid `report_sink` but
+    /// assert nothing about what lands in it — every `hook.fired`/
+    /// `hook.failed`/`hook.dry_run` write is simply discarded. Deliberately
+    /// NOT `LocalFileSink`, same isolation reasoning as `CapturingSink`'s
+    /// own doc above.
+    struct NoopSink;
+    impl FlowSink for NoopSink {
+        fn write(&self, _record: &FlowRecord) -> Result<()> {
+            Ok(())
+        }
+        fn info(&self) -> SinkInfo {
+            SinkInfo { kind: "Noop".into(), config: Default::default(), children: vec![], raw_url: None }
+        }
+    }
+
     fn record(action: &str) -> FlowRecord {
         FlowRecord {
             ts: schema::ts_utc_now(),
@@ -2694,6 +3110,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
 
@@ -2725,6 +3145,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some("http://10.0.0.5:8790/x".to_string()),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         assert!(resolve_rules(&rules, tmp.path()).is_err());
@@ -2740,6 +3164,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -2763,6 +3191,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -2811,6 +3243,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
 
@@ -2874,6 +3310,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -2905,6 +3345,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: Some("darkmux-hook-test-0".to_string()),
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let prev = std::env::var("DARKMUX_HOOK_SECRET_0").ok();
@@ -2983,6 +3427,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -3021,6 +3469,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -3049,7 +3501,7 @@ mod tests {
     #[test]
     fn try_post_classifies_a_malformed_header_value_as_client_error_not_retryable_forever() {
         let receiver = HookReceiver::start();
-        let mut headers = build_delivery_headers("{}", None, &delivery_id_for_line("{}"), None);
+        let mut headers = build_delivery_headers("{}", None, &delivery_id_for_line("{}"), None, &[], true);
         headers.machine_id = Some("bad\r\nheader".to_string()); // deliberately bypasses the sanitizer
         let outcome = try_post(&receiver.url("/events"), "{}", &headers);
         assert!(
@@ -3069,6 +3521,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         #[derive(Default)]
@@ -3118,6 +3574,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(format!("http://{addr}/unreachable")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -3142,6 +3602,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
 
@@ -3185,6 +3649,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
 
@@ -3254,6 +3722,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -3292,6 +3764,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -3342,6 +3818,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -3388,6 +3868,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:1/unused".to_string()),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let rule = resolve_rules(&rules, tmp.path()).unwrap().into_iter().next().unwrap();
@@ -3440,6 +3924,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -3504,6 +3992,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(format!("http://{addr}/unreachable")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
 
@@ -3565,6 +4057,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -3643,6 +4139,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(format!("http://{addr}/unreachable")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
 
@@ -3714,6 +4214,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
@@ -3767,6 +4271,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
@@ -3894,6 +4402,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -3935,6 +4447,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -3960,6 +4476,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let capture = Arc::new(CapturingSink::default());
@@ -3978,7 +4498,7 @@ mod tests {
         // this URL — if `try_post` tried to actually connect, it would
         // hang on connection refused / DNS, not return promptly.
         let start = Instant::now();
-        let headers = build_delivery_headers("{}", None, &delivery_id_for_line("{}"), None);
+        let headers = build_delivery_headers("{}", None, &delivery_id_for_line("{}"), None, &[], true);
         let outcome = try_post("http://evil.example.com/x", "{}", &headers);
         assert!(start.elapsed() < Duration::from_millis(500), "must refuse locally, never attempt the network");
         assert!(matches!(outcome, DeliveryOutcome::ClientError), "an invalid URL is a permanent, non-retryable failure");
@@ -3994,6 +4514,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let key = rule_key(&rules[0].r#match.clone().unwrap_or_default(), &rules[0].http.clone().unwrap());
@@ -4065,6 +4589,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(url),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         let report: Arc<dyn FlowSink> = Arc::new(NullSink);
@@ -4145,12 +4673,20 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/a".to_string()),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         };
         let rule_b = HookRule {
             r#match: Some(HookMatch { action: Some("dispatch.*".to_string()), ..Default::default() }),
             http: Some("http://127.0.0.1:8790/b".to_string()),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         };
         let a_first = resolve_rules(&[rule_a.clone(), rule_b.clone()], tmp.path()).unwrap();
@@ -4188,18 +4724,30 @@ mod tests {
                 r#match: Some(HookMatch { action: Some("work.*".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:1/a".to_string()),
                 signing_secret_keychain_item: None,
+                file: None,
+                transform: None,
+                headers: None,
+                attribution_headers: None,
                 extras: Default::default(),
             },
             HookRule {
                 r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:1/b".to_string()),
                 signing_secret_keychain_item: None,
+                file: None,
+                transform: None,
+                headers: None,
+                attribution_headers: None,
                 extras: Default::default(),
             },
             HookRule {
                 r#match: Some(HookMatch { mission_id: Some("no-such-mission".to_string()), ..Default::default() }),
                 http: Some("http://127.0.0.1:1/c".to_string()),
                 signing_secret_keychain_item: None,
+                file: None,
+                transform: None,
+                headers: None,
+                attribution_headers: None,
                 extras: Default::default(),
             },
         ];
@@ -4231,6 +4779,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("crawl.*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
         #[derive(Default)]
@@ -4258,4 +4810,315 @@ mod tests {
         drop(sink);
     }
 
+    // ─── (#2183) jq transforms + Keychain headers + the `file` transport ──
+
+    /// Point `hooks_adapters_dir()` at a fresh tempdir (via `DARKMUX_HOME`)
+    /// and write one adapter file into it. Returns the tempdir — kept
+    /// alive by the caller for the test's duration — and the outbox dir a
+    /// `HookSink` in the SAME test should use (`<tmp>/hooks`, matching
+    /// what a real deployment resolves both dirs from).
+    fn with_adapter(name: &str, source: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        let adapters_dir = darkmux_types::config_access::hooks_adapters_dir();
+        fs::create_dir_all(&adapters_dir).unwrap();
+        fs::write(adapters_dir.join(name), source).unwrap();
+        let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
+        (tmp, outbox_dir)
+    }
+
+    fn clear_darkmux_home() {
+        unsafe { std::env::remove_var("DARKMUX_HOME") };
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn transform_absent_delivers_record_verbatim_byte_identical_to_today() {
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            ..Default::default()
+        }];
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), Arc::new(NoopSink)).unwrap();
+        let mut rec = record("dispatch.tool");
+        rec.payload = Some(serde_json::json!({"tool_name": "report_finding"}));
+        sink.write(&rec).unwrap();
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
+        drop(sink);
+        let bodies = receiver.bodies();
+        let delivered: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        // Byte-identical to the record's own JSON shape — no transform
+        // ran, so the wire body IS the record, verbatim.
+        assert_eq!(delivered["action"], "dispatch.tool");
+        assert_eq!(delivered["payload"]["tool_name"], "report_finding");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn transform_applied_delivers_transformed_body() {
+        let (_tmp, outbox_dir) = with_adapter("shape.jq", r#"{summary: .payload.tool_name}"#);
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            transform: Some("shape.jq".to_string()),
+            ..Default::default()
+        }];
+        let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
+        let mut rec = record("dispatch.tool");
+        rec.payload = Some(serde_json::json!({"tool_name": "report_finding"}));
+        sink.write(&rec).unwrap();
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
+        drop(sink);
+        clear_darkmux_home();
+        let bodies = receiver.bodies();
+        let delivered: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(delivered, serde_json::json!({"summary": "report_finding"}), "transformed body, not the raw record");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn transform_jq_error_quarantines_and_never_retries_forever() {
+        let (_tmp, outbox_dir) = with_adapter("boom.jq", r#"error("adapter boom")"#);
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            transform: Some("boom.jq".to_string()),
+            ..Default::default()
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, outbox_dir, report).unwrap();
+        sink.write(&record("dispatch.tool")).unwrap();
+        assert!(wait_until(
+            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.failed"),
+            Duration::from_secs(3)
+        ));
+        // Give the drainer several extra poll cycles — a bug that
+        // re-queues the SAME line would keep re-emitting hook.failed or
+        // (worse) eventually reach the receiver.
+        std::thread::sleep(Duration::from_millis(300));
+        drop(sink);
+        clear_darkmux_home();
+        assert_eq!(receiver.request_count(), 0, "a jq error must never reach the network");
+        let failed: Vec<_> = capture.0.lock().unwrap().iter().filter(|r| r.action == "hook.failed").cloned().collect();
+        assert_eq!(failed.len(), 1, "quarantined once, never retried: {failed:?}");
+        let err = failed[0].payload.as_ref().and_then(|p| p.get("error")).and_then(|v| v.as_str()).unwrap_or("");
+        assert!(err.contains("adapter boom"), "{err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn transform_never_sees_a_keychain_resolved_header_value() {
+        // The transform's ONLY input is the raw record line — headers are
+        // resolved on a completely separate path (`build_delivery_headers`,
+        // called AFTER `apply_transform` in the drain loop; see hooks.rs's
+        // drainer_loop). Prove it structurally with a real end-to-end
+        // delivery: configure a `headers` entry carrying a distinctive
+        // sentinel, point `transform` at an adapter that dumps its ENTIRE
+        // input verbatim, and confirm the sentinel reaches the wire as a
+        // header while never appearing in the transformed body. A literal
+        // header resolves through the exact same `RawHookSecret` wrapper +
+        // the exact same `build_delivery_headers` call a Keychain-resolved
+        // one does (`resolve_hook_header_value`'s two branches both return
+        // `RawHookSecret`) — the transform's call site never branches on
+        // where a header's value came from, so this proves separation for
+        // both without a unit test needing real macOS Keychain access.
+        let (_tmp, outbox_dir) = with_adapter("echo.jq", r#"{dump: (. | tostring)}"#);
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            transform: Some("echo.jq".to_string()),
+            headers: Some({
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "Authorization".to_string(),
+                    darkmux_types::config::HeaderValue::Literal("TOTALLY-SECRET-SHOULD-NEVER-LEAK".to_string()),
+                );
+                m
+            }),
+            ..Default::default()
+        }];
+        let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
+        let mut rec = record("dispatch.tool");
+        rec.payload = Some(serde_json::json!({"tool_name": "report_finding"}));
+        sink.write(&rec).unwrap();
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
+        drop(sink);
+        clear_darkmux_home();
+        let bodies = receiver.bodies();
+        assert!(!bodies[0].contains("TOTALLY-SECRET"), "the transform's output must never carry the header value: {}", bodies[0]);
+        let headers = receiver.headers();
+        assert_eq!(
+            headers[0].get("authorization").map(String::as_str),
+            Some("TOTALLY-SECRET-SHOULD-NEVER-LEAK"),
+            "the header value DOES reach the wire — just never through the transform's input"
+        );
+    }
+
+    #[test]
+    fn adapter_name_with_dotdot_or_absolute_refused_at_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
+        for bad_name in ["../escape.jq", "/etc/passwd", "sub/dir.jq"] {
+            let rules = vec![HookRule {
+                r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+                http: Some("http://127.0.0.1:1/events".to_string()),
+                transform: Some(bad_name.to_string()),
+                ..Default::default()
+            }];
+            let err = resolve_rules(&rules, &outbox_dir).unwrap_err();
+            assert!(format!("{err:#}").contains("adapter"), "{bad_name}: {err:#}");
+        }
+        clear_darkmux_home();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_adapter_disables_only_that_rule_the_rest_of_the_sink_still_works() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
+        let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
+        let receiver = HookReceiver::start();
+        let rules = vec![
+            HookRule {
+                r#match: Some(HookMatch { action: Some("broken.*".to_string()), ..Default::default() }),
+                http: Some(receiver.url("/events")),
+                transform: Some("does-not-exist.jq".to_string()),
+                ..Default::default()
+            },
+            HookRule {
+                r#match: Some(HookMatch { action: Some("fine.*".to_string()), ..Default::default() }),
+                http: Some(receiver.url("/events")),
+                ..Default::default()
+            },
+        ];
+        // Construction must NOT fail — the bad-adapter rule is dropped,
+        // the healthy rule still runs.
+        let sink = HookSink::new(&rules, outbox_dir, Arc::new(NoopSink)).unwrap();
+        sink.write(&record("fine.thing")).unwrap();
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
+        drop(sink);
+        clear_darkmux_home();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn file_transport_writes_body_and_redacted_headers_and_emits_dry_run() {
+        let (_tmp, outbox_dir) = with_adapter("shape.jq", r#"{summary: .payload.tool_name}"#);
+        let dryrun_dir = outbox_dir.join("dryrun-out");
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            file: Some(dryrun_dir.to_string_lossy().into_owned()),
+            transform: Some("shape.jq".to_string()),
+            headers: Some({
+                let mut m = BTreeMap::new();
+                m.insert("X-Literal".to_string(), darkmux_types::config::HeaderValue::Literal("plain".to_string()));
+                m.insert(
+                    "Authorization".to_string(),
+                    darkmux_types::config::HeaderValue::Keychain { keychain_item: "darkmux-hook-test-nonexistent".to_string() },
+                );
+                m
+            }),
+            ..Default::default()
+        }];
+        #[derive(Default)]
+        struct CapturingSink(Mutex<Vec<FlowRecord>>);
+        impl FlowSink for CapturingSink {
+            fn write(&self, record: &FlowRecord) -> Result<()> {
+                self.0.lock().unwrap().push(record.clone());
+                Ok(())
+            }
+            fn info(&self) -> SinkInfo {
+                SinkInfo { kind: "Capturing".into(), config: Default::default(), children: vec![], raw_url: None }
+            }
+        }
+        let capture = Arc::new(CapturingSink::default());
+        let report: Arc<dyn FlowSink> = capture.clone();
+        let sink = HookSink::new(&rules, outbox_dir, report).unwrap();
+        let mut rec = record("dispatch.tool");
+        rec.payload = Some(serde_json::json!({"tool_name": "report_finding"}));
+        sink.write(&rec).unwrap();
+        assert!(wait_until(
+            || capture.0.lock().unwrap().iter().any(|r| r.action == "hook.dry_run"),
+            Duration::from_secs(3)
+        ));
+        drop(sink);
+        clear_darkmux_home();
+        let entries: Vec<_> = fs::read_dir(&dryrun_dir).unwrap().filter_map(|e| e.ok()).collect();
+        assert_eq!(entries.len(), 1, "one dump file per delivery");
+        let dump: serde_json::Value = serde_json::from_str(&fs::read_to_string(entries[0].path()).unwrap()).unwrap();
+        assert_eq!(dump["body"], "{\"summary\":\"report_finding\"}");
+        assert_eq!(dump["headers"]["X-Literal"], "plain", "a literal header is NOT redacted");
+        assert_eq!(dump["headers"]["Authorization"], "<redacted>", "a Keychain-referenced header IS redacted");
+        assert!(dump["delivery_id"].is_string());
+        assert!(dump["target_would_be"].as_str().unwrap().starts_with("file://"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(entries[0].path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "dry-run dump must be owner-only");
+        }
+    }
+
+    #[test]
+    fn file_and_http_together_or_neither_is_refused_at_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let both = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some("http://127.0.0.1:1/events".to_string()),
+            file: Some("/tmp/somewhere".to_string()),
+            ..Default::default()
+        }];
+        assert!(resolve_rules(&both, tmp.path()).is_err());
+        let neither = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            ..Default::default()
+        }];
+        assert!(resolve_rules(&neither, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn attribution_headers_false_drops_x_darkmux_headers() {
+        let receiver = HookReceiver::start();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some(receiver.url("/events")),
+            attribution_headers: Some(false),
+            ..Default::default()
+        }];
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sink = HookSink::new(&rules, tmp.path().to_path_buf(), Arc::new(NoopSink)).unwrap();
+        sink.write(&record("dispatch.tool")).unwrap();
+        assert!(wait_until(|| receiver.request_count() >= 1, Duration::from_secs(3)));
+        drop(sink);
+        let headers = receiver.headers();
+        assert!(!headers[0].contains_key("x-darkmux-delivery"), "{:?}", headers[0]);
+        assert!(!headers[0].contains_key("x-darkmux-signature"), "{:?}", headers[0]);
+    }
+
+    #[test]
+    fn wall_clock_and_output_caps_are_wired_from_config_defaults() {
+        // The knobs themselves (`apply_transform`'s enforcement) are
+        // exhaustively covered in `hook_transform`'s own tests; this just
+        // proves the accessor defaults this module reads at drain time.
+        assert_eq!(darkmux_types::config_access::hooks_jq_timeout_ms(), 5_000);
+        assert_eq!(darkmux_types::config_access::hooks_jq_max_output_bytes(), 1_048_576);
+    }
 }

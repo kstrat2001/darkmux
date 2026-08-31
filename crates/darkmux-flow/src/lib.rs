@@ -8,6 +8,7 @@
 
 pub mod daemon_probe;
 pub(crate) mod hmac_sha256;
+pub mod hook_transform;
 pub mod hooks;
 pub mod presence;
 pub mod presence_reconciler;
@@ -798,6 +799,33 @@ pub fn hook_signing_secret(rule_index: usize, keychain_item: Option<&str>) -> Op
     }
     let item = keychain_item.filter(|s| !s.trim().is_empty())?;
     keychain_hook_secret(item).map(RawHookSecret::new)
+}
+
+// ── (#2183) hook rule extra header values ────────────────────────────────
+// Same wrapper (`RawHookSecret`) as the signing secret above — the SHAPE
+// (an opaque string that must stay redacted in every log/record/doctor
+// row) is identical for a literal header value and a Keychain-resolved
+// one, so a new newtype would only duplicate `RawHookSecret`'s Debug/
+// Display redaction. `is_secret` travels ALONGSIDE the wrapper (not
+// inside it) because a LITERAL header (`Content-Type: application/json`)
+// is not actually a secret — callers use it to decide whether a
+// diagnostic surface may show the value or must print `"<redacted>"`.
+
+/// Resolve one `headers` map entry to `(is_secret, value)`. A `Literal`
+/// value resolves unconditionally (`is_secret: false`). A `Keychain`
+/// reference resolves via the SAME bounded Keychain read
+/// `hook_signing_secret` uses (`is_secret: true`); an absent/unreadable
+/// item resolves to `(true, None)` — the header is silently DROPPED at
+/// delivery (never sent empty), same fail-closed shape as an unresolved
+/// signing secret. Non-macOS Keychain references always resolve to
+/// `(true, None)` (no Keychain integration off-platform).
+pub fn resolve_hook_header_value(v: &darkmux_types::config::HeaderValue) -> (bool, Option<RawHookSecret>) {
+    match v {
+        darkmux_types::config::HeaderValue::Literal(s) => (false, Some(RawHookSecret::new(s.clone()))),
+        darkmux_types::config::HeaderValue::Keychain { keychain_item } => {
+            (true, keychain_hook_secret(keychain_item).map(RawHookSecret::new))
+        }
+    }
 }
 
 /// Redis Streams-backed flow sink. Each `write` XADDs the record's

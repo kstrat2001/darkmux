@@ -843,6 +843,10 @@ mod tests {
             r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
             http: Some(receiver.url("/events")),
             signing_secret_keychain_item: None,
+            file: None,
+            transform: None,
+            headers: None,
+            attribution_headers: None,
             extras: Default::default(),
         }];
 
