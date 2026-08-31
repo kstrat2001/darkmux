@@ -73,7 +73,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -1760,6 +1760,14 @@ struct RuleRuntime {
     /// no `action` field — never quarantined (lenient on read), just
     /// counted. In-process only; never reset.
     non_record_lines: AtomicU64,
+    /// (security review, 2026-08-31, #2183) The count of this rule's
+    /// currently-orphaned (timed-out, still-running) transform-evaluation
+    /// threads — see `hook_transform::apply_transform`'s doc for why a
+    /// leaked thread is not harmless and must be bounded. Shared (via
+    /// `Arc`, cloned into every `apply_transform` call for this rule) so
+    /// an orphaned thread can decrement it itself once it eventually
+    /// finishes, regardless of how long after this `RuleRuntime` moved on.
+    orphaned_transforms: Arc<AtomicU32>,
 }
 
 fn apply_backoff(rt: &RuleRuntime) {
@@ -2124,6 +2132,7 @@ fn drainer_loop(
                     &line,
                     Duration::from_millis(darkmux_types::config_access::hooks_jq_timeout_ms()),
                     darkmux_types::config_access::hooks_jq_max_output_bytes() as usize,
+                    &rt.orphaned_transforms,
                 ) {
                     crate::hook_transform::TransformOutcome::Body(b) => b,
                     crate::hook_transform::TransformOutcome::Error(e) => {
@@ -2132,6 +2141,18 @@ fn drainer_loop(
                         let reason = format!("transform `{}` failed: {e}", adapter.path.display());
                         write_last_status(rt, false, Some(&reason));
                         emit_hook_record(report_sink.as_ref(), false, rt, &line, 1, Some(&reason), &delivery_id);
+                        continue;
+                    }
+                    // (security review, 2026-08-31) NOT a claim about
+                    // this line/adapter — this rule already has too
+                    // many timed-out transform threads still running in
+                    // the background (see hook_transform's module doc).
+                    // Back off and retry the SAME undelivered line later
+                    // (never quarantine — an otherwise-fine adapter must
+                    // not be permanently disabled because the process is
+                    // momentarily backed up).
+                    crate::hook_transform::TransformOutcome::Busy => {
+                        apply_backoff(rt);
                         continue;
                     }
                 }
@@ -2352,6 +2373,7 @@ impl HookSink {
                     stalled: AtomicBool::new(false),
                     last_cursor_write_warning: Mutex::new(None),
                     non_record_lines: AtomicU64::new(0),
+                    orphaned_transforms: Arc::new(AtomicU32::new(0)),
                 })
             })
             .collect();
@@ -3887,6 +3909,7 @@ mod tests {
             stalled: AtomicBool::new(false),
             last_cursor_write_warning: Mutex::new(None),
             non_record_lines: AtomicU64::new(0),
+            orphaned_transforms: Arc::new(AtomicU32::new(0)),
         };
         set_force_cursor_write_failure(&rt.rule.cursor_path, true);
 
@@ -4972,6 +4995,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn adapter_name_with_dotdot_or_absolute_refused_at_load() {
         let tmp = tempfile::TempDir::new().unwrap();
         unsafe { std::env::set_var("DARKMUX_HOME", tmp.path()) };
@@ -5077,6 +5101,37 @@ mod tests {
         }
     }
 
+    /// (security review, 2026-08-31, MUST FIX 3) Pins the doc/PR-body
+    /// example's own honesty: a `headers` + `transform` rule targeting a
+    /// real external SaaS endpoint over `https` is STILL refused at load
+    /// — this packet did not touch `validate_hook_target_url`'s policy
+    /// (loopback or tailnet, `http://` only). A copy-pasted doc example
+    /// using `https://<site>.atlassian.net/...` must fail exactly like
+    /// this, not silently construct a broken sink.
+    #[test]
+    fn https_saas_target_still_refused_even_with_headers_and_transform() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rules = vec![HookRule {
+            r#match: Some(HookMatch { action: Some("*".to_string()), ..Default::default() }),
+            http: Some("https://your-site.atlassian.net/rest/api/3/issue".to_string()),
+            headers: Some({
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "Authorization".to_string(),
+                    darkmux_types::config::HeaderValue::Keychain { keychain_item: "darkmux-hook-jira".to_string() },
+                );
+                m
+            }),
+            transform: Some("jira-issue.jq".to_string()),
+            ..Default::default()
+        }];
+        let err = resolve_rules(&rules, tmp.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("neither a loopback target"),
+            "an https SaaS target must still be refused by the unchanged URL policy: {err:#}"
+        );
+    }
+
     #[test]
     fn file_and_http_together_or_neither_is_refused_at_load() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5095,6 +5150,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn attribution_headers_false_drops_x_darkmux_headers() {
         let receiver = HookReceiver::start();
         let rules = vec![HookRule {
