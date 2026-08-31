@@ -4421,6 +4421,161 @@
         );
     }
 
+    // ─── #2169 malformed structured tool-call names ────────────────────
+
+    /// `dispatch.tool.malformed_names` → `{kind:"malformed_tool_names",
+    /// severity:"warn", detail:<non-empty>, count, model,
+    /// sample_name_prefix}` — the issue's own spec names `count`/`model`/
+    /// `sample_name_prefix` as explicit payload fields (not just words
+    /// inside `detail`), so a consumer aggregating or filtering by model
+    /// doesn't have to parse the sentence.
+    #[test]
+    fn detector_telemetry_payload_maps_malformed_tool_names_event() {
+        let event = serde_json::json!({
+            "type": "dispatch.tool.malformed_names",
+            "seq": 4,
+            "count": 5,
+            "model": "mistralai/devstral-small-2-2512",
+            "sample_name_prefix": "} catch (error) { --- [TOOL_CALLS]",
+        });
+        let payload = detector_telemetry_payload("dispatch.tool.malformed_names", &event)
+            .expect("maps malformed_tool_names");
+        assert_eq!(payload["kind"], "malformed_tool_names");
+        assert_eq!(payload["severity"], "warn");
+        assert_eq!(payload["count"], 5);
+        assert_eq!(payload["model"], "mistralai/devstral-small-2-2512");
+        assert_eq!(payload["sample_name_prefix"], "} catch (error) { --- [TOOL_CALLS]");
+        let detail = payload["detail"].as_str().expect("detail is a string");
+        assert!(
+            detail.contains('5') && detail.contains("mistralai/devstral-small-2-2512"),
+            "detail must weave in count + model; got {detail:?}"
+        );
+        // (merge-gate MUST FIX 1) No `reason` field on the event — an
+        // older runtime image predating the split — must default to
+        // "not_a_tool" (the pre-merge-gate meaning of this whole field),
+        // not silently drop or crash.
+        assert_eq!(payload["reason"], "not_a_tool");
+        assert!(
+            !detail.contains("not granted"),
+            "the not-a-tool wording must never say 'not granted' — that's the OTHER reason's wording"
+        );
+    }
+
+    /// (merge-gate MUST FIX 1) Sibling of the test above for the OTHER
+    /// reason — a real darkmux tool this dispatch's role wasn't granted.
+    /// The wording must be DIFFERENT: telling a model "that looks like
+    /// quoted code" when it correctly named `bash` is false, and would
+    /// not correct the actual mistake.
+    #[test]
+    fn detector_telemetry_payload_maps_real_tool_not_granted_reason() {
+        let event = serde_json::json!({
+            "type": "dispatch.tool.malformed_names",
+            "seq": 4,
+            "count": 1,
+            "model": "mistralai/devstral-small-2-2512",
+            "sample_name_prefix": "bash",
+            "reason": "real_tool_not_granted",
+        });
+        let payload = detector_telemetry_payload("dispatch.tool.malformed_names", &event)
+            .expect("maps malformed_tool_names");
+        assert_eq!(payload["kind"], "malformed_tool_names", "same detector kind, different reason");
+        assert_eq!(payload["reason"], "real_tool_not_granted");
+        let detail = payload["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("not granted") && detail.contains("bash"),
+            "detail must name the offending tool and say it's not granted; got {detail:?}"
+        );
+        assert!(
+            !detail.contains("[TOOL_CALLS]") && !detail.contains("quoted"),
+            "must NOT use the not-a-tool wording — bash is a real tool; got {detail:?}"
+        );
+    }
+
+    /// The `tool.completed`/`dispatch.tool.malformed_names` event pair
+    /// accumulates into TWO SEPARATE `TrajectorySummary` counters — a
+    /// dispatched-and-failed call increments `tool_calls_failed`; a
+    /// coalesced malformed-names event's `count` increments
+    /// `tool_calls_invalid_name` — and a malformed-name call never
+    /// touches `tool_calls`/`tool_calls_failed` at all (it never
+    /// produces its own `tool.completed` event, by construction — the
+    /// runtime never dispatches it).
+    #[test]
+    #[serial] // reaches emit_telemetry() -> darkmux_flow::record() via poll_and_emit()
+    fn handle_event_malformed_tool_names_and_tool_failure_accumulate_separately() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("trajectory.jsonl");
+        let mut state = fixture_state(path.clone());
+
+        let lines = "\
+            {\"type\":\"tool.completed\",\"tool_seq\":1,\"tool_name\":\"read\",\"ok\":true}\n\
+            {\"type\":\"tool.completed\",\"tool_seq\":2,\"tool_name\":\"bash\",\"ok\":false}\n\
+            {\"type\":\"dispatch.tool.malformed_names\",\"seq\":1,\"count\":5,\"model\":\"devstral\",\"sample_name_prefix\":\"bogus\"}\n";
+        std::fs::write(&path, lines).unwrap();
+        state.poll_and_emit();
+
+        assert_eq!(state.summary.tool_calls, 2, "total_tools counts only DISPATCHED calls");
+        assert_eq!(
+            state.summary.tool_calls_failed, 1,
+            "exactly the one dispatched-and-failed call, never the 5 malformed ones"
+        );
+        assert_eq!(
+            state.summary.tool_calls_invalid_name, 5,
+            "the coalesced event's count lands here, not in tool_calls/tool_calls_failed"
+        );
+        // Also lands in the envelope's `detections` array via the shared
+        // producer (#1955) — same payload the flow record carries.
+        assert!(
+            state.summary.detections.iter().any(|d| d["kind"] == "malformed_tool_names"),
+            "must also reach the envelope's detections array"
+        );
+    }
+
+    /// (merge-gate MUST FIX 1) A dispatch that fires BOTH reasons across
+    /// its trajectory — one not-a-tool event, one real-tool-not-granted
+    /// event — must accumulate into TWO SEPARATE `TrajectorySummary`
+    /// counters, never one merged bucket. Also pins the lenient-on-read
+    /// fallback: a THIRD event with no `reason` field at all (an older
+    /// runtime image) must land in `tool_calls_invalid_name`, the
+    /// pre-merge-gate meaning of that field.
+    #[test]
+    #[serial]
+    fn handle_event_ungranted_and_not_a_tool_reasons_accumulate_separately() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("trajectory.jsonl");
+        let mut state = fixture_state(path.clone());
+
+        let lines = "\
+            {\"type\":\"dispatch.tool.malformed_names\",\"seq\":1,\"count\":3,\"model\":\"devstral\",\"sample_name_prefix\":\"bogus\",\"reason\":\"not_a_tool\"}\n\
+            {\"type\":\"dispatch.tool.malformed_names\",\"seq\":2,\"count\":2,\"model\":\"devstral\",\"sample_name_prefix\":\"bash\",\"reason\":\"real_tool_not_granted\"}\n\
+            {\"type\":\"dispatch.tool.malformed_names\",\"seq\":3,\"count\":1,\"model\":\"devstral\",\"sample_name_prefix\":\"legacy\"}\n";
+        std::fs::write(&path, lines).unwrap();
+        state.poll_and_emit();
+
+        assert_eq!(
+            state.summary.tool_calls_invalid_name, 4,
+            "the not_a_tool event's 3 plus the reason-less (legacy) event's 1 = 4"
+        );
+        assert_eq!(
+            state.summary.tool_calls_ungranted, 2,
+            "the real_tool_not_granted event's 2, kept in its OWN bucket"
+        );
+        let kinds_and_reasons: Vec<(&str, &str)> = state
+            .summary
+            .detections
+            .iter()
+            .map(|d| (d["kind"].as_str().unwrap(), d["reason"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            kinds_and_reasons,
+            vec![
+                ("malformed_tool_names", "not_a_tool"),
+                ("malformed_tool_names", "real_tool_not_granted"),
+                ("malformed_tool_names", "not_a_tool"),
+            ],
+            "detections array must carry each firing's own reason"
+        );
+    }
+
     /// Sibling of the test above for `max_tokens_per_call` — proves the
     /// wording actually discriminates between the two kinds (the exact
     /// #2165 miss: "hit cap 1000" could have been either).

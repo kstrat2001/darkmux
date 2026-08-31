@@ -33,7 +33,7 @@
     },
 
     "devstral": {
-      "description": "Review pipeline — probe seat, plain draws. Dense wide-instruct model, no reasoning trace.",
+      "description": "Review pipeline — probe seat, plain draws. Dense wide-instruct model, no reasoning trace. (#2169) The observed case this issue was filed for was `mistralai/devstral-small-2-2512` — a DIFFERENT id from the `devstral-small-2507` pinned below; whether 2507 shares the same LM Studio Mistral-parser interaction (structured tool_calls whose `name` is model content sliced around its own [TOOL_CALLS] marker) is unconfirmed. Either way darkmux never executes a call like that regardless of which Devstral id produced it — partitioned + coalesced via the `malformed_tool_names` detector rather than dispatched. Not a reason to avoid this profile; worth knowing if that detector fires in a run's telemetry.",
       "models": [
         { "id": "mistralai/devstral-small-2507", "n_ctx": 32000 }
       ]

@@ -166,6 +166,35 @@ const DEFAULT_TEST_CADENCE_DRIFT_TEMPLATE: &str =
      or lint commands, run them now. Otherwise re-read the file before \
      stacking another edit.";
 
+/// (#2169) Default template for the malformed-tool-names signal —
+/// fires ONCE per turn where one or more structured `tool_calls`
+/// carried a `name` that isn't in the runtime's allowlist (Devstral 2
+/// quoting its own generated code around LM Studio's Mistral
+/// `[TOOL_CALLS]` marker is the observed cause; the runtime never
+/// dispatches these). Placeholders `{count}` and `{tools}` (the
+/// sorted, comma-joined list of real tool names) substituted at
+/// injection.
+const DEFAULT_MALFORMED_TOOL_NAMES_TEMPLATE: &str =
+    "[darkmux-runtime] {count} tool call(s) in this turn carried names that are not \
+     tools — they look like quoted code or the `[TOOL_CALLS]` marker, not a real tool \
+     name. None were executed. Tools available: {tools}. Emit tool calls only through \
+     the function-calling channel, never inside content or reasoning text.";
+
+/// (#2169 merge-gate MUST FIX 1) Default template for the
+/// tool-not-granted signal — the SIBLING of the malformed-tool-names
+/// signal above, for the OTHER cause: the call named a REAL darkmux tool
+/// that this dispatch's role simply was not granted. Distinct wording is
+/// the point — telling a model "that looks like quoted code" when it
+/// correctly named `bash` is false and does not correct the actual
+/// mistake (calling a tool outside its granted set). Placeholders
+/// `{count}`, `{offending}` (the sorted, comma-joined REAL tool name(s) it
+/// called without a grant), and `{tools}` (the sorted, comma-joined list
+/// of tools it DOES have) substituted at injection.
+const DEFAULT_TOOL_NOT_GRANTED_TEMPLATE: &str =
+    "[darkmux-runtime] {count} tool call(s) in this turn named a real tool this role is \
+     not granted — {offending}. None were executed. Tools available to you: {tools}. \
+     Use only the tools in that list.";
+
 /// Per-dispatch state — queue of pending feedback messages to inject
 /// at the top of the next loop iteration.
 ///
@@ -242,6 +271,8 @@ impl FeedbackInjector {
                 "inactivity_approach" => DEFAULT_INACTIVITY_APPROACH_TEMPLATE,
                 "reasoning_loop" => DEFAULT_REASONING_LOOP_TEMPLATE,
                 "per_turn_cap_approach" => DEFAULT_PER_TURN_CAP_APPROACH_TEMPLATE,
+                "malformed_tool_names" => DEFAULT_MALFORMED_TOOL_NAMES_TEMPLATE,
+                "tool_not_granted" => DEFAULT_TOOL_NOT_GRANTED_TEMPLATE,
                 _ => "",
             })
     }
@@ -416,6 +447,43 @@ impl FeedbackInjector {
             .replace("{path}", path);
         self.pending.push(message);
         self.pending_kinds.push("test_cadence_drift");
+    }
+
+    /// (#2169) Queue a malformed-tool-names nudge — ONE message per
+    /// turn regardless of how many invalid-name calls the turn
+    /// carried (`count` is coalesced upstream by the loop runner
+    /// before this is called; this method never fires more than once
+    /// per turn). `tools` is the pre-joined, sorted list of real tool
+    /// names so the model has something concrete to call instead.
+    pub fn queue_malformed_tool_names(&mut self, count: usize, tools: &str) {
+        if !self.enabled {
+            return;
+        }
+        let template = self.template_for("malformed_tool_names");
+        let message = template
+            .replace("{count}", &count.to_string())
+            .replace("{tools}", tools);
+        self.pending.push(message);
+        self.pending_kinds.push("malformed_tool_names");
+    }
+
+    /// (#2169 merge-gate MUST FIX 1) Queue a tool-not-granted nudge — the
+    /// SIBLING of `queue_malformed_tool_names` above for the OTHER cause:
+    /// the call named a real darkmux tool, just not one this role was
+    /// granted. `offending` is the pre-joined, sorted, deduplicated list
+    /// of the real tool name(s) it called without a grant; `tools` is the
+    /// pre-joined, sorted list of tools it DOES have.
+    pub fn queue_tool_not_granted(&mut self, count: usize, offending: &str, tools: &str) {
+        if !self.enabled {
+            return;
+        }
+        let template = self.template_for("tool_not_granted");
+        let message = template
+            .replace("{count}", &count.to_string())
+            .replace("{offending}", offending)
+            .replace("{tools}", tools);
+        self.pending.push(message);
+        self.pending_kinds.push("tool_not_granted");
     }
 
     /// Number of pending messages waiting to be drained. Tests use

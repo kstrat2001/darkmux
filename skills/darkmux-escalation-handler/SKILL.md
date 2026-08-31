@@ -13,7 +13,7 @@ This skill picks up where a local-tier dispatch left off when it hit an operator
 
 You're looking at one of:
 
-- A `darkmux lab run` or `darkmux dispatch` that ended with `result: "escalation_compaction_limit_reached"`, `result: "escalation_cumulative_tokens_exceeded"`, `result: "escalation_intra_turn_stall_exhausted"`, or `result: "escalation_generation_checkpoint_budget_exhausted"` (#2171 — a turn that kept hitting the generation check-in without converging). All escalation results share the `escalation_*` prefix; future variants will too.
+- A `darkmux lab run` or `darkmux dispatch` that ended with `result: "escalation_compaction_limit_reached"`, `result: "escalation_cumulative_tokens_exceeded"`, `result: "escalation_intra_turn_stall_exhausted"`, `result: "escalation_generation_checkpoint_budget_exhausted"` (#2171 — a turn that kept hitting the generation check-in without converging), or `result: "escalation_malformed_tool_calls"` (#2169 — 3 consecutive turns where every tool call named something that wasn't a real, granted tool, so nothing dispatched). All escalation results share the `escalation_*` prefix; future variants will too.
 - A run manifest under `~/.darkmux/runs/<run-id>/manifest.json` whose `ok: false` carries an escalation-shaped error string.
 - A flow record on the topology viewer with `terminal_reason: EscalationTriggered`.
 
@@ -40,7 +40,7 @@ cat $RUN_DIR/manifest.json | jq '.'
 What you're looking for in the manifest:
 
 - `ok: false` (escalation manifests as non-ok in the host layer for back-compat with consumers that grep on ok)
-- An error string containing one of `escalation_compaction_limit_reached`, `escalation_cumulative_tokens_exceeded`, `escalation_intra_turn_stall_exhausted`, or `escalation_generation_checkpoint_budget_exhausted` (#2171)
+- An error string containing one of `escalation_compaction_limit_reached`, `escalation_cumulative_tokens_exceeded`, `escalation_intra_turn_stall_exhausted`, `escalation_generation_checkpoint_budget_exhausted` (#2171), or `escalation_malformed_tool_calls` (#2169)
 - `sandbox` — the workspace path the agent was working in (this is your continuation workspace)
 - `workload` + `profile` — context for what was being attempted
 

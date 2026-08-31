@@ -38,7 +38,7 @@ hours later, by which point dispatch context is gone.
 
 ## Working within a bounded dispatch
 
-This dispatch is bounded along five dimensions:
+This dispatch is bounded along six dimensions:
 
 - **Turn cap** — each chat-completion call counts as one turn. When
   you cross the cap, the dispatch terminates with
@@ -57,6 +57,13 @@ This dispatch is bounded along five dimensions:
 - **Cumulative completion-token cap** — sum of all completion tokens
   (content + reasoning) across every turn. Crossing terminates via
   `escalation_cumulative_tokens_exceeded`.
+- **Malformed tool-call names** — a tool call only counts as progress
+  when its `name` is one of the tools actually offered to you through
+  the function-calling channel. A call whose name isn't a real tool,
+  or names a real tool you weren't given, is never executed — you'll
+  get feedback saying so, not a result. Three turns IN A ROW with no
+  successfully dispatched tool call escalate via
+  `escalation_malformed_tool_calls`.
 - **Wall-clock deadline** — long-running reasoning hangs are killed
   at the deadline regardless of progress.
 
