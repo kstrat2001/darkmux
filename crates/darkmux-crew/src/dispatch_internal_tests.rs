@@ -897,6 +897,7 @@
             "system prompt",
             std::path::Path::new("/tmp/ws"),
             false,
+            None,
         );
 
         // The wiring itself: this key would be ABSENT entirely if the
@@ -938,6 +939,7 @@
             "sys",
             std::path::Path::new("/tmp/ws"),
             true,
+            None,
         );
         assert_eq!(payload["bounds"]["turn_delay_ms"]["source"], serde_json::json!("forced-agentic-remote"));
         assert_eq!(payload["turn_delay_ms"], serde_json::json!(0), "the top-level stamp is also forced");
@@ -968,7 +970,7 @@
         ] {
             unsafe { std::env::remove_var(k) };
         }
-        let bounds = resolved_runtime_bounds_json(false);
+        let bounds = resolved_runtime_bounds_json(false, None);
         assert_eq!(
             bounds["max_tokens_per_call"],
             serde_json::json!({"value": null, "source": "built-in"}),
@@ -1000,7 +1002,7 @@
         unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL", "4000") };
         unsafe { std::env::set_var("DARKMUX_RUNTIME_REASONING_CHECKPOINT_INTERVAL", "500") };
         unsafe { std::env::set_var("DARKMUX_INACTIVITY_TIMEOUT_SECONDS", "120") };
-        let bounds = resolved_runtime_bounds_json(false);
+        let bounds = resolved_runtime_bounds_json(false, None);
         assert_eq!(bounds["max_tokens_per_call"], serde_json::json!({"value": 4000, "source": "env"}));
         assert_eq!(
             bounds["reasoning_checkpoint_interval_tokens"],
@@ -1019,12 +1021,56 @@
         }
     }
 
+    // ─── #2193: effective_max_turns / resolved_runtime_bounds_json's
+    //     max_turns block — operator-explicit vs caller-derived precedence ──
+
+    #[test]
+    #[serial]
+    fn effective_max_turns_uses_the_override_when_the_operator_set_nothing() {
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TURNS") };
+        assert_eq!(effective_max_turns(Some(20)), Some(20));
+        assert_eq!(effective_max_turns(None), None, "no override, nothing configured ⇒ uncapped");
+    }
+
+    #[test]
+    #[serial]
+    fn effective_max_turns_lets_an_operators_explicit_env_setting_win_over_the_override() {
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TURNS", "5") };
+        // The crawl launcher's own derived ceiling (e.g. a 5-site unit's
+        // 15-turn default) must NOT beat an operator's explicit setting —
+        // #2193's own requirement: "an explicit operator setting must
+        // still win."
+        assert_eq!(effective_max_turns(Some(20)), Some(5));
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TURNS") };
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_max_turns_names_launcher_when_the_override_wins() {
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TURNS") };
+        let bounds = resolved_runtime_bounds_json(false, Some(15));
+        assert_eq!(bounds["max_turns"], serde_json::json!({"value": 15, "source": "launcher"}));
+    }
+
+    #[test]
+    #[serial]
+    fn resolved_runtime_bounds_json_max_turns_names_env_when_the_operator_set_one() {
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_TURNS", "5") };
+        let bounds = resolved_runtime_bounds_json(false, Some(15));
+        assert_eq!(
+            bounds["max_turns"],
+            serde_json::json!({"value": 5, "source": "env"}),
+            "the operator's own env setting must win over the launcher's derived override"
+        );
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_TURNS") };
+    }
+
     #[test]
     #[serial]
     fn resolved_runtime_bounds_json_turn_delay_ms_passes_through_for_a_local_dispatch() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "3000") };
-        let bounds = resolved_runtime_bounds_json(false);
+        let bounds = resolved_runtime_bounds_json(false, None);
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({"value": 3000, "source": "env"}),
@@ -1055,7 +1101,7 @@
     fn resolved_runtime_bounds_json_turn_delay_ms_is_self_explaining_when_forced_agentic_remote() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::set_var("DARKMUX_TURN_DELAY_MS", "5000") };
-        let bounds = resolved_runtime_bounds_json(true);
+        let bounds = resolved_runtime_bounds_json(true, None);
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({
@@ -1082,7 +1128,7 @@
     fn resolved_runtime_bounds_json_turn_delay_ms_forced_shape_holds_even_at_the_default() {
         let prev = std::env::var("DARKMUX_TURN_DELAY_MS").ok();
         unsafe { std::env::remove_var("DARKMUX_TURN_DELAY_MS") };
-        let bounds = resolved_runtime_bounds_json(true);
+        let bounds = resolved_runtime_bounds_json(true, None);
         assert_eq!(
             bounds["turn_delay_ms"],
             serde_json::json!({

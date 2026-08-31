@@ -571,6 +571,16 @@ fn interpret_dispatch_result(unit_id: &str, res: &DispatchResult) -> UnitDispatc
     let timed_out = watchdog_timeout_fired(&res.stderr);
     let result_label = match envelope.as_ref().and_then(|e| e.get("result")).and_then(Value::as_str) {
         Some("stop") => "stop".to_string(),
+        // (#2193) A unit that ran out of its `max_turns` ceiling is a
+        // BOUND being hit, not a dispatch failure — the runtime's own
+        // structured `result: "max_turns"` (#325) says so explicitly, so
+        // this launcher names it `unit_budget_exhausted` right here
+        // rather than letting it fall into the generic `"error"` catch-
+        // all below (where it landed before this fix, indistinguishable
+        // from a genuine crash). Checked BEFORE the `timed_out` arm: a
+        // watchdog kill AFTER the turn cap was already hit is still,
+        // first and foremost, a budget exhaustion.
+        Some("max_turns") => UNIT_BUDGET_EXHAUSTED.to_string(),
         Some(_) if timed_out => "timeout".to_string(),
         Some(_) => "error".to_string(),
         None if timed_out => "timeout".to_string(),
@@ -722,6 +732,161 @@ fn count_rejected_report_findings(out_dir: &Path) -> usize {
         .count()
 }
 
+// ── per-unit bounds (#2193) ─────────────────────────────────────────────
+//
+// Live evidence (crawl-1788144785, unit u-0005, Devstral, 2026-08-31): one
+// unit ran 96+ minutes / 38 turns / 65 tool calls with ZERO `report_finding`
+// attempts and nothing able to stop it — `runtime.max_turns` defaults to
+// `None` (uncapped), and nothing in this launcher supplied a per-unit
+// default. Two independent bounds close that gap: a turn CEILING (this
+// unit gets AT MOST this many turns, full stop) and a no-PROGRESS bound
+// (this unit's tail must keep finding new ground or reporting findings, or
+// it ends early even under the ceiling). Both name the SAME outcome —
+// `unit_budget_exhausted` — because the operator-facing question is the
+// same either way: "did this unit run out of room to work in," not "which
+// detector happened to fire."
+
+/// A rough multiple of turns per site — read the site, maybe grep around
+/// it, decide, call `report_finding` (or not). Deliberately generous (a
+/// unit that needs fewer turns just finishes early via `result: "stop"`;
+/// this only bounds the WORST case).
+const TURNS_PER_SITE: u32 = 3;
+/// However small a unit's own site/file count, it gets at least this many
+/// turns — a 1-site unit still needs room to read, search, and report.
+const MIN_UNIT_MAX_TURNS: u32 = 12;
+/// However large a unit's own site/file count, its ceiling never exceeds
+/// this — the backstop that actually closes #2193 (a unit's ceiling can no
+/// longer grow with the plan; the plan's own sizing caps
+/// `max_sites_per_unit`/`max_est_tokens_per_unit` are the lever for "this
+/// unit is too big", not an unbounded turn allowance).
+const MAX_UNIT_MAX_TURNS: u32 = 40;
+/// Default no-progress bound (#2193's "N=8" — operator-settable via
+/// `--param no_progress_turns=<n>`).
+const DEFAULT_NO_PROGRESS_TURNS: usize = 8;
+/// The named outcome BOTH per-unit bounds end a unit under — counted
+/// separately from `error` in `CrawlStats`/the mission close payload/the
+/// envelope (never folded into `units_errored`; see `CrawlStats::units_
+/// budget_exhausted`'s own doc for why that distinction matters to a
+/// later `--param resume=`).
+const UNIT_BUDGET_EXHAUSTED: &str = "unit_budget_exhausted";
+
+/// This unit's own site/file count — the plan's own estimate of how much
+/// ground it covers, and therefore the input to `default_unit_max_turns`.
+fn unit_site_count(unit: &Unit) -> usize {
+    match unit {
+        Unit::Site { sites, .. } | Unit::Edge { sites, .. } => sites.len(),
+        Unit::Read { files, .. } => files.len(),
+    }
+}
+
+/// The per-unit `max_turns` ceiling this launcher sets by DEFAULT for a
+/// unit dispatch — `TURNS_PER_SITE` turns per site/file, floored at
+/// `MIN_UNIT_MAX_TURNS` and capped at `MAX_UNIT_MAX_TURNS`. This is a
+/// DEFAULT, not a mandate: `DispatchOpts::max_turns_override` only fills
+/// the gap an operator's own `runtime.max_turns` config/env setting left
+/// open — see `dispatch_internal::effective_max_turns`'s own doc for the
+/// precedence.
+fn default_unit_max_turns(unit: &Unit) -> u32 {
+    let sites = unit_site_count(unit).max(1) as u32;
+    sites.saturating_mul(TURNS_PER_SITE).clamp(MIN_UNIT_MAX_TURNS, MAX_UNIT_MAX_TURNS)
+}
+
+/// (#2193) Walk `out_dir/.darkmux-runtime/trajectory.jsonl` (the SAME file
+/// `count_rejected_report_findings` reads, best-effort — a missing/
+/// unreadable trajectory reports `false`, never escalates a unit this
+/// launcher can't fully inspect) and report whether this unit's LAST `n`
+/// turns collectively made no progress: no `report_finding` attempt
+/// (accepted OR rejected — an ATTEMPT is engagement, unlike `count_
+/// rejected_report_findings`'s rejected-only count) and no path read that
+/// hadn't already been read in an EARLIER turn. Turns are grouped by
+/// `tool.completed`'s own `seq` field — the same turn-numbering `dispatch_
+/// internal`'s live tailer counts by, so this reads the exact same "turn"
+/// an operator watching the live flow stream would see. A unit that
+/// hasn't even run `n` turns yet reports `false` — this bound only fires
+/// once there IS a full trailing window to judge.
+fn unit_hit_no_progress_bound(out_dir: &Path, n: usize) -> bool {
+    if n == 0 {
+        return false;
+    }
+    let traj_path = out_dir.join(".darkmux-runtime").join("trajectory.jsonl");
+    let Ok(body) = std::fs::read_to_string(&traj_path) else {
+        return false;
+    };
+
+    let mut by_turn: BTreeMap<u64, bool> = BTreeMap::new();
+    let mut read_paths_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for line in body.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v.get("type").and_then(Value::as_str) != Some("tool.completed") {
+            continue;
+        }
+        let Some(seq) = v.get("seq").and_then(Value::as_u64) else { continue };
+        let tool_name = v.get("tool_name").and_then(Value::as_str).unwrap_or("");
+        let entry = by_turn.entry(seq).or_insert(false);
+        match tool_name {
+            "report_finding" => *entry = true,
+            "read" => {
+                let args = v.get("args").and_then(Value::as_str).unwrap_or("");
+                if let Some(path) = serde_json::from_str::<Value>(args)
+                    .ok()
+                    .and_then(|a| a.get("path").and_then(Value::as_str).map(str::to_string))
+                {
+                    if read_paths_seen.insert(path) {
+                        *entry = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if by_turn.len() < n {
+        return false;
+    }
+    by_turn.values().rev().take(n).all(|progressed| !progressed)
+}
+
+// ── crawler seat (#2188) ─────────────────────────────────────────────────
+
+/// (#2188) The crawler role's resolved model + locality + profile —
+/// resolved ONCE, before the per-unit loop starts (the binding doesn't
+/// change mid-run). Every unit's own `DispatchOpts::profile_name` stays
+/// `None` ("use the role's own `role_profiles.crawler` binding", the
+/// existing default-routing behavior) — this is a SEPARATE, best-effort
+/// resolution the launcher does purely to STAMP provenance onto its own
+/// records (`record_context`, below), using the same `role_profiles.
+/// crawler → profile → model` precedence the actual dispatch applies
+/// internally. An unresolvable registry/binding leaves every field
+/// `None`/`"unknown"` rather than failing the crawl — this is provenance
+/// for the run view, not a dispatch-blocking precondition; the real
+/// dispatch resolves independently and raises its own loud error if the
+/// binding is genuinely broken.
+struct CrawlerSeat {
+    model: Option<String>,
+    locality: &'static str,
+    profile_name: Option<String>,
+}
+
+fn resolve_crawler_seat() -> CrawlerSeat {
+    let unresolved = || CrawlerSeat { model: None, locality: "unknown", profile_name: None };
+    let Ok(loaded) = darkmux_profiles::profiles::load_registry(None) else {
+        return unresolved();
+    };
+    let Ok(resolved) = darkmux_profiles::profiles::resolve_role_profile("crawler", &loaded.registry) else {
+        return unresolved();
+    };
+    let Some(model_id) = resolved.profile.default_model_id() else {
+        return CrawlerSeat { model: None, locality: "unknown", profile_name: Some(resolved.profile_name) };
+    };
+    let is_remote = resolved.profile.models.iter().find(|m| m.id == model_id).is_some_and(|m| m.is_remote());
+    CrawlerSeat {
+        model: Some(model_id.to_string()),
+        locality: if is_remote { "endpoint" } else { "local" },
+        profile_name: Some(resolved.profile_name),
+    }
+}
+
 /// One (source, rule-group) Task, and the ordered Step ids of the units
 /// assigned to it.
 struct TaskGroup {
@@ -757,6 +922,21 @@ struct CrawlStats {
     /// `plan_unit_resume` doesn't special-case the label, only whether a
     /// checkpoint exists at the recorded `out_dir`.
     units_interrupted: usize,
+    /// (#2193) A unit that hit its own per-unit bound — the turn ceiling
+    /// (`default_unit_max_turns`, envelope `result: "max_turns"`) or the
+    /// no-progress bound (`unit_hit_no_progress_bound`) — rather than
+    /// converging (`"stop"`) or genuinely failing. Counted separately from
+    /// BOTH `units_completed` (it never reached `"stop"`) and `units_
+    /// errored` (running out of room to work in is an operator-tunable
+    /// BOUND, not a per-unit failure — same reasoning as `units_
+    /// interrupted` above, whose doc this mirrors): folding either into
+    /// `units_errored` would make "how many units genuinely broke" and
+    /// "how many just ran long" indistinguishable in the mission close
+    /// payload/envelope, exactly the ambiguity #2193 was filed to fix. A
+    /// LATER `--param resume=<mission>` finds this unit's row the same way
+    /// it finds any other non-`"stop"` row — `plan_unit_resume` doesn't
+    /// special-case the label.
+    units_budget_exhausted: usize,
     findings_total: usize,
     prompt_tokens_total: u64,
     completion_tokens_total: u64,
@@ -783,6 +963,14 @@ struct FinalizeCtx {
     limit: Option<usize>,
     plan_path: Option<PathBuf>,
     units_filter: Option<String>,
+    /// (#2188) The crawler role's resolved profile name (`CrawlerSeat::
+    /// profile_name`) — surfaced on the mission close payload/envelope
+    /// `"profile"` field, which used to be a hardcoded `Value::Null`
+    /// (crawl dispatches with `profile_name: None` on every unit's own
+    /// `DispatchOpts`, but this is a SEPARATE best-effort resolution the
+    /// launcher does for provenance — see `CrawlerSeat`'s own doc).
+    /// `None` when the registry/binding didn't resolve.
+    crawler_profile: Option<String>,
 }
 
 /// (#2131) Finalize/abort machinery now runs through the shared
@@ -820,9 +1008,12 @@ fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32>
     // interrupted unit DID start (it has a real `out_dir`, possibly a
     // real checkpoint) — it's excluded from `units_not_run` the same way
     // `units_completed`/`units_errored` already are, so it isn't counted
-    // twice and doesn't read as "never attempted."
-    let units_not_run =
-        ctx.units_in_plan.saturating_sub(s.units_completed + s.units_errored + s.units_interrupted);
+    // twice and doesn't read as "never attempted." (#2193) A budget-
+    // exhausted unit DID start too (same real `out_dir` reasoning) — same
+    // exclusion.
+    let units_not_run = ctx.units_in_plan.saturating_sub(
+        s.units_completed + s.units_errored + s.units_interrupted + s.units_budget_exhausted,
+    );
 
     let summary = json!({
         "mission_id": ctx.mission_id,
@@ -833,6 +1024,7 @@ fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32>
         "units_completed": s.units_completed,
         "units_errored": s.units_errored,
         "units_interrupted": s.units_interrupted,
+        "units_budget_exhausted": s.units_budget_exhausted,
         "units_skipped": s.units_skipped,
         "findings": s.findings_total,
         "prompt_tokens": s.prompt_tokens_total,
@@ -842,12 +1034,15 @@ fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32>
         "stopped_by": s.stopped_by,
         // (finding 8) Self-describing envelope header.
         "model": s.first_model,
-        // Not resolvable from this launcher's DispatchOpts today — crawl
-        // always dispatches with `profile_name: None` (default routing),
-        // so there is no profile name to report. Present (not omitted) so
-        // a reader can tell "checked, and there isn't one" apart from
-        // "this launcher never learned to report it."
-        "profile": Value::Null,
+        // (#2188) The crawler role's resolved profile name
+        // (`CrawlerSeat::profile_name`, resolved once before the loop —
+        // every unit's own `DispatchOpts::profile_name` stays `None`,
+        // "use the role's own binding"; this is the launcher's OWN
+        // best-effort mirror of that same resolution, for provenance).
+        // `null` when the registry/binding didn't resolve — present, not
+        // omitted, so a reader can tell "checked, and it didn't resolve"
+        // apart from "this launcher never learned to report it."
+        "profile": ctx.crawler_profile,
         "timeout_secs": ctx.timeout_secs,
         "limit": ctx.limit,
         "plan_path": ctx
@@ -877,6 +1072,7 @@ fn finalize_crawl(stats: &RefCell<CrawlStats>, ctx: &FinalizeCtx) -> Result<i32>
         s.units_completed,
         s.units_errored,
         s.units_interrupted,
+        s.units_budget_exhausted,
         s.units_skipped,
         units_not_run,
         s.findings_total,
@@ -1022,6 +1218,11 @@ pub(crate) fn run(
     let limit = usize_param(collected, "limit")?;
     let no_fetch = bool_param(collected, "no_fetch");
     let timeout = timeout_seconds.unwrap_or(600);
+    // (#2193) Operator-settable no-progress bound — see
+    // `unit_hit_no_progress_bound`'s own doc. `0` disables the check
+    // entirely (never escalates), same opt-out shape `--param limit=0`
+    // etc. already use elsewhere in this launcher.
+    let no_progress_turns = usize_param(collected, "no_progress_turns")?.unwrap_or(DEFAULT_NO_PROGRESS_TURNS);
     // (#2190) Operator-overridable `site`-unit sizing caps — absent means
     // `PlanParams::default()`, i.e. today's hard-coded
     // `MAX_SITES_PER_UNIT`/`MAX_SITE_TOKENS_PER_UNIT`, so a launch with
@@ -1570,6 +1771,7 @@ pub(crate) fn run(
             "units_completed": 0,
             "units_errored": 0,
             "units_interrupted": 0,
+            "units_budget_exhausted": 0,
             "units_skipped": 0,
             "findings": 0,
             "prompt_tokens": 0,
@@ -1601,6 +1803,7 @@ pub(crate) fn run(
         units_completed: 0,
         units_errored: 0,
         units_interrupted: 0,
+        units_budget_exhausted: 0,
         units_skipped: 0,
         findings_total: 0,
         prompt_tokens_total: 0,
@@ -1609,6 +1812,10 @@ pub(crate) fn run(
         per_unit_rows: Vec::new(),
         first_model: None,
     });
+    // (#2188) Resolved once, before dispatching any unit — see
+    // `CrawlerSeat`'s own doc.
+    let crawler_seat = resolve_crawler_seat();
+
     let ctx = FinalizeCtx {
         mission_id: mission_id.clone(),
         phase_id: phase_id.clone(),
@@ -1621,6 +1828,7 @@ pub(crate) fn run(
         limit,
         plan_path: plan_path.clone(),
         units_filter: units_filter.clone(),
+        crawler_profile: crawler_seat.profile_name.clone(),
     };
     // (finding 1b, generalized #2131) Armed here, before the loop starts —
     // an early `?`-return, a panic, or a caught SIGTERM/SIGINT/SIGHUP that
@@ -1847,6 +2055,14 @@ pub(crate) fn run(
             // unit (no `--param resume=`, or planned Fresh/never named)
             // dispatches exactly as before.
             resume_from: resume_from_by_unit.get(unit.id()).cloned(),
+            // (#2193) A per-unit ceiling derived from THIS unit's own plan
+            // estimate — fills the gap left by `runtime.max_turns`
+            // defaulting to `None` (uncapped). Only a DEFAULT: an
+            // operator's own `runtime.max_turns` config/env setting still
+            // wins (`dispatch_internal::effective_max_turns` resolves the
+            // precedence host-side; this launcher doesn't need to check it
+            // itself).
+            max_turns_override: Some(default_unit_max_turns(unit)),
             // (#1959 flow-record vocabulary retirement) Provenance the
             // runtime cannot know — merged by the host tailer under
             // `payload.context` on every record this unit's dispatch
@@ -1859,6 +2075,19 @@ pub(crate) fn run(
                 "rule": single_rule(&rule_ids),
                 "rules": rule_ids,
                 "unit": unit.id(),
+                // (#2188) The launcher resolves the crawler role's model +
+                // locality BEFORE dispatch (see `crawler_seat` above) —
+                // stamped here so `payload.context.model`/`.locality`/
+                // `.profile` ride along on this unit's `dispatch start`
+                // AND its terminal record (`merge_record_context` merges
+                // this SAME object onto every record this dispatch's flow-
+                // record surface emits, bookends included). Fixes the run
+                // view reading a purely-local crawl dispatch as "0 local +
+                // N unattributed" — the model/locality were previously
+                // nowhere on the record for a reader to join against.
+                "model": crawler_seat.model.clone(),
+                "locality": crawler_seat.locality,
+                "profile": crawler_seat.profile_name.clone(),
             })),
         };
 
@@ -1888,6 +2117,26 @@ pub(crate) fn run(
         let interrupted_at_readback = false;
         if interrupted_at_readback {
             result_label = "interrupted".to_string();
+        }
+
+        // (#2193) No-progress bound — checked whenever the dispatch
+        // actually ran and reported a clean `"stop"`: a unit whose LAST
+        // `no_progress_turns` turns show no new file read and no
+        // `report_finding` attempt ends here with the SAME named outcome
+        // `interpret_dispatch_result` gives an envelope `result:
+        // "max_turns"` — the operator-facing question is "did this unit
+        // run out of room to work in," not "which bound happened to
+        // fire." Never overrides an already-`"error"`/`"timeout"`/
+        // `"interrupted"` label — those are their own, more specific
+        // failure shapes.
+        if !interrupted_at_readback && result_label == "stop" {
+            if let Ok(res) = &dispatch_outcome {
+                if let Some(out_dir) = &res.out_dir {
+                    if unit_hit_no_progress_bound(out_dir, no_progress_turns) {
+                        result_label = UNIT_BUDGET_EXHAUSTED.to_string();
+                    }
+                }
+            }
         }
 
         if let Some(m) = &model {
@@ -1990,11 +2239,19 @@ pub(crate) fn run(
         // interrupted` — see `finalize_crawl`): the unit DID start, and
         // (since #2153) always has a real, known `out_dir` on its row,
         // unlike a genuinely never-attempted unit.
-        let is_error = !interrupted_at_readback && (dispatch_outcome.is_err() || result_label != "stop");
+        // (#2193) A budget-exhausted unit is likewise neither a completion
+        // nor a per-unit failure — see `CrawlStats::units_budget_
+        // exhausted`'s own doc for why it gets its own bucket, mirroring
+        // `units_interrupted` immediately above.
+        let is_budget_exhausted = !interrupted_at_readback && result_label == UNIT_BUDGET_EXHAUSTED;
+        let is_error =
+            !interrupted_at_readback && !is_budget_exhausted && (dispatch_outcome.is_err() || result_label != "stop");
         {
             let mut s = stats.borrow_mut();
             if interrupted_at_readback {
                 s.units_interrupted += 1;
+            } else if is_budget_exhausted {
+                s.units_budget_exhausted += 1;
             } else if is_error {
                 s.units_errored += 1;
             } else {
@@ -2037,7 +2294,7 @@ pub(crate) fn run(
         if let Ok(mut step) = crew::lifecycle::load_step(&mission_id, &phase_id, &step_id) {
             step.status = if interrupted_at_readback {
                 NodeStatus::Abandoned
-            } else if is_error {
+            } else if is_error || is_budget_exhausted {
                 NodeStatus::Error
             } else {
                 NodeStatus::Complete
@@ -2118,6 +2375,30 @@ fn unit_sizing_line(plan_params: &plan::PlanParams) -> String {
     )
 }
 
+/// (#2193) The dry-run table's effective per-unit turn-ceiling line —
+/// factored out like `unit_sizing_line` (its own doc explains why: directly
+/// assertable in a test without capturing process stdout). Shows the
+/// ACTUAL min/max ceiling across this plan's own units (not just the bare
+/// formula) so "what's my worst case" is answerable from the table.
+/// `units.is_empty()` (an empty plan) reports the bare formula instead of a
+/// degenerate range.
+fn max_turns_ceiling_line(units: &[Unit]) -> String {
+    let bare = format!(
+        "max_turns per unit: turns_per_site={TURNS_PER_SITE} floor={MIN_UNIT_MAX_TURNS} \
+         cap={MAX_UNIT_MAX_TURNS} (an operator's own `runtime.max_turns` config/env setting \
+         overrides every unit's own ceiling)"
+    );
+    let Some(min) = units.iter().map(default_unit_max_turns).min() else {
+        return bare;
+    };
+    let max = units.iter().map(default_unit_max_turns).max().unwrap_or(min);
+    format!(
+        "max_turns per unit: {min}–{max} (turns_per_site={TURNS_PER_SITE}, floor={MIN_UNIT_MAX_TURNS}, \
+         cap={MAX_UNIT_MAX_TURNS}; an operator's own `runtime.max_turns` config/env setting \
+         overrides every unit's own ceiling)"
+    )
+}
+
 /// (#1959) Ported from the retired `darkmux crawl plan` CLI's own
 /// `print_plan_table` (deleted alongside the standalone verb — see
 /// `src/cli.rs`'s Crawl retirement commit) — renders `--dry-run`'s plan
@@ -2135,6 +2416,9 @@ fn print_plan_table(the_plan: &plan::Plan, out_path: Option<&Path>, plan_params:
     // (the defaults), so "what will each unit look like" is answerable
     // from the table BEFORE dispatching, not discovered live mid-crawl.
     println!("{}", style::dim(&unit_sizing_line(plan_params)));
+    // (#2193) Right next to the unit-sizing line — see that line's own
+    // comment for why this belongs BEFORE dispatch, not discovered live.
+    println!("{}", style::dim(&max_turns_ceiling_line(&the_plan.units)));
     println!();
 
     println!("{}", style::header("sources"));
@@ -2221,6 +2505,7 @@ fn print_summary_table(
     units_completed: usize,
     units_errored: usize,
     units_interrupted: usize,
+    units_budget_exhausted: usize,
     units_skipped: usize,
     units_not_run: usize,
     findings: usize,
@@ -2232,7 +2517,7 @@ fn print_summary_table(
     println!("{}", style::header(&format!("darkmux mission launch crawl — {workspace} ({mission_id})")));
     println!(
         "  units: {units_completed} completed, {units_errored} errored, {units_interrupted} interrupted, \
-         {units_skipped} skipped, {units_not_run} not run"
+         {units_budget_exhausted} budget-exhausted, {units_skipped} skipped, {units_not_run} not run"
     );
     println!("  findings: {findings}");
     println!("  tokens: {total_tokens}   wall: {wall_ms}ms");

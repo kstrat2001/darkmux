@@ -725,6 +725,23 @@ fn apply_compaction_flags(
     }
 }
 
+/// (#2193) Resolve the `max_turns` this dispatch actually runs under.
+/// Precedence: `env(DARKMUX_RUNTIME_MAX_TURNS)`, then `config.runtime.
+/// max_turns`, then `max_turns_override`, then uncapped. The operator's
+/// own explicit setting (env or config — anything `max_turns_with_source`
+/// does NOT resolve as `Source::BuiltIn`) always wins over a caller-
+/// derived override; the override only fills the gap the operator left
+/// open. `max_turns_override` is `DispatchOpts::max_turns_override` —
+/// `None` for every caller except the crawl launcher, which derives one
+/// per unit from its own plan estimate.
+fn effective_max_turns(max_turns_override: Option<u32>) -> Option<u32> {
+    let (configured, source) = darkmux_types::config_access::max_turns_with_source();
+    if source != darkmux_types::config_access::Source::BuiltIn {
+        return configured;
+    }
+    max_turns_override.or(configured)
+}
+
 /// (#457 Changes 2+3) Apply operator-opt-in per-dispatch caps.
 /// Reads two env vars on host side; passes them to the runtime via
 /// `--max-turns` / `--max-tokens` CLI flags. Both default unlimited;
@@ -734,7 +751,7 @@ fn apply_compaction_flags(
 /// Unparseable values fall back to "unset" (no flag added) with a
 /// stderr warning rather than aborting the dispatch — keeps the
 /// dispatch alive on operator-typo'd values, surfaces the issue.
-fn apply_runtime_limit_flags(cmd: &mut Command) {
+fn apply_runtime_limit_flags(cmd: &mut Command, max_turns_override: Option<u32>) {
     // Resolve env(DARKMUX_RUNTIME_MAX_*) > config.runtime.max_* > None (#661
     // Slice 4) and emit the container flag only when a cap is set. A set-but-
     // unparseable env still warns (operator-typo help) before `config_access`
@@ -743,7 +760,13 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
     warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_TOKENS");
     warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_TOKENS_PER_CALL");
     warn_if_unparseable_u32("DARKMUX_RUNTIME_GENERATION_CHECKPOINT_INTERVAL");
-    if let Some(n) = darkmux_types::config_access::max_turns() {
+    // (#2193) `effective_max_turns` is the ONE place that decides operator-
+    // explicit vs caller-derived precedence — this flag emission and the
+    // `resolved_runtime_bounds_json`'s `bounds.max_turns` block (what the
+    // flow record/envelope tell the operator governed the run) both call
+    // it, so the two can't independently drift on what actually bounded
+    // the container.
+    if let Some(n) = effective_max_turns(max_turns_override) {
         cmd.arg("--max-turns").arg(n.to_string());
     }
     if let Some(n) = darkmux_types::config_access::max_tokens() {
@@ -3043,6 +3066,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &system_prompt,
         &workspace,
         agentic_pm.is_some(),
+        opts.max_turns_override,
     );
     // (#1187 follow-up) Mirror `dispatch_remote`'s `"endpoint": label` field —
     // its absence, not just its presence, is meaningful to the viewer (no
@@ -3297,7 +3321,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // host side; pass via --max-turns / --max-tokens CLI flags to
     // the runtime container. Both default unlimited (omitted flag
     // → runtime's `Option<u32>` stays None → no cap applied).
-    apply_runtime_limit_flags(&mut cmd);
+    apply_runtime_limit_flags(&mut cmd, opts.max_turns_override);
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if remote_needs_auth {
@@ -3705,7 +3729,7 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
         &host_stats,
         &host_extras,
         &host_out,
-        resolved_runtime_bounds_json(agentic_pm.is_some()),
+        resolved_runtime_bounds_json(agentic_pm.is_some(), opts.max_turns_override),
     );
 
     // (#782) Read the runtime's token totals from metrics.json now the
@@ -3875,6 +3899,7 @@ fn dispatch_start_payload_json(
     system_prompt: &str,
     workspace: &std::path::Path,
     is_agentic_remote: bool,
+    max_turns_override: Option<u32>,
 ) -> serde_json::Value {
     serde_json::json!({
         "runtime": "internal",
@@ -3906,7 +3931,7 @@ fn dispatch_start_payload_json(
         // `enrich_envelope_with_summary`) — one producer, so a remote
         // reader watching the flow stream and an operator reading the
         // finished envelope can't disagree about what governed this run.
-        "bounds": resolved_runtime_bounds_json(is_agentic_remote),
+        "bounds": resolved_runtime_bounds_json(is_agentic_remote, max_turns_override),
     })
 }
 
@@ -3939,7 +3964,7 @@ fn dispatch_start_payload_json(
 /// value` carries what the operator's own knob resolved to (with ITS real
 /// source, nested) so the row stays self-explaining instead of just going
 /// silent about the configured value.
-fn resolved_runtime_bounds_json(is_agentic_remote: bool) -> serde_json::Value {
+fn resolved_runtime_bounds_json(is_agentic_remote: bool, max_turns_override: Option<u32>) -> serde_json::Value {
     fn vs(value: Option<serde_json::Value>, source: darkmux_types::config_access::Source) -> serde_json::Value {
         serde_json::json!({
             "value": value.unwrap_or(serde_json::Value::Null),
@@ -3964,11 +3989,23 @@ fn resolved_runtime_bounds_json(is_agentic_remote: bool) -> serde_json::Value {
     } else {
         vs(Some(configured_turn_delay_ms.into()), s_delay)
     };
+    // (#2193) Same operator-wins precedence as `effective_max_turns` — kept
+    // as a SEPARATE computation (not calling that fn) because this one also
+    // has to report the WINNING source, including the `"launcher"` tier
+    // `config_access::Source` itself doesn't know about (the crawl
+    // launcher's per-unit derived ceiling, not env/config/built-in).
+    let max_turns_block = if s_turns != darkmux_types::config_access::Source::BuiltIn {
+        vs(max_turns.map(Into::into), s_turns)
+    } else if let Some(n) = max_turns_override {
+        serde_json::json!({ "value": n, "source": "launcher" })
+    } else {
+        vs(max_turns.map(Into::into), s_turns)
+    };
     serde_json::json!({
         "max_tokens_per_call": vs(max_tokens_per_call.map(Into::into), s_mtpc),
         "reasoning_checkpoint_interval_tokens": vs(reasoning_checkpoint_interval_tokens.map(Into::into), s_rci),
         "inactivity_timeout_seconds": vs(Some(inactivity_timeout_seconds.into()), s_inact),
-        "max_turns": vs(max_turns.map(Into::into), s_turns),
+        "max_turns": max_turns_block,
         "max_tokens": vs(max_tokens.map(Into::into), s_tokens),
         "turn_delay_ms": turn_delay_block,
         "feedback_injection": vs(Some(feedback_injection.into()), s_fi),

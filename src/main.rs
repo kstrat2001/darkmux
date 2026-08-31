@@ -1462,6 +1462,7 @@ fn cmd_dispatch(inv: DispatchInvocation) -> Result<i32> {
         // `dispatch` always gets a fresh tempdir. Only the crawl launcher
         // sets this today.
         host_out: None,
+        max_turns_override: None,
     };
     // (#1509) Route the LOCAL half of `dispatch_routed`'s routing decision
     // through the engine as a crew of one (a full Mission -> Phase ->

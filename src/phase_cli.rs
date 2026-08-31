@@ -455,6 +455,7 @@ pub(crate) fn phase_review_output_at(
         record_context: None,
         resume_from: None,
         host_out: None,
+        max_turns_override: None,
         role_id: "code-reviewer".to_string(),
         message: prompt,
         session_id: Some(session_id.clone()),

@@ -418,6 +418,7 @@ impl StepKind for DispatchInternalStepKind {
             // as before — no crew-of-one graph step names an exact out
             // dir today.
             host_out: None,
+            max_turns_override: None,
         };
         let result =
             dispatch(opts).with_context(|| format!("step `{}` dispatch.internal", step.id))?;
