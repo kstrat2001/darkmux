@@ -1033,6 +1033,7 @@ fn dispatch_task(
         record_context: None,
         resume_from: None,
         host_out: None,
+        max_turns_override: None,
         role_id: role_id.to_string(),
         message: prompt.to_string(),
         session_id: Some(session_id.to_string()),

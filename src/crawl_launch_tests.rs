@@ -257,6 +257,12 @@ struct ScriptedUnit {
     /// `host_threads_through_to_the_unit_record` drives the #2107
     /// regression without a live sampler thread.
     host: Option<Value>,
+    /// (#2193) Raw `tool.completed` trajectory events to pre-seed at
+    /// `out_dir/.darkmux-runtime/trajectory.jsonl` — the no-progress
+    /// bound's only way to script a unit's turn-by-turn tool-call history
+    /// without a real container. Empty (default) ⇒ no trajectory file at
+    /// all, matching every other scripted unit's out_dir today.
+    trajectory: Vec<Value>,
 }
 
 impl Default for ScriptedUnit {
@@ -271,6 +277,7 @@ impl Default for ScriptedUnit {
             wall_ms: 100,
             model: "darkmux:test-model",
             host: None,
+            trajectory: Vec::new(),
         }
     }
 }
@@ -320,6 +327,14 @@ fn scripted_ok_result(unit_id: &str, script: &ScriptedUnit, session_id: String) 
             body.push('\n');
         }
         std::fs::write(runtime_dir.join("findings.jsonl"), body).unwrap();
+    }
+    if !script.trajectory.is_empty() {
+        let mut body = String::new();
+        for ev in &script.trajectory {
+            body.push_str(&serde_json::to_string(ev).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(runtime_dir.join("trajectory.jsonl"), body).unwrap();
     }
 
     let mut envelope = json!({
@@ -2414,4 +2429,214 @@ fn resume_with_unchanged_inputs_passes_the_fingerprint_gate() {
         2,
         "expected exactly the 2 calls from the FIRST run only, none new from the resume"
     );
+}
+
+// ── #2193: per-unit turn ceiling + no-progress bound ─────────────────────
+// ── #2188: model/locality/profile provenance on the dispatch ─────────────
+
+fn site_unit(id: &str, n_sites: usize) -> Unit {
+    Unit::Site {
+        id: id.to_string(),
+        rule: "swallowed-error".to_string(),
+        source: "app".to_string(),
+        sites: (0..n_sites.max(1))
+            .map(|i| plan::Site { file: "x.ts".to_string(), line: i, start: i, end: i, hits: vec![i] })
+            .collect(),
+        est_tokens: 100,
+    }
+}
+
+#[test]
+fn default_unit_max_turns_scales_with_site_count_within_the_floor_and_cap() {
+    assert_eq!(
+        default_unit_max_turns(&site_unit("u-0001", 1)),
+        MIN_UNIT_MAX_TURNS,
+        "1 site * 3 turns/site = 3, floored at {MIN_UNIT_MAX_TURNS}"
+    );
+    assert_eq!(
+        default_unit_max_turns(&site_unit("u-0002", 5)),
+        15,
+        "a 5-site unit: 5 * TURNS_PER_SITE(3) = 15, within [floor, cap]"
+    );
+    assert_eq!(
+        default_unit_max_turns(&site_unit("u-0003", 100)),
+        MAX_UNIT_MAX_TURNS,
+        "100 sites * 3 = 300, capped at {MAX_UNIT_MAX_TURNS}"
+    );
+}
+
+#[test]
+fn max_turns_ceiling_line_reports_the_plans_actual_min_max() {
+    let units = vec![site_unit("u-0001", 1), site_unit("u-0002", 5), site_unit("u-0003", 100)];
+    let line = max_turns_ceiling_line(&units);
+    assert!(
+        line.contains(&format!("{MIN_UNIT_MAX_TURNS}\u{2013}{MAX_UNIT_MAX_TURNS}")),
+        "expected the plan's actual min-max range in the line: {line}"
+    );
+}
+
+#[test]
+fn max_turns_ceiling_line_reports_the_bare_formula_for_an_empty_plan() {
+    let line = max_turns_ceiling_line(&[]);
+    assert!(line.contains(&format!("turns_per_site={TURNS_PER_SITE}")), "{line}");
+    assert!(line.contains(&format!("floor={MIN_UNIT_MAX_TURNS}")), "{line}");
+    assert!(line.contains(&format!("cap={MAX_UNIT_MAX_TURNS}")), "{line}");
+}
+
+/// Build one `tool.completed` trajectory event — the shape
+/// `unit_hit_no_progress_bound` and `count_rejected_report_findings` both
+/// parse (mirrors `runtime::trajectory::append_tool_completed`'s real
+/// field set closely enough for these two readers, which only look at
+/// `type`/`seq`/`tool_name`/`args`).
+fn tool_completed_event(seq: u64, tool_name: &str, args: &Value) -> Value {
+    json!({
+        "type": "tool.completed",
+        "seq": seq,
+        "tool_seq": 1,
+        "tool_name": tool_name,
+        "args": serde_json::to_string(args).unwrap(),
+        "args_chars": 10,
+        "result": "…",
+        "result_chars": 3,
+        "outcome": "ok",
+        "ok": true,
+    })
+}
+
+#[test]
+#[serial_test::serial]
+fn unit_dispatch_carries_the_derived_max_turns_and_seat_provenance() {
+    let _guard = TestGuard::new();
+    // A one-model registry the crawler role resolves to via
+    // `default_profile` — a LOCAL model (no `endpoint` block), so
+    // `locality` resolves to `"local"` (#2188).
+    let tmp = TempDir::new().unwrap();
+    let pf = tmp.path().join("profiles.json");
+    std::fs::write(
+        &pf,
+        r#"{"profiles":{"crawler-profile":{"models":[{"id":"darkmux:test-model","n_ctx":32768,"role":"primary"}]}},"default_profile":"crawler-profile"}"#,
+    )
+    .unwrap();
+    let prev_profiles = env::var("DARKMUX_PROFILES").ok();
+    unsafe { env::set_var("DARKMUX_PROFILES", &pf) };
+
+    let fx = multi_catch_fixture(5);
+    let captured: RefCell<Vec<(Option<u32>, Option<Value>)>> = RefCell::new(Vec::new());
+    let mut dispatch = |opts: DispatchOpts| -> Result<DispatchResult> {
+        captured.borrow_mut().push((opts.max_turns_override, opts.record_context.clone()));
+        let session_id = opts.session_id.clone().unwrap_or_default();
+        let unit_id = unit_id_from_session(&session_id);
+        Ok(scripted_ok_result(&unit_id, &ScriptedUnit::default(), session_id))
+    };
+
+    let code = run(&params_for(&fx), None, &mut dispatch).unwrap();
+
+    unsafe {
+        match prev_profiles {
+            Some(v) => env::set_var("DARKMUX_PROFILES", v),
+            None => env::remove_var("DARKMUX_PROFILES"),
+        }
+    }
+
+    assert_eq!(code, 0);
+    let calls = captured.borrow();
+    assert_eq!(calls.len(), 1, "multi_catch_fixture(5) plans exactly one unit: {calls:#?}");
+    let (max_turns, record_context) = &calls[0];
+
+    // (#2193) 5 sites * TURNS_PER_SITE(3) = 15 — exactly the "effective
+    // default ceiling a 5-site unit gets" #2193 asks for, carried on the
+    // real DispatchOpts a unit dispatch is built with.
+    assert_eq!(*max_turns, Some(15));
+
+    // (#2188) model/locality/profile ride on `record_context`, which
+    // `dispatch_internal::merge_record_context` merges onto EVERY record
+    // this dispatch's flow-record surface emits — `dispatch start` AND
+    // the terminal record alike (same object, not re-derived per record).
+    let ctx = record_context.as_ref().expect("record_context must be set on a crawl unit's dispatch");
+    assert_eq!(ctx["model"], json!("darkmux:test-model"));
+    assert_eq!(ctx["locality"], json!("local"));
+    assert_eq!(ctx["profile"], json!("crawler-profile"));
+}
+
+#[test]
+#[serial_test::serial]
+fn no_progress_bound_ends_a_stalled_unit_as_budget_exhausted_not_errored() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture(); // u-0001 (app1), u-0002 (app2)
+    let mut scripts = BTreeMap::new();
+
+    // Turn 0 reads a NEW path (progress). Turns 1-3 all re-read the SAME
+    // path — three consecutive turns with no new file read and no
+    // `report_finding` attempt. With `--param no_progress_turns=3` this
+    // trailing window trips the bound even though the runtime's own
+    // envelope says a clean `"stop"`.
+    let mut trajectory = vec![tool_completed_event(0, "read", &json!({"path": "app1/x.ts"}))];
+    for seq in 1..=3u64 {
+        trajectory.push(tool_completed_event(seq, "read", &json!({"path": "app1/x.ts"})));
+    }
+    scripts.insert(
+        "u-0001".to_string(),
+        ScriptedUnit { result: "stop", trajectory, ..Default::default() },
+    );
+    scripts.insert("u-0002".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    let mut params = params_for(&fx);
+    params.insert("no_progress_turns".to_string(), Value::String("3".to_string()));
+    let code = run(&params, None, &mut dispatch).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(calls.borrow().clone(), vec!["u-0001".to_string(), "u-0002".to_string()]);
+
+    let records = read_all_flow_records();
+    let step_error = records
+        .iter()
+        .find(|r| r["action"] == "step error" && r["payload"]["unit"] == "u-0001")
+        .expect("u-0001 must end with a step error carrying the no-progress outcome");
+    assert_eq!(step_error["payload"]["result"], "unit_budget_exhausted");
+
+    let mission_closed = records.iter().find(|r| r["action"] == "mission close").unwrap();
+    assert_eq!(mission_closed["payload"]["units_budget_exhausted"], 1);
+    assert_eq!(mission_closed["payload"]["units_errored"], 0, "a no-progress unit must NOT count as errored");
+    assert_eq!(mission_closed["payload"]["units_completed"], 1, "u-0002 still completes cleanly");
+    assert_eq!(mission_closed["payload"]["units_not_run"], 0);
+
+    let mission_id = mission_id_from_records(&records);
+    let runs_dir = fx.root.path().join("runs").join(&mission_id);
+    let envelope: Value =
+        serde_json::from_str(&std::fs::read_to_string(runs_dir.join("envelope.json")).unwrap()).unwrap();
+    assert_eq!(envelope["units_budget_exhausted"], 1, "envelope.json must carry the same counter: {envelope}");
+    assert_eq!(envelope["units_errored"], 0);
+    let row = envelope["units"].as_array().unwrap().iter().find(|r| r["unit"] == "u-0001").unwrap();
+    assert_eq!(row["result"], "unit_budget_exhausted");
+}
+
+#[test]
+#[serial_test::serial]
+fn no_progress_bound_never_fires_when_the_unit_has_not_run_that_many_turns_yet() {
+    let _guard = TestGuard::new();
+    let fx = two_source_fixture();
+    let mut scripts = BTreeMap::new();
+    // Only 2 turns total, both non-progress — but `no_progress_turns=3`
+    // needs a FULL trailing window of 3 to judge; 2 turns is not enough.
+    let trajectory = vec![
+        tool_completed_event(0, "read", &json!({"path": "app1/x.ts"})),
+        tool_completed_event(1, "read", &json!({"path": "app1/x.ts"})),
+    ];
+    scripts.insert(
+        "u-0001".to_string(),
+        ScriptedUnit { result: "stop", trajectory, ..Default::default() },
+    );
+    scripts.insert("u-0002".to_string(), ScriptedUnit::default());
+    let calls = RefCell::new(Vec::new());
+    let mut dispatch = make_dispatch_fn(scripts, &calls, |_| {});
+
+    let mut params = params_for(&fx);
+    params.insert("no_progress_turns".to_string(), Value::String("3".to_string()));
+    run(&params, None, &mut dispatch).unwrap();
+
+    let records = read_all_flow_records();
+    let mission_closed = records.iter().find(|r| r["action"] == "mission close").unwrap();
+    assert_eq!(mission_closed["payload"]["units_budget_exhausted"], 0);
+    assert_eq!(mission_closed["payload"]["units_completed"], 2);
 }

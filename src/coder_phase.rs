@@ -850,6 +850,7 @@ impl StepKind for MissionCoderStepKind {
             record_context: None,
             resume_from: None,
             host_out: None,
+            max_turns_override: None,
             role_id: ctx.role.clone(),
             message,
             session_id: Some(ctx.session_id.clone()),

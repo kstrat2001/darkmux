@@ -451,6 +451,7 @@ mod tests {
             record_context: None,
             resume_from: None,
             host_out: None,
+            max_turns_override: None,
             role_id: role.to_string(),
             message: message.to_string(),
             session_id: None,

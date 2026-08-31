@@ -341,6 +341,19 @@ pub struct DispatchOpts {
     /// (every existing caller) preserves the fresh-tempdir behavior
     /// exactly.
     pub host_out: Option<PathBuf>,
+    /// (#2193) A per-dispatch `max_turns` ceiling the CALLER derived on its
+    /// own (e.g. the crawl launcher's per-unit ceiling, derived from the
+    /// unit's own plan estimate) — NOT the same thing as an operator's
+    /// explicit `runtime.max_turns` config/env setting, which always wins
+    /// over this. `dispatch_internal::dispatch` applies this ONLY when
+    /// `darkmux_types::config_access::max_turns_with_source()` resolves to
+    /// `Source::BuiltIn` (the operator hasn't set one); when the operator
+    /// HAS set one (config or env), this field is ignored and the resolved
+    /// bounds block's `source` stays `"config"`/`"env"` — see
+    /// `resolved_max_turns_block` in `dispatch_internal.rs`. `None` (every
+    /// caller but the crawl launcher) preserves today's behavior exactly:
+    /// uncapped unless the operator opted in globally.
+    pub max_turns_override: Option<u32>,
 }
 
 /// Host-side compaction config passthrough to the internal runtime
