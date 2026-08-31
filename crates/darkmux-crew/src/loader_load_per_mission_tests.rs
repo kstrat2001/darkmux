@@ -290,10 +290,14 @@
     #[test]
     fn embedded_preamble_carries_bounded_dispatch_prompt_engineering() {
         let preamble = AUTONOMOUS_DISPATCH_PREAMBLE;
-        // Six-bound enumeration — by concept, not value. (#2171 added the
+        // Seven-bound enumeration — by concept, not value. (#2171 added the
         // per-call generation check-in as its own bound, alongside the
         // pre-existing per-turn token cap. #2169 merge-gate finding 4
-        // added the malformed-tool-call-names bound.)
+        // added the malformed-tool-call-names bound. #2190 added the
+        // empty-tool-call-turns bound — same recovery budget as the
+        // per-turn token cap, but a DIFFERENT failure shape and its own
+        // escalation reason, split out because conflating the two sent a
+        // live diagnosis down the wrong path twice.)
         assert!(
             preamble.contains("Turn cap"),
             "preamble must name the turn cap"
@@ -301,6 +305,10 @@
         assert!(
             preamble.contains("Per-turn token cap"),
             "preamble must name the per-turn cap"
+        );
+        assert!(
+            preamble.contains("Empty tool-call turns"),
+            "preamble must name the empty-tool-call-turns bound (#2190)"
         );
         assert!(
             preamble.contains("Per-call generation check-in"),
@@ -327,6 +335,10 @@
         assert!(
             preamble.contains("escalation_intra_turn_stall_exhausted"),
             "preamble must name the intra-turn-stall escalation"
+        );
+        assert!(
+            preamble.contains("escalation_empty_tool_calls"),
+            "preamble must name the empty-tool-calls escalation (#2190)"
         );
         assert!(
             preamble.contains("escalation_generation_checkpoint_budget_exhausted"),

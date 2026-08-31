@@ -367,6 +367,68 @@ impl Trajectory {
         }));
     }
 
+    /// (#2190) dispatch.empty_tool_calls.recovered — sibling of
+    /// `append_intra_turn_stall_recovered` above, for the shape that is NOT
+    /// runaway reasoning: a turn returned `finish_reason=tool_calls` with an
+    /// EMPTY `tool_calls` array. This is a protocol-shaped failure (the
+    /// model claimed a tool call and produced none), so it gets its own
+    /// event type rather than sharing the runaway-reasoning one — conflating
+    /// the two sent a live diagnosis down the wrong path twice (measured:
+    /// the dropped turns were 286-648 completion tokens, nowhere near any
+    /// configured bound, so "runaway-reasoning turn dropped" was factually
+    /// wrong for this shape).
+    pub fn append_empty_tool_calls_recovered(
+        &mut self,
+        seq: u32,
+        completion_tokens: Option<u32>,
+        recoveries_used: u32,
+        recoveries_budget: u32,
+        bound: crate::bounds::BoundRef,
+    ) {
+        let completion_tokens_value = completion_tokens
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null);
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.empty_tool_calls.recovered",
+            "seq": seq,
+            "ts": unix_ms(),
+            "completion_tokens": completion_tokens_value,
+            "recoveries_used": recoveries_used,
+            "recoveries_budget": recoveries_budget,
+            "bound": bound,
+        }));
+    }
+
+    /// (#2190) dispatch.escalation.triggered — fires once, at the exact
+    /// moment a dispatch terminates via `TerminalReason::EscalationTriggered`,
+    /// for ANY escalation reason. Stamps `model` and the prompt-token count
+    /// AT THAT MOMENT directly onto the record, so "which model, at what
+    /// context, stopped producing calls" is answerable from this one line
+    /// instead of joining `telemetry.lms` (model) and `telemetry.context`
+    /// (token count) by hand — same shape as #2188's model/locality stamp.
+    /// `reason` is the exact same snake_case string `main.rs` emits as the
+    /// JSON envelope's `result` field for this escalation (e.g.
+    /// `"escalation_empty_tool_calls"`) — see [`escalation_reason_str`],
+    /// the single source of truth both call sites read from, so the
+    /// trajectory event and the envelope can never name the same
+    /// termination two different ways.
+    pub fn append_escalation_triggered(
+        &mut self,
+        seq: u32,
+        reason: &str,
+        model: &str,
+        prompt_tokens: u32,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "dispatch.escalation.triggered",
+            "seq": seq,
+            "ts": unix_ms(),
+            "reason": reason,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+        }));
+    }
+
     /// (#2094) One event per turn-delay rest the loop took — harness-owned
     /// idle time between inference turns, never a stall. `ms` is the actual
     /// sleep duration AFTER clamping (see `loop_runner.rs`'s clamp logic),

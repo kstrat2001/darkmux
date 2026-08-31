@@ -286,6 +286,14 @@ pub struct RuntimeBehaviorConfig {
     /// (a non-thinking model's single 10000-token call outlasting the
     /// inactivity watchdog).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub generation_checkpoint_interval_tokens: Option<u32>,
+    /// (#2190) Per-dispatch budget for intra-turn stall recoveries — how
+    /// many times the runtime drops a useless turn (empty `tool_calls`, or
+    /// a runaway-reasoning cut) and nudges before escalating out of local-
+    /// tier. Absent = the runtime's built-in default (`MAX_STALL_RECOVERIES`
+    /// = 2). Surfaced live: a Devstral dispatch hit the SAME shape three
+    /// turns running at ~19k context and died with a hard-coded budget of
+    /// 2 with no operator override available.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub max_stall_recoveries: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub strict_selection: Option<bool>,
     // (#1311) Verbosity for the diagnostic surfaces. `"info"` (default) emits
     // the informative dispatch-liveness phase markers; `"debug"` additionally
@@ -933,7 +941,7 @@ impl DarkmuxConfig {
     ///   discovery surface is `darkmux doctor` (resolved path, overridable).
     /// - caps (`max_turns`/`max_tokens`/`max_tokens_per_call`/
     ///   `reasoning_checkpoint_interval_tokens`/
-    ///   `generation_checkpoint_interval_tokens`), `default_role`,
+    ///   `generation_checkpoint_interval_tokens`/`max_stall_recoveries`), `default_role`,
     ///   `daemon_cors_origins` — absent is a real behavior (uncapped / the
     ///   runtime's built-in per-call default), not a value to default.
     ///
@@ -970,6 +978,7 @@ impl DarkmuxConfig {
                 max_tokens_per_call: None,
                 reasoning_checkpoint_interval_tokens: None,
                 generation_checkpoint_interval_tokens: None,
+                max_stall_recoveries: None,
                 strict_selection: Some(false),
                 log_level: Some("info".to_string()),
                 // (#1548) Now wired end-to-end (config_access accessor +

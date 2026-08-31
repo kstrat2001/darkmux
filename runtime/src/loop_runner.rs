@@ -271,12 +271,35 @@ pub enum EscalationReason {
     /// reasons.
     CumulativeTokensExceeded,
     /// (#414 PR A) Intra-turn stall recovery budget
-    /// ([`MAX_STALL_RECOVERIES`]) exhausted. Fires when the model
-    /// returned `finish_reason=length` with no content and no
-    /// tool_calls more times than the budget allows — the recovery
-    /// nudge isn't breaking the pattern, so the dispatch escalates
-    /// rather than burn more turns on the same stall.
+    /// ([`MAX_STALL_RECOVERIES`], operator-overridable via
+    /// `runtime.max_stall_recoveries` — #2190) exhausted. Fires when the
+    /// model returned `finish_reason=length` with no content and no
+    /// tool_calls more times than the budget allows — the GENUINE
+    /// runaway-reasoning shape: a turn cut at a bound while still writing
+    /// reasoning. The recovery nudge isn't breaking the pattern, so the
+    /// dispatch escalates rather than burn more turns on the same stall.
+    ///
+    /// (#2190) Deliberately does NOT cover `finish_reason=tool_calls` with
+    /// an empty `tool_calls` array — see [`EmptyToolCallsExhausted`] for
+    /// that shape, split out because it is a DIFFERENT failure with a
+    /// different cause (a protocol-shaped model/parser miss, not a
+    /// reasoning cut) and conflating the two sent a live diagnosis down
+    /// the wrong path twice.
     IntraTurnStallExhausted,
+    /// (#2190) Same bounded recovery-budget mechanism as
+    /// [`IntraTurnStallExhausted`] (same
+    /// [`MAX_STALL_RECOVERIES`]/`runtime.max_stall_recoveries` budget,
+    /// same drop-and-nudge recovery), but for a DIFFERENT shape: the model
+    /// returned `finish_reason=tool_calls` with an EMPTY `tool_calls`
+    /// array — it claimed it was calling a tool and produced none. This is
+    /// NOT a reasoning-loop pathology (measured live: Devstral via
+    /// LMStudio hit this three turns running at ~19k context, emitting
+    /// 286-648 completion tokens each time — nowhere near any per-call
+    /// bound, so "runaway reasoning" was factually wrong for this shape).
+    /// Split into its own kind so the diagnosis names the real cause: a
+    /// protocol-shaped model/parser miss (same Devstral+LMStudio parser
+    /// family as #2169/#2182), not a stuck thought.
+    EmptyToolCallsExhausted,
     /// (#2171) A turn kept hitting the GENERATION check-in
     /// (`generation_checkpoint_interval_tokens`) more times than
     /// `answer_max_tokens / generation_checkpoint_interval_tokens` allows.
@@ -301,6 +324,30 @@ pub enum EscalationReason {
     /// QUIETER, so it needs its own explicit bound rather than relying on
     /// an operator noticing a repeating detector line.
     MalformedToolCallsExhausted,
+}
+
+/// (#2190) The exact snake_case `escalation_*` string `main.rs` emits as the
+/// JSON envelope's `result` field for a given [`EscalationReason`] — single
+/// source of truth so the envelope's `result` and the
+/// `dispatch.escalation.triggered` trajectory event's `reason` field can
+/// never name the same termination two different ways. Lives here (not in
+/// `main.rs`) because this is where [`EscalationReason`] itself is defined —
+/// a match over the enum belongs next to the enum, not duplicated at every
+/// consumer.
+pub fn escalation_reason_str(reason: EscalationReason) -> &'static str {
+    match reason {
+        EscalationReason::CompactionLimitReached => "escalation_compaction_limit_reached",
+        EscalationReason::CumulativeTokensExceeded => "escalation_cumulative_tokens_exceeded",
+        EscalationReason::IntraTurnStallExhausted => "escalation_intra_turn_stall_exhausted",
+        // (#2190) Deliberately NOT `..._exhausted` — the issue's own spec
+        // names this exact string, and it reads better than the suffix:
+        // the model didn't exhaust anything, it just returned nothing.
+        EscalationReason::EmptyToolCallsExhausted => "escalation_empty_tool_calls",
+        EscalationReason::GenerationCheckpointBudgetExhausted => {
+            "escalation_generation_checkpoint_budget_exhausted"
+        }
+        EscalationReason::MalformedToolCallsExhausted => "escalation_malformed_tool_calls",
+    }
 }
 
 /// (#799) A bash tool invocation that **failed to run** — never executed —
@@ -974,6 +1021,11 @@ fn recover_intra_turn_stall(
     turns: u32,
     completion_tokens: Option<u32>,
     stall_recoveries_used: &mut u32,
+    // (#2190) The resolved budget (operator override, or MAX_STALL_RECOVERIES)
+    // — threaded in rather than read from the constant, so this shared
+    // recovery path honors `runtime.max_stall_recoveries` the same as every
+    // other call site.
+    stall_recovery_budget: u32,
     nudge: &str,
     bound: BoundRef,
 ) {
@@ -983,7 +1035,7 @@ fn recover_intra_turn_stall(
         turns,
         completion_tokens,
         *stall_recoveries_used,
-        MAX_STALL_RECOVERIES,
+        stall_recovery_budget,
         bound,
     );
     messages.push(Message::system(nudge));
@@ -1082,6 +1134,12 @@ pub fn run(
         // tests) the same way the resume/pace tests already do for
         // out_dir/resume_from.
         Some(u32::MAX),
+        // (#2190) `None` = the built-in `MAX_STALL_RECOVERIES` (2) — this
+        // wrapper's frozen signature (see its own doc above) carries no
+        // param for the new knob; a test exercising the override calls
+        // `run_with_sleeper` directly, same pattern as the generation
+        // check-in override above.
+        None,
         feedback_templates,
         response_format,
         &out_dir,
@@ -1130,6 +1188,9 @@ pub fn run_resumable(
     // (#2171) The GENERATION check-in — bounds every call that does NOT
     // carry the reasoning bound. None = GENERATION_CHECKPOINT_INTERVAL.
     generation_checkpoint_interval: Option<u32>,
+    // (#2190) Per-dispatch budget for intra-turn stall recoveries (empty
+    // `tool_calls`, or a runaway-reasoning cut). None = MAX_STALL_RECOVERIES.
+    max_stall_recoveries: Option<u32>,
     feedback_templates: std::collections::BTreeMap<String, String>,
     response_format: Option<serde_json::Value>,
     // (#2114 finding 3) Container out-dir root — where `pace.json` and
@@ -1168,6 +1229,7 @@ pub fn run_resumable(
         max_tokens_per_call,
         reasoning_checkpoint_interval,
         generation_checkpoint_interval,
+        max_stall_recoveries,
         feedback_templates,
         response_format,
         out_dir,
@@ -1209,6 +1271,10 @@ fn run_with_sleeper(
     // (#2171) The GENERATION check-in — bounds every call that does NOT
     // carry the reasoning bound. None = GENERATION_CHECKPOINT_INTERVAL.
     generation_checkpoint_interval: Option<u32>,
+    // (#2190) Per-dispatch budget for intra-turn stall recoveries — how
+    // many useless turns (empty `tool_calls`, or a runaway-reasoning cut)
+    // the loop tolerates before escalating. None = MAX_STALL_RECOVERIES (2).
+    max_stall_recoveries: Option<u32>,
     feedback_templates: std::collections::BTreeMap<String, String>,
     // (#1038) Optional `response_format` envelope (the role's output_schema,
     // wrapped as json_schema). When set, every model turn is grammar-constrained
@@ -1249,6 +1315,14 @@ fn run_with_sleeper(
     // at the cap-selection site).
     let generation_interval: u32 =
         generation_checkpoint_interval.unwrap_or(GENERATION_CHECKPOINT_INTERVAL);
+    // (#2190) The stall-recovery budget — how many useless turns (empty
+    // `tool_calls`, or a runaway-reasoning cut) the loop tolerates before
+    // escalating out of local-tier. Resolved once, same pattern as the
+    // three per-call knobs above; every live use below reads this instead
+    // of the built-in constant directly, so an operator override is
+    // consistent end-to-end (comparisons, the recovery helper, and every
+    // stderr/trajectory line that names the budget).
+    let stall_recovery_budget: u32 = max_stall_recoveries.unwrap_or(MAX_STALL_RECOVERIES);
     // (#2171, floor added on merge-gate review) How many GENERATION-bound
     // continuations (never reasoning-bound ones — those stay deliberately
     // open-ended, see the checkpoint-continuation site's own comment on why
@@ -1731,6 +1805,16 @@ fn run_with_sleeper(
                          during resume catch-up; emitting EscalationTriggered terminal for \
                          frontier handoff instead of requesting the next turn. (#2114)"
                     );
+                    // (#2190) `latest_prompt_tokens` is still its pre-loop 0
+                    // here — no real turn has completed yet in this resume
+                    // catch-up path (see this fn's own note on the same
+                    // limitation a few lines up).
+                    trajectory.append_escalation_triggered(
+                        turns,
+                        escalation_reason_str(EscalationReason::CompactionLimitReached),
+                        model,
+                        latest_prompt_tokens,
+                    );
                     return Ok(LoopOutcome {
                         final_answer: turn.pending_answer(),
                         terminal_reason: TerminalReason::EscalationTriggered(
@@ -1891,6 +1975,12 @@ fn run_with_sleeper(
                     "darkmux-runtime: cumulative completion_tokens={total_completion_tokens} \
                      reached cap max_tokens={cap}; escalating out of local tier with \
                      partial outcome (#423, #457)"
+                );
+                trajectory.append_escalation_triggered(
+                    turns,
+                    escalation_reason_str(EscalationReason::CumulativeTokensExceeded),
+                    model,
+                    latest_prompt_tokens,
                 );
                 return Ok(LoopOutcome {
                     final_answer: turn.pending_answer(),
@@ -2630,13 +2720,23 @@ fn run_with_sleeper(
                     // empty/useless completion (observed: a degraded run on
                     // devstral-24b returned a wholly empty message under this
                     // finish_reason — no content, no reasoning, no calls).
-                    // Pre-#1123 this hard-killed the dispatch. It's the SAME
-                    // useless-stall shape the length-arm recovers (#414,
-                    // ~line 1150); route it through the same recovery — drop
-                    // the useless turn + nudge + retry, bounded by the stall
-                    // budget, escalating to the frontier when exhausted —
-                    // instead of aborting on the first occurrence.
-                    if stall_recoveries_used >= MAX_STALL_RECOVERIES {
+                    // Pre-#1123 this hard-killed the dispatch.
+                    //
+                    // (#2190) This shape is NOT the runaway-reasoning stall
+                    // the length-arm recovers — it's a protocol-shaped miss
+                    // (the model claimed a tool call and produced none), a
+                    // DIFFERENT failure with a different cause. It shares
+                    // the SAME bounded recovery mechanism (drop the useless
+                    // turn + nudge + retry, bounded by the stall budget,
+                    // escalating when exhausted) but gets its own detector
+                    // kind and escalation reason
+                    // (`EscalationReason::EmptyToolCallsExhausted`) rather
+                    // than borrowing `IntraTurnStallExhausted` — conflating
+                    // the two sent a live diagnosis down the wrong path
+                    // twice (measured: the dropped turns were 286-648
+                    // completion tokens, nowhere near any configured bound,
+                    // so "runaway reasoning" was factually wrong).
+                    if stall_recoveries_used >= stall_recovery_budget {
                         // (#1221) Drop the empty message before handing off.
                         // `main.rs` takes the LAST assistant message as the
                         // deliverable, and this arm pushes a wholly empty one
@@ -2657,16 +2757,23 @@ fn run_with_sleeper(
                             messages.pop();
                         }
                         eprintln!(
-                            "darkmux-runtime: escalation_triggered — finish_reason=\
-                             tool_calls with no tool_calls, and the intra-turn stall \
-                             recovery budget ({MAX_STALL_RECOVERIES}) is exhausted; \
-                             {stall_recoveries_used} prior recoveries didn't break the \
-                             pattern. Emitting EscalationTriggered for frontier handoff."
+                            "darkmux-runtime: escalation_triggered — the model returned \
+                             finish_reason=tool_calls with no tool calls, and the empty- \
+                             tool-calls recovery budget ({stall_recovery_budget}) is \
+                             exhausted; {stall_recoveries_used} prior recoveries didn't \
+                             break the pattern. Emitting EscalationTriggered for frontier \
+                             handoff. (#2190)"
+                        );
+                        trajectory.append_escalation_triggered(
+                            turns,
+                            escalation_reason_str(EscalationReason::EmptyToolCallsExhausted),
+                            model,
+                            latest_prompt_tokens,
                         );
                         return Ok(LoopOutcome {
                             final_answer: turn.pending_answer(),
                             terminal_reason: TerminalReason::EscalationTriggered(
-                                EscalationReason::IntraTurnStallExhausted,
+                                EscalationReason::EmptyToolCallsExhausted,
                             ),
                             messages,
                             turns,
@@ -2706,20 +2813,20 @@ fn run_with_sleeper(
                     }
                     stall_recoveries_used = stall_recoveries_used.saturating_add(1);
                     let bound = active_bound(sent_reasoning_bound, sent_generation_bound, per_call_cap);
-                    trajectory.append_intra_turn_stall_recovered(
+                    trajectory.append_empty_tool_calls_recovered(
                         turns,
                         this_turn_completion_tokens,
                         stall_recoveries_used,
-                        MAX_STALL_RECOVERIES,
+                        stall_recovery_budget,
                         bound,
                     );
                     messages.push(Message::system(STALL_NUDGE_MESSAGE));
                     let kept = if useless { "Dropped the useless turn" } else { "KEPT the turn's work" };
                     eprintln!(
-                        "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} \
-                         returned finish_reason=tool_calls with no tool_calls. {kept}, \
+                        "darkmux-runtime: ⏸ empty-tool-calls turn recovered — turn {turns} \
+                         returned finish_reason=tool_calls with no tool calls. {kept}, \
                          injected a nudge; budget \
-                         {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used, hit {}. (#1123/#1221)",
+                         {stall_recoveries_used}/{stall_recovery_budget} used, hit {}. (#2190)",
                         bound.describe()
                     );
                     continue;
@@ -2789,6 +2896,12 @@ fn run_with_sleeper(
                              consecutive turns produced ONLY invalid/ungranted tool-call names, \
                              none dispatched, no progress possible. Emitting EscalationTriggered \
                              for frontier handoff. (#2169)"
+                        );
+                        trajectory.append_escalation_triggered(
+                            turns,
+                            escalation_reason_str(EscalationReason::MalformedToolCallsExhausted),
+                            model,
+                            latest_prompt_tokens,
                         );
                         return Ok(LoopOutcome {
                             final_answer: turn.pending_answer(),
@@ -3239,6 +3352,12 @@ fn run_with_sleeper(
                                  compactions ({compactions}) reached bail_after_compactions ({bail}); \
                                  emitting EscalationTriggered terminal for frontier handoff"
                             );
+                            trajectory.append_escalation_triggered(
+                                turns,
+                                escalation_reason_str(EscalationReason::CompactionLimitReached),
+                                model,
+                                latest_prompt_tokens,
+                            );
                             return Ok(LoopOutcome {
                                 final_answer: turn.pending_answer(),
                                 terminal_reason: TerminalReason::EscalationTriggered(
@@ -3339,12 +3458,18 @@ fn run_with_sleeper(
                 // Budget check FIRST so an exhausted-budget escalation
                 // doesn't have to also account for the unproductive
                 // turn that just landed.
-                if stall_recoveries_used >= MAX_STALL_RECOVERIES {
+                if stall_recoveries_used >= stall_recovery_budget {
                     eprintln!(
                         "darkmux-runtime: escalation_triggered — intra-turn \
-                         stall recovery budget ({MAX_STALL_RECOVERIES}) exhausted; \
+                         stall recovery budget ({stall_recovery_budget}) exhausted; \
                          {stall_recoveries_used} prior recoveries didn't break the \
                          pattern. Emitting EscalationTriggered for frontier handoff."
+                    );
+                    trajectory.append_escalation_triggered(
+                        turns,
+                        escalation_reason_str(EscalationReason::IntraTurnStallExhausted),
+                        model,
+                        latest_prompt_tokens,
                     );
                     return Ok(LoopOutcome {
                         final_answer: turn.pending_answer(),
@@ -3443,6 +3568,7 @@ fn run_with_sleeper(
                         turns,
                         this_turn_completion_tokens,
                         &mut stall_recoveries_used,
+                        stall_recovery_budget,
                         STALL_NUDGE_MESSAGE,
                         bound,
                     );
@@ -3451,7 +3577,7 @@ fn run_with_sleeper(
                     // cost every checkpoint before it.
                     resuming_after_checkpoint = turn.has_prefill();
                     eprintln!(
-                        "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} hit                          the boundary with an EMPTY completion, so there is nothing to                          resume. Dropped the useless turn, injected a nudge; budget                          {stall_recoveries_used}/{MAX_STALL_RECOVERIES} used, hit {}. (#1123/#1221)",
+                        "darkmux-runtime: ⏸ intra-turn stall recovered — turn {turns} hit                          the boundary with an EMPTY completion, so there is nothing to                          resume. Dropped the useless turn, injected a nudge; budget                          {stall_recoveries_used}/{stall_recovery_budget} used, hit {}. (#1123/#1221)",
                         bound.describe()
                     );
                 } else {
@@ -3477,6 +3603,14 @@ fn run_with_sleeper(
                                  generation_checkpoint_interval_tokens {generation_interval}). \
                                  Emitting EscalationTriggered for frontier handoff with \
                                  everything banked so far ATTACHED. (#2171)"
+                            );
+                            trajectory.append_escalation_triggered(
+                                turns,
+                                escalation_reason_str(
+                                    EscalationReason::GenerationCheckpointBudgetExhausted,
+                                ),
+                                model,
+                                latest_prompt_tokens,
                             );
                             return Ok(LoopOutcome {
                                 final_answer: turn.pending_answer(),
@@ -3619,6 +3753,12 @@ fn run_with_sleeper(
                              Escalating for handoff with everything banked so far ATTACHED. \
                              (#1221)"
                         );
+                        trajectory.append_escalation_triggered(
+                            turns,
+                            escalation_reason_str(EscalationReason::IntraTurnStallExhausted),
+                            model,
+                            latest_prompt_tokens,
+                        );
                         return Ok(LoopOutcome {
                             final_answer: turn.pending_answer(),
                             terminal_reason: TerminalReason::EscalationTriggered(
@@ -3695,7 +3835,7 @@ fn run_with_sleeper(
                     "darkmux-runtime: ⏸ per-call budget reached — turn {turns} \
                      emitted {tokens_str} completion tokens ({shape}); the turn's \
                      reasoning was NOT discarded. Recovery budget \
-                     {stall_recoveries_used}/{MAX_STALL_RECOVERIES}. (#1221)"
+                     {stall_recoveries_used}/{stall_recovery_budget}. (#1221)"
                 );
                 continue;
             }
@@ -4678,7 +4818,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -4753,7 +4893,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok even though it paused mid-run");
@@ -4906,7 +5046,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok even though it paused mid-run");
@@ -4956,7 +5096,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect("2-turn scripted dispatch (tool call, then stop) returns Ok");
@@ -5060,7 +5200,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
@@ -5167,7 +5307,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
@@ -5285,7 +5425,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
@@ -5424,7 +5564,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &sleeper,
         )
         .expect("resumed dispatch returns Ok even though it paused before catch-up");
@@ -5543,7 +5683,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("resumed dispatch returns Ok");
@@ -5576,7 +5716,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("3-turn scripted dispatch returns Ok");
 
@@ -5617,7 +5757,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("single-turn dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -5723,7 +5863,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
-            Some(100), None, None, Some(40), Some(u32::MAX), std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
+            Some(100), None, None, Some(40), Some(u32::MAX), None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &sleeper,
         )
         .expect("checkpoint-continuation scripted dispatch returns Ok");
         std::env::remove_var("DARKMUX_TURN_DELAY_MS");
@@ -5783,7 +5923,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(3), None, Some(10_000), None, Some(4000),
-            std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect(
             "the request must carry max_tokens=4000 (the generation interval) — an Err \
@@ -5832,7 +5972,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(3), None, Some(10_000), None, Some(4000),
-            std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect("generation-bound salvage must drive the loop forward, not Err (#2171)");
         assert!(outcome.turns >= 1);
@@ -5923,7 +6063,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(3), None, None, None, None,
-            std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect(
             "turn 2's first call must carry max_tokens=1000 (the reasoning interval) — an \
@@ -5969,7 +6109,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
             Some(100), None, Some(2000), None, Some(1000),
-            std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect("budget exhaustion is a clean EscalationTriggered outcome, not an Err (#2171)");
 
@@ -8434,7 +8574,7 @@ mod tests {
         let outcome = run_with_sleeper(
             &client, &client, "devstral-test", initial, &tools, &mut traj, false, &cfg,
             Some(5), None, Some(10_000), None, Some(4000),
-            std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
+            None, std::collections::BTreeMap::new(), None, tmp.path(), "test-role", None, &RealSleeper,
         )
         .expect("a generation-bound-salvaged turn carrying a malformed call must not error");
         assert_eq!(outcome.terminal_reason, TerminalReason::Stop);
@@ -10271,7 +10411,7 @@ mod tests {
 
         let outcome = run_with_sleeper(
             &client, &client, "test-primary", vec![], &tools, &mut traj, false, &cfg,
-            Some(100), None, None, None, Some(u32::MAX), std::collections::BTreeMap::new(), None,
+            Some(100), None, None, None, Some(u32::MAX), None, std::collections::BTreeMap::new(), None,
             tmp.path(), "test-role", Some(resume_checkpoint), &RealSleeper,
         )
         .expect("bail should produce Ok with EscalationTriggered, not Err");
@@ -10684,6 +10824,14 @@ mod tests {
     /// occurrence. Every call returns the empty-tool_calls shape, so the loop
     /// recovers `MAX_STALL_RECOVERIES` times then escalates — same bounded
     /// behavior as the length-stall, proving the pre-#1123 hard-fail is gone.
+    ///
+    /// (#2190) Asserts `EmptyToolCallsExhausted`, NOT `IntraTurnStallExhausted`
+    /// — this shape (an empty `tool_calls` array) is a protocol-shaped miss,
+    /// not a runaway-reasoning cut, and #2190 split it into its own kind so
+    /// the escalation names the real cause. Mutation-proof: reverting the
+    /// arm's `EscalationReason::EmptyToolCallsExhausted` back to
+    /// `IntraTurnStallExhausted` makes this assertion fail (confirmed by
+    /// hand before writing this comment — see the PR's test evidence).
     #[test]
     #[serial_test::serial]
     fn loop_recovers_from_empty_tool_calls_then_escalates() {
@@ -10711,11 +10859,53 @@ mod tests {
 
         assert_eq!(
             outcome.terminal_reason,
-            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
-            "empty finish_reason=tool_calls should route to the stall recovery + escalate; got {:?}",
+            TerminalReason::EscalationTriggered(EscalationReason::EmptyToolCallsExhausted),
+            "empty finish_reason=tool_calls should route to its OWN escalation kind \
+             (EmptyToolCallsExhausted), NOT the runaway-reasoning IntraTurnStallExhausted; \
+             got {:?}",
             outcome.terminal_reason
         );
         assert_eq!(outcome.turns, MAX_STALL_RECOVERIES + 1);
+    }
+
+    /// (#2190) A GENUINE runaway-reasoning cut (`finish_reason=length`, no
+    /// content, no tool_calls — the shape `EmptyToolCallsExhausted` was
+    /// split OUT of) must still produce the OLD kind,
+    /// `IntraTurnStallExhausted`. This is the negative case for the split
+    /// above: same recovery mechanism, different escalation reason,
+    /// discriminated purely by which finish_reason produced the stall.
+    #[test]
+    #[serial_test::serial]
+    fn genuine_reasoning_bound_cut_still_produces_intra_turn_stall_kind() {
+        let server = MockServer::start();
+        let _stall = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(
+                None,
+                None,
+                "length",
+                100,
+                MAX_TOKENS_PER_CALL,
+            ));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("genuine-reasoning-stall").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("ask")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, Some(10_000), Some(1000), std::collections::BTreeMap::new(), None)
+            .expect("genuine runaway-reasoning must recover+escalate, not Err");
+
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::IntraTurnStallExhausted),
+            "a finish_reason=length stall must keep the OLD kind (IntraTurnStallExhausted); \
+             got {:?}",
+            outcome.terminal_reason
+        );
     }
 
     /// (#414 PR A) The stall-recovery trajectory event must fire each
@@ -10804,6 +10994,186 @@ mod tests {
             found_recovered,
             "trajectory must contain dispatch.intra_turn_stall.recovered event"
         );
+    }
+
+    /// (#2190) Sibling of `loop_emits_intra_turn_stall_recovered_trajectory_event`
+    /// above, for the NEW event: an empty-`tool_calls` recovery must emit
+    /// `dispatch.empty_tool_calls.recovered`, NOT
+    /// `dispatch.intra_turn_stall.recovered`. Red-proved by hand: reverting
+    /// the arm's trajectory call back to `append_intra_turn_stall_recovered`
+    /// makes `found_empty_tool_calls_recovered` stay false while
+    /// `found_intra_turn_stall_recovered` goes true — this test would then
+    /// fail on the first assertion.
+    #[test]
+    #[serial_test::serial]
+    fn loop_emits_empty_tool_calls_recovered_trajectory_event() {
+        let server = MockServer::start();
+        let _stall = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .matches(|req| {
+                    let body = req.body.as_deref().and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
+                    !body.contains("darkmux-runtime] Your previous response")
+                });
+            then.status(200).json_body(chat_response_json(None, None, "tool_calls", 100, 50));
+        });
+        let _stop = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/chat/completions")
+                .body_contains("darkmux-runtime] Your previous response");
+            then.status(200).json_body(chat_response_json(Some("recovered"), None, "stop", 150, 10));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("empty-toolcalls-traj").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("ask")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::never_compact();
+        let _outcome = run(&client, &client, "test-model", initial, &tools, &mut traj, false, &cfg, Some(100), None, None, None, std::collections::BTreeMap::new(), None)
+            .expect("recovery succeeds");
+
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+        let mut found_empty_tool_calls_recovered = false;
+        let mut found_intra_turn_stall_recovered = false;
+        for line in raw.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).expect("each line is JSON");
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("dispatch.empty_tool_calls.recovered") => {
+                    found_empty_tool_calls_recovered = true;
+                    assert_eq!(
+                        v.get("recoveries_used").and_then(|x| x.as_u64()),
+                        Some(1),
+                        "first recovery records recoveries_used=1"
+                    );
+                    assert_eq!(
+                        v.get("recoveries_budget").and_then(|x| x.as_u64()),
+                        Some(MAX_STALL_RECOVERIES as u64),
+                    );
+                }
+                Some("dispatch.intra_turn_stall.recovered") => {
+                    found_intra_turn_stall_recovered = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            found_empty_tool_calls_recovered,
+            "trajectory must contain dispatch.empty_tool_calls.recovered for the empty-array shape"
+        );
+        assert!(
+            !found_intra_turn_stall_recovered,
+            "an empty-tool_calls recovery must NOT also emit the runaway-reasoning event kind"
+        );
+    }
+
+    /// (#2190) The escalation record (`dispatch.escalation.triggered`) must
+    /// carry `model` and the prompt-token count AT THE MOMENT OF ESCALATION
+    /// — the whole point being "which model, at what context, stopped
+    /// producing calls" is answerable from this one line. Exercises the
+    /// empty-tool-calls escalation path (the exact shape #2190's live
+    /// evidence hit), but the trajectory call is shared by every
+    /// `EscalationTriggered` return site.
+    #[test]
+    #[serial_test::serial]
+    fn escalation_triggered_record_carries_model_and_prompt_tokens() {
+        let server = MockServer::start();
+        let _stall = server.mock(|when, then| {
+            when.method(POST).path("/v1/chat/completions");
+            then.status(200).json_body(chat_response_json(None, None, "tool_calls", 19133, 648));
+        });
+
+        let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+        let tmp = tempfile::Builder::new().prefix("escalation-model-context").tempdir().unwrap();
+        let mut traj = Trajectory::open(tmp.path());
+        let initial = vec![Message::system("test"), Message::user("ask")];
+        let tools = [Tool::Read];
+
+        let cfg = compaction::CompactionConfig::never_compact();
+        let outcome = run(
+            &client, &client, "devstral-small-2-2512", initial, &tools, &mut traj, false, &cfg,
+            Some(100), None, None, None, std::collections::BTreeMap::new(), None,
+        )
+        .expect("empty-tool-calls exhaustion returns Ok(EscalationTriggered)");
+        assert_eq!(
+            outcome.terminal_reason,
+            TerminalReason::EscalationTriggered(EscalationReason::EmptyToolCallsExhausted)
+        );
+
+        let traj_path = tmp.path().join(".darkmux-runtime/trajectory.jsonl");
+        let raw = std::fs::read_to_string(&traj_path).expect("trajectory file exists");
+        let mut found = false;
+        for line in raw.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).expect("each line is JSON");
+            if v.get("type").and_then(|t| t.as_str()) == Some("dispatch.escalation.triggered") {
+                found = true;
+                assert_eq!(
+                    v.get("reason").and_then(|r| r.as_str()),
+                    Some("escalation_empty_tool_calls"),
+                    "reason must be the exact envelope `result` string, got {v:?}"
+                );
+                assert_eq!(
+                    v.get("model").and_then(|m| m.as_str()),
+                    Some("devstral-small-2-2512"),
+                    "escalation record must name the model, got {v:?}"
+                );
+                assert_eq!(
+                    v.get("prompt_tokens").and_then(|p| p.as_u64()),
+                    Some(19133),
+                    "escalation record must carry the prompt-token count AT THE TIME, got {v:?}"
+                );
+            }
+        }
+        assert!(found, "trajectory must contain dispatch.escalation.triggered");
+    }
+
+    /// (#2190) `runtime.max_stall_recoveries` is a real knob, not a doc
+    /// comment: setting the override to 1 escalates ONE recovery earlier
+    /// than the built-in default (2), and setting it to 4 tolerates two
+    /// MORE recoveries before escalating. Both call `run_with_sleeper`
+    /// directly (the frozen `run()` wrapper always passes `None` — see its
+    /// own doc), same pattern the generation-check-in override tests use.
+    #[test]
+    #[serial_test::serial]
+    fn max_stall_recoveries_override_changes_the_escalation_point() {
+        use crate::checkpoint;
+
+        for (budget, expected_turns) in [(1u32, 2u32), (4u32, 5u32)] {
+            let server = MockServer::start();
+            let _stall = server.mock(|when, then| {
+                when.method(POST).path("/v1/chat/completions");
+                then.status(200).json_body(chat_response_json(None, None, "tool_calls", 100, 50));
+            });
+
+            let client = LmStudioClient::with_base_url(format!("{}/v1", server.base_url()));
+            let tmp = tempfile::Builder::new().prefix("stall-budget-override").tempdir().unwrap();
+            let mut traj = Trajectory::open(tmp.path());
+            let initial = vec![Message::system("test"), Message::user("ask")];
+            let tools = [Tool::Read];
+            let cfg = compaction::CompactionConfig::never_compact();
+
+            let outcome = run_with_sleeper(
+                &client, &client, "test-model", initial, &tools, &mut traj, false, &cfg,
+                Some(100), None, None, None, None, Some(budget),
+                std::collections::BTreeMap::new(), None, tmp.path(), "test-role",
+                None::<checkpoint::RunCheckpoint>, &RealSleeper,
+            )
+            .expect("budget exhaustion returns Ok(EscalationTriggered)");
+
+            assert_eq!(
+                outcome.terminal_reason,
+                TerminalReason::EscalationTriggered(EscalationReason::EmptyToolCallsExhausted),
+                "budget={budget}: expected EmptyToolCallsExhausted, got {:?}",
+                outcome.terminal_reason
+            );
+            assert_eq!(
+                outcome.turns, expected_turns,
+                "budget={budget}: expected exactly budget+1 turns (=={expected_turns}); got {}",
+                outcome.turns
+            );
+        }
     }
 
     // ─── (#465) extract_edit_target_path — same-file detector helper ──

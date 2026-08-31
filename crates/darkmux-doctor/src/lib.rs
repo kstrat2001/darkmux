@@ -163,6 +163,7 @@ pub fn run() -> DoctorReport {
         check_review_judge_exhaustion_policy(),
         check_turn_delay(),
         check_reasoning_checkpoint_interval(),
+        check_max_stall_recoveries(),
         check_host_sampler_interval(),
         check_telemetry_record_every_samples(),
         check_generation_checkpoint_interval(),
@@ -1872,6 +1873,41 @@ fn check_reasoning_checkpoint_interval() -> Check {
         message: format!(
             "{shown} tokens ({provenance}) — how far the model reasons between the \
              runtime's mid-turn check-ins (#1221)"
+        ),
+        hint: None,
+    }
+}
+
+/// (#2190) Surface the resolved `runtime.max_stall_recoveries` with
+/// provenance — the budget of intra-turn stall recoveries (empty
+/// `tool_calls`, or a runaway-reasoning cut) the internal runtime spends
+/// before escalating out of local-tier. Live evidence for why this needed a
+/// doctor row: a Devstral dispatch hit the same "finish_reason=tool_calls
+/// with no tool_calls" shape on three consecutive turns at ~19k context and
+/// died with a hard-coded budget of 2 that no config surface could show or
+/// override.
+///
+/// Always Pass — informational, same shape as
+/// `check_reasoning_checkpoint_interval` above.
+fn check_max_stall_recoveries() -> Check {
+    let name = "runtime.max_stall_recoveries";
+    let (value, source) = darkmux_types::config_access::max_stall_recoveries_with_source();
+    let (shown, provenance) = match value {
+        Some(n) => (n, source.as_str()),
+        // `None` means the runtime's own built-in literal governs
+        // (`MAX_STALL_RECOVERIES = 2`, `runtime/src/loop_runner.rs`) —
+        // darkmux-doctor can't import the runtime crate (outside the
+        // workspace), so the built-in value is named here rather than
+        // re-derived from a shared constant.
+        None => (2, "built-in"),
+    };
+    Check {
+        name: name.into(),
+        status: Status::Pass,
+        message: format!(
+            "{shown} recoveries ({provenance}) — how many useless turns (empty tool_calls, \
+             or a runaway-reasoning cut) the runtime tolerates before escalating out of \
+             local-tier (#2190)"
         ),
         hint: None,
     }
@@ -6077,6 +6113,42 @@ mod tests {
         }
     }
 
+    // ─── (#2190) check_max_stall_recoveries — resolved value + provenance ──
+
+    #[serial_test::serial]
+    #[test]
+    fn check_max_stall_recoveries_unset_is_pass_and_names_built_in() {
+        let prev = std::env::var("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES").ok();
+        unsafe { std::env::remove_var("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES") };
+        let check = check_max_stall_recoveries();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("2 recoveries"), "{}", check.message);
+        assert!(check.message.contains("built-in"), "{}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES"),
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn check_max_stall_recoveries_env_override_names_the_value_and_env() {
+        let prev = std::env::var("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES").ok();
+        unsafe { std::env::set_var("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES", "4") };
+        let check = check_max_stall_recoveries();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("4 recoveries"), "{}", check.message);
+        assert!(check.message.contains("env"), "provenance named: {}", check.message);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES", v),
+                None => std::env::remove_var("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES"),
+            }
+        }
+    }
+
     // ─── (#2108) check_host_probe — which sources resolved + the cost ──────
 
     /// Runs the REAL probe. macOS/aarch64-gated for the same reason the
@@ -7517,11 +7589,11 @@ mod tests {
         // thermal-governor [#2110/#2109] +
         // mission-envelope-readability [#1881] + hooks [#2093] +
         // rules [#1959] + host-probe [#2107] + power-posture [#2112,
-        // battery/Low-Power-Mode/thermal-state/thermal-emergency]) + one
-        // per active eureka rule.
+        // battery/Low-Power-Mode/thermal-state/thermal-emergency] +
+        // max-stall-recoveries [#2190]) + one per active eureka rule.
         // Every check should appear regardless of environment — even if the
         // underlying probe couldn't read state.
-        let expected = 49 + darkmux_eureka::all_rules().len();
+        let expected = 50 + darkmux_eureka::all_rules().len();
         assert_eq!(r.checks.len(), expected);
     }
 

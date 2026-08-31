@@ -115,6 +115,10 @@ const KEYS: &[(&str, Ty)] = &[
     // (#2171) The GENERATION check-in — bounds every call that does NOT
     // carry the reasoning bound above, not just reasoning ones.
     ("runtime.generation_checkpoint_interval_tokens", Ty::Uint),
+    // (#2190) Per-dispatch budget for intra-turn stall recoveries — see
+    // #2195's caution: this registry has broken main TWICE by a new
+    // runtime knob being forgotten here.
+    ("runtime.max_stall_recoveries", Ty::Uint),
     ("runtime.strict_selection", Ty::Bool),
     ("runtime.log_level", Ty::Str),
     ("runtime.feedback_injection", Ty::Bool),
@@ -550,6 +554,25 @@ mod tests {
         );
         set_at(p, "runtime.turn_delay_ms", "500").unwrap();
         assert_eq!(get_at(p, "runtime.turn_delay_ms").unwrap(), "500");
+    }
+
+    /// (#2190) `runtime.max_stall_recoveries` is settable via `darkmux config
+    /// set` and round-trips through get — the exact knob #2190's live
+    /// evidence needed (a hard-coded budget of 2 with no operator override).
+    /// Same `Ty::Uint` shape as `turn_delay_ms` above.
+    #[test]
+    fn max_stall_recoveries_settable_and_get_round_trips() {
+        let f = tmp();
+        let p = f.path();
+        let err = set_at(p, "runtime.max_stall_recoveries", "abc").unwrap_err();
+        assert!(
+            format!("{err}").contains("runtime.max_stall_recoveries"),
+            "error names the key: {err}"
+        );
+        set_at(p, "runtime.max_stall_recoveries", "4").unwrap();
+        assert_eq!(get_at(p, "runtime.max_stall_recoveries").unwrap(), "4");
+        let cfg: DarkmuxConfig = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        assert_eq!(cfg.runtime.unwrap().max_stall_recoveries, Some(4));
     }
 
     /// (#1475 packet 1) `role_profiles.<role>` is a dynamic settable key — it

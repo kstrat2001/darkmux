@@ -4639,9 +4639,135 @@
             .expect("maps per-turn-cap even without a bound field");
         assert!(payload.get("bound").is_none(), "no bound field on the event -> none on the payload");
         let detail = payload["detail"].as_str().unwrap();
+        // (#2190) Reworded from "salvaged at the per-call cap" to the
+        // non-causal "salvaged; request bound was the per-call cap" — "at"
+        // reads as "cut BY that bound", which this record never claims.
         assert!(
-            detail.contains("salvaged at the per-call cap"),
-            "must degrade to the pre-#2165 wording, got {detail:?}"
+            detail.contains("salvaged; request bound was the per-call cap"),
+            "must degrade to the (#2190-reworded) generic wording, got {detail:?}"
+        );
+    }
+
+    /// (#2190) `bound_label` must recognize EVERY `BoundKind` the runtime
+    /// side (`runtime/src/bounds.rs`) can emit — this is the exact bug the
+    /// issue's live evidence hit: `generation_checkpoint_interval` fell
+    /// through to the `other` arm and rendered "an unrecognized bound
+    /// (generation_checkpoint_interval))" on a dispatch's THIRD escalating
+    /// stall, reading as a broken formatter rather than a named,
+    /// well-understood bound (built-in 4000, and nowhere near the 286-648
+    /// completion tokens the stalled turns actually emitted). Enumerated by
+    /// hand against `runtime/src/bounds.rs::BoundKind` — keep this list in
+    /// sync when a variant is added there.
+    #[test]
+    fn bound_label_names_every_bound_kind() {
+        let cases = [
+            ("reasoning_checkpoint_interval", "the reasoning check-in interval"),
+            ("generation_checkpoint_interval", "the generation check-in interval"),
+            ("max_tokens_per_call", "the per-call token cap"),
+            ("max_turns", "the max-turns cap"),
+            ("max_tokens", "the cumulative max-tokens cap"),
+            ("inactivity_timeout", "the inactivity timeout"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(
+                bound_label(kind),
+                expected,
+                "bound_label(\"{kind}\") must resolve to a named clause, not fall to \
+                 the `other` (\"an unrecognized bound (...)\") arm"
+            );
+        }
+    }
+
+    /// (#2190) Sibling of `detector_telemetry_payload_forwards_bound_for_
+    /// intra_turn_stall_recovered` above, for the specific bound the live
+    /// evidence hit: `generation_checkpoint_interval`. Pre-fix this rendered
+    /// "an unrecognized bound (generation_checkpoint_interval)" in the
+    /// detail string; post-fix it names the real clause.
+    #[test]
+    fn detector_telemetry_payload_names_generation_checkpoint_interval_bound() {
+        let event = serde_json::json!({
+            "type": "dispatch.intra_turn_stall.recovered",
+            "seq": 7,
+            "completion_tokens": 648,
+            "recoveries_used": 2,
+            "recoveries_budget": 2,
+            "bound": {"kind": "generation_checkpoint_interval", "value": 4000, "source": "built-in"},
+        });
+        let payload = detector_telemetry_payload("dispatch.intra_turn_stall.recovered", &event)
+            .expect("maps intra-turn-stall");
+        let detail = payload["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("the generation check-in interval (built-in 4000)"),
+            "must name the generation check-in interval, not \"an unrecognized bound\"; got {detail:?}"
+        );
+        assert!(
+            !detail.contains("unrecognized"),
+            "must never render as an unrecognized bound; got {detail:?}"
+        );
+        // (#2190) Non-causal wording: "; request bound was X", never "at X"
+        // (which reads as "cut BY that bound" — false for this record, which
+        // only fires for the genuine runaway-reasoning shape, but the
+        // wording itself must not imply causation either way).
+        assert!(
+            detail.contains("dropped + recovered; request bound was"),
+            "must use the non-causal '; request bound was' phrasing, got {detail:?}"
+        );
+    }
+
+    /// (#2190) The NEW `dispatch.empty_tool_calls.recovered` event type must
+    /// route to its own `kind: "empty_tool_calls"` and name the real shape
+    /// in `detail` — not the runaway-reasoning wording its sibling event
+    /// carries.
+    #[test]
+    fn detector_telemetry_payload_maps_empty_tool_calls_recovered_event() {
+        let event = serde_json::json!({
+            "type": "dispatch.empty_tool_calls.recovered",
+            "seq": 2,
+            "completion_tokens": 286,
+            "recoveries_used": 2,
+            "recoveries_budget": 2,
+            "bound": {"kind": "generation_checkpoint_interval", "value": 4000, "source": "built-in"},
+        });
+        let payload = detector_telemetry_payload("dispatch.empty_tool_calls.recovered", &event)
+            .expect("maps empty_tool_calls");
+        assert_eq!(payload["kind"], serde_json::json!("empty_tool_calls"));
+        let detail = payload["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("finish_reason=tool_calls with no tool calls"),
+            "detail must name the real shape, got {detail:?}"
+        );
+        assert!(
+            !detail.contains("runaway-reasoning"),
+            "must NOT use the runaway-reasoning wording for this shape, got {detail:?}"
+        );
+    }
+
+    /// (#2190) The escalation record's own detector-telemetry mapping:
+    /// `dispatch.escalation.triggered` must route to `kind: "escalation"`
+    /// and carry `model`/`prompt_tokens` as EXPLICIT payload fields (not
+    /// only inside the human-readable `detail` string) — same pattern as
+    /// the malformed-tool-names event's explicit `count`/`model`/
+    /// `sample_name_prefix` fields, so a consumer never has to parse prose
+    /// to get the fact.
+    #[test]
+    fn detector_telemetry_payload_maps_escalation_triggered_event() {
+        let event = serde_json::json!({
+            "type": "dispatch.escalation.triggered",
+            "seq": 4,
+            "reason": "escalation_empty_tool_calls",
+            "model": "devstral-small-2-2512",
+            "prompt_tokens": 19133,
+        });
+        let payload = detector_telemetry_payload("dispatch.escalation.triggered", &event)
+            .expect("maps escalation");
+        assert_eq!(payload["kind"], serde_json::json!("escalation"));
+        assert_eq!(payload["model"], serde_json::json!("devstral-small-2-2512"));
+        assert_eq!(payload["prompt_tokens"], serde_json::json!(19133));
+        assert_eq!(payload["reason"], serde_json::json!("escalation_empty_tool_calls"));
+        let detail = payload["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("devstral-small-2-2512") && detail.contains("19133"),
+            "detail must also name model + prompt_tokens in prose, got {detail:?}"
         );
     }
 

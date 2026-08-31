@@ -785,6 +785,18 @@ fn apply_runtime_limit_flags(cmd: &mut Command) {
         cmd.arg("--generation-checkpoint-interval").arg(n.to_string());
         cmd.arg("--generation-checkpoint-interval-source").arg(generation_checkpoint_interval_source.as_str());
     }
+    // (#2190) The stall-recovery budget — how many useless turns (empty
+    // `tool_calls`, or a runaway-reasoning cut) the runtime tolerates before
+    // escalating out of local-tier. Pre-#2190 this was a hard-coded 2 with
+    // no operator override; live evidence (#2190) was a Devstral dispatch
+    // that hit the same shape on three consecutive turns at ~19k context
+    // and had no knob to trade turns for completions. No `-source`
+    // companion flag: unlike the per-call caps above, this budget isn't a
+    // `BoundKind` the runtime stamps per-hit provenance for.
+    warn_if_unparseable_u32("DARKMUX_RUNTIME_MAX_STALL_RECOVERIES");
+    if let Some(n) = darkmux_types::config_access::max_stall_recoveries() {
+        cmd.arg("--max-stall-recoveries").arg(n.to_string());
+    }
 }
 
 
@@ -5792,8 +5804,15 @@ impl TailerState {
             | "dispatch.reasoning_loop.suspected"
             | "dispatch.tool.repeated_failure"
             | "dispatch.intra_turn_stall.recovered"
+            // (#2190) Empty-`tool_calls` recovery — its own detector kind,
+            // routed through the same pure mapping as its sibling above.
+            | "dispatch.empty_tool_calls.recovered"
             | "dispatch.per_turn_cap.salvaged"
-            | "dispatch.tool.malformed_names" => {
+            | "dispatch.tool.malformed_names"
+            // (#2190) The escalation record itself — see
+            // `detector_telemetry_payload`'s own arm for why this rides the
+            // same detector-telemetry path rather than a bespoke one.
+            | "dispatch.escalation.triggered" => {
                 // (#2169, merge-gate MUST FIX 1 split by `reason`) Live
                 // running totals — a call that never dispatches can't
                 // reach `tool.completed`/`self.summary.tool_calls` at
@@ -6051,14 +6070,52 @@ fn detector_telemetry_payload(
             // provenance, not just a bare number — falls back to the
             // pre-#2165 wording when `bound` is absent (an older runtime
             // image; flow records are lenient-on-read).
+            //
+            // (#2190) Worded as "; request bound was X", NOT "at X" — "at"
+            // reads as "cut BY that bound", which is false here: this event
+            // only fires for the GENUINE runaway-reasoning shape (a turn cut
+            // while still writing reasoning at the bound the request
+            // carried). Live evidence of the old wording misleading a
+            // diagnosis: "... at an unrecognized bound
+            // (generation_checkpoint_interval) (built-in 4000)" was read as
+            // "the 4000-token bound cut this turn" when the turns that fired
+            // it were 286-648 tokens — nowhere near 4000.
             let bound_clause = bound_detail_clause(event)
                 .unwrap_or_else(|| "the per-call cap".to_string());
             (
                 "intra-turn-stall",
                 "info",
                 format!(
-                    "runaway-reasoning turn dropped + recovered at {bound_clause} \
+                    "runaway-reasoning turn dropped + recovered; request bound was {bound_clause} \
                      (budget {recoveries_used}/{recoveries_budget}, {completion_tokens} tokens) (#414)"
+                ),
+            )
+        }
+        // (#2190) Distinguished from `dispatch.intra_turn_stall.recovered`
+        // above: this fires when a turn returns `finish_reason=tool_calls`
+        // with an EMPTY `tool_calls` array — a protocol-shaped failure (the
+        // model claimed it was calling a tool and then didn't), not a
+        // reasoning loop cut at a bound. Conflating the two sent a live
+        // diagnosis down the wrong path twice (#2190): the dropped turns
+        // were 286-648 completion tokens, nowhere near any configured
+        // bound, so "runaway reasoning" was factually wrong.
+        "dispatch.empty_tool_calls.recovered" => {
+            let completion_tokens = event
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let recoveries_used = u64_field("recoveries_used");
+            let recoveries_budget = u64_field("recoveries_budget");
+            let bound_clause = bound_detail_clause(event)
+                .unwrap_or_else(|| "the per-call cap".to_string());
+            (
+                "empty_tool_calls",
+                "info",
+                format!(
+                    "the model returned finish_reason=tool_calls with no tool calls — turn \
+                     dropped + recovered; request bound was {bound_clause} \
+                     (budget {recoveries_used}/{recoveries_budget}, {completion_tokens} tokens) (#2190)"
                 ),
             )
         }
@@ -6070,14 +6127,15 @@ fn detector_telemetry_payload(
             // #2165 exists to close: a salvage record that said "hit cap
             // 1000" with no way to tell whether that was the #1221
             // reasoning check-in interval or an operator's
-            // `max_tokens_per_call` override.
+            // `max_tokens_per_call` override. (#2190: same non-causal
+            // rewording as the intra-turn-stall arm above.)
             let bound_clause = bound_detail_clause(event)
                 .unwrap_or_else(|| "the per-call cap".to_string());
             (
                 "per-turn-cap",
                 "info",
                 format!(
-                    "{salvaged_tool_calls} tool call(s) salvaged at {bound_clause} \
+                    "{salvaged_tool_calls} tool call(s) salvaged; request bound was {bound_clause} \
                      ({completion_tokens}/{cap} tokens) (#479)"
                 ),
             )
@@ -6105,6 +6163,30 @@ fn detector_telemetry_payload(
                 ),
             };
             ("malformed_tool_names", "warn", detail)
+        }
+        // (#2190) Fires once, at the exact moment a dispatch terminates via
+        // `TerminalReason::EscalationTriggered`, for ANY escalation reason.
+        // Stamps `model` + the prompt-token count AT THAT MOMENT directly
+        // onto the record — same shape as #2188's model/locality stamp — so
+        // "which model, at what context, stopped producing calls" reads off
+        // this one record instead of joining `telemetry.lms` (model) and
+        // `telemetry.context` (token count) by hand.
+        "dispatch.escalation.triggered" => {
+            let reason = str_field("reason");
+            let model = str_field("model");
+            let prompt_tokens = event
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            (
+                "escalation",
+                "warn",
+                format!(
+                    "escalated out of local-tier ({reason}) — model={model}, \
+                     prompt_tokens={prompt_tokens} (#2190)"
+                ),
+            )
         }
         _ => return None,
     };
@@ -6142,6 +6224,18 @@ fn detector_telemetry_payload(
         payload["reason"] = serde_json::json!(
             event.get("reason").and_then(|v| v.as_str()).unwrap_or("not_a_tool")
         );
+    }
+
+    // (#2190) Same explicit-field pattern as the malformed-names block above
+    // — `model` already rides the FlowRecord's own top-level field, but
+    // repeating it (plus the context fact `prompt_tokens`) directly in the
+    // payload is the whole point of this event: a reader shouldn't have to
+    // join two other record kinds to answer "which model, what context."
+    if event_type == "dispatch.escalation.triggered" {
+        payload["reason"] = event.get("reason").cloned().unwrap_or(serde_json::Value::Null);
+        payload["model"] = event.get("model").cloned().unwrap_or(serde_json::Value::Null);
+        payload["prompt_tokens"] =
+            event.get("prompt_tokens").cloned().unwrap_or(serde_json::Value::Null);
     }
 
     // (#994 engagement-context capture) Key the firing to the file it happened
@@ -6198,9 +6292,19 @@ fn bound_detail_clause(event: &serde_json::Value) -> Option<String> {
 /// sync when either changes). An unrecognized `kind` (a future runtime image
 /// emitting a bound this host binary predates) names the literal string
 /// rather than panicking or silently showing nothing.
+///
+/// (#2190) `"generation_checkpoint_interval"` was MISSING here — every real
+/// firing of that bound (#2171's non-reasoning check-in, the DEFAULT for a
+/// non-thinking model like Devstral) fell to the `other` arm and rendered
+/// "an unrecognized bound (generation_checkpoint_interval)", which reads as
+/// a broken formatter rather than a named, well-understood bound. Keep this
+/// match arm-for-arm with `BoundKind` in `runtime/src/bounds.rs` — a missing
+/// arm here is silent (the `other` fallback never panics), so nothing short
+/// of reading both files side by side catches the next one.
 fn bound_label(kind: &str) -> String {
     match kind {
         "reasoning_checkpoint_interval" => "the reasoning check-in interval".to_string(),
+        "generation_checkpoint_interval" => "the generation check-in interval".to_string(),
         "max_tokens_per_call" => "the per-call token cap".to_string(),
         "max_turns" => "the max-turns cap".to_string(),
         "max_tokens" => "the cumulative max-tokens cap".to_string(),

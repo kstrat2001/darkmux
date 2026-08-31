@@ -251,6 +251,13 @@ fn run_dispatch(args: &[String]) -> ExitCode {
     // None = the built-in default (`loop_runner::GENERATION_CHECKPOINT_INTERVAL`
     // = 4000).
     let mut generation_checkpoint_interval: Option<u32> = None;
+    // (#2190) The stall-recovery budget override. Host derives from
+    // `DARKMUX_RUNTIME_MAX_STALL_RECOVERIES` / `config.runtime.
+    // max_stall_recoveries`. None = the built-in default
+    // (`loop_runner::MAX_STALL_RECOVERIES` = 2). No `-source` companion
+    // flag — unlike the three per-call knobs above, this budget isn't a
+    // `BoundKind` the runtime stamps per-hit provenance for.
+    let mut max_stall_recoveries: Option<u32> = None;
     // (#2165) Provenance for the three knobs above — which of
     // `env(DARKMUX_RUNTIME_*)` / `config.json` / built-in resolved the
     // value the host just forwarded. The host computes this via
@@ -587,6 +594,28 @@ fn run_dispatch(args: &[String]) -> ExitCode {
                     std::process::exit(2);
                 }
             }
+            // (#2190) The stall-recovery budget override — how many useless
+            // turns (empty `tool_calls`, or a runaway-reasoning cut) the
+            // runtime tolerates before escalating out of local-tier.
+            "--max-stall-recoveries" => {
+                if let Some(v) = args.get(i + 1) {
+                    match v.parse::<u32>() {
+                        Ok(n) => {
+                            max_stall_recoveries = Some(n);
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "--max-stall-recoveries requires a non-negative integer (got: {v})"
+                            );
+                            return ExitCode::from(2);
+                        }
+                    }
+                } else {
+                    eprintln!("--max-stall-recoveries requires a value");
+                    return ExitCode::from(2);
+                }
+            }
             "--max-tokens-per-call" => {
                 if let Some(v) = args.get(i + 1) {
                     match v.parse::<u32>() {
@@ -921,6 +950,7 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         max_tokens_per_call,
         reasoning_checkpoint_interval,
         generation_checkpoint_interval,
+        max_stall_recoveries,
         feedback_templates,
         response_format,
         // (#2114 finding 3) pace.json / checkpoint.json live in the
@@ -951,27 +981,16 @@ fn run_dispatch(args: &[String]) -> ExitCode {
         Some(o) => match o.terminal_reason {
             loop_runner::TerminalReason::Stop => "stop",
             loop_runner::TerminalReason::MaxTurns => "max_turns",
-            // (#377) The `result` field is operator-visible in the
-            // JSON envelope; consumers (qa-review skill, lab adapter,
-            // future heuristic engine) branch on it. New variants get
-            // distinct snake-case strings so existing consumers can
-            // add a case without grepping for hidden behavior.
-            loop_runner::TerminalReason::EscalationTriggered(
-                loop_runner::EscalationReason::CompactionLimitReached,
-            ) => "escalation_compaction_limit_reached",
-            loop_runner::TerminalReason::EscalationTriggered(
-                loop_runner::EscalationReason::CumulativeTokensExceeded,
-            ) => "escalation_cumulative_tokens_exceeded",
-            loop_runner::TerminalReason::EscalationTriggered(
-                loop_runner::EscalationReason::IntraTurnStallExhausted,
-            ) => "escalation_intra_turn_stall_exhausted",
-            loop_runner::TerminalReason::EscalationTriggered(
-                loop_runner::EscalationReason::GenerationCheckpointBudgetExhausted,
-            ) => "escalation_generation_checkpoint_budget_exhausted",
-            // (#2169 merge-gate finding 4)
-            loop_runner::TerminalReason::EscalationTriggered(
-                loop_runner::EscalationReason::MalformedToolCallsExhausted,
-            ) => "escalation_malformed_tool_calls",
+            // (#377) The `result` field is operator-visible in the JSON
+            // envelope; consumers (qa-review skill, lab adapter, future
+            // heuristic engine) branch on it. (#2190) Delegates to
+            // `loop_runner::escalation_reason_str` — the single source of
+            // truth for the mapping, so the envelope's `result` and the
+            // `dispatch.escalation.triggered` trajectory event's `reason`
+            // can never drift apart.
+            loop_runner::TerminalReason::EscalationTriggered(reason) => {
+                loop_runner::escalation_reason_str(reason)
+            }
         },
         None => "error",
     };
