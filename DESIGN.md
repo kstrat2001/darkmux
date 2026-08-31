@@ -369,6 +369,22 @@ system — which is itself the finding, because those layers were named with the
 `shift` and `stint` are genuinely unused and were weighed as more humanized alternatives;
 `execution` won on precision and on composing cleanly for sub-executions.
 
+**"Rule" already sits at three grains, and none of them touch.** The word slipped past the
+discipline above — three subsystems own it, each with its own schema, and one of them even has
+a `match` field like another's:
+
+| Which "rule" | Where it lives | What it decides |
+|---|---|---|
+| **hook rule** | `config.hooks.rules[]` (`HookRule`: a `match` predicate + a target URL) | which FLOW RECORDS leave the machine, and to which receiver. Matched mechanically (`hook_match`); identified by position (`rule_index` on `hook.fired`). |
+| **crawl pattern** | a crawl rule file (e.g. `swallowed-error`: `match`/`no_match` prose + `evidence`/`why_hint`) | what COUNTS AS A FINDING. Given to the model verbatim as `<pattern name="…">`; named by id in the manifest, the envelope, and a receiver's `rule` column. |
+| **eureka rule** | `darkmux-eureka`'s `RuleDef`s (`RULES_SCHEMA_VERSION`) | what the detection engine flags, surfaced by `darkmux doctor`. |
+
+The collision is survivable because the keys never meet — a hook rule's `match` is a record
+predicate, a crawl pattern's `match` is instructions for a model — but prose that says "the
+rule fired" is ambiguous in exactly the way this section exists to prevent. Naming discipline,
+not renames: say **hook rule**, **crawl pattern** (the model-facing tag already says
+`<pattern>`), and **eureka rule**. A fourth "rules" surface must pick a different word.
+
 **The rule this leaves behind:** before naming a new layer, check whether the word already
 names a different grain in this system. A word at two grains is the defect that produced this
 whole section — `dispatch` meant both a top-level run kind and the innermost unit, and nothing
