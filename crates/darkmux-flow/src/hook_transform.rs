@@ -64,12 +64,29 @@
 //! adapter can terminate the WHOLE darkmux process, silently, exit code
 //! operator-chosen, no `hook.failed`, no quarantine, no cursor write.
 //! [`registered_funs`] is the single choke point: it chains
-//! `jaq_core::funs()` + `jaq_std::base_funs()` (never `jaq_std::funs()`/
-//! `extra_funs()`/`std()` — so `env`/`now` are never even present) +
-//! `jaq_json::funs()`, then filters the WHOLE set by name against
-//! [`DENIED_FUN_NAMES`] as belt-and-braces (`halt` survives the
-//! `base_funs()`-only switch on its own, so the filter is load-bearing,
-//! not decorative). `jaq_std::defs()` (the jq-syntax-level definitions —
+//! `jaq_core::funs()` + `jaq_std::funs()` + `jaq_json::funs()`, then
+//! filters the WHOLE set by name against [`DENIED_FUN_NAMES`].
+//!
+//! Read that carefully, because an earlier version of this comment
+//! claimed something stronger than the code does. `jaq_std::funs()` IS
+//! `base_funs().chain(extra_funs())` (jaq-std 3.0.3, `lib.rs`), and
+//! `extra_funs()`'s `std()` block is exactly where `env` and `now` are
+//! registered. So `env`/`now`/`halt` ARE present in the chained set, and
+//! the name filter is the ONLY thing keeping them unreachable — not a
+//! belt-and-braces second layer over a structural omission. A name
+//! missing from [`DENIED_FUN_NAMES`] is a direct sandbox escape (env-var
+//! read, or `std::process::exit` via `halt`), with nothing behind it.
+//!
+//! What actually holds the line is
+//! `registered_native_name_set_matches_the_reviewed_snapshot`: it pins
+//! the whole registered name set, so a jaq-std upgrade that introduces a
+//! new native fails the suite rather than silently widening the sandbox.
+//! Treat that test as load-bearing security machinery, not a snapshot
+//! convenience. Restoring the two-layer design (`base_funs()` plus the
+//! specific extra filters adapters actually use — regex/math/format/
+//! time) is tracked separately; it is a behavior change for any adapter
+//! already using an `extra_funs()` filter, which is why it is not a
+//! drive-by. `jaq_std::defs()` (the jq-syntax-level definitions —
 //! `map`, `select`, `debug`, `stderr`, `halt_error`, ...) stays fully
 //! included: `debug`/`stderr`/`halt_error` are defined in terms of the
 //! native `debug_empty`/`stderr_empty` primitives, which live in `log()`

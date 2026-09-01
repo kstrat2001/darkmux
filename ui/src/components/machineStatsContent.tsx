@@ -655,12 +655,25 @@ export function useMachineStatsContent({
   // "clock speed" row would have to pick one.
   const ramTotal = specs?.ram_total_bytes ?? null;
   const ramForAi = specs?.ram_free_for_ai_bytes ?? null;
+  // (#2250 follow-up) Each `Kv` returns null on an empty value, so an
+  // unknown field drops its own row — but a fragment is ALWAYS truthy, so
+  // guarding the section on the element itself rendered a bare "System
+  // specs" heading with nothing under it whenever every field was unknown.
+  // The section's presence has to key on the DATA, the way the pre-#2250
+  // code did when these were plain strings.
+  const identityValues = [
+    machineName ?? "",
+    specs?.cpu_brand ?? "",
+    fmtGbBytes(ramTotal),
+    specs?.os ?? "",
+  ];
+  const hasIdentity = identityValues.some((v) => v !== "");
   const identityBlock = (
     <>
-      <Kv label="machine name" value={machineName ?? ""} />
-      <Kv label="silicon" value={specs?.cpu_brand ?? ""} />
-      <Kv label="shared memory" value={fmtGbBytes(ramTotal)} />
-      <Kv label="OS" value={specs?.os ?? ""} />
+      <Kv label="machine name" value={identityValues[0]} />
+      <Kv label="silicon" value={identityValues[1]} />
+      <Kv label="shared memory" value={identityValues[2]} />
+      <Kv label="OS" value={identityValues[3]} />
     </>
   );
 
@@ -673,7 +686,7 @@ export function useMachineStatsContent({
   // also carries build info and live machine state.
   const statsBody = (
     <>
-      {identityBlock && (
+      {hasIdentity && (
         <div className="hx-section">
           <div className="hx-section__title">System specs</div>
           {identityBlock}
