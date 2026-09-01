@@ -13,7 +13,8 @@ use std::fs;
 
 use crate::schema::{flows_dir, FLOW_SCHEMA_VERSION};
 use crate::{
-    default_sink_info, open_redis_connection_bounded, RawRedisUrl, SinkInfo, REDIS_CONNECT_TIMEOUT,
+    bound_redis_response, default_sink_info, open_redis_connection_bounded, RawRedisUrl, SinkInfo,
+    REDIS_CONNECT_TIMEOUT,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +348,14 @@ pub(crate) fn probe_redis(cfg: &RedisCfg) -> (RedisStatus, Vec<String>) {
             );
         }
     };
+
+    // (#2227) The connect above is bounded; the three commands below were not.
+    // `probe_redis` backs `darkmux flow status` and `darkmux doctor` — the two
+    // verbs an operator reaches for BECAUSE the peer is misbehaving — so "must
+    // not wedge the doctor" has to cover the command phase too, not just the
+    // connect. Bounds each reply individually; all three are COUNT-capped
+    // reads, so none legitimately takes a second.
+    bound_redis_response(&conn);
 
     let xlen_res: redis::RedisResult<u64> = redis::cmd("XLEN").arg(&cfg.stream).query(&mut conn);
     let xlen = xlen_res.ok();
@@ -713,6 +722,56 @@ fn collect_hooks_status() -> HooksStatus {
     let rules = darkmux_types::config_access::hooks_rules();
     let outbox_dir = darkmux_types::config_access::hooks_outbox_dir();
     build_hooks_status(enabled, &outbox_dir, &rules)
+}
+
+#[cfg(test)]
+mod redis_probe_tests {
+    use super::*;
+
+    /// (#2227) Per-site bound: `probe_redis`'s `XLEN` / `XRANGE` / `XREVRANGE`.
+    ///
+    /// The site's pre-existing comment already claimed "a silent-at-TCP-layer
+    /// OR accept-but-don't-respond peer must not wedge the doctor" — but the
+    /// bound behind that claim covered the CONNECT phase only, so a peer that
+    /// completed the handshake and then went quiet wedged `darkmux flow status`
+    /// and `darkmux doctor` anyway. Those are the two verbs an operator runs
+    /// BECAUSE the peer is misbehaving.
+    #[test]
+    fn probe_redis_against_silent_peer_returns_within_bounded_time() {
+        let port = crate::spawn_silent_redis_peer(2);
+        let cfg = RedisCfg {
+            url: RawRedisUrl::new(format!("redis://127.0.0.1:{port}")),
+            stream: "darkmux:flow".to_string(),
+            max_len: Some(10000),
+        };
+
+        let start = std::time::Instant::now();
+        let (status, schemas) = probe_redis(&cfg);
+        let elapsed = start.elapsed();
+
+        // The connect SUCCEEDED (the peer completes the handshake) — this is
+        // the command phase, not #278's connect phase. That is exactly why
+        // every field below is empty while `reachable` is true.
+        assert!(
+            status.reachable,
+            "the fake peer completes the handshake, so the probe must have \
+             reached the COMMAND phase; a false here means this test degenerated \
+             into a connect-phase duplicate"
+        );
+        assert!(status.xlen.is_none(), "XLEN never answered, so it must be None");
+        assert!(schemas.is_empty(), "no entries could be read from a silent peer");
+        // The ceiling is deliberately TIGHT (measured ~3.1s: three 1s socket
+        // deadlines plus the connect). A looser one is not conservative here,
+        // it is vacuous: the fake peer eventually CLOSES the socket, so with
+        // the bound removed the first `XLEN` returns at EOF and the other two
+        // fail instantly on the broken connection — a total of ~5.0s, which a
+        // 6s ceiling accepted. Verified by mutation, both directions.
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "probe_redis took {elapsed:?}; expected bounded by 3 x \
+             REDIS_RESPONSE_TIMEOUT + connect (~3.1s). Unbounded before #2227."
+        );
+    }
 }
 
 #[cfg(test)]

@@ -898,13 +898,47 @@ pub const REDIS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// Redis enabled, 0.5ms with it disabled.
 ///
 /// Applied with `set_read_timeout`/`set_write_timeout` at every SERVE-SIDE
-/// call site that takes a connection. NOT yet applied on the WRITE path —
-/// `RedisSink::route_xadd` below and `darkmux-fleet`'s queue still issue
-/// commands on unbounded connections, so the same accepts-but-never-answers
-/// peer can wedge a flow-record `XADD` from a CLI dispatch. Worse there than
-/// here, because a hang is not an `Err`, so `REDIS_DISABLE_THRESHOLD` never
-/// trips and the sink never self-disables. Tracked separately; do not read
-/// this constant as meaning the whole codebase is bounded. This is load-bearing beyond latency: wrapping the call
+/// call site that takes a connection, and — as of #2227, via
+/// `bound_redis_response` — at EVERY call site in this crate that issues a
+/// command after `open_redis_connection_bounded`:
+///
+/// - `RedisSink::try_write`'s `XADD` and `RedisSink::connect`'s handed-out
+///   connection (`lib.rs`),
+/// - `session_presence`'s `write_session_beat` / `read_live_sessions` and
+///   `SessionEmitter::stop`'s `DEL` (`session_presence.rs`),
+/// - `presence`'s `write_beat` / `read_live` (`presence.rs`),
+/// - `presence_reconciler`'s `claim_edge` / `release_edge_claim`
+///   (`presence_reconciler.rs`),
+/// - `status`'s `probe_redis` — `XLEN` / `XRANGE` / `XREVRANGE` (`status.rs`).
+///
+/// Before #2227 every one of those rode an unbounded connection. The `XADD` is
+/// the worst on its own terms (a hang is not an `Err`, so
+/// `REDIS_DISABLE_THRESHOLD` never tripped and the sink never self-disabled),
+/// but the LIFECYCLE bug is the teardown path: `darkmux-crew`'s
+/// `dispatch_internal` calls `SessionEmitter::stop()` immediately before
+/// emitting `dispatch.complete`, and `stop()` joins a beat thread blocked in
+/// `write_session_beat`'s `SET` and then issues two more commands. Against an
+/// accepts-but-never-answers peer that stranded the dispatch with a
+/// `dispatch.start` and no terminal record at all (measured 89.42s against a
+/// peer that eventually closed; unbounded against a genuinely silent one).
+///
+/// STILL UNBOUNDED: `darkmux-fleet`'s queue (`queue.rs` — `publish_job`,
+/// `init_consumer_group`, `claim_job`, `ack_job`) opens plain
+/// `get_connection()` and is not bounded at either phase. Deliberately left
+/// out of #2227's scope: `claim_job` issues `XREADGROUP ... BLOCK <block_ms>`,
+/// an INTENTIONALLY long-blocking read that a 1s socket deadline would break,
+/// so bounding that queue needs a per-call-site decision rather than this
+/// constant. `darkmux-fleet`'s `routing.rs` (`wait_for_completion`) is
+/// unbounded too and is NOT a per-call-site problem — it POLLS `XREVRANGE`,
+/// so the standard deadline fits; its `--wait` timeout is checked only at the
+/// top of the loop, which an unbounded read never returns to (#2243).
+///
+/// Do not read this list as exhaustive, and do not read this constant as a
+/// standing guarantee that the codebase is bounded: a new call site is
+/// unbounded until someone applies the deadline to it. Two rounds of review
+/// on #2227 each found sites a previous version of this paragraph asserted
+/// were not there — grep for `get_connection` before trusting it.
+/// This is load-bearing beyond latency: wrapping the call
 /// in `tokio::time::timeout` is NOT sufficient on its own, because a timeout
 /// does not cancel an in-flight `spawn_blocking` task — without a socket-level
 /// deadline the blocking thread stays wedged forever and repeated requests
@@ -1011,6 +1045,123 @@ pub(crate) fn open_redis_connection_bounded(
     }
 }
 
+/// (#2227) Apply the per-command response deadline to a freshly obtained
+/// connection. Same shape (and same reason) as `bound_redis_response` on the
+/// serve side: `open_redis_connection_bounded` /
+/// `get_connection_with_timeout` bound only the CONNECT phase, so without
+/// this a peer that accepts TCP and completes the handshake but never answers
+/// the command leaves the caller blocked on the socket read forever.
+///
+/// On the WRITE path that is worse than on the read path. A hang is not an
+/// `Err`, so `note_failure` never runs, `REDIS_DISABLE_THRESHOLD` never trips
+/// and the sink can never self-disable — every subsequent flow-record write
+/// wedges too. And `darkmux_flow::record` is called SYNCHRONOUSLY from the
+/// dispatch thread, so a wedged `XADD` stops the trajectory-tailer loop that
+/// applies the inactivity-deadline resets and the host watchdog SIGKILLs a
+/// fully productive dispatch (`darkmux-crew`'s `dispatch_internal`). With the
+/// deadline applied, the stall surfaces as a `RedisError` out of `query()`,
+/// `try_write` returns `Err`, and the #388 disable accounting does its job.
+///
+/// Best-effort by design, matching the serve-side site: a connection kind
+/// that does not support socket deadlines must not turn a working write into
+/// a failure. The bound is a safety net, not a correctness input.
+pub(crate) fn bound_redis_response(conn: &redis::Connection) {
+    let _ = conn.set_read_timeout(Some(REDIS_RESPONSE_TIMEOUT));
+    let _ = conn.set_write_timeout(Some(REDIS_RESPONSE_TIMEOUT));
+}
+
+/// (#2227) How long the test-only silent peer below holds an accepted socket
+/// open before dropping it.
+///
+/// Deliberately LONGER than the per-call wall-clock ceilings the #2227 tests
+/// assert (~3s), and that is the whole point: when the peer CLOSES the socket
+/// the pending read returns EOF, which bounds the call *for free*. A hold
+/// shorter than the assertion ceiling would make every one of these tests
+/// pass with the socket deadline removed — the same vacuity the round-1
+/// silent-peer test shipped with. 5× `REDIS_RESPONSE_TIMEOUT` keeps the
+/// mutation red-proof meaningful while still being 6× shorter than the 30s
+/// sleeper round 1 used.
+#[cfg(test)]
+pub(crate) const SILENT_PEER_HOLD: std::time::Duration =
+    std::time::Duration::from_millis(REDIS_RESPONSE_TIMEOUT.as_millis() as u64 * 5);
+
+/// (#2227) Spawn a fake Redis peer that COMPLETES redis-rs's connection-setup
+/// handshake and then answers nothing.
+///
+/// This is the only shape that reaches the COMMAND phase at all: a peer that
+/// merely accepts TCP (the #278 test's shape) wedges at the handshake, so
+/// every command-phase assertion written against it passes vacuously. The two
+/// `+OK` replies satisfy the two ignored `CLIENT SETINFO` commands redis-rs
+/// 0.27 pipelines in `connection_setup_pipeline`.
+///
+/// The acceptor is BOUNDED at `max_connections` and each socket is held only
+/// [`SILENT_PEER_HOLD`], so no sleeper thread outlives its test by more than
+/// that hold. Every darkmux-flow call site opens its own connection, so
+/// `max_connections` is "how many Redis calls does this test make", with
+/// slack.
+///
+/// HONEST LIMIT, since a previous version of this comment claimed otherwise:
+/// the acceptor is bounded at `max_connections` but every shipped test
+/// deliberately budgets MORE than it uses, so the budget is never spent, and
+/// `incoming().take(n)` parks in `accept()` rather than returning early. The
+/// listener therefore stays bound for the test binary's life — one parked
+/// thread and one ephemeral port per peer, no CPU, released at process exit.
+/// That is acceptable for a test helper; it is not the "never accumulates
+/// listeners" this comment used to promise.
+#[cfg(test)]
+pub(crate) fn spawn_silent_redis_peer(max_connections: usize) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(max_connections) {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                use std::io::Write;
+                // Two `+OK` replies satisfy the two ignored `CLIENT SETINFO`
+                // commands redis-rs 0.27's `connection_setup_pipeline` sends.
+                let _ = stream.write_all(b"+OK\r\n+OK\r\n");
+                let _ = stream.flush();
+                std::thread::sleep(SILENT_PEER_HOLD);
+                drop(stream);
+            });
+        }
+        // Budget spent: `listener` drops here and the port closes.
+    });
+    // NOT required for correctness: `TcpListener::bind` already puts the
+    // socket in LISTEN with a backlog, so a connect succeeds before
+    // `accept()` is ever called. Kept as a small settling margin only.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    port
+}
+
+/// (#2227) Anti-vacuity guard for silent-peer tests whose subject returns no
+/// error value to inspect (`claim_edge` → `bool`, `SessionEmitter::stop` →
+/// `()`), so they can only assert wall-clock.
+///
+/// A wall-clock-only assertion passes just as happily when the CONNECT fails —
+/// which is exactly how the round-1 test degenerated into a duplicate of the
+/// #278 connect test. This proves the peer at `port` reaches the COMMAND
+/// phase: the connect must SUCCEED, and a command against it must then time
+/// out. Costs one connection from the peer's budget.
+#[cfg(test)]
+pub(crate) fn assert_silent_peer_reaches_command_phase(port: u16) {
+    let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str())
+        .expect("open client against the fake peer");
+    let mut conn = open_redis_connection_bounded(&client, REDIS_CONNECT_TIMEOUT).expect(
+        "the fake peer must COMPLETE redis-rs's connection-setup pipeline — if \
+         the connect fails, every wall-clock assertion in the caller is passing \
+         vacuously against the CONNECT phase (#278's territory) rather than the \
+         command phase #2227 is about",
+    );
+    bound_redis_response(&conn);
+    let res: redis::RedisResult<String> = redis::cmd("PING").query(&mut conn);
+    assert!(
+        res.is_err(),
+        "the fake peer answered a command; it must go silent after the \
+         handshake or the caller is not exercising a command-phase stall"
+    );
+}
+
 impl RedisSink {
     /// Build a sink connecting to `url` and writing to `stream`. Connection
     /// is not established until the first `write` call (the redis client
@@ -1076,8 +1227,17 @@ impl RedisSink {
     /// (#278) so a peer that's silent at the TCP/Redis layer bails
     /// fast instead of wedging the caller for the OS default.
     pub fn connect(&self) -> Result<redis::Connection> {
-        open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
-            .with_context(|| format!("connecting to Redis at {}", self.url))
+        let conn = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
+            .with_context(|| format!("connecting to Redis at {}", self.url))?;
+        // (#2227) Hand the caller a connection whose COMMANDS are bounded too.
+        // This accessor exists to give diagnostics a connection to the same
+        // Redis the sink writes to — and diagnostics are exactly what an
+        // operator runs against a peer that has stopped answering. Bounding it
+        // here means an out-of-crate caller can't reintroduce the unbounded
+        // shape by forgetting; a caller that legitimately needs a longer
+        // deadline (fleet's `XREADGROUP ... BLOCK`) sets its own afterward.
+        bound_redis_response(&conn);
+        Ok(conn)
     }
 
     pub fn url(&self) -> &str { self.url.expose_for_probe() }
@@ -1122,6 +1282,11 @@ impl RedisSink {
     fn try_write(&self, record: &FlowRecord) -> Result<()> {
         let mut conn = open_redis_connection_bounded(&self.client, REDIS_CONNECT_TIMEOUT)
             .context("getting Redis connection")?;
+        // (#2227) The connect above is bounded; the XADD below was not. An
+        // accepts-but-never-answers peer (measured 2026-07-29 on a Tailscale
+        // peer) wedged this write indefinitely — and because a hang is not an
+        // `Err`, the #388 disable accounting never advanced.
+        bound_redis_response(&conn);
         let payload = serde_json::to_string(record)
             .context("serializing FlowRecord for Redis")?;
         // Two-field encoding: `schema` carries the version (so downstream
@@ -1163,6 +1328,17 @@ impl RedisSink {
             "max_len".to_string(),
             self.max_len.map(|n| n.to_string()).unwrap_or_else(|| "unbounded".to_string()),
         );
+        // (#2227) Surface the #388 self-disable. `sink_info` feeds
+        // `darkmux flow status --json` and the daemon's endpoint, and until now
+        // it reported url/stream/max_len only — so a sink that had permanently
+        // disabled itself after REDIS_DISABLE_THRESHOLD failures read as
+        // healthy everywhere an operator would look, with the one-time stderr
+        // warning long since scrolled away. That state was hard to reach before
+        // #2227 (a hang is not an `Err`, so the counter never advanced); this
+        // fix is precisely what makes it reachable from the silent-peer
+        // scenario, which makes it an operator-sovereignty gap now:
+        // "the operator never has to wonder where a decision came from."
+        config.insert("disabled".to_string(), self.is_disabled().to_string());
         SinkInfo {
             kind: "Redis".to_string(),
             config,
@@ -4033,6 +4209,183 @@ mod tests {
              Was effectively unbounded before #278's connect-timeout fix. \
              This is the substrate test for the Studio-offline scenario."
         );
+    }
+
+    /// (#2227) A peer that COMPLETES the Redis handshake and then never
+    /// answers the `XADD` must make the write fail as an `Err`, bounded by
+    /// `REDIS_RESPONSE_TIMEOUT` — not hang forever.
+    ///
+    /// Distinct from the #278 test above, which covers the CONNECT phase.
+    /// `REDIS_CONNECT_TIMEOUT` bounds connect+handshake only; before this fix
+    /// the post-handshake command rode an unbounded socket, so the
+    /// accepts-but-never-answers peer measured live on 2026-07-29 (a Tailscale
+    /// peer accepting TCP but silent at the Redis layer) wedged the CALLER.
+    ///
+    /// Why that is worse than degraded observability: a hang is not an `Err`,
+    /// so `note_failure` never runs and `REDIS_DISABLE_THRESHOLD` never trips
+    /// — the sink can never self-disable. And every flow-record emit is
+    /// synchronous on the dispatch thread, so a wedged `XADD` stops the
+    /// trajectory-tailer loop that applies the inactivity-deadline resets and
+    /// the host watchdog SIGKILLs a fully productive dispatch.
+    ///
+    /// The fake peer ([`spawn_silent_redis_peer`]) replies to the two `CLIENT
+    /// SETINFO` commands redis-rs 0.27 pipelines at connection setup
+    /// (`connection_setup_pipeline`), so the handshake SUCCEEDS, then goes
+    /// silent — which is the only way to reach the command phase at all.
+    ///
+    /// That handshake reply count is a LOAD-BEARING and FRAGILE assumption, so
+    /// the assertions below check the error came from the `XADD` by name. Round
+    /// 1 shipped this test without that check and it passed vacuously: change
+    /// the peer's reply to a single `+OK` (which is also what a redis-rs bump
+    /// altering the setup pipeline, or an operator URL carrying a password or
+    /// `db != 0`, does) and the handshake never completes, `try_write` fails at
+    /// CONNECT, and `is_err` + the elapsed bounds + `is_disabled` ALL still
+    /// hold — the test silently degenerates into a duplicate of the #278
+    /// connect-phase test above while reading as #2227 coverage.
+    #[test]
+    fn redis_sink_xadd_against_silent_peer_errs_and_trips_the_disable_threshold() {
+        // Every `try_write` opens its own connection, so the four writes below
+        // need four accepted sockets.
+        let port = spawn_silent_redis_peer(6);
+
+        let url = format!("redis://127.0.0.1:{port}");
+        let sink = RedisSink::new(&url, "darkmux:flow", Some(10000))
+            .expect("RedisSink::new on a syntactically valid URL");
+        let rec = silent_peer_test_record();
+
+        // (1) The fallible inner write must SURFACE the stall as an `Err`.
+        // A silent skip here is what let the disable machinery starve.
+        let start = std::time::Instant::now();
+        let inner = sink.try_write(&rec);
+        let inner_elapsed = start.elapsed();
+        let inner_err = inner.expect_err(
+            "try_write against a handshake-completing, command-silent peer must \
+             return Err (that is what feeds REDIS_DISABLE_THRESHOLD); got Ok",
+        );
+        // THE anti-vacuity assertion. `XADD` appears only in `try_write`'s
+        // post-handshake context (`XADD to Redis stream \`<stream>\``), so this
+        // is what distinguishes "the command timed out" — the #2227 bug — from
+        // "the connect failed", which the #278 test above already covers and
+        // which every other assertion in this test accepts silently.
+        let inner_msg = format!("{inner_err:#}");
+        assert!(
+            inner_msg.contains("XADD"),
+            "expected the COMMAND phase to fail (an `XADD ...` context), which \
+             is the only thing that exercises #2227's socket deadline. Got \
+             {inner_msg} — a connect-phase failure here means the fake peer no \
+             longer completes redis-rs's setup pipeline and this test is \
+             passing vacuously."
+        );
+        assert!(
+            inner_elapsed < std::time::Duration::from_secs(3),
+            "try_write took {inner_elapsed:?}; expected bounded by \
+             REDIS_RESPONSE_TIMEOUT (1s) + slack. Unbounded before #2227."
+        );
+
+        // (2) The disable path: REDIS_DISABLE_THRESHOLD consecutive `write`s
+        // must flip the sink off, exactly as a connect-phase failure does.
+        // And every one of them returns Ok — a flow-record write is
+        // best-effort and must never propagate a failure into the dispatch.
+        let start = std::time::Instant::now();
+        for i in 0..REDIS_DISABLE_THRESHOLD {
+            assert!(
+                sink.write(&rec).is_ok(),
+                "write #{i} must stay best-effort (Ok) — a flow-record write \
+                 must never fail a dispatch"
+            );
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            sink.is_disabled(),
+            "after {REDIS_DISABLE_THRESHOLD} consecutive command-timeout writes \
+             the sink must self-disable; before #2227 the hang was not an Err so \
+             the counter never advanced"
+        );
+        // (3) (#2227) The self-disabled state must be VISIBLE. `sink_info`
+        // feeds `darkmux flow status --json` and the daemon endpoint; without
+        // this field a permanently-disabled sink reported as healthy in the
+        // only two places an operator would look, and the one-time stderr
+        // warning is long gone by then.
+        assert_eq!(
+            sink.info().config.get("disabled").map(String::as_str),
+            Some("true"),
+            "a self-disabled sink must say so in `sink_info` — the operator \
+             never has to wonder where a decision came from (#44)"
+        );
+        let healthy = RedisSink::new("redis://127.0.0.1:1", "darkmux:flow", None).unwrap();
+        assert_eq!(
+            healthy.info().config.get("disabled").map(String::as_str),
+            Some("false"),
+            "the field must be present-and-false on a healthy sink, not merely \
+             absent — an absent key reads as 'this build predates the field'"
+        );
+        // Hard upper bound so a regression FAILS FAST instead of hanging CI
+        // forever. Budget: 3 writes x (connect + REDIS_RESPONSE_TIMEOUT).
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "{REDIS_DISABLE_THRESHOLD} bounded writes took {elapsed:?}; expected \
+             well under 10s. An unbounded command socket hangs here forever."
+        );
+    }
+
+    /// (#2227) `RedisSink::connect` exists to hand DIAGNOSTICS a connection to
+    /// the same Redis the sink writes to — and diagnostics are what an operator
+    /// runs against a peer that has stopped answering. The connection it hands
+    /// out must therefore arrive with its command deadline already set, so an
+    /// out-of-crate caller cannot reintroduce the unbounded shape by
+    /// forgetting.
+    #[test]
+    fn redis_sink_connect_hands_out_a_command_bounded_connection() {
+        let port = spawn_silent_redis_peer(2);
+        let sink = RedisSink::new(&format!("redis://127.0.0.1:{port}"), "darkmux:flow", None)
+            .expect("RedisSink::new on a syntactically valid URL");
+
+        // The connect itself must SUCCEED — the peer completes the handshake.
+        // If this fails, everything below is a vacuous connect-phase test.
+        let mut conn = sink.connect().expect(
+            "the fake peer completes redis-rs's setup pipeline, so connect must \
+             succeed; a failure here means this test degenerated into a \
+             connect-phase (#278) duplicate",
+        );
+
+        let start = std::time::Instant::now();
+        let res: redis::RedisResult<String> = redis::cmd("PING").query(&mut conn);
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "a command-silent peer must surface as Err, not block");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "a command on a connection from `connect()` took {elapsed:?}; \
+             expected bounded by REDIS_RESPONSE_TIMEOUT (1s). Unbounded before \
+             #2227."
+        );
+    }
+
+    /// (#2227) Minimal FlowRecord for the silent-peer test — the field set is
+    /// irrelevant to the socket deadline being asserted.
+    fn silent_peer_test_record() -> FlowRecord {
+        FlowRecord {
+            ts: ts_utc_now(),
+            level: Level::Info,
+            category: Category::Work,
+            tier: Tier::Local,
+            stage: Stage::Dispatch,
+            action: "test-silent-redis-peer".to_string(),
+            handle: "test".to_string(),
+            phase_id: None,
+            session_id: None,
+            source: None,
+            model: None,
+            reasoning: None,
+            mission_id: None,
+            machine_id: None,
+            machine_uid: None,
+            prev_hash: None,
+            hash: None,
+            payload: None,
+            work_id: None,
+            attempt: None,
+        }
     }
 
     #[test]

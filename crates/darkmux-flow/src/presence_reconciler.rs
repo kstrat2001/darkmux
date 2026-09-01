@@ -26,7 +26,9 @@
 
 use crate::presence::{read_live, PresenceBeat};
 use crate::session_presence::{read_live_sessions, SessionBeat};
-use crate::{open_redis_connection_bounded, FlowRecord, REDIS_CONNECT_TIMEOUT};
+use crate::{
+    bound_redis_response, open_redis_connection_bounded, FlowRecord, REDIS_CONNECT_TIMEOUT,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Redis key namespace for edge-record claims — one short-lived key per
@@ -64,6 +66,13 @@ pub fn claim_edge(client: &redis::Client, kind: &str, id: &str) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    // (#2227) The connect above is bounded; this `SET NX` was not. Load-bearing
+    // on the DISPATCH TEARDOWN path, not just the reconciler's own loop:
+    // `SessionEmitter::stop` pre-claims `session-end:<sid>` here, immediately
+    // before `dispatch.complete` is emitted. The "a Redis error returns false"
+    // contract in the doc above requires the call to be able to ERROR — an
+    // unbounded read blocks instead, and the dispatch strands.
+    bound_redis_response(&conn);
     // `SET key 1 NX EX ttl` replies `+OK` when set, `nil` when the key existed.
     // Bind the reply to Option<String>: Some("OK") = won, None = lost.
     let res: redis::RedisResult<Option<String>> = redis::cmd("SET")
@@ -85,6 +94,10 @@ pub fn claim_edge(client: &redis::Client, kind: &str, id: &str) -> bool {
 pub fn release_edge_claim(client: &redis::Client, kind: &str, id: &str) {
     let key = format!("{EDGE_CLAIM_PREFIX}{kind}:{id}");
     if let Ok(mut conn) = open_redis_connection_bounded(client, REDIS_CONNECT_TIMEOUT) {
+        // (#2227) Bounded like every other flow-internal command. This runs on
+        // the failure path of a record write — the one moment the peer is most
+        // likely to be the thing that is broken.
+        bound_redis_response(&conn);
         let _: redis::RedisResult<()> = redis::cmd("DEL").arg(&key).query(&mut conn);
     }
 }
@@ -437,6 +450,50 @@ pub fn spawn_reconciler_thread() -> Option<std::thread::JoinHandle<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#2227) Per-site bounds for the edge-claim pair. `claim_edge` is on the
+    /// DISPATCH TEARDOWN path (`SessionEmitter::stop` pre-claims
+    /// `session-end:<sid>` there, microseconds before `dispatch.complete`), so
+    /// an unbounded `SET NX` here strands a dispatch with no terminal record.
+    /// Both are timed separately so removing either bound fails its own
+    /// assertion.
+    ///
+    /// Neither returns an error value, so the discriminator is wall-clock plus
+    /// the contract each doc comment states: a failure must produce `false`
+    /// (claim) / a no-op (release), which is only reachable if the command can
+    /// return at all.
+    #[test]
+    fn edge_claim_against_silent_peer_returns_within_bounded_time() {
+        let port = crate::spawn_silent_redis_peer(4);
+        // Neither subject returns an inspectable error, so pin the phase first
+        // — a wall-clock bound alone passes on a CONNECT failure too.
+        crate::assert_silent_peer_reaches_command_phase(port);
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str()).unwrap();
+
+        let start = std::time::Instant::now();
+        let won = claim_edge(&client, "selftest-2227", "id-1");
+        let claim_elapsed = start.elapsed();
+        assert!(
+            !won,
+            "a claim whose SET never gets an answer must not report a WIN — \
+             emitting an edge on an unconfirmed claim is the duplicate the \
+             claim exists to prevent"
+        );
+        assert!(
+            claim_elapsed < std::time::Duration::from_secs(3),
+            "claim_edge took {claim_elapsed:?}; expected bounded by \
+             REDIS_RESPONSE_TIMEOUT (1s) + connect. Unbounded before #2227."
+        );
+
+        let start = std::time::Instant::now();
+        release_edge_claim(&client, "selftest-2227", "id-1");
+        let release_elapsed = start.elapsed();
+        assert!(
+            release_elapsed < std::time::Duration::from_secs(3),
+            "release_edge_claim took {release_elapsed:?}; expected bounded by \
+             REDIS_RESPONSE_TIMEOUT (1s) + connect. Unbounded before #2227."
+        );
+    }
 
     fn beat(uid: &str, name: &str) -> PresenceBeat {
         PresenceBeat {

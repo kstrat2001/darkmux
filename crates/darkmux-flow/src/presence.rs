@@ -18,7 +18,7 @@
 //! the flow stream would pollute the durable work/audit substrate and
 //! re-conflate "is this machine here" with "what did it do".
 
-use crate::{open_redis_connection_bounded, REDIS_CONNECT_TIMEOUT};
+use crate::{bound_redis_response, open_redis_connection_bounded, REDIS_CONNECT_TIMEOUT};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +91,11 @@ pub fn write_beat(client: &redis::Client, beat: &PresenceBeat, ttl_secs: u64) ->
     let payload = serde_json::to_string(beat).context("serializing presence beat")?;
     let mut conn = open_redis_connection_bounded(client, REDIS_CONNECT_TIMEOUT)
         .context("getting Redis connection for presence write")?;
+    // (#2227) The connect above is bounded; this `SET` was not. Same shape as
+    // the session-beat write: an accepts-but-never-answers peer blocks the
+    // daemon's presence thread here indefinitely, and "errors propagate so the
+    // emitter can log + carry on" only holds if the call can RETURN at all.
+    bound_redis_response(&conn);
     // Bind the reply to `redis::Value` (identity `FromRedisValue`) so the
     // `SET` `+OK` status parses regardless of reply shape; errors still
     // propagate.
@@ -111,6 +116,12 @@ pub fn write_beat(client: &redis::Client, beat: &PresenceBeat, ttl_secs: u64) ->
 pub fn read_live(client: &redis::Client) -> Result<Vec<PresenceBeat>> {
     let mut conn = open_redis_connection_bounded(client, REDIS_CONNECT_TIMEOUT)
         .context("getting Redis connection for presence read")?;
+    // (#2227) Bounds each `SCAN`/`GET` below individually (a per-socket-read
+    // deadline, not a budget for the whole loop). `SCAN COUNT 200` is
+    // explicitly non-blocking, so no single reply legitimately takes a second.
+    // This read backs the machine topology view and the reconciler's tick — an
+    // unbounded stall here wedges the reconcile loop, not just one request.
+    bound_redis_response(&conn);
     let pattern = format!("{PRESENCE_KEY_PREFIX}*");
     let mut cursor = "0".to_string();
     let mut keys: Vec<String> = Vec::new();
@@ -255,6 +266,48 @@ pub fn spawn_emitter_thread() -> Option<std::thread::JoinHandle<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#2227) Per-site bounds for the machine-presence pair. Both run on the
+    /// daemon's presence thread, which the reconcile loop depends on — an
+    /// unbounded command there stops machine liveness fleet-wide, not just one
+    /// call. Each half is timed separately so removing EITHER bound fails its
+    /// own assertion rather than hiding behind the other's slack.
+    #[test]
+    fn presence_write_and_read_against_silent_peer_err_within_bounded_time() {
+        let port = crate::spawn_silent_redis_peer(4);
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str()).unwrap();
+
+        let start = std::time::Instant::now();
+        let write_res = write_beat(&client, &sample_beat(), DEFAULT_TTL_SECS);
+        let write_elapsed = start.elapsed();
+        let write_err = write_res.expect_err("a command-silent peer must surface as Err");
+        let write_msg = format!("{write_err:#}");
+        // COMMAND-phase, not connect-phase — otherwise vacuous against #278.
+        assert!(
+            write_msg.contains("SET presence beat"),
+            "expected a SET-phase error (the connect must have SUCCEEDED); got {write_msg}"
+        );
+        assert!(
+            write_elapsed < std::time::Duration::from_secs(3),
+            "write_beat took {write_elapsed:?}; expected bounded by \
+             REDIS_RESPONSE_TIMEOUT (1s) + connect. Unbounded before #2227."
+        );
+
+        let start = std::time::Instant::now();
+        let read_res = read_live(&client);
+        let read_elapsed = start.elapsed();
+        let read_err = read_res.expect_err("a command-silent peer must surface as Err");
+        let read_msg = format!("{read_err:#}");
+        assert!(
+            read_msg.contains("SCAN presence keys"),
+            "expected a SCAN-phase error (the connect must have SUCCEEDED); got {read_msg}"
+        );
+        assert!(
+            read_elapsed < std::time::Duration::from_secs(3),
+            "read_live took {read_elapsed:?}; expected bounded by \
+             REDIS_RESPONSE_TIMEOUT (1s) + connect. Unbounded before #2227."
+        );
+    }
 
     fn sample_beat() -> PresenceBeat {
         PresenceBeat {
