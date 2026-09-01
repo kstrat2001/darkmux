@@ -703,12 +703,29 @@ impl Trajectory {
     /// Observability matters: every promotion is a model wire-format
     /// failure the runtime caught — operators monitoring bail rates
     /// want this rate visible alongside `dispatch.complete`.
+    ///
+    /// (#2230) `xml_openers_skipped_as_fenced` counts the `<tool_call>`
+    /// openers the XML scan declined because they sat inside a markdown fence
+    /// (quoted markup, not an emission). It counts OPENERS, not regions — one
+    /// quoted block holding ten examples reports 10 — so the number bounds how
+    /// much a wrong fence verdict cost.
+    ///
+    /// Non-zero HERE means PARTIAL suppression: this turn promoted some calls
+    /// and dropped others. Two shapes produce it — a fence left unbalanced
+    /// inside an earlier call's parameter value, which swallows every later
+    /// call in the same emission; and the hull rule (three or more fence lines
+    /// make the nesting ambiguous, so the span between the first and the last
+    /// is read as quoted), which additionally declines a real call sandwiched
+    /// between two separate quoted blocks. Either way a `promoted_call_count`
+    /// of 1 beside a skip count of 1 is a turn that emitted two calls and ran
+    /// one. Without the field that asymmetry is invisible.
     pub fn append_tool_call_promoted(
         &mut self,
         seq: u32,
         source: &str,
         format: &str,
         promoted_call_count: usize,
+        xml_openers_skipped_as_fenced: usize,
     ) {
         self.write_event(&serde_json::json!({
             "type": "tool_call.promoted",
@@ -717,6 +734,35 @@ impl Trajectory {
             "source": source,
             "format": format,
             "promoted_call_count": promoted_call_count,
+            "xml_openers_skipped_as_fenced": xml_openers_skipped_as_fenced,
+        }));
+    }
+
+    /// tool_call.promotion_suppressed — (#2230) the turn promoted NOTHING and
+    /// the reason was the fence rule: every `<tool_call>` opener the XML scan
+    /// found sat inside a markdown fence and was read as quoted markup.
+    ///
+    /// This is the event that exists purely so a wrong suppression is
+    /// DIAGNOSABLE. `tool_call.promoted` cannot carry it — there is no
+    /// promotion to hang it on — and without it a genuine call dropped as a
+    /// false quotation is byte-for-byte indistinguishable in the trajectory
+    /// from a model that simply emitted no call at all. Measured against this
+    /// repo's own corpus (2,840 real `model.reasoning` emissions) the joint
+    /// event is rare: 8.8% contain a fence, 0.035% have odd fence parity, and
+    /// none would have had a call suppressed. Rare is not never, and the
+    /// corpus contains ZERO emissions carrying both a fence and a tool call,
+    /// so that measurement bounds the FREQUENCY of the failure and says
+    /// nothing about its cost when it happens. Hence a record, not a silence.
+    pub fn append_tool_call_promotion_suppressed(
+        &mut self,
+        seq: u32,
+        xml_openers_skipped_as_fenced: usize,
+    ) {
+        self.write_event(&serde_json::json!({
+            "type": "tool_call.promotion_suppressed",
+            "seq": seq,
+            "ts": unix_ms(),
+            "xml_openers_skipped_as_fenced": xml_openers_skipped_as_fenced,
         }));
     }
 
