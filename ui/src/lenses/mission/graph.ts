@@ -317,54 +317,94 @@ export function stepForRecord(rec: FlowRecord, idx: GraphIndex, missionId: strin
   return null;
 }
 
-/** (#2223) A session id MINTED BY THE GRAPH rather than observed on a real
- * dispatch. `indexGraph` synthesizes `step-<id>`/`task-<id>` so a record
- * carrying one can be correlated back to its node (see `sessionToStep`),
- * and the mission's own bookkeeping records ride `mission-<id>`. None of
- * the three addresses a dispatch, so none is a legal `#dispatch=` target --
- * routing to one lands on a detail view with nothing to show. */
-export function isSyntheticSession(sessionId: string): boolean {
-  return sessionId.startsWith("step-") || sessionId.startsWith("task-") || sessionId.startsWith("mission-");
+/** (#2223) Does this flow-record action attest MODEL-DISPATCH work?
+ * Covers both the dotted (`dispatch.start`) and legacy space-separated
+ * (`dispatch start`) spellings the stream carries. Mission/phase/step
+ * bookkeeping (`mission start`, `step result`, ...) and telemetry all say
+ * no -- which is the point: it separates "a dispatch actually ran under
+ * this session" from "this session merely appears in the record stream". */
+export function isDispatchAction(action: string): boolean {
+  return action === "dispatch" || action.startsWith("dispatch.") || action.startsWith("dispatch ");
 }
 
 /** `stepDispatchSessions` (#2223) -- the INVERSE of {@link stepForRecord}:
- * for each step, the real dispatch `session_id` observed on that step's own
- * records, which is what makes the step drill-in able to reach the dispatch
- * detail view (`#dispatch=<id>`) instead of only scoping the events column.
+ * for each step, the dispatch session id observed on that step's own
+ * records, which is what lets the step drill-in reach the dispatch detail
+ * view (`#dispatch=<id>`) instead of only scoping the events column.
  *
- * Correlates on `payload.step_id` ALONE -- deliberately the single strong
- * key, not `stepForRecord`'s three-key fallthrough. The other two keys
- * (`session_id` via `sessionToStep`, `handle`) are exactly the SYNTHETIC
- * ids this function exists to filter out, so feeding them back in would
- * resolve every step to its own graph-minted id and route the drill-in to
- * an empty detail view. A step whose records carry no `step_id` gets no
- * entry, and its caller keeps #2189's scoping behavior -- the honest
- * outcome for a procedural step that never dispatched a model at all.
+ * The discriminator is EVIDENCE OF DISPATCH, not the shape of the session
+ * id: a session counts only through records whose action is a
+ * `dispatch.*` bookend/turn ({@link isDispatchAction}). This matters
+ * because the emitter's DEFAULT session id for a `dispatch.internal` step
+ * with no configured session is literally `step-<id>`
+ * (`session_id::step`, see `crates/darkmux-serve/src/runs.rs`'s
+ * "join by session_id" doc) -- the id LOOKS graph-minted and is
+ * simultaneously the real dispatch session for every generic
+ * `mission launch <config>` step. An earlier version of this function
+ * filtered those by prefix and was therefore inert on exactly that
+ * flagship path (caught in adversarial review). Steps that never
+ * dispatched (procedural steps, bookkeeping-only sessions) still produce
+ * no entry, and the caller keeps #2189's scoping -- the honest fallback.
  *
- * When a step's records name more than one dispatch (a retried step), the
- * MOST FREQUENT wins rather than the first or last seen: a handful of
- * bookkeeping records from an abandoned attempt should not outrank the
- * attempt that actually did the work, and "first" and "last" each pick the
- * wrong one depending on which way the retry went. */
-export function stepDispatchSessions(records: FlowRecord[]): Record<string, string> {
-  const tally: Record<string, Record<string, number>> = {};
+ * Selection, when a step's records name more than one dispatch session:
+ * 1. A session whose dispatch records carry THIS mission's `mission_id`
+ *    beats any session that doesn't -- generic-launch dispatch records
+ *    carry `mission_id: null` (the serve doc's gap 1/2), so null-mission
+ *    records are admitted, but a concurrent mission's records leaking in
+ *    through the day-file merge (they pass `recordInMission`'s last-resort
+ *    step-id match only when THEY are null-mission too) can never outrank
+ *    records positively tagged as ours.
+ * 2. Within a tier, the step's own emitter-default session
+ *    (`step-<stepId>`) wins -- it is deterministic and cannot belong to a
+ *    colliding foreign step.
+ * 3. Otherwise the session with the LATEST dispatch-action timestamp wins,
+ *    not the most records: a looped-then-killed attempt emits hundreds of
+ *    turn records while the successful retry emits a dozen, so frequency
+ *    selects the failure; recency selects the attempt that represents the
+ *    step's current state. Count breaks ts ties.
+ */
+export function stepDispatchSessions(records: FlowRecord[], missionId: string): Record<string, string> {
+  type Tally = { n: number; lastTs: number; ours: boolean };
+  const tally: Record<string, Record<string, Tally>> = {};
   for (const rec of records) {
+    if (!isDispatchAction(rec.action || "")) continue;
     const p = rec.payload || {};
     const stepId = typeof p.step_id === "string" ? p.step_id : "";
     const sid = typeof rec.session_id === "string" ? rec.session_id : "";
-    if (!stepId || !sid || isSyntheticSession(sid)) continue;
+    if (!stepId || !sid) continue;
+    if (rec.mission_id && rec.mission_id !== missionId) continue;
     const forStep = (tally[stepId] ||= {});
-    forStep[sid] = (forStep[sid] || 0) + 1;
+    const t = (forStep[sid] ||= { n: 0, lastTs: 0, ours: false });
+    t.n += 1;
+    t.lastTs = Math.max(t.lastTs, tsToMs(rec.ts));
+    if (rec.mission_id === missionId) t.ours = true;
   }
   const out: Record<string, string> = {};
   for (const [stepId, seen] of Object.entries(tally)) {
+    const emitterDefault = "step-" + stepId;
     let best = "";
-    let bestN = 0;
-    for (const [sid, n] of Object.entries(seen)) {
-      if (n > bestN) {
+    let bestT: Tally | null = null;
+    for (const [sid, t] of Object.entries(seen)) {
+      if (!bestT) {
         best = sid;
-        bestN = n;
+        bestT = t;
+        continue;
       }
+      if (t.ours !== bestT.ours) {
+        if (t.ours) { best = sid; bestT = t; }
+        continue;
+      }
+      const aDefault = sid === emitterDefault;
+      const bDefault = best === emitterDefault;
+      if (aDefault !== bDefault) {
+        if (aDefault) { best = sid; bestT = t; }
+        continue;
+      }
+      if (t.lastTs !== bestT.lastTs) {
+        if (t.lastTs > bestT.lastTs) { best = sid; bestT = t; }
+        continue;
+      }
+      if (t.n > bestT.n) { best = sid; bestT = t; }
     }
     if (best) out[stepId] = best;
   }

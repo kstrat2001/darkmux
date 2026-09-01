@@ -907,25 +907,44 @@ describe("App", () => {
     await waitFor(() => expect(window.location.hash).toBe("#dispatch=crew-dispatch-coder-1788254029192466-0"));
   });
 
-  it("(#2223) a step whose only session id is graph-minted still scopes, rather than routing to an empty detail view", async () => {
-    // `step-step-a` is what `indexGraph` synthesizes for this step. It
-    // correlates records back to the node and addresses no dispatch, so
-    // routing to it would land on a detail view with nothing in it.
+  it("(#2223) a generic-launch step drills into its emitter-default `step-<id>` dispatch session", async () => {
+    // `step-step-a` is the session `session_id::step` mints for a
+    // `dispatch.internal` step with no configured session — which is what
+    // EVERY generic `mission launch <config>` step rides. The fixture's
+    // dispatch bookends attest a real dispatch ran under it, so the tap
+    // must reach the detail view. (An earlier version of this test used
+    // the same fixture to pin the OPPOSITE behavior, mislabeled as "graph-
+    // minted" — the adversarial review caught that this shape is byte-for-
+    // byte a real generic-launch dispatch.)
     mockMissionDispatchFixture("step-step-a");
     window.location.hash = "#mission=m1";
     renderApp();
     await waitFor(() => expect(document.querySelector('[data-act="step-row"]')).not.toBeNull());
-    // Wait for the RECORDS, not just the row: the graph renders from
-    // `graph.json` while the records arrive on their own request, and a
-    // click landing in that gap takes the no-dispatch fallback for a
-    // reason that has nothing to do with what these tests assert. Without
-    // this the scoping case below passes vacuously.
     await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(2));
+    fireEvent.click(document.querySelector('[data-act="step-row"]')!);
+    await waitFor(() => expect(window.location.hash).toBe("#dispatch=step-step-a"));
+  });
+
+  it("(#2223) a step with records but NO dispatch evidence still scopes, never routing to an empty detail view", async () => {
+    // This fixture's records carry dispatch actions but no `session_id`
+    // at all, so no dispatch session can be resolved — the tap keeps
+    // #2189's scoping. (The richer no-evidence cases — a procedural step
+    // whose records are all bookkeeping actions — are pinned unit-level in
+    // graph.test.ts; this test proves the App-level fallback WIRING.)
+    mockMissionStepFixture();
+    window.location.hash = "#mission=m1";
+    renderApp();
+    await waitFor(() => expect(document.querySelector('[data-act="step-row"]')).not.toBeNull());
+    // Wait for the RECORDS, not just the row — a click landing in the gap
+    // between graph.json and /flow-mission takes this same fallback for a
+    // reason unrelated to what this test asserts. This fixture carries 3
+    // mission-wide records (2 for step-a, 1 for step-b); the unscoped
+    // column shows all 3.
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(3));
     fireEvent.click(document.querySelector('[data-act="step-row"]')!);
     await waitFor(() => expect(window.location.hash).toBe("#mission=m1&step=step-a"));
     expect(document.querySelector('[data-act="step-header"]')).not.toBeNull();
   });
-
   // (#2072/#2073) Static-build tests run LAST: `useHashRoute` caches the parsed
   // route per hash string, and a hash parsed while the static meta is present
   // resolves to the playback route; a later test on the same hash would

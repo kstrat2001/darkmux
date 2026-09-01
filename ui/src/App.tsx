@@ -248,7 +248,7 @@ export function App() {
       // history entry is the point on a phone, where the back gesture is
       // how the operator returns to the mission.
       if (stepId) {
-        const dispatchId = stepDispatchSessions(missionRecordsRef.current)[stepId];
+        const dispatchId = stepDispatchSessions(missionRecordsRef.current, route.missionId)[stepId];
         if (dispatchId) {
           location.hash = `dispatch=${encodeURIComponent(dispatchId)}`;
           return;
