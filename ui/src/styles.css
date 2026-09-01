@@ -5707,6 +5707,18 @@ body {
   color: var(--dim);
   margin-bottom: 12px;
 }
+/* (#2250) Footnote under the whole panel explaining what avg/max cover.
+   Dimmer and separated from the sections above so it reads as a note about
+   the panel rather than another data row. */
+.machine-drawer__footnote {
+  font-size: calc(10px * var(--fs-scale));
+  color: var(--dim);
+  opacity: 0.85;
+  line-height: 1.45;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
 /* (phone feedback) The idle state — replaces the three dashed meters when
    there is nothing to show, rather than rendering them anyway. */
 .machine-drawer__idle {

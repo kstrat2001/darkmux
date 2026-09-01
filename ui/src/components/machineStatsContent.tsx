@@ -91,13 +91,6 @@ function connectionText(route: Route, liveStatus: LiveTailStatus): string {
   return "no records yet";
 }
 
-function modeText(route: Route): string {
-  if (isLiveRoute(route)) return "live";
-  if (route.kind === "playback") return `playback · ${route.date ?? ""}`;
-  if (route.kind === "dispatch" || route.kind === "mission") return "replay";
-  return "";
-}
-
 function Kv({ label, value }: { label: string; value: string }) {
   if (!value) return null;
   return (
@@ -580,13 +573,13 @@ export function useMachineStatsContent({
     localUid != null ? specOf(flowWindow, liveMachines, specs, localUid) : "";
   const verMeta = injectedMeta("darkmux-version");
   const schemaMeta = injectedMeta("darkmux-flow-schema");
-  const headerLine = [
-    machineName,
-    hardware,
-    verMeta ? `darkmux ${verMeta}` : null,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  // (#2250) The version is NOT in this line. #2108 dropped it from the
+  // MOBILE identity block on exactly this reasoning — "it's already the
+  // `build` row in the about kv block below, so nothing is lost, only
+  // de-duplicated" — but left desktop showing it twice. Same fact, same
+  // panel, so the same dedupe applies; the About block now leads the panel,
+  // which makes the duplicate more obvious, not less.
+  const headerLine = [machineName, hardware].filter(Boolean).join(" · ");
 
   // (#2107, #1833, warm-up finding) On a non-mission/non-dispatch view where
   // the daemon actually supplies the aggregate, the label reflects the
@@ -703,9 +696,22 @@ export function useMachineStatsContent({
     )
   );
 
+  // (#2250) The meters get a title like every other block, and the window
+  // label sits UNDER it rather than under the panel heading. It was never a
+  // subtitle for the modal — it names the window the avg/max are computed
+  // over (the big number is now; "29% avg · 94% max" is the window). Read
+  // directly beneath "MACHINE INFO" it looked like a claim about the whole
+  // panel, which is why "this dispatch" read as nonsense on a modal that
+  // also carries build info and live machine state.
   const statsBody = (
     <>
-      {identityBlock}
+      {identityBlock && (
+        <div className="hx-section">
+          <div className="hx-section__title">System specs</div>
+          {identityBlock}
+        </div>
+      )}
+      <div className="hx-section__title">Load</div>
       <div className="machine-drawer__scope">{scopeLabel}</div>
       {samplerCostLine && (
         <div className="machine-drawer__sampler-cost">{samplerCostLine}</div>
@@ -724,12 +730,6 @@ export function useMachineStatsContent({
     </>
   );
 
-  const aboutLive = isLiveRoute(route);
-  const aboutMachine = aboutLive && specs?.machine_id ? specs.machine_id : "";
-  const aboutHardware =
-    aboutLive && specs?.cpu_brand
-      ? `${specs.cpu_brand}${specs.ram_total_bytes ? ` · ${Math.round(specs.ram_total_bytes / 1073741824)} GB` : ""}`
-      : "";
   // (#2120) The `playback` row — everything the sticky row's folded `#meta`
   // summary used to carry that the transport itself does not already say:
   // the flow day, the recorded time span, the day's record/machine census,
@@ -746,23 +746,49 @@ export function useMachineStatsContent({
     route.kind === "playback"
       ? replayPlaybackKvValue(routeRecords, route.date ?? firstRecordDate(routeRecords) ?? todayUTC())
       : "";
+  // (#2250) Titled and hoisted above the meters. Every other block in this
+  // panel (Thermal, Power, CPU clusters) carries an `hx-section__title`;
+  // this one did not, so it read as loose rows trailing off the end.
+  //
+  // "General" rather than "Daemon" deliberately: `build` and `flow schema`
+  // ARE the daemon's (both injected by the process serving this page, see
+  // `inject_mode_meta` in darkmux-serve), but `connection` and `mode` are
+  // this VIEWER's route state, and `machine`/`hardware` describe the
+  // observed host. Titling the mixed set "Daemon" would be wrong about two
+  // thirds of it.
   const aboutSection = (
-    <div className="dialog__rrdetail">
+    <div className="dialog__rrdetail hx-section">
+      <div className="hx-section__title">General</div>
       <Kv label="build" value={verMeta ?? ""} />
       <Kv label="flow schema" value={schemaMeta ?? ""} />
       <Kv label="connection" value={connectionText(route, liveStatus)} />
-      <Kv label="mode" value={modeText(route)} />
-      <Kv label="machine" value={aboutMachine} />
-      <Kv label="hardware" value={aboutHardware} />
       <Kv label="playback" value={playbackValue} />
     </div>
   );
 
+  // (#2250) About FIRST. Build/schema/connection/mode answer "what am I
+  // looking at and is it current" — the question you open this panel with
+  // — and they were previously below the meters, off the fold on a phone.
+  // (#2250, operator ask) A plain-language footnote for the avg/max window.
+  // The operator asked for "averages and max readings are from the last 24
+  // hours" — but the window is NOT fixed: `scopeLabel` is whatever the
+  // sampler actually covers ("last <1 min · daemon sampler" on a fresh
+  // daemon, the dispatch's own span on a dispatch route, longer on a fleet
+  // view). Hardcoding 24h would be wrong in most of those, so this reuses
+  // the SAME value the Load section shows rather than asserting a figure it
+  // cannot back. Rendered last so it reads as a footnote to the whole panel.
+  const meterFootnote = scopeLabel ? (
+    <div className="machine-drawer__footnote">
+      {`avg and max readings cover ${scopeLabel}; the large number is current.`}
+    </div>
+  ) : null;
+
   const body = (
     <>
-      {statsBody}
-      <div className="dialog__rule" />
       {aboutSection}
+      <div className="dialog__rule" />
+      {statsBody}
+      {meterFootnote}
     </>
   );
 

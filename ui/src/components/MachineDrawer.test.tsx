@@ -308,7 +308,7 @@ describe("MachineDrawer (#2107)", () => {
     expect(screen.queryByText("playback")).toBeNull();
   });
 
-  it("(#2107) the header line carries machine name · hardware · darkmux version — the phone's only route to that info", () => {
+  it("(#2250) the desktop header line carries machine name · hardware — the version lives in the About block, not twice", () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-version";
     meta.content = "3.3.0 (abc1234)";
@@ -351,9 +351,12 @@ describe("MachineDrawer (#2107)", () => {
     // "M5 Max" also appear in the about section's own machine/hardware
     // rows below it, which would make an unscoped `getByText` ambiguous.
     const identity = document.querySelector(".machine-drawer__identity")!;
-    expect(identity.textContent).toBe(
-      "MacBook-Pro · M5 Max · 128 GB · darkmux 3.3.0 (abc1234)",
-    );
+    expect(identity.textContent).toBe("MacBook-Pro · M5 Max · 128 GB");
+    // (#2250) De-duplicated, NOT dropped: the same fact must still be one
+    // glance away in the About block. Without this half, deleting the
+    // version everywhere would pass.
+    const about = document.querySelector(".dialog__rrdetail")!;
+    expect(about.textContent).toContain("3.3.0 (abc1234)");
   });
 
   it("(#2107) omits the header line entirely when nothing is known yet, rather than rendering an empty row", () => {
@@ -1246,7 +1249,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     document.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
   });
 
-  it("desktop: the identity header stays the single dotted line with the version, no --mobile modifier", () => {
+  it("desktop: the identity header stays a single dotted line with no --mobile modifier (#2250: and no version — see the About block)", () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-version";
     meta.content = "3.3.0 (ea3caf27)";
@@ -1286,7 +1289,7 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     ).toBeNull();
     const identity = document.querySelector(".machine-drawer__identity")!;
     expect(identity.textContent).toBe(
-      "MacBook-Pro · Apple M5 Max · 128 GB · darkmux 3.3.0 (ea3caf27)",
+      "MacBook-Pro · Apple M5 Max · 128 GB",
     );
   });
 
