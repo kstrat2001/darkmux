@@ -158,7 +158,6 @@ export function MachineDrawer({
     specs,
     liveStatus,
     isOpen: isStatsSurfaceOpen,
-    isMobile,
     nowMsOverride,
   });
 
@@ -189,7 +188,18 @@ export function MachineDrawer({
   // dialog shell itself, which stays reachable/openable exactly as before
   // via `dialogManager`'s shared `#imodalbg` id.
   return (
-    <Dialog id="imodalbg" titleId="machine-info-title" title="Machine info">
+    <Dialog
+      id="imodalbg"
+      titleId="machine-info-title"
+      title="Machine info"
+      // (#2250, operator finding) This panel is not a short kv list any
+      // more — it carries six titled sections, three gauges, a thermal
+      // ladder and a cluster pair. At `.dialog`'s default 380px the power
+      // rows wrapped mid-phrase and the dials were stacked into a column.
+      // Uses the per-caller `className` escape hatch #2116 added for
+      // exactly this, rather than widening every `.dialog`.
+      className="dialog--machine"
+    >
       {body}
     </Dialog>
   );

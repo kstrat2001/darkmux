@@ -286,7 +286,6 @@ export function MachineLens({
     // displays — exactly the wasted/misleading request `isLocalMach` was
     // introduced to prevent everywhere else on this page.
     isOpen: isLocalMach,
-    isMobile,
   });
 
   // The resources probe is LOCAL-ONLY data (`/machine/resources` always

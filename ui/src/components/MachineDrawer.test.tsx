@@ -150,7 +150,11 @@ describe("MachineDrawer (#2107)", () => {
     expect(screen.getByText("CPU")).toBeInTheDocument();
     expect(screen.getByText("GPU")).toBeInTheDocument();
     expect(screen.getByText("MEM")).toBeInTheDocument();
-    expect(screen.getByText("last 10 min")).toBeInTheDocument();
+    // (#2250) The window is stated once, in the panel footnote, rather
+    // than repeated per section — so assert it is CARRIED there.
+    expect(
+      document.querySelector(".machine-drawer__footnote")!.textContent,
+    ).toContain("last 10 min");
     // The rolling sample's own GPU reading, from the dispatch-derived
     // fallback aggregate (no daemon `load` reachable in this file's
     // default fetch stub). The Meter renders `now` as its own text node
@@ -250,7 +254,9 @@ describe("MachineDrawer (#2107)", () => {
       />,
     );
     openDesktop();
-    expect(screen.getByText("this mission")).toBeInTheDocument();
+    expect(
+      document.querySelector(".machine-drawer__footnote")!.textContent,
+    ).toContain("this mission");
     expect(
       document.querySelector('[data-meter="gpu"] .meter-now')?.textContent,
     ).toBe("55%");
@@ -308,7 +314,7 @@ describe("MachineDrawer (#2107)", () => {
     expect(screen.queryByText("playback")).toBeNull();
   });
 
-  it("(#2107) the header line carries machine name · hardware · darkmux version — the phone's only route to that info", () => {
+  it("(#2250) the desktop header line carries machine name · hardware — the version lives in the About block, not twice", () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-version";
     meta.content = "3.3.0 (abc1234)";
@@ -347,13 +353,21 @@ describe("MachineDrawer (#2107)", () => {
       />,
     );
     openDesktop();
-    // Scoped to the identity line specifically — "MacBook-Pro" and
-    // "M5 Max" also appear in the about section's own machine/hardware
-    // rows below it, which would make an unscoped `getByText` ambiguous.
-    const identity = document.querySelector(".machine-drawer__identity")!;
-    expect(identity.textContent).toBe(
-      "MacBook-Pro · M5 Max · 128 GB · darkmux 3.3.0 (abc1234)",
-    );
+    // (#2250) System specs are kv ROWS now, one labelled fact per line,
+    // not a dotted phrase — so assert each fact carries its own label.
+    // The About block no longer repeats machine/hardware, so an unscoped
+    // query is unambiguous.
+    expect(screen.getByText("machine name")).toBeInTheDocument();
+    expect(screen.getByText("MacBook-Pro")).toBeInTheDocument();
+    expect(screen.getByText("silicon")).toBeInTheDocument();
+    expect(screen.getByText("M5 Max")).toBeInTheDocument();
+    expect(screen.getByText("shared memory")).toBeInTheDocument();
+    expect(screen.getByText("128 GB")).toBeInTheDocument();
+    // De-duplicated, NOT dropped: the version must still be one glance
+    // away in the About block. Without this half, deleting the version
+    // everywhere would pass.
+    const about = document.querySelector(".dialog__rrdetail")!;
+    expect(about.textContent).toContain("3.3.0 (abc1234)");
   });
 
   it("(#2107) omits the header line entirely when nothing is known yet, rather than rendering an empty row", () => {
@@ -371,7 +385,11 @@ describe("MachineDrawer (#2107)", () => {
       />,
     );
     openDesktop();
-    expect(document.querySelector(".machine-drawer__identity")).toBeNull();
+    // (#2250) `Kv` hides an empty value, so a route that knows nothing
+    // renders NO spec rows rather than a column of empty labels.
+    expect(screen.queryByText("machine name")).toBeNull();
+    expect(screen.queryByText("silicon")).toBeNull();
+    expect(screen.queryByText("shared memory")).toBeNull();
   });
 
   // (#2108, operator finding) The external links row (github/guide/
@@ -539,7 +557,11 @@ describe("MachineDrawer — phone skin delegates to PhoneDrawer (isMobileOverrid
     );
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByText("CPU")).toBeInTheDocument();
-    expect(screen.getByText("last 10 min")).toBeInTheDocument();
+    // (#2250) The window is stated once, in the panel footnote, rather
+    // than repeated per section — so assert it is CARRIED there.
+    expect(
+      document.querySelector(".machine-drawer__footnote")!.textContent,
+    ).toContain("last 10 min");
   });
 
   it("tapping the Events tab mounts the EventLogColumn with the records handed down from App", () => {
@@ -760,10 +782,11 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     // 90_000ms span → 2 minutes, not the ring's 10-minute ceiling.
     await waitFor(() =>
       expect(
-        screen.getByText("last 2 min · daemon sampler"),
-      ).toBeInTheDocument(),
+        document.querySelector(".machine-drawer__footnote")?.textContent ?? "",
+      ).toContain("last 2 min · daemon sampler"),
     );
-    expect(screen.getByText("sampler cost 4.2 ms/sample")).toBeInTheDocument();
+    // (#2250 layout model) sampler cost is a kv row like every other fact.
+    expect(kvValue("sampler cost")).toBe("4.2 ms/sample");
     expect(screen.queryByText("daemon does not sample yet")).toBeNull();
     expect(screen.queryByText("last 10 min · daemon sampler")).toBeNull();
     expect(document.querySelector(".meter-row")).not.toBeNull();
@@ -794,7 +817,9 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
 
     // Scope label stays the mission's own — the daemon suffix/cost line is
     // a non-mission/non-dispatch-only affordance.
-    expect(screen.getByText("this mission")).toBeInTheDocument();
+    expect(
+      document.querySelector(".machine-drawer__footnote")!.textContent,
+    ).toContain("this mission");
     expect(screen.queryByText(/daemon sampler/)).toBeNull();
     expect(screen.queryByText(/sampler cost/)).toBeNull();
     // avg/max stay the mission's OWN dispatch-derived numbers (55, the
@@ -802,6 +827,17 @@ describe("MachineDrawer — daemon load block (#2107, #1833)", () => {
     expect(screen.getByText(/55% avg/)).toBeInTheDocument();
   });
 });
+
+/** (#2250 layout model) The value of the panel's kv row with this exact
+ * label — the one row anatomy every fact in the panel now uses. NBSPs
+ * (kvSegs' item-binding spaces) are normalized so assertions read plainly. */
+function kvValue(label: string): string | null {
+  const row = [...document.querySelectorAll(".dialog__kv")].find(
+    (kv) => kv.querySelector("b")?.textContent === label,
+  );
+  const span = row?.querySelector("span");
+  return span ? span.textContent!.replace(/\u00A0/g, " ") : null;
+}
 
 // ── (#2108, host-sample-shape v2) thermal/power/CPU-cluster rows ──────────
 //
@@ -923,33 +959,29 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     );
     openDesktop();
 
-    // GPU row extras — MHz + in-use memory, joined onto the GPU reading.
-    // Scoped container query, not `getByText` with the full string: the
-    // text is split between a bare "GPU " text node and the nested
-    // `<InlineOrCells>` span (desktop), which `getByText` won't bridge.
+    // (#2250) GPU clock and in-use memory are labelled rows in the Load
+    // section now, not a bare line trailing the gauge row.
     await waitFor(() =>
-      expect(
-        document.querySelector(".machine-drawer__gpu-extra")?.textContent,
-      ).toBe("GPU 1296 MHz · 912.0 MB"),
+      expect(screen.getByText("GPU clock")).toBeInTheDocument(),
     );
+    expect(screen.getByText("1296 MHz")).toBeInTheDocument();
+    expect(screen.getByText("GPU memory in use")).toBeInTheDocument();
+    expect(screen.getByText("912.0 MB")).toBeInTheDocument();
 
-    // Thermal: state pill (title-cased) + speed limit (< 100%) + window
-    // worst-state/above-nominal line.
+    // Thermal: the lit ladder step (title-cased), then facts as kv rows
+    // (#2250 layout model — speed limit and the window readings joined the
+    // panel's one row anatomy; same labels, same values).
     expect(screen.getByText("Fair")).toBeInTheDocument();
-    expect(screen.getByText("CPU speed limit 87%")).toBeInTheDocument();
-    expect(
-      screen.getByText("worst Serious · 45s above nominal"),
-    ).toBeInTheDocument();
+    expect(kvValue("CPU speed limit")).toBe("87%");
+    expect(kvValue("highest severity")).toBe("Serious");
+    expect(kvValue("above nominal")).toBe("45s");
 
     // Power: total now/avg/p95/max in W (≥1000 mW), per-channel row, and
-    // the window energy total in Wh (energy_mwh ≥ 1000).
-    expect(
-      screen.getByText("9.0 W now · 7.8 W avg · 9.2 W p95 · 11.0 W max"),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText("CPU 5.2 W · GPU 3.4 W · ANE 400 mW"),
-    ).toBeInTheDocument();
-    expect(screen.getByText("1.29 Wh")).toBeInTheDocument();
+    // the window energy total in Wh (energy_mwh ≥ 1000) — kv rows whose
+    // multi-stat values are single " · "-joined phrase runs (#2250).
+    expect(kvValue("total")).toBe("9.0 W now · 7.8 W avg · 9.2 W p95 · 11.0 W max");
+    expect(kvValue("channels")).toBe("CPU 5.2 W · GPU 3.4 W · ANE 400 mW");
+    expect(kvValue("energy")).toBe("1.29 Wh");
 
     // CPU clusters: one row per cluster — name, core count, pct, MHz.
     expect(screen.getByText("Super")).toBeInTheDocument();
@@ -991,14 +1023,15 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
       />,
     );
     openDesktop();
+    // (#2250) A missing MHz reading simply omits its row — `Kv` hides an
+    // empty value — so the single-item stacking bug this test was written
+    // for cannot recur: there is no cell-grid on this path at all now.
     await waitFor(() =>
-      expect(
-        document.querySelector(".machine-drawer__gpu-extra")?.textContent,
-      ).toBe("GPU 23.8 MB"),
+      expect(screen.getByText("GPU memory in use")).toBeInTheDocument(),
     );
-    expect(
-      document.querySelector('.machine-drawer__gpu-extra [data-act="inline-or-cells"]'),
-    ).toBeNull();
+    expect(screen.getByText("23.8 MB")).toBeInTheDocument();
+    expect(screen.queryByText("GPU clock")).toBeNull();
+    expect(document.querySelector(".machine-drawer__gpu-extra")).toBeNull();
   });
 
   it("a single GPU-extra item (no MHz reading) renders as one inline line on mobile too — the exact case that used to wrap into 3 lines", async () => {
@@ -1021,10 +1054,9 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
       document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
     );
     await waitFor(() =>
-      expect(
-        document.querySelector(".machine-drawer__gpu-extra")?.textContent,
-      ).toBe("GPU 23.8 MB"),
+      expect(screen.getByText("GPU memory in use")).toBeInTheDocument(),
     );
+    expect(screen.getByText("23.8 MB")).toBeInTheDocument();
     // The bug: on mobile, a single item still went through `InlineOrCells`'
     // cell-grid, producing a "MEMORY" cell label styled like a section
     // header sitting above its value. No cell-grid at all for one item now.
@@ -1158,34 +1190,22 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     );
     await waitFor(() => expect(screen.getByText("Fair")).toBeInTheDocument());
     expect(screen.getByText("Super")).toBeInTheDocument();
-    // Phone chrome renders the CELL GRID (InlineOrCells' mobile branch),
-    // not the desktop's joined dotted text — see the dedicated
-    // "wrap fix" describe block below for the row-level proof; this test
-    // only needs to confirm the SAME facts reached this surface too.
-    const channelsGrid = [
-      ...document.querySelectorAll(".dialog__kv"),
-    ].find((kv) => kv.querySelector("b")?.textContent === "Channels");
-    expect(channelsGrid).toBeTruthy();
-    expect(
-      channelsGrid!.querySelector('[data-act="inline-or-cells"]'),
-    ).not.toBeNull();
-    expect(channelsGrid!.textContent).toContain("CPU");
-    expect(channelsGrid!.textContent).toContain("5.2 W");
-    expect(channelsGrid!.textContent).toContain("ANE");
+    // (#2250 layout model) Phone and desktop render the SAME kv rows —
+    // there is no per-viewport branch left in this content at all.
+    expect(kvValue("channels")).toBe("CPU 5.2 W · GPU 3.4 W · ANE 400 mW");
+    expect(kvValue("total")).toBe("9.0 W now · 7.8 W avg · 9.2 W p95 · 11.0 W max");
   });
 
-  // ── (#2108, operator finding — wrap fix) dotted lists that become cell
-  //    grids on narrow viewports. Real-phone review found several rows in
-  //    `machineStatsContent.tsx` wrapping MID-ITEM at ~390px: the power
-  //    total ("15.0 W / p95" split across two lines), the channels row
-  //    ("ANE" pushed onto its own broken line), and the identity header
-  //    (wrapping after "128 GB ·"). `InlineOrCells.test.tsx` proves the
-  //    shared component itself; these prove the WIRING — that the real
-  //    hook/prop thread actually switches these specific rows at the real
-  //    breakpoint, reusing THIS describe block's own `FULL_LOAD`/
-  //    `stubFetch`. ──
+  // ── (#2250 layout model — supersedes #2108's cell grids) ONE row
+  //    anatomy on BOTH viewports: every fact is a `.dialog__kv` row, and a
+  //    multi-stat value is a single " · "-joined phrase run whose items
+  //    are bound with NBSPs so a phrase can wrap ONLY at item boundaries
+  //    (`kvSegs` in `machineStatsContent.tsx`) — the mid-item-wrap fix
+  //    #2108's `InlineOrCells` cell grids existed for, without the second
+  //    layout paradigm. That component is DELETED; these tests pin the
+  //    replacement. ──
 
-  it("mobile: the identity header stacks TWO lines with no separators and drops the version", () => {
+  it("(#2250) mobile renders the same system-spec kv rows as desktop — the mobile-only stack is gone", () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-version";
     meta.content = "3.3.0 (ea3caf27)";
@@ -1227,26 +1247,25 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
     );
-    const identity = document.querySelector(
-      ".machine-drawer__identity--mobile",
-    )!;
-    expect(identity).not.toBeNull();
-    const lines = identity.querySelectorAll(
-      ".machine-drawer__identity-line",
-    );
-    expect(lines.length).toBe(2);
-    expect(lines[0].textContent).toBe("MacBook-Pro");
-    expect(lines[1].textContent).toBe("Apple M5 Max · 128 GB");
-    // The version is dropped from this form — it's already the `build`
-    // row in the about kv block below, nothing is lost.
-    expect(identity.textContent).not.toContain("3.3.0");
-
-    // Desktop keeps the SINGLE dotted line, version included — unchanged
-    // from before this packet.
+    // (#2250) The phone gets the SAME kv rows the desktop dialog does.
+    // #2108's mobile-only two-line stack existed solely because the single
+    // dotted line wrapped mid-item on a narrow screen; rows stack by
+    // construction, so the split is gone and this now pins the unification.
+    expect(screen.getByText("machine name")).toBeInTheDocument();
+    expect(screen.getByText("MacBook-Pro")).toBeInTheDocument();
+    expect(screen.getByText("silicon")).toBeInTheDocument();
+    expect(screen.getByText("Apple M5 Max")).toBeInTheDocument();
+    expect(screen.getByText("shared memory")).toBeInTheDocument();
+    expect(screen.getByText("128 GB")).toBeInTheDocument();
+    // The old mobile-only markup must be gone, not merely unused — if it
+    // came back, two forms of the same block would be live again.
+    expect(
+      document.querySelector(".machine-drawer__identity--mobile"),
+    ).toBeNull();
     document.querySelectorAll('meta[name^="darkmux-"]').forEach((el) => el.remove());
   });
 
-  it("desktop: the identity header stays the single dotted line with the version, no --mobile modifier", () => {
+  it("(#2250) desktop renders system specs as kv rows — neither the dotted line nor the mobile variant survives", () => {
     const meta = document.createElement("meta");
     meta.name = "darkmux-version";
     meta.content = "3.3.0 (ea3caf27)";
@@ -1281,16 +1300,25 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
       />,
     );
     openDesktop();
+    // (#2250) One form for both skins — neither the mobile-only variant
+    // nor the dotted single-line form survives; both are kv rows now.
     expect(
       document.querySelector(".machine-drawer__identity--mobile"),
     ).toBeNull();
-    const identity = document.querySelector(".machine-drawer__identity")!;
-    expect(identity.textContent).toBe(
-      "MacBook-Pro · Apple M5 Max · 128 GB · darkmux 3.3.0 (ea3caf27)",
-    );
+    expect(document.querySelector(".machine-drawer__identity")).toBeNull();
+    expect(screen.getByText("machine name")).toBeInTheDocument();
+    expect(screen.getByText("Apple M5 Max")).toBeInTheDocument();
   });
 
-  it("mobile: power total, channels, thermal window, and GPU lines each render as a nowrap cell grid", async () => {
+  // (#2250 layout model) DELIBERATELY UPDATED: this test used to pin the
+  // #2108 mobile cell grids ("power total, channels, and the thermal
+  // window each render as a nowrap cell grid"). That second layout
+  // paradigm is what the operator kept reading as "alignment isn't right"
+  // — its stacked labels broke the panel's shared label column on exactly
+  // three rows. The multi-stat rows are ordinary kv rows on both viewports
+  // now; the no-mid-item-wrap guarantee moved into the VALUE itself
+  // (`kvSegs`' NBSP-bound items), which is what this pins instead.
+  it("mobile: power total, channels, and the thermal window are kv rows whose items are NBSP-bound — no cell grid, no per-viewport branch", async () => {
     stubFetch(FULL_LOAD);
     render(
       <MachineDrawer
@@ -1309,26 +1337,21 @@ describe("MachineDrawer — host extras: thermal/power/CPU clusters (#2108)", ()
     fireEvent.click(
       document.querySelector('[data-act="phone-drawer-tab-machine"]')!,
     );
-    await waitFor(() =>
-      expect(
-        document.querySelectorAll('[data-act="inline-or-cells"]').length,
-      ).toBeGreaterThan(0),
+    await waitFor(() => expect(kvValue("total")).not.toBeNull());
+    // Same facts, same wording as desktop (kvValue normalizes the NBSPs).
+    expect(kvValue("total")).toBe("9.0 W now · 7.8 W avg · 9.2 W p95 · 11.0 W max");
+    expect(kvValue("channels")).toBe("CPU 5.2 W · GPU 3.4 W · ANE 400 mW");
+    expect(kvValue("highest severity")).toBe("Serious");
+    expect(kvValue("above nominal")).toBe("45s");
+    // The raw value binds each item's internal spaces with NBSP and allows
+    // a break only after the " · " separator — the whole mid-item-wrap fix.
+    const totalRaw = [...document.querySelectorAll(".dialog__kv")]
+      .find((kv) => kv.querySelector("b")?.textContent === "total")!
+      .querySelector("span")!.textContent!;
+    expect(totalRaw).toBe(
+      "9.0\u00A0W\u00A0now\u00A0· 7.8\u00A0W\u00A0avg\u00A0· 9.2\u00A0W\u00A0p95\u00A0· 11.0\u00A0W\u00A0max",
     );
-    // power total (4 cells: now/avg/p95/max), channels (3: CPU/GPU/ANE),
-    // thermal window (2: worst/above nominal), GPU MHz+memory (2).
-    const grids = document.querySelectorAll('[data-act="inline-or-cells"]');
-    expect(grids.length).toBe(4);
-    grids.forEach((grid) => {
-      const values = grid.querySelectorAll(".inline-or-cells__cell-value");
-      expect(values.length).toBeGreaterThan(0);
-      values.forEach((v) => {
-        expect(v.className).toContain("inline-or-cells__cell-value");
-      });
-    });
-    // No dotted-list joined string anywhere on this surface any more.
-    expect(
-      screen.queryByText("9.0 W now · 7.8 W avg · 9.2 W p95 · 11.0 W max"),
-    ).toBeNull();
-    expect(screen.queryByText("worst Serious · 45s above nominal")).toBeNull();
+    // The cell-grid markup is gone from the panel entirely.
+    expect(document.querySelector('[data-act="inline-or-cells"]')).toBeNull();
   });
 });
