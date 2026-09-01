@@ -31,6 +31,26 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// completion (corrects on the next iteration). (#246 PR-C.3)
 const WAIT_XRANGE_COUNT: usize = 10000;
 
+/// (#2243) The read deadline for the next `wait_for_completion` poll: what is
+/// LEFT of the declared wait budget, or `None` once the budget is spent.
+///
+/// Extracted from the loop so its one dangerous property is ASSERTABLE rather
+/// than argued: **a returned `Some` is never `Duration::ZERO`.** A zero
+/// `timeval` means BLOCK FOREVER in several socket APIs, and this value is
+/// handed to `set_read_timeout` at the exact instant the wait's timeout is
+/// supposed to fire — getting it wrong reintroduces the original #2243 hang
+/// precisely when the operator is owed the timeout. `std` happens to reject a
+/// zero duration outright (executed: `Err(InvalidInput, "cannot set a 0
+/// duration timeout")`, leaving the previous deadline in force), but a
+/// swallowed set on a platform that instead honored zero would hang, so the
+/// invariant is enforced HERE and not left to the socket layer.
+///
+/// `checked_sub` covers `elapsed > timeout`; the `is_zero` filter covers the
+/// exact-equality instant that `saturating_sub` would hand back as zero.
+fn remaining_read_deadline(timeout: Duration, elapsed: Duration) -> Option<Duration> {
+    timeout.checked_sub(elapsed).filter(|r| !r.is_zero())
+}
+
 /// Result of `wait_for_completion`. Outcome is the dispatch's
 /// `result_class` from the flow record's payload — typically `"ok"` or
 /// `"error"` (see `crew::dispatch::dispatch` for the canonical values).
@@ -76,23 +96,108 @@ pub fn wait_for_completion(
 ) -> Result<CompletionResult> {
     let client = redis::Client::open(redis_url.expose_for_probe())
         .with_context(|| format!("opening Redis to wait for completion of {session_id}"))?;
-    let mut conn = client
-        .get_connection()
-        .with_context(|| format!("connecting to Redis to wait for completion of {session_id}"))?;
+    // (#2243) Bound BOTH phases, reusing darkmux-flow's connect definition
+    // rather than re-deriving it here. Before this, a peer that accepts TCP and
+    // never answers (measured live 2026-07-29, a Tailscale peer) blocked the
+    // poll below forever, control never returned to the elapsed check at the top
+    // of the loop, and the operator's declared `--wait` timeout could never fire.
+    //
+    // This bounded connect is paid BEFORE `start` is taken, so its own ceiling
+    // (`REDIS_CONNECT_TIMEOUT * 2` = 1s) sits OUTSIDE the declared wait budget —
+    // see the overshoot arithmetic at the read-deadline site below.
+    let mut conn = darkmux_flow::open_redis_connection_bounded(
+        &client,
+        darkmux_flow::REDIS_CONNECT_TIMEOUT,
+    )
+    .with_context(|| format!("connecting to Redis to wait for completion of {session_id}"))?;
+    // Bounds the WRITE side (and seeds a read deadline that the loop below
+    // immediately replaces with the remaining wait budget, per-poll).
+    darkmux_flow::bound_redis_response(&conn);
 
     // (#875) env > config.redis.stream > default, via config_access.
     let stream = darkmux_types::config_access::redis_stream();
 
+    // (#2243) The one operator-facing timeout message, produced from BOTH
+    // budget-exhaustion paths (the top-of-loop check and a read that hit the
+    // deadline) so they cannot drift apart.
+    let budget_exhausted = || {
+        anyhow!(
+            "wait_for_completion: no dispatch.complete for session_id={session_id} \
+             within {}s in Redis stream {stream}. The job may still be running on the \
+             runner — tail `darkmux flow tail --session {session_id}` to keep watching.",
+            timeout.as_secs()
+        )
+    };
+
     let start = std::time::Instant::now();
     loop {
-        if start.elapsed() > timeout {
-            return Err(anyhow!(
-                "wait_for_completion: no dispatch.complete for session_id={session_id} \
-                 within {}s in Redis stream {stream}. The job may still be running on the \
-                 runner — tail `darkmux flow tail --session {session_id}` to keep watching.",
-                timeout.as_secs()
-            ));
-        }
+        // (#2243) Budget check and the ZERO-DURATION GUARD in one call:
+        // `remaining_read_deadline` yields `None` once the budget is spent, and
+        // its `Some` is guaranteed strictly positive (that guarantee is asserted
+        // by `remaining_read_deadline_never_yields_a_zero_duration`). So
+        // `remaining` is safe to hand to `set_read_timeout` below.
+        let Some(remaining) = remaining_read_deadline(timeout, start.elapsed()) else {
+            return Err(budget_exhausted());
+        };
+
+        // (#2243) The read deadline for THIS poll is the REMAINING WAIT BUDGET,
+        // not a fixed constant. That is the difference between a bug and a fix:
+        //
+        // A fixed deadline shorter than a healthy peer's latency makes every
+        // poll time out, and redis-rs makes that permanent. In redis-0.27.6
+        // `connection.rs`, `Connection::read` responds to a read error that is
+        // an IoError and is NOT `UnexpectedEof` by doing `messages_to_skip += 1`
+        // for a RESPONSE read; the next `read()` then DISCARDS that many
+        // successfully-parsed replies before returning one. Re-issuing the
+        // command without draining the backlog creates and consumes the deficit
+        // at the same rate, so it never closes — the client stays permanently
+        // one reply behind and throws away every reply it receives. Measured
+        // against a peer that answered every `XREVRANGE` correctly, in order,
+        // with the completion record present: at 100ms latency `Ok` in 109ms;
+        // at 1200ms latency against a 1000ms deadline, "no dispatch.complete"
+        // after the full budget. Only the latency changed. That trades a loud
+        // hang for a SILENT WRONG ANSWER — `mission dispatch --wait` reporting a
+        // completed job as still running, which `src/main.rs` counts as a
+        // failure. (Rebuilding the connection on timeout does NOT fix it; that
+        // remedy was measured and disproved.)
+        //
+        // With the deadline equal to the remaining budget: a slow-but-healthy
+        // poll completes normally, and a timeout can only mean the budget is
+        // spent — so it ENDS the wait (below) rather than continuing it, and the
+        // skip deficit is structurally unable to accumulate.
+        //
+        // ZERO-DURATION SAFETY. `Some(Duration::ZERO)` is the trap here: in
+        // several socket APIs a zero `timeval` means BLOCK FOREVER, which would
+        // reintroduce the original hang at the exact instant the timeout should
+        // fire. redis-rs delegates straight to `std`'s socket
+        // `set_read_timeout`, and `std` rejects it — executed on this platform:
+        // `Err(InvalidInput, "cannot set a 0 duration timeout")`, with the
+        // PREVIOUS deadline left in force (this call ignores the result, so a
+        // zero would be a silent no-op, not a hang). We do not lean on that:
+        // `remaining` is strictly positive by construction above. `std` also
+        // clamps a sub-microsecond positive duration UP to 1µs rather than down
+        // to zero, so the nanosecond tail is safe too.
+        //
+        // WHAT THIS DEADLINE IS NOT. `set_read_timeout` is `SO_RCVTIMEO`, a
+        // per-`recv` deadline, not a per-command one: it fires on ZERO BYTES for
+        // `remaining`, and any byte that arrives restarts the clock. So it bounds
+        // a peer that goes SILENT (the #2243 failure mode) and does NOT bound a
+        // peer that DRIBBLES — one byte every 400ms into a reply that never
+        // terminates blocked 12s against a declared 2s wait when measured. Call
+        // this bounded against silence, not bounded outright.
+        //
+        // AND IT IS NOT THE WHOLE OPERATOR SYMPTOM. `mission dispatch` publishes
+        // every phase BEFORE it waits on any of them (`src/main.rs`), and
+        // `queue.rs`'s `publish_job` still opens a plain unbounded
+        // `get_connection()` — as does the `init_consumer_group` it calls first,
+        // which is the actual first unbounded touch. That queue is deliberately
+        // out of scope here: its `claim_job` issues `XREADGROUP ... BLOCK`, an
+        // intentionally long-blocking read that a blanket socket deadline would
+        // break, so it needs a per-call-site decision. Against the silent peer
+        // #2243 describes, `--wait` therefore STILL hangs — earlier, in the
+        // publish loop, before this function is ever reached. Fixing the wait
+        // fixes the wait, not the end-to-end operator symptom.
+        let _ = conn.set_read_timeout(Some(remaining));
 
         // (#809) XREVRANGE (newest-first) — the completion record we're
         // waiting for is by definition RECENT. The old oldest-first XRANGE
@@ -101,14 +206,68 @@ pub fn wait_for_completion(
         // stream made this wait MISS the completion entirely and time out.
         // Scan order doesn't matter for a find; newest-first also returns
         // the match in the first entries scanned.
-        let raw: redis::Value = redis::cmd("XREVRANGE")
+        let polled: redis::RedisResult<redis::Value> = redis::cmd("XREVRANGE")
             .arg(&stream)
             .arg("+")
             .arg("-")
             .arg("COUNT")
             .arg(WAIT_XRANGE_COUNT)
-            .query(&mut conn)
-            .with_context(|| format!("XREVRANGE on flow stream {stream}"))?;
+            .query(&mut conn);
+
+        let raw = match polled {
+            Ok(raw) => raw,
+            // (#2243) A poll that hits the deadline ENDS the wait with the
+            // canonical timeout message, because a READ that hits it hit the
+            // remaining budget. (Strictly, `bound_redis_response` above also
+            // installed a FIXED 1s write deadline that this loop never
+            // re-derives, and `is_timeout()` matches `TimedOut`/`WouldBlock`
+            // on either side — so a WRITE expiry would claim the declared
+            // budget was spent at ~1s. The arm is deliberately left wide
+            // rather than narrowed to reads: no reachable path constructs
+            // one, since a write expiry needs ~100KB+ of send-buffer backlog
+            // and this loop issues a single ~50-byte command per poll.)
+            // `continue` was round 1's answer and is wrong
+            // here for two reasons: the budget is spent, so continuing only
+            // re-derives the same message one loop later; and continuing after
+            // a timed-out read is precisely what lets redis-rs's
+            // `messages_to_skip` deficit persist (see the deadline site above).
+            // Returning here means the deficit can never be created twice on
+            // one connection, whatever the deadline actually was.
+            //
+            // `RedisError::is_timeout()` is the predicate: it is true exactly
+            // for an `IoError` of kind `TimedOut`/`WouldBlock`, which is what
+            // a `set_read_timeout` expiry surfaces as (verified against a live
+            // silent peer in this module's tests, not assumed from the docs).
+            // Every OTHER error — a connection reset, a protocol error, a
+            // wrong-type reply — still propagates with today's diagnostics.
+            // The disjointness matters: `ConnectionReset`/`BrokenPipe`/
+            // `UnexpectedEof` belong to `is_connection_dropped()`, so nothing
+            // fatal is swallowed as a timeout.
+            //
+            // The connection is deliberately NOT rebuilt on a timeout, and the
+            // reason is NOT that a late reply gets picked up later — it does
+            // not. redis-rs DISCARDS it, permanently, as a `messages_to_skip`
+            // skip. The reason is simply that this connection has no next poll:
+            // the wait is over on this line, and the connection is dropped.
+            //
+            // OVERSHOOT CEILING for a peer that returns whole replies promptly:
+            //   `REDIS_CONNECT_TIMEOUT * 2` (1s, the bounded connect, paid
+            //   BEFORE `start` and so outside the declared budget)
+            //   + `timeout`
+            //   + `WAIT_POLL_INTERVAL` (250ms — a poll can answer just under the
+            //     budget and still sleep a full interval before the loop-top
+            //     check fires).
+            // That is PER CALL, and `src/main.rs`'s fan-out loops it over N
+            // sessions serially, so the operator-visible ceiling is N times it.
+            // A dribbling peer is NOT covered by it — see the deadline site's
+            // `set_read_timeout` note and #2243's S1: `SO_RCVTIMEO` is a
+            // per-`recv` deadline, not a per-command one.
+            Err(e) if e.is_timeout() => return Err(budget_exhausted()),
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .with_context(|| format!("XREVRANGE on flow stream {stream}"))
+            }
+        };
 
         if let Some(result) = scan_flow_entries_for_completion(&raw, session_id)? {
             return Ok(result);
@@ -729,6 +888,540 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.to_string().contains("injected failure"), "{err}");
+    }
+
+    // ─── `wait_for_completion` against an accepts-but-never-answers peer (#2243) ───
+    //
+    // The failure mode measured live on 2026-07-29 (a Tailscale peer): the TCP
+    // port accepts, the Redis handshake completes, and the command is never
+    // answered. `wait_for_completion` checked its `--wait` deadline only at the
+    // TOP of the loop and then blocked in an unbounded `XREVRANGE` read, so
+    // control never returned to the check and the declared timeout could never
+    // fire. `darkmux mission dispatch --wait 60` hung indefinitely.
+
+    /// How long the fake peer below holds an accepted socket before dropping it.
+    ///
+    /// Deliberately LONGER than every wall-clock ceiling asserted here, and
+    /// that is the whole point: when the peer CLOSES the socket the pending
+    /// read returns EOF, which bounds the call *for free* and would make these
+    /// tests pass with the response deadline removed. Same reasoning (and same
+    /// vacuity trap) as `SILENT_PEER_HOLD` in `darkmux-flow`. (#2243)
+    const SILENT_PEER_HOLD: Duration =
+        Duration::from_millis(darkmux_flow::REDIS_RESPONSE_TIMEOUT.as_millis() as u64 * 10);
+
+    /// Spawn a fake Redis peer that COMPLETES redis-rs's connection-setup
+    /// handshake and then answers nothing. Copied in shape from
+    /// `darkmux_flow::spawn_silent_redis_peer` (`#[cfg(test)]` there, so not
+    /// reachable from this crate's test build).
+    ///
+    /// The two `+OK` replies are load-bearing: redis-rs 0.27 pipelines two
+    /// ignored `CLIENT SETINFO` commands in `connection_setup_pipeline`. A peer
+    /// that merely accepts TCP wedges at the HANDSHAKE, so every command-phase
+    /// assertion written against it would pass vacuously against the connect
+    /// phase instead. (#2243)
+    fn spawn_silent_redis_peer(max_connections: usize) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(max_connections) {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let _ = stream.write_all(b"+OK\r\n+OK\r\n");
+                    let _ = stream.flush();
+                    std::thread::sleep(SILENT_PEER_HOLD);
+                    drop(stream);
+                });
+            }
+        });
+        // Small settling margin only — `bind` already puts the socket in LISTEN.
+        std::thread::sleep(Duration::from_millis(50));
+        port
+    }
+
+    /// Anti-vacuity guard: prove the peer reaches the COMMAND phase, i.e. the
+    /// connect SUCCEEDS and a command against it then times out. Costs one
+    /// connection from the peer's budget. (#2243)
+    fn assert_silent_peer_reaches_command_phase(port: u16) {
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str())
+            .expect("open client against the fake peer");
+        let mut conn = darkmux_flow::open_redis_connection_bounded(
+            &client,
+            darkmux_flow::REDIS_CONNECT_TIMEOUT,
+        )
+        .expect(
+            "the fake peer must COMPLETE redis-rs's connection-setup pipeline — if the \
+             connect fails, every wall-clock assertion here passes vacuously against the \
+             CONNECT phase rather than the command phase #2243 is about",
+        );
+        darkmux_flow::bound_redis_response(&conn);
+        let res: redis::RedisResult<String> = redis::cmd("PING").query(&mut conn);
+        let err = res.expect_err("the fake peer answered a command; it must go silent");
+        assert!(
+            err.is_timeout(),
+            "the response-deadline expiry must classify as `RedisError::is_timeout()` — \
+             that predicate is what `wait_for_completion` keys on to END the wait with \
+             its canonical timeout message. Got kind={:?} err={err:?}",
+            err.kind()
+        );
+    }
+
+    /// The predicate the fix turns on, verified against a REAL timing-out call
+    /// rather than assumed from the docs. (#2243)
+    #[test]
+    fn response_deadline_expiry_classifies_as_a_redis_timeout_error() {
+        let port = spawn_silent_redis_peer(2);
+        assert_silent_peer_reaches_command_phase(port);
+    }
+
+    #[test]
+    fn wait_for_completion_returns_within_a_bounded_wall_clock_against_a_silent_peer() {
+        let port = spawn_silent_redis_peer(4);
+        assert_silent_peer_reaches_command_phase(port);
+
+        let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
+        let declared = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let err = wait_for_completion(&url, "sess-never-completes", declared)
+            .expect_err("no completion record can ever arrive from a silent peer");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "wait_for_completion must honor its declared --wait timeout even when the peer \
+             accepts TCP and never answers; took {elapsed:?} for a {declared:?} wait. \
+             Unbounded before #2243 (the read never returned to the elapsed check). \
+             err={err:#}"
+        );
+    }
+
+    #[test]
+    fn wait_for_completion_ends_on_its_own_declared_timeout_not_a_per_poll_read_error() {
+        // The bad trade this guards against: bounding the read makes a stalled
+        // poll return `Err`, and surfacing that raw `Err` would tell the operator
+        // "XREVRANGE on flow stream ...: Resource temporarily unavailable" —
+        // losing the one message that says the job may still be running on the
+        // runner and how to keep watching it.
+        //
+        // A read that hits the deadline now means the BUDGET is spent (the
+        // deadline is the remaining budget), so it must produce that canonical
+        // message and must not die early. Both halves are asserted below: the
+        // wall clock reaches the declared wait, and the message is ours. (#2243)
+        let port = spawn_silent_redis_peer(4);
+        assert_silent_peer_reaches_command_phase(port);
+
+        let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
+        let declared = Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let err = wait_for_completion(&url, "sess-never-completes", declared).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= declared,
+            "the wait died at {elapsed:?}, BEFORE its declared {declared:?} — the read \
+             deadline was shorter than the remaining budget, so a poll aborted the wait \
+             early instead of the budget ending it. err={err:#}"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no dispatch.complete"),
+            "the wait must end on ITS OWN timeout error (which tells the operator the job \
+             may still be running on the runner), not on a propagated per-poll read error. \
+             Got: {msg}"
+        );
+    }
+
+    // ─── `wait_for_completion` against a SLOW-BUT-HEALTHY peer (#2243) ───
+    //
+    // The three tests above all use a permanently SILENT peer, so every one of
+    // them asserts on the failure path. The dangerous direction is the other
+    // one: a peer that answers every command correctly and in order, just
+    // slowly. Bounding the read with a FIXED deadline turns that peer's healthy
+    // reply into a per-poll `Err`, and redis-rs then makes the damage permanent:
+    //
+    //   redis-0.27.6 `connection.rs` `Connection::read` — on a read error that
+    //   is an IoError and is NOT `UnexpectedEof`, a RESPONSE read does
+    //   `self.messages_to_skip += 1`. The next `read()` then DISCARDS that many
+    //   successfully-parsed replies before returning one.
+    //
+    // A `continue` that re-issues the command without draining the backlog
+    // creates and consumes the deficit at the same rate, so it never closes:
+    // the client stays permanently one reply behind and throws every reply it
+    // receives away as a skip. The wait then NEVER succeeds against a peer whose
+    // completion record is right there — a loud hang traded for a silent wrong
+    // answer, which `src/main.rs` counts as `failures += 1`.
+    //
+    // The fix derives the read deadline from the REMAINING wait budget, so a
+    // healthy-but-slow poll completes normally and a timeout coincides with
+    // budget exhaustion (ending the wait rather than continuing it, which is
+    // what makes the deficit structurally unable to accumulate).
+
+    /// The zero-duration guard, asserted rather than argued. `set_read_timeout`
+    /// is handed this value at the exact instant the wait budget runs out; a
+    /// zero would mean BLOCK FOREVER on a socket API that honors it, which is
+    /// the original #2243 hang reappearing precisely when the operator is owed
+    /// their timeout.
+    ///
+    /// The `elapsed == timeout` case is the one that matters and the one a
+    /// `saturating_sub` gets wrong — it hands back `Duration::ZERO` where this
+    /// must hand back `None`. (#2243)
+    #[test]
+    fn remaining_read_deadline_never_yields_a_zero_duration() {
+        let budget = Duration::from_secs(5);
+
+        // Budget spent: no deadline at all, so the caller ends the wait.
+        assert_eq!(
+            remaining_read_deadline(budget, budget),
+            None,
+            "elapsed EXACTLY equal to the budget must yield None, not \
+             Some(Duration::ZERO) — this is the case `saturating_sub` gets wrong"
+        );
+        assert_eq!(remaining_read_deadline(budget, budget + Duration::from_secs(1)), None);
+
+        // Budget left: a usable, strictly positive deadline.
+        assert_eq!(
+            remaining_read_deadline(budget, Duration::from_secs(2)),
+            Some(Duration::from_secs(3))
+        );
+
+        // Sweep the whole boundary neighborhood at nanosecond grain: whatever
+        // comes back must never be zero.
+        for ns in 0..2_000u32 {
+            let elapsed = budget - Duration::from_nanos(1_000) + Duration::from_nanos(ns as u64);
+            if let Some(d) = remaining_read_deadline(budget, elapsed) {
+                assert!(
+                    !d.is_zero(),
+                    "yielded a ZERO read deadline at elapsed={elapsed:?} of budget={budget:?} \
+                     — `set_read_timeout(Some(Duration::ZERO))` means block-forever on socket \
+                     APIs that honor it, which is #2243's hang at the worst possible moment"
+                );
+            }
+        }
+
+        // A zero-length wait can never produce a deadline either.
+        assert_eq!(remaining_read_deadline(Duration::ZERO, Duration::ZERO), None);
+    }
+
+    /// The platform fact the guard above exists to not depend on, executed
+    /// rather than quoted: `std` REJECTS a zero read deadline (it does not
+    /// install a block-forever one), and the rejection is silently dropped by
+    /// the `let _ =` at every call site — leaving whatever deadline was already
+    /// in force. If this ever starts passing `Ok`, the guard in
+    /// `remaining_read_deadline` is the only thing between #2243 and a hang.
+    /// (#2243)
+    #[test]
+    fn std_rejects_a_zero_read_deadline_rather_than_blocking_forever() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                std::thread::sleep(Duration::from_secs(2));
+                drop(stream);
+            }
+        });
+        let sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to self");
+
+        sock.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("a positive deadline installs");
+        let err = sock
+            .set_read_timeout(Some(Duration::ZERO))
+            .expect_err("std must REJECT a zero read deadline");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(
+            sock.read_timeout().unwrap(),
+            Some(Duration::from_secs(1)),
+            "a rejected zero must leave the PREVIOUS deadline in force — which is \
+             why the swallowed `let _ =` at the call site is not itself a hang"
+        );
+    }
+
+    /// A real RESP2 `XREVRANGE` reply carrying one entry whose `record` field
+    /// is a `dispatch complete` for `session_id` — the exact shape
+    /// `scan_flow_entries_for_completion` walks. (#2243)
+    fn xrevrange_reply_with_completion(session_id: &str) -> Vec<u8> {
+        let record = serde_json::json!({
+            "action": "dispatch complete",
+            "session_id": session_id,
+            "payload": { "result_class": "ok", "wall_ms": 42 },
+        })
+        .to_string();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"*1\r\n"); // one entry
+        out.extend_from_slice(b"*2\r\n"); // entry = [id, fields]
+        out.extend_from_slice(b"$3\r\n1-0\r\n"); // id
+        out.extend_from_slice(b"*2\r\n"); // fields = [k, v]
+        out.extend_from_slice(b"$6\r\nrecord\r\n");
+        out.extend_from_slice(format!("${}\r\n{record}\r\n", record.len()).as_bytes());
+        out
+    }
+
+    /// Spawn a fake Redis peer that completes redis-rs's connection-setup
+    /// handshake and then answers EVERY command correctly and in order — with a
+    /// real completion-bearing `XREVRANGE` reply — after `latency`.
+    ///
+    /// This peer is HEALTHY. The only variable under test is how long its first
+    /// byte takes relative to the read deadline. (#2243)
+    fn spawn_slow_but_healthy_redis_peer(session_id: &str, latency: Duration) -> u16 {
+        let reply = xrevrange_reply_with_completion(session_id);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let reply = reply.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    // The two `+OK`s redis-rs's `connection_setup_pipeline`
+                    // expects for its two ignored `CLIENT SETINFO` commands
+                    // (RESP2, no password, db 0 — verified in the crate source).
+                    if stream.write_all(b"+OK\r\n+OK\r\n").is_err() {
+                        return;
+                    }
+                    let _ = stream.flush();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {
+                                std::thread::sleep(latency);
+                                if stream.write_all(&reply).is_err() {
+                                    return;
+                                }
+                                let _ = stream.flush();
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        // Small settling margin only — `bind` already puts the socket in LISTEN.
+        std::thread::sleep(Duration::from_millis(50));
+        port
+    }
+
+    /// CONTROL, and the anti-vacuity guard for the regression below: the same
+    /// peer, the same reply bytes, at a latency well INSIDE any plausible read
+    /// deadline. This proves the fake peer's reply actually parses into a
+    /// `CompletionResult`, so a failure of the slow test is attributable to
+    /// LATENCY alone rather than to a malformed fixture. (#2243)
+    #[test]
+    fn wait_for_completion_succeeds_against_a_fast_healthy_peer() {
+        let session_id = "sess-fast-control";
+        let port = spawn_slow_but_healthy_redis_peer(session_id, Duration::from_millis(100));
+
+        let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
+        let got = wait_for_completion(&url, session_id, Duration::from_secs(5))
+            .expect("a fast healthy peer's completion record must be found");
+
+        assert_eq!(got.session_id, session_id);
+        assert_eq!(got.result_class, "ok");
+        assert_eq!(got.wall_ms, Some(42));
+    }
+
+    /// THE regression test for #2243's blocker. Same peer, same bytes, same
+    /// completion record as the control above — only the latency changes, and
+    /// it straddles the fixed per-command deadline round 1 used.
+    ///
+    /// With a fixed `REDIS_RESPONSE_TIMEOUT` deadline plus `continue`, this
+    /// runs the full declared wait and returns the "no dispatch.complete"
+    /// error for a job that completed. With the deadline derived from the
+    /// remaining budget, the poll simply succeeds. (#2243)
+    #[test]
+    fn wait_for_completion_succeeds_against_a_slow_but_healthy_peer() {
+        let session_id = "sess-slow-but-healthy";
+        // Straddles the fixed deadline: longer than `REDIS_RESPONSE_TIMEOUT`,
+        // far shorter than the declared wait budget below.
+        let latency = darkmux_flow::REDIS_RESPONSE_TIMEOUT + Duration::from_millis(200);
+        let port = spawn_slow_but_healthy_redis_peer(session_id, latency);
+
+        let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
+        let declared = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let got = wait_for_completion(&url, session_id, declared);
+        let elapsed = started.elapsed();
+
+        let got = got.unwrap_or_else(|e| {
+            panic!(
+                "a HEALTHY peer answered every XREVRANGE correctly and in order at {latency:?} \
+                 with the completion record present, and the wait still failed after \
+                 {elapsed:?} of its {declared:?} budget. This is the #2243 blocker: a fixed \
+                 read deadline shorter than the peer's latency makes redis-rs bump \
+                 `messages_to_skip` on every timed-out poll, and a `continue` that re-issues \
+                 the command never drains that backlog — so every correct reply is discarded \
+                 and the wait reports a completed job as still running. err={e:#}"
+            )
+        });
+
+        assert_eq!(got.session_id, session_id);
+        assert_eq!(got.result_class, "ok");
+        assert_eq!(got.wall_ms, Some(42));
+        assert!(
+            elapsed < declared,
+            "the wait must return as soon as the slow poll answers ({latency:?} plus connect), \
+             not burn its whole {declared:?} budget; took {elapsed:?}"
+        );
+    }
+
+    // ─── `wait_for_completion` against a HEALTHY peer with an EMPTY stream ───
+    //
+    // Every other fixture in this module is PATHOLOGICAL: permanently silent
+    // (which exits through the inner `Err(e) if e.is_timeout()` arm) or
+    // completion-bearing (which exits through `Ok`). Neither ever reaches the
+    // LOOP-TOP budget check — the `let Some(remaining) = ... else { return
+    // Err(budget_exhausted()) }` arm — so that arm had zero behavioral
+    // coverage even though it is the arm #2243's operator symptom runs through.
+    //
+    // The path that reaches it is the ORDINARY one: Redis is fine, answers
+    // every poll promptly, and the job simply has not finished yet, so the
+    // stream holds no `dispatch.complete` and the wait must end when the
+    // DECLARED BUDGET runs out. Break only the call site —
+    //
+    //     let remaining = remaining_read_deadline(timeout, start.elapsed())
+    //         .unwrap_or(timeout);
+    //
+    // — and every read still succeeds, no timeout is ever raised, and the loop
+    // spins forever: `--wait 60` never fires, which is #2243 verbatim. The pure
+    // `remaining_read_deadline` unit test above stays green through that
+    // mutation, which is exactly why this behavioral one has to exist.
+
+    /// Spawn a fake Redis peer that completes redis-rs's connection-setup
+    /// handshake and then answers EVERY command PROMPTLY with an empty RESP
+    /// array (`*0\r\n`) — a healthy Redis whose stream holds no matching
+    /// completion record yet. (#2243)
+    fn spawn_healthy_empty_redis_peer() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    // The two `+OK`s redis-rs's `connection_setup_pipeline`
+                    // expects for its two ignored `CLIENT SETINFO` commands.
+                    if stream.write_all(b"+OK\r\n+OK\r\n").is_err() {
+                        return;
+                    }
+                    let _ = stream.flush();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            // Empty array: a well-formed XREVRANGE reply that
+                            // simply carries no entries. No latency at all —
+                            // the read deadline must never be what ends this
+                            // wait.
+                            Ok(_) => {
+                                if stream.write_all(b"*0\r\n").is_err() {
+                                    return;
+                                }
+                                let _ = stream.flush();
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        // Small settling margin only — `bind` already puts the socket in LISTEN.
+        std::thread::sleep(Duration::from_millis(50));
+        port
+    }
+
+    /// Anti-vacuity guard for the test below: prove the peer ANSWERS, promptly
+    /// and well-formed. If it went silent instead, the wait would exit through
+    /// the read-timeout arm and the loop-top budget check would go untested
+    /// again — the test would pass while covering nothing new. (#2243)
+    fn assert_healthy_empty_peer_answers_promptly(port: u16) {
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}").as_str())
+            .expect("open client against the fake peer");
+        let mut conn = darkmux_flow::open_redis_connection_bounded(
+            &client,
+            darkmux_flow::REDIS_CONNECT_TIMEOUT,
+        )
+        .expect("the fake peer must COMPLETE redis-rs's connection-setup pipeline");
+        darkmux_flow::bound_redis_response(&conn);
+
+        let started = std::time::Instant::now();
+        let got: redis::Value = redis::cmd("XREVRANGE")
+            .arg("darkmux:flow")
+            .arg("+")
+            .arg("-")
+            .arg("COUNT")
+            .arg(WAIT_XRANGE_COUNT)
+            .query(&mut conn)
+            .expect(
+                "the fake peer must ANSWER the command phase — a peer that times out here is a \
+                 SILENT peer, and the wait below would then end through the read-timeout arm \
+                 rather than the loop-top budget check this test exists to cover",
+            );
+        assert!(
+            matches!(&got, redis::Value::Array(a) if a.is_empty()),
+            "the peer must answer with an EMPTY stream (so no completion is ever found and the \
+             budget is the only thing that can end the wait). Got {got:?}"
+        );
+        assert!(
+            started.elapsed() < darkmux_flow::REDIS_RESPONSE_TIMEOUT,
+            "the peer answered in {:?} — it must be PROMPT, so a read deadline can never be \
+             what ends the wait below",
+            started.elapsed()
+        );
+    }
+
+    /// THE coverage for the loop-top budget check. A healthy peer answering
+    /// every poll promptly with an empty stream is the single most common real
+    /// `--wait` timeout: Redis is fine, the job is still running. The wait must
+    /// end on the DECLARED budget.
+    ///
+    /// Run on a worker thread and collected with `recv_timeout` DELIBERATELY:
+    /// the failure this guards against is an infinite loop, and a bare call
+    /// would wedge the test binary (and CI) instead of going red. (#2243)
+    #[test]
+    fn wait_for_completion_ends_on_the_loop_top_budget_check_against_a_healthy_empty_peer() {
+        let port = spawn_healthy_empty_redis_peer();
+        assert_healthy_empty_peer_answers_promptly(port);
+
+        let declared = Duration::from_secs(2);
+        // Covers the documented overshoot ceiling (bounded connect 1s +
+        // `declared` + one `WAIT_POLL_INTERVAL`) with room to spare, while
+        // staying far below any plausible healthy return.
+        let slack = Duration::from_secs(6);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let url = darkmux_flow::RawRedisUrl::new(format!("redis://127.0.0.1:{port}"));
+            let started = std::time::Instant::now();
+            let res = wait_for_completion(&url, "sess-still-running", declared);
+            let _ = tx.send((res.map(|_| ()).map_err(|e| format!("{e:#}")), started.elapsed()));
+        });
+
+        let (res, elapsed) = rx.recv_timeout(declared + slack).unwrap_or_else(|_| {
+            panic!(
+                "wait_for_completion NEVER RETURNED within {:?} for a declared {declared:?}, \
+                 against a HEALTHY peer answering every poll promptly with an empty stream. \
+                 The loop-top budget check is the ONLY thing that can end this wait — no read \
+                 ever times out and no completion is ever found — so this is #2243's original \
+                 symptom: `--wait` that never fires.",
+                declared + slack
+            )
+        });
+
+        let err = res.expect_err("an empty stream can never yield a completion record");
+        assert!(
+            err.contains("no dispatch.complete"),
+            "the wait must end with the canonical operator-facing timeout message (which names \
+             the session and how to keep watching), not some propagated internal error. \
+             Got: {err}"
+        );
+        assert!(
+            elapsed >= declared,
+            "the wait ended at {elapsed:?}, BEFORE its declared {declared:?} — a healthy peer's \
+             prompt reply must never cut the budget short. err={err}"
+        );
+        assert!(
+            elapsed < declared + slack,
+            "the wait ran {elapsed:?} against a declared {declared:?}; the overshoot ceiling is \
+             the bounded connect plus one poll interval, not this. err={err}"
+        );
     }
 }
 
