@@ -7719,6 +7719,613 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         assert_eq!(recorded.trim(), "kill darkmux-test-container-2233-panic");
     }
 
+    // ─── (#2232) the watchdog's kill must be PERSISTENT, not fire-and-forget ─
+
+    /// Same PATH-shadowing seam as `install_fake_docker`, but the stand-in
+    /// `docker` FAILS every kill/rm (the transient-dockerd case #2232 is
+    /// about) and answers `docker ps` with `ps_stdout` / `ps_exit` so a test
+    /// can say whether the container still looks alive — or whether the
+    /// liveness check itself is unavailable (#2232).
+    fn install_failing_docker(
+        dir: &TempDir,
+        ps_stdout: &str,
+        ps_exit: u8,
+    ) -> (std::path::PathBuf, Option<String>) {
+        let record_path = dir.path().join("invoked-with.txt");
+        let fake_docker_path = dir.path().join("docker");
+        std::fs::write(
+            &fake_docker_path,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" >> {record}\n\
+                 case \"$1\" in\n\
+                 ps) printf '%s' '{ps_stdout}'; exit {ps_exit} ;;\n\
+                 *) echo 'Error response from daemon: dockerd is busy' >&2; exit 1 ;;\n\
+                 esac\n",
+                record = record_path.display(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_docker_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_docker_path, perms).unwrap();
+        }
+        let prev_path = std::env::var("PATH").ok();
+        // SAFETY: every caller is `#[serial]`.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.path().display(), prev_path.clone().unwrap_or_default()),
+            );
+        }
+        (record_path, prev_path)
+    }
+
+    /// A stand-in `docker` that faithfully reproduces what docker 29.1.3 does
+    /// when the container **does not exist** — measured live, because the
+    /// three verbs disagree in a way no reading of the code would predict and
+    /// the disagreement is load-bearing (#2232):
+    ///
+    /// | verb                    | exit | stdout |
+    /// |-------------------------|------|--------|
+    /// | `ps --quiet --filter …` | 0    | empty  |
+    /// | `kill <name>`           | 1    | empty  |
+    /// | `rm -f <name>`          | **0**| empty  |
+    ///
+    /// `rm -f` exiting **0** for a container that never existed is the trap:
+    /// `install_failing_docker`'s catch-all branch fails `rm` too, so that
+    /// seam alone cannot see the settle-on-attempt-3 fail-open this models.
+    /// (A `rm -f` that really removes something echoes the name on stdout —
+    /// also measured — which is what separates the two.)
+    fn install_absent_container_docker(dir: &TempDir) -> (std::path::PathBuf, Option<String>) {
+        let record_path = dir.path().join("invoked-with.txt");
+        let fake_docker_path = dir.path().join("docker");
+        std::fs::write(
+            &fake_docker_path,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" >> {record}\n\
+                 case \"$1\" in\n\
+                 ps) exit 0 ;;\n\
+                 kill) echo 'Error response from daemon: cannot kill container: no such \
+                 container' >&2; exit 1 ;;\n\
+                 rm) echo 'Error response from daemon: No such container' >&2; exit 0 ;;\n\
+                 *) exit 1 ;;\n\
+                 esac\n",
+                record = record_path.display(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_docker_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_docker_path, perms).unwrap();
+        }
+        let prev_path = std::env::var("PATH").ok();
+        // SAFETY: every caller is `#[serial]`.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.path().display(), prev_path.clone().unwrap_or_default()),
+            );
+        }
+        (record_path, prev_path)
+    }
+
+    /// A stand-in `docker` whose `ps` answers `first` on its first call and
+    /// `rest` on every call after — the only way to model the state CHANGE
+    /// the false-alarm guard is about (a container observed running that then
+    /// exits under the watchdog). Every kill/rm fails, so the probe is what
+    /// settles it. (#2232)
+    fn install_docker_with_ps_sequence(
+        dir: &TempDir,
+        first: &str,
+        rest: &str,
+    ) -> (std::path::PathBuf, Option<String>) {
+        let record_path = dir.path().join("invoked-with.txt");
+        let probe_count_path = dir.path().join("ps-calls.txt");
+        let fake_docker_path = dir.path().join("docker");
+        std::fs::write(
+            &fake_docker_path,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" >> {record}\n\
+                 case \"$1\" in\n\
+                 ps) if [ -f {counter} ]; then printf '%s' '{rest}'; \
+                 else echo seen > {counter}; printf '%s' '{first}'; fi; exit 0 ;;\n\
+                 *) echo 'Error response from daemon: dockerd is busy' >&2; exit 1 ;;\n\
+                 esac\n",
+                record = record_path.display(),
+                counter = probe_count_path.display(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_docker_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_docker_path, perms).unwrap();
+        }
+        let prev_path = std::env::var("PATH").ok();
+        // SAFETY: every caller is `#[serial]`.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.path().display(), prev_path.clone().unwrap_or_default()),
+            );
+        }
+        (record_path, prev_path)
+    }
+
+    /// 1ms base backoff — the retry CADENCE is a production tuning choice, the
+    /// retry BEHAVIOR is what these tests pin, so they run at speed.
+    const TEST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
+    #[test]
+    #[serial]
+    fn kill_container_persistently_retries_and_escalates_when_every_kill_fails() {
+        // (#2232) THE BUG. The inactivity watchdog fired exactly one
+        // fire-and-forget `docker kill` and then RETURNED. If that single
+        // kill failed — dockerd busy, restarting, a transient API error —
+        // nothing was left to stop the container, and the main thread was
+        // already blocked in `wait_with_output()` with no timeout of its
+        // own, so a genuinely hung container hung the dispatch FOREVER: the
+        // safety net failing open in exactly the case it exists for.
+        let dir = TempDir::new().unwrap();
+        // `docker ps` succeeds and reports the container STILL RUNNING, so
+        // "it was already gone" is ruled out — every failure here is a real
+        // failure to stop a live container.
+        let (record_path, prev_path) =
+            install_failing_docker(&dir, "darkmux-test-container-2232-hung\n", 0);
+
+        let outcome = kill_container_persistently("darkmux-test-container-2232-hung", TEST_BACKOFF);
+
+        restore_path(prev_path);
+
+        let recorded = std::fs::read_to_string(&record_path)
+            .expect("the persistent kill must have invoked the fake `docker` on PATH");
+        let kills: Vec<&str> = recorded
+            .lines()
+            .filter(|l| l.starts_with("kill ") || l.starts_with("rm "))
+            .collect();
+        assert!(
+            kills.len() > 1,
+            "a failing kill must be RETRIED, not attempted once and abandoned — docker was \
+             invoked with: {recorded:?}"
+        );
+        assert_eq!(
+            kills,
+            vec![
+                "kill darkmux-test-container-2232-hung",
+                "kill darkmux-test-container-2232-hung",
+                "rm -f darkmux-test-container-2232-hung",
+                "rm -f darkmux-test-container-2232-hung",
+                "rm -f darkmux-test-container-2232-hung",
+            ],
+            "the retries must ESCALATE from `docker kill` to `docker rm -f` rather than \
+             repeating one verb that is already failing"
+        );
+        assert_eq!(
+            outcome,
+            KillOutcome::Unconfirmed {
+                attempts: 5,
+                last_error: "Error response from daemon: dockerd is busy".to_string(),
+            },
+            "exhausting the attempts must report an UNCONFIRMED kill carrying docker's own \
+             last error, not a silent success"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn kill_container_persistently_gives_up_loudly_not_silently() {
+        // (#2232) A safety net that gives up QUIETLY is the failure mode this
+        // issue is about. When the retries are exhausted the operator must be
+        // told, by name, that a container may still be running and holding a
+        // model load — and a CONFIRMED kill must stay silent so the warning
+        // means something when it does appear.
+        let gave_up = KillOutcome::Unconfirmed {
+            attempts: 5,
+            last_error: "Error response from daemon: dockerd is busy".to_string(),
+        };
+        let warning = gave_up
+            .warning("darkmux-test-container-2232-hung")
+            .expect("giving up must produce an operator-facing warning, never silence");
+        assert!(
+            warning.contains("darkmux-test-container-2232-hung"),
+            "the warning must name the container the operator has to deal with: {warning}"
+        );
+        assert!(
+            warning.contains('5'),
+            "the warning must say how many attempts were made: {warning}"
+        );
+        assert!(
+            warning.contains("dockerd is busy"),
+            "the warning must carry docker's own last error: {warning}"
+        );
+        assert!(
+            warning.to_lowercase().contains("still be running"),
+            "the warning must state the consequence — the container may still be alive: \
+             {warning}"
+        );
+        assert_eq!(
+            KillOutcome::Confirmed { attempts: 1 }.warning("darkmux-test-container-2232-hung"),
+            None,
+            "a confirmed kill must NOT warn"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn kill_container_persistently_stops_once_the_container_is_confirmed_gone() {
+        // (#2232) The false-alarm guard. A container that exited naturally in
+        // the watchdog's final race window makes `docker kill` fail with
+        // "is not running" — indistinguishable from a transient daemon error
+        // by exit code alone. A `docker ps` that saw the container running
+        // and then sees it gone is the evidence that it genuinely stopped,
+        // and it must end the loop rather than burning five attempts and
+        // crying wolf.
+        //
+        // Round 2 rewrote this test: it used to install a `docker ps` that
+        // answered empty from the FIRST call and assert `Confirmed`, which
+        // encoded the fail-open — an empty `ps` alone cannot tell "exited"
+        // from "never created". The observation has to come first, so the
+        // fake now reports the container running on probe 1 and gone after.
+        let dir = TempDir::new().unwrap();
+        let (record_path, prev_path) =
+            install_docker_with_ps_sequence(&dir, "darkmux-test-container-2232-gone\n", "");
+
+        let outcome = kill_container_persistently("darkmux-test-container-2232-gone", TEST_BACKOFF);
+
+        restore_path(prev_path);
+
+        assert_eq!(
+            outcome,
+            KillOutcome::Confirmed { attempts: 2 },
+            "a container SEEN running and then seen gone is confirmed stopped — stop retrying"
+        );
+        let recorded = std::fs::read_to_string(&record_path).unwrap();
+        let kills = recorded.lines().filter(|l| l.starts_with("kill ") || l.starts_with("rm "));
+        assert_eq!(
+            kills.count(),
+            2,
+            "two kill attempts: the first probe saw it alive, the second settled it: {recorded:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn kill_container_persistently_fails_closed_when_the_liveness_check_is_unavailable() {
+        // (#2232) The liveness check must never be the new way to fail open.
+        // When dockerd is unreachable, `docker ps` ALSO fails — and a failed
+        // check is not evidence of anything. Only a successful, empty `ps`
+        // proves the container stopped; anything else keeps retrying.
+        let dir = TempDir::new().unwrap();
+        let (_record_path, prev_path) = install_failing_docker(&dir, "", 1);
+
+        let outcome =
+            kill_container_persistently("darkmux-test-container-2232-nodaemon", TEST_BACKOFF);
+
+        restore_path(prev_path);
+
+        assert!(
+            matches!(outcome, KillOutcome::Unconfirmed { attempts: 5, .. }),
+            "a FAILED liveness check must not be read as `the container is gone` — it must \
+             keep trying and then admit it could not confirm: {outcome:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn kill_container_persistently_does_not_retry_a_kill_that_worked() {
+        // (#2232) The cost side: a healthy kill must still be exactly one
+        // `docker kill`, with no liveness probe and no extra subprocesses.
+        let dir = TempDir::new().unwrap();
+        let (record_path, prev_path) = install_fake_docker(&dir);
+
+        let outcome = kill_container_persistently("darkmux-test-container-2232-ok", TEST_BACKOFF);
+
+        restore_path(prev_path);
+
+        assert_eq!(outcome, KillOutcome::Confirmed { attempts: 1 });
+        let recorded = std::fs::read_to_string(&record_path).unwrap();
+        assert_eq!(
+            recorded.trim(),
+            "kill darkmux-test-container-2232-ok",
+            "one successful `docker kill` and nothing else: {recorded:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn kill_container_persistently_does_not_confirm_a_container_it_never_saw() {
+        // (#2232, round 2) THE FAIL-OPEN IN THE FIX. `docker ps --quiet
+        // --filter name=^X$` answers "exit 0, empty stdout" for a container
+        // that has never been created, exactly as it does for one that ran
+        // and exited — so the liveness probe read "does not exist yet" as
+        // "stopped" and settled `Confirmed { attempts: 1 }`, silently, after
+        // which the WATCHDOG THREAD RETURNED.
+        //
+        // Reachable path: `darkmux dispatch <role> --image rust:latest` with
+        // that image uncached. Only the darkmux image is pre-pulled, so the
+        // BYO image is pulled inline by `docker run` with no container
+        // existing yet, while `inactivity_deadline` is already armed. A pull
+        // longer than the inactivity budget fires the watchdog against a
+        // container that does not exist — and the watchdog retires. The pull
+        // then finishes and the dispatch runs UNWATCHED, with the main thread
+        // parked in `wait_with_output()` and nothing left that can kill it:
+        // #2232's own fail-open, reached through #2232's own fix.
+        //
+        // `Confirmed` must mean "was observed running, now stopped". NEVER
+        // OBSERVED is a different state, and its correct action is to keep
+        // watching, not to retire.
+        let dir = TempDir::new().unwrap();
+        let (record_path, prev_path) = install_absent_container_docker(&dir);
+
+        let outcome = kill_container_persistently("darkmux-dispatch-absent-2232", TEST_BACKOFF);
+
+        restore_path(prev_path);
+        let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+
+        assert!(
+            !matches!(outcome, KillOutcome::Confirmed { .. }),
+            "a container the watchdog NEVER SAW must not be reported as confirmed stopped — \
+             that retires the watchdog over a container that may be seconds from starting. \
+             Got {outcome:?}; docker was invoked with: {recorded:?}"
+        );
+        let attempts: Vec<&str> = recorded
+            .lines()
+            .filter(|l| l.starts_with("kill ") || l.starts_with("rm "))
+            .collect();
+        assert_eq!(
+            attempts.len(),
+            CONTAINER_KILL_MAX_ATTEMPTS as usize,
+            "never having seen the container is not evidence to settle on — the budget must be \
+             burned instead: {recorded:?}"
+        );
+        assert_eq!(
+            outcome,
+            KillOutcome::Absent { attempts: CONTAINER_KILL_MAX_ATTEMPTS },
+            "…and the state must be its own, distinguishable from both a confirmed stop and a \
+             container that may still be running"
+        );
+
+        // The operator-visible text must not claim a kill that did not
+        // happen, and must not raise the "may still be running and holding
+        // its model load" alarm either — docker said, repeatedly and
+        // conclusively, that there was no such container.
+        let marker = inactivity_timeout_stderr(
+            "darkmux-dispatch-absent-2232",
+            600,
+            outcome.disposition(),
+            "boom",
+        );
+        assert!(
+            !marker.contains("was killed by the watchdog"),
+            "nothing was killed — the marker must not say one was: {marker}"
+        );
+        assert!(
+            !marker.to_lowercase().contains("still be running and holding"),
+            "the alarm is for a container we saw and could not stop, not one we never saw: \
+             {marker}"
+        );
+        assert!(marker.contains("boom"), "the original stderr must be preserved: {marker}");
+
+        // Same split on the watchdog's own stderr line.
+        let warning = outcome
+            .warning("darkmux-dispatch-absent-2232")
+            .expect("a watchdog that found nothing to kill must still say so, never go silent");
+        assert!(
+            warning.contains("darkmux-dispatch-absent-2232"),
+            "the warning must name the container: {warning}"
+        );
+        assert!(
+            !warning.to_lowercase().contains("still be running and holding"),
+            "…without the alarming wording reserved for an unconfirmed kill: {warning}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn kill_container_persistently_stays_alarmed_when_docker_never_answered() {
+        // (#2232, round 2) The boundary of `Absent`. "We never saw it" is
+        // only honest when docker was actually ANSWERING — a probe that
+        // failed tells us nothing, and downgrading that to `Absent` would
+        // suppress the "may still be running" alarm in the very case where
+        // the container most plausibly IS running. `Absent` requires positive
+        // absence evidence; anything less stays `Unconfirmed`.
+        let dir = TempDir::new().unwrap();
+        let (_record_path, prev_path) = install_failing_docker(&dir, "", 1);
+
+        let outcome = kill_container_persistently("darkmux-test-container-2232-mute", TEST_BACKOFF);
+
+        restore_path(prev_path);
+
+        assert!(
+            matches!(outcome, KillOutcome::Unconfirmed { .. }),
+            "an unreachable daemon is not evidence of absence: {outcome:?}"
+        );
+        let warning = outcome.warning("darkmux-test-container-2232-mute").unwrap();
+        assert!(
+            warning.to_lowercase().contains("still be running"),
+            "…so the alarm must survive: {warning}"
+        );
+    }
+
+    #[test]
+    fn inactivity_timeout_stderr_admits_when_the_container_was_not_confirmed_stopped() {
+        // (#2232) The marker used to assert flatly that the container "was
+        // killed by the watchdog" — a claim with no evidence behind it, and
+        // false in exactly the case that matters. When the kill could not be
+        // confirmed the operator-visible text must say so.
+        let confirmed = inactivity_timeout_stderr(
+            "darkmux-test-container-2232-x",
+            600,
+            KillDisposition::Confirmed,
+            "boom",
+        );
+        assert!(confirmed.contains(super::INACTIVITY_TIMEOUT_MARKER));
+        assert!(confirmed.contains("boom"), "the original stderr must be preserved");
+        assert!(
+            !confirmed.to_lowercase().contains("could not confirm"),
+            "a confirmed kill must not carry the warning: {confirmed}"
+        );
+
+        let unconfirmed = inactivity_timeout_stderr(
+            "darkmux-test-container-2232-x",
+            600,
+            KillDisposition::Unconfirmed,
+            "boom",
+        );
+        assert!(unconfirmed.contains(super::INACTIVITY_TIMEOUT_MARKER));
+        assert!(unconfirmed.contains("boom"), "the original stderr must be preserved");
+        assert!(
+            unconfirmed.to_lowercase().contains("could not confirm"),
+            "an unconfirmed kill must say so in the operator-visible stderr: {unconfirmed}"
+        );
+        assert!(
+            unconfirmed.contains("darkmux-test-container-2232-x"),
+            "…and name the container to check: {unconfirmed}"
+        );
+
+        let absent = inactivity_timeout_stderr(
+            "darkmux-test-container-2232-x",
+            600,
+            KillDisposition::Absent,
+            "boom",
+        );
+        assert!(absent.contains(super::INACTIVITY_TIMEOUT_MARKER));
+        assert!(absent.contains("boom"), "the original stderr must be preserved");
+        assert!(
+            !absent.contains("was killed by the watchdog"),
+            "a container that was never found was not killed: {absent}"
+        );
+        assert!(
+            !absent.to_lowercase().contains("still be running and holding"),
+            "…and does not warrant the unconfirmed-kill alarm either: {absent}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn watchdog_finalize_kill_publishes_absent_and_warns_when_no_container_was_found() {
+        // (#2232, round 3) THE UNCOVERED CALL SITE. `KillOutcome::warning`
+        // and `inactivity_timeout_stderr` were unit-tested as pure functions,
+        // which pinned the BRANCHES and left the code that CHOOSES between
+        // them — three statements inline in a `thread::spawn` closure — with
+        // no test at all. Both of these mutations passed the whole 1029-test
+        // crate suite before this test existed:
+        //
+        //   W1: store a hardcoded `KillDisposition::Confirmed.code()` instead
+        //       of the outcome's own → the operator-visible marker claims
+        //       "was killed by the watchdog" in the Absent AND Unconfirmed
+        //       cases, which is the precise lie #2232 exists to fix.
+        //   W2: drop the `eprintln!` → the watchdog gives up SILENTLY, which
+        //       is #2232's own headline failure mode.
+        //
+        // The absent-container case pins both at once: the disposition it
+        // must publish is not the one W1 hardcodes, and it must return a
+        // warning W2 would swallow.
+        let dir = TempDir::new().unwrap();
+        let (_record_path, prev_path) = install_absent_container_docker(&dir);
+
+        // Seeded with `Confirmed` — the value W1 would leave standing — so a
+        // pass proves the store actually carried the OUTCOME across, rather
+        // than the atomic merely happening to hold the right byte.
+        let disposition = super::AtomicU8::new(KillDisposition::Confirmed.code());
+        let warning = watchdog_finalize_kill(
+            "darkmux-dispatch-finalize-absent-2232",
+            TEST_BACKOFF,
+            &disposition,
+        );
+
+        restore_path(prev_path);
+
+        assert_eq!(
+            KillDisposition::from_code(disposition.load(super::Ordering::SeqCst)),
+            KillDisposition::Absent,
+            "the watchdog must publish what the kill ESTABLISHED — a hardcoded `Confirmed` here \
+             makes the timeout marker claim a kill that never happened"
+        );
+        let warning = warning.expect(
+            "a watchdog that found nothing to kill must hand its caller a warning, never \
+             silence — giving up quietly is the failure mode #2232 is about",
+        );
+        assert!(
+            warning.contains("darkmux-dispatch-finalize-absent-2232"),
+            "the warning must name the container the operator has to deal with: {warning}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn watchdog_finalize_kill_publishes_confirmed_and_stays_quiet_on_a_healthy_kill() {
+        // (#2232, round 3) The other half of the call site, and the reason
+        // the warning means anything: a kill that actually worked must
+        // publish `Confirmed` — so the marker MAY say the container was
+        // killed — and must return `None`, so the operator's stderr stays
+        // clean and a warning that does appear is signal.
+        let dir = TempDir::new().unwrap();
+        let (record_path, prev_path) = install_fake_docker(&dir);
+
+        // Seeded with `Unconfirmed` — the production initial value (#2232
+        // round 3, fail closed) — so a pass proves the store ran.
+        let disposition = super::AtomicU8::new(KillDisposition::Unconfirmed.code());
+        let warning =
+            watchdog_finalize_kill("darkmux-dispatch-finalize-ok-2232", TEST_BACKOFF, &disposition);
+
+        restore_path(prev_path);
+
+        assert_eq!(
+            KillDisposition::from_code(disposition.load(super::Ordering::SeqCst)),
+            KillDisposition::Confirmed,
+            "a confirmed kill must be published as one, or the marker under-claims forever"
+        );
+        assert_eq!(
+            warning, None,
+            "a confirmed kill must NOT warn — the warning has to stay rare to be read: \
+             {warning:?}"
+        );
+        let recorded = std::fs::read_to_string(&record_path).unwrap();
+        assert_eq!(
+            recorded.trim(),
+            "kill darkmux-dispatch-finalize-ok-2232",
+            "and it must still cost exactly one `docker kill`: {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn kill_disposition_survives_the_atomic_round_trip() {
+        // (#2232, round 2) The disposition crosses from the watchdog thread
+        // to the main thread as a `u8` in an atomic, and it is the only thing
+        // deciding whether the operator-visible marker claims a kill. A
+        // mis-mapped code would make it lie silently, so pin the round trip.
+        for d in
+            [KillDisposition::Confirmed, KillDisposition::Absent, KillDisposition::Unconfirmed]
+        {
+            assert_eq!(KillDisposition::from_code(d.code()), d, "round trip for {d:?}");
+        }
+        assert_eq!(KillDisposition::from_code(0), KillDisposition::Confirmed, "0 is Confirmed");
+        // (#2232, round 3) The catch-all must FAIL CLOSED. `Confirmed` is the
+        // only disposition that licenses the marker to claim a kill happened,
+        // so no unaccounted-for byte may decay into it — not a future variant
+        // an older reader does not know, not an atomic left at some other
+        // value. Unreachable today (the watchdog writes only 0/1/2) and
+        // costless to keep that way; the production initial value is
+        // `Unconfirmed` for the same reason.
+        assert_eq!(
+            KillDisposition::from_code(7),
+            KillDisposition::Unconfirmed,
+            "an unexpected code must not be read as a confirmed kill"
+        );
+    }
+
     // ─── (#2111) should_record_machine_telemetry — periodic curve cadence ─
 
     #[test]
