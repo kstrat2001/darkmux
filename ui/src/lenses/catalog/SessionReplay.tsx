@@ -16,7 +16,7 @@ import { injectedPlaybackDate } from "../../lib/injectedMeta";
  *  container has been hard-killed, so a still-ticking counter would be
  *  asserting something the harness has already ruled out. */
 export const STALE_AFTER_MS = 600_000;
-import { LivenessPulse } from "../../components/LivenessPulse";
+import { livenessState } from "../../components/LivenessPulse";
 import { runRegions } from "../session/sessionRun";
 import type { FlowRecordsResponse } from "../../types/handwritten";
 
@@ -206,6 +206,7 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
     );
   }
   const view = ticking ? runRegions(data, sessionId, nowMs) : base;
+  const liveness = livenessState({ done: !view.live, animate: ticking, lastBeatMs: view.lastBeatMs, nowMs });
 
   return (
     <div data-state="data" className="session-run">
@@ -216,8 +217,13 @@ export function SessionReplay({ sessionId, playhead = null }: { sessionId: strin
             the `{" "}` below — and there must be none before `RUN`. The first
             version added a second and CI caught `RUNNING  RUN ·`, which is
             invisible on screen and unmissable to the golden. */}
-        <span className={`pill pill--${view.header.pillCls}`}>{view.header.pillLabel}</span>{" "}
-        <LivenessPulse done={!view.live} animate={ticking} lastBeatMs={view.lastBeatMs} />
+        <span
+          className={`pill pill--${view.header.pillCls}`}
+          data-live={liveness.state}
+          title={liveness.label}
+        >
+          {view.header.pillLabel}
+        </span>{" "}
         {/* (#1974) No noun. This view's subject is ONE ROLE EXECUTION — one
             role, one model, its turns, tokens and signals. `RUN` was the one
             word contract 8 says it definitely is not: `run` is the umbrella

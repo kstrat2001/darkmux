@@ -16,7 +16,6 @@
  * threshold to the emitter's own constant is the point — a number picked
  * independently would drift the first time that cadence changed.
  */
-import { useNowMs } from "../lib/clock";
 
 /** How long without proof of life before the pulse holds still.
  *
@@ -50,13 +49,37 @@ export interface LivenessPulseProps {
   lastBeatMs: number | null;
 }
 
-export function LivenessPulse({ done, animate, lastBeatMs }: LivenessPulseProps) {
-  // Subscribed only while animating — the shared clock's timer is gated on
-  // having an active subscriber, so a finished run drives nothing.
-  const nowMs = useNowMs(animate);
-  const quiet = !animate || lastBeatMs == null || nowMs - lastBeatMs > PULSE_QUIET_AFTER_MS;
-  const state = done ? "done" : !animate ? "stale" : quiet ? "quiet" : "beating";
+/** (operator, 2026-09-01) The dot was removed and the RUNNING pill pulses
+ *  instead — one element carrying both the semantic state (its text) and the
+ *  liveness state (its beat), rather than two elements a reader has to
+ *  correlate. The four-state computation below is unchanged and still the
+ *  point: `done` (has a terminal record) and `animate` (plausibly executing)
+ *  answer different questions, and a run that opened and went silent reads
+ *  RUNNING while liveness says otherwise. That contradiction is the signal,
+ *  so it survives as `data-live` on the pill.
+ *
+ *  The label rides `title` rather than `aria-label`: the pill already has an
+ *  accessible name from its own text, and overriding it would trade one piece
+ *  of information for another. `title` is exposed as a DESCRIPTION, and adds
+ *  no text — which the parity golden requires, since it compares `#stage`
+ *  innerText byte-for-byte. */
+export type LivenessState = "beating" | "quiet" | "stale" | "done";
 
+export function livenessState({
+  done,
+  animate,
+  lastBeatMs,
+  nowMs,
+}: LivenessPulseProps & { nowMs: number }): {
+  state: LivenessState;
+  label: string;
+} {
+  // A PURE function, not a hook: the view already subscribes to the shared
+  // clock and holds `nowMs`. Calling `useNowMs` again here added a second
+  // hook behind the component's early returns — "Rendered more hooks than
+  // during the previous render" — so the clock stays the caller's.
+  const quiet = !animate || lastBeatMs == null || nowMs - lastBeatMs > PULSE_QUIET_AFTER_MS;
+  const state: LivenessState = done ? "done" : !animate ? "stale" : quiet ? "quiet" : "beating";
   const label =
     state === "beating"
       ? "running"
@@ -65,21 +88,5 @@ export function LivenessPulse({ done, animate, lastBeatMs }: LivenessPulseProps)
         : state === "stale"
           ? "no recent activity, may be abandoned"
           : "finished";
-
-  return (
-    <span
-      className="pulse"
-      data-state={state}
-      // `role="img"`, NOT `role="status"`. `status` is an ARIA live region, so
-      // every state change is announced — and the boundary here is a bare
-      // threshold with no hysteresis, so a dispatch whose turn latency hovers
-      // near the quiet cutoff flaps between labels once a second. That is
-      // exactly the struggling run an operator most needs a CLEAN signal
-      // about. A pulse is ambient status with a text alternative, read on
-      // demand; it is not an alert.
-      role="img"
-      aria-label={label}
-      title={label}
-    />
-  );
+  return { state, label };
 }

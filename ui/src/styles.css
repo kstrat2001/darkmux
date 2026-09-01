@@ -4144,28 +4144,28 @@ body {
    than stopped when a run goes quiet. Stopping and restarting would stutter
    at whatever irregular cadence records happen to arrive at, which reads as a
    fault rather than as health. */
-.pulse {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  vertical-align: middle;
-  background: var(--dim);
+/* (operator, 2026-09-01) The RUNNING pill itself pulses; the separate dot is
+   gone. One element carries the semantic state (its text) and the liveness
+   state (its beat). As before the element is never remounted — beats only move
+   a number — so the animation runs continuously and is PAUSED rather than
+   restarted, which would stutter at whatever cadence records happen to arrive
+   at and read as a fault rather than as health. */
+.pill[data-live] {
   animation: pulse-beat 1.6s ease-in-out infinite;
   animation-play-state: paused;
 }
-.pulse[data-state="beating"] {
-  background: #4fd18b;
+.pill[data-live="beating"] {
   animation-play-state: running;
 }
 /* Quiet: still live, but nothing has landed recently. Held still and hollow —
    distinguishable from "beating" WITHOUT relying on motion or hue alone. */
-.pulse[data-state="quiet"] {
-  background: transparent;
-  box-shadow: inset 0 0 0 1px #4fd18b;
-}
-.pulse[data-state="done"] {
-  background: var(--border);
+/* Quiet/stale: still live, but nothing has landed recently. Dimmed rather
+   than merely un-animated, so the distinction survives for anyone who has
+   asked motion to stop — the original dot solved the same problem with
+   filled-vs-hollow. */
+.pill[data-live="quiet"],
+.pill[data-live="stale"] {
+  opacity: 0.62;
 }
 @keyframes pulse-beat {
   0%,
@@ -4181,7 +4181,7 @@ body {
 /* A pulsing dot is decoration for anyone who has asked motion to stop. The
    state stays legible: filled = beating, hollow = quiet. */
 @media (prefers-reduced-motion: reduce) {
-  .pulse {
+  .pill[data-live] {
     animation: none;
   }
 }
