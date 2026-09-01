@@ -317,6 +317,100 @@ export function stepForRecord(rec: FlowRecord, idx: GraphIndex, missionId: strin
   return null;
 }
 
+/** (#2223) Does this flow-record action attest MODEL-DISPATCH work?
+ * Covers both the dotted (`dispatch.start`) and legacy space-separated
+ * (`dispatch start`) spellings the stream carries. Mission/phase/step
+ * bookkeeping (`mission start`, `step result`, ...) and telemetry all say
+ * no -- which is the point: it separates "a dispatch actually ran under
+ * this session" from "this session merely appears in the record stream". */
+export function isDispatchAction(action: string): boolean {
+  return action === "dispatch" || action.startsWith("dispatch.") || action.startsWith("dispatch ");
+}
+
+/** `stepDispatchSessions` (#2223) -- the INVERSE of {@link stepForRecord}:
+ * for each step, the dispatch session id observed on that step's own
+ * records, which is what lets the step drill-in reach the dispatch detail
+ * view (`#dispatch=<id>`) instead of only scoping the events column.
+ *
+ * The discriminator is EVIDENCE OF DISPATCH, not the shape of the session
+ * id: a session counts only through records whose action is a
+ * `dispatch.*` bookend/turn ({@link isDispatchAction}). This matters
+ * because the emitter's DEFAULT session id for a `dispatch.internal` step
+ * with no configured session is literally `step-<id>`
+ * (`session_id::step`, see `crates/darkmux-serve/src/runs.rs`'s
+ * "join by session_id" doc) -- the id LOOKS graph-minted and is
+ * simultaneously the real dispatch session for every generic
+ * `mission launch <config>` step. An earlier version of this function
+ * filtered those by prefix and was therefore inert on exactly that
+ * flagship path (caught in adversarial review). Steps that never
+ * dispatched (procedural steps, bookkeeping-only sessions) still produce
+ * no entry, and the caller keeps #2189's scoping -- the honest fallback.
+ *
+ * Selection, when a step's records name more than one dispatch session:
+ * 1. A session whose dispatch records carry THIS mission's `mission_id`
+ *    beats any session that doesn't -- generic-launch dispatch records
+ *    carry `mission_id: null` (the serve doc's gap 1/2), so null-mission
+ *    records are admitted, but a concurrent mission's records leaking in
+ *    through the day-file merge (they pass `recordInMission`'s last-resort
+ *    step-id match only when THEY are null-mission too) can never outrank
+ *    records positively tagged as ours.
+ * 2. Within a tier, the step's own emitter-default session
+ *    (`step-<stepId>`) wins -- it is deterministic and cannot belong to a
+ *    colliding foreign step.
+ * 3. Otherwise the session with the LATEST dispatch-action timestamp wins,
+ *    not the most records: a looped-then-killed attempt emits hundreds of
+ *    turn records while the successful retry emits a dozen, so frequency
+ *    selects the failure; recency selects the attempt that represents the
+ *    step's current state. Count breaks ts ties.
+ */
+export function stepDispatchSessions(records: FlowRecord[], missionId: string): Record<string, string> {
+  type Tally = { n: number; lastTs: number; ours: boolean };
+  const tally: Record<string, Record<string, Tally>> = {};
+  for (const rec of records) {
+    if (!isDispatchAction(rec.action || "")) continue;
+    const p = rec.payload || {};
+    const stepId = typeof p.step_id === "string" ? p.step_id : "";
+    const sid = typeof rec.session_id === "string" ? rec.session_id : "";
+    if (!stepId || !sid) continue;
+    if (rec.mission_id && rec.mission_id !== missionId) continue;
+    const forStep = (tally[stepId] ||= {});
+    const t = (forStep[sid] ||= { n: 0, lastTs: 0, ours: false });
+    t.n += 1;
+    t.lastTs = Math.max(t.lastTs, tsToMs(rec.ts));
+    if (rec.mission_id === missionId) t.ours = true;
+  }
+  const out: Record<string, string> = {};
+  for (const [stepId, seen] of Object.entries(tally)) {
+    const emitterDefault = "step-" + stepId;
+    let best = "";
+    let bestT: Tally | null = null;
+    for (const [sid, t] of Object.entries(seen)) {
+      if (!bestT) {
+        best = sid;
+        bestT = t;
+        continue;
+      }
+      if (t.ours !== bestT.ours) {
+        if (t.ours) { best = sid; bestT = t; }
+        continue;
+      }
+      const aDefault = sid === emitterDefault;
+      const bDefault = best === emitterDefault;
+      if (aDefault !== bDefault) {
+        if (aDefault) { best = sid; bestT = t; }
+        continue;
+      }
+      if (t.lastTs !== bestT.lastTs) {
+        if (t.lastTs > bestT.lastTs) { best = sid; bestT = t; }
+        continue;
+      }
+      if (t.n > bestT.n) { best = sid; bestT = t; }
+    }
+    if (best) out[stepId] = best;
+  }
+  return out;
+}
+
 /** `applyRecordToMetrics` — mission-graph.html. Folds one record into the
  * per-step metric accumulator, returning a NEW map only when something
  * changed (so a no-op record doesn't churn state). */
