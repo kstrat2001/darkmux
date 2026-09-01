@@ -22,7 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2699,6 +2699,389 @@ fn docker_kill_by_name(container_name: &str) {
     let _ = Command::new("docker").args(["kill", container_name]).output();
 }
 
+// (#2232) The inactivity watchdog is the UNATTENDED safety net, and its kill
+// used to be one fire-and-forget `docker kill` after which the thread
+// RETURNED. A single transient docker failure (dockerd busy or restarting, an
+// API hiccup) therefore retired the watchdog while the main thread sat in
+// `wait_with_output()` — which has no timeout of its own — so a genuinely hung
+// container hung the dispatch forever: the net failing open in exactly the
+// case it exists for. The constants below make the kill persistent instead.
+/// Total kill attempts before the watchdog admits defeat (loudly). Five with
+/// the backoff below spans ~3.75s of daemon trouble, which covers the
+/// transient class this exists for (a busy or restarting dockerd) while
+/// staying an order of magnitude under the inactivity budget it fires from —
+/// and, since `dispatch` joins this thread, bounding how long any teardown
+/// path can wait on it. A container a healthy daemon cannot remove in five
+/// escalating attempts is not a retry problem; it is an operator problem, and
+/// the warning says so rather than looping forever. (#2232)
+const CONTAINER_KILL_MAX_ATTEMPTS: u32 = 5;
+/// Doubles each attempt (250ms · 500ms · 1s · 2s between the five tries).
+/// Starts short because most kills succeed on the first try and a retry that
+/// waits a full second before its second attempt would add latency to the
+/// common transient case; doubles so the tail of the window is spent waiting
+/// rather than hammering a daemon that is already struggling. (#2232)
+const CONTAINER_KILL_BASE_BACKOFF: Duration = Duration::from_millis(250);
+/// Attempts 1..=2 use `docker kill`; the rest escalate to `docker rm -f`.
+/// Two tries of the gentler verb, because a `kill` that failed once on a busy
+/// daemon usually succeeds on the retry; after that, repeating a verb that is
+/// still failing is not a strategy, so escalate to the one that also removes a
+/// container stuck in a state `kill` will not touch. (#2232)
+const CONTAINER_KILL_ESCALATE_AFTER: u32 = 2;
+
+/// (#2232) What the persistent kill actually established — the distinction
+/// the old fire-and-forget kill could not make, because it discarded the very
+/// exit status that carries it.
+#[derive(Debug, PartialEq, Eq)]
+enum KillOutcome {
+    /// The container was OBSERVED — a successful `docker kill`, a `docker
+    /// rm -f` that really removed something, or a probe that saw it running —
+    /// and is now stopped.
+    Confirmed { attempts: u32 },
+    /// docker answered every probe conclusively and NEVER showed the
+    /// container at all: not running, and no attempt ever proved it existed.
+    /// Distinct from `Confirmed` because "never seen" is not "seen stopped" —
+    /// a container being created right now (an `--image` still being pulled)
+    /// looks exactly like this. (#2232, round 2)
+    ///
+    /// **This variant DISCLOSES the pull window; it does not close it
+    /// ([#2252]).** When the inactivity deadline fires while `docker run` is
+    /// still pulling a BYO `--image`, the watchdog burns its budget against a
+    /// container that does not exist yet, settles here, warns — and then the
+    /// thread RETURNS. Nothing re-arms. The pull finishes, the container
+    /// starts UNWATCHED, and the main thread is still parked in
+    /// `wait_with_output()` with nothing left that can kill it, exactly as
+    /// before. What changed in round 2 is only that the operator is now told:
+    /// the outcome used to read `Confirmed { attempts: 1 }` at ~0s and lie.
+    ///
+    /// Two limits on how far that disclosure reaches, so nobody mistakes this
+    /// for the fix:
+    ///
+    /// - The warning is an `eprintln!` from a process that may never exit. An
+    ///   unattended `mission launch` whose harness reads stderr only at
+    ///   process end shows the operator NOTHING.
+    /// - Nothing re-arms the deadline against the container that eventually
+    ///   starts, so the dispatch can still hang indefinitely.
+    ///
+    /// The real fixes — re-arming the watchdog once the container appears, or
+    /// pulling the image in a preflight step outside the inactivity budget —
+    /// are [#2252], deliberately NOT built here.
+    ///
+    /// [#2252]: https://github.com/kstrat2001/darkmux/issues/2252
+    Absent { attempts: u32 },
+    /// Every attempt was exhausted and the container could NEVER be shown to
+    /// be stopped. It may still be running.
+    Unconfirmed { attempts: u32, last_error: String },
+}
+
+impl KillOutcome {
+    /// The operator-facing warning for a give-up — `None` when the kill was
+    /// confirmed. Giving up is allowed; giving up QUIETLY is the failure mode
+    /// #2232 is about, so the give-up path carries its own message as a value
+    /// rather than trusting a call site to remember to print one. (#2232)
+    fn warning(&self, container_name: &str) -> Option<String> {
+        match self {
+            KillOutcome::Confirmed { .. } => None,
+            // Deliberately NOT the "may still be running and holding its
+            // model load" alarm: docker told us, conclusively and repeatedly,
+            // that there is no such container. What the operator needs to
+            // know is the other thing — the watchdog had nothing to kill, so
+            // whatever the deadline fired against is not accounted for.
+            KillOutcome::Absent { attempts } => Some(format!(
+                "darkmux dispatch: ⚠ the inactivity watchdog found NO container named \
+                 `{container_name}` across {attempts} attempts — nothing was killed. If the \
+                 dispatch is still running, its container was created after the deadline fired \
+                 (an `--image` pulled inline by `docker run` can take longer than the inactivity \
+                 budget) and is now UNWATCHED; stop it with `docker ps` + `docker kill` if it \
+                 hangs. (#2232)"
+            )),
+            KillOutcome::Unconfirmed { attempts, last_error } => Some(format!(
+                "darkmux dispatch: ⚠ the inactivity watchdog could not confirm container \
+                 `{container_name}` stopped after {attempts} attempts (`docker kill`, then \
+                 `docker rm -f`) — it may still be running and holding its model load. Check \
+                 `docker ps` and stop it by hand. Last docker error: {last_error} (#2232)"
+            )),
+        }
+    }
+
+    /// The three-state summary the watchdog thread hands to the main thread
+    /// through an atomic. (#2232)
+    fn disposition(&self) -> KillDisposition {
+        match self {
+            KillOutcome::Confirmed { .. } => KillDisposition::Confirmed,
+            KillOutcome::Absent { .. } => KillDisposition::Absent,
+            KillOutcome::Unconfirmed { .. } => KillDisposition::Unconfirmed,
+        }
+    }
+}
+
+/// (#2232) What the persistent kill established, in the form the main thread
+/// reads back out of an `AtomicU8` after joining the watchdog. A single
+/// three-state value rather than a pair of bools so the impossible fourth
+/// state ("confirmed AND absent") is unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KillDisposition {
+    Confirmed,
+    Absent,
+    Unconfirmed,
+}
+
+impl KillDisposition {
+    fn code(self) -> u8 {
+        match self {
+            KillDisposition::Confirmed => 0,
+            KillDisposition::Absent => 1,
+            KillDisposition::Unconfirmed => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            0 => KillDisposition::Confirmed,
+            1 => KillDisposition::Absent,
+            // FAIL CLOSED. Every other byte is a state we cannot account for
+            // — an atomic never written because the watchdog panicked before
+            // reaching its store, a future variant an older reader does not
+            // know. `Confirmed` is the only value that licenses the marker to
+            // claim a kill happened, so it must never be something a surprise
+            // byte can decay into; `Unconfirmed` merely tells the operator to
+            // check `docker ps`, which is the safe thing to be wrong about.
+            // Unreachable today (the watchdog writes only 0/1/2) and costless
+            // to keep that way. (#2232, round 3)
+            _ => KillDisposition::Unconfirmed,
+        }
+    }
+}
+
+/// (#2232) What one `docker ps` probe established about `container_name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// A successful `docker ps` listed it — it is running RIGHT NOW.
+    Running,
+    /// A successful `docker ps` listed nothing. docker answered, and its
+    /// answer is "there is no running container by that name". Note what this
+    /// does NOT distinguish (measured on docker 29.1.3): a container that ran
+    /// and exited, one still in `created` state, and one that has never been
+    /// created all produce exit 0 + empty stdout. So this is "not running",
+    /// never "was running and stopped" — the caller supplies that half from
+    /// whether it ever observed the container itself. Round 1 of #2232
+    /// collapsed the two and re-opened the fail-open it was fixing.
+    NotPresent,
+    /// The probe itself failed — a non-zero exit, a docker binary that will
+    /// not spawn. *Absence of evidence*, and reading it as "gone" would
+    /// reintroduce the exact fail-open this issue is about: a dockerd that is
+    /// down fails this probe for the same reason it failed the kill.
+    Unknown,
+}
+
+fn probe_container_liveness(container_name: &str) -> Liveness {
+    // The `name` filter is a Go regexp and the container-name sanitizer
+    // upstream lets `.` through, so `darkmux-dispatch-a.b` also matches
+    // `darkmux-dispatch-aXb`. That is SAFE HERE and must stay this shape: a
+    // spurious extra match makes stdout non-empty, which reads as `Running`,
+    // which keeps the watchdog retrying. It can never manufacture a false
+    // `NotPresent`. Do NOT "fix" this toward a `docker ps -a` form or an
+    // unanchored filter — `-a` lists exited containers, so it would report a
+    // dead container as alive, and dropping the anchors would match every
+    // container whose name merely CONTAINS this one's. (#2232)
+    match Command::new("docker")
+        .args(["ps", "--quiet", "--filter", &format!("name=^{container_name}$")])
+        .output()
+    {
+        Ok(o) if !o.status.success() => Liveness::Unknown,
+        Ok(o) if String::from_utf8_lossy(&o.stdout).trim().is_empty() => Liveness::NotPresent,
+        Ok(_) => Liveness::Running,
+        Err(_) => Liveness::Unknown,
+    }
+}
+
+/// (#2232) Stop `container_name` and keep trying until it is confirmed
+/// stopped or the attempts run out — the persistent replacement for the
+/// watchdog's single fire-and-forget `docker kill`.
+///
+/// Why a failed kill is not simply retried with the same verb: `docker kill`
+/// fails for two very different reasons that share an exit code — a daemon
+/// problem (retry helps) and "container is not running / no such container"
+/// (retrying is pointless and would end in a false alarm). The liveness probe
+/// after each failure is what separates them, so a container that was seen
+/// running and then exits in the watchdog's final race window settles as soon
+/// as the probe says so instead of burning the whole budget and crying wolf.
+///
+/// Why the loop tracks whether it EVER OBSERVED the container (#2232, round
+/// 2): every "the container is gone" signal docker offers is also emitted for
+/// a container that has never been created, so none of them is proof on its
+/// own. Measured on docker 29.1.3:
+///
+/// - `docker ps --quiet --filter name=^X$` → exit 0, empty stdout, whether X
+///   exited, is still in `created`, or has never existed.
+/// - `docker rm -f X` → **exit 0** for a container that never existed (empty
+///   stdout; the name is echoed on stdout only when something was removed).
+/// - `docker kill X` → exit 1 unless X is genuinely running, which is what
+///   makes ITS success an observation.
+///
+/// Treating any of those as "confirmed stopped" retires the watchdog over a
+/// container that may be seconds from starting — the case where `docker run`
+/// is pulling a BYO `--image` inline while the inactivity deadline is already
+/// armed. So `Confirmed` requires an observation; without one the loop keeps
+/// watching for the whole budget and reports `Absent`.
+///
+/// `base_backoff` is a parameter rather than a read of the constant so tests
+/// pin the retry BEHAVIOR without paying its production CADENCE; the one
+/// production call site passes `CONTAINER_KILL_BASE_BACKOFF`. It is
+/// deliberately not an operator knob — nothing about a transient dockerd
+/// failure is engagement-specific.
+fn kill_container_persistently(container_name: &str, base_backoff: Duration) -> KillOutcome {
+    let mut last_error = String::new();
+    // Has anything in THIS loop proved the container actually exists?
+    let mut observed = false;
+    // Did any probe fail to answer? A `NotPresent` reading only means
+    // "absent" when docker was reachable for every probe; one `Unknown` and
+    // we know nothing, so the outcome must stay `Unconfirmed` (fail closed).
+    let mut probe_inconclusive = false;
+    for attempt in 1..=CONTAINER_KILL_MAX_ATTEMPTS {
+        let killing = attempt <= CONTAINER_KILL_ESCALATE_AFTER;
+        let args: Vec<&str> =
+            if killing { vec!["kill", container_name] } else { vec!["rm", "-f", container_name] };
+        match Command::new("docker").args(&args).output() {
+            Ok(o) if o.status.success() => {
+                // A successful `docker kill` is itself an observation — it
+                // only succeeds against a RUNNING container. A successful
+                // `docker rm -f` is not: it exits 0 for a container that
+                // never existed. What separates the two is stdout, which
+                // carries the removed container's name and is empty in the
+                // no-such-container case.
+                if killing || !String::from_utf8_lossy(&o.stdout).trim().is_empty() {
+                    return KillOutcome::Confirmed { attempts: attempt };
+                }
+                // Exit 0 that proved nothing. Not an error, so `last_error`
+                // is left alone; fall through to the probe and keep watching.
+            }
+            Ok(o) => {
+                last_error = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                if last_error.is_empty() {
+                    last_error = format!(
+                        "`docker {}` exited without a message ({})",
+                        args.join(" "),
+                        o.status
+                    );
+                }
+            }
+            Err(e) => last_error = format!("could not run `docker`: {e}"),
+        }
+        // The attempt settled nothing — and "already gone", "not created
+        // yet" and "daemon trouble" all look identical from the exit code
+        // alone. Ask.
+        match probe_container_liveness(container_name) {
+            Liveness::Running => observed = true,
+            // Only meaningful once we have seen the container ourselves:
+            // then, and only then, does "not running" mean "stopped".
+            Liveness::NotPresent if observed => {
+                return KillOutcome::Confirmed { attempts: attempt };
+            }
+            Liveness::NotPresent => {}
+            Liveness::Unknown => probe_inconclusive = true,
+        }
+        if attempt < CONTAINER_KILL_MAX_ATTEMPTS {
+            thread::sleep(base_backoff * 2u32.pow(attempt - 1));
+        }
+    }
+    let attempts = CONTAINER_KILL_MAX_ATTEMPTS;
+    if !observed && !probe_inconclusive {
+        // docker answered every probe and never once showed this container.
+        // Honest state, and NOT the "it may still be running" alarm.
+        return KillOutcome::Absent { attempts };
+    }
+    if last_error.is_empty() {
+        // UNREACHABLE with `CONTAINER_KILL_ESCALATE_AFTER >= 1`, and kept
+        // anyway so a future constant change cannot print an empty "Last
+        // docker error:". Attempts 1..=ESCALATE_AFTER run `docker kill`,
+        // which either succeeds (and returns `Confirmed` from inside the
+        // loop) or sets `last_error`; so by the time the loop can fall out
+        // here, `last_error` is always non-empty. Proven, round 3: replacing
+        // this body with `unreachable!()` left the whole crate suite green.
+        // Set `ESCALATE_AFTER` to 0 and it comes alive — every attempt would
+        // be `rm -f`, which exits 0 with empty stdout for a container that
+        // never existed, leaving no error text behind while a mute probe
+        // keeps the outcome `Unconfirmed`. (#2232)
+        last_error =
+            "no attempt reported an error, and `docker ps` never answered conclusively"
+                .to_string();
+    }
+    KillOutcome::Unconfirmed { attempts, last_error }
+}
+
+/// (#2232) The operator-visible stderr the harness prepends when the
+/// inactivity watchdog fired.
+///
+/// Extracted from the inline `format!` it used to be so the honest/dishonest
+/// branch is unit-testable. The old text asserted flatly that the container
+/// "was killed by the watchdog" — a claim with no evidence behind it, and
+/// false in precisely the case that matters. Only `KillDisposition::Confirmed`
+/// may claim a kill happened; the other two say what actually happened
+/// instead of telling the operator a comforting thing that is not true.
+fn inactivity_timeout_stderr(
+    container_name: &str,
+    inactivity_secs: u64,
+    kill: KillDisposition,
+    stderr: &str,
+) -> String {
+    let disposition = match kill {
+        KillDisposition::Confirmed => {
+            format!("container `{container_name}` was killed by the watchdog")
+        }
+        // (#2232, round 2) No kill happened and no alarm is warranted: docker
+        // answered conclusively and never showed the container. Say exactly
+        // that, and name the case that produces it.
+        KillDisposition::Absent => format!(
+            "the watchdog found NO container named `{container_name}` to kill across \
+             {CONTAINER_KILL_MAX_ATTEMPTS} attempts — nothing was stopped, and the deadline may \
+             have fired while `docker run` was still pulling the image"
+        ),
+        KillDisposition::Unconfirmed => format!(
+            "the watchdog COULD NOT CONFIRM container `{container_name}` stopped after \
+             {CONTAINER_KILL_MAX_ATTEMPTS} attempts (`docker kill`, then `docker rm -f`) — it \
+             may still be running and holding its model load; check `docker ps`"
+        ),
+    };
+    format!(
+        "{INACTIVITY_TIMEOUT_MARKER} — no proof-of-work signal in {inactivity_secs}s — \
+         {disposition}. The inactivity timer resets on each successful tool call (read / bash / \
+         edit / write) and on each compaction event. Genuine thinking-mode hangs and total \
+         stalls trigger this; productive dispatches making any tool calls stay alive. \
+         Pathological tool patterns are caught by their dedicated detectors (cycle / cascade / \
+         cadence-drift) so the deadline can trust activity. Override the default with \
+         DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<N>. (#363, #457, #464, #2232)\n{stderr}"
+    )
+}
+
+/// (#2232, round 3) The watchdog's entire give-up sequence, as one unit a test
+/// can drive: run the persistent kill, PUBLISH what it established to the main
+/// thread through `kill_disposition`, and RETURN the operator-facing warning
+/// instead of printing it.
+///
+/// Extracted because the previous shape put three consecutive statements
+/// inline in a `thread::spawn` closure, which no unit test can reach — and
+/// those three statements are the whole decision. `KillOutcome::warning` and
+/// `inactivity_timeout_stderr` were already unit-tested as pure functions,
+/// which pinned the BRANCHES while leaving the code that CHOOSES between them
+/// unpinned: two mutations here (storing a hardcoded `Confirmed`, dropping the
+/// `eprintln!`) each re-opened the exact defect this issue exists to fix and
+/// left the whole 1029-test crate suite green. Both die against the two tests
+/// beside this function now.
+///
+/// Returning the warning rather than printing it is deliberate: it makes the
+/// "did we warn, and about what" decision an asserted VALUE, so the test never
+/// has to capture the process's stderr to see it. The one production caller
+/// does the `eprintln!`.
+fn watchdog_finalize_kill(
+    container_name: &str,
+    base_backoff: Duration,
+    kill_disposition: &AtomicU8,
+) -> Option<String> {
+    let outcome = kill_container_persistently(container_name, base_backoff);
+    kill_disposition.store(outcome.disposition().code(), Ordering::SeqCst);
+    outcome.warning(container_name)
+}
+
 /// (#2233) RAII backstop for the container itself, over the window between a
 /// successful `cmd.spawn()` and the point `wait_with_output()` takes
 /// responsibility for it. Same shape `DispatchBookendGuard` uses for the
@@ -3563,9 +3946,21 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // hang forever.
     let timeout_fired = Arc::new(AtomicBool::new(false));
     let watchdog_done = Arc::new(AtomicBool::new(false));
+    // (#2232) What the persistent kill established, as a `KillDisposition`
+    // code. Read once, below, to decide what the timeout marker may claim —
+    // only `Confirmed` licenses "was killed by the watchdog".
+    //
+    // Initialized to `Unconfirmed`, not `Confirmed`: the read below is gated
+    // on `timeout_fired`, so today the watchdog has always stored a real
+    // disposition before anything looks — but a watchdog that panicked
+    // between setting that flag and reaching its store would leave the
+    // initial value standing, and the initial value must not be the one that
+    // claims a kill. Fails closed for free. (#2232, round 3)
+    let kill_disposition = Arc::new(AtomicU8::new(KillDisposition::Unconfirmed.code()));
     let watchdog_handle = {
         let timeout_fired = Arc::clone(&timeout_fired);
         let watchdog_done = Arc::clone(&watchdog_done);
+        let kill_disposition = Arc::clone(&kill_disposition);
         let container_name = container_name.clone();
         let inactivity_deadline = Arc::clone(&inactivity_deadline);
         thread::spawn(move || {
@@ -3594,7 +3989,49 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
             // Mark timeout BEFORE the kill so the post-wait detection
             // sees the flag, then SIGKILL the container.
             timeout_fired.store(true, Ordering::SeqCst);
-            docker_kill_by_name(&container_name);
+            // (#2232) PERSISTENT, not fire-and-forget. This thread stays
+            // alive until the container is confirmed stopped or the attempts
+            // are exhausted; it used to fire one swallowed `docker kill` and
+            // return, so a single transient docker failure retired the only
+            // thing that could unblock the main thread's `wait_with_output()`
+            // — leaving a hung dispatch hung forever.
+            //
+            // Deliberately does NOT bail out on `watchdog_done`: the main
+            // thread sets that flag when its WAIT returns, which proves the
+            // docker CLI process ended, not that the container did (#2233's
+            // whole finding). Abandoning the kill there would re-open the
+            // orphan. The bound is the attempt budget instead, which keeps
+            // `dispatch`'s `watchdog_handle.join()` bounded WHENEVER THE
+            // DOCKER CLI RETURNS: ~3.75s of backoff plus however long the
+            // subprocesses take, and only on a dispatch that already timed
+            // out (a healthy one returns from the poll loop above without
+            // ever reaching this line).
+            //
+            // It is NOT a hard ceiling, and the ~3.75s figure covers only the
+            // sleeps. Every attempt is a blocking `Command::output()` and the
+            // docker CLI has no client-side timeout of its own, so a daemon
+            // that ACCEPTS a connection and never answers blocks this join
+            // for as long as the CLI hangs (measured against such a socket:
+            // `docker ps` still blocked at 41s, `docker kill` at 25s).
+            // Unchanged from before #2232 — in that hang class attempt 1
+            // blocks and the retries are never reached, so the worst case is
+            // exactly the single fire-and-forget kill's. Bounding it means
+            // spawn-poll-kill instead of `output()`; `LmsHost`'s
+            // `DARKMUX_MODEL_LOAD_TIMEOUT_SECONDS` handling (#1276) already
+            // does exactly that and is the pattern to copy. (#2232)
+            //
+            // The kill + publish + warn sequence lives in
+            // `watchdog_finalize_kill` rather than inline here, because a
+            // `thread::spawn` closure is unreachable from a unit test and
+            // these were the three statements that decided whether the
+            // operator is told the truth. (#2232, round 3)
+            if let Some(warning) = watchdog_finalize_kill(
+                &container_name,
+                CONTAINER_KILL_BASE_BACKOFF,
+                &kill_disposition,
+            ) {
+                eprintln!("{warning}");
+            }
         })
     };
 
@@ -3827,15 +4264,15 @@ pub fn dispatch(opts: DispatchOpts) -> Result<DispatchResult> {
     // this marker the harness would just see "non-zero exit" with no
     // diagnostic detail about why.
     if timeout_fired.load(Ordering::SeqCst) {
-        stderr = format!(
-            "{INACTIVITY_TIMEOUT_MARKER} — no proof-of-work signal in {inactivity_secs}s — \
-             container `{container_name}` was killed by the watchdog. The inactivity timer \
-             resets on each successful tool call (read / bash / edit / write) and on each \
-             compaction event. Genuine thinking-mode hangs and total stalls trigger this; \
-             productive dispatches making any tool calls stay alive. Pathological tool patterns \
-             are caught by their dedicated detectors (cycle / cascade / cadence-drift) so the \
-             deadline can trust activity. Override the default with \
-             DARKMUX_INACTIVITY_TIMEOUT_SECONDS=<N>. (#363, #457, #464)\n{stderr}"
+        // (#2232) The watchdog thread is already joined by this point (the
+        // paths that reach here all `watchdog_done.store` + `join()` above),
+        // so `kill_disposition` is final — and it decides whether this text
+        // may claim the container was killed.
+        stderr = inactivity_timeout_stderr(
+            &container_name,
+            inactivity_secs,
+            KillDisposition::from_code(kill_disposition.load(Ordering::SeqCst)),
+            &stderr,
         );
     }
 
