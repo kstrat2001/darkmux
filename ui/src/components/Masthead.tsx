@@ -192,17 +192,7 @@ export function Masthead({
       ) : (
         <span className="masthead__ver" id="verbadge" />
       )}
-      {getSource().kind === "static" ? (
-        // (#1801) No `<CatalogPanel>` here — see this component's own doc
-        // for why a static build gets inert text instead of a button that
-        // would 404 on click.
-        <span className="chip masthead__srcbadge" title={/^\d{4}-\d{2}-\d{2}$/.test(srcbadgeText(route, replayDate)) ? "the first recorded day in this replay" : undefined}>
-          {srcbadgeText(route, replayDate)}
-        </span>
-      ) : (
-        <CatalogPanel label={srcbadgeText(route, replayDate)} />
-      )}
-      {/* (#1801) A static build shows the PLAYBACK badge on every lens, not
+            {/* (#1801) A static build shows the PLAYBACK badge on every lens, not
           just the playback route. `isLiveRoute()` now returns false for the
           whole build (see its own doc), so keying the fallback on
           `route.kind === "playback"` alone would leave `#lens=runs` on the
@@ -231,6 +221,24 @@ export function Masthead({
           ⟳
         </button>
       ) : null}
+      {/* (operator, 2026-09-01) The day chip renders AFTER the status badge
+          and the refetch control, so the dropdown is the corner element in
+          EVERY state — `live` shows `● LIVE` then the chip, `reconnecting`
+          shows the badge, `⟳`, then the chip. Previously the chip came first
+          and whatever followed it took the corner, which moved with
+          connection state. It also reads in the right order now: "live,
+          today". Moving the refetch button up with the badge is not
+          incidental — it belongs beside the status it acts on. */}
+{getSource().kind === "static" ? (
+        // (#1801) No `<CatalogPanel>` here — see this component's own doc
+        // for why a static build gets inert text instead of a button that
+        // would 404 on click.
+        <span className="chip masthead__srcbadge" title={/^\d{4}-\d{2}-\d{2}$/.test(srcbadgeText(route, replayDate)) ? "the first recorded day in this replay" : undefined}>
+          {srcbadgeText(route, replayDate)}
+        </span>
+      ) : (
+        <CatalogPanel label={srcbadgeText(route, replayDate)} />
+      )}
       <nav className="masthead__nav">
         <a href="https://darkmux.com/" target="_blank" rel="noopener">
           home
