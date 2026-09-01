@@ -18,7 +18,7 @@ import { RunsBoard } from "./lenses/runs/RunsBoard";
 import { ConsolePanel } from "./lenses/console/ConsolePanel";
 import { MissionGraphLens } from "./lenses/mission/MissionGraphLens";
 import { StepHeaderBlock } from "./lenses/mission/StepHeaderBlock";
-import type { StepHeaderField } from "./lenses/mission/graph";
+import { stepDispatchSessions, type StepHeaderField } from "./lenses/mission/graph";
 import { SessionReplay } from "./lenses/catalog/SessionReplay";
 import { PlaybackLens } from "./lenses/catalog/PlaybackLens";
 import { useFlowWindow } from "./hooks/useFlowWindow";
@@ -226,9 +226,32 @@ export function App() {
   const onSelectStep = useCallback(
     (stepId: string | null) => {
       if (route.kind !== "mission") return;
+      // (#2223) Drill in as deep as the data allows. When the step's own
+      // records name a real dispatch, THAT is the drill-in the operator
+      // asked for -- the detail view, with the model's token counts,
+      // context headroom, host peaks and signals. #2189 could only scope
+      // the events column because the step carries no dispatch id itself;
+      // `stepDispatchSessions` recovers it from the records the lens has
+      // already fetched, so this needs no second request.
+      //
+      // A REAL navigation (`location.hash =`, a history entry) rather than
+      // `writeHash`'s `replaceState`, matching how every other cross-lens
+      // jump moves -- `FleetLens`'s activity bars use this exact form. The
+      // history entry is the point on a phone, where the back gesture is
+      // how the operator returns to the mission.
+      if (stepId) {
+        const dispatchId = stepDispatchSessions(missionEvents?.records ?? [])[stepId];
+        if (dispatchId) {
+          location.hash = `dispatch=${encodeURIComponent(dispatchId)}`;
+          return;
+        }
+      }
+      // No dispatch behind this step (a procedural step, or one whose
+      // records predate `step_id` stamping) -- keep #2189's scoping, which
+      // stays the best available view of it.
       writeHash(canonicalHash({ kind: "mission", missionId: route.missionId, stepId }));
     },
-    [route],
+    [route, missionEvents],
   );
   // (#2189) The selected step's header-block fields, reported by
   // `MissionGraphLens` — `null` whenever no step is selected (mirrors

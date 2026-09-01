@@ -21,6 +21,7 @@ import {
   statusFromRecord,
   statusRank,
   stepDisplayMetrics,
+  stepDispatchSessions,
   stepForRecord,
   stepLead,
   stepMeterFor,
@@ -454,5 +455,54 @@ describe("drawnEdges / phaseOrderEdges", () => {
       ["p1", "p2"],
       ["p2", "p3"],
     ]);
+  });
+});
+
+describe("stepDispatchSessions (#2223) — the step drill-in's route to the dispatch detail view", () => {
+  it("recovers the real dispatch session id from the step's own records", () => {
+    const map = stepDispatchSessions([
+      rec({ session_id: "crew-dispatch-coder-1788254029192466-0", payload: { step_id: "s1" } }),
+      rec({ session_id: "crew-dispatch-coder-1788254029192466-0", payload: { step_id: "s1" } }),
+    ]);
+    expect(map.s1).toBe("crew-dispatch-coder-1788254029192466-0");
+  });
+
+  it("REFUSES the graph-minted ids, so the drill-in never routes to an empty detail view", () => {
+    // These three are exactly what `indexGraph` synthesizes and what the
+    // mission's own bookkeeping records ride. Each correlates a record back
+    // to a node; none addresses a dispatch.
+    const map = stepDispatchSessions([
+      rec({ session_id: "step-s1", payload: { step_id: "s1" } }),
+      rec({ session_id: "task-t1", payload: { step_id: "s2" } }),
+      rec({ session_id: "mission-m1", payload: { step_id: "s3" } }),
+    ]);
+    expect(map).toEqual({});
+  });
+
+  it("leaves a step with no dispatch unmapped, so its caller keeps #2189's scoping", () => {
+    // A procedural step: real records, real session, but nothing stamps
+    // `step_id`, which is the only key this function correlates on.
+    expect(stepDispatchSessions([rec({ session_id: "crew-dispatch-x-1-0", payload: {} })])).toEqual({});
+  });
+
+  it("picks the MOST FREQUENT dispatch when a step was retried, not the first or last seen", () => {
+    // Ordered so first-seen AND last-seen both pick the abandoned attempt —
+    // the assertion only passes on a real frequency count.
+    const map = stepDispatchSessions([
+      rec({ session_id: "crew-dispatch-abandoned-0", payload: { step_id: "s1" } }),
+      rec({ session_id: "crew-dispatch-real-0", payload: { step_id: "s1" } }),
+      rec({ session_id: "crew-dispatch-real-0", payload: { step_id: "s1" } }),
+      rec({ session_id: "crew-dispatch-real-0", payload: { step_id: "s1" } }),
+      rec({ session_id: "crew-dispatch-abandoned-0", payload: { step_id: "s1" } }),
+    ]);
+    expect(map.s1).toBe("crew-dispatch-real-0");
+  });
+
+  it("keeps steps independent — one step's dispatch never leaks onto another", () => {
+    const map = stepDispatchSessions([
+      rec({ session_id: "crew-dispatch-a-0", payload: { step_id: "s1" } }),
+      rec({ session_id: "crew-dispatch-b-0", payload: { step_id: "s2" } }),
+    ]);
+    expect(map).toEqual({ s1: "crew-dispatch-a-0", s2: "crew-dispatch-b-0" });
   });
 });

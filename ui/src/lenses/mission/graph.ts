@@ -317,6 +317,60 @@ export function stepForRecord(rec: FlowRecord, idx: GraphIndex, missionId: strin
   return null;
 }
 
+/** (#2223) A session id MINTED BY THE GRAPH rather than observed on a real
+ * dispatch. `indexGraph` synthesizes `step-<id>`/`task-<id>` so a record
+ * carrying one can be correlated back to its node (see `sessionToStep`),
+ * and the mission's own bookkeeping records ride `mission-<id>`. None of
+ * the three addresses a dispatch, so none is a legal `#dispatch=` target --
+ * routing to one lands on a detail view with nothing to show. */
+export function isSyntheticSession(sessionId: string): boolean {
+  return sessionId.startsWith("step-") || sessionId.startsWith("task-") || sessionId.startsWith("mission-");
+}
+
+/** `stepDispatchSessions` (#2223) -- the INVERSE of {@link stepForRecord}:
+ * for each step, the real dispatch `session_id` observed on that step's own
+ * records, which is what makes the step drill-in able to reach the dispatch
+ * detail view (`#dispatch=<id>`) instead of only scoping the events column.
+ *
+ * Correlates on `payload.step_id` ALONE -- deliberately the single strong
+ * key, not `stepForRecord`'s three-key fallthrough. The other two keys
+ * (`session_id` via `sessionToStep`, `handle`) are exactly the SYNTHETIC
+ * ids this function exists to filter out, so feeding them back in would
+ * resolve every step to its own graph-minted id and route the drill-in to
+ * an empty detail view. A step whose records carry no `step_id` gets no
+ * entry, and its caller keeps #2189's scoping behavior -- the honest
+ * outcome for a procedural step that never dispatched a model at all.
+ *
+ * When a step's records name more than one dispatch (a retried step), the
+ * MOST FREQUENT wins rather than the first or last seen: a handful of
+ * bookkeeping records from an abandoned attempt should not outrank the
+ * attempt that actually did the work, and "first" and "last" each pick the
+ * wrong one depending on which way the retry went. */
+export function stepDispatchSessions(records: FlowRecord[]): Record<string, string> {
+  const tally: Record<string, Record<string, number>> = {};
+  for (const rec of records) {
+    const p = rec.payload || {};
+    const stepId = typeof p.step_id === "string" ? p.step_id : "";
+    const sid = typeof rec.session_id === "string" ? rec.session_id : "";
+    if (!stepId || !sid || isSyntheticSession(sid)) continue;
+    const forStep = (tally[stepId] ||= {});
+    forStep[sid] = (forStep[sid] || 0) + 1;
+  }
+  const out: Record<string, string> = {};
+  for (const [stepId, seen] of Object.entries(tally)) {
+    let best = "";
+    let bestN = 0;
+    for (const [sid, n] of Object.entries(seen)) {
+      if (n > bestN) {
+        best = sid;
+        bestN = n;
+      }
+    }
+    if (best) out[stepId] = best;
+  }
+  return out;
+}
+
 /** `applyRecordToMetrics` — mission-graph.html. Folds one record into the
  * per-step metric accumulator, returning a NEW map only when something
  * changed (so a no-op record doesn't churn state). */
