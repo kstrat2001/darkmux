@@ -20,6 +20,7 @@
  */
 
 import type { FlowRecord, PresenceBeat } from "../types/handwritten";
+import { isPlainObject } from "./guards";
 
 /** `LIVE_WINDOW_MS` — viewer.html:3374. The rolling live window `RAW` is
  * bounded to; also the "N records · last Nh" meta-line's hour figure. */
@@ -193,7 +194,7 @@ export function asRecordArray(body: unknown): FlowRecord[] {
  * mission past the server cap must say so, or "N of 10000" silently
  * restates the cap as the mission's whole history. */
 export function bodyTruncated(body: unknown): boolean {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  if (!isPlainObject(body)) return false;
   return !!(body as { truncated?: boolean }).truncated;
 }
 

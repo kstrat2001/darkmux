@@ -52,6 +52,14 @@ export const ANSI_SGR_CLASS: Record<number, string> = {
  * origin the page itself was loaded from; a foreign origin is left absolute
  * and intact.
  */
+export function isLoopback(hostname: string): boolean {
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]" || hostname === "::1";
+}
+
+export function isCsiFinalByte(ch: string): boolean {
+  return ch >= "@" && ch <= "~";
+}
+
 export function panelHref(raw: string): string | null {
   let u: URL;
   try {
@@ -61,7 +69,7 @@ export function panelHref(raw: string): string | null {
   }
   if (u.protocol !== "http:" && u.protocol !== "https:") return null;
   if (u.origin === window.location.origin) return u.pathname + u.search + u.hash;
-  if (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "[::1]" || u.hostname === "::1") {
+  if (isLoopback(u.hostname)) {
     return u.pathname + u.search + u.hash;
   }
   return u.href;
@@ -134,7 +142,7 @@ export function parseAnsi(text: string): AnsiSegment[] {
     // CSI ... final-byte (only `m` — SGR — is honored)
     if (text[i + 1] === "[") {
       let j = i + 2;
-      while (j < text.length && !(text[j] >= "@" && text[j] <= "~")) j++;
+      while (j < text.length && !isCsiFinalByte(text[j])) j++;
       if (j >= text.length) {
         i = text.length;
         break; // truncated: drop

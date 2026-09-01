@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { render } from "@testing-library/react";
-import { parseAnsi, panelHref, panelSwitchId, AnsiText, ANSI_SGR_CLASS } from "./ansi";
+import { parseAnsi, panelHref, panelSwitchId, AnsiText, ANSI_SGR_CLASS, isLoopback, isCsiFinalByte } from "./ansi";
 
 describe("parseAnsi", () => {
   it("plain text with no escapes is a single unstyled segment", () => {
@@ -149,5 +149,33 @@ describe("AnsiText", () => {
   it("innerText concatenates plain and styled segments with no stray markup artifacts", () => {
     const { container } = render(<AnsiText text={"a\x1b[1mb\x1b[0mc"} onPanelSwitch={vi.fn()} />);
     expect(container.textContent).toBe("abc");
+  });
+});
+
+describe("isLoopback", () => {
+  it("is true for each of the four loopback spellings", () => {
+    expect(isLoopback("127.0.0.1")).toBe(true);
+    expect(isLoopback("localhost")).toBe(true);
+    expect(isLoopback("[::1]")).toBe(true);
+    expect(isLoopback("::1")).toBe(true);
+  });
+
+  it("is false for non-loopback hostnames", () => {
+    expect(isLoopback("example.com")).toBe(false);
+    expect(isLoopback("10.0.0.5")).toBe(false);
+    expect(isLoopback("")).toBe(false);
+  });
+});
+
+describe("isCsiFinalByte", () => {
+  it("is true at both boundaries and for a character between", () => {
+    expect(isCsiFinalByte("@")).toBe(true);
+    expect(isCsiFinalByte("~")).toBe(true);
+    expect(isCsiFinalByte("m")).toBe(true);
+  });
+
+  it("is false for a character below '@' and one above '~'", () => {
+    expect(isCsiFinalByte("?")).toBe(false);
+    expect(isCsiFinalByte("é")).toBe(false);
   });
 });

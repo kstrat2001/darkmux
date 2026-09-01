@@ -76,6 +76,20 @@ export interface TokensOffMeter {
   cloudRuns: number;
 }
 
+export function hasAnyTokenCounts(p: {
+  total_tokens?: number; prompt_tokens?: number;
+  completion_tokens?: number; remote_tokens?: number;
+}): boolean {
+  return !!(p.total_tokens || p.prompt_tokens || p.completion_tokens || p.remote_tokens);
+}
+
+export function isRemoteOnlyTokens(p: {
+  total_tokens?: number; prompt_tokens?: number;
+  completion_tokens?: number; remote_tokens?: number;
+}): boolean {
+  return !p.total_tokens && !p.prompt_tokens && !p.completion_tokens && !!p.remote_tokens;
+}
+
 export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // (#1607) Evidence of WHERE a session ran (`epBySid`) is registered from
   // ANY dispatch bookend carrying an `endpoint` — a `dispatch.complete` that
@@ -92,10 +106,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     if (isDispatchStart(r.action) || isDispatchComplete(r.action)) {
       epBySid.set(r.session_id, String(p.endpoint));
     }
-    if (
-      isDispatchComplete(r.action) &&
-      (p.total_tokens || p.prompt_tokens || p.completion_tokens || p.remote_tokens)
-    ) {
+    if (isDispatchComplete(r.action) && hasAnyTokenCounts(p)) {
       dcTok.set(r.session_id, p);
     }
   }
@@ -187,7 +198,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     // A `remote_tokens`-only payload has no prompt/completion split to
     // decompose, so without this its spend joins `total` while appearing in
     // NO class chip.
-    if (!p.total_tokens && !p.prompt_tokens && !p.completion_tokens && p.remote_tokens) uncls += tt;
+    if (isRemoteOnlyTokens(p)) uncls += tt;
     directRuns++;
     cloudRuns++;
   }
