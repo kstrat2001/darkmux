@@ -64,6 +64,7 @@ import { useMachineStatsContent } from "./machineStatsContent";
 import { PhoneDrawer } from "./PhoneDrawer";
 import { useIsMobile } from "../hooks/useIsMobile";
 import type { Route } from "../lib/route";
+import type { ReactNode } from "react";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
 import type {
   FlowRecord,
@@ -104,6 +105,11 @@ export interface MachineDrawerProps {
   eventLogError: { status: number | null; message: string } | null;
   eventLogHistorical: boolean;
   eventLogServerTruncated?: boolean;
+  /** (#2189, step drill-in) The mission lens's `StepHeaderBlock`, or
+   * `null` outside a step selection -- threaded straight through to the
+   * phone Events tab's `EventLogColumn` mount below, mirroring every
+   * other `eventLog*` prop's own "same values as the desktop mount" doc. */
+  eventLogHeaderExtra?: ReactNode;
 }
 
 export function MachineDrawer({
@@ -123,6 +129,7 @@ export function MachineDrawer({
   eventLogError,
   eventLogHistorical,
   eventLogServerTruncated = false,
+  eventLogHeaderExtra = null,
 }: MachineDrawerProps) {
   const measuredIsMobile = useIsMobile();
   const isMobile = isMobileOverride ?? measuredIsMobile;
@@ -170,6 +177,7 @@ export function MachineDrawer({
           error: eventLogError,
           historical: eventLogHistorical,
           serverTruncated: eventLogServerTruncated,
+          headerExtra: eventLogHeaderExtra,
         }}
       />
     );

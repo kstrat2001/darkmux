@@ -20,6 +20,7 @@ import ReactFlow, {
   ReactFlowProvider,
   type Edge,
   type Node,
+  type NodeMouseHandler,
   type NodeProps,
 } from "reactflow";
 import "reactflow/dist/style.css";
@@ -41,6 +42,12 @@ interface MissionNodeData {
   steps: GraphNode["steps"];
   metrics: MetricsMap;
   now: number;
+  /** (#2189, step drill-in) Threaded through from `MissionCanvas`'s own
+   * props, same as `metrics`/`now` above — see this file's own doc on
+   * `onNodeClick` for why a single-step task also gets a whole-card click
+   * target on top of the row's own. */
+  selectedStepId?: string | null;
+  onSelectStep?: (stepId: string) => void;
 }
 
 function MissionNode({ data }: NodeProps<MissionNodeData>) {
@@ -61,7 +68,14 @@ function MissionNode({ data }: NodeProps<MissionNodeData>) {
       {steps.length ? (
         <div className="mn-steps">
           {steps.map((s) => (
-            <StepRow key={s.id} step={s} meter={stepMeterFor(s, data.metrics, data.now)} extraClass="mn-step-row" />
+            <StepRow
+              key={s.id}
+              step={s}
+              meter={stepMeterFor(s, data.metrics, data.now)}
+              extraClass="mn-step-row"
+              selected={data.selectedStepId === s.id}
+              onSelect={data.onSelectStep}
+            />
           ))}
         </div>
       ) : null}
@@ -85,7 +99,14 @@ function PhaseGroup({ data }: NodeProps<{ label: string; status: string; descrip
 
 const nodeTypes = { missionNode: MissionNode, phaseGroup: PhaseGroup };
 
-function toRfNodes(graphNodes: GraphNode[], layout: ReturnType<typeof computeLayout>, metrics: MetricsMap, now: number): Node[] {
+function toRfNodes(
+  graphNodes: GraphNode[],
+  layout: ReturnType<typeof computeLayout>,
+  metrics: MetricsMap,
+  now: number,
+  selectedStepId: string | null | undefined,
+  onSelectStep: ((stepId: string) => void) | undefined,
+): Node[] {
   return graphNodes.map((n) => {
     const pos = layout.positions[n.id] || { x: 0, y: 0 };
     if (n.kind === "phase") {
@@ -106,7 +127,17 @@ function toRfNodes(graphNodes: GraphNode[], layout: ReturnType<typeof computeLay
       type: "missionNode",
       position: pos,
       zIndex: 1,
-      data: { label: n.label, kind: n.kind, status: n.status, description: n.description, steps: n.steps || [], metrics, now },
+      data: {
+        label: n.label,
+        kind: n.kind,
+        status: n.status,
+        description: n.description,
+        steps: n.steps || [],
+        metrics,
+        now,
+        selectedStepId,
+        onSelectStep,
+      },
       draggable: true,
     };
   });
@@ -138,6 +169,8 @@ export function MissionCanvas({
   now,
   note,
   minimapOn,
+  selectedStepId,
+  onSelectStep,
 }: {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -145,6 +178,10 @@ export function MissionCanvas({
   now: number;
   note?: string;
   minimapOn: boolean;
+  /** (#2189, step drill-in) See `MissionGraphLens`'s own doc for where
+   * these two come from and where the resulting route write lands. */
+  selectedStepId?: string | null;
+  onSelectStep?: (stepId: string) => void;
 }) {
   // (#2058) The canvas fills whatever viewport is left below it. React Flow
   // pins its controls and minimap to the canvas's own bottom edge; a canvas
@@ -188,14 +225,43 @@ export function MissionCanvas({
     };
   }, []);
   const layout = useMemo(() => computeLayout(graphNodes), [graphNodes]);
-  const rfNodes = useMemo(() => toRfNodes(graphNodes, layout, metrics, now), [graphNodes, layout, metrics, now]);
+  const rfNodes = useMemo(
+    () => toRfNodes(graphNodes, layout, metrics, now, selectedStepId, onSelectStep),
+    [graphNodes, layout, metrics, now, selectedStepId, onSelectStep],
+  );
   const rfEdges = useMemo(() => toRfEdges(graphEdges, graphNodes), [graphEdges, graphNodes]);
+
+  // (#2189, step drill-in) A whole-card click, for the common case a task
+  // node carries exactly ONE step (the operator's own crawl-unit example —
+  // "five CRAWL.UNIT nodes", each one step). A node with zero or several
+  // steps takes no action here — the individual `StepRow`'s own click (see
+  // that component's own doc) is the only way to pick ONE of several, and
+  // there's nothing to select for a phase group or a step-less task. Phase
+  // nodes are already `selectable:false` in `toRfNodes`, but React Flow
+  // still calls `onNodeClick` for a non-selectable node, so this checks
+  // `n.kind === "task"` itself rather than relying on that flag.
+  const onNodeClick: NodeMouseHandler = (_event, node) => {
+    if (!onSelectStep) return;
+    const gn = graphNodes.find((n) => n.id === node.id);
+    if (!gn || gn.kind !== "task") return;
+    const steps = gn.steps || [];
+    if (steps.length === 1) onSelectStep(steps[0].id);
+  };
 
   return (
     <div className="canvas missionlens__canvas" ref={canvasRef}>
       {note ? <div className="note">{note}</div> : null}
       <ReactFlowProvider>
-        <ReactFlow nodes={rfNodes} edges={rfEdges} nodeTypes={nodeTypes} fitView minZoom={0.1} maxZoom={2} proOptions={{ hideAttribution: true }}>
+        <ReactFlow
+          nodes={rfNodes}
+          edges={rfEdges}
+          nodeTypes={nodeTypes}
+          fitView
+          minZoom={0.1}
+          maxZoom={2}
+          proOptions={{ hideAttribution: true }}
+          onNodeClick={onSelectStep ? onNodeClick : undefined}
+        >
           <Background color="#1f1f24" gap={24} />
           <Controls />
           {minimapOn ? <MiniMap pannable zoomable style={{ background: "#131316" }} /> : null}

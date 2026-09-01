@@ -23,6 +23,8 @@ function TaskCard({
   steps,
   open,
   onToggle,
+  selectedStepId,
+  onSelectStep,
 }: {
   task: GraphNode;
   waitsOn: string[];
@@ -30,6 +32,9 @@ function TaskCard({
   steps: ReturnType<typeof groupTimeline>[number]["tasks"][number]["steps"];
   open: boolean;
   onToggle: () => void;
+  /** (#2189, step drill-in) See `MissionGraphLens`'s own doc. */
+  selectedStepId?: string | null;
+  onSelectStep?: (stepId: string) => void;
 }) {
   return (
     <div className={`tltask s-${task.status}${open ? " open" : ""}`}>
@@ -59,7 +64,16 @@ function TaskCard({
       {open ? (
         <div className="tlt-steps">
           {steps.length ? (
-            steps.map(({ step, meter }) => <StepRow key={step.id} step={step} meter={meter} extraClass="tlt-step" />)
+            steps.map(({ step, meter }) => (
+              <StepRow
+                key={step.id}
+                step={step}
+                meter={meter}
+                extraClass="tlt-step"
+                selected={selectedStepId === step.id}
+                onSelect={onSelectStep}
+              />
+            ))
           ) : (
             <div className="tlt-empty">no steps</div>
           )}
@@ -77,6 +91,8 @@ export function MissionTimelineView({
   note,
   expanded,
   onToggleTask,
+  selectedStepId,
+  onSelectStep,
 }: {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -85,6 +101,9 @@ export function MissionTimelineView({
   note?: string;
   expanded: Record<string, boolean>;
   onToggleTask: (id: string) => void;
+  /** (#2189, step drill-in) See `MissionGraphLens`'s own doc. */
+  selectedStepId?: string | null;
+  onSelectStep?: (stepId: string) => void;
 }) {
   const groups = groupTimeline(nodes, edges, metrics, now);
   return (
@@ -110,6 +129,8 @@ export function MissionTimelineView({
                   steps={steps}
                   open={!!expanded[task.id]}
                   onToggle={() => onToggleTask(task.id)}
+                  selectedStepId={selectedStepId}
+                  onSelectStep={onSelectStep}
                 />
               ))
             ) : (

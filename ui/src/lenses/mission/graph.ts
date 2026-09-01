@@ -664,6 +664,89 @@ export function stepSeat(kind: string | undefined): string {
   return i >= 0 ? kind.slice(i + 1) : "";
 }
 
+// ─── step header block (#2189, step drill-in) ──────────────────────────────
+
+export interface StepHeaderField {
+  key: string;
+  label: string;
+  value: string;
+}
+
+/** Builds the small step-header block's field list -- "unit id, source,
+ * rule, sha (short), status, started/elapsed, turns, tool calls, findings,
+ * tokens, and any detector kinds fired" (#2189's own wording). PROGRESSIVE
+ * by design: a field appears only when real data backs it -- a non-crawl
+ * step (no `source`/`rule`/`sha`/`findings` in its records) renders a
+ * shorter list, never a placeholder "--" row.
+ *
+ * Two data sources, matching the split this module already makes elsewhere:
+ * `step`/`metrics` (the graph's own per-step accumulator -- status, started/
+ * elapsed, turns/tools/tokens, already computed by `applyRecordToMetrics`/
+ * `stepMeterFor`) for the fields every step kind can carry, and
+ * `stepRecords` (this ONE step's own raw flow records -- `payload.step_id`
+ * equality, the same scoping rule the mainstay events column uses; see
+ * `MissionGraphLens`'s own doc) for the crawl-shaped extras that have no
+ * home in `GraphStep`/`StepMetrics` yet. Scanned NEWEST-FIRST so the most
+ * recent record wins when more than one carries the same key (a crawl unit
+ * can emit `source`/`rule` more than once while working through a batch). */
+export function buildStepHeaderFields(step: GraphStep, metrics: MetricsMap, now: number, stepRecords: FlowRecord[]): StepHeaderField[] {
+  const fields: StepHeaderField[] = [];
+  fields.push({ key: "unit", label: "unit", value: step.label || step.id });
+  if (step.kind) fields.push({ key: "kind", label: "kind", value: step.kind });
+
+  const ordered = [...stepRecords].sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+  const pick = (keys: string[]): string | undefined => {
+    for (const rec of ordered) {
+      const p = rec.payload;
+      if (!p) continue;
+      for (const k of keys) {
+        const v = p[k];
+        if (typeof v === "string" && v) return v;
+        if (typeof v === "number" && Number.isFinite(v)) return String(v);
+      }
+    }
+    return undefined;
+  };
+
+  const source = pick(["source"]);
+  if (source) fields.push({ key: "source", label: "source", value: source });
+  const rule = pick(["rule", "rule_id"]);
+  if (rule) fields.push({ key: "rule", label: "rule", value: rule });
+  const sha = pick(["sha", "head_sha", "commit_sha"]);
+  if (sha) fields.push({ key: "sha", label: "sha", value: sha.slice(0, 8) });
+
+  fields.push({ key: "status", label: "status", value: step.status || "planned" });
+
+  const m = metrics[step.id];
+  const meter = stepMeterFor(step, metrics, now);
+  const startMs = stepStartMs(step, m);
+  if (startMs) {
+    const endMs = m && m.endTs ? m.endTs : meter.generating ? now : 0;
+    const elapsed = endMs ? fmtElapsed(Math.max(0, endMs - startMs)) : meter.generating ? fmtElapsed(meter.elapsedMs) : "";
+    fields.push({ key: "started", label: "started", value: elapsed ? `${hhmmss(startMs)} · ${elapsed}` : hhmmss(startMs) });
+  }
+
+  const d = stepDisplayMetrics(m);
+  if (d.turns) fields.push({ key: "turns", label: "turns", value: String(d.turns) });
+  if (d.tools) fields.push({ key: "tools", label: "tool calls", value: String(d.tools) });
+  if (d.tokens) fields.push({ key: "tokens", label: "tokens", value: fmtTok(d.tokens) + (d.cloud ? " cloud" : "") });
+
+  const findings = pick(["findings", "finding_count", "findings_count"]);
+  if (findings) fields.push({ key: "findings", label: "findings", value: findings });
+
+  const detectorKinds = new Set<string>();
+  for (const rec of stepRecords) {
+    const isDetector = rec.action === "telemetry.detector" || (rec.category === "telemetry" && rec.source === "detector");
+    if (!isDetector) continue;
+    const p = rec.payload;
+    const kind = p ? (typeof p.kind === "string" ? p.kind : typeof p.detector === "string" ? p.detector : undefined) : undefined;
+    if (kind) detectorKinds.add(kind);
+  }
+  if (detectorKinds.size) fields.push({ key: "detectors", label: "detectors", value: [...detectorKinds].sort().join(", ") });
+
+  return fields;
+}
+
 // ─── phase-order edges + React-Flow-ready node/edge shaping
 // (mission-graph.html: phaseOrderEdges, toRfNodes, toRfEdges) ──────────────
 

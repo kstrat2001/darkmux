@@ -789,6 +789,74 @@ describe("App", () => {
     expect(document.querySelector(".eventlog__head h3")?.textContent).not.toMatch(/last \d+h/i);
   });
 
+  // (#2189, step drill-in) The mainstay column narrows to EXACTLY the
+  // selected step's own records (`payload.step_id` equality — App.tsx's own
+  // doc on `eventLogRecords`'s mission branch), with a header block above
+  // it and a one-tap way back to the whole mission. `deep-link` here means
+  // `#mission=<id>&step=<id>` is set BEFORE the app ever renders — the
+  // exact shape a bookmark/reload reproduces.
+  function mockMissionStepFixture() {
+    const graph = {
+      mission_id: "m1",
+      mission_status: "active",
+      nodes: [
+        { id: "p1", label: "phase", kind: "phase", status: "running", depth: 0 },
+        { id: "a", label: "task-a", kind: "task", status: "running", parentId: "p1", depth: 0, steps: [{ id: "step-a", label: "Unit A", kind: "dispatch.internal", status: "running" }] },
+        { id: "b", label: "task-b", kind: "task", status: "running", parentId: "p1", depth: 0, steps: [{ id: "step-b", label: "Unit B", kind: "dispatch.internal", status: "running" }] },
+        { id: "c", label: "task-c", kind: "task", status: "planned", parentId: "p1", depth: 0, steps: [{ id: "step-c", label: "Unit C", kind: "dispatch.internal", status: "planned" }] },
+      ],
+      edges: [
+        { id: "e1", source: "p1", target: "a", kind: "contains" },
+        { id: "e2", source: "p1", target: "b", kind: "contains" },
+      ],
+    };
+    const recs = [
+      { ts: "2026-08-19T00:00:01Z", action: "dispatch.start", mission_id: "m1", payload: { step_id: "step-a" } },
+      { ts: "2026-08-19T00:00:02Z", action: "dispatch.complete", mission_id: "m1", payload: { step_id: "step-a", total_turns: 2 } },
+      { ts: "2026-08-19T00:00:03Z", action: "dispatch.start", mission_id: "m1", payload: { step_id: "step-b" } },
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const path = String(url);
+        if (path === "/mission/m1/graph.json") return Promise.resolve(new Response(JSON.stringify(graph), { status: 200 }));
+        if (path === "/flow-mission/m1") return Promise.resolve(new Response(JSON.stringify({ records: recs, count: recs.length, truncated: false, generated_at_ms: 1 }), { status: 200 }));
+        if (path.startsWith("/flow/")) return Promise.resolve(new Response("[]", { status: 200 }));
+        return Promise.resolve(new Response("not found", { status: 404 }));
+      }),
+    );
+  }
+
+  it("(#2189) deep-linking #mission=<id>&step=<id> lands drilled in: the mainstay column shows only that step's records", async () => {
+    mockMissionStepFixture();
+    window.location.hash = "#mission=m1&step=step-a";
+    renderApp();
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(2));
+    // The header block names the unit and offers a way back.
+    await waitFor(() => expect(document.querySelector('[data-act="step-header"]')).not.toBeNull());
+    expect(document.querySelector('[data-act="step-header"]')!.textContent).toMatch(/Unit A/);
+    expect(document.querySelector('[data-act="step-back"]')).not.toBeNull();
+  });
+
+  it("(#2189) a selected step with zero records renders the header AND an explicit empty state, never a blank body", async () => {
+    mockMissionStepFixture();
+    window.location.hash = "#mission=m1&step=step-c";
+    renderApp();
+    await waitFor(() => expect(document.querySelector(".eventlog__empty")).not.toBeNull());
+    expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(0);
+  });
+
+  it("(#2189) the back control clears the step and restores the whole mission's records", async () => {
+    mockMissionStepFixture();
+    window.location.hash = "#mission=m1&step=step-a";
+    renderApp();
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(2));
+    fireEvent.click(document.querySelector('[data-act="step-back"]')!);
+    await waitFor(() => expect(window.location.hash).toBe("#mission=m1"));
+    await waitFor(() => expect(document.querySelectorAll(".eventlog__rec")).toHaveLength(3));
+    expect(document.querySelector('[data-act="step-header"]')).toBeNull();
+  });
+
   // (#2072/#2073) Static-build tests run LAST: `useHashRoute` caches the parsed
   // route per hash string, and a hash parsed while the static meta is present
   // resolves to the playback route; a later test on the same hash would

@@ -27,7 +27,7 @@ describe("NavChrome", () => {
     // fleet, not console — see `NavChrome.tsx`'s own `isActive` doc for the
     // full measurement, and its #1868 note for why this still holds now
     // that the route renders `MissionGraphLens` for real.
-    [{ kind: "mission", missionId: "m1" }, "lens-fleet"],
+    [{ kind: "mission", missionId: "m1", stepId: null }, "lens-fleet"],
     // (#1809) A fleet-card drill (uid set) is the SAME shape as the session
     // drill above — arriving IN from fleet, not from a lens tab — so it
     // keeps FLEET lit, not MACHINE. The inverted case (uid: null) is
