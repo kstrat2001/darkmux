@@ -216,6 +216,14 @@ export function App() {
   const onMissionEvents = useCallback((records: FlowRecord[], truncated: boolean) => {
     setMissionEvents({ records, truncated });
   }, []);
+  // (#2223) The same records, held in a REF purely so `onSelectStep` can
+  // read them without taking `missionEvents` as a dependency. That
+  // callback is handed down to `MissionGraphLens` and on to the React Flow
+  // canvas; depending on state that changes on every records fold would
+  // give it a new identity on every fold, churning the canvas's renders
+  // for a value only ever read INSIDE a click handler, long after render.
+  const missionRecordsRef = useRef<FlowRecord[]>([]);
+  missionRecordsRef.current = missionEvents?.records ?? [];
   // (#2189, step drill-in) `route.stepId` — App.tsx owns the route/hash, so
   // the WRITE lives here too: a click on a node/row calls this, which
   // writes the canonical `mission=<id>&step=<id>` (or drops `step` on
@@ -240,7 +248,7 @@ export function App() {
       // history entry is the point on a phone, where the back gesture is
       // how the operator returns to the mission.
       if (stepId) {
-        const dispatchId = stepDispatchSessions(missionEvents?.records ?? [])[stepId];
+        const dispatchId = stepDispatchSessions(missionRecordsRef.current)[stepId];
         if (dispatchId) {
           location.hash = `dispatch=${encodeURIComponent(dispatchId)}`;
           return;
@@ -251,7 +259,7 @@ export function App() {
       // stays the best available view of it.
       writeHash(canonicalHash({ kind: "mission", missionId: route.missionId, stepId }));
     },
-    [route, missionEvents],
+    [route],
   );
   // (#2189) The selected step's header-block fields, reported by
   // `MissionGraphLens` — `null` whenever no step is selected (mirrors
