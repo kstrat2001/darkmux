@@ -4511,7 +4511,13 @@ body {
    `.dialog__fgroup--activity` below for why the grid itself needs none
    either. */
 .dialog--filters {
-  width: min(90vw, 720px);
+  /* (operator, 2026-09-01: "seems crunched") 720px still read tight — the
+     activity facet alone can run to ~40 checkboxes, and at 720 the
+     `auto-fill minmax(180px, 1fr)` grid below resolves to three columns, so
+     that facet scrolled while the dialog had screen to spare. 960px buys two
+     more columns on a laptop; `92vw` keeps it inside a narrow window, and the
+     phone path is unaffected (auto-fill still computes one column there). */
+  width: min(92vw, 960px);
 }
 @keyframes dialog-pop-in {
   from {

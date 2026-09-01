@@ -15,7 +15,8 @@ import {
   type Facets,
   type FacetSeen,
   type FilterState, activeFilterCount, restoreFilterState, persistFilterState, storedFilterPicks, applyStoredPicks } from "../lib/eventFilters";
-import { FiltersDialog, onlyModelFacet } from "./FiltersDialog";
+import { FiltersDialog, FiltersBody, onlyModelFacet } from "./FiltersDialog";
+import { useIsMobile } from "../hooks/useIsMobile";
 import { ActivityIcon } from "./ActivityIcon";
 import { recordDetail } from "../lib/recordDetail";
 import { openModalEl } from "../lib/dialogManager";
@@ -358,6 +359,14 @@ export function EventLogColumn({
     });
   };
 
+  // (operator, 2026-09-01) On a phone the filters render INLINE in this pane
+  // rather than as a modal stacked over a small screen, and the `filters`
+  // button becomes a toggle back to the list. Desktop is untouched: it still
+  // opens `#modalbg`, a named e2e surface (`viewer-keyboard.spec.js` drives
+  // Escape and focus-restore through it), so that path had to stay identical
+  // rather than be reshaped around the phone.
+  const isMobile = useIsMobile();
+  const [filtersInline, setFiltersInline] = useState(false);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   // (#2108, operator finding — phone divider persistence) Initialized
   // from `paneId`-scoped storage, not always `DEFAULT_DETAIL_PCT` — see
@@ -725,7 +734,8 @@ export function EventLogColumn({
                 data-active={activeFilters > 0 ? "1" : undefined}
                 title={activeFilters > 0 ? `${activeFilters} filter${activeFilters === 1 ? "" : "s"} hiding events` : "filters"}
                 aria-label={activeFilters > 0 ? `filters, ${activeFilters} active` : "filters"}
-                onClick={() => openModalEl("modalbg")}
+                onClick={() => (isMobile ? setFiltersInline((v) => !v) : openModalEl("modalbg"))}
+                aria-expanded={isMobile ? filtersInline : undefined}
               >
                 filters
                 {activeFilters > 0 ? <span className="eventlog__fcount"> · {activeFilters}</span> : null}
@@ -802,7 +812,22 @@ export function EventLogColumn({
           </div>
         ) : (
         <div id="logbody" className="eventlog__body" ref={listBodyRef}>
-          {visibleRecs.length ? (
+          {/* (operator, 2026-09-01) Phone: the filters take over THIS pane —
+              the one that already scrolls — instead of a modal over a small
+              screen. Rendered inside `#logbody` on purpose: the scroll
+              container, the drawer sizing and the sticky header all already
+              work here, so the filters inherit them rather than needing their
+              own. The `filters` button toggles back to the list. */}
+          {isMobile && filtersInline ? (
+            <FiltersBody
+              facets={facets}
+              filters={filters}
+              onToggle={toggleFacet}
+              onSetQuery={setQuery}
+              onOnlyModel={onlyModel}
+              onClearAll={clearAllFilters}
+            />
+          ) : visibleRecs.length ? (
             visibleRecs.map((r) => {
               const key = recKey(r);
               const detail = recordDetail(r);
