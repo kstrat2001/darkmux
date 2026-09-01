@@ -672,11 +672,14 @@ describe("App", () => {
 
     await waitFor(() => expect(document.querySelector(".fleet-lens")).toBeTruthy());
 
-    // topbar: the source chip names the day, and the mode badge says what
-    // mode this is. Both were absent/wrong — the chip showed a bare date and
-    // no mode badge rendered at all on a replay.
+    // topbar: the source chip names the day. The mode badge does NOT render
+    // here (operator, 2026-09-01): the transport is mounted on this route —
+    // asserted below — and the controls state the mode unambiguously, so the
+    // badge would only repeat them. It still renders where the transport is
+    // absent; that carve-out is what keeps #1801's regression fixed rather
+    // than reintroduced ("a page that is neither live nor visibly playback").
     expect(document.querySelector(".catalog-toggle")?.textContent).toContain("2026-08-07");
-    expect(document.getElementById("modebadge")?.textContent).toBe("▶ playback");
+    expect(document.getElementById("modebadge")).toBeNull();
 
     // crumb: empty now — the raw-id `◆ <mission>` this used to carry moved
     // into the Machine info modal's `playback` row only (the transport
@@ -937,13 +940,19 @@ describe("App", () => {
     );
   }
 
-  it("a daemon dispatch page names its day in the chip, shows the playback badge, and gets the transport", async () => {
+  it("a daemon dispatch page names its day in the chip and gets the transport — WITHOUT a redundant playback badge", async () => {
+    // (operator, 2026-09-01) The badge and the transport controls both state
+    // the mode, and the controls do it unambiguously. Where they are on
+    // screen the badge is noise, so it is suppressed there — and ONLY there.
+    // The companion test below covers the case that keeps it: a route with no
+    // transport, which would otherwise be neither live nor visibly playback
+    // (the #1801 regression the badge exists to prevent).
     mockDaemonReplay();
     window.location.hash = "#dispatch=s1";
     renderApp();
     await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07"));
-    expect(document.querySelector("#modebadge")?.textContent).toMatch(/playback/i);
     await screen.findByRole("group", { name: "playback transport" });
+    expect(document.querySelector("#modebadge")).toBeNull();
   });
 
   it("a run that crossed the loaded day's end renders whole at rest AND after a play-through; only a moved playhead cuts it", async () => {
@@ -1001,12 +1010,17 @@ describe("App", () => {
     expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
   });
 
-  it("a daemon mission page names its day in the chip with the playback badge, and (for now) no transport", async () => {
+  it("a daemon mission page names its day in the chip, with NO playback badge and no transport", async () => {
+    // (operator, 2026-09-01) A mission is an overview, not a scrubbable
+    // recording — playback lives in the drill-in detail view. So the badge
+    // was not merely redundant here, it was FALSE: a `▶` glyph promising a
+    // control this route will never have. The chip carries the mode instead
+    // (a date means recorded; `TODAY` is the live view's word).
     mockDaemonReplay();
     window.location.hash = "#mission=m-one";
     renderApp();
     await waitFor(() => expect(document.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07"));
-    expect(document.querySelector("#modebadge")?.textContent).toMatch(/playback/i);
+    expect(document.querySelector("#modebadge")).toBeNull();
     expect(screen.queryByRole("group", { name: "playback transport" })).not.toBeInTheDocument();
   });
 

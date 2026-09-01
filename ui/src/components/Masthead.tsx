@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { LiveStatusBadge, PlaybackModeBadge } from "./LiveStatusBadge";
+import { LiveStatusBadge } from "./LiveStatusBadge";
 import { CatalogPanel } from "../lenses/catalog/CatalogPanel";
 import { openModalEl } from "../lib/dialogManager";
 import { isLiveRoute, type Route } from "../lib/route";
@@ -211,8 +211,6 @@ export function Masthead({
           badge on every lens, mode being global there. */}
       {live ? (
         <LiveStatusBadge status={liveStatus} />
-      ) : getSource().kind === "static" || route.kind === "playback" || replayDate !== null ? (
-        <PlaybackModeBadge />
       ) : null}
       {/* (operator: "a reload button next to 'live' is absurd") — and it is:
           a refresh control beside a badge reading `● LIVE` contradicts

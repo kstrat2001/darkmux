@@ -274,7 +274,7 @@ describe("SessionReplay", () => {
     });
     expect(readWall()).toBe(before);
     // ...and the pulse says quiet rather than beating.
-    expect(document.querySelector(".pulse")?.getAttribute("data-state")).not.toBe("beating");
+    expect(document.querySelector(".pill[data-live]")?.getAttribute("data-live")).not.toBe("beating");
     vi.useRealTimers();
   });
 
@@ -324,11 +324,11 @@ describe("SessionReplay", () => {
     await vi.waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
 
     const pill = document.querySelector(".session-run__header .pill")?.textContent ?? "";
-    const pulseLabel = document.querySelector(".pulse")?.getAttribute("aria-label") ?? "";
+    const pulseLabel = document.querySelector(".pill[data-live]")?.getAttribute("title") ?? "";
     expect(pill).toContain("RUNNING");
     // The pulse may say "may be abandoned"; it must NOT claim the run finished.
     expect(pulseLabel).not.toContain("finished");
-    expect(document.querySelector(".pulse")?.getAttribute("data-state")).toBe("stale");
+    expect(document.querySelector(".pill[data-live]")?.getAttribute("data-live")).toBe("stale");
     vi.useRealTimers();
   });
 
@@ -383,8 +383,12 @@ describe("SessionReplay", () => {
     stubSession();
     renderReplay("s-disc");
     await waitFor(() => expect(document.querySelector(".session-run")).toBeInTheDocument());
-    const pulse = document.querySelector(".pulse");
-    expect(pulse?.getAttribute("role")).toBe("img");
+    // (operator, 2026-09-01) The dot was removed and the pill pulses instead.
+    // The non-live-region requirement is unchanged and now applies to the
+    // pill: its liveness rides `title` (a DESCRIPTION, so the pill keeps its
+    // own accessible name from its text) and it must never announce.
+    const pulse = document.querySelector(".pill[data-live]");
+    expect(pulse?.getAttribute("title")).toBeTruthy();
     expect(pulse?.getAttribute("aria-live")).toBeNull();
   });
 

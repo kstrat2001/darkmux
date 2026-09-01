@@ -335,8 +335,16 @@ body {
   .app-shell__crumb {
     flex: 1 1 100%;
   }
+  /* (operator, 2026-09-01) The "N machines · last dispatch …" summary is
+     GONE on a phone, not merely reflowed. It was spending a full row of
+     precious vertical space on data that is a tap away and better presented
+     in three other places: the fleet lens shows the machines themselves with
+     per-machine health, and runs/console both carry recency. A summary earns
+     a row when it saves you a navigation; this one duplicated the lens
+     directly below it. Desktop keeps it — the row has width to spare there
+     and it costs nothing. */
   .app-shell__meta {
-    flex: 1 1 100%;
+    display: none;
   }
   /* (operator, on the phone, 2026-08-28) Uniform-width tabs filling the
      row: sized by their labels, RUNS was the slim one and the strip sat
@@ -2651,11 +2659,13 @@ body {
    order, so the parity goldens are untouched by a purely visual swap. (Run
    the suites after touching this — that assumption is the whole reason this
    is safe, and it is worth re-proving rather than trusting.) */
-.tlhdr > :first-child {
-  order: 2;
-}
-.tlhdr .twin {
-  order: 1;
+/* (operator, 2026-09-01) The window picker FOLLOWS the heading it belongs to.
+   It was ordered before it, which read as chrome floating above the section
+   rather than as this timeline's own control — the association is the point.
+   DOM order is already heading-then-control, so the override is simply gone
+   rather than inverted. */
+.tlhdr {
+  flex-wrap: wrap;
 }
 
 .tlhdr {
@@ -2700,6 +2710,41 @@ body {
    `overflow:hidden` + shared border still frame the group the same way at
    the larger size. */
 @media (max-width: 768px) {
+  /* (operator, 2026-09-01) On a phone `28% avg · 98% high` wrapped to two
+     lines and the label took a third. If the tile is spending a second line
+     anyway, spend it on the LABEL rather than on a widow: value and label
+     share the first line and wrap together.
+     `row-reverse` puts the label first VISUALLY while leaving DOM order
+     (value, then label) untouched — the session goldens compare innerText
+     byte-for-byte, so the reading order must not move. */
+  .met {
+    display: flex;
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+  }
+  .met .ml {
+    flex: 0 0 auto;
+  }
+}
+
+@media (max-width: 768px) {
+  /* (operator, 2026-09-01) Tab-like on a phone: the group spans the content
+     width and the segments share it equally. This is NOT the form rejected in
+     the earlier touch-target pass — that was a 44px slab around 11px text,
+     mostly empty ink. Here the TYPE grows with the box, so the weight is
+     carried by the label rather than by padding. */
+  .twin {
+    display: flex;
+    width: 100%;
+  }
+  .twinb {
+    flex: 1 1 0;
+    font-size: calc(13px * var(--fs-scale));
+    padding: 9px 8px;
+  }
   .twinb {
     display: inline-flex;
     align-items: center;
@@ -4144,28 +4189,28 @@ body {
    than stopped when a run goes quiet. Stopping and restarting would stutter
    at whatever irregular cadence records happen to arrive at, which reads as a
    fault rather than as health. */
-.pulse {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  vertical-align: middle;
-  background: var(--dim);
+/* (operator, 2026-09-01) The RUNNING pill itself pulses; the separate dot is
+   gone. One element carries the semantic state (its text) and the liveness
+   state (its beat). As before the element is never remounted — beats only move
+   a number — so the animation runs continuously and is PAUSED rather than
+   restarted, which would stutter at whatever cadence records happen to arrive
+   at and read as a fault rather than as health. */
+.pill[data-live] {
   animation: pulse-beat 1.6s ease-in-out infinite;
   animation-play-state: paused;
 }
-.pulse[data-state="beating"] {
-  background: #4fd18b;
+.pill[data-live="beating"] {
   animation-play-state: running;
 }
 /* Quiet: still live, but nothing has landed recently. Held still and hollow —
    distinguishable from "beating" WITHOUT relying on motion or hue alone. */
-.pulse[data-state="quiet"] {
-  background: transparent;
-  box-shadow: inset 0 0 0 1px #4fd18b;
-}
-.pulse[data-state="done"] {
-  background: var(--border);
+/* Quiet/stale: still live, but nothing has landed recently. Dimmed rather
+   than merely un-animated, so the distinction survives for anyone who has
+   asked motion to stop — the original dot solved the same problem with
+   filled-vs-hollow. */
+.pill[data-live="quiet"],
+.pill[data-live="stale"] {
+  opacity: 0.62;
 }
 @keyframes pulse-beat {
   0%,
@@ -4181,7 +4226,7 @@ body {
 /* A pulsing dot is decoration for anyone who has asked motion to stop. The
    state stays legible: filled = beating, hollow = quiet. */
 @media (prefers-reduced-motion: reduce) {
-  .pulse {
+  .pill[data-live] {
     animation: none;
   }
 }
