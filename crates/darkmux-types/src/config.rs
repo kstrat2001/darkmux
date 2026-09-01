@@ -121,7 +121,20 @@ use std::path::Path;
 // rule that names ONLY `transform`/`headers`/`file` with no `http` simply
 // sees a rule its own `resolve_rules` refuses at load (no `http`), same as
 // any other misconfigured rule today.
-pub const CONFIG_SCHEMA_VERSION: &str = "1.18";
+//   1.19 (#2200, #2171 — bookkeeping): two `RuntimeBehaviorConfig` fields
+//           shipped without a bump of their own and are credited here.
+//           `runtime.max_stall_recoveries` (#2200) landed AFTER 1.18 was
+//           set, so 3.5.0 would have declared a schema that did not cover
+//           a field it ships; `runtime.generation_checkpoint_interval_
+//           tokens` (#2171) landed one commit before the 1.16 bump and
+//           was never named by any entry. Both are `Option<u32>` caps —
+//           additive, lenient-on-read, absent meaning "uncapped" — so no
+//           reader breaks either way. The bump exists so the declared
+//           version and the shipped shape agree, which is the whole point
+//           of the contract. Neither is written by `init` (a literal
+//           would be wrong: absent is a real behavior), same carve-out as
+//           `runtime.max_turns`.
+pub const CONFIG_SCHEMA_VERSION: &str = "1.19";
 
 /// The `~/.darkmux/config.json` document. All fields optional + skipped when
 /// `None`, so a fresh/empty config serializes to `{}` and any field absent
