@@ -68,7 +68,7 @@ import {
   lastTs,
   nameOf,
 } from "../../lib/flow";
-import { clkhm, clkrange } from "../../lib/format";
+import { clkhm } from "../../lib/format";
 import type { FlowRecord, PresenceBeat } from "../../types/handwritten";
 
 /** The live-only window presets (#1151) — minutes, matching legacy's
@@ -108,8 +108,14 @@ export interface TimelineLane {
 }
 
 export interface ActivityTimeline {
-  /** `recent activity · <clkrange>` — lowercase; `.tlhdr`'s CSS
-   * `text-transform: uppercase` renders it, matching legacy. */
+  /** `recent activity` — lowercase; `.tlhdr`'s CSS `text-transform:
+   * uppercase` renders it.
+   *
+   * (operator, 2026-09-01) The `· <clkrange>` suffix is GONE. It wrapped to
+   * two lines on a phone to restate what two other surfaces already say: the
+   * axis under the lanes carries the times and updates live, and the masthead
+   * chip carries the day. A heading that wraps in order to repeat its own
+   * neighbours is spending the scarcest thing on screen. */
   headerText: string;
   lanes: TimelineLane[];
   axis: [string, string, string];
@@ -206,10 +212,10 @@ export function buildActivityTimeline(
   });
 
   return {
-    // `${liveMode?'recent activity':'activity'} · ${clkrange(tlMin,tlMax)}`
-    // — viewer.html:1766. Lowercase; `.tlhdr`'s `text-transform: uppercase`
-    // renders it, matching legacy.
-    headerText: `${liveMode ? "recent activity" : "activity"} · ${clkrange(tlMin, tlMax)}`,
+    // Legacy appended `· ${clkrange(tlMin,tlMax)}` here (viewer.html:1766);
+    // dropped 2026-09-01 — see `headerText`'s own doc. Deliberate divergence
+    // from legacy, not drift.
+    headerText: liveMode ? "recent activity" : "activity",
     lanes,
     axis: [clkhm(tlMin), clkhm(tlMin + span / 2), clkhm(tlMax)],
     playheadPct: pct(playheadT),

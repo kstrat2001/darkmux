@@ -44,7 +44,7 @@ m1-max-32gb-studio
 hardware not reported
 idle
 0 running
-RECENT ACTIVITY · AUG 7 16:40:59–AUG 8 16:40:59
+RECENT ACTIVITY
 10M
 1H
 4H

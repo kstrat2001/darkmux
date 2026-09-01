@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildActivityTimeline } from "./timeline";
-import { clkhm, clkrange } from "../../lib/format";
+import { clkhm } from "../../lib/format";
 import type { FlowRecord } from "../../types/handwritten";
 
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
@@ -21,31 +21,14 @@ const iso = (offsetMin: number) => new Date(TMAX + offsetMin * 60000).toISOStrin
 // same-day-vs-straddling branch) — it just reads the expected clock text
 // from the same clock the implementation uses, instead of assuming a TZ.
 describe("buildActivityTimeline — header text", () => {
-  it("a 24h window straddling a day boundary prefixes each end with its short date", () => {
-    const windowMs = 1440 * 60000;
+  // (operator, 2026-09-01) The header no longer carries `· <clkrange>`, so
+  // its two date-format tests moved to `lib/format.test.ts` and now exercise
+  // `clkrange` directly. They were always format tests using this header as a
+  // vehicle; `replayMeta.ts` still renders `clkrange`, so the coverage had to
+  // move rather than go with the header.
+  it("is the bare title — the axis carries the times, the masthead chip the day", () => {
     const tl = buildActivityTimeline([], new Map(), [], new Set(), TMAX, TMAX, 1440);
-    expect(tl.headerText).toBe(`recent activity · ${clkrange(TMAX - windowMs, TMAX)}`);
-    // A real 24h span crosses a calendar day boundary in EVERY timezone —
-    // assert the date-prefixed shape rather than a literal, so this red-
-    // proves against `clkrange` silently collapsing to the bare form.
-    const range = tl.headerText.split("· ")[1];
-    expect(range).toMatch(/–/);
-    expect(range.split("–")[0]).toMatch(/^[A-Za-z]{3} \d{1,2} \d{2}:\d{2}:\d{2}$/);
-  });
-
-  it("a same-day (1h) window stays bare HH:MM:SS-HH:MM:SS", () => {
-    // Anchored at local noon so a 1h window can't straddle local midnight
-    // in any real timezone — a TZ-safe way to force the SAME-day branch.
-    const localNoon = new Date();
-    localNoon.setHours(12, 0, 0, 0);
-    const anchor = localNoon.getTime();
-    const windowMs = 60 * 60000;
-    const tl = buildActivityTimeline([], new Map(), [], new Set(), anchor, anchor, 60);
-    expect(tl.headerText).toBe(`recent activity · ${clkrange(anchor - windowMs, anchor)}`);
-    // The same-day form has no letters (no month abbreviation) before the
-    // en-dash — red-proves against the date-prefixed branch firing instead.
-    const range = tl.headerText.split("· ")[1];
-    expect(range.split("–")[0]).not.toMatch(/[A-Za-z]/);
+    expect(tl.headerText).toBe("recent activity");
   });
 
   it("the axis has three points: window start, midpoint, window end (via clkhm)", () => {
@@ -147,7 +130,7 @@ describe("buildActivityTimeline — replay (liveMode = false)", () => {
 
   it("spans tMin..tMax — the recorded day, NOT a window ending at now", () => {
     const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
-    expect(tl.headerText).toBe(`activity · ${clkrange(TMIN, TMAX)}`);
+    // The AXIS is what proves the span now that the header carries no range.
     expect(tl.axis).toEqual([clkhm(TMIN), clkhm(TMIN + (TMAX - TMIN) / 2), clkhm(TMAX)]);
     // The playhead sits at the right edge (state.t = tMax on boot).
     expect(tl.playheadPct).toBe(100);
@@ -155,7 +138,7 @@ describe("buildActivityTimeline — replay (liveMode = false)", () => {
 
   it("drops 'recent' from the header — the day is not recent", () => {
     const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN);
-    expect(tl.headerText.startsWith("activity · ")).toBe(true);
+    expect(tl.headerText).toBe("activity");
     expect(tl.headerText).not.toContain("recent");
   });
 
@@ -168,7 +151,10 @@ describe("buildActivityTimeline — replay (liveMode = false)", () => {
     // bars because all of them ended before `nowMs - 24h`.
     const live = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, true, TMIN);
     expect(live.lanes[0].bars).toHaveLength(0);
-    expect(live.headerText).toBe(`recent activity · ${clkrange(NOW - 1440 * 60000, NOW)}`);
+    // The live arm's window is anchored at NOW, not at the recorded day. The
+    // header used to say so; the axis says it now.
+    expect(live.axis[2]).toBe(clkhm(NOW));
+    expect(live.axis[0]).toBe(clkhm(NOW - 1440 * 60000));
   });
 
   it("a closed session reads 'done', not 'run', on an EMPTY live set", () => {
@@ -223,7 +209,6 @@ describe("buildActivityTimeline — replay (liveMode = false)", () => {
   it("scrubbing the playhead back to tMin does NOT collapse the axis — it stays the day's whole span", () => {
     const tl = buildActivityTimeline(day, new Map(), uids, new Set(), TMAX, NOW, 1440, false, TMIN, TMIN);
     expect(tl.axis).toEqual([clkhm(TMIN), clkhm(TMIN + (TMAX - TMIN) / 2), clkhm(TMAX)]);
-    expect(tl.headerText).toBe(`activity · ${clkrange(TMIN, TMAX)}`);
     // The marker itself DID move — to the axis's own left edge.
     expect(tl.playheadPct).toBe(0);
   });
