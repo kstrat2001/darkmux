@@ -12,11 +12,25 @@ import type { FlowRecord } from "../../types/handwritten";
  *  tail's `flowTail` slot, owned by `useLiveTail` (mounted internally, no
  *  SSE test seam on this component) — the same way `useLiveTail` itself
  *  would via `queryClient.setQueryData`. See the `.mproc` readout tests. */
-function renderLens(missionId = "m1", onEvents?: (events: FlowRecord[], srvTruncated: boolean) => void) {
+function renderLens(
+  missionId = "m1",
+  onEvents?: (events: FlowRecord[], srvTruncated: boolean) => void,
+  opts: {
+    selectedStepId?: string | null;
+    onSelectStep?: (stepId: string) => void;
+    onStepHeader?: (fields: import("./graph").StepHeaderField[] | null) => void;
+  } = {},
+) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const result = render(
     <QueryClientProvider client={queryClient}>
-      <MissionGraphLens missionId={missionId} onEvents={onEvents} />
+      <MissionGraphLens
+        missionId={missionId}
+        onEvents={onEvents}
+        selectedStepId={opts.selectedStepId}
+        onSelectStep={opts.onSelectStep}
+        onStepHeader={opts.onStepHeader}
+      />
     </QueryClientProvider>,
   );
   return { ...result, queryClient };
@@ -416,5 +430,70 @@ describe("MissionGraphLens", () => {
     } finally {
       nowSpy.mockRestore();
     }
+  });
+});
+
+describe("MissionGraphLens step drill-in (#2189)", () => {
+  it("clicking a step row calls onSelectStep with that step's id", async () => {
+    mockFetch();
+    const onSelectStep = vi.fn();
+    renderLens("m1", undefined, { onSelectStep });
+    await waitFor(() => expect(document.querySelector(".steprow")).not.toBeNull());
+    fireEvent.click(document.querySelector('.steprow[data-act="step-row"]')!);
+    expect(onSelectStep).toHaveBeenCalledWith("a-step");
+  });
+
+  it("clicking anywhere on a single-step task node ALSO selects its one step (onNodeClick)", async () => {
+    mockFetch();
+    const onSelectStep = vi.fn();
+    renderLens("m1", undefined, { onSelectStep });
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    // Click the node's kind label, not the step row itself — this exercises
+    // React Flow's own `onNodeClick`, not the row's `stopPropagation`ed one.
+    fireEvent.click(document.querySelector(".mnode .mn-kind")!);
+    expect(onSelectStep).toHaveBeenCalledWith("a-step");
+  });
+
+  it("the selected step's row carries the selected marker class", async () => {
+    mockFetch();
+    renderLens("m1", undefined, { selectedStepId: "a-step" });
+    await waitFor(() => expect(document.querySelector(".steprow")).not.toBeNull());
+    const row = document.querySelector(".steprow")!;
+    expect(row.className).toMatch(/\bselected\b/);
+    expect(row.getAttribute("data-selected")).toBe("1");
+  });
+
+  it("reports the selected step's header fields upward via onStepHeader, and null once cleared", async () => {
+    mockFetch({
+      flowMissionRecords: [
+        { ts: "2026-08-19T00:00:01Z", action: "dispatch.start", handle: "a-step", mission_id: "m1", payload: { step_id: "a-step" } },
+        { ts: "2026-08-19T00:00:02Z", action: "dispatch.complete", handle: "a-step", mission_id: "m1", payload: { step_id: "a-step", total_turns: 3, total_tokens: 1200 } },
+      ],
+    });
+    const onStepHeader = vi.fn();
+    const { rerender } = renderLens("m1", undefined, { selectedStepId: "a-step", onStepHeader });
+    await waitFor(() => {
+      const fields = onStepHeader.mock.calls.at(-1)?.[0];
+      expect(fields).not.toBeNull();
+      expect(fields.some((f: { key: string }) => f.key === "unit")).toBe(true);
+    });
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <MissionGraphLens missionId="m1" selectedStepId={null} onStepHeader={onStepHeader} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(onStepHeader.mock.calls.at(-1)?.[0]).toBeNull());
+  });
+
+  it("a step selected on a COLLAPSED timeline task auto-expands that task so the step still renders", async () => {
+    mockFetch();
+    renderLens("m1", undefined, { selectedStepId: "a-step" });
+    await waitFor(() => expect(document.querySelector(".mnode")).not.toBeNull());
+    fireEvent.click(screen.getByTitle("switch renderer"));
+    await waitFor(() => expect(document.querySelector(".tltask")).not.toBeNull());
+    expect(document.querySelector(".tltask")!.className).toMatch(/\bopen\b/);
+    expect(document.querySelector(".tlt-step")).not.toBeNull();
   });
 });

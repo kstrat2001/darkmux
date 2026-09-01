@@ -132,7 +132,21 @@ describe("parseRoute", () => {
 
   it("parses #mission=<id> as the mission-graph lens route (#1868)", () => {
     setHash("#mission=my-mission");
-    expect(parseRoute()).toEqual({ kind: "mission", missionId: "my-mission" });
+    expect(parseRoute()).toEqual({ kind: "mission", missionId: "my-mission", stepId: null });
+  });
+
+  it("(#2189) parses #mission=<id>&step=<id> with the step selected", () => {
+    setHash("#mission=my-mission&step=step-01");
+    expect(parseRoute()).toEqual({ kind: "mission", missionId: "my-mission", stepId: "step-01" });
+  });
+
+  it("(#2189) step= precedence: a non-empty search value wins over the hash, matching every other named param's get() -- no second precedence rule for this one", () => {
+    const url = new URL(window.location.href);
+    url.hash = "#mission=my-mission&step=from-hash";
+    url.search = "?step=from-search";
+    window.history.replaceState(null, "", url.toString());
+    expect(parseRoute()).toEqual({ kind: "mission", missionId: "my-mission", stepId: "from-search" });
+    window.history.replaceState(null, "", "/");
   });
 
   /// (#1920) `opt.*` must resolve search-vs-hash the same way every other
@@ -251,7 +265,7 @@ describe("parseRoute", () => {
     url.hash = "";
     url.search = "?mission=my-mission&date=2026-08-07";
     window.history.replaceState(null, "", url.toString());
-    expect(parseRoute()).toEqual({ kind: "mission", missionId: "my-mission" });
+    expect(parseRoute()).toEqual({ kind: "mission", missionId: "my-mission", stepId: null });
     window.history.replaceState(null, "", "/");
   });
 });
@@ -471,7 +485,7 @@ describe("isLiveRoute — a daemon-less build is never live, on any lens", () =>
   it("historical routes are non-live either way — the kind test still stands on its own", () => {
     expect(isLiveRoute({ kind: "playback", date: "2026-08-07" })).toBe(false);
     expect(isLiveRoute({ kind: "dispatch", dispatchId: "s1" })).toBe(false);
-    expect(isLiveRoute({ kind: "mission", missionId: "m1" })).toBe(false);
+    expect(isLiveRoute({ kind: "mission", missionId: "m1", stepId: null })).toBe(false);
   });
 
   it("an unrelated darkmux meta does not make a page static — flow-src is the signal", () => {

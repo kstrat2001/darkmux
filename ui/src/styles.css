@@ -5157,6 +5157,96 @@ body {
   min-width: 50px;
 }
 
+/* (#2189, step drill-in) A step row with a click handler (`onSelect` set —
+   see `StepRow.tsx`'s own doc) is a real activation target: pointer cursor,
+   a visible focus ring for keyboard activation, and a highlighted state
+   once selected — the SAME `.selected` class in both renderers (canvas's
+   `.mn-step-row` and the timeline's `.tlt-step`), since both render the
+   identical shared row. */
+.missionlens .steprow[data-act="step-row"] {
+  cursor: pointer;
+}
+.missionlens .steprow[data-act="step-row"]:hover {
+  color: var(--fg);
+}
+.missionlens .steprow[data-act="step-row"]:focus-visible {
+  outline: 1.5px solid var(--accent);
+  outline-offset: -1px;
+  border-radius: 3px;
+}
+.missionlens .steprow.selected {
+  background: #1a2030;
+  border-radius: 4px;
+  color: var(--fg);
+}
+.missionlens .steprow.selected .sring {
+  border-color: var(--accent);
+}
+
+/* (#2189, step drill-in) The step header block — rendered above the
+   mainstay events column (`EventLogColumn`'s own `headerExtra` slot) on
+   BOTH the desktop right column and the phone drawer's Events tab. */
+.stephdr {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font: calc(11px * var(--fs-scale))/1.4 var(--font-mono);
+}
+.stephdr__top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.stephdr__back {
+  flex: 0 0 auto;
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--accent);
+  font: inherit;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.stephdr__back:hover {
+  border-color: var(--accent);
+}
+.stephdr__unit {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--fg);
+}
+.stephdr__fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 0;
+}
+.stephdr__field {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+.stephdr__field dt {
+  color: var(--dim);
+}
+.stephdr__field dt::after {
+  content: ":";
+}
+.stephdr__field dd {
+  margin: 0;
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg);
+}
+
 /* Mobile vertical-timeline renderer (#1404 lineage). */
 .missionlens .timeline {
   flex: 1 1 auto;

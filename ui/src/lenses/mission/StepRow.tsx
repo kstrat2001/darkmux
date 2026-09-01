@@ -53,11 +53,67 @@ export function StepMeterEl({ meter }: { meter: MeterLike | undefined }) {
  * card's row (`mn-step-row`) from the timeline's (`tlt-step`) — the SAME
  * distinction legacy's own dual call sites make, kept for parity-extractor
  * selector compatibility (`extract-graph.js` selects `.tlt-step` separately
- * from a bare `.steprow`). */
-export function StepRow({ step, meter, extraClass }: { step: GraphStep; meter: StepMeter | undefined; extraClass: string }) {
+ * from a bare `.steprow`).
+ *
+ * (#2189, step drill-in) `onSelect`/`selected` are optional so every
+ * existing call site (and every existing parity/golden test) that doesn't
+ * pass them keeps rendering byte-identically — `onSelect` absent means "no
+ * drill-in for this row" (a `<div>`, not a `<button>`, exactly as before).
+ * When present, the row becomes keyboard-activatable
+ * (`role="button" tabIndex={0}`, the same `Enter`/`Space` pattern
+ * `MissionTimelineView.tsx`'s own `.tlt-hd` toggle already uses) and
+ * `stopPropagation`s its click — this row can be nested INSIDE a React Flow
+ * node (the canvas's `.mn-step-row` case), and without the stop, a tap here
+ * would also bubble up to `MissionCanvas`'s own `onNodeClick`, which
+ * resolves the SAME id for a single-step node, so it never disagrees — it
+ * would just be redundant work, not a bug. Stopping it is still the right
+ * call: it keeps the row the sole source of truth for its own click,
+ * exactly like `MissionCanvas`'s node click already defers to a step row
+ * when one exists (see that file's own doc). */
+export function StepRow({
+  step,
+  meter,
+  extraClass,
+  selected = false,
+  onSelect,
+}: {
+  step: GraphStep;
+  meter: StepMeter | undefined;
+  extraClass: string;
+  selected?: boolean;
+  onSelect?: (stepId: string) => void;
+}) {
   const seat = stepSeat(step.kind);
+  const clickable = !!onSelect;
   return (
-    <div className={`steprow ${extraClass} s-${step.status}`} title={step.label}>
+    <div
+      className={`steprow ${extraClass} s-${step.status}${selected ? " selected" : ""}`}
+      title={step.label}
+      data-act={clickable ? "step-row" : undefined}
+      data-selected={selected ? "1" : undefined}
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      aria-pressed={clickable ? selected : undefined}
+      onClick={
+        clickable
+          ? (e) => {
+              e.stopPropagation();
+              onSelect!(step.id);
+            }
+          : undefined
+      }
+      onKeyDown={
+        clickable
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                e.stopPropagation();
+                onSelect!(step.id);
+              }
+            }
+          : undefined
+      }
+    >
       <span className="sring" />
       <span className="slead">{stepLead(step)}</span>
       {seat ? <span className="sname">{seat}</span> : null}

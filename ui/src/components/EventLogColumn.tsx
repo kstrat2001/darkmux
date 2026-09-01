@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import type { FlowRecord } from "../types/handwritten";
 import { recKey } from "../lib/flow";
 import { useThrottledValue } from "../hooks/useThrottledValue";
@@ -196,6 +196,7 @@ export function EventLogColumn({
   serverTruncated = false,
   paneId = "app",
   pushDetail = false,
+  headerExtra = null,
 }: {
   records: FlowRecord[];
   visible: boolean;
@@ -244,6 +245,15 @@ export function EventLogColumn({
    * `MissionGraphLens.tsx`'s) omits this prop and keeps the original split
    * behavior unchanged. */
   pushDetail?: boolean;
+  /** (#2189, step drill-in) An optional block rendered ABOVE the events
+   * list/header, inside `.eventlog__list` -- the mission lens's
+   * `StepHeaderBlock` when a step is selected, `null` everywhere else.
+   * Lives here (rather than a second surface) so the desktop mount and the
+   * phone drawer's Events tab -- the SAME component, per this file's own
+   * "one display surface" doc -- both pick it up for free from the SAME
+   * prop, threaded down from `App.tsx` exactly like `records`/`scopeLabel`
+   * already are. */
+  headerExtra?: ReactNode;
 }) {
   // The full facet-filter model (activity/category/tier/telemetry-source +
   // free-text search) — `FiltersDialog` renders the checkbox grid for it,
@@ -665,6 +675,7 @@ export function EventLogColumn({
             </div>
           )}
           <div className="eventlog__list">
+        {headerExtra}
         <div className="eventlog__head">
           <h3>
             {/* (operator) The header names the WINDOW; the outer UI owns

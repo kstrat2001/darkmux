@@ -166,9 +166,16 @@ describe("canonicalHash / parseRoute round-trip", () => {
     expect(window.location.hash).toBe("#dispatch=abc-123");
   });
 
-  it("mission is never canonicalized (#1868 — the hash it arrives on already IS canonical, nothing to compress)", () => {
-    const route: Route = { kind: "mission", missionId: "my-mission" };
-    expect(canonicalHash(route)).toBeNull();
+  it("mission (no step) round-trips to a bare mission= hash — the pre-#2189 shape, unchanged", () => {
+    const route: Route = { kind: "mission", missionId: "my-mission", stepId: null };
+    expect(canonicalHash(route)).toBe("mission=my-mission");
+    expect(roundTrip(route)).toEqual(route);
+  });
+
+  it("(#2189) mission WITH a selected step round-trips with an explicit step= param", () => {
+    const route: Route = { kind: "mission", missionId: "my-mission", stepId: "step-01" };
+    expect(canonicalHash(route)).toBe("mission=my-mission&step=step-01");
+    expect(roundTrip(route)).toEqual(route);
   });
 
   it("unknown is never canonicalized (a broken bookmark must stay visibly broken, not get silently rewritten)", () => {
@@ -201,9 +208,31 @@ describe("writeHash", () => {
     expect(window.location.hash).toBe("");
   });
 
-  it("null is a no-op — mission/unknown routes are never rewritten", () => {
+  it("null is a no-op — unknown routes are never rewritten", () => {
+    window.location.hash = "#lens=bogus-lens";
+    writeHash(canonicalHash({ kind: "unknown", hash: "lens=bogus-lens" }));
+    expect(window.location.hash).toBe("#lens=bogus-lens");
+  });
+
+  it("(#2189) a mission hash with no step is idempotent — writeHash is a no-op when the canonical form already matches", () => {
     window.location.hash = "#mission=my-mission";
-    writeHash(canonicalHash({ kind: "mission", missionId: "my-mission" }));
+    const lengthBefore = window.history.length;
+    writeHash(canonicalHash({ kind: "mission", missionId: "my-mission", stepId: null }));
+    expect(window.location.hash).toBe("#mission=my-mission");
+    expect(window.history.length).toBe(lengthBefore);
+  });
+
+  it("(#2189) selecting a step rewrites the hash via replaceState — no new history entry", () => {
+    window.location.hash = "#mission=my-mission";
+    const lengthBefore = window.history.length;
+    writeHash(canonicalHash({ kind: "mission", missionId: "my-mission", stepId: "step-01" }));
+    expect(window.location.hash).toBe("#mission=my-mission&step=step-01");
+    expect(window.history.length).toBe(lengthBefore);
+  });
+
+  it("(#2189) clearing the step (the back control) drops the step= param", () => {
+    window.location.hash = "#mission=my-mission&step=step-01";
+    writeHash(canonicalHash({ kind: "mission", missionId: "my-mission", stepId: null }));
     expect(window.location.hash).toBe("#mission=my-mission");
   });
 });

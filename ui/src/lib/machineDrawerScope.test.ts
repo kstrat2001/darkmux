@@ -14,7 +14,7 @@ const proc = (ts: string, cpu: number, machine_uid?: string): FlowRecord => ({
 describe("resolveDrawerScope (#2107)", () => {
   it("on a mission route, scopes to the mission's own route records and labels it", () => {
     const routeRecords = [proc("2026-01-01T00:00:00Z", 10), proc("2026-01-01T00:00:02Z", 20)];
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1" }, routeRecords, [], null, Date.parse("2026-01-01T00:00:02Z"));
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, routeRecords, [], null, Date.parse("2026-01-01T00:00:02Z"));
     expect(s.scopeLabel).toBe("this mission");
     expect(s.samples.map((p) => p.cpu)).toEqual([10, 20]);
   });
@@ -28,7 +28,7 @@ describe("resolveDrawerScope (#2107)", () => {
 
   it("mission/dispatch route records are sorted chronologically regardless of input order", () => {
     const routeRecords = [proc("2026-01-01T00:00:04Z", 40), proc("2026-01-01T00:00:00Z", 0)];
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1" }, routeRecords, [], null, 0);
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, routeRecords, [], null, 0);
     expect(s.samples.map((p) => p.cpu)).toEqual([0, 40]);
   });
 
@@ -61,7 +61,7 @@ describe("resolveDrawerScope (#2107)", () => {
 
 describe("lastKnown (#2107 phone feedback)", () => {
   it("is null on the mission/dispatch branch even when samples is empty", () => {
-    const s = resolveDrawerScope({ kind: "mission", missionId: "m1" }, [], [], null, 0);
+    const s = resolveDrawerScope({ kind: "mission", missionId: "m1", stepId: null }, [], [], null, 0);
     expect(s.samples).toEqual([]);
     expect(s.lastKnown).toBeNull();
   });
