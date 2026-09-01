@@ -42,6 +42,20 @@ export const ANSI_SGR_CLASS: Record<number, string> = {
   97: "a-fg15",
 };
 
+/** (#2206/#2207, slop-chop pilot) The loopback spellings an OSC 8 target
+ * may carry. Extracted token-identically from `panelHref`'s inline check. */
+export function isLoopback(hostname: string): boolean {
+  return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "[::1]" || hostname === "::1";
+}
+
+/** (#2206/#2207, slop-chop pilot) Is `ch` a CSI final byte (`@`..`~`,
+ * ECMA-48's terminator range)? Extracted token-identically from the SGR
+ * scanner's inline comparison; the `j < text.length` bounds check stays at
+ * the call site, exactly as before. */
+export function isCsiFinalByte(ch: string): boolean {
+  return ch >= "@" && ch <= "~";
+}
+
 /**
  * viewer.html: `function panelHref(raw)`. An OSC 8 target is safe to
  * linkify only when it is http(s). `mission status` bakes ABSOLUTE daemon
@@ -61,7 +75,7 @@ export function panelHref(raw: string): string | null {
   }
   if (u.protocol !== "http:" && u.protocol !== "https:") return null;
   if (u.origin === window.location.origin) return u.pathname + u.search + u.hash;
-  if (u.hostname === "127.0.0.1" || u.hostname === "localhost" || u.hostname === "[::1]" || u.hostname === "::1") {
+  if (isLoopback(u.hostname)) {
     return u.pathname + u.search + u.hash;
   }
   return u.href;
@@ -134,7 +148,7 @@ export function parseAnsi(text: string): AnsiSegment[] {
     // CSI ... final-byte (only `m` — SGR — is honored)
     if (text[i + 1] === "[") {
       let j = i + 2;
-      while (j < text.length && !(text[j] >= "@" && text[j] <= "~")) j++;
+      while (j < text.length && !isCsiFinalByte(text[j])) j++;
       if (j >= text.length) {
         i = text.length;
         break; // truncated: drop

@@ -8,6 +8,7 @@ import {
   fmtModel,
   fmtTok,
   foldFlowRecords,
+  hasNoMetricsData,
   hhmmss,
   indexGraph,
   isAiKind,
@@ -362,6 +363,29 @@ describe("seedMetricsFromGraph", () => {
   it("is a no-op (same reference) when nothing in the graph has any backfill data", () => {
     const m: MetricsMap = {};
     expect(seedMetricsFromGraph(m, baseGraph())).toBe(m);
+  });
+});
+
+describe("hasNoMetricsData", () => {
+  it("returns true for exactly one of the 64 falsy/truthy combinations — all six falsy", () => {
+    // Truthy samples match each field's type: nonzero numbers for the three
+    // counters and startedMs, true for the two booleans. Bit i selects the
+    // truthy sample for field i; the original expression
+    // `!tf && !nf && !cf && !cl && !lok && !st` is true only when every
+    // operand is falsy, i.e. bits === 0.
+    const TRUTHY = { tokensFinal: 123, turnsFinal: 7, toolsFinal: 3, cloud: true, localOk: true, startedMs: 1_700_000_000_000 };
+    const FALSY = { tokensFinal: 0, turnsFinal: 0, toolsFinal: 0, cloud: false, localOk: false, startedMs: 0 };
+    for (let bits = 0; bits < 64; bits++) {
+      const m = {
+        tokensFinal: bits & 1 ? TRUTHY.tokensFinal : FALSY.tokensFinal,
+        turnsFinal: bits & 2 ? TRUTHY.turnsFinal : FALSY.turnsFinal,
+        toolsFinal: bits & 4 ? TRUTHY.toolsFinal : FALSY.toolsFinal,
+        cloud: bits & 8 ? TRUTHY.cloud : FALSY.cloud,
+        localOk: bits & 16 ? TRUTHY.localOk : FALSY.localOk,
+        startedMs: bits & 32 ? TRUTHY.startedMs : FALSY.startedMs,
+      };
+      expect(hasNoMetricsData(m)).toBe(bits === 0);
+    }
   });
 });
 

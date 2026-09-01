@@ -481,6 +481,18 @@ export function applyRecordToMetrics(metrics: MetricsMap, rec: FlowRecord, idx: 
   return { ...metrics, [sid]: next };
 }
 
+/** `hasNoMetricsData` — the "this step reports no measurements yet" guard
+ * from `seedMetricsFromGraph` (mission-graph.html): true exactly when all
+ * six finalized fields are falsy. Single object parameter on purpose —
+ * three adjacent numbers and two adjacent booleans would be easy to pass
+ * in the wrong order positionally. */
+export function hasNoMetricsData(m: {
+  tokensFinal: number; turnsFinal: number; toolsFinal: number;
+  cloud: boolean; localOk: boolean; startedMs: number;
+}): boolean {
+  return !m.tokensFinal && !m.turnsFinal && !m.toolsFinal && !m.cloud && !m.localOk && !m.startedMs;
+}
+
 /** `seedMetricsFromGraph` — mission-graph.html. Seeds the accumulator from
  * the finalized totals the server folded into graph.json, taking the max so
  * a live SSE value already climbing is never regressed. */
@@ -494,7 +506,7 @@ export function seedMetricsFromGraph(metrics: MetricsMap, g: { nodes: GraphNode[
       const cl = !!s.cloud;
       const lok = !!s.localOk;
       const st = tsToMs(s.startedTs);
-      if (!tf && !nf && !cf && !cl && !lok && !st) continue;
+      if (hasNoMetricsData({ tokensFinal: tf, turnsFinal: nf, toolsFinal: cf, cloud: cl, localOk: lok, startedMs: st })) continue;
       const cur = out[s.id] || EMPTY_METRICS;
       const ntf = Math.max(cur.tokFinal, tf);
       const nnf = Math.max(cur.turnFinal, nf);

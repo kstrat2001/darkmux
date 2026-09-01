@@ -10,6 +10,7 @@
  * full modal — and the facet lists it needs — didn't exist yet).
  */
 import type { FlowRecord } from "../types/handwritten";
+import { isPlainObject } from "./guards";
 
 /** `activityOf()` — viewer.html:1014-1042, the FULL mapping (every branch,
  * including session end / machine online-offline / note, which the port's
@@ -365,7 +366,7 @@ export function restoreFilterState(
   // error boundary in the app at the time, a blank page. The documented
   // contract already promised "the plain default when the payload is
   // unrecognizable"; this makes the code match it.
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return base;
+  if (!isPlainObject(parsed)) return base;
   const out = base;
   for (const k of FACET_KEYS) {
     const stored = parsed[k];
@@ -432,7 +433,7 @@ export function storedFilterPicks(
     const raw = storage.getItem(filtersKeyFor(scope));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as unknown;
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    if (!isPlainObject(parsed)) return null;
     const o = parsed as Partial<StoredFilters>;
     return {
       act: Array.isArray(o.act) ? o.act.filter((v) => typeof v === "string") : [],

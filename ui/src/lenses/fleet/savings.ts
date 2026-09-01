@@ -76,6 +76,29 @@ export interface TokensOffMeter {
   cloudRuns: number;
 }
 
+/** (#2206/#2207, slop-chop pilot) Does this dispatch payload carry ANY
+ * token count? Extracted from the `dispatch.complete` guard below — the
+ * parenthesised half only; `isDispatchComplete` stays at the call site
+ * (the unit of extraction is the concept, not the condition). The `!!`
+ * is the one added token, forced by the boolean return; equivalence over
+ * the full field space is pinned in savings.test.ts. */
+export function hasAnyTokenCounts(p: {
+  total_tokens?: number; prompt_tokens?: number;
+  completion_tokens?: number; remote_tokens?: number;
+}): boolean {
+  return !!(p.total_tokens || p.prompt_tokens || p.completion_tokens || p.remote_tokens);
+}
+
+/** (#2206/#2207, slop-chop pilot) A review-path remote complete: remote
+ * tokens present and NO local counts. Extracted from the classifier
+ * below; same `!!` note as `hasAnyTokenCounts`. */
+export function isRemoteOnlyTokens(p: {
+  total_tokens?: number; prompt_tokens?: number;
+  completion_tokens?: number; remote_tokens?: number;
+}): boolean {
+  return !p.total_tokens && !p.prompt_tokens && !p.completion_tokens && !!p.remote_tokens;
+}
+
 export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
   // (#1607) Evidence of WHERE a session ran (`epBySid`) is registered from
   // ANY dispatch bookend carrying an `endpoint` — a `dispatch.complete` that
@@ -92,10 +115,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     if (isDispatchStart(r.action) || isDispatchComplete(r.action)) {
       epBySid.set(r.session_id, String(p.endpoint));
     }
-    if (
-      isDispatchComplete(r.action) &&
-      (p.total_tokens || p.prompt_tokens || p.completion_tokens || p.remote_tokens)
-    ) {
+    if (isDispatchComplete(r.action) && hasAnyTokenCounts(p)) {
       dcTok.set(r.session_id, p);
     }
   }
@@ -187,7 +207,7 @@ export function tokensOffMeter(data: FlowRecord[]): TokensOffMeter {
     // A `remote_tokens`-only payload has no prompt/completion split to
     // decompose, so without this its spend joins `total` while appearing in
     // NO class chip.
-    if (!p.total_tokens && !p.prompt_tokens && !p.completion_tokens && p.remote_tokens) uncls += tt;
+    if (isRemoteOnlyTokens(p)) uncls += tt;
     directRuns++;
     cloudRuns++;
   }

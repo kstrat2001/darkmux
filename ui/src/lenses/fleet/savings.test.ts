@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { tokensOffMeter } from "./savings";
+import { tokensOffMeter, hasAnyTokenCounts, isRemoteOnlyTokens } from "./savings";
 import type { FlowRecord } from "../../types/handwritten";
 
 function rec(overrides: Partial<FlowRecord>): FlowRecord {
@@ -191,5 +191,61 @@ describe("bookend spelling independence (#1852)", () => {
     const out = tokensOffMeter([raw("dispatch complete", { endpoint: "azure" }), tokens()]);
     expect(out.cloud).toBe(1000);
     expect(out.unknown).toBe(0);
+  });
+});
+
+describe("hasAnyTokenCounts", () => {
+  it("is false for an empty payload", () => {
+    expect(hasAnyTokenCounts({})).toBe(false);
+  });
+
+  it("is false when all four fields are zero", () => {
+    expect(hasAnyTokenCounts({ total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, remote_tokens: 0 })).toBe(false);
+  });
+
+  it("is true when total_tokens is nonzero", () => {
+    expect(hasAnyTokenCounts({ total_tokens: 5 })).toBe(true);
+  });
+
+  it("is true when prompt_tokens is nonzero", () => {
+    expect(hasAnyTokenCounts({ prompt_tokens: 5 })).toBe(true);
+  });
+
+  it("is true when completion_tokens is nonzero", () => {
+    expect(hasAnyTokenCounts({ completion_tokens: 5 })).toBe(true);
+  });
+
+  it("is true when remote_tokens is nonzero", () => {
+    expect(hasAnyTokenCounts({ remote_tokens: 5 })).toBe(true);
+  });
+});
+
+describe("isRemoteOnlyTokens", () => {
+  it("is true when only remote_tokens is nonzero (others absent)", () => {
+    expect(isRemoteOnlyTokens({ remote_tokens: 5 })).toBe(true);
+  });
+
+  it("is true when remote_tokens is nonzero and the other three are zero", () => {
+    expect(isRemoteOnlyTokens({ total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, remote_tokens: 5 })).toBe(true);
+  });
+
+  it("is false when total_tokens is nonzero", () => {
+    expect(isRemoteOnlyTokens({ total_tokens: 1, remote_tokens: 5 })).toBe(false);
+  });
+
+  it("is false when prompt_tokens is nonzero", () => {
+    expect(isRemoteOnlyTokens({ prompt_tokens: 1, remote_tokens: 5 })).toBe(false);
+  });
+
+  it("is false when completion_tokens is nonzero", () => {
+    expect(isRemoteOnlyTokens({ completion_tokens: 1, remote_tokens: 5 })).toBe(false);
+  });
+
+  it("is false when remote_tokens is absent", () => {
+    expect(isRemoteOnlyTokens({})).toBe(false);
+  });
+
+  it("is false when remote_tokens is zero", () => {
+    expect(isRemoteOnlyTokens({ remote_tokens: 0 })).toBe(false);
   });
 });

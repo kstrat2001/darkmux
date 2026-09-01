@@ -20,6 +20,7 @@
  */
 
 import type { FlowRecord, PresenceBeat } from "../types/handwritten";
+import { isPlainObject } from "./guards";
 
 /** `LIVE_WINDOW_MS` — viewer.html:3374. The rolling live window `RAW` is
  * bounded to; also the "N records · last Nh" meta-line's hour figure. */
@@ -177,7 +178,10 @@ export function firstRecordDate(records: FlowRecord[]): string | null {
  * backstop's `?since=` fetch, which hits the SAME `/flow/<date>` handler). */
 export function asRecordArray(body: unknown): FlowRecord[] {
   if (Array.isArray(body)) return body as FlowRecord[];
-  if (body && typeof body === "object") {
+  // (#2206) `isPlainObject` is drop-in here: the array case returned above,
+  // and `body && typeof body === "object"` differs from it only on `null`,
+  // which both reject.
+  if (isPlainObject(body)) {
     const obj = body as { records?: FlowRecord[]; flow?: FlowRecord[] };
     return obj.records ?? obj.flow ?? [];
   }
@@ -193,7 +197,7 @@ export function asRecordArray(body: unknown): FlowRecord[] {
  * mission past the server cap must say so, or "N of 10000" silently
  * restates the cap as the mission's whole history. */
 export function bodyTruncated(body: unknown): boolean {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
+  if (!isPlainObject(body)) return false;
   return !!(body as { truncated?: boolean }).truncated;
 }
 
