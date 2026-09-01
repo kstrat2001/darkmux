@@ -12,6 +12,140 @@ cadence (see `CLAUDE.md`) — a major bump in one of those is a breaking change
 to that payload, called out in the entry, and does not by itself force a major
 darkmux release.
 
+## [3.5.0] - 2026-09-02
+
+An unattended run stops lying to you.
+
+This release is about the run you are not watching. A **thermal governor**
+pauses an in-flight dispatch at its next turn boundary instead of killing it,
+and a **breaker** stops the work at critical — both riding the pause/resume
+mechanism this release adds (a pace file, a turn-boundary checkpoint, and
+`dispatch --resume-from`), so a machine that gets hot rests and resumes rather
+than losing an hour of work. A **power-posture pre-flight** refuses to start a
+mission at serious thermal state and holds a sleep assertion for the launch's
+lifetime. The rest is a burn-down, most of it found by a review swarm over the
+merged diff: every way a dispatch could hang past its own deadline, spin
+without terminating, execute quoted markup as a tool call, or leave a container
+running after it exited.
+
+### Added
+
+- **Pause/resume for runs** ([#2139](https://github.com/kstrat2001/darkmux/pull/2139), [#2146](https://github.com/kstrat2001/darkmux/pull/2146), closes [#2114](https://github.com/kstrat2001/darkmux/issues/2114)).
+  Between turns the loop reads `<host_out>/pace.json`; while `pause: true`
+  holds it rests in bounded increments, re-reading each time, emitting a
+  `runtime.rest` event per increment and absorbing the rest into the soft
+  inactivity clock — so a long pause never trips the inactivity detector. State
+  is checkpointed at the turn boundary, and every pace write is stamped
+  `written_at_ms` so a stale pause expires instead of wedging a container.
+
+- **`dispatch --resume-from` + `crawl --param resume=`** ([#2153](https://github.com/kstrat2001/darkmux/pull/2153)).
+  The runtime has honored `--resume` since #2114, but nothing could ever
+  trigger it. Now a prior dispatch's out dir is verified (`checkpoint.json`
+  exists and parses), copied into this dispatch's own fresh out dir — the prior
+  dir is left untouched as evidence — and `resumed_from` is stamped into the
+  `dispatch.start`/`dispatch.complete` payloads. A missing or invalid
+  checkpoint fails with a named error; it never silently starts fresh. For a
+  crawl, `resume=<mission-id>` skips units that completed and resumes units
+  that have a checkpoint.
+
+- **Thermal governor + breaker** ([#2140](https://github.com/kstrat2001/darkmux/pull/2140), closes [#2110](https://github.com/kstrat2001/darkmux/issues/2110) and [#2109](https://github.com/kstrat2001/darkmux/issues/2109)).
+  A host-side state machine fed one OS thermal reading per tick from the
+  existing per-dispatch sampler — no new poller. At `runtime.thermal.pause_at`
+  (default `serious`) it writes the pace file so the dispatch rests at its next
+  turn boundary, clearing only after the state holds at or below `resume_at`
+  for `resume_hold_ms`, so a state bouncing on the threshold cannot flap. At
+  `critical`, or below `min_cpu_speed_limit_pct`, the breaker stops further
+  dispatch. It **never kills the container** — the unit pauses with its
+  checkpoint persisted, and resume is the operator's call. On by default:
+  hardware safety is not an opt-in integration.
+
+- **Power-posture pre-flight and a sleep assertion** ([#2138](https://github.com/kstrat2001/darkmux/pull/2138), closes [#2112](https://github.com/kstrat2001/darkmux/issues/2112)).
+  A no-sudo probe reads AC/battery, Low Power Mode, thermal state, the CPU
+  speed cap, and any thermal-emergency forced sleep in the last 24h. `darkmux
+  doctor` warns; a mission launch **refuses to start at serious or critical
+  thermal state** unless `--force`. Each launch holds an
+  `IOPMAssertionCreateWithName` sleep assertion for its lifetime, released on
+  every exit path.
+
+- **Machine telemetry as flow records** ([#2173](https://github.com/kstrat2001/darkmux/pull/2173), closes [#2111](https://github.com/kstrat2001/darkmux/issues/2111); [#2167](https://github.com/kstrat2001/darkmux/pull/2167), closes [#2165](https://github.com/kstrat2001/darkmux/issues/2165)).
+  `machine.thermal` and `machine.telemetry` records, a `host_window` on
+  `dispatch complete`, bound provenance on cap/salvage/detector records, and a
+  resolved-knobs snapshot so every run is self-describing for later comparison.
+
+- **Hooks reach the tailnet, and transform on the way out** ([#2178](https://github.com/kstrat2001/darkmux/pull/2178), closes [#2135](https://github.com/kstrat2001/darkmux/issues/2135); [#2187](https://github.com/kstrat2001/darkmux/pull/2187), closes [#2183](https://github.com/kstrat2001/darkmux/issues/2183)).
+  Delivery is no longer loopback-only: a tailnet receiver is reachable under a
+  signed, attributed contract (HMAC-SHA256). Records can be reshaped by a pure
+  in-process `jq` transform bounded by `hooks.jq_timeout_ms` and
+  `hooks.jq_max_output_bytes`, auth headers are Keychain-referenced rather than
+  written into config, and a `file` transport writes deliveries to disk
+  (owner-only, `0600`) for local testing without a network.
+
+- **Crawl unit sizing** ([#2192](https://github.com/kstrat2001/darkmux/pull/2192)).
+  `max_sites_per_unit` lets an operator keep per-turn context small.
+
+- **Viewer** — a thermal alert ladder showing all four states with the current
+  one highlighted, and the mission lens's private event pane folded into the
+  shared mainstay column it had been silently failing on
+  ([#2163](https://github.com/kstrat2001/darkmux/pull/2163)); step drill-in,
+  which selects a step and scopes the events column
+  ([#2191](https://github.com/kstrat2001/darkmux/pull/2191), closes [#2189](https://github.com/kstrat2001/darkmux/issues/2189));
+  a pulsing RUNNING pill and no playback badge
+  ([#2221](https://github.com/kstrat2001/darkmux/pull/2221)); and a mobile pass
+  — inline filters, masthead order, a header that stops repeating itself
+  ([#2222](https://github.com/kstrat2001/darkmux/pull/2222)).
+
+### Fixed
+
+**The runtime loop.**
+
+- **A generation check-in bounds every call** ([#2176](https://github.com/kstrat2001/darkmux/pull/2176), closes [#2171](https://github.com/kstrat2001/darkmux/issues/2171)). A non-thinking model could outlast the inactivity budget inside a single call, with no proof-of-work signal to reset the clock.
+- **The reasoning check-in bounds reasoning only** ([#2166](https://github.com/kstrat2001/darkmux/pull/2166), closes [#2164](https://github.com/kstrat2001/darkmux/issues/2164)) — not a fresh turn's first call.
+- **Tool calls with non-tool names are never executed** ([#2182](https://github.com/kstrat2001/darkmux/pull/2182), closes [#2169](https://github.com/kstrat2001/darkmux/issues/2169)): partition, coalesce, and name the model.
+- **Quoted tool-call markup is not promoted into a dispatched call** ([#2254](https://github.com/kstrat2001/darkmux/pull/2254), closes [#2230](https://github.com/kstrat2001/darkmux/issues/2230)). Text inside a fenced code block — a model *explaining* a command — could be promoted by the plain-text tool-call promoter and executed. Confirmed executable with `rm -rf /workspace` before the fix.
+- **The degeneracy gate can see whitespace-free output** ([#2245](https://github.com/kstrat2001/darkmux/pull/2245), closes [#2228](https://github.com/kstrat2001/darkmux/issues/2228)). When tokenization goes blind, a character-level fallback terminates a spinning run in 0.34s where it previously spun for 5.69s and counting.
+- **The stall-recovery budget pays down on a turn that actually opened** ([#2241](https://github.com/kstrat2001/darkmux/pull/2241), closes [#2229](https://github.com/kstrat2001/darkmux/issues/2229)) — the first fix made escalation unreachable across 41 turns.
+- **Empty `tool_calls` is its own signal**, the stall budget is a knob (`runtime.max_stall_recoveries`), and escalations name the model and context ([#2200](https://github.com/kstrat2001/darkmux/pull/2200), closes [#2190](https://github.com/kstrat2001/darkmux/issues/2190)).
+
+**Dispatch lifecycle.**
+
+- **The container is reaped on every non-success exit** ([#2249](https://github.com/kstrat2001/darkmux/pull/2249), closes [#2233](https://github.com/kstrat2001/darkmux/issues/2233)). A kill guard is armed at spawn and disarmed only on a successful exit status, so an error, a panic, or a signal no longer leaves a container running with a model resident.
+- **The inactivity watchdog keeps killing until the container is gone** ([#2255](https://github.com/kstrat2001/darkmux/pull/2255), closes [#2232](https://github.com/kstrat2001/darkmux/issues/2232)). A single `docker kill` was treated as success — but `docker rm -f` exits 0 on a container that does not exist, so a failed kill was indistinguishable from a successful one. Now: retry with backoff, escalate to `rm -f`, and distinguish confirmed-stopped from never-existed.
+- **A shared finalize guard across all three mission launchers** ([#2141](https://github.com/kstrat2001/darkmux/pull/2141), closes [#2131](https://github.com/kstrat2001/darkmux/issues/2131)) — SIGINT, SIGTERM, and SIGHUP each write the terminal record and reap children.
+- **The crew index rebuilds when the binary's builtin set changes** ([#2145](https://github.com/kstrat2001/darkmux/pull/2145), closes [#2144](https://github.com/kstrat2001/darkmux/issues/2144)), and `missions.status` accepts `Aborted` ([#2147](https://github.com/kstrat2001/darkmux/pull/2147), closes [#2142](https://github.com/kstrat2001/darkmux/issues/2142)).
+
+**Hangs.**
+
+- **Every Redis command path is bounded, including the dispatch teardown** ([#2244](https://github.com/kstrat2001/darkmux/pull/2244), closes [#2227](https://github.com/kstrat2001/darkmux/issues/2227)). An unreachable-but-routable Redis wedged a dispatch's teardown for 89.4s at ten production command sites.
+- **`mission dispatch --wait` cannot hang past its own timeout** ([#2251](https://github.com/kstrat2001/darkmux/pull/2251), closes [#2243](https://github.com/kstrat2001/darkmux/issues/2243)). Each blocking read now carries the remaining deadline rather than the full one, and a timed-out connection is discarded instead of reused — a reused one returns the *previous* command's reply, trading a hang for a silently wrong answer.
+
+**Crawl, config, viewer, docs.**
+
+- A crawl unit is bounded by turns and by progress, and its dispatch names the model ([#2198](https://github.com/kstrat2001/darkmux/pull/2198), closes [#2193](https://github.com/kstrat2001/darkmux/issues/2193) and [#2188](https://github.com/kstrat2001/darkmux/issues/2188)); a unit with an unresolvable source sha is refused rather than dispatched ([#2152](https://github.com/kstrat2001/darkmux/pull/2152)).
+- Two knobs that were settable in the struct but missing from the `config set` key registry — `runtime.telemetry_record_every_samples` ([#2177](https://github.com/kstrat2001/darkmux/pull/2177)) and `hooks.jq_timeout_ms` / `hooks.jq_max_output_bytes` ([#2194](https://github.com/kstrat2001/darkmux/pull/2194)). The underlying cause, two hand-maintained lists, is tracked as [#2195](https://github.com/kstrat2001/darkmux/issues/2195).
+- **The step drill-in reaches the dispatch detail view** ([#2223](https://github.com/kstrat2001/darkmux/pull/2223)). The first version keyed on session-id *shape*, which made it inert on every generic `mission launch` mission while its tests stayed green; it now discriminates on evidence of dispatch.
+- **The machine info panel leads with what it is** ([#2250](https://github.com/kstrat2001/darkmux/pull/2250)) — one definition table, one value edge, sampler cadence stated once at the bottom instead of three times.
+  A pre-release review caught that the rework guarded the section on a JSX
+  fragment, which is always truthy, so a machine whose identity was not yet
+  known rendered a bare "System specs" heading with nothing under it; the
+  test named for that exact shape had been passing throughout because it
+  only asserted the rows, never the heading ([#2256](https://github.com/kstrat2001/darkmux/pull/2256)).
+- Docs and tests use synthetic network identifiers only ([#2179](https://github.com/kstrat2001/darkmux/pull/2179)); the SIGTERM reap assertions are scoped to the test's own child ([#2148](https://github.com/kstrat2001/darkmux/pull/2148)).
+
+### Schema
+
+- `FLOW_SCHEMA_VERSION` 1.28.0 → **1.31.0** — `dispatch start` gains a `bounds` block carrying the resolved runtime knobs with `{value, source}` provenance (1.29.0); `dispatch.rest` gains `reason` and `state`, and `dispatch.complete` gains `paced_rest_ms`, so a governor pause and a routine inter-turn rest are no longer distinguishable only by cadence (1.30.0); and the `machine.thermal` / `machine.telemetry` actions plus `host_window` on the dispatch terminal (1.31.0). All additive — payload keys on existing records and two new action values.
+- `CONFIG_SCHEMA_VERSION` 1.14 → **1.19** — `runtime.thermal.*` (1.15), `runtime.telemetry_record_every_samples` (1.16), the hook rules' signing and attribution fields (1.17), the jq bounds plus the `headers` / `file` / `transform` rule fields (1.18), and a bookkeeping bump crediting `runtime.max_stall_recoveries` and `runtime.generation_checkpoint_interval_tokens`, two caps that shipped without one (1.19). All additive and lenient-on-read.
+
+  Note that reaching a tailnet receiver is **not** a config flag — there is no
+  enable knob. The rule's URL is the decision: loopback or a genuine Tailscale
+  address is accepted, anything else is refused at load and at every POST.
+
+Both are minor bumps, so a v3.4.0 binary reading v3.5.0 records or config sees
+fields it ignores rather than breaking — which matters on a mixed-version
+fleet, where the hub and a peer are not always upgraded on the same day.
+
+[3.5.0]: https://github.com/kstrat2001/darkmux/releases/tag/v3.5.0
+
 ## [3.4.0] - 2026-08-30
 
 The crawler becomes a mission, and the machine tells you what it is doing.

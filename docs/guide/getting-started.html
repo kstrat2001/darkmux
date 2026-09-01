@@ -94,14 +94,14 @@ Next steps:
     <p><code>doctor</code> asks "is my setup correct": registry, models, RAM, daemon, flow sinks, skills. Pass, warn, or fail per check, with the fix under each warning; exit 1 only on a fail. <code>machine status</code> asks the other question, "what is loaded right now".</p>
     <div class="session">
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux doctor</span><button class="copy-btn" data-copy="darkmux doctor" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
-      <div class="cmd-out">darkmux doctor — 41 checks
+      <div class="cmd-out">darkmux doctor — 56 checks
 
 ● needs attention — flow sink health: LocalFile · warnings: flows_dir_absent
 
-  ✓ build                  darkmux 3.4.0 (2b4e38b5) · flow schema 1.28.0
+  ✓ build                  darkmux 3.5.0 (937fa27b) · flow schema 1.31.0
   ✓ daemon reachable       reachable · viewer http://127.0.0.1:8765/ · phone
                            http://&lt;tailnet-hostname&gt;/
-  ✓ 36 more checks passed — <code>-v</code> for detail
+  ✓ 51 more checks passed — <code>-v</code> for detail
   ⚠ flow sink health       LocalFile · warnings: flows_dir_absent
         → Run <code>darkmux flow status</code> for full detail. Common fixes: start Redis (`brew services start
           redis<code>) if </code>redis_unreachable<code>; raise </code>DARKMUX_REDIS_MAXLEN` if
@@ -119,7 +119,7 @@ Next steps:
           --identifier darkmux:&lt;id&gt;<code> — since a bare </code>lms load` creates a resident darkmux won't
           reuse and <code>machine eject</code> can't reclaim. (#590, #1616, #1675)
 
-38 pass, 3 warn — workable but worth a look</div>
+53 pass, 3 warn — workable but worth a look</div>
       <div class="cmd-line"><span class="prompt">$ </span><span class="cmd">darkmux machine status</span><button class="copy-btn" data-copy="darkmux machine status" aria-label="Copy command" title="Copy"><svg class="copy-btn__copy" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="copy-btn__ok" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
       <div class="cmd-out">registry: ~/.darkmux/profiles.json
 

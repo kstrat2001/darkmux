@@ -687,7 +687,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "darkmux"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-crew"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "darkmux-flow",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-doctor"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "darkmux-crew",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-eureka"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "darkmux-hardware",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-fleet"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "darkmux-crew",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-flow"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-gestalt"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "darkmux-types",
  "serde",
@@ -822,14 +822,14 @@ dependencies = [
 
 [[package]]
 name = "darkmux-hardware"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "darkmux-heuristics"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "darkmux-hardware",
  "darkmux-profiles",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-lab"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-profiles"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "darkmux-gestalt",
@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-serve"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "darkmux-types"
-version = "3.4.0"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "dirs",
