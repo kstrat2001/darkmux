@@ -4642,23 +4642,61 @@ body {
   white-space: pre-wrap;
 }
 .dialog__rrdetail {
-  font: calc(11px * var(--fs-scale)) var(--font-mono);
   color: var(--dim);
 }
+/* (#2250) The type treatment lives on the ROW, not on one wrapper.
+   It used to sit on `.dialog__rrdetail`, so a `.dialog__kv` inside that
+   wrapper (General) rendered mono/11px while the SAME class inside
+   `.power-block` (Power) inherited the dialog's default sans at default
+   size — two visibly different treatments for identical markup, in one
+   panel. Both classes are used only by the machine panel, so moving it
+   down standardizes every kv row wherever it appears and cannot reach
+   another dialog. */
 .dialog__kv {
   display: flex;
   gap: 10px;
   margin-top: 4px;
+  font: calc(11px * var(--fs-scale)) var(--font-mono);
+  color: var(--dim);
+}
+/* (#2250 layout model) The panel is ONE definition table: every fact row
+   is a label in a shared fixed-width left column, then its value starting
+   at the single value edge that runs through the whole panel. Labels are
+   LEFT-aligned, small, dim, and uppercase — the same label vocabulary the
+   section titles already speak (`.hx-section__title`), one step quieter —
+   so the panel has exactly two text roles: dim labels, `--fg` mono data.
+   The previous right-aligned bold-label form put the emphasis on the
+   labels and left their STARTS ragged mid-panel, which is what read as
+   "alignment isn't right"; it also overflowed its own 18ch column on the
+   18-character "memory free for AI" label, breaking the shared value edge
+   by 8px on both viewports. No colon: the column gap does that work, and
+   a trailing colon at 10 different x-positions is noise. */
+.dialog__kv {
+  align-items: baseline;
 }
 .dialog__kv b {
-  color: var(--fg);
-  font-weight: 600;
-  min-width: 92px;
-  flex-shrink: 0;
+  color: var(--dim);
+  font-weight: 500;
+  font-size: calc(10px * var(--fs-scale));
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  /* `ch` because these labels are mono: 1ch IS one character. The longest
+     label is "memory free for AI" (18 chars); letter-spacing adds ~1ch
+     across it, and 21ch leaves ~2ch slack so a hidden/absent row can never
+     change the column and a one-character-longer future label still fits.
+     Verified by measurement (getBoundingClientRect), not eyeballed. */
+  flex: 0 0 21ch;
+  text-align: left;
 }
 .dialog__kv span {
   min-width: 0;
   word-break: break-word;
+  color: var(--fg);
+}
+/* Tone hook, not a layout switch: the thermal CPU-speed-limit row keeps
+   its warning color inside the same row anatomy as every other fact. */
+.dialog__kv--warn span {
+  color: var(--warn);
 }
 .dialog__kv a {
   color: var(--accent);
@@ -4667,11 +4705,6 @@ body {
 .dialog__kv a:hover {
   text-decoration: underline;
 }
-.dialog__rule {
-  border-top: 1px solid var(--border);
-  margin: 10px 0;
-}
-
 /* ── Mission-graph lens (#1868) — a port of `mission-graph.html`'s own
    inline <style> block. DOM class names (`.mnode`, `.phasegroup`,
    `.steprow`, `.tlphase`, `.tltask`, `.evbtn`, …) are kept IDENTICAL to that
@@ -5704,8 +5737,38 @@ body {
 }
 .machine-drawer__scope {
   font-size: calc(11px * var(--fs-scale));
+  /* (#2250) Family pinned. It set size and colour but not family, so it
+     inherited the dialog's sans while every line around it is mono — the
+     last of the panel's three mismatched treatments. */
+  font-family: var(--font-mono);
   color: var(--dim);
   margin-bottom: 12px;
+}
+/* (#2250, operator finding) The machine panel is roughly double the base
+   `.dialog` width on desktop. It outgrew the 380px short-kv-list default:
+   the power channel row wrapped mid-phrase ("ANE / 0 mW" onto its own
+   line) and the CPU/GPU/MEM gauges had no room to sit side by side. Scoped
+   to this dialog via the `className` hook rather than widening `.dialog`,
+   which About and Filters also use. `min()` keeps the phone/narrow case on
+   the viewport-relative bound — the phone skin is the bottom drawer, not
+   this dialog, but a narrow desktop window still gets a sane width. */
+.dialog--machine {
+  width: min(92vw, 760px);
+}
+/* Give the three gauges room to breathe now that there is width for it.
+   The container is `.meter-row` — an earlier draft of this rule targeted
+   `.machine-drawer__meters`, which does not exist, and would have been a
+   silent no-op. */
+.dialog--machine .meter-row {
+  gap: 28px;
+}
+/* (#2250, operator finding — mobile) Separate the first kv row from the
+   gauges above it. The GPU rows sit directly under the avg/max line, and
+   with no gap they read as a fourth caption belonging to the MEM gauge
+   rather than as their own rows. Scoped to the row that FOLLOWS the meters
+   so it does not add space between consecutive rows. */
+.meter-row + .dialog__kv {
+  margin-top: 14px;
 }
 /* (#2250) Footnote under the whole panel explaining what avg/max cover.
    Dimmer and separated from the sections above so it reads as a note about
@@ -5745,12 +5808,6 @@ body {
    Apple Silicon story. All share the machine drawer's existing quiet/dim
    text vocabulary (`--dim`, `.dialog__kv`'s own row shape) so they read
    as continuations of the same body, not a bolted-on second widget. */
-.machine-drawer__gpu-extra {
-  margin-top: 6px;
-  font: 500 calc(11px * var(--fs-scale))/1.4 var(--font-mono);
-  color: var(--dim);
-  font-variant-numeric: tabular-nums;
-}
 /* (operator finding — "hard to tell what starts and ends a section")
    ONE shared section convention for every titled block in the host-extras
    body — Thermal, Power, CPU clusters — so the reader gets a single
@@ -5760,9 +5817,7 @@ body {
    from Thermal's/Clusters' own uppercase title, which is exactly what made
    the boundary between them illegible). `.hx-section` owns the spacing +
    divider; `.hx-section__title` owns the label typography — apply BOTH to
-   every section, never just one. The GPU MHz/memory caption stays OUTSIDE
-   this system on purpose: it is a footnote to the meter row above it, not
-   a section of its own. */
+   every section, never just one. */
 .hx-section {
   margin-top: 16px;
   padding-top: 14px;
@@ -5771,6 +5826,10 @@ body {
 .hx-section__title {
   text-transform: uppercase;
   letter-spacing: 0.08em;
+  /* (#2250) Family pinned rather than inherited: these titles sit inside
+     wrappers with different fonts (`.dialog__rrdetail` vs `.power-block`),
+     so an inherited family made the headings themselves inconsistent. */
+  font-family: var(--font-mono);
   font-size: calc(10px * var(--fs-scale));
   font-weight: 600;
   color: var(--dim);
@@ -5844,17 +5903,6 @@ body {
   background: color-mix(in srgb, var(--bad) 12%, transparent);
   box-shadow: 0 0 8px color-mix(in srgb, var(--bad) 35%, transparent);
 }
-.thermal-row__limit {
-  margin-left: 8px;
-  font: 500 calc(11px * var(--fs-scale))/1.4 var(--font-mono);
-  color: var(--warn);
-}
-.thermal-row__window {
-  margin-top: 4px;
-  font: 500 calc(11px * var(--fs-scale))/1.4 var(--font-mono);
-  color: var(--dim);
-  font-variant-numeric: tabular-nums;
-}
 .power-block .dialog__kv:first-child {
   margin-top: 0;
 }
@@ -5880,50 +5928,6 @@ body {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
   text-align: center;
-}
-
-/* ── (#2108, operator finding — wrap fix) `InlineOrCells`' mobile cell
-   grid — the shared fix for a dotted list that wrapped mid-item at
-   ~390px ("15.0 W / p95" split across two lines, "ANE" pushed onto its
-   own broken line). `auto-fit`/`minmax` lets whole CELLS reflow to the
-   next row as a unit (never mid-phrase); `nowrap` + tabular-nums on the
-   value is what makes a single cell's own text un-splittable. `minmax`'s
-   64px floor comfortably clears 2+ columns at the drawer/lens's own
-   content width (~300-330px after padding) for every caller today
-   (2, 3, and 4-item rows), satisfying the "2 per row minimum" rule
-   without hand-tuning a column count per caller. */
-.inline-or-cells {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
-  gap: 6px 12px;
-  width: 100%;
-}
-.inline-or-cells__cell {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-.inline-or-cells__cell-label {
-  font-size: calc(9px * var(--fs-scale));
-  color: var(--dim);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
-}
-.inline-or-cells__cell-value {
-  font: 600 calc(11px * var(--fs-scale))/1.3 var(--font-mono);
-  color: var(--fg);
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-/* Inside a `.dialog__kv` row (Power/Channels/thermal-window's own wrapper),
-   the grid is the "value" half of the existing label-left/value-right
-   flex row — `min-width: 0` lets it actually SHRINK into the row's
-   available space rather than being pushed wide by its own content
-   (the same flex-shrink fix `.mm-gauge--compact` needed). */
-.dialog__kv .inline-or-cells {
-  min-width: 0;
-  flex: 1;
 }
 
 /* (#2108, operator finding — wrap fix) The mobile identity block — two

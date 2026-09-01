@@ -45,7 +45,6 @@ import {
   MEM_WARN_AT,
   MEM_CRITICAL_AT,
 } from "./Meter";
-import { InlineOrCells, type InlineOrCellsItem } from "./InlineOrCells";
 import { COMPACT_METER_WIDTH, COMPACT_METER_HEIGHT } from "./Meter";
 import { aggregateHostSamples, type HostAggregate } from "../lib/hostStats";
 import { resolveDrawerScope } from "../lib/machineDrawerScope";
@@ -53,7 +52,6 @@ import { injectedMeta } from "../lib/injectedMeta";
 import { firstRecordDate, nameOf, todayUTC } from "../lib/flow";
 import { relAgoFrom } from "../lib/format";
 import { replayPlaybackKvValue } from "../lib/replayMeta";
-import { specOf } from "../lenses/fleet/cards";
 import { isLiveRoute, type Route } from "../lib/route";
 import { useDaemonLoad } from "../hooks/useDaemonLoad";
 import type { LiveTailStatus } from "../hooks/useLiveTail";
@@ -91,14 +89,45 @@ function connectionText(route: Route, liveStatus: LiveTailStatus): string {
   return "no records yet";
 }
 
-function Kv({ label, value }: { label: string; value: string }) {
+/** (#2250 layout model) ONE row anatomy for every fact in this panel: a
+ * label in the shared left column (`.dialog__kv b` — the panel-wide fixed
+ * column), then the value starting at the shared value edge. `className`
+ * is a tone hook (`dialog__kv--warn` for the thermal speed-limit row),
+ * never a layout switch — the point of this model is that there are no
+ * per-row layout exceptions left. */
+function Kv({
+  label,
+  value,
+  className,
+}: {
+  label: string;
+  value: string;
+  className?: string;
+}) {
   if (!value) return null;
   return (
-    <div className="dialog__kv">
+    <div className={`dialog__kv${className ? ` ${className}` : ""}`}>
       <b>{label}</b>
       <span>{value}</span>
     </div>
   );
+}
+
+/** (#2250 layout model) A multi-stat value ("9.0 W now · 7.8 W avg · …")
+ * as ONE string whose internal spaces are non-breaking, joined with a
+ * breakable space only AFTER each "·" separator. This is the whole
+ * mid-item-wrap fix in one place: the value is ordinary row content that
+ * wraps ONLY at item boundaries, identically on both viewports — no
+ * mobile cell-grid, no per-viewport branch, no stacked-label modifier.
+ * (The `InlineOrCells` component this replaces existed solely for these
+ * rows; it is deleted with them.) Testing-library's default normalizer
+ * collapses ` ` like any whitespace, so tests assert the plain
+ * "a · b" reading. */
+function kvSegs(segs: Array<string | null>): string {
+  return segs
+    .filter((s): s is string => s !== null)
+    .map((s) => s.replace(/ /g, "\u00A0"))
+    .join("\u00A0· ");
 }
 
 /** (#2108, host-sample-shape v2) `mW` below 1000, `W` at one decimal from
@@ -122,6 +151,13 @@ function fmtEnergyMwh(mwh: number | null): string | null {
 /** `gpu_mem_bytes` → `GB` at one decimal from 1 GB up, `MB` (one decimal)
  * below — the GPU's in-use system memory is typically tens to low
  * hundreds of MB, but a heavy workload can cross into GB. */
+/** (#2250) Whole-GB for the system-spec rows. Returns "" (not null) so it
+ * drops straight into `Kv`, which hides an empty value. */
+function fmtGbBytes(bytes: number | null): string {
+  if (bytes === null || !Number.isFinite(bytes)) return "";
+  return `${Math.round(bytes / 1073741824)} GB`;
+}
+
 function fmtGpuMemBytes(bytes: number | null): string | null {
   if (bytes === null) return null;
   return bytes >= 1_000_000_000
@@ -206,18 +242,7 @@ function ThermalLadder({ state }: { state: ThermalState }) {
  * a question thermal/power/clusters don't have (they're never scoped to a
  * dispatch on the wire), so mission/dispatch routes render these rows too
  * whenever the daemon itself is reachable. */
-function HostExtras({
-  load,
-  isMobile,
-}: {
-  load: MachineLoad | null;
-  /** (#2108, operator finding — wrap fix) Threaded down from
-   * `useMachineStatsContent`'s own `isMobile` input so the dotted-list
-   * rows below can switch to `InlineOrCells`' cell-grid form at the same
-   * breakpoint the rest of the drawer/lens uses. See that component's
-   * own doc for why a phrase must never break mid-item. */
-  isMobile: boolean;
-}) {
+function HostExtras({ load }: { load: MachineLoad | null }) {
   if (load === null) return null;
   const { thermal, power_mw, cpu_clusters } = load.now;
   // (#2108 review finding 7) `load.window` itself, and the v2-only
@@ -229,131 +254,37 @@ function HostExtras({
   const windowThermal = load.window?.thermal ?? null;
   const windowPower = load.window?.power_mw ?? null;
   const energyLine = fmtEnergyMwh(load.window?.energy_mwh ?? null);
-  // `?? null` here too: a v1-shaped `now` predates `gpu_mhz`/
-  // `gpu_mem_bytes` entirely, and `undefined` fails both formatters' `===
-  // null` checks (`fmtGpuMemBytes` below), rendering a literal "NaN MHz ·
-  // NaN MB" instead of hiding the row — caught by this file's own v1
-  // render test.
-  const gpuMhz = load.now.gpu_mhz ?? null;
-  const gpuMem = fmtGpuMemBytes(load.now.gpu_mem_bytes ?? null);
-  const gpuExtraItems: InlineOrCellsItem[] = [
-    gpuMhz !== null
-      ? { cellLabel: "MHz", cellValue: `${Math.round(gpuMhz)}`, inline: `${Math.round(gpuMhz)} MHz` }
-      : null,
-    gpuMem !== null ? { cellLabel: "memory", cellValue: gpuMem, inline: gpuMem } : null,
-  ].filter((x): x is InlineOrCellsItem => x !== null);
-
-  const powerTotalItems: InlineOrCellsItem[] = power_mw
-    ? [
-        { cellLabel: "now", cellValue: fmtMw(power_mw.total) ?? "—", inline: `${fmtMw(power_mw.total)} now` },
+  // (#2250 layout model) Multi-stat rows are ordinary kv rows whose value
+  // is a `kvSegs` phrase run — same facts, same wording, one row anatomy.
+  const powerTotal = power_mw
+    ? kvSegs([
+        `${fmtMw(power_mw.total) ?? "—"} now`,
         ...(windowPower
           ? [
-              {
-                cellLabel: "avg",
-                cellValue: fmtMw(windowPower.total?.mean ?? null) ?? "—",
-                inline: `${fmtMw(windowPower.total?.mean ?? null)} avg`,
-              },
-              {
-                cellLabel: "p95",
-                cellValue: fmtMw(windowPower.total?.p95 ?? null) ?? "—",
-                inline: `${fmtMw(windowPower.total?.p95 ?? null)} p95`,
-              },
-              {
-                cellLabel: "max",
-                cellValue: fmtMw(windowPower.total?.max ?? null) ?? "—",
-                inline: `${fmtMw(windowPower.total?.max ?? null)} max`,
-              },
+              `${fmtMw(windowPower.total?.mean ?? null) ?? "—"} avg`,
+              `${fmtMw(windowPower.total?.p95 ?? null) ?? "—"} p95`,
+              `${fmtMw(windowPower.total?.max ?? null) ?? "—"} max`,
             ]
           : []),
-      ]
-    : [];
-  const channelItems: InlineOrCellsItem[] = power_mw
-    ? [
-        fmtMw(power_mw.cpu) !== null
-          ? { cellLabel: "CPU", cellValue: fmtMw(power_mw.cpu)!, inline: `CPU ${fmtMw(power_mw.cpu)}` }
-          : null,
-        fmtMw(power_mw.gpu) !== null
-          ? { cellLabel: "GPU", cellValue: fmtMw(power_mw.gpu)!, inline: `GPU ${fmtMw(power_mw.gpu)}` }
-          : null,
-        fmtMw(power_mw.ane) !== null
-          ? { cellLabel: "ANE", cellValue: fmtMw(power_mw.ane)!, inline: `ANE ${fmtMw(power_mw.ane)}` }
-          : null,
-      ].filter((x): x is InlineOrCellsItem => x !== null)
-    : [];
+      ])
+    : "";
+  const powerChannels = power_mw
+    ? kvSegs([
+        fmtMw(power_mw.cpu) !== null ? `CPU ${fmtMw(power_mw.cpu)}` : null,
+        fmtMw(power_mw.gpu) !== null ? `GPU ${fmtMw(power_mw.gpu)}` : null,
+        fmtMw(power_mw.ane) !== null ? `ANE ${fmtMw(power_mw.ane)}` : null,
+      ])
+    : "";
 
   return (
     <>
-      {gpuExtraItems.length > 0 && (
-        <div className="machine-drawer__gpu-extra">
-          {/* (operator finding — "GPU memory is wrapping") A single item
-              (MHz absent, only memory measured — the common case on this
-              hardware) went through `InlineOrCells`' mobile cell-grid path
-              regardless of count, which stacks a label ABOVE its value even
-              for one item. Combined with the "GPU " prefix text before it,
-              that read as three floating lines ("GPU" / "MEMORY" /
-              "23.8 MB") indistinguishable from real section headers. The
-              grid exists to stop a MULTI-item phrase breaking mid-item
-              (`InlineOrCells`' own doc) — a lone item has nothing to break
-              against, so it renders as plain inline text instead. */}
-          GPU {gpuExtraItems.length === 1 ? gpuExtraItems[0].inline : <InlineOrCells items={gpuExtraItems} isMobile={isMobile} />}
-        </div>
-      )}
-      {thermal && (
-        <div className="thermal-row hx-section">
-          <div className="hx-section__title">
-            Thermal
-            {THERMAL_STEPS.every((s) => s.key !== thermal.state) && ` · ${fmtThermalState(thermal.state)}`}
-          </div>
-          <ThermalLadder state={thermal.state} />
-          {thermal.cpu_speed_limit_pct < 100 && (
-            <span className="thermal-row__limit">
-              {`CPU speed limit ${Math.round(thermal.cpu_speed_limit_pct)}%`}
-            </span>
-          )}
-          {windowThermal && (
-            <div className="thermal-row__window">
-              <InlineOrCells
-                items={[
-                  {
-                    cellLabel: "worst",
-                    cellValue: fmtThermalState(windowThermal.worst_state),
-                    inline: `worst ${fmtThermalState(windowThermal.worst_state)}`,
-                  },
-                  {
-                    cellLabel: "above nominal",
-                    cellValue: fmtAboveNominal(windowThermal.above_nominal_ms),
-                    inline: `${fmtAboveNominal(windowThermal.above_nominal_ms)} above nominal`,
-                  },
-                ]}
-                isMobile={isMobile}
-              />
-            </div>
-          )}
-        </div>
-      )}
-      {(power_mw || energyLine) && (
-        <div className="power-block hx-section">
-          <div className="hx-section__title">Power</div>
-          {power_mw && (
-            <div className="dialog__kv">
-              <b>Total</b>
-              <InlineOrCells items={powerTotalItems} isMobile={isMobile} />
-            </div>
-          )}
-          {power_mw && (
-            <div className="dialog__kv">
-              <b>Channels</b>
-              <InlineOrCells items={channelItems} isMobile={isMobile} />
-            </div>
-          )}
-          {energyLine && (
-            <div className="dialog__kv">
-              <b>Energy (window)</b>
-              <span>{energyLine}</span>
-            </div>
-          )}
-        </div>
-      )}
+      {/* (#2250, operator finding) CPU clusters sits FIRST here, directly
+          under the Load section, because it is a decomposition of Load's
+          own CPU gauge — you read "CPU 25%" and then the per-cluster split
+          that explains it, rather than scrolling past thermal and power to
+          find it. It also puts the per-cluster MHz next to the utilization
+          it belongs to. Thermal and power follow as the environmental
+          readings they are. */}
       {cpu_clusters && cpu_clusters.length > 0 && (
         <div className="cluster-block hx-section">
           <div className="hx-section__title">CPU clusters</div>
@@ -383,6 +314,46 @@ function HostExtras({
               </div>
             ))}
           </div>
+        </div>
+      )}
+      {thermal && (
+        <div className="thermal-row hx-section">
+          <div className="hx-section__title">
+            Thermal
+            {THERMAL_STEPS.every((s) => s.key !== thermal.state) && ` · ${fmtThermalState(thermal.state)}`}
+          </div>
+          <ThermalLadder state={thermal.state} />
+          {/* (#2250 layout model) The ladder is a figure; every FACT under
+              it is a kv row like everywhere else in the panel. The
+              speed-limit row keeps its warn color via the tone hook and
+              renders only under throttling, exactly as before. */}
+          {thermal.cpu_speed_limit_pct < 100 && (
+            <Kv
+              className="dialog__kv--warn"
+              label="CPU speed limit"
+              value={`${Math.round(thermal.cpu_speed_limit_pct)}%`}
+            />
+          )}
+          {windowThermal && (
+            <>
+              <Kv
+                label="highest severity"
+                value={fmtThermalState(windowThermal.worst_state)}
+              />
+              <Kv
+                label="above nominal"
+                value={fmtAboveNominal(windowThermal.above_nominal_ms)}
+              />
+            </>
+          )}
+        </div>
+      )}
+      {(power_mw || energyLine) && (
+        <div className="power-block hx-section">
+          <div className="hx-section__title">Power</div>
+          {power_mw && <Kv label="total" value={powerTotal} />}
+          {power_mw && <Kv label="channels" value={powerChannels} />}
+          {energyLine && <Kv label="energy" value={energyLine} />}
         </div>
       )}
     </>
@@ -489,16 +460,6 @@ export interface MachineStatsInput {
    * the caller — which DOES know whether it's currently showing this
    * content — has to say so explicitly rather than the hook guessing. */
   isOpen: boolean;
-  /** (#2108, operator finding — wrap fix) Whether the caller's own
-   * surface is currently rendering the PHONE chrome — the same
-   * `useIsMobile` breakpoint `MachineDrawer.tsx` already measures for its
-   * own dialog/phone-drawer split, threaded down here so this shared body
-   * can switch its own dotted-list rows (header line, thermal window,
-   * power total/channels, the GPU MHz/memory line) to `InlineOrCells`'
-   * cell-grid form at the SAME breakpoint, rather than re-measuring
-   * `window.innerWidth` a second time in a hook that's already handed a
-   * `nowMsOverride` for testability. */
-  isMobile: boolean;
   /** Test-only override — production omits this and the hook ticks its
    * own clock (see [[useTickingNow]]). */
   nowMsOverride?: number;
@@ -529,7 +490,6 @@ export function useMachineStatsContent({
   specs,
   liveStatus,
   isOpen,
-  isMobile,
   nowMsOverride,
 }: MachineStatsInput): MachineStatsContent {
   const tickedNow = useTickingNow(5000);
@@ -569,17 +529,8 @@ export function useMachineStatsContent({
 
   const machineName =
     localUid != null ? nameOf(flowWindow, liveMachines, localUid) : null;
-  const hardware =
-    localUid != null ? specOf(flowWindow, liveMachines, specs, localUid) : "";
   const verMeta = injectedMeta("darkmux-version");
   const schemaMeta = injectedMeta("darkmux-flow-schema");
-  // (#2250) The version is NOT in this line. #2108 dropped it from the
-  // MOBILE identity block on exactly this reasoning — "it's already the
-  // `build` row in the about kv block below, so nothing is lost, only
-  // de-duplicated" — but left desktop showing it twice. Same fact, same
-  // panel, so the same dedupe applies; the About block now leads the panel,
-  // which makes the duplicate more obvious, not less.
-  const headerLine = [machineName, hardware].filter(Boolean).join(" · ");
 
   // (#2107, #1833, warm-up finding) On a non-mission/non-dispatch view where
   // the daemon actually supplies the aggregate, the label reflects the
@@ -595,10 +546,13 @@ export function useMachineStatsContent({
     !isMissionOrDispatch && daemonLoad != null
       ? daemonWindowLabel(daemonLoad.window?.span_ms ?? 0)
       : scope.scopeLabel;
-  const samplerCostLine =
+  // (#2250 layout model) "sampler cost" is a fact like any other, so it is
+  // a kv row in Load rather than a free-floating caption line with its own
+  // one-off style rule (`.machine-drawer__sampler-cost`, now deleted).
+  const samplerCostValue =
     !isMissionOrDispatch && daemonLoad != null
-      ? `sampler cost ${Math.round(daemonLoad.now.sampler_cost_ms * 10) / 10} ms/sample`
-      : null;
+      ? `${Math.round(daemonLoad.now.sampler_cost_ms * 10) / 10} ms/sample`
+      : "";
 
   // (#2108, host-sample-shape v2) Thermal/power/CPU-cluster rows are host
   // readings, not scoped to any one dispatch — they render off the raw
@@ -608,7 +562,13 @@ export function useMachineStatsContent({
   // right now" is orthogonal to "what did THIS dispatch use." Each row
   // hides independently on its own null field — see this module's own
   // `HostExtras` doc.
-  const hostExtras = <HostExtras load={daemonLoad} isMobile={isMobile} />;
+  // (#2250) Read here rather than in `HostExtras`: these describe the GPU
+  // gauge, so they are Load-section facts and the parent owns that section.
+  // `?? null` keeps a v1-shaped `now` predating both fields rendering
+  // nothing rather than "NaN MHz" — the guard the old call site had.
+  const gpuMhz = daemonLoad?.now?.gpu_mhz ?? null;
+  const gpuMem = fmtGpuMemBytes(daemonLoad?.now?.gpu_mem_bytes ?? null);
+  const hostExtras = <HostExtras load={daemonLoad} />;
 
   const meters = (
     <div className="meter-row">
@@ -679,21 +639,29 @@ export function useMachineStatsContent({
   // fact: it's already the `build` row in the "about" kv block below,
   // so nothing is lost, only de-duplicated. Desktop keeps the single
   // dotted `headerLine` unchanged.
-  const identityBlock = isMobile ? (
-    (machineName || hardware) && (
-      <div className="machine-drawer__identity machine-drawer__identity--mobile">
-        {machineName && (
-          <div className="machine-drawer__identity-line">{machineName}</div>
-        )}
-        {hardware && (
-          <div className="machine-drawer__identity-line">{hardware}</div>
-        )}
-      </div>
-    )
-  ) : (
-    headerLine && (
-      <div className="machine-drawer__identity">{headerLine}</div>
-    )
+  // (#2250) System specs as kv ROWS, matching General and Power, rather
+  // than one dotted line. This also retires the mobile/desktop split that
+  // lived here: #2108 stacked two lines on a phone only because the single
+  // dotted line wrapped mid-item ("128 GB ·" onto its own row). Rows stack
+  // by construction, so one form serves both skins now.
+  //
+  // Sourced from `specs` where it has the field, so each fact carries its
+  // own label instead of being concatenated into a phrase. `Kv` hides an
+  // empty value, so a route without `specs` shows fewer rows rather than
+  // empty ones. Disk is absent because nothing collects it — `MachineSpecs`
+  // has no disk field. Clock speed is deliberately NOT duplicated here: the
+  // CPU clusters section already reports per-cluster MHz, which is the
+  // honest form, since the clusters run at different speeds and a single
+  // "clock speed" row would have to pick one.
+  const ramTotal = specs?.ram_total_bytes ?? null;
+  const ramForAi = specs?.ram_free_for_ai_bytes ?? null;
+  const identityBlock = (
+    <>
+      <Kv label="machine name" value={machineName ?? ""} />
+      <Kv label="silicon" value={specs?.cpu_brand ?? ""} />
+      <Kv label="shared memory" value={fmtGbBytes(ramTotal)} />
+      <Kv label="OS" value={specs?.os ?? ""} />
+    </>
   );
 
   // (#2250) The meters get a title like every other block, and the window
@@ -711,21 +679,53 @@ export function useMachineStatsContent({
           {identityBlock}
         </div>
       )}
-      <div className="hx-section__title">Load</div>
-      <div className="machine-drawer__scope">{scopeLabel}</div>
-      {samplerCostLine && (
-        <div className="machine-drawer__sampler-cost">{samplerCostLine}</div>
-      )}
-      {isIdle ? (
-        <div className="machine-drawer__idle">
-          <div className="machine-drawer__idle-line">{idleLine}</div>
-          {lastKnownLine && (
-            <div className="machine-drawer__lastknown">{lastKnownLine}</div>
-          )}
-        </div>
-      ) : (
-        meters
-      )}
+      {/* (#2250) An `hx-section` wrapper, not a bare title: the border-top
+          is what draws the rule between this and System specs above. Without
+          it this was the one section boundary in the panel with no divider. */}
+      <div className="hx-section">
+        <div className="hx-section__title">Load</div>
+        <Kv label="sampler cost" value={samplerCostValue} />
+        {isIdle ? (
+          <div className="machine-drawer__idle">
+            <div className="machine-drawer__idle-line">{idleLine}</div>
+            {lastKnownLine && (
+              <div className="machine-drawer__lastknown">{lastKnownLine}</div>
+            )}
+          </div>
+        ) : (
+          meters
+        )}
+        {/* (#2250, operator: "what's going on with this stray GPU line?")
+            These rendered as a bare `GPU 338 MHz · 1.4 GB` at the top of
+            `HostExtras` — AFTER the Load section closed, so it belonged to
+            no section, and once the gauge row wrapped it sat under whichever
+            gauge landed last, reading as unrelated to the GPU gauge it
+            describes. As labelled rows inside Load it is unambiguous, and it
+            retires two workarounds with it: the `GPU ` text prefix and the
+            `length === 1` branch added because `InlineOrCells`' grid stacked
+            a label above its value for a lone item.
+
+            "in use" is load-bearing, not padding (operator: "what's the
+            1 - 1.5 GB about?"). The source is `IOAccelerator`'s
+            `PerformanceStatistics` -> "In use system memory"
+            (`host_probe/mod.rs::gpu_read`). Apple Silicon has UNIFIED
+            memory, so there is no GPU pool to report a capacity for — this
+            is system RAM mapped by the GPU at that instant, machine-wide
+            (window server, browser compositing, any Metal work), not
+            darkmux's own usage and not a total. Labelled "GPU memory" it
+            reads as a capacity, which is why it looked like a mystery
+            number drifting between 1 and 1.5 GB. */}
+        <Kv label="GPU clock" value={gpuMhz !== null ? `${Math.round(gpuMhz)} MHz` : ""} />
+        <Kv label="GPU memory in use" value={gpuMem ?? ""} />
+        {/* (#2250, operator: "same kind of thing is going on with free for
+            AI") Memory free for AI is a LIVE reading — it falls as models
+            load and rises as they unload — so it belongs beside the other
+            live readings, not in System specs. Next to a static "shared
+            memory: 128 GB" capacity it read as a second capacity figure.
+            The section split is static capability vs current state: System
+            specs is what the machine IS, Load is what it is DOING. */}
+        <Kv label="memory free for AI" value={fmtGbBytes(ramForAi)} />
+      </div>
       {hostExtras}
     </>
   );
@@ -769,7 +769,27 @@ export function useMachineStatsContent({
   // (#2250) About FIRST. Build/schema/connection/mode answer "what am I
   // looking at and is it current" — the question you open this panel with
   // — and they were previously below the meters, off the fold on a phone.
-  // (#2250, operator ask) A plain-language footnote for the avg/max window.
+  // (#2250, operator ask) The panel's SINGLE statement of the sample
+  // window. It was briefly repeated per-section (Load, Thermal) and the
+  // operator cut that as redundant — every aggregate in the panel comes
+  // from the same `daemonLoad.window`, so one footnote covers all of them
+  // and the sections stay uncluttered.
+  //
+  // It NAMES each aggregate rather than saying "avg and max", because the
+  // operator noticed thermal's "highest severity" is obviously windowed
+  // and was not listed — an unnamed value leaves the reader guessing which
+  // window it belongs to. The split is exhaustive and checkable against
+  // the code, not asserted:
+  //   `load.window` -> cpu/gpu/mem `.mean`/`.max` (the avg·max under each
+  //     gauge), `thermal.worst_state`, `thermal.above_nominal_ms`,
+  //     `power_mw` (avg/p95/max), `energy_mwh`
+  //   `load.now`    -> the gauges' large numbers, `thermal.state` (the lit
+  //     pill), `power_mw` ("W now"), `cpu_clusters`, `gpu_mhz` (GPU clock),
+  //     `gpu_mem_bytes` (GPU memory in use), and `specs.
+  //     ram_free_for_ai_bytes` (memory free for AI — from the specs fetch
+  //     rather than `load`, but a current reading all the same)
+  // If a new field lands on either side, this sentence is what goes stale
+  // — it is the one place the reader is told which is which.
   // The operator asked for "averages and max readings are from the last 24
   // hours" — but the window is NOT fixed: `scopeLabel` is whatever the
   // sampler actually covers ("last <1 min · daemon sampler" on a fresh
@@ -779,14 +799,16 @@ export function useMachineStatsContent({
   // cannot back. Rendered last so it reads as a footnote to the whole panel.
   const meterFootnote = scopeLabel ? (
     <div className="machine-drawer__footnote">
-      {`avg and max readings cover ${scopeLabel}; the large number is current.`}
+      {`Measured over ${scopeLabel} — each gauge's avg and max, the highest thermal severity and time above nominal, power avg/p95/max, and energy (a total for the window). Everything else is current: the large number on each gauge, the lit thermal state, W now, the CPU cluster readings, the GPU clock and memory in use, and the memory free for AI.`}
     </div>
   ) : null;
 
+  // (#2250 layout model) No `.dialog__rule` between General and the stats
+  // body any more: every `.hx-section` draws its own top border, so the
+  // extra rule doubled the divider at exactly one boundary in the panel.
   const body = (
     <>
       {aboutSection}
-      <div className="dialog__rule" />
       {statsBody}
       {meterFootnote}
     </>
