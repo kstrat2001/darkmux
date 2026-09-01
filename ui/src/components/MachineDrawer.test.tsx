@@ -390,6 +390,13 @@ describe("MachineDrawer (#2107)", () => {
     expect(screen.queryByText("machine name")).toBeNull();
     expect(screen.queryByText("silicon")).toBeNull();
     expect(screen.queryByText("shared memory")).toBeNull();
+    // (#2250 follow-up) The rows going away is only half of it — the
+    // SECTION has to go away too. Guarding on the JSX fragment made this
+    // assertion pass while a bare "System specs" heading still rendered
+    // with nothing under it, which is exactly the empty-row shape this
+    // test is named for. Assert the heading, or the guard can regress to
+    // always-truthy again and this test will not notice.
+    expect(screen.queryByText("System specs")).toBeNull();
   });
 
   // (#2108, operator finding) The external links row (github/guide/
