@@ -7589,6 +7589,136 @@ fn no_findings_file_means_the_channel_was_never_used_not_that_nothing_was_found(
         );
     }
 
+    // ─── (#2233) ContainerKillGuard — the container's RAII backstop ───────
+
+    /// Drops a fake `docker` executable that records its own argv into
+    /// `<dir>/invoked-with.txt`, and prepends `dir` to `PATH`. Returns the
+    /// record path plus the previous `PATH` so the caller can restore it.
+    /// Same seam `docker_kill_by_name_invokes_docker_kill_with_the_exact_container_name`
+    /// above already uses — no real Docker CLI or daemon exists in this
+    /// sandbox, so a script on `PATH` standing in for the `docker` binary is
+    /// how this file proves WHAT gets shelled out (#2233).
+    fn install_fake_docker(dir: &TempDir) -> (std::path::PathBuf, Option<String>) {
+        let record_path = dir.path().join("invoked-with.txt");
+        let fake_docker_path = dir.path().join("docker");
+        std::fs::write(
+            &fake_docker_path,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n", record_path.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_docker_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_docker_path, perms).unwrap();
+        }
+        let prev_path = std::env::var("PATH").ok();
+        // SAFETY: every caller is `#[serial]`.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", dir.path().display(), prev_path.clone().unwrap_or_default()),
+            );
+        }
+        (record_path, prev_path)
+    }
+
+    fn restore_path(prev_path: Option<String>) {
+        // SAFETY: every caller is `#[serial]`.
+        unsafe {
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn container_kill_guard_armed_kills_the_container_on_drop() {
+        // (#2233) THE BUG this guard exists for: between `cmd.spawn()` and
+        // the watchdog's own `docker kill`, the remote-auth stdin block has
+        // two `?` early returns (missing stdin handle; a failed/partial
+        // header write). Both used to return with the container ALIVE and
+        // nothing at all scheduled to stop it — `PidRegistration`'s Drop
+        // only deregisters, and the watchdog that would eventually kill it
+        // does not exist yet at that point. The container then held its
+        // LMStudio model load indefinitely. An armed guard dropped without a
+        // disarm must `docker kill <name>`.
+        let dir = TempDir::new().unwrap();
+        let (record_path, prev_path) = install_fake_docker(&dir);
+
+        {
+            let _guard = ContainerKillGuard::new("darkmux-test-container-2233-armed".to_string());
+            // drop here (end of scope) — no disarm, exactly as an early `?`
+            // return out of the stdin block would leave it.
+        }
+
+        restore_path(prev_path);
+
+        let recorded = std::fs::read_to_string(&record_path)
+            .expect("an armed guard's Drop must have invoked the fake `docker` on PATH");
+        assert_eq!(
+            recorded.trim(),
+            "kill darkmux-test-container-2233-armed",
+            "the guard must stop the container by its deterministic name"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn container_kill_guard_disarmed_does_not_kill_on_drop() {
+        // (#2233) The high-risk direction. The happy path hands the
+        // container off to `wait_with_output()` (and, on its error arm, to
+        // that arm's own `docker kill`), so the guard MUST be disarmed
+        // before that hand-off. A guard that stayed armed there would kill
+        // every healthy dispatch's container mid-run.
+        let dir = TempDir::new().unwrap();
+        let (record_path, prev_path) = install_fake_docker(&dir);
+
+        {
+            let mut guard =
+                ContainerKillGuard::new("darkmux-test-container-2233-disarmed".to_string());
+            guard.disarm();
+        }
+
+        restore_path(prev_path);
+
+        assert!(
+            !record_path.exists(),
+            "a disarmed guard must not shell out to docker at all — it recorded: {}",
+            std::fs::read_to_string(&record_path).unwrap_or_default()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn container_kill_guard_fires_on_panic_unwind() {
+        // (#2233) The free side benefit of the RAII shape, same as
+        // `bookend_guard_fires_on_panic_unwind` pins for the bookends: Rust
+        // runs Drop on unwind, so a panic between spawn and the hand-off
+        // also stops the container. No extra machinery — just the guard.
+        let dir = TempDir::new().unwrap();
+        let (record_path, prev_path) = install_fake_docker(&dir);
+
+        // Silence the expected panic backtrace so test output stays clean.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            let _guard = ContainerKillGuard::new("darkmux-test-container-2233-panic".to_string());
+            panic!("simulated mid-dispatch panic between spawn and hand-off");
+        });
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "the closure should have panicked");
+
+        restore_path(prev_path);
+
+        let recorded = std::fs::read_to_string(&record_path)
+            .expect("the guard's Drop must run on unwind and invoke the fake `docker`");
+        assert_eq!(recorded.trim(), "kill darkmux-test-container-2233-panic");
+    }
+
     // ─── (#2111) should_record_machine_telemetry — periodic curve cadence ─
 
     #[test]
