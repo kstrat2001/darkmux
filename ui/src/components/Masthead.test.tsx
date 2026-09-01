@@ -184,7 +184,7 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     vi.unstubAllGlobals();
   });
 
-  it("a daemon dispatch/mission page reads RESULT until the shell knows its day, then the date with the playback badge", () => {
+  it("a daemon dispatch/mission page reads RESULT until the shell knows its day, then the date — and never a playback badge", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response("[]", { status: 200 }))));
     const unknown = renderMasthead({ kind: "dispatch", dispatchId: "s1" } as never);
     expect(unknown.container.querySelector(".catalog-toggle")?.textContent).toBe("RESULT");
@@ -192,7 +192,10 @@ describe("Masthead — static-build badge suppression (#1801)", () => {
     unknown.unmount();
     const known = renderMasthead({ kind: "mission", missionId: "m1" } as never, "live", "2026-08-07");
     expect(known.container.querySelector(".catalog-toggle")?.textContent).toBe("2026-08-07");
-    expect(known.container.querySelector("#modebadge")?.textContent).toMatch(/playback/i);
+    // (operator, 2026-09-01) No mode badge on either route: redundant on a
+    // dispatch (the transport states the mode) and false on a mission (which
+    // has no playback at all — that lives in the drill-in detail view).
+    expect(known.container.querySelector("#modebadge")).toBeNull();
     vi.unstubAllGlobals();
   });
 
