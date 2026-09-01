@@ -335,8 +335,16 @@ body {
   .app-shell__crumb {
     flex: 1 1 100%;
   }
+  /* (operator, 2026-09-01) The "N machines · last dispatch …" summary is
+     GONE on a phone, not merely reflowed. It was spending a full row of
+     precious vertical space on data that is a tap away and better presented
+     in three other places: the fleet lens shows the machines themselves with
+     per-machine health, and runs/console both carry recency. A summary earns
+     a row when it saves you a navigation; this one duplicated the lens
+     directly below it. Desktop keeps it — the row has width to spare there
+     and it costs nothing. */
   .app-shell__meta {
-    flex: 1 1 100%;
+    display: none;
   }
   /* (operator, on the phone, 2026-08-28) Uniform-width tabs filling the
      row: sized by their labels, RUNS was the slim one and the strip sat
@@ -2651,11 +2659,13 @@ body {
    order, so the parity goldens are untouched by a purely visual swap. (Run
    the suites after touching this — that assumption is the whole reason this
    is safe, and it is worth re-proving rather than trusting.) */
-.tlhdr > :first-child {
-  order: 2;
-}
-.tlhdr .twin {
-  order: 1;
+/* (operator, 2026-09-01) The window picker FOLLOWS the heading it belongs to.
+   It was ordered before it, which read as chrome floating above the section
+   rather than as this timeline's own control — the association is the point.
+   DOM order is already heading-then-control, so the override is simply gone
+   rather than inverted. */
+.tlhdr {
+  flex-wrap: wrap;
 }
 
 .tlhdr {
@@ -2700,6 +2710,41 @@ body {
    `overflow:hidden` + shared border still frame the group the same way at
    the larger size. */
 @media (max-width: 768px) {
+  /* (operator, 2026-09-01) On a phone `28% avg · 98% high` wrapped to two
+     lines and the label took a third. If the tile is spending a second line
+     anyway, spend it on the LABEL rather than on a widow: value and label
+     share the first line and wrap together.
+     `row-reverse` puts the label first VISUALLY while leaving DOM order
+     (value, then label) untouched — the session goldens compare innerText
+     byte-for-byte, so the reading order must not move. */
+  .met {
+    display: flex;
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+  }
+  .met .ml {
+    flex: 0 0 auto;
+  }
+}
+
+@media (max-width: 768px) {
+  /* (operator, 2026-09-01) Tab-like on a phone: the group spans the content
+     width and the segments share it equally. This is NOT the form rejected in
+     the earlier touch-target pass — that was a 44px slab around 11px text,
+     mostly empty ink. Here the TYPE grows with the box, so the weight is
+     carried by the label rather than by padding. */
+  .twin {
+    display: flex;
+    width: 100%;
+  }
+  .twinb {
+    flex: 1 1 0;
+    font-size: calc(13px * var(--fs-scale));
+    padding: 9px 8px;
+  }
   .twinb {
     display: inline-flex;
     align-items: center;
